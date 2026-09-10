@@ -1218,17 +1218,14 @@ async fn peer_delta_pull_with_client_factory<
 }
 
 fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_data_dir()
+    crate::app_data_root::resolve(app)
         .map_err(|error| format!("failed to resolve application data directory: {error}"))
 }
 
 /// The same directory for the commands that finish through a bounded code, so
 /// the resolver failure stays a `PeerSyncError` all the way to the boundary.
 fn delta_app_data_root(app: &AppHandle) -> Result<PathBuf, PeerSyncError> {
-    app.path()
-        .app_data_dir()
-        .map_err(|error| PeerSyncError::Storage(error.to_string()))
+    crate::app_data_root::resolve(app).map_err(|error| PeerSyncError::Storage(error.to_string()))
 }
 
 pub(crate) fn canonical_source_device_id(app_root: &Path) -> Result<String, PeerSyncError> {

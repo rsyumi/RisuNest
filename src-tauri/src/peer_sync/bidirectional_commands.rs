@@ -5071,8 +5071,7 @@ pub fn peer_bidirectional_target_foreground_release(
 fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
     finish_peer_command(
         "bidirectional application data directory",
-        app.path()
-            .app_data_dir()
+        crate::app_data_root::resolve(app)
             .map_err(|error| PeerSyncError::Storage(error.to_string())),
     )
 }
@@ -6435,8 +6434,16 @@ impl PeerBidirectionalOperationJournal {
 
     fn restore_claim(&self, claim_path: &Path) -> Result<(), PeerSyncError> {
         let operation_path = self.root.join(OPERATION_FILE);
-        fs::hard_link(claim_path, &operation_path)?;
-        fs::remove_file(claim_path)?;
+        #[cfg(target_os = "android")]
+        {
+            crate::trust_boundary::rename_without_replace(claim_path, &operation_path)?;
+            crate::trust_boundary::sync_directory(&self.root)?;
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            fs::hard_link(claim_path, &operation_path)?;
+            fs::remove_file(claim_path)?;
+        }
         Ok(())
     }
 

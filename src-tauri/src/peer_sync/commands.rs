@@ -2365,8 +2365,7 @@ fn as_store_error(error: PeerSyncError) -> StoreError {
 fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
     finish_peer_command(
         "peer clone application data directory",
-        app.path()
-            .app_data_dir()
+        crate::app_data_root::resolve(app)
             .map_err(|error| PeerSyncError::Storage(error.to_string())),
     )
 }

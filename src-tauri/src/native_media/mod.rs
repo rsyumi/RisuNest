@@ -21,7 +21,7 @@ use tauri::http::{
     header::{self, HeaderValue},
     Method, Request, Response, StatusCode,
 };
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 const MAX_BODY_BYTES: u64 = 1024 * 1024;
 const EXPOSED_HEADERS: &str = "Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag";
@@ -1122,9 +1122,7 @@ pub(crate) async fn native_media_write_inlay_image(
     name: String,
     options: Option<InlayEncodeOptions>,
 ) -> Result<InlayImageMetadata, String> {
-    let root = app
-        .path()
-        .app_data_dir()
+    let root = crate::app_data_root::resolve(&app)
         .map_err(|error| format!("failed to resolve application data directory: {error}"))?;
     tauri::async_runtime::spawn_blocking(move || {
         write_inlay_image_with_options(&root, &id, &data, &name, options)

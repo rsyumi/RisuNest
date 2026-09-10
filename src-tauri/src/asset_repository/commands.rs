@@ -32,8 +32,7 @@ impl Default for DurableCasJobState {
 }
 
 fn repository_root(app: &AppHandle) -> Result<std::path::PathBuf, String> {
-    app.path()
-        .app_data_dir()
+    crate::app_data_root::resolve(app)
         .map_err(|error| format!("failed to resolve application data directory: {error}"))
 }
 

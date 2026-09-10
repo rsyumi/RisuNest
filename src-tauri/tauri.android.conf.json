@@ -3,6 +3,13 @@
   "build": {
     "beforeBuildCommand": "pnpm tauribuild:android"
   },
+  "app": {
+    "security": {
+      "assetProtocol": {
+        "scope": ["asset", "$APPDATA", "$APPDATA/*", "$APPDATA/**/*"]
+      }
+    }
+  },
   "bundle": {
     "resources": [],
     "createUpdaterArtifacts": false,

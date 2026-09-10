@@ -8,7 +8,7 @@ use std::{
     sync::{Mutex, OnceLock},
     time::UNIX_EPOCH,
 };
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -782,9 +782,7 @@ fn cleanup_temp_with_predelete_hooks_inner(
 }
 
 fn app_root(app: &AppHandle) -> Result<PathBuf, PeerSyncError> {
-    app.path()
-        .app_data_dir()
-        .map_err(|error| PeerSyncError::Storage(error.to_string()))
+    crate::app_data_root::resolve(app).map_err(|error| PeerSyncError::Storage(error.to_string()))
 }
 
 fn finish_string_command<T>(

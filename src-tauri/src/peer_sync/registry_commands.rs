@@ -17,7 +17,7 @@ use crate::persistent_store::{
     PersistentStore, RegisteredSyncDeviceStatus, StoreError, PRODUCT_LOGICAL_LIBRARY_ID,
 };
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, State};
 
 fn registered_source_lifecycle_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -65,8 +65,7 @@ trait RegistryAppRootResolver {
 
 impl RegistryAppRootResolver for AppHandle {
     fn resolve_registry_app_root(&self) -> Result<PathBuf, PeerSyncError> {
-        self.path()
-            .app_data_dir()
+        crate::app_data_root::resolve(self)
             .map_err(|error| PeerSyncError::Storage(error.to_string()))
     }
 }

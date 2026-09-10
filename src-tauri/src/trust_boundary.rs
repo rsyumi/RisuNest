@@ -46,3 +46,32 @@ pub(crate) fn sync_directory(path: &Path) -> io::Result<bool> {
 pub(crate) fn sync_directory(_path: &Path) -> io::Result<bool> {
     Ok(false)
 }
+
+/// Android forbids app hard links. Move a completed file atomically while
+/// preserving an existing destination, including a dangling symlink.
+/// Callers must sync the source and destination directories after success.
+#[cfg(target_os = "android")]
+pub(crate) fn rename_without_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+    let source = CString::new(source.as_os_str().as_bytes())?;
+    let destination = CString::new(destination.as_os_str().as_bytes())?;
+    // Use the syscall without depending on bionic's API 30 renameat2 wrapper.
+    // SAFETY: both C strings remain valid for the duration of the syscall.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        // Do not fall back to rename(), which would overwrite a live object.
+        Err(io::Error::last_os_error())
+    }
+}

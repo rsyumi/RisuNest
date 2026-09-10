@@ -151,7 +151,12 @@ impl PayloadCas {
         )?;
         let object_path = object_directory.join(&content_hash[2..]);
 
-        let deduplicated = match fs::hard_link(&staging_path, &object_path) {
+        #[cfg(target_os = "android")]
+        let publication =
+            crate::trust_boundary::rename_without_replace(&staging_path, &object_path);
+        #[cfg(not(target_os = "android"))]
+        let publication = fs::hard_link(&staging_path, &object_path);
+        let deduplicated = match publication {
             Ok(()) => {
                 directory_entries_synced &= sync_directory(&object_directory)?;
                 false
@@ -161,7 +166,12 @@ impl PayloadCas {
                 directory_entries_synced &= sync_directory(&object_directory)?;
                 true
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("failed to publish CAS object without replacement: {error}"),
+                ));
+            }
         };
 
         directory_entries_synced &= staging.remove_and_sync()?;
@@ -663,6 +673,71 @@ mod tests {
     use super::{create_staging_file, ExactObjectUnlink, PayloadCas};
     use sha2::Digest;
     use std::io::Cursor;
+
+    #[test]
+    fn duplicate_publication_verifies_existing_bytes_and_cleans_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let original = b"original synthetic object";
+        let prepared = cas.prepare_bytes(original).unwrap();
+        assert!(!prepared.deduplicated);
+        assert!(cas.prepare_bytes(original).unwrap().deduplicated);
+        let object = directory.path().join(&prepared.physical_key);
+        let corrupted = vec![b'x'; original.len()];
+        std::fs::write(&object, &corrupted).unwrap();
+        let error = cas.prepare_bytes(original).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error
+            .to_string()
+            .contains("payload collision or corruption"));
+        assert_eq!(std::fs::read(object).unwrap(), corrupted);
+        assert_eq!(
+            std::fs::read_dir(directory.path().join("assets-v2/staging"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn concurrent_publication_never_replaces_the_winning_object() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = std::sync::Arc::new(PayloadCas::new(directory.path()).unwrap());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let cas = cas.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    cas.prepare_bytes(b"concurrent synthetic object").unwrap()
+                })
+            })
+            .collect();
+        let published: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(
+            published
+                .iter()
+                .filter(|object| !object.deduplicated)
+                .count(),
+            1
+        );
+        assert_eq!(
+            cas.read_object(&published[0].content_hash)
+                .unwrap()
+                .unwrap(),
+            b"concurrent synthetic object"
+        );
+        assert_eq!(
+            std::fs::read_dir(directory.path().join("assets-v2/staging"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
 
     #[test]
     fn existing_directory_from_a_crash_window_resyncs_its_parent_before_acceptance() {

@@ -1,3 +1,6 @@
+#[cfg(any(test, target_os = "android"))]
+mod android_commit_transport;
+mod app_data_root;
 mod asset_repository;
 mod cold_payload_codec;
 pub mod import_export_jobs;
@@ -14,11 +17,9 @@ mod native_tokenizer;
 #[cfg(desktop)]
 mod opened_files;
 mod peer_sync;
-mod persistent_store;
 #[cfg(windows)]
 mod persistent_commit_transport;
-#[cfg(any(test, target_os = "android"))]
-mod android_commit_transport;
+mod persistent_store;
 #[cfg(feature = "official-publication-upload-pilot")]
 mod publication_upload;
 #[cfg(any(test, target_os = "windows", target_os = "android"))]
@@ -540,11 +541,15 @@ pub fn run() {
             });
     }
     #[cfg(windows)]
-    { builder = builder.on_page_load(|webview, payload| {
-        if webview.label() == "main" && matches!(payload.event(), tauri::webview::PageLoadEvent::Started) {
-            let _ = webview.with_webview(|_| persistent_commit_transport::reset());
-        }
-    }); }
+    {
+        builder = builder.on_page_load(|webview, payload| {
+            if webview.label() == "main"
+                && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
+            {
+                let _ = webview.with_webview(|_| persistent_commit_transport::reset());
+            }
+        });
+    }
 
     #[cfg(desktop)]
     {
@@ -563,7 +568,7 @@ pub fn run() {
 
     let app = builder
         .setup(move |app| {
-            let app_data_dir = app.path().app_data_dir()?;
+            let app_data_dir = app_data_root::resolve(app)?;
             setup_native_log_state.configure_file_path(&app_data_dir);
             app.manage(setup_native_log_state.clone());
             native_media::recover_inlay_writes(&app_data_dir).map_err(std::io::Error::other)?;
@@ -601,7 +606,7 @@ pub fn run() {
             Ok(())
         })
         .register_asynchronous_uri_scheme_protocol("risuasset", |context, request, responder| {
-            let root = context.app_handle().path().app_data_dir();
+            let root = app_data_root::resolve(context.app_handle());
             tauri::async_runtime::spawn_blocking(move || {
                 let response = match root {
                     Ok(root) => native_media::respond(&root, request),
@@ -854,10 +859,8 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .expect("error while resolving tauri app data directory");
+    let app_data_dir =
+        app_data_root::resolve(&app).expect("error while resolving tauri app data directory");
     native_log_state.configure_file_path(&app_data_dir);
     app.run(|app, event| {
         #[cfg(desktop)]

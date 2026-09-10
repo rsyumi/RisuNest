@@ -245,12 +245,9 @@ pub(crate) fn pds_open(
         message: format!("persistent store mutex poisoned: {error}"),
     })?;
 
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| StoreError::Store {
-            message: format!("failed to resolve application data directory: {error}"),
-        })?;
+    let app_data_dir = crate::app_data_root::resolve(&app).map_err(|error| StoreError::Store {
+        message: format!("failed to resolve application data directory: {error}"),
+    })?;
     open_persistent_store(&app_data_dir, &mut store)
 }
 

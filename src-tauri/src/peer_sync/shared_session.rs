@@ -1936,7 +1936,7 @@ pub async fn device_sync_prepare(
     state.clear_error_category();
     let worker_state = state.clone();
     match tauri::async_runtime::spawn_blocking(move || {
-        let app_root = app.path().app_data_dir().map_err(|error| {
+        let app_root = crate::app_data_root::resolve(&app).map_err(|error| {
             PeerSyncError::Storage(format!(
                 "device sync application data directory is unavailable: {error}"
             ))
@@ -2123,7 +2123,7 @@ pub(crate) async fn device_sync_prepare(
     let state = state.inner().clone();
     let worker_state = state.clone();
     match tauri::async_runtime::spawn_blocking(move || {
-        let app_root = app.path().app_data_dir().map_err(|error| {
+        let app_root = crate::app_data_root::resolve(&app).map_err(|error| {
             PeerSyncError::Storage(format!(
                 "device sync application data directory is unavailable: {error}"
             ))

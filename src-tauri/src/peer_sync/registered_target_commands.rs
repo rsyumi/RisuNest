@@ -14,7 +14,7 @@ use std::{
     fmt,
     path::{Path, PathBuf},
 };
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, State};
 
 #[cfg(target_os = "android")]
 use super::android_commands::AndroidPeerCloneCommandState;
@@ -183,8 +183,7 @@ fn refresh_clone_lane(
 }
 
 fn app_root(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_data_dir()
+    crate::app_data_root::resolve(app)
         .map_err(|error| safe_command_failure("registered source app root", error))
 }
 

@@ -21,13 +21,7 @@
     "fs:allow-read",
     {
       "identifier": "fs:scope",
-      "allow": [
-        "$APPDATA",
-        "$APPDATA/*",
-        "$APPDATA/**/*",
-        "$DOWNLOAD/*",
-        "/data/**/*"
-      ]
+      "allow": ["$APPDATA", "$APPDATA/*", "$APPDATA/**/*", "$DOWNLOAD/*"]
     },
     "dialog:allow-open",
     "dialog:allow-save",
