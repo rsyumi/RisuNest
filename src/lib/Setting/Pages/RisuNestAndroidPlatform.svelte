@@ -1,8 +1,10 @@
 <script lang="ts">
     import { onDestroy, onMount } from 'svelte'
     import { language } from 'src/lang'
-    import Check from 'src/lib/UI/GUI/CheckInput.svelte'
     import Button from 'src/lib/UI/GUI/Button.svelte'
+    import SettingGroup from '../RisuNest/SettingGroup.svelte'
+    import SettingRow from '../RisuNest/SettingRow.svelte'
+    import SettingToggle from '../RisuNest/SettingToggle.svelte'
     import { getDetailedOSLabel } from 'src/ts/platform'
     import { getDeviceSettings, subscribeDeviceSettings, updateDeviceSettings } from 'src/ts/storage/deviceSettings'
     import { androidGenerationNotificationsEnabled } from 'src/ts/androidGenerationKeepAlive'
@@ -62,41 +64,38 @@
     })
 </script>
 
-<h2 class="mb-2 text-2xl font-bold mt-6">{language.risuNest.platform.title}</h2>
-<div class="flex flex-col gap-2 text-textcolor">
-    {#if notificationStatus !== null}
-        <div class="flex items-center gap-2">
-            <span>{language.risuNest.platform.notifications}:</span>
+<SettingGroup id="risunest-platform" title={language.risuNest.platform.title}>
+    <SettingRow label={language.risuNest.platform.notifications} help={language.risuNest.platform.notificationsHelp}>
+        {#if notificationStatus !== null}
             <span
                 role="status"
                 aria-live="polite"
-                class={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-semibold ${notificationStatus
-                    ? 'border-success-500 bg-success-500/10 text-textcolor'
-                    : 'border-draculared bg-draculared/10 text-textcolor'}`}
-            >
-                {notificationStatus ? language.risuNest.platform.notificationsOn : language.risuNest.platform.notificationsOff}
-            </span>
-        </div>
-    {/if}
-    <Check bind:check={keepAlive} name={language.risuNest.platform.keepAlive} />
-    <span class="text-textcolor2 text-sm">{language.risuNest.platform.keepAliveHelp}</span>
-    {#if notificationStatus === false}
-        <span class="text-draculared text-sm" role="alert">{language.risuNest.platform.keepAliveNeedsNotifications}</span>
-    {/if}
-    <div class="flex flex-wrap gap-2">
-        <Button onclick={openNotificationSettings}>{language.risuNest.platform.openSettings}</Button>
-    </div>
+                class={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-xs font-semibold text-textcolor ${notificationStatus
+                    ? 'border-success-500 bg-success-500/10'
+                    : 'border-draculared bg-draculared/10'}`}
+            ><span class="h-2 w-2 rounded-full {notificationStatus ? 'bg-success-500' : 'bg-draculared'}" aria-hidden="true"></span>{notificationStatus ? language.risuNest.platform.notificationsOn : language.risuNest.platform.notificationsOff}</span>
+        {/if}
+        <Button size="sm" styled="outlined" onclick={openNotificationSettings}>{language.risuNest.platform.openSettings}</Button>
+    </SettingRow>
+    <SettingRow label={language.risuNest.platform.keepAlive} help={language.risuNest.platform.keepAliveHelp}>
+        {#snippet below()}
+            {#if notificationStatus === false}
+                <p class="mt-1 text-sm text-draculared" role="alert">{language.risuNest.platform.keepAliveNeedsNotifications}</p>
+            {/if}
+        {/snippet}
+        <SettingToggle bind:checked={keepAlive} label={language.risuNest.platform.keepAlive} />
+    </SettingRow>
     {#if operatingSystem || webView || transfer}
-        <div data-platform-info class="mt-2 flex flex-col gap-1 text-sm text-textcolor2">
+        <dl data-platform-info class="grid grid-cols-[auto_1fr] gap-x-5 gap-y-1 px-4 py-3 text-sm">
             {#if operatingSystem}
-                <span>{language.risuNest.platform.operatingSystem}: {operatingSystem}</span>
+                <dt class="text-textcolor2">{language.risuNest.platform.operatingSystem}</dt><dd>{operatingSystem}</dd>
             {/if}
             {#if webView}
-                <span>{language.risuNest.platform.webView}: {webView}</span>
+                <dt class="text-textcolor2">{language.risuNest.platform.webView}</dt><dd>{webView}</dd>
             {/if}
             {#if transfer}
-                <span>{language.risuNest.platform.transferMode}: {transfer}</span>
+                <dt class="text-textcolor2">{language.risuNest.platform.transferMode}</dt><dd>{transfer}</dd>
             {/if}
-        </div>
+        </dl>
     {/if}
-</div>
+</SettingGroup>

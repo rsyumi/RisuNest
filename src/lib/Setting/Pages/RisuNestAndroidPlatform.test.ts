@@ -97,8 +97,9 @@ describe('RisuNest Android platform settings', () => {
         const toggle = target.querySelector('input[type="checkbox"]')!
         const action = target.querySelector('button')!
         expect(action.textContent?.trim()).toBe('Open notification settings')
-        expect(Boolean(toggle.compareDocumentPosition(action) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true)
-        expect(Boolean(action.compareDocumentPosition(target.querySelector('[data-platform-info]')!) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true)
+        // The notification status row leads, then the keep-alive toggle, then the device facts.
+        expect(Boolean(action.compareDocumentPosition(toggle) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true)
+        expect(Boolean(toggle.compareDocumentPosition(target.querySelector('[data-platform-info]')!) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true)
         target.querySelector('button')?.click()
         expect(mocks.openNotificationSettings).toHaveBeenCalledOnce()
         mocks.updateDeviceSettings.mockClear()

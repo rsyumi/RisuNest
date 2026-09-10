@@ -38,7 +38,7 @@ describe('RisuNest settings navigation', () => {
     it('renders final RisuNest groups in order with platform gates', () => {
         const groups = [
             'RisuNestPerformanceSettings',
-            'SettingRenderer',
+            'RisuNestSettingRows',
             'RisuNestStorageDashboard',
             'RisuNestBackupRestore',
             'RisuNestAndroidPlatform',
@@ -48,9 +48,16 @@ describe('RisuNest settings navigation', () => {
 
         expect(positions.every((position) => position >= 0)).toBe(true)
         expect(positions).toEqual([...positions].sort((left, right) => left - right))
-        expect(pageSource).toContain('{#if isTauri}\n    <RisuNestStorageDashboard />')
-        expect(pageSource).toContain('{#if isTauriAndroid}\n    <RisuNestAndroidPlatform />')
-        expect(pageSource).toContain('{#if isTauri}\n    <RisuNestLogViewer />')
+        expect(pageSource).toContain('{#if isTauri}\n        <RisuNestStorageDashboard />')
+        expect(pageSource).toContain('{#if isTauriAndroid}\n        <RisuNestAndroidPlatform />')
+        expect(pageSource).toContain('{#if isTauri}\n        <RisuNestLogViewer />')
+    })
+
+    it('offers a section shortcut for every group on the page', () => {
+        for (const id of ['risunest-perf', 'risunest-streaming', 'risunest-inlay', 'risunest-storage', 'risunest-backup', 'risunest-platform', 'risunest-diag']) {
+            expect(pageSource).toContain(`'${id}'`)
+        }
+        expect(pageSource).toContain('scrollIntoView')
     })
 })
 

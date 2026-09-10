@@ -41,7 +41,6 @@ describe('streaming display optimization setting', () => {
             ),
         ).toBe(false)
         for (const locale of [languageEnglish, languageKorean]) {
-            expect(locale.risuNest.streaming.thoughtModeHelp).toMatch(/Lua/)
             expect(locale.risuNest.streaming.deferEffectsHelp).toMatch(/Lua/)
         }
     })

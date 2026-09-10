@@ -2,6 +2,9 @@
     import { onDestroy, onMount } from 'svelte'
     import { language } from 'src/lang'
     import { alertMd } from 'src/ts/alert'
+    import SettingGroup from '../RisuNest/SettingGroup.svelte'
+    import SettingRow from '../RisuNest/SettingRow.svelte'
+    import SettingToggle from '../RisuNest/SettingToggle.svelte'
     import {
         getNativeLogFilePath,
         getNativeLogTail,
@@ -23,6 +26,8 @@
     let viewRequest = 0
     let copyRequest = 0
     let clipboardWriteQueue = Promise.resolve()
+
+    const buttonClass = 'bg-darkbutton border border-darkborderc rounded-md px-4 py-2 text-textcolor shadow-xs transition-colors duration-200 hover:bg-selected focus-visible:outline focus-visible:outline-2 focus-visible:outline-darkborderc focus-visible:outline-offset-2'
 
     function formatLog(logEntries: NativeLogEntry[]) {
         return logEntries
@@ -134,42 +139,33 @@
     }
 </script>
 
-<section class="flex flex-col gap-2 text-textcolor">
-    <h2 class="mb-2 text-2xl font-bold mt-6">{language.risuNest.diag.title}</h2>
-    <div class="flex gap-2 flex-wrap">
-        <button class="bg-darkbutton border border-darkborderc rounded-md px-4 py-2 text-textcolor shadow-xs transition-colors duration-200 hover:bg-selected focus-visible:outline focus-visible:outline-2 focus-visible:outline-darkborderc focus-visible:outline-offset-2" data-view-log onclick={viewLog}>
+<SettingGroup id="risunest-diag" title={language.risuNest.diag.title}>
+    <SettingRow label={language.risuNest.diag.logTitle} help={language.risuNest.diag.logHelp}>
+        {#snippet below()}
+            {#if errorMessage}
+                <p class="mt-1 text-sm text-draculared" role="alert" aria-live="assertive">{errorMessage}</p>
+            {:else if logLoaded && entries.length === 0}
+                <p class="mt-1 text-sm text-textcolor2" role="status" aria-live="polite">{language.risuNest.diag.logEmpty}</p>
+            {/if}
+        {/snippet}
+        <button class={buttonClass} data-view-log onclick={viewLog}>
             {language.risuNest.diag.viewLog}
         </button>
-        <button class="bg-darkbutton border border-darkborderc rounded-md px-4 py-2 text-textcolor shadow-xs transition-colors duration-200 hover:bg-selected focus-visible:outline focus-visible:outline-2 focus-visible:outline-darkborderc focus-visible:outline-offset-2" data-copy-log onclick={() => void copyLog()}>
+        <button class={buttonClass} data-copy-log onclick={() => void copyLog()}>
             {language.risuNest.diag.copyLog}
         </button>
-    </div>
-
-    <label class="flex items-center gap-2 cursor-pointer rounded-md focus-within:outline focus-within:outline-2 focus-within:outline-darkborderc focus-within:outline-offset-2">
-        <input
-            class="sr-only"
-            type="checkbox"
+    </SettingRow>
+    <SettingRow label={language.risuNest.diag.fileLog} help={language.risuNest.diag.fileLogHelp}>
+        {#snippet below()}
+            {#if fileLogEnabled && fileLogPath}
+                <code class="mt-1 block text-xs break-all text-textcolor2" role="status" aria-live="polite">{fileLogPath}</code>
+            {/if}
+        {/snippet}
+        <SettingToggle
             checked={fileLogEnabled}
             disabled={fileLogUpdatePending}
-            onchange={(event) => void changeFileLogging(event.currentTarget.checked)}
+            label={language.risuNest.diag.fileLog}
+            onchange={(enabled) => void changeFileLogging(enabled)}
         />
-        <span class="w-5 h-5 min-w-5 min-h-5 rounded-md border-2 border-darkborderc flex justify-center items-center transition-colors duration-200 {fileLogEnabled ? 'bg-darkborderc' : 'bg-darkbutton'}" aria-hidden="true">
-            {#if fileLogEnabled}
-                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="white" class="w-3 h-3" aria-hidden="true">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
-                </svg>
-            {/if}
-        </span>
-        <span>{language.risuNest.diag.fileLog}</span>
-    </label>
-    <span class="text-textcolor2 text-sm">{language.risuNest.diag.fileLogHelp}</span>
-    {#if fileLogEnabled && fileLogPath}
-        <code class="text-textcolor2 text-sm break-all" role="status" aria-live="polite">{fileLogPath}</code>
-    {/if}
-
-    {#if errorMessage}
-        <span class="text-draculared" role="alert" aria-live="assertive">{errorMessage}</span>
-    {:else if logLoaded && entries.length === 0}
-        <span class="text-textcolor2" role="status" aria-live="polite">{language.risuNest.diag.logEmpty}</span>
-    {/if}
-</section>
+    </SettingRow>
+</SettingGroup>
