@@ -55,6 +55,8 @@ dist.zip
 /server/node/ssl/certificate
 .worktrees/
 temp
+.claude
+.codex
 
 # Android release signing (never commit a keystore or its passwords)
 /src-tauri/gen/android/keystore.properties
