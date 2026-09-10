@@ -154,13 +154,13 @@
         }
     })
 </script>
-<div class="flex flex-col w-full h-[calc(100%-2rem)] max-h-[calc(100%-2rem)]">
+<div class="flex flex-col w-full shrink-0">
     <Button className="relative bottom-2" onclick={async () => {
         await addNewChat(chara)
     }}>{language.newChat}</Button>
 
     {#key sorted}
-    <div class="flex flex-col mt-2 overflow-y-auto grow" bind:this={listEle}>
+    <div class="flex flex-col mt-2 overflow-y-auto max-h-80 shrink-0" bind:this={listEle}>
         <!-- folder div -->
         <div class="flex flex-col" bind:this={folderEles}>
             <!-- chat folder -->
@@ -490,7 +490,7 @@
         </div>
 
         {#if DBState.db.characters[$selectedCharID]?.chaId !== '§playground'}            
-            <Toggles bind:chara={chara} />
+            <Toggles bind:chara={chara} noContainer />
         {/if}
     </div>
     {#if chara.type === 'group'}

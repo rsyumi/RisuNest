@@ -1,12 +1,12 @@
 <script lang="ts">
     import { getModuleToggles } from "src/ts/process/modules";
-    import { DBState, MobileGUI, selectedCharID } from "src/ts/stores.svelte";
+    import { DBState, selectedCharID } from "src/ts/stores.svelte";
     import { parseToggleSyntax, type sidebarToggle, type sidebarToggleGroup } from "src/ts/util";
     import { language } from "src/lang";
     import type { PromptItem } from "src/ts/process/prompt";
     import { getCurrentCharacter, getCurrentChat, type character, type groupChat } from "src/ts/storage/database.svelte";
     import Accordion from '../UI/Accordion.svelte'
-    import CheckInput from "../UI/GUI/CheckInput.svelte";
+    import SwitchInput from "../UI/GUI/SwitchInput.svelte";
     import SelectInput from "../UI/GUI/SelectInput.svelte";
     import OptionInput from "../UI/GUI/OptionInput.svelte";
     import TextAreaInput from '../UI/GUI/TextAreaInput.svelte'
@@ -105,9 +105,11 @@
 
 {#snippet localToggle(toggle: sidebarToggle)}
     {#if isLocallyHandledGlobalChatVar(`toggle_${toggle.key}`)}
-        <button onclick={() => {
-            removeLocallyHandledGlobalChatVar(`toggle_${toggle.key}`)
-        }}>
+        <button
+            onclick={() => {
+                removeLocallyHandledGlobalChatVar(`toggle_${toggle.key}`)
+            }}
+        >
             📌
         </button>
     {/if}
@@ -119,41 +121,57 @@
 
 {#snippet toggles(items: sidebarToggle[], reverse: boolean = false)}
     {#each items as toggle, index}
+        {#if index > 0 && toggle.type !== 'divider' && items[index - 1]?.type !== 'divider' && toggle.type !== 'caption' && items[index - 1]?.type !== 'caption' && !(toggle.type === 'group' && items[index - 1]?.type === 'group')}
+            <div class="w-full mt-0.5 -mb-1.5 border-t border-darkborderc/20"></div>
+        {/if}
         {#if toggle.type === 'group' && toggle.children.length > 0}
-            <div class="w-full">
+            <div class="w-full mt-1">
                 <Accordion styled name={toggle.value}>
                     {@render toggles((toggle as sidebarToggleGroup).children, reverse)}
                 </Accordion>
             </div>
         {:else if toggle.type === 'select'}
-            <div class="w-full flex gap-2 mt-2 items-center" class:justify-end={$MobileGUI} >
-                <span>{@render getToggleDisplayName(toggle)}</span>
-                <SelectInput className="w-32" value={getGlobalChatVarNH(`toggle_${toggle.key}`)} onchange={(e) => {
-                    setGlobalChatVar(`toggle_${toggle.key}`, e.currentTarget.value)
-                }}>
+            <div class="w-full flex gap-2 mt-2 items-center justify-between min-h-10 rounded-md px-1">
+                <span class="min-w-0 break-words">{@render getToggleDisplayName(toggle)}</span>
+                <SelectInput
+                    className="w-32 shrink-0"
+                    value={getGlobalChatVarNH(`toggle_${toggle.key}`)}
+                    onchange={(e) => {
+                        setGlobalChatVar(`toggle_${toggle.key}`, e.currentTarget.value)
+                    }}
+                >
                     {#each toggle.options as option, i}
                         <OptionInput value={i.toString()}>{option}</OptionInput>
                     {/each}
                 </SelectInput>
             </div>
         {:else if toggle.type === 'text'}
-            <div class="w-full flex gap-2 mt-2 items-center" class:justify-end={$MobileGUI}>
-                <span>{@render getToggleDisplayName(toggle)}</span>
-                <TextInput className="w-32" value={getGlobalChatVarNH(`toggle_${toggle.key}`)} onchange={(e) => {
-                    setGlobalChatVar(`toggle_${toggle.key}`, e.currentTarget.value)
-                }} />
+            <div class="w-full flex gap-2 mt-2 items-center justify-between min-h-10 rounded-md px-1">
+                <span class="min-w-0 break-words">{@render getToggleDisplayName(toggle)}</span>
+                <TextInput
+                    className="w-32 shrink-0"
+                    value={getGlobalChatVarNH(`toggle_${toggle.key}`)}
+                    onchange={(e) => {
+                        setGlobalChatVar(`toggle_${toggle.key}`, e.currentTarget.value)
+                    }}
+                />
             </div>
         {:else if toggle.type === 'textarea'}
-            <div class="w-full flex gap-2 mt-2 items-start" class:justify-end={$MobileGUI}>
-                <span class="mt-1.5">{@render getToggleDisplayName(toggle)}</span>
-                <TextAreaInput className="w-32" height='20' value={getGlobalChatVarNH(`toggle_${toggle.key}`)} onchange={(e) => {
-                    //check is div
-                    if(e.currentTarget instanceof HTMLDivElement){
-                        setGlobalChatVar(`toggle_${toggle.key}`, e.currentTarget.innerText)
-                    } else {
-                        setGlobalChatVar(`toggle_${toggle.key}`, e.currentTarget.value)
-                    }
-                }} />
+            <div class="w-full flex gap-2 mt-2 items-start justify-between min-h-10 rounded-md px-1">
+                <span class="min-w-0 break-words mt-1.5">{@render getToggleDisplayName(toggle)}</span>
+                <TextAreaInput
+                    className="w-32 shrink-0"
+                    height="20"
+                    value={getGlobalChatVarNH(`toggle_${toggle.key}`)}
+                    onchange={(e) => {
+                        //check is div
+                        if (e.currentTarget instanceof HTMLDivElement) {
+                            setGlobalChatVar(`toggle_${toggle.key}`, e.currentTarget.innerText)
+                        } else {
+                            setGlobalChatVar(`toggle_${toggle.key}`, e.currentTarget.value)
+                        }
+                    }}
+                />
             </div>
         {:else if toggle.type === 'caption'}
             <div class="w-full mt-1 text-xs text-textcolor2">
@@ -170,20 +188,22 @@
                 </div>
             {/if}
         {:else}
-            <div class="w-full flex mt-2 items-center" class:justify-end={$MobileGUI}>
-                <CheckInput check={getGlobalChatVarNH(`toggle_${toggle.key}`) === '1'} reverse={reverse} name={toggle.value} onChange={() => {
-                    setGlobalChatVar(`toggle_${toggle.key}`, getGlobalChatVarNH(`toggle_${toggle.key}`) === '1' ? '0' : '1')
-                }}>
-                    {@render localToggle(toggle)}
-                </CheckInput>
-            </div>
+            <SwitchInput
+                check={getGlobalChatVarNH(`toggle_${toggle.key}`) === '1'}
+                name={toggle.value}
+                onChange={(checked) => {
+                    setGlobalChatVar(`toggle_${toggle.key}`, checked ? '1' : '0')
+                }}
+            >
+                {@render localToggle(toggle)}
+            </SwitchInput>
         {/if}
     {/each}
 {/snippet}
 
 <div class="flex flex-col gap-2 w-full mt-2">
-    {#if !DBState.db.customSidebarItems?.some(item => item.type === 'model')}<ModelBind />{/if}
-    {#if !DBState.db.customSidebarItems?.some(item => item.type === 'persona')}<PersonaBind />{/if}
+    {#if !DBState.db.customSidebarItems?.some((item) => item.type === 'model')}<ModelBind />{/if}
+    {#if !DBState.db.customSidebarItems?.some((item) => item.type === 'persona')}<PersonaBind />{/if}
     <ToggleBind />
 </div>
 {#if !noContainer && groupedToggles.length > 4}
@@ -191,42 +211,54 @@
         <CustomSideBar />
 
         {#if hasJailbreakPrompt}
-            <div class="flex mt-2 items-center w-full" class:justify-end={$MobileGUI}>
-                <CheckInput bind:check={DBState.db.jailbreakToggle} name={language.jailbreakToggle} reverse />
-            </div>
+            <SwitchInput bind:check={DBState.db.jailbreakToggle} name={language.jailbreakToggle} />
         {/if}
 
         {@render toggles(groupedToggles, true)}
         {#if chara && (DBState.db.supaModelType !== 'none' || DBState.db.hanuraiEnable || DBState.db.hypaV3)}
-            <div class="flex mt-2 items-center w-full" class:justify-end={$MobileGUI}>
-                <CheckInput bind:check={chara.supaMemory} reverse name={DBState.db.hypaV3 ? language.ToggleHypaMemory : DBState.db.hanuraiEnable ? language.hanuraiMemory : DBState.db.hypaMemory ? language.ToggleHypaMemory : language.ToggleSuperMemory}/>
-            </div>
+            <SwitchInput
+                bind:check={chara.supaMemory}
+                name={DBState.db.hypaV3
+                    ? language.ToggleHypaMemory
+                    : DBState.db.hanuraiEnable
+                      ? language.hanuraiMemory
+                      : DBState.db.hypaMemory
+                        ? language.ToggleHypaMemory
+                        : language.ToggleSuperMemory}
+            />
         {/if}
     </div>
 {:else}
     <CustomSideBar />
 
     {#if hasJailbreakPrompt}
-        <div class="flex mt-2 items-center">
-            <CheckInput bind:check={DBState.db.jailbreakToggle} name={language.jailbreakToggle}/>
-        </div>
+        <SwitchInput bind:check={DBState.db.jailbreakToggle} name={language.jailbreakToggle} />
     {/if}
     {@render toggles(groupedToggles)}
     {#if chara && (DBState.db.supaModelType !== 'none' || DBState.db.hanuraiEnable || DBState.db.hypaV3)}
-        <div class="flex mt-2 items-center">
-            <CheckInput bind:check={chara.supaMemory} name={DBState.db.hypaV3 ? language.ToggleHypaMemory : DBState.db.hanuraiEnable ? language.hanuraiMemory : DBState.db.hypaMemory ? language.ToggleHypaMemory : language.ToggleSuperMemory}/>
-        </div>
+        <SwitchInput
+            bind:check={chara.supaMemory}
+            name={DBState.db.hypaV3
+                ? language.ToggleHypaMemory
+                : DBState.db.hanuraiEnable
+                  ? language.hanuraiMemory
+                  : DBState.db.hypaMemory
+                    ? language.ToggleHypaMemory
+                    : language.ToggleSuperMemory}
+        />
     {/if}
 
     {#if chara}
-        <div class="flex mt-2 items-center w-full" class:justify-end={$MobileGUI}>
-            <CheckInput check={getCurrentChat()?.useLocallySetGlobalVariables} name={language.localToggles} onChange={() => {
+        <SwitchInput
+            check={getCurrentChat()?.useLocallySetGlobalVariables}
+            name={language.localToggles}
+            onChange={(checked) => {
                 const chatIndx = DBState.db.characters[$selectedCharID].chatPage
                 const chat = DBState.db.characters[$selectedCharID].chats[chatIndx]
-                if(chat){
-                    chat.useLocallySetGlobalVariables = !chat.useLocallySetGlobalVariables
+                if (chat) {
+                    chat.useLocallySetGlobalVariables = checked
                 }
-            }} />
-        </div>
+            }}
+        />
     {/if}
 {/if}
