@@ -537,15 +537,17 @@
                 <input id="device-sync-public-url" type="url" inputmode="url" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" class="{inputClass} w-full @xl:w-64" value={settings.syncPublicBaseUrl} oninput={(event) => updateSettings({ syncPublicBaseUrl: event.currentTarget.value })} />
             </SettingRow>
         {/if}
-        <SettingRow label={sync.share.autoListen}>
+        <SettingRow inline label={sync.share.autoListen}>
             <SettingToggle checked={settings.syncAutoListen} label={sync.share.autoListen} onchange={(checked) => updateSettings({ syncAutoListen: checked })} />
         </SettingRow>
-        <SettingRow label={sync.share.permissionsTitle} help={sync.share.permissionsHelp}>
-            <div data-permissions class="flex flex-col gap-2 @xl:items-end">
-                <SettingToggle showLabel checked={permissions.read} disabled={permissions.bidirectional} label={sync.share.permRead} onchange={(checked) => { permissions.read = checked }} />
-                <SettingToggle showLabel checked={permissions.bidirectional} label={sync.share.permBidirectional} onchange={(checked) => { permissions.bidirectional = checked; if (checked) permissions.read = true }} />
-            </div>
-        </SettingRow>
+        <div data-permissions class="divide-y divide-darkborderc/55">
+            <SettingRow inline label={sync.share.permRead} help={sync.share.permReadHelp}>
+                <SettingToggle checked={permissions.read} disabled={permissions.bidirectional} label={sync.share.permRead} onchange={(checked) => { permissions.read = checked }} />
+            </SettingRow>
+            <SettingRow inline label={sync.share.permBidirectional} help={sync.share.permBidirectionalHelp}>
+                <SettingToggle checked={permissions.bidirectional} label={sync.share.permBidirectional} onchange={(checked) => { permissions.bidirectional = checked; if (checked) permissions.read = true }} />
+            </SettingRow>
+        </div>
 
         {#if running && pairUri}
             <div class="grid grid-cols-1 items-center gap-5 p-4 @xl:grid-cols-[auto_minmax(0,1fr)]">

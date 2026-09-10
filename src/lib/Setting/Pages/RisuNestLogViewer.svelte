@@ -155,7 +155,7 @@
             {language.risuNest.diag.copyLog}
         </button>
     </SettingRow>
-    <SettingRow label={language.risuNest.diag.fileLog} help={language.risuNest.diag.fileLogHelp}>
+    <SettingRow inline label={language.risuNest.diag.fileLog} help={language.risuNest.diag.fileLogHelp}>
         {#snippet below()}
             {#if fileLogEnabled && fileLogPath}
                 <code class="mt-1 block text-xs break-all text-textcolor2" role="status" aria-live="polite">{fileLogPath}</code>

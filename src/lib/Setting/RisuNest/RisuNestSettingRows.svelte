@@ -49,7 +49,7 @@
     <SettingGroup id={groupId(group.header)} title={getLabel(group.header)}>
         {#each group.items as item (item.id)}
             {#if checkCondition(item, ctx)}
-                <SettingRow label={getLabel(item)} help={helpText(item)}>
+                <SettingRow label={getLabel(item)} help={helpText(item)} inline={item.type === 'check'}>
                     <RisuNestSettingControl {item} {ctx} />
                 </SettingRow>
             {/if}

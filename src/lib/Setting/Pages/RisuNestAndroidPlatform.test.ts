@@ -87,7 +87,8 @@ describe('RisuNest Android platform settings', () => {
         expect(target.textContent).toContain('Allowed')
         expect(target.textContent).toContain('Android 16')
         expect(target.textContent).toContain('140.0.1')
-        expect(target.textContent).toContain('foreground')
+        // A known wire value gets its readable name; the wire value stays for bug reports.
+        expect(target.textContent).toContain('Foreground service (foreground)')
         const notificationBadge = target.querySelector('[role="status"][aria-live="polite"]')
         expect(notificationBadge?.textContent).toBe('Allowed')
         expect(notificationBadge?.classList.contains('rounded-full')).toBe(true)

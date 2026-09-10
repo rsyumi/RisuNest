@@ -62,6 +62,13 @@
     $effect(() => {
         updateDeviceSettings({ androidKeepAliveDuringGeneration: keepAlive })
     })
+
+    // The bridge reports a wire value; a known one gets its readable name in front.
+    const transferLabel = $derived.by(() => {
+        const labels: Record<string, string | undefined> = language.risuNest.platform.transferModes
+        const label = labels[transfer]
+        return label ? `${label} (${transfer})` : transfer
+    })
 </script>
 
 <SettingGroup id="risunest-platform" title={language.risuNest.platform.title}>
@@ -77,7 +84,7 @@
         {/if}
         <Button size="sm" styled="outlined" onclick={openNotificationSettings}>{language.risuNest.platform.openSettings}</Button>
     </SettingRow>
-    <SettingRow label={language.risuNest.platform.keepAlive} help={language.risuNest.platform.keepAliveHelp}>
+    <SettingRow inline label={language.risuNest.platform.keepAlive} help={language.risuNest.platform.keepAliveHelp}>
         {#snippet below()}
             {#if notificationStatus === false}
                 <p class="mt-1 text-sm text-draculared" role="alert">{language.risuNest.platform.keepAliveNeedsNotifications}</p>
@@ -94,7 +101,7 @@
                 <dt class="text-textcolor2">{language.risuNest.platform.webView}</dt><dd>{webView}</dd>
             {/if}
             {#if transfer}
-                <dt class="text-textcolor2">{language.risuNest.platform.transferMode}</dt><dd>{transfer}</dd>
+                <dt class="text-textcolor2">{language.risuNest.platform.transferMode}</dt><dd>{transferLabel}</dd>
             {/if}
         </dl>
     {/if}
