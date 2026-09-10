@@ -30,6 +30,7 @@ export let appVer = "2026.8.250" //<APP_VERSION_POINT>
 export let appSubVer = ''
 
 export type StreamingDisplayOptimizationMode = 'off'|'balanced'|'strong'
+export type StreamingThoughtMode = 'recent' | 'collapsed' | 'off'
 
 export function normalizeDatabaseDefaults(data:Database): Database {
     if(checkNullish(data.characters)){
@@ -705,8 +706,9 @@ export function normalizeDatabaseDefaults(data:Database): Database {
     data.risunestInlayWebpQuality = normalizedInlayOptions.quality
     data.risunestInlayMaxDimension = normalizedInlayOptions.maxDimension
     data.risunestInlaySkipReencode = normalizedInlayOptions.skipReencode
-    data.streamingDisplayOptimizationMode ??= (data as {largeChatPerformanceMode?: StreamingDisplayOptimizationMode}).largeChatPerformanceMode ?? 'off'
-    delete (data as {largeChatPerformanceMode?: unknown}).largeChatPerformanceMode
+    data.streamingDisplayOptimizationMode ??= 'off'
+    data.streamingThoughtMode ??= 'recent'
+    data.streamingDeferDisplayProcessing ??= false
     data.echoMessage ??= "Echo Message"
     data.echoDelay ??= 0
     if(!isNodeServer && !isTauri){
@@ -1282,6 +1284,8 @@ export interface Database{
     chatLoadInitialPages?: number
     chatLoadAdditionalPages?: number
     streamingDisplayOptimizationMode?: StreamingDisplayOptimizationMode
+    streamingThoughtMode?: StreamingThoughtMode
+    streamingDeferDisplayProcessing?: boolean
     pluginDevelopMode?: boolean
     echoMessage?:string
     echoDelay?:number

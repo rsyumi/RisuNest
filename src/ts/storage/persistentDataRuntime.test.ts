@@ -1327,12 +1327,14 @@ describe('prepared persistent replacement', () => {
         expect(materializeDatabase).not.toHaveBeenCalled()
 
         await runtime.flushPendingData('persist-rebased-live-edit')
-        expect(commit).toHaveBeenCalledWith(expect.objectContaining({
-            expectedRevision: 8,
-            root: expect.objectContaining({
-                customBackground: 'live edit during replacement',
+        expect(commit).toHaveBeenCalledWith(
+            expect.objectContaining({
+                expectedRevision: 8,
+                rootMutations: [
+                    { type: 'set', key: 'customBackground', value: 'live edit during replacement' },
+                ],
             }),
-        }))
+        )
     })
 
     it('cannot split committed replacement publication on revision read or release failure', async () => {
@@ -1522,9 +1524,13 @@ describe('native replacement working-set refresh', () => {
         fence.release()
         await runtime.flushPendingData('post-native-commit-edit')
         expect(harness.database.username).toBe('Edit after native commit')
-        expect(harness.store.commit).toHaveBeenCalledWith(expect.objectContaining({
-            root: expect.objectContaining({ username: 'Edit after native commit' }),
-        }))
+        expect(harness.store.commit).toHaveBeenCalledWith(
+            expect.objectContaining({
+                rootMutations: [
+                    { type: 'set', key: 'username', value: 'Edit after native commit' },
+                ],
+            }),
+        )
     })
 
     it('does not overwrite an already-applied edit during committed working-set projection', async () => {
@@ -1573,9 +1579,13 @@ describe('native replacement working-set refresh', () => {
         fence.release()
         await runtime.flushPendingData('large-post-publication-edit')
 
-        expect(harness.store.commit).toHaveBeenCalledWith(expect.objectContaining({
-            root: expect.objectContaining({ username: 'Large post-publication edit' }),
-        }))
+        expect(harness.store.commit).toHaveBeenCalledWith(
+            expect.objectContaining({
+                rootMutations: [
+                    { type: 'set', key: 'username', value: 'Large post-publication edit' },
+                ],
+            }),
+        )
     })
 
     it('materializes the complete restored working set for enabled v2.1 plugins', async () => {

@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
+import { nativeCommitTransport } from './nativeCommitTransport'
 
 import type { Chat, Database, botPreset } from './database.svelte'
 import {
@@ -327,7 +328,9 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
 
     commit(input: WorkingSetCommit): Promise<{ revision: DataRevision }> {
         const { assetAliases = [], ...commit } = input
-        return invokeStore('pds_commit', { commit, assetAliases })
+        return nativeCommitTransport.commit({ commit, assetAliases }).catch((error) => {
+            throw restoreStoreError(error)
+        })
     }
 
     async replaceFromDatabase(

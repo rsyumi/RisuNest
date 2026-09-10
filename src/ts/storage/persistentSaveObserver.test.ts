@@ -30,6 +30,66 @@ function fixture(): Database {
 }
 
 describe('persistent save mutation observation', () => {
+    it('keeps observing when compatibility code temporarily clears the message value', () => {
+        const state = createPersistentSaveObserverHarness(fixture())
+        const markDirty = vi.fn()
+        disposers.push(
+            observePersistentSaveChanges({
+                readDatabase: () => state.database,
+                readSelectedCharacter: () => state.database.characters[0],
+                markDirty,
+            }),
+        )
+        flushSync()
+        state.database.characters[0].chats[0].message = undefined
+        expect(() => flushSync()).not.toThrow()
+        state.database.characters[0].chats[0].message = [{ role: 'char', data: 'Restored' }]
+        flushSync()
+        markDirty.mockClear()
+        state.database.characters[0].chats[0].message[0].data += '!'
+        flushSync()
+        expect(markDirty).toHaveBeenCalled()
+    })
+
+    it('does not revisit unrelated root fields or sibling messages', () => {
+        const database = fixture()
+        const rootProbe = vi.fn()
+        const siblingProbe = vi.fn()
+        database.pluginCustomStorage.deep = {
+            get probe() {
+                rootProbe()
+                return 1
+            },
+        }
+        database.characters[0].chats[0].message.push({
+            role: 'char',
+            data: 'Second',
+            get probe() {
+                siblingProbe()
+                return 1
+            },
+        } as unknown as Database['characters'][number]['chats'][number]['message'][number])
+        const state = createPersistentSaveObserverHarness(database)
+        disposers.push(
+            observePersistentSaveChanges({
+                readDatabase: () => state.database,
+                readSelectedCharacter: () => state.database.characters[0],
+                markDirty: vi.fn(),
+            }),
+        )
+        flushSync()
+        rootProbe.mockClear()
+        siblingProbe.mockClear()
+        state.database.username += '!'
+        flushSync()
+        expect(rootProbe).not.toHaveBeenCalled()
+        expect(siblingProbe).not.toHaveBeenCalled()
+        state.database.characters[0].chats[0].message[0].data += '!'
+        flushSync()
+        expect(rootProbe).not.toHaveBeenCalled()
+        expect(siblingProbe).not.toHaveBeenCalled()
+    })
+
     it('walks only the changed history and skips all message bodies for metadata edits', () => {
         const database = fixture()
         const probes = [vi.fn(), vi.fn()]

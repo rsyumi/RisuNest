@@ -200,6 +200,7 @@ fn source_pin_survives_normal_writes_and_store_reopen_until_explicit_release() {
     writer
         .commit(&WorkingSetCommit {
             expected_revision: 0,
+            root_mutations: None,
             root: Some(json!({ "username": "Changed after pin" })),
             replace_presets: None,
             character: None,

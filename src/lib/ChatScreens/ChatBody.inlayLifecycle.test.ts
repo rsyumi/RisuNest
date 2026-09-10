@@ -192,6 +192,216 @@ describe('ChatBody deferred inlay lifecycle', () => {
         vi.useRealTimers()
     })
 
+    test('mounts a deferred collapsed thought body only when opened, retaining its state across updates', async () => {
+        const body = 'FULL REASONING '.repeat(20_000)
+        mounted = mount(ChatBodyInlayHarness, {
+            target,
+            props: {
+                initialMessage: `<Thoughts>${body}</Thoughts>Answer`,
+                initialThoughtPreview: true,
+                streamingThoughtMode: 'collapsed',
+            },
+        })
+        await tick()
+        const details = target.querySelector('details')!
+        expect(details.open).toBe(false)
+        expect(target.textContent!.length).toBeLessThan(100)
+        details.open = true
+        details.dispatchEvent(new Event('toggle'))
+        await tick()
+        expect(details.textContent).toContain(body)
+        ;(mounted as { setMessage(value: string): void }).setMessage(
+            `<Thoughts>${body}LATEST</Thoughts>Answer`,
+        )
+        await tick()
+        expect(target.querySelector('details')).toBe(details)
+        expect(details.open).toBe(true)
+        expect(details.textContent).toContain('LATEST')
+        expect(parserMocks.ParseMarkdown).not.toHaveBeenCalled()
+    })
+
+    test('preserves a live collapsed block that the user expanded through parsed replacements', async () => {
+        parserMocks.ParseMarkdown.mockImplementation(
+            async (value, _char, _mode, _idx, _conditions, context) => {
+                expect(context?.streamingThoughtMode).toBe('collapsed')
+                return `<details data-risu-streaming-thought><summary>Thought</summary>${value}</details>`
+            },
+        )
+        mounted = mount(ChatBodyInlayHarness, {
+            target,
+            props: { streamingThoughtMode: 'collapsed' },
+        })
+        await vi.waitFor(() =>
+            expect(target.querySelector('details')).not.toBeNull(),
+        )
+        target.querySelector('details')!.open = true
+        ;(mounted as { setMessage(value: string): void }).setMessage('new content')
+        await vi.waitFor(() =>
+            expect(target.querySelector('details')?.textContent).toContain(
+                'new content',
+            ),
+        )
+        expect(target.querySelector('details')?.open).toBe(true)
+    })
+
+    test('defers display parsing even if translation was enabled and keeps raw text until the final render is ready', async () => {
+        mounted = mount(ChatBodyInlayHarness, {
+            target,
+            props: { initialTranslated: true, deferStreamingDisplay: true },
+        })
+        const harness = mounted as {
+            setRaw(value: boolean): void
+            setTranslated(value: boolean): void
+        }
+        harness.setRaw(true)
+        await tick()
+        expect(parserMocks.ParseMarkdown).not.toHaveBeenCalled()
+        expect(target.textContent).toBe('streaming')
+        const gate = deferred<string>()
+        parserMocks.ParseMarkdown.mockReturnValue(gate.promise)
+        harness.setTranslated(false)
+        harness.setRaw(false)
+        await vi.waitFor(() =>
+            expect(parserMocks.ParseMarkdown).toHaveBeenCalledOnce(),
+        )
+        expect(target.textContent).toBe('streaming')
+        gate.resolve('<strong>Final</strong>')
+        await vi.waitFor(() =>
+            expect(target.querySelector('strong')?.textContent).toBe('Final'),
+        )
+    })
+
+    test('rerenders the same source canonically when only the streaming thought mode ends', async () => {
+        parserMocks.ParseMarkdown.mockImplementation(
+            async (value, _char, _mode, _idx, _conditions, context) =>
+                context?.streamingThoughtMode === 'recent'
+                    ? '<span>Recent</span>'
+                    : `<strong>${value}</strong>`,
+        )
+        mounted = mount(ChatBodyInlayHarness, {
+            target,
+            props: { initialMessage: 'FULL', streamingThoughtMode: 'recent' },
+        })
+        await vi.waitFor(() => expect(target.textContent).toBe('Recent'))
+        ;(mounted as { setThoughtMode(value: string): void }).setThoughtMode('off')
+        await vi.waitFor(() =>
+            expect(target.querySelector('strong')?.textContent).toBe('FULL'),
+        )
+    })
+
+    test('bounds streaming thoughts and applies a deleting regex to the full original after streaming', async () => {
+        const original =
+            '<Thoughts>' +
+            'old reasoning '.repeat(40_000) +
+            '\nLATEST</Thoughts>\n**Answer**'
+        const finalGate = deferred<string>()
+        parserMocks.ParseMarkdown.mockImplementation((value: string) => {
+            expect(value).toBe(original)
+            return finalGate.promise
+        })
+        mounted = mount(ChatBodyInlayHarness, {
+            target,
+            props: { initialMessage: original, initialThoughtPreview: true },
+        })
+        await tick()
+        const preview = target.querySelector('[data-streaming-thought-preview]')
+        expect(preview?.textContent).toContain('LATEST')
+        expect(preview!.textContent!.length).toBeLessThan(1_000)
+        expect(target.textContent).toContain('**Answer**')
+        expect(parserMocks.ParseMarkdown).not.toHaveBeenCalled()
+
+        ;(mounted as { setThoughtPreview(value: boolean): void }).setThoughtPreview(
+            false,
+        )
+        await vi.waitFor(() =>
+            expect(parserMocks.ParseMarkdown).toHaveBeenCalledOnce(),
+        )
+        expect(target.querySelector('[data-streaming-thought-preview]')).toBe(
+            preview,
+        )
+        finalGate.resolve(
+            original
+                .replace(/<Thoughts>[\s\S]*?<\/Thoughts>/g, '')
+                .trim()
+                .replace('**Answer**', '<strong>Answer</strong>'),
+        )
+        await vi.waitFor(() =>
+            expect(target.querySelector('strong')?.textContent).toBe('Answer'),
+        )
+        expect(target.querySelector('[data-streaming-thought-preview]')).toBeNull()
+        expect(target.textContent).toBe('Answer')
+    })
+
+    test('releases old media when entering a thought preview and discards a cancelled final render', async () => {
+        inlayMocks.getInlayAssetBlob.mockResolvedValue({
+            data: new Blob(['first']),
+            type: 'image',
+            name: 'first.png',
+        })
+        mounted = mount(ChatBodyInlayHarness, { target })
+        await vi.waitFor(() => expect(target.querySelector('img')).not.toBeNull())
+        const harness = mounted as {
+            setMessage(value: string): void
+            setThoughtPreview(value: boolean): void
+        }
+        harness.setMessage('<Thoughts>Partial reasoning')
+        harness.setThoughtPreview(true)
+        await tick()
+        expect(target.querySelector('img')).toBeNull()
+        expect(revokeObjectURL).toHaveBeenCalledWith('blob:first')
+        const gate = deferred<string>()
+        parserMocks.ParseMarkdown.mockReturnValue(gate.promise)
+        harness.setThoughtPreview(false)
+        await vi.waitFor(() =>
+            expect(parserMocks.ParseMarkdown).toHaveBeenCalledTimes(2),
+        )
+        await unmount(mounted)
+        mounted = undefined
+        gate.resolve('<strong>Stale result</strong>')
+        await tick()
+        expect(target.textContent).toBe('')
+    })
+
+    test('clears the preview even when the final display rule removes the whole message', async () => {
+        mounted = mount(ChatBodyInlayHarness, {
+            target,
+            props: {
+                initialMessage: '<Thoughts>Only thoughts</Thoughts>',
+                initialThoughtPreview: true,
+            },
+        })
+        await tick()
+        expect(target.textContent).toContain('Only thoughts')
+        parserMocks.ParseMarkdown.mockResolvedValue('')
+        ;(mounted as { setThoughtPreview(value: boolean): void }).setThoughtPreview(
+            false,
+        )
+        await vi.waitFor(() => expect(target.textContent).toBe(''))
+    })
+
+    test('renders preview text inertly and keeps its block when the provider rewrites the snapshot', async () => {
+        mounted = mount(ChatBodyInlayHarness, {
+            target,
+            props: {
+                initialMessage: '<Thoughts><img src=x onerror=alert(1)></Thoughts>',
+                initialThoughtPreview: true,
+            },
+        })
+        await tick()
+        const preview = target.querySelector('[data-streaming-thought-preview]')
+        expect(target.querySelector('img')).toBeNull()
+        expect(preview?.textContent).toContain('<img src=x')
+        ;(mounted as { setMessage(value: string): void }).setMessage(
+            '<Thoughts>Replaced reasoning</Thoughts>Answer',
+        )
+        await tick()
+        expect(target.querySelector('[data-streaming-thought-preview]')).toBe(
+            preview,
+        )
+        expect(preview?.textContent).toContain('Replaced reasoning')
+        expect(parserMocks.ParseMarkdown).not.toHaveBeenCalled()
+    })
+
     test('revokes mounted URLs exactly once on parsed rerender, raw switch, and later destroy', async () => {
         inlayMocks.getInlayAssetBlob.mockImplementation(async (id: string) => ({
             data: new Blob([id], { type: 'image/png' }),

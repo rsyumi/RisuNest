@@ -2239,6 +2239,7 @@ mod tests {
         let committed = store
             .commit(&WorkingSetCommit {
                 expected_revision: 1,
+                root_mutations: None,
                 root: None,
                 replace_presets: None,
                 character: None,

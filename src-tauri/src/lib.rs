@@ -15,6 +15,8 @@ mod native_tokenizer;
 mod opened_files;
 mod peer_sync;
 mod persistent_store;
+#[cfg(windows)]
+mod persistent_commit_transport;
 #[cfg(feature = "official-publication-upload-pilot")]
 mod publication_upload;
 #[cfg(any(test, target_os = "windows", target_os = "android"))]
@@ -521,6 +523,12 @@ pub fn run() {
     let native_log_state = native_log::global_state();
     let setup_native_log_state = native_log_state.clone();
     let mut builder = tauri::Builder::default();
+    #[cfg(windows)]
+    { builder = builder.on_page_load(|webview, payload| {
+        if webview.label() == "main" && matches!(payload.event(), tauri::webview::PageLoadEvent::Started) {
+            let _ = webview.with_webview(|_| persistent_commit_transport::reset());
+        }
+    }); }
 
     #[cfg(desktop)]
     {
@@ -777,6 +785,16 @@ pub fn run() {
             persistent_store::commands::pds_delete_cold_alias,
             persistent_store::commands::pds_activate_cold_payload_migration,
             persistent_store::commands::pds_commit,
+            #[cfg(windows)]
+            persistent_commit_transport::pds_commit_raw,
+            #[cfg(windows)]
+            persistent_commit_transport::pds_commit_shared_open,
+            #[cfg(windows)]
+            persistent_commit_transport::pds_commit_shared_chunk,
+            #[cfg(windows)]
+            persistent_commit_transport::pds_commit_shared_finish,
+            #[cfg(windows)]
+            persistent_commit_transport::pds_commit_shared_cancel,
             persistent_store::commands::pds_replace_begin,
             persistent_store::commands::pds_replace_put_root,
             persistent_store::commands::pds_replace_put_presets,

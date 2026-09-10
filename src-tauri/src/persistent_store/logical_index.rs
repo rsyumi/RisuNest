@@ -4233,6 +4233,7 @@ mod tests {
     fn root_commit(expected_revision: i64, value: Value) -> WorkingSetCommit {
         WorkingSetCommit {
             expected_revision,
+            root_mutations: None,
             root: Some(value),
             replace_presets: None,
             character: None,
@@ -4390,6 +4391,7 @@ mod tests {
             .commit_with_asset_aliases(
                 &WorkingSetCommit {
                     expected_revision: 0,
+                    root_mutations: None,
                     root: Some(json!({ "modules": [module] })),
                     replace_presets: None,
                     character: None,

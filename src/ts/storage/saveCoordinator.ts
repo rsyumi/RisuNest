@@ -1,4 +1,6 @@
 import { Mutex } from '../mutex'
+import { diffRootMutations } from './rootMutation'
+import type { PersistenceCanonicalCapture } from './reactivePersistenceCapture.svelte'
 import type { Chat, Database, Message, botPreset, character, groupChat } from './database.svelte'
 import type {
     AssetAlias,
@@ -77,6 +79,7 @@ export interface SaveCoordinatorClock {
 }
 
 export interface SaveCoordinatorDependencies {
+    canonicalCapture?: PersistenceCanonicalCapture
     store: PersistentDataStore
     captureRoot(): RootDatabase
     capturePluginStorage?(): Database['pluginCustomStorage'] | null
@@ -172,6 +175,7 @@ interface WindowedSelectedCharacterCapture {
 }
 
 interface CapturedState {
+    characterId?: string | null
     root: RootDatabase
     rootCanonical: string
     pluginStorage: Database['pluginCustomStorage'] | null
@@ -533,8 +537,7 @@ export class SaveCoordinator {
         return this.pluginStorageBaselineEntries?.json ?? null
     }
     private set pluginStorageBaseline(value: string | null) {
-        this.pluginStorageBaselineEntries =
-            value === null ? null : new PluginStorageBaseline(value)
+        this.pluginStorageBaselineEntries = value === null ? null : new PluginStorageBaseline(value)
     }
     private presetsBaseline: string | null = null
     private characterBaseline: string | null = null
@@ -562,8 +565,7 @@ export class SaveCoordinator {
     private pendingCharacterAddition: PendingCharacterAddition | null = null
     private reservedCharacterAddition: ReservedCharacterAddition | null = null
     private pendingResidentCompensations: PendingResidentCompensation[] = []
-    private pendingResidentConversationCompensations:
-        PendingResidentConversationCompensation[] = []
+    private pendingResidentConversationCompensations: PendingResidentConversationCompensation[] = []
     private pendingConversationMutations: PendingConversationMutation[] = []
     private lastBackgroundErrorMessage: string | null = null
     private destructiveReplacementFence: {
@@ -603,7 +605,8 @@ export class SaveCoordinator {
     }
 
     get hasPendingPersistenceWork(): boolean {
-        return this.pendingByteCount > 0 ||
+        return (
+            this.pendingByteCount > 0 ||
             this.debounceHandle !== undefined ||
             this.flushPromise !== null ||
             this.localFlushPromise !== null ||
@@ -616,6 +619,7 @@ export class SaveCoordinator {
             this.pendingResidentConversationCompensations.length > 0 ||
             this.pendingConversationMutations.length > 0 ||
             this.pendingWindowedActivationChange !== null
+        )
     }
 
     get isSelectedConversationTransitionActive(): boolean {
@@ -634,8 +638,7 @@ export class SaveCoordinator {
             windowedCharacterBaseline: this.windowedCharacterBaseline
                 ? safeStructuredClone(this.windowedCharacterBaseline)
                 : null,
-            pendingWindowedActivationChange: this
-                .pendingWindowedActivationChange
+            pendingWindowedActivationChange: this.pendingWindowedActivationChange
                 ? safeStructuredClone(this.pendingWindowedActivationChange)
                 : null,
         }
@@ -646,8 +649,7 @@ export class SaveCoordinator {
             this.characterBaseline = saved.characterBaseline
             this.characterBaselineId = saved.characterBaselineId
             this.windowedCharacterBaseline = saved.windowedCharacterBaseline
-            this.pendingWindowedActivationChange =
-                saved.pendingWindowedActivationChange
+            this.pendingWindowedActivationChange = saved.pendingWindowedActivationChange
             throw error
         } finally {
             this.selectedConversationTransitionActive = false
@@ -721,7 +723,8 @@ export class SaveCoordinator {
             this.currentRevision !== revision ||
             this.dirtyGeneration !== mutationGeneration ||
             (this.dependencies.captureSelectedConversationAuthority?.() ?? null) !== null
-        ) return false
+        )
+            return false
         this.characterBaseline = canonicalJson(character)
         this.characterBaselineId = character.chaId
         this.windowedCharacterBaseline = null
@@ -749,16 +752,17 @@ export class SaveCoordinator {
             this.pendingResidentCompensations.length > 0 ||
             this.pendingResidentConversationCompensations.length > 0 ||
             this.pendingCharacterAddition !== null
-        ) return false
-        const currentAuthority =
-            this.dependencies.captureSelectedConversationAuthority?.() ?? null
+        )
+            return false
+        const currentAuthority = this.dependencies.captureSelectedConversationAuthority?.() ?? null
         const currentCharacter = this.dependencies.captureSelectedCharacter()
         if (
             !currentAuthority ||
             !validWindowedAuthority(currentAuthority) ||
             !sameWindowedAuthority(currentAuthority, authority) ||
             currentCharacter?.chaId !== authority.characterId
-        ) return false
+        )
+            return false
         const shell = captureWindowedCharacterShell(character)
         const currentShell = captureWindowedCharacterShell(currentCharacter)
         const matchingConversations = shell.chats.filter(
@@ -767,15 +771,12 @@ export class SaveCoordinator {
         if (
             matchingConversations.length !== 1 ||
             canonicalJson(shell) !== canonicalJson(currentShell)
-        ) return false
+        )
+            return false
         let persistedShell = shell
         let pendingActivation: PendingWindowedActivationChange | null = null
         if (activationChange) {
-            const prepared = prepareWindowedActivationChange(
-                shell,
-                authority,
-                activationChange,
-            )
+            const prepared = prepareWindowedActivationChange(shell, authority, activationChange)
             if (!prepared) return false
             persistedShell = prepared.persistedShell
             pendingActivation = {
@@ -816,11 +817,10 @@ export class SaveCoordinator {
             baseline.authority.sessionVersion !== authority.sessionVersion ||
             baseline.authority.totalMessages !== authority.totalMessages ||
             baseline.authority.storeRevision > revision ||
-            (
-                pendingActivation !== null &&
-                !sameWindowedAuthority(pendingActivation.authority, baseline.authority)
-            )
-        ) return false
+            (pendingActivation !== null &&
+                !sameWindowedAuthority(pendingActivation.authority, baseline.authority))
+        )
+            return false
         baseline.authority = safeStructuredClone(authority)
         if (pendingActivation) {
             pendingActivation.authority = {
@@ -840,7 +840,8 @@ export class SaveCoordinator {
             this.destructiveReplacementFence !== null ||
             this.currentRevision !== revision ||
             this.dirtyGeneration !== mutationGeneration
-        ) return false
+        )
+            return false
         const captured = this.captureDatabase(database)
         this.rootBaseline = captured.rootCanonical
         this.pluginStorageBaseline = captured.pluginStorageCanonical
@@ -902,8 +903,10 @@ export class SaveCoordinator {
         let previousMutationVersion = event.previousVersion
         for (const mutation of event.mutations) {
             if (
-                !Number.isSafeInteger(mutation.start) || mutation.start < 0 ||
-                !Number.isSafeInteger(mutation.deleteCount) || mutation.deleteCount < 0 ||
+                !Number.isSafeInteger(mutation.start) ||
+                mutation.start < 0 ||
+                !Number.isSafeInteger(mutation.deleteCount) ||
+                mutation.deleteCount < 0 ||
                 !Number.isSafeInteger(mutation.sessionVersion) ||
                 mutation.sessionVersion !== previousMutationVersion + 1 ||
                 mutation.sessionVersion > event.sessionVersion ||
@@ -914,7 +917,9 @@ export class SaveCoordinator {
             previousMutationVersion = mutation.sessionVersion
         }
         if (previousMutationVersion !== event.sessionVersion) {
-            throw new RangeError('Conversation replacement evidence does not reach its session version')
+            throw new RangeError(
+                'Conversation replacement evidence does not reach its session version',
+            )
         }
         const previous = this.pendingConversationMutations.findLast(
             (pending) =>
@@ -926,8 +931,7 @@ export class SaveCoordinator {
                 previous.event.sessionToken === event.sessionToken &&
                 previous.event.sessionVersion === event.previousVersion
             const startsReplacementSession =
-                previous.event.sessionToken !== event.sessionToken &&
-                event.previousVersion === 0
+                previous.event.sessionToken !== event.sessionToken && event.previousVersion === 0
             if (!continuesSession && !startsReplacementSession) {
                 throw new Error('Conversation mutation session sequence changed before persistence')
             }
@@ -948,7 +952,9 @@ export class SaveCoordinator {
         this.trackPromiseSlot(
             promise,
             () => this.flushPromise,
-            (value) => { this.flushPromise = value },
+            (value) => {
+                this.flushPromise = value
+            },
         )
         return promise
     }
@@ -966,7 +972,9 @@ export class SaveCoordinator {
         this.trackPromiseSlot(
             promise,
             () => this.localFlushPromise,
-            (value) => { this.localFlushPromise = value },
+            (value) => {
+                this.localFlushPromise = value
+            },
         )
         return promise
     }
@@ -1005,15 +1013,16 @@ export class SaveCoordinator {
         if (expectationError) return Promise.reject(expectationError)
         if (!options.authoritative && this.dependencies.isIncompleteWorkingSet?.(database)) {
             return Promise.reject(
-                new Error('Cannot replace persistent data from an incomplete persistent working set'),
+                new Error(
+                    'Cannot replace persistent data from an incomplete persistent working set',
+                ),
             )
         }
         const candidate = canonicalDatabaseClone(database)
         const before = this.capture()
         const capturedGeneration = this.dirtyGeneration
-        const supersededAdditionToken = (
-            this.pendingCharacterAddition ?? this.reservedCharacterAddition
-        )?.token ?? null
+        const supersededAdditionToken =
+            (this.pendingCharacterAddition ?? this.reservedCharacterAddition)?.token ?? null
         const hadPendingDebounce = this.debounceHandle !== undefined
         this.cancelDebounce()
         const replacement = this.enqueue(() => {
@@ -1045,9 +1054,8 @@ export class SaveCoordinator {
         if (expectationError) return Promise.reject(expectationError)
         const before = this.capture()
         const capturedGeneration = this.dirtyGeneration
-        const supersededAdditionToken = (
-            this.pendingCharacterAddition ?? this.reservedCharacterAddition
-        )?.token ?? null
+        const supersededAdditionToken =
+            (this.pendingCharacterAddition ?? this.reservedCharacterAddition)?.token ?? null
         const hadPendingDebounce = this.debounceHandle !== undefined
         this.cancelDebounce()
         const preparation = Promise.resolve().then(prepare)
@@ -1059,7 +1067,10 @@ export class SaveCoordinator {
                 const prepared = await preparation
                 const preparedExpectationError = this.replacementExpectationError(options)
                 if (preparedExpectationError) throw preparedExpectationError
-                if (!options.authoritative && this.dependencies.isIncompleteWorkingSet?.(prepared)) {
+                if (
+                    !options.authoritative &&
+                    this.dependencies.isIncompleteWorkingSet?.(prepared)
+                ) {
                     throw new Error(
                         'Cannot replace persistent data from an incomplete persistent working set',
                     )
@@ -1083,10 +1094,7 @@ export class SaveCoordinator {
         })
     }
 
-    mutatePersistentPresets(
-        reason: string,
-        mutate: PersistentPresetMutation,
-    ): Promise<void> {
+    mutatePersistentPresets(reason: string, mutate: PersistentPresetMutation): Promise<void> {
         this.assertInitialized()
         this.assertPersistentMutationAllowed()
         this.cancelDebounce()
@@ -1105,12 +1113,14 @@ export class SaveCoordinator {
             const ordered = [...catalog.items].sort(
                 (left, right) => left.configuredIndex - right.configuredIndex,
             )
-            const presets = await Promise.all(ordered.map(async (summary) => {
-                const value = await this.dependencies.store.readPreset(summary.id)
-                if (!value) throw new Error(`Preset ${summary.id} was not found`)
-                this.assertReadRevision(revision, value.revision)
-                return canonicalClone(value.value)
-            }))
+            const presets = await Promise.all(
+                ordered.map(async (summary) => {
+                    const value = await this.dependencies.store.readPreset(summary.id)
+                    if (!value) throw new Error(`Preset ${summary.id} was not found`)
+                    this.assertReadRevision(revision, value.revision)
+                    return canonicalClone(value.value)
+                }),
+            )
             const state: PersistentPresetMutationState = {
                 root: canonicalClone(rootValue.value),
                 presets,
@@ -1118,11 +1128,7 @@ export class SaveCoordinator {
             await mutate(state)
 
             const liveBeforeCommit = this.capture()
-            const mutatedRoot = rebaseRootMutation(
-                rootValue.value,
-                state.root,
-                operationStart.root,
-            )
+            const mutatedRoot = rebaseRootMutation(rootValue.value, state.root, operationStart.root)
             const committedRoot = rebaseConcurrentLiveDelta(
                 operationStart.root,
                 liveBeforeCommit.root,
@@ -1177,8 +1183,7 @@ export class SaveCoordinator {
         try {
             this.assertInitialized()
             this.assertPersistentMutationAllowed()
-        }
-        catch (error) {
+        } catch (error) {
             throw persistentRootModuleAppendRejected(error)
         }
         let commitStarted = false
@@ -1204,8 +1209,8 @@ export class SaveCoordinator {
                     signal?.throwIfAborted()
                     const previous = uniqueAliases.get(alias.key)
                     if (
-                        previous
-                        && (previous.objectHash !== alias.objectHash || previous.size !== alias.size)
+                        previous &&
+                        (previous.objectHash !== alias.objectHash || previous.size !== alias.size)
                     ) {
                         throw new PersistentRootModuleAppendRejectedError(
                             `Imported module alias conflicts with duplicate ${alias.key}`,
@@ -1269,9 +1274,7 @@ export class SaveCoordinator {
                     'Persistent root changed during module import',
                 )
             }
-            const modules = Array.isArray(snapshot.root.modules)
-                ? snapshot.root.modules
-                : []
+            const modules = Array.isArray(snapshot.root.modules) ? snapshot.root.modules : []
             const moduleIndex = modules.length
             snapshot.root.modules = [...modules, canonicalClone(input.module)]
             const ownerHead: AssetOwnerHead = {
@@ -1289,8 +1292,7 @@ export class SaveCoordinator {
                     assetAliases: snapshot.aliases,
                     assetOwnerHeads: [...snapshot.ownerHeads, ownerHead],
                 })
-            }
-            catch (error) {
+            } catch (error) {
                 if (error instanceof RevisionConflictError) {
                     throw persistentRootModuleAppendRejected(error)
                 }
@@ -1332,9 +1334,7 @@ export class SaveCoordinator {
             if (mutations.length === 0) return
             const revision = this.revision
             const baseline = this.pluginStorageBaselineEntries
-            const committedMutations = canonicalClone(
-                mutations,
-            ) as PluginStorageMutation[]
+            const committedMutations = canonicalClone(mutations) as PluginStorageMutation[]
             const readLiveStorage = () =>
                 this.dependencies.capturePluginStorage
                     ? this.dependencies.capturePluginStorage()
@@ -1343,15 +1343,11 @@ export class SaveCoordinator {
                               pluginCustomStorage?: Database['pluginCustomStorage']
                           }
                       ).pluginCustomStorage ?? null)
-            const liveBeforeCommit =
-                baseline === null ? null : readLiveStorage()
+            const liveBeforeCommit = baseline === null ? null : readLiveStorage()
             const beforeScope =
                 liveBeforeCommit === null
                     ? null
-                    : capturePluginMutationScope(
-                          liveBeforeCommit,
-                          committedMutations,
-                      )
+                    : capturePluginMutationScope(liveBeforeCommit, committedMutations)
             const committed = await this.dependencies.store.commit({
                 expectedRevision: revision,
                 pluginStorage: committedMutations,
@@ -1365,10 +1361,7 @@ export class SaveCoordinator {
                     const publication = rebasePluginMutationPublication(
                         committedMutations,
                         beforeScope,
-                        capturePluginMutationScope(
-                            liveAfterCommit,
-                            committedMutations,
-                        ),
+                        capturePluginMutationScope(liveAfterCommit, committedMutations),
                     )
                     if (this.dependencies.publishPluginStorageMutations) {
                         this.dependencies.publishPluginStorageMutations(
@@ -1378,10 +1371,7 @@ export class SaveCoordinator {
                     } else {
                         this.dependencies.publishPluginStorageWorkingSet?.(
                             orderPluginStorageKeys(
-                                applyPluginStorageMutations(
-                                    liveAfterCommit,
-                                    publication.mutations,
-                                ),
+                                applyPluginStorageMutations(liveAfterCommit, publication.mutations),
                                 publication.keys,
                             ),
                         )
@@ -1493,9 +1483,9 @@ export class SaveCoordinator {
                 const committedCharacter = deleting
                     ? null
                     : this.mergeCommittedDetailWithResident(
-                        state.character,
-                        residentBefore?.character ?? null,
-                    )
+                          state.character,
+                          residentBefore?.character ?? null,
+                      )
                 return this.compensateConcurrentResidentCharacter({
                     committedRevision: committed.revision,
                     committedRoot,
@@ -1507,17 +1497,20 @@ export class SaveCoordinator {
                 })
             }
             const liveAfterCommit = this.capture()
-            this.finishCharacterMutation({
-                revision: committed.revision,
-                root: rebaseRootMutation(
-                    liveBeforeCommit.root,
-                    liveAfterCommit.root,
-                    committedRoot,
-                ),
-                characterId,
-                kind: deleting ? 'delete' : 'detail',
-                character: deleting ? null : canonicalClone(state.character),
-            }, committedRoot)
+            this.finishCharacterMutation(
+                {
+                    revision: committed.revision,
+                    root: rebaseRootMutation(
+                        liveBeforeCommit.root,
+                        liveAfterCommit.root,
+                        committedRoot,
+                    ),
+                    characterId,
+                    kind: deleting ? 'delete' : 'detail',
+                    character: deleting ? null : canonicalClone(state.character),
+                },
+                committedRoot,
+            )
             await this.finishExplicitCommit(committed.revision)
             return true
         })
@@ -1569,7 +1562,9 @@ export class SaveCoordinator {
                             if (!value) throw new Error(`Character ${summary.id} was not found`)
                             this.assertReadRevision(revision, value.revision)
                             if (value.value.chaId !== summary.id || value.value.type !== 'group') {
-                                throw new Error(`Character ${summary.id} returned mismatched detail`)
+                                throw new Error(
+                                    `Character ${summary.id} returned mismatched detail`,
+                                )
                             }
                             const group = canonicalClone(value.value) as Omit<groupChat, 'chats'>
                             if (!this.removeGroupCharacterReference(group, characterId)) continue
@@ -1631,20 +1626,24 @@ export class SaveCoordinator {
                 return residentDetail as CharacterDetail
             })
             const liveAfterCommit = this.capture()
-            this.finishCharacterMutation({
-                revision: committed.revision,
-                root: rebaseRootMutation(
-                    liveBeforeCommit.root,
-                    liveAfterCommit.root,
-                    committedRoot,
-                ),
-                characterId,
-                kind: 'delete',
-                character: null,
-                relatedCharacters: publishedRelatedCharacters,
-            }, committedRoot, {
-                preservePendingWork: changedDuringCommit || relatedRaces.size > 0,
-            })
+            this.finishCharacterMutation(
+                {
+                    revision: committed.revision,
+                    root: rebaseRootMutation(
+                        liveBeforeCommit.root,
+                        liveAfterCommit.root,
+                        committedRoot,
+                    ),
+                    characterId,
+                    kind: 'delete',
+                    character: null,
+                    relatedCharacters: publishedRelatedCharacters,
+                },
+                committedRoot,
+                {
+                    preservePendingWork: changedDuringCommit || relatedRaces.size > 0,
+                },
+            )
             for (const relatedId of relatedRaces.keys()) {
                 this.enqueueResidentCompensation(relatedId)
             }
@@ -1674,7 +1673,8 @@ export class SaveCoordinator {
             if (
                 options.expectedRevision !== undefined &&
                 options.expectedRevision !== this.revision
-            ) throw new RevisionConflictError(options.expectedRevision, this.revision)
+            )
+                throw new RevisionConflictError(options.expectedRevision, this.revision)
             const residentBefore = this.captureResidentCharacter(characterId)
             const revision = this.revision
             const [rootValue, characterValue] = await Promise.all([
@@ -1714,13 +1714,16 @@ export class SaveCoordinator {
                     reason,
                 })
             }
-            this.finishCharacterMutation({
-                revision: committed.revision,
-                root: this.capture().root,
-                characterId,
-                kind: 'replace',
-                character: replacement,
-            }, rootValue.value)
+            this.finishCharacterMutation(
+                {
+                    revision: committed.revision,
+                    root: this.capture().root,
+                    characterId,
+                    kind: 'replace',
+                    character: replacement,
+                },
+                rootValue.value,
+            )
             await this.finishExplicitCommit(committed.revision)
             return true
         })
@@ -1741,7 +1744,8 @@ export class SaveCoordinator {
             if (
                 options.expectedRevision !== undefined &&
                 options.expectedRevision !== this.revision
-            ) throw new RevisionConflictError(options.expectedRevision, this.revision)
+            )
+                throw new RevisionConflictError(options.expectedRevision, this.revision)
 
             const authority = this.dependencies.captureSelectedConversationAuthority?.() ?? null
             if (
@@ -1755,7 +1759,8 @@ export class SaveCoordinator {
             }
             const mutationGeneration = this.dirtyGeneration
             const residentBefore = this.captureResidentConversation(characterId, conversationId)
-            const summaryBefore = residentBefore === null &&
+            const summaryBefore =
+                residentBefore === null &&
                 this.isResidentConversationSummary(characterId, conversationId)
             const current = await this.dependencies.store.readConversation(
                 characterId,
@@ -1773,15 +1778,17 @@ export class SaveCoordinator {
             const { message, ...conversation } = candidate
             const committed = await this.dependencies.store.commit({
                 expectedRevision: this.revision,
-                conversations: [{
-                    type: 'replace-range',
-                    characterId,
-                    conversationId,
-                    start: 0,
-                    deleteCount: current.value.message.length,
-                    messages: message,
-                    conversation,
-                }],
+                conversations: [
+                    {
+                        type: 'replace-range',
+                        characterId,
+                        conversationId,
+                        start: 0,
+                        deleteCount: current.value.message.length,
+                        messages: message,
+                        conversation,
+                    },
+                ],
             })
             const residentAfterCommit = this.captureResidentConversation(
                 characterId,
@@ -1797,16 +1804,19 @@ export class SaveCoordinator {
                     replacementMessageCount: candidate.message.length,
                 })
             }
-            await this.finishPersistentConversationReplacement({
-                revision: committed.revision,
-                characterId,
-                conversationId,
-                conversation: candidate,
-            }, {
-                preservePendingWork: this.dirtyGeneration !== mutationGeneration,
-                residentBefore,
-                summaryBefore,
-            })
+            await this.finishPersistentConversationReplacement(
+                {
+                    revision: committed.revision,
+                    characterId,
+                    conversationId,
+                    conversation: candidate,
+                },
+                {
+                    preservePendingWork: this.dirtyGeneration !== mutationGeneration,
+                    residentBefore,
+                    summaryBefore,
+                },
+            )
             return true
         })
     }
@@ -1854,10 +1864,13 @@ export class SaveCoordinator {
             }
             if (options.assetOwnerHeads !== undefined) {
                 const assetOwnerHeads = [...canonicalClone(options.assetOwnerHeads)]
-                if (assetOwnerHeads.some((head) => (
-                    head.owner.kind !== 'character-additional-assets'
-                    || head.owner.characterId !== characterId
-                ))) {
+                if (
+                    assetOwnerHeads.some(
+                        (head) =>
+                            head.owner.kind !== 'character-additional-assets' ||
+                            head.owner.characterId !== characterId,
+                    )
+                ) {
                     throw new TypeError(
                         `Prepared character owner heads must belong to ${characterId}`,
                     )
@@ -1893,19 +1906,19 @@ export class SaveCoordinator {
                     reason,
                 })
             }
-            this.finishCharacterMutation({
-                revision: committed.revision,
-                root: current || options.includeInCharacterOrder === false
-                    ? this.capture().root
-                    : rebaseRootMutation(
-                        rootValue.value,
-                        mutatedRoot,
-                        this.capture().root,
-                    ),
-                characterId,
-                kind: current ? 'replace' : 'add',
-                character: replacement,
-            }, committedRoot)
+            this.finishCharacterMutation(
+                {
+                    revision: committed.revision,
+                    root:
+                        current || options.includeInCharacterOrder === false
+                            ? this.capture().root
+                            : rebaseRootMutation(rootValue.value, mutatedRoot, this.capture().root),
+                    characterId,
+                    kind: current ? 'replace' : 'add',
+                    character: replacement,
+                },
+                committedRoot,
+            )
             await this.finishExplicitCommit(committed.revision)
             return true
         })
@@ -1983,16 +1996,14 @@ export class SaveCoordinator {
         this.assertInitialized()
         this.assertPersistentMutationAllowed()
         if (!Number.isInteger(orderedPosition) || orderedPosition < 0) {
-            return Promise.reject(new RangeError('Conversation position must be a nonnegative integer'))
+            return Promise.reject(
+                new RangeError('Conversation position must be a nonnegative integer'),
+            )
         }
         this.cancelDebounce()
         return this.enqueue(async () => {
             await this.flushIterations(reason, true)
-            return this.readConversationAtRevision(
-                characterId,
-                orderedPosition,
-                this.revision,
-            )
+            return this.readConversationAtRevision(characterId, orderedPosition, this.revision)
         })
     }
 
@@ -2068,7 +2079,7 @@ export class SaveCoordinator {
                 if (this.dirtyGeneration !== expected.mutationGeneration) {
                     throw new Error(
                         `Expected mutation generation ${expected.mutationGeneration}, ` +
-                        `but current generation is ${this.dirtyGeneration}`,
+                            `but current generation is ${this.dirtyGeneration}`,
                     )
                 }
                 if (this.destructiveReplacementFence?.owner !== owner) {
@@ -2130,11 +2141,9 @@ export class SaveCoordinator {
             throw new PersistentMutationFencedError()
         }
         if (
-            !this.destructiveReplacementFence.acceptsPostPublicationDirty
-            && !(this.destructiveReplacementFence.refreshBaseline
-                ? this.captureMatchesCapturedState(
-                    this.destructiveReplacementFence.refreshBaseline,
-                )
+            !this.destructiveReplacementFence.acceptsPostPublicationDirty &&
+            !(this.destructiveReplacementFence.refreshBaseline
+                ? this.captureMatchesCapturedState(this.destructiveReplacementFence.refreshBaseline)
                 : this.captureMatchesBaseline())
         ) {
             this.destructiveReplacementFence.blockedPrePublicationDirty = true
@@ -2144,8 +2153,8 @@ export class SaveCoordinator {
 
     releaseDestructiveReplacementFence(owner: symbol): void {
         if (
-            this.destructiveReplacementFence?.owner !== owner
-            || this.destructiveReplacementFence.state !== 'held'
+            this.destructiveReplacementFence?.owner !== owner ||
+            this.destructiveReplacementFence.state !== 'held'
         ) {
             throw new Error('Destructive persistent replacement fence is not held')
         }
@@ -2214,8 +2223,9 @@ export class SaveCoordinator {
         }
         if (this.pendingCharacterAddition) {
             // A previous addition failed and left its work pending; retry it before this import.
-            return this.flushPendingData(reason)
-                .then(() => this.commitCharacterAddition(request, reason))
+            return this.flushPendingData(reason).then(() =>
+                this.commitCharacterAddition(request, reason),
+            )
         }
         if (this.reservedCharacterAddition) {
             throw new Error('A character addition is already pending')
@@ -2235,7 +2245,9 @@ export class SaveCoordinator {
         this.trackPromiseSlot(
             promise,
             () => this.additionPromise,
-            (value) => { this.additionPromise = value },
+            (value) => {
+                this.additionPromise = value
+            },
         )
         return promise
     }
@@ -2294,11 +2306,12 @@ export class SaveCoordinator {
             let yieldedAfterCapture = windowedCapture !== null
             const selectionSwitched =
                 windowedCapture === null &&
-                captured.character !== null &&
+                captured.characterCanonical !== null &&
                 this.characterBaselineId !== null &&
-                captured.character.chaId !== this.characterBaselineId
+                (captured.characterId ?? captured.character?.chaId) !== this.characterBaselineId
             const detached =
-                windowedCapture === null && (!captured.character || selectionSwitched)
+                windowedCapture === null &&
+                (captured.characterCanonical === null || selectionSwitched)
                     ? this.captureDetachedCharacter()
                     : null
             const addition = this.capturePendingAddition()
@@ -2309,19 +2322,26 @@ export class SaveCoordinator {
             }
             const conversationProjection = windowedCapture
                 ? await this.projectWindowedConversationMutations(
-                    captured,
-                    pendingConversationMutations,
-                )
-                : this.projectConversationMutations(
-                    captured,
-                    pendingConversationMutations,
-                )
+                      captured,
+                      pendingConversationMutations,
+                  )
+                : this.projectConversationMutations(captured, pendingConversationMutations)
             const recordedConversations = conversationProjection?.exactMutations ?? null
             const commit: WorkingSetCommit = { expectedRevision: this.revision }
-            if (captured.rootCanonical !== this.rootBaseline) commit.root = captured.root
-            if (
-                !this.pluginStorageMatchesBaseline(captured)
-            ) {
+            if (captured.rootCanonical !== this.rootBaseline) {
+                if (this.rootBaseline === null) commit.root = captured.root
+                else
+                    commit.rootMutations = this.dependencies.canonicalCapture
+                        ? this.dependencies.canonicalCapture.diffRoot(
+                              this.rootBaseline,
+                              captured.rootCanonical,
+                          )
+                        : diffRootMutations(
+                              JSON.parse(this.rootBaseline) as RootDatabase,
+                              captured.root,
+                          )
+            }
+            if (!this.pluginStorageMatchesBaseline(captured)) {
                 commit.pluginStorage = diffPluginStorage(
                     this.pluginStorageBaseline,
                     captured.pluginStorage!,
@@ -2341,13 +2361,12 @@ export class SaveCoordinator {
             } else if (detached) {
                 commit.replaceCharacter = detached.character
             } else if (
-                captured.character &&
-                (
-                    captured.characterCanonical !== this.characterBaseline ||
-                    recordedConversations !== null
-                )
+                captured.characterCanonical !== null &&
+                (captured.characterCanonical !== this.characterBaseline ||
+                    recordedConversations !== null)
             ) {
-                const conversations = recordedConversations ?? this.diffSelectedConversations(captured)
+                const conversations =
+                    recordedConversations ?? this.diffSelectedConversations(captured)
                 if (conversations) {
                     if (conversations.length > 0) commit.conversations = conversations
                     if (this.characterBaseline !== null) {
@@ -2360,9 +2379,11 @@ export class SaveCoordinator {
                             commit.character = character
                         }
                     }
-                } else commit.replaceCharacter = captured.conversationStubIds.size > 0
-                    ? await this.reconstructCapturedCharacter(captured)
-                    : captured.character
+                } else
+                    commit.replaceCharacter =
+                        captured.conversationStubIds.size > 0
+                            ? await this.reconstructCapturedCharacter(captured)
+                            : captured.character
             }
 
             let replacementIsAddition = false
@@ -2381,6 +2402,7 @@ export class SaveCoordinator {
 
             if (
                 commit.root ||
+                commit.rootMutations?.length ||
                 commit.pluginStorage ||
                 commit.replacePresets ||
                 commit.character ||
@@ -2396,11 +2418,12 @@ export class SaveCoordinator {
                 )
                 const replacedCharacterId = commit.replaceCharacter?.chaId
                 const persistedConversationMutations =
-                    conversationProjection?.coveredPending.filter(({ event }) =>
-                        event.characterId === replacedCharacterId ||
-                        committedConversationKeys.has(
-                            `${event.characterId}\u0000${event.conversationId}`,
-                        ),
+                    conversationProjection?.coveredPending.filter(
+                        ({ event }) =>
+                            event.characterId === replacedCharacterId ||
+                            committedConversationKeys.has(
+                                `${event.characterId}\u0000${event.conversationId}`,
+                            ),
                     ) ?? []
                 const persistenceHandles: ConversationMutationPersistenceHandle[] = []
                 for (const { event } of persistedConversationMutations) {
@@ -2415,7 +2438,8 @@ export class SaveCoordinator {
                 try {
                     const committed = await this.dependencies.store.commit(commit)
                     this.currentRevision = committed.revision
-                    if (commit.root) this.rootBaseline = captured.rootCanonical
+                    if (commit.root || commit.rootMutations)
+                        this.rootBaseline = captured.rootCanonical
                     if (commit.pluginStorage) {
                         this.pluginStorageBaseline = captured.pluginStorageCanonical
                     }
@@ -2459,9 +2483,9 @@ export class SaveCoordinator {
                         ) {
                             this.pendingWindowedActivationChange = null
                         }
-                        const persistedSessionVersion = persistedConversationMutations.at(-1)
-                            ?.event.sessionVersion
-                            ?? windowedCapture.authority.persistedSessionVersion
+                        const persistedSessionVersion =
+                            persistedConversationMutations.at(-1)?.event.sessionVersion ??
+                            windowedCapture.authority.persistedSessionVersion
                         this.setWindowedCharacterBaseline(
                             windowedCapture,
                             committed.revision,
@@ -2493,9 +2517,10 @@ export class SaveCoordinator {
 
             if (
                 windowedCapture === null &&
-                !captured.character &&
+                captured.characterCanonical === null &&
                 !commit.replaceCharacter
-            ) this.setCharacterBaseline(captured)
+            )
+                this.setCharacterBaseline(captured)
 
             // With no await or commit, the live state cannot have changed between
             // these captures. Reuse the snapshot instead of serializing it twice.
@@ -2523,7 +2548,11 @@ export class SaveCoordinator {
                     this.pendingByteCount = 0
                     return
                 }
-                if (!publishOfficial && this.hasPendingOfficialPublication && !this.publicationInProgress) {
+                if (
+                    !publishOfficial &&
+                    this.hasPendingOfficialPublication &&
+                    !this.publicationInProgress
+                ) {
                     this.armOfficialPublishRetry(this.officialPublishDelayMs())
                 }
                 this.pendingCharacterAddition = null
@@ -2599,9 +2628,7 @@ export class SaveCoordinator {
 
         const rebased = this.rebaseReplacementPublication(candidate, before, live, true)
         const published = rebased.database
-        const compensation = rebased.compensation
-            ? canonicalClone(rebased.compensation)
-            : null
+        const compensation = rebased.compensation ? canonicalClone(rebased.compensation) : null
 
         this.dependencies.replaceDatabase(published)
         if (stalePublication) {
@@ -2618,9 +2645,7 @@ export class SaveCoordinator {
                 this.rootBaseline = canonicalJson(compensation.root)
             }
             if (compensation.pluginStorage) {
-                this.pluginStorageBaseline = pluginStorageJson(
-                    published.pluginCustomStorage ?? {},
-                )
+                this.pluginStorageBaseline = pluginStorageJson(published.pluginCustomStorage ?? {})
             }
             if (compensation.replacePresets) {
                 this.presetsBaseline = canonicalJson(compensation.replacePresets)
@@ -2705,9 +2730,7 @@ export class SaveCoordinator {
         const summary = page.items[0]
         if (!summary) return null
         if (summary.characterId !== characterId) {
-            throw new Error(
-                `Conversation position ${orderedPosition} returned mismatched content`,
-            )
+            throw new Error(`Conversation position ${orderedPosition} returned mismatched content`)
         }
         const value = await this.dependencies.store.readConversation(characterId, summary.id)
         if (!value) throw new Error(`Conversation ${summary.id} was not found`)
@@ -2759,8 +2782,8 @@ export class SaveCoordinator {
         conversationId: string,
     ): { conversation: Chat; canonical: string } | null {
         const character = this.dependencies.captureCharacter(characterId)
-        const conversation = character?.chats.find((candidate) =>
-            candidate.id === conversationId && !isConversationSummaryStub(candidate),
+        const conversation = character?.chats.find(
+            (candidate) => candidate.id === conversationId && !isConversationSummaryStub(candidate),
         )
         // Metadata-only shells hold no messages (their message getter throws),
         // so they must not be treated as a resident complete conversation.
@@ -2772,13 +2795,15 @@ export class SaveCoordinator {
         }
     }
 
-    private isResidentConversationSummary(
-        characterId: string,
-        conversationId: string,
-    ): boolean {
-        return this.dependencies.captureCharacter(characterId)?.chats.some((candidate) =>
-            candidate.id === conversationId && isConversationSummaryStub(candidate),
-        ) === true
+    private isResidentConversationSummary(characterId: string, conversationId: string): boolean {
+        return (
+            this.dependencies
+                .captureCharacter(characterId)
+                ?.chats.some(
+                    (candidate) =>
+                        candidate.id === conversationId && isConversationSummaryStub(candidate),
+                ) === true
+        )
     }
 
     private residentConversationsMatch(
@@ -2817,10 +2842,7 @@ export class SaveCoordinator {
         reason: string
         replacementMessageCount: number
     }): Promise<never> {
-        this.enqueueResidentConversationCompensation(
-            options.characterId,
-            options.conversationId,
-        )
+        this.enqueueResidentConversationCompensation(options.characterId, options.conversationId)
         this.currentRevision = options.committedRevision
         this.dirtyGeneration++
         this.dependencies.onLocalRevision?.(options.committedRevision)
@@ -2837,15 +2859,17 @@ export class SaveCoordinator {
             const { message, ...conversation } = candidate
             const compensated = await this.dependencies.store.commit({
                 expectedRevision: this.revision,
-                conversations: [{
-                    type: 'replace-range',
-                    characterId: options.characterId,
-                    conversationId: options.conversationId,
-                    start: 0,
-                    deleteCount,
-                    messages: message,
-                    conversation,
-                }],
+                conversations: [
+                    {
+                        type: 'replace-range',
+                        characterId: options.characterId,
+                        conversationId: options.conversationId,
+                        start: 0,
+                        deleteCount,
+                        messages: message,
+                        conversation,
+                    },
+                ],
             })
             this.currentRevision = compensated.revision
             this.dependencies.onLocalRevision?.(compensated.revision)
@@ -2855,12 +2879,15 @@ export class SaveCoordinator {
             )
             if (this.residentConversationsMatch(resident, next)) {
                 targetSettled = true
-                this.advanceCharacterBaselineForConversation({
-                    revision: compensated.revision,
-                    characterId: options.characterId,
-                    conversationId: options.conversationId,
-                    conversation: resident.conversation,
-                }, resident)
+                this.advanceCharacterBaselineForConversation(
+                    {
+                        revision: compensated.revision,
+                        characterId: options.characterId,
+                        conversationId: options.conversationId,
+                        conversation: resident.conversation,
+                    },
+                    resident,
+                )
                 break
             }
             deleteCount = candidate.message.length
@@ -2869,17 +2896,14 @@ export class SaveCoordinator {
         }
 
         if (targetSettled) {
-            this.removeResidentConversationCompensation(
-                options.characterId,
-                options.conversationId,
-            )
+            this.removeResidentConversationCompensation(options.characterId, options.conversationId)
         } else {
             this.armDebounce()
         }
         await this.finishExplicitCommit(this.revision)
         throw new Error(
             `Resident conversation changed during persistent mutation: ` +
-            `${options.characterId}/${options.conversationId}`,
+                `${options.characterId}/${options.conversationId}`,
         )
     }
 
@@ -2963,7 +2987,8 @@ export class SaveCoordinator {
 
         const current = this.capture()
         const currentAddition = this.capturePendingAddition()
-        const isClean = targetSettled &&
+        const isClean =
+            targetSettled &&
             current.rootCanonical === this.rootBaseline &&
             this.pluginStorageMatchesBaseline(current) &&
             (current.presetsCanonical === null ||
@@ -3065,15 +3090,17 @@ export class SaveCoordinator {
                 const { message, ...conversation } = candidate
                 committed = await this.dependencies.store.commit({
                     expectedRevision: this.revision,
-                    conversations: [{
-                        type: 'replace-range',
-                        characterId: pending.characterId,
-                        conversationId: pending.conversationId,
-                        start: 0,
-                        deleteCount: durable.value.message.length,
-                        messages: message,
-                        conversation,
-                    }],
+                    conversations: [
+                        {
+                            type: 'replace-range',
+                            characterId: pending.characterId,
+                            conversationId: pending.conversationId,
+                            start: 0,
+                            deleteCount: durable.value.message.length,
+                            messages: message,
+                            conversation,
+                        },
+                    ],
                 })
             } catch (error) {
                 this.armDebounce()
@@ -3085,23 +3112,28 @@ export class SaveCoordinator {
                 if (publishOfficial) await this.stagePublication(committed.revision)
                 else this.deferPublication(committed.revision)
             }
-            if (!this.residentConversationsMatch(
-                resident,
-                this.captureResidentConversation(pending.characterId, pending.conversationId),
-            )) {
+            if (
+                !this.residentConversationsMatch(
+                    resident,
+                    this.captureResidentConversation(pending.characterId, pending.conversationId),
+                )
+            ) {
                 this.armDebounce()
                 throw new Error(
                     `Resident conversation changed during deferred compensation: ` +
-                    `${pending.characterId}/${pending.conversationId}`,
+                        `${pending.characterId}/${pending.conversationId}`,
                 )
             }
             this.pendingResidentConversationCompensations.shift()
-            this.advanceCharacterBaselineForConversation({
-                revision: committed.revision,
-                characterId: pending.characterId,
-                conversationId: pending.conversationId,
-                conversation: resident.conversation,
-            }, resident)
+            this.advanceCharacterBaselineForConversation(
+                {
+                    revision: committed.revision,
+                    characterId: pending.characterId,
+                    conversationId: pending.conversationId,
+                    conversation: resident.conversation,
+                },
+                resident,
+            )
         }
     }
 
@@ -3131,9 +3163,10 @@ export class SaveCoordinator {
     }
 
     private enqueueResidentCompensation(characterId: string): void {
-        if (this.pendingResidentCompensations.some(
-            (pending) => pending.characterId === characterId,
-        )) return
+        if (
+            this.pendingResidentCompensations.some((pending) => pending.characterId === characterId)
+        )
+            return
         this.pendingResidentCompensations.push({ characterId })
     }
 
@@ -3141,10 +3174,14 @@ export class SaveCoordinator {
         characterId: string,
         conversationId: string,
     ): void {
-        if (this.pendingResidentConversationCompensations.some((pending) =>
-            pending.characterId === characterId &&
-            pending.conversationId === conversationId,
-        )) return
+        if (
+            this.pendingResidentConversationCompensations.some(
+                (pending) =>
+                    pending.characterId === characterId &&
+                    pending.conversationId === conversationId,
+            )
+        )
+            return
         this.pendingResidentConversationCompensations.push({ characterId, conversationId })
     }
 
@@ -3152,9 +3189,9 @@ export class SaveCoordinator {
         characterId: string,
         conversationId: string,
     ): void {
-        const index = this.pendingResidentConversationCompensations.findIndex((pending) =>
-            pending.characterId === characterId &&
-            pending.conversationId === conversationId,
+        const index = this.pendingResidentConversationCompensations.findIndex(
+            (pending) =>
+                pending.characterId === characterId && pending.conversationId === conversationId,
         )
         if (index >= 0) this.pendingResidentConversationCompensations.splice(index, 1)
     }
@@ -3168,7 +3205,8 @@ export class SaveCoordinator {
             this.windowedCharacterBaseline !== null ||
             this.characterBaselineId !== result.characterId ||
             this.characterBaseline === null
-        ) return
+        )
+            return
         const baseline = JSON.parse(this.characterBaseline) as CompleteCharacter
         const index = baseline.chats.findIndex(
             (conversation) => conversation.id === result.conversationId,
@@ -3186,35 +3224,34 @@ export class SaveCoordinator {
             if (
                 baseline.authority.characterId !== result.characterId ||
                 baseline.authority.conversationId === result.conversationId
-            ) return
+            )
+                return
             const matches = baseline.shell.chats
                 .map((conversation, index) => ({ conversation, index }))
                 .filter(({ conversation }) => conversation.id === result.conversationId)
             if (matches.length !== 1) return
-            const summary = canonicalClone(createConversationSummaryStubFromChat(
-                result.characterId,
-                result.conversation,
-                matches[0].index,
-            ))
+            const summary = canonicalClone(
+                createConversationSummaryStubFromChat(
+                    result.characterId,
+                    result.conversation,
+                    matches[0].index,
+                ),
+            )
             const { message: _message, ...shell } = summary
             baseline.shell.chats[matches[0].index] = shell
             baseline.shellCanonical = canonicalJson(baseline.shell)
             return
         }
-        if (
-            this.characterBaselineId !== result.characterId ||
-            this.characterBaseline === null
-        ) return
+        if (this.characterBaselineId !== result.characterId || this.characterBaseline === null)
+            return
         const baseline = JSON.parse(this.characterBaseline) as CompleteCharacter
         const index = baseline.chats.findIndex(
             (conversation) => conversation.id === result.conversationId,
         )
         if (index < 0) return
-        baseline.chats[index] = canonicalClone(createConversationSummaryStubFromChat(
-            result.characterId,
-            result.conversation,
-            index,
-        ))
+        baseline.chats[index] = canonicalClone(
+            createConversationSummaryStubFromChat(result.characterId, result.conversation, index),
+        )
         this.characterBaseline = canonicalJson(baseline)
     }
 
@@ -3301,8 +3338,7 @@ export class SaveCoordinator {
             current.authority.storeRevision !== this.revision ||
             baseline.authority.persistedSessionVersion !==
                 current.authority.persistedSessionVersion ||
-            baseline.authority.sessionVersion !==
-                baseline.authority.persistedSessionVersion
+            baseline.authority.sessionVersion !== baseline.authority.persistedSessionVersion
         ) {
             throw new WindowedConversationRequiresCompatibilityError(
                 'session authority no longer matches the adopted baseline',
@@ -3323,10 +3359,11 @@ export class SaveCoordinator {
             )
         }
         const authority = current.authority
-        const relevantPending = pending.filter(({ event }) =>
-            event.characterId === authority.characterId &&
-            event.conversationId === authority.conversationId &&
-            event.sessionToken === authority.sessionToken
+        const relevantPending = pending.filter(
+            ({ event }) =>
+                event.characterId === authority.characterId &&
+                event.conversationId === authority.conversationId &&
+                event.sessionToken === authority.sessionToken,
         )
         if (relevantPending.length !== pending.length) {
             throw new WindowedConversationRequiresCompatibilityError(
@@ -3338,9 +3375,7 @@ export class SaveCoordinator {
         const activation = this.pendingWindowedActivationChange
         let activationCharacter: CharacterDetail | undefined
         if (activation) {
-            if (
-                !sameWindowedAuthority(activation.authority, baseline.authority)
-            ) {
+            if (!sameWindowedAuthority(activation.authority, baseline.authority)) {
                 throw new WindowedConversationRequiresCompatibilityError(
                     'activation evidence belongs to another authority',
                 )
@@ -3351,10 +3386,7 @@ export class SaveCoordinator {
                     projectedShell as unknown as Record<string, unknown>,
                     'chats',
                 ) as CharacterDetail
-                if (
-                    canonicalJson(projectedDetail) !==
-                    canonicalJson(characterChange.before)
-                ) {
+                if (canonicalJson(projectedDetail) !== canonicalJson(characterChange.before)) {
                     throw new WindowedConversationRequiresCompatibilityError(
                         'activation character evidence does not match the persisted baseline',
                     )
@@ -3368,13 +3400,11 @@ export class SaveCoordinator {
             const conversationChange = activation.change.conversation
             if (conversationChange) {
                 const matches = projectedShell.chats.filter(
-                    (conversation) =>
-                        conversation.id === authority.conversationId,
+                    (conversation) => conversation.id === authority.conversationId,
                 )
                 if (
                     matches.length !== 1 ||
-                    canonicalJson(matches[0]) !==
-                        canonicalJson(conversationChange.before)
+                    canonicalJson(matches[0]) !== canonicalJson(conversationChange.before)
                 ) {
                     throw new WindowedConversationRequiresCompatibilityError(
                         'activation conversation evidence does not match the persisted baseline',
@@ -3467,10 +3497,7 @@ export class SaveCoordinator {
                     )
                 }
                 const deleteCount = range.deleteCount
-                if (
-                    range.start > messageCount ||
-                    deleteCount > messageCount - range.start
-                ) {
+                if (range.start > messageCount || deleteCount > messageCount - range.start) {
                     throw new WindowedConversationRequiresCompatibilityError(
                         'absolute mutation range exceeds the persistent conversation',
                     )
@@ -3516,16 +3543,20 @@ export class SaveCoordinator {
 
     private selectedCaptureMatchesBaseline(captured: CapturedState): boolean {
         if (this.windowedCharacterBaseline) {
-            return captured.windowedCharacter !== null
-                && captured.windowedCharacter.shellCanonical ===
-                    this.windowedCharacterBaseline.shellCanonical
-                && sameWindowedAuthority(
+            return (
+                captured.windowedCharacter !== null &&
+                captured.windowedCharacter.shellCanonical ===
+                    this.windowedCharacterBaseline.shellCanonical &&
+                sameWindowedAuthority(
                     captured.windowedCharacter.authority,
                     this.windowedCharacterBaseline.authority,
                 )
+            )
         }
-        return captured.windowedCharacter === null
-            && captured.characterCanonical === this.characterBaseline
+        return (
+            captured.windowedCharacter === null &&
+            captured.characterCanonical === this.characterBaseline
+        )
     }
 
     private projectConversationMutations(
@@ -3537,27 +3568,22 @@ export class SaveCoordinator {
             !captured.character ||
             this.characterBaseline === null ||
             this.characterBaselineId !== captured.character.chaId
-        ) return null
+        )
+            return null
 
         const projected = JSON.parse(this.characterBaseline) as CompleteCharacter
-        const relevantPending = pending.filter(
-            ({ event }) => event.characterId === projected.chaId,
-        )
+        const relevantPending = pending.filter(({ event }) => event.characterId === projected.chaId)
         if (relevantPending.length === 0) return null
         const pendingByConversation = new Map<string, PendingConversationMutation[]>()
         for (const pendingMutation of relevantPending) {
-            const conversationPending = pendingByConversation.get(
-                pendingMutation.event.conversationId,
-            ) ?? []
+            const conversationPending =
+                pendingByConversation.get(pendingMutation.event.conversationId) ?? []
             conversationPending.push(pendingMutation)
             pendingByConversation.set(pendingMutation.event.conversationId, conversationPending)
         }
 
         const coveredSet = new Set<PendingConversationMutation>()
-        const mutationsByPending = new Map<
-            PendingConversationMutation,
-            ConversationMutation[]
-        >()
+        const mutationsByPending = new Map<PendingConversationMutation, ConversationMutation[]>()
         for (const [conversationId, conversationPending] of pendingByConversation) {
             if (captured.conversationStubIds.has(conversationId)) continue
             const projectedMatches = projected.chats.filter(
@@ -3589,9 +3615,10 @@ export class SaveCoordinator {
                 if (previous && !continuesSession && !startsReplacementSession) break
 
                 const eventMutations: ConversationMutation[] = []
-                const conversationMetadata = safeStructuredClone(
-                    event.conversation,
-                ) as Omit<Chat, 'message'>
+                const conversationMetadata = safeStructuredClone(event.conversation) as Omit<
+                    Chat,
+                    'message'
+                >
                 let valid = true
                 for (const range of event.mutations) {
                     const deleteCount = range.completeOwner
@@ -3649,8 +3676,7 @@ export class SaveCoordinator {
         )
         return {
             exactMutations:
-                mutations.length > 0 &&
-                canonicalJson(projected) === captured.characterCanonical
+                mutations.length > 0 && canonicalJson(projected) === captured.characterCanonical
                     ? mutations
                     : null,
             coveredPending,
@@ -3695,16 +3721,8 @@ export class SaveCoordinator {
         const baselineChats = baseline.chats
         if (!Array.isArray(capturedChats) || !Array.isArray(baselineChats)) return null
         if (capturedChats.length !== baselineChats.length) return null
-        const {
-            chats: _capturedChats,
-            chatPage: capturedChatPage,
-            ...capturedDetail
-        } = character
-        const {
-            chats: _baselineChats,
-            chatPage: baselineChatPage,
-            ...baselineDetail
-        } = baseline
+        const { chats: _capturedChats, chatPage: capturedChatPage, ...capturedDetail } = character
+        const { chats: _baselineChats, chatPage: baselineChatPage, ...baselineDetail } = baseline
         if (JSON.stringify(capturedDetail) !== JSON.stringify(baselineDetail)) return null
 
         const mutations: ConversationMutation[] = []
@@ -3731,11 +3749,7 @@ export class SaveCoordinator {
                 conversation,
             })
         }
-        return mutations.length > 0
-            ? mutations
-            : capturedChatPage !== baselineChatPage
-                ? []
-                : null
+        return mutations.length > 0 ? mutations : capturedChatPage !== baselineChatPage ? [] : null
     }
 
     /** Returns the last tracked character when the selection moved away before its edits were committed. */
@@ -3754,7 +3768,8 @@ export class SaveCoordinator {
     }
 
     private capture(): CapturedState {
-        const capturedRoot = this.dependencies.captureRoot() as RootDatabase & {
+        const optimized = this.dependencies.canonicalCapture
+        const capturedRoot = (optimized ? {} : this.dependencies.captureRoot()) as RootDatabase & {
             characters?: Database['characters']
             botPresets?: botPreset[]
             pluginCustomStorage?: Database['pluginCustomStorage']
@@ -3765,21 +3780,35 @@ export class SaveCoordinator {
             pluginCustomStorage: legacyPluginStorage,
             ...rootValue
         } = capturedRoot
-        const rootCanonical = canonicalJson(rootValue)
+        const rootCanonical = optimized ? optimized.root() : canonicalJson(rootValue)
         const pluginStorageValue = this.dependencies.capturePluginStorage
             ? this.dependencies.capturePluginStorage()
-            : legacyPluginStorage ?? null
+            : (legacyPluginStorage ?? null)
         if (pluginStorageValue === null) this.pluginStorageCaptureCache.clear()
-        const pluginStorageCapture = pluginStorageValue === null
-            ? null
-            : this.pluginStorageCaptureCache.capture(pluginStorageValue)
+        const pluginStorageCapture = optimized
+            ? optimized.pluginStorage()
+            : pluginStorageValue === null
+              ? null
+              : this.pluginStorageCaptureCache.capture(pluginStorageValue)
         const presetsValue = this.dependencies.capturePresets
             ? this.dependencies.capturePresets()
-            : legacyPresets ?? []
-        const presetsCanonical = presetsValue === null ? null : canonicalJson(presetsValue)
+            : (legacyPresets ?? [])
+        const presetsCanonical = optimized
+            ? optimized.presets()
+            : presetsValue === null
+              ? null
+              : canonicalJson(presetsValue)
+        let detachedRoot: RootDatabase | undefined
+        let detachedPresets: botPreset[] | null | undefined
+        const readRoot = () => (detachedRoot ??= JSON.parse(rootCanonical) as RootDatabase)
+        const readPresets = () => {
+            if (detachedPresets === undefined)
+                detachedPresets =
+                    presetsCanonical === null ? null : (JSON.parse(presetsCanonical) as botPreset[])
+            return detachedPresets
+        }
         const characterValue = this.dependencies.captureSelectedCharacter()
-        const windowedAuthority =
-            this.dependencies.captureSelectedConversationAuthority?.() ?? null
+        const windowedAuthority = this.dependencies.captureSelectedConversationAuthority?.() ?? null
         if (windowedAuthority !== null) {
             if (
                 !characterValue ||
@@ -3792,7 +3821,9 @@ export class SaveCoordinator {
             }
             const shell = captureWindowedCharacterShell(characterValue)
             return {
-                root: JSON.parse(rootCanonical) as RootDatabase,
+                get root() {
+                    return readRoot()
+                },
                 rootCanonical,
                 get pluginStorage() {
                     return pluginStorageCapture?.value ?? null
@@ -3801,9 +3832,9 @@ export class SaveCoordinator {
                     return pluginStorageCapture?.json ?? null
                 },
                 pluginStorageCapture,
-                presets: presetsCanonical === null
-                    ? null
-                    : JSON.parse(presetsCanonical) as botPreset[],
+                get presets() {
+                    return readPresets()
+                },
                 presetsCanonical,
                 character: null,
                 characterCanonical: null,
@@ -3821,9 +3852,16 @@ export class SaveCoordinator {
                 .map((conversation) => conversation.id)
                 .filter((id): id is string => Boolean(id)) ?? [],
         )
-        const characterCanonical = characterValue ? canonicalJson(characterValue) : null
+        const characterCanonical = optimized
+            ? optimized.character()
+            : characterValue
+              ? canonicalJson(characterValue)
+              : null
+        let detachedCharacter: CompleteCharacter | null | undefined
         return {
-            root: JSON.parse(rootCanonical) as RootDatabase,
+            get root() {
+                return readRoot()
+            },
             rootCanonical,
             get pluginStorage() {
                 return pluginStorageCapture?.value ?? null
@@ -3832,13 +3870,18 @@ export class SaveCoordinator {
                 return pluginStorageCapture?.json ?? null
             },
             pluginStorageCapture,
-            presets: presetsCanonical === null
-                ? null
-                : JSON.parse(presetsCanonical) as botPreset[],
+            get presets() {
+                return readPresets()
+            },
             presetsCanonical,
-            character: characterCanonical
-                ? (JSON.parse(characterCanonical) as CompleteCharacter)
-                : null,
+            characterId: characterValue?.chaId ?? null,
+            get character() {
+                if (detachedCharacter === undefined)
+                    detachedCharacter = characterCanonical
+                        ? (JSON.parse(characterCanonical) as CompleteCharacter)
+                        : null
+                return detachedCharacter
+            },
             characterCanonical,
             conversationStubIds,
             windowedCharacter: null,
@@ -3846,12 +3889,7 @@ export class SaveCoordinator {
     }
 
     private captureDatabase(database: Database): CapturedState {
-        const {
-            characters,
-            botPresets,
-            pluginCustomStorage,
-            ...rootValue
-        } = database
+        const { characters, botPresets, pluginCustomStorage, ...rootValue } = database
         const rootCanonical = canonicalJson(rootValue)
         const presetsCanonical = canonicalJson(botPresets ?? [])
         const pluginStorageUnavailable =
@@ -3861,19 +3899,22 @@ export class SaveCoordinator {
             ? null
             : pluginStorageJson(pluginCustomStorage ?? {})
         const selectedId = this.dependencies.captureSelectedCharacter()?.chaId
-        const character = selectedId ? characters.find((candidate) => candidate.chaId === selectedId) ?? null : null
+        const character = selectedId
+            ? (characters.find((candidate) => candidate.chaId === selectedId) ?? null)
+            : null
         const characterCanonical = character ? canonicalJson(character) : null
         return {
             root: JSON.parse(rootCanonical) as RootDatabase,
             rootCanonical,
-            pluginStorage: pluginStorageCanonical === null
-                ? null
-                : JSON.parse(pluginStorageCanonical) as Database['pluginCustomStorage'],
+            pluginStorage:
+                pluginStorageCanonical === null
+                    ? null
+                    : (JSON.parse(pluginStorageCanonical) as Database['pluginCustomStorage']),
             pluginStorageCanonical,
             presets: JSON.parse(presetsCanonical) as botPreset[],
             presetsCanonical,
             character: characterCanonical
-                ? JSON.parse(characterCanonical) as CompleteCharacter
+                ? (JSON.parse(characterCanonical) as CompleteCharacter)
                 : null,
             characterCanonical,
             conversationStubIds: new Set(),
@@ -3881,7 +3922,9 @@ export class SaveCoordinator {
         }
     }
 
-    private async reconstructCapturedCharacter(captured: CapturedState): Promise<CompleteCharacter> {
+    private async reconstructCapturedCharacter(
+        captured: CapturedState,
+    ): Promise<CompleteCharacter> {
         if (captured.windowedCharacter) {
             throw new WindowedConversationRequiresCompatibilityError(
                 'character reconstruction requires complete ownership',
@@ -3971,9 +4014,10 @@ export class SaveCoordinator {
             baseline: null,
         }
         this.dirtyGeneration++
-        const bytes = Number.isFinite(request.estimatedBytes) && request.estimatedBytes > 0
-            ? request.estimatedBytes
-            : 0
+        const bytes =
+            Number.isFinite(request.estimatedBytes) && request.estimatedBytes > 0
+                ? request.estimatedBytes
+                : 0
         this.pendingByteCount += bytes
     }
 
@@ -4146,11 +4190,7 @@ export class SaveCoordinator {
         const compensation: Omit<WorkingSetCommit, 'expectedRevision'> = {}
         let publishedRoot: RootDatabase
         try {
-            publishedRoot = rebaseConcurrentLiveDelta(
-                before.root,
-                live.root,
-                publishedParts.root,
-            )
+            publishedRoot = rebaseConcurrentLiveDelta(before.root, live.root, publishedParts.root)
         } catch (error) {
             if (!preserveConflicts) throw error
             publishedRoot = canonicalClone(live.root)
@@ -4221,16 +4261,13 @@ export class SaveCoordinator {
             }
         }
 
-        const includesPluginStorage = Object.prototype.hasOwnProperty.call(
-            candidate,
-            'pluginCustomStorage',
-        ) || live.pluginStorage !== null
+        const includesPluginStorage =
+            Object.prototype.hasOwnProperty.call(candidate, 'pluginCustomStorage') ||
+            live.pluginStorage !== null
         return {
             database: {
                 ...publishedRoot,
-                ...(includesPluginStorage
-                    ? { pluginCustomStorage: publishedPluginStorage }
-                    : {}),
+                ...(includesPluginStorage ? { pluginCustomStorage: publishedPluginStorage } : {}),
                 characters: publishedParts.characters,
                 botPresets: publishedPresets,
             } as Database,
@@ -4238,13 +4275,8 @@ export class SaveCoordinator {
         }
     }
 
-    private replacementExpectationError(
-        options: PersistentReplacementOptions,
-    ): Error | null {
-        if (
-            options.expectedRevision !== undefined &&
-            options.expectedRevision !== this.revision
-        ) {
+    private replacementExpectationError(options: PersistentReplacementOptions): Error | null {
+        if (options.expectedRevision !== undefined && options.expectedRevision !== this.revision) {
             return new RevisionConflictError(options.expectedRevision, this.revision)
         }
         if (
@@ -4253,7 +4285,7 @@ export class SaveCoordinator {
         ) {
             return new Error(
                 `Expected mutation generation ${options.expectedMutationGeneration}, ` +
-                `but current generation is ${this.dirtyGeneration}`,
+                    `but current generation is ${this.dirtyGeneration}`,
             )
         }
         return null
@@ -4282,13 +4314,13 @@ export class SaveCoordinator {
 
     private captureMatchesBaseline(): boolean {
         const captured = this.capture()
-        return captured.rootCanonical === this.rootBaseline
-            && this.pluginStorageMatchesBaseline(captured)
-            && (
-                captured.presetsCanonical === null
-                || captured.presetsCanonical === this.presetsBaseline
-            )
-            && this.selectedCaptureMatchesBaseline(captured)
+        return (
+            captured.rootCanonical === this.rootBaseline &&
+            this.pluginStorageMatchesBaseline(captured) &&
+            (captured.presetsCanonical === null ||
+                captured.presetsCanonical === this.presetsBaseline) &&
+            this.selectedCaptureMatchesBaseline(captured)
+        )
     }
 
     private pluginStorageMatchesBaseline(captured: CapturedState): boolean {
@@ -4306,19 +4338,22 @@ export class SaveCoordinator {
     private captureMatchesCapturedState(expected: CapturedState): boolean {
         const captured = this.capture()
         if (
-            captured.rootCanonical !== expected.rootCanonical
-            || captured.pluginStorageCanonical !== expected.pluginStorageCanonical
-            || captured.presetsCanonical !== expected.presetsCanonical
-        ) return false
+            captured.rootCanonical !== expected.rootCanonical ||
+            captured.pluginStorageCanonical !== expected.pluginStorageCanonical ||
+            captured.presetsCanonical !== expected.presetsCanonical
+        )
+            return false
         if (expected.windowedCharacter || captured.windowedCharacter) {
-            return expected.windowedCharacter !== null
-                && captured.windowedCharacter !== null
-                && captured.windowedCharacter.shellCanonical ===
-                    expected.windowedCharacter.shellCanonical
-                && sameWindowedAuthority(
+            return (
+                expected.windowedCharacter !== null &&
+                captured.windowedCharacter !== null &&
+                captured.windowedCharacter.shellCanonical ===
+                    expected.windowedCharacter.shellCanonical &&
+                sameWindowedAuthority(
                     captured.windowedCharacter.authority,
                     expected.windowedCharacter.authority,
                 )
+            )
         }
         return captured.characterCanonical === expected.characterCanonical
     }

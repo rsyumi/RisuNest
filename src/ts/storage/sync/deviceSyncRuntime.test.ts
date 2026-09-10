@@ -9,6 +9,7 @@ import {
     type WorkingSetCommit,
 } from '../persistentDataStore'
 import { createDeviceSyncFacade } from './deviceSync'
+import { applyRootMutations } from '../rootMutation'
 
 function makeDatabase(username: string): Database {
     return {
@@ -73,6 +74,12 @@ function createRuntimeHarness() {
             durable = {
                 ...durable,
                 ...structuredClone(input.root),
+            }
+        }
+        if (input.rootMutations) {
+            durable = {
+                ...durable,
+                ...applyRootMutations(capturePersistentRoot(durable), input.rootMutations),
             }
         }
         revision += 1

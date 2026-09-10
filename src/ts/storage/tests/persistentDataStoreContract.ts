@@ -16,120 +16,184 @@ export interface PersistentDataStoreHarness {
 
 export function persistentDataStoreContract(createHarness: () => Promise<PersistentDataStoreHarness>): void {
     describe('PersistentDataStore contract', () => {
-        it('isolates occurrence-located owner heads across a pinned root reorder', async () => {
-            const { store } = await createHarness()
-            const database = structuredClone(fixtureDatabase)
-            database.modules = [
-                {
-                    id: 'duplicate-module',
-                    name: 'First duplicate',
-                    description: '',
-                    assets: [
-                        ['first', 'assets/first.bin', 'BIN'],
-                        ['first', 'assets/first.bin', 'BIN'],
-                    ],
-                },
-                {
-                    id: 'duplicate-module',
-                    name: 'Second duplicate',
-                    description: '',
-                    assets: [],
-                },
+        it('applies root deltas atomically and preserves leased roots', async () => {
+            const { store, reopen } = await createHarness()
+            const imported = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+            const before = (await store.readRoot()).value
+            const lease = await store.acquireRevision(imported.revision)
+            const rootMutations = [
+                { type: 'set' as const, key: 'username', value: 'Changed' },
+                { type: 'set' as const, key: '__proto__', value: { safe: true } },
+                { type: 'set' as const, key: 'optional', value: null },
+                { type: 'delete' as const, key: 'missing' },
             ]
-            database.personas = [
-                {
-                    name: 'Missing ID and absent assets',
-                    personaPrompt: '',
-                    icon: '',
-                    embeddedModule: {
-                        id: '',
-                        name: 'Absent assets',
-                        description: '',
-                    },
-                },
-                {
-                    name: 'Missing ID and present assets',
-                    personaPrompt: '',
-                    icon: '',
-                    embeddedModule: {
-                        id: '',
-                        name: 'Present assets',
-                        description: '',
-                        assets: [['persona', 'assets/persona.bin', 'OddExt']],
-                    },
-                },
-            ]
-            const imported = await store.replaceFromDatabase(database)
-            const root = (await store.readRoot()).value
-            const originalHeads: AssetOwnerHead[] = [
-                {
-                    owner: { kind: 'root-module-assets', index: 0 },
-                    present: true,
-                    manifestHash: '11'.repeat(32),
-                    entryCount: 2,
-                },
-                {
-                    owner: { kind: 'root-module-assets', index: 1 },
-                    present: true,
-                    manifestHash: '22'.repeat(32),
-                    entryCount: 0,
-                },
-                {
-                    owner: { kind: 'persona-embedded-module-assets', index: 0 },
-                    present: false,
-                    manifestHash: null,
-                    entryCount: 0,
-                },
-                {
-                    owner: { kind: 'persona-embedded-module-assets', index: 1 },
-                    present: true,
-                    manifestHash: '33'.repeat(32),
-                    entryCount: 1,
-                },
-            ]
-            const shadowed = await store.commit({
+            const committed = await store.commit({
                 expectedRevision: imported.revision,
-                root,
-                assetOwnerHeads: originalHeads,
+                rootMutations,
             })
-            const lease = await store.acquireRevision(shadowed.revision)
-            const reorderedRoot = structuredClone(root)
-            reorderedRoot.modules.reverse()
-            const reorderedHeads: AssetOwnerHead[] = [
-                {
-                    owner: { kind: 'root-module-assets', index: 0 },
-                    present: true,
-                    manifestHash: '22'.repeat(32),
-                    entryCount: 0,
-                },
-                {
-                    owner: { kind: 'root-module-assets', index: 1 },
-                    present: true,
-                    manifestHash: '11'.repeat(32),
-                    entryCount: 2,
-                },
-            ]
-
-            const reordered = await store.commit({
-                expectedRevision: shadowed.revision,
-                root: reorderedRoot,
-                assetOwnerHeads: reorderedHeads,
-            })
-
-            expect(await store.readAssetOwnerHead({
-                kind: 'root-module-assets',
-                index: 0,
-            })).toEqual({ revision: reordered.revision, value: reorderedHeads[0] })
-            expect(await lease.readAssetOwnerHead({
-                kind: 'root-module-assets',
-                index: 0,
-            })).toEqual({ revision: shadowed.revision, value: originalHeads[0] })
-            expect(await lease.readAssetOwnerHead({
-                kind: 'persona-embedded-module-assets',
-                index: 0,
-            })).toEqual({ revision: shadowed.revision, value: originalHeads[2] })
+            const expected = {
+                ...before,
+                username: 'Changed',
+                ['__proto__']: { safe: true },
+                optional: null,
+            }
+            expect((await store.readRoot()).value).toEqual(expected)
+            expect((await lease.readRoot()).value).toEqual(before)
+            await expect(
+                store.commit({ expectedRevision: imported.revision, rootMutations }),
+            ).rejects.toBeInstanceOf(RevisionConflictError)
+            for (const invalid of [
+                { root: before, rootMutations: [] },
+                { rootMutations: [{ type: 'delete' as const, key: 'characters' }] },
+                { rootMutations: [{ type: 'delete' as const, key: 'botPresets' }] },
+                { rootMutations: [{ type: 'delete' as const, key: 'pluginCustomStorage' }] },
+                { rootMutations: [rootMutations[0], rootMutations[0]] },
+            ]) {
+                await expect(
+                    store.commit({ expectedRevision: committed.revision, ...invalid }),
+                ).rejects.toThrow()
+                expect(await store.readRoot()).toEqual({
+                    revision: committed.revision,
+                    value: expected,
+                })
+            }
             await lease.release()
+            expect((await (await reopen()).readRoot()).value).toEqual(expected)
         })
+
+        it.each(['root', 'rootMutations'] as const)(
+            'isolates occurrence-located owner heads across a pinned reorder with %s',
+            async (mode) => {
+                const { store } = await createHarness()
+                const database = structuredClone(fixtureDatabase)
+                database.modules = [
+                    {
+                        id: 'duplicate-module',
+                        name: 'First duplicate',
+                        description: '',
+                        assets: [
+                            ['first', 'assets/first.bin', 'BIN'],
+                            ['first', 'assets/first.bin', 'BIN'],
+                        ],
+                    },
+                    {
+                        id: 'duplicate-module',
+                        name: 'Second duplicate',
+                        description: '',
+                        assets: [],
+                    },
+                ]
+                database.personas = [
+                    {
+                        name: 'Missing ID and absent assets',
+                        personaPrompt: '',
+                        icon: '',
+                        embeddedModule: {
+                            id: '',
+                            name: 'Absent assets',
+                            description: '',
+                        },
+                    },
+                    {
+                        name: 'Missing ID and present assets',
+                        personaPrompt: '',
+                        icon: '',
+                        embeddedModule: {
+                            id: '',
+                            name: 'Present assets',
+                            description: '',
+                            assets: [['persona', 'assets/persona.bin', 'OddExt']],
+                        },
+                    },
+                ]
+                const imported = await store.replaceFromDatabase(database)
+                const root = (await store.readRoot()).value
+                const originalHeads: AssetOwnerHead[] = [
+                    {
+                        owner: { kind: 'root-module-assets', index: 0 },
+                        present: true,
+                        manifestHash: '11'.repeat(32),
+                        entryCount: 2,
+                    },
+                    {
+                        owner: { kind: 'root-module-assets', index: 1 },
+                        present: true,
+                        manifestHash: '22'.repeat(32),
+                        entryCount: 0,
+                    },
+                    {
+                        owner: { kind: 'persona-embedded-module-assets', index: 0 },
+                        present: false,
+                        manifestHash: null,
+                        entryCount: 0,
+                    },
+                    {
+                        owner: { kind: 'persona-embedded-module-assets', index: 1 },
+                        present: true,
+                        manifestHash: '33'.repeat(32),
+                        entryCount: 1,
+                    },
+                ]
+                const shadowed = await store.commit({
+                    expectedRevision: imported.revision,
+                    root,
+                    assetOwnerHeads: originalHeads,
+                })
+                const lease = await store.acquireRevision(shadowed.revision)
+                const reorderedRoot = structuredClone(root)
+                reorderedRoot.modules.reverse()
+                const reorderedHeads: AssetOwnerHead[] = [
+                    {
+                        owner: { kind: 'root-module-assets', index: 0 },
+                        present: true,
+                        manifestHash: '22'.repeat(32),
+                        entryCount: 0,
+                    },
+                    {
+                        owner: { kind: 'root-module-assets', index: 1 },
+                        present: true,
+                        manifestHash: '11'.repeat(32),
+                        entryCount: 2,
+                    },
+                ]
+
+                const reordered = await store.commit({
+                    expectedRevision: shadowed.revision,
+                    ...(mode === 'root'
+                        ? { root: reorderedRoot }
+                        : {
+                              rootMutations: [
+                                  {
+                                      type: 'set' as const,
+                                      key: 'modules',
+                                      value: reorderedRoot.modules,
+                                  },
+                              ],
+                          }),
+                    assetOwnerHeads: reorderedHeads,
+                })
+
+                expect(
+                    await store.readAssetOwnerHead({
+                        kind: 'root-module-assets',
+                        index: 0,
+                    }),
+                ).toEqual({ revision: reordered.revision, value: reorderedHeads[0] })
+                expect(
+                    await lease.readAssetOwnerHead({
+                        kind: 'root-module-assets',
+                        index: 0,
+                    }),
+                ).toEqual({ revision: shadowed.revision, value: originalHeads[0] })
+                expect(
+                    await lease.readAssetOwnerHead({
+                        kind: 'persona-embedded-module-assets',
+                        index: 0,
+                    }),
+                ).toEqual({ revision: shadowed.revision, value: originalHeads[2] })
+                await lease.release()
+            },
+        )
 
         it('rejects stale or invalid owner-head commits without changing parent data', async () => {
             const { store } = await createHarness()

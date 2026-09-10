@@ -344,7 +344,7 @@ describe('SaveCoordinator', () => {
         expect(commit).toHaveBeenCalledTimes(2)
         expect(commit.mock.calls[1][0]).toEqual({
             expectedRevision: 8,
-            root: expect.objectContaining({ username: 'Unrelated root change' }),
+            rootMutations: [{ type: 'set', key: 'username', value: 'Unrelated root change' }],
         })
     })
 
@@ -936,10 +936,12 @@ describe('SaveCoordinator', () => {
             }, controller.signal)).rejects.toBe(reason)
 
             await vi.advanceTimersByTimeAsync(500)
-            expect(commit).toHaveBeenCalledWith(expect.objectContaining({
-                expectedRevision: 7,
-                root: { username: 'Pending dirty edit', modules: [] },
-            }))
+            expect(commit).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    expectedRevision: 7,
+                    rootMutations: [{ type: 'set', key: 'username', value: 'Pending dirty edit' }],
+                }),
+            )
         } finally {
             vi.useRealTimers()
         }
@@ -1190,14 +1192,17 @@ describe('SaveCoordinator', () => {
 
         expect(commit).toHaveBeenCalledWith({
             expectedRevision: 4,
-            root: { username: 'Root changed too' },
+            rootMutations: [{ type: 'set', key: 'username', value: 'Root changed too' }],
             pluginStorage: [
                 { type: 'delete', key: 'removed' },
                 { type: 'set', key: 'alpha', value: 'new' },
                 { type: 'set', key: 'beta', value: { nested: true } },
             ],
         })
-        expect(commit.mock.calls[0][0].root).not.toHaveProperty('pluginCustomStorage')
+        expect(commit.mock.calls[0][0]).not.toHaveProperty('root')
+        expect(commit.mock.calls[0][0].rootMutations).not.toContainEqual(
+            expect.objectContaining({ key: 'pluginCustomStorage' }),
+        )
     })
 
     it('does not clear plugin storage when the scalable working set omits it', async () => {
@@ -1220,7 +1225,7 @@ describe('SaveCoordinator', () => {
 
         expect(commit).toHaveBeenCalledWith({
             expectedRevision: 4,
-            root: { username: 'Scalable edit' },
+            rootMutations: [{ type: 'set', key: 'username', value: 'Scalable edit' }],
         })
     })
 
@@ -1455,10 +1460,13 @@ describe('SaveCoordinator', () => {
 
         expect(store.commit).toHaveBeenCalledWith({
             expectedRevision: 2,
-            root: expect.objectContaining({ username: 'Changed with presets' }),
+            rootMutations: [{ type: 'set', key: 'username', value: 'Changed with presets' }],
             replacePresets: database.botPresets,
         })
-        expect(vi.mocked(store.commit).mock.calls[0][0].root).not.toHaveProperty('botPresets')
+        expect(vi.mocked(store.commit).mock.calls[0][0]).not.toHaveProperty('root')
+        expect(vi.mocked(store.commit).mock.calls[0][0].rootMutations).not.toContainEqual(
+            expect.objectContaining({ key: 'botPresets' }),
+        )
     })
 
     it('never replaces persisted presets from a partial scalable working set', async () => {
@@ -1481,7 +1489,13 @@ describe('SaveCoordinator', () => {
         expect(commit).toHaveBeenCalledTimes(1)
         expect(commit.mock.calls[0][0]).toMatchObject({
             expectedRevision: 5,
-            root: expect.objectContaining({ username: 'Root edit with a partial preset working set' }),
+            rootMutations: [
+                {
+                    type: 'set',
+                    key: 'username',
+                    value: 'Root edit with a partial preset working set',
+                },
+            ],
         })
         expect(commit.mock.calls[0][0]).not.toHaveProperty('replacePresets')
     })
@@ -1745,10 +1759,12 @@ describe('SaveCoordinator', () => {
 
             expect(store.replaceFromDatabase).not.toHaveBeenCalled()
             await vi.advanceTimersByTimeAsync(500)
-            expect(commit).toHaveBeenCalledWith(expect.objectContaining({
-                expectedRevision: 6,
-                root: { username: 'Later live edit' },
-            }))
+            expect(commit).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    expectedRevision: 6,
+                    rootMutations: [{ type: 'set', key: 'username', value: 'Later live edit' }],
+                }),
+            )
         } finally {
             vi.useRealTimers()
         }
@@ -1820,10 +1836,12 @@ describe('SaveCoordinator', () => {
             )).rejects.toBeInstanceOf(RevisionConflictError)
 
             await vi.advanceTimersByTimeAsync(500)
-            expect(commit).toHaveBeenCalledWith(expect.objectContaining({
-                expectedRevision: 6,
-                root: { username: 'Retryable edit' },
-            }))
+            expect(commit).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    expectedRevision: 6,
+                    rootMutations: [{ type: 'set', key: 'username', value: 'Retryable edit' }],
+                }),
+            )
         } finally {
             vi.useRealTimers()
         }
@@ -3048,12 +3066,14 @@ describe('SaveCoordinator', () => {
 
         coordinator.releaseDestructiveReplacementFence(fence)
         await coordinator.flushPendingData('post-fence-edit')
-        expect(store.commit).toHaveBeenCalledWith(expect.objectContaining({
-            expectedRevision: 13,
-            root: expect.objectContaining({
-                username: 'Edit after authoritative publication',
+        expect(store.commit).toHaveBeenCalledWith(
+            expect.objectContaining({
+                expectedRevision: 13,
+                rootMutations: [
+                    { type: 'set', key: 'username', value: 'Edit after authoritative publication' },
+                ],
             }),
-        }))
+        )
     })
 
     it('admits an already-applied edit while the exact fence is still acquiring', async () => {
@@ -3880,10 +3900,7 @@ describe('SaveCoordinator', () => {
         expect(commit).toHaveBeenCalledTimes(2)
         expect(commit.mock.calls[1][0]).toMatchObject({
             expectedRevision: 7,
-            root: {
-                botPresetsId: 1,
-                username: 'Edit during preset commit',
-            },
+            rootMutations: [{ type: 'set', key: 'username', value: 'Edit during preset commit' }],
         })
         expect(commit.mock.calls[1][0]).not.toHaveProperty('replacePresets')
         expect(coordinator.revision).toBe(8)
@@ -3946,7 +3963,7 @@ describe('SaveCoordinator', () => {
         expect(commit).toHaveBeenCalledTimes(2)
         expect(commit.mock.calls[1][0]).toMatchObject({
             expectedRevision: 31,
-            root: expect.objectContaining({ mainPrompt: 'later user edit' }),
+            rootMutations: [{ type: 'set', key: 'mainPrompt', value: 'later user edit' }],
         })
         expect(coordinator.revision).toBe(32)
     })

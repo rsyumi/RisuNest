@@ -76,6 +76,7 @@ fn open_fixture() -> (tempfile::TempDir, PersistentStore, Value) {
 fn empty_working_set_commit(expected_revision: i64) -> WorkingSetCommit {
     WorkingSetCommit {
         expected_revision,
+        root_mutations: None,
         root: None,
         replace_presets: None,
         character: None,

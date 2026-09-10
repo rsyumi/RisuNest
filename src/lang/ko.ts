@@ -1599,6 +1599,18 @@ export const languageKorean = {
     nanoGPTManualInput: "수동 입력",
     nanoGPTManualModelSelect: "수동 모델 선택",
     risuNest: {
+        streaming: {
+            title: '스트리밍',
+            thoughtMode: '생성 중 추론 표시',
+            recent: '최신 몇 줄',
+            collapsed: '접기',
+            off: '전용 처리 끄기',
+            thoughtModeHelp:
+                '최신 몇 줄은 추론의 마지막 네 줄만 표시합니다. 접기는 추론 블록을 처음부터 접어 두며 직접 펼칠 수 있습니다. 전용 처리를 끄면 기존 표시 방식을 사용합니다. 이 선택은 스트리밍 중에만 적용됩니다. 표시 후처리 지연을 끄면 정규식·Lua·플러그인을 전체 원문에 적용한 뒤 추론 표시를 바꿉니다.',
+            deferEffects: '생성 중 표시 후처리 미루기',
+            deferEffectsHelp:
+                '켜면 스트리밍 중 해당 응답의 표시 정규식·Lua·플러그인·CBS·번역·서식을 미루고 가벼운 텍스트로 표시합니다. 추론 표시 선택과 독립적으로 동작합니다. 종료 후 전체 원문에 기존 표시 처리를 적용하므로 추론 삭제 규칙도 적용됩니다. 상태를 변경하는 표시 훅의 실행 횟수는 줄어듭니다. 출력 후처리와 저장 내용은 고급 설정의 스트리밍 표시 최적화 설정을 따릅니다.',
+        },
         startup: {
             storage: '저장소 여는 중',
             data: '대화 데이터 준비 중',

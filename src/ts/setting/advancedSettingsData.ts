@@ -141,10 +141,16 @@ export const advancedSettingsItems: SettingItem[] = [
         options: {
             segmentOptions: [
                 { value: 'off', labelKey: 'streamingDisplayOptimizationOff' },
-                { value: 'balanced', labelKey: 'streamingDisplayOptimizationBalanced' },
-                { value: 'strong', labelKey: 'streamingDisplayOptimizationStrong' }
-            ]
-        }
+                {
+                    value: 'balanced',
+                    labelKey: 'streamingDisplayOptimizationBalanced',
+                },
+                {
+                    value: 'strong',
+                    labelKey: 'streamingDisplayOptimizationStrong',
+                },
+            ],
+        },
     },
     { id: 'adv.newOai', type: 'check', labelKey: 'newOAIHandle', bindKey: 'newOAIHandle', classes: 'mt-4' },
     { id: 'adv.noWaitTrans', type: 'check', labelKey: 'noWaitForTranslate', bindKey: 'noWaitForTranslate', classes: 'mt-4' },

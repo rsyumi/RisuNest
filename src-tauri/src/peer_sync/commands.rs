@@ -3680,6 +3680,7 @@ mod tests {
         target_store
             .commit(&WorkingSetCommit {
                 expected_revision: local_revision,
+                root_mutations: None,
                 root: Some(local_root),
                 replace_presets: None,
                 character: None,
@@ -5099,6 +5100,7 @@ mod tests {
         store
             .commit(&WorkingSetCommit {
                 expected_revision,
+                root_mutations: None,
                 root: Some(root),
                 replace_presets: None,
                 character: None,

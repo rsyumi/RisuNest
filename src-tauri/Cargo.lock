@@ -4101,6 +4101,8 @@ dependencies = [
  "url",
  "uuid",
  "webp",
+ "webview2-com",
+ "windows",
  "windows-sys 0.61.2",
  "zip 0.6.6",
 ]

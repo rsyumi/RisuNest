@@ -2,6 +2,38 @@ import type { SettingItem } from './types'
 import { MAX_INLAY_DIMENSION, normalizeInlayEncodeOptions } from '../storage/blobStore'
 
 export const risuNestSettingsItems: SettingItem[] = [
+    {
+        id: 'risunest.streaming.header',
+        type: 'header',
+        labelKey: 'risuNest.streaming.title',
+        classes: 'mt-6',
+        options: { level: 'h2' },
+    },
+    {
+        id: 'risunest.streaming.thoughtMode',
+        type: 'segmented',
+        labelKey: 'risuNest.streaming.thoughtMode',
+        helpKey: 'risuNest.streaming.thoughtModeHelp',
+        bindKey: 'streamingThoughtMode',
+        options: {
+            segmentOptions: [
+                { value: 'recent', labelKey: 'risuNest.streaming.recent' },
+                {
+                    value: 'collapsed',
+                    labelKey: 'risuNest.streaming.collapsed',
+                },
+                { value: 'off', labelKey: 'risuNest.streaming.off' },
+            ],
+        },
+    },
+    {
+        id: 'risunest.streaming.deferEffects',
+        type: 'check',
+        labelKey: 'risuNest.streaming.deferEffects',
+        helpKey: 'risuNest.streaming.deferEffectsHelp',
+        bindKey: 'streamingDeferDisplayProcessing',
+        classes: 'mt-4',
+    },
     { id: 'risunest.inlay.header', type: 'header', labelKey: 'risuNest.inlay.title', classes: 'mt-6', options: { level: 'h2' } },
     {
         id: 'risunest.inlay.format',

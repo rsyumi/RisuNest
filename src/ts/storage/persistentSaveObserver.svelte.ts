@@ -26,7 +26,12 @@ export function observePersistentSaveChanges(
         $effect(() => {
             const database = dependencies.readDatabase()
             for (const key in database) {
-                if (key !== 'characters') subscribeDeep(database[key])
+                if (key !== 'characters') {
+                    $effect(() => {
+                        subscribeDeep(database[key])
+                        untrack(() => dependencies.markDirty(0))
+                    })
+                }
             }
             // A deep observer knows that something changed, not the byte size
             // of that change. The complete root size would force an immediate
@@ -61,7 +66,17 @@ export function observePersistentSaveChanges(
                     // Metadata-only selected shells deliberately expose a
                     // non-enumerable message getter which must not be invoked.
                     for (const key in chat) {
-                        if (key === 'message') subscribeDeep(chat[key])
+                        if (key === 'message') {
+                            const messages = chat.message
+                            if (Array.isArray(messages)) {
+                                for (let index = 0; index < messages.length; index++) {
+                                    $effect(() => {
+                                        subscribeDeep(messages[index])
+                                        untrack(() => dependencies.markDirty(0))
+                                    })
+                                }
+                            } else subscribeDeep(messages)
+                        }
                     }
                     untrack(() => dependencies.markDirty(0))
                 })

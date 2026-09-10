@@ -1430,6 +1430,7 @@ mod tests {
         store
             .commit(&WorkingSetCommit {
                 expected_revision: 1,
+                root_mutations: None,
                 root: Some(root),
                 replace_presets: None,
                 character: None,
@@ -1569,6 +1570,7 @@ mod tests {
         store
             .commit(&WorkingSetCommit {
                 expected_revision: 1,
+                root_mutations: None,
                 root: Some(root),
                 replace_presets: None,
                 character: None,

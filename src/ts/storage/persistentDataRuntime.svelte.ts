@@ -1,3 +1,4 @@
+import { createPersistenceCanonicalCapture } from './reactivePersistenceCapture.svelte'
 import { get } from 'svelte/store'
 import { doingChat } from '../process/generationState'
 import { ReloadGUIPointer, selectedCharID } from '../stores.svelte'
@@ -81,7 +82,19 @@ export { createPersistentDataRuntime } from './persistentDataRuntime'
 type CompleteCharacter = character | groupChat
 
 export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapter {
+    const readSelectedCharacter = () => {
+        const database = getDatabase()
+        const selected = captureSelectedPersistentCharacter(database, get(selectedCharID))
+        return selected ? captureResidentPersistentCharacter(database, selected.chaId) : null
+    }
+    const canonicalCapture = createPersistenceCanonicalCapture({
+        root: getDatabase,
+        pluginStorage: () => capturePersistentPluginStorage(getDatabase()),
+        presets: () => capturePersistentPresets(getDatabase()),
+        character: readSelectedCharacter,
+    })
     return {
+        canonicalCapture,
         captureRoot() {
             return capturePersistentRoot(getDatabase())
         },
@@ -106,11 +119,7 @@ export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapte
             return capturePersistentPresets(getDatabase())
         },
         captureSelectedCharacter(): CompleteCharacter | null {
-            const database = getDatabase()
-            const selected = captureSelectedPersistentCharacter(database, get(selectedCharID))
-            return selected
-                ? captureResidentPersistentCharacter(database, selected.chaId)
-                : null
+            return readSelectedCharacter()
         },
         captureCharacter(id) {
             return captureResidentPersistentCharacter(getDatabase(), id)

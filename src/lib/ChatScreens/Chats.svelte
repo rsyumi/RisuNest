@@ -100,6 +100,7 @@
 
     type ChatInstance = {
         updateCandidatePosition?: (page: number, total: number) => void
+        hasStreamingPreview?: () => boolean
         refreshMessageDisplay?: (state: ChatDisplayRefresh) => void
         hasActiveEditor?: () => boolean
         refreshParserProjection?: (projection?: BoundedLiveChatParserProjection) => void
@@ -889,9 +890,14 @@
             pendingMissingRowsAnchor = result.anchor
             return
         }
-        const activeStreamingIndex = performanceMode !== 'off' && currentChat?.isStreaming
-            ? totalMessages - 1
-            : -1
+        const activeStreamingIndex =
+            (performanceMode !== 'off' ||
+                (DBState.db.streamingThoughtMode ?? 'recent') !== 'off' ||
+                DBState.db.streamingDeferDisplayProcessing) &&
+            currentChat?.isStreaming
+                ? totalMessages - 1
+                : -1
+
         let rerollIndex = totalMessages - 1
         while (rerollIndex >= 0) {
             const last = sourceSnapshot?.rowAt(rerollIndex)?.message ?? messages?.[rerollIndex]
@@ -987,10 +993,21 @@
                 sourceHandoff ||
                 parserProjectionState?.needsRemount === true ||
                 !areChatRenderSignaturesEqual(previousSignature, renderSignature)
+            const settlingThoughtPreview =
+                !activeStreamingMessage &&
+                previousSignature?.content === null &&
+                untrack(() => mountInstances.get(key)?.hasStreamingPreview?.()) ===
+                    true
             const refreshMountedDisplay =
                 !sourceHandoff &&
-                canRefreshChatRenderInPlace(previousSignature, renderSignature) &&
+                canRefreshChatRenderInPlace(
+                    settlingThoughtPreview
+                        ? { ...previousSignature, content: renderSignature.content }
+                        : previousSignature,
+                    renderSignature,
+                ) &&
                 typeof mountInstances.get(key)?.refreshMessageDisplay === 'function'
+
             const preserveMountedRuntime =
                 (sourceHandoff || parserProjectionState?.preserveMountedRuntime === true) &&
                 mountInstances.has(key) &&
@@ -1044,6 +1061,16 @@
                     run: () => {
                         if (refreshMountedDisplay) {
                             const instance = mountInstances.get(key)
+                            // Exit the preview in the retained Chat before requesting
+                            // its canonical render. Keep the preview visible meanwhile.
+                            untrack(() =>
+                                instance?.updateStreamingDisplay?.({
+                                    isOptimizedStreamingMessage: activeStreamingMessage,
+                                    streamingOptimizationMode: performanceMode,
+                                    rawStreamingText: message.data,
+                                }),
+                            )
+
                             untrack(() =>
                                 instance?.refreshMessageDisplay?.({
                                     message: message.data,

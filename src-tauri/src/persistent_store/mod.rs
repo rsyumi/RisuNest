@@ -830,6 +830,8 @@ pub(crate) struct WorkingSetCommit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) root: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) root_mutations: Option<Vec<RootMutation>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) replace_presets: Option<Vec<Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) character: Option<Value>,
@@ -847,6 +849,13 @@ pub(crate) struct WorkingSetCommit {
     pub(crate) plugin_storage: Option<Vec<PluginStorageMutation>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) asset_owner_heads: Option<Vec<AssetOwnerHead>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub(crate) enum RootMutation {
+    Set { key: String, value: Value },
+    Delete { key: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1506,6 +1515,29 @@ impl PersistentStore {
         commit: &WorkingSetCommit,
         asset_aliases: &[AssetAlias],
     ) -> StoreResult<RevisionResult> {
+        let resolved;
+        let commit = if let Some(mutations) = &commit.root_mutations {
+            if commit.root.is_some() {
+                return Err(StoreError::Validation {
+                    message: "Root and rootMutations are mutually exclusive".to_owned(),
+                });
+            }
+            let current = self.read_root(None)?;
+            if current.revision != commit.expected_revision {
+                return Err(StoreError::RevisionConflict {
+                    expected: commit.expected_revision,
+                    actual: current.revision,
+                });
+            }
+            resolved = WorkingSetCommit {
+                root: Some(commit::apply_root_mutations(current.value, mutations)?),
+                root_mutations: None,
+                ..commit.clone()
+            };
+            &resolved
+        } else {
+            commit
+        };
         let cas = logical_index::logical_index_is_active(&self.connection)?
             .then(|| crate::asset_repository::PayloadCas::new(&self.repository_root))
             .transpose()?;

@@ -18,6 +18,8 @@ import hljs from 'highlight.js/lib/core'
 import 'highlight.js/styles/atom-one-dark.min.css'
 import { language } from 'src/lang';
 import katex from 'katex'
+import { getStreamingThoughtPreview, renderStreamingThoughtPreview } from './streamingThoughtPreview'
+import type { StreamingThoughtMode } from '../storage/database.svelte'
 import { getModelInfo } from '../model/modellist';
 import { registerCBS, type matcherArg, type RegisterCallback } from '../cbs';
 import cssSelectorParser from 'postcss-selector-parser'
@@ -681,6 +683,7 @@ export interface simpleCharacterArgument{
 }
 
 export interface ParseMarkdownRenderContext {
+    streamingThoughtMode?: StreamingThoughtMode
     signal?: AbortSignal
     deferredInlays?: DeferredInlayMarkerRegistry
     moduleAssets?: readonly (readonly string[])[]
@@ -696,27 +699,40 @@ export interface ParseMarkdownRenderContext {
     projectedChatID?: number
 }
 
-function parseThoughtsAndTools(data:string){
-    let result = '', i = 0
+function parseThoughtsAndTools(
+    data: string,
+    thoughtMode: StreamingThoughtMode = 'off',
+) {
+    if (thoughtMode === 'recent') {
+        const preview = getStreamingThoughtPreview(data)
+        if (preview) data = renderStreamingThoughtPreview(preview, language.cot)
+    }
+    let result = '',
+        i = 0
     while (i < data.length) {
         if (data.slice(i, i + 10) === '<Thoughts>') {
-            let j = i + 10, depth = 1
+            let j = i + 10,
+                depth = 1
             while (j < data.length && depth > 0) {
                 if (data.slice(j, j + 10) === '<Thoughts>') depth++
                 if (data.slice(j, j + 11) === '</Thoughts>') depth--
                 j++
             }
-            if (depth === 0) {
-                result += `<details><summary>${language.cot}</summary>${data.substring(i + 10, j - 1)}</details>`
-                i = j + 10
+            if (depth === 0 || thoughtMode === 'collapsed') {
+                const contentEnd = depth === 0 ? j - 1 : data.length
+                result += `<details${thoughtMode === 'collapsed' ? ' data-risu-streaming-thought' : ''}><summary>${language.cot}</summary>${data.substring(i + 10, contentEnd)}</details>`
+                i = depth === 0 ? j + 10 : data.length
                 continue
             }
         }
         result += data[i++]
     }
-    return result.replace(/<tool_call>(.+?)<\/tool_call>/gms, (full, txt:string) => {
-        return `<div class="x-risu-tool-call">🛠️ ${language.toolCalled.replace('{{tool}}',txt.split('\uf100')?.[1] ?? 'unknown')}</div>\n\n`
-    })
+    return result.replace(
+        /<tool_call>(.+?)<\/tool_call>/gms,
+        (full, txt: string) => {
+            return `<div class="x-risu-tool-call">🛠️ ${language.toolCalled.replace('{{tool}}', txt.split('\uf100')?.[1] ?? 'unknown')}</div>\n\n`
+        },
+    )
 }
 
 export async function ParseMarkdown(
@@ -760,7 +776,7 @@ export async function ParseMarkdown(
     data = await parseInlayAssets(data ?? '', renderContext.deferredInlays, renderContext.hideAllImages)
     renderContext.signal?.throwIfAborted()
 
-    data = parseThoughtsAndTools(data)
+    data = parseThoughtsAndTools(data, renderContext.streamingThoughtMode)
 
     data = encodeStyle(data)
     if(mode === 'normal' || mode === 'notrim'){

@@ -406,6 +406,36 @@ describe('Chats imperative mount lifecycle', () => {
         expect(chatMountProbe.unmounts).toContain(streamingInstance)
     })
 
+    test.each(['off', 'balanced', 'strong'] as const)(
+        'retains the compact thought row through the %s stream completion',
+        async (mode) => {
+            const original = '<Thoughts>Reasoning</Thoughts>Answer'
+            const messages = [makeMessage(0, { role: 'char', data: original })]
+            const character = makeCharacter(messages, true)
+            character.chats[0].activeStreamingDisplayOptimizationMode = mode
+            mounted = mount(ChatsHarness, {
+                target,
+                props: { initialMessages: messages, initialCharacter: character },
+            })
+            await vi.waitFor(() => expect(probeElements(target)).toHaveLength(1))
+            const node = probeElements(target)[0]
+            const instance = Number(node.dataset.chatProbe)
+            ;(mounted as HarnessInstance).setStreaming(false)
+            await vi.waitFor(() =>
+                expect(
+                    chatMountProbe.streamingUpdates.some(
+                        (update) =>
+                            update.instanceId === instance &&
+                            !update.isOptimizedStreamingMessage,
+                    ),
+                ).toBe(true),
+            )
+            expect(probeElements(target)[0]).toBe(node)
+            expect(node.dataset.message).toBe(original)
+            expect(chatMountProbe.unmounts).not.toContain(instance)
+        },
+    )
+
     test('remounts when resolved image mode or parser dependency identity changes', async () => {
         const messages = Array.from({ length: 8 }, (_, index) => makeMessage(index, { role: 'char' }))
         mounted = mount(ChatsHarness, {

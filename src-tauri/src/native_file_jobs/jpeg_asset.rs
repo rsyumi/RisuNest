@@ -336,6 +336,7 @@ fn import_jpeg_asset_with_before_commit(
             .commit_with_asset_aliases(
                 &WorkingSetCommit {
                     expected_revision,
+                    root_mutations: None,
                     root: None,
                     replace_presets: None,
                     character: Some(character),
@@ -465,6 +466,7 @@ mod tests {
         store
             .commit(&WorkingSetCommit {
                 expected_revision: 1,
+                root_mutations: None,
                 root: None,
                 replace_presets: None,
                 character: Some(character),
@@ -817,6 +819,7 @@ mod tests {
                 racing_store
                     .commit(&WorkingSetCommit {
                         expected_revision: 2,
+                        root_mutations: None,
                         root: Some(root),
                         replace_presets: None,
                         character: None,

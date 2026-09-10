@@ -8,7 +8,9 @@ vi.mock('../util', () => ({
 }))
 vi.mock('../alert', () => ({ alertNormal: vi.fn() }))
 vi.mock('../gui/colorscheme', () => ({ defaultColorScheme: {} }))
-vi.mock('../translator/presets', () => ({ normalizeTranslatorPresetState: vi.fn() }))
+vi.mock('../translator/presets', () => ({
+    normalizeTranslatorPresetState: vi.fn(),
+}))
 vi.mock('../stores.svelte', async () => {
     const { writable } = await import('svelte/store')
     return {
@@ -24,9 +26,44 @@ vi.mock('../model/modellist', () => ({
 }))
 import { normalizeDatabaseDefaults, type Database } from './database.svelte'
 
+describe('streaming display defaults', () => {
+    it('enables compact thoughts by default and preserves an explicit opt-out', () => {
+        expect(
+            normalizeDatabaseDefaults({ characters: [] } as Database)
+                .streamingThoughtMode,
+        ).toBe('recent')
+        expect(
+            normalizeDatabaseDefaults({
+                characters: [],
+                streamingThoughtMode: 'off',
+            } as Database).streamingThoughtMode,
+        ).toBe('off')
+        expect(
+            normalizeDatabaseDefaults({ characters: [] } as Database)
+                .streamingDeferDisplayProcessing,
+        ).toBe(false)
+        expect(
+            normalizeDatabaseDefaults({
+                characters: [],
+                streamingDeferDisplayProcessing: true,
+            } as Database).streamingDeferDisplayProcessing,
+        ).toBe(true)
+    })
+
+    it('does not import the removed RisuNest-only performance setting', () => {
+        const database = normalizeDatabaseDefaults({
+            characters: [],
+            largeChatPerformanceMode: 'strong',
+        } as unknown as Database)
+        expect(database.streamingDisplayOptimizationMode).toBe('off')
+    })
+})
+
 describe('RisuNest inlay database defaults', () => {
     it('normalizes the persisted inlay settings to their exact defaults', () => {
-        const database = normalizeDatabaseDefaults({ characters: [] } as Database)
+        const database = normalizeDatabaseDefaults({
+            characters: [],
+        } as Database)
 
         expect(database.risunestInlayFormat).toBe('webp')
         expect(database.risunestInlayWebpQuality).toBe(85)
@@ -51,12 +88,15 @@ describe('RisuNest inlay database defaults', () => {
         [12.6, 13],
         [4_294_967_296, 4_294_967_295],
         [Number.MAX_SAFE_INTEGER, 4_294_967_295],
-    ])('normalizes persisted maximum dimension %s into the native u32 range', (input, expected) => {
-        const database = normalizeDatabaseDefaults({
-            characters: [],
-            risunestInlayMaxDimension: input,
-        } as Database)
+    ])(
+        'normalizes persisted maximum dimension %s into the native u32 range',
+        (input, expected) => {
+            const database = normalizeDatabaseDefaults({
+                characters: [],
+                risunestInlayMaxDimension: input,
+            } as Database)
 
-        expect(database.risunestInlayMaxDimension).toBe(expected)
-    })
+            expect(database.risunestInlayMaxDimension).toBe(expected)
+        },
+    )
 })
