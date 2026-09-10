@@ -1,3 +1,4 @@
+import { MAX_CONTENT_METADATA_BYTES } from './contentImportLimits'
 import { invoke } from '@tauri-apps/api/core'
 
 import { isTauri } from '../platform'
@@ -205,7 +206,11 @@ export interface NativeFileJobDetail {
 }
 
 /** Which user-facing import a dialog-presented operation belongs to. */
-export type NativeFileOperationFormat = 'risu-save' | 'local-backup' | 'lossless-backup'
+export type NativeFileOperationFormat =
+    | 'risu-save'
+    | 'local-backup'
+    | 'lossless-backup'
+    | 'content'
 
 /**
  * Resolves the stage a status describes. Statuses carrying `detail` name it
@@ -219,7 +224,9 @@ export function resolveNativeFileJobStage(
     if (status.detail) return status.detail.stage
     switch (status.phase) {
         case 'reading-source':
-            return format === 'local-backup' ? 'reading-archive' : 'reading-database'
+            return format === 'local-backup' || format === 'content'
+                ? 'reading-archive'
+                : 'reading-database'
         case 'staging-database':
             return 'finalizing-staging'
         case 'awaiting-activation':
@@ -488,39 +495,58 @@ function requiredDescriptorString(
     return value
 }
 
-function validatePreparedContent(value: unknown, expectedCasSessionId: string): PreparedNativeContent {
+function validatePreparedContent(
+    value: unknown,
+    expectedCasSessionId: string,
+): PreparedNativeContent {
     if (typeof value !== 'object' || value === null || Array.isArray(value)) {
         throw preparedContentError('Prepared content must be an object')
     }
     const content = value as Record<string, unknown>
     if (
-        content.format !== 'json-card'
-        && content.format !== 'png-card'
-        && content.format !== 'charx-card'
-        && content.format !== 'appended-charx-jpeg'
-        && content.format !== 'risu-module'
+        content.format !== 'json-card' &&
+        content.format !== 'png-card' &&
+        content.format !== 'charx-card' &&
+        content.format !== 'appended-charx-jpeg' &&
+        content.format !== 'risu-module'
     ) {
         throw preparedContentError('Prepared content format is unsupported')
     }
     if (
-        typeof content.metadata !== 'object'
-        || content.metadata === null
-        || Array.isArray(content.metadata)
+        typeof content.metadata !== 'object' ||
+        content.metadata === null ||
+        Array.isArray(content.metadata)
     ) {
-        throw preparedContentError('Prepared content metadata must be an object')
+        throw preparedContentError(
+            'Prepared content metadata must be an object',
+        )
     }
     if (!Array.isArray(content.assets)) {
         throw preparedContentError('Prepared content assets must be an array')
     }
-    const casSessionId = requiredDescriptorString(content.casSessionId, 'casSessionId')
+    const casSessionId = requiredDescriptorString(
+        content.casSessionId,
+        'casSessionId',
+    )
     if (casSessionId !== expectedCasSessionId) {
-        throw preparedContentError('Prepared content casSessionId must match its native job')
+        throw preparedContentError(
+            'Prepared content casSessionId must match its native job',
+        )
     }
-    const expectedContentFields = ['assets', 'casSessionId', 'format', 'metadata']
-    if (content.portraitLogicalId !== undefined) expectedContentFields.push('portraitLogicalId')
+    const expectedContentFields = [
+        'assets',
+        'casSessionId',
+        'format',
+        'metadata',
+    ]
+    if (content.portraitLogicalId !== undefined)
+        expectedContentFields.push('portraitLogicalId')
     if (content.module !== undefined) expectedContentFields.push('module')
     if (content.ownerHead !== undefined) expectedContentFields.push('ownerHead')
-    if (Object.keys(content).sort().join('\0') !== expectedContentFields.sort().join('\0')) {
+    if (
+        Object.keys(content).sort().join('\0') !==
+        expectedContentFields.sort().join('\0')
+    ) {
         throw preparedContentError('Prepared content fields are invalid')
     }
     const expectedCardFields = [
@@ -543,62 +569,126 @@ function validatePreparedContent(value: unknown, expectedCasSessionId: string): 
         'ext',
     ].sort()
     const tokens = new Set<string>()
-    const assets = content.assets.map((value, index): PreparedContentAssetDescriptor => {
-        if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-            throw preparedContentError(`Prepared content asset ${index} must be an object`)
-        }
-        const asset = value as Record<string, unknown>
-        const risum = content.format === 'risu-module'
-        const expectedFields = risum ? expectedRisumFields : expectedCardFields
-        if (Object.keys(asset).sort().join('\0') !== expectedFields.join('\0')) {
-            throw preparedContentError(`Prepared content asset ${index} fields are invalid`)
-        }
-        const objectHash = requiredDescriptorString(asset.objectHash, 'objectHash')
-        if (!/^[0-9a-f]{64}$/.test(objectHash)) {
-            throw preparedContentError(`Prepared content asset ${index} objectHash is invalid`)
-        }
-        if (!Number.isSafeInteger(asset.byteSize) || (asset.byteSize as number) < 0) {
-            throw preparedContentError(`Prepared content asset ${index} byteSize is invalid`)
-        }
-        let token: string | undefined
-        if (!risum) {
-            token = requiredDescriptorString(asset.token, 'token')
-            if (tokens.has(token)) {
-                throw preparedContentError(`Prepared content asset ${index} token is duplicated`)
+    const assets = content.assets.map(
+        (value, index): PreparedContentAssetDescriptor => {
+            if (
+                typeof value !== 'object' ||
+                value === null ||
+                Array.isArray(value)
+            ) {
+                throw preparedContentError(
+                    `Prepared content asset ${index} must be an object`,
+                )
             }
-            tokens.add(token)
-        }
-        const ext = risum && typeof asset.ext === 'string'
-            ? asset.ext
-            : requiredDescriptorString(asset.ext, 'ext')
-        if (!risum && (ext.length > 32 || !/^[A-Za-z0-9+_-]+$/.test(ext))) {
-            throw preparedContentError(`Prepared content asset ${index} ext is invalid`)
-        }
-        const logicalId = requiredDescriptorString(asset.logicalId, 'logicalId')
-        const logicalPrefix = `assets/${objectHash}.`
-        if (!logicalId.startsWith(logicalPrefix)) {
-            throw preparedContentError(`Prepared content asset ${index} logicalId does not match its object`)
-        }
-        const logicalSuffix = logicalId.slice(logicalPrefix.length)
-        if (logicalSuffix.length > 32 || !/^[A-Za-z0-9+_-]+$/.test(logicalSuffix)) {
-            throw preparedContentError(`Prepared content asset ${index} logicalId suffix is invalid`)
-        }
-        if (typeof asset.name !== 'string') {
-            throw preparedContentError(`Prepared content asset ${index} name must be a string`)
-        }
-        if (typeof asset.mime !== 'string') {
-            throw preparedContentError(`Prepared content asset ${index} mime must be a string`)
-        }
-        const mime = asset.mime
-        if (mime.length === 0 && content.format !== 'png-card' && !risum) {
-            throw preparedContentError(`Prepared content asset ${index} mime must be a nonempty string`)
-        }
-        if (risum) {
-            if (!Number.isSafeInteger(asset.position) || asset.position !== index) {
-                throw preparedContentError(`Prepared RISUM asset ${index} position is invalid`)
+            const asset = value as Record<string, unknown>
+            const risum = content.format === 'risu-module'
+            const expectedFields = risum
+                ? expectedRisumFields
+                : expectedCardFields
+            if (
+                Object.keys(asset).sort().join('\0') !==
+                expectedFields.join('\0')
+            ) {
+                throw preparedContentError(
+                    `Prepared content asset ${index} fields are invalid`,
+                )
+            }
+            const objectHash = requiredDescriptorString(
+                asset.objectHash,
+                'objectHash',
+            )
+            if (!/^[0-9a-f]{64}$/.test(objectHash)) {
+                throw preparedContentError(
+                    `Prepared content asset ${index} objectHash is invalid`,
+                )
+            }
+            if (
+                !Number.isSafeInteger(asset.byteSize) ||
+                (asset.byteSize as number) < 0
+            ) {
+                throw preparedContentError(
+                    `Prepared content asset ${index} byteSize is invalid`,
+                )
+            }
+            let token: string | undefined
+            if (!risum) {
+                token = requiredDescriptorString(asset.token, 'token')
+                if (tokens.has(token)) {
+                    throw preparedContentError(
+                        `Prepared content asset ${index} token is duplicated`,
+                    )
+                }
+                tokens.add(token)
+            }
+            const ext =
+                risum && typeof asset.ext === 'string'
+                    ? asset.ext
+                    : requiredDescriptorString(asset.ext, 'ext')
+            if (!risum && (ext.length > 32 || !/^[A-Za-z0-9+_-]+$/.test(ext))) {
+                throw preparedContentError(
+                    `Prepared content asset ${index} ext is invalid`,
+                )
+            }
+            const logicalId = requiredDescriptorString(
+                asset.logicalId,
+                'logicalId',
+            )
+            const logicalPrefix = `assets/${objectHash}.`
+            if (!logicalId.startsWith(logicalPrefix)) {
+                throw preparedContentError(
+                    `Prepared content asset ${index} logicalId does not match its object`,
+                )
+            }
+            const logicalSuffix = logicalId.slice(logicalPrefix.length)
+            if (
+                logicalSuffix.length > 32 ||
+                !/^[A-Za-z0-9+_-]+$/.test(logicalSuffix)
+            ) {
+                throw preparedContentError(
+                    `Prepared content asset ${index} logicalId suffix is invalid`,
+                )
+            }
+            if (typeof asset.name !== 'string') {
+                throw preparedContentError(
+                    `Prepared content asset ${index} name must be a string`,
+                )
+            }
+            if (typeof asset.mime !== 'string') {
+                throw preparedContentError(
+                    `Prepared content asset ${index} mime must be a string`,
+                )
+            }
+            const mime = asset.mime
+            if (mime.length === 0 && content.format !== 'png-card' && !risum) {
+                throw preparedContentError(
+                    `Prepared content asset ${index} mime must be a nonempty string`,
+                )
+            }
+            if (risum) {
+                if (
+                    !Number.isSafeInteger(asset.position) ||
+                    asset.position !== index
+                ) {
+                    throw preparedContentError(
+                        `Prepared RISUM asset ${index} position is invalid`,
+                    )
+                }
+                return {
+                    position: index,
+                    logicalId,
+                    objectHash,
+                    byteSize: asset.byteSize as number,
+                    mime,
+                    name: asset.name,
+                    ext,
+                }
             }
             return {
-                position: index,
+                referenceKey: requiredDescriptorString(
+                    asset.referenceKey,
+                    'referenceKey',
+                ),
+                token: token!,
                 logicalId,
                 objectHash,
                 byteSize: asset.byteSize as number,
@@ -606,45 +696,70 @@ function validatePreparedContent(value: unknown, expectedCasSessionId: string): 
                 name: asset.name,
                 ext,
             }
-        }
-        return {
-            referenceKey: requiredDescriptorString(asset.referenceKey, 'referenceKey'),
-            token: token!,
-            logicalId,
-            objectHash,
-            byteSize: asset.byteSize as number,
-            mime,
-            name: asset.name,
-            ext,
-        }
-    })
+        },
+    )
     if (content.format === 'risu-module') {
-        if (content.portraitLogicalId !== undefined || content.module !== undefined) {
-            throw preparedContentError('Prepared RISUM content cannot contain card fields')
+        if (
+            content.portraitLogicalId !== undefined ||
+            content.module !== undefined
+        ) {
+            throw preparedContentError(
+                'Prepared RISUM content cannot contain card fields',
+            )
         }
-        if (typeof content.ownerHead !== 'object' || content.ownerHead === null || Array.isArray(content.ownerHead)) {
-            throw preparedContentError('Prepared RISUM ownerHead must be an object')
+        if (
+            typeof content.ownerHead !== 'object' ||
+            content.ownerHead === null ||
+            Array.isArray(content.ownerHead)
+        ) {
+            throw preparedContentError(
+                'Prepared RISUM ownerHead must be an object',
+            )
         }
         const ownerHead = content.ownerHead as Record<string, unknown>
-        if (Object.keys(ownerHead).sort().join('\0') !== ['entryCount', 'manifestHash', 'present'].join('\0')) {
-            throw preparedContentError('Prepared RISUM ownerHead fields are invalid')
+        if (
+            Object.keys(ownerHead).sort().join('\0') !==
+            ['entryCount', 'manifestHash', 'present'].join('\0')
+        ) {
+            throw preparedContentError(
+                'Prepared RISUM ownerHead fields are invalid',
+            )
         }
         if (typeof ownerHead.present !== 'boolean') {
-            throw preparedContentError('Prepared RISUM ownerHead present is invalid')
+            throw preparedContentError(
+                'Prepared RISUM ownerHead present is invalid',
+            )
         }
-        if (!Number.isSafeInteger(ownerHead.entryCount) || (ownerHead.entryCount as number) < 0) {
-            throw preparedContentError('Prepared RISUM ownerHead entryCount is invalid')
+        if (
+            !Number.isSafeInteger(ownerHead.entryCount) ||
+            (ownerHead.entryCount as number) < 0
+        ) {
+            throw preparedContentError(
+                'Prepared RISUM ownerHead entryCount is invalid',
+            )
         }
         if (ownerHead.present) {
-            if (typeof ownerHead.manifestHash !== 'string' || !/^[0-9a-f]{64}$/.test(ownerHead.manifestHash)) {
-                throw preparedContentError('Prepared RISUM ownerHead manifestHash is invalid')
+            if (
+                typeof ownerHead.manifestHash !== 'string' ||
+                !/^[0-9a-f]{64}$/.test(ownerHead.manifestHash)
+            ) {
+                throw preparedContentError(
+                    'Prepared RISUM ownerHead manifestHash is invalid',
+                )
             }
             if (ownerHead.entryCount !== assets.length) {
-                throw preparedContentError('Prepared RISUM ownerHead entryCount does not match assets')
+                throw preparedContentError(
+                    'Prepared RISUM ownerHead entryCount does not match assets',
+                )
             }
-        }
-        else if (ownerHead.manifestHash !== null || ownerHead.entryCount !== 0 || assets.length !== 0) {
-            throw preparedContentError('Absent RISUM ownerHead must have no assets')
+        } else if (
+            ownerHead.manifestHash !== null ||
+            ownerHead.entryCount !== 0 ||
+            assets.length !== 0
+        ) {
+            throw preparedContentError(
+                'Absent RISUM ownerHead must have no assets',
+            )
         }
         return {
             casSessionId,
@@ -657,83 +772,155 @@ function validatePreparedContent(value: unknown, expectedCasSessionId: string): 
     const cardAssets = assets as PreparedCardContentAssetDescriptor[]
     let portraitLogicalId: string | undefined
     if (content.portraitLogicalId !== undefined) {
-        portraitLogicalId = requiredDescriptorString(content.portraitLogicalId, 'portraitLogicalId')
-        if (!cardAssets.some((asset) => asset.logicalId === portraitLogicalId)) {
-            throw preparedContentError('Prepared content portraitLogicalId must reference a prepared asset')
+        portraitLogicalId = requiredDescriptorString(
+            content.portraitLogicalId,
+            'portraitLogicalId',
+        )
+        if (
+            !cardAssets.some((asset) => asset.logicalId === portraitLogicalId)
+        ) {
+            throw preparedContentError(
+                'Prepared content portraitLogicalId must reference a prepared asset',
+            )
         }
     }
     if (content.format === 'png-card') {
         const metadata = content.metadata as Record<string, unknown>
-        if (!Object.keys(metadata).every((field) => field === 'chara' || field === 'ccv3')) {
-            throw preparedContentError('Prepared PNG metadata fields are invalid')
+        if (
+            !Object.keys(metadata).every(
+                (field) => field === 'chara' || field === 'ccv3',
+            )
+        ) {
+            throw preparedContentError(
+                'Prepared PNG metadata fields are invalid',
+            )
         }
         const encodedMetadata = [metadata.chara, metadata.ccv3]
-        if (!encodedMetadata.some((value) => typeof value === 'string' && value.length > 0)) {
+        if (
+            !encodedMetadata.some(
+                (value) => typeof value === 'string' && value.length > 0,
+            )
+        ) {
             throw preparedContentError('Prepared PNG card metadata is missing')
         }
         for (const value of encodedMetadata) {
-            if (value !== undefined && (typeof value !== 'string' || value.length === 0)) {
-                throw preparedContentError('Prepared PNG card metadata must be a nonempty string')
+            if (
+                value !== undefined &&
+                (typeof value !== 'string' || value.length === 0)
+            ) {
+                throw preparedContentError(
+                    'Prepared PNG card metadata must be a nonempty string',
+                )
             }
-            if (typeof value === 'string' && value.length > 5 * 1024 * 1024) {
-                throw preparedContentError('Prepared PNG card metadata exceeds the 5 MiB limit')
+            if (
+                typeof value === 'string' &&
+                value.length > MAX_CONTENT_METADATA_BYTES
+            ) {
+                throw preparedContentError(
+                    'Prepared PNG card metadata exceeds the 128 MiB limit',
+                )
             }
         }
         if (content.module !== undefined) {
-            throw preparedContentError('Prepared PNG content cannot contain a module')
+            throw preparedContentError(
+                'Prepared PNG content cannot contain a module',
+            )
         }
         if (!portraitLogicalId) {
-            throw preparedContentError('Prepared PNG portraitLogicalId is required')
+            throw preparedContentError(
+                'Prepared PNG portraitLogicalId is required',
+            )
         }
         const portrait = cardAssets[0]
         if (!portrait || portrait.logicalId !== portraitLogicalId) {
-            throw preparedContentError('Prepared PNG portrait must be the first asset')
+            throw preparedContentError(
+                'Prepared PNG portrait must be the first asset',
+            )
         }
         if (
-            !/^native-png-portrait(?:-[1-9][0-9]*)?$/.test(portrait.token)
-            || portrait.referenceKey !== portrait.token
-            || portrait.mime !== 'image/png'
-            || portrait.ext !== 'png'
-            || portrait.logicalId !== `assets/${portrait.objectHash}.png`
-            || portrait.name !== `${portrait.objectHash}.png`
+            !/^native-png-portrait(?:-[1-9][0-9]*)?$/.test(portrait.token) ||
+            portrait.referenceKey !== portrait.token ||
+            portrait.mime !== 'image/png' ||
+            portrait.ext !== 'png' ||
+            portrait.logicalId !== `assets/${portrait.objectHash}.png` ||
+            portrait.name !== `${portrait.objectHash}.png`
         ) {
-            throw preparedContentError('Prepared PNG portrait descriptor is invalid')
+            throw preparedContentError(
+                'Prepared PNG portrait descriptor is invalid',
+            )
         }
         for (const [index, asset] of cardAssets.slice(1).entries()) {
             if (asset.token !== asset.referenceKey) {
-                throw preparedContentError(`Prepared PNG embedded asset ${index} token must equal referenceKey`)
+                throw preparedContentError(
+                    `Prepared PNG embedded asset ${index} token must equal referenceKey`,
+                )
             }
             if (asset.mime !== '') {
-                throw preparedContentError(`Prepared PNG embedded asset ${index} mime must be empty`)
+                throw preparedContentError(
+                    `Prepared PNG embedded asset ${index} mime must be empty`,
+                )
             }
             if (
-                asset.ext !== 'png'
-                || asset.logicalId !== `assets/${asset.objectHash}.png`
-                || asset.name !== `${asset.objectHash}.png`
+                asset.ext !== 'png' ||
+                asset.logicalId !== `assets/${asset.objectHash}.png` ||
+                asset.name !== `${asset.objectHash}.png`
             ) {
-                throw preparedContentError(`Prepared PNG embedded asset ${index} descriptor is invalid`)
+                throw preparedContentError(
+                    `Prepared PNG embedded asset ${index} descriptor is invalid`,
+                )
             }
         }
     }
     let module: PreparedNativeCharacterCardModule | undefined
     if (content.module !== undefined) {
-        if (typeof content.module !== 'object' || content.module === null || Array.isArray(content.module)) {
-            throw preparedContentError('Prepared content module must be an object')
+        if (
+            typeof content.module !== 'object' ||
+            content.module === null ||
+            Array.isArray(content.module)
+        ) {
+            throw preparedContentError(
+                'Prepared content module must be an object',
+            )
         }
         const rawModule = content.module as Record<string, unknown>
         const expectedModuleFields = ['lorebook', 'regex', 'trigger']
-        if (!Object.keys(rawModule).every((field) => expectedModuleFields.includes(field))) {
-            throw preparedContentError('Prepared content module fields are invalid')
+        if (
+            !Object.keys(rawModule).every((field) =>
+                expectedModuleFields.includes(field),
+            )
+        ) {
+            throw preparedContentError(
+                'Prepared content module fields are invalid',
+            )
         }
         for (const field of expectedModuleFields) {
-            if (rawModule[field] !== undefined && !Array.isArray(rawModule[field])) {
-                throw preparedContentError(`Prepared content module ${field} must be an array`)
+            if (
+                rawModule[field] !== undefined &&
+                !Array.isArray(rawModule[field])
+            ) {
+                throw preparedContentError(
+                    `Prepared content module ${field} must be an array`,
+                )
             }
         }
         module = {
-            ...(rawModule.trigger === undefined ? {} : { trigger: rawModule.trigger as PreparedNativeCharacterCardModule['trigger'] }),
-            ...(rawModule.regex === undefined ? {} : { regex: rawModule.regex as PreparedNativeCharacterCardModule['regex'] }),
-            ...(rawModule.lorebook === undefined ? {} : { lorebook: rawModule.lorebook as PreparedNativeCharacterCardModule['lorebook'] }),
+            ...(rawModule.trigger === undefined
+                ? {}
+                : {
+                      trigger:
+                          rawModule.trigger as PreparedNativeCharacterCardModule['trigger'],
+                  }),
+            ...(rawModule.regex === undefined
+                ? {}
+                : {
+                      regex: rawModule.regex as PreparedNativeCharacterCardModule['regex'],
+                  }),
+            ...(rawModule.lorebook === undefined
+                ? {}
+                : {
+                      lorebook:
+                          rawModule.lorebook as PreparedNativeCharacterCardModule['lorebook'],
+                  }),
         }
     }
     return {

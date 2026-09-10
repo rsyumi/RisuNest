@@ -8,6 +8,7 @@ import {
     isAndroidSafFileJobsEnabled,
     listenAndroidSpoolBatches,
     pickAndroidLegacyBackupSource,
+    pickAndroidContentSource,
     pickAndroidLosslessBackupSource,
     type AndroidSafDestinationEvent,
 } from './androidSafBridge'
@@ -562,4 +563,50 @@ describe('Android SAF bridge', () => {
         })
         expect([...listeners.values()].every((registered) => registered.size === 0)).toBe(true)
     })
+})
+
+it('selects a 500 MiB content spool without passing bytes through the WebView', async () => {
+    const listeners = new Set<(event: Event) => void>()
+    const source = await pickAndroidContentSource(
+        {},
+        {
+            createRequestId: () => 'request',
+            bridge: {
+                copyExport: vi.fn(),
+                pickContentSource: (requestId) =>
+                    queueMicrotask(() => {
+                        for (const listener of listeners)
+                            listener(
+                                new CustomEvent(
+                                    'risu-android-content-source-picked',
+                                    {
+                                        detail: {
+                                            requestId,
+                                            ready: [
+                                                {
+                                                    token: '11111111-1111-4111-8111-111111111111',
+                                                    displayName: 'large.CHARX',
+                                                    bytes: 500 * 1024 * 1024,
+                                                },
+                                            ],
+                                            failures: [],
+                                        },
+                                    },
+                                ),
+                            )
+                    }),
+            },
+            addEventListener: (_name, listener) => {
+                listeners.add(listener)
+            },
+            removeEventListener: (_name, listener) => {
+                listeners.delete(listener)
+            },
+        },
+    )
+    expect(source).toEqual({
+        type: 'androidSpool',
+        token: '11111111-1111-4111-8111-111111111111',
+    })
+    expect(listeners.size).toBe(0)
 })

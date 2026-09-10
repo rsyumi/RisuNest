@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { isTauri } from './ts/platform'
     import ChatBindingLifecycle from './lib/SideBars/ChatBindingLifecycle.svelte'
     import { DynamicGUI, settingsOpen, sideBarStore, ShowRealmFrameStore, openPresetList, openPersonaList, MobileGUI, CustomGUISettingMenuStore, loadedStore, alertStore, LoadingStatusState, bookmarkListOpen, popupStore, easyPanelStore, popUpEditorStore, loadoutModalStore, irisStore, customSideBarConfigDialogStore, bootFailure, type BootFailure } from './ts/stores.svelte';
     import Sidebar from './lib/SideBars/Sidebar.svelte';
@@ -160,6 +161,11 @@
         await importPreset({ name: file.name, data })
         alertNormal(language.successImport)
     } else if (name.endsWith('.risum')) {
+        if (isTauri) {
+            const { importNativeContentFile } = await import('./ts/storage/nativeContentFile')
+            await importNativeContentFile(file, 'module')
+            return
+        }
         const data = new Uint8Array(await file.arrayBuffer())
         const module = await readModule(Buffer.from(data))
         DBState.db.modules.push(module)

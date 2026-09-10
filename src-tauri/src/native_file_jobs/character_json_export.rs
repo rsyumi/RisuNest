@@ -15,7 +15,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    const IMPORTER_JSON_LIMIT: usize = 8 * 1024 * 1024;
+    const IMPORTER_JSON_LIMIT: usize = JSON_CARD_MAX_METADATA_BYTES;
 
     struct Fixture {
         directory: TempDir,
@@ -458,7 +458,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
-const JSON_LIMIT_MESSAGE: &str = "native JSON character card exceeds the 8 MiB importer limit";
+const JSON_LIMIT_MESSAGE: &str = "native JSON character card exceeds the 128 MiB importer limit";
 pub(super) const FALLBACK_PORTRAIT: &[u8] = include_bytes!("../../../public/none.webp");
 
 pub(super) enum JsonAssetSource {

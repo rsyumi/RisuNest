@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { MAX_CONTENT_METADATA_BYTES } from './contentImportLimits'
 
 import {
     prepareNativeContentImport,
@@ -686,7 +687,7 @@ describe('native prepared content import', () => {
         ['portrait after a chunk', { assets: undefined }, 'portrait must be the first asset'],
         ['nonempty chunk MIME', { chunkMime: 'image/png' }, 'mime must be empty'],
         ['renamed chunk token', { chunkToken: 'different' }, 'token must equal referenceKey'],
-        ['oversized selected metadata', { ccv3: 'x'.repeat(5 * 1024 * 1024 + 1) }, 'metadata exceeds'],
+        ['oversized selected metadata', { ccv3: 'x'.repeat(MAX_CONTENT_METADATA_BYTES + 1) }, 'metadata exceeds'],
     ]
 
     it.each(invalidPngContentCases)('rejects PNG content with %s', async (_case, change, expectedMessage) => {

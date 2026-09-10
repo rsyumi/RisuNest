@@ -206,6 +206,27 @@ impl DurableCasJob {
         Ok(prepared)
     }
 
+    pub(crate) fn adopt_import_payload(
+        &mut self,
+        cas: &PayloadCas,
+        path: &Path,
+        hash: &str,
+        size: u64,
+        cancelled: &impl Fn() -> bool,
+    ) -> io::Result<PreparedPayload> {
+        self.ensure_preparable()?;
+        self.ensure_cas(cas)?;
+        let prepared = cas.adopt_import_payload(path, hash, size, cancelled)?;
+        // Adoption just validated and published this object. The unsealed job
+        // blocks GC, so reopening the whole CAS path here adds no new guarantee.
+        self.record_pin(
+            &prepared.content_hash,
+            prepared.byte_size,
+            CasObjectRole::DirectObject,
+        )?;
+        Ok(prepared)
+    }
+
     pub(crate) fn pin_existing(
         &mut self,
         cas: &PayloadCas,

@@ -43,6 +43,7 @@ export interface NativeFileJobDialogTerminal {
 }
 
 export interface NativeFileJobDialogModel {
+    compact: boolean
     open: boolean
     title: string
     subtitle: string
@@ -83,12 +84,30 @@ const STAGE_ORDER: DialogStageId[] = [
 
 /** Stages shown as pending from the start; optional stages appear only once observed. */
 const EXPECTED_STAGES: Record<NativeFileOperationFormat, DialogStageId[]> = {
+    content: ['reading-archive', 'preparing-attachments', 'finalizing-staging'],
     'local-backup': [
-        'reading-archive', 'preparing-attachments', 'reading-database', 'finalizing-staging',
-        'activating', 'refreshing-app', 'reloading-plugins',
+        'reading-archive',
+        'preparing-attachments',
+        'reading-database',
+        'finalizing-staging',
+        'activating',
+        'refreshing-app',
+        'reloading-plugins',
     ],
-    'risu-save': ['reading-database', 'finalizing-staging', 'activating', 'refreshing-app', 'reloading-plugins'],
-    'lossless-backup': ['reading-database', 'finalizing-staging', 'activating', 'refreshing-app', 'reloading-plugins'],
+    'risu-save': [
+        'reading-database',
+        'finalizing-staging',
+        'activating',
+        'refreshing-app',
+        'reloading-plugins',
+    ],
+    'lossless-backup': [
+        'reading-database',
+        'finalizing-staging',
+        'activating',
+        'refreshing-app',
+        'reloading-plugins',
+    ],
 }
 
 const UNCANCELLABLE_STAGES = new Set<DialogStageId>([
@@ -96,6 +115,7 @@ const UNCANCELLABLE_STAGES = new Set<DialogStageId>([
 ])
 
 const CLOSED: NativeFileJobDialogModel = {
+    compact: false,
     open: false,
     title: '',
     subtitle: '',
@@ -313,30 +333,70 @@ function buildCounters(
     succeeded: boolean,
 ): NativeFileJobDialogCounter[] {
     const copy = language.risuNest.importDialog
+    if (format === 'content')
+        return [
+            {
+                key: 'assets',
+                label: copy.countAssets,
+                value: counts ? formatCount(counts.attachmentsPrepared) : '–',
+            },
+        ]
     const finalResult = succeeded ? result : undefined
     const rows: NativeFileJobDialogCounter[] = [
         {
             key: 'characters',
             label: copy.countCharacters,
-            value: counterValue(counts?.characters ?? 0, counts?.charactersTotal, finalResult?.characterCount),
+            value: counterValue(
+                counts?.characters ?? 0,
+                counts?.charactersTotal,
+                finalResult?.characterCount,
+            ),
         },
         {
             key: 'presets',
             label: copy.countPresets,
-            value: counterValue(counts?.presets ?? 0, undefined, finalResult?.presetCount),
+            value: counterValue(
+                counts?.presets ?? 0,
+                undefined,
+                finalResult?.presetCount,
+            ),
         },
     ]
     if (format === 'local-backup') {
-        const known = (value: number | undefined) => counts ? formatCount(value ?? 0) : '–'
+        const known = (value: number | undefined) =>
+            counts ? formatCount(value ?? 0) : '–'
         rows.push(
-            { key: 'assets', label: copy.countAssets, value: known(counts?.assets) },
-            { key: 'inlays', label: copy.countInlays, value: known(counts?.inlays) },
-            { key: 'coldStorage', label: copy.countColdStorage, value: known(counts?.coldStorage) },
+            {
+                key: 'assets',
+                label: copy.countAssets,
+                value: known(counts?.assets),
+            },
+            {
+                key: 'inlays',
+                label: copy.countInlays,
+                value: known(counts?.inlays),
+            },
+            {
+                key: 'coldStorage',
+                label: copy.countColdStorage,
+                value: known(counts?.coldStorage),
+            },
         )
-        if (counts && counts.pocketMedia + counts.pocketMetadata + counts.skipped > 0) {
+        if (
+            counts &&
+            counts.pocketMedia + counts.pocketMetadata + counts.skipped > 0
+        ) {
             rows.push(
-                { key: 'pocketMedia', label: copy.countPocketMedia, value: formatCount(counts.pocketMedia) },
-                { key: 'skipped', label: copy.countSkipped, value: formatCount(counts.skipped) },
+                {
+                    key: 'pocketMedia',
+                    label: copy.countPocketMedia,
+                    value: formatCount(counts.pocketMedia),
+                },
+                {
+                    key: 'skipped',
+                    label: copy.countSkipped,
+                    value: formatCount(counts.skipped),
+                },
             )
         }
     }
@@ -422,6 +482,31 @@ function overallOf(
     }
 }
 
+function contentOverall(
+    status?: NativeFileJobStatus,
+): Pick<
+    NativeFileJobDialogModel,
+    'overallPercent' | 'overallText' | 'indeterminate'
+> {
+    const detail = status?.detail
+    const total = detail?.stageTotal
+    if (!total)
+        return { overallPercent: null, overallText: '', indeterminate: true }
+    const percent = Math.round((detail.stageCompleted / total) * 100)
+    return {
+        overallPercent: Math.min(99, percent),
+        overallText:
+            detail.stageUnit === 'items'
+                ? fillTemplate(
+                      language.risuNest.importDialog.itemsOf,
+                      formatCount(detail.stageCompleted),
+                      formatCount(total),
+                  )
+                : '',
+        indeterminate: false,
+    }
+}
+
 export function buildNativeFileJobDialogModel(
     state: NativeFileOperationState | null,
     outcome: NativeFileOperationOutcome | null,
@@ -435,74 +520,116 @@ export function buildNativeFileJobDialogModel(
         const counts = state.status?.detail?.counts
         // Waiting for activation is still cancellable; the native job only commits after finalize.
         const rawCurrent = state.observedStages.at(-1)
-        const uncancellable = (
-            current !== null
-            && rawCurrent !== 'awaiting-activation'
-            && UNCANCELLABLE_STAGES.has(current)
-        )
-            || state.status?.phase === 'activating-database'
-            || state.status?.state === 'succeeded'
+        const uncancellable =
+            (current !== null &&
+                rawCurrent !== 'awaiting-activation' &&
+                UNCANCELLABLE_STAGES.has(current)) ||
+            state.status?.phase === 'activating-database' ||
+            (state.status?.state === 'succeeded' && format !== 'content')
         const cancelEnabled = !state.cancelRequested && !uncancellable
         const currentItem = state.status?.detail?.currentItem
         return {
+            compact: format === 'content',
             open: true,
             title: titleOf(format),
             subtitle: subtitleOf(format, counts, false),
             sourceName: state.source?.name ?? '',
-            sourceSize: state.source?.bytes !== undefined ? formatBytes(state.source.bytes) : '',
-            elapsed: fillTemplate(copy.elapsed, formatElapsed(now - state.startedAt)),
+            sourceSize:
+                state.source?.bytes !== undefined
+                    ? formatBytes(state.source.bytes)
+                    : '',
+            elapsed: fillTemplate(
+                copy.elapsed,
+                formatElapsed(now - state.startedAt),
+            ),
             ...overallOf(state.status, null),
-            stages: buildStages(format, state.observedStages, state.status, null),
-            currentItem: currentItem && (current === 'reading-archive' || current === 'preparing-attachments')
-                ? fillTemplate(copy.currentItem, currentItem)
-                : '',
-            counters: buildCounters(format, counts, state.status?.result, false),
+            ...(format === 'content' ? contentOverall(state.status) : {}),
+            stages: buildStages(
+                format,
+                state.observedStages,
+                state.status,
+                null,
+            ),
+            currentItem:
+                currentItem &&
+                (current === 'reading-archive' ||
+                    current === 'preparing-attachments')
+                    ? fillTemplate(copy.currentItem, currentItem)
+                    : '',
+            counters: buildCounters(
+                format,
+                counts,
+                state.status?.result,
+                false,
+            ),
             warnings: (state.status?.warningCodes ?? []).map(warningText),
             terminal: null,
             cancelVisible: true,
             cancelEnabled,
             cancelLabel: state.cancelRequested ? copy.cancelling : copy.cancel,
-            cancelNote: !cancelEnabled && !state.cancelRequested ? copy.cancelUnavailable : '',
+            cancelNote:
+                !cancelEnabled && !state.cancelRequested
+                    ? copy.cancelUnavailable
+                    : '',
             closeVisible: false,
         }
     }
     if (outcome) {
         const format = formatOf(outcome.format, outcome.status)
         const history = stageHistory(outcome.observedStages)
-        const restarting = outcome.state === 'succeeded' && history.at(-1) === 'restarting-app'
+        const restarting =
+            outcome.state === 'succeeded' && history.at(-1) === 'restarting-app'
         const counts = outcome.status?.detail?.counts
         let summary: string
         let reason = ''
         if (outcome.state === 'succeeded') {
             summary = restarting ? copy.resultRestarting : copy.resultSucceeded
-        }
-        else if (outcome.state === 'cancelled') {
-            summary = outcome.partialWritesPossible ? copy.resultCancelledPartial : copy.resultCancelled
-        }
-        else if (outcome.error?.recoveryRequired) {
+        } else if (outcome.state === 'cancelled') {
+            summary = outcome.partialWritesPossible
+                ? copy.resultCancelledPartial
+                : copy.resultCancelled
+        } else if (outcome.error?.recoveryRequired) {
             summary = copy.resultFailedAfterCommit
-        }
-        else {
+        } else {
             summary = copy.resultFailed
             reason = failureReason(outcome.error?.code ?? '')
         }
         return {
+            compact: format === 'content',
             open: true,
             title: titleOf(format),
             subtitle: subtitleOf(format, counts, true),
             sourceName: outcome.source?.name ?? '',
-            sourceSize: outcome.source?.bytes !== undefined ? formatBytes(outcome.source.bytes) : '',
-            elapsed: fillTemplate(copy.elapsed, formatElapsed(outcome.finishedAt - outcome.startedAt)),
+            sourceSize:
+                outcome.source?.bytes !== undefined
+                    ? formatBytes(outcome.source.bytes)
+                    : '',
+            elapsed: fillTemplate(
+                copy.elapsed,
+                formatElapsed(outcome.finishedAt - outcome.startedAt),
+            ),
             ...overallOf(outcome.status, outcome.state),
-            stages: buildStages(format, outcome.observedStages, outcome.status, outcome.state),
+            stages: buildStages(
+                format,
+                outcome.observedStages,
+                outcome.status,
+                outcome.state,
+            ),
             currentItem: '',
-            counters: buildCounters(format, counts, outcome.result, outcome.state === 'succeeded'),
+            counters: buildCounters(
+                format,
+                counts,
+                outcome.result,
+                outcome.state === 'succeeded',
+            ),
             warnings: outcome.warningCodes.map(warningText),
             terminal: {
                 state: outcome.state,
                 summary,
                 reason,
-                details: outcome.error ? `[${outcome.error.code}] ${outcome.error.message}` : '',
+                details: outcome.error
+                    ? `[${outcome.error.code}] ${outcome.error.message}`
+                    : '',
                 restarting,
             },
             cancelVisible: false,

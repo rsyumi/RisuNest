@@ -20,6 +20,114 @@ const RACE_START_ENV: &str = "RISUNEST_CAS_RACE_START";
 const RACE_READY_ENV: &str = "RISUNEST_CAS_RACE_READY";
 const RACE_RESULT_ENV: &str = "RISUNEST_CAS_RACE_RESULT";
 
+fn import_payload(root: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+    use std::io::Write;
+    let directory = root.join("native-file-jobs/jobs/synthetic-import");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(name);
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(bytes).unwrap();
+    file.sync_all().unwrap();
+    path
+}
+
+#[test]
+fn adopts_import_without_copying_and_preserves_conflicts_and_cancelled_sources() {
+    use sha2::{Digest, Sha256};
+    let directory = tempfile::tempdir().unwrap();
+    let cas = PayloadCas::new(directory.path()).unwrap();
+    let bytes = b"synthetic immutable payload";
+    let hash = hex::encode(Sha256::digest(bytes));
+    let path = import_payload(directory.path(), "first.payload", bytes);
+    let prepared = cas
+        .adopt_import_payload(&path, &hash, bytes.len() as u64, &|| false)
+        .unwrap();
+    assert!(!prepared.deduplicated);
+    assert!(!path.exists());
+    assert_eq!(cas.read_object(&hash).unwrap().unwrap(), bytes);
+    let duplicate = import_payload(directory.path(), "second.payload", bytes);
+    assert!(
+        cas.adopt_import_payload(&duplicate, &hash, bytes.len() as u64, &|| false)
+            .unwrap()
+            .deduplicated
+    );
+    assert!(!duplicate.exists());
+    let corrupt = import_payload(
+        directory.path(),
+        "corrupt.payload",
+        &vec![0_u8; bytes.len()],
+    );
+    assert!(cas
+        .adopt_import_payload(&corrupt, &hash, bytes.len() as u64, &|| false)
+        .is_err());
+    assert!(corrupt.exists());
+    let linked = import_payload(directory.path(), "linked.payload", bytes);
+    let alias = directory.path().join("external-alias");
+    std::fs::hard_link(&linked, &alias).unwrap();
+    assert!(cas
+        .adopt_import_payload(&linked, &hash, bytes.len() as u64, &|| false)
+        .is_err());
+    assert!(linked.exists());
+    assert_eq!(std::fs::read(&alias).unwrap(), bytes);
+    let cancelled = import_payload(directory.path(), "cancelled.payload", bytes);
+    assert_eq!(
+        cas.adopt_import_payload(&cancelled, &hash, bytes.len() as u64, &|| true)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::Interrupted
+    );
+    assert!(cancelled.exists());
+    let external = directory.path().join("user.payload");
+    std::fs::write(&external, bytes).unwrap();
+    assert!(cas
+        .adopt_import_payload(&external, &hash, bytes.len() as u64, &|| false)
+        .is_err());
+    assert!(external.exists());
+}
+
+#[test]
+#[ignore = "synthetic IO measurements"]
+fn import_adoption_benchmark() {
+    use sha2::{Digest, Sha256};
+    for (count, size) in [(1000, 100 * 1024), (2500, 200 * 1024), (10000, 1024)] {
+        for adoption in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let cas = PayloadCas::new(directory.path()).unwrap();
+            let mut descriptors = Vec::new();
+            for i in 0..count {
+                let mut bytes = vec![42_u8; size];
+                bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                let hash = hex::encode(Sha256::digest(&bytes));
+                descriptors.push((
+                    import_payload(directory.path(), &format!("{i}.payload"), &bytes),
+                    hash,
+                ));
+            }
+            let started = Instant::now();
+            for (path, hash) in &descriptors {
+                let prepared = if adoption {
+                    cas.adopt_import_payload(path, hash, size as u64, &|| false)
+                        .unwrap()
+                } else {
+                    cas.prepare_reader_expected(
+                        &mut std::fs::File::open(path).unwrap(),
+                        hash,
+                        size as u64,
+                    )
+                    .unwrap()
+                };
+                assert_eq!(&prepared.content_hash, hash);
+                assert_eq!(prepared.byte_size, size as u64);
+            }
+            println!(
+                "import-io count={count} bytes={} adoption={adoption} elapsed_ms={}",
+                count * size,
+                started.elapsed().as_millis()
+            );
+        }
+    }
+}
+
 #[cfg(unix)]
 fn symlink_file(original: &Path, link: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(original, link)

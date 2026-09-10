@@ -75,3 +75,24 @@ pub(crate) fn rename_without_replace(source: &Path, destination: &Path) -> io::R
         Err(io::Error::last_os_error())
     }
 }
+
+/// Same-volume move with no replacement. Unlike hard-link + unlink, this updates
+/// the staging name in one operation and also works on Windows filesystems without links.
+#[cfg(windows)]
+pub(crate) fn rename_without_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: both paths are NUL terminated and live throughout the call. Flags 0
+    // neither replace an existing destination nor copy across volumes.
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) } != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}

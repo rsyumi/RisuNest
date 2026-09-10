@@ -1,11 +1,11 @@
 use super::{
     charx::{
-        inspect_charx_file, CharXContainerKind, CharXInspection, CharXLimits, CharXParseError,
-        CharXParseErrorCode, ParsedCharXDescriptor, StagedPayloadDescriptor,
+        inspect_charx_opened_file, CharXContainerKind, CharXInspection, CharXLimits,
+        CharXParseError, CharXParseErrorCode, ParsedCharXDescriptor, StagedPayloadDescriptor,
     },
-    content_cancelled, open_regular_file_no_follow, JobControl, JobPhase, JobProgress,
-    NativeJobError, OpenedJobSource, PreparedContent, PreparedContentAsset, PreparedContentFormat,
-    PreparedContentModule, PreparedContentOwnerHead,
+    content_cancelled, open_regular_file_no_follow, ImportCounts, JobControl, JobDetail, JobPhase,
+    JobProgress, JobStage, NativeJobError, OpenedJobSource, PreparedContent, PreparedContentAsset,
+    PreparedContentFormat, PreparedContentModule, PreparedContentOwnerHead, StageUnit,
 };
 use crate::asset_repository::job_pins::{
     CasJobKind, CasObjectRole, CasReleaseOutcome, DurableCasJob,
@@ -21,14 +21,20 @@ use crate::import_export_jobs::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+#[cfg(test)]
+use std::io::Write;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
-pub(super) const JSON_CARD_MAX_METADATA_BYTES: usize = 8 * 1024 * 1024;
-const MAX_MODULE_OVERLAY_ITEMS: usize = 256;
+pub(super) const JSON_CARD_MAX_METADATA_BYTES: usize =
+    crate::import_export_jobs::MAX_CONTENT_METADATA_BYTES;
+// Metadata bytes already bound memory; large lorebooks must round-trip through
+// our own module.risum overlay just like standalone modules.
+const MAX_MODULE_OVERLAY_ITEMS: usize = 50_000;
 const ZIP_LOCAL_FILE_HEADER_BYTES: u64 = 30;
 const ZIP_LOCAL_VARIABLE_HEADER_MAX_BYTES: u64 = u16::MAX as u64 * 2;
 const ZIP_DATA_DESCRIPTOR_MAX_BYTES: u64 = 24;
@@ -54,6 +60,7 @@ impl<R: Read> Read for CancellableReader<'_, R> {
     }
 }
 
+#[cfg(test)]
 pub(super) fn spool_opened_source(
     source: &mut OpenedJobSource,
     destination: &Path,
@@ -143,6 +150,7 @@ pub(super) fn max_charx_spool_bytes() -> u64 {
         .expect("CharX raw source limit must fit in u64")
 }
 
+#[cfg(test)]
 pub(super) fn spool_charx_source(
     source: &mut OpenedJobSource,
     destination: &Path,
@@ -185,6 +193,7 @@ pub(super) fn prepare_content(
     })
     .map_err(|error| NativeJobError::new("store-error", error))?;
 
+    report_content_progress(job, JobStage::ReadingArchive, 0, None)?;
     let classifier_limits = content_classification_limits();
     let kind = classify_content(display_name, &mut source.file, &classifier_limits, &|| {
         job.is_cancel_requested()
@@ -226,10 +235,16 @@ pub(super) fn prepare_content(
         ),
         ContentKind::PngCard => prepare_png_content(&mut source, owned_directory, &cas, job),
         ContentKind::CharxCard | ContentKind::AppendedCharxJpeg => {
-            let spool_path = owned_directory.join("source.charx");
-            spool_charx_source(&mut source, &spool_path, &|| job.is_cancel_requested()).and_then(
-                |()| prepare_charx_content(&spool_path, display_name, owned_directory, &cas, job),
-            )
+            if source.total_bytes > max_charx_spool_bytes() {
+                return Err(abort_failed_content_session(
+                    cas_session,
+                    NativeJobError::new(
+                        "invalid-input",
+                        "CharX source exceeds its raw container limit",
+                    ),
+                ));
+            }
+            prepare_charx_content(&mut source, display_name, owned_directory, &cas, job)
         }
         ContentKind::RisuModule => {
             prepare_risum_content(&mut source, owned_directory, &cas, &mut cas_session, job)
@@ -241,6 +256,12 @@ pub(super) fn prepare_content(
         Err(error) => return Err(abort_failed_content_session(cas_session, error)),
     };
     let item_count = prepared.assets.len() as u64;
+    report_content_progress(
+        job,
+        JobStage::PreparingAttachments,
+        item_count,
+        Some(item_count),
+    )?;
     if let Err(error) = job.set_progress(JobProgress {
         completed_bytes: source.total_bytes,
         total_bytes: Some(source.total_bytes),
@@ -427,14 +448,18 @@ fn prepare_json_content(
 }
 
 fn prepare_charx_content(
-    spool_path: &Path,
+    source: &mut OpenedJobSource,
     display_name: &str,
     owned_directory: &Path,
     cas: &PayloadCas,
     job: &JobControl,
 ) -> Result<PreparedContent, NativeJobError> {
-    let inspection = inspect_charx_file(
-        spool_path,
+    let source_metadata = source
+        .file
+        .metadata()
+        .map_err(|e| NativeJobError::new("invalid-source", e.to_string()))?;
+    let inspection = inspect_charx_opened_file(
+        &source.file,
         display_name,
         owned_directory,
         CharXLimits::default(),
@@ -473,6 +498,13 @@ fn prepare_charx_content(
     )
     .map_err(native_format_error)?;
     let ParsedJsonCard { metadata, payloads } = parsed;
+    let total = descriptor.asset_references.len() as u64
+        + payloads.len() as u64
+        + u64::from(matches!(
+            descriptor.container_kind,
+            CharXContainerKind::AppendedCharXJpeg
+        ));
+    report_content_progress(job, JobStage::PreparingAttachments, 0, Some(total))?;
     let mut assets = promote_archive_asset_occurrences(&descriptor, cas, job)?;
     assets.extend(promote_json_assets(
         &metadata,
@@ -484,8 +516,9 @@ fn prepare_charx_content(
     let portrait_logical_id = match descriptor.container_kind {
         CharXContainerKind::CharX => None,
         CharXContainerKind::AppendedCharXJpeg => {
-            let portrait = promote_jpeg_prefix(spool_path, descriptor.archive_offset, cas, job)?;
+            let portrait = promote_jpeg_prefix(source, descriptor.archive_offset, cas, job)?;
             let logical_id = portrait.logical_id.clone();
+            advance_content_asset(job)?;
             assets.push(portrait);
             Some(logical_id)
         }
@@ -494,6 +527,18 @@ fn prepare_charx_content(
         CharXContainerKind::CharX => PreparedContentFormat::CharxCard,
         CharXContainerKind::AppendedCharXJpeg => PreparedContentFormat::AppendedCharxJpeg,
     };
+    let after = source
+        .file
+        .metadata()
+        .map_err(|e| NativeJobError::new("invalid-source", e.to_string()))?;
+    if after.len() != source_metadata.len()
+        || after.modified().ok() != source_metadata.modified().ok()
+    {
+        return Err(NativeJobError::new(
+            "invalid-source",
+            "CharX source changed during import",
+        ));
+    }
     Ok(PreparedContent {
         format,
         metadata,
@@ -547,25 +592,26 @@ fn prepare_risum_content(
     }
     let mut assets = Vec::with_capacity(parsed.assets.len());
     let mut manifest_entries = Vec::with_capacity(parsed.assets.len());
+    report_content_progress(
+        job,
+        JobStage::PreparingAttachments,
+        0,
+        Some(parsed.assets.len() as u64),
+    )?;
     for asset in parsed.assets {
         if job.is_cancel_requested() {
             return Err(content_cancelled());
         }
         let extension = asset.declared_extension;
         let staged_path = owned_directory.join(&asset.payload.staged_name);
-        let staged = open_regular_file_no_follow(&staged_path)?;
-        if staged.total_bytes != asset.payload.byte_size {
-            return Err(NativeJobError::new(
-                "invalid-source",
-                "staged Risu module asset length changed",
-            ));
-        }
-        let mut reader = CancellableReader {
-            inner: staged.file,
-            job,
-        };
         let prepared = cas_session
-            .prepare_reader(cas, &mut reader, CasObjectRole::DirectObject)
+            .adopt_import_payload(
+                cas,
+                &staged_path,
+                &asset.payload.sha256,
+                asset.payload.byte_size,
+                &|| job.is_cancel_requested(),
+            )
             .map_err(|error| {
                 if job.is_cancel_requested() {
                     content_cancelled()
@@ -573,6 +619,7 @@ fn prepare_risum_content(
                     NativeJobError::new("store-error", error.to_string())
                 }
             })?;
+        advance_content_asset(job)?;
         if prepared.content_hash != asset.payload.sha256
             || prepared.byte_size != asset.payload.byte_size
         {
@@ -699,7 +746,10 @@ fn promote_archive_asset_occurrences(
                 )
             })?;
         let promoted_payload = match promoted.get(&reference.normalized_name) {
-            Some(promoted_payload) => promoted_payload.clone(),
+            Some(promoted_payload) => {
+                advance_content_asset(job)?;
+                promoted_payload.clone()
+            }
             None => {
                 let promoted_payload = promote_staged_payload(cas, payload, job)?;
                 promoted.insert(reference.normalized_name.clone(), promoted_payload.clone());
@@ -820,8 +870,20 @@ fn promote_staged_payload(
     if job.is_cancel_requested() {
         return Err(content_cancelled());
     }
-    let staged = open_regular_file_no_follow(&payload.staged_path)?.file;
-    let promoted = prepare_cancellable_payload(cas, staged, job)?;
+    let promoted = cas
+        .adopt_import_payload(
+            &payload.staged_path,
+            &payload.sha256,
+            payload.decoded_size,
+            &|| job.is_cancel_requested(),
+        )
+        .map_err(|error| {
+            if job.is_cancel_requested() {
+                content_cancelled()
+            } else {
+                NativeJobError::new("store-error", error.to_string())
+            }
+        })?;
     if promoted.content_hash != payload.sha256 || promoted.byte_size != payload.decoded_size {
         return Err(NativeJobError::new(
             "store-error",
@@ -831,6 +893,7 @@ fn promote_staged_payload(
     if job.is_cancel_requested() {
         return Err(content_cancelled());
     }
+    advance_content_asset(job)?;
     Ok(PromotedPayload {
         content_hash: promoted.content_hash,
         byte_size: promoted.byte_size,
@@ -890,7 +953,7 @@ fn bounded_module_array(
 }
 
 fn promote_jpeg_prefix(
-    spool_path: &Path,
+    source: &mut OpenedJobSource,
     archive_offset: u64,
     cas: &PayloadCas,
     job: &JobControl,
@@ -904,8 +967,11 @@ fn promote_jpeg_prefix(
     if job.is_cancel_requested() {
         return Err(content_cancelled());
     }
-    let source = open_regular_file_no_follow(spool_path)?;
-    let promoted = prepare_cancellable_payload(cas, source.file.take(archive_offset), job)?;
+    source
+        .file
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| NativeJobError::new("invalid-source", e.to_string()))?;
+    let promoted = prepare_cancellable_payload(cas, (&mut source.file).take(archive_offset), job)?;
     if promoted.byte_size != archive_offset {
         return Err(NativeJobError::new(
             "invalid-source",
@@ -990,20 +1056,16 @@ fn content_import_limits() -> ImportLimits {
     ImportLimits {
         max_metadata_bytes: JSON_CARD_MAX_METADATA_BYTES,
         max_payload_bytes: 64 * 1024 * 1024,
-        max_aggregate_payload_bytes: 256 * 1024 * 1024,
-        max_payload_count: 256,
+        max_aggregate_payload_bytes: 10 * 1024 * 1024 * 1024,
+        max_payload_count: 50_000,
         max_container_entries: 4096,
         max_container_directory_bytes: 32 * 1024 * 1024,
-        charx_probe_metadata_bytes: 8 * 1024 * 1024,
+        charx_probe_metadata_bytes: JSON_CARD_MAX_METADATA_BYTES as u64,
     }
 }
 
 pub(super) fn risum_import_limits() -> ImportLimits {
-    ImportLimits {
-        max_aggregate_payload_bytes: 10 * 1024 * 1024 * 1024,
-        max_payload_count: 50_000,
-        ..content_import_limits()
-    }
+    content_import_limits()
 }
 
 pub(super) fn content_classification_limits() -> ImportLimits {
@@ -1055,4 +1117,78 @@ fn native_png_error(error: PngCardError) -> NativeJobError {
         PngCardError::LimitExceeded(_) => "native-limit",
     };
     NativeJobError::new(code, error.to_string())
+}
+
+fn report_content_progress(
+    job: &JobControl,
+    stage: JobStage,
+    completed: u64,
+    total: Option<u64>,
+) -> Result<(), NativeJobError> {
+    job.set_detail(JobDetail::new(
+        stage,
+        StageUnit::Items,
+        completed,
+        total,
+        ImportCounts {
+            assets: completed,
+            attachments_prepared: completed,
+            ..Default::default()
+        },
+    ))
+    .map_err(|error| {
+        if job.is_cancel_requested() {
+            content_cancelled()
+        } else {
+            NativeJobError::new("store-error", error)
+        }
+    })
+}
+
+fn advance_content_asset(job: &JobControl) -> Result<(), NativeJobError> {
+    let detail = job.status().detail;
+    let completed = detail.as_ref().map_or(0, |d| d.counts.attachments_prepared) + 1;
+    let total = detail.and_then(|d| {
+        if d.stage == JobStage::PreparingAttachments {
+            d.stage_total
+        } else {
+            None
+        }
+    });
+    report_content_progress(job, JobStage::PreparingAttachments, completed, total)
+}
+
+#[cfg(test)]
+mod large_metadata_tests {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    #[test]
+    fn json_cards_accept_a_thousand_inline_assets_without_the_old_256_item_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = JobStaging::open(directory.path()).unwrap();
+        let assets: Vec<Value> = (0_u32..1000).map(|index| serde_json::json!({
+            "type": "x-risu-asset", "name": index.to_string(), "ext": "bin",
+            "uri": format!("data:application/octet-stream;base64,{}", STANDARD.encode(index.to_le_bytes()))
+        })).collect();
+        let document = serde_json::to_vec(&serde_json::json!({
+            "spec": "chara_card_v3", "spec_version": "3.0",
+            "data": { "name": "synthetic", "assets": assets }
+        }))
+        .unwrap();
+        let parsed = parse_json_card(
+            &mut document.as_slice(),
+            &staging,
+            &content_import_limits(),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(parsed.payloads.len(), 1000);
+        for (index, payload) in parsed.payloads.iter().enumerate() {
+            assert_eq!(
+                payload.payload.sha256,
+                hex::encode(Sha256::digest((index as u32).to_le_bytes()))
+            );
+        }
+    }
 }

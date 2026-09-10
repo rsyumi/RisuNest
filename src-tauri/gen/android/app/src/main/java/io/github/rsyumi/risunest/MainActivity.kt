@@ -63,6 +63,7 @@ private const val OPENED_FILE_INTENT_CONSUMED = "io.github.rsyumi.risunest.OPENE
 private const val OPENED_FILE_FINGERPRINT_STATE = "risu.opened-file-fingerprint"
 private const val LOSSLESS_SOURCE_REQUEST_STATE = "risu.lossless-source-request"
 private const val LOSSLESS_SOURCE_CANCELLED_STATE = "risu.lossless-source-cancelled"
+private const val CONTENT_SOURCE_STATE = "risu.content-source"
 private const val LEGACY_BACKUP_SOURCE_REQUEST_STATE = "risu.legacy-backup-source-request"
 private const val LEGACY_BACKUP_SOURCE_CANCELLED_STATE = "risu.legacy-backup-source-cancelled"
 private const val TAG = "RisuNative"
@@ -312,6 +313,7 @@ private data class PendingLosslessSource(
 private data class PendingLegacyBackupSource(
   val requestId: String,
   val cancellation: AtomicBoolean,
+  val content: Boolean = false,
   val restored: Boolean = false,
 )
 
@@ -553,12 +555,13 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         ?.takeIf(::isCanonicalUuidV4)
         ?.let { requestId ->
           val cancellation = AtomicBoolean(
-            state.getBoolean(LEGACY_BACKUP_SOURCE_CANCELLED_STATE, false),
+            state.getBoolean(LEGACY_BACKUP_SOURCE_CANCELLED_STATE, false) || state.getBoolean(CONTENT_SOURCE_STATE, false),
           )
           pendingLegacyBackupSource = PendingLegacyBackupSource(
             requestId,
             cancellation,
             restored = true,
+            content = state.getBoolean(CONTENT_SOURCE_STATE, false),
           )
           safSourceCancellations[requestId] = cancellation
           safPickerSlot.acquireRestored()
@@ -696,6 +699,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       outState.putBoolean(LOSSLESS_SOURCE_CANCELLED_STATE, pending.cancellation.get())
     }
     pendingLegacyBackupSource?.let { pending ->
+      outState.putBoolean(CONTENT_SOURCE_STATE, pending.content)
       outState.putString(LEGACY_BACKUP_SOURCE_REQUEST_STATE, pending.requestId)
       outState.putBoolean(LEGACY_BACKUP_SOURCE_CANCELLED_STATE, pending.cancellation.get())
     }
@@ -926,7 +930,12 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     }
 
     @JavascriptInterface
-    fun pickLegacyBackupSource(requestId: String) {
+    fun pickLegacyBackupSource(requestId: String) = pickDocumentSource(requestId, false)
+
+    @JavascriptInterface
+    fun pickContentSource(requestId: String) = pickDocumentSource(requestId, true)
+
+    private fun pickDocumentSource(requestId: String, content: Boolean) {
       if (!isCanonicalUuidV4(requestId)) return
       val cancellation = AtomicBoolean(false)
       safSourcePickFlow.begin(
@@ -934,20 +943,22 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         registerRequest = { safSourceCancellations.putIfAbsent(requestId, cancellation) == null },
         releaseSlot = safPickerSlot::release,
         dispatchBusy = {
-          dispatchLegacyBackupSourceBatch(
+          dispatchDocumentSourceBatch(
+            content,
             requestId,
             SafSpoolBatch(emptyList(), listOf(SafSpoolFailure("backup.bin", "source-busy"))),
           )
         },
         startPicker = {
-          pendingLegacyBackupSource = PendingLegacyBackupSource(requestId, cancellation)
+          pendingLegacyBackupSource = PendingLegacyBackupSource(requestId, cancellation, content = content)
           try {
             legacyBackupSourcePicker.launch(arrayOf("*/*"))
           } catch (error: Exception) {
             pendingLegacyBackupSource = null
             safSourceCancellations.remove(requestId, cancellation)
             safPickerSlot.release()
-            dispatchLegacyBackupSourceBatch(
+            dispatchDocumentSourceBatch(
+            content,
               requestId,
               SafSpoolBatch(
                 emptyList(),
@@ -1245,7 +1256,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
             }
           contentResolverSource(uri, displayName, totalBytes)
         }
-        if (!source.displayName.endsWith(".bin", ignoreCase = true)) {
+        if (!(if (pending.content) isNativeContentSource(source.displayName) else source.displayName.endsWith(".bin", ignoreCase = true))) {
           SafSpoolBatch(
             emptyList(),
             listOf(SafSpoolFailure(source.displayName, "unsupported-source")),
@@ -1303,14 +1314,17 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     }
     safPickerSlot.release()
     lifecycleWebView?.evaluateJavascript(
-      androidLegacyBackupSourceResultScript(pending.requestId, batch, pending.restored),
+      if (pending.content && pending.restored) androidSpoolBatchScript(pending.requestId,
+        SafSpoolBatch(emptyList(), listOf(SafSpoolFailure("content", "source-reselect-required"))))
+      else if (pending.content) androidContentSourcePickedScript(pending.requestId, batch)
+      else androidLegacyBackupSourceResultScript(pending.requestId, batch, pending.restored),
       null,
     )
   }
 
-  private fun dispatchLegacyBackupSourceBatch(requestId: String, batch: SafSpoolBatch) {
+  private fun dispatchDocumentSourceBatch(content: Boolean, requestId: String, batch: SafSpoolBatch) {
     lifecycleWebView?.evaluateJavascript(
-      androidLegacyBackupSourcePickedScript(requestId, batch),
+      if (content) androidContentSourcePickedScript(requestId, batch) else androidLegacyBackupSourcePickedScript(requestId, batch),
       null,
     )
   }
