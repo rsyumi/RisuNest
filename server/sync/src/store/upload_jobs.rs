@@ -14,6 +14,14 @@ impl Store {
         if state == "failed" {
             return Err(Error::new("upload-finalization-failed", 409));
         }
+        let delta: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM upload_deltas WHERE upload=?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        if delta {
+            return Ok(None);
+        }
         if size < 64 * 1024 * 1024 {
             drop(db);
             return self.finish_upload(device, id).map(Some);

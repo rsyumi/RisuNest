@@ -55,9 +55,13 @@ compression is rejected with 415; object Range offsets address identity bytes.
 | `POST /objects/pins`                         | Renew device-owned 24-hour leases for up to 1024 hashes                                                      |
 | `POST /uploads`                              | Begin `{hash,size}` manifest; returns `uploadId`                                                             |
 | `PUT /uploads/{id}/chunks/{index}`           | Exact 8 MiB chunk except final remainder; `X-Content-SHA256` required                                        |
-| `GET /uploads/{id}?after=INDEX`              | Paged verified chunk bitmap and completion status                                                            |
+| `GET /uploads/{id}?after=INDEX`              | Paged verified chunk bitmap and completion status; optional `wait=true` waits up to 20 seconds               |
 | `POST /uploads/{id}/complete`                | Below 64 MiB: verified CAS publication; otherwise durable 202 finalization job, resumed after restart        |
 | `DELETE /uploads/{id}`                       | Owner-scoped cancellation                                                                                    |
+| `PUT /uploads/{id}/delta`                    | Attach an exact `RNSL` file recipe and queue durable reconstruction (202)                                    |
+| `POST /objects/delta`                        | Queue a file delta for `{target,bases}`, returning a stable device-owned `jobId`                             |
+| `GET /object-deltas/{id}?wait=true`          | Delta bytes (200), explicit full-required (204), or pending (202); waits at most 20 seconds                  |
+| `DELETE /object-deltas/{id}`                 | Release or cancel this device's file-delta job                                                               |
 | `POST /staged-changes`                       | Single-page convenience staging                                                                              |
 | `POST /staged-changes/start`                 | Begin a multi-page staging set                                                                               |
 | `PUT /staged-changes/{id}/pages/{index}`     | Consecutive pages, identical-page retry, conflicting retry rejected                                          |
@@ -73,7 +77,6 @@ compression is rejected with 415; object Range offsets address identity bytes.
 | `POST /checkpoints`                          | Capture fixed record metadata                                                                                |
 | `GET /checkpoints/{id}`                      | Pages with optional `afterKey` and `limit`                                                                   |
 | `DELETE /checkpoints/{id}`                   | Release this device's checkpoint                                                                             |
-| `GET /scopes?scope=NAME`                     | Current generic keyspace version                                                                             |
 | `POST /acks`                                 | Monotonic per-device `{epoch,seq}`                                                                           |
 
 For unpinned `/changes`, supply `epoch`, `afterSeq`, `afterOrdinal`, `throughSeq`,
@@ -133,13 +136,25 @@ control rules. Rust/ECMAScript tests share exact UTF-8 golden vectors.
 - `RNSD` is a custom exact COPY/INSERT profile, not VCDIFF: ordered base IDs,
   checked offsets, exact base/target hashes and lengths, no output-copy chains.
   Current encoder/materializer limits: 4 bases, 32 MiB aggregate base bytes,
-  16 MiB target, 8 MiB patch, 262,144 operations. Larger objects use chunks/Range;
-  their small-change optimization remains an open gate.
+  16 MiB target, 8 MiB patch, 262,144 operations.
+- `RNSL` uses file IO for larger objects: 1 TiB target/aggregate bases, 4 bases,
+  8 MiB recipe, 262,144 operations, 64 KiB IO buffers. A sorted sparse anchor
+  index uses about 6 MiB for a 1 GiB base, bounded to about 262,144 entries.
+  Generation checks cancellation and a 120-second CPU/elapsed budget. Poor
+  matches or exhausted generation budget explicitly request full chunks/Range.
+  Every base and reconstructed target is verified in full. Private temporary
+  output is published only after verification. Upload reconstruction and download
+  recipe generation use separate durable workers and return 202 immediately.
+  Waiting requests have their own bounded slots so head/transfer requests remain
+  available. Recipe and base identities survive daemon restart.
 - Upload manifests: up to 1 TiB per object and per device's active uploads, 16
   concurrent manifests, 24-hour expiry, bounded 1024-entry bitmap pages.
 - Read pins: 16 per device; checkpoints: 2 per device; each expires after 24 hours.
-- Recipe cache: at most 64 MiB, one-hour entries, exact ordered bases; missing
-  bases require only the needed target's full transfer.
+- Small-recipe cache, queued upload recipes, and download recipes each have a
+  64 MiB cap. Download jobs expire after one hour (16 per device); upload recipes
+  follow their 24-hour manifests. Maintenance removes expired recipes and keeps
+  every active job's bases as GC roots. Missing bases require only the target's
+  full transfer.
 
 ## Retention and restore
 
@@ -206,8 +221,8 @@ parent. The large HTTP integration uses a multithread Tokio runtime matching
 the daemon. Windows single-thread client/server co-location stalled before
 request dispatch and is not used as a daemon performance measurement.
 
-On 2026-09-11, the standalone server suite passed 44 tests and the wire suite
-passed 16. The native PDS modules passed 335 tests, including two real TCP
+On 2026-09-11, the standalone server suite passed 45 tests and the wire suite
+passed 18. Both crates also passed Clippy with warnings denied. The native PDS modules passed 335 tests, including two real TCP
 replicas, both conflict choices, clear in both directions, parent deletion versus
 child edits, operation recovery, and backup corruption rejection. Settings,
 backup routing, and server facade/controller tests passed 88 cases; svelte-check
@@ -217,9 +232,16 @@ The real HTTP append gate passed at 1/127/128/129/1024/10000 existing messages.
 For 72 new bytes, total request-plus-response bytes (including headers) were
 14595–15263 for upload and 10240–10578 for download, each below D + 16 KiB.
 These debug timings and message-only results do not establish the remaining
-large-library CPU, RSS, latency, asset, owner-list, or 1 GiB small-edit gates.
-Large opaque objects above 16 MiB currently use resumable full chunks. Bounded
-client projection/apply, cache/orphan collection, Android foreground integration,
+large-library CPU, RSS, latency, asset, or owner-list gates.
+File-based delta is connected for opaque objects above 16 MiB. A 17 MiB file's
+22-byte insertion used 6,974 upload and 6,253 download HTTP bytes in the direct
+TCP integration test (2,343/2,408 ms, debug). The 1 GiB fixture passed too:
+22 inserted bytes used 8,530 upload and 7,630 download HTTP bytes, including
+long-poll requests, at 119,820/143,202 ms in the debug build. Both endpoints
+verify the whole result hash. This combined native-client/server test process
+had an observed peak working set of 68,096,000 bytes; that is not a separate
+daemon or four-transfer RSS measurement. The test counts at the accepted server
+socket, without a forwarding proxy. Bounded client projection/apply, cache/orphan collection, Android foreground integration,
 proxy fault scenarios and OS distribution validation remain in progress.
 Windows x86_64 is exercised locally; Linux/macOS and app-device combinations
 remain unverified. This is still an intermediate implementation.

@@ -30,10 +30,11 @@ pub struct Recipe {
 
 impl Recipe {
     pub fn validate(&self) -> Result<()> {
+        self.validate_limits(MAX_TARGET_BYTES as u64, MAX_BASE_BYTES as u64)
+    }
+    pub(crate) fn validate_limits(&self, max_target: u64, max_bases: u64) -> Result<()> {
         validate_hash(&self.target_hash)?;
-        if self.bases.len() > MAX_BASES
-            || self.target_size > MAX_TARGET_BYTES as u64
-            || self.ops.len() > MAX_OPS
+        if self.bases.len() > MAX_BASES || self.target_size > max_target || self.ops.len() > MAX_OPS
         {
             return Err(WireError("delta-limit"));
         }
@@ -46,7 +47,7 @@ impl Recipe {
                 return Err(WireError("duplicate-base"));
             }
         }
-        if sum > MAX_BASE_BYTES as u64 {
+        if sum > max_bases {
             return Err(WireError("delta-limit"));
         }
         let mut output = 0u64;
@@ -120,7 +121,10 @@ impl Recipe {
     }
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
-        let mut out = b"RNSD".to_vec();
+        self.encode_profile(b"RNSD")
+    }
+    pub(crate) fn encode_profile(&self, magic: &[u8; 4]) -> Result<Vec<u8>> {
+        let mut out = magic.to_vec();
         put_hash(&mut out, &self.target_hash);
         out.extend(self.target_size.to_be_bytes());
         out.push(self.bases.len() as u8);
@@ -153,11 +157,16 @@ impl Recipe {
         Ok(out)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let recipe = Self::decode_profile(bytes, b"RNSD")?;
+        recipe.validate()?;
+        Ok(recipe)
+    }
+    pub(crate) fn decode_profile(bytes: &[u8], magic: &[u8; 4]) -> Result<Self> {
         if bytes.len() > MAX_PATCH_BYTES {
             return Err(WireError("delta-limit"));
         }
         let mut input = bytes;
-        if take(&mut input, 4)? != b"RNSD" {
+        if take(&mut input, 4)? != magic {
             return Err(WireError("invalid-magic"));
         }
         let target_hash = get_hash(&mut input)?;
@@ -202,7 +211,6 @@ impl Recipe {
             target_size,
             ops,
         };
-        recipe.validate()?;
         Ok(recipe)
     }
 }

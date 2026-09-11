@@ -7,6 +7,7 @@ pub mod delta;
 pub mod descriptor;
 pub mod head;
 pub mod payload;
+pub mod stream_delta;
 pub mod transfer;
 
 pub use changes::*;

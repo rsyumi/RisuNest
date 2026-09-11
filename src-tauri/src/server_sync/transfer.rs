@@ -172,7 +172,7 @@ impl<'a> Transfer<'a> {
                     .stat_object(target)?
                     .ok_or_else(|| SyncError::new("cached-object-missing", 409))?;
                 if size > delta::MAX_TARGET_BYTES as u64 {
-                    self.upload_large(target, size)?;
+                    self.upload_large(target, size, base_candidates)?;
                     continue;
                 }
                 let bytes = self.cache.read(target, delta::MAX_TARGET_BYTES)?;
@@ -209,7 +209,7 @@ impl<'a> Transfer<'a> {
                 let length = match encoded {
                     Ok(bytes) => bytes.len() - 8,
                     Err(_) if size >= CHUNK as u64 => {
-                        self.upload_large(target, size)?;
+                        self.upload_large(target, size, base_candidates)?;
                         continue;
                     }
                     Err(e) => return Err(e.into()),
@@ -353,14 +353,212 @@ impl<'a> Transfer<'a> {
                         if hash != *target {
                             return Err(SyncError::new("transfer-target-mismatch", 502));
                         }
-                        self.download_large(target, size)?;
+                        if !self.download_delta(target, size, base_candidates)? {
+                            self.download_large(target, size)?;
+                        }
                     }
                 }
             }
         }
         Ok(())
     }
-    fn upload_large(&self, hash: &str, size: u64) -> Result<()> {
+    fn large_bases(&self, target: &str, size: u64, candidates: &[String]) -> Result<Vec<String>> {
+        let mut ranked = Vec::new();
+        for candidate in candidates {
+            if candidate == target {
+                continue;
+            }
+            if let Some(bytes) = self.cache.cas.stat_object(candidate)? {
+                if bytes > delta::MAX_TARGET_BYTES as u64
+                    && bytes <= risunest_sync_wire::stream_delta::MAX_FILE_BYTES
+                {
+                    ranked.push((candidate.clone(), bytes));
+                }
+            }
+        }
+        ranked.sort_by_key(|(_, bytes)| size.abs_diff(*bytes));
+        let mut total = 0;
+        let mut result = Vec::new();
+        for (digest, bytes) in ranked {
+            if result.contains(&digest)
+                || total + bytes > risunest_sync_wire::stream_delta::MAX_FILE_BYTES
+            {
+                continue;
+            }
+            total += bytes;
+            result.push(digest);
+            if result.len() == delta::MAX_BASES {
+                break;
+            }
+        }
+        Ok(result)
+    }
+    fn upload_delta(
+        &self,
+        id: &str,
+        target: &str,
+        size: u64,
+        candidates: &[String],
+    ) -> Result<bool> {
+        use risunest_sync_wire::{delta::Base, stream_delta, WireError};
+        let candidates = self.large_bases(target, size, candidates)?;
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+        let mut sources = candidates
+            .iter()
+            .map(|h| {
+                self.cache
+                    .cas
+                    .open_object(h)?
+                    .ok_or_else(|| SyncError::new("cached-object-missing", 409))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let identities = candidates
+            .iter()
+            .zip(&sources)
+            .map(|(hash, file)| {
+                Ok(Base {
+                    hash: hash.clone(),
+                    size: file.metadata()?.len(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut file = self
+            .cache
+            .cas
+            .open_object(target)?
+            .ok_or_else(|| SyncError::new("cached-object-missing", 409))?;
+        let started = std::time::Instant::now();
+        let recipe = stream_delta::create(
+            &mut sources,
+            &identities,
+            &mut file,
+            Base {
+                hash: target.into(),
+                size,
+            },
+            || {
+                self.client
+                    .ensure_active()
+                    .map_err(|_| WireError("cancelled"))?;
+                if started.elapsed() > std::time::Duration::from_secs(120) {
+                    return Err(WireError("delta-budget"));
+                }
+                Ok(())
+            },
+        );
+        let recipe = match recipe {
+            Ok(recipe) => recipe,
+            Err(WireError("delta-limit" | "delta-budget")) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        let reply = self.client.request(
+            Method::PUT,
+            &format!("uploads/{id}/delta"),
+            &[],
+            Some(stream_delta::encode(&recipe)?),
+            &[],
+            MAX_METADATA_BYTES,
+        )?;
+        match reply.status {
+            202 => Ok(true),
+            404 => Ok(false),
+            _ => Err(response_error(reply)),
+        }
+    }
+    fn download_delta(&self, target: &str, size: u64, candidates: &[String]) -> Result<bool> {
+        use risunest_sync_wire::{stream_delta, WireError};
+        if size <= delta::MAX_TARGET_BYTES as u64 {
+            return Ok(false);
+        }
+        let bases = self.large_bases(target, size, candidates)?;
+        if bases.is_empty() {
+            return Ok(false);
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Started {
+            job_id: String,
+        }
+        let (_, started): (_, Started) = self.client.json(
+            Method::POST,
+            "objects/delta",
+            &[],
+            Some(&serde_json::json!({"target":target,"bases":bases})),
+            &[],
+        )?;
+        risunest_sync_wire::validate_id(&started.job_id)?;
+        let path = format!("object-deltas/{}", started.job_id);
+        loop {
+            let reply = self.client.request(
+                Method::GET,
+                &path,
+                &[("wait", "true".into())],
+                None,
+                &[],
+                CHUNK,
+            )?;
+            match reply.status {
+                202 => continue,
+                204 => {
+                    self.client.request(
+                        Method::DELETE,
+                        &path,
+                        &[],
+                        None,
+                        &[],
+                        MAX_METADATA_BYTES,
+                    )?;
+                    return Ok(false);
+                }
+                200 => {
+                    let recipe = stream_delta::decode(&reply.body)?;
+                    if recipe.target_hash != target
+                        || recipe.target_size != size
+                        || recipe.bases.iter().any(|b| !bases.contains(&b.hash))
+                    {
+                        return Err(SyncError::new("transfer-target-mismatch", 502));
+                    }
+                    let mut sources = recipe
+                        .bases
+                        .iter()
+                        .map(|b| {
+                            self.cache
+                                .cas
+                                .open_object(&b.hash)?
+                                .ok_or_else(|| SyncError::new("cached-object-missing", 409))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let mut temporary =
+                        tempfile::NamedTempFile::new_in(self.cache.cas.repository_root())?;
+                    stream_delta::apply(&recipe, &mut sources, &mut temporary, || {
+                        self.client
+                            .ensure_active()
+                            .map_err(|_| WireError("cancelled"))
+                    })?;
+                    temporary.seek(SeekFrom::Start(0))?;
+                    self.cache
+                        .cas
+                        .prepare_reader_expected(&mut temporary, target, size)?;
+                    let released = self.client.request(
+                        Method::DELETE,
+                        &path,
+                        &[],
+                        None,
+                        &[],
+                        MAX_METADATA_BYTES,
+                    )?;
+                    if released.status != 204 {
+                        return Err(response_error(released));
+                    }
+                    return Ok(true);
+                }
+                _ => return Err(response_error(reply)),
+            }
+        }
+    }
+    fn upload_large(&self, hash: &str, size: u64, base_candidates: &[String]) -> Result<()> {
         let cached: Option<(String, String)> = self
             .db
             .query_row("SELECT id,size FROM uploads WHERE hash=?1", [hash], |r| {
@@ -444,6 +642,12 @@ impl<'a> Transfer<'a> {
             self.db.execute("INSERT INTO uploads VALUES(?1,?2,?3) ON CONFLICT(hash) DO UPDATE SET id=excluded.id,size=excluded.size",params![hash,started.upload_id,size.to_string()])?;
             started.upload_id
         };
+        if verified.is_empty()
+            && size > delta::MAX_TARGET_BYTES as u64
+            && self.upload_delta(&id, hash, size, base_candidates)?
+        {
+            return self.wait_upload(&id, hash, size);
+        }
         let mut file = self
             .cache
             .cas
@@ -493,9 +697,13 @@ impl<'a> Transfer<'a> {
     }
     fn wait_upload(&self, id: &str, hash: &str, size: u64) -> Result<()> {
         loop {
-            let (_, progress): (_, UploadProgress) =
-                self.client
-                    .json(Method::GET, &format!("uploads/{id}"), &[], None::<&()>, &[])?;
+            let (_, progress): (_, UploadProgress) = self.client.json(
+                Method::GET,
+                &format!("uploads/{id}"),
+                &[("wait", "true".into())],
+                None::<&()>,
+                &[],
+            )?;
             if progress.upload_id != id
                 || progress.manifest.hash != hash
                 || progress.manifest.size != Sequence::from(size)

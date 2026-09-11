@@ -73,6 +73,10 @@ impl Store {
         let mut db = self.db()?;
         let tx = db.transaction()?;
         let current = now()?;
+        tx.execute("DELETE FROM transfer_recipes WHERE expires<=?1", [current])?;
+        tx.execute("DELETE FROM download_deltas WHERE state!='working' AND (expires<=?1 OR device IN (SELECT id FROM devices WHERE revoked=1))", [current])?;
+        tx.execute("DELETE FROM upload_deltas WHERE upload IN (SELECT id FROM uploads WHERE state='complete')", [])?;
+        tx.execute("DELETE FROM upload_delta_bases WHERE upload IN (SELECT id FROM uploads WHERE state='complete')", [])?;
         tx.execute("INSERT OR IGNORE INTO staging_trash SELECT c.upload,c.ordinal FROM upload_chunks c JOIN uploads u ON c.upload=u.id WHERE u.state!='finalizing' AND (u.state='complete' OR u.expires<=?1 OR u.device IN (SELECT id FROM devices WHERE revoked=1))",[current])?;
         tx.execute("DELETE FROM upload_chunks WHERE (upload,ordinal) IN (SELECT upload,ordinal FROM staging_trash)",[])?;
         tx.execute("DELETE FROM uploads WHERE state!='finalizing' AND (expires<=?1 OR device IN (SELECT id FROM devices WHERE revoked=1))",[current])?;
@@ -106,6 +110,8 @@ impl Store {
         tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS gc_roots(hash TEXT PRIMARY KEY); DELETE FROM gc_roots;
             INSERT OR IGNORE INTO gc_roots SELECT hash FROM object_leases;
             INSERT OR IGNORE INTO gc_roots SELECT hash FROM uploads WHERE expires>unixepoch();
+            INSERT OR IGNORE INTO gc_roots SELECT hash FROM upload_delta_bases;
+            INSERT OR IGNORE INTO gc_roots SELECT hash FROM download_delta_bases;
             CREATE TEMP TABLE IF NOT EXISTS gc_versions(body TEXT); DELETE FROM gc_versions;
             INSERT INTO gc_versions SELECT version FROM records UNION ALL SELECT version FROM checkpoint_records;
             INSERT INTO gc_versions SELECT json_extract(body,'$.before') FROM changes UNION ALL SELECT json_extract(body,'$.after') FROM changes;
@@ -170,7 +176,7 @@ impl Store {
             &head.library_id,
             &head.epoch,
         ])?);
-        tx.execute_batch("DELETE FROM changes; DELETE FROM commits; DELETE FROM receipts; DELETE FROM commit_jobs; DELETE FROM staged_changes; DELETE FROM read_pins; DELETE FROM checkpoints; DELETE FROM uploads; DELETE FROM object_leases; DELETE FROM scope_versions; UPDATE devices SET ack='0';")?;
+        tx.execute_batch("DELETE FROM changes; DELETE FROM commits; DELETE FROM receipts; DELETE FROM commit_jobs; DELETE FROM staged_changes; DELETE FROM read_pins; DELETE FROM checkpoints; DELETE FROM uploads; DELETE FROM download_deltas; DELETE FROM transfer_recipes; DELETE FROM object_leases; DELETE FROM scope_versions; UPDATE devices SET ack='0';")?;
         tx.execute("UPDATE library SET head=?1", [json(&head)?])?;
         tx.commit()?;
         Ok(())

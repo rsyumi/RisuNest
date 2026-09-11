@@ -446,6 +446,28 @@ struct CountedSocket {
     socket: tokio::net::TcpStream,
     bytes: Arc<std::sync::atomic::AtomicU64>,
 }
+struct CountedListener {
+    listener: tokio::net::TcpListener,
+    bytes: Arc<std::sync::atomic::AtomicU64>,
+}
+impl axum::serve::Listener for CountedListener {
+    type Io = CountedSocket;
+    type Addr = std::net::SocketAddr;
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        let (socket, address) = self.listener.accept().await.unwrap();
+        socket.set_nodelay(true).unwrap();
+        (
+            CountedSocket {
+                socket,
+                bytes: self.bytes.clone(),
+            },
+            address,
+        )
+    }
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.listener.local_addr()
+    }
+}
 impl tokio::io::AsyncRead for CountedSocket {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
@@ -502,32 +524,17 @@ fn server_sync_message_append_total_http_bytes_gate() {
     let listener = runtime
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
         .unwrap();
-    let backend = listener.local_addr().unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let listener = CountedListener {
+        listener,
+        bytes: counter.clone(),
+    };
     let server_clone = server.clone();
     let task = runtime.spawn(async move {
         axum::serve(listener, http::router(server_clone))
             .await
             .unwrap();
-    });
-    let proxy = runtime
-        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-        .unwrap();
-    let endpoint = format!("http://{}", proxy.local_addr().unwrap());
-    let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let count = counter.clone();
-    let proxy_task = runtime.spawn(async move {
-        loop {
-            let (socket, _) = proxy.accept().await.unwrap();
-            let count = count.clone();
-            tokio::spawn(async move {
-                let mut source = CountedSocket {
-                    socket,
-                    bytes: count,
-                };
-                let mut target = tokio::net::TcpStream::connect(backend).await.unwrap();
-                let _ = tokio::io::copy_bidirectional(&mut source, &mut target).await;
-            });
-        }
     });
     let (_first_dir, mut first) = prepared();
     let (_second_dir, mut second) = prepared();
@@ -619,7 +626,147 @@ fn server_sync_message_append_total_http_bytes_gate() {
             d + 16 * 1024
         );
     }
-    proxy_task.abort();
+    task.abort();
+    runtime.shutdown_timeout(Duration::from_secs(2));
+}
+
+#[test]
+fn server_sync_large_opaque_file_delta_http_gate() {
+    large_opaque_file_http_gate(17 * 1024 * 1024);
+}
+#[test]
+#[ignore = "Explicit 1 GiB file delta HTTP traffic acceptance gate"]
+fn server_sync_gib_opaque_file_delta_http_gate() {
+    large_opaque_file_http_gate(1024 * 1024 * 1024);
+}
+fn large_opaque_file_http_gate(size: u64) {
+    use crate::server_sync::{cache::Cache, client::ServerClient, transfer::Transfer};
+    use std::io::{Read, Seek, SeekFrom};
+    let directory = tempfile::tempdir().unwrap();
+    let server = Arc::new(Store::init(directory.path()).unwrap());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let listener = CountedListener {
+        listener,
+        bytes: counter.clone(),
+    };
+    let server_clone = server.clone();
+    let task = runtime.spawn(async move {
+        axum::serve(listener, http::router(server_clone))
+            .await
+            .unwrap();
+    });
+    let credential = server.add_device().unwrap();
+    let client = ServerClient::new(ServerConfig {
+        endpoint,
+        library_id: credential.library_id,
+        device_id: credential.device_id,
+        token: credential.token,
+    })
+    .unwrap();
+    let first_dir = tempfile::tempdir().unwrap();
+    let second_dir = tempfile::tempdir().unwrap();
+    let first = Cache::open(first_dir.path()).unwrap();
+    let second = Cache::open(second_dir.path()).unwrap();
+    struct Synthetic {
+        left: u64,
+        state: u64,
+    }
+    impl Read for Synthetic {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            let n = bytes.len().min(self.left as usize);
+            for byte in &mut bytes[..n] {
+                self.state ^= self.state << 13;
+                self.state ^= self.state >> 7;
+                self.state ^= self.state << 17;
+                *byte = self.state as u8;
+            }
+            self.left -= n as u64;
+            Ok(n)
+        }
+    }
+    let base = first
+        .cas
+        .prepare_reader(&mut Synthetic {
+            left: size,
+            state: 97,
+        })
+        .unwrap();
+    let mut file = first.cas.open_object(&base.content_hash).unwrap().unwrap();
+    second
+        .cas
+        .prepare_reader_expected(&mut file, &base.content_hash, size)
+        .unwrap();
+    Transfer::new(&client, &first)
+        .unwrap()
+        .upload(std::slice::from_ref(&base.content_hash), &[])
+        .expect("initial full base upload");
+    let insertion = b"small opaque insertion";
+    let offset = size / 2 + 173;
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let suffix = first.cas.open_object(&base.content_hash).unwrap().unwrap();
+    let mut suffix = suffix;
+    suffix.seek(SeekFrom::Start(offset)).unwrap();
+    let mut changed = file
+        .take(offset)
+        .chain(std::io::Cursor::new(insertion))
+        .chain(suffix);
+    let target = first.cas.prepare_reader(&mut changed).unwrap();
+    counter.store(0, AtomicOrdering::Relaxed);
+    let started = std::time::Instant::now();
+    Transfer::new(&client, &first)
+        .unwrap()
+        .upload(
+            std::slice::from_ref(&target.content_hash),
+            std::slice::from_ref(&base.content_hash),
+        )
+        .expect("warm delta upload");
+    let upload = counter.swap(0, AtomicOrdering::Relaxed);
+    let upload_ms = started.elapsed().as_millis();
+    let started = std::time::Instant::now();
+    Transfer::new(&client, &second)
+        .unwrap()
+        .download(
+            std::slice::from_ref(&target.content_hash),
+            std::slice::from_ref(&base.content_hash),
+        )
+        .expect("warm delta download");
+    let download = counter.load(AtomicOrdering::Relaxed);
+    eprintln!("Opaque HTTP totals (file bytes, D, upload bidirectional bytes, download bidirectional bytes, upload ms, download ms): ({size}, {}, {upload}, {download}, {upload_ms}, {})",insertion.len(),started.elapsed().as_millis());
+    assert!(
+        upload <= insertion.len() as u64 + 16384,
+        "upload total {upload}"
+    );
+    assert!(
+        download <= insertion.len() as u64 + 16384,
+        "download total {download}"
+    );
+    assert_eq!(
+        second.cas.stat_object(&target.content_hash).unwrap(),
+        Some(size + insertion.len() as u64)
+    );
+    let mut downloaded = second
+        .cas
+        .open_object(&target.content_hash)
+        .unwrap()
+        .unwrap();
+    risunest_sync_wire::stream_delta::verify(
+        &mut downloaded,
+        &risunest_sync_wire::delta::Base {
+            hash: target.content_hash,
+            size: size + insertion.len() as u64,
+        },
+        &mut || Ok(()),
+    )
+    .unwrap();
     task.abort();
     runtime.shutdown_timeout(Duration::from_secs(2));
 }

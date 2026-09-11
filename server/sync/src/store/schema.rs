@@ -14,6 +14,10 @@ CREATE TABLE checkpoint_records(checkpoint TEXT NOT NULL REFERENCES checkpoints(
 CREATE TABLE uploads (id TEXT PRIMARY KEY,device TEXT NOT NULL REFERENCES devices(id),hash TEXT NOT NULL,size INTEGER NOT NULL,expires INTEGER NOT NULL,state TEXT NOT NULL DEFAULT 'open');
 CREATE INDEX uploads_device ON uploads(device);
 CREATE TABLE upload_jobs(upload TEXT PRIMARY KEY REFERENCES uploads(id) ON DELETE CASCADE,retry_after INTEGER NOT NULL DEFAULT 0,terminal INTEGER NOT NULL DEFAULT 0,error TEXT);
+CREATE TABLE upload_deltas(upload TEXT PRIMARY KEY REFERENCES uploads(id) ON DELETE CASCADE,body BLOB NOT NULL);
+CREATE TABLE upload_delta_bases(upload TEXT NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,hash TEXT NOT NULL,PRIMARY KEY(upload,hash));
+CREATE TABLE download_deltas(id TEXT PRIMARY KEY,device TEXT NOT NULL REFERENCES devices(id),request TEXT NOT NULL,expires INTEGER NOT NULL,state TEXT NOT NULL DEFAULT 'queued',body BLOB,error TEXT);
+CREATE TABLE download_delta_bases(job TEXT NOT NULL REFERENCES download_deltas(id) ON DELETE CASCADE,hash TEXT NOT NULL,PRIMARY KEY(job,hash));
 CREATE TABLE upload_chunks (upload TEXT NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,ordinal INTEGER NOT NULL,hash TEXT NOT NULL,size INTEGER NOT NULL,PRIMARY KEY(upload,ordinal));
 CREATE TABLE staging_trash(upload TEXT NOT NULL,ordinal INTEGER NOT NULL,PRIMARY KEY(upload,ordinal));
 CREATE TABLE reference_nodes (hash TEXT PRIMARY KEY REFERENCES objects(hash), kind TEXT NOT NULL, item_count INTEGER NOT NULL, tree_depth INTEGER NOT NULL, first_value TEXT NOT NULL, last_value TEXT NOT NULL);
@@ -49,5 +53,5 @@ CREATE TABLE changes (
  PRIMARY KEY(seq,ordinal)
 );
 CREATE INDEX changes_cursor ON changes(length(seq),seq,ordinal);
-PRAGMA user_version=4;
+PRAGMA user_version=5;
 "#;

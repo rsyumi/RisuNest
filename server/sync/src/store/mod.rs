@@ -11,6 +11,8 @@ mod objects;
 mod schema;
 mod scopes;
 mod staged;
+mod stream_transfers;
+pub use stream_transfers::DeltaProgress;
 mod transfers;
 mod upload_jobs;
 mod uploads;
@@ -36,6 +38,7 @@ pub struct Store {
     read_db: Mutex<Connection>,
     objects_gate: Mutex<()>,
     upload_job_gate: Mutex<()>,
+    download_job_gate: Mutex<()>,
     _owner: File,
 }
 
@@ -145,12 +148,16 @@ impl Store {
             objects::sync_directory(&root)?;
         } else {
             let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            if version != 4 {
+            if version != 5 {
                 return Err(Error::new("incompatible-store", 409));
             }
         }
         db.execute(
             "UPDATE uploads SET state=CASE WHEN id IN (SELECT upload FROM upload_jobs) THEN 'queued' ELSE 'open' END WHERE state='finalizing'",
+            [],
+        )?;
+        db.execute(
+            "UPDATE download_deltas SET state='queued' WHERE state='working'",
             [],
         )?;
         let read_db = Connection::open_with_flags(
@@ -164,6 +171,7 @@ impl Store {
             read_db: Mutex::new(read_db),
             objects_gate: Mutex::new(()),
             upload_job_gate: Mutex::new(()),
+            download_job_gate: Mutex::new(()),
             _owner: owner,
         };
         store

@@ -207,7 +207,12 @@ impl Store {
                 [id],
                 |r| r.get(0),
             )?;
-            if count as u64 != size.div_ceil(UPLOAD_CHUNK_BYTES) {
+            let delta: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM upload_deltas WHERE upload=?1)",
+                [id],
+                |r| r.get(0),
+            )?;
+            if !delta && count as u64 != size.div_ceil(UPLOAD_CHUNK_BYTES) {
                 return Err(Error::new("upload-incomplete", 409));
             }
             db.execute("UPDATE uploads SET state='finalizing' WHERE id=?1", [id])?;
@@ -215,38 +220,69 @@ impl Store {
         };
         let result = (|| {
             let mut temp = tempfile::NamedTempFile::new_in(self.root.join("staging"))?;
-            let mut full = Sha256::new();
-            let mut buffer = vec![0u8; 1024 * 1024];
-            let mut total = 0u64;
-            for index in 0..size.div_ceil(UPLOAD_CHUNK_BYTES) {
-                let (expected, expected_size): (String, i64) = self.reader()?.query_row(
-                    "SELECT hash,size FROM upload_chunks WHERE upload=?1 AND ordinal=?2",
-                    params![id, index as i64],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )?;
-                let mut file = File::open(self.chunk_path(id, index)?)?;
-                let mut chunk = Sha256::new();
-                let mut length = 0u64;
-                loop {
-                    let n = file.read(&mut buffer)?;
-                    if n == 0 {
-                        break;
+            let recipe: Option<Vec<u8>> = self
+                .reader()?
+                .query_row(
+                    "SELECT body FROM upload_deltas WHERE upload=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(bytes) = recipe {
+                let recipe = risunest_sync_wire::stream_delta::decode(&bytes)?;
+                let mut bases = recipe
+                    .bases
+                    .iter()
+                    .map(|b| self.open_object(&b.hash).map(|v| v.0))
+                    .collect::<Result<Vec<_>>>()?;
+                let mut checked = std::time::Instant::now() - std::time::Duration::from_secs(1);
+                risunest_sync_wire::stream_delta::apply(&recipe, &mut bases, &mut temp, || {
+                    if checked.elapsed() >= std::time::Duration::from_millis(100) {
+                        checked = std::time::Instant::now();
+                        let db = self
+                            .reader()
+                            .map_err(|_| risunest_sync_wire::WireError("delta-cancelled"))?;
+                        Self::upload_row(&db, device, id)
+                            .map_err(|_| risunest_sync_wire::WireError("delta-cancelled"))?;
                     }
-                    length += n as u64;
-                    if length > expected_size as u64 {
+                    Ok(())
+                })?;
+            } else {
+                let mut full = Sha256::new();
+                let mut buffer = vec![0u8; 1024 * 1024];
+                let mut total = 0u64;
+                for index in 0..size.div_ceil(UPLOAD_CHUNK_BYTES) {
+                    let (expected, expected_size): (String, i64) = self.reader()?.query_row(
+                        "SELECT hash,size FROM upload_chunks WHERE upload=?1 AND ordinal=?2",
+                        params![id, index as i64],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )?;
+                    let mut file = File::open(self.chunk_path(id, index)?)?;
+                    let mut chunk = Sha256::new();
+                    let mut length = 0u64;
+                    loop {
+                        let n = file.read(&mut buffer)?;
+                        if n == 0 {
+                            break;
+                        }
+                        length += n as u64;
+                        if length > expected_size as u64 {
+                            return Err(Error::new("corrupt-chunk", 503));
+                        }
+                        chunk.update(&buffer[..n]);
+                        full.update(&buffer[..n]);
+                        temp.write_all(&buffer[..n])?;
+                    }
+                    if length != expected_size as u64
+                        || format!("{:x}", chunk.finalize()) != expected
+                    {
                         return Err(Error::new("corrupt-chunk", 503));
                     }
-                    chunk.update(&buffer[..n]);
-                    full.update(&buffer[..n]);
-                    temp.write_all(&buffer[..n])?;
+                    total += length;
                 }
-                if length != expected_size as u64 || format!("{:x}", chunk.finalize()) != expected {
-                    return Err(Error::new("corrupt-chunk", 503));
+                if total != size || format!("{:x}", full.finalize()) != digest {
+                    return Err(Error::new("hash-mismatch", 400));
                 }
-                total += length;
-            }
-            if total != size || format!("{:x}", full.finalize()) != digest {
-                return Err(Error::new("hash-mismatch", 400));
             }
             temp.as_file().sync_all()?;
             let destination = self.object_path(&digest)?;

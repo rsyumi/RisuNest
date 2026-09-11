@@ -27,6 +27,7 @@ use tokio::sync::Semaphore;
 struct App {
     store: Arc<Store>,
     slots: Arc<Semaphore>,
+    wait_slots: Arc<Semaphore>,
     devices: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     _lifetime: Arc<()>,
 }
@@ -69,9 +70,25 @@ pub fn router(store: Arc<Store>) -> Router {
             }
         }
     });
+    let delta_alive = Arc::downgrade(&lifetime);
+    let delta_store = Arc::downgrade(&store);
+    tokio::spawn(async move {
+        while delta_alive.strong_count() > 0 {
+            let Some(store) = delta_store.upgrade() else {
+                break;
+            };
+            if !matches!(
+                blocking(move || store.run_pending_download_delta()).await,
+                Ok(true)
+            ) {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    });
     let app = App {
         store,
         slots: Arc::new(Semaphore::new(8)),
+        wait_slots: Arc::new(Semaphore::new(8)),
         devices: Arc::new(Mutex::new(HashMap::new())),
         _lifetime: lifetime,
     };
@@ -99,6 +116,12 @@ pub fn router(store: Arc<Store>) -> Router {
         .route("/uploads/{id}", get(upload_progress).delete(cancel_upload))
         .route("/uploads/{id}/chunks/{index}", put(upload_chunk))
         .route("/uploads/{id}/complete", post(finish_upload))
+        .route("/uploads/{id}/delta", put(upload_delta))
+        .route("/objects/delta", post(begin_download_delta))
+        .route(
+            "/object-deltas/{id}",
+            get(download_delta_progress).delete(release_download_delta),
+        )
         .route("/staged-changes", post(stage))
         .route("/staged-changes/start", post(begin_stage))
         .route(
@@ -159,6 +182,8 @@ async fn authorize(State(app): State<App>, request: Request, next: Next) -> Resp
                 .ok_or(Error::new("invalid-content-length", 400))?;
             let limit = if ["/uploads/batch", "/uploads/frames"].contains(&request.uri().path())
                 || request.uri().path().contains("/chunks/")
+                || (request.uri().path().starts_with("/uploads/")
+                    && request.uri().path().ends_with("/delta"))
             {
                 batch::MAX_BATCH_BYTES
             } else {
@@ -184,8 +209,12 @@ async fn authorize(State(app): State<App>, request: Request, next: Next) -> Resp
         let _device_permit = semaphore
             .try_acquire_owned()
             .map_err(|_| Error::new("device-busy", 429))?;
-        let _global_permit = app
-            .slots
+        // Waiting for a durable worker does not consume a transfer/head slot.
+        let is_wait = request.method() == axum::http::Method::GET
+            && (request.uri().path().starts_with("/object-deltas/")
+                || request.uri().path().starts_with("/uploads/"));
+        let slots = if is_wait { app.wait_slots } else { app.slots };
+        let _global_permit = slots
             .try_acquire_owned()
             .map_err(|_| Error::new("server-busy", 429))?;
         let mut request = request;
@@ -564,6 +593,7 @@ async fn begin_upload(
 #[serde(deny_unknown_fields)]
 struct UploadQuery {
     after: Option<u64>,
+    wait: Option<bool>,
 }
 async fn upload_progress(
     State(app): State<App>,
@@ -571,10 +601,17 @@ async fn upload_progress(
     Path(id): Path<String>,
     Query(query): Query<UploadQuery>,
 ) -> Result<Response> {
-    blocking(
-        move || Ok(Json(app.store.upload_progress(&device, &id, query.after)?).into_response()),
-    )
-    .await
+    let until = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let store = app.store.clone();
+        let device = device.clone();
+        let id = id.clone();
+        let progress = blocking(move || store.upload_progress(&device, &id, query.after)).await?;
+        if query.wait != Some(true) || !progress.finishing || tokio::time::Instant::now() >= until {
+            return Ok(Json(progress).into_response());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 async fn upload_chunk(
     State(app): State<App>,
@@ -759,4 +796,69 @@ async fn transfer_objects(
             .into_response())
     })
     .await
+}
+
+async fn upload_delta(
+    State(app): State<App>,
+    Extension(device): Extension<Device>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<StatusCode> {
+    blocking(move || app.store.attach_upload_delta(&device, &id, &body)).await?;
+    Ok(StatusCode::ACCEPTED)
+}
+async fn begin_download_delta(
+    State(app): State<App>,
+    Extension(device): Extension<Device>,
+    body: Bytes,
+) -> Result<Response> {
+    let request: crate::store::TransferRequest = canonical::decode(&body, MAX_METADATA_BYTES)?;
+    blocking(move || {
+        Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"jobId":app.store.begin_download_delta(&device,&request)?})),
+        )
+            .into_response())
+    })
+    .await
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WaitQuery {
+    wait: Option<bool>,
+}
+async fn download_delta_progress(
+    State(app): State<App>,
+    Extension(device): Extension<Device>,
+    Path(id): Path<String>,
+    Query(query): Query<WaitQuery>,
+) -> Result<Response> {
+    use crate::store::DeltaProgress;
+    let until = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let store = app.store.clone();
+        let device = device.clone();
+        let id = id.clone();
+        let progress = blocking(move || store.download_delta_progress(&device, &id)).await?;
+        match progress {
+            DeltaProgress::Ready(bytes) => {
+                return Ok(([("content-type", "application/octet-stream")], bytes).into_response())
+            }
+            DeltaProgress::FullRequired => return Ok(StatusCode::NO_CONTENT.into_response()),
+            DeltaProgress::Pending
+                if query.wait != Some(true) || tokio::time::Instant::now() >= until =>
+            {
+                return Ok(StatusCode::ACCEPTED.into_response())
+            }
+            DeltaProgress::Pending => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+}
+async fn release_download_delta(
+    State(app): State<App>,
+    Extension(device): Extension<Device>,
+    Path(id): Path<String>,
+) -> Result<StatusCode> {
+    blocking(move || app.store.release_download_delta(&device, &id)).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
