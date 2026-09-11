@@ -222,6 +222,14 @@ describe('device sync facade', () => {
         await expect(facade.status()).resolves.toEqual({ phase: 'error' })
     })
 
+    it('preserves local LAN discovery failure in source status', async () => {
+        const facade = createDeviceSyncFacade({
+            invoke: vi.fn(async () => ({ phase: 'error', latestError: 'lan-address-unavailable' })),
+            runtime: runtimeStub(),
+        })
+        await expect(facade.status()).resolves.toEqual({ phase: 'error', latestError: 'lan-address-unavailable' })
+    })
+
     it.each([
         ['registrationBlockedByActiveWork', 'registration-blocked-by-active-work'],
         ['sourceInUse', 'source-in-use'],
@@ -238,6 +246,7 @@ describe('device sync facade', () => {
         ['invalid-configuration', 'invalid-configuration'],
         ['port-unavailable', 'port-unavailable'],
         ['preparation-failed', 'preparation-failed'],
+        ['lan-address-unavailable', 'lan-address-unavailable'],
         ['transport-unavailable', 'transport-unavailable'],
         ['cleanup-failed', 'cleanup-failed'],
         ['state-unavailable', 'state-unavailable'],

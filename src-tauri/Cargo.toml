@@ -84,6 +84,7 @@ reqwest = { version = "0.11.16", features = ["blocking", "json"] }
 regex = "1.13.1"
 
 [target.'cfg(windows)'.dependencies]
+if-addrs = "0.14.0"
 webview2-com = "0.38.2"
 windows = { version = "0.61.3", features = ["Win32_System_Com"] }
 # Trust internal HTTPS endpoints whose CA is installed in the Windows store.
@@ -91,6 +92,9 @@ windows = { version = "0.61.3", features = ["Win32_System_Com"] }
 tauri-plugin-http = { version = "2.5.9", features = ["rustls-tls-native-roots"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_JobObjects",

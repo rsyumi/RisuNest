@@ -4015,9 +4015,9 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-// Discovers this device's private or link-local IPv4 by opening a UDP socket
-// toward a TEST-NET address; nothing is sent. Shared by every peer sync lane.
-// Android sources bind explicitly selected interfaces instead.
+// Shared by every peer sync lane. Windows enumerates active interfaces because
+// its internet route may use a public address while a separate LAN is connected.
+// Other platforms probe a TEST-NET route without sending anything.
 #[cfg(any(desktop, target_os = "android"))]
 #[cfg_attr(target_os = "android", allow(dead_code))]
 pub(crate) fn discover_lan_ipv4() -> Result<Ipv4Addr, PeerSyncError> {
@@ -4025,21 +4025,28 @@ pub(crate) fn discover_lan_ipv4() -> Result<Ipv4Addr, PeerSyncError> {
     if let Some(address) = DISCOVER_LAN_IPV4_OVERRIDE.with(std::cell::Cell::take) {
         return Ok(address);
     }
-    let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-    socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9))?;
-    match socket.local_addr()?.ip() {
-        std::net::IpAddr::V4(address) if address.is_private() || address.is_link_local() => {
-            Ok(address)
+    #[cfg(windows)]
+    {
+        super::windows_lan::discover()
+    }
+    #[cfg(not(windows))]
+    {
+        let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+        socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9))?;
+        match socket.local_addr()?.ip() {
+            std::net::IpAddr::V4(address) if address.is_private() || address.is_link_local() => {
+                Ok(address)
+            }
+            _ => Err(PeerSyncError::Validation(
+                "no private IPv4 LAN address is available".to_owned(),
+            )),
         }
-        _ => Err(PeerSyncError::Validation(
-            "no private IPv4 LAN address is available".to_owned(),
-        )),
     }
 }
 
 /// Picks this device's private (or, failing that, link-local) IPv4 from the
 /// interface list. Android sources bind an explicitly selected interface, so
-/// they enumerate instead of asking the routing table like `discover_lan_ipv4`.
+/// their selection is separate from the desktop's advertised-address policy.
 #[cfg(any(target_os = "android", test))]
 fn private_lan_address(candidates: impl IntoIterator<Item = std::net::IpAddr>) -> Option<Ipv4Addr> {
     let candidates = candidates.into_iter().collect::<Vec<_>>();
@@ -4182,6 +4189,17 @@ fn has_bare_authority_path(value: &str) -> bool {
 #[cfg(test)]
 mod endpoint_tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an active private IPv4 LAN interface on this machine"]
+    fn windows_lan_discovery_binds_without_a_peer() {
+        let address = discover_lan_ipv4().expect("discover an active LAN address");
+        assert!(address.is_private() || address.is_link_local());
+        let listener = std::net::TcpListener::bind((address, 0)).expect("bind LAN listener");
+        assert_eq!(listener.local_addr().unwrap().ip(), address);
+        eprintln!("LAN discovery and listener bind succeeded at {address}");
+    }
 
     #[test]
     fn address_selection_accepts_only_private_or_link_local_ipv4() {

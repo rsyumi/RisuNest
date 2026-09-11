@@ -1592,6 +1592,49 @@ fn available_port() -> u16 {
         .port()
 }
 
+#[cfg(windows)]
+#[test]
+#[ignore = "requires an active private IPv4 LAN interface on this machine"]
+fn windows_lan_sharing_starts_without_a_registered_peer() {
+    // Only the adapter list is real. All source data and registration state are
+    // synthetic, isolated in a temporary directory by host().
+    let (root, host) = host();
+    let state = DeviceSyncSourceState::new_for_test(
+        TransportPreparation {
+            host: Some(host),
+            events: Arc::new(Mutex::new(Vec::new())),
+        },
+        None,
+    );
+    let port = available_port();
+    state.prepare(&mut (), root.path(), DeviceSyncPrepareRequest {
+        method: DeviceSyncListenMethod::Lan,
+        fixed_port: port,
+        public_base_url: None,
+    }).unwrap();
+    let result = state.start(DeviceSyncLinkPermissions { read: true, bidirectional: false });
+    // Always release the listener, including before reporting a failed assert.
+    state.stop().unwrap();
+    let status = result.unwrap();
+    assert_eq!(status.phase, DeviceSyncSourcePhase::Running);
+    assert_eq!(status.latest_error, None);
+    let endpoint = url::Url::parse(status.endpoint.as_deref().unwrap()).unwrap();
+    let Some(url::Host::Ipv4(address)) = endpoint.host() else { panic!("expected IPv4 endpoint") };
+    assert!(address.is_private() || address.is_link_local());
+    assert_eq!(endpoint.port(), Some(port));
+    assert!(status.pairing_uri.is_some());
+    TcpListener::bind((address, port)).unwrap();
+    eprintln!("Synthetic sharing started and stopped without a peer on {address}");
+}
+
+#[test]
+fn local_lan_address_failure_has_a_distinct_wire_code() {
+    assert_eq!(
+        serde_json::to_value(super::super::shared_session::DeviceSyncErrorCategory::LanAddressUnavailable).unwrap(),
+        "lan-address-unavailable",
+    );
+}
+
 #[test]
 fn unified_lan_transport_uses_the_requested_fixed_port_and_releases_it_on_stop() {
     let (root, host) = host();

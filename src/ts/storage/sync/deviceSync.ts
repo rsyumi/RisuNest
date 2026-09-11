@@ -11,6 +11,7 @@ export type DeviceSyncErrorCode =
     | 'invalid-configuration'
     | 'port-unavailable'
     | 'preparation-failed'
+    | 'lan-address-unavailable'
     | 'transport-unavailable'
     | 'cleanup-failed'
     | 'state-unavailable'
@@ -36,6 +37,7 @@ const SHARED_SESSION_CODES = [
     'invalid-configuration',
     'port-unavailable',
     'preparation-failed',
+    'lan-address-unavailable',
     'transport-unavailable',
     'cleanup-failed',
     'state-unavailable',

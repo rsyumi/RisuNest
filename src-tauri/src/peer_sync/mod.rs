@@ -43,6 +43,8 @@ mod protocol;
 mod session;
 #[cfg(any(desktop, target_os = "android"))]
 pub(crate) mod shared_session;
+#[cfg(windows)]
+mod windows_lan;
 
 #[cfg(test)]
 mod delta_completion_tests;

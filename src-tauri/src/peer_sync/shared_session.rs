@@ -591,6 +591,7 @@ pub enum DeviceSyncErrorCategory {
     InvalidConfiguration,
     PortUnavailable,
     PreparationFailed,
+    LanAddressUnavailable,
     TransportUnavailable,
     CleanupFailed,
     StateUnavailable,
@@ -924,7 +925,7 @@ where
                 Some(address) => address,
                 None => super::lan::discover_lan_ipv4().map_err(|error| {
                     if let Ok(mut runtime) = self.runtime() {
-                        runtime.latest_error = Some(DeviceSyncErrorCategory::TransportUnavailable);
+                        runtime.latest_error = Some(DeviceSyncErrorCategory::LanAddressUnavailable);
                     }
                     error
                 })?,
@@ -1361,10 +1362,10 @@ where
     }
 
     #[cfg(test)]
-    pub(crate) fn new_for_test(preparation: P, lan_address: Ipv4Addr) -> Self {
+    pub(crate) fn new_for_test(preparation: P, lan_address: impl Into<Option<Ipv4Addr>>) -> Self {
         Self::new(
             preparation,
-            Some(lan_address),
+            lan_address.into(),
             Arc::new(UnavailableSharedPeerTunnelLauncher),
             Arc::new(SystemSharedPublicOriginVerifier),
         )
@@ -1512,7 +1513,7 @@ where
                 None => match super::lan::discover_lan_ipv4() {
                     Ok(address) => address,
                     Err(error) => {
-                        return self.fail(DeviceSyncErrorCategory::TransportUnavailable, error)
+                        return self.fail(DeviceSyncErrorCategory::LanAddressUnavailable, error)
                     }
                 },
             })

@@ -215,6 +215,7 @@
         if (is('delta-completion-retained')) return sync.work.deltaBlockedByRetained
         if (is('peer-outdated')) return sync.work.peerOutdated
         if (safeCode === 'port-unavailable') return sync.share.errorPortUnavailable
+        if (safeCode === 'lan-address-unavailable') return sync.share.errorLanAddressUnavailable
         if (safeCode === 'invalid-configuration') return sync.share.errorInvalidConfiguration
         if (safeCode === 'cleanup-failed') return sync.share.errorCleanupFailed
         if (safeCode === 'transport-unavailable') return sync.errorTransportUnavailable
