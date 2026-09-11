@@ -4,6 +4,9 @@ const state = vi.hoisted(() => ({
   native: true,
   ready: true,
   running: false,
+  available: undefined as undefined | (() => boolean),
+  revisionListener: undefined as undefined | (() => void),
+  scheduler: { resume: vi.fn(), suspend: vi.fn(), localCommit: vi.fn() },
   invoke: vi.fn(async () => "synthetic-backup-path"),
   restore: vi.fn(async () => {}),
   controller: {
@@ -38,11 +41,28 @@ vi.mock("./serverSync", async (original) => ({
 vi.mock("./serverSyncController", () => ({
   createServerSyncController: () => state.controller,
 }));
+vi.mock("./serverSyncScheduler", () => ({
+  createServerSyncScheduler: (
+    _controller: unknown,
+    options: { available(): boolean },
+  ) => {
+    state.available = options.available;
+    return state.scheduler;
+  },
+}));
+vi.mock("../persistentRevisionEvents", () => ({
+  subscribeLocalPersistentRevision: (listener: () => void) => {
+    state.revisionListener = listener;
+    return () => {};
+  },
+}));
 beforeEach(() => {
   vi.resetModules();
   vi.clearAllMocks();
   vi.useFakeTimers();
   state.native = true;
+  state.available = undefined;
+  state.revisionListener = undefined;
   state.ready = true;
   state.running = false;
   state.controller.canRestore.mockReturnValue(true);
@@ -77,7 +97,7 @@ describe("native server synchronization scheduling", () => {
     ).rejects.toMatchObject({ code: "resolve-pending-operation-first" });
     expect(state.restore).toHaveBeenCalledTimes(1);
   });
-  it("starts once after initialization and pauses transport when the app is hidden", async () => {
+  it("starts once after initialization and connects durable saves, visibility, and network signals", async () => {
     const listeners = new Map<string, EventListener>();
     vi.spyOn(document, "addEventListener").mockImplementation(
       (event, listener) => {
@@ -92,25 +112,29 @@ describe("native server synchronization scheduling", () => {
     const visibility = vi
       .spyOn(document, "visibilityState", "get")
       .mockReturnValue("visible");
-    vi.spyOn(navigator, "onLine", "get").mockReturnValue(true);
+    const online = vi.spyOn(navigator, "onLine", "get").mockReturnValue(true);
     const { startServerSync } = await import("./serverSyncProduction");
     startServerSync();
     startServerSync();
     await Promise.resolve();
     expect(state.controller.initialize).toHaveBeenCalledTimes(1);
-    expect(state.controller.synchronize).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(30_000);
-    expect(state.controller.synchronize).toHaveBeenCalledTimes(2);
+    expect(state.scheduler.resume).toHaveBeenCalledTimes(1);
+    expect(state.available!()).toBe(true);
+    state.revisionListener!();
+    expect(state.scheduler.localCommit).toHaveBeenCalledTimes(1);
     visibility.mockReturnValue("hidden");
-    state.running = true;
     listeners.get("visibilitychange")!(new Event("visibilitychange"));
-    expect(state.controller.suspend).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(30_000);
-    expect(state.controller.synchronize).toHaveBeenCalledTimes(2);
+    expect(state.scheduler.suspend).toHaveBeenCalledTimes(1);
+    expect(state.available!()).toBe(false);
     visibility.mockReturnValue("visible");
-    state.ready = false;
+    listeners.get("visibilitychange")!(new Event("visibilitychange"));
+    online.mockReturnValue(false);
+    listeners.get("offline")!(new Event("offline"));
+    expect(state.available!()).toBe(false);
+    expect(state.scheduler.suspend).toHaveBeenCalledTimes(2);
+    online.mockReturnValue(true);
     listeners.get("online")!(new Event("online"));
-    expect(state.controller.synchronize).toHaveBeenCalledTimes(2);
+    expect(state.scheduler.resume).toHaveBeenCalledTimes(3);
   });
   it("does not install a native scheduler in the browser build", async () => {
     state.native = false;
@@ -119,5 +143,6 @@ describe("native server synchronization scheduling", () => {
     startServerSync();
     expect(interval).not.toHaveBeenCalled();
     expect(state.controller.initialize).not.toHaveBeenCalled();
+    expect(state.available).toBeUndefined();
   });
 });

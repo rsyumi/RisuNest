@@ -33,6 +33,22 @@ function fixture() {
 }
 afterEach(() => vi.useRealTimers());
 describe("server sync controller", () => {
+  it("reports the last completed synchronization without replacing it on failure or conflict", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1000);
+    const { controller, facade } = fixture();
+    await controller.initialize();
+    expect(controller.snapshot().lastSuccessAt).toBeUndefined();
+    await controller.synchronize();
+    expect(controller.snapshot().lastSuccessAt).toBe(1000);
+    vi.setSystemTime(2000);
+    facade.cycle.mockRejectedValueOnce({ code: "server-unreachable" });
+    await controller.synchronize();
+    expect(controller.snapshot().lastSuccessAt).toBe(1000);
+    facade.cycle.mockResolvedValueOnce({ phase: "conflict", conflictCount: 1 });
+    await controller.synchronize();
+    expect(controller.snapshot().lastSuccessAt).toBe(1000);
+  });
   it("holds conflicts for an explicit choice and forwards the preview fence", async () => {
     const { controller, facade } = fixture();
     await controller.initialize();

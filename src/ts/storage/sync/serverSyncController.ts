@@ -13,6 +13,7 @@ export interface ServerSyncSnapshot {
   running: boolean;
   paused: boolean;
   error: string;
+  lastSuccessAt?: number;
 }
 export function createServerSyncController(facade: ServerSyncFacade) {
   let state: ServerSyncSnapshot = { running: false, paused: false, error: "" };
@@ -42,6 +43,7 @@ export function createServerSyncController(facade: ServerSyncFacade) {
         await new Promise<void>((resolve) => setTimeout(resolve, 300));
       }
       await refreshStatus();
+      if (state.result?.phase === "idle") state.lastSuccessAt = Date.now();
     } catch (cause) {
       state.error = serverSyncError(cause).code;
     } finally {
@@ -73,6 +75,7 @@ export function createServerSyncController(facade: ServerSyncFacade) {
     },
     async bind(config: ServerConfig): Promise<void> {
       state.status = await facade.bind(config);
+      state.lastSuccessAt = undefined;
       state.error = "";
       state.paused = false;
       publish();
@@ -80,6 +83,7 @@ export function createServerSyncController(facade: ServerSyncFacade) {
     async unbind(): Promise<void> {
       if (active) return;
       await facade.unbind();
+      state.lastSuccessAt = undefined;
       state.result = undefined;
       await refreshStatus();
     },
@@ -129,7 +133,11 @@ export function createServerSyncController(facade: ServerSyncFacade) {
           !state.status.registrationRequired &&
           !state.running &&
           !state.paused &&
-          state.error !== "epoch-reconciliation-required" &&
+          ![
+            "epoch-reconciliation-required",
+            "unauthorized",
+            "new-device-registration-required",
+          ].includes(state.error) &&
           state.result?.phase !== "conflict" &&
           !facade.needsRefresh(),
       ),

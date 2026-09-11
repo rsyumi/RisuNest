@@ -11,6 +11,8 @@ import {
   type ServerHead,
 } from "./serverSync";
 import { createServerSyncController } from "./serverSyncController";
+import { createServerSyncScheduler } from "./serverSyncScheduler";
+import { subscribeLocalPersistentRevision } from "../persistentRevisionEvents";
 
 let controller: ReturnType<typeof createServerSyncController> | undefined;
 export function getServerSyncController() {
@@ -58,20 +60,15 @@ export function startServerSync(): void {
   if (started || !isTauri) return;
   started = true;
   const controller = getServerSyncController();
-  const tick = (): void => {
-    if (
-      document.visibilityState !== "hidden" &&
-      navigator.onLine &&
-      controller.canAutoSync()
-    )
-      void controller.synchronize();
-  };
-  void controller.initialize().then(tick);
-  setInterval(tick, 30_000);
-  window.addEventListener("online", tick);
+  const scheduler = createServerSyncScheduler(controller, {
+    available: () => document.visibilityState !== "hidden" && navigator.onLine,
+  });
+  subscribeLocalPersistentRevision(() => scheduler.localCommit());
+  void controller.initialize().then(() => scheduler.resume());
+  window.addEventListener("online", () => scheduler.resume());
+  window.addEventListener("offline", () => scheduler.suspend());
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden" && controller.snapshot().running)
-      void controller.suspend();
-    else tick();
+    if (document.visibilityState === "hidden") scheduler.suspend();
+    else scheduler.resume();
   });
 }

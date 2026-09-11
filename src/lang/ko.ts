@@ -1692,6 +1692,7 @@ export const languageKorean = {
             refresh: '화면 새로고침',
             disconnected: '연결 안 됨',
             ready: '연결됨',
+            lastSuccess: '최근 동기화 성공',
             running: '동기화 중',
             paused: '일시 중지됨',
             pending: '동기화 완료 확인 중',

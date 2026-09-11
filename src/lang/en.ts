@@ -1879,6 +1879,7 @@ export const languageEnglish = {
             refresh: 'Refresh screen',
             disconnected: 'Not connected',
             ready: 'Connected',
+            lastSuccess: 'Last successful sync',
             running: 'Syncing',
             paused: 'Paused',
             pending: 'Finishing sync',

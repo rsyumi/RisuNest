@@ -159,6 +159,13 @@
       <p class="text-xs opacity-65">
         {text.deviceId}: {snapshot.status.deviceId}
       </p>
+      {#if snapshot.lastSuccessAt !== undefined}
+        <p class="text-xs opacity-65">
+          {text.lastSuccess}: {new Date(
+            snapshot.lastSuccessAt,
+          ).toLocaleString()}
+        </p>
+      {/if}
     </div>
     <div class="flex flex-wrap gap-2">
       <button
@@ -169,7 +176,7 @@
       >
       <button
         class="action border border-darkborderc hover:bg-selected"
-        disabled={!snapshot.running || refreshRequired}
+        disabled={connecting || snapshot.paused || refreshRequired}
         onclick={() => void controller.pause()}>{text.pause}</button
       >
       <button
