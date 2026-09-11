@@ -446,7 +446,10 @@ async fn chunk_upload_delta_download_checkpoint_and_durable_job_over_tcp() {
         .as_str()
         .unwrap()
         .to_owned();
-    for (index, chunk) in base.chunks(8 * 1024 * 1024).enumerate() {
+    for (index, chunk) in base
+        .chunks(risunest_sync_server::store::UPLOAD_CHUNK_BYTES as usize)
+        .enumerate()
+    {
         let response = s
             .auth(
                 s.client

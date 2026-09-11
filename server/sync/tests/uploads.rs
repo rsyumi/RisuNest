@@ -10,8 +10,9 @@ fn large_finalization_reservation_survives_restart_and_completes_exactly_once() 
     let store = Store::init(dir.path()).unwrap();
     let a = device(&store);
     let chunk = vec![0x93; UPLOAD_CHUNK_BYTES as usize];
+    let chunks = 64 * 1024 * 1024 / UPLOAD_CHUNK_BYTES;
     let mut whole = Sha256::new();
-    for _ in 0..8 {
+    for _ in 0..chunks {
         whole.update(&chunk);
     }
     let digest = format!("{:x}", whole.finalize());
@@ -20,7 +21,7 @@ fn large_finalization_reservation_survives_restart_and_completes_exactly_once() 
             &a,
             &UploadManifest {
                 hash: digest.clone(),
-                size: (8 * UPLOAD_CHUNK_BYTES).into(),
+                size: (chunks * UPLOAD_CHUNK_BYTES).into(),
             },
         )
         .unwrap();
@@ -28,7 +29,7 @@ fn large_finalization_reservation_survives_restart_and_completes_exactly_once() 
         store.submit_upload(&a, &id).unwrap_err().code,
         "upload-incomplete"
     );
-    for index in 0..8 {
+    for index in 0..chunks {
         store
             .put_upload_chunk(&a, &id, index, &hash(&chunk), &chunk)
             .unwrap();
@@ -56,11 +57,15 @@ fn large_finalization_reservation_survives_restart_and_completes_exactly_once() 
     assert_eq!(store.submit_upload(&a, &id).unwrap(), Some(digest.clone()));
     assert_eq!(
         store.object_size(&digest).unwrap(),
-        Some(8 * UPLOAD_CHUNK_BYTES)
+        Some(chunks * UPLOAD_CHUNK_BYTES)
     );
     assert_eq!(
         store
-            .read_object_range(&digest, 7 * UPLOAD_CHUNK_BYTES, UPLOAD_CHUNK_BYTES)
+            .read_object_range(
+                &digest,
+                (chunks - 1) * UPLOAD_CHUNK_BYTES,
+                UPLOAD_CHUNK_BYTES
+            )
             .unwrap(),
         chunk
     );
@@ -74,7 +79,7 @@ fn large_finalization_reservation_survives_restart_and_completes_exactly_once() 
     );
     assert_eq!(
         store.object_size(&digest).unwrap(),
-        Some(8 * UPLOAD_CHUNK_BYTES)
+        Some(chunks * UPLOAD_CHUNK_BYTES)
     );
 }
 

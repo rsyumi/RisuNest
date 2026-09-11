@@ -15,7 +15,7 @@ use std::{
     collections::BTreeSet,
     io::{Read, Seek, SeekFrom},
 };
-const CHUNK: usize = 8 * 1024 * 1024;
+const CHUNK: usize = transfer::UPLOAD_CHUNK_BYTES;
 
 /// Resume metadata contains only content identities and server staging IDs.
 /// Every resumed chunk lives in the verified cache CAS before its row is saved.
@@ -222,7 +222,13 @@ impl<'a> Transfer<'a> {
                     }
                     Err(e) => return Err(e.into()),
                 };
-                if used + length > CHUNK || materialized + size as usize > 32 * 1024 * 1024 {
+                if length + 8 > transfer::PREFERRED_BATCH_BYTES && matches!(frame, Frame::Full(_)) {
+                    self.upload_large(target, size, base_candidates)?;
+                    continue;
+                }
+                if used + length > transfer::PREFERRED_BATCH_BYTES
+                    || materialized + size as usize > 32 * 1024 * 1024
+                {
                     self.send_frames(&frames)?;
                     frames.clear();
                     used = 8;
@@ -327,7 +333,7 @@ impl<'a> Transfer<'a> {
                 &[],
                 Some(canonical::encode(&requests)?),
                 &[],
-                CHUNK,
+                risunest_sync_wire::batch::MAX_BATCH_BYTES,
             )?;
             if reply.status != 200 {
                 return Err(response_error(reply));
@@ -505,7 +511,7 @@ impl<'a> Transfer<'a> {
                 &[("wait", "true".into())],
                 None,
                 &[],
-                CHUNK,
+                risunest_sync_wire::batch::MAX_BATCH_BYTES,
             )?;
             match reply.status {
                 202 => continue,

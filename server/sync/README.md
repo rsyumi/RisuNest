@@ -49,7 +49,8 @@ Every route requires `Authorization: Bearer TOKEN` and
 `X-Risu-Library: LIBRARY_ID`, before reading request bodies. There are no HTTP
 administration routes. Limits are two active requests per device and eight total;
 streaming responses retain their slots until consumed or disconnected. Saturation
-returns 429 and `Retry-After: 1`. Body/handler timeout is 60 seconds. Request
+returns 429 and `Retry-After: 1`. Body/handler timeout is 60 seconds, or 110 seconds
+for bounded full/frame/recipe upload bodies. Request
 compression is rejected with 415; object Range offsets address identity bytes.
 
 | Endpoint                                     | Contract                                                                                                     |
@@ -65,7 +66,7 @@ compression is rejected with 415; object Range offsets address identity bytes.
 | `GET /objects/{hash}`                        | Bounded-memory stream, single Range/If-Range, ETag                                                           |
 | `POST /objects/pins`                         | Renew device-owned 24-hour leases for up to 1024 hashes                                                      |
 | `POST /uploads`                              | Begin `{hash,size}` manifest; returns `uploadId`                                                             |
-| `PUT /uploads/{id}/chunks/{index}`           | Exact 8 MiB chunk except final remainder; `X-Content-SHA256` required                                        |
+| `PUT /uploads/{id}/chunks/{index}`           | Exact 1 MiB chunk except final remainder; `X-Content-SHA256` required                                        |
 | `GET /uploads/{id}?after=INDEX`              | Paged verified chunk bitmap and completion status; optional `wait=true` waits up to 20 seconds               |
 | `POST /uploads/{id}/complete`                | Below 64 MiB: verified CAS publication; otherwise durable 202 finalization job, resumed after restart        |
 | `DELETE /uploads/{id}`                       | Owner-scoped cancellation                                                                                    |
@@ -143,6 +144,9 @@ control rules. Rust/ECMAScript tests share exact UTF-8 golden vectors.
 - Record descriptors: immutable bounded reference trees, up to 1,000,000
   references, depth 8, generic dependency/relation roots and up to 16 scopes.
 - Full `RNSF` batches: at most 8 MiB including framing, 1024 frames.
+- Native full batches prefer 1 MiB. Upload and resumed Range chunks are 1 MiB;
+  larger useful delta frames retain the 8 MiB wire ceiling. Native recipe/frame
+  requests have a 120-second deadline, ordinary requests 30 seconds.
 - Mixed `RNSB` batches: full, `RNSD` delta, or download-only full-required frames.
 - `RNSD` is a custom exact COPY/INSERT profile, not VCDIFF: ordered base IDs,
   checked offsets, exact base/target hashes and lengths, no output-copy chains.
@@ -252,8 +256,20 @@ long-poll requests, at 119,820/143,202 ms in the debug build. Both endpoints
 verify the whole result hash. This combined native-client/server test process
 had an observed peak working set of 68,096,000 bytes; that is not a separate
 daemon or four-transfer RSS measurement. The test counts at the accepted server
-socket, without a forwarding proxy. Bounded client projection/apply, cache/orphan collection, Android foreground integration,
-proxy fault scenarios and OS distribution validation remain in progress.
+socket, without a forwarding proxy. The 100,000-entry owner fixture passed a
+6-byte name edit at 15,322 upload / 10,925 download HTTP bytes. Its unresolved
+asset references do not establish a 100,000-unique-blob result.
+
+Native request retries after synthetic 413, 429 and 524 responses reuse verified
+chunks, including a chunk whose accepted response was lost. A 2 MiB + 17-byte
+full object round trip used 10 requests and 4,200,463/4,200,473 HTTP bytes under
+10 Mbps/80 ms and 1 Mbps/200 ms synthetic limits. Upload/download times were
+2,565/2,213 ms and 18,081/17,672 ms (debug). These are per-socket bandwidth caps
+and per-request injected delays, not measured Internet RTT, TLS or Tunnel tests.
+Received payloads are staged in a private SQLite database and applied one record
+at a time; temporary conflict-backup mirrors are removed after verification.
+Individual large JSON projection, cache/orphan collection, Android foreground
+integration and OS distribution validation remain in progress.
 Windows x86_64 is exercised locally; Linux/macOS and app-device combinations
 remain unverified. This is still an intermediate implementation.
 

@@ -141,6 +141,15 @@ impl ServerClient {
             .bearer_auth(&self.config.token)
             .header("x-risu-library", &self.config.library_id)
             .header("accept-encoding", "identity");
+        if path == "objects/transfer"
+            || path == "uploads/frames"
+            || path.starts_with("object-deltas/")
+            || (path.starts_with("uploads/") && path.ends_with("/delta"))
+        {
+            // Large recipes can approach 8 MiB. Include the 20-second job
+            // wait plus transfer time at 1 Mbps; ordinary chunks stay 1 MiB.
+            request = request.timeout(Duration::from_secs(120));
+        }
         for (name, value) in headers {
             request = request.header(*name, value);
         }

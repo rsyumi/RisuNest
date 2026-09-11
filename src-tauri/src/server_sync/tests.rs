@@ -5,6 +5,7 @@ use super::{
 };
 use risunest_sync_server::{http, store::Store};
 use std::sync::Arc;
+mod network;
 
 #[test]
 fn native_client_roundtrips_large_objects_and_exact_delta_against_daemon() {

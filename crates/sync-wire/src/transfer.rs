@@ -3,6 +3,10 @@ use crate::{
     delta::Recipe,
     hash, validate_hash, Result, WireError,
 };
+/// A full chunk takes about 8.4 seconds at 1 Mbps, leaving room for RTT and
+/// verification within request deadlines. The hard wire ceiling stays 8 MiB.
+pub const UPLOAD_CHUNK_BYTES: usize = 1024 * 1024;
+pub const PREFERRED_BATCH_BYTES: usize = 1024 * 1024;
 #[derive(Debug)]
 pub enum Frame {
     Full(Vec<u8>),

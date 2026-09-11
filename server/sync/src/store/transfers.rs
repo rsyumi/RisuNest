@@ -138,7 +138,7 @@ impl Store {
                     }
                 }
                 if matches!(frame, Frame::FullRequired { .. })
-                    && used + target.len() + 45 <= 8 * 1024 * 1024
+                    && used + target.len() + 45 <= transfer::PREFERRED_BATCH_BYTES
                 {
                     frame = Frame::Full(target);
                 }

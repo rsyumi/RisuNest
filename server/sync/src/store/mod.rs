@@ -148,7 +148,7 @@ impl Store {
             objects::sync_directory(&root)?;
         } else {
             let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            if version != 5 {
+            if version != 6 {
                 return Err(Error::new("incompatible-store", 409));
             }
         }

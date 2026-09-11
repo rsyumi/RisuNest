@@ -14,7 +14,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const UPLOAD_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+pub const UPLOAD_CHUNK_BYTES: u64 = risunest_sync_wire::transfer::UPLOAD_CHUNK_BYTES as u64;
 const MAX_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 pub(super) fn now() -> Result<i64> {
     Ok(SystemTime::now()

@@ -53,5 +53,5 @@ CREATE TABLE changes (
  PRIMARY KEY(seq,ordinal)
 );
 CREATE INDEX changes_cursor ON changes(length(seq),seq,ordinal);
-PRAGMA user_version=5;
+PRAGMA user_version=6;
 "#;

@@ -219,7 +219,15 @@ async fn authorize(State(app): State<App>, request: Request, next: Next) -> Resp
             .map_err(|_| Error::new("server-busy", 429))?;
         let mut request = request;
         request.extensions_mut().insert(device);
-        let mut response = tokio::time::timeout(Duration::from_secs(60), next.run(request))
+        let deadline = if matches!(request.uri().path(), "/uploads/frames" | "/uploads/batch")
+            || (request.uri().path().starts_with("/uploads/")
+                && request.uri().path().ends_with("/delta"))
+        {
+            110
+        } else {
+            60
+        };
+        let mut response = tokio::time::timeout(Duration::from_secs(deadline), next.run(request))
             .await
             .map_err(|_| Error::new("request-timeout", 408))?;
         response
