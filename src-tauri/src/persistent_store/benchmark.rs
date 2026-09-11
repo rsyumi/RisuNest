@@ -6,7 +6,7 @@ use rusqlite::{ffi, Connection};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{path::Path, time::Instant};
+use std::time::Instant;
 
 const NORMAL_CHARACTERS: usize = 500;
 const CHATS_PER_CHARACTER: usize = 10;
@@ -672,11 +672,12 @@ fn run_sample(database: &Value, root: &Value) -> Sample {
         .expect("create benchmark snapshot");
     let snapshot_us = elapsed_us(snapshot_started);
     assert!(snapshot.bytes > 0);
-    assert!(Path::new(&snapshot.path).is_file());
-    assert_eq!(
-        std::fs::metadata(&snapshot.path).unwrap().len(),
-        snapshot.bytes
-    );
+    assert!(store
+        .snapshot_list()
+        .unwrap()
+        .iter()
+        .any(|s| s.id == snapshot.id));
+    assert!(store.storage_stats().unwrap().snapshot_bytes > 0);
 
     Sample {
         import_us,
@@ -770,7 +771,11 @@ fn run_one_gib_diagnostic() -> OneGibDiagnostic {
                 .expect("create 1 GiB diagnostic snapshot");
             let command_duration_us = elapsed_us(started);
             assert!(snapshot.bytes >= 1024 * 1024 * 1024);
-            assert!(Path::new(&snapshot.path).is_file());
+            assert!(store
+                .snapshot_list()
+                .unwrap()
+                .iter()
+                .any(|s| s.id == snapshot.id));
             OneGibSample {
                 vacuum_duration_ms: snapshot.duration_ms,
                 command_duration_us,

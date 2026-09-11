@@ -8,13 +8,16 @@ const PERIODIC_SNAPSHOT_CHECK_INTERVAL_MS = 60 * 60 * 1000
 export type NativeCheckpointMode = 'passive' | 'truncate'
 
 export interface NativeSnapshotInfo {
-    path: string
+    id: string
+    reason: string
+    reclaimableBytes: number
     bytes: number
     modifiedAt: number
 }
 
 export interface NativeSnapshotCreated {
-    path: string
+    id: string
+    revision: number
     bytes: number
     durationMs: number
 }
@@ -25,6 +28,7 @@ export interface NativeStorageBytes {
 }
 
 export interface NativePersistentStorageStats {
+    snapshotBytes: number
     databaseBytes: number
     assetObjects: NativeStorageBytes
     assetAliases: NativeStorageAliasStats[]
@@ -87,20 +91,18 @@ interface NativeRestartBridge {
 }
 
 function nativeRestartBridge(): NativeRestartBridge | undefined {
-    return (window as Window & {
-        RisuLifecycleBridge?: NativeRestartBridge
-    }).RisuLifecycleBridge
+    return (
+        window as Window & {
+            RisuLifecycleBridge?: NativeRestartBridge
+        }
+    ).RisuLifecycleBridge
 }
 
-export async function checkpointNativePersistentStore(
-    mode: NativeCheckpointMode,
-): Promise<void> {
+export async function checkpointNativePersistentStore(mode: NativeCheckpointMode): Promise<void> {
     await invoke('pds_checkpoint', { mode })
 }
 
-export function createNativePersistentSnapshot(
-    reason: string,
-): Promise<NativeSnapshotCreated> {
+export function createNativePersistentSnapshot(reason: string): Promise<NativeSnapshotCreated> {
     return invoke('pds_snapshot_create', { reason })
 }
 
@@ -112,8 +114,8 @@ export function getNativePersistentStorageStats(): Promise<NativePersistentStora
     return invoke('pds_storage_stats')
 }
 
-export function deleteNativePersistentSnapshot(path: string): Promise<void> {
-    return invoke('pds_snapshot_delete', { path })
+export function deleteNativePersistentSnapshot(id: string): Promise<void> {
+    return invoke('pds_snapshot_delete', { id })
 }
 
 export function previewNativePersistentAssetGc(): Promise<NativeAssetGcResult> {
@@ -140,10 +142,8 @@ export function cleanupPeerTemp(): Promise<NativePeerTempUsage> {
     return invoke('peer_temp_cleanup')
 }
 
-export async function requestNativePersistentSnapshotRestore(
-    path: string,
-): Promise<void> {
-    await invoke('pds_snapshot_restore_request', { path })
+export async function requestNativePersistentSnapshotRestore(id: string): Promise<void> {
+    await invoke('pds_snapshot_restore_request', { id })
 }
 
 export async function restartNativeApp(): Promise<void> {
@@ -194,14 +194,14 @@ export async function restoreNativePersistentSnapshot(
         return false
     }
 
-    const path = await actions.choose(snapshots)
-    if (path === null) return false
-    if (!snapshots.some((snapshot) => snapshot.path === path)) {
+    const id = await actions.choose(snapshots)
+    if (id === null) return false
+    if (!snapshots.some((snapshot) => snapshot.id === id)) {
         throw new Error('Selected native snapshot is not available')
     }
-    if (!await actions.confirm()) return false
+    if (!(await actions.confirm())) return false
 
-    await requestNativePersistentSnapshotRestore(path)
+    await requestNativePersistentSnapshotRestore(id)
     await actions.restart()
     return true
 }

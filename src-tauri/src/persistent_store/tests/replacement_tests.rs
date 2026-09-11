@@ -19,8 +19,7 @@ fn replacements_snapshot_only_nonzero_revisions_and_abort_on_snapshot_failure() 
         .expect("activate protected replacement");
     let snapshots = store.snapshot_list().expect("list pre-replace snapshots");
     assert_eq!(snapshots.len(), 1);
-    let snapshot =
-        rusqlite::Connection::open(&snapshots[0].path).expect("open pre-replace snapshot");
+    let (_capture, snapshot) = reconstruct_snapshot(&store, &snapshots[0].id);
     let revision: String = snapshot
         .query_row(
             "SELECT value FROM meta WHERE key = 'currentRevision'",

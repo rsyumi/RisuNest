@@ -520,7 +520,7 @@ fn clone_backup_is_in_use(
     if desktop_clone_backup_job_is_active(app_root, backup) {
         return Ok(true);
     }
-    #[cfg(any(desktop, test))]
+    #[cfg(desktop)]
     {
         if root == app_root.join("peer-clone/activation/backups")
             && super::commands::retryable_target_operation_references_backup(

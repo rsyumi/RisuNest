@@ -25,6 +25,7 @@ import RisuNestStorageDashboard from './RisuNestStorageDashboard.svelte'
 import { languageKorean } from 'src/lang/ko'
 
 const stats = {
+    snapshotBytes: 2 * 1024 * 1024,
     databaseBytes: 1024 * 1024,
     assetObjects: { count: 2, bytes: 2 * 1024 * 1024 }, assetAliases: [{ kind: 'inlay', inlayType: null, count: 1, bytes: 1024 * 1024 }], coldAliases: { count: 0, bytes: 0 }, pluginStorage: { count: 1, bytes: 1024 },
     characters: { active: { count: 2, bytes: 0 }, trashedCount: 1 }, conversations: { count: 3, messageCount: 4 }, assetObjectDeletions: [],
@@ -42,7 +43,7 @@ describe('RisuNestStorageDashboard', () => {
 
     function setup(statsPromise: Promise<typeof stats> = Promise.resolve(stats)): HTMLElement {
         maintenance.getNativePersistentStorageStats.mockImplementation(() => statsPromise)
-        maintenance.listNativePersistentSnapshots.mockResolvedValue([{ path: 'snapshot.db', bytes: 1024, modifiedAt: 1 }])
+        maintenance.listNativePersistentSnapshots.mockResolvedValue([{ id: 'snapshot.db', reason: 'manual', reclaimableBytes: 0, bytes: 1024, modifiedAt: 1 }])
         maintenance.listPeerBackups.mockResolvedValue([{ path: 'peer.risudat', bytes: 2048, modifiedAt: 2 }])
         backups.list.mockResolvedValue([{ id: 'conflict', createdAt: 3, side: 'local', characterCount: 2, byteLength: 4096, scope: 'database-only' }])
         const target = document.createElement('div')
@@ -136,12 +137,14 @@ describe('RisuNestStorageDashboard', () => {
 
         const summaries = [...target.querySelectorAll<HTMLElement>('[data-storage-backup-list] > summary')]
         expect(summaries.map((summary) => summary.textContent?.replace(/\s+/g, ' ').trim())).toEqual([
-            'Snapshots (1 items · 1.0 KiB)',
+            'Snapshots (1 items · 2.0 MiB)',
             'Conflict backups (1 items · 4.0 KiB)',
             'Sync backups (1 items · 2.0 KiB)',
         ])
         const row = target.querySelector<HTMLElement>('[data-storage-backup-list] [data-storage-backup-row]')
         expect(row?.className).not.toContain('justify-between')
+        expect(row?.textContent).toContain('1.0 KiB')
+        expect(target.textContent).toContain('The total counts shared storage once.')
         expect(target.textContent).toContain('2 characters · 3 chats · 4 messages')
     })
 

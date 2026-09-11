@@ -825,6 +825,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(desktop)]
     fn the_clone_target_never_serializes_the_bearer() {
         let root = tempfile::tempdir().unwrap();
         register_incoming_source(root.path(), source(DevicePermissions::read())).unwrap();

@@ -300,7 +300,7 @@ fn snapshot_restore_without_newer_catalog_rows_leaves_objects_untracked() {
         )
         .expect("register post-snapshot object");
     store
-        .snapshot_restore_request(Path::new(&snapshot.path))
+        .snapshot_restore_request(&snapshot.id)
         .expect("request empty-catalog restore");
     drop(store);
 

@@ -147,8 +147,9 @@
 
     <details data-storage-backup-list class="mt-3">
         <summary class="cursor-pointer select-none py-1 text-textcolor">{language.risuNest.storage.snapshots}{#if state.snapshots.length > 0}{' '}<span class="text-sm text-textcolor2">({listSummary(state.snapshots.length, rollup.snapshotBytes)})</span>{/if}</summary>
+        <p class="ml-5 py-1 text-sm text-textcolor2">{language.risuNest.storage.snapshotSizeNote}</p>
         {#each state.snapshots as snapshot}
-            <div data-storage-backup-row class="ml-5 flex flex-wrap items-center gap-3 py-1 text-sm"><span class="min-w-0 break-words">{new Date(snapshot.modifiedAt).toLocaleString()} ({formatRisuNestStorageBytes(snapshot.bytes)})</span><button class={backupActionClass} disabled={isBusy(`delete-snapshot:${snapshot.path}`)} onclick={() => deleteSnapshot(snapshot.path)}>{isBusy(`delete-snapshot:${snapshot.path}`) ? language.loading : language.remove}</button></div>
+            <div data-storage-backup-row class="ml-5 flex flex-wrap items-center gap-3 py-1 text-sm"><span class="min-w-0 break-words">{new Date(snapshot.modifiedAt).toLocaleString()} ({formatRisuNestStorageBytes(snapshot.bytes)})</span><button class={backupActionClass} disabled={isBusy(`delete-snapshot:${snapshot.id}`)} onclick={() => deleteSnapshot(snapshot.id)}>{isBusy(`delete-snapshot:${snapshot.id}`) ? language.loading : language.remove}</button></div>
         {:else}
             <p class="ml-5 py-1 text-sm text-textcolor2">{language.risuNest.storage.emptyList}</p>
         {/each}

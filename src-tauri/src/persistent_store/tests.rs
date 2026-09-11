@@ -11,7 +11,7 @@ use rusqlite::{params, Connection, TransactionBehavior};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{self, OpenOptions},
+    fs,
     io::Read,
     path::{Path, PathBuf},
     sync::{
@@ -140,3 +140,15 @@ mod snapshot_lease_tests;
 mod storage_stats_tests;
 #[path = "tests/working_set_tests.rs"]
 mod working_set_tests;
+
+fn reconstruct_snapshot(store: &PersistentStore, id: &str) -> (tempfile::TempDir, Connection) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("reconstructed.db");
+    fs::write(&path, []).unwrap();
+    super::snapshot_archive::Archive::open(&store.snapshots_dir)
+        .unwrap()
+        .restore(id, &path)
+        .unwrap();
+    let connection = Connection::open(path).unwrap();
+    (directory, connection)
+}

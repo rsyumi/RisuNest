@@ -3,16 +3,14 @@ use super::owner_manifest_codec::{decode_owner_manifest, owner_manifest_identity
 use super::payload_cas::{PayloadCas, PreparedPayload};
 use crate::trust_boundary::is_lower_hex_256;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    io::{self, ErrorKind, Read, Write},
+    io::{self, ErrorKind, Read},
     path::{Path, PathBuf},
 };
 
 const MIGRATION_JOURNAL_VERSION: u32 = 1;
-const SNAPSHOT_ROOT_SIDECAR_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -468,116 +466,7 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct SnapshotAssetRootSidecar {
-    pub version: u32,
-    pub snapshot_file: String,
-    pub revision: i64,
-    pub roots: AssetRootSet,
-    pub content_hash: String,
-}
-
-pub fn snapshot_asset_root_sidecar_path(snapshot_path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.asset-roots.json", snapshot_path.display()))
-}
-
-pub fn write_snapshot_asset_root_sidecar(
-    snapshot_path: &Path,
-    revision: i64,
-    roots: &AssetRootSet,
-) -> io::Result<PathBuf> {
-    if revision < 0 {
-        return invalid_data("snapshot revision must be nonnegative");
-    }
-    validate_root_set(roots)?;
-    let snapshot_file = snapshot_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "snapshot file name is invalid"))?
-        .to_owned();
-    let unsigned = SnapshotSidecarPayload {
-        version: SNAPSHOT_ROOT_SIDECAR_VERSION,
-        snapshot_file: snapshot_file.clone(),
-        revision,
-        roots: roots.clone(),
-    };
-    let unsigned_bytes = serde_json::to_vec(&unsigned).map_err(json_error)?;
-    let sidecar = SnapshotAssetRootSidecar {
-        version: SNAPSHOT_ROOT_SIDECAR_VERSION,
-        snapshot_file,
-        revision,
-        roots: roots.clone(),
-        content_hash: hex::encode(Sha256::digest(&unsigned_bytes)),
-    };
-    let bytes = serde_json::to_vec(&sidecar).map_err(json_error)?;
-    let sidecar_path = snapshot_asset_root_sidecar_path(snapshot_path);
-    let temporary_path = PathBuf::from(format!(
-        "{}.{}.tmp",
-        sidecar_path.display(),
-        uuid::Uuid::new_v4()
-    ));
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary_path)?;
-        file.write_all(&bytes)?;
-        file.flush()?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temporary_path, &sidecar_path)?;
-        Ok(sidecar_path.clone())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary_path);
-    }
-    result
-}
-
-pub fn read_snapshot_asset_root_sidecar(
-    snapshot_path: &Path,
-) -> io::Result<SnapshotAssetRootSidecar> {
-    let sidecar_path = snapshot_asset_root_sidecar_path(snapshot_path);
-    let bytes = fs::read(sidecar_path)?;
-    let sidecar: SnapshotAssetRootSidecar = serde_json::from_slice(&bytes).map_err(json_error)?;
-    if sidecar.version != SNAPSHOT_ROOT_SIDECAR_VERSION {
-        return invalid_data("unsupported snapshot asset-root sidecar version");
-    }
-    let expected_snapshot_file = snapshot_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "snapshot file name is invalid"))?;
-    if sidecar.snapshot_file != expected_snapshot_file {
-        return invalid_data("snapshot asset-root sidecar names a different snapshot");
-    }
-    if sidecar.revision < 0 {
-        return invalid_data("snapshot revision must be nonnegative");
-    }
-    validate_root_set(&sidecar.roots)?;
-    validate_hash(&sidecar.content_hash, "snapshot sidecar content hash")?;
-    let unsigned = SnapshotSidecarPayload {
-        version: sidecar.version,
-        snapshot_file: sidecar.snapshot_file.clone(),
-        revision: sidecar.revision,
-        roots: sidecar.roots.clone(),
-    };
-    let unsigned_bytes = serde_json::to_vec(&unsigned).map_err(json_error)?;
-    let actual_hash = hex::encode(Sha256::digest(&unsigned_bytes));
-    if sidecar.content_hash != actual_hash {
-        return invalid_data("snapshot asset-root sidecar checksum mismatch");
-    }
-    Ok(sidecar)
-}
-
-#[derive(Serialize)]
-struct SnapshotSidecarPayload {
-    version: u32,
-    snapshot_file: String,
-    revision: i64,
-    roots: AssetRootSet,
-}
-
-fn validate_root_set(roots: &AssetRootSet) -> io::Result<()> {
+pub(crate) fn validate_root_set(roots: &AssetRootSet) -> io::Result<()> {
     for hash in roots.manifest_hashes.iter().chain(&roots.object_hashes) {
         validate_hash(hash, "asset root hash")?;
     }
@@ -721,9 +610,8 @@ pub fn dry_run_mark_and_sweep(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_staged_migration_roots, dry_run_mark_and_sweep, read_snapshot_asset_root_sidecar,
-        snapshot_asset_root_sidecar_path, write_snapshot_asset_root_sidecar, AssetGcCandidate,
-        AssetRootSet, MigrationPayloadKind, StagedAssetMigration,
+        collect_staged_migration_roots, dry_run_mark_and_sweep, AssetGcCandidate, AssetRootSet,
+        MigrationPayloadKind, StagedAssetMigration,
     };
     use crate::asset_repository::owner_manifest_codec::{
         encode_owner_manifest, OwnerManifestEntry,
@@ -860,53 +748,13 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_asset_root_sidecar_round_trips_sorted_roots_and_rejects_corruption() {
-        let directory = tempfile::tempdir().expect("temporary snapshots");
-        let snapshot = directory.path().join("persistent-test.db");
-        std::fs::write(&snapshot, b"sqlite").unwrap();
-        let mut roots = AssetRootSet::default();
-        roots.manifest_hashes.insert("b".repeat(64));
-        roots.manifest_hashes.insert("a".repeat(64));
-        roots.object_hashes.insert("c".repeat(64));
-        roots
-            .legacy_asset_keys
-            .insert("assets/exact.bin".to_owned());
-        roots.inlay_ids.insert("inlay-id".to_owned());
-        roots.cold_keys.insert("cold-id".to_owned());
-        roots.blockers.insert("plugin-storage-opaque".to_owned());
-
-        let sidecar_path = write_snapshot_asset_root_sidecar(&snapshot, 9, &roots).unwrap();
-        assert_eq!(sidecar_path, snapshot_asset_root_sidecar_path(&snapshot));
-        let sidecar = read_snapshot_asset_root_sidecar(&snapshot).unwrap();
-        assert_eq!(sidecar.snapshot_file, "persistent-test.db");
-        assert_eq!(sidecar.revision, 9);
-        assert_eq!(sidecar.roots, roots);
-        assert_eq!(sidecar.content_hash.len(), 64);
-
-        let mut bytes = std::fs::read(&sidecar_path).unwrap();
-        let index = bytes.iter().position(|byte| *byte == b'c').unwrap();
-        bytes[index] = b'd';
-        std::fs::write(&sidecar_path, bytes).unwrap();
-        let error = read_snapshot_asset_root_sidecar(&snapshot)
-            .expect_err("corrupt sidecar must fail closed");
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn legacy_opaque_snapshot_blockers_retain_every_catalog_candidate() {
+    fn opaque_snapshot_blockers_retain_every_catalog_candidate() {
         let directory = tempfile::tempdir().expect("temporary repository");
         let cas = PayloadCas::new(directory.path()).expect("open payload CAS");
-        let candidate = cas.prepare_bytes(b"legacy-sidecar-candidate").unwrap();
-        let snapshot = directory.path().join("persistent-legacy.db");
-        std::fs::write(&snapshot, b"sqlite").unwrap();
+        let candidate = cas.prepare_bytes(b"opaque-snapshot-candidate").unwrap();
         let mut roots = AssetRootSet::default();
         roots.blockers.insert("plugin-storage-opaque".to_owned());
         roots.blockers.insert("cold-payload-unscanned".to_owned());
-        let sidecar_path = write_snapshot_asset_root_sidecar(&snapshot, 8, &roots).unwrap();
-        let encoded = std::fs::read_to_string(sidecar_path).unwrap();
-        assert!(!encoded.contains("retain_all_objects"));
-        let legacy_roots = read_snapshot_asset_root_sidecar(&snapshot).unwrap().roots;
-
         let report = dry_run_mark_and_sweep(
             &cas,
             [AssetGcCandidate {
@@ -914,7 +762,7 @@ mod tests {
                 byte_size: candidate.byte_size,
                 created_at_ms: 0,
             }],
-            [legacy_roots],
+            [roots],
             100,
             10,
         )

@@ -55,8 +55,8 @@ describe('native persistent maintenance', () => {
     })
 
     it('maps snapshot operations to native persistent store commands', async () => {
-        const created = { path: 'snapshot-1.db', bytes: 1024, durationMs: 8 }
-        const snapshots = [{ path: 'snapshot-1.db', bytes: 1024, modifiedAt: 123 }]
+        const created = { id: 'ab18b8a5-f45c-46ba-bbf9-74b2cae87717', bytes: 1024, durationMs: 8 }
+        const snapshots = [{ id: 'ab18b8a5-f45c-46ba-bbf9-74b2cae87717', bytes: 1024, modifiedAt: 123 }]
         mocks.invoke
             .mockResolvedValueOnce(created)
             .mockResolvedValueOnce(snapshots)
@@ -64,12 +64,12 @@ describe('native persistent maintenance', () => {
 
         await expect(createNativePersistentSnapshot('periodic')).resolves.toEqual(created)
         await expect(listNativePersistentSnapshots()).resolves.toEqual(snapshots)
-        await requestNativePersistentSnapshotRestore('snapshot-1.db')
+        await requestNativePersistentSnapshotRestore('ab18b8a5-f45c-46ba-bbf9-74b2cae87717')
 
         expect(mocks.invoke.mock.calls).toEqual([
             ['pds_snapshot_create', { reason: 'periodic' }],
             ['pds_snapshot_list'],
-            ['pds_snapshot_restore_request', { path: 'snapshot-1.db' }],
+            ['pds_snapshot_restore_request', { id: 'ab18b8a5-f45c-46ba-bbf9-74b2cae87717' }],
         ])
     })
 
@@ -78,7 +78,7 @@ describe('native persistent maintenance', () => {
         mocks.invoke.mockResolvedValue({})
 
         await getNativePersistentStorageStats()
-        await deleteNativePersistentSnapshot(path)
+        await deleteNativePersistentSnapshot('ab18b8a5-f45c-46ba-bbf9-74b2cae87717')
         await previewNativePersistentAssetGc()
         await executeNativePersistentAssetGc()
         await listPeerBackups()
@@ -88,7 +88,7 @@ describe('native persistent maintenance', () => {
 
         expect(mocks.invoke.mock.calls).toEqual([
             ['pds_storage_stats'],
-            ['pds_snapshot_delete', { path }],
+            ['pds_snapshot_delete', { id: 'ab18b8a5-f45c-46ba-bbf9-74b2cae87717' }],
             ['pds_asset_gc_preview'],
             ['pds_asset_gc_execute'],
             ['peer_backup_list'],
@@ -99,9 +99,18 @@ describe('native persistent maintenance', () => {
     })
 
     it('recognizes only the safe serialized peer-backup delete errors', () => {
-        expect(isNativePeerBackupDeleteError({ code: 'peer-backup-in-use' })).toEqual({ code: 'peer-backup-in-use' })
-        expect(isNativePeerBackupDeleteError({ code: 'peer-backup-delete-failed' })).toEqual({ code: 'peer-backup-delete-failed' })
-        expect(isNativePeerBackupDeleteError({ code: 'peer-backup-in-use', message: 'raw native text' })).toBeNull()
+        expect(isNativePeerBackupDeleteError({ code: 'peer-backup-in-use' })).toEqual({
+            code: 'peer-backup-in-use',
+        })
+        expect(isNativePeerBackupDeleteError({ code: 'peer-backup-delete-failed' })).toEqual({
+            code: 'peer-backup-delete-failed',
+        })
+        expect(
+            isNativePeerBackupDeleteError({
+                code: 'peer-backup-in-use',
+                message: 'raw native text',
+            }),
+        ).toBeNull()
         expect(isNativePeerBackupDeleteError({ code: 'other' })).toBeNull()
     })
 
@@ -125,10 +134,7 @@ describe('native persistent maintenance', () => {
             expect(result).toEqual(due ? created : null)
             expect(mocks.invoke.mock.calls).toEqual(
                 due
-                    ? [
-                          ['pds_snapshot_list'],
-                          ['pds_snapshot_create', { reason: 'periodic' }],
-                      ]
+                    ? [['pds_snapshot_list'], ['pds_snapshot_create', { reason: 'periodic' }]]
                     : [['pds_snapshot_list']],
             )
         },
@@ -180,9 +186,7 @@ describe('native persistent maintenance', () => {
     it('re-checks hourly so long sessions still create periodic snapshots', async () => {
         vi.useFakeTimers()
         vi.stubGlobal('requestIdleCallback', undefined)
-        mocks.invoke.mockResolvedValue([
-            { path: 'recent.db', bytes: 1, modifiedAt: Date.now() },
-        ])
+        mocks.invoke.mockResolvedValue([{ path: 'recent.db', bytes: 1, modifiedAt: Date.now() }])
 
         schedulePeriodicNativeSnapshot()
         await vi.advanceTimersByTimeAsync(0)
@@ -201,16 +205,14 @@ describe('native persistent maintenance', () => {
         }
         mocks.invoke.mockResolvedValueOnce([])
 
-        await expect(restoreNativePersistentSnapshot(actions)).resolves.toBe(
-            false,
-        )
+        await expect(restoreNativePersistentSnapshot(actions)).resolves.toBe(false)
 
         expect(actions.onEmpty).toHaveBeenCalledOnce()
         expect(actions.choose).not.toHaveBeenCalled()
     })
 
     it('stops when snapshot choice or confirmation is cancelled', async () => {
-        const snapshot = { path: 'snapshot.db', bytes: 1, modifiedAt: 2 }
+        const snapshot = { id: 'snapshot.db', bytes: 1, modifiedAt: 2 }
         const baseActions = {
             restart: vi.fn(),
             onEmpty: vi.fn(),
@@ -229,22 +231,17 @@ describe('native persistent maintenance', () => {
         await expect(
             restoreNativePersistentSnapshot({
                 ...baseActions,
-                choose: vi.fn().mockResolvedValue(snapshot.path),
+                choose: vi.fn().mockResolvedValue(snapshot.id),
                 confirm: vi.fn().mockResolvedValue(false),
             }),
         ).resolves.toBe(false)
 
-        expect(mocks.invoke.mock.calls).toEqual([
-            ['pds_snapshot_list'],
-            ['pds_snapshot_list'],
-        ])
+        expect(mocks.invoke.mock.calls).toEqual([['pds_snapshot_list'], ['pds_snapshot_list']])
         expect(baseActions.restart).not.toHaveBeenCalled()
     })
 
     it('rejects a path outside the returned snapshot list', async () => {
-        mocks.invoke.mockResolvedValueOnce([
-            { path: 'allowed.db', bytes: 1, modifiedAt: 2 },
-        ])
+        mocks.invoke.mockResolvedValueOnce([{ path: 'allowed.db', bytes: 1, modifiedAt: 2 }])
 
         await expect(
             restoreNativePersistentSnapshot({
@@ -260,7 +257,7 @@ describe('native persistent maintenance', () => {
 
     it('confirms, writes the restore marker, and only then restarts', async () => {
         const order: string[] = []
-        const snapshot = { path: 'snapshot.db', bytes: 1, modifiedAt: 2 }
+        const snapshot = { id: 'snapshot.db', bytes: 1, modifiedAt: 2 }
         mocks.invoke.mockImplementation(async (command: string) => {
             order.push(command)
             return command === 'pds_snapshot_list' ? [snapshot] : undefined
@@ -270,7 +267,7 @@ describe('native persistent maintenance', () => {
             restoreNativePersistentSnapshot({
                 choose: async () => {
                     order.push('choose')
-                    return snapshot.path
+                    return snapshot.id
                 },
                 confirm: async () => {
                     order.push('confirm')
@@ -296,7 +293,7 @@ describe('native persistent maintenance', () => {
         const requestError = new Error('marker failed')
         const restart = vi.fn()
         mocks.invoke
-            .mockResolvedValueOnce([{ path: 'snapshot.db', bytes: 1, modifiedAt: 2 }])
+            .mockResolvedValueOnce([{ id: 'snapshot.db', bytes: 1, modifiedAt: 2 }])
             .mockRejectedValueOnce(requestError)
 
         await expect(

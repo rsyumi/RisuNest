@@ -113,19 +113,25 @@ use std::{
     collections::BTreeMap,
     io::Cursor,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
 };
 
+#[cfg(desktop)]
+use std::sync::atomic::AtomicUsize;
+
+#[cfg(desktop)]
 static REVERSE_CLEANUP_TEST_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+#[cfg(desktop)]
 struct FakeReverseProcess {
     attempts: Arc<AtomicUsize>,
     fail_through_attempt: usize,
 }
 
+#[cfg(desktop)]
 impl ReverseTunnelProcess for FakeReverseProcess {
     fn stop(&mut self) -> Result<(), PeerSyncError> {
         let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
@@ -139,6 +145,7 @@ impl ReverseTunnelProcess for FakeReverseProcess {
     }
 }
 
+#[cfg(desktop)]
 fn fake_reverse_owner(
     attempts: &Arc<AtomicUsize>,
     fail_through_attempt: usize,
@@ -11012,6 +11019,7 @@ fn private_lan_durable_credential_remains_complete() {
 }
 
 #[test]
+#[cfg(desktop)]
 fn reverse_cleanup_failure_retains_exact_owner_and_retry_completes_without_remote_apply() {
     let _serial = REVERSE_CLEANUP_TEST_MUTEX.lock().unwrap();
     let (directory, cas, mut store, remote, credential) = disjoint_target_fixture();
@@ -11098,6 +11106,7 @@ fn reverse_cleanup_failure_retains_exact_owner_and_retry_completes_without_remot
 }
 
 #[test]
+#[cfg(desktop)]
 fn reverse_remote_error_and_cancellation_preserve_primary_and_local_commit() {
     let _serial = REVERSE_CLEANUP_TEST_MUTEX.lock().unwrap();
     let directory = tempfile::tempdir().unwrap();
@@ -11141,6 +11150,7 @@ fn reverse_remote_error_and_cancellation_preserve_primary_and_local_commit() {
 }
 
 #[test]
+#[cfg(desktop)]
 fn reverse_cleanup_rejects_cross_operation_retry_and_app_exit_attempts_owner() {
     let _serial = REVERSE_CLEANUP_TEST_MUTEX.lock().unwrap();
     let operation_id = "123e4567-e89b-42d3-a456-426614174182";
@@ -11166,6 +11176,7 @@ fn reverse_cleanup_rejects_cross_operation_retry_and_app_exit_attempts_owner() {
 }
 
 #[test]
+#[cfg(desktop)]
 fn receipt_store_failure_still_retains_and_retries_exact_reverse_cleanup() {
     let _serial = REVERSE_CLEANUP_TEST_MUTEX.lock().unwrap();
     let (directory, cas, mut store, remote, credential) = disjoint_target_fixture();

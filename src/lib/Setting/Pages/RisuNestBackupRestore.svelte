@@ -81,7 +81,7 @@
                 choose: async (snapshots) => {
                     const labels = snapshots.map((snapshot) => `${new Date(snapshot.modifiedAt).toLocaleString()} (${snapshot.bytes / (1024 * 1024) >= 1 ? `${(snapshot.bytes / (1024 * 1024)).toFixed(1)} MiB` : `${Math.max(1, Math.round(snapshot.bytes / 1024))} KiB`})`)
                     const selected = Number(await alertSelect([...labels, language.cancel], language.chooseLocalSnapshot))
-                    return snapshots[selected]?.path ?? null
+                    return snapshots[selected]?.id ?? null
                 },
                 confirm: () => alertConfirm(language.restoreLocalSnapshotConfirm),
                 restart: restartNativeApp,

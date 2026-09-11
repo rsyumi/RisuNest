@@ -1,3 +1,4 @@
+use super::super::snapshot_archive::Archive;
 use super::*;
 
 #[test]
@@ -32,7 +33,11 @@ fn snapshots_create_list_and_restore_on_reopen() {
     let snapshot = store
         .snapshot_create("contract-test")
         .expect("create snapshot");
-    assert!(std::path::Path::new(&snapshot.path).is_file());
+    assert!(store
+        .snapshot_list()
+        .unwrap()
+        .iter()
+        .any(|s| s.id == snapshot.id));
     assert!(snapshot.bytes > 0);
     assert_eq!(store.snapshot_list().expect("list snapshots").len(), 1);
 
@@ -43,7 +48,7 @@ fn snapshots_create_list_and_restore_on_reopen() {
         })
         .expect("change database after snapshot");
     store
-        .snapshot_restore_request(std::path::Path::new(&snapshot.path))
+        .snapshot_restore_request(&snapshot.id)
         .expect("request snapshot restore");
     drop(store);
 
@@ -55,11 +60,18 @@ fn snapshots_create_list_and_restore_on_reopen() {
             .expect("materialize restored data"),
         database
     );
-    assert!(std::path::Path::new(&snapshot.path).is_file());
-    assert!(!directory
-        .path()
-        .join("persistent/snapshots/pending-restore.json")
-        .exists());
+    assert!(restored
+        .snapshot_list()
+        .unwrap()
+        .iter()
+        .any(|s| s.id == snapshot.id));
+    assert_eq!(
+        Archive::open(&restored.snapshots_dir)
+            .unwrap()
+            .pending_restore()
+            .unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -71,125 +83,75 @@ fn source_preservation_snapshot_keeps_invalid_json_and_retains_objects() {
         .unwrap();
     assert!(store.materialize(None).is_err());
     let snapshot = store.snapshot_create("preserve-invalid-json").unwrap();
-    let connection = rusqlite::Connection::open(&snapshot.path).unwrap();
+    let (_capture, connection) = reconstruct_snapshot(&store, &snapshot.id);
     let value: String = connection
         .query_row("SELECT value FROM root LIMIT 1", [], |row| row.get(0))
         .unwrap();
     assert_eq!(value, "synthetic invalid JSON");
-    let sidecar = crate::asset_repository::migration_gc::read_snapshot_asset_root_sidecar(
-        std::path::Path::new(&snapshot.path),
-    )
-    .unwrap();
-    assert!(sidecar.roots.retain_all_objects);
+    let metadata = Archive::open(&store.snapshots_dir)
+        .unwrap()
+        .metadata(&snapshot.id)
+        .unwrap();
+    assert!(metadata.roots.retain_all_objects);
     assert!(store.materialize(None).is_err());
 }
 
 #[test]
-fn snapshot_delete_requires_a_listed_top_level_snapshot_and_removes_its_sidecar() {
-    let (directory, store, _) = open_fixture();
-    let created = store
-        .snapshot_create("delete-test")
-        .expect("create snapshot");
-    let snapshot = std::path::PathBuf::from(&created.path);
-    let sidecar =
-        crate::asset_repository::migration_gc::snapshot_asset_root_sidecar_path(&snapshot);
-    assert!(sidecar.is_file());
-
-    store
-        .snapshot_delete(&snapshot)
-        .expect("delete listed snapshot");
-    assert!(!snapshot.exists());
-    assert!(!sidecar.exists());
-
-    let nested = directory
-        .path()
-        .join("persistent/snapshots/nested/not-a-snapshot.db");
-    std::fs::create_dir_all(nested.parent().expect("nested parent")).expect("create nested parent");
-    std::fs::write(&nested, b"not a snapshot").expect("write nested file");
-    assert!(store.snapshot_delete(&nested).is_err());
+fn snapshot_delete_requires_a_listed_id_and_removes_its_roots() {
+    let (_directory, store, _) = open_fixture();
+    let created = store.snapshot_create("delete-test").unwrap();
+    store.snapshot_delete(&created.id).unwrap();
+    assert!(store.snapshot_list().unwrap().is_empty());
+    assert!(Archive::open(&store.snapshots_dir)
+        .unwrap()
+        .roots()
+        .unwrap()
+        .is_empty());
+    assert!(store.snapshot_delete("../not-a-snapshot.db").is_err());
+    assert!(store
+        .snapshot_restore_request("../not-a-snapshot.db")
+        .is_err());
+    assert!(store.snapshot_delete(&created.id).is_err());
 }
 
 #[test]
 fn snapshot_delete_rejects_a_pending_restore_target_without_removing_it() {
-    let (directory, store, _) = open_fixture();
-    let created = store
-        .snapshot_create("pending-delete")
-        .expect("create snapshot");
-    let snapshot = std::path::PathBuf::from(&created.path);
-    store
-        .snapshot_restore_request(&snapshot)
-        .expect("request pending restore");
-
-    let error = store
-        .snapshot_delete(&snapshot)
-        .expect_err("pending restore target must not be deleted");
-
+    let (_directory, store, _) = open_fixture();
+    let created = store.snapshot_create("pending-delete").unwrap();
+    store.snapshot_restore_request(&created.id).unwrap();
+    let error = store.snapshot_delete(&created.id).unwrap_err();
     assert!(error.to_string().contains("pending restore"));
-    assert!(snapshot.is_file());
-    assert!(directory
-        .path()
-        .join("persistent/snapshots/pending-restore.json")
-        .is_file());
-}
-
-#[cfg(unix)]
-#[test]
-fn snapshot_list_and_restore_reject_linked_candidates() {
-    let (directory, store, _) = open_fixture();
-    let external = directory.path().join("external-snapshot.db");
-    std::fs::write(&external, b"external snapshot").expect("write external candidate");
-    let linked = directory
-        .path()
-        .join("persistent/snapshots/linked-snapshot.db");
-    std::os::unix::fs::symlink(&external, &linked).expect("create snapshot symlink");
-
-    assert!(store
-        .snapshot_list()
-        .expect("list snapshots")
-        .iter()
-        .all(|snapshot| snapshot.path != linked.to_string_lossy()));
-    assert!(store.snapshot_restore_request(&linked).is_err());
+    assert_eq!(store.snapshot_list().unwrap().len(), 1);
     assert_eq!(
-        std::fs::read(&external).expect("read external candidate"),
-        b"external snapshot"
+        Archive::open(&store.snapshots_dir)
+            .unwrap()
+            .pending_restore()
+            .unwrap()
+            .as_deref(),
+        Some(created.id.as_str())
     );
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 #[test]
-fn snapshot_list_and_restore_reject_file_symlink_candidates() {
+fn snapshot_archive_rejects_linked_database() {
     let (directory, store, _) = open_fixture();
-    let external = directory.path().join("external-snapshot.db");
-    std::fs::write(&external, b"external snapshot").expect("write external candidate");
-    let linked = directory
-        .path()
-        .join("persistent/snapshots/linked-snapshot.db");
+    let external = directory.path().join("external.sqlite");
+    fs::write(&external, b"external synthetic bytes").unwrap();
+    let linked = store.snapshots_dir.join("snapshots.sqlite");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&external, &linked).unwrap();
+    #[cfg(windows)]
     match std::os::windows::fs::symlink_file(&external, &linked) {
-        Ok(()) => {}
+        Ok(()) => (),
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            eprintln!(
-                "Windows denied file symlink creation, so linked snapshot integration coverage is unavailable: {error}"
-            );
-            assert!(!snapshot::snapshot_path_is_link_or_reparse(&external)
-                .expect("inspect regular snapshot candidate"));
+            eprintln!("Windows symlink integration unavailable: {error}");
             return;
         }
-        Err(error) => panic!("create snapshot file symlink: {error}"),
+        Err(error) => panic!("create symlink: {error}"),
     }
-
-    assert!(snapshot::snapshot_path_is_link_or_reparse(&linked)
-        .expect("inspect linked snapshot candidate"));
-
-    assert!(store
-        .snapshot_list()
-        .expect("list snapshots")
-        .iter()
-        .all(|snapshot| snapshot.path != linked.to_string_lossy()));
-    assert!(store.snapshot_restore_request(&linked).is_err());
-    assert_eq!(
-        std::fs::read(&external).expect("read external candidate"),
-        b"external snapshot"
-    );
+    assert!(store.snapshot_list().is_err());
+    assert_eq!(fs::read(&external).unwrap(), b"external synthetic bytes");
 }
 
 #[test]
@@ -263,42 +225,36 @@ fn snapshot_creation_persists_asset_roots_before_returning() {
         .unwrap();
 
     let snapshot = store.snapshot_create("asset-roots").unwrap();
-    let sidecar = crate::asset_repository::migration_gc::read_snapshot_asset_root_sidecar(
-        Path::new(&snapshot.path),
-    )
-    .expect("read snapshot asset-root sidecar");
+    let metadata = Archive::open(&store.snapshots_dir)
+        .unwrap()
+        .metadata(&snapshot.id)
+        .unwrap();
 
-    assert_eq!(sidecar.revision, 1);
-    assert_eq!(sidecar.roots.manifest_hashes, [manifest_hash].into());
+    assert_eq!(metadata.revision, 1);
+    assert_eq!(metadata.roots.manifest_hashes, [manifest_hash].into());
     assert_eq!(
-        sidecar.roots.object_hashes,
+        metadata.roots.object_hashes,
         [object_hash, cold_object_hash].into()
     );
     assert_eq!(
-        sidecar.roots.legacy_asset_keys,
+        metadata.roots.legacy_asset_keys,
         [
             "assets/exact.bin".to_owned(),
             "assets/missing.bin".to_owned()
         ]
         .into()
     );
-    assert_eq!(sidecar.roots.inlay_ids, ["kept-inlay".to_owned()].into());
-    assert_eq!(sidecar.roots.cold_keys, ["cold-chat".to_owned()].into());
+    assert_eq!(metadata.roots.inlay_ids, ["kept-inlay".to_owned()].into());
+    assert_eq!(metadata.roots.cold_keys, ["cold-chat".to_owned()].into());
     assert_eq!(
-        sidecar.roots.blockers,
+        metadata.roots.blockers,
         [
             "cold-payload-unscanned".to_owned(),
             "plugin-storage-opaque".to_owned()
         ]
         .into()
     );
-    assert!(sidecar.roots.retain_all_objects);
-    assert!(
-        crate::asset_repository::migration_gc::snapshot_asset_root_sidecar_path(Path::new(
-            &snapshot.path
-        ))
-        .is_file()
-    );
+    assert!(metadata.roots.retain_all_objects);
     drop(directory);
 }
 
@@ -1110,115 +1066,184 @@ fn dropping_store_with_active_lease_reopens_latest_state_and_truncates_recovered
     );
 }
 
-fn sparse_snapshot(path: &Path, bytes: u64) {
-    let file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)
-        .expect("create sparse snapshot");
-    file.set_len(bytes).expect("size sparse snapshot");
-    thread::sleep(Duration::from_millis(10));
-}
-
 #[test]
 fn ninth_snapshot_removes_the_oldest_and_leaves_eight() {
-    let directory = tempfile::tempdir().expect("create temporary directory");
-    let store = PersistentStore::open(directory.path()).expect("open persistent store");
-    let mut created = Vec::new();
-
+    let (_directory, store, _) = open_fixture();
+    let mut ids = Vec::new();
     for index in 0..9 {
-        created.push(
+        ids.push(
             store
                 .snapshot_create(&format!("rotation-{index}"))
-                .expect("create rotating snapshot")
-                .path,
+                .unwrap()
+                .id,
         );
         thread::sleep(Duration::from_millis(10));
     }
-
-    let listed = store.snapshot_list().expect("list rotated snapshots");
+    let listed = store.snapshot_list().unwrap();
     assert_eq!(listed.len(), 8);
-    assert!(!Path::new(&created[0]).exists());
-    assert!(
-        !crate::asset_repository::migration_gc::snapshot_asset_root_sidecar_path(Path::new(
-            &created[0]
-        ))
-        .exists()
-    );
-    assert!(created[1..].iter().all(|path| Path::new(path).is_file()));
-    assert!(created[1..].iter().all(|path| {
-        crate::asset_repository::migration_gc::snapshot_asset_root_sidecar_path(Path::new(path))
-            .is_file()
-    }));
+    assert!(!listed.iter().any(|s| s.id == ids[0]));
+    for id in &ids[1..] {
+        let (_capture, db) = reconstruct_snapshot(&store, id);
+        assert_eq!(
+            db.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+    }
 }
 
 #[test]
-fn byte_rotation_uses_the_512_mib_floor_and_removes_oldest_first() {
-    const MIB: u64 = 1024 * 1024;
-    let directory = tempfile::tempdir().expect("create temporary directory");
-    let store = PersistentStore::open(directory.path()).expect("open persistent store");
-    let snapshots = snapshots_dir(&directory);
-    let mut sparse = Vec::new();
-    for index in 0..6 {
-        let path = snapshots.join(format!("persistent-sparse-{index}.db"));
-        sparse_snapshot(&path, 100 * MIB);
-        sparse.push(path);
-    }
-
-    let created = store
-        .snapshot_create("floor-rotation")
-        .expect("create snapshot and rotate");
-    let listed = store.snapshot_list().expect("list floor-rotated snapshots");
-    let total: u64 = listed.iter().map(|snapshot| snapshot.bytes).sum();
-
-    assert!(total <= 512 * MIB);
-    assert!(!sparse[0].exists());
-    assert!(sparse[1..].iter().all(|path| path.is_file()));
-    assert!(Path::new(&created.path).is_file());
+fn byte_rotation_counts_shared_storage_and_preserves_pending_and_newest() {
+    let (_directory, store, _) = open_fixture();
+    let target = store.snapshot_create("target").unwrap();
+    store.snapshot_restore_request(&target.id).unwrap();
+    let middle = store.snapshot_create("middle").unwrap();
+    let latest = store.snapshot_create("latest").unwrap();
+    let mut archive = Archive::open(&store.snapshots_dir).unwrap();
+    archive.rotate(0, &latest.id).unwrap();
+    let ids: Vec<_> = archive.list().unwrap().into_iter().map(|s| s.id).collect();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&target.id));
+    assert!(ids.contains(&latest.id));
+    assert!(!ids.contains(&middle.id));
 }
 
 #[test]
-fn byte_rotation_uses_four_times_current_logical_database_size() {
+fn retention_budget_keeps_the_documented_floor_and_logical_database_multiplier() {
     const MIB: u64 = 1024 * 1024;
-    let directory = tempfile::tempdir().expect("create temporary directory");
-    let store = PersistentStore::open(directory.path()).expect("open persistent store");
-    store
-        .connection
-        .execute_batch(
-            "CREATE TABLE rotation_payload (value BLOB);\n             INSERT INTO rotation_payload VALUES (zeroblob(140 * 1024 * 1024));",
-        )
-        .expect("grow logical database above the rotation floor branch");
-    let page_count: i64 = store
-        .connection
-        .query_row("PRAGMA page_count", [], |row| row.get(0))
-        .expect("read page count");
-    let page_size: i64 = store
-        .connection
-        .query_row("PRAGMA page_size", [], |row| row.get(0))
-        .expect("read page size");
-    let logical_bytes = (page_count * page_size) as u64;
-    assert!(logical_bytes * 4 > 512 * MIB);
+    assert_eq!(snapshot::byte_budget(0), 512 * MIB);
+    assert_eq!(snapshot::byte_budget(128 * MIB), 512 * MIB);
+    assert_eq!(snapshot::byte_budget(140 * MIB), 560 * MIB);
+    assert_eq!(snapshot::byte_budget(u64::MAX), u64::MAX);
+}
 
-    let snapshots = snapshots_dir(&directory);
-    let sparse_bytes = logical_bytes * 2 / 3;
-    let mut sparse = Vec::new();
-    for index in 0..5 {
-        let path = snapshots.join(format!("persistent-large-sparse-{index}.db"));
-        sparse_snapshot(&path, sparse_bytes);
-        sparse.push(path);
+#[test]
+#[ignore = "actual-schema synthetic storage measurements"]
+fn snapshot_deduplication_actual_schema_measurements() {
+    use std::collections::HashMap;
+    use std::time::Instant;
+    for scenario in [
+        "unchanged",
+        "append",
+        "grow",
+        "delete",
+        "replace-generation",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let mut database = fixture();
+        let mut seed = 614_u64;
+        let messages: Vec<_> = (0..4096).map(|index| {
+            let data: String = (0..1024).map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                char::from(b'a' + ((seed >> 32) % 26) as u8)
+            }).collect();
+            json!({"role":"char", "data":data, "time":index, "chatId":format!("synthetic-{index}")})
+        }).collect();
+        database["characters"][0]["chats"][0]["message"] = Value::Array(messages);
+        let import = |store: &mut PersistentStore, value: &Value| {
+            let revision = store.revision().unwrap();
+            let staging = store.replace_begin().unwrap();
+            store
+                .replace_put_root(&staging.staging_id, &staged_root(value))
+                .unwrap();
+            store
+                .replace_put_presets(&staging.staging_id, value["botPresets"].as_array().unwrap())
+                .unwrap();
+            store
+                .replace_add_characters(
+                    &staging.staging_id,
+                    value["characters"].as_array().unwrap(),
+                )
+                .unwrap();
+            store
+                .replace_commit(&staging.staging_id, Some(revision))
+                .unwrap();
+        };
+        import(&mut store, &database);
+        let mut expected = HashMap::new();
+        let mut create_ms = Vec::new();
+        let mut restore_ms = Vec::new();
+        for iteration in 0..8 {
+            if iteration > 0 && scenario != "unchanged" {
+                if scenario == "replace-generation" {
+                    database["username"] = json!(format!("synthetic revision {iteration}"));
+                    import(&mut store, &database);
+                } else {
+                    let character_id = database["characters"][0]["chaId"].as_str().unwrap();
+                    let chat_id = database["characters"][0]["chats"][0]["id"]
+                        .as_str()
+                        .unwrap();
+                    let generation = active_generation(&store.connection).unwrap();
+                    match scenario {
+                        "append" => {
+                            let index: i64 = store.connection.query_row("SELECT coalesce(max(message_index),-1)+1 FROM messages WHERE generation=?1 AND character_id=?2 AND conversation_id=?3", params![generation,character_id,chat_id], |r| r.get(0)).unwrap();
+                            store.connection.execute("INSERT INTO messages(generation,character_id,conversation_id,message_index,message_id,value) VALUES(?1,?2,?3,?4,?5,?6)",
+                                params![generation,character_id,chat_id,index,format!("append-{iteration}"),json!({"role":"char","data":"synthetic appended message"}).to_string()]).unwrap();
+                        }
+                        "grow" => {
+                            store.connection.execute("UPDATE messages SET value=json_set(value,'$.data',json_extract(value,'$.data')||?4) WHERE generation=?1 AND character_id=?2 AND conversation_id=?3 AND message_index=2000",params![generation,character_id,chat_id,"x".repeat(120)]).unwrap();
+                        }
+                        "delete" => {
+                            store.connection.execute("DELETE FROM messages WHERE generation=?1 AND character_id=?2 AND conversation_id=?3 AND message_index>=?4 AND message_index<?5",params![generation,character_id,chat_id,(iteration-1)*100,iteration*100]).unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                    store.connection.execute("UPDATE conversations SET message_count=(SELECT count(*) FROM messages m WHERE m.generation=conversations.generation AND m.character_id=conversations.character_id AND m.conversation_id=conversations.conversation_id) WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![generation,character_id,chat_id]).unwrap();
+                    store
+                        .commit(&WorkingSetCommit {
+                            root: Some(json!({"username":format!("synthetic {iteration}")})),
+                            ..empty_working_set_commit(store.revision().unwrap())
+                        })
+                        .unwrap();
+                }
+            }
+            expected.insert(
+                store.revision().unwrap(),
+                Sha256::digest(serde_json::to_vec(&store.materialize(None).unwrap()).unwrap())
+                    .to_vec(),
+            );
+            let start = Instant::now();
+            store.snapshot_create(scenario).unwrap();
+            create_ms.push(start.elapsed().as_millis());
+        }
+        let snapshots = store.snapshot_list().unwrap();
+        let logical: u64 = snapshots.iter().map(|s| s.bytes).sum();
+        let stored = store.storage_stats().unwrap().snapshot_bytes;
+        let unique: i64 = Connection::open(store.snapshots_dir.join("snapshots.sqlite"))
+            .unwrap()
+            .query_row("SELECT sum(length(data)) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        for entry in &snapshots {
+            let start = Instant::now();
+            let (_capture, connection) = reconstruct_snapshot(&store, &entry.id);
+            let actual = super::super::query::materialize(&connection, None).unwrap();
+            assert_eq!(
+                Sha256::digest(serde_json::to_vec(&actual).unwrap()).to_vec(),
+                expected[&current_revision(&connection).unwrap()]
+            );
+            restore_ms.push(start.elapsed().as_millis());
+        }
+        assert!(stored < logical, "archive must save space on {scenario}");
+        if scenario == "unchanged" {
+            assert!(unique as u64 <= snapshots[0].bytes);
+        }
+        store
+            .snapshot_delete(&snapshots.last().unwrap().id)
+            .unwrap();
+        for entry in store.snapshot_list().unwrap() {
+            let (_capture, connection) = reconstruct_snapshot(&store, &entry.id);
+            let actual = super::super::query::materialize(&connection, None).unwrap();
+            assert_eq!(
+                Sha256::digest(serde_json::to_vec(&actual).unwrap()).to_vec(),
+                expected[&current_revision(&connection).unwrap()]
+            );
+        }
+        eprintln!(
+            "snapshot-dedup-measurement {}",
+            json!({"scenario":scenario,"snapshots":snapshots.len(),"logicalBytes":logical,"archiveBytes":stored,"uniquePayloadBytes":unique,"createMs":create_ms,"restoreAndMaterializeMs":restore_ms})
+        );
     }
-
-    let created = store
-        .snapshot_create("large-rotation")
-        .expect("create snapshot and rotate using logical size");
-    let listed = store.snapshot_list().expect("list size-rotated snapshots");
-    let total: u64 = listed.iter().map(|snapshot| snapshot.bytes).sum();
-
-    assert!(total <= logical_bytes * 4);
-    assert!(total > 512 * MIB);
-    assert!(!sparse[0].exists());
-    assert!(sparse[1..].iter().all(|path| path.is_file()));
-    assert!(Path::new(&created.path).is_file());
 }
 
 #[test]
@@ -1237,7 +1262,7 @@ fn pending_restore_reopens_cleanly_after_the_store_drops_an_active_lease() {
         })
         .expect("commit after restore snapshot");
     store
-        .snapshot_restore_request(Path::new(&snapshot.path))
+        .snapshot_restore_request(&snapshot.id)
         .expect("prepare restore while lease is active");
     drop(store);
 
@@ -1274,7 +1299,7 @@ fn pending_restore_target_and_pre_restore_snapshot_survive_rotation() {
         })
         .expect("change current data");
     store
-        .snapshot_restore_request(Path::new(&target.path))
+        .snapshot_restore_request(&target.id)
         .expect("request restore");
     drop(store);
 
@@ -1285,10 +1310,18 @@ fn pending_restore_target_and_pre_restore_snapshot_survive_rotation() {
             .expect("materialize restored data"),
         database
     );
-    assert!(Path::new(&target.path).is_file());
-    assert!(!snapshots_dir(&directory)
-        .join("pending-restore.json")
-        .exists());
+    assert!(restored
+        .snapshot_list()
+        .unwrap()
+        .iter()
+        .any(|s| s.id == target.id));
+    assert_eq!(
+        Archive::open(&restored.snapshots_dir)
+            .unwrap()
+            .pending_restore()
+            .unwrap(),
+        None
+    );
     assert!(
         restored
             .snapshot_list()
@@ -1301,10 +1334,9 @@ fn pending_restore_target_and_pre_restore_snapshot_survive_rotation() {
         .snapshot_list()
         .expect("list restore snapshots")
         .into_iter()
-        .find(|snapshot| snapshot.path.contains("pre-restore"))
+        .find(|snapshot| snapshot.reason == "pre-restore")
         .expect("pre-restore snapshot remains after rotation");
-    let connection =
-        rusqlite::Connection::open(pre_restore.path).expect("open pre-restore snapshot");
+    let (_capture, connection) = reconstruct_snapshot(&restored, &pre_restore.id);
     let value: String = connection
         .query_row(
             "SELECT value FROM root WHERE generation = 'revision-1'",
@@ -1321,44 +1353,38 @@ fn pending_restore_target_and_pre_restore_snapshot_survive_rotation() {
 #[test]
 fn invalid_restore_candidates_preserve_current_data_and_marker() {
     for wrong_version in [false, true] {
-        let (directory, mut store, database) = open_fixture();
+        let (directory, mut store, _) = open_fixture();
         store
             .commit(&WorkingSetCommit {
-                root: Some(json!({ "username": "Current protected data" })),
+                root: Some(json!({"username":"Current protected data"})),
                 ..empty_working_set_commit(1)
             })
-            .expect("change current data");
-        let expected = store.materialize(None).expect("materialize current data");
-        assert_ne!(expected, database);
-        let candidate = snapshots_dir(&directory).join(if wrong_version {
-            "persistent-wrong-version.db"
-        } else {
-            "persistent-corrupt.db"
-        });
-        if wrong_version {
-            let connection =
-                rusqlite::Connection::open(&candidate).expect("create wrong-version database");
-            connection
-                .execute_batch("PRAGMA user_version = 17;")
-                .expect("set wrong schema version");
-        } else {
-            fs::write(&candidate, b"not a sqlite database").expect("write corrupt database");
-        }
-        store
-            .snapshot_restore_request(&candidate)
-            .expect("write pending marker");
+            .unwrap();
+        let expected = store.materialize(None).unwrap();
+        let id = {
+            let mut archive = Archive::open(&store.snapshots_dir).unwrap();
+            let scratch = archive.scratch().unwrap();
+            if wrong_version {
+                let connection = Connection::open(&scratch.path).unwrap();
+                connection.execute_batch("PRAGMA user_version=17;").unwrap();
+            } else {
+                fs::write(&scratch.path, b"not a sqlite database").unwrap();
+            }
+            let metadata = archive
+                .insert(&scratch.path, 1, "invalid", Default::default())
+                .unwrap();
+            archive.request_restore(&metadata.id).unwrap();
+            metadata.id
+        };
         drop(store);
-
-        let reopened =
-            PersistentStore::open(directory.path()).expect("reopen after rejected restore");
+        let reopened = PersistentStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.materialize(None).unwrap(), expected);
         assert_eq!(
-            reopened
-                .materialize(None)
-                .expect("read preserved current data"),
-            expected
+            Archive::open(&reopened.snapshots_dir)
+                .unwrap()
+                .pending_restore()
+                .unwrap(),
+            Some(id)
         );
-        assert!(snapshots_dir(&directory)
-            .join("pending-restore.json")
-            .exists());
     }
 }

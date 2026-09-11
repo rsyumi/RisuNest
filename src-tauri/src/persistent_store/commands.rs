@@ -779,11 +779,11 @@ pub(crate) fn pds_snapshot_list(
 #[tauri::command(async)]
 pub(crate) fn pds_snapshot_delete(
     state: State<'_, PersistentStoreState>,
-    path: String,
+    id: String,
 ) -> Result<(), StoreError> {
     finish_storage_command(
         "pds_snapshot_delete",
-        with_store(state, |store| store.snapshot_delete(Path::new(&path))),
+        with_store(state, |store| store.snapshot_delete(&id)),
     )
 }
 
@@ -902,11 +902,9 @@ fn pds_asset_gc_execute_all(
 #[tauri::command(async)]
 pub(crate) fn pds_snapshot_restore_request(
     state: State<'_, PersistentStoreState>,
-    path: String,
+    id: String,
 ) -> Result<(), StoreError> {
-    with_store(state, |store| {
-        store.snapshot_restore_request(Path::new(&path))
-    })
+    with_store(state, |store| store.snapshot_restore_request(&id))
 }
 
 #[tauri::command(async)]

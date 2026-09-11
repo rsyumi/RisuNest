@@ -7,6 +7,7 @@ import {
 } from './risuNestStorageDashboard'
 
 const stats = {
+    snapshotBytes: 2 * 1024 * 1024,
     databaseBytes: 2 * 1024 * 1024,
     assetObjects: { count: 4, bytes: 3 * 1024 * 1024 },
     assetAliases: [
@@ -20,11 +21,23 @@ const stats = {
     assetObjectDeletions: [],
 }
 
-const snapshots = [{ path: 'snapshot.db', bytes: 2 * 1024 * 1024, modifiedAt: 1 }]
+const snapshots = [{ id: 'snapshot.db', reason: 'manual', reclaimableBytes: 0, bytes: 2 * 1024 * 1024, modifiedAt: 1 }]
 const conflictBackups = [{ id: 'conflict', createdAt: 2, side: 'local' as const, characterCount: 1, byteLength: 1024 * 1024, scope: 'database-only' as const }]
 const peerBackups = [{ path: 'peer.risudat', bytes: 3 * 1024 * 1024, modifiedAt: 3 }]
 
 describe('RisuNest storage dashboard view model', () => {
+    it('counts archive storage once even when multiple snapshots restore the same large database', () => {
+        const shared = [
+            { ...snapshots[0], id: 'first', bytes: 100 * 1024 * 1024 },
+            { ...snapshots[0], id: 'second', bytes: 100 * 1024 * 1024 },
+        ]
+        const rollup = storageDashboardRollup({ ...stats, snapshotBytes: 1024 }, shared, [], [])
+        expect(rollup.snapshotBytes).toBe(1024)
+        expect(rollup.cards.find((card) => card.id === 'total')?.bytes).toBe(
+            stats.databaseBytes + stats.assetObjects.bytes + 1024,
+        )
+    })
+
     it('rolls up six overlapping logical cards and formats MiB and GiB', () => {
         const rollup = storageDashboardRollup(stats, snapshots, conflictBackups, peerBackups)
 
@@ -254,9 +267,10 @@ describe('RisuNest storage dashboard view model', () => {
         const getStats = vi.fn()
             .mockResolvedValueOnce(stats)
             .mockImplementationOnce(() => new Promise<typeof stats>((resolve) => { resolveReload = resolve }))
+        getStats.mockResolvedValue({ ...stats, snapshotBytes: 0 })
         const deleteSnapshot = vi.fn().mockResolvedValue(undefined)
         const dashboard = createRisuNestStorageDashboard({
-            getStats, listSnapshots: vi.fn().mockResolvedValue(snapshots), listConflictBackups: vi.fn().mockResolvedValue([]), listPeerBackups: vi.fn().mockResolvedValue([]),
+            getStats, listSnapshots: vi.fn().mockResolvedValueOnce(snapshots).mockResolvedValueOnce(snapshots).mockResolvedValue([]), listConflictBackups: vi.fn().mockResolvedValue([]), listPeerBackups: vi.fn().mockResolvedValue([]),
             getTemp: vi.fn(), cleanupTemp: vi.fn(), previewGc: vi.fn(), executeGc: vi.fn(), deleteSnapshot, deleteConflictBackup: vi.fn(), deletePeerBackup: vi.fn(), createSnapshot: vi.fn(),
         })
         await dashboard.load()
@@ -268,6 +282,7 @@ describe('RisuNest storage dashboard view model', () => {
 
         resolveReload?.(stats)
         await reload
-        expect(dashboard.snapshot()).toMatchObject({ snapshots: [], loadFailed: true, loading: false })
+        expect(dashboard.snapshot()).toMatchObject({ snapshots: [], loadFailed: false, loading: false })
+        expect(dashboard.snapshot().stats?.snapshotBytes).toBe(0)
     })
 })

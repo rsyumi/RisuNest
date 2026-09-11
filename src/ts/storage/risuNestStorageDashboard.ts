@@ -32,7 +32,7 @@ export interface RisuNestStorageDashboardDependencies {
     cleanupTemp(): Promise<NativePeerTempUsage>
     previewGc(): Promise<NativeAssetGcResult>
     executeGc(): Promise<NativeAssetGcResult>
-    deleteSnapshot(path: string): Promise<void>
+    deleteSnapshot(id: string): Promise<void>
     deleteConflictBackup(id: string): Promise<void>
     deletePeerBackup(path: string): Promise<void>
     createSnapshot(reason: string): Promise<NativeSnapshotCreated>
@@ -53,25 +53,41 @@ function isInlay(alias: NativePersistentStorageStats['assetAliases'][number]): b
 
 export function storageDashboardRollup(
     stats: NativePersistentStorageStats,
-    snapshots: readonly NativeSnapshotInfo[],
+    _snapshots: readonly NativeSnapshotInfo[],
     conflictBackups: readonly SyncConflictBackupEntry[],
     peerBackups: readonly NativePeerBackupInfo[],
 ): {
     cards: { id: RisuNestStorageCardId; bytes: number }[]
-    counts: { characters: number; trashedCharacters: number; conversations: number; messages: number }
+    counts: {
+        characters: number
+        trashedCharacters: number
+        conversations: number
+        messages: number
+    }
     snapshotBytes: number
     conflictBackupBytes: number
     peerBackupBytes: number
 } {
-    const snapshotBytes = snapshots.reduce((total, snapshot) => total + snapshot.bytes, 0)
-    const conflictBackupBytes = conflictBackups.reduce((total, backup) => total + backup.byteLength, 0)
+    const snapshotBytes = stats.snapshotBytes
+    const conflictBackupBytes = conflictBackups.reduce(
+        (total, backup) => total + backup.byteLength,
+        0,
+    )
     const peerBackupBytes = peerBackups.reduce((total, backup) => total + backup.bytes, 0)
     const inlayBytes = stats.assetAliases
         .filter(isInlay)
         .reduce((total, alias) => total + alias.bytes, 0)
     return {
         cards: [
-            { id: 'total', bytes: stats.databaseBytes + stats.assetObjects.bytes + snapshotBytes + conflictBackupBytes + peerBackupBytes },
+            {
+                id: 'total',
+                bytes:
+                    stats.databaseBytes +
+                    stats.assetObjects.bytes +
+                    snapshotBytes +
+                    conflictBackupBytes +
+                    peerBackupBytes,
+            },
             { id: 'media', bytes: stats.assetObjects.bytes },
             { id: 'inlays', bytes: inlayBytes },
             { id: 'plugins', bytes: stats.pluginStorage.bytes },
@@ -92,8 +108,16 @@ export function storageDashboardRollup(
 
 export function createRisuNestStorageDashboard(deps: RisuNestStorageDashboardDependencies) {
     let state: RisuNestStorageDashboardSnapshot = {
-        loading: false, loadFailed: false, busy: [], stats: null,
-        snapshots: [], conflictBackups: [], peerBackups: [], tempUsage: null, gcPreview: null, gcResult: null,
+        loading: false,
+        loadFailed: false,
+        busy: [],
+        stats: null,
+        snapshots: [],
+        conflictBackups: [],
+        peerBackups: [],
+        tempUsage: null,
+        gcPreview: null,
+        gcResult: null,
     }
     const listeners = new Set<(snapshot: RisuNestStorageDashboardSnapshot) => void>()
     const publish = () => listeners.forEach((listener) => listener(state))
@@ -127,9 +151,13 @@ export function createRisuNestStorageDashboard(deps: RisuNestStorageDashboardDep
         update({ loading: true })
         try {
             const [stats, snapshots, conflictBackups, peerBackups] = await Promise.all([
-                deps.getStats(), deps.listSnapshots(), deps.listConflictBackups(), deps.listPeerBackups(),
+                deps.getStats(),
+                deps.listSnapshots(),
+                deps.listConflictBackups(),
+                deps.listPeerBackups(),
             ])
-            if (reloadId === latestReload) update({ stats, snapshots, conflictBackups, peerBackups, loadFailed: false })
+            if (reloadId === latestReload)
+                update({ stats, snapshots, conflictBackups, peerBackups, loadFailed: false })
         } catch {
             if (reloadId === latestReload) update({ loadFailed: true })
         } finally {
@@ -180,18 +208,21 @@ export function createRisuNestStorageDashboard(deps: RisuNestStorageDashboardDep
                 return result
             })
         },
-        async deleteSnapshot(path: string) {
-            return run(`delete-snapshot:${path}`, async () => {
-                await deps.deleteSnapshot(path)
+        async deleteSnapshot(id: string) {
+            return run(`delete-snapshot:${id}`, async () => {
+                await deps.deleteSnapshot(id)
                 invalidatePendingReloads()
-                update({ snapshots: state.snapshots.filter((snapshot) => snapshot.path !== path) })
+                update({ snapshots: state.snapshots.filter((snapshot) => snapshot.id !== id) })
+                await reload()
             })
         },
         async deleteConflictBackup(id: string) {
             return run(`delete-conflict-backup:${id}`, async () => {
                 await deps.deleteConflictBackup(id)
                 invalidatePendingReloads()
-                update({ conflictBackups: state.conflictBackups.filter((backup) => backup.id !== id) })
+                update({
+                    conflictBackups: state.conflictBackups.filter((backup) => backup.id !== id),
+                })
             })
         },
         async deletePeerBackup(path: string) {

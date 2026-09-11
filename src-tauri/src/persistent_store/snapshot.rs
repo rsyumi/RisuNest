@@ -1,17 +1,14 @@
+use super::snapshot_archive::Archive;
 use super::{
     active_generation, current_revision, generation_is_retained, CheckpointMode, ReadTarget,
     SnapshotCreated, SnapshotInfo, StoreError, StoreResult, GENERATION_TABLES,
 };
-use crate::asset_repository::migration_gc::{
-    snapshot_asset_root_sidecar_path, write_snapshot_asset_root_sidecar, AssetRootSet,
-};
+use crate::asset_repository::migration_gc::AssetRootSet;
 use crate::asset_repository::PayloadCas;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    cmp::Reverse,
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap},
     fs,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -19,22 +16,15 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
-const PENDING_RESTORE_FILE: &str = "pending-restore.json";
 const DATABASE_FILE: &str = "persistent.db";
-const MAX_SNAPSHOTS: usize = 8;
 const MIN_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_COLD_DECODED_BYTES: u64 = 64 * 1024 * 1024;
 const CAS_PHYSICAL_PREFIX: &[u8] = b"assets-v2/objects/";
 const COLD_STORAGE_HEADER: &str = "\u{ef01}COLDSTORAGE\u{ef01}";
-
-#[derive(Deserialize, Serialize)]
-struct PendingRestore {
-    path: PathBuf,
-}
 
 #[derive(Default)]
 pub(crate) struct ActiveReaderRegistry {
@@ -133,27 +123,32 @@ pub(super) fn apply_pending_restore(
     persistent_dir: &Path,
     snapshots_dir: &Path,
 ) -> StoreResult<Option<String>> {
-    let marker = snapshots_dir.join(PENDING_RESTORE_FILE);
-    if !marker.exists() {
+    if !snapshots_dir.join("snapshots.sqlite").exists()
+        && !snapshots_dir.join("pending-restore.json").exists()
+    {
         return Ok(None);
     }
-
     let result = (|| -> StoreResult<()> {
-        let pending: PendingRestore = serde_json::from_slice(&fs::read(&marker)?)?;
-        let target = validate_snapshot_path(snapshots_dir, &pending.path)?;
-        validate_restore_database(&target)?;
-
+        let mut archive = Archive::open(snapshots_dir)?;
+        let Some(id) = archive.pending_restore()? else {
+            return Ok(());
+        };
+        let reconstructed = archive.scratch()?;
+        let metadata = archive.restore(&id, &reconstructed.path)?;
+        validate_restore_database(&reconstructed.path)?;
+        let connection = Connection::open(&reconstructed.path)?;
+        if current_revision(&connection)? != metadata.revision {
+            return Err(validation("restored snapshot revision mismatch"));
+        }
+        drop(connection);
         let database_path = persistent_dir.join(DATABASE_FILE);
-        let candidate = prepare_restore_candidate(persistent_dir, &target)?;
+        let candidate = prepare_restore_candidate(persistent_dir, &reconstructed.path)?;
         let replacement = (|| -> StoreResult<()> {
             if database_path.is_file() {
                 let connection = Connection::open(&database_path)?;
-                create(&connection, snapshots_dir, "pre-restore")?;
-                drop(connection);
+                create_in_archive(&connection, &mut archive, snapshots_dir, "pre-restore")?;
             }
-
-            replace_database(&database_path, &candidate)?;
-            Ok(())
+            replace_database(&database_path, &candidate)
         })();
         if let Err(error) = remove_database_files(&candidate) {
             crate::nlog!(
@@ -162,14 +157,11 @@ pub(super) fn apply_pending_restore(
             );
         }
         replacement?;
+        archive.clear_pending_restore(&id)?;
         Ok(())
     })();
-
     match result {
-        Ok(()) => {
-            fs::remove_file(&marker)?;
-            Ok(None)
-        }
+        Ok(()) => Ok(None),
         Err(error) => {
             let message = format!("persistent snapshot restore skipped: {error}");
             crate::nlog!("warn", "{message}");
@@ -380,71 +372,41 @@ pub(super) fn create(
     snapshots_dir: &Path,
     reason: &str,
 ) -> StoreResult<SnapshotCreated> {
-    fs::create_dir_all(snapshots_dir)?;
-    let current_bytes = logical_database_bytes(connection)?;
-    let stamp: String =
-        connection.query_row("SELECT strftime('%Y%m%d-%H%M%f', 'now')", [], |row| {
-            row.get(0)
-        })?;
-    let reason = safe_name(reason);
-    let path = snapshots_dir.join(format!("persistent-{stamp}-{reason}-{}.db", Uuid::new_v4()));
+    let mut archive = Archive::open(snapshots_dir)?;
+    create_in_archive(connection, &mut archive, snapshots_dir, reason)
+}
+
+fn create_in_archive(
+    connection: &Connection,
+    archive: &mut Archive,
+    snapshots_dir: &Path,
+    reason: &str,
+) -> StoreResult<SnapshotCreated> {
     let started = Instant::now();
-    connection.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])?;
-    let sidecar_result = (|| -> StoreResult<()> {
-        let snapshot_connection = Connection::open(&path)?;
-        let revision = current_revision(&snapshot_connection)?;
-        let cas = PayloadCas::new(repository_root_from_snapshots_dir(snapshots_dir)?)?;
-        let roots = collect_asset_roots(&snapshot_connection, &cas)?;
-        write_snapshot_asset_root_sidecar(&path, revision, &roots)?;
-        Ok(())
-    })();
-    if let Err(error) = sidecar_result {
-        let _ = fs::remove_file(snapshot_asset_root_sidecar_path(&path));
-        let _ = fs::remove_file(&path);
-        return Err(error);
-    }
-    let metadata = fs::metadata(&path)?;
-    let created = SnapshotCreated {
-        path: path.to_string_lossy().into_owned(),
-        bytes: metadata.len(),
+    let current_bytes = logical_database_bytes(connection)?;
+    let scratch = archive.scratch()?;
+    connection.execute("VACUUM INTO ?1", [scratch.path.to_string_lossy().as_ref()])?;
+    let captured = Connection::open(&scratch.path)?;
+    let revision = current_revision(&captured)?;
+    let cas = PayloadCas::new(repository_root_from_snapshots_dir(snapshots_dir)?)?;
+    let roots = collect_asset_roots(&captured, &cas)?;
+    drop(captured);
+    let metadata = archive.insert(&scratch.path, revision, reason, roots)?;
+    archive.rotate(byte_budget(current_bytes), &metadata.id)?;
+    Ok(SnapshotCreated {
+        id: metadata.id,
+        revision,
+        bytes: metadata.bytes,
         duration_ms: started.elapsed().as_millis() as u64,
-    };
-    let mut protected = vec![path];
-    if let Some(target) = pending_restore_target(snapshots_dir)? {
-        protected.push(target);
-    }
-    rotate(snapshots_dir, current_bytes, &protected)?;
-    Ok(created)
+    })
+}
+
+pub(super) fn byte_budget(current_bytes: u64) -> u64 {
+    current_bytes.saturating_mul(4).max(MIN_SNAPSHOT_BYTES)
 }
 
 pub(super) fn list(snapshots_dir: &Path) -> StoreResult<Vec<SnapshotInfo>> {
-    let mut snapshots = Vec::new();
-    for entry in fs::read_dir(snapshots_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if !file_type.is_file()
-            || path.extension().and_then(|value| value.to_str()) != Some("db")
-            || snapshot_path_is_link_or_reparse(&path)?
-        {
-            continue;
-        }
-        let metadata = entry.metadata()?;
-        let modified_at = metadata
-            .modified()?
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| StoreError::Store {
-                message: error.to_string(),
-            })?
-            .as_millis() as u64;
-        snapshots.push(SnapshotInfo {
-            path: path.to_string_lossy().into_owned(),
-            bytes: metadata.len(),
-            modified_at,
-        });
-    }
-    snapshots.sort_by_key(|snapshot| Reverse(snapshot.modified_at));
-    Ok(snapshots)
+    Archive::open(snapshots_dir)?.list()
 }
 
 pub(super) fn snapshot_path_is_link_or_reparse(path: &Path) -> StoreResult<bool> {
@@ -465,45 +427,6 @@ pub(super) fn snapshot_path_is_link_or_reparse(path: &Path) -> StoreResult<bool>
     }
 }
 
-pub(super) fn restore_request(snapshots_dir: &Path, path: &Path) -> StoreResult<()> {
-    let path = validate_snapshot_path(snapshots_dir, path)?;
-    let marker = snapshots_dir.join(PENDING_RESTORE_FILE);
-    fs::write(marker, serde_json::to_vec(&PendingRestore { path })?)?;
-    Ok(())
-}
-
-pub(super) fn delete(snapshots_dir: &Path, path: &Path) -> StoreResult<()> {
-    // The UI may only delete a path returned by the current list.  This second
-    // lookup closes the time-of-check gap and avoids accepting an arbitrary
-    // direct child supplied by a renderer or plugin.
-    let listed = list(snapshots_dir)?;
-    let requested = fs::canonicalize(path)
-        .map_err(|_| validation("snapshot delete target is not currently listed"))?;
-    let selected = listed
-        .into_iter()
-        .find_map(|snapshot| {
-            let listed_path = PathBuf::from(snapshot.path);
-            fs::canonicalize(&listed_path)
-                .ok()
-                .filter(|candidate| candidate == &requested)
-        })
-        .ok_or_else(|| validation("snapshot delete target is not currently listed"))?;
-    let metadata = fs::symlink_metadata(&selected)?;
-    if !metadata.is_file() || snapshot_path_is_link_or_reparse(&selected)? {
-        return Err(validation("snapshot delete target must be a regular file"));
-    }
-    let snapshots_dir = fs::canonicalize(snapshots_dir)?;
-    if selected.parent() != Some(snapshots_dir.as_path()) {
-        return Err(validation(
-            "snapshot delete target must be directly inside snapshots",
-        ));
-    }
-    if pending_restore_target(&snapshots_dir)?.as_deref() == Some(selected.as_path()) {
-        return Err(validation("snapshot delete target is pending restore"));
-    }
-    remove_snapshot_with_sidecar(&selected)
-}
-
 fn delete_generation(transaction: &rusqlite::Transaction<'_>, generation: &str) -> StoreResult<()> {
     for (table, _) in GENERATION_TABLES.iter().rev() {
         transaction.execute(
@@ -514,75 +437,10 @@ fn delete_generation(transaction: &rusqlite::Transaction<'_>, generation: &str) 
     Ok(())
 }
 
-fn validate_snapshot_path(snapshots_dir: &Path, path: &Path) -> StoreResult<PathBuf> {
-    if path.extension().and_then(|value| value.to_str()) != Some("db") || !path.is_file() {
-        return Err(validation("restore target must be a snapshot .db file"));
-    }
-    let snapshots_dir = fs::canonicalize(snapshots_dir)?;
-    let path = fs::canonicalize(path)?;
-    if path.parent() != Some(snapshots_dir.as_path()) {
-        return Err(validation(
-            "restore target must be directly inside the snapshots directory",
-        ));
-    }
-    Ok(path)
-}
-
 fn logical_database_bytes(connection: &Connection) -> StoreResult<u64> {
     let page_count: i64 = connection.query_row("PRAGMA page_count", [], |row| row.get(0))?;
     let page_size: i64 = connection.query_row("PRAGMA page_size", [], |row| row.get(0))?;
     Ok((page_count as u64).saturating_mul(page_size as u64))
-}
-
-fn pending_restore_target(snapshots_dir: &Path) -> StoreResult<Option<PathBuf>> {
-    let marker = snapshots_dir.join(PENDING_RESTORE_FILE);
-    if !marker.is_file() {
-        return Ok(None);
-    }
-    let pending: PendingRestore = serde_json::from_slice(&fs::read(marker)?)?;
-    Ok(Some(validate_snapshot_path(snapshots_dir, &pending.path)?))
-}
-
-fn rotate(
-    snapshots_dir: &Path,
-    current_database_bytes: u64,
-    protected: &[PathBuf],
-) -> StoreResult<()> {
-    let byte_budget = current_database_bytes
-        .saturating_mul(4)
-        .max(MIN_SNAPSHOT_BYTES);
-    let protected = protected
-        .iter()
-        .filter_map(|path| fs::canonicalize(path).ok())
-        .collect::<HashSet<_>>();
-    let mut snapshots = list(snapshots_dir)?;
-    snapshots.sort_by(|left, right| {
-        left.modified_at
-            .cmp(&right.modified_at)
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    let mut total = snapshots
-        .iter()
-        .fold(0u64, |sum, snapshot| sum.saturating_add(snapshot.bytes));
-
-    while snapshots.len() > MAX_SNAPSHOTS || total > byte_budget {
-        let Some(index) = snapshots.iter().position(|snapshot| {
-            fs::canonicalize(&snapshot.path)
-                .map(|path| !protected.contains(&path))
-                .unwrap_or(true)
-        }) else {
-            break;
-        };
-        let snapshot = snapshots.remove(index);
-        remove_snapshot_with_sidecar(Path::new(&snapshot.path))?;
-        total = total.saturating_sub(snapshot.bytes);
-    }
-    Ok(())
-}
-
-fn remove_snapshot_with_sidecar(snapshot_path: &Path) -> StoreResult<()> {
-    remove_file_if_exists(&snapshot_asset_root_sidecar_path(snapshot_path))?;
-    remove_file_if_exists(snapshot_path)
 }
 
 pub(super) fn collect_asset_roots(
@@ -1124,24 +982,6 @@ fn remove_file_if_exists(path: &Path) -> StoreResult<()> {
         fs::remove_file(path)?;
     }
     Ok(())
-}
-
-fn safe_name(reason: &str) -> String {
-    let name: String = reason
-        .chars()
-        .filter(|character| {
-            matches!(
-                *character,
-                'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_'
-            )
-        })
-        .take(32)
-        .collect();
-    if name.is_empty() {
-        "snapshot".to_owned()
-    } else {
-        name
-    }
 }
 
 fn validation(message: impl Into<String>) -> StoreError {

@@ -20,6 +20,7 @@ mod preservation;
 mod query;
 mod schema;
 mod snapshot;
+mod snapshot_archive;
 mod sync_device_registry;
 #[cfg(test)]
 mod sync_device_registry_tests;
@@ -881,7 +882,9 @@ pub(crate) fn materialized_asset_owner_entries<'a>(
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SnapshotInfo {
-    pub(crate) path: String,
+    pub(crate) id: String,
+    pub(crate) reason: String,
+    pub(crate) reclaimable_bytes: u64,
     pub(crate) bytes: u64,
     pub(crate) modified_at: u64,
 }
@@ -889,7 +892,8 @@ pub(crate) struct SnapshotInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SnapshotCreated {
-    pub(crate) path: String,
+    pub(crate) id: String,
+    pub(crate) revision: i64,
     pub(crate) bytes: u64,
     pub(crate) duration_ms: u64,
 }
@@ -958,6 +962,7 @@ pub(crate) struct StorageDeletionStats {
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PersistentStorageStats {
+    pub(crate) snapshot_bytes: u64,
     pub(crate) database_bytes: u64,
     pub(crate) asset_objects: StorageCountBytes,
     pub(crate) asset_aliases: Vec<StorageAliasStats>,
@@ -1190,8 +1195,7 @@ impl PreparedReplaceCommit {
             connection.execute_batch("PRAGMA busy_timeout = 5000")?;
             let created = snapshot::create(&connection, &self.snapshots_dir, "pre-replace")?;
             drop(connection);
-            let snapshot_connection = Connection::open(&created.path)?;
-            let snapshot_revision = current_revision(&snapshot_connection)?;
+            let snapshot_revision = created.revision;
             if snapshot_revision != self.revision {
                 return Err(StoreError::RevisionConflict {
                     expected: self.revision,
@@ -2040,8 +2044,8 @@ impl PersistentStore {
         snapshot::list(&self.snapshots_dir)
     }
 
-    pub(crate) fn snapshot_delete(&self, path: &Path) -> StoreResult<()> {
-        snapshot::delete(&self.snapshots_dir, path)
+    pub(crate) fn snapshot_delete(&self, id: &str) -> StoreResult<()> {
+        snapshot_archive::Archive::open(&self.snapshots_dir)?.delete(id)
     }
 
     pub(crate) fn storage_stats(&self) -> StoreResult<PersistentStorageStats> {
@@ -2127,6 +2131,7 @@ impl PersistentStore {
         drop(statement);
         transaction.commit()?;
         Ok(PersistentStorageStats {
+            snapshot_bytes: snapshot_archive::Archive::open(&self.snapshots_dir)?.bytes()?,
             database_bytes,
             asset_objects,
             asset_aliases: aliases,
@@ -2144,8 +2149,8 @@ impl PersistentStore {
         })
     }
 
-    pub(crate) fn snapshot_restore_request(&self, path: &Path) -> StoreResult<()> {
-        snapshot::restore_request(&self.snapshots_dir, path)
+    pub(crate) fn snapshot_restore_request(&self, id: &str) -> StoreResult<()> {
+        snapshot_archive::Archive::open(&self.snapshots_dir)?.request_restore(id)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -2432,18 +2437,14 @@ impl PersistentStore {
             collect_durable_cas_job_roots, collect_durable_cas_job_roots_already_guarded,
             collect_durable_cas_job_roots_read_only,
         };
-        use crate::asset_repository::migration_gc::{
-            collect_staged_migration_roots, read_snapshot_asset_root_sidecar,
-        };
+        use crate::asset_repository::migration_gc::collect_staged_migration_roots;
 
         let mut roots = vec![snapshot::collect_asset_roots(&self.connection, cas)?];
         for reader in self.revision_leases.values() {
             roots.push(snapshot::collect_asset_roots(&reader.connection, cas)?);
         }
         roots.extend(self.active_readers.detached_asset_roots()?);
-        for snapshot in snapshot::list(&self.snapshots_dir)? {
-            roots.push(read_snapshot_asset_root_sidecar(Path::new(&snapshot.path))?.roots);
-        }
+        roots.extend(snapshot_archive::Archive::open(&self.snapshots_dir)?.roots()?);
         roots.extend(collect_staged_migration_roots(&self.repository_root)?);
         roots.push(if read_only {
             collect_durable_cas_job_roots_read_only(&self.repository_root)
