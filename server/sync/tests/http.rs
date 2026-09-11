@@ -23,6 +23,57 @@ impl Drop for Server {
         self.task.abort();
     }
 }
+
+#[tokio::test]
+async fn session_identity_and_previous_device_status_are_authenticated_and_revocation_aware() {
+    let server = Server::start().await;
+    let url = format!("{}/session", server.base);
+    assert_eq!(
+        server.client.get(&url).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let session: serde_json::Value = server
+        .auth(server.client.get(&url), &server.a)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        session,
+        serde_json::json!({"libraryId":server.a.library_id,"deviceId":server.a.device_id,"operationWatermark":"0","operationPending":false})
+    );
+    let url = format!("{}/devices/{}/status", server.base, server.a.device_id);
+    let before: serde_json::Value = server
+        .auth(server.client.get(&url), &server.b)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(before["active"], true);
+    server.store.revoke_device(&server.a.device_id).unwrap();
+    let after: serde_json::Value = server
+        .auth(server.client.get(&url), &server.b)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after["active"], false);
+    assert_eq!(
+        server
+            .auth(server.client.get(&url), &server.a)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
 impl Server {
     async fn start() -> Self {
         let dir = tempfile::tempdir().unwrap();

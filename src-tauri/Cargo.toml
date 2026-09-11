@@ -13,6 +13,7 @@ edition = "2021"
 tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
+risunest-sync-wire = { path = "../crates/sync-wire" }
 tauri = { version = "2.11.5", features = ["protocol-asset", "devtools"] }
 rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
 ryu-js = { version = "1.0.3", optional = true }
@@ -107,9 +108,12 @@ jni = "0.21.1"
 reqwest = { version = "0.11.16", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
-reqwest = { version = "0.11.16", features = ["json", "stream"] }
+reqwest = { version = "0.11.16", features = ["blocking", "json", "stream"] }
 
 [dev-dependencies]
+risunest-sync-server = { path = "../server/sync" }
+axum = "0.8.9"
+tokio = { version = "1", features = ["rt-multi-thread", "net"] }
 tauri = { version = "2.11.5", features = ["test"] }
 if-addrs = "0.14.0"
 regex = "1.13.1"

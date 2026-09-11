@@ -115,7 +115,7 @@ pub struct ChangeSet {
 }
 impl ChangeSet {
     pub fn validate(&self) -> Result<()> {
-        if self.changes.is_empty() {
+        if self.changes.is_empty() && !self.scope_fences.iter().any(|f| f.clear) {
             return Err(WireError("invalid-change-count"));
         }
         self.validate_page()

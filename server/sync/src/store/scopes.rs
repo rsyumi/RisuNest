@@ -9,6 +9,27 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::BTreeSet;
 
 impl Store {
+    pub fn scope_state(&self, scope: &str) -> Result<(String, String)> {
+        let db = self.reader()?;
+        let version = Self::read_scope_version(&db, scope)?;
+        let clear: Option<String> = db
+            .query_row(
+                "SELECT version FROM scope_clears WHERE scope=?1",
+                [scope],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let head = Self::read_head(&db)?;
+        Ok((
+            version,
+            clear.unwrap_or(hash(&canonical::encode(&[
+                "risunest-sync-clear-v1",
+                &head.library_id,
+                &head.epoch,
+                scope,
+            ])?)),
+        ))
+    }
     pub fn scope_version(&self, scope: &str) -> Result<String> {
         Self::read_scope_version(&*self.reader()?, scope)
     }
@@ -38,7 +59,7 @@ impl Store {
                 return Err(Error::new("scope-fence-mismatch", 409));
             }
             if fence.clear {
-                let incomplete: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM record_scopes WHERE scope=?1 AND NOT EXISTS(SELECT 1 FROM staged_records WHERE stage=?2 AND staged_records.key=record_scopes.key))",params![fence.scope,stage],|r|r.get(0))?;
+                let incomplete: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM record_scopes WHERE scope=?1 AND NOT EXISTS(SELECT 1 FROM staged_records WHERE stage=?2 AND staged_records.key=record_scopes.key) AND NOT EXISTS(SELECT 1 FROM staged_fences WHERE stage=?2 AND staged_fences.key=record_scopes.key))",params![fence.scope,stage],|r|r.get(0))?;
                 if incomplete {
                     return Err(Error::new("incomplete-scope-clear", 409));
                 }
@@ -48,6 +69,13 @@ impl Store {
     }
     pub(super) fn update_scopes(db: &Connection, stage: &str, operation: &str) -> Result<()> {
         let mut touched = BTreeSet::new();
+        Self::each_scope_fence(db, stage, |fence| {
+            if fence.clear {
+                db.execute("INSERT INTO scope_clears VALUES(?1,?2) ON CONFLICT(scope) DO UPDATE SET version=excluded.version",params![fence.scope,operation])?;
+                touched.insert(fence.scope);
+            }
+            Ok(())
+        })?;
         Self::each_change(db, stage, |change| {
             let mut statement = db.prepare("SELECT scope FROM record_scopes WHERE key=?1")?;
             for scope in statement.query_map([&change.key], |r| r.get::<_, String>(0))? {

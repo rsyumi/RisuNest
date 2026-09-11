@@ -334,6 +334,7 @@ fn create_v1(connection: &mut Connection) -> StoreResult<()> {
             message: error.to_string(),
         }
     })?;
+    super::server_sync_outbox::create_schema(&transaction)?;
     validate_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
@@ -341,6 +342,7 @@ fn create_v1(connection: &mut Connection) -> StoreResult<()> {
 }
 
 fn validate_schema(connection: &Connection) -> StoreResult<()> {
+    super::server_sync_outbox::validate_schema(connection)?;
     validate_object_sql(
         connection,
         "table",

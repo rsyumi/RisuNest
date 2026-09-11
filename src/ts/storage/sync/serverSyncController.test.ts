@@ -1,0 +1,85 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createServerSyncController } from "./serverSyncController";
+import type { ServerSyncFacade, ServerStatus } from "./serverSync";
+
+function fixture() {
+  const status: ServerStatus = {
+    localRevision: 3,
+    reconciling: false,
+    configured: true,
+    endpoint: "http://localhost",
+    libraryId: "library",
+    deviceId: "device",
+    head: null,
+    dirtyRecords: 1,
+    fullScan: false,
+    registrationRequired: false,
+    operationPending: false,
+  };
+  const facade = {
+    status: vi.fn(async () => status),
+    cycle: vi.fn(async () => ({ phase: "idle", conflictCount: 0 })),
+    cancel: vi.fn(async () => {}),
+    needsRefresh: vi.fn(() => false),
+    bind: vi.fn(async () => status),
+    unbind: vi.fn(async () => {}),
+    reregister: vi.fn(async () => ({ ...status, reconciling: true })),
+    reconcile: vi.fn(async () => ({ ...status, reconciling: true })),
+  };
+  const controller = createServerSyncController(
+    facade as unknown as ServerSyncFacade,
+  );
+  return { controller, facade, status };
+}
+afterEach(() => vi.useRealTimers());
+describe("server sync controller", () => {
+  it("holds conflicts for an explicit choice and forwards the preview fence", async () => {
+    const { controller, facade } = fixture();
+    await controller.initialize();
+    facade.cycle.mockResolvedValueOnce({ phase: "conflict", conflictCount: 2 });
+    await controller.synchronize();
+    expect(controller.canAutoSync()).toBe(false);
+    const options = { resolution: "keep-local" as const, expectedRevision: 3 };
+    await controller.synchronize(options);
+    expect(facade.cycle).toHaveBeenLastCalledWith(options);
+    expect(controller.canAutoSync()).toBe(true);
+  });
+  it("bounds polling and coalesces concurrent foreground requests", async () => {
+    vi.useFakeTimers();
+    const { controller, facade } = fixture();
+    await controller.initialize();
+    facade.cycle.mockResolvedValue({ phase: "pending", conflictCount: 0 });
+    const first = controller.synchronize();
+    expect(controller.synchronize()).toBe(first);
+    await vi.runAllTimersAsync();
+    await first;
+    expect(facade.cycle).toHaveBeenCalledTimes(4);
+  });
+  it("keeps manual pause across status refresh, but suspension does not pause scheduling", async () => {
+    const { controller, facade } = fixture();
+    await controller.initialize();
+    await controller.suspend();
+    expect(controller.canAutoSync()).toBe(true);
+    await controller.pause();
+    await controller.initialize();
+    expect(controller.canAutoSync()).toBe(false);
+    expect(facade.cancel).toHaveBeenCalledTimes(2);
+  });
+  it("stops epoch retry polling and clears the old result only after recovery succeeds", async () => {
+    const { controller, facade } = fixture();
+    await controller.initialize();
+    facade.cycle.mockRejectedValueOnce({
+      code: "epoch-reconciliation-required",
+    });
+    await controller.synchronize();
+    expect(controller.canAutoSync()).toBe(false);
+    facade.reconcile.mockRejectedValueOnce({ code: "local-revision-changed" });
+    await expect(controller.reconcile()).rejects.toMatchObject({
+      code: "local-revision-changed",
+    });
+    expect(controller.snapshot().error).toBe("epoch-reconciliation-required");
+    await controller.reconcile();
+    expect(controller.snapshot().error).toBe("");
+    expect(controller.snapshot().status?.reconciling).toBe(true);
+  });
+});

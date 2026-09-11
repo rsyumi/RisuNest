@@ -24,6 +24,7 @@ mod persistent_store;
 mod publication_upload;
 #[cfg(any(test, target_os = "windows", target_os = "android"))]
 mod regex_shadow;
+mod server_sync;
 mod trust_boundary;
 
 use base64::{engine::general_purpose, Engine as _};
@@ -617,6 +618,7 @@ pub fn run() {
         })
         .manage(asset_repository::commands::DurableCasJobState::default())
         .manage(persistent_store::PersistentStoreState::default())
+        .manage(server_sync::commands::ServerSyncCommandState::default())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_shell::init())
@@ -625,6 +627,17 @@ pub fn run() {
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
+            server_sync::commands::server_sync_status,
+            server_sync::commands::server_sync_backups,
+            server_sync::commands::server_sync_backup_source,
+            server_sync::commands::server_sync_bind,
+            server_sync::commands::server_sync_reregister,
+            server_sync::commands::server_sync_reconcile,
+            server_sync::commands::server_sync_unbind,
+            server_sync::commands::server_sync_prepare,
+            server_sync::commands::server_sync_activate,
+            server_sync::commands::server_sync_publish,
+            server_sync::commands::server_sync_cancel,
             greet,
             native_request,
             check_auth,

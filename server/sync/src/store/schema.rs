@@ -27,6 +27,7 @@ CREATE INDEX record_relations_target ON record_relations(target);
 CREATE TABLE record_scopes (key TEXT NOT NULL REFERENCES records(key), scope TEXT NOT NULL, PRIMARY KEY(key,scope));
 CREATE INDEX record_scopes_members ON record_scopes(scope,key);
 CREATE TABLE scope_versions (scope TEXT PRIMARY KEY, version TEXT NOT NULL);
+CREATE TABLE scope_clears (scope TEXT PRIMARY KEY, version TEXT NOT NULL);
 CREATE TABLE staged_changes (
  id TEXT PRIMARY KEY, device TEXT NOT NULL REFERENCES devices(id), digest TEXT,
  page_count INTEGER NOT NULL DEFAULT 0, byte_count INTEGER NOT NULL DEFAULT 0, change_count INTEGER NOT NULL DEFAULT 0,
@@ -48,5 +49,5 @@ CREATE TABLE changes (
  PRIMARY KEY(seq,ordinal)
 );
 CREATE INDEX changes_cursor ON changes(length(seq),seq,ordinal);
-PRAGMA user_version=3;
+PRAGMA user_version=4;
 "#;

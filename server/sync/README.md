@@ -41,38 +41,40 @@ streaming responses retain their slots until consumed or disconnected. Saturatio
 returns 429 and `Retry-After: 1`. Body/handler timeout is 60 seconds. Request
 compression is rejected with 415; object Range offsets address identity bytes.
 
-| Endpoint                                     | Contract                                                                                              |
-| -------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `GET /session`                               | Authenticated library/device identity, checked before client binding                                  |
-| `GET /head`                                  | Small stored head, ETag, bodyless conditional 304                                                     |
-| `POST /objects/missing`                      | Candidate `{hash,size}` array, decimal string sizes                                                   |
-| `POST /uploads/batch`, `POST /objects/batch` | Bounded full object batches                                                                           |
-| `POST /uploads/frames`                       | Full/delta transfer batch, exact target verification                                                  |
-| `POST /objects/transfer`                     | Array of `{target,bases}`; delta, full, or full-required frames                                       |
-| `GET /objects/{hash}`                        | Bounded-memory stream, single Range/If-Range, ETag                                                    |
-| `POST /objects/pins`                         | Renew device-owned 24-hour leases for up to 1024 hashes                                               |
-| `POST /uploads`                              | Begin `{hash,size}` manifest; returns `uploadId`                                                      |
-| `PUT /uploads/{id}/chunks/{index}`           | Exact 8 MiB chunk except final remainder; `X-Content-SHA256` required                                 |
-| `GET /uploads/{id}?after=INDEX`              | Paged verified chunk bitmap and completion status                                                     |
-| `POST /uploads/{id}/complete`                | Below 64 MiB: verified CAS publication; otherwise durable 202 finalization job, resumed after restart |
-| `DELETE /uploads/{id}`                       | Owner-scoped cancellation                                                                             |
-| `POST /staged-changes`                       | Single-page convenience staging                                                                       |
-| `POST /staged-changes/start`                 | Begin a multi-page staging set                                                                        |
-| `PUT /staged-changes/{id}/pages/{index}`     | Consecutive pages, identical-page retry, conflicting retry rejected                                   |
-| `GET /staged-changes/{id}`                   | Next page and optional sealed digest                                                                  |
-| `POST /staged-changes/{id}/seal`             | Partition-independent streaming digest                                                                |
-| `DELETE /staged-changes/{id}`                | Cancellation before operation reservation                                                             |
-| `POST /commits`                              | Durable operation reservation and atomic commit; required `If-Match`                                  |
-| `GET /operations/{id}`                       | Owner-scoped pending status or terminal receipt                                                       |
-| `GET /changes`                               | Fixed-through journal traversal                                                                       |
-| `POST /read-pins`                            | Pin `{epoch,afterSeq}` through current head                                                           |
-| `GET /read-pins/{id}`                        | Pinned journal pages with `afterSeq`, `afterOrdinal`, `limit`                                         |
-| `DELETE /read-pins/{id}`                     | Release this device's traversal                                                                       |
-| `POST /checkpoints`                          | Capture fixed record metadata                                                                         |
-| `GET /checkpoints/{id}`                      | Pages with optional `afterKey` and `limit`                                                            |
-| `DELETE /checkpoints/{id}`                   | Release this device's checkpoint                                                                      |
-| `GET /scopes?scope=NAME`                     | Current generic keyspace version                                                                      |
-| `POST /acks`                                 | Monotonic per-device `{epoch,seq}`                                                                    |
+| Endpoint                                     | Contract                                                                                                     |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `GET /session`                               | Authenticated identity, operation watermark and pending state; binding requires an unused operation identity |
+| `GET /devices/{id}/status`                   | Authenticated read-only active/revoked status used before replacing a lost device identity                   |
+| `GET /scopes?scope=NAME`                     | Current scope version and last clear identity; distinguishes independent key edits from a clear              |
+| `GET /head`                                  | Small stored head, ETag, bodyless conditional 304                                                            |
+| `POST /objects/missing`                      | Candidate `{hash,size}` array, decimal string sizes                                                          |
+| `POST /uploads/batch`, `POST /objects/batch` | Bounded full object batches                                                                                  |
+| `POST /uploads/frames`                       | Full/delta transfer batch, exact target verification                                                         |
+| `POST /objects/transfer`                     | Array of `{target,bases}`; delta, full, or full-required frames                                              |
+| `GET /objects/{hash}`                        | Bounded-memory stream, single Range/If-Range, ETag                                                           |
+| `POST /objects/pins`                         | Renew device-owned 24-hour leases for up to 1024 hashes                                                      |
+| `POST /uploads`                              | Begin `{hash,size}` manifest; returns `uploadId`                                                             |
+| `PUT /uploads/{id}/chunks/{index}`           | Exact 8 MiB chunk except final remainder; `X-Content-SHA256` required                                        |
+| `GET /uploads/{id}?after=INDEX`              | Paged verified chunk bitmap and completion status                                                            |
+| `POST /uploads/{id}/complete`                | Below 64 MiB: verified CAS publication; otherwise durable 202 finalization job, resumed after restart        |
+| `DELETE /uploads/{id}`                       | Owner-scoped cancellation                                                                                    |
+| `POST /staged-changes`                       | Single-page convenience staging                                                                              |
+| `POST /staged-changes/start`                 | Begin a multi-page staging set                                                                               |
+| `PUT /staged-changes/{id}/pages/{index}`     | Consecutive pages, identical-page retry, conflicting retry rejected                                          |
+| `GET /staged-changes/{id}`                   | Next page and optional sealed digest                                                                         |
+| `POST /staged-changes/{id}/seal`             | Partition-independent streaming digest                                                                       |
+| `DELETE /staged-changes/{id}`                | Cancellation before operation reservation                                                                    |
+| `POST /commits`                              | Durable operation reservation and atomic commit; required `If-Match`                                         |
+| `GET /operations/{id}`                       | Owner-scoped pending status or terminal receipt                                                              |
+| `GET /changes`                               | Fixed-through journal traversal                                                                              |
+| `POST /read-pins`                            | Pin `{epoch,afterSeq}` through current head                                                                  |
+| `GET /read-pins/{id}`                        | Pinned journal pages with `afterSeq`, `afterOrdinal`, `limit`                                                |
+| `DELETE /read-pins/{id}`                     | Release this device's traversal                                                                              |
+| `POST /checkpoints`                          | Capture fixed record metadata                                                                                |
+| `GET /checkpoints/{id}`                      | Pages with optional `afterKey` and `limit`                                                                   |
+| `DELETE /checkpoints/{id}`                   | Release this device's checkpoint                                                                             |
+| `GET /scopes?scope=NAME`                     | Current generic keyspace version                                                                             |
+| `POST /acks`                                 | Monotonic per-device `{epoch,seq}`                                                                           |
 
 For unpinned `/changes`, supply `epoch`, `afterSeq`, `afterOrdinal`, `throughSeq`,
 and optional `limit` (1–1024). Start after an applied commit using
@@ -164,6 +166,29 @@ It retains content and device watermarks. Clients must reconcile the changed
 epoch. An interrupted copy without its completion marker is not a valid backup.
 Power-loss and cross-OS backup validation remain pending.
 
+## Native application integration
+
+The native RisuNest settings page accepts the server URL and a separate device
+credential for each installation. PDS transactions record outgoing edits; HTTP
+preparation and publication run outside the UI replacement fence. Only atomic
+local activation and the working-set/plugin refresh hold that fence. Lost IPC
+replies are retried without enabling editing against an unconfirmed revision.
+
+Conflicts retain the local revision and remote head used for the preview. Both
+complete `.risulossless` packages are verified before applying either choice.
+The settings page can restore either archive through the normal validated
+lossless-import workflow, which backs up the current library and refreshes plugin
+state. Restored content remains paused for inspection. Parent/child and order
+conflicts are resolved as groups. Plugin clear retains its original scope and
+membership, including empty clear and clear followed by an identical set.
+
+After losing device operation history, revoke that device while the daemon is
+stopped, issue a new credential, restart the daemon, and select **Register a new
+device** in the app. The old device must be revoked before replacement. Local
+edits and bases survive this reset and differences require comparison. A changed
+server epoch has a separate **Compare restored server** action. Independent,
+nonempty libraries are not automatically combined on first registration.
+
 ## Verification and remaining work
 
 ```powershell
@@ -181,11 +206,23 @@ parent. The large HTTP integration uses a multithread Tokio runtime matching
 the daemon. Windows single-thread client/server co-location stalled before
 request dispatch and is not used as a daemon performance measurement.
 
-The PDS outbox and native client integration are in progress. Full app conflict
-handling, stable large-payload projection, UI/lifecycle wiring, whole-library
-compatibility fixtures, total HTTP D + 16 KiB/CPU/RSS gates, proxy faults, and
-OS release validation are not complete. Windows x86_64 is exercised locally;
-Linux/macOS and application-device combinations remain unverified.
+On 2026-09-11, the standalone server suite passed 44 tests and the wire suite
+passed 16. The native PDS modules passed 335 tests, including two real TCP
+replicas, both conflict choices, clear in both directions, parent deletion versus
+child edits, operation recovery, and backup corruption rejection. Settings,
+backup routing, and server facade/controller tests passed 88 cases; svelte-check
+reported no errors or warnings. The ignored crash child is run by its parent.
+
+The real HTTP append gate passed at 1/127/128/129/1024/10000 existing messages.
+For 72 new bytes, total request-plus-response bytes (including headers) were
+14595–15263 for upload and 10240–10578 for download, each below D + 16 KiB.
+These debug timings and message-only results do not establish the remaining
+large-library CPU, RSS, latency, asset, owner-list, or 1 GiB small-edit gates.
+Large opaque objects above 16 MiB currently use resumable full chunks. Bounded
+client projection/apply, cache/orphan collection, Android foreground integration,
+proxy fault scenarios and OS distribution validation remain in progress.
+Windows x86_64 is exercised locally; Linux/macOS and app-device combinations
+remain unverified. This is still an intermediate implementation.
 
 Registry, GUI/tray, service installation, peer transfer optimization, content
 E2EE, and same-PC deduplication are separate from this server implementation.

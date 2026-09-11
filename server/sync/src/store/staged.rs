@@ -190,7 +190,14 @@ impl Store {
             });
         }
         if count == 0 {
-            return Err(Error::new("empty-staged-changes", 400));
+            let mut has_clear = false;
+            Self::each_scope_fence(&db, id, |fence| {
+                has_clear |= fence.clear;
+                Ok(())
+            })?;
+            if !has_clear {
+                return Err(Error::new("empty-staged-changes", 400));
+            }
         }
         let mut digest = ChangeDigest::new();
         Self::each_change(&db, id, |change| {

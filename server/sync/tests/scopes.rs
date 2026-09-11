@@ -80,3 +80,41 @@ fn clear_keeps_original_scope_fence_after_remote_new_key_and_preserves_every_key
         TerminalStatus::Committed
     );
 }
+
+#[test]
+fn empty_clear_and_clear_then_identical_set_are_durable_scope_operations() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::init(dir.path()).unwrap();
+    let a = device(&store);
+    let head = store.head().unwrap();
+    let original = store.scope_version("plugin-storage").unwrap();
+    let mut clear = ChangeSet {
+        changes: vec![],
+        read_fences: vec![],
+        scope_fences: vec![ScopeFence {
+            scope: "plugin-storage".into(),
+            expected_version: original.clone(),
+            clear: true,
+        }],
+    };
+    let intent = stage(&store, &a, &head, 1, &clear);
+    let receipt = store.commit(&a, &intent, &head.etag()).unwrap();
+    assert_eq!(receipt.status, TerminalStatus::Committed);
+    assert_ne!(store.scope_version("plugin-storage").unwrap(), original);
+    assert_eq!(store.commit(&a, &intent, &head.etag()).unwrap(), receipt);
+    let c = scoped(&store, &a, "plugin/a");
+    let head = store.head().unwrap();
+    let intent = stage(&store, &a, &head, 2, &c);
+    let head = store.commit(&a, &intent, &head.etag()).unwrap().head;
+    clear.scope_fences[0].expected_version = store.scope_version("plugin-storage").unwrap();
+    clear.read_fences.push(risunest_sync_wire::ReadFence {
+        key: "plugin/a".into(),
+        version: c.changes[0].after.clone(),
+    });
+    let intent = stage(&store, &a, &head, 3, &clear);
+    assert_eq!(
+        store.commit(&a, &intent, &head.etag()).unwrap().status,
+        TerminalStatus::Committed
+    );
+    assert_eq!(store.record("plugin/a").unwrap(), c.changes[0].after);
+}

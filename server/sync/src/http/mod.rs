@@ -77,6 +77,7 @@ pub fn router(store: Arc<Store>) -> Router {
     };
     Router::new()
         .route("/session", get(session))
+        .route("/devices/{id}/status", get(device_status))
         .route("/head", get(head))
         .route("/changes", get(changes))
         .route("/read-pins", post(pin_changes))
@@ -222,12 +223,17 @@ async fn head(State(app): State<App>, headers: HeaderMap) -> Result<Response> {
     Ok(response)
 }
 async fn session(State(app): State<App>, Extension(device): Extension<Device>) -> Result<Response> {
+    blocking(move || Ok(Json(app.store.device_session(&device)?).into_response())).await
+}
+async fn device_status(
+    State(app): State<App>,
+    Extension(device): Extension<Device>,
+    Path(id): Path<String>,
+) -> Result<Response> {
     blocking(move || {
         Ok(
-            Json(
-                serde_json::json!({"libraryId":app.store.head()?.library_id,"deviceId":device.id}),
-            )
-            .into_response(),
+            Json(serde_json::json!({"deviceId":id,"active":app.store.device_active(&device,&id)?}))
+                .into_response(),
         )
     })
     .await
@@ -247,7 +253,14 @@ struct ScopeQuery {
     scope: String,
 }
 async fn scope(State(app): State<App>, Query(query): Query<ScopeQuery>) -> Result<Response> {
-    blocking(move||Ok(Json(serde_json::json!({"scope":query.scope,"version":app.store.scope_version(&query.scope)?})).into_response())).await
+    blocking(move || {
+        let (version, clear_version) = app.store.scope_state(&query.scope)?;
+        Ok(Json(
+            serde_json::json!({"scope":query.scope,"version":version,"clearVersion":clear_version}),
+        )
+        .into_response())
+    })
+    .await
 }
 async fn changes(State(app): State<App>, Query(query): Query<ChangesQuery>) -> Result<Response> {
     let cursor = crate::store::ChangeCursor {

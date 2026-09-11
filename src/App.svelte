@@ -1,5 +1,4 @@
 <script lang="ts">
-    import { isTauri } from './ts/platform'
     import ChatBindingLifecycle from './lib/SideBars/ChatBindingLifecycle.svelte'
     import { DynamicGUI, settingsOpen, sideBarStore, ShowRealmFrameStore, openPresetList, openPersonaList, MobileGUI, CustomGUISettingMenuStore, loadedStore, alertStore, LoadingStatusState, bookmarkListOpen, popupStore, easyPanelStore, popUpEditorStore, loadoutModalStore, irisStore, customSideBarConfigDialogStore, bootFailure, type BootFailure } from './ts/stores.svelte';
     import Sidebar from './lib/SideBars/Sidebar.svelte';
@@ -35,7 +34,7 @@
     import CustomSidebarConfig from './lib/Others/CustomSidebarConfig.svelte';
     import { RISU_APP_INTERNAL_DRAG_TYPE, RISU_SIDEBAR_DRAG_TYPE } from './ts/dragTypes';
     import { keepFocusedInputVisible } from './ts/gui/imeVisibility';
-    import { isTauriMobile } from './ts/platform';
+    import { isTauri, isTauriMobile } from './ts/platform';
     import NativeFileJobDialog from './lib/Others/NativeFileJobDialog.svelte';
     import LoadingIndicator from './lib/UI/GUI/LoadingIndicator.svelte';
 
@@ -49,6 +48,13 @@
         updateElapsed()
         const timer = setInterval(updateElapsed, 1000)
         return () => clearInterval(timer)
+    })
+
+    $effect(() => {
+        if (isTauri && $loadedStore) {
+            // Start only after storage, asset authority and the working set are ready.
+            void import('./ts/storage/sync/serverSyncProduction').then(({ startServerSync }) => startServerSync())
+        }
     })
 
     let settingsPromise:

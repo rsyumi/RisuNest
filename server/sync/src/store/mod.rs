@@ -53,6 +53,15 @@ pub struct Device {
     pub id: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceSession {
+    pub library_id: String,
+    pub device_id: String,
+    pub operation_watermark: Sequence,
+    pub operation_pending: bool,
+}
+
 pub(super) fn random_id() -> Result<String> {
     let mut bytes = [0u8; 32];
     getrandom::getrandom(&mut bytes).map_err(|_| Error::new("entropy-unavailable", 503))?;
@@ -136,7 +145,7 @@ impl Store {
             objects::sync_directory(&root)?;
         } else {
             let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            if version != 3 {
+            if version != 4 {
                 return Err(Error::new("incompatible-store", 409));
             }
         }
@@ -175,6 +184,36 @@ impl Store {
     }
     pub fn head(&self) -> Result<RemoteHead> {
         Self::read_head(&*self.reader()?)
+    }
+    pub fn device_session(&self, device: &Device) -> Result<DeviceSession> {
+        let db = self.reader()?;
+        Self::require_device(&db, device)?;
+        let watermark: String = db.query_row(
+            "SELECT watermark FROM devices WHERE id=?1",
+            [&device.id],
+            |r| r.get(0),
+        )?;
+        let pending = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM commit_jobs WHERE device=?1)",
+            [&device.id],
+            |r| r.get(0),
+        )?;
+        Ok(DeviceSession {
+            library_id: Self::read_head(&db)?.library_id,
+            device_id: device.id.clone(),
+            operation_watermark: watermark.try_into()?,
+            operation_pending: pending,
+        })
+    }
+    pub fn device_active(&self, actor: &Device, id: &str) -> Result<bool> {
+        validate_id(id)?;
+        let db = self.reader()?;
+        Self::require_device(&db, actor)?;
+        Ok(db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM devices WHERE id=?1 AND revoked=0)",
+            [id],
+            |r| r.get(0),
+        )?)
     }
     pub(super) fn read_head(db: &Connection) -> Result<RemoteHead> {
         parse(&db.query_row::<String, _, _>(

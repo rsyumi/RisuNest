@@ -44,7 +44,9 @@ fn incremental_commit<T>(
         &generation,
         revision,
     )?;
+    super::server_sync_outbox::begin_mutation(&transaction, &generation, revision)?;
     body(&transaction, &generation, logical.as_ref(), prepared)?;
+    super::server_sync_outbox::finish_mutation(&transaction)?;
     set_active(&transaction, revision, &generation)?;
     transaction.commit()?;
     Ok(RevisionResult { revision })
@@ -1524,6 +1526,7 @@ pub(super) fn replace_commit_with_app_kv(
         delete_generation(&transaction, &active)?;
     }
     move_generation(&transaction, staging_id, &generation)?;
+    super::server_sync_outbox::full_replacement(&transaction)?;
     set_active(&transaction, revision, &generation)?;
     if let Some((key, value)) = serialized_app_kv {
         transaction.execute(
@@ -1735,6 +1738,7 @@ fn apply_plugin_storage_mutation(
             Ok(())
         }
         PluginStorageMutation::Clear => {
+            super::server_sync_outbox::capture_clear(transaction, generation)?;
             transaction.execute(
                 "DELETE FROM plugin_storage WHERE generation = ?1",
                 [generation],
@@ -2432,7 +2436,7 @@ fn move_generation(transaction: &Transaction<'_>, source: &str, target: &str) ->
     Ok(())
 }
 
-fn writable_generation(
+pub(super) fn writable_generation(
     transaction: &Transaction<'_>,
     source: &str,
     revision: i64,
@@ -2454,7 +2458,11 @@ fn writable_generation(
     Ok(target)
 }
 
-fn set_active(transaction: &Transaction<'_>, revision: i64, generation: &str) -> StoreResult<()> {
+pub(super) fn set_active(
+    transaction: &Transaction<'_>,
+    revision: i64,
+    generation: &str,
+) -> StoreResult<()> {
     transaction.execute(
         "UPDATE meta SET value = ?2 WHERE key = ?1",
         params!["currentRevision", serde_json::to_string(&revision)?],

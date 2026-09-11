@@ -8,11 +8,13 @@
     import RisuNestBackupRestore from './RisuNestBackupRestore.svelte'
     import RisuNestAndroidPlatform from './RisuNestAndroidPlatform.svelte'
     import RisuNestLogViewer from './RisuNestLogViewer.svelte'
+    import ServerSyncSettings from './ServerSyncSettings.svelte'
 
     const sections: { id: string; label: string }[] = [
         { id: 'risunest-perf', label: language.risuNest.perf.title },
         { id: 'risunest-streaming', label: language.risuNest.streaming.title },
         { id: 'risunest-inlay', label: language.risuNest.inlay.title },
+        ...(isTauri ? [{ id: 'risunest-server-sync', label: language.risuNest.serverSync.title }] : []),
         ...(isTauri ? [{ id: 'risunest-storage', label: language.risuNest.storage.title }] : []),
         { id: 'risunest-backup', label: language.risuNest.backup.title },
         ...(isTauriAndroid ? [{ id: 'risunest-platform', label: language.risuNest.platform.title }] : []),
@@ -33,6 +35,9 @@
     </nav>
     <RisuNestPerformanceSettings />
     <RisuNestSettingRows items={risuNestSettingsItems} />
+    {#if isTauri}
+        <section id="risunest-server-sync" class="scroll-mt-4"><ServerSyncSettings /></section>
+    {/if}
     {#if isTauri}
         <RisuNestStorageDashboard />
     {/if}
