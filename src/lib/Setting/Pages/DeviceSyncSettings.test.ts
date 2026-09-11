@@ -80,7 +80,8 @@ describe('DeviceSyncSettings', () => {
     })
     afterEach(async () => { if (mounted) await unmount(mounted); mounted = undefined; document.body.replaceChildren(); vi.useRealTimers() })
     const render = async (state = snapshot()) => { controllerState.controller.snapshot.mockReturnValue(state); mounted = mount(DeviceSyncSettings, { target }); await tick() }
-    const button = (name: string) => [...target.querySelectorAll<HTMLButtonElement>('button')].find((candidate) => candidate.textContent?.trim() === name)
+    // Task tiles carry their description inside the button, so they name themselves through data-label.
+    const button = (name: string) => [...target.querySelectorAll<HTMLButtonElement>('button')].find((candidate) => (candidate.dataset.label ?? candidate.textContent ?? '').trim() === name)
 
     it('renders the exact three-card order and desktop sharing controls accessibly', async () => {
         await render()
@@ -89,7 +90,9 @@ describe('DeviceSyncSettings', () => {
         expect(target.querySelectorAll('[role="radio"]')).toHaveLength(3)
         const permissionPanel = target.querySelector('[data-permissions]')!
         const start = button('Start sharing')!
-        expect(permissionPanel.compareDocumentPosition(start) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+        // The primary action sits in the section heading, above the settings it applies to.
+        expect(start.compareDocumentPosition(permissionPanel) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+        expect(target.querySelector('[data-sync-card="sharing"]')?.contains(permissionPanel)).toBe(true)
     })
 
     it('persists method-specific fields without exposing a tunnel token', async () => {
@@ -450,7 +453,7 @@ describe('DeviceSyncSettings', () => {
         await tick()
         button('Get changes only')!.click(); await tick()
         expect(target.querySelector('[data-work-status]')?.textContent).toContain('Receiving')
-        expect(target.querySelector('[data-work-status]')?.textContent).not.toContain('previous data is kept')
+        expect(target.querySelector('[data-work-status]')?.textContent).not.toContain('Backup location')
         release()
     })
 
@@ -508,7 +511,7 @@ describe('DeviceSyncSettings', () => {
         await unmount(mounted!); mounted = undefined; target.replaceChildren()
         await render(snapshot({ targets: { clone: cloneBase, delta: deltaBase, bidirectional: { ...bidiBase, operationPhase: 'completed', operationResult: { kind: 'updated', operationId: 'op', revision: 2, remoteRevision: 3, transferredObjects: 4, transferredBytes: 4096, backups: [{ packageId: 'p', side: 'local', path: 'safe/backup.risulossless' }] } } } }))
         expect(target.querySelector('[data-work-status]')?.textContent).toContain('Received 4 items (4.0 KiB).')
-        expect(target.querySelector('[data-work-status]')?.textContent).toContain('Your previous data is kept as a backup.')
+        expect(target.querySelector('[data-work-status]')?.textContent).toContain('Backup location')
         expect(target.querySelector('[data-work-status]')?.textContent).toContain('safe/backup.risulossless')
     })
 
@@ -525,12 +528,12 @@ describe('DeviceSyncSettings', () => {
     it('shows clone backup paths only when the completed snapshot has receipts', async () => {
         const completed = { ...cloneBase, state: { ...cloneBase.state, target: { ...cloneBase.state.target, phase: 'completed' as const, completedBytes: 1024 } } }
         await render(snapshot({ targets: { clone: completed, delta: deltaBase, bidirectional: bidiBase } }))
-        expect(target.querySelector('[data-work-status]')?.textContent).not.toContain('previous data is kept')
+        expect(target.querySelector('[data-work-status]')?.textContent).not.toContain('Backup location')
         await unmount(mounted!); mounted = undefined; target.replaceChildren()
         const withReceipt = { ...completed, state: { ...completed.state, target: { ...completed.state.target, backupPaths: ['safe/clone-backup.risulossless'] } } }
         await render(snapshot({ targets: { clone: withReceipt, delta: deltaBase, bidirectional: bidiBase } }))
         const status = target.querySelector('[data-work-status]')?.textContent ?? ''
-        expect(status).toContain('previous data is kept')
+        expect(status).toContain('Backup location')
         expect(status).toContain('safe/clone-backup.risulossless')
     })
 
@@ -697,7 +700,9 @@ describe('DeviceSyncSettings', () => {
         const remove = [...target.querySelectorAll<HTMLButtonElement>('button')]
             .find((candidate) => candidate.getAttribute('aria-label')?.startsWith('Remove: Outgoing'))!
         expect(`${card.className} ${remove.className}`).not.toMatch(/(?:red|yellow)-\d/)
-        expect(remove.className).toContain('bg-draculared')
+        // Removal is quiet until hovered, and the hover colour comes from the theme token.
+        expect(remove.className).toContain('hover:text-draculared')
+        expect(remove.className).not.toMatch(/(?:^|\s)bg-draculared/)
     })
 
     it('gates conflict resolution while the first winner is pending', async () => {
