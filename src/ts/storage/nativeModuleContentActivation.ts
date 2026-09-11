@@ -42,19 +42,81 @@ export async function activatePreparedNativeModuleContent(
     dependencies: NativeModuleContentActivationDependencies = productionDependencies,
     signal?: AbortSignal,
 ): Promise<{ moduleId: string } | null> {
+    if (prepared.format !== 'risu-module') {
+        const [
+            { convertCharacterToModule },
+            {
+                mapPreparedNativeContent,
+                preparedAliases,
+                prepareAdditionalAssetOwnerHead,
+            },
+        ] = await Promise.all([
+            import('../interchangeability'),
+            import('./nativeCharacterContentActivation'),
+        ])
+        const character = await mapPreparedNativeContent(
+            prepared,
+            undefined,
+            signal,
+        )
+        if (!character) return null
+        const module = convertCharacterToModule(character)
+        module.id = dependencies.createId()
+        const assetAliases = preparedAliases(prepared)
+        signal?.throwIfAborted()
+        const head = await prepareAdditionalAssetOwnerHead(
+            character,
+            assetAliases,
+            lifecycle.prepareOwnerManifestAndSeal,
+        )
+        try {
+            signal?.throwIfAborted()
+            await dependencies.append(
+                {
+                    module,
+                    assetAliases,
+                    ownerHead: {
+                        present: true,
+                        manifestHash: head.manifestHash!,
+                        entryCount: head.entryCount,
+                    },
+                },
+                signal,
+            )
+        } catch (error) {
+            if (
+                error instanceof PersistentRootModuleAppendRejectedError ||
+                (signal?.aborted && error === signal.reason)
+            ) {
+                try {
+                    await lifecycle.abortPreparedContent?.()
+                } catch {}
+            }
+            throw error
+        }
+        return { moduleId: module.id }
+    }
     const content = requireRisum(prepared)
     const module = structuredClone(content.metadata) as unknown as RisuModule
-    if (module.lowLevelAccess && !await dependencies.confirmLowLevelAccess()) return null
+    if (module.lowLevelAccess && !(await dependencies.confirmLowLevelAccess()))
+        return null
 
     const moduleId = dependencies.createId()
     module.id = moduleId
     if (Object.hasOwn(module, 'assets')) {
-        if (!Array.isArray(module.assets) || module.assets.length !== content.assets.length) {
-            throw new TypeError('Prepared RISUM asset metadata does not match its descriptors')
+        if (
+            !Array.isArray(module.assets) ||
+            module.assets.length !== content.assets.length
+        ) {
+            throw new TypeError(
+                'Prepared RISUM asset metadata does not match its descriptors',
+            )
         }
         module.assets = module.assets.map((tuple, position) => {
             if (!Array.isArray(tuple) || tuple.length < 3) {
-                throw new TypeError(`Prepared RISUM asset tuple ${position} is invalid`)
+                throw new TypeError(
+                    `Prepared RISUM asset tuple ${position} is invalid`,
+                )
             }
             const retained = structuredClone(tuple)
             retained[1] = content.assets[position].logicalId
@@ -62,7 +124,10 @@ export async function activatePreparedNativeModuleContent(
         })
     }
 
-    const assetAliasesByKey = new Map<string, Extract<AssetAlias, { kind: 'asset' }>>()
+    const assetAliasesByKey = new Map<
+        string,
+        Extract<AssetAlias, { kind: 'asset' }>
+    >()
     for (const asset of content.assets) {
         const alias: Extract<AssetAlias, { kind: 'asset' }> = {
             kind: 'asset',
@@ -74,36 +139,44 @@ export async function activatePreparedNativeModuleContent(
             ext: asset.ext,
         }
         const previous = assetAliasesByKey.get(alias.key)
-        if (previous && (previous.objectHash !== alias.objectHash || previous.size !== alias.size)) {
-            throw new TypeError(`Prepared RISUM alias ${alias.key} has conflicting payloads`)
+        if (
+            previous &&
+            (previous.objectHash !== alias.objectHash ||
+                previous.size !== alias.size)
+        ) {
+            throw new TypeError(
+                `Prepared RISUM alias ${alias.key} has conflicting payloads`,
+            )
         }
         if (!previous) assetAliasesByKey.set(alias.key, alias)
     }
     const assetAliases = [...assetAliasesByKey.values()]
     if (!lifecycle.sealPreparedContent) {
-        throw new TypeError('Prepared RISUM content cannot seal its native roots')
+        throw new TypeError(
+            'Prepared RISUM content cannot seal its native roots',
+        )
     }
     signal?.throwIfAborted()
     await lifecycle.sealPreparedContent()
     if (signal?.aborted) {
         try {
             await lifecycle.abortPreparedContent?.()
-        }
-        catch {}
+        } catch {}
         signal.throwIfAborted()
     }
     try {
-        await dependencies.append({ module, assetAliases, ownerHead: content.ownerHead }, signal)
-    }
-    catch (error) {
+        await dependencies.append(
+            { module, assetAliases, ownerHead: content.ownerHead },
+            signal,
+        )
+    } catch (error) {
         if (
-            error instanceof PersistentRootModuleAppendRejectedError
-            || (signal?.aborted && error === signal.reason)
+            error instanceof PersistentRootModuleAppendRejectedError ||
+            (signal?.aborted && error === signal.reason)
         ) {
             try {
                 await lifecycle.abortPreparedContent?.()
-            }
-            catch {}
+            } catch {}
         }
         throw error
     }

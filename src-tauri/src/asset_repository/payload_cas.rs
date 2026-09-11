@@ -97,6 +97,111 @@ impl PayloadCas {
         self.prepare_reader_inner(reader, Some((expected_content_hash, expected_byte_size)))
     }
 
+    /// Adopt an immutable payload produced in this repository's private import
+    /// staging. Revalidate bytes and identity, but do not rewrite or fsync the
+    /// payload a second time. The parser already synced it before returning.
+    pub(crate) fn adopt_import_payload(
+        &self,
+        path: &Path,
+        expected_hash: &str,
+        expected_size: u64,
+        cancelled: &impl Fn() -> bool,
+    ) -> io::Result<PreparedPayload> {
+        validate_content_hash(expected_hash)?;
+        self.ensure_repository_root()?;
+        reject_link_components(path)?;
+        let canonical = fs::canonicalize(path)?;
+        let jobs = self.repository_root.join("native-file-jobs").join("jobs");
+        if !canonical.starts_with(&jobs)
+            || !matches!(
+                path.extension().and_then(|s| s.to_str()),
+                Some("payload" | "stage")
+            )
+        {
+            return invalid_owned_path(path, "only private import payloads may be adopted");
+        }
+        let mut file = self.open_exact_owned_file(&canonical)?;
+        let identity = exact_file_identity(&file)?;
+        #[cfg(any(unix, windows))]
+        if identity.links != 1 {
+            return invalid_owned_path(path, "import staging must have exactly one link");
+        }
+        if identity.byte_size() != expected_size {
+            return collision_or_corruption(expected_hash);
+        }
+        let mut hash = Sha256::new();
+        let mut buffer = [0_u8; COPY_BUFFER_BYTES];
+        loop {
+            if cancelled() {
+                return Err(io::Error::new(ErrorKind::Interrupted, "import cancelled"));
+            }
+            let length = file.read(&mut buffer)?;
+            if length == 0 {
+                break;
+            }
+            hash.update(&buffer[..length]);
+        }
+        if hex::encode(hash.finalize()) != expected_hash || exact_file_identity(&file)? != identity
+        {
+            return collision_or_corruption(expected_hash);
+        }
+        // Check the path still names the held, verified file before publishing.
+        let path_file = self.open_exact_owned_file(&canonical)?;
+        if exact_file_identity(&path_file)? != identity {
+            return exact_object_changed();
+        }
+        let mut directory_entries_synced = true;
+        let assets = self.ensure_directory(
+            &self.repository_root,
+            "assets-v2",
+            &mut directory_entries_synced,
+        )?;
+        let objects = self.ensure_directory(&assets, "objects", &mut directory_entries_synced)?;
+        let shard =
+            self.ensure_directory(&objects, &expected_hash[..2], &mut directory_entries_synced)?;
+        let object_path = shard.join(&expected_hash[2..]);
+        let physical_key = object_physical_key(expected_hash);
+        if cancelled() {
+            return Err(io::Error::new(ErrorKind::Interrupted, "import cancelled"));
+        }
+        #[cfg(any(target_os = "android", windows))]
+        let published = crate::trust_boundary::rename_without_replace(&canonical, &object_path);
+        #[cfg(not(any(target_os = "android", windows)))]
+        let published = fs::hard_link(&canonical, &object_path);
+        let deduplicated = match published {
+            Ok(()) => false,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                self.verify_existing_object(
+                    &object_path,
+                    expected_hash,
+                    expected_size,
+                    &physical_key,
+                )?;
+                true
+            }
+            Err(error) => return Err(error),
+        };
+        directory_entries_synced &= sync_directory(&shard)?;
+        // Both held handles deny writes on Windows. Drop them before unlinking
+        // the staging name; the CAS name is now durable and never overwritten.
+        drop(path_file);
+        drop(file);
+        #[cfg(any(target_os = "android", windows))]
+        if deduplicated {
+            fs::remove_file(&canonical)?;
+        }
+        #[cfg(not(any(target_os = "android", windows)))]
+        fs::remove_file(&canonical)?;
+        directory_entries_synced &= sync_directory(canonical.parent().expect("payload parent"))?;
+        Ok(PreparedPayload {
+            content_hash: expected_hash.to_owned(),
+            byte_size: expected_size,
+            physical_key,
+            deduplicated,
+            directory_entries_synced,
+        })
+    }
+
     fn prepare_reader_inner(
         &self,
         reader: &mut impl Read,

@@ -1,6 +1,6 @@
 <script lang="ts">
     import { onMount } from 'svelte'
-    import { MonitorSmartphone } from '@lucide/svelte'
+    import { ArrowDownLeft, ArrowLeftRight, ArrowUpRight, Download, Monitor, RefreshCw, Smartphone } from '@lucide/svelte'
     import { language } from 'src/lang'
     import { alertConfirm, alertToast } from 'src/ts/alert'
     import { isTauriAndroid } from 'src/ts/platform'
@@ -14,11 +14,25 @@
     import type { DeviceSyncErrorCode } from 'src/ts/storage/sync/deviceSync'
     import { androidPeerSyncNotificationsEnabled } from 'src/ts/storage/sync/peerSyncShared'
     import Button from 'src/lib/UI/GUI/Button.svelte'
+    import SettingGroup from '../RisuNest/SettingGroup.svelte'
+    import SettingRow from '../RisuNest/SettingRow.svelte'
+    import SettingToggle from '../RisuNest/SettingToggle.svelte'
+    import SegmentedButtons from '../RisuNest/SegmentedButtons.svelte'
 
     type WorkLane = 'clone' | 'delta' | 'bidirectional'
+    type ListenMethod = ReturnType<typeof getDeviceSettings>['syncListenMethod']
+    interface PeerEntry {
+        deviceId: string
+        name?: string | null
+        lastSeenMs?: number
+        totalBytes?: number
+        permissions: readonly string[]
+    }
 
     const controller = getProductionDeviceSyncController()
     const sync = language.risuNest.sync
+    // Registration links expire ten minutes after they are created.
+    const linkLifetimeMs = 10 * 60 * 1000
     const initialSnapshot = controller.snapshot()
     let snapshot = $state<DeviceSyncControllerSnapshot>(initialSnapshot)
     let settings = $state(getDeviceSettings())
@@ -49,6 +63,7 @@
     const pairUri = $derived(snapshot.source.pairingUri ?? '')
     const expired = $derived(!snapshot.source.expiresAtMs || snapshot.source.expiresAtMs <= now)
     const remaining = $derived(snapshot.source.expiresAtMs ? Math.max(0, snapshot.source.expiresAtMs - now) : 0)
+    const remainingRatio = $derived(Math.max(0, Math.min(1, remaining / linkLifetimeMs)))
     const clone = $derived(snapshot.targets.clone)
     const delta = $derived(snapshot.targets.delta)
     const bidi = $derived(snapshot.targets.bidirectional)
@@ -107,6 +122,25 @@
         ?? (activeWork === 'delta' && delta?.error ? safeError(delta.error) : null)
         ?? (activeWork === 'bidirectional' && bidi?.operationError ? safeError(bidi.operationError) : null)
     )
+    const running = $derived(snapshot.source.phase === 'running')
+    const methodOptions: { value: ListenMethod; label: string }[] = [
+        { value: 'lan', label: sync.share.methodLan },
+        { value: 'quick', label: sync.share.methodQuick },
+        { value: 'fixed-url', label: sync.share.methodFixed },
+    ]
+    const methodHelp = $derived(
+        settings.syncListenMethod === 'quick' ? sync.share.quickNote
+            : settings.syncListenMethod === 'fixed-url' ? sync.share.fixedNote
+            : sync.share.methodLanHelp,
+    )
+    const laneTitle = $derived(
+        activeWork === 'clone' ? sync.work.clone
+            : activeWork === 'delta' ? sync.work.delta
+            : sync.work.bidirectional,
+    )
+    const inputClass = 'rounded-md border border-darkborderc bg-bgcolor px-3 py-1.5 text-sm text-textcolor transition-colors duration-200 focus:border-borderc focus:ring-2 focus:ring-borderc/45 focus:outline-hidden'
+    const revokeClass = 'shrink-0 rounded-md border border-darkborderc bg-transparent px-2 py-1 text-sm text-textcolor2 transition-colors duration-200 hover:border-draculared hover:bg-draculared/10 hover:text-draculared focus:outline-hidden focus:ring-2 focus:ring-draculared disabled:cursor-not-allowed disabled:opacity-50'
+    const tileClass = 'flex flex-col gap-1 rounded-lg border border-darkborderc bg-darkbutton px-3.5 py-3 text-left shadow-xs transition-colors duration-200 hover:bg-selected focus:outline-hidden focus:ring-2 focus:ring-selected disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-darkbutton'
 
     function inferWork(value: DeviceSyncControllerSnapshot): WorkLane | null {
         const bidiValue = value.targets.bidirectional
@@ -135,11 +169,14 @@
         if (['prepared', 'preparing', 'starting'].includes(snapshot.source.phase)) return sync.share.statePreparing
         return sync.share.stateOff
     }
-    function stateColor(): string {
-        if (sourceError || snapshot.source.phase === 'error') return 'bg-draculared'
-        if (snapshot.source.phase === 'running') return 'bg-selected'
-        if (['prepared', 'preparing', 'starting', 'stopping'].includes(snapshot.source.phase)) return 'bg-darkbutton'
-        return 'bg-textcolor2'
+    function statePill(): { border: string; dot: string } {
+        if (sourceError || snapshot.source.phase === 'error') return { border: 'border-draculared bg-draculared/10 text-textcolor', dot: 'bg-draculared' }
+        if (snapshot.source.phase === 'running') return { border: 'border-success-500 bg-success-500/10 text-textcolor', dot: 'bg-success-500' }
+        if (['prepared', 'preparing', 'starting', 'stopping'].includes(snapshot.source.phase)) return { border: 'border-darkborderc bg-darkbutton text-textcolor', dot: 'bg-borderc' }
+        return { border: 'border-darkborderc text-textcolor2', dot: 'bg-textcolor2' }
+    }
+    function deviceIcon(name: string | null | undefined): typeof Monitor {
+        return name === 'Android' ? Smartphone : Monitor
     }
     function format(template: string, ...values: Array<string | number>): string {
         return values.reduce<string>((value, next, index) => value.replace(`{${index}}`, String(next)), template)
@@ -439,114 +476,164 @@
     })
 </script>
 
-<section class="mt-4">
-    <h3 class="text-xl font-bold">{sync.menuTitle}</h3>
-    <p data-sync-intro class="mt-1 text-sm text-textcolor2">{sync.intro}</p>
+{#snippet deviceRow(device: PeerEntry, direction: 'incoming' | 'outgoing')}
+    {@const name = device.name || device.deviceId.slice(0, 8)}
+    {@const DeviceIcon = deviceIcon(device.name)}
+    {@const columnTitle = direction === 'outgoing' ? sync.devices.outgoingTitle : sync.devices.incomingTitle}
+    <div class="flex items-center gap-3 px-4 py-2.5 text-sm">
+        <span data-device-icon class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-darkborderc bg-bgcolor" aria-hidden="true"><DeviceIcon size={18} /></span>
+        <div class="min-w-0 flex-1">
+            <p class="break-words">{name}</p>
+            <p class="text-xs text-textcolor2 tabular-nums">{format(sync.devices.lastSeen, formatTime(device.lastSeenMs), formatRisuNestStorageBytes(device.totalBytes ?? 0))}</p>
+            <div class="mt-1 flex flex-wrap gap-1">
+                {#if device.permissions.includes('read')}<span class="rounded-md border border-darkborderc px-1.5 text-xs text-textcolor2">{sync.devices.permRead}</span>{/if}
+                {#if device.permissions.includes('bidirectional')}<span class="rounded-md border border-darkborderc px-1.5 text-xs text-textcolor2">{sync.devices.permBidirectional}</span>{/if}
+            </div>
+        </div>
+        <button type="button" aria-label={`${sync.devices.revoke}: ${name}, ${columnTitle}`} disabled={sourceTransition} class={revokeClass} onclick={() => revoke(direction, device.deviceId)}>{sync.devices.revoke}</button>
+    </div>
+{/snippet}
+
+{#snippet tile(title: string, description: string, Icon: typeof Download, disabled: boolean, onclick: () => void)}
+    <button type="button" data-label={title} {disabled} class={tileClass} {onclick}>
+        <span class="flex items-center gap-1.5 text-sm font-bold"><Icon size={16} aria-hidden="true" />{title}</span>
+        <span class="help text-xs leading-snug">{description}</span>
+    </button>
+{/snippet}
+
+<div class="@container w-full max-w-3xl">
+    <h1 class="text-2xl font-bold">{sync.menuTitle}</h1>
+    <p data-sync-intro class="help mt-1 max-w-[62ch] text-sm">{sync.intro}</p>
     {#if isTauriAndroid && notificationsEnabled === false}
-        <div class="mt-3 rounded-md border border-draculared bg-darkbg p-3">
+        <div class="mt-4 rounded-lg border border-draculared bg-darkbg p-4">
             <p data-notification-warning class="text-sm text-draculared">{sync.notificationsDisabledWarning}</p>
             <Button className="mt-2" size="sm" styled="outlined" onclick={openNotificationSettings}>{language.risuNest.platform.openSettings}</Button>
         </div>
     {/if}
-    <div data-sync-card="sharing" class="mt-4 rounded-md border border-darkborderc bg-darkbg p-4">
-        <div class="flex items-center justify-between gap-3">
-            <h4 class="font-bold">{sync.share.title}</h4>
-            <span role="status" aria-live="polite" class="flex items-center gap-2 text-sm"><span class="h-2 w-2 rounded-full {stateColor()}"></span>{stateLabel()}</span>
-        </div>
+
+    <SettingGroup id="sync-share" title={sync.share.title} panelProps={{ 'data-sync-card': 'sharing' }}>
+        {#snippet actions()}
+            {@const pill = statePill()}
+            <span role="status" aria-live="polite" class="inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-xs font-semibold {pill.border}"><span class="h-2 w-2 rounded-full {pill.dot}" aria-hidden="true"></span>{stateLabel()}</span>
+            <Button size="sm" disabled={sourceTransition || ['preparing', 'starting', 'stopping'].includes(snapshot.source.phase) || (!running && (receiveWorkBusy || !permissionsChosen))} styled={running ? 'danger' : 'primary'} onclick={startOrStop}>{running ? sync.share.stop : sync.share.start}</Button>
+        {/snippet}
         {#if isTauriAndroid}
-            <p class="mt-3 text-sm text-textcolor2">{sync.androidLanOnly}</p>
+            <p class="help px-4 py-3 text-sm">{sync.androidLanOnly}</p>
         {:else}
-            <div class="mt-3 flex flex-wrap gap-2" role="radiogroup" aria-label={sync.share.title}>
-                {#each [['lan', sync.share.methodLan], ['quick', sync.share.methodQuick], ['fixed-url', sync.share.methodFixed]] as [method, label]}
-                    <button type="button" role="radio" aria-checked={settings.syncListenMethod === method} class="rounded-md border border-darkborderc px-2 py-1 text-sm text-textcolor2 transition-colors hover:bg-darkbg focus:outline-hidden focus:ring-2 focus:ring-selected {settings.syncListenMethod === method ? 'bg-darkbutton' : 'bg-transparent'}" onclick={() => updateSettings({ syncListenMethod: method as typeof settings.syncListenMethod })}>{label}</button>
-                {/each}
-            </div>
+            <SettingRow label={sync.share.method} help={methodHelp}>
+                <SegmentedButtons role="radiogroup" label={sync.share.method} value={settings.syncListenMethod} options={methodOptions} onchange={(method) => updateSettings({ syncListenMethod: method })} />
+            </SettingRow>
         {/if}
         {#if settings.syncListenMethod !== 'quick' || isTauriAndroid}
-            <label class="mt-3 block text-sm font-bold" for="device-sync-port">{sync.share.port}</label>
-            <input id="device-sync-port" type="number" min="1" max="65535" class="mt-1 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm" value={settings.syncFixedPort} oninput={(event) => { const port = Number(event.currentTarget.value); if (Number.isInteger(port) && port >= 1 && port <= 65535) updateSettings({ syncFixedPort: port }) }} />
-        {:else}
-            <p class="mt-3 text-sm text-textcolor2">{sync.share.quickNote}</p>
+            <SettingRow label={sync.share.port} labelFor="device-sync-port">
+                <input id="device-sync-port" type="number" min="1" max="65535" class="{inputClass} w-28 text-right tabular-nums" value={settings.syncFixedPort} oninput={(event) => { const port = Number(event.currentTarget.value); if (Number.isInteger(port) && port >= 1 && port <= 65535) updateSettings({ syncFixedPort: port }) }} />
+            </SettingRow>
         {/if}
         {#if settings.syncListenMethod === 'fixed-url' && !isTauriAndroid}
-            <label class="mt-3 block text-sm font-bold" for="device-sync-public-url">{sync.share.publicUrl}</label>
-            <input id="device-sync-public-url" type="url" inputmode="url" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" class="mt-1 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm" value={settings.syncPublicBaseUrl} oninput={(event) => updateSettings({ syncPublicBaseUrl: event.currentTarget.value })} />
-            <p class="mt-2 text-sm text-textcolor2">{sync.share.fixedNote}</p>
-            <details class="mt-2 text-sm text-textcolor2"><summary class="cursor-pointer">{sync.share.fixedGuideTitle}</summary><p class="mt-2">{format(sync.share.fixedGuideBody, settings.syncFixedPort)}</p></details>
+            <SettingRow label={sync.share.publicUrl} labelFor="device-sync-public-url" help={sync.share.publicUrlHelp}>
+                {#snippet below()}
+                    <details class="mt-1 text-sm text-textcolor2"><summary class="cursor-pointer underline underline-offset-2">{sync.share.fixedGuideTitle}</summary><p class="mt-1">{format(sync.share.fixedGuideBody, settings.syncFixedPort)}</p></details>
+                {/snippet}
+                <input id="device-sync-public-url" type="url" inputmode="url" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" class="{inputClass} w-full @xl:w-64" value={settings.syncPublicBaseUrl} oninput={(event) => updateSettings({ syncPublicBaseUrl: event.currentTarget.value })} />
+            </SettingRow>
         {/if}
-        <label class="mt-3 flex gap-2 text-sm"><input type="checkbox" checked={settings.syncAutoListen} onchange={(event) => updateSettings({ syncAutoListen: event.currentTarget.checked })} />{sync.share.autoListen}</label>
-        <div data-permissions class="mt-3">
-            <label class="flex gap-2 text-sm"><input type="checkbox" checked={permissions.read} disabled={permissions.bidirectional} onchange={(event) => { permissions.read = event.currentTarget.checked }} />{sync.share.permRead}</label>
-            <label class="mt-2 flex gap-2 text-sm"><input type="checkbox" checked={permissions.bidirectional} onchange={(event) => { permissions.bidirectional = event.currentTarget.checked; if (permissions.bidirectional) permissions.read = true }} />{sync.share.permBidirectional}</label>
-            <p class="mt-1 text-xs text-textcolor2">{sync.share.permBidirectionalHelp}</p>
+        <SettingRow inline label={sync.share.autoListen}>
+            <SettingToggle checked={settings.syncAutoListen} label={sync.share.autoListen} onchange={(checked) => updateSettings({ syncAutoListen: checked })} />
+        </SettingRow>
+        <div data-permissions class="divide-y divide-darkborderc/55">
+            <SettingRow inline label={sync.share.permRead} help={sync.share.permReadHelp}>
+                <SettingToggle checked={permissions.read} disabled={permissions.bidirectional} label={sync.share.permRead} onchange={(checked) => { permissions.read = checked }} />
+            </SettingRow>
+            <SettingRow inline label={sync.share.permBidirectional} help={sync.share.permBidirectionalHelp}>
+                <SettingToggle checked={permissions.bidirectional} label={sync.share.permBidirectional} onchange={(checked) => { permissions.bidirectional = checked; if (checked) permissions.read = true }} />
+            </SettingRow>
         </div>
-        <Button className="mt-3" disabled={sourceTransition || ['preparing', 'starting', 'stopping'].includes(snapshot.source.phase) || (snapshot.source.phase !== 'running' && (receiveWorkBusy || !permissionsChosen))} styled={snapshot.source.phase === 'running' ? 'danger' : 'primary'} onclick={startOrStop}>{snapshot.source.phase === 'running' ? sync.share.stop : sync.share.start}</Button>
 
-        {#if snapshot.source.phase === 'running' && pairUri}
-            <div class="mt-4 border-t border-darkborderc pt-4">
-                <div class="mt-3 flex flex-wrap gap-4">
-                    {#if qrDataUrl}<img class:opacity-40={expired} src={qrDataUrl} alt={sync.share.pairTitle} width="192" height="192" />{/if}
-                    <div class="min-w-0 flex-1">
-                        <h5 class="font-bold">{sync.share.pairTitle}</h5>
-                        <p class="mt-1 text-sm text-textcolor2">{sync.share.pairNote}</p>
-                        <p class="mt-2 text-sm">{expired ? sync.share.pairExpired : format(sync.share.pairRemaining, formatDuration(remaining))}</p>
-                        <div class="mt-2 flex flex-wrap gap-2"><Button size="sm" disabled={expired} onclick={copyLink}>{sync.share.copyLink}</Button><Button size="sm" styled="outlined" disabled={sourceTransition || !permissionsChosen} onclick={rotate}>{sync.share.newLink}</Button></div>
-                        {#if copyFailed && !expired}<p data-pair-uri class="mt-2 break-all rounded-md border border-darkborderc bg-bgcolor p-2 text-xs select-all">{pairUri}</p>{/if}
-                    </div>
+        {#if running && pairUri}
+            <div class="grid grid-cols-1 items-center gap-5 p-4 @xl:grid-cols-[auto_minmax(0,1fr)]">
+                <div class="mx-auto flex h-44 w-44 items-center justify-center rounded-lg bg-white p-2 transition-opacity duration-300 @xl:mx-0" class:opacity-40={expired}>
+                    {#if qrDataUrl}<img src={qrDataUrl} alt={sync.share.pairTitle} width="160" height="160" />{/if}
+                </div>
+                <div class="min-w-0 text-center @xl:text-left">
+                    <h3 class="font-bold">{sync.share.pairTitle}</h3>
+                    <p class="help mx-auto mt-1 max-w-[62ch] text-sm @xl:mx-0">{sync.share.pairNote}</p>
+                    <p class="mt-2 text-sm tabular-nums">{expired ? sync.share.pairExpired : format(sync.share.pairRemaining, formatDuration(remaining))}</p>
+                    <div class="mx-auto mt-1.5 h-1 max-w-80 overflow-hidden rounded-full bg-bgcolor @xl:mx-0" aria-hidden="true"><div class="h-full bg-success-500 transition-[width] duration-1000 ease-linear" style:width={`${remainingRatio * 100}%`}></div></div>
+                    <div class="mt-3 flex flex-wrap justify-center gap-2 @xl:justify-start"><Button size="sm" disabled={expired} onclick={copyLink}>{sync.share.copyLink}</Button><Button size="sm" styled="outlined" disabled={sourceTransition || !permissionsChosen} onclick={rotate}>{sync.share.newLink}</Button></div>
+                    {#if copyFailed && !expired}<p data-pair-uri class="mt-2 rounded-md border border-darkborderc bg-bgcolor p-2 text-xs break-all select-all">{pairUri}</p>{/if}
                 </div>
             </div>
         {/if}
-        {#if shareActionError}<p data-share-error role="alert" class="mt-3 text-sm text-draculared">{shareActionError}</p>
-        {:else if sourceError}<p role="alert" class="mt-3 text-sm text-draculared">{safeError(sourceError)}</p>
-        {:else if snapshot.remoteCommitNotice === 'editsDiscarded'}<p data-share-refresh role="alert" class="mt-3 text-sm text-draculared">{sync.work.bidirectionalEditsDiscarded}</p>
-        {:else if snapshot.remoteCommitNotice === 'refreshFailed'}<p data-share-refresh role="alert" class="mt-3 text-sm text-draculared">{sync.work.bidirectionalRefreshPending}</p>{/if}
-    </div>
+        {#if shareActionError}<p data-share-error role="alert" class="px-4 py-3 text-sm text-draculared">{shareActionError}</p>
+        {:else if sourceError}<p role="alert" class="px-4 py-3 text-sm text-draculared">{safeError(sourceError)}</p>
+        {:else if snapshot.remoteCommitNotice === 'editsDiscarded'}<p data-share-refresh role="alert" class="px-4 py-3 text-sm text-draculared">{sync.work.bidirectionalEditsDiscarded}</p>
+        {:else if snapshot.remoteCommitNotice === 'refreshFailed'}<p data-share-refresh role="alert" class="px-4 py-3 text-sm text-draculared">{sync.work.bidirectionalRefreshPending}</p>{/if}
+    </SettingGroup>
 
-    <div data-sync-card="devices" class="mt-4 rounded-md border border-darkborderc bg-darkbg p-4">
-        <h4 class="font-bold">{sync.devices.title}</h4><p class="mt-1 text-sm text-textcolor2">{sync.devices.note}</p>
-        <div class="mt-4"><h5 class="font-bold">{sync.devices.outgoingTitle}</h5>
-            {#if snapshot.devices.length === 0}<p class="mt-2 text-sm text-textcolor2">{sync.devices.outgoingEmpty}</p>{:else}
-                {#each snapshot.devices as device (device.deviceId)}
-                    <div class="mt-2 flex items-center justify-between gap-3 border-t border-darkborderc pt-2 text-sm">
-                        <div class="flex min-w-0 items-center gap-3"><span data-device-icon class="shrink-0" aria-hidden="true"><MonitorSmartphone size={18} /></span><div class="min-w-0"><p class="break-words">{device.name || device.deviceId.slice(0, 8)}</p><p class="text-textcolor2">{format(sync.devices.lastSeen, formatTime(device.lastSeenMs), formatRisuNestStorageBytes(device.totalBytes ?? 0))}</p><div class="mt-1 flex gap-1">{#if device.permissions.includes('read')}<span class="rounded-md border border-darkborderc px-1.5 text-xs">{sync.devices.permRead}</span>{/if}{#if device.permissions.includes('bidirectional')}<span class="rounded-md border border-darkborderc px-1.5 text-xs">{sync.devices.permBidirectional}</span>{/if}</div></div></div>
-                        <button type="button" aria-label={`${sync.devices.revoke}: ${device.name || device.deviceId.slice(0, 8)}, ${sync.devices.outgoingTitle}`} disabled={sourceTransition} class="shrink-0 rounded-md border border-draculared bg-draculared/80 px-2 py-1 text-sm text-textcolor shadow-xs transition-colors duration-200 hover:bg-draculared focus:outline-hidden focus:ring-2 focus:ring-draculared disabled:cursor-not-allowed disabled:opacity-50" onclick={() => revoke('outgoing', device.deviceId)}>{sync.devices.revoke}</button>
+    <SettingGroup id="sync-devices" title={sync.devices.title} divide={false} panelProps={{ 'data-sync-card': 'devices' }}>
+        <div class="grid grid-cols-1 @xl:grid-cols-2">
+            <div>
+                <h3 class="flex items-center gap-1.5 px-4 pt-3 pb-1 text-xs font-bold text-textcolor2"><ArrowUpRight size={14} aria-hidden="true" />{sync.devices.outgoingTitle}</h3>
+                {#if snapshot.devices.length === 0}
+                    <p class="px-4 pt-1 pb-4 text-sm text-textcolor2">{sync.devices.outgoingEmpty}</p>
+                {:else}
+                    <div class="divide-y divide-darkborderc/55">
+                        {#each snapshot.devices as device (device.deviceId)}
+                            {@render deviceRow(device, 'outgoing')}
+                        {/each}
                     </div>
-                {/each}
-            {/if}
-        </div>
-        <div class="mt-4"><h5 class="font-bold">{sync.devices.incomingTitle}</h5>
-            {#if snapshot.sources.length === 0}<p class="mt-2 text-sm text-textcolor2">{sync.devices.incomingEmpty}</p>{:else}
-                {#each snapshot.sources as device (device.deviceId)}
-                    <div class="mt-2 flex items-center justify-between gap-3 border-t border-darkborderc pt-2 text-sm">
-                        <div class="flex min-w-0 items-center gap-3"><span data-device-icon class="shrink-0" aria-hidden="true"><MonitorSmartphone size={18} /></span><div class="min-w-0"><p class="break-words">{device.name || device.deviceId.slice(0, 8)}</p><p class="text-textcolor2">{format(sync.devices.lastSeen, formatTime(device.lastSeenMs), formatRisuNestStorageBytes(device.totalBytes ?? 0))}</p><div class="mt-1 flex gap-1">{#if device.permissions.includes('read')}<span class="rounded-md border border-darkborderc px-1.5 text-xs">{sync.devices.permRead}</span>{/if}{#if device.permissions.includes('bidirectional')}<span class="rounded-md border border-darkborderc px-1.5 text-xs">{sync.devices.permBidirectional}</span>{/if}</div></div></div>
-                        <button type="button" aria-label={`${sync.devices.revoke}: ${device.name || device.deviceId.slice(0, 8)}, ${sync.devices.incomingTitle}`} disabled={sourceTransition} class="shrink-0 rounded-md border border-draculared bg-draculared/80 px-2 py-1 text-sm text-textcolor shadow-xs transition-colors duration-200 hover:bg-draculared focus:outline-hidden focus:ring-2 focus:ring-draculared disabled:cursor-not-allowed disabled:opacity-50" onclick={() => revoke('incoming', device.deviceId)}>{sync.devices.revoke}</button>
+                {/if}
+            </div>
+            <div class="border-t border-darkborderc/55 @xl:border-t-0 @xl:border-l">
+                <h3 class="flex items-center gap-1.5 px-4 pt-3 pb-1 text-xs font-bold text-textcolor2"><ArrowDownLeft size={14} aria-hidden="true" />{sync.devices.incomingTitle}</h3>
+                {#if snapshot.sources.length === 0}
+                    <p class="px-4 pt-1 pb-4 text-sm text-textcolor2">{sync.devices.incomingEmpty}</p>
+                {:else}
+                    <div class="divide-y divide-darkborderc/55">
+                        {#each snapshot.sources as device (device.deviceId)}
+                            {@render deviceRow(device, 'incoming')}
+                        {/each}
                     </div>
-                {/each}
-            {/if}
+                {/if}
+            </div>
         </div>
-    </div>
+    </SettingGroup>
 
-    <div data-sync-card="work" class="mt-4 rounded-md border border-darkborderc bg-darkbg p-4">
-        <h4 class="font-bold">{sync.work.title}</h4>
-        <label class="mt-3 block text-sm font-bold" for="device-sync-target">{sync.work.target}</label>
-        <select id="device-sync-target" class="mt-1 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm" value={targetId} onchange={(event) => { targetId = event.currentTarget.value }}>
-            {#each snapshot.sources as source (source.deviceId)}<option value={source.deviceId}>{source.name || source.deviceId.slice(0, 8)}</option>{/each}<option value="new-link">{sync.work.useNewLink}</option>
-        </select>
-        {#if targetId === 'new-link'}<label class="sr-only" for="device-sync-link">{sync.work.linkPlaceholder}</label><input id="device-sync-link" type="text" inputmode="url" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-invalid={stagedLinkInvalid} class="mt-2 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm" placeholder={sync.work.linkPlaceholder} value={stagedUri} oninput={(event) => updateStagedUri(event.currentTarget.value)} />{/if}
-        {#if stagedLinkInvalid}<p data-link-invalid class="mt-2 text-sm text-draculared">{sync.work.linkInvalid}</p>{/if}
-        <div class="mt-3 flex flex-col gap-2 sm:flex-row"><Button disabled={receiveBusy || !workAllowed('clone')} onclick={startClone}>{sync.work.clone}</Button><Button disabled={receiveBusy || !workAllowed('delta')} onclick={startDelta}>{sync.work.delta}</Button><Button disabled={receiveBusy || !workAllowed('bidirectional')} onclick={startBidi}>{sync.work.bidirectional}</Button></div>
-        {#if sourceBusy}<p class="mt-2 text-sm text-textcolor2">{sync.work.blockedWhileSharing}</p>{/if}
-        {#if selectedExpired && !(activeWork && latestWorkError)}<p role="alert" class="mt-2 text-sm text-draculared">{sync.registrationExpired}</p>{/if}
+    <SettingGroup id="sync-work" title={sync.work.title} panelProps={{ 'data-sync-card': 'work' }}>
+        {#snippet actions()}
+            <span class="text-xs text-textcolor2">{sync.work.backupNote}</span>
+        {/snippet}
+        <SettingRow label={sync.work.target} labelFor="device-sync-target">
+            <select id="device-sync-target" class="{inputClass} w-full @xl:w-64" value={targetId} onchange={(event) => { targetId = event.currentTarget.value }}>
+                {#each snapshot.sources as source (source.deviceId)}<option value={source.deviceId}>{source.name || source.deviceId.slice(0, 8)}</option>{/each}<option value="new-link">{sync.work.useNewLink}</option>
+            </select>
+        </SettingRow>
+        {#if targetId === 'new-link'}
+            <SettingRow label={sync.work.linkLabel} labelFor="device-sync-link" help={sync.work.linkHelp}>
+                {#snippet below()}
+                    {#if stagedLinkInvalid}<p data-link-invalid class="mt-1 text-sm text-draculared">{sync.work.linkInvalid}</p>{/if}
+                {/snippet}
+                <input id="device-sync-link" type="text" inputmode="url" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-invalid={stagedLinkInvalid} class="{inputClass} w-full @xl:w-64" placeholder={sync.work.linkPlaceholder} value={stagedUri} oninput={(event) => updateStagedUri(event.currentTarget.value)} />
+            </SettingRow>
+        {/if}
+        <div class="grid grid-cols-1 gap-2.5 p-4 @xl:grid-cols-3">
+            {@render tile(sync.work.clone, sync.work.cloneHelp, Download, receiveBusy || !workAllowed('clone'), startClone)}
+            {@render tile(sync.work.delta, sync.work.deltaHelp, RefreshCw, receiveBusy || !workAllowed('delta'), startDelta)}
+            {@render tile(sync.work.bidirectional, sync.work.bidirectionalHelp, ArrowLeftRight, receiveBusy || !workAllowed('bidirectional'), startBidi)}
+        </div>
+        {#if sourceBusy}<p class="px-4 py-2.5 text-sm text-textcolor2">{sync.work.blockedWhileSharing}</p>{/if}
+        {#if selectedExpired && !(activeWork && latestWorkError)}<p role="alert" class="px-4 py-2.5 text-sm text-draculared">{sync.registrationExpired}</p>{/if}
 
         {#if activeWork}
-            <div data-work-status aria-live="polite" aria-busy={workActionPending} class="mt-4 border-t border-darkborderc pt-4">
+            <div data-work-status aria-live="polite" aria-busy={workActionPending} class="p-4">
+                <p class="mb-2 text-sm font-bold">{laneTitle}</p>
                 {#if activeWork === 'clone'}
-                    {#if workActionPending || cloneTarget?.phase === 'confirmed'}<progress class="w-full" aria-label={sync.work.receiving}></progress><p class="mt-1 text-sm">{sync.work.receiving}</p>
+                    {#if workActionPending || cloneTarget?.phase === 'confirmed'}<progress class="h-2 w-full accent-borderc" aria-label={sync.work.receiving}></progress><p class="mt-1 text-sm">{sync.work.receiving}</p>
                     {:else if cloneTarget?.phase === 'downloading'}
                         {#if cloneTarget.totalBytes !== undefined}
                             {@const percent = Math.round((cloneTarget.completedBytes / Math.max(1, cloneTarget.totalBytes)) * 100)}
-                            <progress class="w-full" aria-label={format(sync.work.progress, percent)} value={cloneTarget.completedBytes} max={Math.max(1, cloneTarget.totalBytes)}></progress><p class="mt-1 text-sm">{format(sync.work.progress, percent)}</p>
-                        {:else}<progress class="w-full" aria-label={sync.work.progressLabel}></progress><p class="mt-1 text-sm">{sync.work.progressLabel}</p>{/if}
+                            <progress class="h-2 w-full accent-borderc" aria-label={format(sync.work.progress, percent)} value={cloneTarget.completedBytes} max={Math.max(1, cloneTarget.totalBytes)}></progress><p class="mt-1 text-sm tabular-nums">{format(sync.work.progress, percent)}</p>
+                        {:else}<progress class="h-2 w-full accent-borderc" aria-label={sync.work.progressLabel}></progress><p class="mt-1 text-sm">{sync.work.progressLabel}</p>{/if}
                         <Button className="mt-2" size="sm" styled="danger" disabled={workActionPending} onclick={() => runWorkAction(() => controller.cancelClone())}>{sync.work.cancel}</Button>
                     {:else if cloneRetryable}
                         <div class="flex flex-wrap gap-2">
@@ -558,7 +645,7 @@
                     {:else if cloneTarget?.phase === 'completed'}
                         {@const backupPaths = cloneBackupPaths()}
                         <p class="text-sm">{format(sync.work.doneUpdated, 1, formatRisuNestStorageBytes(cloneTarget.totalBytes ?? cloneTarget.completedBytes))}</p>
-                        {#if backupPaths.length > 0}<details class="mt-2 text-sm text-textcolor2"><summary class="cursor-pointer">{sync.work.backupNote}</summary><ul class="mt-1 list-inside list-disc">{#each backupPaths as path}<li class="break-all">{path}</li>{/each}</ul></details>{/if}
+                        {#if backupPaths.length > 0}<details class="mt-2 text-sm text-textcolor2"><summary class="cursor-pointer underline underline-offset-2">{sync.work.backupLocation}</summary><ul class="mt-1 list-inside list-disc">{#each backupPaths as path}<li class="break-all">{path}</li>{/each}</ul></details>{/if}
                         <Button className="mt-2" size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>
                     {/if}
                 {:else if activeWork === 'delta'}
@@ -571,7 +658,7 @@
                             {/if}
                             <Button size="sm" styled="danger" disabled={workActionPending || sourceBusy} onclick={abandonRetainedDelta}>{sync.work.abandon}</Button>
                         </div>
-                    {:else if workActionPending || delta?.pullPhase === 'running'}<progress class="w-full" aria-label={sync.work.receiving}></progress><p class="mt-1 text-sm">{sync.work.receiving}</p>
+                    {:else if workActionPending || delta?.pullPhase === 'running'}<progress class="h-2 w-full accent-borderc" aria-label={sync.work.receiving}></progress><p class="mt-1 text-sm">{sync.work.receiving}</p>
                     {:else if delta?.pullPhase === 'completed' && delta.pullResult?.kind === 'noChanges'}<p class="text-sm">{sync.work.doneUpToDate}</p><Button className="mt-2" size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>
                     {:else if delta?.pullPhase === 'completed' && delta.pullResult?.kind === 'updated'}<p class="text-sm">{format(sync.work.doneUpdated, delta.pullResult.transferredObjects, formatRisuNestStorageBytes(delta.pullResult.transferredBytes))}</p><Button className="mt-2" size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>
                     {:else if delta?.pullPhase === 'fullCloneRequired'}<p class="text-sm">{sync.work.needClone}</p><Button className="mt-2" size="sm" onclick={dismissWork}>{sync.work.dismiss}</Button>
@@ -581,7 +668,7 @@
                     {#if workActionPending || bidiPhase === 'running'}<p class="text-sm">{sync.work.bidirectionalSyncing}</p>
                     {:else if bidiPhase === 'awaitingConflict'}
                         {@const conflict = conflictNames()}
-                        <div class="rounded-md border border-draculared p-3"><p class="font-bold text-draculared">{sync.work.conflictTitle}</p><p class="mt-1 text-sm text-textcolor2">{sync.work.conflictBody}</p><ul class="mt-2 list-inside list-disc text-sm">{#each conflict.names as name}<li>{name}</li>{/each}{#if conflict.otherCount > 0}<li>{format(sync.work.conflictOthers, conflict.otherCount)}</li>{/if}</ul><div class="mt-2 flex flex-wrap gap-2"><Button size="sm" disabled={!conflictSourceId} onclick={() => resolve('local')}>{sync.work.keepThis}</Button><Button size="sm" disabled={!conflictSourceId} onclick={() => resolve('remote')}>{sync.work.keepOther}</Button></div>{#if !conflictSourceId}<p data-conflict-target class="mt-2 text-sm text-draculared">{sync.work.conflictSelectTarget}</p>{/if}</div>
+                        <div class="rounded-lg border border-draculared p-3.5"><p class="font-bold text-draculared">{sync.work.conflictTitle}</p><p class="help mt-1 text-sm">{sync.work.conflictBody}</p><ul class="mt-2 list-inside list-disc text-sm">{#each conflict.names as name}<li>{name}</li>{/each}{#if conflict.otherCount > 0}<li>{format(sync.work.conflictOthers, conflict.otherCount)}</li>{/if}</ul><div class="mt-2 flex flex-wrap gap-2"><Button size="sm" disabled={!conflictSourceId} onclick={() => resolve('local')}>{sync.work.keepThis}</Button><Button size="sm" disabled={!conflictSourceId} onclick={() => resolve('remote')}>{sync.work.keepOther}</Button></div>{#if !conflictSourceId}<p data-conflict-target class="mt-2 text-sm text-draculared">{sync.work.conflictSelectTarget}</p>{/if}</div>
                     {:else if bidiPhase === 'sourcePrepared'}<p class="text-sm text-textcolor2">{sync.share.start}: {sync.work.bidirectionalResumeRequired}</p><div class="mt-2 flex gap-2"><Button size="sm" disabled={!['idle', 'error', 'prepared'].includes(snapshot.source.phase)} onclick={resumeBidi}>{sync.work.resume}</Button>{#if snapshot.source.phase === 'idle'}<Button size="sm" styled="danger" onclick={abandon}>{sync.work.abandon}</Button>{/if}</div>
                     {:else if ['sourceUnavailable', 'localCommitted', 'targetPrepared'].includes(bidiPhase)}<p class="text-sm text-textcolor2">{bidiPhase === 'sourceUnavailable' ? sync.work.bidirectionalSourceUnavailable : sync.work.bidirectionalResumeRequired}</p><div class="mt-2 flex gap-2"><Button size="sm" onclick={resumeBidi}>{sync.work.resume}</Button><Button size="sm" styled="danger" onclick={abandon}>{sync.work.abandon}</Button></div>
                     {:else if bidiPhase === 'refreshPending'}<p class="text-sm text-textcolor2">{sync.work.bidirectionalRefreshPending}</p><Button className="mt-2" size="sm" onclick={resumeBidi}>{sync.work.resume}</Button>
@@ -589,12 +676,18 @@
                     {:else if bidiPhase === 'completed' && bidi?.operationResult?.kind !== 'conflict'}
                         {@const result = bidi.operationResult}
                         <p class="text-sm">{result?.kind === 'noChanges' ? sync.work.doneUpToDate : result?.kind === 'updated' ? format(sync.work.doneUpdated, result.transferredObjects, formatRisuNestStorageBytes(result.transferredBytes)) : sync.work.doneUpToDate}</p>
-                        {#if result && 'backups' in result && result.backups.length > 0}<details class="mt-2 text-sm text-textcolor2"><summary class="cursor-pointer">{sync.work.backupNote}</summary><ul class="mt-1 list-inside list-disc">{#each result.backups as backup (backup.packageId)}<li class="break-all">{backup.path}</li>{/each}</ul></details>{/if}
+                        {#if result && 'backups' in result && result.backups.length > 0}<details class="mt-2 text-sm text-textcolor2"><summary class="cursor-pointer underline underline-offset-2">{sync.work.backupLocation}</summary><ul class="mt-1 list-inside list-disc">{#each result.backups as backup (backup.packageId)}<li class="break-all">{backup.path}</li>{/each}</ul></details>{/if}
                         <Button className="mt-2" size="sm" onclick={acknowledgeBidi}>{sync.work.dismiss}</Button>
                     {/if}
                 {/if}
                 {#if latestWorkError}<p data-work-error role="alert" class="mt-2 text-sm text-draculared">{latestWorkError}</p>{/if}
             </div>
         {/if}
-    </div>
-</section>
+    </SettingGroup>
+</div>
+
+<style>
+    .help {
+        color: color-mix(in srgb, var(--risu-theme-textcolor2) 62%, var(--risu-theme-textcolor) 38%);
+    }
+</style>

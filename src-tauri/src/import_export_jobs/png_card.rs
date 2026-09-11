@@ -27,7 +27,7 @@ pub(crate) struct PngCardLimits {
 impl Default for PngCardLimits {
     fn default() -> Self {
         Self {
-            max_card_metadata_bytes: 5 * 1024 * 1024,
+            max_card_metadata_bytes: crate::import_export_jobs::MAX_CONTENT_METADATA_BYTES as u64,
             max_recognized_metadata_bytes: 768 * 1024 * 1024,
             max_embedded_asset_bytes: 50 * 1024 * 1024,
             max_embedded_asset_total_bytes: 512 * 1024 * 1024,

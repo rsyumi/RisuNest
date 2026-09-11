@@ -1279,10 +1279,10 @@ impl NativeFileJobState {
                 }
                 let metadata_bytes = serde_json::to_vec(&(&card, &module))
                     .map_err(|error| NativeJobError::new("invalid-input", error.to_string()))?;
-                if metadata_bytes.len() > 8 * 1024 * 1024 {
+                if metadata_bytes.len() > content::JSON_CARD_MAX_METADATA_BYTES {
                     return Err(NativeJobError::new(
                         "invalid-input",
-                        "character export metadata exceeds the 8 MiB limit",
+                        "character export metadata exceeds the 128 MiB limit",
                     ));
                 }
                 let prepared =
@@ -1321,7 +1321,7 @@ impl NativeFileJobState {
                 if metadata_bytes.len() > content::JSON_CARD_MAX_METADATA_BYTES {
                     return Err(NativeJobError::new(
                         "invalid-input",
-                        "character export metadata exceeds the 8 MiB limit",
+                        "character export metadata exceeds the 128 MiB limit",
                     ));
                 }
                 let prepared =
@@ -5183,6 +5183,91 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "synthetic large content import measurements"]
+    fn large_content_import_benchmark() {
+        for (count, size) in [(1000, 100 * 1024), (2500, 200 * 1024), (10000, 1024)] {
+            let directory = TempDir::new().unwrap();
+            let source = directory.path().join("synthetic.charx");
+            let mut archive = ZipWriter::new(fs::File::create(&source).unwrap());
+            let options = FileOptions::default().compression_method(CompressionMethod::Stored);
+            let references = (0..count).map(|i| json!({"type":"x-risu-asset", "uri":format!("embeded://assets/{i}.bin"), "name":format!("asset-{i}"), "ext":"bin"})).collect::<Vec<_>>();
+            archive.start_file("card.json", options).unwrap();
+            archive.write_all(&serde_json::to_vec(&json!({"spec":"chara_card_v3","spec_version":"3.0","data":{"name":"synthetic","extensions":{},"assets":references}})).unwrap()).unwrap();
+            for i in 0..count {
+                let mut bytes = vec![42_u8; size];
+                bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                archive
+                    .start_file(format!("assets/{i}.bin"), options)
+                    .unwrap();
+                archive.write_all(&bytes).unwrap();
+            }
+            archive.finish().unwrap();
+            let state = NativeFileJobState::initialize(directory.path().join("native-file-jobs"));
+            let now = Instant::now();
+            let started = start_test_content_job(&state, &source, "synthetic.charx");
+            let status = loop {
+                let status = state.status(&started.job_id).unwrap();
+                if status.state.is_terminal() {
+                    break status;
+                }
+                assert!(
+                    now.elapsed() < Duration::from_secs(300),
+                    "import benchmark timed out"
+                );
+                thread::sleep(Duration::from_millis(100));
+            };
+            let elapsed = now.elapsed();
+            assert_eq!(status.state, JobState::Succeeded, "{:?}", status.error);
+            let content = status.prepared_content.unwrap();
+            assert_eq!(content.assets.len(), count);
+            assert_eq!(
+                status.detail.unwrap().counts.attachments_prepared,
+                count as u64
+            );
+            assert_eq!(
+                content.assets.iter().map(|a| a.byte_size).sum::<u64>(),
+                (count * size) as u64
+            );
+            assert!(!state
+                .root
+                .join("jobs")
+                .join(&started.job_id)
+                .join("source.charx")
+                .exists());
+            println!(
+                "native-content count={count} bytes={} elapsed_ms={}",
+                count * size,
+                elapsed.as_millis()
+            );
+        }
+    }
+
+    #[test]
+    fn charx_overlay_accepts_ten_thousand_lore_entries_above_eight_mib() {
+        let directory = TempDir::new().unwrap();
+        let source = directory.path().join("large-lore.charx");
+        let lore = vec![json!({"key": "synthetic", "content": "x".repeat(1024)}); 10_000];
+        let module = risum_fixture(
+            json!({"name": "synthetic", "id": "module", "lorebook": lore, "assets": []}),
+            &[],
+        );
+        assert!(module.len() > 8 * 1024 * 1024);
+        let mut archive = ZipWriter::new(fs::File::create(&source).unwrap());
+        let options = FileOptions::default().compression_method(CompressionMethod::Stored);
+        archive.start_file("card.json", options).unwrap();
+        archive.write_all(br#"{"spec":"chara_card_v3","spec_version":"3.0","data":{"name":"synthetic","extensions":{},"assets":[]}}"#).unwrap();
+        archive.start_file("module.risum", options).unwrap();
+        archive.write_all(&module).unwrap();
+        archive.finish().unwrap();
+        let state = NativeFileJobState::initialize(directory.path().join("native-file-jobs"));
+        let started = start_test_content_job(&state, &source, "large-lore.charx");
+        let status = wait_for_content_job(&state, &started.job_id);
+        assert_eq!(status.state, JobState::Succeeded, "{:?}", status.error);
+        let content = status.prepared_content.unwrap();
+        assert_eq!(content.module.unwrap().lorebook.unwrap().len(), 10_000);
+    }
+
+    #[test]
     fn content_prepare_charx_promotes_only_referenced_assets_with_distinct_tokens() {
         let directory = TempDir::new().unwrap();
         let source = directory.path().join("prepared.charx");
@@ -7142,4 +7227,38 @@ mod tests {
         assert!(!owned.exists());
         assert!(unrelated.exists());
     }
+}
+
+#[tauri::command]
+pub(crate) async fn native_content_source_metadata(
+    state: tauri::State<'_, NativeFileJobState>,
+    token: String,
+) -> Result<String, NativeJobError> {
+    let root = state.root.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::io::Read;
+        let source = open_job_source(&root, &JobSource::AndroidSpool { token })?;
+        const LIMIT: u64 = crate::import_export_jobs::MAX_CONTENT_METADATA_BYTES as u64;
+        if source.total_bytes > LIMIT {
+            return Err(NativeJobError::new(
+                "native-limit",
+                "Content metadata exceeds 128 MiB",
+            ));
+        }
+        let mut text = String::new();
+        source
+            .file
+            .take(LIMIT + 1)
+            .read_to_string(&mut text)
+            .map_err(|e| NativeJobError::new("invalid-input", e.to_string()))?;
+        if text.len() as u64 > LIMIT {
+            return Err(NativeJobError::new(
+                "native-limit",
+                "Content metadata exceeds 128 MiB",
+            ));
+        }
+        Ok(text)
+    })
+    .await
+    .map_err(|e| NativeJobError::new("store-error", e.to_string()))?
 }

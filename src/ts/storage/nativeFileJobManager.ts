@@ -254,18 +254,19 @@ export function runSharedNativeFileOperation<T>(
 export function runExternalAndroidNativeFileOperation<T>(
     kind: NativeFileOperationKind,
     operation: (context: SharedNativeFileOperationContext) => Promise<T>,
+    options: SharedNativeFileOperationOptions = {},
 ): Promise<T> {
     return externalAndroidOperationMutex.runExclusive(async () => {
         while (activeOperation) {
             try {
                 await activeOperation
-            }
-            catch {}
+            } catch {}
         }
         return await runSharedNativeFileOperation(
             kind,
             `external-android:${kind}`,
             operation,
+            options,
         )
     })
 }

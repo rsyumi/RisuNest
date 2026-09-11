@@ -1,4 +1,5 @@
 <script lang="ts">
+    import ListPager from "src/lib/UI/GUI/ListPager.svelte"
     import { language } from "src/lang";
     import TextInput from "src/lib/UI/GUI/TextInput.svelte";
     import type { loreBook } from "src/ts/storage/database.svelte";
@@ -28,21 +29,23 @@
     let assetFileExtensions:string[] = $state([])
     let assetFilePath:string[] = $state([])
 
-    $effect.pre(() => {
-        if(DBState.db.useAdditionalAssetsPreview){
-            if(currentModule?.assets){
-                for(let i = 0; i < currentModule.assets.length; i++){
-                    if(currentModule.assets[i].length > 2 && currentModule.assets[i][2]) {
-                        assetFileExtensions[i] = currentModule.assets[i][2]
-                    } else 
-                        assetFileExtensions[i] = currentModule.assets[i][1].split('.').pop()
-                        getFileSrc(currentModule.assets[i][1]).then((filePath) => {
-                        assetFilePath[i] = filePath
-                    })
-                }
+    let assetPage = $state(0)
+    const allAssets = $derived(currentModule.assets ?? [])
+    const assetRows = $derived(allAssets.slice(assetPage * 60, (assetPage + 1) * 60).map((asset, offset) => ({ asset, i: assetPage * 60 + offset })))
+    $effect(() => {
+        let active = true
+        assetFilePath = []
+        const extensions: string[] = []
+        if (submenu === 5 && DBState.db.useAdditionalAssetsPreview) {
+            for (const { asset, i } of assetRows) {
+                extensions[i] = asset[2] || asset[1].split('.').pop()
+                void getFileSrc(asset[1]).then(path => { if (active) assetFilePath[i] = path }).catch(() => {})
             }
         }
-    });
+        assetFileExtensions = extensions
+        return () => { active = false }
+    })
+
 
     function addLorebook(){
         if(Array.isArray(currentModule.lorebook)){
@@ -245,6 +248,7 @@
 
 {#if submenu === 5 && (Array.isArray(currentModule.assets))}
     <div class="w-full max-w-full border border-selected rounded-md p-2">
+        <ListPager bind:page={assetPage} total={allAssets.length} />
         <table class="contain w-full max-w-full tabler mt-2">
             <tbody>
             <tr>
@@ -274,7 +278,7 @@
                     <td colspan="3">{language.noData}</td>
                 </tr>
             {:else}
-                {#each currentModule.assets as assets, i}
+                {#each assetRows as { asset: assets, i } (assets)}
                     <tr>
                         <td class="font-medium truncate">
                             {#if assetFilePath[i] && DBState.db.useAdditionalAssetsPreview}

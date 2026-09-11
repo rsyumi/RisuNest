@@ -344,7 +344,7 @@ fn write_projected_risum(
     }
     let metadata = serde_json::to_vec_pretty(&json!({"module": module, "type": "risuModule"}))
         .map_err(|error| invalid_input(error.to_string()))?;
-    if metadata.len() > 8 * 1024 * 1024 {
+    if metadata.len() > crate::import_export_jobs::MAX_CONTENT_METADATA_BYTES {
         return Err(invalid_input("RISUM metadata exceeds the importer limit"));
     }
     output.write_all(&[111, 0]).map_err(io_error)?;

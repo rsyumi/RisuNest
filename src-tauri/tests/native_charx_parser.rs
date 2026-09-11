@@ -1350,3 +1350,38 @@ fn cancellation_is_checked_after_validation_before_staging_is_preserved() {
     assert_eq!(error.code(), CharXParseErrorCode::Cancelled);
     assert_eq!(fs::read_dir(staging).unwrap().count(), 0);
 }
+
+#[test]
+fn metadata_has_a_separate_generous_limit_from_binary_assets() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("metadata.charx");
+    let card = br#"{"spec":"chara_card_v3","spec_version":"3.0","data":{"name":"synthetic","extensions":{},"assets":[]}}"#;
+    fs::write(
+        &path,
+        zip_bytes(
+            &[
+                ("card.json", card, CompressionMethod::Stored),
+                ("module.risum", &[0_u8; 32], CompressionMethod::Stored),
+            ],
+            false,
+        ),
+    )
+    .unwrap();
+    let limits = CharXLimits {
+        max_entry_decoded_bytes: 4,
+        max_metadata_bytes: 1024,
+        ..CharXLimits::default()
+    };
+    assert!(matches!(
+        inspect_charx_file(
+            &path,
+            "metadata.charx",
+            &directory.path().join("stage"),
+            limits,
+            || false
+        )
+        .unwrap(),
+        CharXInspection::Card(_)
+    ));
+    assert_eq!(CharXLimits::default().max_metadata_bytes, 128 * 1024 * 1024);
+}

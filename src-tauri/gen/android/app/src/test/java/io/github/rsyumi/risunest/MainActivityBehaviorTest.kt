@@ -12,6 +12,15 @@ import org.junit.Test
 
 class MainActivityBehaviorTest {
   @Test
+  fun `content picker recognizes binary cards and upstream metadata formats only`() {
+    for (name in listOf("card.CHARX", "card.png", "module.risum", "book.lorebook", "module.json", "card.JPEG")) {
+      assertEquals(true, isNativeContentSource(name))
+    }
+    assertEquals(false, isNativeContentSource("database.risudat"))
+    assertEquals(false, isNativeContentSource("program.exe"))
+  }
+
+  @Test
   fun `SAF RisuSave import is enabled by default`() {
     assertEquals(true, BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS)
   }

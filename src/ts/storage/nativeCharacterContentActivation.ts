@@ -77,7 +77,7 @@ function hashBytes(hash: string): Uint8Array {
     )
 }
 
-function preparedAliases(
+export function preparedAliases(
     content: PreparedNativeContent,
 ): PersistentCharacterAssetAlias[] {
     const aliases = new Map<string, PersistentCharacterAssetAlias>()
@@ -94,16 +94,25 @@ function preparedAliases(
         const existing = aliases.get(alias.key)
         if (existing) {
             if (
-                existing.objectHash !== alias.objectHash
-                || existing.size !== alias.size
-                || existing.ext !== alias.ext
+                existing.objectHash !== alias.objectHash ||
+                existing.size !== alias.size ||
+                existing.ext !== alias.ext
             ) {
-                throw new TypeError(`Conflicting prepared asset alias: ${alias.key}`)
+                throw new TypeError(
+                    `Conflicting prepared asset alias: ${alias.key}`,
+                )
             }
-            if (existing.mime !== alias.mime && existing.mime !== '' && alias.mime !== '') {
-                throw new TypeError(`Conflicting prepared asset alias: ${alias.key}`)
+            if (
+                existing.mime !== alias.mime &&
+                existing.mime !== '' &&
+                alias.mime !== ''
+            ) {
+                throw new TypeError(
+                    `Conflicting prepared asset alias: ${alias.key}`,
+                )
             }
-            if (existing.mime === '' && alias.mime !== '') existing.mime = alias.mime
+            if (existing.mime === '' && alias.mime !== '')
+                existing.mime = alias.mime
             continue
         }
         aliases.set(alias.key, alias)
@@ -111,7 +120,7 @@ function preparedAliases(
     return [...aliases.values()]
 }
 
-async function prepareAdditionalAssetOwnerHead(
+export async function prepareAdditionalAssetOwnerHead(
     character: character,
     aliases: readonly PersistentCharacterAssetAlias[],
     prepareManifest: PreparedNativeContentActivationLifecycle['prepareOwnerManifestAndSeal'],
@@ -134,8 +143,8 @@ async function prepareAdditionalAssetOwnerHead(
         ownerManifestIdentity(bytes),
     ])
     if (
-        prepared.contentHash !== manifestHash
-        || prepared.byteSize !== bytes.byteLength
+        prepared.contentHash !== manifestHash ||
+        prepared.byteSize !== bytes.byteLength
     ) {
         throw new Error('Owner manifest CAS identity mismatch')
     }
@@ -162,25 +171,11 @@ export async function activatePreparedNativeCharacterContent(
     dependencies: NativeCharacterContentActivationDependencies = productionDependencies,
     signal?: AbortSignal,
 ): Promise<NativeCharacterContentActivationResult | null> {
-    if (content.format === 'risu-module') {
-        throw new UnsupportedPreparedNativeCharacterCardError()
-    }
-    const cardAssets = content.assets as import('./nativeFileJobs').PreparedCardContentAssetDescriptor[]
-    throwIfAborted(signal)
-    const card = content.format === 'png-card'
-        ? await dependencies.decodePng(content.metadata as PreparedNativePngCardMetadata)
-        : requireCharacterCardMetadata(content.metadata)
-    throwIfAborted(signal)
-    if (!card) return null
-    const character = await dependencies.map({
-        card,
-        assets: cardAssets.map(({ token, logicalId }) => ({ token, logicalId })),
-        ...(content.portraitLogicalId === undefined
-            ? {}
-            : { portraitLogicalId: content.portraitLogicalId }),
-        ...(content.module === undefined ? {} : { module: content.module }),
-    })
-    throwIfAborted(signal)
+    const character = await mapPreparedNativeContent(
+        content,
+        dependencies,
+        signal,
+    )
     if (!character) return null
 
     const assetAliases = preparedAliases(content)
@@ -200,4 +195,41 @@ export async function activatePreparedNativeCharacterContent(
         },
     )
     return { characterId: character.chaId }
+}
+
+export async function mapPreparedNativeContent(
+    content: PreparedNativeContent,
+    dependencies: Pick<
+        NativeCharacterContentActivationDependencies,
+        'decodePng' | 'map'
+    > = productionDependencies,
+    signal?: AbortSignal,
+): Promise<character | null> {
+    if (content.format === 'risu-module') {
+        throw new UnsupportedPreparedNativeCharacterCardError()
+    }
+    const cardAssets =
+        content.assets as import('./nativeFileJobs').PreparedCardContentAssetDescriptor[]
+    throwIfAborted(signal)
+    const card =
+        content.format === 'png-card'
+            ? await dependencies.decodePng(
+                  content.metadata as PreparedNativePngCardMetadata,
+              )
+            : requireCharacterCardMetadata(content.metadata)
+    throwIfAborted(signal)
+    if (!card) return null
+    const character = await dependencies.map({
+        card,
+        assets: cardAssets.map(({ token, logicalId }) => ({
+            token,
+            logicalId,
+        })),
+        ...(content.portraitLogicalId === undefined
+            ? {}
+            : { portraitLogicalId: content.portraitLogicalId }),
+        ...(content.module === undefined ? {} : { module: content.module }),
+    })
+    throwIfAborted(signal)
+    return character || null
 }

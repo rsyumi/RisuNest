@@ -933,7 +933,20 @@ fn write_module_overlay(
         .ok()
         .and_then(|bytes| bytes.checked_add(7))
         .ok_or_else(|| invalid_input("module overlay size overflowed"))?;
-    reserve_decoded_entry(decoded_bytes, entry_bytes, "module overlay", limits)?;
+    if entry_bytes > limits.max_metadata_bytes {
+        return Err(invalid_input(
+            "module overlay exceeds the configured metadata limit",
+        ));
+    }
+    reserve_decoded_entry(
+        decoded_bytes,
+        entry_bytes,
+        "module overlay",
+        CharXLimits {
+            max_entry_decoded_bytes: limits.max_metadata_bytes,
+            ..limits
+        },
+    )?;
     archive
         .start_file(
             "module.risum",
@@ -963,13 +976,18 @@ fn write_card_metadata(
     let metadata = serde_json::to_vec_pretty(card)
         .map_err(|error| invalid_input(format!("CCv3 metadata is invalid: {error}")))?;
     if metadata.len() as u64 > limits.max_metadata_bytes {
-        return Err(invalid_input("CCv3 metadata exceeds the 8 MiB limit"));
+        return Err(invalid_input(
+            "CCv3 metadata exceeds the configured metadata limit",
+        ));
     }
     reserve_decoded_entry(
         decoded_bytes,
         metadata.len() as u64,
         "CCv3 metadata",
-        limits,
+        CharXLimits {
+            max_entry_decoded_bytes: limits.max_metadata_bytes,
+            ..limits
+        },
     )?;
     archive
         .start_file(

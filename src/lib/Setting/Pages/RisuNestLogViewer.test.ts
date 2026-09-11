@@ -42,6 +42,8 @@ vi.mock('src/lang', () => ({
         risuNest: {
             diag: {
                 title: 'Diagnostics',
+                logTitle: 'Error log',
+                logHelp: 'Recent errors.',
                 viewLog: 'View error log',
                 copyLog: 'Copy error log',
                 fileLog: 'Save error log to a file',

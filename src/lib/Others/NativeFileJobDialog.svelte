@@ -90,7 +90,7 @@
             {/if}
 
             <div class="flex flex-col gap-1" aria-live="polite">
-                <div class="h-2 w-full overflow-hidden rounded-md border border-darkborderc bg-bgcolor">
+                <div role="progressbar" aria-label={copy.titleImport} aria-valuemin={0} aria-valuemax={100} aria-valuenow={model.overallPercent ?? undefined} class="h-2 w-full overflow-hidden rounded-md border border-darkborderc bg-bgcolor">
                     {#if model.indeterminate}
                         <div class="h-full w-full bg-borderc/60 motion-safe:animate-pulse"></div>
                     {:else}
@@ -105,7 +105,7 @@
 
             {#if model.stages.length > 0}
                 <ol class="flex flex-col gap-1.5 text-sm">
-                    {#each model.stages as row (row.stage)}
+                    {#each (model.compact ? model.stages.filter(row => row.state === 'active' || row.state === 'stopped' || row.stage === 'complete') : model.stages) as row (row.stage)}
                         <li class="flex items-center gap-2" data-stage={row.stage} data-stage-state={row.state}>
                             {#if row.state === 'done'}
                                 <CheckIcon size={16} class="shrink-0 text-borderc" />
@@ -117,7 +117,7 @@
                                 <span class="inline-block size-4 shrink-0 rounded-full border border-darkborderc"></span>
                             {/if}
                             <span class="grow truncate" class:text-textcolor2={row.state === 'pending'}>{row.label}</span>
-                            {#if row.detail}
+                            {#if row.detail && !model.compact}
                                 <span class="shrink-0 text-xs tabular-nums text-textcolor2">{row.detail}</span>
                             {/if}
                         </li>
@@ -130,7 +130,7 @@
             {/if}
 
             {#if model.counters.length > 0}
-                <dl class="grid grid-cols-2 gap-2 text-sm sm:grid-cols-4">
+                <dl class={model.compact ? "flex text-sm" : "grid grid-cols-2 gap-2 text-sm sm:grid-cols-4"}>
                     {#each model.counters as counter (counter.key)}
                         <div class="flex flex-col rounded-md border border-darkborderc bg-bgcolor px-2 py-1">
                             <dt class="text-xs text-textcolor2">{counter.label}</dt>

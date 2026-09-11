@@ -145,6 +145,7 @@ export interface AndroidSafJavascriptBridge {
     cancelExport?(requestId: string): boolean | void
     cancelSource?(requestId: string): void
     pickLosslessSource?(requestId: string): void
+    pickContentSource?(requestId: string): void
     pickLegacyBackupSource?(requestId: string): void
     discardSource?(token: string): boolean
     getActiveSourceRequestIds?(): string
@@ -221,9 +222,12 @@ export class AndroidSafSourceError extends Error {
 
 interface AndroidSafSourcePickerConfig {
     eventName: string
-    pickMethod: 'pickLosslessSource' | 'pickLegacyBackupSource'
+    pickMethod:
+        | 'pickLosslessSource'
+        | 'pickLegacyBackupSource'
+        | 'pickContentSource'
     pickerUnavailableMessage: string
-    acceptExtension: string
+    acceptExtension: string | string[]
     cancelMessage: string
 }
 
@@ -233,7 +237,9 @@ function pickAndroidSpoolSource(
     dependencies: AndroidSafSourcePickerDependencies,
 ): Promise<NativeFileJobSource | null> {
     if (options.signal?.aborted) {
-        return Promise.reject(new DOMException(config.cancelMessage, 'AbortError'))
+        return Promise.reject(
+            new DOMException(config.cancelMessage, 'AbortError'),
+        )
     }
     const requestId = dependencies.createRequestId()
     return new Promise((resolve, reject) => {
@@ -267,24 +273,40 @@ function pickAndroidSpoolSource(
             if (aborted) {
                 let cleanupFailed = false
                 for (const source of batch.ready) {
-                    if (dependencies.bridge.discardSource?.(source.token) !== true) {
+                    if (
+                        dependencies.bridge.discardSource?.(source.token) !==
+                        true
+                    ) {
                         cleanupFailed = true
                     }
                 }
-                finish(() => cleanupFailed
-                    ? reject(new AndroidSafSourceError(
-                        'cleanup-failed',
-                        'Cancelled Android backup source could not be cleaned up',
-                    ))
-                    : reject(new DOMException(config.cancelMessage, 'AbortError')))
+                finish(() =>
+                    cleanupFailed
+                        ? reject(
+                              new AndroidSafSourceError(
+                                  'cleanup-failed',
+                                  'Cancelled Android backup source could not be cleaned up',
+                              ),
+                          )
+                        : reject(
+                              new DOMException(
+                                  config.cancelMessage,
+                                  'AbortError',
+                              ),
+                          ),
+                )
                 return
             }
             const failure = batch.failures[0]
             if (failure) {
-                finish(() => reject(new AndroidSafSourceError(
-                    failure.code,
-                    `${failure.displayName}: ${failure.code}`,
-                )))
+                finish(() =>
+                    reject(
+                        new AndroidSafSourceError(
+                            failure.code,
+                            `${failure.displayName}: ${failure.code}`,
+                        ),
+                    ),
+                )
                 return
             }
             const source = batch.ready[0]
@@ -292,19 +314,38 @@ function pickAndroidSpoolSource(
                 finish(() => resolve(null))
                 return
             }
-            if (!source.displayName.toLocaleLowerCase('en-US').endsWith(config.acceptExtension)) {
-                finish(() => reject(new AndroidSafSourceError(
-                    'unsupported-format',
-                    `${source.displayName}: unsupported-format`,
-                )))
+            if (
+                !(
+                    Array.isArray(config.acceptExtension)
+                        ? config.acceptExtension
+                        : [config.acceptExtension]
+                ).some((ext) =>
+                    source.displayName.toLocaleLowerCase('en-US').endsWith(ext),
+                )
+            ) {
+                dependencies.bridge.discardSource?.(source.token)
+                finish(() =>
+                    reject(
+                        new AndroidSafSourceError(
+                            'unsupported-format',
+                            `${source.displayName}: unsupported-format`,
+                        ),
+                    ),
+                )
                 return
             }
-            options.onSource?.({ displayName: source.displayName, bytes: source.bytes })
+            options.onSource?.({
+                displayName: source.displayName,
+                bytes: source.bytes,
+            })
             finish(() => resolve({ type: 'androidSpool', token: source.token }))
         }
         const onProgress = (event: Event) => {
             const progress = (event as CustomEvent<AndroidSafProgress>).detail
-            if (progress?.requestId === requestId && progress.operation === 'source-copy') {
+            if (
+                progress?.requestId === requestId &&
+                progress.operation === 'source-copy'
+            ) {
                 options.onProgress?.(progress)
             }
         }
@@ -317,8 +358,7 @@ function pickAndroidSpoolSource(
             const pick = dependencies.bridge[config.pickMethod]
             if (!pick) throw new Error(config.pickerUnavailableMessage)
             pick.call(dependencies.bridge, requestId)
-        }
-        catch (error) {
+        } catch (error) {
             finish(() => reject(error))
         }
     })
@@ -505,4 +545,29 @@ export function copyNativeExportToAndroidSaf(
             finish(() => reject(error))
         }
     })
+}
+
+export function pickAndroidContentSource(
+    options: AndroidSafSourcePickerOptions = {},
+    dependencies: AndroidSafSourcePickerDependencies = productionDependencies,
+): Promise<NativeFileJobSource | null> {
+    return pickAndroidSpoolSource(
+        {
+            eventName: 'risu-android-content-source-picked',
+            pickMethod: 'pickContentSource',
+            pickerUnavailableMessage: 'Android content picker is unavailable',
+            acceptExtension: [
+                '.json',
+                '.png',
+                '.charx',
+                '.jpg',
+                '.jpeg',
+                '.risum',
+                '.lorebook',
+            ],
+            cancelMessage: 'Android content selection was cancelled',
+        },
+        options,
+        dependencies,
+    )
 }

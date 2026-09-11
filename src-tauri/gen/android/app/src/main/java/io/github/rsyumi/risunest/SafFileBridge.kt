@@ -890,3 +890,9 @@ private fun jsonString(value: String): String = buildString {
   }
   append('"')
 }
+
+internal fun isNativeContentSource(name: String): Boolean =
+  listOf(".json", ".png", ".charx", ".jpg", ".jpeg", ".risum", ".lorebook").any { name.endsWith(it, ignoreCase = true) }
+
+internal fun androidContentSourcePickedScript(requestId: String, batch: SafSpoolBatch): String =
+  sourcePickedScript("risu-android-content-source-picked", requestId, batch)

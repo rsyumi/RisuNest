@@ -6,6 +6,8 @@
     import { LoadLocalBackup } from 'src/ts/drive/backuplocal'
     import { openSyncConflictBackups } from 'src/ts/storage/sync/syncConflictRestore'
     import Button from 'src/lib/UI/GUI/Button.svelte'
+    import SettingGroup from '../RisuNest/SettingGroup.svelte'
+    import SettingRow from '../RisuNest/SettingRow.svelte'
     import { restoreNativePersistentSnapshot, restartNativeApp } from 'src/ts/storage/nativePersistentMaintenance'
     import { getNativeOfficialAccountFlow } from 'src/ts/storage/sync/nativeOfficialAccountFlow'
     import { DBState } from 'src/ts/stores.svelte'
@@ -120,45 +122,37 @@
     onDestroy(() => nativePublishController?.abort())
 </script>
 
-<h2 class="mb-2 text-2xl font-bold mt-6">{language.risuNest.backup.title}</h2>
-<div class="flex flex-col gap-4">
-    <div data-backup-group="files" class="flex flex-col gap-2">
-        <span class="text-sm text-textcolor2">{language.risuNest.backup.groupFiles}</span>
-        <div class="flex flex-wrap gap-2">
-            {#if !isTauri || isTauriDesktop}
-                <Button disabled={risuSaveOperation !== null} onclick={() => runRisuSaveOperation('import')}>{language.importRisuSave}</Button>
+<SettingGroup id="risunest-backup" title={language.risuNest.backup.title}>
+    <SettingRow data-backup-group="files" label={language.risuNest.backup.groupFiles} help={language.risuNest.backup.filesHelp}>
+        {#snippet below()}
+            {#if risuSaveOperation && inlineOperation}
+                <div class="mt-1 flex flex-wrap items-center gap-2 text-sm text-textcolor2" role="status" aria-live="polite">
+                    <span>{nativeFileJobProgressText(risuSaveStatus)}</span>
+                    <Button styled="outlined" size="sm" onclick={cancelActiveNativeFileOperation}>{language.cancelRisuSaveOperation}</Button>
+                </div>
             {/if}
-            {#if !isTauri || isTauriDesktop || isTauriAndroid}
-                <Button disabled={risuSaveOperation !== null} onclick={() => runRisuSaveOperation('export')}>{language.exportRisuSave}</Button>
-            {/if}
-        </div>
-        {#if risuSaveOperation && inlineOperation}
-            <div class="flex items-center gap-2 text-sm text-textcolor2" role="status" aria-live="polite">
-                <span>{nativeFileJobProgressText(risuSaveStatus)}</span>
-                <Button styled="outlined" size="sm" onclick={cancelActiveNativeFileOperation}>{language.cancelRisuSaveOperation}</Button>
-            </div>
+        {/snippet}
+        {#if !isTauri || isTauriDesktop}
+            <Button disabled={risuSaveOperation !== null} onclick={() => runRisuSaveOperation('import')}>{language.risuNest.backup.importFile}</Button>
         {/if}
-    </div>
-    <div data-backup-group="restore" class="flex flex-col gap-2">
-        <span class="text-sm text-textcolor2">{language.risuNest.backup.groupRestore}</span>
-        <div class="flex flex-wrap gap-2">
-            {#if isTauri}
-                <Button disabled={snapshotRestoreBusy} onclick={restoreLocalSnapshot}>{language.restoreLocalSnapshot}</Button>
-            {/if}
-            <Button disabled={risuSaveOperation !== null} onclick={loadPocketRisuBackup}>{language.loadPocketRisuBackup}</Button>
-            <Button onclick={() => openSyncConflictBackups()}>{language.syncConflictBackups}</Button>
-        </div>
-    </div>
+        {#if !isTauri || isTauriDesktop || isTauriAndroid}
+            <Button disabled={risuSaveOperation !== null} onclick={() => runRisuSaveOperation('export')}>{language.risuNest.backup.exportFile}</Button>
+        {/if}
+    </SettingRow>
+    <SettingRow data-backup-group="restore" label={language.risuNest.backup.groupRestore} help={language.risuNest.backup.restoreHelp}>
+        {#if isTauri}
+            <Button disabled={snapshotRestoreBusy} onclick={restoreLocalSnapshot}>{language.restoreLocalSnapshot}</Button>
+        {/if}
+        <Button disabled={risuSaveOperation !== null} onclick={loadPocketRisuBackup}>{language.loadPocketRisuBackup}</Button>
+        <Button styled="outlined" onclick={() => openSyncConflictBackups()}>{language.syncConflictBackups}</Button>
+    </SettingRow>
     {#if isTauri && DBState.db.account}
-        <div data-backup-group="account" class="flex flex-col gap-2">
-            <span class="text-sm text-textcolor2">{language.risuNest.backup.groupAccount}</span>
-            <div class="flex flex-wrap gap-2">
-                <Button disabled={nativeAccountBusy} onclick={restoreOfficialBackup}>{language.risuNest.backup.officialRestore}</Button>
-                <Button disabled={nativeAccountBusy} onclick={publishOfficialBackup}>{language.risuNest.backup.officialPublish}</Button>
-                {#if nativePublishController}
-                    <Button onclick={() => nativePublishController?.abort()}>{language.risuNest.backup.officialCancel}</Button>
-                {/if}
-            </div>
-        </div>
+        <SettingRow data-backup-group="account" label={language.risuNest.backup.groupAccount} help={language.risuNest.backup.accountHelp}>
+            <Button disabled={nativeAccountBusy} onclick={publishOfficialBackup}>{language.risuNest.backup.officialPublish}</Button>
+            <Button disabled={nativeAccountBusy} onclick={restoreOfficialBackup}>{language.risuNest.backup.officialRestore}</Button>
+            {#if nativePublishController}
+                <Button styled="outlined" onclick={() => nativePublishController?.abort()}>{language.risuNest.backup.officialCancel}</Button>
+            {/if}
+        </SettingRow>
     {/if}
-</div>
+</SettingGroup>

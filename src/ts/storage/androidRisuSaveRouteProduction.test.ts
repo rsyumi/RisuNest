@@ -242,7 +242,7 @@ describe('Android opened spool production route', () => {
         expect(prepare).toHaveBeenCalledExactlyOnceWith(
             { type: 'androidSpool', token: source.token },
             source.displayName,
-            {},
+            { onStatus: expect.any(Function) },
         )
         expect(activateCharacter).toHaveBeenCalledTimes(expected === 'character' ? 1 : 0)
         expect(activateModule).toHaveBeenCalledTimes(expected === 'module' ? 1 : 0)
@@ -311,7 +311,7 @@ describe('Android opened spool production route', () => {
             expect(prepare).toHaveBeenCalledExactlyOnceWith(
                 { type: 'androidSpool', token: source.token },
                 displayName,
-                {},
+                { onStatus: expect.any(Function) },
             )
             expect(activateCharacter).toHaveBeenCalledTimes(expected === 'character' ? 1 : 0)
             expect(activateModule).toHaveBeenCalledTimes(expected === 'module' ? 1 : 0)

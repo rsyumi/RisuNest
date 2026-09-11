@@ -52,11 +52,14 @@ describe('RisuNestStorageDashboard', () => {
         return target
     }
 
-    it('renders six cards, count summary, and backup rows without calculating temp usage', async () => {
+    it('renders the total with its five-part breakdown, count summary, and backup rows without calculating temp usage', async () => {
         const target = setup()
         await vi.waitFor(() => expect(target.textContent).toContain('Total data'))
 
-        expect(target.querySelectorAll('.grid.grid-cols-2.sm\\:grid-cols-3 > *')).toHaveLength(6)
+        expect(target.querySelectorAll('[data-storage-legend] > li')).toHaveLength(5)
+        expect(target.textContent).toContain('5.0 MiB')
+        expect(target.textContent).toContain('Database')
+        expect(target.textContent).toContain('Chat attachments 1.0 MiB (included in images & media) · Plugin data 1.0 KiB')
         expect(target.textContent).toContain('2 characters · 3 chats · 4 messages')
         expect(target.textContent).toContain('(1 in trash)')
         expect(target.textContent).toContain(new Date(1).toLocaleString())
@@ -88,17 +91,17 @@ describe('RisuNestStorageDashboard', () => {
         alerts.alertConfirm.mockResolvedValue(true)
         await vi.waitFor(() => expect(target.textContent).toContain('Calculate size'))
         const button = (text: string) => [...target.querySelectorAll<HTMLButtonElement>('button')].find((candidate) => candidate.textContent?.trim() === text)
-        expect(button('Clean up sync temp files')).toBeUndefined()
+        expect(button('Clean up')).toBeUndefined()
 
         button('Calculate size')?.click()
         await vi.waitFor(() => expect(target.textContent).toContain('1.0 KiB used'))
-        await vi.waitFor(() => expect(button('Clean up sync temp files')?.disabled).toBe(false))
-        button('Clean up sync temp files')?.click()
+        await vi.waitFor(() => expect(button('Clean up')?.disabled).toBe(false))
+        button('Clean up')?.click()
         await vi.waitFor(() => expect(maintenance.cleanupPeerTemp).toHaveBeenCalledOnce())
         expect(button('Calculate size')).toBeDefined()
-        button('Clean up unused images')?.click()
+        button('Find')?.click()
         await vi.waitFor(() => expect(target.textContent).toContain('Removable: 2 items (2.0 KiB)'))
-        expect(button('Clean up unused images')).toBeDefined()
+        expect(button('Find')).toBeDefined()
         expect(languageKorean.risuNest.storage.gcRunConfirm).toBe('지금 삭제')
         button('Delete now')?.click()
         await vi.waitFor(() => expect(maintenance.executeNativePersistentAssetGc).toHaveBeenCalledOnce())
@@ -114,18 +117,17 @@ describe('RisuNestStorageDashboard', () => {
         await vi.waitFor(() => expect(target.textContent).toContain('Calculate size'))
         const button = (text: string) => [...target.querySelectorAll<HTMLButtonElement>('button')].find((candidate) => candidate.textContent?.trim() === text)
         const rowOf = (element: Element | undefined) => element?.closest<HTMLElement>('[data-storage-action]') ?? null
-        expect(target.textContent).not.toContain('Removes leftover temporary files only.')
 
         button('Calculate size')?.click()
         await vi.waitFor(() => expect(target.textContent).toContain('1.0 KiB used'))
         const tempRow = rowOf(button('Calculate size'))
         expect(tempRow?.textContent).toContain('1.0 KiB used')
-        expect(tempRow?.contains(button('Clean up sync temp files') ?? null)).toBe(true)
-        expect(target.textContent).toContain('Removes leftover temporary files only.')
+        expect(tempRow?.contains(button('Clean up') ?? null)).toBe(true)
+        expect(tempRow?.textContent).toContain('Removes temporary files left behind by device sync.')
 
-        button('Clean up unused images')?.click()
+        button('Find')?.click()
         await vi.waitFor(() => expect(target.textContent).toContain('Removable: 2 items (2.0 KiB)'))
-        const gcRow = rowOf(button('Clean up unused images'))
+        const gcRow = rowOf(button('Find'))
         expect(gcRow?.textContent).toContain('Removable: 2 items (2.0 KiB)')
         expect(gcRow?.contains(button('Delete now') ?? null)).toBe(true)
         expect(gcRow).not.toBe(tempRow)
@@ -137,9 +139,9 @@ describe('RisuNestStorageDashboard', () => {
 
         const summaries = [...target.querySelectorAll<HTMLElement>('[data-storage-backup-list] > summary')]
         expect(summaries.map((summary) => summary.textContent?.replace(/\s+/g, ' ').trim())).toEqual([
-            'Snapshots (1 items · 2.0 MiB)',
-            'Conflict backups (1 items · 4.0 KiB)',
-            'Sync backups (1 items · 2.0 KiB)',
+            'Snapshots 1 items · 2.0 MiB',
+            'Conflict backups 1 items · 4.0 KiB',
+            'Sync backups 1 items · 2.0 KiB',
         ])
         const row = target.querySelector<HTMLElement>('[data-storage-backup-list] [data-storage-backup-row]')
         expect(row?.className).not.toContain('justify-between')
@@ -202,8 +204,8 @@ describe('RisuNestStorageDashboard', () => {
         button('Calculate size')?.click()
         await tick()
         expect(button('Loading')?.disabled).toBe(true)
-        expect(button('Create snapshot now')?.disabled).toBe(false)
-        expect(button('Clean up unused images')?.disabled).toBe(false)
+        expect(button('Create now')?.disabled).toBe(false)
+        expect(button('Find')?.disabled).toBe(false)
         button('Loading')?.click()
         expect(maintenance.getPeerTempUsage).toHaveBeenCalledOnce()
 
@@ -213,7 +215,7 @@ describe('RisuNestStorageDashboard', () => {
 
     it('orders all backup lists before the storage action row', async () => {
         const target = setup()
-        await vi.waitFor(() => expect(target.textContent).toContain('Create snapshot now'))
+        await vi.waitFor(() => expect(target.textContent).toContain('Create now'))
 
         const actionRow = target.querySelector<HTMLElement>('[data-storage-action-row]')
         const lists = [...target.querySelectorAll<HTMLElement>('[data-storage-backup-list]')]
@@ -228,7 +230,7 @@ describe('RisuNestStorageDashboard', () => {
         await vi.waitFor(() => expect(target.textContent).toContain('Total data'))
         maintenance.getNativePersistentStorageStats.mockRejectedValueOnce(new Error('reload failed'))
 
-        ;[...target.querySelectorAll<HTMLButtonElement>('button')].find((button) => button.textContent?.trim() === 'Create snapshot now')?.click()
+        ;[...target.querySelectorAll<HTMLButtonElement>('button')].find((button) => button.textContent?.trim() === 'Create now')?.click()
 
         await vi.waitFor(() => expect(target.textContent).toContain('Storage totals may be out of date.'))
         expect(target.textContent).toContain('Total data')
