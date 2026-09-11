@@ -25,7 +25,10 @@ use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
-#[derive(Clone)]
+mod staging;
+pub(crate) use staging::ValidatedRecords;
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RemoteRecord {
     pub key: String,
     pub version: RecordVersion,
@@ -217,6 +220,7 @@ pub(crate) fn validate_remote(
 }
 
 impl PersistentStore {
+    #[cfg(test)]
     pub(crate) fn server_apply(
         &mut self,
         expected_revision: i64,
@@ -226,11 +230,15 @@ impl PersistentStore {
         acknowledged: &[ServerDirtyKey],
         scopes: &[(String, String)],
     ) -> StoreResult<i64> {
+        let mut staged = ValidatedRecords::new()?;
+        for record in records {
+            staged.push(record)?;
+        }
         self.server_apply_advance(
             expected_revision,
             expected_head,
             next_head,
-            records,
+            &staged,
             acknowledged,
             scopes,
             ReplicaAdvance::default(),
@@ -241,7 +249,7 @@ impl PersistentStore {
         expected_revision: i64,
         expected_head: Option<&RemoteHead>,
         next_head: &RemoteHead,
-        mut records: Vec<ValidatedRecord>,
+        records: &ValidatedRecords,
         acknowledged: &[ServerDirtyKey],
         scopes: &[(String, String)],
         advance: ReplicaAdvance,
@@ -277,12 +285,7 @@ impl PersistentStore {
             }
         }
         let active = active_generation(&tx)?;
-        let deleted: BTreeSet<&str> = records
-            .iter()
-            .filter(|r| r.record.payload.is_none())
-            .map(|r| r.record.key.as_str())
-            .collect();
-        for item in &records {
+        records.visit(true, |item| {
             if let (LogicalRecordLocator::Character { character_id }, None) =
                 (&item.locator, &item.record.payload)
             {
@@ -296,14 +299,15 @@ impl PersistentStore {
                     .map_err(|_| StoreError::Validation {
                         message: "Invalid local conversation key".into(),
                     })?;
-                    if !deleted.contains(key.as_str()) {
+                    if !records.deletes(&key)? {
                         return invalid(
                             "Server character deletion would discard a preserved conversation",
                         );
                     }
                 }
             }
-        }
+            Ok(())
+        })?;
         let revision = if records.is_empty() {
             actual
         } else {
@@ -319,14 +323,8 @@ impl PersistentStore {
         if !records.is_empty() {
             super::logical_index::detach_logical_head_for_full_replace(&tx, &active)?;
         }
-        records.sort_by_key(|r| match (&r.record.payload, &r.locator) {
-            (None, _) => 0,
-            (Some(_), LogicalRecordLocator::Root) => 1,
-            (Some(_), LogicalRecordLocator::Character { .. }) => 2,
-            _ => 3,
-        });
         let mut touched = BTreeSet::new();
-        for item in records {
+        records.visit(false, |item| {
             if let LogicalRecordLocator::Character { character_id }
             | LogicalRecordLocator::Conversation { character_id, .. } = &item.locator
             {
@@ -373,7 +371,8 @@ impl PersistentStore {
                 rows::apply_delete(&tx, &generation, &item.locator).map_err(semantic)?;
             }
             tx.execute("INSERT INTO server_sync_base(key,version,local_hash) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET version=excluded.version,local_hash=excluded.local_hash",params![item.record.key,serde_json::to_string(&item.record.version)?,item.record.local_hash])?;
-        }
+            Ok(())
+        })?;
         for id in touched {
             tx.execute("UPDATE characters SET conversation_count=(SELECT count(*) FROM conversations WHERE generation=?1 AND character_id=?2) WHERE generation=?1 AND character_id=?2",params![generation,id])?;
         }

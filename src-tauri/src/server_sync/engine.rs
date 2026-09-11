@@ -2,7 +2,7 @@
 //! IPC. Network work uses a dedicated job-store connection and a frozen read lease.
 use super::{
     asset_object_catalog::{AssetObjectCatalog, AssetObjectRegistration},
-    server_sync_apply::{validate_remote, RemoteRecord, ReplicaAdvance, ValidatedRecord},
+    server_sync_apply::{validate_remote, RemoteRecord, ReplicaAdvance, ValidatedRecords},
     server_sync_outbox as outbox, server_sync_projection as projection, PersistentStore,
 };
 use crate::{
@@ -64,7 +64,7 @@ pub(crate) struct PreparedCycle {
     pub revision: i64,
     previous: Option<RemoteHead>,
     pub through: RemoteHead,
-    records: Vec<ValidatedRecord>,
+    records: ValidatedRecords,
     bases: Vec<(String, RecordVersion, Option<String>)>,
     acknowledged: Vec<outbox::ServerDirtyKey>,
     publish_keys: Vec<outbox::ServerDirtyKey>,
@@ -761,7 +761,7 @@ impl PersistentStore {
             }
         }
         let clear_acknowledged = clear && scope_fences.is_empty();
-        let mut records = Vec::new();
+        let mut records = ValidatedRecords::new()?;
         let mut bases = Vec::new();
         let mut acknowledged = Vec::new();
         let mut publish_keys = Vec::new();
@@ -811,7 +811,7 @@ impl PersistentStore {
                                 local_hash: hash.clone(),
                             },
                             &PayloadCas::new(&self.repository_root)?,
-                        )?);
+                        )?)?;
                         acknowledged.push(dirty);
                         hash
                     }
@@ -867,7 +867,7 @@ impl PersistentStore {
             ready.revision,
             ready.previous.as_ref(),
             &ready.through,
-            ready.records.clone(),
+            &ready.records,
             &ready.acknowledged,
             &ready.scope_versions,
             ReplicaAdvance {
@@ -884,7 +884,7 @@ impl PersistentStore {
             },
         )?;
         ready.activated = Some(revision);
-        ready.records.clear();
+        ready.records.clear()?;
         ready.bases.clear();
         self.connection
             .execute("DELETE FROM server_sync_objects", [])?;
@@ -1303,27 +1303,30 @@ impl PersistentStore {
             .join("server-sync/backups")
             .join(uuid::Uuid::new_v4().to_string());
         std::fs::create_dir_all(&root)?;
-        std::fs::create_dir_all(root.join("local-staging"))?;
-        std::fs::create_dir_all(root.join("remote-staging"))?;
+        let scratch = tempfile::Builder::new()
+            .prefix("working-")
+            .tempdir_in(&root)?;
+        std::fs::create_dir_all(scratch.path().join("local-staging"))?;
+        std::fs::create_dir_all(scratch.path().join("remote-staging"))?;
         let cancel = Cancel(client);
         let local_cas = PayloadCas::new(&self.repository_root)?;
         let local = crate::lossless_backup::create_and_verify_lossless_backup_v1_report(
             &root.join("local.risulossless"),
-            &root.join("local-staging"),
+            &scratch.path().join("local-staging"),
             &local_cas,
             self,
             revision,
             &cancel,
         )
         .map_err(|_| SyncError::new("complete-local-backup-required", 409))?;
-        let mut remote_store = PersistentStore::open(&root.join("remote-source"))?;
+        let mut remote_store = PersistentStore::open(&scratch.path().join("remote-source"))?;
         remote_store.server_bind(
             &self
                 .server_config()?
                 .ok_or_else(|| SyncError::new("server-not-bound", 409))?,
         )?;
         let remote_cas = PayloadCas::new(&remote_store.repository_root)?;
-        let mut records = Vec::new();
+        let mut records = ValidatedRecords::new()?;
         let mut after = String::new();
         loop {
             let page = {
@@ -1366,12 +1369,19 @@ impl PersistentStore {
                         local_hash: Some(hash),
                     },
                     &remote_cas,
-                )?);
+                )?)?;
             }
         }
         let initial_revision = remote_store.revision()?;
-        let remote_revision =
-            remote_store.server_apply(initial_revision, None, head, records, &[], &[])?;
+        let remote_revision = remote_store.server_apply_advance(
+            initial_revision,
+            None,
+            head,
+            &records,
+            &[],
+            &[],
+            ReplicaAdvance::default(),
+        )?;
         // A complete verified mirror has an authoritative alias inventory, even
         // for references already missing on the server. No legacy files exist
         // in this newly created staging repository.
@@ -1393,7 +1403,7 @@ impl PersistentStore {
         remote_store.connection.execute("INSERT INTO cold_payload_authority(generation,value) VALUES(?1,?2) ON CONFLICT(generation) DO UPDATE SET value=excluded.value",params![generation,authority])?;
         let remote = crate::lossless_backup::create_and_verify_lossless_backup_v1_report(
             &root.join("remote.risulossless"),
-            &root.join("remote-staging"),
+            &scratch.path().join("remote-staging"),
             &remote_cas,
             &mut remote_store,
             remote_revision,
@@ -1412,6 +1422,12 @@ impl PersistentStore {
             .open(root.join("complete.json"))?;
         file.write_all(&receipt)?;
         file.sync_all()?;
+        // The verified packages now own every byte. Close database handles
+        // before removing the temporary mirror, especially on Windows.
+        remote_store.server_unbind()?;
+        drop(remote_store);
+        drop(records);
+        scratch.close()?;
         Ok(())
     }
     fn promote_server_dependencies(&mut self, cache: &Cache, hashes: &[String]) -> Result<()> {
