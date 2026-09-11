@@ -113,13 +113,15 @@ impl Store {
             .lock()
             .map_err(|_| Error::new("storage-unavailable", 503))?;
         publish(temp.path(), &destination)?;
-        let db = self.db()?;
+        let mut db = self.db()?;
         Self::require_device(&db, device)?;
-        db.execute(
+        let tx = db.transaction()?;
+        tx.execute(
             "INSERT INTO objects(hash,size) VALUES(?1,?2) ON CONFLICT(hash) DO NOTHING",
             params![digest, bytes.len() as i64],
         )?;
-        Self::lease_object(&db, device, digest)?;
+        Self::lease_object(&tx, device, digest)?;
+        tx.commit()?;
         Ok(())
     }
     pub fn object_size(&self, digest: &str) -> Result<Option<u64>> {
@@ -149,5 +151,76 @@ impl Store {
             return Err(Error::new("corrupt-object", 503));
         }
         Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_capacity_failure_cannot_publish_partial_object_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init(directory.path()).unwrap();
+        let credential = store.add_device().unwrap();
+        let device = super::super::Device {
+            id: credential.device_id,
+        };
+        let head = store.head().unwrap();
+        {
+            let db = store.db().unwrap();
+            let pages: i64 = db.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap();
+            db.pragma_update(None, "max_page_count", pages).unwrap();
+            // Force the real SQLite SQLITE_FULL path without filling a host
+            // volume or changing storage outside this synthetic directory.
+            let failure = db
+                .execute(
+                    "CREATE TABLE synthetic_capacity_probe AS SELECT zeroblob(1048576) AS value",
+                    [],
+                )
+                .unwrap_err();
+            assert_eq!(
+                failure.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DiskFull)
+            );
+        }
+        let mut failed = None;
+        for index in 0..1024 {
+            let bytes = format!("synthetic capacity object {index}");
+            let digest = hash(bytes.as_bytes());
+            match store.put_object(&device, &digest, bytes.as_bytes()) {
+                Ok(()) => (),
+                Err(error) => {
+                    assert_eq!(error.code, "metadata-storage");
+                    failed = Some(digest);
+                    break;
+                }
+            }
+        }
+        let failed = failed.expect("bounded SQLite capacity must be exhausted");
+        assert!(store.object_size(&failed).unwrap().is_none());
+        let leased: bool = store
+            .db()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM object_leases WHERE hash=?1)",
+                [&failed],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!leased, "object and lease must roll back together");
+        assert_eq!(store.head().unwrap(), head);
+        drop(store);
+        let reopened = Store::open(directory.path()).unwrap();
+        assert_eq!(reopened.head().unwrap(), head);
+        assert!(reopened.object_size(&failed).unwrap().is_none());
+        assert_eq!(
+            reopened
+                .db()
+                .unwrap()
+                .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
     }
 }

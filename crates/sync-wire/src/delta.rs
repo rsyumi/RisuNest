@@ -1,7 +1,6 @@
 //! RNSD exact-byte COPY/INSERT profile, not VCDIFF. Ordered CAS bases are
 //! independent sources; COPY never references output or a patch chain.
 use crate::{hash, validate_hash, Result, WireError};
-use std::collections::HashMap;
 
 pub const MAX_BASES: usize = 4;
 pub const MAX_TARGET_BYTES: usize = 16 * 1024 * 1024;
@@ -249,22 +248,38 @@ pub fn create(bases: &[&[u8]], target: &[u8]) -> Result<Recipe> {
     {
         return Err(WireError("delta-limit"));
     }
-    let mut index = HashMap::<u64, Vec<(u8, usize)>>::new();
+    // A flat index avoids one allocator block per 64-byte source anchor.
+    // MAX_BASE_BYTES / BLOCK entries occupy at most 8 MiB, including padding.
+    #[derive(Clone, Copy)]
+    struct Anchor {
+        fingerprint: u64,
+        offset: u32,
+        base: u8,
+    }
+    let capacity = bases.iter().map(|b| b.len() / BLOCK).sum();
+    let mut index = Vec::with_capacity(capacity);
     for (id, base) in bases.iter().enumerate() {
         for offset in (0..base.len().saturating_sub(BLOCK - 1)).step_by(BLOCK) {
-            let bucket = index
-                .entry(fingerprint(&base[offset..offset + BLOCK]))
-                .or_default();
-            if bucket
-                .iter()
-                .filter(|(source, _)| *source == id as u8)
-                .count()
-                < 2
-            {
-                bucket.push((id as u8, offset));
-            }
+            index.push(Anchor {
+                fingerprint: fingerprint(&base[offset..offset + BLOCK]),
+                offset: offset as u32,
+                base: id as u8,
+            });
         }
     }
+    index.sort_unstable_by_key(|a| (a.fingerprint, a.base, a.offset));
+    let mut previous = None;
+    let mut occurrences = 0;
+    index.retain(|anchor| {
+        let key = (anchor.fingerprint, anchor.base);
+        if previous == Some(key) {
+            occurrences += 1;
+        } else {
+            previous = Some(key);
+            occurrences = 1;
+        }
+        occurrences <= 2
+    });
     let factor = 257u64.wrapping_pow((BLOCK - 1) as u32);
     let mut position = 0;
     let mut literal = 0;
@@ -273,20 +288,24 @@ pub fn create(bases: &[&[u8]], target: &[u8]) -> Result<Recipe> {
     while position + BLOCK <= target.len() {
         let key = *rolling.get_or_insert_with(|| fingerprint(&target[position..position + BLOCK]));
         let mut best = (0u8, 0usize, 0usize);
-        if let Some(candidates) = index.get(&key) {
-            for &(base, offset) in candidates {
-                let source = bases[base as usize];
-                if source[offset..offset + BLOCK] == target[position..position + BLOCK] {
-                    let mut length = BLOCK;
-                    while offset + length < source.len()
-                        && position + length < target.len()
-                        && source[offset + length] == target[position + length]
-                    {
-                        length += 1;
-                    }
-                    if length > best.2 {
-                        best = (base, offset, length);
-                    }
+        let start = index.partition_point(|anchor| anchor.fingerprint < key);
+        for anchor in index[start..]
+            .iter()
+            .take_while(|anchor| anchor.fingerprint == key)
+        {
+            let base = anchor.base;
+            let offset = anchor.offset as usize;
+            let source = bases[base as usize];
+            if source[offset..offset + BLOCK] == target[position..position + BLOCK] {
+                let mut length = BLOCK;
+                while offset + length < source.len()
+                    && position + length < target.len()
+                    && source[offset + length] == target[position + length]
+                {
+                    length += 1;
+                }
+                if length > best.2 {
+                    best = (base, offset, length);
                 }
             }
         }

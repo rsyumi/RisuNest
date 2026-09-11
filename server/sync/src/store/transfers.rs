@@ -85,7 +85,7 @@ impl Store {
                 let target = self.get_object(&request.target)?;
                 let mut bases = Vec::new();
                 let mut base_bytes = 0;
-                for digest in &request.bases {
+                for digest in request.bases.iter().filter(|_| size > 64) {
                     if let Some(size) = self.object_size(digest)? {
                         if size <= delta::MAX_TARGET_BYTES as u64
                             && base_bytes + size <= delta::MAX_BASE_BYTES as u64

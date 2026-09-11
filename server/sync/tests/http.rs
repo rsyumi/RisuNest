@@ -18,6 +18,78 @@ struct Server {
     task: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
 }
+
+#[tokio::test]
+async fn bounded_bulk_buffers_leave_head_available_and_release_after_completion() {
+    let server = Server::start().await;
+    let third = server.store.add_device().unwrap();
+    let address = server.base.strip_prefix("http://").unwrap();
+    let frame = risunest_sync_wire::transfer::encode(&[]).unwrap();
+    let mut sockets = Vec::new();
+    for credential in [&server.a, &server.a, &server.b, &server.b] {
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket.write_all(format!("POST /uploads/frames HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nX-Risu-Library: {}\r\nContent-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",credential.token,credential.library_id,frame.len()).as_bytes()).await.unwrap();
+        let mut interim = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !interim.ends_with(b"\r\n\r\n") {
+                interim.push(socket.read_u8().await.unwrap());
+            }
+        })
+        .await
+        .unwrap();
+        assert!(interim.starts_with(b"HTTP/1.1 100 Continue"));
+        sockets.push(socket);
+    }
+    let rejected = server
+        .auth(
+            server
+                .client
+                .post(format!("{}/uploads/frames", server.base)),
+            &third,
+        )
+        .body(frame.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        rejected.json::<serde_json::Value>().await.unwrap()["error"],
+        "transfer-memory-busy"
+    );
+    assert_eq!(
+        server
+            .auth(server.client.get(format!("{}/head", server.base)), &third)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let mut first = sockets.remove(0);
+    first.write_all(&frame).await.unwrap();
+    let mut completed = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), first.read_to_end(&mut completed))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(completed.starts_with(b"HTTP/1.1 200 OK"));
+    assert_eq!(
+        server
+            .auth(
+                server
+                    .client
+                    .post(format!("{}/uploads/frames", server.base)),
+                &third
+            )
+            .body(frame)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    drop(sockets);
+}
 impl Drop for Server {
     fn drop(&mut self) {
         self.task.abort();

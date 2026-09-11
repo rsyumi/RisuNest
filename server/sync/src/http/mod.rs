@@ -28,8 +28,14 @@ struct App {
     store: Arc<Store>,
     slots: Arc<Semaphore>,
     wait_slots: Arc<Semaphore>,
+    buffers: Arc<Semaphore>,
+    materializers: Arc<Semaphore>,
     devices: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     _lifetime: Arc<()>,
+}
+#[derive(Clone)]
+struct BufferedRequest {
+    _permit: Arc<tokio::sync::OwnedSemaphorePermit>,
 }
 pub fn router(store: Arc<Store>) -> Router {
     let lifetime = Arc::new(());
@@ -89,6 +95,8 @@ pub fn router(store: Arc<Store>) -> Router {
         store,
         slots: Arc::new(Semaphore::new(8)),
         wait_slots: Arc::new(Semaphore::new(8)),
+        buffers: Arc::new(Semaphore::new(4)),
+        materializers: Arc::new(Semaphore::new(1)),
         devices: Arc::new(Mutex::new(HashMap::new())),
         _lifetime: lifetime,
     };
@@ -217,8 +225,31 @@ async fn authorize(State(app): State<App>, request: Request, next: Next) -> Resp
         let _global_permit = slots
             .try_acquire_owned()
             .map_err(|_| Error::new("server-busy", 429))?;
+        // Reserve bounded body/response memory before consuming any bulk body.
+        // A worker clone retains the reservation even if its HTTP future times out.
+        let path = request.uri().path();
+        let buffered = if matches!(
+            path,
+            "/uploads/frames" | "/uploads/batch" | "/objects/transfer" | "/objects/batch"
+        ) || path.contains("/chunks/")
+            || (path.starts_with("/uploads/") && path.ends_with("/delta"))
+        {
+            Some(BufferedRequest {
+                _permit: Arc::new(
+                    app.buffers
+                        .clone()
+                        .try_acquire_owned()
+                        .map_err(|_| Error::new("transfer-memory-busy", 429))?,
+                ),
+            })
+        } else {
+            None
+        };
         let mut request = request;
         request.extensions_mut().insert(device);
+        if let Some(buffered) = &buffered {
+            request.extensions_mut().insert(buffered.clone());
+        }
         let deadline = if matches!(request.uri().path(), "/uploads/frames" | "/uploads/batch")
             || (request.uri().path().starts_with("/uploads/")
                 && request.uri().path().ends_with("/delta"))
@@ -237,7 +268,7 @@ async fn authorize(State(app): State<App>, request: Request, next: Next) -> Resp
         // disconnected, not just until response headers are ready.
         use futures_util::StreamExt;
         let (parts, body) = response.into_parts();
-        let permits = (_device_permit, _global_permit);
+        let permits = (_device_permit, _global_permit, buffered);
         let stream = body.into_data_stream().map(move |chunk| {
             let _ = &permits;
             chunk
@@ -318,9 +349,11 @@ async fn changes(State(app): State<App>, Query(query): Query<ChangesQuery>) -> R
 async fn upload_batch(
     State(app): State<App>,
     Extension(device): Extension<Device>,
+    Extension(buffer): Extension<BufferedRequest>,
     body: Bytes,
 ) -> Result<Response> {
     blocking(move || {
+        let _buffer = buffer;
         // Decode and validate the entire batch before publishing any frame.
         let frames = batch::decode(&body)?;
         let mut hashes = Vec::new();
@@ -358,12 +391,17 @@ async fn missing(State(app): State<App>, body: Bytes) -> Result<Response> {
     })
     .await
 }
-async fn download_batch(State(app): State<App>, body: Bytes) -> Result<Response> {
+async fn download_batch(
+    State(app): State<App>,
+    Extension(buffer): Extension<BufferedRequest>,
+    body: Bytes,
+) -> Result<Response> {
     let hashes: Vec<String> = canonical::decode(&body, MAX_METADATA_BYTES)?;
     if hashes.len() > batch::MAX_BATCH_OBJECTS {
         return Err(Error::new("too-many-candidates", 400));
     }
     blocking(move || {
+        let _buffer = buffer;
         let mut budget = 8u64;
         // Preflight without allocating payloads.
         for digest in &hashes {
@@ -624,6 +662,7 @@ async fn upload_progress(
 async fn upload_chunk(
     State(app): State<App>,
     Extension(device): Extension<Device>,
+    Extension(buffer): Extension<BufferedRequest>,
     Path((id, index)): Path<(String, u64)>,
     headers: HeaderMap,
     body: Bytes,
@@ -632,6 +671,7 @@ async fn upload_chunk(
         .ok_or(Error::new("chunk-hash-required", 400))?
         .to_owned();
     blocking(move || {
+        let _buffer = buffer;
         app.store
             .put_upload_chunk(&device, &id, index, &hash, &body)
     })
@@ -779,9 +819,20 @@ async fn pin_objects(
 async fn upload_frames(
     State(app): State<App>,
     Extension(device): Extension<Device>,
+    Extension(buffer): Extension<BufferedRequest>,
     body: Bytes,
 ) -> Result<Response> {
+    // Tokio's FIFO semaphore queues CPU materialization, never the library writer
+    // or another device's network/Range transfer. Keep it inside the worker lifetime.
+    let permit = app
+        .materializers
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| Error::new("worker-unavailable", 503))?;
     blocking(move || {
+        let _permit = permit;
+        let _buffer = buffer;
         Ok(
             Json(serde_json::json!({"verified":app.store.receive_frames(&device,&body)?}))
                 .into_response(),
@@ -792,11 +843,20 @@ async fn upload_frames(
 async fn transfer_objects(
     State(app): State<App>,
     Extension(device): Extension<Device>,
+    Extension(buffer): Extension<BufferedRequest>,
     body: Bytes,
 ) -> Result<Response> {
     let requests: Vec<crate::store::TransferRequest> =
         canonical::decode(&body, MAX_METADATA_BYTES)?;
+    let permit = app
+        .materializers
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| Error::new("worker-unavailable", 503))?;
     blocking(move || {
+        let _permit = permit;
+        let _buffer = buffer;
         Ok((
             [("content-type", "application/octet-stream")],
             app.store.transfer_objects(&device, &requests)?,
@@ -809,10 +869,15 @@ async fn transfer_objects(
 async fn upload_delta(
     State(app): State<App>,
     Extension(device): Extension<Device>,
+    Extension(buffer): Extension<BufferedRequest>,
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<StatusCode> {
-    blocking(move || app.store.attach_upload_delta(&device, &id, &body)).await?;
+    blocking(move || {
+        let _buffer = buffer;
+        app.store.attach_upload_delta(&device, &id, &body)
+    })
+    .await?;
     Ok(StatusCode::ACCEPTED)
 }
 async fn begin_download_delta(
