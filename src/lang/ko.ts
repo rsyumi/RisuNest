@@ -1685,6 +1685,7 @@ export const languageKorean = {
             token: '기기 토큰',
             credentialsHelp:
                 '서버에서 발급한 주소와 기기 인증 정보를 입력하세요. 기기마다 별도의 인증 정보가 필요합니다.',
+            credentialUnavailable: '운영체제에서 기기 인증 정보를 열 수 없습니다. 키 저장소 잠금을 해제하거나, 서버에서 기존 기기를 해지한 뒤 새 기기 토큰으로 재등록하세요. Linux에서는 잠금 해제된 Secret Service가 필요합니다.',
             connect: '연결하고 동기화',
             disconnect: '연결 해제',
             syncNow: '지금 동기화',

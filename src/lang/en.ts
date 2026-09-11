@@ -1872,6 +1872,7 @@ export const languageEnglish = {
             token: 'Device token',
             credentialsHelp:
                 'Use the address and device credentials issued by your server. Each device needs its own credentials.',
+            credentialUnavailable: 'The operating system could not open this device credential. Unlock its key storage or revoke the old device on the server and register a new device token. Linux requires an unlocked Secret Service.',
             connect: 'Connect and sync',
             disconnect: 'Disconnect',
             syncNow: 'Sync now',

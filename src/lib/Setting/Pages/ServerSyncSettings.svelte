@@ -294,7 +294,9 @@
         ? text.activationHelp
         : error === "committed-refresh-pending"
           ? text.refreshHelp
-          : text.errorHelp} <span class="opacity-60">({error})</span>
+          : error === "device-credential-unavailable"
+            ? text.credentialUnavailable
+            : text.errorHelp} <span class="opacity-60">({error})</span>
     </p>
   {/if}
   <button

@@ -569,6 +569,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     }
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
+    ServerSyncSecrets.initialize()
     if (BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS) {
       recoverSafDestination(savedInstanceState != null)
     }

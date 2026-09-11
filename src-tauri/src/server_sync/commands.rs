@@ -161,7 +161,7 @@ pub(crate) async fn server_sync_reregister(
         state.require_no_preparation()?;
         let mut store = job_store(&app)?;
         let old = store
-            .server_config()?
+            .server_stored_config()?
             .ok_or_else(|| SyncError::new("server-not-bound", 409))?;
         if old.library_id != config.library_id || old.device_id == config.device_id {
             return Err(SyncError::new("new-device-registration-required", 409));

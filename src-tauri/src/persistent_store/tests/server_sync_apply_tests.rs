@@ -31,6 +31,52 @@ fn bind(store: &mut PersistentStore) {
         })
         .unwrap();
 }
+#[test]
+fn server_sync_credentials_stay_outside_source_backups_and_allow_recovery_after_loss() {
+    let (dir, mut store, _) = open_fixture();
+    bind(&mut store);
+    let credential = store.server_stored_config().unwrap().unwrap();
+    let revision = store.revision().unwrap();
+    let lease = store.acquire_revision(revision).unwrap().lease;
+    let output = dir.path().join("synthetic-preservation.db");
+    store
+        .capture_preservation_database(&lease, &output, &crate::local_backup::NeverCancelled)
+        .unwrap();
+    store.release_revision(&lease).unwrap();
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(!bytes
+        .windows(64)
+        .any(|part| part == "a".repeat(64).as_bytes()));
+    let db = rusqlite::Connection::open(&output).unwrap();
+    let config: String = db
+        .query_row("SELECT config FROM server_sync_state", [], |r| r.get(0))
+        .unwrap();
+    assert!(serde_json::from_str::<Value>(&config)
+        .unwrap()
+        .get("token")
+        .is_none());
+    credential.remove(dir.path()).unwrap();
+    assert!(store.server_config().is_err());
+    assert!(store.server_status().unwrap().configured);
+    // A native command verifies a new identity and the old revocation first.
+    store
+        .server_replace_registration(
+            &ServerConfig {
+                endpoint: "http://127.0.0.1:4319".into(),
+                library_id: "library".into(),
+                device_id: "replacement".into(),
+                token: "b".repeat(64),
+            },
+            revision,
+        )
+        .unwrap();
+    assert_eq!(
+        store.server_config().unwrap().unwrap().device_id,
+        "replacement"
+    );
+    store.server_unbind().unwrap();
+    assert!(!store.server_status().unwrap().configured);
+}
 fn remote_root(value: Value) -> RemoteRecord {
     let payload = ServerPayload {
         derived_objects: Default::default(),

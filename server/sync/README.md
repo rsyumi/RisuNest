@@ -20,6 +20,17 @@ $daemon = 'E:/Programming/Github/RisuNest/src-tauri/target/debug/risunest-sync-s
 credential privately to its device. Only the token's SHA-256 verifier is stored
 on the server. Do not put credentials into URLs, logs, or library content.
 
+The app keeps only a credential reference in PDS. Windows protects a separate
+local file with user-scoped DPAPI; Android encrypts it with an Android Keystore
+AES-GCM key. Apple clients use Keychain, and Linux clients require an unlocked
+Secret Service (the native Linux build also needs the libdbus development
+package). Key-store errors do not fall back to plaintext. A data backup cannot
+transfer a device credential. Unlock the OS store or revoke the previous device
+and register a new credential when one is lost. Windows protection and raw-source
+backup exclusion have automated coverage; other OS key-store runtime checks
+remain pending. See [DPAPI](https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata)
+and [Keyring's platform stores](https://docs.rs/keyring/3.6.3/keyring/).
+
 `status`, `device add`, `device revoke ID`, `maintain`, `backup`, `restore`, and `restore-epoch` require
 the daemon to be stopped. All commands take `--data-dir ABSOLUTE_PATH` and use
 an exclusive owner lock. A second daemon or `init` fails without replacing data.

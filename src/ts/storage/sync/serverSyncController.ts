@@ -137,6 +137,7 @@ export function createServerSyncController(facade: ServerSyncFacade) {
             "epoch-reconciliation-required",
             "unauthorized",
             "new-device-registration-required",
+            "device-credential-unavailable",
           ].includes(state.error) &&
           state.result?.phase !== "conflict" &&
           !facade.needsRefresh(),

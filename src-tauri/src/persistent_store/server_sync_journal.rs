@@ -1,5 +1,5 @@
 use super::{server_sync_outbox::ServerDirtyKey, PersistentStore};
-use crate::server_sync::{client::ServerConfig, Result, SyncError};
+use crate::server_sync::{client::ServerConfig, credentials::StoredConfig, Result, SyncError};
 use risunest_sync_wire::{
     canonical, operation_id, CommitIntent, Receipt, RecordVersion, RemoteHead, Sequence,
     TerminalStatus,
@@ -30,6 +30,11 @@ pub(crate) struct PendingOperation {
 
 impl PersistentStore {
     pub(crate) fn server_config(&self) -> Result<Option<ServerConfig>> {
+        self.server_stored_config()?
+            .map(|stored| stored.resolve(self.repository_root()))
+            .transpose()
+    }
+    pub(crate) fn server_stored_config(&self) -> Result<Option<StoredConfig>> {
         let text: Option<String> = self
             .connection
             .query_row(
@@ -45,6 +50,7 @@ impl PersistentStore {
     }
     pub(crate) fn server_bind(&mut self, config: &ServerConfig) -> Result<()> {
         config.validate()?;
+        let root = self.repository_root().to_owned();
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -55,17 +61,25 @@ impl PersistentStore {
         )? {
             return Err(SyncError::new("server-already-bound", 409));
         }
-        tx.execute(
-            "INSERT INTO server_sync_state(singleton,config) VALUES(1,?1)",
-            [serde_json::to_string(config)
-                .map_err(|_| SyncError::new("invalid-server-config", 400))?],
-        )?;
-        tx.commit()?;
-        Ok(())
+        let stored = StoredConfig::persist(&root, config)?;
+        let outcome = (|| -> Result<()> {
+            tx.execute(
+                "INSERT INTO server_sync_state(singleton,config) VALUES(1,?1)",
+                [serde_json::to_string(&stored)
+                    .map_err(|_| SyncError::new("invalid-server-config", 400))?],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })();
+        if outcome.is_err() {
+            let _ = stored.remove(&root);
+        }
+        outcome
     }
     /// Disconnect keeps PDS and cached immutable bytes. An unresolved operation
     /// must first be reconciled with its receipt so it cannot be forgotten.
     pub(crate) fn server_unbind(&mut self) -> Result<()> {
+        let stored = self.server_stored_config()?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -94,10 +108,13 @@ impl PersistentStore {
             tx.execute(&format!("DELETE FROM {table}"), [])?;
         }
         tx.commit()?;
+        if let Some(stored) = stored {
+            let _ = stored.remove(self.repository_root());
+        }
         Ok(())
     }
     pub(crate) fn server_status(&self) -> Result<ReplicaStatus> {
-        let config = self.server_config()?;
+        let config = self.server_stored_config()?;
         let (head,full_scan,registration_required)=self.connection.query_row("SELECT head,full_scan,registration_required FROM server_sync_state WHERE singleton=1",[],|r|Ok((r.get::<_,Option<String>>(0)?,r.get::<_,bool>(1)?,r.get::<_,bool>(2)?))).optional()?.unwrap_or((None,false,false));
         Ok(ReplicaStatus {
             local_revision: self.revision()?,
@@ -143,7 +160,7 @@ impl PersistentStore {
     ) -> Result<()> {
         config.validate()?;
         let previous = self
-            .server_config()?
+            .server_stored_config()?
             .ok_or_else(|| SyncError::new("server-not-bound", 409))?;
         if previous.library_id != config.library_id || previous.device_id == config.device_id {
             return Err(SyncError::new("new-device-registration-required", 409));
@@ -179,6 +196,8 @@ impl PersistentStore {
             return Err(SyncError::new("local-revision-changed", 409));
         }
         self.snapshot_create("server-sync-recovery")?;
+        let root = self.repository_root().to_owned();
+        let previous = self.server_stored_config()?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -200,15 +219,28 @@ impl PersistentStore {
             "UPDATE server_sync_state SET head=NULL,full_scan=1,reconciling=1",
             [],
         )?;
-        if let Some(config) = config {
-            tx.execute(
+        let replacement = config
+            .map(|config| StoredConfig::persist(&root, config))
+            .transpose()?;
+        let outcome = (|| -> Result<()> {
+            if let Some(config) = &replacement {
+                tx.execute(
                 "UPDATE server_sync_state SET config=?1,next_sequence='1',registration_required=0",
                 [serde_json::to_string(config)
                     .map_err(|_| SyncError::new("invalid-server-config", 400))?],
             )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })();
+        if outcome.is_ok() && replacement.is_some() {
+            if let Some(previous) = previous {
+                let _ = previous.remove(&root);
+            }
+        } else if let Some(replacement) = replacement {
+            let _ = replacement.remove(&root);
         }
-        tx.commit()?;
-        Ok(())
+        outcome
     }
     pub(crate) fn server_pending(&self) -> Result<Option<PendingOperation>> {
         let row = self

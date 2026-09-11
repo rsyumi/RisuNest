@@ -98,4 +98,17 @@ describe("server sync controller", () => {
     expect(controller.snapshot().error).toBe("");
     expect(controller.snapshot().status?.reconciling).toBe(true);
   });
+  it("keeps credential loss actionable without repeatedly opening the key store", async () => {
+    const { controller, facade } = fixture();
+    await controller.initialize();
+    facade.cycle.mockRejectedValueOnce({
+      code: "device-credential-unavailable",
+    });
+    await controller.synchronize();
+    expect(controller.snapshot().status?.configured).toBe(true);
+    expect(controller.canAutoSync()).toBe(false);
+    await controller.synchronize();
+    expect(controller.snapshot().error).toBe("");
+    expect(controller.canAutoSync()).toBe(true);
+  });
 });
