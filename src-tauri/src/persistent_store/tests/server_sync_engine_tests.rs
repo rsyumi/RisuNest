@@ -770,3 +770,118 @@ fn large_opaque_file_http_gate(size: u64) {
     task.abort();
     runtime.shutdown_timeout(Duration::from_secs(2));
 }
+
+#[test]
+#[ignore = "Explicit 100k owner manifest end-to-end HTTP acceptance gate"]
+fn server_sync_hundred_thousand_owner_entries_http_gate() {
+    use crate::asset_repository::owner_manifest_codec::{
+        encode_owner_manifest, OwnerManifestEntry,
+    };
+    use crate::asset_repository::PayloadCas;
+    let directory = tempfile::tempdir().unwrap();
+    let server = Arc::new(Store::init(directory.path()).unwrap());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let listener = CountedListener {
+        listener,
+        bytes: counter.clone(),
+    };
+    let server_clone = server.clone();
+    let task = runtime.spawn(async move {
+        axum::serve(listener, http::router(server_clone))
+            .await
+            .unwrap();
+    });
+    let (_first_dir, mut first) = prepared();
+    let (_second_dir, mut second) = prepared();
+    for store in [&mut first, &mut second] {
+        let credential = server.add_device().unwrap();
+        store
+            .server_bind(&ServerConfig {
+                endpoint: endpoint.clone(),
+                library_id: credential.library_id,
+                device_id: credential.device_id,
+                token: credential.token,
+            })
+            .unwrap();
+    }
+
+    // Establish the shared base before adding the large owner manifest. Two
+    // independent nonempty libraries must otherwise ask for a conflict choice.
+    assert_eq!(settle(&mut first).phase, "idle");
+    assert_eq!(settle(&mut second).phase, "idle");
+    let mut entries = (0..100_000)
+        .map(|index| OwnerManifestEntry {
+            tuple: [
+                format!("owner-{index}"),
+                format!("assets/synthetic-missing-{index}"),
+                "png".into(),
+            ],
+            payload_hash: None,
+        })
+        .collect::<Vec<_>>();
+    let commit_owner = |store: &mut PersistentStore, entries: &[OwnerManifestEntry]| {
+        let generation = active_generation(&store.connection).unwrap();
+        let raw: String = store
+            .connection
+            .query_row(
+                "SELECT detail FROM characters WHERE generation=?1 AND character_id='char-a'",
+                [generation],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut detail: Value = serde_json::from_str(&raw).unwrap();
+        detail["additionalAssets"] = Value::Array(
+            entries
+                .iter()
+                .map(|entry| Value::Array(entry.tuple.iter().cloned().map(Value::String).collect()))
+                .collect(),
+        );
+        let cas = PayloadCas::new(&store.repository_root).unwrap();
+        let manifest = cas
+            .prepare_bytes(&encode_owner_manifest(entries).unwrap())
+            .unwrap();
+        store
+            .commit(&WorkingSetCommit {
+                character_details: Some(vec![detail]),
+                asset_owner_heads: Some(vec![AssetOwnerHead::present(
+                    AssetOwnerLocator::CharacterAdditionalAssets {
+                        character_id: "char-a".into(),
+                    },
+                    manifest.content_hash,
+                    entries.len() as i64,
+                )]),
+                ..empty_working_set_commit(store.revision().unwrap())
+            })
+            .unwrap();
+    };
+    commit_owner(&mut first, &entries);
+    assert_eq!(settle(&mut first).phase, "idle");
+    assert_eq!(settle(&mut second).phase, "idle");
+    entries[50_000].tuple[0] = "edited".into();
+    commit_owner(&mut first, &entries);
+    counter.store(0, AtomicOrdering::Relaxed);
+    let start = std::time::Instant::now();
+    assert_eq!(settle(&mut first).phase, "idle");
+    let upload = counter.swap(0, AtomicOrdering::Relaxed);
+    let upload_ms = start.elapsed().as_millis();
+    let start = std::time::Instant::now();
+    assert_eq!(settle(&mut second).phase, "idle");
+    let download = counter.load(AtomicOrdering::Relaxed);
+    eprintln!("100k owner HTTP totals (D, upload bytes, download bytes, upload ms, download ms): (6, {upload}, {download}, {upload_ms}, {})",start.elapsed().as_millis());
+    assert!(upload <= 16384 + 6, "owner upload {upload}");
+    assert!(download <= 16384 + 6, "owner download {download}");
+    let generation = active_generation(&second.connection).unwrap();
+    let name:String=second.connection.query_row("SELECT json_extract(detail,'$.additionalAssets[50000][0]') FROM characters WHERE generation=?1 AND character_id='char-a'",[generation],|r|r.get(0)).unwrap();
+    assert_eq!(name, "edited");
+    task.abort();
+    runtime.shutdown_timeout(Duration::from_secs(2));
+}

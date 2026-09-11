@@ -147,11 +147,19 @@ impl<'a> Transfer<'a> {
                 .filter(|h| !absent.contains(h.as_str()))
                 .cloned()
                 .collect::<Vec<_>>();
-            let candidates = base_candidates
-                .iter()
-                .filter(|h| !present.contains(h))
-                .cloned()
-                .collect::<Vec<_>>();
+            let mut candidates = BTreeSet::new();
+            for target in &missing.missing {
+                let size = self
+                    .cache
+                    .cas
+                    .stat_object(target)?
+                    .ok_or_else(|| SyncError::new("cached-object-missing", 409))?;
+                candidates.extend(if size > delta::MAX_TARGET_BYTES as u64 {
+                    self.large_bases(target, size, base_candidates)?
+                } else {
+                    self.select_bases(target, base_candidates)?
+                });
+            }
             let mut leased = present.clone();
             leased.extend(candidates);
             let bases_pinned = match self.pin(&leased) {

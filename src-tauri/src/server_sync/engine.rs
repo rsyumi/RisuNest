@@ -420,52 +420,58 @@ impl PersistentStore {
     }
     fn upload_pending_objects(&self, transfer: &Transfer<'_>) -> Result<()> {
         self.connection.execute_batch("CREATE TEMP TABLE IF NOT EXISTS server_upload_objects(hash TEXT PRIMARY KEY); DELETE FROM server_upload_objects;")?;
-        let mut bases = BTreeSet::new();
         let mut after = String::new();
         loop {
-            let mut stmt=self.connection.prepare("SELECT key,version FROM server_sync_operation_records WHERE key>?1 ORDER BY key LIMIT 1024")?;
-            let records = stmt
-                .query_map([&after], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            drop(stmt);
+            let records = {
+                let mut stmt=self.connection.prepare("SELECT key,version FROM server_sync_operation_records WHERE key>?1 ORDER BY key LIMIT 1024")?;
+                let rows = stmt
+                    .query_map([&after], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows
+            };
             if records.is_empty() {
                 break;
             }
             for (key, version) in records {
+                transfer.client.ensure_active()?;
                 after = key.clone();
                 let version: RecordVersion = parse(&version)?;
-                for hash in transfer.cache.closure(&version)? {
-                    self.connection.execute(
+                let mut objects = transfer.cache.closure(&version)?;
+                let (base, _) = self.server_base(&key)?;
+                if let Ok(previous) = transfer.cache.closure(&base) {
+                    let roots = base
+                        .object_hashes()
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
+                    if !roots.is_empty() {
+                        match transfer.pin(&roots) {
+                            Ok(()) => {
+                                // The committed descriptor is a transitive GC root.
+                                // Its verified closure needs no 100k-hash missing query.
+                                let previous = previous.into_iter().collect::<BTreeSet<_>>();
+                                objects.retain(|hash| !previous.contains(hash));
+                            }
+                            Err(error) if error.status == 404 => (),
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+                let mut unsent = Vec::new();
+                for hash in objects {
+                    if self.connection.execute(
                         "INSERT OR IGNORE INTO server_upload_objects VALUES(?1)",
-                        [hash],
-                    )?;
+                        [&hash],
+                    )? != 0
+                    {
+                        unsent.push(hash);
+                    }
                 }
-                if bases.len() < 64 {
-                    bases.extend(
-                        self.server_base_candidates(&key, transfer.cache, false)?
-                            .into_iter()
-                            .take(64 - bases.len()),
-                    );
-                }
+                let bases = self.server_base_candidates(&key, transfer.cache, false)?;
+                transfer.upload(&unsent, &bases)?;
             }
-        }
-        let bases = bases.into_iter().collect::<Vec<_>>();
-        let mut after = String::new();
-        loop {
-            let mut stmt = self.connection.prepare(
-                "SELECT hash FROM server_upload_objects WHERE hash>?1 ORDER BY hash LIMIT 1024",
-            )?;
-            let hashes = stmt
-                .query_map([&after], |r| r.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            drop(stmt);
-            if hashes.is_empty() {
-                break;
-            }
-            after = hashes.last().unwrap().clone();
-            transfer.upload(&hashes, &bases)?;
         }
         Ok(())
     }
@@ -970,7 +976,7 @@ impl PersistentStore {
     ) -> Result<Vec<String>> {
         let (base, _) = self.effective_server_base(key, committed)?;
         // Missing local bases use the protocol's explicit full transfer path.
-        Ok(cache.closure(&base).unwrap_or_default())
+        Ok(cache.base_candidates(key, &base).unwrap_or_default())
     }
     fn prepare_server_cycle(
         &mut self,
