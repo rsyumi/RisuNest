@@ -46,7 +46,7 @@ impl Default for CharXLimits {
             max_entry_decoded_bytes: 50 * 1024 * 1024,
             max_total_decoded_bytes: 10 * 1024 * 1024 * 1024,
             max_compression_ratio: 1_000,
-            max_metadata_bytes: 8 * 1024 * 1024,
+            max_metadata_bytes: crate::import_export_jobs::MAX_CONTENT_METADATA_BYTES as u64,
         }
     }
 }
@@ -375,19 +375,34 @@ pub fn inspect_charx_file<F>(
 where
     F: FnMut() -> bool,
 {
+    let source = File::open(source_path).map_err(|error| io_error("open CharX source", error))?;
+    inspect_charx_opened_file(&source, original_name, staging_root, limits, is_cancelled)
+}
+
+pub fn inspect_charx_opened_file<F>(
+    source_file: &File,
+    original_name: &str,
+    staging_root: &Path,
+    limits: CharXLimits,
+    is_cancelled: F,
+) -> Result<CharXInspection, CharXParseError>
+where
+    F: FnMut() -> bool,
+{
     let cancellation = Cancellation::new(is_cancelled);
     cancellation.check()?;
     validate_limits(limits)?;
 
-    let source_length = fs::metadata(source_path)
+    let source_length = source_file
+        .metadata()
         .map_err(|error| io_error("read CharX source metadata", error))?
         .len();
     let extension = extension_of(original_name);
     let normalized_extension = extension.as_ref().map(|value| value.to_ascii_lowercase());
-    let jpeg_signature = has_jpeg_signature(source_path, &cancellation)?;
+    let jpeg_signature = has_jpeg_signature(source_file, &cancellation)?;
 
     match inspect_card_container(
-        source_path,
+        source_file,
         staging_root,
         limits,
         jpeg_signature,
@@ -772,7 +787,7 @@ fn write_zip_error(operation: &str, error: zip::result::ZipError) -> CharXWriteE
 }
 
 fn inspect_card_container<F>(
-    source_path: &Path,
+    source_file: &File,
     staging_root: &Path,
     limits: CharXLimits,
     jpeg_signature: bool,
@@ -781,7 +796,9 @@ fn inspect_card_container<F>(
 where
     F: FnMut() -> bool,
 {
-    let file = File::open(source_path).map_err(|error| io_error("open CharX source", error))?;
+    let file = source_file
+        .try_clone()
+        .map_err(|error| io_error("open CharX source", error))?;
     let mut source = CancellableReader::new(file, cancellation.clone());
     let preflight = preflight_zip(&mut source, usize::MAX, u64::MAX, &|| {
         cancellation.is_cancelled()
@@ -797,7 +814,7 @@ where
     validate_preflight_limits(preflight, limits)?;
     let container_kind = if jpeg_signature {
         if preflight.archive_start == 0
-            || !jpeg_prefix_ends_at_archive(source_path, preflight.archive_start, cancellation)?
+            || !jpeg_prefix_ends_at_archive(source_file, preflight.archive_start, cancellation)?
         {
             return Err(CharXParseError::new(
                 CharXParseErrorCode::InvalidArchive,
@@ -847,7 +864,7 @@ where
         }
     }
 
-    let entries = inspect_entries(source_path, preflight, &mut archive, limits, cancellation)?;
+    let entries = inspect_entries(source_file, preflight, &mut archive, limits, cancellation)?;
     let card_entry = entries
         .iter()
         .find(|entry| entry.normalized_name == "card.json")
@@ -1001,7 +1018,7 @@ fn ordinary_jpeg_descriptor(
 }
 
 fn inspect_entries<R, F>(
-    source_path: &Path,
+    source_file: &File,
     preflight: ZipPreflight,
     archive: &mut ZipArchive<R>,
     limits: CharXLimits,
@@ -1041,7 +1058,7 @@ where
         }
         let raw_name = entry.name_raw();
         layouts.push(inspect_entry_layout(
-            source_path,
+            source_file,
             preflight,
             &entry,
             cancellation,
@@ -1073,9 +1090,19 @@ where
 
         let decoded_size = entry.size();
         let compressed_size = entry.compressed_size();
-        if decoded_size > limits.max_entry_decoded_bytes {
+        let metadata_entry = matches!(normalized_name.as_str(), "card.json" | "module.risum");
+        let entry_limit = if metadata_entry {
+            limits.max_metadata_bytes
+        } else {
+            limits.max_entry_decoded_bytes
+        };
+        if decoded_size > entry_limit {
             return Err(CharXParseError::new(
-                CharXParseErrorCode::EntryTooLarge,
+                if metadata_entry {
+                    CharXParseErrorCode::MetadataTooLarge
+                } else {
+                    CharXParseErrorCode::EntryTooLarge
+                },
                 format!("CharX entry exceeds decoded-size limit: {normalized_name}"),
             ));
         }
@@ -1099,12 +1126,6 @@ where
             return Err(CharXParseError::new(
                 CharXParseErrorCode::CompressionRatioExceeded,
                 format!("CharX entry exceeds compression-ratio limit: {normalized_name}"),
-            ));
-        }
-        if normalized_name == "card.json" && decoded_size > limits.max_metadata_bytes {
-            return Err(CharXParseError::new(
-                CharXParseErrorCode::MetadataTooLarge,
-                "CharX card.json exceeds metadata limit",
             ));
         }
 
@@ -1221,7 +1242,7 @@ fn has_drive_prefix(name: &str) -> bool {
 }
 
 fn inspect_entry_layout<F>(
-    source_path: &Path,
+    source_file: &File,
     preflight: ZipPreflight,
     entry: &zip::read::ZipFile<'_>,
     cancellation: &Cancellation<F>,
@@ -1261,7 +1282,7 @@ where
         .checked_add(central_relative_start)
         .ok_or_else(|| invalid_archive("CharX central header offset overflowed"))?;
     let central = read_exact_at::<CENTRAL_DIRECTORY_HEADER_BYTES, _>(
-        source_path,
+        source_file,
         central_start,
         cancellation,
         "central ZIP header",
@@ -1294,7 +1315,7 @@ where
         .and_then(|value| value.checked_add(central_name_length))
         .ok_or_else(|| invalid_archive("CharX central extra offset overflowed"))?;
     let central_extra = read_bytes_at(
-        source_path,
+        source_file,
         central_extra_start,
         usize::try_from(central_extra_length)
             .map_err(|_| invalid_archive("CharX central extra length does not fit memory"))?,
@@ -1317,7 +1338,7 @@ where
         .checked_add(local_relative_start)
         .ok_or_else(|| invalid_archive("CharX local header offset overflowed"))?;
     let local = read_exact_at::<LOCAL_FILE_HEADER_BYTES, _>(
-        source_path,
+        source_file,
         local_start,
         cancellation,
         "local ZIP header",
@@ -1374,7 +1395,7 @@ where
         .checked_add(LOCAL_FILE_HEADER_BYTES as u64)
         .ok_or_else(|| invalid_archive("CharX local name offset overflowed"))?;
     let local_name = read_bytes_at(
-        source_path,
+        source_file,
         name_start,
         usize::from(read_u16(&local, 26).unwrap()),
         cancellation,
@@ -1391,7 +1412,7 @@ where
         .checked_add(name_length)
         .ok_or_else(|| invalid_archive("CharX local extra offset overflowed"))?;
     let local_extra = read_bytes_at(
-        source_path,
+        source_file,
         extra_start,
         usize::try_from(extra_length)
             .map_err(|_| invalid_archive("CharX local extra length does not fit memory"))?,
@@ -1431,7 +1452,7 @@ where
             ));
         }
         validate_data_descriptor(
-            source_path,
+            source_file,
             preflight,
             data_end,
             DataDescriptorExpected {
@@ -1541,7 +1562,7 @@ fn descriptor_size_placeholder_matches(value: u32, expected: u64) -> bool {
 }
 
 fn validate_data_descriptor<F>(
-    source_path: &Path,
+    source_file: &File,
     preflight: ZipPreflight,
     data_end: u64,
     expected: DataDescriptorExpected,
@@ -1566,7 +1587,7 @@ where
         .checked_add(data_end)
         .ok_or_else(|| invalid_archive("CharX data descriptor offset overflowed"))?;
     let bytes = read_bytes_at(
-        source_path,
+        source_file,
         descriptor_start,
         available as usize,
         cancellation,
@@ -1604,7 +1625,7 @@ where
 }
 
 fn read_exact_at<const N: usize, F>(
-    source_path: &Path,
+    source_file: &File,
     offset: u64,
     cancellation: &Cancellation<F>,
     label: &str,
@@ -1612,12 +1633,12 @@ fn read_exact_at<const N: usize, F>(
 where
     F: FnMut() -> bool,
 {
-    let bytes = read_bytes_at(source_path, offset, N, cancellation, label)?;
+    let bytes = read_bytes_at(source_file, offset, N, cancellation, label)?;
     Ok(bytes.try_into().expect("read exact fixed-size buffer"))
 }
 
 fn read_bytes_at<F>(
-    source_path: &Path,
+    source_file: &File,
     offset: u64,
     length: usize,
     cancellation: &Cancellation<F>,
@@ -1626,16 +1647,36 @@ fn read_bytes_at<F>(
 where
     F: FnMut() -> bool,
 {
-    let mut source = File::open(source_path)
-        .map(|file| CancellableReader::new(file, cancellation.clone()))
-        .map_err(|error| io_error(&format!("open {label}"), error))?;
-    source
-        .seek(SeekFrom::Start(offset))
-        .map_err(|error| io_error(&format!("seek {label}"), error))?;
     let mut bytes = vec![0_u8; length];
-    source
-        .read_exact(&mut bytes)
-        .map_err(|error| io_error(&format!("read {label}"), error))?;
+    let mut completed = 0;
+    while completed < length {
+        cancellation.check()?;
+        #[cfg(windows)]
+        let saved_position = (&*source_file)
+            .stream_position()
+            .map_err(|e| io_error(label, e))?;
+        #[cfg(windows)]
+        let read = std::os::windows::fs::FileExt::seek_read(
+            source_file,
+            &mut bytes[completed..],
+            offset + completed as u64,
+        );
+        #[cfg(windows)]
+        (&*source_file)
+            .seek(SeekFrom::Start(saved_position))
+            .map_err(|e| io_error(label, e))?;
+        #[cfg(unix)]
+        let read = std::os::unix::fs::FileExt::read_at(
+            source_file,
+            &mut bytes[completed..],
+            offset + completed as u64,
+        );
+        let read = read.map_err(|error| io_error(label, error))?;
+        if read == 0 {
+            return Err(invalid_archive(format!("truncated {label}")));
+        }
+        completed += read;
+    }
     Ok(bytes)
 }
 
@@ -1997,25 +2038,25 @@ fn extension_of(name: &str) -> Option<String> {
 }
 
 fn has_jpeg_signature<F>(
-    path: &Path,
+    file: &File,
     cancellation: &Cancellation<F>,
 ) -> Result<bool, CharXParseError>
 where
     F: FnMut() -> bool,
 {
-    let mut file = File::open(path)
-        .map(|file| CancellableReader::new(file, cancellation.clone()))
-        .map_err(|error| io_error("open JPEG source", error))?;
-    let mut signature = [0_u8; 3];
-    match file.read_exact(&mut signature) {
-        Ok(()) => Ok(signature == [0xff, 0xd8, 0xff]),
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
-        Err(error) => Err(io_error("read JPEG signature", error)),
+    if file
+        .metadata()
+        .map_err(|e| io_error("source length", e))?
+        .len()
+        < 3
+    {
+        return Ok(false);
     }
+    Ok(read_bytes_at(file, 0, 3, cancellation, "JPEG signature")? == [0xff, 0xd8, 0xff])
 }
 
 fn jpeg_prefix_ends_at_archive<F>(
-    path: &Path,
+    file: &File,
     archive_offset: u64,
     cancellation: &Cancellation<F>,
 ) -> Result<bool, CharXParseError>
@@ -2025,14 +2066,10 @@ where
     if archive_offset < 2 {
         return Ok(false);
     }
-    let marker = read_bytes_at(
-        path,
-        archive_offset - 2,
-        2,
-        cancellation,
-        "appended JPEG end marker",
-    )?;
-    Ok(marker == [0xff, 0xd9])
+    Ok(
+        read_bytes_at(file, archive_offset - 2, 2, cancellation, "JPEG end marker")?
+            == [0xff, 0xd9],
+    )
 }
 
 fn detect_mime(prefix: &[u8], extension: Option<&str>) -> &'static str {
@@ -2148,7 +2185,7 @@ mod tests {
 
         assert_eq!(
             validate_data_descriptor(
-                &source,
+                &fs::File::open(&source).unwrap(),
                 preflight,
                 0,
                 DataDescriptorExpected {

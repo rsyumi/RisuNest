@@ -1,4 +1,6 @@
 <script lang="ts">
+    import ListPager from "src/lib/UI/GUI/ListPager.svelte"
+    import { loreListWindow, loreDropIndex, groupLoreFolders } from "src/ts/gui/loreListWindow"
     import { type loreBook } from "src/ts/storage/database.svelte";
     import { DBState } from 'src/ts/stores.svelte';
     import LoreBookData from "./LoreBookData.svelte";
@@ -20,6 +22,14 @@
     }
 
     let { globalMode = false, submenu = 0, lorePlus = false, externalLoreBooks = null, showFolder = '' }: Props = $props();
+    let page = $state(0)
+    const currentItems = $derived(externalLoreBooks ?? (globalMode
+        ? DBState.db.loreBook[DBState.db.loreBookPage]?.data ?? []
+        : submenu === 1
+            ? DBState.db.characters[$selectedCharID]?.chats[DBState.db.characters[$selectedCharID].chatPage]?.localLore ?? []
+            : DBState.db.characters[$selectedCharID]?.globalLore ?? []))
+    const windowed = $derived(loreListWindow(currentItems, showFolder, page))
+    const pageRows = $derived(windowed.rows)
     let stb: Sortable = null
     let ele: HTMLDivElement = $state()
     let sorted = $state(0)
@@ -42,25 +52,8 @@
         }
         
         // 4. Calculate expected number of child elements
-        let expectedElements = 0;
-        if (externalLoreBooks) {
-            expectedElements = externalLoreBooks.filter(item => 
-                (!showFolder && !item.folder) || (showFolder === item.folder)
-            ).length;
-        } else if (submenu === 1) {
-            expectedElements = DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].localLore.filter(item => 
-                (!showFolder && !item.folder) || (showFolder === item.folder)
-            ).length;
-        } else if (globalMode) {
-            expectedElements = DBState.db.loreBook[DBState.db.loreBookPage].data.filter(item => 
-                (!showFolder && !item.folder) || (showFolder === item.folder)
-            ).length;
-        } else {
-            expectedElements = DBState.db.characters[$selectedCharID].globalLore.filter(item => 
-                (!showFolder && !item.folder) || (showFolder === item.folder)
-            ).length;
-        }
-        
+        const expectedElements = pageRows.length;
+
         // 5. Wait until all child elements are rendered (max 200ms)
         let attempts = 0;
         const maxAttempts = 20;
@@ -145,6 +138,13 @@
                 // ===== Stage 1: Revert SortableJS DOM manipulation =====
                 // SortableJS automatically manipulates DOM upon drag completion,
                 // but Svelte uses data-driven rendering, so DOM manipulation must be invalidated
+                const indexOfRow = (node: Element | null): number | null => {
+                    const value = node?.getAttribute('data-risu-idx')
+                    return value === null || value === undefined ? null : Number(value)
+                }
+                const backingSource = indexOfRow(evt.item)
+                const backingNext = indexOfRow(evt.item.nextElementSibling)
+                const backingPrevious = indexOfRow(evt.item.previousElementSibling)
                 const originalParent = evt.from;    // Drag start container
                 const originalIndex = evt.oldIndex; // Drag start position
                 
@@ -165,8 +165,9 @@
                 // Identify source and target folders (using data-show-folder attribute)
                 const sourceFolder = evt.from.getAttribute('data-show-folder') || '';
                 const targetFolder = evt.to.getAttribute('data-show-folder') || '';
-                const oldIndex = evt.oldIndex; // Drag start index provided by SortableJS
-                const newIndex = evt.newIndex; // Drag end index provided by SortableJS
+                if (backingSource === null) { await recreateStb(); return }
+                const oldIndex = backingSource;
+                const newIndex = loreDropIndex(oldIndex, backingNext, backingPrevious, currentItems.length);
                 
                 // ===== Stage 3: Identify current data array =====
                 // Select the correct data array based on component props and state
@@ -214,9 +215,7 @@
 
                 // 4-3. Sort item to appropriate position
                 let finalNewIndex = newIndex; // Final insertion position
-                if (moveFolder && oldIndex < newIndex) {
-                    finalNewIndex -= 1; // Adjust index when moving folder
-                }
+
 
                 // 4-3-1. Move item in array using oldIndex and modified finalNewIndex
                 // First remove original item from array
@@ -244,29 +243,8 @@
                 newArray.splice(adjustedFinalIndex, 0, updatedMovedItem);
 
                 // 4-3-2. Reorganize entire array according to folder structure
-                const sortedArray = [];
-                const processedItems = new Set();
-                
-                // Maintain basic order while organizing folder structure only
-                for (const item of newArray) {
-                    if (processedItems.has(item)) continue;
-                    
-                    // Add current item first (whether folder or regular item)
-                    sortedArray.push(item);
-                    processedItems.add(item);
-                    
-                    // If current item is a folder, add items belonging to that folder immediately after
-                    if (item.mode === 'folder') {
-                        for (const subItem of newArray) {
-                            if (processedItems.has(subItem)) continue;
-                            if (subItem.folder === item.key) {
-                                sortedArray.push(subItem);
-                                processedItems.add(subItem);
-                            }
-                        }
-                    }
-                }
-                
+                const sortedArray = groupLoreFolders(newArray);
+
                 // Assign final sorted array to newArray
                 newArray.splice(0, newArray.length, ...sortedArray);
 
@@ -351,6 +329,7 @@
     })
 </script>
 
+<ListPager bind:page total={windowed.total} disabled={openedRefs.size > 0} />
 {#key sorted}
     <div class="border-solid border-selected p-2 flex flex-col border-1 rounded-md" 
          bind:this={ele} 
@@ -360,12 +339,11 @@
                 This was a place for global lorebooks, but it was removed :)
             -->
         {:else if externalLoreBooks}
-            {@const visibleItems = externalLoreBooks.filter(book => (!showFolder && !book.folder) || (showFolder === book.folder))}
-            {@const lastVisibleItem = visibleItems[visibleItems.length - 1]}
+            {@const lastVisibleItem = pageRows.at(-1)?.book}
             {#if externalLoreBooks.length === 0}
                 <span class="text-textcolor2">No Lorebook</span>
             {:else}
-                {#each externalLoreBooks as book, i}
+                {#each pageRows as { book, i } (book)}
                     {#if (!showFolder && !book.folder) || (showFolder === book.folder)}
                         <LoreBookData idgroup={idgroup} bind:value={externalLoreBooks[i]} idx={i} 
                         isOpen={openedRefs.has(book)}
@@ -404,19 +382,15 @@
                         onOpen={(isDetail = true) => onOpen(isDetail, book)}
                         onClose={(isDetail = true) => onClose(isDetail, book)}
                         bind:externalLoreBooks={externalLoreBooks} />
-                    {:else}
-                        <!-- Hidden marker for filtered items (for SortableJS) -->
-                        <div data-risu-idx={i} data-risu-idgroup={idgroup} style="display: none;"></div>
                     {/if}
                 {/each}
             {/if}
         {:else if submenu === 0}
-            {@const visibleItems = DBState.db.characters[$selectedCharID].globalLore.filter(book => (!showFolder && !book.folder) || (showFolder === book.folder))}
-            {@const lastVisibleItem = visibleItems[visibleItems.length - 1]}
+            {@const lastVisibleItem = pageRows.at(-1)?.book}
             {#if DBState.db.characters[$selectedCharID].globalLore.length === 0}
                 <span class="text-textcolor2">No Lorebook</span>
             {:else}
-                {#each DBState.db.characters[$selectedCharID].globalLore as book, i}
+                {#each pageRows as { book, i } (book)}
                     {#if (!showFolder && !book.folder) || (showFolder === book.folder)}
                         <LoreBookData idgroup={idgroup} bind:value={DBState.db.characters[$selectedCharID].globalLore[i]} idx={i} 
                         isOpen={openedRefs.has(book)}
@@ -455,19 +429,15 @@
                         onOpen={(isDetail = true) => onOpen(isDetail, book)}
                         onClose={(isDetail = true) => onClose(isDetail, book)}
                         lorePlus={lorePlus} bind:externalLoreBooks={DBState.db.characters[$selectedCharID].globalLore}/>
-                    {:else}
-                        <!-- Hidden marker for filtered items (for SortableJS) -->
-                        <div data-risu-idx={i} data-risu-idgroup={idgroup} style="display: none;"></div>
                     {/if}
                 {/each}
             {/if}
         {:else if submenu === 1}
-            {@const visibleItems = DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].localLore.filter(book => (!showFolder && !book.folder) || (showFolder === book.folder))}
-            {@const lastVisibleItem = visibleItems[visibleItems.length - 1]}
+            {@const lastVisibleItem = pageRows.at(-1)?.book}
             {#if DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].localLore.length === 0}
                 <span class="text-textcolor2">No Lorebook</span>
             {:else}
-                {#each DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].localLore as book, i}
+                {#each pageRows as { book, i } (book)}
                     {#if (!showFolder && !book.folder) || (showFolder === book.folder)}
                         <LoreBookData idgroup={idgroup} bind:value={DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].localLore[i]} idx={i} 
                         isOpen={openedRefs.has(book)}
@@ -506,9 +476,6 @@
                         onOpen={(isDetail = true) => onOpen(isDetail, book)}
                         onClose={(isDetail = true) => onClose(isDetail, book)}
                         lorePlus={lorePlus} bind:externalLoreBooks={DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].localLore}/>
-                    {:else}
-                        <!-- Hidden marker for filtered items (for SortableJS) -->
-                        <div data-risu-idx={i} data-risu-idgroup={idgroup} style="display: none;"></div>
                     {/if}
                 {/each}
             {/if}

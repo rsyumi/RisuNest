@@ -1,4 +1,5 @@
 <script lang="ts">
+    import ListPager from "src/lib/UI/GUI/ListPager.svelte"
     import { FileMusicIcon, PlusIcon } from "@lucide/svelte";
     import { type character, type groupChat } from "src/ts/storage/database.svelte";
     import { getFileSrc, saveAsset } from "src/ts/globalApi.svelte";
@@ -13,23 +14,21 @@
     let assetFileExtensions:string[] = $state([])
     let assetFilePath:string[] = $state([])
 
-    $effect.pre(() => {
-        if(currentCharacter.type ==='character'){
-            if(currentCharacter.additionalAssets){
-                for(let i = 0; i < currentCharacter.additionalAssets.length; i++){
-                    // console.log('check content type ...', currentCharacter.additionalAssets[i][0], currentCharacter.additionalAssets[i][1]);
-                    if(currentCharacter.additionalAssets[i].length > 2 && currentCharacter.additionalAssets[i][2]) {
-                        assetFileExtensions[i] = currentCharacter.additionalAssets[i][2]
-                    } else {
-                        assetFileExtensions[i] = currentCharacter.additionalAssets[i][1].split('.').pop()
-                    }
-                    getFileSrc(currentCharacter.additionalAssets[i][1]).then((filePath) => {
-                        assetFilePath[i] = filePath
-                    })
-                }
-            }
+    let assetPage = $state(0)
+    const allAssets = $derived(currentCharacter.type === 'character' ? currentCharacter.additionalAssets ?? [] : [])
+    const assetRows = $derived(allAssets.slice(assetPage * 60, (assetPage + 1) * 60).map((asset, offset) => ({ asset, i: assetPage * 60 + offset })))
+    $effect(() => {
+        let active = true
+        assetFilePath = []
+        const extensions: string[] = []
+        for (const { asset, i } of assetRows) {
+            extensions[i] = asset[2] || asset[1].split('.').pop()
+            void getFileSrc(asset[1]).then(path => { if (active) assetFilePath[i] = path }).catch(() => {})
         }
-    });
+        assetFileExtensions = extensions
+        return () => { active = false }
+    })
+
 </script>
 {#if currentCharacter.type ==='character'}
     <button class="hover:text-green-500 bg-textcolor2 flex justify-center items-center w-16 h-16 m-1 rounded-md" onclick={async () => {
@@ -51,8 +50,9 @@
     }}>
         <PlusIcon />
     </button>
+    <ListPager bind:page={assetPage} total={allAssets.length} />
     {#if currentCharacter.additionalAssets}
-        {#each currentCharacter.additionalAssets as additionalAsset, i}
+        {#each assetRows as { asset: additionalAsset, i } (additionalAsset)}
                 <button onclick={()=>{
                     onSelect(additionalAsset)
                 }}>

@@ -16,6 +16,7 @@ export const OPENED_FILES_TAKE_COMMAND = 'opened_files_take'
 
 export type OpenedFileImporter = (name: string, data: Uint8Array) => Promise<void>
 
+let openedPathImporter: ((path: string) => Promise<boolean>) | undefined
 let openedFileImporter: OpenedFileImporter | null = null
 let domListener: ((event: Event) => void) | null = null
 let queue: Promise<void> = Promise.resolve()
@@ -35,10 +36,13 @@ export async function consumeOpenedFiles(files: string[]): Promise<void> {
                 continue
             }
             try {
+                if (await openedPathImporter?.(file)) continue
                 const data = await readFile(file)
                 await importer(file, data)
             } catch (error) {
-                alertError(`Failed to open the selected file: ${file}\n${error}`)
+                alertError(
+                    `Failed to open the selected file: ${file}\n${error}`,
+                )
             }
         }
     })
@@ -50,8 +54,12 @@ export async function consumeOpenedFiles(files: string[]): Promise<void> {
  * Wires every path a file association can take: the Android cold start injection, the Android warm
  * start DOM event, and the desktop launch arguments plus single instance forwarding.
  */
-export function registerOpenedFileListeners(importFile: OpenedFileImporter): void {
+export function registerOpenedFileListeners(
+    importFile: OpenedFileImporter,
+    importPath?: (path: string) => Promise<boolean>,
+): void {
     openedFileImporter = importFile
+    openedPathImporter = importPath
     if (domListener) {
         return
     }

@@ -22,3 +22,6 @@ pub struct ImportLimits {
     pub max_container_directory_bytes: u64,
     pub charx_probe_metadata_bytes: u64,
 }
+
+/// Generous metadata ceiling, independent of the per-asset payload cap.
+pub const MAX_CONTENT_METADATA_BYTES: usize = 128 * 1024 * 1024;

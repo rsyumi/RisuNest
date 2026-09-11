@@ -148,31 +148,50 @@ async function importAndroidCharacterSpool(
     return await importAndroidNativeCharacterSpool(source, {
         chooseDesktopPath: async () => null,
         readDesktopPath: async () => {
-            throw new Error('Android spool character import cannot read source bytes in TypeScript')
+            throw new Error(
+                'Android spool character import cannot read source bytes in TypeScript',
+            )
         },
         nativeEnabled: isNativeCharacterContentImportEnabled,
-        nativeImport: async () => await runExternalAndroidNativeFileOperation(
-            'import',
-            ({ signal, onStatus }) => importAndroidOpenedPreparedContent(source, {
-                prepare: prepareNativeContentImport,
-                activateCharacter: (content, lifecycle, activationSignal) =>
-                    activatePreparedNativeCharacterContent(
-                        content,
-                        lifecycle,
-                        undefined,
-                        activationSignal,
+        nativeImport: async () =>
+            await runExternalAndroidNativeFileOperation(
+                'import',
+                ({ signal, onStatus }) =>
+                    importAndroidOpenedPreparedContent(
+                        source,
+                        {
+                            prepare: prepareNativeContentImport,
+                            activateCharacter: (
+                                content,
+                                lifecycle,
+                                activationSignal,
+                            ) =>
+                                activatePreparedNativeCharacterContent(
+                                    content,
+                                    lifecycle,
+                                    undefined,
+                                    activationSignal,
+                                ),
+                            activateModule: (
+                                content,
+                                lifecycle,
+                                activationSignal,
+                            ) =>
+                                activatePreparedNativeModuleContent(
+                                    content,
+                                    lifecycle,
+                                    undefined,
+                                    activationSignal,
+                                ),
+                        },
+                        { signal, onStatus },
                     ),
-                activateModule: (content, lifecycle, activationSignal) =>
-                    activatePreparedNativeModuleContent(
-                        content,
-                        lifecycle,
-                        undefined,
-                        activationSignal,
-                    ),
-            }, { signal, onStatus }),
-        ),
+                { presentation: 'dialog', format: 'content' },
+            ),
         legacyImport: async () => {
-            throw new Error('Android spool character import has no legacy byte fallback')
+            throw new Error(
+                'Android spool character import has no legacy byte fallback',
+            )
         },
     })
 }

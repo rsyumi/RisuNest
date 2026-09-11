@@ -1,4 +1,5 @@
-import { language } from "src/lang"
+import { runContentImport } from '../storage/contentImportOperation'
+import { language } from 'src/lang'
 import { alertClear, alertConfirm, alertError, alertModuleSelect, alertNormal, alertStore, alertWait } from "../alert"
 import { getCurrentCharacter, getCurrentChat, getDatabase, setCurrentCharacter, setDatabase, type customscript, type loreBook, type triggerscript } from "../storage/database.svelte"
 import { downloadFile, forageStorage, LocalWriter, readImage, saveAsset, VirtualWriter } from "../globalApi.svelte"
@@ -39,27 +40,43 @@ export interface RisuModule{
     icon?:string
 }
 
-export async function importPreparedNativeModuleContent(input: {
-    source: NativeFileJobSource
-    displayName: string
-}, options: NativeFileJobOptions = {}): Promise<
-    { kind: 'declined' } | { kind: 'imported'; value: string }
-> {
-    const [{ runNativePreparedContentRoute }, { activatePreparedNativeModuleContent }] = await Promise.all([
+export async function importPreparedNativeModuleContent(
+    input: {
+        source: NativeFileJobSource
+        displayName: string
+    },
+    options: NativeFileJobOptions = {},
+): Promise<{ kind: 'declined' } | { kind: 'imported'; value: string }> {
+    const [
+        { runNativePreparedContentRoute },
+        { activatePreparedNativeModuleContent },
+    ] = await Promise.all([
         import('../storage/nativePreparedContentRoute'),
         import('../storage/nativeModuleContentActivation'),
     ])
-    const result = await runNativePreparedContentRoute(
-        input.source,
+    const result = await runContentImport(
         input.displayName,
-        {
-            map: async (content) => content,
-            activate: (content, lifecycle, signal) =>
-                activatePreparedNativeModuleContent(content, lifecycle, undefined, signal),
-        },
         options,
+        (operationOptions) =>
+            runNativePreparedContentRoute(
+                input.source,
+                input.displayName,
+                {
+                    map: async (content) => content,
+                    activate: (content, lifecycle, signal) =>
+                        activatePreparedNativeModuleContent(
+                            content,
+                            lifecycle,
+                            undefined,
+                            signal,
+                        ),
+                },
+                operationOptions,
+            ),
     )
-    return result ? { kind: 'imported', value: result.moduleId } : { kind: 'declined' }
+    return result
+        ? { kind: 'imported', value: result.moduleId }
+        : { kind: 'declined' }
 }
 
 export async function exportModule(module:RisuModule, arg:{
@@ -291,20 +308,32 @@ export async function readModule(buf:Buffer):Promise<RisuModule> {
     return module
 }
 
-export async function importModule(){
-    let desktopFile:{name:string,data:Uint8Array}|undefined
-    if(isTauriDesktop){
+export async function importModule() {
+    if (isTauri && !isTauriDesktop) {
+        const { importAndroidContentFromPicker } = await import(
+            '../storage/androidContentPicker'
+        )
+        return await importAndroidContentFromPicker('module')
+    }
+    let desktopFile: { name: string; data: Uint8Array } | undefined
+    if (isTauriDesktop) {
         const selected = await open({
             multiple: false,
             directory: false,
-            filters: [{
-                name: 'json, lorebook, risum, charx',
-                extensions: ['json', 'lorebook', 'risum', 'charx'],
-            }],
+            filters: [
+                {
+                    name: 'json, lorebook, risum, charx',
+                    extensions: ['json', 'lorebook', 'risum', 'charx'],
+                },
+            ],
         })
-        if(typeof selected !== 'string') return
+        if (typeof selected !== 'string') return
         const displayName = selected.split(/[\\/]/).at(-1) || selected
-        if(displayName.split('.').at(-1)?.toLocaleLowerCase('en-US') === 'risum'){
+        if (
+            ['risum', 'charx'].includes(
+                displayName.split('.').at(-1)?.toLocaleLowerCase('en-US') ?? '',
+            )
+        ) {
             const result = await importDesktopNativeModulePath(
                 selected,
                 importPreparedNativeModuleContent,
@@ -314,25 +343,30 @@ export async function importModule(){
                     alertError(language.errors.noData)
                 },
             )
-            if(result.kind === 'imported') alertNormal(language.successImport)
             return
         }
         desktopFile = { name: displayName, data: await readFile(selected) }
     }
-    const f = desktopFile ?? await selectSingleFile(['json', 'lorebook', 'risum', 'charx'])
-    if(!f){
+    const f =
+        desktopFile ??
+        (await selectSingleFile(['json', 'lorebook', 'risum', 'charx']))
+    if (!f) {
         return
     }
+    return importModuleData(f)
+}
+
+export async function importModuleData(f: { name: string; data: Uint8Array }) {
     let fileData = f.data
-    if(f.name.endsWith('.charx')){
+    if (f.name.endsWith('.charx')) {
         try {
             const buf = Buffer.from(fileData)
             const char = await importCharacterProcess({
                 name: f.name,
                 data: buf,
-                returnCharacter: true
+                returnCharacter: true,
             })
-            if(!char || typeof char === 'number'){
+            if (!char || typeof char === 'number') {
                 alertError(language.errors.noData)
                 return
             }
@@ -345,7 +379,7 @@ export async function importModule(){
         alertNormal(language.successImport)
         return
     }
-    if(f.name.endsWith('.risum')){
+    if (f.name.endsWith('.risum')) {
         try {
             const buf = Buffer.from(fileData)
             const module = await readModule(buf)
@@ -358,19 +392,16 @@ export async function importModule(){
     }
     try {
         const importData = JSON.parse(Buffer.from(fileData).toString())
-        if(importData.type === 'risuModule'){
-            if(
-                (!importData.name)
-                || (!importData.id)
-            ){
+        if (importData.type === 'risuModule') {
+            if (!importData.name || !importData.id) {
                 alertError(language.errors.noData)
                 return
             }
             importData.id = v4()
 
-            if(importData.lowLevelAccess){
+            if (importData.lowLevelAccess) {
                 const conf = await alertConfirm(language.lowLevelAccessConfirm)
-                if(!conf){
+                if (!conf) {
                     return false
                 }
             }
@@ -379,35 +410,45 @@ export async function importModule(){
         }
         // importData.type === 'risu' in conflict with HypaV3 preset exports
         // difference: record vs. array
-        if(importData.type === 'risu' && importData.data && Array.isArray(importData.data)){
-            const lores:loreBook[] = importData.data
+        if (
+            importData.type === 'risu' &&
+            importData.data &&
+            Array.isArray(importData.data)
+        ) {
+            const lores: loreBook[] = importData.data
             const importModule = {
                 name: importData.name || 'Imported Lorebook',
-                description: importData.description || 'Converted from risu lorebook',
+                description:
+                    importData.description || 'Converted from risu lorebook',
                 lorebook: lores,
-                id: v4()
+                id: v4(),
             }
             DBState.db.modules.push(importModule)
             return
         }
-        if(importData.entries){
-            const lores:loreBook[] = convertExternalLorebook(importData.entries)
+        if (importData.entries) {
+            const lores: loreBook[] = convertExternalLorebook(
+                importData.entries,
+            )
             const importModule = {
                 name: importData.name || 'Imported Lorebook',
-                description: importData.description || 'Converted from external lorebook',
+                description:
+                    importData.description ||
+                    'Converted from external lorebook',
                 lorebook: lores,
-                id: v4()
+                id: v4(),
             }
             DBState.db.modules.push(importModule)
             return
         }
-        if(importData.type === 'regex'  && importData.data){
-            const regexs:customscript[] = importData.data
+        if (importData.type === 'regex' && importData.data) {
+            const regexs: customscript[] = importData.data
             const importModule = {
                 name: importData.name || 'Imported Regex',
-                description: importData.description || 'Converted from risu regex',
+                description:
+                    importData.description || 'Converted from risu regex',
                 regex: regexs,
-                id: v4()
+                id: v4(),
             }
             DBState.db.modules.push(importModule)
             return
