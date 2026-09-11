@@ -1,57 +1,13 @@
-use super::{json, parse, random_id, Device, Store};
+use super::{json, parse, Device, Store};
 use crate::{Error, Result};
 use risunest_sync_wire::{
-    canonical, hash, operation_id, ChangeSet, CommitIntent, Receipt, RecordVersion, RemoteHead,
-    Sequence, TerminalStatus,
+    canonical, hash, operation_id, CommitIntent, Receipt, RecordVersion, RemoteHead, Sequence,
+    TerminalStatus,
 };
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::{Deserialize, Serialize};
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct StagedChanges {
-    pub staged_changes_id: String,
-    pub changes_digest: String,
-}
 
 impl Store {
-    pub fn stage_changes(&self, device: &Device, changes: &ChangeSet) -> Result<StagedChanges> {
-        changes.validate()?;
-        let digest = changes.digest()?;
-        let body = json(changes)?;
-        let id = random_id()?;
-        let db = self.db()?;
-        Self::require_device(&db, device)?;
-        let count: i64 = db.query_row(
-            "SELECT count(*) FROM staged_changes WHERE device=?1",
-            [&device.id],
-            |r| r.get(0),
-        )?;
-        if count >= 16 {
-            return Err(Error::new("staging-quota", 429));
-        }
-        db.execute(
-            "INSERT INTO staged_changes VALUES(?1,?2,?3,?4)",
-            params![id, device.id, digest, body],
-        )?;
-        Ok(StagedChanges {
-            staged_changes_id: id,
-            changes_digest: digest,
-        })
-    }
-    pub fn cancel_staged_changes(&self, device: &Device, id: &str) -> Result<()> {
-        let db = self.db()?;
-        Self::require_device(&db, device)?;
-        if db.execute(
-            "DELETE FROM staged_changes WHERE id=?1 AND device=?2",
-            params![id, device.id],
-        )? == 0
-        {
-            return Err(Error::new("staging-not-found", 404));
-        }
-        Ok(())
-    }
-    fn read_version(db: &Connection, key: &str) -> Result<RecordVersion> {
+    pub(super) fn read_version(db: &Connection, key: &str) -> Result<RecordVersion> {
         let value: Option<String> = db
             .query_row("SELECT version FROM records WHERE key=?1", [key], |r| {
                 r.get(0)
@@ -62,7 +18,7 @@ impl Store {
             .unwrap_or(Ok(RecordVersion::Absent))
     }
     pub fn record(&self, key: &str) -> Result<RecordVersion> {
-        Self::read_version(&*self.db()?, key)
+        Self::read_version(&*self.reader()?, key)
     }
 
     /// The mutex is the single library writer queue. There is no network/file IO in
@@ -109,11 +65,26 @@ impl Store {
             return Err(Error::new("operation-history-expired", 410));
         }
         let tx = db.transaction()?;
-        let staged: Option<(String, String)> = tx
+        let pending: Option<(String, String)> = tx
             .query_row(
-                "SELECT digest,body FROM staged_changes WHERE id=?1 AND device=?2",
-                params![intent.staged_changes_id, device.id],
+                "SELECT operation,digest FROM commit_jobs WHERE device=?1",
+                [&device.id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((reserved, reserved_digest)) = pending {
+            if reserved != operation {
+                return Err(Error::new("device-operation-active", 409));
+            }
+            if reserved_digest != digest {
+                return Err(Error::new("operation-intent-conflict", 409));
+            }
+        }
+        let staged: Option<Option<String>> = tx
+            .query_row(
+                "SELECT digest FROM staged_changes WHERE id=?1 AND device=?2",
+                params![intent.staged_changes_id, device.id],
+                |r| r.get(0),
             )
             .optional()?;
         let mut receipt = Receipt {
@@ -124,18 +95,21 @@ impl Store {
             head: head.clone(),
             error: None,
         };
-        let validation = (|| -> Result<ChangeSet> {
-            if intent.expected_head != head {
+        let stage = &intent.staged_changes_id;
+        let validation = (|| -> Result<()> {
+            if !intent.expected_head.same_revision(&head) {
                 return Err(Error::new("stale-head", 412));
             }
-            let (stored_digest, body) = staged
+            Self::require_staging(&tx, device, stage)?;
+            let stored_digest = staged
                 .as_ref()
-                .ok_or(Error::new("staging-not-found", 404))?;
+                .ok_or(Error::new("staging-not-found", 404))?
+                .as_ref()
+                .ok_or(Error::new("staging-not-sealed", 409))?;
             if stored_digest != &intent.changes_digest {
                 return Err(Error::new("changes-digest-mismatch", 409));
             }
-            let changes: ChangeSet = parse(body)?;
-            for change in &changes.changes {
+            Self::each_change(&tx, stage, |change| {
                 if Self::read_version(&tx, &change.key)? != change.before {
                     return Err(Error::new("before-version-mismatch", 409));
                 }
@@ -149,16 +123,19 @@ impl Store {
                         return Err(Error::new("missing-dependency", 409));
                     }
                 }
-            }
-            for fence in &changes.read_fences {
+                Ok(())
+            })?;
+            Self::each_fence(&tx, stage, |fence| {
                 if Self::read_version(&tx, &fence.key)? != fence.version {
                     return Err(Error::new("read-fence-mismatch", 409));
                 }
-            }
-            Ok(changes)
+                Ok(())
+            })?;
+            Self::validate_scope_fences(&tx, stage)?;
+            Ok(())
         })();
         match validation {
-            Ok(changes) => {
+            Ok(()) => {
                 let seq = head.seq.next()?;
                 let next = RemoteHead {
                     seq: seq.clone(),
@@ -167,23 +144,40 @@ impl Store {
                     )?),
                     ..head
                 };
+                tx.execute_batch("SAVEPOINT apply_records")?;
                 tx.execute(
                     "INSERT INTO commits VALUES(?1,?2,?3)",
                     params![seq.as_str(), json(&next)?, operation],
                 )?;
-                for (index, change) in changes.changes.iter().enumerate() {
+                let mut index = 0i64;
+                Self::each_change(&tx, stage, |change| {
                     tx.execute("INSERT INTO records VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET version=excluded.version",params![change.key,json(&change.after)?])?;
                     tx.execute(
                         "INSERT INTO changes VALUES(?1,?2,?3)",
-                        params![seq.as_str(), index as i64, json(change)?],
+                        params![seq.as_str(), index, json(&change)?],
                     )?;
+                    index += 1;
+                    Ok(())
+                })?;
+                Self::each_change(&tx, stage, |change| {
+                    Self::update_relations(&tx, &change.key, &change.after)
+                })?;
+                if let Err(error) = Self::validate_relations(&tx, stage) {
+                    if error.status >= 500 {
+                        return Err(error);
+                    }
+                    tx.execute_batch("ROLLBACK TO apply_records; RELEASE apply_records")?;
+                    receipt.error = Some(error.code.into());
+                } else {
+                    Self::update_scopes(&tx, stage, &operation)?;
+                    tx.execute_batch("RELEASE apply_records")?;
+                    tx.execute(
+                        "UPDATE library SET head=?1 WHERE singleton=1",
+                        [json(&next)?],
+                    )?;
+                    receipt.head = next;
+                    receipt.status = TerminalStatus::Committed;
                 }
-                tx.execute(
-                    "UPDATE library SET head=?1 WHERE singleton=1",
-                    [json(&next)?],
-                )?;
-                receipt.head = next;
-                receipt.status = TerminalStatus::Committed;
             }
             Err(error) if error.status < 500 => {
                 receipt.status = if error.status == 412 {
@@ -196,7 +190,7 @@ impl Store {
             Err(error) => return Err(error),
         }
         tx.execute(
-            "INSERT INTO receipts VALUES(?1,?2,?3,?4,?5)",
+            "INSERT INTO receipts(operation,device,seq,digest,body) VALUES(?1,?2,?3,?4,?5)",
             params![
                 operation,
                 device.id,
@@ -213,12 +207,13 @@ impl Store {
             "DELETE FROM staged_changes WHERE id=?1 AND device=?2",
             params![intent.staged_changes_id, device.id],
         )?;
+        tx.execute("DELETE FROM commit_jobs WHERE operation=?1", [&operation])?;
         tx.commit()?;
         Ok(receipt)
     }
     pub fn receipt(&self, device: &Device, operation: &str) -> Result<Receipt> {
         risunest_sync_wire::validate_hash(operation)?;
-        let db = self.db()?;
+        let db = self.reader()?;
         Self::require_device(&db, device)?;
         let body: Option<String> = db
             .query_row(

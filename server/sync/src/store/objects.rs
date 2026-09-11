@@ -1,6 +1,6 @@
 use super::Store;
 use crate::{Error, Result};
-use risunest_sync_wire::{batch::MAX_BATCH_BYTES, hash, validate_hash};
+use risunest_sync_wire::{delta::MAX_TARGET_BYTES, hash, validate_hash};
 use rusqlite::{params, OptionalExtension};
 use std::{
     fs::{self, File},
@@ -38,7 +38,7 @@ pub(super) fn sync_directory(path: &Path) -> Result<()> {
     let _ = path;
     Ok(())
 }
-fn publish(from: &Path, to: &Path) -> Result<()> {
+pub(super) fn publish(from: &Path, to: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -67,7 +67,21 @@ fn publish(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 impl Store {
-    fn object_path(&self, digest: &str) -> Result<std::path::PathBuf> {
+    pub fn open_object(&self, digest: &str) -> Result<(File, u64)> {
+        let _gate = self
+            .objects_gate
+            .lock()
+            .map_err(|_| Error::new("storage-unavailable", 503))?;
+        let size = self
+            .object_size(digest)?
+            .ok_or(Error::new("object-not-found", 404))?;
+        let file = File::open(self.object_path(digest)?)?;
+        if file.metadata()?.len() != size {
+            return Err(Error::new("corrupt-object", 503));
+        }
+        Ok((file, size))
+    }
+    pub(super) fn object_path(&self, digest: &str) -> Result<std::path::PathBuf> {
         validate_hash(digest)?;
         let path = self.root.join("objects").join(&digest[..2]).join(digest);
         check_path(&path)?;
@@ -75,7 +89,7 @@ impl Store {
     }
     pub fn put_object(&self, device: &super::Device, digest: &str, bytes: &[u8]) -> Result<()> {
         validate_hash(digest)?;
-        if bytes.len() > MAX_BATCH_BYTES {
+        if bytes.len() > MAX_TARGET_BYTES {
             return Err(Error::new("object-too-large", 413));
         }
         {
@@ -94,6 +108,10 @@ impl Store {
         temp.as_file().sync_all()?;
         // No DB lock during upload, hashing, flush or rename. Concurrent identical
         // publishes replace only with independently verified identical bytes.
+        let _gate = self
+            .objects_gate
+            .lock()
+            .map_err(|_| Error::new("storage-unavailable", 503))?;
         publish(temp.path(), &destination)?;
         let db = self.db()?;
         Self::require_device(&db, device)?;
@@ -101,12 +119,13 @@ impl Store {
             "INSERT INTO objects(hash,size) VALUES(?1,?2) ON CONFLICT(hash) DO NOTHING",
             params![digest, bytes.len() as i64],
         )?;
+        Self::lease_object(&db, device, digest)?;
         Ok(())
     }
     pub fn object_size(&self, digest: &str) -> Result<Option<u64>> {
         validate_hash(digest)?;
         let size: Option<i64> = self
-            .db()?
+            .reader()?
             .query_row("SELECT size FROM objects WHERE hash=?1", [digest], |r| {
                 r.get(0)
             })
@@ -118,7 +137,7 @@ impl Store {
         let size = self
             .object_size(digest)?
             .ok_or(Error::new("object-not-found", 404))?;
-        if size > MAX_BATCH_BYTES as u64 {
+        if size > MAX_TARGET_BYTES as u64 {
             return Err(Error::new("corrupt-object", 503));
         }
         let path = self.object_path(digest)?;

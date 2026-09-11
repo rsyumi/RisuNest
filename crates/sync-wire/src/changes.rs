@@ -12,7 +12,8 @@ pub enum RecordVersion {
     Live {
         #[serde(rename = "objectHash")]
         object_hash: String,
-        dependencies: Vec<String>,
+        #[serde(rename = "descriptorHash")]
+        descriptor_hash: Option<String>,
     },
     Tombstone {
         #[serde(rename = "deletionId")]
@@ -30,7 +31,8 @@ impl<'de> Deserialize<'de> for RecordVersion {
             Live {
                 #[serde(rename = "objectHash")]
                 object_hash: String,
-                dependencies: Vec<String>,
+                #[serde(rename = "descriptorHash")]
+                descriptor_hash: Option<String>,
             },
             Tombstone {
                 #[serde(rename = "deletionId")]
@@ -41,10 +43,10 @@ impl<'de> Deserialize<'de> for RecordVersion {
             Input::Absent {} => Self::Absent,
             Input::Live {
                 object_hash,
-                dependencies,
+                descriptor_hash,
             } => Self::Live {
                 object_hash,
-                dependencies,
+                descriptor_hash,
             },
             Input::Tombstone { deletion_id } => Self::Tombstone { deletion_id },
         })
@@ -57,14 +59,11 @@ impl RecordVersion {
             Self::Tombstone { deletion_id } => validate_id(deletion_id),
             Self::Live {
                 object_hash,
-                dependencies,
+                descriptor_hash,
             } => {
                 validate_hash(object_hash)?;
-                for hash in dependencies {
+                if let Some(hash) = descriptor_hash {
                     validate_hash(hash)?;
-                }
-                if dependencies.windows(2).any(|w| w[0] >= w[1]) {
-                    return Err(WireError("unordered-dependencies"));
                 }
                 Ok(())
             }
@@ -74,9 +73,9 @@ impl RecordVersion {
         match self {
             Self::Live {
                 object_hash,
-                dependencies,
+                descriptor_hash,
             } => std::iter::once(object_hash.as_str())
-                .chain(dependencies.iter().map(String::as_str))
+                .chain(descriptor_hash.iter().map(String::as_str))
                 .collect(),
             _ => Vec::new(),
         }
@@ -100,15 +99,32 @@ pub struct ReadFence {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScopeFence {
+    pub scope: String,
+    pub expected_version: String,
+    /// Preserve clear intent: every existing member must be accounted for.
+    pub clear: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChangeSet {
     pub changes: Vec<RecordChange>,
     pub read_fences: Vec<ReadFence>,
+    pub scope_fences: Vec<ScopeFence>,
 }
 impl ChangeSet {
     pub fn validate(&self) -> Result<()> {
-        if self.changes.is_empty()
+        if self.changes.is_empty() {
+            return Err(WireError("invalid-change-count"));
+        }
+        self.validate_page()
+    }
+    pub fn validate_page(&self) -> Result<()> {
+        if (self.changes.is_empty() && self.read_fences.is_empty() && self.scope_fences.is_empty())
             || self.changes.len() > MAX_PAGE_RECORDS
             || self.read_fences.len() > MAX_PAGE_RECORDS
+            || self.scope_fences.len() > MAX_PAGE_RECORDS
         {
             return Err(WireError("invalid-change-count"));
         }
@@ -129,8 +145,16 @@ impl ChangeSet {
             }
             fence.version.validate()?;
         }
+        for fence in &self.scope_fences {
+            crate::descriptor::validate_scope(&fence.scope)?;
+            validate_hash(&fence.expected_version)?;
+        }
         if self.changes.windows(2).any(|w| w[0].key >= w[1].key)
             || self.read_fences.windows(2).any(|w| w[0].key >= w[1].key)
+            || self
+                .scope_fences
+                .windows(2)
+                .any(|w| w[0].scope >= w[1].scope)
         {
             return Err(WireError("unordered-keys"));
         }

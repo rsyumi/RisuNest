@@ -56,10 +56,11 @@ fn changes() -> ChangeSet {
             before: RecordVersion::Absent,
             after: RecordVersion::Live {
                 object_hash: hash(b"raw"),
-                dependencies: vec![],
+                descriptor_hash: None,
             },
         }],
         read_fences: vec![],
+        scope_fences: vec![],
     }
 }
 fn intent() -> CommitIntent {
@@ -117,13 +118,13 @@ fn change_schema_rejects_duplicate_keys_absent_targets_unknown_fields_and_bad_ha
     );
     assert!(RecordVersion::Live {
         object_hash: "../bad".into(),
-        dependencies: vec![]
+        descriptor_hash: None
     }
     .validate()
     .is_err());
     assert!(RecordVersion::Live {
         object_hash: hash(b"x"),
-        dependencies: vec![hash(b"x"), hash(b"x")]
+        descriptor_hash: Some("invalid".into())
     }
     .validate()
     .is_err());

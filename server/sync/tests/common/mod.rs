@@ -14,10 +14,11 @@ pub fn changes(key: &str, body: &[u8]) -> ChangeSet {
             before: RecordVersion::Absent,
             after: RecordVersion::Live {
                 object_hash: hash(body),
-                dependencies: vec![],
+                descriptor_hash: None,
             },
         }],
         read_fences: vec![],
+        scope_fences: vec![],
     }
 }
 pub fn stage(

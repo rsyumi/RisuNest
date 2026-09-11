@@ -694,14 +694,17 @@ name = "risunest-sync-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "getrandom 0.2.17",
  "reqwest",
  "risunest-sync-wire",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
+ "tokio-util",
  "windows-sys",
 ]
 
