@@ -16,6 +16,7 @@ import {
     runNativeLosslessBackupRestore,
     syntheticNativeFileJobStatus,
     type NativeFileJobOptions,
+    type NativeFileJobSource,
 } from './nativeFileJobs'
 import { describeDesktopSource } from './nativeFileSourceInfo'
 import { getPersistentDataRuntime } from './persistentDataRuntime.svelte'
@@ -90,30 +91,48 @@ export function exportLocalBackupFromSystemPicker(
         }, productionDependencies))
 }
 
-export function restoreLocalBackupFromSystemPicker(
+export function restoreLocalBackupFromSystemPicker(options: LosslessBackupRestoreOptions = {}) {
+    return restoreWithDependencies(options, productionDependencies)
+}
+
+export function restoreLocalBackupFromNativeSource(
+    source: NativeFileJobSource,
     options: LosslessBackupRestoreOptions = {},
 ) {
-    if (!isTauri) return restoreLocalBackupFromPicker(options, productionDependencies)
+    return restoreWithDependencies(options, {
+        ...productionDependencies,
+        chooseNativeImport: async () => source,
+    })
+}
+
+function restoreWithDependencies(
+    options: LosslessBackupRestoreOptions,
+    dependencies: LosslessBackupFileRouteDependencies,
+) {
+    if (!isTauri) return restoreLocalBackupFromPicker(options, dependencies)
     return runSharedNativeFileOperation(
         'import',
         'lossless-backup-import',
         ({ signal, onStatus, setBlocking, setSource }) =>
-            restoreLocalBackupFromPicker({
-                ...options,
-                signal,
-                onStatus: (status) => {
-                    onStatus(status)
-                    options.onStatus?.(status)
+            restoreLocalBackupFromPicker(
+                {
+                    ...options,
+                    signal,
+                    onStatus: (status) => {
+                        onStatus(status)
+                        options.onStatus?.(status)
+                    },
+                    onBlockingChange: (blocking) => {
+                        setBlocking(blocking)
+                        options.onBlockingChange?.(blocking)
+                    },
+                    onSource: (source) => {
+                        setSource(source)
+                        options.onSource?.(source)
+                    },
                 },
-                onBlockingChange: (blocking) => {
-                    setBlocking(blocking)
-                    options.onBlockingChange?.(blocking)
-                },
-                onSource: (source) => {
-                    setSource(source)
-                    options.onSource?.(source)
-                },
-            }, productionDependencies),
+                dependencies,
+            ),
         { presentation: 'dialog', format: 'lossless-backup' },
     )
 }

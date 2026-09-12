@@ -3441,13 +3441,33 @@ fn referenced_object_size(
     }
 }
 
-fn reconstruct_record(
+pub(super) fn reconstruct_record(
     connection: &Connection,
     cas: &PayloadCas,
     library_id: &str,
     generation_id: &str,
     pds_generation: &str,
     record_key: &str,
+) -> StoreResult<Vec<u8>> {
+    reconstruct_record_with_owner_objects(
+        connection,
+        cas,
+        library_id,
+        generation_id,
+        pds_generation,
+        record_key,
+        |_| Ok(()),
+    )
+}
+
+pub(super) fn reconstruct_record_with_owner_objects(
+    connection: &Connection,
+    cas: &PayloadCas,
+    library_id: &str,
+    generation_id: &str,
+    pds_generation: &str,
+    record_key: &str,
+    mut derived: impl FnMut(&[u8]) -> StoreResult<()>,
 ) -> StoreResult<Vec<u8>> {
     let locator = decode_logical_record_key(record_key).map_err(codec_error)?;
     let envelope = match locator {
@@ -3461,6 +3481,11 @@ fn reconstruct_record(
             let mut value: Value = serde_json::from_str(&raw)?;
             let mut owner_heads =
                 resolve_owner_heads(connection, cas, pds_generation, &value, None)?;
+            for head in &owner_heads {
+                if let Some(bytes) = &head.derived_manifest {
+                    derived(bytes)?;
+                }
+            }
             strip_root_owner_properties(&mut value, &mut owner_heads)?;
             LogicalRecordEnvelope::Root {
                 value,
@@ -3515,6 +3540,11 @@ fn reconstruct_record(
                 &detail,
                 Some(&character_id),
             )?;
+            for head in &owner_heads {
+                if let Some(bytes) = &head.derived_manifest {
+                    derived(bytes)?;
+                }
+            }
             strip_character_owner_property(&mut detail, &character_id, &mut owner_heads)?;
             LogicalRecordEnvelope::Character {
                 configured_index: nonnegative_u64(configured_index, "character configured index")?,

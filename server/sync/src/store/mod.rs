@@ -1,8 +1,26 @@
+mod backup;
 mod commits;
+pub use backup::BackupManifest;
+mod jobs;
+pub use jobs::CommitSubmission;
+mod checkpoints;
+mod descriptors;
 mod journal;
+mod maintenance;
 mod objects;
 mod schema;
+mod scopes;
+mod staged;
+mod stream_transfers;
+pub use stream_transfers::DeltaProgress;
+mod transfers;
+mod upload_jobs;
+mod uploads;
+pub use checkpoints::{Checkpoint, CheckpointPage, ReadPin};
 pub use journal::{ChangeCursor, ChangePage, JournalChange};
+pub use staged::StagedChanges;
+pub use transfers::TransferRequest;
+pub use uploads::{UploadManifest, UploadProgress, UPLOAD_CHUNK_BYTES};
 
 use crate::{Error, Result};
 use risunest_sync_wire::{canonical, hash, validate_id, RemoteHead, Sequence};
@@ -17,6 +35,10 @@ use std::{
 pub struct Store {
     root: PathBuf,
     db: Mutex<Connection>,
+    read_db: Mutex<Connection>,
+    objects_gate: Mutex<()>,
+    upload_job_gate: Mutex<()>,
+    download_job_gate: Mutex<()>,
     _owner: File,
 }
 
@@ -32,6 +54,15 @@ pub struct DeviceCredential {
 #[derive(Clone, Debug)]
 pub struct Device {
     pub id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceSession {
+    pub head: RemoteHead,
+    pub device_id: String,
+    pub operation_watermark: Sequence,
+    pub operation_pending: bool,
 }
 
 pub(super) fn random_id() -> Result<String> {
@@ -117,13 +148,30 @@ impl Store {
             objects::sync_directory(&root)?;
         } else {
             let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            if version != 1 {
+            if version != 6 {
                 return Err(Error::new("incompatible-store", 409));
             }
         }
+        db.execute(
+            "UPDATE uploads SET state=CASE WHEN id IN (SELECT upload FROM upload_jobs) THEN 'queued' ELSE 'open' END WHERE state='finalizing'",
+            [],
+        )?;
+        db.execute(
+            "UPDATE download_deltas SET state='queued' WHERE state='working'",
+            [],
+        )?;
+        let read_db = Connection::open_with_flags(
+            root.join("metadata.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        read_db.busy_timeout(std::time::Duration::from_secs(5))?;
         let store = Self {
             root,
             db: Mutex::new(db),
+            read_db: Mutex::new(read_db),
+            objects_gate: Mutex::new(()),
+            upload_job_gate: Mutex::new(()),
+            download_job_gate: Mutex::new(()),
             _owner: owner,
         };
         store
@@ -137,8 +185,44 @@ impl Store {
             .lock()
             .map_err(|_| Error::new("writer-unavailable", 503))
     }
+    pub(super) fn reader(&self) -> Result<MutexGuard<'_, Connection>> {
+        self.read_db
+            .lock()
+            .map_err(|_| Error::new("reader-unavailable", 503))
+    }
     pub fn head(&self) -> Result<RemoteHead> {
-        Self::read_head(&*self.db()?)
+        Self::read_head(&*self.reader()?)
+    }
+    pub fn device_session(&self, device: &Device) -> Result<DeviceSession> {
+        let mut connection = self.reader()?;
+        let db = connection.transaction()?;
+        Self::require_device(&db, device)?;
+        let watermark: String = db.query_row(
+            "SELECT watermark FROM devices WHERE id=?1",
+            [&device.id],
+            |r| r.get(0),
+        )?;
+        let pending = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM commit_jobs WHERE device=?1)",
+            [&device.id],
+            |r| r.get(0),
+        )?;
+        Ok(DeviceSession {
+            head: Self::read_head(&db)?,
+            device_id: device.id.clone(),
+            operation_watermark: watermark.try_into()?,
+            operation_pending: pending,
+        })
+    }
+    pub fn device_active(&self, actor: &Device, id: &str) -> Result<bool> {
+        validate_id(id)?;
+        let db = self.reader()?;
+        Self::require_device(&db, actor)?;
+        Ok(db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM devices WHERE id=?1 AND revoked=0)",
+            [id],
+            |r| r.get(0),
+        )?)
     }
     pub(super) fn read_head(db: &Connection) -> Result<RemoteHead> {
         parse(&db.query_row::<String, _, _>(
@@ -177,7 +261,7 @@ impl Store {
         if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(Error::new("unauthorized", 401));
         }
-        let db = self.db()?;
+        let db = self.reader()?;
         if Self::read_head(&db)?.library_id != library {
             return Err(Error::new("unauthorized", 401));
         }

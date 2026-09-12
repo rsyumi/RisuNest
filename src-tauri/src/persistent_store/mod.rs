@@ -19,6 +19,12 @@ mod owner_projection;
 mod preservation;
 mod query;
 mod schema;
+pub(crate) mod server_sync_apply;
+#[path = "../server_sync/engine.rs"]
+pub(crate) mod server_sync_engine;
+pub(crate) mod server_sync_journal;
+pub(crate) mod server_sync_outbox;
+pub(crate) mod server_sync_projection;
 mod snapshot;
 mod snapshot_archive;
 mod sync_device_registry;

@@ -181,6 +181,7 @@ fn prepare_restore_candidate(persistent_dir: &Path, target: &Path) -> StoreResul
     let result = (|| -> StoreResult<()> {
         let mut connection = Connection::open(&candidate)?;
         super::schema::initialize(&mut connection)?;
+        super::server_sync_outbox::restored_copy(&connection)?;
         let _ = super::query::materialize(&connection, None)?;
         let integrity: String =
             connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
@@ -511,6 +512,14 @@ fn collect_asset_roots_scoped(
     )?;
     let mut has_cross_generation_cold_aliases = false;
     if !scoped {
+        if table_exists(connection, "server_sync_objects")? {
+            scan_optional_hash_column(
+                connection,
+                "SELECT hash FROM server_sync_objects",
+                [],
+                &mut roots.object_hashes,
+            )?;
+        }
         let retained_generations: i64 =
             connection.query_row("SELECT COUNT(*) FROM root", [], |row| row.get(0))?;
         has_cross_generation_cold_aliases = retained_generations > 1 && !cold_aliases.is_empty();

@@ -69,6 +69,12 @@ pub struct RemoteHead {
     pub min_retained_seq: Sequence,
 }
 impl RemoteHead {
+    pub fn same_revision(&self, other: &Self) -> bool {
+        self.library_id == other.library_id
+            && self.epoch == other.epoch
+            && self.seq == other.seq
+            && self.head_id == other.head_id
+    }
     pub fn validate(&self) -> Result<()> {
         validate_id(&self.library_id)?;
         validate_id(&self.epoch)?;

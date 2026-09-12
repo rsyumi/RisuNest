@@ -1,6 +1,6 @@
 use super::Store;
 use crate::{Error, Result};
-use risunest_sync_wire::{batch::MAX_BATCH_BYTES, hash, validate_hash};
+use risunest_sync_wire::{delta::MAX_TARGET_BYTES, hash, validate_hash};
 use rusqlite::{params, OptionalExtension};
 use std::{
     fs::{self, File},
@@ -38,7 +38,7 @@ pub(super) fn sync_directory(path: &Path) -> Result<()> {
     let _ = path;
     Ok(())
 }
-fn publish(from: &Path, to: &Path) -> Result<()> {
+pub(super) fn publish(from: &Path, to: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -67,7 +67,21 @@ fn publish(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 impl Store {
-    fn object_path(&self, digest: &str) -> Result<std::path::PathBuf> {
+    pub fn open_object(&self, digest: &str) -> Result<(File, u64)> {
+        let _gate = self
+            .objects_gate
+            .lock()
+            .map_err(|_| Error::new("storage-unavailable", 503))?;
+        let size = self
+            .object_size(digest)?
+            .ok_or(Error::new("object-not-found", 404))?;
+        let file = File::open(self.object_path(digest)?)?;
+        if file.metadata()?.len() != size {
+            return Err(Error::new("corrupt-object", 503));
+        }
+        Ok((file, size))
+    }
+    pub(super) fn object_path(&self, digest: &str) -> Result<std::path::PathBuf> {
         validate_hash(digest)?;
         let path = self.root.join("objects").join(&digest[..2]).join(digest);
         check_path(&path)?;
@@ -75,7 +89,7 @@ impl Store {
     }
     pub fn put_object(&self, device: &super::Device, digest: &str, bytes: &[u8]) -> Result<()> {
         validate_hash(digest)?;
-        if bytes.len() > MAX_BATCH_BYTES {
+        if bytes.len() > MAX_TARGET_BYTES {
             return Err(Error::new("object-too-large", 413));
         }
         {
@@ -94,19 +108,26 @@ impl Store {
         temp.as_file().sync_all()?;
         // No DB lock during upload, hashing, flush or rename. Concurrent identical
         // publishes replace only with independently verified identical bytes.
+        let _gate = self
+            .objects_gate
+            .lock()
+            .map_err(|_| Error::new("storage-unavailable", 503))?;
         publish(temp.path(), &destination)?;
-        let db = self.db()?;
+        let mut db = self.db()?;
         Self::require_device(&db, device)?;
-        db.execute(
+        let tx = db.transaction()?;
+        tx.execute(
             "INSERT INTO objects(hash,size) VALUES(?1,?2) ON CONFLICT(hash) DO NOTHING",
             params![digest, bytes.len() as i64],
         )?;
+        Self::lease_object(&tx, device, digest)?;
+        tx.commit()?;
         Ok(())
     }
     pub fn object_size(&self, digest: &str) -> Result<Option<u64>> {
         validate_hash(digest)?;
         let size: Option<i64> = self
-            .db()?
+            .reader()?
             .query_row("SELECT size FROM objects WHERE hash=?1", [digest], |r| {
                 r.get(0)
             })
@@ -118,7 +139,7 @@ impl Store {
         let size = self
             .object_size(digest)?
             .ok_or(Error::new("object-not-found", 404))?;
-        if size > MAX_BATCH_BYTES as u64 {
+        if size > MAX_TARGET_BYTES as u64 {
             return Err(Error::new("corrupt-object", 503));
         }
         let path = self.object_path(digest)?;
@@ -130,5 +151,76 @@ impl Store {
             return Err(Error::new("corrupt-object", 503));
         }
         Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_capacity_failure_cannot_publish_partial_object_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::init(directory.path()).unwrap();
+        let credential = store.add_device().unwrap();
+        let device = super::super::Device {
+            id: credential.device_id,
+        };
+        let head = store.head().unwrap();
+        {
+            let db = store.db().unwrap();
+            let pages: i64 = db.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap();
+            db.pragma_update(None, "max_page_count", pages).unwrap();
+            // Force the real SQLite SQLITE_FULL path without filling a host
+            // volume or changing storage outside this synthetic directory.
+            let failure = db
+                .execute(
+                    "CREATE TABLE synthetic_capacity_probe AS SELECT zeroblob(1048576) AS value",
+                    [],
+                )
+                .unwrap_err();
+            assert_eq!(
+                failure.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DiskFull)
+            );
+        }
+        let mut failed = None;
+        for index in 0..1024 {
+            let bytes = format!("synthetic capacity object {index}");
+            let digest = hash(bytes.as_bytes());
+            match store.put_object(&device, &digest, bytes.as_bytes()) {
+                Ok(()) => (),
+                Err(error) => {
+                    assert_eq!(error.code, "metadata-storage");
+                    failed = Some(digest);
+                    break;
+                }
+            }
+        }
+        let failed = failed.expect("bounded SQLite capacity must be exhausted");
+        assert!(store.object_size(&failed).unwrap().is_none());
+        let leased: bool = store
+            .db()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM object_leases WHERE hash=?1)",
+                [&failed],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!leased, "object and lease must roll back together");
+        assert_eq!(store.head().unwrap(), head);
+        drop(store);
+        let reopened = Store::open(directory.path()).unwrap();
+        assert_eq!(reopened.head().unwrap(), head);
+        assert!(reopened.object_size(&failed).unwrap().is_none());
+        assert_eq!(
+            reopened
+                .db()
+                .unwrap()
+                .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
     }
 }

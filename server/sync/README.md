@@ -1,13 +1,36 @@
 # RisuNest sync daemon
 
-This is the first implementation slice of the standalone server. It runs without
-Tauri, a WebView, Node, providers, or plugins. It is **not yet an end-user sync
-release**: the RisuNest client adapter and the remaining protocol gates below are
-not implemented. Use synthetic data while developing it.
+Standalone Rust daemon with no Tauri, WebView, Node, provider, or plugin runtime.
+The server and application integration are under development. This checkout is
+not yet an end-user sync release; use synthetic data until the remaining gates
+are verified.
 
-## Run locally
+## Run
 
-Use the repository's shared Cargo target on the development machine:
+After extracting a binary archive, open a terminal in that directory. Choose a
+new absolute data directory, then initialize, register each device and start:
+
+```powershell
+# Windows, PowerShell
+$data = Join-Path $env:LOCALAPPDATA 'RisuNestSync'
+./risunest-sync-server.exe init --data-dir $data
+./risunest-sync-server.exe device add --data-dir $data
+./risunest-sync-server.exe serve --data-dir $data
+```
+
+```sh
+# Linux or macOS
+./risunest-sync-server init --data-dir "$HOME/RisuNestSync"
+./risunest-sync-server device add --data-dir "$HOME/RisuNestSync"
+./risunest-sync-server serve --data-dir "$HOME/RisuNestSync"
+```
+
+In RisuNest's server synchronization settings, register the endpoint, library ID,
+device ID and token printed for that installation. Use `http://127.0.0.1:4319`
+only on the server machine; other devices need the HTTPS proxy URL described
+below. Pause the daemon before adding another device, then restart it.
+
+To build from this repository on the local development machine:
 
 ```powershell
 $env:CARGO_TARGET_DIR = 'E:/Programming/Github/RisuNest/src-tauri/target'
@@ -18,138 +41,350 @@ $daemon = 'E:/Programming/Github/RisuNest/src-tauri/target/debug/risunest-sync-s
 & $daemon serve --data-dir E:/sync-server-synthetic
 ```
 
-`init` prints the library head. `device add` prints a fresh device ID, library ID,
-and 256-bit token **once**, for secure transfer to that device. Only the token's
-SHA-256 verifier is stored. Do not put the credential output into logs, scripts,
-URLs, library data, or screenshots. Normal errors contain bounded codes only.
+`device add` prints a device ID, library ID, and 256-bit token once. Transfer this
+credential privately to its device. Only the token's SHA-256 verifier is stored
+on the server. Do not put credentials into URLs, logs, or library content.
 
-`status`, `device add`, and `device revoke ID` require the daemon to be stopped in
-this slice. They use the same exclusive data-directory lock as `serve`. A second
-daemon or an accidental second `init` fails without replacing the library.
-Ctrl+C requests graceful shutdown; Unix SIGTERM is also handled in code.
+The app keeps only a credential reference in PDS. Windows protects a separate
+local file with user-scoped DPAPI; Android encrypts it with an Android Keystore
+AES-GCM key. Apple clients use Keychain, and Linux clients require an unlocked
+Secret Service (the native Linux build also needs the libdbus development
+package). Key-store errors do not fall back to plaintext. A data backup cannot
+transfer a device credential. Unlock the OS store or revoke the previous device
+and register a new credential when one is lost. Windows protection and raw-source
+backup exclusion have automated coverage; Android registration and retrieval after
+process restart passed in an isolated agent APK. Apple/Linux key-store runtime
+checks remain pending. See [DPAPI](https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata)
+and [Keyring's platform stores](https://docs.rs/keyring/3.6.3/keyring/).
 
-The listener defaults to `127.0.0.1:4319`. `--listen` accepts only a loopback
-address. For remote development, configure a trusted HTTPS reverse proxy or
-Tunnel pointing at the loopback listener and acknowledge that configuration with
-`--https-proxy`. This flag does not install a proxy, enable TLS, or permit a public
-cleartext bind. Direct TLS serving and live proxy verification remain pending.
-The private data directory belongs on a local disk under the daemon user's
-exclusive control. Existing symlinks/junctions in storage paths are rejected.
+`status`, `device add`, `device revoke ID`, `maintain`, `backup`, `restore`, and `restore-epoch` require
+the daemon to be stopped. All commands take `--data-dir ABSOLUTE_PATH` and use
+an exclusive owner lock. A second daemon or `init` fails without replacing data.
+Ctrl+C and Unix SIGTERM request graceful shutdown.
 
-## Implemented contract
+The default is `127.0.0.1:4319`. `--listen` accepts loopback addresses only.
+Configure a trusted HTTPS reverse proxy or Tunnel for remote clients and pass
+`--https-proxy` to acknowledge that origin configuration. This flag does not
+install a proxy, provide TLS, or enable public cleartext binding. Live HTTPS proxy
+verification remains pending. Keep the data directory on a local disk
+owned exclusively by the daemon user. Existing symlinks/junctions are rejected.
 
-Every sync request requires `Authorization: Bearer TOKEN` and
-`X-Risu-Library: LIBRARY_ID`. Authentication precedes body consumption and declared
-body-length checks. There are no public administration routes. Authenticated
-requests have a 60-second timeout, at most two active requests per device and
-eight overall; saturation returns 429 with `Retry-After: 1`.
+## HTTP contract
 
-| Endpoint                        | Behavior                                                                   |
-| ------------------------------- | -------------------------------------------------------------------------- |
-| `GET /head`                     | Stored small head, strong ETag, exact `If-None-Match` returns bodyless 304 |
-| `POST /uploads/batch`           | Verified full binary frames, durable immutable CAS publication             |
-| `POST /objects/missing`         | Array of `{hash,size}` candidates; size is a decimal string                |
-| `POST /objects/batch`           | Array of target hashes; bounded full binary response                       |
-| `GET /objects/{hash}`           | Exact bytes, hash verification, single Range/If-Range, strong ETag         |
-| `POST /staged-changes`          | Validated change set; returns `stagedChangesId` and `changesDigest`        |
-| `DELETE /staged-changes/{id}`   | Owner-scoped cancellation; releases a staging slot                         |
-| `POST /commits`                 | `CommitIntent` plus required matching `If-Match`; atomic acceptance        |
-| `GET /operations/{operationId}` | Owner-scoped terminal receipt lookup                                       |
-| `GET /changes`                  | Fixed-through cursor pages over immutable journal rows                     |
-| `POST /acks`                    | Monotonic per-device `{epoch,seq}` acknowledgement                         |
+For persistent remote access, configure a named Tunnel or another trusted HTTPS
+terminator to forward to the loopback listener, then register that HTTPS URL in
+RisuNest settings. No router port forwarding or public HTTP bind is needed with
+an outbound Tunnel. Creating or installing the Tunnel is a separate operator step.
+[Cloudflare's setup guide](https://developers.cloudflare.com/tunnel/setup/)
+describes the named Tunnel flow. Quick Tunnels are for development, have a
+200 in-flight request limit and do not support SSE; this protocol uses HTTP
+requests and foreground polling. [Quick Tunnel limits](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/).
 
-For `/changes`, supply `epoch`, `afterSeq`, `afterOrdinal`, `throughSeq`, and
-optional `limit` (1–1024). Start after an applied commit with `afterOrdinal=1024`.
-Continue using the returned `next` cursor while `hasMore` is true and preserve
-the initial `throughSeq`. A subsequent head is a separate traversal. All journal
-rows, tombstones, receipts, and objects are retained in this slice; acknowledgement
-does not trigger deletion. No background GC or checkpoint expiration runs.
+Cloudflare's proxied request-body upload limit is 100 MB on Free/Pro plans;
+an operator can configure a lower limit. It applies per request, not to the whole
+library or a resumable object. This protocol's 8 MiB ceiling and 1 MiB default
+chunks stay below it. [Cloudflare upload limits](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/4xx-client-error/error-413/).
 
-SQLite uses WAL and `synchronous=FULL`. Object publication orders write, file
-flush, same-volume rename, then metadata registration. Windows uses
-`MoveFileExW` with write-through; Unix syncs the destination directory. A commit
-atomically writes records, journal changes, head, receipt, and device watermark.
-Network transfers and object IO do not hold the library writer mutex. No commit
-creates a full manifest or copies all existing records.
+The default Cloudflare Proxy Read Timeout is 125 seconds per request, not a limit
+on the entire resumable job; Proxy Write Timeout is 30 seconds. Large work returns
+202 and uses bounded status waits, and full uploads default to 1 MiB chunks.
+413/429/524 responses retain verified transfer state for retry. The fault and
+bandwidth tests use a synthetic local transport, not a live Cloudflare connection.
+[Cloudflare timeout reference](https://developers.cloudflare.com/fundamentals/reference/connection-limits/).
 
-The server checks exact expected head, before versions, declared object
-dependencies, and exact-record read fences. It does not parse or re-encode content
-objects, execute plugins, or enforce application payload schemas. Application
-staged validation remains a future client responsibility.
+Every route requires `Authorization: Bearer TOKEN` and
+`X-Risu-Library: LIBRARY_ID`, before reading request bodies. There are no HTTP
+administration routes. Limits are two active requests per device and eight total;
+streaming responses retain their slots until consumed or disconnected. Saturation
+returns 429 and `Retry-After: 1`. Bulk bodies have four additional memory slots,
+reserved before reading the body and retained through blocking work and response
+consumption. CPU materialization uses one queued worker slot, keeping head reads
+available while bounding aggregate base/index memory. Body/handler timeout is 60 seconds, or 110 seconds
+for bounded full/frame/recipe upload bodies. Request
+compression is rejected with 415; object Range offsets address identity bytes.
 
-Committed, stale, and failed receipts are terminal and consume the device's
-operation sequence. Retry lookup precedes current-head/staging checks. The same
-intent returns the same receipt even after restart or with a different staging
-locator; a different intent on that identity returns 409. Stale heads return 412.
-A missing receipt at or below the durable watermark returns 410
-`operation-history-expired`. Reconciliation must allocate a new operation sequence.
-HTTP timeout is not evidence that a commit failed: query/retry the same operation.
+| Endpoint                                     | Contract                                                                                                                |
+| -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `GET /session`                               | Authenticated head/identity, operation watermark and pending state in one snapshot; binding requires an unused identity |
+| `GET /devices/{id}/status`                   | Authenticated read-only active/revoked status used before replacing a lost device identity                              |
+| `GET /scopes?scope=NAME`                     | Scope version, last clear identity and head in one snapshot; distinguishes independent edits from a clear               |
+| `GET /head`                                  | Small stored head, ETag, bodyless conditional 304                                                                       |
+| `POST /objects/missing`                      | Candidate `{hash,size}` array, decimal string sizes; response lists missing hashes                                      |
+| `POST /uploads/batch`, `POST /objects/batch` | Bounded full object batches                                                                                             |
+| `POST /uploads/frames`                       | Full/delta transfer batch, exact target verification; successful whole batch returns bodyless 204                       |
+| `POST /objects/transfer`                     | Array of `{target,bases}`; delta, full, or full-required frames                                                         |
+| `GET /objects/{hash}`                        | Bounded-memory stream, single Range/If-Range, ETag                                                                      |
+| `POST /objects/pins`                         | Renew device-owned 24-hour leases for up to 1024 hashes                                                                 |
+| `POST /uploads`                              | Begin `{hash,size}` manifest; returns `uploadId`                                                                        |
+| `PUT /uploads/{id}/chunks/{index}`           | Exact 1 MiB chunk except final remainder; `X-Content-SHA256` required                                                   |
+| `GET /uploads/{id}?after=INDEX`              | Paged verified chunk bitmap and completion status; optional `wait=true` waits up to 20 seconds                          |
+| `POST /uploads/{id}/complete`                | Below 64 MiB: verified CAS publication; otherwise durable 202 finalization job, resumed after restart                   |
+| `DELETE /uploads/{id}`                       | Owner-scoped cancellation                                                                                               |
+| `PUT /uploads/{id}/delta`                    | Attach an exact `RNSL` file recipe and queue durable reconstruction (202)                                               |
+| `POST /objects/delta`                        | Queue a file delta for `{target,bases}`, returning a stable device-owned `jobId`                                        |
+| `GET /object-deltas/{id}?wait=true`          | Delta bytes (200), explicit full-required (204), or pending (202); waits at most 20 seconds                             |
+| `DELETE /object-deltas/{id}`                 | Release or cancel this device's file-delta job                                                                          |
+| `POST /staged-changes`                       | Single-page convenience staging                                                                                         |
+| `POST /staged-changes/start`                 | Begin a multi-page staging set                                                                                          |
+| `PUT /staged-changes/{id}/pages/{index}`     | Consecutive pages, identical-page retry, conflicting retry rejected                                                     |
+| `GET /staged-changes/{id}`                   | Next page and optional sealed digest                                                                                    |
+| `POST /staged-changes/{id}/seal`             | Partition-independent streaming digest                                                                                  |
+| `DELETE /staged-changes/{id}`                | Cancellation before operation reservation                                                                               |
+| `POST /commits`                              | Durable operation reservation and atomic commit; required `If-Match`                                                    |
+| `GET /operations/{id}`                       | Owner-scoped pending status or terminal receipt                                                                         |
+| `GET /changes`                               | Fixed-through journal traversal                                                                                         |
+| `POST /read-pins`                            | Pin `{epoch,afterSeq}` through current head                                                                             |
+| `GET /read-pins/{id}`                        | Pinned journal pages with `afterSeq`, `afterOrdinal`, `limit`                                                           |
+| `DELETE /read-pins/{id}`                     | Release this device's traversal                                                                                         |
+| `POST /checkpoints`                          | Capture fixed record metadata                                                                                           |
+| `GET /checkpoints/{id}`                      | Pages with optional `afterKey` and `limit`                                                                              |
+| `DELETE /checkpoints/{id}`                   | Release this device's checkpoint                                                                                        |
+| `POST /acks`                                 | Monotonic per-device `{epoch,seq}`                                                                                      |
 
-## Wire profile and current bounds
+For unpinned `/changes`, supply `epoch`, `afterSeq`, `afterOrdinal`, `throughSeq`,
+and optional `limit` (1–1024). Start after an applied commit using
+`afterOrdinal=9223372036854775807`; use the returned `next` while `hasMore`.
+Use read pins when maintenance may run. History below `minRetainedSeq` returns
+410 `checkpoint-required`; clients must retain unsent local changes.
 
-`crates/sync-wire` owns the pure codec. Control metadata uses a restricted
-[RFC 8785 profile](https://www.rfc-editor.org/rfc/rfc8785.html): strings, booleans,
-null, arrays, and objects. All JSON numbers are forbidden; counters/sizes use
-canonical unsigned decimal strings (up to 64 digits). Object property ordering
-uses UTF-16 code units. Logical change/fence keys use strict UTF-8 lexical order;
-hash lists use ascending lowercase hexadecimal order. Duplicate JSON keys, lone
-surrogates, unknown fields, duplicate logical keys, and trailing input fail.
+Multi-page commits return 202 and an operation ID. The worker resumes reserved
+jobs after restart and checks the expected head at actual commit time. A device
+has one reserved operation at a time; other devices keep their own work. A
+single-page request also reserves durably, then normally returns its terminal
+receipt directly. A lost response never authorizes allocating a replacement
+operation without checking the original result.
 
-Intent digest includes the expected head and the digest of sorted changes/read
-fences. It excludes staging locators and transport representation. Operation ID
-is domain-separated SHA-256 over the canonical library/device/sequence tuple.
-Object identity is SHA-256 over exact content bytes, independent of these rules.
-Rust and an independent ECMAScript reference share golden UTF-8 vectors.
+## Storage, identity, and validation
 
-A full batch is `RNSF`, a big-endian u32 frame count, then frames containing a
-one-byte codec (`0` only), 32 raw hash bytes, big-endian u64 target length, and
-exact target bytes. The complete batch including framing is at most 8 MiB and
-1024 objects. Empty objects work. Unknown codecs are rejected; delta support is
-not advertised. Compressed request bodies are currently rejected with 415.
+SQLite uses WAL and synchronous FULL with separate reader/writer connections.
+The commit transaction updates records, relations/scopes, journal, head, receipt,
+watermark, and job removal together. Pages are normalized into staging tables;
+large commits are iterated without constructing a full change-set in memory.
 
-Staged changes are currently one page, at most 1 MiB and 1024 changes/fences with
-64 KiB logical keys. A device may hold 16 staged sets and explicitly cancel them.
-These are **intermediate bounds**, not a claim that all existing library shapes
-fit. Large descriptors, large dependency lists, initial full-library transactions,
-and objects exceeding a batch need the pending paging/chunk work before client
-integration. The implementation does not truncate or discard such source data.
+CAS publication orders write, file flush, same-volume rename, then registration.
+Windows uses write-through MoveFileExW; Unix syncs destination directories.
+Incomplete objects never become visible via registered object APIs. Publication
+and GC coordinate; request-body IO and byte hashing do not hold the writer lock.
 
-## Validation and remaining gates
+Content identity is SHA-256 over exact bytes. The server validates control
+metadata, before versions, dependencies, generic parent relations, record read
+fences, and scope clear intent. It does not parse application payload schemas or
+execute plugin contents. Clients must validate the entire staged apply before
+advancing their local base or acknowledgement.
+
+Operation IDs derive from library/device/decimal sequence. Intent digests include
+the expected content head and sorted changes/fences, independent of page layout,
+staging locator, and full/delta choice. Committed/stale/failed outcomes consume
+the sequence. Identical retries return the receipt; different intent returns 409.
+Stale heads return 412. A pruned receipt below the durable watermark returns
+410 `operation-history-expired`, never a new execution. Retention metadata alone
+does not change the content revision or make an otherwise valid proposal stale.
+
+## Wire bounds
+
+Control JSON uses restricted RFC 8785 canonicalization: strings, booleans, null,
+arrays, objects, no JSON numbers. Sizes and counters are canonical decimal
+strings up to 64 digits. Object properties sort by UTF-16; record keys sort by
+UTF-8 lexical order. Duplicate keys, unknown fields, invalid Unicode, malformed
+hashes, and trailing bytes fail. Application content is not normalized by these
+control rules. Rust/ECMAScript tests share exact UTF-8 golden vectors.
+
+- Metadata pages: 1 MiB, up to 1024 changes/fences per category, 64 KiB keys.
+- Staging: 16 sets per device, 256 MiB total metadata per set, 500,000 changes.
+- Record descriptors: immutable bounded reference trees, up to 1,000,000
+  references, depth 8, generic dependency/relation roots and up to 16 scopes.
+- Full `RNSF` batches: at most 8 MiB including framing, 1024 frames.
+- Native full batches prefer 1 MiB. Upload and resumed Range chunks are 1 MiB,
+  with at most two concurrent chunk requests per direction;
+  larger useful delta frames retain the 8 MiB wire ceiling. Native recipe/frame
+  requests have a 120-second deadline, ordinary requests 30 seconds.
+- Mixed `RNSB` batches: full, `RNSD` delta, or download-only full-required frames.
+- `RNSD` is a custom exact COPY/INSERT profile, not VCDIFF: ordered base IDs,
+  checked offsets, exact base/target hashes and lengths, no output-copy chains.
+  Current encoder/materializer limits: 4 bases, 32 MiB aggregate base bytes,
+  16 MiB target, 8 MiB patch, 262,144 operations. The compact sorted anchor index
+  is bounded to 524,288 entries (8 MiB), with two matches per fingerprint/base.
+- `RNSL` uses file IO for larger objects: 1 TiB target/aggregate bases, 4 bases,
+  8 MiB recipe, 262,144 operations, 64 KiB IO buffers. A sorted sparse anchor
+  index uses about 6 MiB for a 1 GiB base, bounded to about 262,144 entries.
+  Generation checks cancellation and a 120-second CPU/elapsed budget. Poor
+  matches or exhausted generation budget explicitly request full chunks/Range.
+  Every base and reconstructed target is verified in full. Private temporary
+  output is published only after verification. Upload reconstruction and download
+  recipe generation use separate durable workers and return 202 immediately.
+  Waiting requests have their own bounded slots so head/transfer requests remain
+  available. Recipe and base identities survive daemon restart.
+- Upload manifests: up to 1 TiB per object and per device's active uploads, 16
+  concurrent manifests, 24-hour expiry, bounded 1024-entry bitmap pages.
+- Read pins: 16 per device; checkpoints: 2 per device; each expires after 24 hours.
+- Small-recipe cache, queued upload recipes, and download recipes each have a
+  64 MiB cap. Download jobs expire after one hour (16 per device); upload recipes
+  follow their 24-hour manifests. Maintenance removes expired recipes and keeps
+  every active job's bases as GC roots. Missing bases require only the target's
+  full transfer.
+
+## Retention and restore
+
+Run `maintain` while stopped to collect acknowledged history and unreachable
+registered objects. Every active device ack and unexpired read pin limits the
+history floor. Offline devices are never automatically forgotten. Revoke a
+retired device explicitly and register it anew if it returns. Tombstone identities
+remain as fences. Receipt pruning also requires an age of at least 24 hours;
+terminal operation watermarks survive pruning. Checkpoints, staging, object
+leases, and upload manifests protect their referenced content.
+
+The daemon runs maintenance every minute. Expired staging cannot resume or hold
+quota; an already reserved commit retains its staging until a terminal receipt.
+Completed/expired upload chunks enter a durable deletion queue, drained in pages
+of 1024 files. Object publication and each device's leases protect complete bytes.
+
+Stop the daemon and run `backup --data-dir SOURCE --backup-dir NEW_BACKUP`.
+The command copies a consistent SQLite image and verifies every registered CAS
+object, then writes `backup.json` as a completion marker. Restore with
+`restore --backup-dir BACKUP --data-dir NEW_DATA_DIR`. Both destinations must be
+new absolute paths. Restore verifies metadata and object hashes, rotates epoch,
+and clears old server cursors/jobs before the new directory can serve clients.
+It retains content and device watermarks. Clients must reconcile the changed
+epoch. An interrupted copy without its completion marker is not a valid backup.
+Power-loss and cross-OS backup validation remain pending.
+
+## Native application integration
+
+The native RisuNest settings page accepts the server URL and a separate device
+credential for each installation. PDS transactions record outgoing edits; HTTP
+preparation and publication run outside the UI replacement fence. Only atomic
+local activation and the working-set/plugin refresh hold that fence. Lost IPC
+replies are retried without enabling editing against an unconfirmed revision.
+The settings view reports saving, preparation, local activation, refresh and
+publication, plus verified object bytes. This byte counter describes reconstructed
+content, not wire traffic; it excludes reused local objects. Progress polling
+cannot delay completion or update a subsequent cycle after cancellation.
+
+Conflicts retain the local revision and remote head used for the preview. Both
+complete `.risulossless` packages are verified before applying either choice.
+The settings page can restore either archive through the normal validated
+lossless-import workflow, which backs up the current library and refreshes plugin
+state. Restored content remains paused for inspection. Parent/child and order
+conflicts are resolved as groups. Plugin clear retains its original scope and
+membership, including empty clear and clear followed by an identical set.
+
+After losing device operation history, revoke that device while the daemon is
+stopped, issue a new credential, restart the daemon, and select **Register a new
+device** in the app. The old device must be revoked before replacement. Local
+edits and bases survive this reset and differences require comparison. A changed
+server epoch has a separate **Compare restored server** action. Independent,
+nonempty libraries are not automatically combined on first registration.
+
+## Verification and distribution
+
+The workflow in `.github/workflows/sync-server-check.yml` defines native runners
+for Windows x86_64, Linux x86_64/arm64 and macOS x86_64/arm64. It tests the standalone
+crate without building RisuNest, then packages the tested binary. This session did
+not dispatch or publish that workflow. See the [runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+
+Locally exercised targets on 2026-09-12:
+
+| Target                          | Tested host               |  Release binary | Runtime dependencies                        |
+| ------------------------------- | ------------------------- | --------------: | ------------------------------------------- |
+| Windows x86_64                  | Windows 11 build 26200    | 5,209,600 bytes | Windows system DLLs, UCRT, VCRUNTIME140.dll |
+| Linux x86_64                    | Ubuntu 24.04.4 under WSL2 | 6,945,024 bytes | glibc loader, libc, libm, libgcc_s          |
+| Linux arm64, macOS x86_64/arm64 | Not run locally           |    Not measured | Not verified                                |
+
+These hosts do not establish minimum supported OS versions. Linux used an isolated
+Rust 1.97.1 toolchain and the same shared Cargo target as Windows. The Windows
+server suite passed 50 tests and the Linux release suite passed 51, including the
+Unix SIGTERM case. Wire tests passed 19 cases plus an ECMAScript golden-vector
+check. Standalone subprocess tests clear PATH and verify serving, directory/port
+ownership, missing storage, process loss and verified-chunk resume. Synthetic
+SQLite `max_page_count` exhaustion verifies rollback and restart integrity without
+filling the host disk. Physical power loss and cross-OS backup restore remain
+unverified.
+
+To package an already-tested binary, use Python 3.11+ (packaging only):
 
 ```powershell
-$env:CARGO_TARGET_DIR = 'E:/Programming/Github/RisuNest/src-tauri/target'
+python server/sync/distribution/package.py --binary E:/Programming/Github/RisuNest/src-tauri/target/release/risunest-sync-server.exe --target x86_64-pc-windows-msvc --output server/sync/distribution/artifacts
+```
+
+Archives contain the executable, this operating guide and the repository license,
+with a separate SHA-256 checksum. Existing archives are never overwritten. Unix
+archives preserve the executable permission even when packaged on Windows.
+Packaging does not publish a release.
+
+```powershell
 cargo test --manifest-path crates/sync-wire/Cargo.toml --locked
 cargo test --manifest-path server/sync/Cargo.toml --locked
 node --test crates/sync-wire/tests/golden.test.mjs
 cargo clippy --manifest-path server/sync/Cargo.toml --locked --all-targets -- -D warnings
 ```
 
-Tests use temporary synthetic stores and real loopback TCP. They cover two-device
-commit races, interrupted uploads, auth before body reads, Range, failed SQL
-transactions, process exit without destructors, replay, and fixed-through pages.
-The ignored child test is invoked by its parent recovery test, not skipped
-recovery coverage. Power-loss durability and every fsync/rename failure boundary
-are not yet verified. Windows x86_64 is the currently exercised target; Linux,
-macOS, arm64 servers, and Windows/Android application clients remain unverified.
+Native PDS regression tests passed 343 cases (11 explicit measurement/child tests
+ignored in that invocation). Separate native transport tests passed 11, including
+exact large-object reconstruction, two concurrent chunk requests in each direction,
+413/429/524 retry, accepted-response loss and preserving a successful Range when
+its parallel sibling fails. PDS activation tests cover transactional cursor/base
+updates, outbox tails, clear intent, conflict backups and corrupt-payload refusal.
+The required eight TypeScript sync suites passed 79 cases; svelte-check reported
+no errors or warnings. The latest isolated Windows agent app passed actual form
+registration, synchronization and credential recovery after process restart.
+The latest Android agent APK passed Keystore recovery, registration, progress and
+mobile layout checks. During a 35-second server stall, local settings interaction
+completed in 5,687 ms and the head stayed unchanged. Both Windows and Android apps
+also passed registration and restart against the Linux x86_64 release daemon.
+Apple/Linux application key-store runtime checks remain unverified, separately
+from the Linux daemon tests.
 
-Remaining implementation gates from the approved plan:
+## Measured transfer behavior
 
-- Task 0: full synthetic-library compatibility matrix, PDS outbox/projection and
-  plugin boundary audit; the existing application and startup paths are untouched.
-- Tasks 1–2: immutable descriptor/multi-page staged changes, generic relation and
-  keyspace-clear fences, durable asynchronous jobs with sequence reservation,
-  large-object chunk upload/resume, fuller fault injection, administration/config.
-- Task 3: checkpoints, persistent pins/leases, bounded retention and GC, restored
-  snapshot epoch rotation, and verified resume metadata.
-- Tasks 4–6: native/TS client, durable PDS outbox, conflict-preserving staged apply,
-  multi-base byte delta in both directions, small-change traffic/CPU/RSS gates,
-  and three-OS distribution verification.
+Measurements use synthetic content. HTTP totals include request and response
+headers, but exclude TLS unless stated. Debug native tests are not release CPU
+benchmarks, and a combined test-process working set is not daemon RSS.
 
-Until epoch rotation/reconciliation exists, an old backup must not be restarted
-as if it were the current live server. A development backup is a stopped,
-consistent copy of the complete metadata and objects directory, including SQLite
-sidecars if present. Do not copy just a live SQLite file. Production restore
-instructions belong to the pending restore gate.
+- A 72-byte message append at 1/127/128/129/1024/10000 existing messages used
+  14,595–15,263 upload and 10,240–10,578 download HTTP bytes. Every case met
+  D + 16 KiB in both directions.
+- The 13-case native matrix covers prefix/middle insertion and deletion, message
+  edit/reorder, root, preset, lorebook, Unicode plugin key, new conversation and
+  asset metadata. A six-byte insertion in a 10 MiB plugin string used 13,543
+  upload / 9,841 download bytes. The remaining twelve cases used at most 12,659
+  upload / 9,330 download bytes, with exact values and order checked.
+- A 22-byte insertion into a 17 MiB opaque file used 6,974 upload / 6,253 download
+  bytes (2,343/2,408 ms). The 1 GiB case used 8,530/7,630 bytes
+  (119,820/143,202 ms). Both verify the entire reconstructed hash. The observed
+  combined native test-process peak was 68,096,000 bytes, not daemon RSS.
+- A 100,000-reference control-tree regression used 3,311 upload / 3,558 download
+  bytes. It excludes raw asset bodies. The separate end-to-end 100,000-unique-CAS
+  gate includes those bodies; its result is recorded separately in the plan.
+- A 2 MiB + 17-byte full object round trip used 10 requests and 4,200,473 HTTP
+  bytes with two concurrent chunks per direction. At a per-socket 10 Mbps cap
+  and 80 ms request delay, upload/download took 1,817/1,296 ms; at 1 Mbps and
+  200 ms, 9,746/9,005 ms. Two sockets can together exceed one socket's cap.
+  These are injected request delays, not measured Internet RTT or Tunnel tests.
 
-Endpoint directory/registry, GUI/tray, service installation, peer-mode changes,
-content E2EE, and same-PC storage deduplication are not part of this slice.
+Separate release-daemon measurements keep the client, GUI and cloudflared outside
+the reported memory. Four distinct uncached 8 MiB delta targets each use four
+bases totalling 32 MiB. Exact reconstruction is asserted for all four devices.
+
+| Host       | Idle resident/working-set bytes | Four-transfer peak bytes |  Head P95 |
+| ---------- | ------------------------------: | -----------------------: | --------: |
+| Windows    |                      11,603,968 |               64,847,872 | 12.735 ms |
+| Linux WSL2 |                       7,532,544 |              103,792,640 |  0.429 ms |
+
+Both passed the candidate 64 MiB idle / 128 MiB peak / 50 ms head gates on this
+local SSD host. The earlier allocation-per-anchor implementation failed at
+516,591,616 bytes; bounded sorted indexing and one materializer fixed that case.
+
+A separate 500-character, 10 MiB plugin fixture measures local costs independently
+of wire bytes. Nine small root saves per configuration had median commit times
+of 271/457 microseconds without a pinned revision (outbox off/on), and 939/882
+microseconds with a pinned revision. Reading/parsing the large record took about
+1.00–1.41 s, encoding/caching 1.47–1.82 s, and restoration 1.17–1.67 s. These debug
+samples ran alongside other synthetic IO; they do not establish a statistical
+outbox overhead or eliminate per-record JSON materialization.
+
+See [the benchmark guide](../../benchmarks/sync-server/README.md) for the
+single-object/batch/concurrency/gzip comparison and separately counted TLS 1.3
+handshakes. Product Range and batch transport currently use identity bytes.
+Local transfer caches remain retained after disconnect; server-side retention,
+leases and GC are implemented. Registry, daemon GUI/tray, service installation,
+peer transfer optimization, content E2EE and same-PC deduplication are separate.

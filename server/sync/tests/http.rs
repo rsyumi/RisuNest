@@ -18,10 +18,151 @@ struct Server {
     task: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
 }
+
+#[tokio::test]
+async fn bounded_bulk_buffers_leave_head_available_and_release_after_completion() {
+    let server = Server::start().await;
+    let third = server.store.add_device().unwrap();
+    let address = server.base.strip_prefix("http://").unwrap();
+    let frame = risunest_sync_wire::transfer::encode(&[]).unwrap();
+    let mut sockets = Vec::new();
+    for credential in [&server.a, &server.a, &server.b, &server.b] {
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket.write_all(format!("POST /uploads/frames HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nX-Risu-Library: {}\r\nContent-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",credential.token,credential.library_id,frame.len()).as_bytes()).await.unwrap();
+        let mut interim = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !interim.ends_with(b"\r\n\r\n") {
+                interim.push(socket.read_u8().await.unwrap());
+            }
+        })
+        .await
+        .unwrap();
+        assert!(interim.starts_with(b"HTTP/1.1 100 Continue"));
+        sockets.push(socket);
+    }
+    let rejected = server
+        .auth(
+            server
+                .client
+                .post(format!("{}/uploads/frames", server.base)),
+            &third,
+        )
+        .body(frame.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        rejected.json::<serde_json::Value>().await.unwrap()["error"],
+        "transfer-memory-busy"
+    );
+    assert_eq!(
+        server
+            .auth(server.client.get(format!("{}/head", server.base)), &third)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let mut first = sockets.remove(0);
+    first.write_all(&frame).await.unwrap();
+    let mut completed = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), first.read_to_end(&mut completed))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(completed.starts_with(b"HTTP/1.1 204 No Content"));
+    assert_eq!(
+        server
+            .auth(
+                server
+                    .client
+                    .post(format!("{}/uploads/frames", server.base)),
+                &third
+            )
+            .body(frame)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    drop(sockets);
+}
 impl Drop for Server {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+#[tokio::test]
+async fn session_identity_and_previous_device_status_are_authenticated_and_revocation_aware() {
+    let server = Server::start().await;
+    let url = format!("{}/session", server.base);
+    assert_eq!(
+        server.client.get(&url).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let session: serde_json::Value = server
+        .auth(server.client.get(&url), &server.a)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        session,
+        serde_json::json!({"head":server.store.head().unwrap(),"deviceId":server.a.device_id,"operationWatermark":"0","operationPending":false})
+    );
+    let scope: serde_json::Value = server
+        .auth(
+            server
+                .client
+                .get(format!("{}/scopes?scope=plugin-storage", server.base)),
+            &server.a,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let (version, clear) = server.store.scope_state("plugin-storage").unwrap();
+    assert_eq!(
+        scope,
+        serde_json::json!({"head":server.store.head().unwrap(),"scope":"plugin-storage","version":version,"clearVersion":clear})
+    );
+    let url = format!("{}/devices/{}/status", server.base, server.a.device_id);
+    let before: serde_json::Value = server
+        .auth(server.client.get(&url), &server.b)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(before["active"], true);
+    server.store.revoke_device(&server.a.device_id).unwrap();
+    let after: serde_json::Value = server
+        .auth(server.client.get(&url), &server.b)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after["active"], false);
+    assert_eq!(
+        server
+            .auth(server.client.get(&url), &server.a)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
 }
 impl Server {
     async fn start() -> Self {
@@ -327,6 +468,20 @@ async fn identity_range_and_batch_retries_use_verified_target_bytes() {
     let missing: serde_json::Value = response.json().await.unwrap();
     assert_eq!(missing["missing"], serde_json::json!([]));
     let response = s
+        .auth(s.client.post(format!("{}/objects/missing", s.base)), &s.a)
+        .json(&serde_json::json!([
+            {"hash":hash(b"missing-a"),"size":"9"},
+            {"hash":digest,"size":"10"},
+            {"hash":hash(b"missing-b"),"size":"9"}
+        ]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({"missing":[hash(b"missing-a"),hash(b"missing-b")]})
+    );
+    let response = s
         .auth(s.client.post(format!("{}/objects/batch", s.base)), &s.b)
         .json(&[digest])
         .send()
@@ -369,4 +524,215 @@ async fn malformed_metadata_and_frame_fail_without_mutation() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(s.store.object_size(&hash(b"good")).unwrap().is_none());
     assert_eq!(s.head(&s.a).await, head);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chunk_upload_delta_download_checkpoint_and_durable_job_over_tcp() {
+    use risunest_sync_wire::{
+        delta,
+        transfer::{self, Frame},
+    };
+    let s = Server::start().await;
+    let base = vec![b'a'; 10 * 1024 * 1024];
+    let mut target = base.clone();
+    target.splice(
+        5 * 1024 * 1024..5 * 1024 * 1024,
+        b"new-content".iter().copied(),
+    );
+    let response = s
+        .auth(s.client.post(format!("{}/uploads", s.base)), &s.a)
+        .json(&serde_json::json!({"hash":hash(&base),"size":base.len().to_string()}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let upload = response.json::<serde_json::Value>().await.unwrap()["uploadId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for (index, chunk) in base
+        .chunks(risunest_sync_server::store::UPLOAD_CHUNK_BYTES as usize)
+        .enumerate()
+    {
+        let response = s
+            .auth(
+                s.client
+                    .put(format!("{}/uploads/{upload}/chunks/{index}", s.base)),
+                &s.a,
+            )
+            .header("x-content-sha256", hash(chunk))
+            .body(chunk.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+    s.auth(
+        s.client
+            .post(format!("{}/uploads/{upload}/complete", s.base)),
+        &s.a,
+    )
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+    let patch =
+        transfer::encode(&[Frame::Delta(delta::create(&[&base], &target).unwrap())]).unwrap();
+    assert!(patch.len() < 1024);
+    s.auth(s.client.post(format!("{}/uploads/frames", s.base)), &s.a)
+        .body(patch)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let response = s
+        .auth(s.client.post(format!("{}/objects/transfer", s.base)), &s.b)
+        .json(&serde_json::json!([{"target":hash(&target),"bases":[hash(&base)]}]))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let received = response.bytes().await.unwrap();
+    assert!(received.len() < 1024);
+    let mut frames = transfer::decode(&received).unwrap();
+    match frames.remove(0) {
+        Frame::Delta(recipe) => assert_eq!(recipe.apply(&[&base]).unwrap(), target),
+        _ => panic!("warm download must use delta"),
+    }
+    let response = s
+        .auth(s.client.post(format!("{}/objects/transfer", s.base)), &s.b)
+        .json(&serde_json::json!([{"target":hash(&target),"bases":[]}]))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert!(matches!(
+        transfer::decode(&response.bytes().await.unwrap()).unwrap()[0],
+        Frame::FullRequired { .. }
+    ));
+    let response = s
+        .auth(
+            s.client
+                .get(format!("{}/objects/{}", s.base, hash(&target))),
+            &s.b,
+        )
+        .header("range", "bytes=5242880-5242890")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(&response.bytes().await.unwrap()[..], b"new-content");
+    let head = s.head(&s.a).await;
+    let response = s
+        .auth(
+            s.client.post(format!("{}/staged-changes/start", s.base)),
+            &s.a,
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let id = response.json::<serde_json::Value>().await.unwrap()["stagedChangesId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for index in 0..2 {
+        let page = changes(&format!("key-{index}"), &target);
+        s.auth(
+            s.client
+                .put(format!("{}/staged-changes/{id}/pages/{index}", s.base)),
+            &s.a,
+        )
+        .json(&page)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    }
+    let sealed = s
+        .auth(
+            s.client
+                .post(format!("{}/staged-changes/{id}/seal", s.base)),
+            &s.a,
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let intent = CommitIntent {
+        device_operation_seq: 1.into(),
+        expected_head: head.clone(),
+        staged_changes_id: id,
+        changes_digest: sealed["changesDigest"].as_str().unwrap().into(),
+    };
+    let response = s
+        .auth(s.client.post(format!("{}/commits", s.base)), &s.a)
+        .header("if-match", head.etag())
+        .json(&intent)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let operation = response.json::<serde_json::Value>().await.unwrap()["operationId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = s
+            .auth(
+                s.client.get(format!("{}/operations/{operation}", s.base)),
+                &s.a,
+            )
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        if status["status"] == "committed" {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(s.head(&s.a).await.seq.as_str(), "1");
+    let checkpoint = s
+        .auth(s.client.post(format!("{}/checkpoints", s.base)), &s.b)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let id = checkpoint["checkpointId"].as_str().unwrap();
+    let page = s
+        .auth(
+            s.client.get(format!("{}/checkpoints/{id}?limit=1", s.base)),
+            &s.b,
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(page["records"].as_array().unwrap().len(), 1);
+    assert!(page["nextKey"].is_string());
 }

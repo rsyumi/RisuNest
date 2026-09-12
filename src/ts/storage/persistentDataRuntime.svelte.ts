@@ -31,6 +31,7 @@ import type {
     PersistentSelectedConversation,
 } from './saveCoordinator'
 import type { CharacterActivationOptions } from './activeWorkingSet.svelte'
+import { notifyLocalPersistentRevision } from './persistentRevisionEvents'
 import {
     capturePersistentRoot,
     capturePersistentPluginStorage,
@@ -410,7 +411,10 @@ export function getPersistentDataRuntime(): PersistentDataRuntime {
             store: getPersistentDataStore(),
             state: createProductionStateAdapter(),
             getOfficialPublisher: () => productionConfiguration.officialPublisher,
-            onLocalRevision: (revision) => productionConfiguration.onLocalRevision?.(revision),
+            onLocalRevision: (revision) => {
+                productionConfiguration.onLocalRevision?.(revision)
+                notifyLocalPersistentRevision(revision)
+            },
             onFlushPromise: (promise) => productionConfiguration.onFlushPromise?.(promise),
             onBackgroundError: (error) => productionConfiguration.onBackgroundError?.(error),
             prepareDatabase: prepareDatabaseForPersistence,

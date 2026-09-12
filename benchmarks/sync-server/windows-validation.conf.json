@@ -1,0 +1,17 @@
+{
+  "productName": "RisuNest Sync Validation",
+  "identifier": "io.github.rsyumi.risunest.syncservervalidation20260911",
+  "mainBinaryName": "RisuNestSyncValidation",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "RisuNest Synthetic Sync Validation",
+        "visible": false,
+        "width": 1100,
+        "height": 800,
+        "dragDropEnabled": false
+      }
+    ]
+  }
+}

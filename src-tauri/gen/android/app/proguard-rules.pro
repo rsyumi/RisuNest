@@ -29,6 +29,7 @@
 # PeerCloneNativeBridge and PeerSyncForegroundNativeBridge) are already kept by
 # the generated proguard-wry.pro `native <methods>` rule.
 -keep interface io.github.rsyumi.risunest.PeerCloneNativeProgress { *; }
+-keep class io.github.rsyumi.risunest.ServerSyncSecrets { *; }
 -keepclassmembers class * implements io.github.rsyumi.risunest.PeerCloneNativeProgress {
     void onProgress(long);
 }

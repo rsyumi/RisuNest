@@ -178,9 +178,9 @@ struct PreparedDelete {
     deleted_generation_sequence: String,
 }
 
-struct ResolvedOwnerHead {
-    head: LogicalOwnerHead,
-    tuples: Option<Vec<Value>>,
+pub(super) struct ResolvedOwnerHead {
+    pub(super) head: LogicalOwnerHead,
+    pub(super) tuples: Option<Vec<Value>>,
 }
 
 pub(crate) fn establish_logical_common_base(
@@ -2592,7 +2592,7 @@ fn derive_policy_three_way_plan(
     })
 }
 
-fn validate_locator_envelope(
+pub(super) fn validate_locator_envelope(
     locator: &LogicalRecordLocator,
     envelope: &LogicalRecordEnvelope,
 ) -> Result<(), PeerSyncError> {
@@ -2740,7 +2740,7 @@ fn rehydrate_owner_property(
     Ok(())
 }
 
-fn rehydrate_root_owners(
+pub(super) fn rehydrate_root_owners(
     value: &mut Value,
     heads: &[ResolvedOwnerHead],
 ) -> Result<(), PeerSyncError> {
@@ -2801,7 +2801,7 @@ fn rehydrate_root_owners(
     Ok(())
 }
 
-fn rehydrate_character_owner(
+pub(super) fn rehydrate_character_owner(
     detail: &mut Value,
     character_id: &str,
     heads: &[ResolvedOwnerHead],
@@ -3016,7 +3016,7 @@ fn refresh_touched_character_counts(
     Ok(())
 }
 
-fn validate_configured_index_uniqueness(
+pub(super) fn validate_configured_index_uniqueness(
     transaction: &Transaction<'_>,
     generation: &str,
 ) -> Result<(), PeerSyncError> {
@@ -3055,7 +3055,7 @@ fn validate_configured_index_uniqueness(
     Ok(())
 }
 
-fn apply_delete(
+pub(super) fn apply_delete(
     transaction: &Transaction<'_>,
     generation: &str,
     locator: &LogicalRecordLocator,
@@ -3160,6 +3160,61 @@ fn delete_alias(
             params![generation, kind, logical_key],
         )
         .map_err(sql_error)?;
+    Ok(())
+}
+
+// Shared PDS row writer. The server adapter supplies already verified semantic
+// records and an ordered message sequence, without adopting peer page framing.
+pub(super) fn apply_materialized_record(
+    transaction: &Transaction<'_>,
+    generation: &str,
+    locator: LogicalRecordLocator,
+    envelope: LogicalRecordEnvelope,
+    messages: Option<&[Value]>,
+) -> Result<(), PeerSyncError> {
+    let key = encode_logical_record_key(&locator)
+        .map_err(|e| PeerSyncError::Validation(e.to_string()))?;
+    let pages = messages
+        .map(|m| {
+            vec![PreparedPage {
+                hash: String::new(),
+                size: 0,
+                message_count: m.len() as u64,
+            }]
+        })
+        .unwrap_or_default();
+    let put = PreparedPut {
+        key,
+        locator,
+        envelope,
+        object_hash: String::new(),
+        object_size: 0,
+        dependencies: Vec::new(),
+        pages,
+    };
+    apply_put(transaction, generation, &put)?;
+    if let (
+        LogicalRecordLocator::Conversation {
+            character_id,
+            conversation_id,
+        },
+        Some(messages),
+    ) = (&put.locator, messages)
+    {
+        let mut statement=transaction.prepare_cached("INSERT INTO messages(generation,character_id,conversation_id,message_index,message_id,value) VALUES(?1,?2,?3,?4,?5,?6)").map_err(sql_error)?;
+        for (index, message) in messages.iter().enumerate() {
+            statement
+                .execute(params![
+                    generation,
+                    character_id,
+                    conversation_id,
+                    index as i64,
+                    message.get("chatId").and_then(Value::as_str),
+                    serde_json::to_string(message).map_err(json_error)?
+                ])
+                .map_err(sql_error)?;
+        }
+    }
     Ok(())
 }
 
@@ -3717,6 +3772,7 @@ fn set_active(
     revision: i64,
     generation: &str,
 ) -> Result<(), PeerSyncError> {
+    super::server_sync_outbox::require_peer_unbound(transaction).map_err(storage_error)?;
     transaction
         .execute(
             "UPDATE meta SET value = ?1 WHERE key = 'currentRevision'",

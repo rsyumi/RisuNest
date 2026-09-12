@@ -13,11 +13,11 @@ pub struct ChangeCursor {
     pub ordinal: Sequence,
 }
 impl ChangeCursor {
-    /// Start after an entirely applied commit; ordinal 1024 is an end-of-commit sentinel.
+    /// Start after an entirely applied commit; ordinal i64::MAX is an end-of-commit sentinel.
     pub fn after_commit(seq: Sequence) -> Self {
         Self {
             seq,
-            ordinal: (MAX_PAGE_RECORDS as u64).into(),
+            ordinal: (i64::MAX as u64).into(),
         }
     }
 }
@@ -53,11 +53,12 @@ impl Store {
         let ordinal = after
             .ordinal
             .as_str()
-            .parse::<usize>()
+            .parse::<i64>()
             .ok()
-            .filter(|v| *v <= MAX_PAGE_RECORDS)
+            .filter(|v| *v >= 0)
             .ok_or(Error::new("invalid-cursor", 400))?;
-        let db = self.db()?;
+        let mut connection = self.reader()?;
+        let db = connection.transaction()?;
         let head = Self::read_head(&db)?;
         if epoch != head.epoch {
             return Err(Error::new("epoch-changed", 409));
@@ -95,7 +96,7 @@ impl Store {
         let mut rows = statement.query(params![
             after.seq.as_str().len() as i64,
             after.seq.as_str(),
-            ordinal as i64,
+            ordinal,
             through.as_str().len() as i64,
             through.as_str(),
             limit as i64 + 1

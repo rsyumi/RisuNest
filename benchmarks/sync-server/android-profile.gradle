@@ -1,0 +1,12 @@
+// Verification-only APK identity. Native Kotlin namespace/JNI remain unchanged.
+// Run after an :agent build, using the same generated frontend/native inputs.
+gradle.beforeProject { app ->
+    if (app.path != ':app') return
+    app.plugins.withId('com.android.application') {
+        app.androidComponents.finalizeDsl { android ->
+            android.defaultConfig.applicationId = 'io.github.rsyumi.risunest.syncservervalidation20260911'
+            android.defaultConfig.versionNameSuffix = '-sync-validation'
+        }
+        app.layout.buildDirectory.set(new File(app.rootDir, '../../../benchmarks/sync-server/.local/android-build'))
+    }
+}
