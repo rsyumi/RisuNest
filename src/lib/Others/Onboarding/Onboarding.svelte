@@ -23,7 +23,6 @@
     import { changeLanguage, language } from 'src/lang'
     import { alertConfirm, alertError, alertNormal } from 'src/ts/alert'
     import { hubURL } from 'src/ts/characterCards'
-    import { loadRisuAccountBackup } from 'src/ts/drive/accounter'
     import { LoadLocalBackup } from 'src/ts/drive/backuplocal'
     import { getVersionString } from 'src/ts/globalApi.svelte'
     import { updateTextThemeAndCSS } from 'src/ts/gui/colorscheme'
@@ -225,14 +224,13 @@
         if (accountBusy) return
         accountBusy = true
         try {
-            if (isTauri) {
-                const result = await getNativeOfficialAccountFlow().restore()
-                if (result.kind === 'missing') {
-                    alertNormal(strings.risuNest.backup.officialMissing)
-                    return
-                }
-            } else {
-                await loadRisuAccountBackup()
+            // The account snapshot, the same one the backup settings restore.
+            // The versioned /hub/backup list is a rollback tool for readers
+            // already running on account storage, not a way onto a new device.
+            const result = await getNativeOfficialAccountFlow().restore()
+            if (result.kind === 'missing') {
+                alertNormal(strings.risuNest.backup.officialMissing)
+                return
             }
             flow = goToOnboardingState(flow, 'done', 'account')
         } catch {
@@ -251,9 +249,7 @@
     if (!message?.data?.vaild) return
     loginOpen = false
     const credential = { id: message.id, token: message.token, data: message.data }
-    DBState.db.account = isTauri
-        ? await getNativeOfficialAccountFlow().login(credential)
-        : credential
+    DBState.db.account = await getNativeOfficialAccountFlow().login(credential)
     flow = goToOnboardingState(flow, 'sync-account-found', 'account')
 }}></svelte:window>
 
@@ -329,11 +325,15 @@
                             <span class="tx"><b>{t.home.importTitle}</b><small>{t.home.importDesc}</small></span>
                             <span class="chev"><ChevronRight /></span>
                         </button>
-                        <button class="row" type="button" onclick={() => goTo('sync')}>
-                            <span class="ic"><MonitorSmartphone /></span>
-                            <span class="tx"><b>{t.home.syncTitle}</b><small>{t.home.syncDesc}</small></span>
-                            <span class="chev"><ChevronRight /></span>
-                        </button>
+                        <!-- Every sync route needs the native transports, so the web
+                             build would open this on an empty screen. -->
+                        {#if isTauri}
+                            <button class="row" type="button" onclick={() => goTo('sync')}>
+                                <span class="ic"><MonitorSmartphone /></span>
+                                <span class="tx"><b>{t.home.syncTitle}</b><small>{t.home.syncDesc}</small></span>
+                                <span class="chev"><ChevronRight /></span>
+                            </button>
+                        {/if}
                     </div>
                     <footer class="panel-foot">
                         <label class="pill">
@@ -385,18 +385,16 @@
                     <h1>{t.sync.title}</h1>
                     <p class="lead">{t.sync.lead}</p>
                     <div class="rows">
-                        {#if isTauri}
-                            <button class="row" type="button" onclick={() => goTo('sync-device')}>
-                                <span class="ic"><QrCode /></span>
-                                <span class="tx"><b>{t.sync.deviceTitle}</b><small>{t.sync.deviceDesc}</small></span>
-                                <span class="chev"><ChevronRight /></span>
-                            </button>
-                            <button class="row" type="button" onclick={() => goTo('sync-hub')}>
-                                <span class="ic"><Server /></span>
-                                <span class="tx"><b>{t.sync.hubTitle}</b><small>{t.sync.hubDesc}</small></span>
-                                <span class="chev"><ChevronRight /></span>
-                            </button>
-                        {/if}
+                        <button class="row" type="button" onclick={() => goTo('sync-device')}>
+                            <span class="ic"><QrCode /></span>
+                            <span class="tx"><b>{t.sync.deviceTitle}</b><small>{t.sync.deviceDesc}</small></span>
+                            <span class="chev"><ChevronRight /></span>
+                        </button>
+                        <button class="row" type="button" onclick={() => goTo('sync-hub')}>
+                            <span class="ic"><Server /></span>
+                            <span class="tx"><b>{t.sync.hubTitle}</b><small>{t.sync.hubDesc}</small></span>
+                            <span class="chev"><ChevronRight /></span>
+                        </button>
                         <button class="row" type="button" onclick={() => goTo('sync-account')}>
                             <span class="ic"><Cloud /></span>
                             <span class="tx"><b>{t.sync.accountTitle}</b><small>{t.sync.accountDesc}</small></span>
