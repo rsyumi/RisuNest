@@ -1,8 +1,62 @@
 import { describe, expect, it } from 'vitest'
+import { parse } from 'svelte/compiler'
 
 import source from './UserSettings.svelte?raw'
 
 describe('UserSettings local backup route', () => {
+    it('makes the existing backup import action reachable on Android and uses the common native picker', async () => {
+        const backup = (await import('./RisuNestBackupRestore.svelte?raw'))
+            .default
+        const ast = parse(backup)
+        const guards: string[][] = []
+        function visit(node: any, parents: string[] = []) {
+            if (!node || typeof node !== 'object') return
+            const conditions =
+                node.type === 'IfBlock'
+                    ? [
+                          ...parents,
+                          backup.slice(
+                              node.expression.start,
+                              node.expression.end,
+                          ),
+                      ]
+                    : parents
+            if (
+                node.type === 'InlineComponent' &&
+                node.name === 'Button' &&
+                /runRisuSaveOperation\(['"]import['"]\)/.test(
+                    backup.slice(node.start, node.end),
+                )
+            ) {
+                guards.push(conditions)
+            }
+            for (const value of Object.values(node)) {
+                if (Array.isArray(value))
+                    for (const child of value) visit(child, conditions)
+                else if (value && typeof value === 'object')
+                    visit(value, conditions)
+            }
+        }
+        visit(ast.html)
+        expect(guards).toHaveLength(1)
+        for (const expression of guards[0]) {
+            // Evaluate the actual Svelte template's platform guard for an Android build.
+            expect(
+                new Function(
+                    'isTauri',
+                    'isTauriDesktop',
+                    'isTauriAndroid',
+                    `return (${expression})`,
+                )(true, false, true),
+            ).toBe(true)
+        }
+        expect(backup).toContain(
+            'if (isTauri) await restoreBackupFromSystemPicker()',
+        )
+        expect(backup).toContain(
+            "if (isTauri) return runRisuSaveOperation('import')",
+        )
+    })
     it('routes native full backup and restore through the common production caller and retains the web adapter', () => {
         expect(source).toContain('exportPortableBackupFromSystemPicker')
         expect(source).toContain('restoreBackupFromSystemPicker')
