@@ -318,7 +318,7 @@ node --test crates/sync-wire/tests/golden.test.mjs
 cargo clippy --manifest-path server/sync/Cargo.toml --locked --all-targets -- -D warnings
 ```
 
-Native PDS regression tests passed 342 cases (11 explicit measurement/child tests
+Native PDS regression tests passed 343 cases (11 explicit measurement/child tests
 ignored in that invocation). Separate native transport tests passed 11, including
 exact large-object reconstruction, two concurrent chunk requests in each direction,
 413/429/524 retry, accepted-response loss and preserving a successful Range when
@@ -345,14 +345,14 @@ benchmarks, and a combined test-process working set is not daemon RSS.
   D + 16 KiB in both directions.
 - The 13-case native matrix covers prefix/middle insertion and deletion, message
   edit/reorder, root, preset, lorebook, Unicode plugin key, new conversation and
-  asset metadata. A six-byte insertion in a 10 MiB plugin string used 16,073
-  upload / 10,866 download bytes. The remaining twelve cases used at most 15,114
-  upload / 10,355 download bytes, with exact values and order checked.
+  asset metadata. A six-byte insertion in a 10 MiB plugin string used 13,543
+  upload / 9,841 download bytes. The remaining twelve cases used at most 12,659
+  upload / 9,330 download bytes, with exact values and order checked.
 - A 22-byte insertion into a 17 MiB opaque file used 6,974 upload / 6,253 download
   bytes (2,343/2,408 ms). The 1 GiB case used 8,530/7,630 bytes
   (119,820/143,202 ms). Both verify the entire reconstructed hash. The observed
   combined native test-process peak was 68,096,000 bytes, not daemon RSS.
-- A 100,000-reference control-tree regression used 3,711 upload / 3,558 download
+- A 100,000-reference control-tree regression used 3,311 upload / 3,558 download
   bytes. It excludes raw asset bodies. The separate end-to-end 100,000-unique-CAS
   gate includes those bodies; its result is recorded separately in the plan.
 - A 2 MiB + 17-byte full object round trip used 10 requests and 4,200,473 HTTP

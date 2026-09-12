@@ -156,14 +156,31 @@ not a substitute for this end-to-end test.
 For the combined 500-character follow-up, set `RISUNEST_SYNTHETIC_OWNER_REPORT` to a
 new absolute `.local` JSON path before the initial owner gate. That explicit mode
 retains only its three marked synthetic temporary directories and writes their
-paths. After the first process exits successfully, run
+paths. After the first process exits and both replicas have settled, run
 `server_sync_retained_owner_library_500_character_gate` with `--ignored --nocapture`
 and the same report path. The follow-up validates temporary-directory boundaries,
-markers, clean replica state, the 100,000-entry owner and three exact body samples
-before adding characters. The preceding gate must have completed its exhaustive
-100,000-body verification successfully.
+markers, clean replica state, the 100,000-entry owner and three exact body samples.
+It then makes a new six-byte owner-name change, measures both complete HTTP cycles,
+compares every one of the 100,000 received bodies and enforces a D + 32 KiB
+regression ceiling for this extreme owner fixture. On 2026-09-12 the user directed
+us to stop byte-level micro-optimization: D + 16 KiB remains a reference target,
+not a pass/fail requirement for the 100,000-entry owner. The preceding measured
+result was 19,451 upload / 16,555 download HTTP bytes for D = 6. Ordinary small
+record gates retain their existing budget. Each rerun uses a new revision-derived name to avoid
+passing through an already cached historical target. Only after that gate passes
+does it add characters up to 500 and check a warm root change in the combined
+library. A failed budget does not count as a completed scale gate.
 The daemon owner lock prevents overlapping use. No retained fixture is an installed
 app profile, and no credential or synthetic body is printed in the report.
+
+The final retained run on 2026-09-12 passed after exact comparison of all 100,000
+bodies: owner D = 6 used 16,402 upload / 14,652 download HTTP bytes, taking
+397,053 / 742,195 ms in the debug native test. The combined 500-character library
+then used 11,908 / 8,941 bytes for a six-byte root change with exact apply.
+The complete retained run took 1,585.62 seconds. These are local debug IO costs,
+not release latency or network-only transfer times. This gate uses `e0204e3dd`
+product behavior; the subsequent revision-zero placeholder fix affects only
+uninitialized stores and has its own full PDS regression coverage.
 
 `windows-runtime.mjs --linux-server` and `android-runtime.mjs --ui --linux-server`
 run against the already-built Linux x86_64 release binary in WSL Ubuntu-24.04.
