@@ -1,0 +1,8 @@
+{
+  "source": "Synthetic Node.js node:crypto AES-256-GCM vector. Fixed key/nonce are test-only.",
+  "uuid": "12345678-1234-4234-9234-123456789abc",
+  "plaintext": "https://sync.example.invalid/library/",
+  "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "nonceHex": "000102030405060708090a0b",
+  "envelope": "AAECAwQFBgcICQoLL3aia7bf7TT-OPnon4wADO6m61HeEjEKWQuM4TIFadBzcdyFgPy3Rbb0-QBzLMogMPvvD40"
+}
