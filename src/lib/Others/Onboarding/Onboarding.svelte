@@ -1,23 +1,25 @@
 <script lang="ts">
     import { onMount } from 'svelte'
-    import { get } from 'svelte/store'
     import {
         ArrowRight,
         Check,
         ChevronLeft,
         ChevronRight,
         Cloud,
+        Copy,
         FileDown,
         FolderOpen,
         Globe,
         Info,
         Link as LinkIcon,
+        LoaderCircle,
         MonitorSmartphone,
         QrCode,
         Server,
         Smartphone,
         TriangleAlert,
         User,
+        X as XIcon,
     } from '@lucide/svelte'
 
     import { changeLanguage, language } from 'src/lang'
@@ -26,11 +28,19 @@
     import { LoadLocalBackup } from 'src/ts/drive/backuplocal'
     import { getVersionString } from 'src/ts/globalApi.svelte'
     import { updateTextThemeAndCSS } from 'src/ts/gui/colorscheme'
+    import {
+        buildNativeFileJobDialogModel,
+        type NativeFileJobDialogStageState,
+    } from 'src/ts/gui/nativeFileJobDialogModel'
     import { isTauri, isTauriAndroid } from 'src/ts/platform'
     import { prebuiltPresets } from 'src/ts/process/templates/templates'
     import { setPreset } from 'src/ts/storage/database.svelte'
     import {
         NativeFileOperationBusyError,
+        cancelActiveNativeFileOperation,
+        dismissNativeFileOperationOutcome,
+        nativeFileJobHost,
+        nativeFileOperation,
         nativeFileOperationOutcome,
     } from 'src/ts/storage/nativeFileJobManager'
     import {
@@ -98,6 +108,36 @@
     let loginUrl = $state('')
     let loginFrame = $state<HTMLIFrameElement | undefined>()
 
+    // The shared import dialog's view model, drawn in this panel instead of
+    // the popup while the onboarding is up. `now` only feeds the elapsed time.
+    let now = $state(Date.now())
+    const job = $derived(buildNativeFileJobDialogModel($nativeFileOperation, $nativeFileOperationOutcome, now))
+    const jobShown = $derived(job.open && !job.compact)
+    const jobTicking = $derived(jobShown && job.terminal === null)
+    let jobDetailsOpen = $state(false)
+    let jobDetailsCopied = $state(false)
+
+    type StageRow = {
+        stage: string
+        label: string
+        state: NativeFileJobDialogStageState
+        detail: string
+    }
+
+    $effect(() => {
+        if (!jobTicking) return
+        now = Date.now()
+        const timer = setInterval(() => { now = Date.now() }, 1000)
+        return () => clearInterval(timer)
+    })
+
+    $effect(() => {
+        if (jobTicking) {
+            jobDetailsOpen = false
+            jobDetailsCopied = false
+        }
+    })
+
     // Device sync is a native feature; the web build has no transport for it.
     const controller = isTauri ? getProductionDeviceSyncController() : null
     let syncSnapshot = $state<DeviceSyncControllerSnapshot | null>(controller?.snapshot() ?? null)
@@ -112,10 +152,41 @@
     )
     const linkValid = $derived(parsesAsLink(linkInput))
 
+    /** The download screen's stages, in the same language as an import. */
+    const cloneRows = $derived.by((): StageRow[] => {
+        const phase = cloneTarget?.phase
+        const status = syncSnapshot?.targets.clone?.targetPhase
+        const labels = t.progress
+        const done = phase === 'completed'
+        // The native side reports the transfer complete before the renderer
+        // has activated it, so both readings count as applying.
+        const applying = !done && phase === 'downloading'
+            && (status === 'awaitingActivation' || status === 'completed')
+        const receiving = !done && phase === 'downloading' && !applying
+        const stopped = phase === 'failed' || phase === 'cancelled'
+        const state = (active: boolean, past: boolean): NativeFileJobDialogStageState =>
+            done || past ? 'done' : active ? (stopped ? 'stopped' : 'active') : 'pending'
+        return [
+            { stage: 'connect', label: labels.stageConnect, state: state(!receiving && !applying, receiving || applying), detail: '' },
+            {
+                stage: 'receive',
+                label: labels.stageReceive,
+                state: state(receiving, applying),
+                detail: receiving && cloneTotal
+                    ? `${formatRisuNestStorageBytes(cloneReceived)} / ${formatRisuNestStorageBytes(cloneTotal)}`
+                    : '',
+            },
+            { stage: 'apply', label: labels.stageApply, state: state(applying, false), detail: '' },
+        ]
+    })
+
     onMount(() => {
         // A restored database carries its own `didFirstSetup`; the hold keeps
         // this screen up until the reader presses start.
         onboardingHold.set(true)
+        // Backup restores report through the shared operation stores; this
+        // panel draws them while it is up, so the popup stays closed.
+        nativeFileJobHost.set('onboarding')
         const stopWeave = weaveCanvas ? observeOnboardingWeave(weaveCanvas) : () => {}
         const stopSync = controller?.subscribe((value) => {
             syncSnapshot = value
@@ -124,6 +195,7 @@
         return () => {
             stopWeave()
             stopSync()
+            nativeFileJobHost.set('dialog')
             onboardingHold.set(false)
         }
     })
@@ -163,6 +235,12 @@
 
     /** The defaults a reader who skips setup would otherwise have to choose. */
     function startFresh(): void {
+        // Data that arrived outside this screen, such as a backup opened from
+        // a file manager, already carries its own settings.
+        if (DBState.db.didFirstSetup) {
+            flow = goToOnboardingState(flow, 'done', 'import')
+            return
+        }
         DBState.db = setPreset(DBState.db, prebuiltPresets.OAI2)
         DBState.db.textTheme = 'highcontrast'
         updateTextThemeAndCSS()
@@ -174,26 +252,41 @@
 
     function finish(): void {
         DBState.db.didFirstSetup = true
+        dismissNativeFileOperationOutcome()
         onboardingHold.set(false)
     }
 
     /**
-     * Both import routes open the shared progress dialog, which reports every
-     * outcome itself. Only a succeeded operation moves the screen on.
+     * Both import routes report through the shared operation stores. The job
+     * panel draws the progress and outcome, and the reader moves on from it.
      */
     async function runImport(operation: () => Promise<unknown>): Promise<void> {
         if (importBusy) return
         importBusy = true
         try {
             await operation()
-            if (get(nativeFileOperationOutcome)?.state === 'succeeded') {
-                flow = goToOnboardingState(flow, 'done', 'import')
-            }
         } catch (error) {
-            // The dialog never opens for a slot that is already taken.
+            // The operation never starts for a slot that is already taken.
             if (error instanceof NativeFileOperationBusyError) alertError(strings.risuNest.backup.actionFailed)
         } finally {
             importBusy = false
+        }
+    }
+
+    function continueAfterImport(): void {
+        dismissNativeFileOperationOutcome()
+        flow = goToOnboardingState(flow, 'done', 'import')
+    }
+
+    async function copyJobDetails(): Promise<void> {
+        const details = job.terminal?.details
+        if (!details) return
+        try {
+            await navigator.clipboard.writeText(details)
+            jobDetailsCopied = true
+            setTimeout(() => { jobDetailsCopied = false }, 1500)
+        } catch {
+            jobDetailsCopied = false
         }
     }
 
@@ -337,6 +430,37 @@
     </div>
 {/snippet}
 
+{#snippet bar(percent: number | null, label: string)}
+    <div
+        class="track"
+        role="progressbar"
+        aria-label={label}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={percent ?? undefined}
+    >
+        <div class="fill" class:pulse={percent === null} style:width={percent === null ? '100%' : `${percent}%`}></div>
+    </div>
+{/snippet}
+
+{#snippet stageList(rows: StageRow[])}
+    {#if rows.length > 0}
+        <ol class="stages">
+            {#each rows as row (row.stage)}
+                <li data-state={row.state}>
+                    <span class="mark">
+                        {#if row.state === 'done'}<Check />
+                        {:else if row.state === 'active'}<LoaderCircle />
+                        {:else if row.state === 'stopped'}<XIcon />{/if}
+                    </span>
+                    <span class="label">{row.label}</span>
+                    {#if row.detail}<span class="detail">{row.detail}</span>{/if}
+                </li>
+            {/each}
+        </ol>
+    {/if}
+{/snippet}
+
 <div class="onb-root" class:keep-all={DBState.db.language === 'ko'}>
 <div class="onb">
     <aside class="brand">
@@ -354,189 +478,277 @@
     </aside>
 
     <section class="panel">
-        {#key flow.state}
+        {#if jobShown}
             <div class="panel-in">
-                {#if flow.state === 'home'}
-                    <h1>{t.home.title}</h1>
-                    <p class="lead">{t.home.lead}</p>
-                    <div class="rows">
-                        <button class="row primary" type="button" onclick={startFresh}>
-                            <span class="ic"><ArrowRight /></span>
-                            <span class="tx"><b>{t.home.freshTitle}</b><small>{t.home.freshDesc}</small></span>
-                            <span class="chev"><ChevronRight /></span>
-                        </button>
-                        <button class="row" type="button" onclick={() => goTo('import')}>
-                            <span class="ic"><FileDown /></span>
-                            <span class="tx"><b>{t.home.importTitle}</b><small>{t.home.importDesc}</small></span>
-                            <span class="chev"><ChevronRight /></span>
-                        </button>
-                        <!-- Every sync route needs the native transports, so the web
-                             build would open this on an empty screen. -->
-                        {#if isTauri}
-                            <button class="row" type="button" onclick={() => goTo('sync')}>
-                                <span class="ic"><MonitorSmartphone /></span>
-                                <span class="tx"><b>{t.home.syncTitle}</b><small>{t.home.syncDesc}</small></span>
-                                <span class="chev"><ChevronRight /></span>
-                            </button>
-                        {/if}
-                    </div>
-                    <footer class="panel-foot">
-                        <label class="pill">
-                            <Globe />
-                            <span class="sr-only">{t.language}</span>
-                            <select
-                                value={DBState.db.language}
-                                onchange={(event) => setLanguage(event.currentTarget.value)}
-                            >
-                                {#each UI_LANGUAGES as option}
-                                    <option value={option.value}>{option.label}</option>
-                                {/each}
-                            </select>
-                        </label>
-                        <span>RisuNest {getVersionString()}</span>
-                    </footer>
-                {:else if flow.state === 'import'}
-                    {@render back('home', t.backHome)}
-                    <h1>{t.import.title}</h1>
-                    <p class="lead">{t.import.lead}</p>
-                    <div class="drop">
-                        <span class="ic"><FileDown /></span>
-                        <b>{t.import.dropTitle}</b>
-                        <button
-                            class="btn primary"
-                            type="button"
-                            disabled={importBusy}
-                            onclick={() => runImport(importRisuSaveFromSystemPicker)}
-                        >
-                            <FolderOpen />{t.import.choose}
-                        </button>
-                    </div>
-                    {#if isTauriAndroid}
-                        <p class="hint"><Smartphone /><span>{t.import.hintAndroid}</span></p>
-                    {/if}
-                    <div class="detect">
-                        <span class="ic"><FolderOpen /></span>
-                        <div><b>{t.import.pocketTitle}</b><small>{t.import.pocketDesc}</small></div>
-                        <button class="btn ghost" type="button" disabled={importBusy} onclick={() => runImport(LoadLocalBackup)}>
-                            {t.import.pocketAction}
-                        </button>
-                    </div>
-                    <p class="note warn"><TriangleAlert /><span>{t.import.warning}</span></p>
-                {:else if flow.state === 'sync'}
-                    {@render back('home', t.backHome)}
-                    <h1>{t.sync.title}</h1>
-                    <p class="lead">{t.sync.lead}</p>
-                    <div class="rows">
-                        <button class="row" type="button" onclick={() => goTo('sync-device')}>
-                            <span class="ic"><QrCode /></span>
-                            <span class="tx"><b>{t.sync.deviceTitle}</b><small>{t.sync.deviceDesc}</small></span>
-                            <span class="chev"><ChevronRight /></span>
-                        </button>
-                        <button class="row" type="button" onclick={() => goTo('sync-hub')}>
-                            <span class="ic"><Server /></span>
-                            <span class="tx"><b>{t.sync.hubTitle}</b><small>{t.sync.hubDesc}</small></span>
-                            <span class="chev"><ChevronRight /></span>
-                        </button>
-                        <button class="row" type="button" onclick={() => goTo('sync-account')}>
-                            <span class="ic"><Cloud /></span>
-                            <span class="tx"><b>{t.sync.accountTitle}</b><small>{t.sync.accountDesc}</small></span>
-                            <span class="chev"><ChevronRight /></span>
-                        </button>
-                    </div>
-                {:else if flow.state === 'sync-device'}
-                    {@render back('sync', t.back)}
-                    <h1>{t.device.title}</h1>
-                    <ol class="howto">
-                        <li><span>{t.device.stepShare}</span></li>
-                        <li><span>{t.device.stepLink}</span></li>
-                        <li><span>{t.device.stepPaste}</span></li>
-                    </ol>
-                    {@render linkField(connectDevice, connectBusy)}
-                {:else if flow.state === 'sync-hub'}
-                    {@render back('sync', t.back)}
-                    <h1>{t.hub.title}</h1>
-                    <ol class="howto">
-                        <li><span>{t.hub.stepLink}</span></li>
-                        <li><span>{t.device.stepPaste}</span></li>
-                    </ol>
-                    {@render linkField(() => {}, false)}
-                {:else if flow.state === 'sync-progress'}
-                    <h1>{t.progress.title}</h1>
-                    <p class="lead">{t.progress.lead}</p>
-                    <div class="peer">
-                        {#if flow.path === 'hub'}<Server />{:else}<MonitorSmartphone />{/if}
-                        <span class="name">
-                            {flow.path === 'hub'
-                                ? t.progress.server
-                                : cloneSource?.name || strings.risuNest.sync.work.unknownDevice}
-                        </span>
-                    </div>
-                    <progress
-                        class="bar"
-                        aria-label={strings.risuNest.sync.work.progressLabel}
-                        value={clonePercent ?? undefined}
-                        max="100"
-                    ></progress>
-                    <p class="meta">
-                        {#if cloneTotal}
-                            {t.progress.meta
-                                .replace('{0}', formatRisuNestStorageBytes(cloneReceived))
-                                .replace('{1}', formatRisuNestStorageBytes(cloneTotal))}
-                        {:else}
-                            {t.progress.metaStarting}
-                        {/if}
-                    </p>
-                    <div class="actions">
-                        <button class="btn ghost" type="button" onclick={cancelDownload}>{t.progress.cancel}</button>
-                    </div>
-                {:else if flow.state === 'sync-account'}
-                    {@render back('sync', t.back)}
-                    <h1>{t.account.title}</h1>
-                    <p class="lead">{t.account.lead}</p>
-                    <div class="actions">
-                        {#if DBState.db.account}
-                            <button class="btn primary big" type="button" onclick={() => goTo('sync-account-found')}>
-                                <User />{t.account.cont}
-                            </button>
-                        {:else}
-                            <button class="btn primary big" type="button" onclick={openAccountLogin}>
-                                <User />{t.account.login}
-                            </button>
-                        {/if}
-                    </div>
-                    <p class="hint spaced"><Info /><span>{t.account.hint}</span></p>
-                {:else if flow.state === 'sync-account-found'}
-                    {@render back('sync', t.back)}
-                    <h1>{t.accountFound.title}</h1>
-                    <div class="account">
-                        <span class="av"><User /></span>
-                        <span>{t.account.signedIn.replace('{0}', DBState.db.account?.id ?? '')}</span>
-                    </div>
-                    <div class="found">
-                        <span class="ic"><Cloud /></span>
-                        <div><b>{t.accountFound.cardTitle}</b><small>{t.accountFound.cardDesc}</small></div>
-                    </div>
-                    <p class="note"><Info /><span>{t.accountFound.note}</span></p>
-                    <div class="actions">
-                        <button class="btn primary" type="button" disabled={accountBusy} onclick={restoreAccountBackup}>
-                            {t.accountFound.restore}
-                        </button>
-                        <button class="btn ghost" type="button" disabled={accountBusy} onclick={() => goTo('home')}>
-                            {t.accountFound.other}
-                        </button>
-                    </div>
-                {:else}
-                    <div class="done">
-                        <span class="check-ring"><Check /></span>
-                        <h1>{t.done.title}</h1>
-                        <p class="lead flush">{t.done[onboardingSummary(flow.path)]}</p>
-                        <button class="btn primary big" type="button" onclick={finish}>
-                            {t.done.start}<ArrowRight />
-                        </button>
+                <h1>{job.title}</h1>
+                {#if job.terminal === null}
+                    <p class="lead">{t.import.warning}</p>
+                {/if}
+                {#if job.sourceName}
+                    <div class="file">
+                        <FileDown />
+                        <span class="name">{job.sourceName}</span>
+                        {#if job.sourceSize}<span class="dim">{job.sourceSize}</span>{/if}
+                        {#if job.subtitle}<span class="tag">{job.subtitle}</span>{/if}
                     </div>
                 {/if}
+                {@render bar(job.indeterminate ? null : job.overallPercent ?? 0, strings.risuNest.importDialog.titleImport)}
+                <p class="meta">
+                    <span>{job.overallPercent !== null ? `${job.overallPercent}%` : job.terminal ? '' : strings.risuNest.importDialog.preparing}</span>
+                    <span>{job.overallText}</span>
+                    <span class="dim">{job.elapsed}</span>
+                </p>
+                {#if job.terminal}
+                    <p
+                        class="result"
+                        class:succeeded={job.terminal.state === 'succeeded'}
+                        class:failed={job.terminal.state === 'failed'}
+                        class:cancelled={job.terminal.state === 'cancelled'}
+                        role="status"
+                    >
+                        {job.terminal.summary}
+                    </p>
+                    {#if job.terminal.reason}<p class="reason">{job.terminal.reason}</p>{/if}
+                {/if}
+                {@render stageList(job.stages)}
+                {#if job.currentItem}<p class="item">{job.currentItem}</p>{/if}
+                {#if job.counters.length > 0}
+                    <dl class="counts">
+                        {#each job.counters as counter (counter.key)}
+                            <div><dt>{counter.label}</dt><dd>{counter.value}</dd></div>
+                        {/each}
+                    </dl>
+                {/if}
+                {#if job.warnings.length > 0}
+                    <ul class="warnings">
+                        {#each job.warnings as warning}<li>{warning}</li>{/each}
+                    </ul>
+                {/if}
+                {#if job.terminal?.details}
+                    <div class="details">
+                        <button class="btn ghost" type="button" onclick={() => { jobDetailsOpen = !jobDetailsOpen }}>
+                            {strings.risuNest.importDialog.errorDetails}
+                        </button>
+                        {#if jobDetailsOpen}
+                            <div class="details-body">
+                                <button
+                                    class="copy"
+                                    type="button"
+                                    title={jobDetailsCopied ? strings.risuNest.importDialog.copied : strings.risuNest.importDialog.copyDetails}
+                                    aria-label={strings.risuNest.importDialog.copyDetails}
+                                    onclick={copyJobDetails}
+                                >
+                                    {#if jobDetailsCopied}<Check />{:else}<Copy />{/if}
+                                </button>
+                                <pre>{job.terminal.details}</pre>
+                            </div>
+                        {/if}
+                    </div>
+                {/if}
+                <div class="actions">
+                    {#if job.cancelVisible}
+                        <button class="btn ghost" type="button" disabled={!job.cancelEnabled} onclick={cancelActiveNativeFileOperation}>
+                            {job.cancelLabel}
+                        </button>
+                        {#if job.cancelNote}<span class="dim">{job.cancelNote}</span>{/if}
+                    {/if}
+                    {#if job.closeVisible}
+                        {#if job.terminal?.state === 'succeeded'}
+                            <button class="btn primary" type="button" onclick={continueAfterImport}>
+                                {t.import.next}<ArrowRight />
+                            </button>
+                        {:else}
+                            <button class="btn" type="button" onclick={dismissNativeFileOperationOutcome}>
+                                {strings.risuNest.importDialog.close}
+                            </button>
+                        {/if}
+                    {/if}
+                </div>
             </div>
-        {/key}
+        {:else}
+            {#key flow.state}
+                <div class="panel-in">
+                    {#if flow.state === 'home'}
+                        <h1>{t.home.title}</h1>
+                        <p class="lead">{t.home.lead}</p>
+                        <div class="rows">
+                            <button class="row primary" type="button" onclick={startFresh}>
+                                <span class="ic"><ArrowRight /></span>
+                                <span class="tx"><b>{t.home.freshTitle}</b><small>{t.home.freshDesc}</small></span>
+                                <span class="chev"><ChevronRight /></span>
+                            </button>
+                            <button class="row" type="button" onclick={() => goTo('import')}>
+                                <span class="ic"><FileDown /></span>
+                                <span class="tx"><b>{t.home.importTitle}</b><small>{t.home.importDesc}</small></span>
+                                <span class="chev"><ChevronRight /></span>
+                            </button>
+                            <!-- Every sync route needs the native transports, so the web
+                                 build would open this on an empty screen. -->
+                            {#if isTauri}
+                                <button class="row" type="button" onclick={() => goTo('sync')}>
+                                    <span class="ic"><MonitorSmartphone /></span>
+                                    <span class="tx"><b>{t.home.syncTitle}</b><small>{t.home.syncDesc}</small></span>
+                                    <span class="chev"><ChevronRight /></span>
+                                </button>
+                            {/if}
+                        </div>
+                        <footer class="panel-foot">
+                            <label class="pill">
+                                <Globe />
+                                <span class="sr-only">{t.language}</span>
+                                <select
+                                    value={DBState.db.language}
+                                    onchange={(event) => setLanguage(event.currentTarget.value)}
+                                >
+                                    {#each UI_LANGUAGES as option}
+                                        <option value={option.value}>{option.label}</option>
+                                    {/each}
+                                </select>
+                            </label>
+                            <span>RisuNest {getVersionString()}</span>
+                        </footer>
+                    {:else if flow.state === 'import'}
+                        {@render back('home', t.backHome)}
+                        <h1>{t.import.title}</h1>
+                        <p class="lead">{t.import.lead}</p>
+                        <div class="drop">
+                            <span class="ic"><FileDown /></span>
+                            <b>{t.import.dropTitle}</b>
+                            <button
+                                class="btn primary"
+                                type="button"
+                                disabled={importBusy}
+                                onclick={() => runImport(importRisuSaveFromSystemPicker)}
+                            >
+                                <FolderOpen />{t.import.choose}
+                            </button>
+                        </div>
+                        {#if isTauriAndroid}
+                            <p class="hint"><Smartphone /><span>{t.import.hintAndroid}</span></p>
+                        {/if}
+                        <div class="detect">
+                            <span class="ic"><FolderOpen /></span>
+                            <div><b>{t.import.pocketTitle}</b><small>{t.import.pocketDesc}</small></div>
+                            <button class="btn ghost" type="button" disabled={importBusy} onclick={() => runImport(LoadLocalBackup)}>
+                                {t.import.pocketAction}
+                            </button>
+                        </div>
+                        <p class="note warn"><TriangleAlert /><span>{t.import.warning}</span></p>
+                    {:else if flow.state === 'sync'}
+                        {@render back('home', t.backHome)}
+                        <h1>{t.sync.title}</h1>
+                        <p class="lead">{t.sync.lead}</p>
+                        <div class="rows">
+                            <button class="row" type="button" onclick={() => goTo('sync-device')}>
+                                <span class="ic"><QrCode /></span>
+                                <span class="tx"><b>{t.sync.deviceTitle}</b><small>{t.sync.deviceDesc}</small></span>
+                                <span class="chev"><ChevronRight /></span>
+                            </button>
+                            <button class="row" type="button" onclick={() => goTo('sync-hub')}>
+                                <span class="ic"><Server /></span>
+                                <span class="tx"><b>{t.sync.hubTitle}</b><small>{t.sync.hubDesc}</small></span>
+                                <span class="chev"><ChevronRight /></span>
+                            </button>
+                            <button class="row" type="button" onclick={() => goTo('sync-account')}>
+                                <span class="ic"><Cloud /></span>
+                                <span class="tx"><b>{t.sync.accountTitle}</b><small>{t.sync.accountDesc}</small></span>
+                                <span class="chev"><ChevronRight /></span>
+                            </button>
+                        </div>
+                    {:else if flow.state === 'sync-device'}
+                        {@render back('sync', t.back)}
+                        <h1>{t.device.title}</h1>
+                        <ol class="howto">
+                            <li><span>{t.device.stepShare}</span></li>
+                            <li><span>{t.device.stepLink}</span></li>
+                            <li><span>{t.device.stepPaste}</span></li>
+                        </ol>
+                        {@render linkField(connectDevice, connectBusy)}
+                    {:else if flow.state === 'sync-hub'}
+                        {@render back('sync', t.back)}
+                        <h1>{t.hub.title}</h1>
+                        <ol class="howto">
+                            <li><span>{t.hub.stepLink}</span></li>
+                            <li><span>{t.device.stepPaste}</span></li>
+                        </ol>
+                        {@render linkField(() => {}, false)}
+                    {:else if flow.state === 'sync-progress'}
+                        <h1>{t.progress.title}</h1>
+                        <p class="lead">{t.progress.lead}</p>
+                        <div class="file">
+                            {#if flow.path === 'hub'}<Server />{:else}<MonitorSmartphone />{/if}
+                            <span class="name">
+                                {flow.path === 'hub'
+                                    ? t.progress.server
+                                    : cloneSource?.name || strings.risuNest.sync.work.unknownDevice}
+                            </span>
+                        </div>
+                        {@render bar(clonePercent, strings.risuNest.sync.work.progressLabel)}
+                        <p class="meta">
+                            <span>{clonePercent === null ? '' : `${clonePercent}%`}</span>
+                            <span>
+                                {#if cloneTotal}
+                                    {t.progress.meta
+                                        .replace('{0}', formatRisuNestStorageBytes(cloneReceived))
+                                        .replace('{1}', formatRisuNestStorageBytes(cloneTotal))}
+                                {:else}
+                                    {t.progress.metaStarting}
+                                {/if}
+                            </span>
+                        </p>
+                        {@render stageList(cloneRows)}
+                        <div class="actions">
+                            <button class="btn ghost" type="button" onclick={cancelDownload}>{t.progress.cancel}</button>
+                        </div>
+                    {:else if flow.state === 'sync-account'}
+                        {@render back('sync', t.back)}
+                        <h1>{t.account.title}</h1>
+                        <p class="lead">{t.account.lead}</p>
+                        <div class="actions">
+                            {#if DBState.db.account}
+                                <button class="btn primary big" type="button" onclick={() => goTo('sync-account-found')}>
+                                    <User />{t.account.cont}
+                                </button>
+                            {:else}
+                                <button class="btn primary big" type="button" onclick={openAccountLogin}>
+                                    <User />{t.account.login}
+                                </button>
+                            {/if}
+                        </div>
+                        <p class="hint spaced"><Info /><span>{t.account.hint}</span></p>
+                    {:else if flow.state === 'sync-account-found'}
+                        {@render back('sync', t.back)}
+                        <h1>{t.accountFound.title}</h1>
+                        <div class="account">
+                            <span class="av"><User /></span>
+                            <span>{t.account.signedIn.replace('{0}', DBState.db.account?.id ?? '')}</span>
+                        </div>
+                        <div class="found">
+                            <span class="ic"><Cloud /></span>
+                            <div><b>{t.accountFound.cardTitle}</b><small>{t.accountFound.cardDesc}</small></div>
+                        </div>
+                        <p class="note"><Info /><span>{t.accountFound.note}</span></p>
+                        <div class="actions">
+                            <button class="btn primary" type="button" disabled={accountBusy} onclick={restoreAccountBackup}>
+                                {t.accountFound.restore}
+                            </button>
+                            <button class="btn ghost" type="button" disabled={accountBusy} onclick={() => goTo('home')}>
+                                {t.accountFound.other}
+                            </button>
+                        </div>
+                    {:else}
+                        <div class="done">
+                            <span class="check-ring"><Check /></span>
+                            <h1>{t.done.title}</h1>
+                            <p class="lead flush">{t.done[onboardingSummary(flow.path)]}</p>
+                            <button class="btn primary big" type="button" onclick={finish}>
+                                {t.done.start}<ArrowRight />
+                            </button>
+                        </div>
+                    {/if}
+                </div>
+            {/key}
+        {/if}
     </section>
 </div>
 </div>
@@ -890,6 +1102,7 @@
     .actions {
         display: flex;
         flex-wrap: wrap;
+        align-items: center;
         gap: 10px;
     }
 
@@ -1043,47 +1256,227 @@
         color: var(--color-draculared);
     }
 
-    /* ── download ── */
-    .peer {
+    /* ── progress: imports and the clone download share one look ── */
+    .file {
         display: flex;
+        flex-wrap: wrap;
         align-items: center;
-        gap: 10px;
+        gap: 6px 10px;
         padding: 10px 12px;
         border: 1px solid var(--o-line);
         border-radius: 12px;
         font-size: 13.5px;
     }
-    .peer :global(svg) {
+    .file > :global(svg) {
+        flex: none;
         width: 18px;
         height: 18px;
         color: var(--o-soft);
     }
-    .bar {
-        appearance: none;
+    .file .name {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-weight: 600;
+    }
+    .file .tag {
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: rgba(34, 200, 198, 0.14);
+        font-size: 12px;
+        color: var(--o-teal);
+    }
+    .dim {
+        font-size: 12.5px;
+        color: var(--o-faint);
+    }
+    .track {
         width: 100%;
         height: 8px;
-        margin: 18px 0 10px;
-        border: 0;
+        margin: 18px 0 8px;
         border-radius: 999px;
         background: color-mix(in srgb, var(--o-ink) 8%, transparent);
         overflow: hidden;
     }
-    .bar::-webkit-progress-bar {
-        background: color-mix(in srgb, var(--o-ink) 8%, transparent);
-    }
-    .bar::-webkit-progress-value {
+    .fill {
+        height: 100%;
         border-radius: 999px;
         background: linear-gradient(90deg, var(--o-teal), var(--o-blue));
+        transition: width 0.3s;
     }
-    .bar::-moz-progress-bar {
-        border-radius: 999px;
-        background: linear-gradient(90deg, var(--o-teal), var(--o-blue));
+    .fill.pulse {
+        animation: onboarding-pulse 1.4s ease-in-out infinite;
+    }
+    @keyframes onboarding-pulse {
+        0%, 100% { opacity: 0.55; }
+        50% { opacity: 0.2; }
     }
     .meta {
-        margin: 0 0 18px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px 12px;
+        margin: 0 0 16px;
         font-size: 13px;
         font-variant-numeric: tabular-nums;
         color: var(--o-soft);
+    }
+    .meta > :last-child {
+        margin-inline-start: auto;
+    }
+    .result {
+        margin: 0 0 6px;
+        font-size: 14px;
+        font-weight: 600;
+    }
+    .result.succeeded {
+        color: var(--o-ok);
+    }
+    .result.failed {
+        color: var(--color-draculared);
+    }
+    .result.cancelled {
+        color: var(--o-soft);
+    }
+    .reason {
+        margin: 0 0 14px;
+        font-size: 13px;
+        color: var(--o-soft);
+    }
+    .stages {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin: 0 0 16px;
+        padding: 0;
+        list-style: none;
+        font-size: 13.5px;
+    }
+    .stages li {
+        display: grid;
+        grid-template-columns: 18px 1fr auto;
+        align-items: center;
+        gap: 10px;
+    }
+    .stages li[data-state='pending'] {
+        color: var(--o-faint);
+    }
+    .stages .mark {
+        display: grid;
+        place-items: center;
+        width: 18px;
+        height: 18px;
+        color: var(--o-teal);
+    }
+    .stages li[data-state='pending'] .mark::before {
+        content: '';
+        width: 12px;
+        height: 12px;
+        border: 1px solid var(--o-line);
+        border-radius: 50%;
+    }
+    .stages li[data-state='stopped'] .mark {
+        color: var(--color-draculared);
+    }
+    .stages .mark :global(svg) {
+        width: 16px;
+        height: 16px;
+    }
+    .stages li[data-state='active'] .mark :global(svg) {
+        animation: onboarding-spin 1s linear infinite;
+    }
+    @keyframes onboarding-spin {
+        to { transform: rotate(360deg); }
+    }
+    .stages .label {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .stages .detail {
+        font-size: 12.5px;
+        font-variant-numeric: tabular-nums;
+        color: var(--o-soft);
+    }
+    .item {
+        margin: -8px 0 16px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-family: ui-monospace, Consolas, monospace;
+        font-size: 12px;
+        color: var(--o-faint);
+    }
+    .counts {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+        gap: 8px;
+        margin: 0 0 16px;
+    }
+    .counts div {
+        padding: 8px 10px;
+        border: 1px solid var(--o-line);
+        border-radius: 10px;
+    }
+    .counts dt {
+        font-size: 12px;
+        color: var(--o-soft);
+    }
+    .counts dd {
+        margin: 2px 0 0;
+        font-size: 14px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+    }
+    .warnings {
+        margin: 0 0 16px;
+        padding: 10px 12px 10px 28px;
+        border: 1px solid rgba(246, 196, 83, 0.35);
+        border-radius: 10px;
+        font-size: 12.5px;
+        color: #f6c453;
+    }
+    .details {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 8px;
+        margin: 0 0 16px;
+    }
+    .details-body {
+        position: relative;
+        width: 100%;
+    }
+    .details-body pre {
+        max-height: 180px;
+        margin: 0;
+        padding: 10px 40px 10px 12px;
+        overflow: auto;
+        border: 1px solid var(--o-line);
+        border-radius: 10px;
+        background: color-mix(in srgb, var(--o-ink) 3%, transparent);
+        font-size: 12px;
+        white-space: pre-wrap;
+        word-break: break-all;
+        color: var(--o-soft);
+    }
+    .details-body .copy {
+        position: absolute;
+        top: 6px;
+        right: 6px;
+        display: grid;
+        place-items: center;
+        width: 26px;
+        height: 26px;
+        border: 0;
+        border-radius: 6px;
+        background: none;
+        color: var(--o-soft);
+    }
+    .details-body .copy :global(svg) {
+        width: 14px;
+        height: 14px;
     }
 
     /* ── account ── */
@@ -1260,7 +1653,9 @@
     }
 
     @media (prefers-reduced-motion: reduce) {
-        .panel-in {
+        .panel-in,
+        .fill.pulse,
+        .stages li[data-state='active'] .mark :global(svg) {
             animation: none;
         }
     }

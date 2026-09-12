@@ -1890,6 +1890,7 @@ export const languageEnglish = {
                 pocketDesc: 'Loads a risu-backup .bin file exported from either app.',
                 pocketAction: 'Import',
                 warning: 'A large backup can take a while. Do not close the app until it finishes.',
+                next: 'Continue',
             },
             sync: {
                 title: 'Choose how to sync.',
@@ -1920,6 +1921,9 @@ export const languageEnglish = {
                 server: 'Sync server',
                 meta: 'Full copy · {0} / {1}',
                 metaStarting: 'Full copy',
+                stageConnect: 'Connecting',
+                stageReceive: 'Receiving',
+                stageApply: 'Applying',
                 cancel: 'Cancel',
                 cancelConfirm: 'Cancel this download? Nothing received so far will be applied.',
             },

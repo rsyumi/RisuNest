@@ -1702,6 +1702,7 @@ export const languageKorean = {
                 pocketDesc: '두 앱에서 내보낸 risu-backup .bin 파일을 불러옵니다.',
                 pocketAction: '가져오기',
                 warning: '백업 용량이 큰 경우 시간이 소요될 수 있습니다. 끝날 때까지 앱을 닫지 말아주세요.',
+                next: '계속',
             },
             sync: {
                 title: '동기화 방식을 선택해주세요.',
@@ -1732,6 +1733,9 @@ export const languageKorean = {
                 server: '동기화 서버',
                 meta: '전체 복사 · {0} / {1}',
                 metaStarting: '전체 복사',
+                stageConnect: '연결',
+                stageReceive: '받는 중',
+                stageApply: '적용 중',
                 cancel: '취소',
                 cancelConfirm: '다운로드를 취소할까요? 지금까지 받은 내용은 적용되지 않습니다.',
             },
