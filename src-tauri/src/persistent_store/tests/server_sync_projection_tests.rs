@@ -51,6 +51,22 @@ fn server_projection_preserves_all_families_and_removes_only_local_activity() {
             ..empty_working_set_commit(1)
         })
         .unwrap();
+    // Library credentials/settings are shared losslessly with the trusted server.
+    // Device credentials live outside these records (covered by backup tests).
+    let mut root = store.read_root(None).unwrap().value;
+    root["openAIKey"] = json!("synthetic-provider-secret");
+    root["syntheticPreference"] = json!({"enabled":true,"value":"unchanged"});
+    let plugin_value = json!({"token":"synthetic-plugin-secret","nested":[null,"가🦀",{}]});
+    store
+        .commit(&WorkingSetCommit {
+            root: Some(root),
+            plugin_storage: Some(vec![PluginStorageMutation::Set {
+                key: "synthetic-secret-contract".into(),
+                value: plugin_value.clone(),
+            }]),
+            ..empty_working_set_commit(store.revision().unwrap())
+        })
+        .unwrap();
     let generation = active_generation(&store.connection).unwrap();
     let mut keys = Vec::new();
     let mut after = None;
@@ -83,6 +99,21 @@ fn server_projection_preserves_all_families_and_removes_only_local_activity() {
         assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
         if key.kind == "conversation" {
             assert!(payload.messages.is_some());
+        }
+        match &payload.record {
+            crate::peer_sync::logical_delta::LogicalRecordEnvelope::Root { value, .. } => {
+                assert_eq!(value["openAIKey"], "synthetic-provider-secret");
+                assert_eq!(
+                    value["syntheticPreference"],
+                    json!({"enabled":true,"value":"unchanged"})
+                );
+            }
+            crate::peer_sync::logical_delta::LogicalRecordEnvelope::Plugin { value, .. }
+                if key.key1 == "synthetic-secret-contract" =>
+            {
+                assert_eq!(value, &plugin_value)
+            }
+            _ => (),
         }
     }
     let root_key = ServerDirtyKey {

@@ -59,7 +59,7 @@ pub struct Device {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceSession {
-    pub library_id: String,
+    pub head: RemoteHead,
     pub device_id: String,
     pub operation_watermark: Sequence,
     pub operation_pending: bool,
@@ -194,7 +194,8 @@ impl Store {
         Self::read_head(&*self.reader()?)
     }
     pub fn device_session(&self, device: &Device) -> Result<DeviceSession> {
-        let db = self.reader()?;
+        let mut connection = self.reader()?;
+        let db = connection.transaction()?;
         Self::require_device(&db, device)?;
         let watermark: String = db.query_row(
             "SELECT watermark FROM devices WHERE id=?1",
@@ -207,7 +208,7 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(DeviceSession {
-            library_id: Self::read_head(&db)?.library_id,
+            head: Self::read_head(&db)?,
             device_id: device.id.clone(),
             operation_watermark: watermark.try_into()?,
             operation_pending: pending,

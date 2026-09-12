@@ -322,9 +322,9 @@ struct ScopeQuery {
 }
 async fn scope(State(app): State<App>, Query(query): Query<ScopeQuery>) -> Result<Response> {
     blocking(move || {
-        let (version, clear_version) = app.store.scope_state(&query.scope)?;
+        let (head, version, clear_version) = app.store.scope_snapshot(&query.scope)?;
         Ok(Json(
-            serde_json::json!({"scope":query.scope,"version":version,"clearVersion":clear_version}),
+            serde_json::json!({"head":head,"scope":query.scope,"version":version,"clearVersion":clear_version}),
         )
         .into_response())
     })
@@ -833,10 +833,10 @@ async fn upload_frames(
     blocking(move || {
         let _permit = permit;
         let _buffer = buffer;
-        Ok(
-            Json(serde_json::json!({"verified":app.store.receive_frames(&device,&body)?}))
-                .into_response(),
-        )
+        app.store.receive_frames(&device, &body)?;
+        // Successful completion verifies every submitted target. Repeating the
+        // complete hash list adds no information; failures still return errors.
+        Ok(StatusCode::NO_CONTENT.into_response())
     })
     .await
 }

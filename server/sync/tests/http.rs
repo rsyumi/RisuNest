@@ -72,7 +72,7 @@ async fn bounded_bulk_buffers_leave_head_available_and_release_after_completion(
         .await
         .unwrap()
         .unwrap();
-    assert!(completed.starts_with(b"HTTP/1.1 200 OK"));
+    assert!(completed.starts_with(b"HTTP/1.1 204 No Content"));
     assert_eq!(
         server
             .auth(
@@ -86,7 +86,7 @@ async fn bounded_bulk_buffers_leave_head_available_and_release_after_completion(
             .await
             .unwrap()
             .status(),
-        StatusCode::OK
+        StatusCode::NO_CONTENT
     );
     drop(sockets);
 }
@@ -114,7 +114,25 @@ async fn session_identity_and_previous_device_status_are_authenticated_and_revoc
         .unwrap();
     assert_eq!(
         session,
-        serde_json::json!({"libraryId":server.a.library_id,"deviceId":server.a.device_id,"operationWatermark":"0","operationPending":false})
+        serde_json::json!({"head":server.store.head().unwrap(),"deviceId":server.a.device_id,"operationWatermark":"0","operationPending":false})
+    );
+    let scope: serde_json::Value = server
+        .auth(
+            server
+                .client
+                .get(format!("{}/scopes?scope=plugin-storage", server.base)),
+            &server.a,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let (version, clear) = server.store.scope_state("plugin-storage").unwrap();
+    assert_eq!(
+        scope,
+        serde_json::json!({"head":server.store.head().unwrap(),"scope":"plugin-storage","version":version,"clearVersion":clear})
     );
     let url = format!("{}/devices/{}/status", server.base, server.a.device_id);
     let before: serde_json::Value = server
@@ -449,6 +467,20 @@ async fn identity_range_and_batch_retries_use_verified_target_bytes() {
         .unwrap();
     let missing: serde_json::Value = response.json().await.unwrap();
     assert_eq!(missing["missing"], serde_json::json!([]));
+    let response = s
+        .auth(s.client.post(format!("{}/objects/missing", s.base)), &s.a)
+        .json(&serde_json::json!([
+            {"hash":hash(b"missing-a"),"size":"9"},
+            {"hash":digest,"size":"10"},
+            {"hash":hash(b"missing-b"),"size":"9"}
+        ]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({"missing":[hash(b"missing-a"),hash(b"missing-b")]})
+    );
     let response = s
         .auth(s.client.post(format!("{}/objects/batch", s.base)), &s.b)
         .json(&[digest])

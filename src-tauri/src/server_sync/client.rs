@@ -56,12 +56,15 @@ pub(crate) struct Reply {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Identity {
-    library_id: String,
+    head: risunest_sync_wire::RemoteHead,
     device_id: String,
     operation_watermark: risunest_sync_wire::Sequence,
     operation_pending: bool,
 }
 impl ServerClient {
+    pub fn verified_head(&self) -> Result<risunest_sync_wire::RemoteHead> {
+        self.identity().map(|identity| identity.head)
+    }
     pub fn verify_identity(&self) -> Result<()> {
         self.identity().map(|_| ())
     }
@@ -75,7 +78,8 @@ impl ServerClient {
     fn identity(&self) -> Result<Identity> {
         let (_, identity): (_, Identity) =
             self.json(Method::GET, "session", &[], None::<&()>, &[])?;
-        if identity.library_id != self.config.library_id
+        identity.head.validate()?;
+        if identity.head.library_id != self.config.library_id
             || identity.device_id != self.config.device_id
         {
             return Err(SyncError::new("device-identity-mismatch", 409));

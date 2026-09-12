@@ -103,43 +103,43 @@ available while bounding aggregate base/index memory. Body/handler timeout is 60
 for bounded full/frame/recipe upload bodies. Request
 compression is rejected with 415; object Range offsets address identity bytes.
 
-| Endpoint                                     | Contract                                                                                                     |
-| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `GET /session`                               | Authenticated identity, operation watermark and pending state; binding requires an unused operation identity |
-| `GET /devices/{id}/status`                   | Authenticated read-only active/revoked status used before replacing a lost device identity                   |
-| `GET /scopes?scope=NAME`                     | Current scope version and last clear identity; distinguishes independent key edits from a clear              |
-| `GET /head`                                  | Small stored head, ETag, bodyless conditional 304                                                            |
-| `POST /objects/missing`                      | Candidate `{hash,size}` array, decimal string sizes                                                          |
-| `POST /uploads/batch`, `POST /objects/batch` | Bounded full object batches                                                                                  |
-| `POST /uploads/frames`                       | Full/delta transfer batch, exact target verification                                                         |
-| `POST /objects/transfer`                     | Array of `{target,bases}`; delta, full, or full-required frames                                              |
-| `GET /objects/{hash}`                        | Bounded-memory stream, single Range/If-Range, ETag                                                           |
-| `POST /objects/pins`                         | Renew device-owned 24-hour leases for up to 1024 hashes                                                      |
-| `POST /uploads`                              | Begin `{hash,size}` manifest; returns `uploadId`                                                             |
-| `PUT /uploads/{id}/chunks/{index}`           | Exact 1 MiB chunk except final remainder; `X-Content-SHA256` required                                        |
-| `GET /uploads/{id}?after=INDEX`              | Paged verified chunk bitmap and completion status; optional `wait=true` waits up to 20 seconds               |
-| `POST /uploads/{id}/complete`                | Below 64 MiB: verified CAS publication; otherwise durable 202 finalization job, resumed after restart        |
-| `DELETE /uploads/{id}`                       | Owner-scoped cancellation                                                                                    |
-| `PUT /uploads/{id}/delta`                    | Attach an exact `RNSL` file recipe and queue durable reconstruction (202)                                    |
-| `POST /objects/delta`                        | Queue a file delta for `{target,bases}`, returning a stable device-owned `jobId`                             |
-| `GET /object-deltas/{id}?wait=true`          | Delta bytes (200), explicit full-required (204), or pending (202); waits at most 20 seconds                  |
-| `DELETE /object-deltas/{id}`                 | Release or cancel this device's file-delta job                                                               |
-| `POST /staged-changes`                       | Single-page convenience staging                                                                              |
-| `POST /staged-changes/start`                 | Begin a multi-page staging set                                                                               |
-| `PUT /staged-changes/{id}/pages/{index}`     | Consecutive pages, identical-page retry, conflicting retry rejected                                          |
-| `GET /staged-changes/{id}`                   | Next page and optional sealed digest                                                                         |
-| `POST /staged-changes/{id}/seal`             | Partition-independent streaming digest                                                                       |
-| `DELETE /staged-changes/{id}`                | Cancellation before operation reservation                                                                    |
-| `POST /commits`                              | Durable operation reservation and atomic commit; required `If-Match`                                         |
-| `GET /operations/{id}`                       | Owner-scoped pending status or terminal receipt                                                              |
-| `GET /changes`                               | Fixed-through journal traversal                                                                              |
-| `POST /read-pins`                            | Pin `{epoch,afterSeq}` through current head                                                                  |
-| `GET /read-pins/{id}`                        | Pinned journal pages with `afterSeq`, `afterOrdinal`, `limit`                                                |
-| `DELETE /read-pins/{id}`                     | Release this device's traversal                                                                              |
-| `POST /checkpoints`                          | Capture fixed record metadata                                                                                |
-| `GET /checkpoints/{id}`                      | Pages with optional `afterKey` and `limit`                                                                   |
-| `DELETE /checkpoints/{id}`                   | Release this device's checkpoint                                                                             |
-| `POST /acks`                                 | Monotonic per-device `{epoch,seq}`                                                                           |
+| Endpoint                                     | Contract                                                                                                                |
+| -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `GET /session`                               | Authenticated head/identity, operation watermark and pending state in one snapshot; binding requires an unused identity |
+| `GET /devices/{id}/status`                   | Authenticated read-only active/revoked status used before replacing a lost device identity                              |
+| `GET /scopes?scope=NAME`                     | Scope version, last clear identity and head in one snapshot; distinguishes independent edits from a clear               |
+| `GET /head`                                  | Small stored head, ETag, bodyless conditional 304                                                                       |
+| `POST /objects/missing`                      | Candidate `{hash,size}` array, decimal string sizes; response lists missing hashes                                      |
+| `POST /uploads/batch`, `POST /objects/batch` | Bounded full object batches                                                                                             |
+| `POST /uploads/frames`                       | Full/delta transfer batch, exact target verification; successful whole batch returns bodyless 204                       |
+| `POST /objects/transfer`                     | Array of `{target,bases}`; delta, full, or full-required frames                                                         |
+| `GET /objects/{hash}`                        | Bounded-memory stream, single Range/If-Range, ETag                                                                      |
+| `POST /objects/pins`                         | Renew device-owned 24-hour leases for up to 1024 hashes                                                                 |
+| `POST /uploads`                              | Begin `{hash,size}` manifest; returns `uploadId`                                                                        |
+| `PUT /uploads/{id}/chunks/{index}`           | Exact 1 MiB chunk except final remainder; `X-Content-SHA256` required                                                   |
+| `GET /uploads/{id}?after=INDEX`              | Paged verified chunk bitmap and completion status; optional `wait=true` waits up to 20 seconds                          |
+| `POST /uploads/{id}/complete`                | Below 64 MiB: verified CAS publication; otherwise durable 202 finalization job, resumed after restart                   |
+| `DELETE /uploads/{id}`                       | Owner-scoped cancellation                                                                                               |
+| `PUT /uploads/{id}/delta`                    | Attach an exact `RNSL` file recipe and queue durable reconstruction (202)                                               |
+| `POST /objects/delta`                        | Queue a file delta for `{target,bases}`, returning a stable device-owned `jobId`                                        |
+| `GET /object-deltas/{id}?wait=true`          | Delta bytes (200), explicit full-required (204), or pending (202); waits at most 20 seconds                             |
+| `DELETE /object-deltas/{id}`                 | Release or cancel this device's file-delta job                                                                          |
+| `POST /staged-changes`                       | Single-page convenience staging                                                                                         |
+| `POST /staged-changes/start`                 | Begin a multi-page staging set                                                                                          |
+| `PUT /staged-changes/{id}/pages/{index}`     | Consecutive pages, identical-page retry, conflicting retry rejected                                                     |
+| `GET /staged-changes/{id}`                   | Next page and optional sealed digest                                                                                    |
+| `POST /staged-changes/{id}/seal`             | Partition-independent streaming digest                                                                                  |
+| `DELETE /staged-changes/{id}`                | Cancellation before operation reservation                                                                               |
+| `POST /commits`                              | Durable operation reservation and atomic commit; required `If-Match`                                                    |
+| `GET /operations/{id}`                       | Owner-scoped pending status or terminal receipt                                                                         |
+| `GET /changes`                               | Fixed-through journal traversal                                                                                         |
+| `POST /read-pins`                            | Pin `{epoch,afterSeq}` through current head                                                                             |
+| `GET /read-pins/{id}`                        | Pinned journal pages with `afterSeq`, `afterOrdinal`, `limit`                                                           |
+| `DELETE /read-pins/{id}`                     | Release this device's traversal                                                                                         |
+| `POST /checkpoints`                          | Capture fixed record metadata                                                                                           |
+| `GET /checkpoints/{id}`                      | Pages with optional `afterKey` and `limit`                                                                              |
+| `DELETE /checkpoints/{id}`                   | Release this device's checkpoint                                                                                        |
+| `POST /acks`                                 | Monotonic per-device `{epoch,seq}`                                                                                      |
 
 For unpinned `/changes`, supply `epoch`, `afterSeq`, `afterOrdinal`, `throughSeq`,
 and optional `limit` (1–1024). Start after an applied commit using
@@ -286,8 +286,8 @@ Locally exercised targets on 2026-09-12:
 
 | Target                          | Tested host               |  Release binary | Runtime dependencies                        |
 | ------------------------------- | ------------------------- | --------------: | ------------------------------------------- |
-| Windows x86_64                  | Windows 11 build 26200    | 5,209,088 bytes | Windows system DLLs, UCRT, VCRUNTIME140.dll |
-| Linux x86_64                    | Ubuntu 24.04.4 under WSL2 | 6,963,552 bytes | glibc loader, libc, libm, libgcc_s          |
+| Windows x86_64                  | Windows 11 build 26200    | 5,209,600 bytes | Windows system DLLs, UCRT, VCRUNTIME140.dll |
+| Linux x86_64                    | Ubuntu 24.04.4 under WSL2 | 6,945,024 bytes | glibc loader, libc, libm, libgcc_s          |
 | Linux arm64, macOS x86_64/arm64 | Not run locally           |    Not measured | Not verified                                |
 
 These hosts do not establish minimum supported OS versions. Linux used an isolated
@@ -318,7 +318,7 @@ node --test crates/sync-wire/tests/golden.test.mjs
 cargo clippy --manifest-path server/sync/Cargo.toml --locked --all-targets -- -D warnings
 ```
 
-Native PDS regression tests passed 336 cases (10 explicit measurement/child tests
+Native PDS regression tests passed 342 cases (11 explicit measurement/child tests
 ignored in that invocation). Separate native transport tests passed 11, including
 exact large-object reconstruction, two concurrent chunk requests in each direction,
 413/429/524 retry, accepted-response loss and preserving a successful Range when

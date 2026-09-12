@@ -10,7 +10,15 @@ use std::collections::BTreeSet;
 
 impl Store {
     pub fn scope_state(&self, scope: &str) -> Result<(String, String)> {
-        let db = self.reader()?;
+        let (_, version, clear) = self.scope_snapshot(scope)?;
+        Ok((version, clear))
+    }
+    pub fn scope_snapshot(
+        &self,
+        scope: &str,
+    ) -> Result<(risunest_sync_wire::RemoteHead, String, String)> {
+        let mut connection = self.reader()?;
+        let db = connection.transaction()?;
         let version = Self::read_scope_version(&db, scope)?;
         let clear: Option<String> = db
             .query_row(
@@ -21,6 +29,7 @@ impl Store {
             .optional()?;
         let head = Self::read_head(&db)?;
         Ok((
+            head.clone(),
             version,
             clear.unwrap_or(hash(&canonical::encode(&[
                 "risunest-sync-clear-v1",

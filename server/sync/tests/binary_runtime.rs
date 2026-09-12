@@ -174,9 +174,9 @@ async fn thousand_small_objects_use_one_verified_frame_batch() {
         .unwrap()
         .error_for_status()
         .unwrap();
-    let verified: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert!(response.bytes().await.unwrap().is_empty());
     let hashes = objects.iter().map(|b| hash(b)).collect::<Vec<_>>();
-    assert_eq!(verified["verified"], serde_json::json!(hashes));
     eprintln!(
         "1000 small-object frame batch: request_body_bytes={body_bytes}, elapsed_ms={}",
         started.elapsed().as_millis()

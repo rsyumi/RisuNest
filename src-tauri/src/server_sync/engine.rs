@@ -505,7 +505,10 @@ impl PersistentStore {
         let mut client =
             ServerClient::with_cancellation(config.clone(), options.cancellation.clone())?;
         client.verified_bytes = options.verified_bytes.clone();
-        client.verify_identity()?;
+        let identity_head = client.verified_head()?;
+        let resume_may_commit = self
+            .server_pending()?
+            .is_some_and(|p| !p.phase.starts_with('{'));
         let cache = Cache::open(&self.repository_root.join("server-sync").join(
             risunest_sync_wire::hash(
                 format!("{}:{}", config.library_id, config.device_id).as_bytes(),
@@ -523,7 +526,13 @@ impl PersistentStore {
                 proposed_records: 0,
             }));
         }
-        let observed = client.head()?;
+        // A pending job may finish after the identity snapshot. Its completed
+        // receipt must be followed by a fresh head before remote catch-up.
+        let observed = if resume_may_commit {
+            client.head()?
+        } else {
+            identity_head
+        };
         if status
             .head
             .as_ref()
@@ -658,6 +667,7 @@ impl PersistentStore {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase", deny_unknown_fields)]
             struct Scope {
+                head: RemoteHead,
                 scope: String,
                 version: String,
                 clear_version: String,
@@ -669,7 +679,8 @@ impl PersistentStore {
                 None::<&()>,
                 &[],
             )?;
-            if scope.scope != "plugin-storage" || !client.head()?.same_revision(&through) {
+            scope.head.validate()?;
+            if scope.scope != "plugin-storage" || !scope.head.same_revision(&through) {
                 return Err(SyncError::new("server-head-changed", 409));
             }
             risunest_sync_wire::validate_hash(&scope.version)?;
