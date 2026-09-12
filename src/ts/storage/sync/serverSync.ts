@@ -42,6 +42,12 @@ export interface ServerCycleOptions {
   expectedRevision?: number;
   expectedHead?: ServerHead;
 }
+export type ServerSyncProgress =
+  | "saving"
+  | "preparing"
+  | "applying"
+  | "refreshing"
+  | "publishing";
 type Prepared =
   | { kind: "report"; result: ServerCycle }
   | {
@@ -78,8 +84,43 @@ export function createServerSyncFacade(options: {
   runtime: PeerSyncMutationRuntime;
   invoke?: NativeInvoke;
   restorePlugins?: () => Promise<void>;
+  onProgress?: (phase: ServerSyncProgress) => void;
+  onVerifiedBytes?: (bytes: string) => void;
 }) {
   const native = options.invoke ?? invoke;
+  const transfer = async <T>(
+    command: string,
+    args: Record<string, unknown>,
+  ): Promise<T> => {
+    let closed = false;
+    let sampling = false;
+    const sample = async () => {
+      if (sampling || !options.onVerifiedBytes) return;
+      sampling = true;
+      try {
+        const bytes = await native<string>("server_sync_verified_bytes");
+        if (
+          !closed &&
+          typeof bytes === "string" &&
+          /^(0|[1-9][0-9]{0,19})$/.test(bytes)
+        )
+          options.onVerifiedBytes(bytes);
+      } catch {
+        /* Progress must never change the synchronization outcome. */
+      } finally {
+        sampling = false;
+      }
+    };
+    const timer = options.onVerifiedBytes
+      ? setInterval(() => void sample(), 1000)
+      : undefined;
+    try {
+      return await native<T>(command, args);
+    } finally {
+      closed = true;
+      if (timer !== undefined) clearInterval(timer);
+    }
+  };
   let pendingRefresh:
     | {
         revision: number;
@@ -98,6 +139,7 @@ export function createServerSyncFacade(options: {
   const refresh = async (): Promise<string> => {
     const pending = pendingRefresh;
     if (!pending) throw new ServerSyncError("refresh-not-pending");
+    options.onProgress?.("refreshing");
     try {
       await pending.fence.refreshCommittedWorkingSet(pending.revision);
       await options.restorePlugins?.();
@@ -111,6 +153,7 @@ export function createServerSyncFacade(options: {
   const activate = async (): Promise<string> => {
     const pending = pendingActivation;
     if (!pending) throw new ServerSyncError("activation-not-pending");
+    options.onProgress?.("applying");
     let revision: number;
     try {
       revision = await native<number>("server_sync_activate", {
@@ -150,14 +193,18 @@ export function createServerSyncFacade(options: {
     cancelled = false;
     if (pendingActivation) {
       const preparationId = await activate();
-      return native<ServerCycle>("server_sync_publish", { preparationId });
+      options.onProgress?.("publishing");
+      return transfer<ServerCycle>("server_sync_publish", { preparationId });
     }
     if (pendingRefresh) {
       const preparationId = await refresh();
-      return native<ServerCycle>("server_sync_publish", { preparationId });
+      options.onProgress?.("publishing");
+      return transfer<ServerCycle>("server_sync_publish", { preparationId });
     }
+    options.onProgress?.("saving");
     await options.runtime.flushPendingData("server-sync-prepare");
-    const prepared = await native<Prepared>("server_sync_prepare", {
+    options.onProgress?.("preparing");
+    const prepared = await transfer<Prepared>("server_sync_prepare", {
       options: cycleOptions,
     });
     if (prepared.kind === "report") return prepared.result;
@@ -182,7 +229,8 @@ export function createServerSyncFacade(options: {
     }
     // The mutation fence has been released before any upload or server job
     // wait. New local edits become the durable outbox tail for the next run.
-    return native<ServerCycle>("server_sync_publish", {
+    options.onProgress?.("publishing");
+    return transfer<ServerCycle>("server_sync_publish", {
       preparationId: prepared.preparationId,
     });
   };

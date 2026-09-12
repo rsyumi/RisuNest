@@ -37,7 +37,9 @@
         : conflict
           ? text.conflict
           : snapshot.running
-            ? text.running
+            ? snapshot.progress
+              ? text.progress[snapshot.progress]
+              : text.running
             : snapshot.paused
               ? text.paused
               : snapshot.status?.operationPending
@@ -164,6 +166,13 @@
           {text.lastSuccess}: {new Date(
             snapshot.lastSuccessAt,
           ).toLocaleString()}
+        </p>
+      {/if}
+      {#if snapshot.verifiedBytes !== undefined}
+        <p class="text-xs opacity-65">
+          {text.verifiedBytes}: {BigInt(
+            snapshot.verifiedBytes,
+          ).toLocaleString()} B
         </p>
       {/if}
     </div>
@@ -338,6 +347,9 @@
 <style>
   .server-sync {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    min-width: 0;
+    overflow-wrap: anywhere;
     gap: 1rem;
     margin-block: 2rem;
   }
@@ -364,6 +376,7 @@
   }
   .connection {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 0.75rem;
     border-radius: 0.5rem;
     padding: 1rem;
@@ -371,6 +384,7 @@
   .connection-form,
   .field {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 0.5rem;
   }
   .connection-form {

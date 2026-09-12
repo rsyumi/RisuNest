@@ -25,6 +25,7 @@ pub(crate) struct ServerSyncCommandState {
     running: AtomicBool,
     cancelled: Mutex<Arc<AtomicBool>>,
     prepared: Mutex<Option<PreparedJob>>,
+    verified_bytes: Mutex<Arc<std::sync::atomic::AtomicU64>>,
 }
 struct Running<'a>(&'a ServerSyncCommandState);
 impl Drop for Running<'_> {
@@ -121,6 +122,15 @@ pub(crate) enum PreparedReply {
 #[tauri::command]
 pub(crate) async fn server_sync_status(app: AppHandle) -> Result<ReplicaStatus> {
     blocking(move || job_store(&app)?.server_status()).await
+}
+#[tauri::command]
+pub(crate) fn server_sync_verified_bytes(app: AppHandle) -> Result<String> {
+    let state = app.state::<ServerSyncCommandState>();
+    let counter = state
+        .verified_bytes
+        .lock()
+        .map_err(|_| SyncError::new("server-sync-state-unavailable", 503))?;
+    Ok(counter.load(Ordering::Relaxed).to_string())
 }
 #[tauri::command]
 pub(crate) async fn server_sync_bind(
@@ -222,6 +232,12 @@ pub(crate) async fn server_sync_prepare(
         let (_running, flag) = state.claim_preparation()?;
         state.require_no_preparation()?;
         options.cancellation = Some(flag);
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        *state
+            .verified_bytes
+            .lock()
+            .map_err(|_| SyncError::new("server-sync-state-unavailable", 503))? = counter.clone();
+        options.verified_bytes = Some(counter);
         let mut store = job_store(&app)?;
         match store.server_prepare_cycle(&options)? {
             Preparation::Report(result) => Ok(PreparedReply::Report { result }),

@@ -8,7 +8,11 @@ use risunest_sync_wire::{
     payload, RecordVersion, WireError, MAX_METADATA_BYTES,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, io::Cursor, path::Path};
+use std::{
+    collections::BTreeSet,
+    io::{Cursor, Read},
+    path::Path,
+};
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -35,18 +39,19 @@ impl Cache {
         Ok(self.cas.prepare_bytes(bytes)?.content_hash)
     }
     pub fn read(&self, hash: &str, limit: usize) -> Result<Vec<u8>> {
-        if self
+        let file = self
             .cas
-            .stat_object(hash)?
-            .ok_or_else(|| SyncError::new("cached-object-missing", 409))?
-            > limit as u64
-        {
+            .open_object(hash)?
+            .ok_or_else(|| SyncError::new("cached-object-missing", 409))?;
+        if file.metadata()?.len() > limit as u64 {
             return Err(SyncError::new("cached-object-too-large", 413));
         }
-        let bytes = self
-            .cas
-            .read_object(hash)?
-            .ok_or_else(|| SyncError::new("cached-object-missing", 409))?;
+        let mut bytes = Vec::new();
+        file.take((limit as u64).saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            return Err(SyncError::new("cached-object-too-large", 413));
+        }
         if risunest_sync_wire::hash(&bytes) != hash {
             return Err(SyncError::new("cached-object-corrupt", 409));
         }

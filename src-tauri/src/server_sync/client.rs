@@ -46,6 +46,7 @@ pub(crate) struct ServerClient {
     url: Url,
     config: ServerConfig,
     cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub(crate) verified_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 pub(crate) struct Reply {
     pub status: u16,
@@ -100,7 +101,13 @@ impl ServerClient {
             url,
             config,
             cancelled,
+            verified_bytes: None,
         })
+    }
+    pub fn verified(&self, bytes: u64) {
+        if let Some(counter) = &self.verified_bytes {
+            counter.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     pub fn ensure_active(&self) -> Result<()> {
         if self

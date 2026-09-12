@@ -43,6 +43,8 @@ pub(crate) struct CycleOptions {
     #[serde(skip)]
     pub cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     #[serde(skip)]
+    pub verified_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    #[serde(skip)]
     pub groups: BTreeSet<String>,
 }
 #[derive(Serialize)]
@@ -78,6 +80,7 @@ pub(crate) struct PreparedCycle {
     clear_acknowledged: bool,
     activated: Option<i64>,
     cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    verified_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 fn json<T: Serialize>(value: &T) -> Result<String> {
     String::from_utf8(canonical::encode(value)?)
@@ -439,6 +442,7 @@ impl PersistentStore {
                 after = key.clone();
                 let version: RecordVersion = parse(&version)?;
                 let mut objects = transfer.cache.closure(&version)?;
+                let mut base_lease = false;
                 let (base, _) = self.server_base(&key)?;
                 if let Ok(previous) = transfer.cache.closure(&base) {
                     let roots = base
@@ -449,6 +453,7 @@ impl PersistentStore {
                     if !roots.is_empty() {
                         match transfer.pin(&roots) {
                             Ok(()) => {
+                                base_lease = true;
                                 // The committed descriptor is a transitive GC root.
                                 // Its verified closure needs no 100k-hash missing query.
                                 let previous = previous.into_iter().collect::<BTreeSet<_>>();
@@ -470,7 +475,7 @@ impl PersistentStore {
                     }
                 }
                 let bases = self.server_base_candidates(&key, transfer.cache, false)?;
-                transfer.upload(&unsent, &bases)?;
+                transfer.upload_with_leased_bases(&unsent, &bases, base_lease)?;
             }
         }
         Ok(())
@@ -492,7 +497,9 @@ impl PersistentStore {
         if status.registration_required {
             return Err(SyncError::new("device-registration-required", 409));
         }
-        let client = ServerClient::with_cancellation(config.clone(), options.cancellation.clone())?;
+        let mut client =
+            ServerClient::with_cancellation(config.clone(), options.cancellation.clone())?;
+        client.verified_bytes = options.verified_bytes.clone();
         client.verify_identity()?;
         let cache = Cache::open(&self.repository_root.join("server-sync").join(
             risunest_sync_wire::hash(
@@ -716,6 +723,7 @@ impl PersistentStore {
                 expected_revision: options.expected_revision,
                 expected_head: options.expected_head.clone(),
                 cancellation: options.cancellation.clone(),
+                verified_bytes: options.verified_bytes.clone(),
                 groups: required_groups,
             });
         }
@@ -855,6 +863,7 @@ impl PersistentStore {
             clear_acknowledged,
             activated: None,
             cancellation: options.cancellation.clone(),
+            verified_bytes: options.verified_bytes.clone(),
         }))
     }
     /// No network work is allowed here. Production holds the JS mutation fence
@@ -897,7 +906,9 @@ impl PersistentStore {
         let config = self
             .server_config()?
             .ok_or_else(|| SyncError::new("server-not-bound", 409))?;
-        let client = ServerClient::with_cancellation(config.clone(), ready.cancellation.clone())?;
+        let mut client =
+            ServerClient::with_cancellation(config.clone(), ready.cancellation.clone())?;
+        client.verified_bytes = ready.verified_bytes.clone();
         let cache = Cache::open(&self.repository_root.join("server-sync").join(
             risunest_sync_wire::hash(
                 format!("{}:{}", config.library_id, config.device_id).as_bytes(),

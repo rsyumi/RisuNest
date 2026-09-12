@@ -27,13 +27,15 @@ fn native_client_roundtrips_large_objects_and_exact_delta_against_daemon() {
             .await
             .unwrap();
     });
-    let client = ServerClient::new(ServerConfig {
+    let mut client = ServerClient::new(ServerConfig {
         endpoint,
         library_id: credential.library_id.clone(),
         device_id: credential.device_id.clone(),
         token: credential.token.clone(),
     })
     .unwrap();
+    let verified = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    client.verified_bytes = Some(verified.clone());
     assert_eq!(client.head().unwrap(), server.head().unwrap());
     let first_dir = tempfile::tempdir().unwrap();
     let second_dir = tempfile::tempdir().unwrap();
@@ -62,6 +64,10 @@ fn native_client_roundtrips_large_objects_and_exact_delta_against_daemon() {
             .unwrap();
     }
     let download = Transfer::new(&client, &second).unwrap();
+    assert_eq!(
+        verified.load(std::sync::atomic::Ordering::Relaxed),
+        (base.len() + changed.len()) as u64
+    );
     download
         .download(std::slice::from_ref(&base_hash), &[])
         .unwrap();
@@ -77,6 +83,11 @@ fn native_client_roundtrips_large_objects_and_exact_delta_against_daemon() {
         changed
     );
     assert_eq!(server.get_object(&changed_hash).unwrap(), changed);
+    let completed = 2 * (base.len() + changed.len()) as u64;
+    assert_eq!(
+        verified.load(std::sync::atomic::Ordering::Relaxed),
+        completed
+    );
     // Cache and transfer database reopen without retransferring verified targets.
     drop(download);
     let reopened = Cache::open(second_dir.path()).unwrap();
@@ -84,6 +95,10 @@ fn native_client_roundtrips_large_objects_and_exact_delta_against_daemon() {
         .unwrap()
         .download(&[base_hash, changed_hash], &[])
         .unwrap();
+    assert_eq!(
+        verified.load(std::sync::atomic::Ordering::Relaxed),
+        completed
+    );
     task.abort();
     runtime.shutdown_timeout(std::time::Duration::from_secs(2));
 }

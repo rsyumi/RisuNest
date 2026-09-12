@@ -17,7 +17,7 @@ const result: ServerCycle = {
   appliedRecords: 1,
   proposedRecords: 0,
 };
-function fixture() {
+function fixture(onVerifiedBytes?: (bytes: string) => void) {
   const trace: string[] = [];
   let fenced = false;
   const fence = {
@@ -67,10 +67,66 @@ function fixture() {
   const facade = createServerSyncFacade({
     runtime: runtime as never,
     invoke: native as never,
+    onProgress: (phase) => progress.push(phase),
+    onVerifiedBytes,
   });
-  return { facade, native, runtime, fence, trace };
+  const progress: string[] = [];
+  return { facade, native, runtime, fence, trace, progress };
 }
 describe("server sync activation boundary", () => {
+  it("does not let a stalled progress reply hold completion or update a later cycle", async () => {
+    vi.useFakeTimers();
+    try {
+      const receive = vi.fn();
+      const { facade, native } = fixture(receive);
+      let finish!: (value: unknown) => void;
+      let progress!: (value: unknown) => void;
+      native.mockImplementation((command) => {
+        if (command === "server_sync_prepare")
+          return new Promise((resolve) => {
+            finish = resolve;
+          }) as never;
+        if (command === "server_sync_verified_bytes")
+          return new Promise((resolve) => {
+            progress = resolve;
+          }) as never;
+        throw new Error("Unexpected command");
+      });
+      const active = facade.cycle();
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(
+        native.mock.calls.filter(
+          ([command]) => command === "server_sync_verified_bytes",
+        ),
+      ).toHaveLength(1);
+      finish({ kind: "report", result });
+      await expect(active).resolves.toEqual(result);
+      progress("1234");
+      await Promise.resolve();
+      expect(receive).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("reports preparation, activation and publication in their actual order", async () => {
+    const { facade, progress, native } = fixture();
+    await facade.cycle();
+    expect(progress).toEqual([
+      "saving",
+      "preparing",
+      "applying",
+      "refreshing",
+      "publishing",
+    ]);
+    progress.length = 0;
+    native.mockResolvedValueOnce({
+      kind: "report",
+      result: { ...result, phase: "conflict" },
+    } as never);
+    await facade.cycle();
+    expect(progress).toEqual(["saving", "preparing"]);
+  });
   it("flushes local edits and guards recovery with the freshly read revision", async () => {
     const { facade, native, runtime } = fixture();
     native.mockResolvedValue({ localRevision: 19 } as never);

@@ -18,6 +18,8 @@ let controller: ReturnType<typeof createServerSyncController> | undefined;
 export function getServerSyncController() {
   return (controller ??= createServerSyncController(
     createServerSyncFacade({
+      onProgress: (phase) => controller?.reportProgress(phase),
+      onVerifiedBytes: (bytes) => controller?.reportVerifiedBytes(bytes),
       runtime: {
         flushPendingData,
         capturePersistentMutationToken,

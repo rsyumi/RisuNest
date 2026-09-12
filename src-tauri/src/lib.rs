@@ -628,6 +628,7 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
             server_sync::commands::server_sync_status,
+            server_sync::commands::server_sync_verified_bytes,
             server_sync::commands::server_sync_backups,
             server_sync::commands::server_sync_backup_source,
             server_sync::commands::server_sync_bind,

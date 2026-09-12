@@ -23,6 +23,7 @@ pub(crate) struct Transfer<'a> {
     pub client: &'a ServerClient,
     pub cache: &'a Cache,
     db: Connection,
+    base_sizes: std::cell::RefCell<Option<(Vec<String>, Vec<(String, u64)>)>>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -111,11 +112,28 @@ impl<'a> Transfer<'a> {
     pub fn new(client: &'a ServerClient, cache: &'a Cache) -> Result<Self> {
         let db = Connection::open(cache.cas.repository_root().join("transfers.sqlite"))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS uploads(hash TEXT PRIMARY KEY,id TEXT NOT NULL,size TEXT NOT NULL); CREATE TABLE IF NOT EXISTS chunks(target TEXT NOT NULL,part INTEGER NOT NULL,hash TEXT NOT NULL,size INTEGER NOT NULL,PRIMARY KEY(target,part));")?;
-        Ok(Self { client, cache, db })
+        Ok(Self {
+            client,
+            cache,
+            db,
+            base_sizes: std::cell::RefCell::new(None),
+        })
     }
+    #[cfg(test)]
     pub fn upload(&self, hashes: &[String], base_candidates: &[String]) -> Result<()> {
+        self.upload_with_leased_bases(hashes, base_candidates, false)
+    }
+    /// The caller may reuse a successfully renewed committed descriptor lease.
+    /// It protects every candidate in that descriptor's verified closure.
+    pub fn upload_with_leased_bases(
+        &self,
+        hashes: &[String],
+        base_candidates: &[String],
+        base_lease: bool,
+    ) -> Result<()> {
         for page in hashes.chunks(1024) {
             let mut descriptors = Vec::with_capacity(page.len());
+            let mut sizes = std::collections::BTreeMap::new();
             for hash in page {
                 let size = self
                     .cache
@@ -123,6 +141,7 @@ impl<'a> Transfer<'a> {
                     .stat_object(hash)?
                     .ok_or_else(|| SyncError::new("cached-object-missing", 409))?;
                 descriptors.push(serde_json::json!({"hash":hash,"size":size.to_string()}));
+                sizes.insert(hash.as_str(), size);
             }
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
@@ -148,16 +167,12 @@ impl<'a> Transfer<'a> {
                 .cloned()
                 .collect::<Vec<_>>();
             let mut candidates = BTreeSet::new();
-            for target in &missing.missing {
-                let size = self
-                    .cache
-                    .cas
-                    .stat_object(target)?
-                    .ok_or_else(|| SyncError::new("cached-object-missing", 409))?;
+            for target in missing.missing.iter().filter(|_| !base_lease) {
+                let size = sizes[target.as_str()];
                 candidates.extend(if size > delta::MAX_TARGET_BYTES as u64 {
                     self.large_bases(target, size, base_candidates)?
                 } else {
-                    self.select_bases(target, base_candidates)?
+                    self.select_bases(target, Some(size), base_candidates)?
                 });
             }
             let mut leased = present.clone();
@@ -174,17 +189,14 @@ impl<'a> Transfer<'a> {
             let mut used = 8usize;
             let mut materialized = 0usize;
             for target in &missing.missing {
-                let size = self
-                    .cache
-                    .cas
-                    .stat_object(target)?
-                    .ok_or_else(|| SyncError::new("cached-object-missing", 409))?;
+                let size = sizes[target.as_str()];
                 if size > delta::MAX_TARGET_BYTES as u64 {
                     self.upload_large(target, size, base_candidates)?;
+                    self.client.verified(size);
                     continue;
                 }
                 let bytes = self.cache.read(target, delta::MAX_TARGET_BYTES)?;
-                let candidates = self.select_bases(target, base_candidates)?;
+                let candidates = self.select_bases(target, Some(size), base_candidates)?;
                 let mut frame = None;
                 if !candidates.is_empty() {
                     // Missing/collected bases are an explicit full fallback, never
@@ -218,12 +230,14 @@ impl<'a> Transfer<'a> {
                     Ok(bytes) => bytes.len() - 8,
                     Err(_) if size >= CHUNK as u64 => {
                         self.upload_large(target, size, base_candidates)?;
+                        self.client.verified(size);
                         continue;
                     }
                     Err(e) => return Err(e.into()),
                 };
                 if length + 8 > transfer::PREFERRED_BATCH_BYTES && matches!(frame, Frame::Full(_)) {
                     self.upload_large(target, size, base_candidates)?;
+                    self.client.verified(size);
                     continue;
                 }
                 if used + length > transfer::PREFERRED_BATCH_BYTES
@@ -257,6 +271,13 @@ impl<'a> Transfer<'a> {
         if !(200..300).contains(&reply.status) {
             return Err(response_error(reply));
         }
+        for frame in frames {
+            self.client.verified(match frame {
+                Frame::Full(bytes) => bytes.len() as u64,
+                Frame::Delta(recipe) => recipe.target_size,
+                Frame::FullRequired { .. } => 0,
+            });
+        }
         Ok(())
     }
     pub fn pin(&self, hashes: &[String]) -> Result<()> {
@@ -275,16 +296,23 @@ impl<'a> Transfer<'a> {
         }
         Ok(())
     }
-    fn select_bases(&self, target: &str, candidates: &[String]) -> Result<Vec<String>> {
+    fn select_bases(
+        &self,
+        target: &str,
+        target_size: Option<u64>,
+        candidates: &[String],
+    ) -> Result<Vec<String>> {
         let mut result = Vec::new();
         let mut total = 0;
-        let target_size = self.cache.cas.stat_object(target)?;
+        // The minimum useful recipe saving is 64 bytes, so no base can help a
+        // smaller full object. Avoid repeatedly opening unrelated metadata bases.
+        if target_size.is_some_and(|size| size <= 64) {
+            return Ok(Vec::new());
+        }
         let mut ranked = Vec::new();
-        for candidate in candidates {
-            if let Some(size) = self.cache.cas.stat_object(candidate)? {
-                if size <= delta::MAX_TARGET_BYTES as u64 {
-                    ranked.push((candidate, size));
-                }
+        for (candidate, size) in self.candidate_sizes(candidates)? {
+            if size <= delta::MAX_TARGET_BYTES as u64 {
+                ranked.push((candidate, size));
             }
         }
         ranked.sort_by_key(|(_, size)| {
@@ -292,23 +320,40 @@ impl<'a> Transfer<'a> {
                 .map(|target| target.abs_diff(*size))
                 .unwrap_or(u64::MAX - *size)
         });
-        for (candidate, _) in ranked {
-            if candidate == target || result.contains(candidate) {
+        for (candidate, size) in ranked {
+            if candidate == target || result.contains(&candidate) {
                 continue;
             }
-            if let Some(size) = self.cache.cas.stat_object(candidate)? {
-                if size <= delta::MAX_TARGET_BYTES as u64
-                    && total + size <= delta::MAX_BASE_BYTES as u64
-                {
-                    result.push(candidate.clone());
-                    total += size;
-                    if result.len() == delta::MAX_BASES {
-                        break;
-                    }
+            if size <= delta::MAX_TARGET_BYTES as u64
+                && total + size <= delta::MAX_BASE_BYTES as u64
+            {
+                result.push(candidate);
+                total += size;
+                if result.len() == delta::MAX_BASES {
+                    break;
                 }
             }
         }
         Ok(result)
+    }
+    fn candidate_sizes(&self, candidates: &[String]) -> Result<Vec<(String, u64)>> {
+        if let Some((keys, sizes)) = &*self.base_sizes.borrow() {
+            if keys == candidates {
+                return Ok(sizes.clone());
+            }
+        }
+        let mut sizes = Vec::new();
+        for candidate in candidates {
+            if let Some(size) = self.cache.cas.stat_object(candidate)? {
+                sizes.push((candidate.clone(), size));
+            }
+        }
+        // Only one record's immutable base inventory is retained. Missing entries
+        // are not cached, since a subsequent download may make them available.
+        if sizes.len() == candidates.len() {
+            *self.base_sizes.borrow_mut() = Some((candidates.to_vec(), sizes.clone()));
+        }
+        Ok(sizes)
     }
     pub fn download(&self, hashes: &[String], base_candidates: &[String]) -> Result<()> {
         for page in hashes.chunks(1024) {
@@ -325,7 +370,7 @@ impl<'a> Transfer<'a> {
             }
             let mut requests = Vec::new();
             for target in &missing {
-                requests.push(serde_json::json!({"target":target,"bases":self.select_bases(target,base_candidates)?}));
+                requests.push(serde_json::json!({"target":target,"bases":self.select_bases(target,None,base_candidates)?}));
             }
             let reply = self.client.request(
                 Method::POST,
@@ -349,6 +394,7 @@ impl<'a> Transfer<'a> {
                             return Err(SyncError::new("transfer-target-mismatch", 502));
                         }
                         self.cache.put(&bytes)?;
+                        self.client.verified(bytes.len() as u64);
                     }
                     Frame::Delta(recipe) => {
                         if recipe.target_hash != *target {
@@ -362,6 +408,7 @@ impl<'a> Transfer<'a> {
                         let bytes =
                             recipe.apply(&bases.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
                         self.cache.put(&bytes)?;
+                        self.client.verified(bytes.len() as u64);
                     }
                     Frame::FullRequired { hash, size } => {
                         if hash != *target {
@@ -370,6 +417,7 @@ impl<'a> Transfer<'a> {
                         if !self.download_delta(target, size, base_candidates)? {
                             self.download_large(target, size)?;
                         }
+                        self.client.verified(size);
                     }
                 }
             }
@@ -378,16 +426,14 @@ impl<'a> Transfer<'a> {
     }
     fn large_bases(&self, target: &str, size: u64, candidates: &[String]) -> Result<Vec<String>> {
         let mut ranked = Vec::new();
-        for candidate in candidates {
+        for (candidate, bytes) in self.candidate_sizes(candidates)? {
             if candidate == target {
                 continue;
             }
-            if let Some(bytes) = self.cache.cas.stat_object(candidate)? {
-                if bytes > delta::MAX_TARGET_BYTES as u64
-                    && bytes <= risunest_sync_wire::stream_delta::MAX_FILE_BYTES
-                {
-                    ranked.push((candidate.clone(), bytes));
-                }
+            if bytes > delta::MAX_TARGET_BYTES as u64
+                && bytes <= risunest_sync_wire::stream_delta::MAX_FILE_BYTES
+            {
+                ranked.push((candidate, bytes));
             }
         }
         ranked.sort_by_key(|(_, bytes)| size.abs_diff(*bytes));

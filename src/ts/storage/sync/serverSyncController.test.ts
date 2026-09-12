@@ -33,6 +33,42 @@ function fixture() {
 }
 afterEach(() => vi.useRealTimers());
 describe("server sync controller", () => {
+  it.each(["idle", "conflict"])(
+    "keeps the %s result when progress publishes while the cycle awaits",
+    async (phase) => {
+      const { controller, facade } = fixture();
+      const result = { phase, conflictCount: phase === "conflict" ? 1 : 0 };
+      facade.cycle.mockImplementationOnce(async () => {
+        controller.reportProgress("preparing");
+        await Promise.resolve();
+        controller.reportVerifiedBytes("1234");
+        controller.reportProgress("publishing");
+        return result;
+      });
+      await controller.synchronize();
+      expect(controller.snapshot().error).toBe("");
+      expect(controller.snapshot().result).toEqual(result);
+      expect(controller.snapshot().verifiedBytes).toBe("1234");
+      expect(controller.snapshot().status?.configured).toBe(true);
+      expect(controller.snapshot().progress).toBeUndefined();
+      if (phase === "idle")
+        expect(controller.snapshot().lastSuccessAt).toBeDefined();
+      else expect(controller.canAutoSync()).toBe(false);
+    },
+  );
+  it("shows progress only while a synchronization is active and clears it on failure", async () => {
+    const { controller, facade } = fixture();
+    controller.reportProgress("publishing");
+    expect(controller.snapshot().progress).toBeUndefined();
+    facade.cycle.mockImplementationOnce(async () => {
+      controller.reportProgress("preparing");
+      expect(controller.snapshot().progress).toBe("preparing");
+      throw { code: "server-timeout" };
+    });
+    await controller.synchronize();
+    expect(controller.snapshot().progress).toBeUndefined();
+    expect(controller.snapshot().error).toBe("server-timeout");
+  });
   it("reports the last completed synchronization without replacing it on failure or conflict", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(1000);
