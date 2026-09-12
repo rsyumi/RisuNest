@@ -81,6 +81,14 @@ export interface SharedNativeFileOperationOptions {
 export const nativeFileOperation = writable<NativeFileOperationState | null>(null)
 export const nativeFileOperationOutcome = writable<NativeFileOperationOutcome | null>(null)
 
+/**
+ * Which surface draws a dialog-presented operation. The onboarding takes
+ * backup restores into its own panel while it is on screen; the shared
+ * dialog draws everything else.
+ */
+export type NativeFileJobHost = 'dialog' | 'onboarding'
+export const nativeFileJobHost = writable<NativeFileJobHost>('dialog')
+
 let activeOperation: Promise<unknown> | null = null
 let activeOperationKey: string | null = null
 let activeController: AbortController | null = null

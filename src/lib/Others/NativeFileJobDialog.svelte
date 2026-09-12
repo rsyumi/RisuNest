@@ -6,6 +6,7 @@
     import {
         cancelActiveNativeFileOperation,
         dismissNativeFileOperationOutcome,
+        nativeFileJobHost,
         nativeFileOperation,
         nativeFileOperationOutcome,
     } from 'src/ts/storage/nativeFileJobManager'
@@ -16,7 +17,11 @@
     let copied = $state(false)
 
     const model = $derived(buildNativeFileJobDialogModel($nativeFileOperation, $nativeFileOperationOutcome, now))
-    const ticking = $derived(model.open && model.terminal === null)
+    // Backup restores belong to the onboarding panel while it is up; content
+    // imports stay here because the onboarding has no screen for them.
+    const embedded = $derived($nativeFileJobHost === 'onboarding' && !model.compact)
+    const open = $derived(model.open && !embedded)
+    const ticking = $derived(open && model.terminal === null)
     const copy = $derived(language.risuNest.importDialog)
 
     $effect(() => {
@@ -27,7 +32,7 @@
     })
 
     $effect(() => {
-        if (model.open) panel?.focus()
+        if (open) panel?.focus()
     })
 
     $effect(() => {
@@ -50,7 +55,7 @@
     }
 </script>
 
-{#if model.open}
+{#if open}
     <div class="fixed inset-0 z-[1000] flex items-center justify-center bg-black/60 p-4">
         <div
             bind:this={panel}

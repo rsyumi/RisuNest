@@ -7,7 +7,8 @@
     import ChatScreen from './lib/ChatScreens/ChatScreen.svelte';
     import AlertComp from './lib/Others/AlertComp.svelte';
     import RealmPopUp from './lib/UI/Realm/RealmPopUp.svelte';
-    import WelcomeRisu from './lib/Others/WelcomeRisu.svelte';
+    import Onboarding from './lib/Others/Onboarding/Onboarding.svelte';
+    import { onboardingHold } from './lib/Others/Onboarding/onboardingGate';
     import BookmarkList from './lib/Others/BookmarkList.svelte';
     import { showRealmInfoStore, importCharacterProcess } from './ts/characterCards';
     import { importPreset, getDatabase, setDatabase } from './ts/storage/database.svelte';
@@ -333,8 +334,8 @@
                 >
             </div>
         {/await}
-    {:else if !didFirstSetup}
-        <WelcomeRisu />
+    {:else if !didFirstSetup || $onboardingHold}
+        <Onboarding />
     {:else if $settingsOpen}
         {#await loadSettings()}
             <div
