@@ -101,14 +101,14 @@ fn server_projection_preserves_all_families_and_removes_only_local_activity() {
             assert!(payload.messages.is_some());
         }
         match &payload.record {
-            crate::peer_sync::logical_delta::LogicalRecordEnvelope::Root { value, .. } => {
+            crate::logical_records::LogicalRecordEnvelope::Root { value, .. } => {
                 assert_eq!(value["openAIKey"], "synthetic-provider-secret");
                 assert_eq!(
                     value["syntheticPreference"],
                     json!({"enabled":true,"value":"unchanged"})
                 );
             }
-            crate::peer_sync::logical_delta::LogicalRecordEnvelope::Plugin { value, .. }
+            crate::logical_records::LogicalRecordEnvelope::Plugin { value, .. }
                 if key.key1 == "synthetic-secret-contract" =>
             {
                 assert_eq!(value, &plugin_value)

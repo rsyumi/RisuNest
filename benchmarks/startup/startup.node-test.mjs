@@ -121,7 +121,6 @@ test('every measured source boundary exists in the current checkout', async () =
         'storage/databasePreparation.ts',
         'storage/saveCoordinatorHelpers.ts',
         'storage/saveCoordinator.ts',
-        'storage/sync/deviceSyncController.ts',
         'bootstrap.ts',
         'globalApi.svelte.ts',
     ]) {

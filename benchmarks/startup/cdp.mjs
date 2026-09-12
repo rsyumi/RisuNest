@@ -116,7 +116,7 @@ export const instrumentation = `(() => {
     const commands = new Set(['pds_open', 'pds_materialize', 'pds_commit', 'pds_replace_commit',
         'pds_read_root', 'pds_query_characters', 'pds_snapshot_create', 'pds_snapshot_list',
         'pds_read_character', 'pds_query_conversations', 'pds_read_conversation_window', 'pds_read_conversation',
-        'pds_asset_gc_maintenance', 'device_sync_prepare', 'plugin:fs|read_dir', 'plugin:fs|stat',
+        'pds_asset_gc_maintenance', 'plugin:fs|read_dir', 'plugin:fs|stat',
         'asset_cas_read_object', 'asset_cas_read_object_range', 'asset_cas_stat_object']);
     const state = window.__startupMetrics = { calls: [], longTasks: [], operations: [], phases: [], active: {}, elapsedSeen: false, firstRevision: null, interaction: null };
     state.peakHeapBytes = 0; state.mediaInFlight = 0; state.maxMediaInFlight = 0; state.cleanChunksReason = 0;

@@ -17,10 +17,6 @@ const defaults = {
     performanceProfile: 'normal',
     androidKeepAliveDuringGeneration: true,
     nativeFileLogEnabled: true,
-    syncAutoListen: false,
-    syncListenMethod: 'lan',
-    syncFixedPort: 32145,
-    syncPublicBaseUrl: '',
 }
 
 describe('device settings', () => {
@@ -51,13 +47,6 @@ describe('device settings', () => {
         expect(getDeviceSettings().androidKeepAliveDuringGeneration).toBe(false)
     })
 
-    it.each([0, 65536, -1, 1.5])('recovers exact defaults from an invalid stored port %s', async (syncFixedPort) => {
-        localStorage.setItem('risuNestDeviceSettings', JSON.stringify({ ...defaults, syncFixedPort }))
-
-        const deviceSettings = await loadDeviceSettings()
-
-        expect(deviceSettings.getDeviceSettings()).toEqual(defaults)
-    })
 
     it('recovers defaults from malformed stored JSON', async () => {
         localStorage.setItem('risuNestDeviceSettings', '{not json')
@@ -95,7 +84,7 @@ describe('device settings', () => {
         expect(setProfile).toHaveBeenCalledWith('normal')
 
         deviceSettings.getDeviceSettings()
-        deviceSettings.updateDeviceSettings({ syncAutoListen: true })
+        deviceSettings.updateDeviceSettings({ nativeFileLogEnabled: false })
         const unsubscribe = deviceSettings.subscribeDeviceSettings(vi.fn())
         unsubscribe()
 
@@ -117,12 +106,14 @@ describe('device settings', () => {
         expect(getItem).not.toHaveBeenCalled()
         expect(setProfile).not.toHaveBeenCalled()
 
-        const updated = deviceSettings.updateDeviceSettings({ syncAutoListen: true })
+        const updated = deviceSettings.updateDeviceSettings({
+            nativeFileLogEnabled: false,
+        })
 
         expect(updated).toEqual({
             ...defaults,
             performanceProfile: 'low-spec',
-            syncAutoListen: true,
+            nativeFileLogEnabled: false,
         })
         expect(getItem).toHaveBeenCalledOnce()
         expect(setProfile).toHaveBeenCalledOnce()
@@ -159,11 +150,19 @@ describe('device settings', () => {
         expect(deviceSettings.getDeviceSettings()).toEqual(defaults)
 
         getItem.mockRestore()
-        const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
-            throw new Error('blocked write')
-        })
-        expect(() => deviceSettings.updateDeviceSettings({ syncAutoListen: true })).not.toThrow()
-        expect(deviceSettings.getDeviceSettings().syncAutoListen).toBe(true)
+        const setItem = vi
+            .spyOn(Storage.prototype, 'setItem')
+            .mockImplementation(() => {
+                throw new Error('blocked write')
+            })
+        expect(() =>
+            deviceSettings.updateDeviceSettings({
+                nativeFileLogEnabled: false,
+            }),
+        ).not.toThrow()
+        expect(deviceSettings.getDeviceSettings().nativeFileLogEnabled).toBe(
+            false,
+        )
         setItem.mockRestore()
     })
 
@@ -174,10 +173,6 @@ describe('device settings', () => {
             performanceProfile: 'low-spec',
             androidKeepAliveDuringGeneration: true,
             nativeFileLogEnabled: false,
-            syncAutoListen: true,
-            syncListenMethod: 'fixed-url',
-            syncFixedPort: 43000,
-            syncPublicBaseUrl: 'https://sync.example.test',
         })
 
         expect(getDeviceSettings()).toEqual({
@@ -185,67 +180,75 @@ describe('device settings', () => {
             performanceProfile: 'low-spec',
             androidKeepAliveDuringGeneration: true,
             nativeFileLogEnabled: false,
-            syncAutoListen: true,
-            syncListenMethod: 'fixed-url',
-            syncFixedPort: 43000,
-            syncPublicBaseUrl: 'https://sync.example.test',
         })
         expect(JSON.parse(localStorage.getItem('risuNestDeviceSettings') ?? '')).toEqual(getDeviceSettings())
     })
 
-    it.each([0, 65536])('recovers exact defaults from an invalid updated port %s', async (syncFixedPort) => {
-        const { getDeviceSettings, updateDeviceSettings } = await loadDeviceSettings()
-        updateDeviceSettings({ syncAutoListen: true })
-
-        updateDeviceSettings({ syncFixedPort })
-
-        expect(getDeviceSettings()).toEqual(defaults)
-        expect(JSON.parse(localStorage.getItem('risuNestDeviceSettings') ?? '')).toEqual(defaults)
-    })
 
     it('ignores a runtime schema override while applying valid settings', async () => {
         const { getDeviceSettings, updateDeviceSettings } = await loadDeviceSettings()
 
         updateDeviceSettings({
             schema: 'not-a-device-settings-schema',
-            syncAutoListen: true,
+            nativeFileLogEnabled: false,
         } as never)
 
-        expect(getDeviceSettings()).toEqual({ ...defaults, syncAutoListen: true })
+        expect(getDeviceSettings()).toEqual({
+            ...defaults,
+            nativeFileLogEnabled: false,
+        })
     })
 
     it('returns an isolated normalized snapshot after persistence and notification', async () => {
         const { getDeviceSettings, subscribeDeviceSettings, updateDeviceSettings } = await loadDeviceSettings()
         const listener = vi.fn(() => {
-            expect(JSON.parse(localStorage.getItem('risuNestDeviceSettings') ?? '')).toEqual({
+            expect(
+                JSON.parse(
+                    localStorage.getItem('risuNestDeviceSettings') ?? '',
+                ),
+            ).toEqual({
                 ...defaults,
-                syncFixedPort: 43000,
+                androidKeepAliveDuringGeneration: false,
             })
         })
         subscribeDeviceSettings(listener)
 
-        const updated = updateDeviceSettings({ syncFixedPort: 43000 })
+        const updated = updateDeviceSettings({
+            androidKeepAliveDuringGeneration: false,
+        })
 
         expect(listener).toHaveBeenCalledOnce()
-        expect(updated).toEqual({ ...defaults, syncFixedPort: 43000 })
-        updated.syncFixedPort = 1
-        expect(getDeviceSettings().syncFixedPort).toBe(43000)
+        expect(updated).toEqual({
+            ...defaults,
+            androidKeepAliveDuringGeneration: false,
+        })
+        updated.androidKeepAliveDuringGeneration = true
+        expect(getDeviceSettings().androidKeepAliveDuringGeneration).toBe(false)
     })
 
     it('returns immutable snapshots and notifies only active subscribers', async () => {
-        const { getDeviceSettings, subscribeDeviceSettings, updateDeviceSettings } = await loadDeviceSettings()
+        const {
+            getDeviceSettings,
+            subscribeDeviceSettings,
+            updateDeviceSettings,
+        } = await loadDeviceSettings()
         const listener = vi.fn()
         const unsubscribe = subscribeDeviceSettings(listener)
         const snapshot = getDeviceSettings()
-        ;(snapshot as { syncFixedPort: number }).syncFixedPort = 1
+        ;(
+            snapshot as { androidKeepAliveDuringGeneration: boolean }
+        ).androidKeepAliveDuringGeneration = true
 
-        updateDeviceSettings({ syncFixedPort: 43000 })
+        updateDeviceSettings({ androidKeepAliveDuringGeneration: false })
         unsubscribe()
-        updateDeviceSettings({ syncFixedPort: 43001 })
+        updateDeviceSettings({ androidKeepAliveDuringGeneration: true })
 
-        expect(getDeviceSettings().syncFixedPort).toBe(43001)
+        expect(getDeviceSettings().androidKeepAliveDuringGeneration).toBe(true)
         expect(listener).toHaveBeenCalledTimes(1)
-        expect(listener).toHaveBeenCalledWith({ ...defaults, syncFixedPort: 43000 })
+        expect(listener).toHaveBeenCalledWith({
+            ...defaults,
+            androidKeepAliveDuringGeneration: false,
+        })
     })
 
     it('applies a changed performance profile immediately', async () => {

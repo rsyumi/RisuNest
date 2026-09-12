@@ -13,26 +13,27 @@ const pageSource = normalizeNewlines(pageRawSource)
 const backupRestoreSource = normalizeNewlines(backupRestoreRawSource)
 const tauriLibSource = normalizeNewlines(tauriLibRawSource)
 
-function expectExactRustBlock(source: string, block: string): void {
-    expect(source.split(block)).toHaveLength(2)
-}
 
 describe('RisuNest settings navigation', () => {
-    it('places RisuNest and Tauri-only Device Sync before plugin-added entries', () => {
+    it('places RisuNest before plugin-added entries', () => {
         expect(settingsSource).toContain('Wrench')
         expect(settingsSource).toContain('$SettingsMenuIndex === 17')
         expect(settingsSource).toContain('language.risuNest.menuTitle')
-        expect(settingsSource).toContain('MonitorSmartphone')
-        expect(settingsSource).toContain('{#if isTauri}')
-        expect(settingsSource).toContain('$SettingsMenuIndex === 18')
-        expect(settingsSource).toContain('{#each additionalSettingsMenu as menu}')
-        expect(settingsSource.indexOf('$SettingsMenuIndex === 17')).toBeLessThan(settingsSource.indexOf('{#each additionalSettingsMenu as menu}'))
-        expect(settingsSource.indexOf('$SettingsMenuIndex === 18')).toBeLessThan(settingsSource.indexOf('{#each additionalSettingsMenu as menu}'))
+        expect(settingsSource).toContain(
+            '{#each additionalSettingsMenu as menu}',
+        )
+        expect(
+            settingsSource.indexOf('$SettingsMenuIndex === 17'),
+        ).toBeLessThan(
+            settingsSource.indexOf('{#each additionalSettingsMenu as menu}'),
+        )
     })
 
-    it('dispatches both dedicated pages', () => {
+    it('dispatches the RisuNest page with server settings', () => {
         expect(settingsSource).toContain('<RisuNestSettings />')
-        expect(settingsSource).toContain('<DeviceSyncSettings />')
+        expect(pageSource).toContain('<ServerSyncSettings />')
+        expect(settingsSource).not.toContain('DeviceSyncSettings')
+        expect(settingsSource).not.toContain('$SettingsMenuIndex === 18')
     })
 
     it('renders final RisuNest groups in order with platform gates', () => {
@@ -85,9 +86,6 @@ describe('RisuNest backup and restore layout', () => {
 })
 
 describe('RisuNest native command integration', () => {
-    const setupStart = tauriLibSource.indexOf('.setup(move |app| {')
-    const setupEnd = tauriLibSource.indexOf('Ok(())', setupStart)
-    const setupSource = tauriLibSource.slice(setupStart, setupEnd)
     const handlerStart = tauriLibSource.indexOf('.invoke_handler(tauri::generate_handler![')
     const handlerEnd = tauriLibSource.indexOf('])\n        .build(', handlerStart)
     const handlerSource = tauriLibSource.slice(handlerStart, handlerEnd)
@@ -96,97 +94,31 @@ describe('RisuNest native command integration', () => {
         'pds_snapshot_delete',
         'pds_asset_gc_preview',
         'pds_asset_gc_execute',
-        'peer_backup_list',
-        'peer_backup_delete',
-        'peer_temp_usage',
-        'peer_temp_cleanup',
         'native_log_tail',
         'native_log_file_path',
         'native_log_set_file_enabled',
-        'peer_sync_outgoing_devices',
-        'peer_sync_incoming_sources',
-        'peer_sync_remove_incoming_source',
-        'peer_sync_revoke_outgoing_device',
-        'device_sync_prepare',
-        'device_sync_start',
-        'device_sync_status',
-        'device_sync_stop',
-        'device_sync_rotate_link',
-        'device_sync_source_reserve',
-        'peer_clone_claim_registered_client',
-        'peer_delta_pull_registered',
-        'peer_delta_target_retained',
-        'peer_delta_target_abandon',
-        'peer_bidirectional_sync_registered',
-        'peer_bidirectional_resolve_registered',
     ]
 
     it.each(commands)('registers %s exactly once', (command) => {
         expect(handlerSource.match(new RegExp(`\\b${command}\\b`, 'g')) ?? []).toHaveLength(1)
     })
 
-    it('manages the target-specific unified sharing state exactly once', () => {
-        expectExactRustBlock(setupSource, `#[cfg(desktop)]
-            app.manage(peer_sync::shared_session::DeviceSyncSourceState::default());`)
-        expectExactRustBlock(setupSource, `#[cfg(target_os = "android")]
-            app.manage(peer_sync::shared_session::AndroidDeviceSyncSourceState::default());`)
-    })
-
-    it.each([
-        'device_sync_prepare',
-        'device_sync_start',
-        'device_sync_status',
-        'device_sync_stop',
-        'device_sync_rotate_link',
-    ])('exposes shared_session::%s on desktop and Android', (command) => {
-        expectExactRustBlock(handlerSource, `#[cfg(any(desktop, target_os = "android"))]
-            peer_sync::shared_session::${command},`)
-    })
-
-    it('registers the Android source reservation command only on Android', () => {
-        expectExactRustBlock(handlerSource, `#[cfg(target_os = "android")]
-            peer_sync::shared_session::device_sync_source_reserve,`)
-    })
-
-    it('uses target-exclusive canonical v2 clone claim handlers', () => {
-        expectExactRustBlock(handlerSource, `#[cfg(desktop)]
-            peer_sync::commands::peer_clone_claim_v2_client,`)
-        expectExactRustBlock(handlerSource, `#[cfg(target_os = "android")]
-            peer_sync::registered_target_commands::peer_clone_claim_v2_client,`)
-    })
-
-    it('exposes registered reconnect commands on both supported native targets', () => {
+    it('keeps server commands and Python cleanup without a peer runtime', () => {
+        expect(tauriLibSource).not.toContain('peer_sync')
         for (const command of [
-            'peer_clone_claim_registered_client',
-            'peer_delta_pull_registered',
-            'peer_bidirectional_sync_registered',
-            'peer_bidirectional_resolve_registered',
+            'server_sync_bind',
+            'server_sync_backup_inventory',
+            'server_sync_backup_delete',
+            'server_sync_cache_usage',
+            'server_sync_cache_cleanup',
         ]) {
-            expectExactRustBlock(handlerSource, `#[cfg(any(desktop, target_os = "android"))]
-            peer_sync::registered_target_commands::${command},`)
+            expect(
+                handlerSource.match(new RegExp(`\\b${command}\\b`, 'g')) ?? [],
+            ).toHaveLength(1)
         }
-    })
-
-    it('exposes the retained delta completion commands on desktop and Android', () => {
-        for (const command of ['peer_delta_target_retained', 'peer_delta_target_abandon']) {
-            expectExactRustBlock(handlerSource, `#[cfg(any(desktop, target_os = "android"))]
-            peer_sync::delta_commands::${command},`)
-        }
-    })
-
-    it('preserves directional registry commands on desktop and Android', () => {
-        for (const command of [
-            'peer_sync_outgoing_devices',
-            'peer_sync_incoming_sources',
-            'peer_sync_remove_incoming_source',
-            'peer_sync_revoke_outgoing_device',
-        ]) {
-            expectExactRustBlock(handlerSource, `#[cfg(any(desktop, target_os = "android"))]
-            peer_sync::registry_commands::${command},`)
-        }
+        expect(tauriLibSource).toContain('run_event_requires_python_shutdown')
     })
 })
-
 describe('RisuNest startup failure language schema', () => {
     const required = ['title', 'schemaUnsupported', 'storeOpen', 'unknown', 'restart', 'copyDetails', 'copied', 'dataPathWindows', 'dataPathAndroid', 'stage']
 
@@ -201,22 +133,5 @@ describe('RisuNest startup failure language schema', () => {
         for (const translation of [languageEnglish, languageKorean]) {
             expect(translation.risuNest.boot.dataPathWindows).toContain('%APPDATA%\\RisuNest\\')
         }
-    })
-})
-
-describe('RisuNest sync language schema', () => {
-    const required = ['share.title', 'share.stateOff', 'share.methodLan', 'share.fixedGuideBody', 'share.errorLanAddressUnavailable', 'errorGeneric', 'errorTransportUnavailable', 'devices.outgoingTitle', 'devices.revokeConfirm', 'work.cloneConfirm', 'work.linkInvalid', 'work.receiving', 'work.conflictSelectTarget', 'work.conflictBody', 'work.dismiss', 'work.deltaRetained', 'work.deltaRetainedResumable', 'work.deltaRetainedAmbiguous', 'work.deltaAbandonConfirm', 'work.unknownDevice', 'work.progressLabel', 'work.deltaConflictBothChanged', 'work.deltaConflictLocalChanged', 'work.bidirectionalSyncing', 'work.bidirectionalResumeRequired', 'work.bidirectionalSourceUnavailable', 'work.bidirectionalRefreshPending', 'work.bidirectionalEditsDiscarded', 'androidLanOnly', 'notificationsDisabledWarning']
-
-    it.each([languageEnglish, languageKorean])('contains every required nested sync branch', (translation) => {
-        for (const path of required) {
-            const value = path.split('.').reduce<any>((current, key) => current?.[key], translation.risuNest.sync)
-            expect(value).toEqual(expect.any(String))
-        }
-    })
-
-    it.each([languageEnglish, languageKorean])('no longer carries the per-lane blocks', (translation) => {
-        expect('peerClone' in translation).toBe(false)
-        expect('peerDelta' in translation).toBe(false)
-        expect('peerBidirectional' in translation).toBe(false)
     })
 })

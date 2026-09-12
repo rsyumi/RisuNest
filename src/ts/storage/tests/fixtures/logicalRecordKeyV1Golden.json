@@ -1,5 +1,5 @@
 {
-    "description": "Golden vectors for the r1: logical record key codec. Consumed by src/ts/storage/sync/logicalRecordKey.test.ts and the parity tests in src-tauri/src/peer_sync/logical_delta.rs; a vector change must keep both suites passing.",
+    "description": "Golden vectors for the r1: logical record key codec. Consumed by src/ts/storage/sync/logicalRecordKey.test.ts and the parity tests in src-tauri/src/logical_records.rs; a vector change must keep both suites passing.",
     "roundTrip": [
         {
             "locator": {

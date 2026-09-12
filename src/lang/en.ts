@@ -1842,7 +1842,6 @@ export const languageEnglish = {
             data: 'Preparing chat data',
             compatibility: 'Preparing plugin compatibility data',
             plugins: 'Preparing plugins',
-            sync: 'Preparing device sync',
             account: 'Preparing account sync',
             update: 'Checking for updates',
             serviceWorker: 'Preparing offline support',
@@ -1850,6 +1849,25 @@ export const languageEnglish = {
             elapsed: (seconds: number) => `${seconds}s elapsed`,
         },
         serverSync: {
+            management: {
+                title: 'Server sync storage',
+                disk: 'Local disk usage',
+                complete: 'Completed backup payloads',
+                incomplete: 'Incomplete preservation (protected)',
+                cache: 'Transfer cache',
+                protected: 'Protected',
+                reclaimable: 'Can be cleared',
+                clean: 'Clear unused transfer objects',
+                more: 'Older backups',
+                refresh: 'Refresh list',
+                scope: 'Library only. Device plugin data is not included.',
+                restoreConfirm:
+                    'Restore this library backup? The current library will be backed up first. Synchronization stays paused.',
+                deleteConfirm:
+                    'Delete this completed server conflict backup from this device?',
+                cleanConfirm:
+                    'Clear unused transfer objects? Active work, required bases and local library files are kept.',
+            },
             backups: 'Conflict backups',
             backupHelp:
                 'Restore the complete library from either side of a conflict. The current library is backed up before replacement. Sync stays paused so you can check the restored contents before continuing.',
@@ -1862,7 +1880,8 @@ export const languageEnglish = {
             reconcile: 'Compare restored server',
             reconcileHelp:
                 'The server was restored to a different history. Back up the local state and compare both versions before continuing.',
-            activationHelp: 'Confirm the saved revision before editing. Select Refresh screen to retry.',
+            activationHelp:
+                'Confirm the saved revision before editing. Select Refresh screen to retry.',
             title: 'Personal sync server',
             description:
                 'Keep this library in sync across your devices. Your edits are saved locally first.',
@@ -1872,7 +1891,8 @@ export const languageEnglish = {
             token: 'Device token',
             credentialsHelp:
                 'Use the address and device credentials issued by your server. Each device needs its own credentials.',
-            credentialUnavailable: 'The operating system could not open this device credential. Unlock its key storage or revoke the old device on the server and register a new device token. Linux requires an unlocked Secret Service.',
+            credentialUnavailable:
+                'The operating system could not open this device credential. Unlock its key storage or revoke the old device on the server and register a new device token. Linux requires an unlocked Secret Service.',
             connect: 'Connect and sync',
             disconnect: 'Disconnect',
             syncNow: 'Sync now',
@@ -1882,7 +1902,8 @@ export const languageEnglish = {
             ready: 'Connected',
             lastSuccess: 'Last successful sync',
             running: 'Syncing',
-            verifiedBytes: 'Object data verified this cycle (before delta compression)',
+            verifiedBytes:
+                'Object data verified this cycle (before delta compression)',
             progress: {
                 saving: 'Saving local changes',
                 preparing: 'Comparing and downloading changes',
@@ -1896,31 +1917,260 @@ export const languageEnglish = {
             refreshPending: 'Screen refresh needed',
             initialScan: 'Preparing the first complete comparison',
             queued: '{0} items waiting to sync',
-            pendingHelp: 'Resume to confirm the unfinished operation before disconnecting.',
+            pendingHelp:
+                'Resume to confirm the unfinished operation before disconnecting.',
             conflict: 'Conflicts need attention',
             conflictCount: '{0} conflicting items',
             conflictHelp:
                 'These items changed on both sides. Choose which version to keep. A backup is required before applying your choice.',
             keepLocal: 'Keep this device',
             keepRemote: 'Keep server version',
-            errorHelp: 'Sync stopped. Your local edits are retained. Check the connection and retry.',
-            refreshHelp: 'The received changes are saved. Refresh the screen to continue editing.',
+            errorHelp:
+                'Sync stopped. Your local edits are retained. Check the connection and retry.',
+            refreshHelp:
+                'The received changes are saved. Refresh the screen to continue editing.',
         },
         menuTitle: 'RisuNest',
         sectionNav: 'Sections',
-        perf: { title: 'Performance', profile: 'Performance profile', profileNormal: 'Standard', profileLowSpec: 'Low-spec', profileHelp: 'Low-spec uses less memory, but scrolling long chats may be slightly slower.' },
-        inlay: { title: 'Chat image attachments', format: 'Storage format', formatWebp: 'WebP (recommended)', formatPng: 'PNG (lossless)', formatOriginal: 'Keep original', quality: 'WebP quality', qualityHelp: 'Lower values save space but reduce image quality.', maxDimension: 'Maximum resolution', maxDimensionHelp: 'Images whose long side exceeds this are scaled down when saved. 0 means no limit.', skipReencode: "Don't re-convert images that are already WebP", skipReencodeHelp: 'Converting the same image again loses a little quality each time.', unsupportedAnimated: "GIF and animated images can't be attached yet." },
-        storage: { snapshotSizeNote: 'The total counts shared storage once. Each snapshot shows its size when restored.', title: 'Storage', refresh: 'Refresh', total: 'Total data', media: 'Images & media', database: 'Database', inlays: 'Chat attachments', plugins: 'Plugin data', snapshots: 'Snapshots', conflictBackups: 'Conflict backups', counts: '{0} characters · {1} chats · {2} messages', subMetrics: 'Chat attachments {0} (included in images & media) · Plugin data {1}', createSnapshotTitle: 'Create a snapshot', createSnapshotHelp: 'Saves the current state so you can return to it later.', createSnapshot: 'Create now', tempTitle: 'Sync temp files', cleanSyncTemp: 'Clean up', cleanSyncTempConfirm: 'Clean up sync temp files?', calculateSize: 'Calculate size', calculateSizeFailed: "Couldn't calculate temporary file size. Refresh the information and try again.", tempUsage: '{size} used', gcTitle: 'Unused images', gcHelp: 'Finds and deletes images that nothing refers to.', gcRun: 'Find', gcRunConfirm: 'Delete now', gcResult: 'Removable: {0} items ({1})', gcDeletedResult: 'Deleted: {0} items ({1})', gcConfirm: 'This will delete {0} unused images ({1}). Continue?', deleteSnapshotConfirm: "Delete this snapshot? You won't be able to restore to this point.", deleteConflictBackupConfirm: 'Delete this conflict backup? This conflict backup cannot be recovered after deletion.', syncBackups: 'Sync backups', deleteSyncBackupConfirm: "Delete this sync backup? You won't be able to roll back to the state before that sync.", syncBackupInUse: "This backup is used by a sync in progress and can't be deleted.", cleanSyncTempNote: 'Removes temporary files left behind by device sync. Backups and tasks in progress are not touched.', trashedCount: '({0} in trash)', loadFailed: "Couldn't load storage information.", staleTotals: 'Storage totals may be out of date. Refresh the information and try again.', emptyList: 'Nothing saved yet.', listSummary: '{0} items · {1}', retry: 'Retry', actionFailed: "Couldn't complete the action. Some changes may already have been applied. Refresh the information and try again." },
-        backup: { generationBusy: 'A response is being generated. Finish or stop it, then try the backup or restore again.', fileBusy: 'Another file operation is running. Wait for it to finish, or cancel it and wait for cleanup before trying again.', syncBusy: 'Synchronization is running or still needs recovery. Finish it before starting a backup or restore.', syncUnconfirmed: 'The synchronization outcome could not be confirmed. Resolve the pending operation before restoring.', title: 'Backup & restore', groupFiles: 'RisuSave file', filesHelp: 'A backup file compatible with RisuAI. Use it to move data to another device or keep a copy.', importFile: 'Import', exportFile: 'Export', groupRestore: 'Restore', restoreHelp: "Restores from a snapshot kept on this device or from another app's backup.", groupAccount: 'Official account', accountHelp: 'Uploads a backup to your RisuAI account or downloads it. Chat attachments are not included.', officialPublish: 'Create backup', officialRestore: 'Restore backup', officialCancel: 'Cancel backup upload', officialRestoreConfirm: 'Replace local data with the official account backup?', officialRestoreInlayWarning: 'Official snapshots do not include separate chat attachments. Referenced images, audio, video, and signatures may not be restored. The app will restart after restoring the backup. Continue?', officialMissing: 'No official account backup was found. Local data was not changed.', officialPublishConfirm: 'Overwrite the official account backup with current local data?', officialPublished: 'Official account backup published.', actionFailed: "Couldn't complete the backup operation. Some changes may already have been applied.", progressPreparing: 'Preparing', progressReading: 'Reading file', progressTransferring: 'Transferring data', progressFinalizing: 'Finishing', localBackupSaved: 'Local backup saved.', localBackupRestored: 'Local backup restored.', sourcePreserved: 'The original database and files were saved. This source archive requires data repair before it can replace a library.', recoverySourcePreserved: 'The backup was restored. The previous data was saved in a source archive that requires repair before it can be used again.', sourceRepairRequired: 'The source archive was verified, but data repair is required before it can replace a library. Your current data has not changed.' },
-        importDialog: { titleImport: 'Import', titleRisuSave: 'Import RisuSave', titleLocalBackup: 'Import local backup', titleLossless: 'Import RisuNest backup', formatPocketRisu: 'PocketRisu backup', formatRisuAi: 'RisuAI backup', elapsed: 'Elapsed {0}', overall: '{0} / {1}', preparing: 'Preparing', stageCopyingSource: 'Copying file', stageReadingArchive: 'Reading backup file', stagePreparingAttachments: 'Preparing attachments', stageReadingDatabase: 'Reading database', stageDecodingDatabase: 'Decoding database', stageStagingCharacters: 'Saving characters', stageFinalizingStaging: 'Saving settings and presets', stageActivating: 'Applying data', stageRefreshingApp: 'Refreshing the app', stageReloadingPlugins: 'Reloading plugins', stageRestartingApp: 'Restarting the app', stageAwaitingReselect: 'Switching to the compatibility importer. Select the file again.', stageComplete: 'Done', currentItem: 'Current: {0}', itemsOf: '{0} / {1}', itemsCount: '{0} items', countCharacters: 'Characters', countPresets: 'Presets', countAssets: 'Assets', countInlays: 'Chat attachments', countColdStorage: 'Cold storage', countPocketMedia: 'Media files', countSkipped: 'Skipped', cancel: 'Cancel import', cancelling: 'Cancelling', cancelUnavailable: "The import can't be cancelled while data is being applied.", close: 'Close', resultSucceeded: 'Import completed.', resultRestarting: 'Import completed. Restarting the app.', resultCancelled: 'Import cancelled. Your existing data is unchanged.', resultCancelledPartial: 'Import cancelled. Some attachments that were already saved may remain.', resultFailed: 'Import failed. Your existing data is unchanged.', resultFailedAfterCommit: 'The data was imported, but the screen could not be refreshed. Restart the app before doing anything else.', errorDetails: 'Error details', copyDetails: 'Copy', copied: 'Copied', reasonUnsupportedFormat: 'The file format is not supported.', reasonInvalidSource: 'The file is damaged or not in the expected format.', reasonTruncated: 'The file ended early. It may be truncated.', reasonCorrupt: 'The file contents are corrupted.', reasonRevisionConflict: 'Other changes happened during the import, so it could not be applied. Try again.', reasonStoreError: 'A storage error stopped the import.', reasonUnknown: 'An unknown error occurred.', warningCleanupFailed: 'A temporary file could not be cleaned up. It will be retried at startup.', warningPocketInlayFailed: 'Some PocketRisu attachments could not be imported.', warningUnknown: 'Warning: {0}' },
-        platform: { title: 'Platform', notifications: 'Notifications', notificationsHelp: 'Shows generation and sync progress as notifications.', notificationsOn: 'Allowed', notificationsOff: 'Off', openSettings: 'Open notification settings', keepAlive: 'Keep app alive while generating', keepAliveHelp: "Shows a notification while receiving a response so Android doesn't stop the app in the background.", keepAliveNeedsNotifications: "This feature doesn't work while notifications are off.", operatingSystem: 'Operating system', webView: 'WebView', transferMode: 'Transfer mode', transferModes: { disabled: 'Disabled', foreground: 'Foreground service', uidt: 'User-initiated data transfer' } },
-        boot: { title: 'RisuNest could not start', schemaUnsupported: 'The data folder holds a persistent store from an incompatible pre-release build. RisuNest cannot open it and will not convert it. Remove that store from the data folder yourself, then start RisuNest again.', storeOpen: 'The local data store could not be opened. Another copy of RisuNest may still be using it, or the data folder may be unreadable. Close any other running copy, then start RisuNest again.', unknown: 'Startup failed before the app finished loading. The details below show what went wrong.', restart: 'Restart', copyDetails: 'Copy error details', copied: 'Error details copied.', dataPathWindows: 'Windows: %APPDATA%\\RisuNest\\', dataPathAndroid: 'Android: App info > Storage > Clear data', stage: 'Stage' },
-        diag: { title: 'Diagnostics', logTitle: 'Error log', logHelp: 'Recent errors. Attach them when reporting a problem.', viewLog: 'View', copyLog: 'Copy', fileLog: 'Save error log to a file', fileLogHelp: 'Secrets such as API keys are masked before being written.', logEmpty: 'No errors recorded.', actionFailed: 'Diagnostics are unavailable right now. Restart the app and try again.' },
-        sync: { menuTitle: 'Device sync', intro: 'Turn on sharing on the device that sends data, then run a sync task on the device that receives it.', registrationExpired: 'Registration expired. Register again with a new link.', errorGeneric: 'The task did not finish. Try again, and if it keeps failing restart the app on both devices.', errorTransportUnavailable: 'Could not reach the other device. Check that it is turned on, that sharing is running there, and that both devices are on the same network.', share: { title: 'Sharing', stateOff: 'Off', statePreparing: 'Preparing', stateListening: 'Sharing', stateStopping: 'Stopping', stateError: 'Error', errorLanAddressUnavailable: 'No LAN IPv4 address is available for sharing on this device. Check the Wi-Fi or wired network connection and VPN settings on this device.', errorPortUnavailable: 'That port is already in use. Choose another port.', errorInvalidConfiguration: 'Check the sharing method, port, and public address.', errorCleanupFailed: 'Sharing stopped, but cleanup did not finish. Try stopping again.', method: 'Sharing method', methodLan: 'Same network (LAN)', methodLanHelp: 'Only devices on the same Wi-Fi or wired network can connect.', methodQuick: 'Temporary internet address', methodFixed: 'Fixed address (advanced)', port: 'Port', publicUrl: 'Public address (URL)', publicUrlHelp: 'Registered devices connect to this address.', quickNote: 'Connects over the internet. The address changes when you restart the app, so devices must be registered again.', fixedNote: 'Connect the port below to your public address with your own tunnel or port forwarding. The address stays the same, so devices never need to register again.', fixedGuideTitle: 'How to connect it yourself', fixedGuideBody: 'If you use Cloudflare Tunnel: create a tunnel in the Cloudflare dashboard, install cloudflared as a service on this computer, and point the tunnel at http://127.0.0.1:{0}.', autoListen: 'Start sharing automatically when the app opens', start: 'Start sharing', stop: 'Stop sharing', pairTitle: 'Register a new device', pairNote: 'Scan the QR code or paste the link on the other device. A link works for 10 minutes and for one device only.', pairRemaining: '{0} left', durationMinute: '{0} minute', durationMinutes: '{0} minutes', durationSecond: '{0} second', durationSeconds: '{0} seconds', pairExpired: 'Expired. Create a new link.', copyLink: 'Copy link', newLink: 'Create new link', permRead: 'Allow copying data', permReadHelp: 'A device registered with the link can copy data from this device.', permBidirectional: 'Allow two-way sync', permBidirectionalHelp: 'If allowed, the other device can also change data on this device.' }, devices: { title: 'Registered devices', outgoingTitle: 'Devices that copy from this device', incomingTitle: 'Devices this device copies from', permRead: 'Copy', permBidirectional: 'Two-way', outgoingEmpty: 'None yet. Start sharing and open the registration link on another device to add it here.', incomingEmpty: "None yet. Use another device's registration link in Sync tasks below to save it here.", lastSeen: 'Last connected {0} · {1} total', revoke: 'Remove', revokeConfirm: "Remove this device? It won't be able to connect until you register it again." }, work: { title: 'Sync tasks', target: 'Target device', useNewLink: 'Use a new registration link...', linkLabel: 'Registration link', linkHelp: "Copy the link from the other device's Sharing section.", linkPlaceholder: 'Paste a registration link', linkInvalid: 'That is not a registration link. Copy the whole link from the other device, or open its QR code.', receiving: 'Receiving...', conflictSelectTarget: 'Choose the other device under Target device first, then pick which side to keep.', clone: 'Copy everything', cloneHelp: "Replaces all data on this device with the other device's data.", cloneConfirm: 'This replaces all data on this device with the other device\'s data. Your current data is kept as a backup first. Continue?', delta: 'Get changes only', deltaHelp: 'Receives only the items that changed on the other device since the last sync.', bidirectional: 'Two-way sync', bidirectionalHelp: 'Applies changes in both directions. The other device must allow two-way sync.', blockedWhileSharing: 'Stop sharing to run a receive task.', registerBlockedByActiveWork: 'Finish or stop the current operation before registering a new device.', sourceInUse: 'A sync task is still using this device. Finish or cancel it, then try again.', sourceChanged: "The target device's registration changed. Select the target device again and retry.", deltaBlockedByRetained: 'An unfinished earlier update is still pending. Continue or cancel it under Sync tasks.', deltaRetained: 'An earlier update from {0} did not finish.', deltaRetainedResumable: 'Turn the other device back on and continue to finish it. Cancel if that device is no longer available.', deltaRetainedAmbiguous: "This device's data changed afterwards, so it cannot continue. Cancel to unblock receiving, removing, and registering.", deltaAbandonConfirm: "Cancel the pending update? Data on this device stays as it is, but the other device's transfer statistics may not update.", unknownDevice: 'Unknown device', peerOutdated: 'The other device runs an older RisuNest. Update both devices to the same version and try again.', progress: 'Receiving {0}%', cancel: 'Cancel', conflictTitle: 'There are conflicts', conflictBody: 'The same items changed differently on both devices. Choose which side to keep. The other side is kept as a backup.', conflictOthers: '{0} other items', keepThis: 'Keep this device', keepOther: 'Keep other device', resume: 'Continue', abandon: 'Abandon task', abandonConfirm: 'Cancel this sync? Nothing received so far will be applied.', doneUpToDate: 'Already up to date.', doneUpdated: 'Received {0} items ({1}).', needClone: 'A full copy is required. Use Copy everything above.', backupNote: 'Your previous data is kept as a backup.', backupLocation: 'Backup location', dismiss: 'Dismiss', progressLabel: 'Progress', deltaConflictBothChanged: 'The same items changed on both devices, so the changes could not be received. No data was changed. Use two-way sync instead.', deltaConflictLocalChanged: 'Local data changed while the update was starting. No data was changed. Retry the update.', bidirectionalSyncing: 'Exchanging and verifying changes...', bidirectionalResumeRequired: 'The local change is committed. Resume to finish the other device and acknowledgement.', bidirectionalSourceUnavailable: 'Cannot connect to the other device. Check that sharing is on there, then continue. If that device uses a temporary internet address and restarted the app, register it again.', bidirectionalRefreshPending: 'Both devices are committed, but the local screen could not refresh.', bidirectionalEditsDiscarded: "The other device's changes were applied, and recent unsaved edits on this device were lost. The screen may differ from what you last saw." }, androidLanOnly: 'Android supports same-network (LAN) connections only.', notificationsDisabledWarning: 'Notifications are turned off for this app, so Android will not show the transfer notification with its Stop button. You can still stop sharing from this screen, or allow notifications in system settings to get the notification Stop control back.' },
+        perf: {
+            title: 'Performance',
+            profile: 'Performance profile',
+            profileNormal: 'Standard',
+            profileLowSpec: 'Low-spec',
+            profileHelp:
+                'Low-spec uses less memory, but scrolling long chats may be slightly slower.',
+        },
+        inlay: {
+            title: 'Chat image attachments',
+            format: 'Storage format',
+            formatWebp: 'WebP (recommended)',
+            formatPng: 'PNG (lossless)',
+            formatOriginal: 'Keep original',
+            quality: 'WebP quality',
+            qualityHelp: 'Lower values save space but reduce image quality.',
+            maxDimension: 'Maximum resolution',
+            maxDimensionHelp:
+                'Images whose long side exceeds this are scaled down when saved. 0 means no limit.',
+            skipReencode: "Don't re-convert images that are already WebP",
+            skipReencodeHelp:
+                'Converting the same image again loses a little quality each time.',
+            unsupportedAnimated:
+                "GIF and animated images can't be attached yet.",
+        },
+        storage: {
+            snapshotSizeNote:
+                'The total counts shared storage once. Each snapshot shows its size when restored.',
+            title: 'Storage',
+            refresh: 'Refresh',
+            total: 'Total data',
+            media: 'Images & media',
+            database: 'Database',
+            inlays: 'Chat attachments',
+            plugins: 'Plugin data',
+            snapshots: 'Snapshots',
+            conflictBackups: 'Conflict backups',
+            counts: '{0} characters · {1} chats · {2} messages',
+            subMetrics:
+                'Chat attachments {0} (included in images & media) · Plugin data {1}',
+            createSnapshotTitle: 'Create a snapshot',
+            createSnapshotHelp:
+                'Saves the current state so you can return to it later.',
+            createSnapshot: 'Create now',
+            tempTitle: 'Sync temp files',
+            cleanSyncTemp: 'Clean up',
+            cleanSyncTempConfirm: 'Clean up sync temp files?',
+            calculateSize: 'Calculate size',
+            calculateSizeFailed:
+                "Couldn't calculate temporary file size. Refresh the information and try again.",
+            tempUsage: '{size} used',
+            gcTitle: 'Unused images',
+            gcHelp: 'Finds and deletes images that nothing refers to.',
+            gcRun: 'Find',
+            gcRunConfirm: 'Delete now',
+            gcResult: 'Removable: {0} items ({1})',
+            gcDeletedResult: 'Deleted: {0} items ({1})',
+            gcConfirm: 'This will delete {0} unused images ({1}). Continue?',
+            deleteSnapshotConfirm:
+                "Delete this snapshot? You won't be able to restore to this point.",
+            deleteConflictBackupConfirm:
+                'Delete this conflict backup? This conflict backup cannot be recovered after deletion.',
+            syncBackups: 'Sync backups',
+            deleteSyncBackupConfirm:
+                "Delete this sync backup? You won't be able to roll back to the state before that sync.",
+            syncBackupInUse:
+                "This backup is used by a sync in progress and can't be deleted.",
+            trashedCount: '({0} in trash)',
+            loadFailed: "Couldn't load storage information.",
+            staleTotals:
+                'Storage totals may be out of date. Refresh the information and try again.',
+            emptyList: 'Nothing saved yet.',
+            listSummary: '{0} items · {1}',
+            retry: 'Retry',
+            actionFailed:
+                "Couldn't complete the action. Some changes may already have been applied. Refresh the information and try again.",
+        },
+        backup: {
+            generationBusy:
+                'A response is being generated. Finish or stop it, then try the backup or restore again.',
+            fileBusy:
+                'Another file operation is running. Wait for it to finish, or cancel it and wait for cleanup before trying again.',
+            syncBusy:
+                'Synchronization is running or still needs recovery. Finish it before starting a backup or restore.',
+            syncUnconfirmed:
+                'The synchronization outcome could not be confirmed. Resolve the pending operation before restoring.',
+            title: 'Backup & restore',
+            groupFiles: 'RisuSave file',
+            filesHelp:
+                'A backup file compatible with RisuAI. Use it to move data to another device or keep a copy.',
+            importFile: 'Import',
+            exportFile: 'Export',
+            groupRestore: 'Restore',
+            restoreHelp:
+                "Restores from a snapshot kept on this device or from another app's backup.",
+            groupAccount: 'Official account',
+            accountHelp:
+                'Uploads a backup to your RisuAI account or downloads it. Chat attachments are not included.',
+            officialPublish: 'Create backup',
+            officialRestore: 'Restore backup',
+            officialCancel: 'Cancel backup upload',
+            officialRestoreConfirm:
+                'Replace local data with the official account backup?',
+            officialRestoreInlayWarning:
+                'Official snapshots do not include separate chat attachments. Referenced images, audio, video, and signatures may not be restored. The app will restart after restoring the backup. Continue?',
+            officialMissing:
+                'No official account backup was found. Local data was not changed.',
+            officialPublishConfirm:
+                'Overwrite the official account backup with current local data?',
+            officialPublished: 'Official account backup published.',
+            actionFailed:
+                "Couldn't complete the backup operation. Some changes may already have been applied.",
+            progressPreparing: 'Preparing',
+            progressReading: 'Reading file',
+            progressTransferring: 'Transferring data',
+            progressFinalizing: 'Finishing',
+            localBackupSaved: 'Local backup saved.',
+            localBackupRestored: 'Local backup restored.',
+            sourcePreserved:
+                'The original database and files were saved. This source archive requires data repair before it can replace a library.',
+            recoverySourcePreserved:
+                'The backup was restored. The previous data was saved in a source archive that requires repair before it can be used again.',
+            sourceRepairRequired:
+                'The source archive was verified, but data repair is required before it can replace a library. Your current data has not changed.',
+        },
+        importDialog: {
+            titleImport: 'Import',
+            titleRisuSave: 'Import RisuSave',
+            titleLocalBackup: 'Import local backup',
+            titleLossless: 'Import RisuNest backup',
+            formatPocketRisu: 'PocketRisu backup',
+            formatRisuAi: 'RisuAI backup',
+            elapsed: 'Elapsed {0}',
+            overall: '{0} / {1}',
+            preparing: 'Preparing',
+            stageCopyingSource: 'Copying file',
+            stageReadingArchive: 'Reading backup file',
+            stagePreparingAttachments: 'Preparing attachments',
+            stageReadingDatabase: 'Reading database',
+            stageDecodingDatabase: 'Decoding database',
+            stageStagingCharacters: 'Saving characters',
+            stageFinalizingStaging: 'Saving settings and presets',
+            stageActivating: 'Applying data',
+            stageRefreshingApp: 'Refreshing the app',
+            stageReloadingPlugins: 'Reloading plugins',
+            stageRestartingApp: 'Restarting the app',
+            stageAwaitingReselect:
+                'Switching to the compatibility importer. Select the file again.',
+            stageComplete: 'Done',
+            currentItem: 'Current: {0}',
+            itemsOf: '{0} / {1}',
+            itemsCount: '{0} items',
+            countCharacters: 'Characters',
+            countPresets: 'Presets',
+            countAssets: 'Assets',
+            countInlays: 'Chat attachments',
+            countColdStorage: 'Cold storage',
+            countPocketMedia: 'Media files',
+            countSkipped: 'Skipped',
+            cancel: 'Cancel import',
+            cancelling: 'Cancelling',
+            cancelUnavailable:
+                "The import can't be cancelled while data is being applied.",
+            close: 'Close',
+            resultSucceeded: 'Import completed.',
+            resultRestarting: 'Import completed. Restarting the app.',
+            resultCancelled:
+                'Import cancelled. Your existing data is unchanged.',
+            resultCancelledPartial:
+                'Import cancelled. Some attachments that were already saved may remain.',
+            resultFailed: 'Import failed. Your existing data is unchanged.',
+            resultFailedAfterCommit:
+                'The data was imported, but the screen could not be refreshed. Restart the app before doing anything else.',
+            errorDetails: 'Error details',
+            copyDetails: 'Copy',
+            copied: 'Copied',
+            reasonUnsupportedFormat: 'The file format is not supported.',
+            reasonInvalidSource:
+                'The file is damaged or not in the expected format.',
+            reasonTruncated: 'The file ended early. It may be truncated.',
+            reasonCorrupt: 'The file contents are corrupted.',
+            reasonRevisionConflict:
+                'Other changes happened during the import, so it could not be applied. Try again.',
+            reasonStoreError: 'A storage error stopped the import.',
+            reasonUnknown: 'An unknown error occurred.',
+            warningCleanupFailed:
+                'A temporary file could not be cleaned up. It will be retried at startup.',
+            warningPocketInlayFailed:
+                'Some PocketRisu attachments could not be imported.',
+            warningUnknown: 'Warning: {0}',
+        },
+        platform: {
+            title: 'Platform',
+            notifications: 'Notifications',
+            notificationsHelp: 'Shows generation progress as notifications.',
+            notificationsOn: 'Allowed',
+            notificationsOff: 'Off',
+            openSettings: 'Open notification settings',
+            keepAlive: 'Keep app alive while generating',
+            keepAliveHelp:
+                "Shows a notification while receiving a response so Android doesn't stop the app in the background.",
+            keepAliveNeedsNotifications:
+                "This feature doesn't work while notifications are off.",
+            operatingSystem: 'Operating system',
+            webView: 'WebView',
+        },
+        boot: {
+            title: 'RisuNest could not start',
+            schemaUnsupported:
+                'The data folder holds a persistent store from an incompatible pre-release build. RisuNest cannot open it and will not convert it. Remove that store from the data folder yourself, then start RisuNest again.',
+            storeOpen:
+                'The local data store could not be opened. Another copy of RisuNest may still be using it, or the data folder may be unreadable. Close any other running copy, then start RisuNest again.',
+            unknown:
+                'Startup failed before the app finished loading. The details below show what went wrong.',
+            restart: 'Restart',
+            copyDetails: 'Copy error details',
+            copied: 'Error details copied.',
+            dataPathWindows: 'Windows: %APPDATA%\\RisuNest\\',
+            dataPathAndroid: 'Android: App info > Storage > Clear data',
+            stage: 'Stage',
+        },
+        diag: {
+            title: 'Diagnostics',
+            logTitle: 'Error log',
+            logHelp: 'Recent errors. Attach them when reporting a problem.',
+            viewLog: 'View',
+            copyLog: 'Copy',
+            fileLog: 'Save error log to a file',
+            fileLogHelp:
+                'Secrets such as API keys are masked before being written.',
+            logEmpty: 'No errors recorded.',
+            actionFailed:
+                'Diagnostics are unavailable right now. Restart the app and try again.',
+        },
         onboarding: {
             eyebrow: 'Onboarding',
             brandTitle: 'Walk through the first-run setup.',
-            brandDesc: 'Bring an existing backup over, or sync with another device to carry your whole setup across.',
+            brandDesc:
+                'Bring an existing backup over, or connect to your sync server.',
             stepStart: 'How to start',
             stepData: 'Data',
             stepDone: 'Finished',
@@ -1931,58 +2181,44 @@ export const languageEnglish = {
                 title: 'Choose how to start.',
                 lead: 'Even if you start right away, you can restore or sync from settings at any time.',
                 freshTitle: 'Start right away',
-                freshDesc: 'Starts with empty settings. Choose this if you want to set things up yourself.',
+                freshDesc:
+                    'Starts with empty settings. Choose this if you want to set things up yourself.',
                 importTitle: 'Import from a backup file',
-                importDesc: 'Loads a RisuAI, RisuNest, or PocketRisu backup file.',
-                syncTitle: 'Sync from another device or server',
-                syncDesc: 'Uses another RisuNest device, a RisuNest sync server, or a RisuAI account backup.',
+                importDesc:
+                    'Loads a RisuAI, RisuNest, or PocketRisu backup file.',
+                syncTitle: 'Connect to a sync server',
+                syncDesc:
+                    'Uses a RisuNest sync server or a RisuAI account backup.',
             },
             import: {
                 title: 'Import a backup file',
                 lead: 'Choose a .risudat file exported from RisuNest, or a .bin file exported from RisuAI or PocketRisu.',
                 dropTitle: 'Choose a backup file',
                 choose: 'Choose file',
-                hintAndroid: 'Opening a backup file from a file manager also leads here.',
+                hintAndroid:
+                    'Opening a backup file from a file manager also leads here.',
                 pocketTitle: 'PocketRisu / RisuAI backup (.bin)',
-                pocketDesc: 'Loads a risu-backup .bin file exported from either app.',
+                pocketDesc:
+                    'Loads a risu-backup .bin file exported from either app.',
                 pocketAction: 'Import',
-                warning: 'A large backup can take a while. Do not close the app until it finishes.',
+                warning:
+                    'A large backup can take a while. Do not close the app until it finishes.',
                 next: 'Continue',
             },
             sync: {
                 title: 'Choose how to sync.',
                 lead: 'Pick a RisuNest device, a sync server, or your RisuAI account.',
-                deviceTitle: 'From another device',
-                deviceDesc: 'Syncs with another RisuNest device and receives a full copy. Connect with a QR code or a link.',
                 hubTitle: 'From a sync server',
-                hubDesc: 'Receives data from a RisuNest sync server. Connect with a QR code or a link.',
+                hubDesc:
+                    'Receives data from a RisuNest sync server. Connect with a QR code or a link.',
                 accountTitle: 'From a RisuAI account backup',
-                accountDesc: 'Restores the backup uploaded to the RisuAI account server. Chat attachments and inlay images are not restored.',
-            },
-            device: {
-                title: 'Connect to another device',
-                stepShare: 'On the other device, open Settings, Device sync, then Start sharing.',
-                stepLink: 'Create a link under Register a new device.',
-                stepPaste: 'Paste the link below.',
-                stepPasteMobile: 'Scan the QR code, or paste the link below.',
-                scan: 'Scan QR code',
-                connect: 'Connect',
+                accountDesc:
+                    'Restores the backup uploaded to the RisuAI account server. Chat attachments and inlay images are not restored.',
             },
             hub: {
                 title: 'Connect to a sync server',
-                stepLink: 'Create a new device registration link under Device management on the sync server.',
-            },
-            progress: {
-                title: 'Downloading',
-                lead: 'Keep this screen open until the download finishes.',
-                server: 'Sync server',
-                meta: 'Full copy · {0} / {1}',
-                metaStarting: 'Full copy',
-                stageConnect: 'Connecting',
-                stageReceive: 'Receiving',
-                stageApply: 'Applying',
-                cancel: 'Cancel',
-                cancelConfirm: 'Cancel this download? Nothing received so far will be applied.',
+                stepLink:
+                    'Create a new device registration link under Device management on the sync server.',
             },
             account: {
                 title: 'RisuAI account backup',
@@ -1995,7 +2231,8 @@ export const languageEnglish = {
             accountFound: {
                 title: 'Check the backup',
                 cardTitle: 'Account backup',
-                cardDesc: 'Restores the most recent backup stored on the account server.',
+                cardDesc:
+                    'Restores the most recent backup stored on the account server.',
                 note: 'Chat attachments and inlay images are not included. The app restarts once the restore finishes.',
                 restore: 'Restore and start',
                 other: 'Another way',
@@ -2004,7 +2241,6 @@ export const languageEnglish = {
                 title: 'Ready',
                 fresh: 'Starting with empty settings.',
                 import: 'The backup file has been loaded.',
-                device: "The other device's data has been received.",
                 data: 'All your data is ready.',
                 start: 'Start RisuNest',
             },

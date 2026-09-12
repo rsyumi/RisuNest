@@ -16,10 +16,6 @@ val enableExperimentalSafFileJobs = providers
     .gradleProperty("risuEnableExperimentalSafFileJobs")
     .map { it.equals("true", ignoreCase = true) }
     .orElse(true)
-val enableExperimentalPeerCloneClient = providers
-    .gradleProperty("risuEnableExperimentalPeerCloneClient")
-    .map { it.equals("true", ignoreCase = true) }
-    .orElse(true)
 
 // Release signing. `keystore.properties` lives next to this module (in
 // src-tauri/gen/android) and is gitignored, so a checkout without it still
@@ -49,8 +45,6 @@ android {
     defaultConfig {
         // User-configured endpoints and plugin resources may use HTTP on a LAN.
         manifestPlaceholders["usesCleartextTraffic"] = "true"
-        manifestPlaceholders["enableExperimentalPeerCloneClient"] =
-            enableExperimentalPeerCloneClient.get().toString()
         applicationId = "io.github.rsyumi.risunest"
         minSdk = 24
         targetSdk = 36
@@ -60,11 +54,6 @@ android {
             "boolean",
             "ENABLE_EXPERIMENTAL_SAF_FILE_JOBS",
             enableExperimentalSafFileJobs.get().toString(),
-        )
-        buildConfigField(
-            "boolean",
-            "ENABLE_EXPERIMENTAL_PEER_CLONE_CLIENT",
-            enableExperimentalPeerCloneClient.get().toString(),
         )
     }
     signingConfigs {

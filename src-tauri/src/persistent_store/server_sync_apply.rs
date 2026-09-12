@@ -314,12 +314,7 @@ impl PersistentStore {
                     message: "Local revision overflow".into(),
                 })?
         };
-        let generation = super::commit::writable_generation(&tx, &active, revision, true)?;
-        // Peer indexes describe a distinct protocol and cannot describe this new
-        // server revision. Retained generations remain available to their leases.
-        if !records.is_empty() {
-            super::logical_index::detach_logical_head_for_full_replace(&tx, &active)?;
-        }
+        let generation = active;
         let mut touched = BTreeSet::new();
         records.visit(false, |item| {
             if let LogicalRecordLocator::Character { character_id }

@@ -5,9 +5,7 @@ use super::super::{
 use super::*;
 use crate::{
     asset_repository::PayloadCas,
-    peer_sync::logical_delta::{
-        encode_logical_record_key, LogicalRecordEnvelope, LogicalRecordLocator,
-    },
+    logical_records::{encode_logical_record_key, LogicalRecordEnvelope, LogicalRecordLocator},
     server_sync::client::ServerConfig,
 };
 use risunest_sync_wire::{Receipt, RecordVersion, RemoteHead, Sequence, TerminalStatus};
@@ -313,4 +311,26 @@ fn recovery_preserves_local_edits_and_bases_while_invalidating_old_operations() 
             .device_operation_seq,
         Sequence::from(1)
     );
+}
+
+#[test]
+fn unconfigured_status_still_reports_pending_operation_for_management_protection() {
+    let (_dir, mut store, _) = open_fixture();
+    bind(&mut store);
+    store
+        .server_reserve(&head(0), "b".repeat(64), "stage-a".into(), 1)
+        .unwrap();
+    // A disconnected/restored state must not hide the independent durable journal.
+    store
+        .connection
+        .execute("DELETE FROM server_sync_state", [])
+        .unwrap();
+    let status = store.server_status().unwrap();
+    assert!(!status.configured);
+    assert!(status.operation_pending);
+    assert_eq!(
+        store.server_unbind().unwrap_err().code,
+        "resolve-pending-operation-first"
+    );
+    assert!(store.server_pending().unwrap().is_some());
 }

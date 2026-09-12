@@ -167,18 +167,6 @@ pub(super) fn restored_copy(db: &Connection) -> StoreResult<()> {
     db.execute("DELETE FROM server_sync_context", [])?;
     Ok(())
 }
-pub(super) fn require_peer_unbound(db: &Connection) -> StoreResult<()> {
-    let bound: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM server_sync_state)", [], |r| {
-        r.get(0)
-    })?;
-    if bound {
-        return Err(StoreError::Validation {
-            message: "Disconnect server sync before accepting a direct peer commit".into(),
-        });
-    }
-    Ok(())
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ServerDirtyKey {

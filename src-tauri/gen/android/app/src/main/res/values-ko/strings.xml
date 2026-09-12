@@ -1,8 +1,4 @@
 <resources>
-    <string name="peer_sync_source_notification_channel">연결된 기기 전송</string>
-    <string name="peer_sync_source_notification_title">RisuNest 데이터 공유 중</string>
-    <string name="peer_sync_source_notification_text">근처 기기에서 준비된 라이브러리를 복사할 수 있습니다.</string>
-    <string name="peer_sync_source_notification_stop">공유 중지</string>
     <string name="generation_notification_channel">응답 생성 중</string>
     <string name="generation_notification_title">응답 생성 중</string>
     <string name="generation_notification_text">AI 응답을 받고 있습니다.</string>

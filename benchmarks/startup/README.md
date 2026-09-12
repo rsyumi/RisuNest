@@ -43,7 +43,6 @@ Single-condition options use `--name=value`:
 | `interact=true`, `images=true`          | Open the visible sidebar, select a chat, edit unsent input, scroll                             |
 | `mutation=true`                         | Synthetic API 2.1 plugin toggles a supported root setting                                      |
 | `snapshot=missing`                      | Remove only the isolated app's snapshots before each measurement                               |
-| `autoListen=true`                       | Enable LAN listening in the isolated device settings                                           |
 | `legacyAssets=100`                      | Re-create separate synthetic legacy files before each sample                                   |
 | `referencedAssets=100000`               | Additional body references, separate from the file-count comparison                            |
 | `coldStorage=true`                      | Exercise the cold-storage cleanup guard                                                        |

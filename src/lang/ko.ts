@@ -1654,7 +1654,6 @@ export const languageKorean = {
             data: '대화 데이터 준비 중',
             compatibility: '플러그인 호환 데이터 준비 중',
             plugins: '플러그인 준비 중',
-            sync: '기기 동기화 준비 중',
             account: '계정 동기화 준비 중',
             update: '업데이트 확인 중',
             serviceWorker: '오프라인 기능 준비 중',
@@ -1662,6 +1661,25 @@ export const languageKorean = {
             elapsed: (seconds: number) => `${seconds}초 경과`,
         },
         serverSync: {
+            management: {
+                title: '서버 동기화 저장 공간',
+                disk: '로컬 디스크 사용량',
+                complete: '완성된 백업 본문',
+                incomplete: '미완성 보존본 (보호됨)',
+                cache: '전송 캐시',
+                protected: '보호 중',
+                reclaimable: '정리 가능',
+                clean: '미사용 전송 객체 정리',
+                more: '이전 백업',
+                refresh: '목록 새로고침',
+                scope: '라이브러리만 포함합니다. 기기 플러그인 데이터는 포함하지 않습니다.',
+                restoreConfirm:
+                    '이 라이브러리 백업을 복원할까요? 현재 라이브러리를 먼저 백업하며 동기화는 일시정지 상태로 유지합니다.',
+                deleteConfirm:
+                    '이 기기에서 완성된 서버 충돌 백업을 삭제할까요?',
+                cleanConfirm:
+                    '미사용 전송 객체를 정리할까요? 진행 중 작업과 필요한 기준 데이터, 로컬 라이브러리 파일은 보존합니다.',
+            },
             backups: '충돌 백업',
             backupHelp:
                 '충돌 당시 한쪽의 전체 라이브러리를 복원합니다. 교체 전 현재 라이브러리도 백업합니다. 복원된 내용을 확인한 후 다시 동기화할 수 있도록 일시 중지 상태를 유지합니다.',
@@ -1685,7 +1703,8 @@ export const languageKorean = {
             token: '기기 토큰',
             credentialsHelp:
                 '서버에서 발급한 주소와 기기 인증 정보를 입력하세요. 기기마다 별도의 인증 정보가 필요합니다.',
-            credentialUnavailable: '운영체제에서 기기 인증 정보를 열 수 없습니다. 키 저장소 잠금을 해제하거나, 서버에서 기존 기기를 해지한 뒤 새 기기 토큰으로 재등록하세요. Linux에서는 잠금 해제된 Secret Service가 필요합니다.',
+            credentialUnavailable:
+                '운영체제에서 기기 인증 정보를 열 수 없습니다. 키 저장소 잠금을 해제하거나, 서버에서 기존 기기를 해지한 뒤 새 기기 토큰으로 재등록하세요. Linux에서는 잠금 해제된 Secret Service가 필요합니다.',
             connect: '연결하고 동기화',
             disconnect: '연결 해제',
             syncNow: '지금 동기화',
@@ -1717,24 +1736,254 @@ export const languageKorean = {
                 '양쪽에서 같은 항목이 변경되었습니다. 유지할 내용을 선택하세요. 적용 전에 백업이 필요합니다.',
             keepLocal: '이 기기 내용 유지',
             keepRemote: '서버 내용 유지',
-            errorHelp: '동기화가 중단되었습니다. 로컬 편집은 보존됩니다. 연결을 확인한 후 다시 시도하세요.',
-            refreshHelp: '받은 변경 사항은 저장되었습니다. 화면을 새로고침하면 편집을 계속할 수 있습니다.',
+            errorHelp:
+                '동기화가 중단되었습니다. 로컬 편집은 보존됩니다. 연결을 확인한 후 다시 시도하세요.',
+            refreshHelp:
+                '받은 변경 사항은 저장되었습니다. 화면을 새로고침하면 편집을 계속할 수 있습니다.',
         },
         menuTitle: 'RisuNest',
         sectionNav: '섹션 바로가기',
-        perf: { title: '성능', profile: '성능 프로파일', profileNormal: '표준', profileLowSpec: '저사양', profileHelp: '저사양은 메모리 사용량을 줄이는 대신 긴 대화에서 스크롤이 조금 느려질 수 있습니다.' },
-        inlay: { title: '채팅 첨부 이미지', format: '저장 형식', formatWebp: 'WebP (권장)', formatPng: 'PNG (무손실)', formatOriginal: '원본 유지', quality: 'WebP 품질', qualityHelp: '낮출수록 용량이 줄지만 화질이 떨어집니다.', maxDimension: '최대 해상도', maxDimensionHelp: '긴 변이 이 값을 넘는 이미지는 저장할 때 축소합니다. 0이면 제한하지 않습니다.', skipReencode: '이미 WebP인 이미지는 다시 변환하지 않기', skipReencodeHelp: '같은 이미지를 다시 변환할수록 화질이 조금씩 나빠집니다.', unsupportedAnimated: 'GIF와 애니메이션 이미지는 아직 첨부할 수 없습니다.' },
-        storage: { snapshotSizeNote: '합계는 공유 저장 공간을 한 번만 계산합니다. 각 스냅샷에는 복원했을 때의 크기를 표시합니다.', title: '저장 공간', refresh: '새로 고침', total: '전체 데이터', media: '이미지·미디어', database: '데이터베이스', inlays: '채팅 첨부', plugins: '플러그인 데이터', snapshots: '스냅샷', conflictBackups: '충돌 백업', counts: '캐릭터 {0}개 · 대화 {1}개 · 메시지 {2}개', subMetrics: '채팅 첨부 {0} (이미지·미디어에 포함) · 플러그인 데이터 {1}', createSnapshotTitle: '스냅샷 만들기', createSnapshotHelp: '지금 상태를 저장해 두고 나중에 되돌릴 수 있습니다.', createSnapshot: '지금 만들기', tempTitle: '동기화 임시 파일', cleanSyncTemp: '정리', cleanSyncTempConfirm: '동기화 임시 파일을 정리할까요?', calculateSize: '크기 계산', calculateSizeFailed: '임시 파일 크기를 계산하지 못했습니다. 정보를 새로 고친 뒤 다시 시도하세요.', tempUsage: '{size} 사용 중', gcTitle: '사용하지 않는 이미지', gcHelp: '어디에서도 쓰지 않는 이미지를 찾아 지웁니다.', gcRun: '찾기', gcRunConfirm: '지금 삭제', gcResult: '삭제 가능: {0}개 ({1})', gcDeletedResult: '삭제됨: {0}개 ({1})', gcConfirm: '어디에서도 사용하지 않는 이미지 {0}개({1})를 삭제합니다. 계속할까요?', deleteSnapshotConfirm: '이 스냅샷을 삭제할까요? 삭제하면 이 시점으로 되돌릴 수 없습니다.', deleteConflictBackupConfirm: '이 충돌 백업을 삭제할까요? 삭제한 충돌 백업은 복구할 수 없습니다.', syncBackups: '동기화 백업', deleteSyncBackupConfirm: '이 동기화 백업을 삭제할까요? 해당 작업 이전 상태로 되돌릴 수 없게 됩니다.', syncBackupInUse: '진행 중인 동기화가 사용하는 백업이라 삭제할 수 없습니다.', cleanSyncTempNote: '기기 동기화가 남긴 임시 파일을 지웁니다. 백업과 진행 중인 작업은 그대로 둡니다.', trashedCount: '(휴지통 {0}개)', loadFailed: '저장 공간 정보를 불러오지 못했습니다.', staleTotals: '저장 공간 합계가 최신 정보가 아닐 수 있습니다. 정보를 새로 고친 뒤 다시 시도하세요.', emptyList: '아직 저장된 항목이 없습니다.', listSummary: '{0}개 · {1}', retry: '다시 시도', actionFailed: '작업을 완료하지 못했습니다. 일부 변경이 이미 적용되었을 수 있습니다. 정보를 새로 고친 뒤 다시 시도하세요.' },
-        backup: { generationBusy: '응답을 생성하고 있습니다. 생성이 끝나거나 중단 처리가 끝난 뒤 백업·복원을 다시 실행해주세요.', fileBusy: '다른 파일 작업이 실행 중입니다. 작업이 끝나거나 취소 후 정리가 끝난 뒤 다시 실행해주세요.', syncBusy: '동기화가 실행 중이거나 복구가 필요합니다. 처리가 끝난 뒤 백업·복원을 다시 실행해주세요.', syncUnconfirmed: '동기화 결과를 확정하지 못했습니다. 미확정 작업을 해결한 뒤 복원해주세요.', title: '백업·복구', groupFiles: 'RisuSave 파일', filesHelp: 'RisuAI와 호환되는 백업 파일입니다. 다른 기기로 옮기거나 보관할 때 씁니다.', importFile: '가져오기', exportFile: '내보내기', groupRestore: '복원', restoreHelp: '이 기기에 보관된 스냅샷이나 다른 앱의 백업으로 되돌립니다.', groupAccount: '공식 계정', accountHelp: 'RisuAI 계정 서버에 백업을 올리거나 내려받습니다. 채팅 첨부 파일은 포함되지 않습니다.', officialPublish: '백업 만들기', officialRestore: '백업 복원', officialCancel: '백업 업로드 취소', officialRestoreConfirm: '공식 계정 백업으로 이 기기의 데이터를 교체할까요?', officialRestoreInlayWarning: '공식 스냅샷에는 별도로 저장된 채팅 첨부가 포함되지 않습니다. 연결된 이미지, 오디오, 동영상, 서명은 복원되지 않을 수 있습니다. 백업을 복원한 뒤 앱이 다시 시작됩니다. 계속할까요?', officialMissing: '공식 계정 백업을 찾지 못했습니다. 이 기기의 데이터는 변경되지 않았습니다.', officialPublishConfirm: '현재 이 기기의 데이터로 공식 계정 백업을 덮어쓸까요?', officialPublished: '공식 계정 백업을 만들었습니다.', actionFailed: '백업 작업을 완료하지 못했습니다. 일부 변경이 이미 적용되었을 수 있습니다.', progressPreparing: '준비 중', progressReading: '파일 읽는 중', progressTransferring: '데이터 전송 중', progressFinalizing: '마무리 중', localBackupSaved: '로컬 백업을 저장했습니다.', localBackupRestored: '로컬 백업을 복원했습니다.', sourcePreserved: '원본 DB와 파일을 보존했습니다. 이 보존용 백업으로 라이브러리를 교체하려면 데이터 복구가 먼저 필요합니다.', recoverySourcePreserved: '백업을 복원했습니다. 교체 전 데이터는 원본 보존용 백업에 담았으며, 이를 다시 사용하려면 데이터 복구가 필요합니다.', sourceRepairRequired: '원본 보존 백업을 검증했지만 라이브러리를 교체하려면 데이터 복구가 필요합니다. 현재 데이터는 변경하지 않았습니다.' },
-        importDialog: { titleImport: '가져오기', titleRisuSave: 'RisuSave 가져오기', titleLocalBackup: '로컬 백업 가져오기', titleLossless: 'RisuNest 백업 가져오기', formatPocketRisu: 'PocketRisu 백업', formatRisuAi: 'RisuAI 백업', elapsed: '경과 {0}', overall: '{0} / {1}', preparing: '준비 중', stageCopyingSource: '파일 복사 중', stageReadingArchive: '백업 파일 읽는 중', stagePreparingAttachments: '첨부 파일 준비 중', stageReadingDatabase: '데이터베이스 읽는 중', stageDecodingDatabase: '데이터베이스 해석 중', stageStagingCharacters: '캐릭터 저장 중', stageFinalizingStaging: '설정과 프리셋 저장 중', stageActivating: '데이터 적용 중', stageRefreshingApp: '화면 새로 고침 중', stageReloadingPlugins: '플러그인 다시 불러오는 중', stageRestartingApp: '앱 다시 시작 중', stageAwaitingReselect: '호환 방식으로 전환합니다. 파일을 다시 선택하세요.', stageComplete: '완료', currentItem: '현재: {0}', itemsOf: '{0} / {1}', itemsCount: '{0}개 항목', countCharacters: '캐릭터', countPresets: '프리셋', countAssets: '에셋', countInlays: '채팅 첨부', countColdStorage: '콜드 스토리지', countPocketMedia: '미디어 파일', countSkipped: '건너뜀', cancel: '가져오기 취소', cancelling: '취소하는 중', cancelUnavailable: '데이터를 적용하는 동안에는 취소할 수 없습니다.', close: '닫기', resultSucceeded: '가져오기를 완료했습니다.', resultRestarting: '가져오기를 완료했습니다. 앱을 다시 시작합니다.', resultCancelled: '가져오기를 취소했습니다. 기존 데이터는 그대로입니다.', resultCancelledPartial: '가져오기를 취소했습니다. 이미 저장된 첨부 파일 일부가 남아 있을 수 있습니다.', resultFailed: '가져오기에 실패했습니다. 기존 데이터는 그대로입니다.', resultFailedAfterCommit: '데이터는 가져왔지만 화면을 새로 고치지 못했습니다. 다른 작업을 하기 전에 앱을 다시 시작하세요.', errorDetails: '오류 상세', copyDetails: '복사', copied: '복사됨', reasonUnsupportedFormat: '지원하지 않는 파일 형식입니다.', reasonInvalidSource: '파일이 손상되었거나 형식이 올바르지 않습니다.', reasonTruncated: '파일이 끝까지 읽히지 않았습니다. 파일이 잘렸을 수 있습니다.', reasonCorrupt: '파일 내용이 손상되었습니다.', reasonRevisionConflict: '가져오는 동안 다른 변경이 있어 적용하지 못했습니다. 다시 시도하세요.', reasonStoreError: '저장소 오류로 가져오지 못했습니다.', reasonUnknown: '알 수 없는 오류가 발생했습니다.', warningCleanupFailed: '임시 파일을 정리하지 못했습니다. 다음 시작 때 다시 시도합니다.', warningPocketInlayFailed: '일부 PocketRisu 첨부를 가져오지 못했습니다.', warningUnknown: '경고: {0}' },
-        platform: { title: '플랫폼', notifications: '알림', notificationsHelp: '응답 생성과 동기화 진행 상황을 알림으로 보여줍니다.', notificationsOn: '허용됨', notificationsOff: '꺼짐', openSettings: '알림 설정 열기', keepAlive: '응답 생성 중 앱 유지', keepAliveHelp: '응답을 받는 동안 알림을 띄워 앱이 백그라운드에서 꺼지지 않게 합니다.', keepAliveNeedsNotifications: '알림이 꺼져 있으면 이 기능이 동작하지 않습니다.', operatingSystem: '운영체제', webView: 'WebView', transferMode: '전송 방식', transferModes: { disabled: '사용 안 함', foreground: '포그라운드 서비스', uidt: '사용자 시작 데이터 전송' } },
-        boot: { title: 'RisuNest를 시작하지 못했습니다', schemaUnsupported: '데이터 폴더에 호환되지 않는 사전 배포 빌드의 저장소가 남아 있습니다. RisuNest는 이 저장소를 열 수 없고 자동으로 변환하지도 않습니다. 데이터 폴더에서 저장소를 직접 삭제한 뒤 RisuNest를 다시 시작하세요.', storeOpen: '로컬 데이터 저장소를 열지 못했습니다. 다른 RisuNest 창이 저장소를 사용 중이거나 데이터 폴더를 읽을 수 없는 상태일 수 있습니다. 실행 중인 다른 창을 닫고 다시 시작하세요.', unknown: '앱을 불러오는 도중 시작에 실패했습니다. 아래 오류 내용을 확인하세요.', restart: '다시 시작', copyDetails: '오류 내용 복사', copied: '오류 내용을 복사했습니다.', dataPathWindows: 'Windows: %APPDATA%\\RisuNest\\', dataPathAndroid: 'Android: 앱 정보 > 저장공간에서 데이터 삭제', stage: '단계' },
-        diag: { title: '진단', logTitle: '오류 로그', logHelp: '최근 오류 기록입니다. 문제를 신고할 때 함께 보내면 도움이 됩니다.', viewLog: '보기', copyLog: '복사', fileLog: '오류 로그를 파일로 저장', fileLogHelp: 'API 키 같은 비밀 정보는 가려서 기록합니다.', logEmpty: '기록된 오류가 없습니다.', actionFailed: '지금은 진단 기능을 사용할 수 없습니다. 앱을 다시 시작한 뒤 다시 시도하세요.' },
-        sync: { menuTitle: '기기 동기화', intro: '데이터를 내보낼 기기에서 공유를 켜고, 받을 기기에서 동기화 작업을 실행합니다.', registrationExpired: '등록이 만료되었습니다. 새 등록 링크로 다시 등록하세요.', errorGeneric: '작업을 끝내지 못했습니다. 다시 시도하고, 계속 실패하면 두 기기의 앱을 다시 시작하세요.', errorTransportUnavailable: '상대 기기에 연결할 수 없습니다. 상대 기기가 켜져 있고 공유가 실행 중인지, 두 기기가 같은 네트워크에 있는지 확인하세요.', share: { title: '공유', stateOff: '꺼짐', statePreparing: '준비 중', stateListening: '공유 중', stateStopping: '정리 중', stateError: '오류', errorLanAddressUnavailable: '이 기기에서 공유에 사용할 LAN IPv4 주소를 찾을 수 없습니다. 이 기기의 Wi-Fi나 유선 네트워크 연결과 VPN 설정을 확인하세요.', errorPortUnavailable: '이 포트는 이미 사용 중입니다. 다른 포트를 선택하세요.', errorInvalidConfiguration: '공유 방법, 포트, 공개 주소를 확인하세요.', errorCleanupFailed: '공유는 중지되었지만 정리를 끝내지 못했습니다. 다시 중지해 보세요.', method: '공유 방법', methodLan: '같은 네트워크(LAN)', methodLanHelp: '같은 Wi-Fi나 유선 네트워크에 있는 기기만 연결됩니다.', methodQuick: '임시 인터넷 주소', methodFixed: '고정 주소(고급)', port: '포트', publicUrl: '공개 주소(URL)', publicUrlHelp: '등록된 기기가 이 주소로 연결합니다.', quickNote: '인터넷을 통해 연결합니다. 앱을 다시 켜면 주소가 바뀌어 기기를 다시 등록해야 합니다.', fixedNote: '터널이나 포트 포워딩으로 아래 포트를 공개 주소에 연결하세요. 주소가 바뀌지 않아 기기를 다시 등록할 필요가 없습니다.', fixedGuideTitle: '직접 연결하는 방법', fixedGuideBody: 'Cloudflare Tunnel을 쓰는 경우: Cloudflare 대시보드에서 터널을 만들고, 이 컴퓨터에 cloudflared를 서비스로 설치한 뒤, 터널 대상 주소를 http://127.0.0.1:{0} 으로 지정하세요.', autoListen: '앱을 켤 때 자동으로 공유 시작', start: '공유 시작', stop: '공유 중지', pairTitle: '새 기기 등록', pairNote: '다른 기기에서 QR 코드를 찍거나 링크를 붙여 넣으세요. 링크는 10분 동안 한 기기에만 쓸 수 있습니다.', pairRemaining: '{0} 남음', durationMinute: '{0}분', durationMinutes: '{0}분', durationSecond: '{0}초', durationSeconds: '{0}초', pairExpired: '만료됨. 새 링크를 만드세요.', copyLink: '링크 복사', newLink: '새 링크 만들기', permRead: '데이터 가져가기 허용', permReadHelp: '등록 링크로 연결한 기기가 이 기기의 데이터를 받아갈 수 있습니다.', permBidirectional: '양방향 동기화 허용', permBidirectionalHelp: '허용하면 상대 기기가 이 기기의 데이터를 바꿀 수도 있습니다.' }, devices: { title: '등록된 기기', outgoingTitle: '이 기기에서 가져가는 기기', incomingTitle: '이 기기가 받아오는 기기', permRead: '가져가기', permBidirectional: '양방향', outgoingEmpty: '아직 없습니다. 공유를 켜고 다른 기기에서 등록 링크를 열면 여기에 표시됩니다.', incomingEmpty: '아직 없습니다. 다른 기기의 등록 링크를 아래 동기화 작업에서 사용하면 여기에 저장됩니다.', lastSeen: '마지막 연결 {0} · 누적 {1}', revoke: '해제', revokeConfirm: '이 기기를 해제할까요? 해제한 기기는 다시 등록하기 전까지 연결할 수 없습니다.' }, work: { title: '동기화 작업', target: '대상 기기', useNewLink: '새 등록 링크 사용...', linkLabel: '등록 링크', linkHelp: '상대 기기의 공유 화면에서 링크를 복사할 수 있습니다.', linkPlaceholder: '등록 링크 붙여넣기', linkInvalid: '등록 링크 형식이 아닙니다. 상대 기기의 링크를 처음부터 끝까지 복사하거나 QR 코드를 여세요.', receiving: '받는 중...', conflictSelectTarget: '먼저 위의 대상 기기에서 상대 기기를 선택한 뒤 어느 쪽을 유지할지 고르세요.', clone: '전체 복사 받기', cloneHelp: '이 기기의 데이터를 상대 기기의 데이터로 통째로 바꿉니다.', cloneConfirm: '상대 기기의 데이터로 이 기기의 데이터를 통째로 교체합니다. 교체 전에 현재 데이터를 백업으로 보관합니다. 계속할까요?', delta: '바뀐 내용만 받기', deltaHelp: '마지막 동기화 이후 상대 기기에서 바뀐 항목만 받습니다.', bidirectional: '양방향 동기화', bidirectionalHelp: '두 기기의 변경 사항을 서로 반영합니다. 상대 기기가 양방향을 허용해야 합니다.', blockedWhileSharing: '공유를 끄면 받기 작업을 할 수 있습니다.', registerBlockedByActiveWork: '진행 중인 작업을 끝내거나 중단한 뒤 새 기기를 등록하세요.', sourceInUse: '이 기기를 쓰는 작업이 진행 중입니다. 작업을 끝내거나 취소한 뒤 다시 시도하세요.', sourceChanged: '대상 기기의 등록 정보가 바뀌었습니다. 대상 기기를 다시 선택한 뒤 다시 시도하세요.', deltaBlockedByRetained: '끝나지 않은 이전 증분 업데이트가 남아 있어 진행할 수 없습니다. 동기화 작업에서 이어서 진행하거나 취소하세요.', deltaRetained: '이전 증분 업데이트가 끝나지 않은 채 남아 있습니다. 상대 기기: {0}', deltaRetainedResumable: '상대 기기를 다시 켜고 이어서 진행하면 마무리됩니다. 상대 기기를 더 쓸 수 없으면 취소하세요.', deltaRetainedAmbiguous: '그 뒤 이 기기의 데이터가 바뀌어 이어서 진행할 수 없습니다. 취소하면 받기, 해제, 등록을 다시 할 수 있습니다.', deltaAbandonConfirm: '남아 있는 증분 업데이트를 취소할까요? 이 기기의 데이터는 그대로 유지되지만 상대 기기의 전송 통계는 갱신되지 않을 수 있습니다.', unknownDevice: '알 수 없는 기기', peerOutdated: '상대 기기의 RisuNest 버전이 오래되었습니다. 두 기기를 같은 버전으로 업데이트한 뒤 다시 시도하세요.', progress: '받는 중 {0}%', cancel: '취소', conflictTitle: '충돌이 있습니다', conflictBody: '같은 항목이 두 기기에서 다르게 바뀌었습니다. 유지할 쪽을 고르세요. 다른 쪽은 백업으로 남습니다.', conflictOthers: '기타 항목 {0}개', keepThis: '이 기기 유지', keepOther: '상대 기기 유지', resume: '이어서 진행', abandon: '작업 취소', abandonConfirm: '진행 중인 동기화를 취소할까요? 지금까지 받은 내용은 적용되지 않습니다.', doneUpToDate: '이미 최신 상태입니다.', doneUpdated: '{0}개 항목을 받았습니다 ({1}).', needClone: '전체 복사가 필요합니다. 위의 전체 복사 받기를 사용하세요.', backupNote: '작업 전 데이터는 백업으로 보관됩니다.', backupLocation: '백업 위치', dismiss: '닫기', progressLabel: '진행률', deltaConflictBothChanged: '같은 항목이 두 기기에서 모두 바뀌어 받을 수 없습니다. 데이터는 바뀌지 않았습니다. 양방향 동기화를 사용하세요.', deltaConflictLocalChanged: '업데이트 시작 중 로컬 데이터가 변경되었습니다. 데이터는 변경되지 않았습니다. 다시 시도하세요.', bidirectionalSyncing: '변경 사항을 교환하고 검증하는 중...', bidirectionalResumeRequired: '로컬 변경 사항이 반영되었습니다. 다른 기기 반영과 확인을 끝내려면 재개하세요.', bidirectionalSourceUnavailable: '상대 기기에 연결할 수 없습니다. 상대 기기의 공유가 켜져 있는지 확인한 뒤 이어서 진행하세요. 임시 인터넷 주소를 쓰는 기기가 앱을 다시 켰다면 다시 등록해야 합니다.', bidirectionalRefreshPending: '두 기기 반영은 끝났지만 로컬 화면을 새로 고치지 못했습니다.', bidirectionalEditsDiscarded: '상대 기기의 변경을 반영하면서 저장되지 않은 최근 편집이 사라졌습니다. 화면이 방금 전과 다를 수 있습니다.' }, androidLanOnly: 'Android에서는 같은 네트워크(LAN) 연결만 지원합니다.', notificationsDisabledWarning: '이 앱의 알림이 꺼져 있어 전송 중 중지 버튼이 있는 알림이 표시되지 않습니다. 이 화면에서 공유를 중지할 수 있으며, 시스템 설정에서 알림을 허용하면 알림의 중지 버튼을 다시 사용할 수 있습니다.' },
+        perf: {
+            title: '성능',
+            profile: '성능 프로파일',
+            profileNormal: '표준',
+            profileLowSpec: '저사양',
+            profileHelp:
+                '저사양은 메모리 사용량을 줄이는 대신 긴 대화에서 스크롤이 조금 느려질 수 있습니다.',
+        },
+        inlay: {
+            title: '채팅 첨부 이미지',
+            format: '저장 형식',
+            formatWebp: 'WebP (권장)',
+            formatPng: 'PNG (무손실)',
+            formatOriginal: '원본 유지',
+            quality: 'WebP 품질',
+            qualityHelp: '낮출수록 용량이 줄지만 화질이 떨어집니다.',
+            maxDimension: '최대 해상도',
+            maxDimensionHelp:
+                '긴 변이 이 값을 넘는 이미지는 저장할 때 축소합니다. 0이면 제한하지 않습니다.',
+            skipReencode: '이미 WebP인 이미지는 다시 변환하지 않기',
+            skipReencodeHelp:
+                '같은 이미지를 다시 변환할수록 화질이 조금씩 나빠집니다.',
+            unsupportedAnimated:
+                'GIF와 애니메이션 이미지는 아직 첨부할 수 없습니다.',
+        },
+        storage: {
+            snapshotSizeNote:
+                '합계는 공유 저장 공간을 한 번만 계산합니다. 각 스냅샷에는 복원했을 때의 크기를 표시합니다.',
+            title: '저장 공간',
+            refresh: '새로 고침',
+            total: '전체 데이터',
+            media: '이미지·미디어',
+            database: '데이터베이스',
+            inlays: '채팅 첨부',
+            plugins: '플러그인 데이터',
+            snapshots: '스냅샷',
+            conflictBackups: '충돌 백업',
+            counts: '캐릭터 {0}개 · 대화 {1}개 · 메시지 {2}개',
+            subMetrics:
+                '채팅 첨부 {0} (이미지·미디어에 포함) · 플러그인 데이터 {1}',
+            createSnapshotTitle: '스냅샷 만들기',
+            createSnapshotHelp:
+                '지금 상태를 저장해 두고 나중에 되돌릴 수 있습니다.',
+            createSnapshot: '지금 만들기',
+            tempTitle: '동기화 임시 파일',
+            cleanSyncTemp: '정리',
+            cleanSyncTempConfirm: '동기화 임시 파일을 정리할까요?',
+            calculateSize: '크기 계산',
+            calculateSizeFailed:
+                '임시 파일 크기를 계산하지 못했습니다. 정보를 새로 고친 뒤 다시 시도하세요.',
+            tempUsage: '{size} 사용 중',
+            gcTitle: '사용하지 않는 이미지',
+            gcHelp: '어디에서도 쓰지 않는 이미지를 찾아 지웁니다.',
+            gcRun: '찾기',
+            gcRunConfirm: '지금 삭제',
+            gcResult: '삭제 가능: {0}개 ({1})',
+            gcDeletedResult: '삭제됨: {0}개 ({1})',
+            gcConfirm:
+                '어디에서도 사용하지 않는 이미지 {0}개({1})를 삭제합니다. 계속할까요?',
+            deleteSnapshotConfirm:
+                '이 스냅샷을 삭제할까요? 삭제하면 이 시점으로 되돌릴 수 없습니다.',
+            deleteConflictBackupConfirm:
+                '이 충돌 백업을 삭제할까요? 삭제한 충돌 백업은 복구할 수 없습니다.',
+            syncBackups: '동기화 백업',
+            deleteSyncBackupConfirm:
+                '이 동기화 백업을 삭제할까요? 해당 작업 이전 상태로 되돌릴 수 없게 됩니다.',
+            syncBackupInUse:
+                '진행 중인 동기화가 사용하는 백업이라 삭제할 수 없습니다.',
+            trashedCount: '(휴지통 {0}개)',
+            loadFailed: '저장 공간 정보를 불러오지 못했습니다.',
+            staleTotals:
+                '저장 공간 합계가 최신 정보가 아닐 수 있습니다. 정보를 새로 고친 뒤 다시 시도하세요.',
+            emptyList: '아직 저장된 항목이 없습니다.',
+            listSummary: '{0}개 · {1}',
+            retry: '다시 시도',
+            actionFailed:
+                '작업을 완료하지 못했습니다. 일부 변경이 이미 적용되었을 수 있습니다. 정보를 새로 고친 뒤 다시 시도하세요.',
+        },
+        backup: {
+            generationBusy:
+                '응답을 생성하고 있습니다. 생성이 끝나거나 중단 처리가 끝난 뒤 백업·복원을 다시 실행해주세요.',
+            fileBusy:
+                '다른 파일 작업이 실행 중입니다. 작업이 끝나거나 취소 후 정리가 끝난 뒤 다시 실행해주세요.',
+            syncBusy:
+                '동기화가 실행 중이거나 복구가 필요합니다. 처리가 끝난 뒤 백업·복원을 다시 실행해주세요.',
+            syncUnconfirmed:
+                '동기화 결과를 확정하지 못했습니다. 미확정 작업을 해결한 뒤 복원해주세요.',
+            title: '백업·복구',
+            groupFiles: 'RisuSave 파일',
+            filesHelp:
+                'RisuAI와 호환되는 백업 파일입니다. 다른 기기로 옮기거나 보관할 때 씁니다.',
+            importFile: '가져오기',
+            exportFile: '내보내기',
+            groupRestore: '복원',
+            restoreHelp:
+                '이 기기에 보관된 스냅샷이나 다른 앱의 백업으로 되돌립니다.',
+            groupAccount: '공식 계정',
+            accountHelp:
+                'RisuAI 계정 서버에 백업을 올리거나 내려받습니다. 채팅 첨부 파일은 포함되지 않습니다.',
+            officialPublish: '백업 만들기',
+            officialRestore: '백업 복원',
+            officialCancel: '백업 업로드 취소',
+            officialRestoreConfirm:
+                '공식 계정 백업으로 이 기기의 데이터를 교체할까요?',
+            officialRestoreInlayWarning:
+                '공식 스냅샷에는 별도로 저장된 채팅 첨부가 포함되지 않습니다. 연결된 이미지, 오디오, 동영상, 서명은 복원되지 않을 수 있습니다. 백업을 복원한 뒤 앱이 다시 시작됩니다. 계속할까요?',
+            officialMissing:
+                '공식 계정 백업을 찾지 못했습니다. 이 기기의 데이터는 변경되지 않았습니다.',
+            officialPublishConfirm:
+                '현재 이 기기의 데이터로 공식 계정 백업을 덮어쓸까요?',
+            officialPublished: '공식 계정 백업을 만들었습니다.',
+            actionFailed:
+                '백업 작업을 완료하지 못했습니다. 일부 변경이 이미 적용되었을 수 있습니다.',
+            progressPreparing: '준비 중',
+            progressReading: '파일 읽는 중',
+            progressTransferring: '데이터 전송 중',
+            progressFinalizing: '마무리 중',
+            localBackupSaved: '로컬 백업을 저장했습니다.',
+            localBackupRestored: '로컬 백업을 복원했습니다.',
+            sourcePreserved:
+                '원본 DB와 파일을 보존했습니다. 이 보존용 백업으로 라이브러리를 교체하려면 데이터 복구가 먼저 필요합니다.',
+            recoverySourcePreserved:
+                '백업을 복원했습니다. 교체 전 데이터는 원본 보존용 백업에 담았으며, 이를 다시 사용하려면 데이터 복구가 필요합니다.',
+            sourceRepairRequired:
+                '원본 보존 백업을 검증했지만 라이브러리를 교체하려면 데이터 복구가 필요합니다. 현재 데이터는 변경하지 않았습니다.',
+        },
+        importDialog: {
+            titleImport: '가져오기',
+            titleRisuSave: 'RisuSave 가져오기',
+            titleLocalBackup: '로컬 백업 가져오기',
+            titleLossless: 'RisuNest 백업 가져오기',
+            formatPocketRisu: 'PocketRisu 백업',
+            formatRisuAi: 'RisuAI 백업',
+            elapsed: '경과 {0}',
+            overall: '{0} / {1}',
+            preparing: '준비 중',
+            stageCopyingSource: '파일 복사 중',
+            stageReadingArchive: '백업 파일 읽는 중',
+            stagePreparingAttachments: '첨부 파일 준비 중',
+            stageReadingDatabase: '데이터베이스 읽는 중',
+            stageDecodingDatabase: '데이터베이스 해석 중',
+            stageStagingCharacters: '캐릭터 저장 중',
+            stageFinalizingStaging: '설정과 프리셋 저장 중',
+            stageActivating: '데이터 적용 중',
+            stageRefreshingApp: '화면 새로 고침 중',
+            stageReloadingPlugins: '플러그인 다시 불러오는 중',
+            stageRestartingApp: '앱 다시 시작 중',
+            stageAwaitingReselect:
+                '호환 방식으로 전환합니다. 파일을 다시 선택하세요.',
+            stageComplete: '완료',
+            currentItem: '현재: {0}',
+            itemsOf: '{0} / {1}',
+            itemsCount: '{0}개 항목',
+            countCharacters: '캐릭터',
+            countPresets: '프리셋',
+            countAssets: '에셋',
+            countInlays: '채팅 첨부',
+            countColdStorage: '콜드 스토리지',
+            countPocketMedia: '미디어 파일',
+            countSkipped: '건너뜀',
+            cancel: '가져오기 취소',
+            cancelling: '취소하는 중',
+            cancelUnavailable: '데이터를 적용하는 동안에는 취소할 수 없습니다.',
+            close: '닫기',
+            resultSucceeded: '가져오기를 완료했습니다.',
+            resultRestarting: '가져오기를 완료했습니다. 앱을 다시 시작합니다.',
+            resultCancelled:
+                '가져오기를 취소했습니다. 기존 데이터는 그대로입니다.',
+            resultCancelledPartial:
+                '가져오기를 취소했습니다. 이미 저장된 첨부 파일 일부가 남아 있을 수 있습니다.',
+            resultFailed:
+                '가져오기에 실패했습니다. 기존 데이터는 그대로입니다.',
+            resultFailedAfterCommit:
+                '데이터는 가져왔지만 화면을 새로 고치지 못했습니다. 다른 작업을 하기 전에 앱을 다시 시작하세요.',
+            errorDetails: '오류 상세',
+            copyDetails: '복사',
+            copied: '복사됨',
+            reasonUnsupportedFormat: '지원하지 않는 파일 형식입니다.',
+            reasonInvalidSource:
+                '파일이 손상되었거나 형식이 올바르지 않습니다.',
+            reasonTruncated:
+                '파일이 끝까지 읽히지 않았습니다. 파일이 잘렸을 수 있습니다.',
+            reasonCorrupt: '파일 내용이 손상되었습니다.',
+            reasonRevisionConflict:
+                '가져오는 동안 다른 변경이 있어 적용하지 못했습니다. 다시 시도하세요.',
+            reasonStoreError: '저장소 오류로 가져오지 못했습니다.',
+            reasonUnknown: '알 수 없는 오류가 발생했습니다.',
+            warningCleanupFailed:
+                '임시 파일을 정리하지 못했습니다. 다음 시작 때 다시 시도합니다.',
+            warningPocketInlayFailed:
+                '일부 PocketRisu 첨부를 가져오지 못했습니다.',
+            warningUnknown: '경고: {0}',
+        },
+        platform: {
+            title: '플랫폼',
+            notifications: '알림',
+            notificationsHelp: '응답 생성 진행 상황을 알림으로 보여줍니다.',
+            notificationsOn: '허용됨',
+            notificationsOff: '꺼짐',
+            openSettings: '알림 설정 열기',
+            keepAlive: '응답 생성 중 앱 유지',
+            keepAliveHelp:
+                '응답을 받는 동안 알림을 띄워 앱이 백그라운드에서 꺼지지 않게 합니다.',
+            keepAliveNeedsNotifications:
+                '알림이 꺼져 있으면 이 기능이 동작하지 않습니다.',
+            operatingSystem: '운영체제',
+            webView: 'WebView',
+        },
+        boot: {
+            title: 'RisuNest를 시작하지 못했습니다',
+            schemaUnsupported:
+                '데이터 폴더에 호환되지 않는 사전 배포 빌드의 저장소가 남아 있습니다. RisuNest는 이 저장소를 열 수 없고 자동으로 변환하지도 않습니다. 데이터 폴더에서 저장소를 직접 삭제한 뒤 RisuNest를 다시 시작하세요.',
+            storeOpen:
+                '로컬 데이터 저장소를 열지 못했습니다. 다른 RisuNest 창이 저장소를 사용 중이거나 데이터 폴더를 읽을 수 없는 상태일 수 있습니다. 실행 중인 다른 창을 닫고 다시 시작하세요.',
+            unknown:
+                '앱을 불러오는 도중 시작에 실패했습니다. 아래 오류 내용을 확인하세요.',
+            restart: '다시 시작',
+            copyDetails: '오류 내용 복사',
+            copied: '오류 내용을 복사했습니다.',
+            dataPathWindows: 'Windows: %APPDATA%\\RisuNest\\',
+            dataPathAndroid: 'Android: 앱 정보 > 저장공간에서 데이터 삭제',
+            stage: '단계',
+        },
+        diag: {
+            title: '진단',
+            logTitle: '오류 로그',
+            logHelp:
+                '최근 오류 기록입니다. 문제를 신고할 때 함께 보내면 도움이 됩니다.',
+            viewLog: '보기',
+            copyLog: '복사',
+            fileLog: '오류 로그를 파일로 저장',
+            fileLogHelp: 'API 키 같은 비밀 정보는 가려서 기록합니다.',
+            logEmpty: '기록된 오류가 없습니다.',
+            actionFailed:
+                '지금은 진단 기능을 사용할 수 없습니다. 앱을 다시 시작한 뒤 다시 시도하세요.',
+        },
         onboarding: {
             eyebrow: '온보딩',
             brandTitle: '온보딩 절차를 진행해주세요.',
-            brandDesc: '기존 백업을 가져오거나, 다른 기기와 동기화하여 사용 환경을 그대로 옮겨올 수 있습니다.',
+            brandDesc:
+                '기존 백업을 가져오거나 동기화 서버에 연결할 수 있습니다.',
             stepStart: '시작 방식',
             stepData: '데이터',
             stepDone: '완료',
@@ -1745,58 +1994,44 @@ export const languageKorean = {
                 title: '시작 방식을 선택해주세요.',
                 lead: '바로 시작해도 나중에 설정에서 언제든지 복원 및 동기화가 가능합니다.',
                 freshTitle: '바로 시작',
-                freshDesc: '빈 설정으로 바로 시작합니다. 직접 설정하는 경우 선택해주세요.',
+                freshDesc:
+                    '빈 설정으로 바로 시작합니다. 직접 설정하는 경우 선택해주세요.',
                 importTitle: '백업 파일에서 가져오기',
-                importDesc: 'RisuAI, RisuNest, PocketRisu 백업 파일을 불러옵니다.',
-                syncTitle: '다른 기기·서버에서 동기화',
-                syncDesc: '다른 RisuNest 기기나 RisuNest 동기화 서버, 혹은 RisuAI 계정 백업을 사용합니다.',
+                importDesc:
+                    'RisuAI, RisuNest, PocketRisu 백업 파일을 불러옵니다.',
+                syncTitle: '동기화 서버에 연결',
+                syncDesc:
+                    'RisuNest 동기화 서버나 RisuAI 계정 백업을 사용합니다.',
             },
             import: {
                 title: '백업 파일 가져오기',
                 lead: 'RisuNest에서 내보낸 .risudat 파일이나 RisuAI·PocketRisu에서 내보낸 .bin 파일을 선택해주세요.',
                 dropTitle: '백업 파일을 선택해주세요',
                 choose: '파일 선택',
-                hintAndroid: '파일 관리자에서 백업 파일을 열어도 여기로 이어집니다.',
+                hintAndroid:
+                    '파일 관리자에서 백업 파일을 열어도 여기로 이어집니다.',
                 pocketTitle: 'PocketRisu·RisuAI 백업(.bin)',
-                pocketDesc: '두 앱에서 내보낸 risu-backup .bin 파일을 불러옵니다.',
+                pocketDesc:
+                    '두 앱에서 내보낸 risu-backup .bin 파일을 불러옵니다.',
                 pocketAction: '가져오기',
-                warning: '백업 용량이 큰 경우 시간이 소요될 수 있습니다. 끝날 때까지 앱을 닫지 말아주세요.',
+                warning:
+                    '백업 용량이 큰 경우 시간이 소요될 수 있습니다. 끝날 때까지 앱을 닫지 말아주세요.',
                 next: '계속',
             },
             sync: {
                 title: '동기화 방식을 선택해주세요.',
                 lead: 'RisuNest 기기, 동기화 서버, RisuAI 계정 중에서 선택합니다.',
-                deviceTitle: '다른 기기에서',
-                deviceDesc: '다른 RisuNest 기기와 동기화하여 전체 사본을 받아옵니다. QR 코드나 링크로 연결할 수 있습니다.',
                 hubTitle: '동기화 서버에서',
-                hubDesc: 'RisuNest 동기화 서버에서 데이터를 받아옵니다. QR 코드나 링크로 연결할 수 있습니다.',
+                hubDesc:
+                    'RisuNest 동기화 서버에서 데이터를 받아옵니다. QR 코드나 링크로 연결할 수 있습니다.',
                 accountTitle: 'RisuAI 계정 백업에서',
-                accountDesc: 'RisuAI 계정 서버에 업로드된 백업을 복원합니다. 채팅 첨부 파일이나 인레이 이미지는 복원되지 않습니다.',
-            },
-            device: {
-                title: '다른 기기와 연결',
-                stepShare: '다른 기기에서 설정 → 기기 동기화 → 공유 시작',
-                stepLink: '새 기기 등록에서 링크를 만들 수 있습니다.',
-                stepPaste: '아래에 링크를 붙여 넣어주세요.',
-                stepPasteMobile: 'QR 코드를 찍거나 아래에 링크를 붙여 넣어주세요.',
-                scan: 'QR 코드 스캔',
-                connect: '연결',
+                accountDesc:
+                    'RisuAI 계정 서버에 업로드된 백업을 복원합니다. 채팅 첨부 파일이나 인레이 이미지는 복원되지 않습니다.',
             },
             hub: {
                 title: '동기화 서버와 연결',
-                stepLink: '동기화 서버의 기기 관리에서 새 기기 등록 링크를 만들 수 있습니다.',
-            },
-            progress: {
-                title: '다운로드 중',
-                lead: '다운로드가 끝날 때까지 이 화면을 유지해주세요.',
-                server: '동기화 서버',
-                meta: '전체 복사 · {0} / {1}',
-                metaStarting: '전체 복사',
-                stageConnect: '연결',
-                stageReceive: '받는 중',
-                stageApply: '적용 중',
-                cancel: '취소',
-                cancelConfirm: '다운로드를 취소할까요? 지금까지 받은 내용은 적용되지 않습니다.',
+                stepLink:
+                    '동기화 서버의 기기 관리에서 새 기기 등록 링크를 만들 수 있습니다.',
             },
             account: {
                 title: 'RisuAI 계정 백업',
@@ -1818,7 +2053,6 @@ export const languageKorean = {
                 title: '준비 완료',
                 fresh: '빈 설정으로 시작합니다.',
                 import: '백업 파일을 불러왔습니다.',
-                device: '다른 기기의 데이터를 받았습니다.',
                 data: '모든 데이터가 준비되었습니다.',
                 start: 'RisuNest 시작',
             },

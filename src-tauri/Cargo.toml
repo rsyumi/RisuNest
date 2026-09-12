@@ -78,7 +78,6 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = { version = "2.4.3", features = ["deep-link"] }
 tauri-plugin-updater = "2.10.1"
-tiny_http = "0.12.0"
 getrandom = "0.2.15"
 reqwest = { version = "0.11.16", features = ["blocking", "json"] }
 
@@ -86,7 +85,6 @@ reqwest = { version = "0.11.16", features = ["blocking", "json"] }
 regex = "1.13.1"
 
 [target.'cfg(windows)'.dependencies]
-if-addrs = "0.14.0"
 webview2-com = "0.38.2"
 windows = { version = "0.61.3", features = ["Win32_System_Com"] }
 # Trust internal HTTPS endpoints whose CA is installed in the Windows store.
@@ -94,9 +92,6 @@ windows = { version = "0.61.3", features = ["Win32_System_Com"] }
 tauri-plugin-http = { version = "2.5.9", features = ["rustls-tls-native-roots"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
-    "Win32_NetworkManagement_IpHelper",
-    "Win32_NetworkManagement_Ndis",
-    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
@@ -115,7 +110,6 @@ keyring = { version = "3.6.3", default-features = false, features = ["sync-secre
 
 [target.'cfg(target_os = "android")'.dependencies]
 getrandom = "0.2.15"
-if-addrs = "0.14.0"
 jni = "0.21.1"
 reqwest = { version = "0.11.16", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 
@@ -123,9 +117,9 @@ reqwest = { version = "0.11.16", default-features = false, features = ["blocking
 reqwest = { version = "0.11.16", features = ["blocking", "json", "stream"] }
 
 [dev-dependencies]
+tiny_http = "0.12.0"
 risunest-sync-server = { path = "../server/sync" }
 axum = "0.8.9"
 tokio = { version = "1", features = ["rt-multi-thread", "net"] }
 tauri = { version = "2.11.5", features = ["test"] }
-if-addrs = "0.14.0"
 regex = "1.13.1"

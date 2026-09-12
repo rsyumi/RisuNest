@@ -29,6 +29,34 @@ pub(crate) struct PendingOperation {
 }
 
 impl PersistentStore {
+    pub(crate) fn server_cache_references(
+        &self,
+        cache: &crate::server_sync::cache::Cache,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let mut hashes = std::collections::BTreeSet::new();
+        for table in [
+            "server_sync_base",
+            "server_sync_remote",
+            "server_sync_operation_records",
+        ] {
+            let mut statement = self
+                .connection
+                .prepare(&format!("SELECT version FROM {table}"))?;
+            for version in statement.query_map([], |row| row.get::<_, String>(0))? {
+                let version: RecordVersion = serde_json::from_str(&version?)
+                    .map_err(|_| SyncError::new("invalid-local-server-version", 409))?;
+                hashes.extend(cache.closure(&version)?);
+            }
+        }
+        let mut statement = self
+            .connection
+            .prepare("SELECT hash FROM server_sync_objects")?;
+        for hash in statement.query_map([], |row| row.get::<_, String>(0))? {
+            hashes.insert(hash?);
+        }
+        Ok(hashes)
+    }
+
     pub(crate) fn server_config(&self) -> Result<Option<ServerConfig>> {
         self.server_stored_config()?
             .map(|stored| stored.resolve(self.repository_root()))

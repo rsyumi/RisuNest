@@ -81,3 +81,26 @@ test("rejects test modules and removed test helpers in source maps", () => {
 test("rejects an empty bundle instead of claiming validation", () => {
   assert.throws(() => assertProductionBundle([]), /No JavaScript/);
 });
+
+test("rejects removed peer transport modules but preserves upstream PeerJS", () => {
+  assertProductionBundle([
+    chunk({
+      "/src/ts/sync/multiuser.ts": {},
+      "/node_modules/peerjs/dist/bundler.mjs": {},
+    }),
+  ]);
+  for (const id of [
+    "/src/ts/storage/sync/peerClone.ts",
+    "/src/ts/storage/sync/deviceSyncController.ts",
+    "/src/lib/Setting/Pages/DeviceSyncSettings.svelte",
+  ]) {
+    assert.throws(
+      () => assertProductionBundle([chunk({ [id]: {} })]),
+      /module/,
+    );
+    assert.throws(() => assertProductionBundle([chunk(), map([id])]), /source/);
+  }
+  assert.throws(() =>
+    assertProductionBundle([chunk({}, "window.RisuPeerCloneBridge = {}")]),
+  );
+});

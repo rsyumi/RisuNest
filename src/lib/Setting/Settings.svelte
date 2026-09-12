@@ -1,5 +1,20 @@
 <script lang="ts">
-    import { AccessibilityIcon, ActivityIcon, PackageIcon, BotIcon, CodeIcon, ContactIcon, LanguagesIcon, MonitorIcon, MonitorSmartphone, Sailboat, UserIcon, CircleXIcon, KeyboardIcon, SparkleIcon, Wrench } from "@lucide/svelte";
+    import {
+        AccessibilityIcon,
+        ActivityIcon,
+        PackageIcon,
+        BotIcon,
+        CodeIcon,
+        ContactIcon,
+        LanguagesIcon,
+        MonitorIcon,
+        Sailboat,
+        UserIcon,
+        CircleXIcon,
+        KeyboardIcon,
+        SparkleIcon,
+        Wrench,
+    } from '@lucide/svelte'
     import { language } from "src/lang";
     import DisplaySettings from "./Pages/DisplaySettings.svelte";
     import UserSettings from "./Pages/UserSettings.svelte";
@@ -23,8 +38,6 @@
     import HotkeySettings from "./Pages/HotkeySettings.svelte";
     import PluginDefinedIcon from "../Others/PluginDefinedIcon.svelte";
     import RisuNestSettings from "./Pages/RisuNestSettings.svelte";
-    import DeviceSyncSettings from "./Pages/DeviceSyncSettings.svelte";
-    import { isTauri } from "src/ts/platform";
 
     let openLoreList = $state(false)
     if(window.innerWidth >= 900 && $SettingsMenuIndex === -1 && !$MobileGUI){
@@ -154,17 +167,6 @@
                         <Wrench />
                         <span>{language.risuNest.menuTitle}</span>
                     </button>
-                    {#if isTauri}
-                        <button class="flex gap-2 items-center hover:text-textcolor"
-                            class:text-textcolor={$SettingsMenuIndex === 18}
-                            class:text-textcolor2={$SettingsMenuIndex !== 18}
-                            onclick={() => {
-                            $SettingsMenuIndex = 18
-                        }}>
-                            <MonitorSmartphone />
-                            <span>{language.risuNest.sync.menuTitle}</span>
-                        </button>
-                    {/if}
                     {#if DBState.db.enableRisuaiProTools}
                         <button class="flex gap-2 items-center hover:text-textcolor"
                             class:text-textcolor={$SettingsMenuIndex === 16}
@@ -230,8 +232,6 @@
                         <AdvancedSettings />
                     {:else if $SettingsMenuIndex === 17}
                         <RisuNestSettings />
-                    {:else if $SettingsMenuIndex === 18 && isTauri}
-                        <DeviceSyncSettings />
                     {:else if $SettingsMenuIndex === 7}
                         <Communities />
                     {:else if $SettingsMenuIndex === 8}

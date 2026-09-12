@@ -13,7 +13,6 @@
     let keepAlive = $state(getDeviceSettings().androidKeepAliveDuringGeneration)
     let operatingSystem = $state('')
     let webView = $state('')
-    let transfer = $state('')
     const unsubscribe = subscribeDeviceSettings((settings) => {
         keepAlive = settings.androidKeepAliveDuringGeneration
     })
@@ -24,7 +23,6 @@
         if (!bridge) return
         try {
             webView = bridge.webViewVersion()
-            transfer = bridge.transferMode()
         } catch {
             notificationStatus = null
         }
@@ -63,12 +61,6 @@
         updateDeviceSettings({ androidKeepAliveDuringGeneration: keepAlive })
     })
 
-    // The bridge reports a wire value; a known one gets its readable name in front.
-    const transferLabel = $derived.by(() => {
-        const labels: Record<string, string | undefined> = language.risuNest.platform.transferModes
-        const label = labels[transfer]
-        return label ? `${label} (${transfer})` : transfer
-    })
 </script>
 
 <SettingGroup id="risunest-platform" title={language.risuNest.platform.title}>
@@ -92,16 +84,13 @@
         {/snippet}
         <SettingToggle bind:checked={keepAlive} label={language.risuNest.platform.keepAlive} />
     </SettingRow>
-    {#if operatingSystem || webView || transfer}
+    {#if operatingSystem || webView}
         <dl data-platform-info class="grid grid-cols-[auto_1fr] gap-x-5 gap-y-1 px-4 py-3 text-sm">
             {#if operatingSystem}
                 <dt class="text-textcolor2">{language.risuNest.platform.operatingSystem}</dt><dd>{operatingSystem}</dd>
             {/if}
             {#if webView}
                 <dt class="text-textcolor2">{language.risuNest.platform.webView}</dt><dd>{webView}</dd>
-            {/if}
-            {#if transfer}
-                <dt class="text-textcolor2">{language.risuNest.platform.transferMode}</dt><dd>{transferLabel}</dd>
             {/if}
         </dl>
     {/if}

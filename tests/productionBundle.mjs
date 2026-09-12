@@ -8,6 +8,11 @@ const forbiddenMarkers = [
   "resetOpenedFileListenersForTest",
   "VITE_TOKENIZER_BENCHMARK",
   "VITE_STREAMING_SMOKE",
+  "RisuPeerCloneBridge",
+  "peer_clone_prepare",
+  "peer_delta_prepare",
+  "peer_bidirectional_sync",
+  "device_sync_start",
 ];
 
 export function isVerificationModule(id) {
@@ -22,6 +27,15 @@ export function isVerificationModule(id) {
   );
 }
 
+function isRemovedPeerModule(id) {
+  const normalized = id.replaceAll("\\", "/").split("?")[0];
+  return (
+    /\/src\/ts\/storage\/sync\/(?:peer[A-Z]|deviceSync|bidirectionalSyncPlan|conflictBackupGate)/.test(
+      normalized,
+    ) || /\/DeviceSyncSettings\.svelte$/.test(normalized)
+  );
+}
+
 export function assertProductionBundle(output) {
   let javascriptFiles = 0;
   let sourceMaps = 0;
@@ -29,7 +43,7 @@ export function assertProductionBundle(output) {
     if (item.type === "chunk") {
       for (const id of Object.keys(item.modules)) {
         assert.ok(
-          !isVerificationModule(id),
+          !isVerificationModule(id) && !isRemovedPeerModule(id),
           `Verification module in ${item.fileName}: ${id}`,
         );
       }
@@ -48,7 +62,7 @@ export function assertProductionBundle(output) {
       const map = JSON.parse(String(item.source));
       for (const source of map.sources ?? [])
         assert.ok(
-          !isVerificationModule(source),
+          !isVerificationModule(source) && !isRemovedPeerModule(source),
           `Verification source in ${item.fileName}: ${source}`,
         );
       for (const content of map.sourcesContent ?? []) {

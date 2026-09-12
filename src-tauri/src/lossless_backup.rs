@@ -184,43 +184,6 @@ pub(crate) struct CreatedLosslessBackup {
     pub(crate) warning_codes: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct LosslessPeerSourceBinding {
-    operation_id: String,
-    side: String,
-    generation_id: String,
-    manifest_hash: String,
-    generation_sequence: String,
-}
-
-impl LosslessPeerSourceBinding {
-    pub(crate) fn new(
-        operation_id: &str,
-        side: &str,
-        generation_id: &str,
-        manifest_hash: &str,
-        generation_sequence: &str,
-    ) -> Self {
-        Self {
-            operation_id: operation_id.to_owned(),
-            side: side.to_owned(),
-            generation_id: generation_id.to_owned(),
-            manifest_hash: manifest_hash.to_owned(),
-            generation_sequence: generation_sequence.to_owned(),
-        }
-    }
-
-    pub(crate) fn extension(&self) -> Value {
-        serde_json::json!({
-            "operationId": self.operation_id,
-            "side": self.side,
-            "generationId": self.generation_id,
-            "manifestHash": self.manifest_hash,
-            "generationSequence": self.generation_sequence,
-        })
-    }
-}
-
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct LosslessRestoreReport {
     pub(crate) revision: i64,
@@ -1303,7 +1266,6 @@ fn restore_lossless_package_v1_inner(
             durable_job.as_deref_mut(),
             job_owner_manifest_hashes.as_ref(),
             require_v2,
-            None,
             cancellation,
         )
         .or_else(|error| {
@@ -1773,7 +1735,6 @@ fn create_and_verify_pre_replacement_backup(
     mut durable_job: Option<&mut DurableCasJob>,
     job_owner_manifest_hashes: Option<&HashSet<String>>,
     require_v2: bool,
-    peer_source: Option<&LosslessPeerSourceBinding>,
     cancellation: &dyn CancellationProbe,
 ) -> Result<CreatedLosslessBackup, LosslessError> {
     check_cancelled(cancellation)?;
@@ -1899,20 +1860,11 @@ fn create_and_verify_pre_replacement_backup(
             .iter()
             .map(lossless_reference)
             .collect::<Vec<_>>();
-        let mut extensions = serde_json::json!({
+        let extensions = serde_json::json!({
             "sourceRevision": expected_revision,
             "assetRepositoryAuthority": asset_repository_authority.value,
             "coldPayloadAuthority": cold_payload_authority.value,
         });
-        if let Some(peer_source) = peer_source {
-            extensions
-                .as_object_mut()
-                .expect("lossless extensions are an object")
-                .insert(
-                    "peerBidirectionalSource".to_owned(),
-                    peer_source.extension(),
-                );
-        }
         let mut output_guard = IncompleteBackupFile::create(output_path)?;
         let written = write_lossless_package_v1(
             output_guard.file_mut(),
@@ -2013,42 +1965,6 @@ pub(crate) fn create_and_verify_lossless_backup_v1_report(
         None,
         None,
         false,
-        None,
-        cancellation,
-    );
-    let released = store.release_revision(&lease).map_err(store_error);
-    match (exported, released) {
-        (Ok(bytes), Ok(())) => Ok(bytes),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(cleanup)) => Err(cleanup),
-        (Err(error), Err(cleanup)) => Err(cleanup_error(error, "revision lease release", cleanup)),
-    }
-}
-
-pub(crate) fn create_and_verify_peer_bidirectional_backup_v1_report(
-    output_path: &Path,
-    job_staging_root: &Path,
-    cas: &PayloadCas,
-    store: &mut PersistentStore,
-    expected_revision: i64,
-    peer_source: &LosslessPeerSourceBinding,
-    cancellation: &dyn CancellationProbe,
-) -> Result<CreatedLosslessBackup, LosslessError> {
-    let lease = store
-        .acquire_revision(expected_revision)
-        .map_err(store_error)?
-        .lease;
-    let exported = create_and_verify_pre_replacement_backup(
-        output_path,
-        job_staging_root,
-        cas,
-        store,
-        &lease,
-        expected_revision,
-        None,
-        None,
-        true,
-        Some(peer_source),
         cancellation,
     );
     let released = store.release_revision(&lease).map_err(store_error);
@@ -2084,7 +2000,6 @@ pub(crate) fn create_and_verify_lossless_backup_v1_durable_report(
         Some(durable_job),
         None,
         true,
-        None,
         cancellation,
     );
     let released = store.release_revision(&lease).map_err(store_error);
@@ -3470,10 +3385,6 @@ mod tests {
     };
     use crate::local_backup::NeverCancelled;
     use crate::lossless_f0::legacy_canonical_database_sha256_v1;
-    use crate::peer_sync::{
-        prepare_lossless_clone_session, CloneActivation, CloneObjectKind, CloneTargetAdapter,
-        LosslessCloneTargetAdapter, PeerSyncError, CLONE_LOSSLESS_DATABASE_FORMAT,
-    };
     use crate::persistent_store::WorkingSetCommit;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::json;
@@ -3549,7 +3460,7 @@ mod tests {
                 .unwrap();
             concurrent
                 .set_app_kv(
-                    "peerCloneActiveManifest",
+                    "syntheticRestoreMarker",
                     &json!({ "manifestId": self.manifest_id, "revision": 2 }),
                 )
                 .unwrap();
@@ -3989,7 +3900,7 @@ mod tests {
         let repository = directory.path().join("repository");
         fs::create_dir(&staging).unwrap();
         fs::create_dir(&repository).unwrap();
-        let output = directory.path().join("peer-source.lossless");
+        let output = directory.path().join("library-source.lossless");
         let mut store = PersistentStore::open(&repository).unwrap();
         let cas = PayloadCas::new(&repository).unwrap();
         seed_active_store(&mut store, &cas, "Source", b"source");
@@ -4048,7 +3959,7 @@ mod tests {
         let repository = directory.path().join("repository");
         fs::create_dir(&staging).unwrap();
         fs::create_dir(&repository).unwrap();
-        let output = directory.path().join("peer-source.lossless");
+        let output = directory.path().join("library-source.lossless");
         let mut store = PersistentStore::open(&repository).unwrap();
         let cas = PayloadCas::new(&repository).unwrap();
         seed_active_store(&mut store, &cas, "Source", b"source");
@@ -4087,26 +3998,26 @@ mod tests {
     }
 
     #[test]
-    fn peer_source_with_no_saved_presets_prepares_and_restores() {
-        assert_peer_source_preserves_missing_references(false, false, false);
+    fn lossless_source_with_no_saved_presets_prepares_and_restores() {
+        assert_lossless_source_preserves_missing_references(false, false, false);
     }
 
     #[test]
-    fn peer_source_preserves_missing_internal_references_without_losing_payloads() {
-        assert_peer_source_preserves_missing_references(true, false, false);
+    fn lossless_source_preserves_missing_internal_references_without_losing_payloads() {
+        assert_lossless_source_preserves_missing_references(true, false, false);
     }
 
     #[test]
-    fn peer_source_preserves_missing_v2_payload_references_and_available_bytes() {
-        assert_peer_source_preserves_missing_references(false, true, false);
+    fn lossless_source_preserves_missing_v2_payload_references_and_available_bytes() {
+        assert_lossless_source_preserves_missing_references(false, true, false);
     }
 
     #[test]
-    fn peer_source_preserves_swipes_without_import_conversion() {
-        assert_peer_source_preserves_missing_references(false, true, true);
+    fn lossless_source_preserves_swipes_without_import_conversion() {
+        assert_lossless_source_preserves_missing_references(false, true, true);
     }
 
-    fn assert_peer_source_preserves_missing_references(
+    fn assert_lossless_source_preserves_missing_references(
         extra_missing: bool,
         missing_payloads: bool,
         preserve_swipes: bool,
@@ -4162,16 +4073,6 @@ mod tests {
             })
             .unwrap();
         let original = store.materialize(None).unwrap();
-
-        crate::peer_sync::prepare_lossless_clone_session(
-            &mut store,
-            &cas,
-            2,
-            &directory.path().join("preparation"),
-            &directory.path().join("session"),
-            &NeverCancelled,
-        )
-        .expect("peer sync must preserve references already missing from the source");
 
         let output = directory.path().join("source.lossless");
         create_and_verify_lossless_backup_v1_report(
@@ -5061,7 +4962,7 @@ mod tests {
             &mut store,
             1,
             &recovery,
-            Some(("peerCloneActiveManifest", &marker)),
+            Some(("syntheticRestoreMarker", &marker)),
             &mut durable,
             2,
             &|| Ok(()),
@@ -5072,7 +4973,7 @@ mod tests {
 
         assert_eq!(report.revision, 2);
         assert_eq!(
-            store.get_app_kv("peerCloneActiveManifest").unwrap(),
+            store.get_app_kv("syntheticRestoreMarker").unwrap(),
             Some(marker)
         );
         assert_eq!(store.materialize(None).unwrap()["username"], "New");
@@ -5094,9 +4995,9 @@ mod tests {
         rusqlite::Connection::open(directory.path().join("persistent/persistent.db"))
             .unwrap()
             .execute_batch(
-                "CREATE TRIGGER reject_peer_clone_marker
+                "CREATE TRIGGER reject_restore_marker
                  BEFORE INSERT ON app_kv
-                 WHEN NEW.key = 'peerCloneActiveManifest'
+                 WHEN NEW.key = 'syntheticRestoreMarker'
                  BEGIN
                      SELECT RAISE(ABORT, 'marker rejected');
                  END;",
@@ -5119,7 +5020,7 @@ mod tests {
             &mut store,
             1,
             &recovery,
-            Some(("peerCloneActiveManifest", &marker)),
+            Some(("syntheticRestoreMarker", &marker)),
             &mut durable,
             2,
             &|| Ok(()),
@@ -5130,7 +5031,7 @@ mod tests {
 
         assert_eq!(store.revision().unwrap(), 1);
         assert_eq!(store.materialize(None).unwrap()["username"], "Old");
-        assert_eq!(store.get_app_kv("peerCloneActiveManifest").unwrap(), None);
+        assert_eq!(store.get_app_kv("syntheticRestoreMarker").unwrap(), None);
         durable.release(CasReleaseOutcome::Aborted).unwrap();
     }
 
@@ -5381,7 +5282,7 @@ mod tests {
             &mut store,
             1,
             &backup_path,
-            "peerCloneActiveManifest",
+            "syntheticRestoreMarker",
             &json!({ "manifestId": "manifest-2", "revision": 2 }),
             &NeverCancelled,
         )
@@ -5389,526 +5290,10 @@ mod tests {
 
         assert_eq!(report.revision, 2);
         assert_eq!(
-            store.get_app_kv("peerCloneActiveManifest").unwrap(),
+            store.get_app_kv("syntheticRestoreMarker").unwrap(),
             Some(json!({ "manifestId": "manifest-2", "revision": 2 }))
         );
         assert_eq!(store.materialize(None).unwrap()["username"], "New");
-    }
-
-    #[test]
-    fn production_target_activates_the_verified_lossless_package_once() {
-        let directory = tempfile::tempdir().unwrap();
-        let repository = directory.path();
-        let incoming = production_package(directory.path(), "New", b"new");
-        let mut store = PersistentStore::open(directory.path()).unwrap();
-        let cas = PayloadCas::new(&repository).unwrap();
-        seed_active_store(&mut store, &cas, "Old", b"old");
-        let target_root = directory.path().join("peer-target");
-        let manifest_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let mut target =
-            LosslessCloneTargetAdapter::new(&mut store, &cas, &target_root, 1, &NeverCancelled)
-                .unwrap();
-        let mut stage = target.begin(manifest_id).unwrap();
-        target
-            .stage_object(
-                &mut stage,
-                CloneObjectKind::Database,
-                "database",
-                &Value::Null,
-                &mut Cursor::new(incoming),
-            )
-            .unwrap();
-
-        assert_eq!(
-            target
-                .activate_if_current(&mut stage, None, manifest_id)
-                .unwrap(),
-            CloneActivation::Activated
-        );
-        assert_eq!(
-            target.active_manifest_id().unwrap().as_deref(),
-            Some(manifest_id)
-        );
-        assert_eq!(
-            target
-                .activate_if_current(&mut stage, Some(manifest_id), manifest_id)
-                .unwrap(),
-            CloneActivation::AlreadyActive
-        );
-        drop(target);
-        assert_eq!(store.revision().unwrap(), 2);
-        assert_eq!(store.materialize(None).unwrap()["username"], "New");
-        assert_eq!(fs::read_dir(&target_root).unwrap().count(), 1);
-    }
-
-    #[test]
-    fn production_target_reports_the_exact_pre_replacement_backup() {
-        let directory = tempfile::tempdir().unwrap();
-        let incoming = production_package(directory.path(), "New", b"new");
-        let mut store = PersistentStore::open(directory.path()).unwrap();
-        let cas = PayloadCas::new(directory.path()).unwrap();
-        seed_active_store(&mut store, &cas, "Old", b"old");
-        let target_root = directory.path().join("peer-target");
-        let manifest_id = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
-        let mut observed = Vec::new();
-        let mut observer = |path: &Path| {
-            observed.push(path.to_owned());
-            Ok(())
-        };
-        let mut target = LosslessCloneTargetAdapter::new_with_backup_observer(
-            &mut store,
-            &cas,
-            &target_root,
-            1,
-            &NeverCancelled,
-            &mut observer,
-        )
-        .unwrap();
-        let mut stage = target.begin(manifest_id).unwrap();
-        target
-            .stage_object(
-                &mut stage,
-                CloneObjectKind::Database,
-                "database",
-                &Value::Null,
-                &mut Cursor::new(incoming),
-            )
-            .unwrap();
-
-        assert_eq!(
-            target
-                .activate_if_current(&mut stage, None, manifest_id)
-                .unwrap(),
-            CloneActivation::Activated
-        );
-        let expected = target.committed_backup_path().unwrap().to_owned();
-        let backups = fs::canonicalize(target_root.join("backups")).unwrap();
-        assert_eq!(expected.parent(), Some(backups.as_path()));
-        drop(target);
-        assert_eq!(observed, vec![expected.clone()]);
-        assert!(expected.is_file());
-    }
-
-    #[test]
-    fn production_target_retries_backup_observation_before_cleaning_a_committed_stage() {
-        let directory = tempfile::tempdir().unwrap();
-        let incoming = production_package(directory.path(), "New", b"new");
-        let mut store = PersistentStore::open(directory.path()).unwrap();
-        let cas = PayloadCas::new(directory.path()).unwrap();
-        seed_active_store(&mut store, &cas, "Old", b"old");
-        let target_root = directory.path().join("peer-target");
-        let manifest_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
-        let mut rejecting_observer = |_path: &Path| {
-            Err(PeerSyncError::Storage(
-                "backup receipt unavailable".to_owned(),
-            ))
-        };
-        let mut target = LosslessCloneTargetAdapter::new_with_backup_observer(
-            &mut store,
-            &cas,
-            &target_root,
-            1,
-            &NeverCancelled,
-            &mut rejecting_observer,
-        )
-        .unwrap();
-        let mut stage = target.begin(manifest_id).unwrap();
-        target
-            .stage_object(
-                &mut stage,
-                CloneObjectKind::Database,
-                "database",
-                &Value::Null,
-                &mut Cursor::new(incoming),
-            )
-            .unwrap();
-
-        assert_eq!(
-            target
-                .activate_if_current(&mut stage, None, manifest_id)
-                .unwrap_err(),
-            PeerSyncError::Storage("backup receipt unavailable".to_owned())
-        );
-        drop(target);
-        assert_eq!(store.revision().unwrap(), 2);
-        let expected = fs::canonicalize(
-            fs::read_dir(target_root.join("backups"))
-                .unwrap()
-                .next()
-                .unwrap()
-                .unwrap()
-                .path(),
-        )
-        .unwrap();
-        let retained_stage = fs::read_dir(&target_root)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .find(|path| path.is_dir() && path.file_name().unwrap() != "backups")
-            .unwrap();
-        assert!(expected.is_file());
-        assert!(retained_stage.is_dir());
-
-        let mut observed = Vec::new();
-        let mut observer = |path: &Path| {
-            observed.push(path.to_owned());
-            Ok(())
-        };
-        let target = LosslessCloneTargetAdapter::new_with_backup_observer(
-            &mut store,
-            &cas,
-            &target_root,
-            2,
-            &NeverCancelled,
-            &mut observer,
-        )
-        .unwrap();
-        assert_eq!(target.committed_backup_path(), Some(expected.as_path()));
-        drop(target);
-        assert_eq!(observed, vec![expected.clone()]);
-        assert!(!retained_stage.exists());
-    }
-
-    #[test]
-    fn production_target_does_not_report_a_foreign_same_manifest_stage() {
-        let directory = tempfile::tempdir().unwrap();
-        let incoming = production_package(directory.path(), "New", b"new");
-        let mut store = PersistentStore::open(directory.path()).unwrap();
-        let cas = PayloadCas::new(directory.path()).unwrap();
-        seed_active_store(&mut store, &cas, "Old", b"old");
-        let target_root = directory.path().join("peer-target");
-        let manifest_id = "abababababababababababababababababababababababababababababababab";
-        let old_session_id = uuid::Uuid::new_v4().to_string();
-        let mut old_observer = |_path: &Path| Ok(());
-        let mut target = LosslessCloneTargetAdapter::new_with_owned_backup_observer(
-            &mut store,
-            &cas,
-            &target_root,
-            1,
-            &NeverCancelled,
-            manifest_id,
-            &old_session_id,
-            &mut old_observer,
-        )
-        .unwrap();
-        let mut stage = target.begin(manifest_id).unwrap();
-        target
-            .stage_object(
-                &mut stage,
-                CloneObjectKind::Database,
-                "database",
-                &Value::Null,
-                &mut Cursor::new(incoming),
-            )
-            .unwrap();
-        target.leave_durable_job_after_commit_once_for_test();
-        assert!(target
-            .activate_if_current(&mut stage, None, manifest_id)
-            .is_err());
-        drop(target);
-
-        let new_session_id = uuid::Uuid::new_v4().to_string();
-        let mut observed = Vec::new();
-        let mut new_observer = |path: &Path| {
-            observed.push(path.to_owned());
-            Ok(())
-        };
-        let target = LosslessCloneTargetAdapter::new_with_owned_backup_observer(
-            &mut store,
-            &cas,
-            &target_root,
-            2,
-            &NeverCancelled,
-            manifest_id,
-            &new_session_id,
-            &mut new_observer,
-        )
-        .unwrap();
-
-        assert_eq!(target.committed_backup_path(), None);
-        drop(target);
-        assert!(observed.is_empty());
-        assert_eq!(
-            fs::read_dir(target_root.join("backups")).unwrap().count(),
-            1
-        );
-    }
-
-    #[test]
-    fn production_target_retries_same_manifest_with_a_new_pre_replacement_backup() {
-        let directory = tempfile::tempdir().unwrap();
-        let repository = directory.path();
-        let incoming = production_package(directory.path(), "New", b"new");
-        let mut store = PersistentStore::open(directory.path()).unwrap();
-        let cas = PayloadCas::new(&repository).unwrap();
-        seed_active_store(&mut store, &cas, "Old", b"old");
-        let target_root = directory.path().join("peer-target");
-        let manifest_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-        let mut target =
-            LosslessCloneTargetAdapter::new(&mut store, &cas, &target_root, 1, &NeverCancelled)
-                .unwrap();
-        let mut stage = target.begin(manifest_id).unwrap();
-        target
-            .stage_object(
-                &mut stage,
-                CloneObjectKind::Database,
-                "database",
-                &Value::Null,
-                &mut Cursor::new(incoming.clone()),
-            )
-            .unwrap();
-        assert_eq!(
-            target
-                .activate_if_current(&mut stage, None, manifest_id)
-                .unwrap(),
-            CloneActivation::Activated
-        );
-        drop(target);
-
-        let mut root = store.read_root(None).unwrap().value;
-        root["username"] = Value::String("Local edit".to_owned());
-        store
-            .commit(&WorkingSetCommit {
-                expected_revision: 2,
-                root_mutations: None,
-                root: Some(root),
-                replace_presets: None,
-                character: None,
-                character_details: None,
-                replace_character: None,
-                add_character: None,
-                conversations: None,
-                delete_character_id: None,
-                plugin_storage: None,
-                asset_owner_heads: None,
-            })
-            .unwrap();
-
-        let mut target =
-            LosslessCloneTargetAdapter::new(&mut store, &cas, &target_root, 3, &NeverCancelled)
-                .unwrap();
-        assert_eq!(target.active_manifest_id().unwrap(), None);
-        let mut stage = target.begin(manifest_id).unwrap();
-        target
-            .stage_object(
-                &mut stage,
-                CloneObjectKind::Database,
-                "database",
-                &Value::Null,
-                &mut Cursor::new(incoming),
-            )
-            .unwrap();
-        assert_eq!(
-            target
-                .activate_if_current(&mut stage, None, manifest_id)
-                .unwrap(),
-            CloneActivation::Activated
-        );
-        drop(target);
-
-        assert_eq!(store.revision().unwrap(), 4);
-        assert_eq!(store.materialize(None).unwrap()["username"], "New");
-        assert_eq!(
-            fs::read_dir(target_root.join("backups")).unwrap().count(),
-            2
-        );
-    }
-
-    #[test]
-    fn production_target_adopts_same_manifest_that_wins_the_commit_race() {
-        let directory = tempfile::tempdir().unwrap();
-        let repository = directory.path();
-        let incoming = production_package(directory.path(), "New", b"new");
-        let mut store = PersistentStore::open(directory.path()).unwrap();
-        let cas = PayloadCas::new(&repository).unwrap();
-        seed_active_store(&mut store, &cas, "Old", b"old");
-        let target_root = directory.path().join("peer-target");
-        let manifest_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let cancellation = CommitSameManifestOnFirstCheck {
-            store_root: directory.path().to_owned(),
-            manifest_id: manifest_id.to_owned(),
-            fired: AtomicBool::new(false),
-        };
-        let mut target =
-            LosslessCloneTargetAdapter::new(&mut store, &cas, &target_root, 1, &cancellation)
-                .unwrap();
-        let mut stage = target.begin(manifest_id).unwrap();
-        target
-            .stage_object(
-                &mut stage,
-                CloneObjectKind::Database,
-                "database",
-                &Value::Null,
-                &mut Cursor::new(incoming),
-            )
-            .unwrap();
-
-        assert_eq!(
-            target
-                .activate_if_current(&mut stage, None, manifest_id)
-                .unwrap(),
-            CloneActivation::AlreadyActive
-        );
-        target.abort(stage).unwrap();
-        drop(target);
-
-        assert_eq!(store.revision().unwrap(), 2);
-        assert_eq!(store.materialize(None).unwrap()["username"], "New");
-    }
-
-    #[test]
-    fn production_target_recovers_a_sealed_precommit_peer_clone_job() {
-        let directory = tempfile::tempdir().unwrap();
-        let incoming = production_package(directory.path(), "New", b"new");
-        let mut store = PersistentStore::open(directory.path()).unwrap();
-        let cas = PayloadCas::new(directory.path()).unwrap();
-        seed_active_store(&mut store, &cas, "Old", b"old");
-        let target_root = directory.path().join("peer-target");
-        let manifest_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-
-        let mut target =
-            LosslessCloneTargetAdapter::new(&mut store, &cas, &target_root, 1, &NeverCancelled)
-                .unwrap();
-        let mut stage = target.begin(manifest_id).unwrap();
-        target
-            .stage_object(
-                &mut stage,
-                CloneObjectKind::Database,
-                "database",
-                &Value::Null,
-                &mut Cursor::new(incoming.clone()),
-            )
-            .unwrap();
-        target.leave_durable_job_after_precommit_failure_once_for_test();
-
-        assert!(target
-            .activate_if_current(&mut stage, None, manifest_id)
-            .is_err());
-        let retained = collect_durable_cas_job_roots(directory.path());
-        assert!(retained.blockers.is_empty());
-        assert!(!retained.object_hashes.is_empty() || !retained.manifest_hashes.is_empty());
-        drop(stage);
-        drop(target);
-        assert_eq!(store.revision().unwrap(), 1);
-
-        let mut target =
-            LosslessCloneTargetAdapter::new(&mut store, &cas, &target_root, 1, &NeverCancelled)
-                .unwrap();
-        assert_eq!(
-            collect_durable_cas_job_roots(directory.path()),
-            Default::default()
-        );
-        let mut retry = target.begin(manifest_id).unwrap();
-        target
-            .stage_object(
-                &mut retry,
-                CloneObjectKind::Database,
-                "database",
-                &Value::Null,
-                &mut Cursor::new(incoming),
-            )
-            .unwrap();
-        assert_eq!(
-            target
-                .activate_if_current(&mut retry, None, manifest_id)
-                .unwrap(),
-            CloneActivation::Activated
-        );
-        drop(target);
-        assert_eq!(store.revision().unwrap(), 2);
-        assert_eq!(
-            collect_durable_cas_job_roots(directory.path()),
-            Default::default()
-        );
-    }
-
-    #[test]
-    fn production_target_recovers_a_committed_peer_clone_job_before_idempotent_retry() {
-        let directory = tempfile::tempdir().unwrap();
-        let incoming = production_package(directory.path(), "New", b"new");
-        let mut store = PersistentStore::open(directory.path()).unwrap();
-        let cas = PayloadCas::new(directory.path()).unwrap();
-        seed_active_store(&mut store, &cas, "Old", b"old");
-        let target_root = directory.path().join("peer-target");
-        let manifest_id = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-
-        let mut target =
-            LosslessCloneTargetAdapter::new(&mut store, &cas, &target_root, 1, &NeverCancelled)
-                .unwrap();
-        let mut stage = target.begin(manifest_id).unwrap();
-        target
-            .stage_object(
-                &mut stage,
-                CloneObjectKind::Database,
-                "database",
-                &Value::Null,
-                &mut Cursor::new(incoming),
-            )
-            .unwrap();
-        target.leave_durable_job_after_commit_once_for_test();
-
-        assert!(target
-            .activate_if_current(&mut stage, None, manifest_id)
-            .is_err());
-        assert_eq!(
-            target.active_manifest_id().unwrap().as_deref(),
-            Some(manifest_id)
-        );
-        let retained = collect_durable_cas_job_roots(directory.path());
-        assert!(retained.blockers.is_empty());
-        assert!(!retained.object_hashes.is_empty() || !retained.manifest_hashes.is_empty());
-        drop(target);
-        assert_eq!(store.revision().unwrap(), 2);
-
-        let mut target =
-            LosslessCloneTargetAdapter::new(&mut store, &cas, &target_root, 2, &NeverCancelled)
-                .unwrap();
-        assert_eq!(
-            collect_durable_cas_job_roots(directory.path()),
-            Default::default()
-        );
-        assert_eq!(
-            target
-                .activate_if_current(&mut stage, None, manifest_id)
-                .unwrap(),
-            CloneActivation::AlreadyActive
-        );
-        assert_eq!(
-            collect_durable_cas_job_roots(directory.path()),
-            Default::default()
-        );
-    }
-
-    #[test]
-    fn production_source_pins_one_complete_lossless_package_before_serving() {
-        let directory = tempfile::tempdir().unwrap();
-        let repository = directory.path().join("repository");
-        let preparation = directory.path().join("source-preparation");
-        let session_root = directory.path().join("source-session");
-        fs::create_dir(&repository).unwrap();
-        let mut store = PersistentStore::open(&repository).unwrap();
-        let cas = PayloadCas::new(&repository).unwrap();
-        seed_active_store(&mut store, &cas, "Source", b"source");
-
-        let session = prepare_lossless_clone_session(
-            &mut store,
-            &cas,
-            1,
-            &preparation,
-            &session_root,
-            &NeverCancelled,
-        )
-        .unwrap();
-
-        assert_eq!(session.manifest().source_revision, 1);
-        assert_eq!(
-            session.manifest().database.format,
-            CLONE_LOSSLESS_DATABASE_FORMAT
-        );
-        assert!(session.manifest().payloads.is_empty());
-        assert_eq!(session.manifest().objects.len(), 1);
-        assert!(!preparation.exists());
-        assert_eq!(store.revision().unwrap(), 1);
     }
 
     #[test]

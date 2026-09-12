@@ -23,7 +23,7 @@ import { getCurrent, onOpenUrl } from '@tauri-apps/plugin-deep-link';
 import { REALM_HUB_URL, REALM_NIGHTLY_HUB_URL, REALM_NODE_PROXY_BASE, REALM_SITE_URL } from "./realmEndpoints"
 import { dispatchRisuLocalUrl } from "./deepLinkDispatcher"
 import { registerOpenedFileListeners } from "./openedFiles"
-import { receiveDeviceSyncUri } from "./storage/sync/peerCloneDeepLink"
+import { serverSyncNavigation } from './storage/sync/serverSyncDeepLink'
 import { importDesktopNativeCharacterPath } from './storage/nativeCharacterFileRoute'
 import type { NativeFileJobOptions, NativeFileJobSource } from './storage/nativeFileJobs'
 import {
@@ -720,11 +720,8 @@ export async function characterURLImport() {
             for (const url of urls) {
                 dispatchRisuLocalUrl(url, {
                     onRealm: (id) => void downloadRisuHub(id),
-                    onDeviceSync: (uri) => {
-                        receiveDeviceSyncUri(uri, (menuIndex) => {
-                            SettingsMenuIndex.set(menuIndex)
-                            settingsOpen.set(true)
-                        })
+                    onServerSync: (uri) => {
+                        serverSyncNavigation.receive(uri)
                     },
                 })
             }

@@ -18,12 +18,7 @@ import {
     deleteNativePersistentSnapshot,
     executeNativePersistentAssetGc,
     getNativePersistentStorageStats,
-    listPeerBackups,
     previewNativePersistentAssetGc,
-    removePeerBackup,
-    isNativePeerBackupDeleteError,
-    cleanupPeerTemp,
-    getPeerTempUsage,
     checkpointNativePersistentStore,
     createNativePersistentSnapshot,
     createPeriodicNativeSnapshotIfDue,
@@ -74,45 +69,21 @@ describe('native persistent maintenance', () => {
     })
 
     it('maps storage maintenance commands through their typed invoke boundary', async () => {
-        const path = 'C:/app/persistent/snapshots/snapshot.db'
         mocks.invoke.mockResolvedValue({})
 
         await getNativePersistentStorageStats()
         await deleteNativePersistentSnapshot('ab18b8a5-f45c-46ba-bbf9-74b2cae87717')
         await previewNativePersistentAssetGc()
         await executeNativePersistentAssetGc()
-        await listPeerBackups()
-        await removePeerBackup(path)
-        await getPeerTempUsage()
-        await cleanupPeerTemp()
 
         expect(mocks.invoke.mock.calls).toEqual([
             ['pds_storage_stats'],
             ['pds_snapshot_delete', { id: 'ab18b8a5-f45c-46ba-bbf9-74b2cae87717' }],
             ['pds_asset_gc_preview'],
             ['pds_asset_gc_execute'],
-            ['peer_backup_list'],
-            ['peer_backup_delete', { path }],
-            ['peer_temp_usage'],
-            ['peer_temp_cleanup'],
         ])
     })
 
-    it('recognizes only the safe serialized peer-backup delete errors', () => {
-        expect(isNativePeerBackupDeleteError({ code: 'peer-backup-in-use' })).toEqual({
-            code: 'peer-backup-in-use',
-        })
-        expect(isNativePeerBackupDeleteError({ code: 'peer-backup-delete-failed' })).toEqual({
-            code: 'peer-backup-delete-failed',
-        })
-        expect(
-            isNativePeerBackupDeleteError({
-                code: 'peer-backup-in-use',
-                message: 'raw native text',
-            }),
-        ).toBeNull()
-        expect(isNativePeerBackupDeleteError({ code: 'other' })).toBeNull()
-    })
 
     it.each([
         { age: 24 * 60 * 60 * 1000 - 1, due: false },

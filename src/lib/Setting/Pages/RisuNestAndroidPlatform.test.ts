@@ -54,7 +54,6 @@ describe('RisuNest Android platform settings', () => {
             notificationsEnabled: () => status === true,
             openNotificationSettings: mocks.openNotificationSettings,
             webViewVersion: () => '140.0.1',
-            transferMode: () => 'foreground',
         }
         const target = document.createElement('div')
         document.body.append(target)
@@ -73,7 +72,6 @@ describe('RisuNest Android platform settings', () => {
         expect(target.textContent).toContain('Keep app alive while generating')
         expect(target.textContent).toContain('Android 16')
         expect(target.textContent).toContain('140.0.1')
-        expect(target.textContent).toContain('foreground')
         expect(target.querySelector('[role="status"]')).toBeNull()
         expect(target.querySelector('[role="alert"]')).toBeNull()
     })
@@ -87,8 +85,6 @@ describe('RisuNest Android platform settings', () => {
         expect(target.textContent).toContain('Allowed')
         expect(target.textContent).toContain('Android 16')
         expect(target.textContent).toContain('140.0.1')
-        // A known wire value gets its readable name; the wire value stays for bug reports.
-        expect(target.textContent).toContain('Foreground service (foreground)')
         const notificationBadge = target.querySelector('[role="status"][aria-live="polite"]')
         expect(notificationBadge?.textContent).toBe('Allowed')
         expect(notificationBadge?.classList.contains('rounded-full')).toBe(true)
