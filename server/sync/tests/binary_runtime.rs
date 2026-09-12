@@ -328,9 +328,24 @@ fn memory(child: &Child) -> (u64, u64) {
     (current.parse().unwrap(), peak.parse().unwrap())
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "linux")]
+fn memory(child: &Child) -> (u64, u64) {
+    let status = std::fs::read_to_string(format!("/proc/{}/status", child.id())).unwrap();
+    let value = |name: &str| {
+        let line = status.lines().find(|line| line.starts_with(name)).unwrap();
+        line.split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            * 1024
+    };
+    (value("VmRSS:"), value("VmHWM:"))
+}
+
+#[cfg(any(windows, target_os = "linux"))]
 #[tokio::test]
-#[ignore = "Explicit Windows release daemon head latency and four-transfer RSS gate"]
+#[ignore = "Explicit release daemon head latency and four-transfer RSS gate"]
 async fn release_daemon_head_and_four_delta_transfers_resource_gate() {
     use risunest_sync_wire::{
         delta,

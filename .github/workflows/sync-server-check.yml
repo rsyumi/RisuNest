@@ -1,0 +1,68 @@
+name: Standalone sync server
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "server/sync/**"
+      - "crates/sync-wire/**"
+      - ".github/workflows/sync-server-check.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            suffix: ".exe"
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            suffix: ""
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            suffix: ""
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            suffix: ""
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            suffix: ""
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy, rustfmt
+      - name: Check standalone formatting
+        run: cargo fmt --manifest-path server/sync/Cargo.toml --check
+      - name: Check protocol and daemon warnings
+        run: cargo clippy --manifest-path server/sync/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Test wire
+        run: cargo test --manifest-path crates/sync-wire/Cargo.toml --release --locked
+      - name: Test standalone runtime and recovery
+        run: cargo test --manifest-path server/sync/Cargo.toml --release --locked --target ${{ matrix.target }}
+      - name: Build headless binary
+        run: cargo build --manifest-path server/sync/Cargo.toml --release --locked --target ${{ matrix.target }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Package tested binary
+        run: >-
+          python server/sync/distribution/package.py
+          --binary src-tauri/target/${{ matrix.target }}/release/risunest-sync-server${{ matrix.suffix }}
+          --target ${{ matrix.target }}
+          --output server/sync/distribution/artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: risunest-sync-server-${{ matrix.target }}
+          path: server/sync/distribution/artifacts/*
+          if-no-files-found: error

@@ -1,14 +1,14 @@
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
+import { syntheticDaemon } from "./daemon.mjs";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { createServer } from "node:net";
 import { REALM_BLOCKED_URL_PATTERNS } from "../../scripts/realmBlocklist.mjs";
 
 // A separately installed package is mandatory. Never inspect the user's app.
 const packageName = "io.github.rsyumi.risunest.syncservervalidation20260911";
 const adb = process.env.ANDROID_HOME + "/platform-tools/adb.exe";
 const root = fileURLToPath(new URL(".local/", import.meta.url));
-const executable =
-  process.env.CARGO_TARGET_DIR + "/debug/risunest-sync-server.exe";
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const run = (...args) =>
   execFileSync(adb, ["-P", "15037", "-s", "emulator-5554", ...args], {
@@ -22,27 +22,24 @@ if (!run("shell", "pm", "path", packageName).startsWith("package:"))
   throw new Error("Isolated validation package is not installed");
 mkdirSync(root, { recursive: true });
 const data = root + "runtime-server-" + Date.now();
-const cli = (...args) =>
-  execFileSync(executable, [...args, "--data-dir", data], {
-    encoding: "utf8",
-    windowsHide: true,
-    timeout: 15000,
-  });
+const server = syntheticDaemon(data, 19419);
+const cli = server.cli;
 cli("init");
 const config = {
   ...JSON.parse(cli("device", "add")),
   endpoint: "http://127.0.0.1:19419",
 };
-const daemon = spawn(
-  executable,
-  ["serve", "--data-dir", data, "--listen", "127.0.0.1:19419"],
-  {
-    windowsHide: true,
-    stdio: ["ignore", "ignore", "pipe"],
-  },
+const verifyUnresponsiveStartup = process.argv.includes(
+  "--unresponsive-startup",
 );
-daemon.stderr.resume();
+const verifyUi = process.argv.includes("--ui") || verifyUnresponsiveStartup;
+const uiConfig = verifyUi
+  ? { ...JSON.parse(cli("device", "add")), endpoint: config.endpoint }
+  : undefined;
+const daemon = await server.start();
 let client;
+let reverseInstalled = false;
+let forwardInstalled = false;
 async function connect() {
   const pid = run("shell", "pidof", packageName);
   if (!/^\d+$/.test(pid)) throw new Error("Isolated package is not running");
@@ -52,6 +49,7 @@ async function connect() {
   )
     throw new Error("Unexpected Android process identity");
   run("forward", "tcp:19420", `localabstract:webview_devtools_remote_${pid}`);
+  forwardInstalled = true;
   const targets = await (
     await fetch("http://127.0.0.1:19420/json/list")
   ).json();
@@ -135,9 +133,155 @@ async function cycle() {
     preparationId: prepared.preparationId,
   });
 }
+async function waitForUi(expression) {
+  const started = Date.now();
+  while (!(await client.evaluate(expression))) {
+    if (Date.now() - started > 60000)
+      throw new Error(`Synthetic UI did not become ready: ${expression}`);
+    await delay(250);
+  }
+}
+async function exerciseUi() {
+  // This separately installed profile contains only this harness's synthetic
+  // state. Seed its local onboarding marker without contacting an account API.
+  await client.evaluate(`(async()=>{
+    const invoke=window.__TAURI_INTERNALS__.invoke;
+    const root=await invoke('pds_read_root');
+    await invoke('pds_commit',{commit:{expectedRevision:root.revision,rootMutations:[{type:'set',key:'didFirstSetup',value:true}]},assetAliases:[]});
+    localStorage.setItem('tos4','true'); return true;
+  })()`);
+  await client.call("Page.reload");
+  await waitForUi("!!document.querySelector('button:has(svg.lucide-list)')");
+  await client.evaluate(
+    "document.querySelector('button:has(svg.lucide-list)').click(); true",
+  );
+  await waitForUi(
+    "!!document.querySelector('button:has(svg.lucide-settings)')",
+  );
+  await client.evaluate(
+    "document.querySelector('button:has(svg.lucide-settings)').click(); true",
+  );
+  await waitForUi(
+    "Array.from(document.querySelectorAll('button')).some(b=>b.innerText==='RisuNest')",
+  );
+  await client.evaluate(
+    "Array.from(document.querySelectorAll('button')).find(b=>b.innerText==='RisuNest').click(); true",
+  );
+  await waitForUi(
+    "Array.from(document.querySelectorAll('.server-sync button')).some(b=>['Disconnect','연결 해제'].includes(b.innerText)&&!b.disabled)",
+  );
+  await client.evaluate(
+    "Array.from(document.querySelectorAll('.server-sync button')).find(b=>['Disconnect','연결 해제'].includes(b.innerText)).click(); true",
+  );
+  await waitForUi("document.querySelectorAll('.server-sync input').length===4");
+  // Only synthetic credentials enter the form, never logs or screenshots.
+  await client.evaluate(`(()=>{
+    const values=${JSON.stringify([uiConfig.endpoint, uiConfig.libraryId, uiConfig.deviceId, uiConfig.token])};
+    document.querySelectorAll('.server-sync input').forEach((input,index)=>{input.value=values[index]; input.dispatchEvent(new Event('input',{bubbles:true}));});
+    document.querySelector('.server-sync form').requestSubmit(); return true;
+  })()`);
+  await waitForUi(
+    "['Last successful sync','최근 동기화 성공'].some(text=>document.querySelector('.server-sync')?.innerText.includes(text))",
+  );
+  const layout = await client.evaluate(`(()=>{
+    const panel=document.querySelector('.server-sync'); panel.scrollIntoView();
+    const connection=panel.querySelector('.connection');
+    return {viewport:innerWidth,panelWidth:panel.getBoundingClientRect().width,connectionWidth:connection.clientWidth,connectionScrollWidth:connection.scrollWidth,credentialInputs:panel.querySelectorAll('input').length};
+  })()`);
+  if (
+    layout.credentialInputs !== 0 ||
+    layout.connectionScrollWidth > layout.connectionWidth + 1
+  )
+    throw new Error(
+      "Synthetic server settings overflow or exposed credential form",
+    );
+  const shot = await client.call("Page.captureScreenshot", { format: "png" });
+  writeFileSync(
+    root + "android-server-settings.png",
+    Buffer.from(shot.data, "base64"),
+  );
+  return layout;
+}
+async function unresponsiveStartup() {
+  const before = await checked("server_sync_status");
+  const stopped = new Promise((resolve) => daemon.once("exit", resolve));
+  daemon.kill();
+  await stopped;
+  const sockets = new Set();
+  let receivedRequest = false;
+  const stall = createServer((socket) => {
+    sockets.add(socket);
+    socket.on("data", () => {
+      receivedRequest = true;
+    });
+    socket.on("close", () => sockets.delete(socket));
+    socket.on("error", () => {});
+    // Consume synthetic requests without returning headers or a body.
+  });
+  await new Promise((resolve, reject) => {
+    stall.once("error", reject);
+    stall.listen(19419, "127.0.0.1", resolve);
+  });
+  try {
+    client.close();
+    run("shell", "am", "force-stop", packageName);
+    const started = Date.now();
+    run(
+      "shell",
+      "am",
+      "start",
+      "-n",
+      `${packageName}/io.github.rsyumi.risunest.MainActivity`,
+    );
+    await delay(5000);
+    client = await connect();
+    await waitForUi("!!document.querySelector('button:has(svg.lucide-list)')");
+    await client.evaluate(
+      "document.querySelector('button:has(svg.lucide-list)').click(); true",
+    );
+    await waitForUi(
+      "!!document.querySelector('button:has(svg.lucide-settings)')",
+    );
+    await client.evaluate(
+      "document.querySelector('button:has(svg.lucide-settings)').click(); true",
+    );
+    await waitForUi(
+      "Array.from(document.querySelectorAll('button')).some(b=>b.innerText==='RisuNest')",
+    );
+    const localInteractionMs = Date.now() - started;
+    if (localInteractionMs >= 30000)
+      throw new Error("Startup waited for the stalled server");
+    await delay(Math.max(0, 35000 - (Date.now() - started)));
+    if (!receivedRequest)
+      throw new Error("Startup never attempted its configured server");
+    const after = await checked("server_sync_status");
+    if (
+      !after.configured ||
+      JSON.stringify(after.head) !== JSON.stringify(before.head)
+    )
+      throw new Error("Stalled startup changed the confirmed server head");
+    return {
+      localInteractionMs,
+      stalledForMs: Date.now() - started,
+      requestObserved: true,
+      headPreserved: true,
+    };
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    await new Promise((resolve) => stall.close(resolve));
+  }
+}
 try {
   run("reverse", "tcp:19419", "tcp:19419");
-  await delay(1500);
+  reverseInstalled = true;
+  run(
+    "shell",
+    "am",
+    "start",
+    "-n",
+    `${packageName}/io.github.rsyumi.risunest.MainActivity`,
+  );
+  await delay(5000);
   client = await connect();
   await checked("pds_open");
   if ((await checked("server_sync_status")).configured) {
@@ -165,7 +309,15 @@ try {
     throw new Error(
       "Restarted replica did not reach the synthetic server head",
     );
+  const verifiedBytes = await checked("server_sync_verified_bytes");
+  if (typeof verifiedBytes !== "string" || !/^\d+$/.test(verifiedBytes))
+    throw new Error("Native transfer progress is unavailable");
+  const ui = verifyUi ? await exerciseUi() : undefined;
+  const stalledStartup = verifyUnresponsiveStartup
+    ? await unresponsiveStartup()
+    : undefined;
   const report = {
+    serverPlatform: server.platform,
     packageName,
     avd: "risunest_vm_retest",
     registration: true,
@@ -173,12 +325,25 @@ try {
     initialPhase: initial.phase,
     resumedPhase: resumed.phase,
     credentialResolvedAfterRestart: true,
+    verifiedByteProgress: true,
+    ui,
+    stalledStartup,
   };
   writeFileSync(root + "android-runtime.json", JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report));
 } finally {
   client?.close();
-  daemon.kill();
-  run("reverse", "--remove", "tcp:19419");
-  run("forward", "--remove", "tcp:19420");
+  // Cleanup must not replace the original failure during startup/connection.
+  for (const cleanup of [
+    () => reverseInstalled && run("reverse", "--remove", "tcp:19419"),
+    () => forwardInstalled && run("forward", "--remove", "tcp:19420"),
+    () => run("shell", "am", "force-stop", packageName),
+  ]) {
+    try {
+      cleanup();
+    } catch {
+      console.error("Synthetic Android cleanup failed");
+    }
+  }
+  await daemon.stop();
 }

@@ -7,6 +7,31 @@ are verified.
 
 ## Run
 
+After extracting a binary archive, open a terminal in that directory. Choose a
+new absolute data directory, then initialize, register each device and start:
+
+```powershell
+# Windows, PowerShell
+$data = Join-Path $env:LOCALAPPDATA 'RisuNestSync'
+./risunest-sync-server.exe init --data-dir $data
+./risunest-sync-server.exe device add --data-dir $data
+./risunest-sync-server.exe serve --data-dir $data
+```
+
+```sh
+# Linux or macOS
+./risunest-sync-server init --data-dir "$HOME/RisuNestSync"
+./risunest-sync-server device add --data-dir "$HOME/RisuNestSync"
+./risunest-sync-server serve --data-dir "$HOME/RisuNestSync"
+```
+
+In RisuNest's server synchronization settings, register the endpoint, library ID,
+device ID and token printed for that installation. Use `http://127.0.0.1:4319`
+only on the server machine; other devices need the HTTPS proxy URL described
+below. Pause the daemon before adding another device, then restart it.
+
+To build from this repository on the local development machine:
+
 ```powershell
 $env:CARGO_TARGET_DIR = 'E:/Programming/Github/RisuNest/src-tauri/target'
 cargo build --manifest-path server/sync/Cargo.toml --locked
@@ -27,8 +52,9 @@ Secret Service (the native Linux build also needs the libdbus development
 package). Key-store errors do not fall back to plaintext. A data backup cannot
 transfer a device credential. Unlock the OS store or revoke the previous device
 and register a new credential when one is lost. Windows protection and raw-source
-backup exclusion have automated coverage; other OS key-store runtime checks
-remain pending. See [DPAPI](https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata)
+backup exclusion have automated coverage; Android registration and retrieval after
+process restart passed in an isolated agent APK. Apple/Linux key-store runtime
+checks remain pending. See [DPAPI](https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata)
 and [Keyring's platform stores](https://docs.rs/keyring/3.6.3/keyring/).
 
 `status`, `device add`, `device revoke ID`, `maintain`, `backup`, `restore`, and `restore-epoch` require
@@ -39,17 +65,41 @@ Ctrl+C and Unix SIGTERM request graceful shutdown.
 The default is `127.0.0.1:4319`. `--listen` accepts loopback addresses only.
 Configure a trusted HTTPS reverse proxy or Tunnel for remote clients and pass
 `--https-proxy` to acknowledge that origin configuration. This flag does not
-install a proxy, provide TLS, or enable public cleartext binding. Direct TLS and
-live proxy verification remain pending. Keep the data directory on a local disk
+install a proxy, provide TLS, or enable public cleartext binding. Live HTTPS proxy
+verification remains pending. Keep the data directory on a local disk
 owned exclusively by the daemon user. Existing symlinks/junctions are rejected.
 
 ## HTTP contract
+
+For persistent remote access, configure a named Tunnel or another trusted HTTPS
+terminator to forward to the loopback listener, then register that HTTPS URL in
+RisuNest settings. No router port forwarding or public HTTP bind is needed with
+an outbound Tunnel. Creating or installing the Tunnel is a separate operator step.
+[Cloudflare's setup guide](https://developers.cloudflare.com/tunnel/setup/)
+describes the named Tunnel flow. Quick Tunnels are for development, have a
+200 in-flight request limit and do not support SSE; this protocol uses HTTP
+requests and foreground polling. [Quick Tunnel limits](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/).
+
+Cloudflare's proxied request-body upload limit is 100 MB on Free/Pro plans;
+an operator can configure a lower limit. It applies per request, not to the whole
+library or a resumable object. This protocol's 8 MiB ceiling and 1 MiB default
+chunks stay below it. [Cloudflare upload limits](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/4xx-client-error/error-413/).
+
+The default Cloudflare Proxy Read Timeout is 125 seconds per request, not a limit
+on the entire resumable job; Proxy Write Timeout is 30 seconds. Large work returns
+202 and uses bounded status waits, and full uploads default to 1 MiB chunks.
+413/429/524 responses retain verified transfer state for retry. The fault and
+bandwidth tests use a synthetic local transport, not a live Cloudflare connection.
+[Cloudflare timeout reference](https://developers.cloudflare.com/fundamentals/reference/connection-limits/).
 
 Every route requires `Authorization: Bearer TOKEN` and
 `X-Risu-Library: LIBRARY_ID`, before reading request bodies. There are no HTTP
 administration routes. Limits are two active requests per device and eight total;
 streaming responses retain their slots until consumed or disconnected. Saturation
-returns 429 and `Retry-After: 1`. Body/handler timeout is 60 seconds, or 110 seconds
+returns 429 and `Retry-After: 1`. Bulk bodies have four additional memory slots,
+reserved before reading the body and retained through blocking work and response
+consumption. CPU materialization uses one queued worker slot, keeping head reads
+available while bounding aggregate base/index memory. Body/handler timeout is 60 seconds, or 110 seconds
 for bounded full/frame/recipe upload bodies. Request
 compression is rejected with 415; object Range offsets address identity bytes.
 
@@ -144,14 +194,16 @@ control rules. Rust/ECMAScript tests share exact UTF-8 golden vectors.
 - Record descriptors: immutable bounded reference trees, up to 1,000,000
   references, depth 8, generic dependency/relation roots and up to 16 scopes.
 - Full `RNSF` batches: at most 8 MiB including framing, 1024 frames.
-- Native full batches prefer 1 MiB. Upload and resumed Range chunks are 1 MiB;
+- Native full batches prefer 1 MiB. Upload and resumed Range chunks are 1 MiB,
+  with at most two concurrent chunk requests per direction;
   larger useful delta frames retain the 8 MiB wire ceiling. Native recipe/frame
   requests have a 120-second deadline, ordinary requests 30 seconds.
 - Mixed `RNSB` batches: full, `RNSD` delta, or download-only full-required frames.
 - `RNSD` is a custom exact COPY/INSERT profile, not VCDIFF: ordered base IDs,
   checked offsets, exact base/target hashes and lengths, no output-copy chains.
   Current encoder/materializer limits: 4 bases, 32 MiB aggregate base bytes,
-  16 MiB target, 8 MiB patch, 262,144 operations.
+  16 MiB target, 8 MiB patch, 262,144 operations. The compact sorted anchor index
+  is bounded to 524,288 entries (8 MiB), with two matches per fingerprint/base.
 - `RNSL` uses file IO for larger objects: 1 TiB target/aggregate bases, 4 bases,
   8 MiB recipe, 262,144 operations, 64 KiB IO buffers. A sorted sparse anchor
   index uses about 6 MiB for a 1 GiB base, bounded to about 262,144 entries.
@@ -203,6 +255,10 @@ credential for each installation. PDS transactions record outgoing edits; HTTP
 preparation and publication run outside the UI replacement fence. Only atomic
 local activation and the working-set/plugin refresh hold that fence. Lost IPC
 replies are retried without enabling editing against an unconfirmed revision.
+The settings view reports saving, preparation, local activation, refresh and
+publication, plus verified object bytes. This byte counter describes reconstructed
+content, not wire traffic; it excludes reused local objects. Progress polling
+cannot delay completion or update a subsequent cycle after cancellation.
 
 Conflicts retain the local revision and remote head used for the preview. Both
 complete `.risulossless` packages are verified before applying either choice.
@@ -219,7 +275,41 @@ edits and bases survive this reset and differences require comparison. A changed
 server epoch has a separate **Compare restored server** action. Independent,
 nonempty libraries are not automatically combined on first registration.
 
-## Verification and remaining work
+## Verification and distribution
+
+The workflow in `.github/workflows/sync-server-check.yml` defines native runners
+for Windows x86_64, Linux x86_64/arm64 and macOS x86_64/arm64. It tests the standalone
+crate without building RisuNest, then packages the tested binary. This session did
+not dispatch or publish that workflow. See the [runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+
+Locally exercised targets on 2026-09-12:
+
+| Target                          | Tested host               |  Release binary | Runtime dependencies                        |
+| ------------------------------- | ------------------------- | --------------: | ------------------------------------------- |
+| Windows x86_64                  | Windows 11 build 26200    | 5,209,088 bytes | Windows system DLLs, UCRT, VCRUNTIME140.dll |
+| Linux x86_64                    | Ubuntu 24.04.4 under WSL2 | 6,963,552 bytes | glibc loader, libc, libm, libgcc_s          |
+| Linux arm64, macOS x86_64/arm64 | Not run locally           |    Not measured | Not verified                                |
+
+These hosts do not establish minimum supported OS versions. Linux used an isolated
+Rust 1.97.1 toolchain and the same shared Cargo target as Windows. The Windows
+server suite passed 50 tests and the Linux release suite passed 51, including the
+Unix SIGTERM case. Wire tests passed 19 cases plus an ECMAScript golden-vector
+check. Standalone subprocess tests clear PATH and verify serving, directory/port
+ownership, missing storage, process loss and verified-chunk resume. Synthetic
+SQLite `max_page_count` exhaustion verifies rollback and restart integrity without
+filling the host disk. Physical power loss and cross-OS backup restore remain
+unverified.
+
+To package an already-tested binary, use Python 3.11+ (packaging only):
+
+```powershell
+python server/sync/distribution/package.py --binary E:/Programming/Github/RisuNest/src-tauri/target/release/risunest-sync-server.exe --target x86_64-pc-windows-msvc --output server/sync/distribution/artifacts
+```
+
+Archives contain the executable, this operating guide and the repository license,
+with a separate SHA-256 checksum. Existing archives are never overwritten. Unix
+archives preserve the executable permission even when packaged on Windows.
+Packaging does not publish a release.
 
 ```powershell
 cargo test --manifest-path crates/sync-wire/Cargo.toml --locked
@@ -228,50 +318,73 @@ node --test crates/sync-wire/tests/golden.test.mjs
 cargo clippy --manifest-path server/sync/Cargo.toml --locked --all-targets -- -D warnings
 ```
 
-Tests use synthetic stores and real loopback TCP: two-device races, auth before
-body reads, chunk restart/retry, SQL rollback, abrupt process exit, fixed-through
-pages, checkpoint/pin GC, clear fences, operation recovery, and bidirectional
-10 MiB value delta transfer. The ignored crash-test child is executed by its
-parent. The large HTTP integration uses a multithread Tokio runtime matching
-the daemon. Windows single-thread client/server co-location stalled before
-request dispatch and is not used as a daemon performance measurement.
+Native PDS regression tests passed 336 cases (10 explicit measurement/child tests
+ignored in that invocation). Separate native transport tests passed 11, including
+exact large-object reconstruction, two concurrent chunk requests in each direction,
+413/429/524 retry, accepted-response loss and preserving a successful Range when
+its parallel sibling fails. PDS activation tests cover transactional cursor/base
+updates, outbox tails, clear intent, conflict backups and corrupt-payload refusal.
+The required eight TypeScript sync suites passed 79 cases; svelte-check reported
+no errors or warnings. The latest isolated Windows agent app passed actual form
+registration, synchronization and credential recovery after process restart.
+The latest Android agent APK passed Keystore recovery, registration, progress and
+mobile layout checks. During a 35-second server stall, local settings interaction
+completed in 5,687 ms and the head stayed unchanged. Both Windows and Android apps
+also passed registration and restart against the Linux x86_64 release daemon.
+Apple/Linux application key-store runtime checks remain unverified, separately
+from the Linux daemon tests.
 
-On 2026-09-11, the standalone server suite passed 45 tests and the wire suite
-passed 18. Both crates also passed Clippy with warnings denied. The native PDS modules passed 335 tests, including two real TCP
-replicas, both conflict choices, clear in both directions, parent deletion versus
-child edits, operation recovery, and backup corruption rejection. Settings,
-backup routing, and server facade/controller tests passed 88 cases; svelte-check
-reported no errors or warnings. The ignored crash child is run by its parent.
+## Measured transfer behavior
 
-The real HTTP append gate passed at 1/127/128/129/1024/10000 existing messages.
-For 72 new bytes, total request-plus-response bytes (including headers) were
-14595–15263 for upload and 10240–10578 for download, each below D + 16 KiB.
-These debug timings and message-only results do not establish the remaining
-large-library CPU, RSS, latency, asset, or owner-list gates.
-File-based delta is connected for opaque objects above 16 MiB. A 17 MiB file's
-22-byte insertion used 6,974 upload and 6,253 download HTTP bytes in the direct
-TCP integration test (2,343/2,408 ms, debug). The 1 GiB fixture passed too:
-22 inserted bytes used 8,530 upload and 7,630 download HTTP bytes, including
-long-poll requests, at 119,820/143,202 ms in the debug build. Both endpoints
-verify the whole result hash. This combined native-client/server test process
-had an observed peak working set of 68,096,000 bytes; that is not a separate
-daemon or four-transfer RSS measurement. The test counts at the accepted server
-socket, without a forwarding proxy. The 100,000-entry owner fixture passed a
-6-byte name edit at 15,322 upload / 10,925 download HTTP bytes. Its unresolved
-asset references do not establish a 100,000-unique-blob result.
+Measurements use synthetic content. HTTP totals include request and response
+headers, but exclude TLS unless stated. Debug native tests are not release CPU
+benchmarks, and a combined test-process working set is not daemon RSS.
 
-Native request retries after synthetic 413, 429 and 524 responses reuse verified
-chunks, including a chunk whose accepted response was lost. A 2 MiB + 17-byte
-full object round trip used 10 requests and 4,200,463/4,200,473 HTTP bytes under
-10 Mbps/80 ms and 1 Mbps/200 ms synthetic limits. Upload/download times were
-2,565/2,213 ms and 18,081/17,672 ms (debug). These are per-socket bandwidth caps
-and per-request injected delays, not measured Internet RTT, TLS or Tunnel tests.
-Received payloads are staged in a private SQLite database and applied one record
-at a time; temporary conflict-backup mirrors are removed after verification.
-Individual large JSON projection, cache/orphan collection, Android foreground
-integration and OS distribution validation remain in progress.
-Windows x86_64 is exercised locally; Linux/macOS and app-device combinations
-remain unverified. This is still an intermediate implementation.
+- A 72-byte message append at 1/127/128/129/1024/10000 existing messages used
+  14,595–15,263 upload and 10,240–10,578 download HTTP bytes. Every case met
+  D + 16 KiB in both directions.
+- The 13-case native matrix covers prefix/middle insertion and deletion, message
+  edit/reorder, root, preset, lorebook, Unicode plugin key, new conversation and
+  asset metadata. A six-byte insertion in a 10 MiB plugin string used 16,073
+  upload / 10,866 download bytes. The remaining twelve cases used at most 15,114
+  upload / 10,355 download bytes, with exact values and order checked.
+- A 22-byte insertion into a 17 MiB opaque file used 6,974 upload / 6,253 download
+  bytes (2,343/2,408 ms). The 1 GiB case used 8,530/7,630 bytes
+  (119,820/143,202 ms). Both verify the entire reconstructed hash. The observed
+  combined native test-process peak was 68,096,000 bytes, not daemon RSS.
+- A 100,000-reference control-tree regression used 3,711 upload / 3,558 download
+  bytes. It excludes raw asset bodies. The separate end-to-end 100,000-unique-CAS
+  gate includes those bodies; its result is recorded separately in the plan.
+- A 2 MiB + 17-byte full object round trip used 10 requests and 4,200,473 HTTP
+  bytes with two concurrent chunks per direction. At a per-socket 10 Mbps cap
+  and 80 ms request delay, upload/download took 1,817/1,296 ms; at 1 Mbps and
+  200 ms, 9,746/9,005 ms. Two sockets can together exceed one socket's cap.
+  These are injected request delays, not measured Internet RTT or Tunnel tests.
 
-Registry, GUI/tray, service installation, peer transfer optimization, content
-E2EE, and same-PC deduplication are separate from this server implementation.
+Separate release-daemon measurements keep the client, GUI and cloudflared outside
+the reported memory. Four distinct uncached 8 MiB delta targets each use four
+bases totalling 32 MiB. Exact reconstruction is asserted for all four devices.
+
+| Host       | Idle resident/working-set bytes | Four-transfer peak bytes |  Head P95 |
+| ---------- | ------------------------------: | -----------------------: | --------: |
+| Windows    |                      11,603,968 |               64,847,872 | 12.735 ms |
+| Linux WSL2 |                       7,532,544 |              103,792,640 |  0.429 ms |
+
+Both passed the candidate 64 MiB idle / 128 MiB peak / 50 ms head gates on this
+local SSD host. The earlier allocation-per-anchor implementation failed at
+516,591,616 bytes; bounded sorted indexing and one materializer fixed that case.
+
+A separate 500-character, 10 MiB plugin fixture measures local costs independently
+of wire bytes. Nine small root saves per configuration had median commit times
+of 271/457 microseconds without a pinned revision (outbox off/on), and 939/882
+microseconds with a pinned revision. Reading/parsing the large record took about
+1.00–1.41 s, encoding/caching 1.47–1.82 s, and restoration 1.17–1.67 s. These debug
+samples ran alongside other synthetic IO; they do not establish a statistical
+outbox overhead or eliminate per-record JSON materialization.
+
+See [the benchmark guide](../../benchmarks/sync-server/README.md) for the
+single-object/batch/concurrency/gzip comparison and separately counted TLS 1.3
+handshakes. Product Range and batch transport currently use identity bytes.
+Local transfer caches remain retained after disconnect; server-side retention,
+leases and GC are implemented. Registry, daemon GUI/tray, service installation,
+peer transfer optimization, content E2EE and same-PC deduplication are separate.
