@@ -42,23 +42,7 @@ fn all_live_tables_have_an_explicit_preservation_owner() {
         "server_sync_remote_dirty",
         "server_sync_remote_cursor",
     ];
-    let peer_only = [
-        "logical_sync_generations",
-        "logical_library_head",
-        "logical_generation_session_pins",
-        "logical_record_heads",
-        "logical_record_dependencies",
-        "logical_message_page_sources",
-        "logical_peer_common_bases",
-        "logical_sync_devices",
-        "logical_sync_device_ack_proofs",
-    ];
-    let groups = [
-        &portable[..],
-        &local_operations[..],
-        &server_operations[..],
-        &peer_only[..],
-    ];
+    let groups = [&portable[..], &local_operations[..], &server_operations[..]];
     let mut classified = BTreeSet::new();
     for group in groups {
         for name in group {

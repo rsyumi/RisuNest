@@ -176,7 +176,6 @@ async function main() {
         assets,
         mode: options.mode ?? 'compatibility',
         recentSnapshot: options.snapshot !== 'missing',
-        autoListen: options.autoListen === 'true',
         interaction: !!options.suite || options.interact === 'true',
     }
     const output = path.resolve(options.output ?? 'benchmarks/startup/result.local.json')
@@ -254,8 +253,7 @@ async function main() {
             }
             localStorage.setItem('startupInteract', '${scenario.interaction}');
             localStorage.setItem('risuNestDeviceSettings', JSON.stringify({schema: 'risunest.device-settings/v1',
-                performanceProfile: 'normal', androidKeepAliveDuringGeneration: false, nativeFileLogEnabled: false,
-                syncAutoListen: ${scenario.autoListen}, syncListenMethod: 'lan', syncFixedPort: 32145, syncPublicBaseUrl: ''}));
+                performanceProfile: 'normal', androidKeepAliveDuringGeneration: false, nativeFileLogEnabled: false}));
         })()`)
         recentSnapshotReady = scenario.recentSnapshot
     }
@@ -396,28 +394,24 @@ async function main() {
                       assets: 11345,
                       mode: 'compatibility',
                       recentSnapshot: true,
-                      autoListen: false,
                       interaction: true,
                   },
                   {
                       assets: 11345,
                       mode: 'scalable',
                       recentSnapshot: true,
-                      autoListen: false,
                       interaction: true,
                   },
                   {
                       assets: 100000,
                       mode: 'compatibility',
                       recentSnapshot: true,
-                      autoListen: false,
                       interaction: true,
                   },
                   {
                       assets: 100000,
                       mode: 'scalable',
                       recentSnapshot: true,
-                      autoListen: false,
                       interaction: true,
                   },
               ]

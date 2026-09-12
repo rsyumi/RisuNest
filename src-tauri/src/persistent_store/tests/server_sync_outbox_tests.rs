@@ -383,7 +383,7 @@ fn server_outbox_tracks_each_public_record_mutation_and_alias_deletion() {
 }
 
 #[test]
-fn replacement_restore_and_peer_activation_cannot_bypass_server_replica() {
+fn replacement_restore_preserves_server_replica_reconciliation() {
     let (_dir, mut store, _) = open_fixture();
     bind(&store);
     let staged = stage_root(&mut store, "synthetic replacement");
@@ -395,7 +395,6 @@ fn replacement_restore_and_peer_activation_cannot_bypass_server_replica() {
             .unwrap(),
         1
     );
-    assert!(outbox::require_peer_unbound(&store.connection).is_err());
     outbox::restored_copy(&store.connection).unwrap();
     assert_eq!(
         store

@@ -19,7 +19,6 @@ import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.IntentCompat
 import androidx.core.graphics.Insets
 import androidx.core.view.ViewCompat
@@ -49,7 +48,6 @@ private const val NATIVE_LIFECYCLE_EVENT = "risu-native-lifecycle"
 private const val OPENED_FILES_EVENT = "risu-opened-files"
 private const val LIFECYCLE_BRIDGE_NAME = "RisuLifecycleBridge"
 private const val SAF_BRIDGE_NAME = "RisuSafBridge"
-private const val PEER_CLONE_BRIDGE_NAME = "RisuPeerCloneBridge"
 private const val GENERATION_KEEP_ALIVE_BRIDGE_NAME = "RisuGenerationKeepAlive"
 private const val STOP_REASON = "stop"
 private const val TRIM_MEMORY_REASON = "trim-memory"
@@ -506,7 +504,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   private val postNotificationsPermissionLauncher = registerForActivityResult(
     ActivityResultContracts.RequestPermission(),
   ) {
-    // Peer sync can proceed after denial. Generation keep-alive checks notification
+    // Generation keep-alive checks notification
     // availability on each begin and declines to start until it is granted.
     dispatchNotificationStateRefresh()
   }
@@ -586,7 +584,6 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       removeJavascriptBridge = {
         webView.removeJavascriptInterface(LIFECYCLE_BRIDGE_NAME)
         webView.removeJavascriptInterface(SAF_BRIDGE_NAME)
-        webView.removeJavascriptInterface(PEER_CLONE_BRIDGE_NAME)
         webView.removeJavascriptInterface(GENERATION_KEEP_ALIVE_BRIDGE_NAME)
       },
       destroyView = webView::destroy,
@@ -606,7 +603,6 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     commitBridge?.close()
     commitBridge = AndroidCommitBridge.attach(webView)
     webView.addJavascriptInterface(LifecycleFlushBridge(), LIFECYCLE_BRIDGE_NAME)
-    webView.addJavascriptInterface(PeerCloneBridge(), PEER_CLONE_BRIDGE_NAME)
     webView.addJavascriptInterface(GenerationKeepAliveBridge(), GENERATION_KEEP_ALIVE_BRIDGE_NAME)
     if (BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS) {
       deliveredSpoolTokens.clear()
@@ -664,17 +660,8 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     )
   }
 
-  override fun onStart() {
-    super.onStart()
-    updateForegroundPeerCloneLifecycle(currentPeerCloneTransferMode(), foreground = true) {
-      runCatching { PeerCloneNativeBridge.setForegroundAllowed(it) }
-    }
-  }
 
   override fun onStop() {
-    updateForegroundPeerCloneLifecycle(currentPeerCloneTransferMode(), foreground = false) {
-      runCatching { PeerCloneNativeBridge.setForegroundAllowed(it) }
-    }
     lifecycleFlushDispatcher.onStop()
     super.onStop()
   }
@@ -730,7 +717,6 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     safDestinationCancellations.clear()
     safProgressDispatchMillis.clear()
     lifecycleWebView?.removeJavascriptInterface(SAF_BRIDGE_NAME)
-    lifecycleWebView?.removeJavascriptInterface(PEER_CLONE_BRIDGE_NAME)
     generationKeepAliveOwner.teardown(
       removeJavascriptBridge = {
         lifecycleWebView?.removeJavascriptInterface(GENERATION_KEEP_ALIVE_BRIDGE_NAME)
@@ -799,45 +785,6 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     }
   }
 
-  private inner class PeerCloneBridge {
-    @JavascriptInterface
-    fun transferMode(): String = peerCloneTransferModeWire(currentPeerCloneTransferMode())
-
-    @JavascriptInterface
-    fun schedule(jobId: String): String = peerCloneScheduleResultWire(
-      PeerCloneTransferScheduler.schedule(this@MainActivity, jobId),
-    )
-
-    @JavascriptInterface
-    fun cancel(jobId: String): Boolean =
-      PeerCloneTransferScheduler.cancel(this@MainActivity, jobId)
-
-    @JavascriptInterface
-    fun startSource(lane: String, operationId: String, generation: Long): Boolean {
-      val identity = peerSyncForegroundIdentity(lane, operationId, generation) ?: return false
-      requestPostNotificationsForForegroundService()
-      return PeerSyncForegroundService.start(this@MainActivity, identity)
-    }
-
-    @JavascriptInterface
-    fun stopSource(lane: String, operationId: String, generation: Long): Boolean {
-      val identity = peerSyncForegroundIdentity(lane, operationId, generation) ?: return false
-      return PeerSyncForegroundService.stop(this@MainActivity, identity)
-    }
-
-    // Whether the peer-sync foreground notification (the user's Stop
-    // affordance) can actually be shown: app notifications on, and the
-    // peer-sync channel not silenced. The web UI warns when this is false.
-    @JavascriptInterface
-    fun notificationsEnabled(): Boolean {
-      val manager = NotificationManagerCompat.from(this@MainActivity)
-      if (!manager.areNotificationsEnabled()) return false
-      val channel = manager.getNotificationChannelCompat(PEER_SYNC_FOREGROUND_CHANNEL)
-      return channel == null ||
-        channel.importance != NotificationManagerCompat.IMPORTANCE_NONE
-    }
-  }
-
   private inner class GenerationKeepAliveBridge {
     @JavascriptInterface
     fun begin(): Boolean = generationKeepAliveOwner.begin {
@@ -874,18 +821,11 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     @JavascriptInterface
     fun webViewVersion(): String = WebViewCompat.getCurrentWebViewPackage(this@MainActivity)?.versionName ?: ""
 
-    @JavascriptInterface
-    fun transferMode(): String = peerCloneTransferModeWire(currentPeerCloneTransferMode())
   }
 
-  private fun currentPeerCloneTransferMode() = peerCloneTransferMode(
-    experimentalEnabled = BuildConfig.ENABLE_EXPERIMENTAL_PEER_CLONE_CLIENT,
-    sdkInt = Build.VERSION.SDK_INT,
-  )
 
   // Android 13+ can hide foreground-service notifications unless POST_NOTIFICATIONS
-  // is granted. Request it at most once per process before peer sync or generation
-  // keep-alive starts. Peer sync proceeds without it, while generation keep-alive
+  // is granted. Request it once per process. Generation keep-alive
   // declines to start until notifications and its channel are available.
   private fun requestPostNotificationsForForegroundService() {
     requestPostNotificationsIfNeeded(

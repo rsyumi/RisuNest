@@ -25,6 +25,10 @@ pub(crate) struct Backup {
     pub created_at: u64,
     pub head: RemoteHead,
     pub local_revision: i64,
+    pub local_bytes: u64,
+    pub remote_bytes: u64,
+    pub preservation_scope: &'static str,
+    pub recovery_ready: bool,
 }
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -32,17 +36,51 @@ pub(crate) enum Side {
     Local,
     Remote,
 }
-fn directory(root: &Path, id: &str) -> Result<PathBuf> {
+pub(super) fn directory(root: &Path, id: &str) -> Result<PathBuf> {
     let uuid = uuid::Uuid::parse_str(id).map_err(|_| SyncError::new("invalid-backup-id", 400))?;
     if uuid.to_string() != id {
         return Err(SyncError::new("invalid-backup-id", 400));
     }
-    let base = std::fs::canonicalize(root.join("server-sync/backups"))?;
+    let server_root = root.join("server-sync");
+    let backup_root = server_root.join("backups");
+    for path in [&server_root, &backup_root] {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if crate::trust_boundary::is_link_like(&metadata) || !metadata.is_dir() {
+            return Err(SyncError::new("invalid-backup-path", 409));
+        }
+    }
+    let base = std::fs::canonicalize(backup_root)?;
     let path = base.join(id);
     if std::fs::canonicalize(&path)? != path {
         return Err(SyncError::new("invalid-backup-path", 409));
     }
     Ok(path)
+}
+pub(super) fn inspect(root: &Path, id: &str) -> Result<Backup> {
+    let path = directory(root, id)?;
+    let receipt = receipt(&path)?;
+    let size = |name: &str| -> Result<u64> {
+        let file = path.join(name);
+        let metadata = std::fs::symlink_metadata(&file)?;
+        if !metadata.is_file() || crate::trust_boundary::is_link_like(&metadata) {
+            return Err(SyncError::new("invalid-backup-path", 409));
+        }
+        Ok(metadata.len())
+    };
+    Ok(Backup {
+        id: id.to_owned(),
+        created_at: std::fs::metadata(path.join("complete.json"))?
+            .modified()?
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        head: receipt.head,
+        local_revision: receipt.local_revision,
+        local_bytes: size("local.risulossless")?,
+        remote_bytes: size("remote.risulossless")?,
+        preservation_scope: "library",
+        recovery_ready: true,
+    })
 }
 fn receipt(directory: &Path) -> Result<Receipt> {
     let path = directory.join("complete.json");
@@ -73,30 +111,10 @@ pub(crate) fn list(root: &Path) -> Result<Vec<Backup>> {
         let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        let Ok(path) = directory(root, &id) else {
+        let Ok(backup) = inspect(root, &id) else {
             continue;
         };
-        let Ok(receipt) = receipt(&path) else {
-            continue;
-        };
-        if !path.join("local.risulossless").is_file() || !path.join("remote.risulossless").is_file()
-        {
-            continue;
-        }
-        let created_at = std::fs::metadata(path.join("complete.json"))?
-            .modified()?
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        newest.insert(
-            (created_at, id.clone()),
-            Backup {
-                id,
-                created_at,
-                head: receipt.head,
-                local_revision: receipt.local_revision,
-            },
-        );
+        newest.insert((backup.created_at, id), backup);
         if newest.len() > 100 {
             newest.pop_first();
         }

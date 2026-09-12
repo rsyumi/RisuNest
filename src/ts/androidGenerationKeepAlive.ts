@@ -7,7 +7,6 @@ export interface AndroidGenerationKeepAliveBridge {
     notificationsEnabled(): boolean
     openNotificationSettings(): boolean | void
     webViewVersion(): string
-    transferMode(): string
 }
 
 declare global {

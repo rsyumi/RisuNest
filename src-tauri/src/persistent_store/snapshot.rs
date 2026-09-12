@@ -1,7 +1,7 @@
 use super::snapshot_archive::Archive;
 use super::{
-    active_generation, current_revision, generation_is_retained, CheckpointMode, ReadTarget,
-    SnapshotCreated, SnapshotInfo, StoreError, StoreResult, GENERATION_TABLES,
+    active_generation, current_revision, CheckpointMode, ReadTarget, SnapshotCreated, SnapshotInfo,
+    StoreError, StoreResult, GENERATION_TABLES,
 };
 use crate::asset_repository::migration_gc::AssetRootSet;
 use crate::asset_repository::PayloadCas;
@@ -234,7 +234,7 @@ pub(super) fn sweep_temporary_generations(connection: &mut Connection) -> StoreR
     stale.sort();
     stale.dedup();
     for generation in stale {
-        if generation != active && !generation_is_retained(&transaction, &generation)? {
+        if generation != active {
             delete_generation(&transaction, &generation)?;
         }
     }
@@ -523,22 +523,6 @@ fn collect_asset_roots_scoped(
         let retained_generations: i64 =
             connection.query_row("SELECT COUNT(*) FROM root", [], |row| row.get(0))?;
         has_cross_generation_cold_aliases = retained_generations > 1 && !cold_aliases.is_empty();
-        if table_exists(connection, "logical_sync_generations")? {
-            scan_optional_hash_column(
-                connection,
-                "SELECT manifest_hash FROM logical_sync_generations WHERE state = 'complete'",
-                [],
-                &mut roots.object_hashes,
-            )?;
-        }
-        if table_exists(connection, "logical_peer_common_bases")? {
-            scan_optional_hash_column(
-                connection,
-                "SELECT manifest_hash FROM logical_peer_common_bases",
-                [],
-                &mut roots.object_hashes,
-            )?;
-        }
     }
 
     for (table, column) in [

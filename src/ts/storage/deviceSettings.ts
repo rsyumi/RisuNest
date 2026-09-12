@@ -8,10 +8,6 @@ export interface RisuNestDeviceSettings {
     performanceProfile: RuntimePerformanceProfile
     androidKeepAliveDuringGeneration: boolean
     nativeFileLogEnabled: boolean
-    syncAutoListen: boolean
-    syncListenMethod: 'lan' | 'quick' | 'fixed-url'
-    syncFixedPort: number
-    syncPublicBaseUrl: string
 }
 
 const storageKey = 'risuNestDeviceSettings'
@@ -21,10 +17,6 @@ const defaults: RisuNestDeviceSettings = {
     performanceProfile: 'normal',
     androidKeepAliveDuringGeneration: true,
     nativeFileLogEnabled: true,
-    syncAutoListen: false,
-    syncListenMethod: 'lan',
-    syncFixedPort: 32145,
-    syncPublicBaseUrl: '',
 }
 
 function snapshot(settings: RisuNestDeviceSettings): RisuNestDeviceSettings {
@@ -34,18 +26,14 @@ function snapshot(settings: RisuNestDeviceSettings): RisuNestDeviceSettings {
 function isValidSettings(value: unknown): value is RisuNestDeviceSettings {
     if (!value || typeof value !== 'object') return false
     const settings = value as Record<string, unknown>
-    const syncFixedPort = settings.syncFixedPort
-    return settings.schema === defaults.schema
-        && (settings.performanceProfile === 'normal' || settings.performanceProfile === 'low-spec')
-        && typeof settings.androidKeepAliveDuringGeneration === 'boolean'
-        && typeof settings.nativeFileLogEnabled === 'boolean'
-        && typeof settings.syncAutoListen === 'boolean'
-        && (settings.syncListenMethod === 'lan' || settings.syncListenMethod === 'quick' || settings.syncListenMethod === 'fixed-url')
-        && typeof syncFixedPort === 'number'
-        && Number.isInteger(syncFixedPort)
-        && syncFixedPort >= 1
-        && syncFixedPort <= 65535
-        && typeof settings.syncPublicBaseUrl === 'string'
+    return (
+        Object.keys(settings).length === 4 &&
+        settings.schema === defaults.schema &&
+        (settings.performanceProfile === 'normal' ||
+            settings.performanceProfile === 'low-spec') &&
+        typeof settings.androidKeepAliveDuringGeneration === 'boolean' &&
+        typeof settings.nativeFileLogEnabled === 'boolean'
+    )
 }
 
 function readSettings(): RisuNestDeviceSettings {

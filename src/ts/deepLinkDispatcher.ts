@@ -1,6 +1,8 @@
+import { parseServerSyncDeepLink } from './storage/sync/serverSyncDeepLink'
+
 export interface RisuLocalUrlHandlers {
     onRealm(id: string): void
-    onDeviceSync(uri: string): void
+    onServerSync(uri: string): void
 }
 
 export function dispatchRisuLocalUrl(value: string, handlers: RisuLocalUrlHandlers): boolean {
@@ -25,8 +27,8 @@ export function dispatchRisuLocalUrl(value: string, handlers: RisuLocalUrlHandle
         }
         return true
     }
-    if (url.hostname === 'peer-clone' && url.pathname === '/v2') {
-        handlers.onDeviceSync(value)
+    if (parseServerSyncDeepLink(value)) {
+        handlers.onServerSync(value)
         return true
     }
     return false

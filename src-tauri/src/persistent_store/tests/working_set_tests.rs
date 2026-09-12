@@ -13,15 +13,22 @@ fn root_mutations_preserve_unchanged_fields_and_leased_revision() {
             { "type": "set", "key": "nullable", "value": null },
             { "type": "delete", "key": "missing" }
         ]
-    })).unwrap();
+    }))
+    .unwrap();
     let revision = store.commit(&input).unwrap().revision;
     let mut expected = before.value.clone();
     expected["username"] = json!("Changed");
     expected["__proto__"] = json!({"nested": [1]});
     expected["nullable"] = Value::Null;
     assert_eq!(store.read_root(None).unwrap().value, expected);
-    assert_eq!(store.read_root(Some(&lease.lease)).unwrap().value, before.value);
-    assert!(matches!(store.commit(&input), Err(StoreError::RevisionConflict { .. })));
+    assert_eq!(
+        store.read_root(Some(&lease.lease)).unwrap().value,
+        before.value
+    );
+    assert!(matches!(
+        store.commit(&input),
+        Err(StoreError::RevisionConflict { .. })
+    ));
     assert_eq!(store.read_root(None).unwrap().revision, revision);
     store.release_revision(&lease.lease).unwrap();
 }
@@ -38,12 +45,15 @@ fn invalid_root_mutations_do_not_change_state() {
         json!({"rootMutations": [
             {"type":"set", "key":"username", "value":"Temporary"},
             {"type":"delete", "key":"username"}
-        ]})
+        ]}),
     ] {
         let mut value = changes;
         value["expectedRevision"] = json!(before.revision);
         let input: WorkingSetCommit = serde_json::from_value(value).unwrap();
-        assert!(matches!(store.commit(&input), Err(StoreError::Validation { .. })));
+        assert!(matches!(
+            store.commit(&input),
+            Err(StoreError::Validation { .. })
+        ));
         let after = store.read_root(None).unwrap();
         assert_eq!(after.revision, before.revision);
         assert_eq!(after.value, before.value);
@@ -2738,7 +2748,7 @@ fn pilot_mutated_database_supports_generation_cow_compatible_reopen_read_and_com
         compatibility
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read schema version"),
-        1
+        2
     );
     assert_eq!(
         super::current_revision(&compatibility).expect("read pilot revision through COW path"),

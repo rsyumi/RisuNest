@@ -45,8 +45,6 @@ for (const samples of groups.values()) {
         'capture',
         'capture-database',
         'flush',
-        'sync-initialize',
-        'sync-prepare',
         'clean-chunks',
     ]) {
         operations[stage] = distribution(

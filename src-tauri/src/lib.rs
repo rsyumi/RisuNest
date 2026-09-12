@@ -17,7 +17,6 @@ mod native_media;
 mod native_tokenizer;
 #[cfg(desktop)]
 mod opened_files;
-mod peer_sync;
 #[cfg(windows)]
 mod persistent_commit_transport;
 mod persistent_store;
@@ -587,24 +586,6 @@ pub fn run() {
                         .join("screenshot-output"),
                 ),
             );
-            #[cfg(desktop)]
-            app.manage(peer_sync::commands::PeerCloneCommandState::initialize(
-                &app_data_dir.join("peer-clone"),
-            ));
-            #[cfg(target_os = "android")]
-            app.manage(
-                peer_sync::android_commands::AndroidPeerCloneCommandState::initialize(
-                    app_data_dir.clone(),
-                ),
-            );
-            #[cfg(any(desktop, target_os = "android"))]
-            app.manage(peer_sync::delta_commands::PeerDeltaCommandState::default());
-            #[cfg(any(desktop, target_os = "android"))]
-            app.manage(peer_sync::bidirectional_commands::PeerBidirectionalCommandState::default());
-            #[cfg(desktop)]
-            app.manage(peer_sync::shared_session::DeviceSyncSourceState::default());
-            #[cfg(target_os = "android")]
-            app.manage(peer_sync::shared_session::AndroidDeviceSyncSourceState::default());
             #[cfg(any(target_os = "windows", target_os = "android"))]
             app.manage(regex_shadow::RegexCancellationRegistry::default());
             Ok(())
@@ -633,6 +614,11 @@ pub fn run() {
             server_sync::commands::server_sync_status,
             server_sync::commands::server_sync_verified_bytes,
             server_sync::commands::server_sync_backups,
+            server_sync::commands::server_sync_backup_inventory,
+            server_sync::commands::server_sync_backup_delete,
+            server_sync::commands::server_sync_backup_release,
+            server_sync::commands::server_sync_cache_usage,
+            server_sync::commands::server_sync_cache_cleanup,
             server_sync::commands::server_sync_backup_source,
             server_sync::commands::server_sync_bind,
             server_sync::commands::server_sync_reregister,
@@ -659,112 +645,14 @@ pub fn run() {
             install_py_dependencies,
             #[cfg(desktop)]
             opened_files::opened_files_take,
-            #[cfg(desktop)]
-            peer_sync::commands::peer_clone_capabilities,
-            #[cfg(desktop)]
-            peer_sync::commands::peer_clone_claim_v2_client,
-            #[cfg(target_os = "android")]
-            peer_sync::registered_target_commands::peer_clone_claim_v2_client,
-            #[cfg(desktop)]
-            peer_sync::commands::peer_clone_download,
-            #[cfg(desktop)]
-            peer_sync::commands::peer_clone_resume,
-            #[cfg(desktop)]
-            peer_sync::commands::peer_clone_cancel,
-            #[cfg(desktop)]
-            peer_sync::commands::peer_clone_target_status,
-            #[cfg(desktop)]
-            peer_sync::commands::peer_clone_release_target,
-            #[cfg(desktop)]
-            peer_sync::commands::peer_clone_finalize,
-            #[cfg(target_os = "android")]
-            peer_sync::android_commands::peer_clone_android_capabilities,
-            #[cfg(target_os = "android")]
-            peer_sync::android_commands::peer_clone_android_current,
-            #[cfg(target_os = "android")]
-            peer_sync::android_commands::peer_clone_android_download,
-            #[cfg(target_os = "android")]
-            peer_sync::android_commands::peer_clone_android_request_cancel,
-            #[cfg(target_os = "android")]
-            peer_sync::android_commands::peer_clone_android_cancel_foreground,
-            #[cfg(target_os = "android")]
-            peer_sync::android_commands::peer_clone_android_finalize,
-            #[cfg(target_os = "android")]
-            peer_sync::android_commands::peer_clone_android_release,
-            #[cfg(target_os = "android")]
-            peer_sync::android_foreground::peer_sync_foreground_source_abandon,
-            #[cfg(target_os = "android")]
-            peer_sync::android_foreground::peer_sync_foreground_source_status,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::delta_commands::peer_delta_capabilities,
-            #[cfg(target_os = "android")]
-            peer_sync::delta_commands::peer_delta_target_reserve,
-            #[cfg(target_os = "android")]
-            peer_sync::delta_commands::peer_delta_target_foreground_status,
-            #[cfg(target_os = "android")]
-            peer_sync::delta_commands::peer_delta_target_foreground_release,
-            #[cfg(target_os = "android")]
-            peer_sync::delta_commands::peer_delta_target_foreground_cancel,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::delta_commands::peer_delta_target_retained,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::delta_commands::peer_delta_target_abandon,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::bidirectional_commands::peer_bidirectional_capabilities,
-            #[cfg(target_os = "android")]
-            peer_sync::bidirectional_commands::peer_bidirectional_target_reserve,
-            #[cfg(target_os = "android")]
-            peer_sync::bidirectional_commands::peer_bidirectional_target_foreground_status,
-            #[cfg(target_os = "android")]
-            peer_sync::bidirectional_commands::peer_bidirectional_target_foreground_cancel,
-            #[cfg(target_os = "android")]
-            peer_sync::bidirectional_commands::peer_bidirectional_target_foreground_release,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::bidirectional_commands::peer_bidirectional_status,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::bidirectional_commands::peer_bidirectional_resume,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::bidirectional_commands::peer_bidirectional_acknowledge,
             persistent_store::commands::pds_storage_stats,
             persistent_store::commands::pds_snapshot_delete,
             persistent_store::commands::pds_asset_gc_preview,
             persistent_store::commands::pds_asset_gc_execute,
-            peer_sync::maintenance::peer_backup_list,
-            peer_sync::maintenance::peer_backup_delete,
-            peer_sync::maintenance::peer_temp_usage,
-            peer_sync::maintenance::peer_temp_cleanup,
             native_log::native_log_tail,
             native_log::native_log_error,
             native_log::native_log_file_path,
             native_log::native_log_set_file_enabled,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::registry_commands::peer_sync_outgoing_devices,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::registry_commands::peer_sync_incoming_sources,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::registry_commands::peer_sync_remove_incoming_source,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::registry_commands::peer_sync_revoke_outgoing_device,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::shared_session::device_sync_prepare,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::shared_session::device_sync_start,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::shared_session::device_sync_status,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::shared_session::device_sync_stop,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::shared_session::device_sync_rotate_link,
-            #[cfg(target_os = "android")]
-            peer_sync::shared_session::device_sync_source_reserve,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::registered_target_commands::peer_clone_claim_registered_client,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::registered_target_commands::peer_delta_pull_registered,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::registered_target_commands::peer_bidirectional_sync_registered,
-            #[cfg(any(desktop, target_os = "android"))]
-            peer_sync::registered_target_commands::peer_bidirectional_resolve_registered,
             oauth_login,
             native_tokenizer::tokenize_batch,
             native_media::native_media_write_inlay_image,
@@ -882,15 +770,8 @@ pub fn run() {
     native_log_state.configure_file_path(&app_data_dir);
     app.run(|app, event| {
         #[cfg(desktop)]
-        if run_event_requires_peer_sync_shutdown(&event) {
+        if run_event_requires_python_shutdown(&event) {
             app.state::<PyServerState>().shutdown();
-            peer_sync::bidirectional_commands::cleanup_reverse_tunnels_for_exit();
-            if let Err(error) = app
-                .state::<peer_sync::shared_session::DeviceSyncSourceState>()
-                .stop()
-            {
-                crate::nlog!("warn", "device sync exit shutdown failed: {error}");
-            }
         }
         #[cfg(not(desktop))]
         let _ = (app, event);
@@ -898,7 +779,7 @@ pub fn run() {
 }
 
 #[cfg(desktop)]
-fn run_event_requires_peer_sync_shutdown(event: &tauri::RunEvent) -> bool {
+fn run_event_requires_python_shutdown(event: &tauri::RunEvent) -> bool {
     matches!(event, tauri::RunEvent::Exit)
 }
 
@@ -942,11 +823,11 @@ mod header_map_tests {
 #[cfg(all(test, desktop))]
 mod tests {
     #[test]
-    fn peer_sync_shutdown_is_requested_only_for_the_final_exit_event() {
-        assert!(super::run_event_requires_peer_sync_shutdown(
+    fn python_shutdown_is_requested_only_for_the_final_exit_event() {
+        assert!(super::run_event_requires_python_shutdown(
             &tauri::RunEvent::Exit
         ));
-        assert!(!super::run_event_requires_peer_sync_shutdown(
+        assert!(!super::run_event_requires_python_shutdown(
             &tauri::RunEvent::Ready
         ));
     }

@@ -9,7 +9,7 @@ fn fresh_schema_adds_only_the_global_empty_asset_object_catalog() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read current version"),
-        1
+        2
     );
     assert_eq!(
         table_columns(&store.connection, "asset_objects")
@@ -81,7 +81,7 @@ fn fresh_schema_adds_generation_scoped_exact_replacement_alias_provenance() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .unwrap(),
-        1
+        2
     );
     assert_eq!(
         table_columns(&store.connection, "asset_alias_replacement_candidates")
@@ -111,7 +111,7 @@ fn fresh_schema_adds_one_validated_asset_gc_maintenance_cursor_row() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .unwrap(),
-        1
+        2
     );
     assert_eq!(
         table_columns(&store.connection, "asset_gc_maintenance_state")

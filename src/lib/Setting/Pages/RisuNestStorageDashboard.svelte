@@ -6,18 +6,20 @@
     import Button from 'src/lib/UI/GUI/Button.svelte'
     import SettingGroup from '../RisuNest/SettingGroup.svelte'
     import SettingRow from '../RisuNest/SettingRow.svelte'
+    import ServerSyncStorage from '../ServerSync/ServerSyncStorage.svelte'
     import {
-        cleanupPeerTemp,
+        getServerSyncBackupInventory,
+        getServerSyncCacheUsage,
+        cleanupServerSyncCache,
+        deleteServerSyncBackup,
+    } from 'src/ts/storage/sync/serverSyncProduction'
+    import {
         createNativePersistentSnapshot,
         deleteNativePersistentSnapshot,
         executeNativePersistentAssetGc,
         getNativePersistentStorageStats,
-        getPeerTempUsage,
-        isNativePeerBackupDeleteError,
         listNativePersistentSnapshots,
-        listPeerBackups,
         previewNativePersistentAssetGc,
-        removePeerBackup,
     } from 'src/ts/storage/nativePersistentMaintenance'
     import { getSyncConflictBackupStore } from 'src/ts/storage/sync/syncConflictBackup'
     import {
@@ -32,20 +34,28 @@
         getStats: getNativePersistentStorageStats,
         listSnapshots: listNativePersistentSnapshots,
         listConflictBackups: () => conflictStore.list(),
-        listPeerBackups,
-        getTemp: getPeerTempUsage,
-        cleanupTemp: cleanupPeerTemp,
+        getServerBackups: getServerSyncBackupInventory,
+        getTemp: getServerSyncCacheUsage,
+        cleanupTemp: cleanupServerSyncCache,
         previewGc: previewNativePersistentAssetGc,
         executeGc: executeNativePersistentAssetGc,
         deleteSnapshot: deleteNativePersistentSnapshot,
         deleteConflictBackup: (id) => conflictStore.remove(id),
-        deletePeerBackup: removePeerBackup,
+        deleteServerBackup: deleteServerSyncBackup,
         createSnapshot: createNativePersistentSnapshot,
     })
     let state = $state(dashboard.snapshot())
-    let rollup = $derived(state.stats
-        ? storageDashboardRollup(state.stats, state.snapshots, state.conflictBackups, state.peerBackups)
-        : null)
+    let rollup = $derived(
+        state.stats
+            ? storageDashboardRollup(
+                  state.stats,
+                  state.snapshots,
+                  state.conflictBackups,
+                  state.serverBackups,
+                  state.tempUsage,
+              )
+            : null,
+    )
     const strings = language.risuNest.storage
     const formatCount = (value: number): string => value.toLocaleString()
     const listSummary = (count: number, bytes: number): string => strings.listSummary
@@ -54,34 +64,59 @@
     const cardBytes = (id: RisuNestStorageCardId): number => rollup?.cards.find((card) => card.id === id)?.bytes ?? 0
     let totalBytes = $derived(cardBytes('total'))
     // The bar partitions the total: media, database, and the three backup kinds.
-    let segments = $derived(rollup && state.stats ? [
-        { id: 'media', label: strings.media, bytes: cardBytes('media'), color: 'bg-borderc' },
-        { id: 'database', label: strings.database, bytes: state.stats.databaseBytes, color: 'bg-secondary-400' },
-        { id: 'syncBackups', label: strings.syncBackups, bytes: rollup.peerBackupBytes, color: 'bg-primary-300' },
-        { id: 'snapshots', label: strings.snapshots, bytes: rollup.snapshotBytes, color: 'bg-success-400' },
-        { id: 'conflictBackups', label: strings.conflictBackups, bytes: rollup.conflictBackupBytes, color: 'bg-danger-400' },
-    ] : [])
+    let segments = $derived(
+        rollup && state.stats
+            ? [
+                  {
+                      id: 'media',
+                      label: strings.media,
+                      bytes: cardBytes('media'),
+                      color: 'bg-borderc',
+                  },
+                  {
+                      id: 'database',
+                      label: strings.database,
+                      bytes: state.stats.databaseBytes,
+                      color: 'bg-secondary-400',
+                  },
+                  {
+                      id: 'syncBackups',
+                      label: strings.syncBackups,
+                      bytes: rollup.serverBackupBytes,
+                      color: 'bg-primary-300',
+                  },
+                  {
+                      id: 'cache',
+                      label: language.risuNest.serverSync.management.cache,
+                      bytes: rollup.cacheBytes,
+                      color: 'bg-borderc',
+                  },
+                  {
+                      id: 'snapshots',
+                      label: strings.snapshots,
+                      bytes: rollup.snapshotBytes,
+                      color: 'bg-success-400',
+                  },
+                  {
+                      id: 'conflictBackups',
+                      label: strings.conflictBackups,
+                      bytes: rollup.conflictBackupBytes,
+                      color: 'bg-danger-400',
+                  },
+              ]
+            : [],
+    )
     const listHeaderClass = 'flex cursor-pointer list-none items-center gap-2 px-4 py-2.5 text-[15px] select-none [&::-webkit-details-marker]:hidden'
     const listRowClass = 'flex items-center gap-3 border-t border-darkborderc/55 py-1.5 pr-4 pl-10 text-sm'
     const listEmptyClass = 'border-t border-darkborderc/55 py-2 pr-4 pl-10 text-sm text-textcolor2'
 
     function showActionError(error: unknown, fallback = strings.actionFailed): void {
-        alertError(isNativePeerBackupDeleteError(error)?.code === 'peer-backup-in-use'
-            ? strings.syncBackupInUse
-            : fallback)
+        void error
+        alertError(fallback)
     }
 
     function isBusy(action: string): boolean {
         return state.busy.includes(action)
-    }
-
-    async function calculateTempSize(): Promise<void> {
-        try { await dashboard.calculateTempSize() } catch (error) { showActionError(error, strings.calculateSizeFailed) }
-    }
-
-    async function cleanTemp(): Promise<void> {
-        if (!await alertConfirm(strings.cleanSyncTempConfirm)) return
-        try { await dashboard.cleanupTemp() } catch (error) { showActionError(error) }
     }
 
     async function previewGc(): Promise<void> {
@@ -106,11 +141,6 @@
     async function deleteConflictBackup(id: string): Promise<void> {
         if (!await alertConfirm(strings.deleteConflictBackupConfirm)) return
         try { await dashboard.deleteConflictBackup(id) } catch (error) { showActionError(error) }
-    }
-
-    async function deletePeerBackup(path: string): Promise<void> {
-        if (!await alertConfirm(strings.deleteSyncBackupConfirm)) return
-        try { await dashboard.deletePeerBackup(path) } catch (error) { showActionError(error) }
     }
 
     async function createSnapshot(): Promise<void> {
@@ -195,31 +225,11 @@
                 <p class={listEmptyClass}>{strings.emptyList}</p>
             {/each}
         </details>
-        <details data-storage-backup-list class="group">
-            <summary class={listHeaderClass}><ChevronRight size={16} class="shrink-0 text-textcolor2 transition-transform duration-200 group-open:rotate-90" aria-hidden="true" /><span>{strings.syncBackups}</span>{#if state.peerBackups.length > 0}{' '}<span class="ml-auto text-sm text-textcolor2 tabular-nums">{listSummary(state.peerBackups.length, rollup.peerBackupBytes)}</span>{/if}</summary>
-            {#each state.peerBackups as backup}
-                <div data-storage-backup-row class={listRowClass}><span class="min-w-0 flex-1 break-words tabular-nums">{new Date(backup.modifiedAt).toLocaleString()}</span><span class="text-textcolor2 tabular-nums">{formatRisuNestStorageBytes(backup.bytes)}</span><button class="shrink-0 rounded-md border border-darkborderc bg-transparent px-2 py-1 text-sm text-textcolor2 transition-colors duration-200 hover:bg-selected hover:text-textcolor focus:outline-hidden focus:ring-2 focus:ring-selected disabled:cursor-not-allowed disabled:opacity-50" data-path={backup.path} disabled={isBusy(`delete-peer-backup:${backup.path}`)} onclick={() => deletePeerBackup(backup.path)}>{isBusy(`delete-peer-backup:${backup.path}`) ? language.loading : language.remove}</button></div>
-            {:else}
-                <p class={listEmptyClass}>{strings.emptyList}</p>
-            {/each}
-        </details>
+        <div class="px-4"><ServerSyncStorage onChange={() => { void dashboard.load(); }} /></div>
 
         <div data-storage-action-row class="divide-y divide-darkborderc/55">
             <SettingRow data-storage-action="snapshot" label={strings.createSnapshotTitle} help={strings.createSnapshotHelp}>
                 <Button disabled={isBusy('create-snapshot')} onclick={createSnapshot}>{isBusy('create-snapshot') ? language.loading : strings.createSnapshot}</Button>
-            </SettingRow>
-            <SettingRow data-storage-action="temp" label={strings.tempTitle} help={strings.cleanSyncTempNote}>
-                {#snippet below()}
-                    <div role="status" aria-live="polite">
-                        {#if state.tempUsage}
-                            <p class="mt-1 text-sm tabular-nums">{strings.tempUsage.replace('{size}', formatRisuNestStorageBytes(state.tempUsage.bytes))}</p>
-                        {/if}
-                    </div>
-                {/snippet}
-                <Button styled="outlined" disabled={isBusy('calculate-temp')} onclick={calculateTempSize}>{isBusy('calculate-temp') ? language.loading : strings.calculateSize}</Button>
-                {#if state.tempUsage || isBusy('cleanup-temp')}
-                    <Button disabled={isBusy('cleanup-temp')} onclick={cleanTemp}>{isBusy('cleanup-temp') ? language.loading : strings.cleanSyncTemp}</Button>
-                {/if}
             </SettingRow>
             <SettingRow data-storage-action="gc" label={strings.gcTitle} help={strings.gcHelp}>
                 {#snippet below()}

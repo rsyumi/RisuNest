@@ -16,10 +16,6 @@ const observed = {
         captureDatabase: 'capture-database',
         flushIterations: 'flush',
     },
-    '/src/ts/storage/sync/deviceSyncController.ts': {
-        initialize: 'sync-initialize',
-        prepare: 'sync-prepare',
-    },
     '/src/ts/bootstrap.ts': { loadData: 'bootstrap', cleanChunks: 'clean-chunks' },
     '/src/ts/globalApi.svelte.ts': { saveDb: 'save-observer' },
 }
@@ -38,24 +34,6 @@ export function instrumentSource(source, id) {
     const found = new Set()
     const wrap = (body, label) => {
         const variable = '__startupObservation'
-        if (label === 'sync-initialize' || label === 'sync-prepare') {
-            edits.push({
-                at: body.getStart(file) + 1,
-                text: `
-                const ${variable} = performance.now();
-                const __startupResult = (() => {
-            `,
-            })
-            edits.push({
-                at: body.end - 1,
-                text: `
-                })();
-                window.__startupTrackPromise?.('${label}', ${variable}, __startupResult);
-                return __startupResult;
-            `,
-            })
-            return
-        }
         edits.push({
             at: body.getStart(file) + 1,
             text: `
