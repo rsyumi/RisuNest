@@ -1484,7 +1484,9 @@ export async function fetchNative(url: string, arg: {
                 headers,
                 body: realBody,
                 signal: arg.signal,
-                requestTimeoutMs: arg.requestTimeoutMs,
+                // The native route enforces the budget as an inactivity window, so a
+                // long running generation keeps going while a silent one is released.
+                idleTimeoutMs: arg.requestTimeoutMs,
                 onChunk: decoder ? (chunk) => {
                     responseParts.push(decoder.decode(chunk, { stream: true }))
                 } : undefined,

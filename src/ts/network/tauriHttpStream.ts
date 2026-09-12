@@ -1,7 +1,11 @@
 import { fetch as tauriFetch } from '@tauri-apps/plugin-http'
 
-/** Matches the whole-request default of the removed Rust streamed_fetch. */
-export const DEFAULT_REQUEST_TIMEOUT_MS = 240_000
+/**
+ * Silence allowed between response events before a native request is released.
+ * The window measures inactivity rather than total duration, so a slow but still
+ * streaming generation is never cut off while a dead connection is still dropped.
+ */
+export const DEFAULT_IDLE_TIMEOUT_MS = 600_000
 
 export type TauriHttpStreamFinish = () => void
 
@@ -11,7 +15,8 @@ export interface TauriHttpStreamOptions {
     headers: { [key: string]: string }
     body?: Uint8Array
     signal?: AbortSignal
-    requestTimeoutMs?: number
+    /** Inactivity window in milliseconds. A nonpositive value disables the timer. */
+    idleTimeoutMs?: number
     onChunk?: (chunk: Uint8Array) => void
     onFinish?: TauriHttpStreamFinish
 }
@@ -47,17 +52,30 @@ function createRequestLifecycle(options: TauriHttpStreamOptions) {
     else if (options.signal) {
         options.signal.addEventListener('abort', abortFromCaller, { once: true })
     }
-    const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
-    if (requestTimeoutMs > 0 && !controller.signal.aborted) {
-        timer = setTimeout(() => {
-            controller.abort(new DOMException('The operation timed out', 'TimeoutError'))
-            finish()
-        }, requestTimeoutMs)
+    const idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS
+    const armed = idleTimeoutMs > 0 && !controller.signal.aborted
+    let deadline = armed ? Date.now() + idleTimeoutMs : 0
+    const onIdleDeadline = () => {
+        const remaining = deadline - Date.now()
+        // Progress landed while this timer was pending, so wait out the new window.
+        if (remaining > 0) {
+            timer = setTimeout(onIdleDeadline, remaining)
+            return
+        }
+        controller.abort(new DOMException('The operation timed out', 'TimeoutError'))
+        finish()
+    }
+    if (armed) {
+        timer = setTimeout(onIdleDeadline, idleTimeoutMs)
     }
 
     return {
         signal: controller.signal,
         finish,
+        /** Restarts the inactivity window whenever the request makes progress. */
+        noteProgress() {
+            if (armed && !finished) deadline = Date.now() + idleTimeoutMs
+        },
         /** Lets an aborted or timed out request release the native response body. */
         onRelease(release: () => void) {
             if (finished) release()
@@ -83,6 +101,7 @@ export async function fetchTauriHttpStream(options: TauriHttpStreamOptions): Pro
         lifecycle.finish()
         throw error
     }
+    lifecycle.noteProgress()
 
     if (response.body === null) {
         lifecycle.finish()
@@ -100,6 +119,7 @@ export async function fetchTauriHttpStream(options: TauriHttpStreamOptions): Pro
                     controller.close()
                     return
                 }
+                lifecycle.noteProgress()
                 options.onChunk?.(result.value)
                 controller.enqueue(result.value)
             }

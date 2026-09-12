@@ -8,7 +8,7 @@ vi.mock('@tauri-apps/plugin-http', () => ({
     fetch: pluginFetch,
 }))
 
-import { DEFAULT_REQUEST_TIMEOUT_MS, fetchTauriHttpStream } from './tauriHttpStream'
+import { DEFAULT_IDLE_TIMEOUT_MS, fetchTauriHttpStream } from './tauriHttpStream'
 
 function pluginResponse(
     body: ReadableStream<Uint8Array> | null,
@@ -147,23 +147,25 @@ describe('fetchTauriHttpStream', () => {
         await reader.cancel()
     })
 
-    test('keeps the composed timeout active after the first chunk', async () => {
+    test('restarts the inactivity window after each chunk', async () => {
         vi.useFakeTimers()
         const caller = trackedSignal()
         const cancellationError = new Error('plugin timeout cancellation')
         let effectiveSignal: AbortSignal | undefined
+        let release: (() => void) | undefined
         pluginFetch.mockImplementation(async (_url, init) => {
             effectiveSignal = init?.signal
-            let sent = false
             return pluginResponse(new ReadableStream<Uint8Array>({
                 start(controller) {
                     effectiveSignal!.addEventListener('abort', () => controller.error(cancellationError), { once: true })
                 },
                 pull(controller) {
-                    if (!sent) {
-                        sent = true
-                        controller.enqueue(new Uint8Array([1]))
-                    }
+                    return new Promise<void>((resolve) => {
+                        release = () => {
+                            controller.enqueue(new Uint8Array([1]))
+                            resolve()
+                        }
+                    })
                 },
             }, { highWaterMark: 0 }))
         })
@@ -174,23 +176,36 @@ describe('fetchTauriHttpStream', () => {
             method: 'GET',
             headers: {},
             signal: caller.controller.signal,
-            requestTimeoutMs: 25,
+            idleTimeoutMs: 25,
             onFinish,
         })
         expect(effectiveSignal).not.toBe(caller.controller.signal)
         expect(effectiveSignal?.aborted).toBe(false)
         const reader = response.body!.getReader()
-        expect(await reader.read()).toMatchObject({ done: false, value: new Uint8Array([1]) })
 
-        await vi.advanceTimersByTimeAsync(25)
+        // Three windows of steady traffic must not end a request that keeps moving.
+        for (let round = 0; round < 3; round += 1) {
+            const pending = reader.read()
+            await vi.advanceTimersByTimeAsync(20)
+            release!()
+            expect(await pending).toMatchObject({ done: false, value: new Uint8Array([1]) })
+            expect(effectiveSignal?.aborted).toBe(false)
+        }
+
+        const stalled = reader.read()
+        stalled.catch(() => undefined)
+        await vi.advanceTimersByTimeAsync(24)
+        expect(effectiveSignal?.aborted).toBe(false)
+        await vi.advanceTimersByTimeAsync(1)
         expect(effectiveSignal?.aborted).toBe(true)
-        await expect(reader.read()).rejects.toBe(cancellationError)
+        expect((effectiveSignal?.reason as DOMException).name).toBe('TimeoutError')
+        await expect(stalled).rejects.toBe(cancellationError)
         expect(vi.getTimerCount()).toBe(0)
         expect(caller.remove).toHaveBeenCalledWith('abort', expect.any(Function))
         expect(onFinish).toHaveBeenCalledOnce()
     })
 
-    test('defaults the whole-request timeout to 240 seconds when unspecified', async () => {
+    test('defaults the inactivity window to ten minutes when unspecified', async () => {
         vi.useFakeTimers()
         const cancellationError = new Error('stalled connection cancelled')
         let effectiveSignal: AbortSignal | undefined
@@ -214,7 +229,7 @@ describe('fetchTauriHttpStream', () => {
         const pendingRead = reader.read()
         pendingRead.catch(() => undefined)
 
-        await vi.advanceTimersByTimeAsync(DEFAULT_REQUEST_TIMEOUT_MS - 1)
+        await vi.advanceTimersByTimeAsync(DEFAULT_IDLE_TIMEOUT_MS - 1)
         expect(effectiveSignal?.aborted).toBe(false)
         await vi.advanceTimersByTimeAsync(1)
         expect(effectiveSignal?.aborted).toBe(true)
@@ -224,7 +239,7 @@ describe('fetchTauriHttpStream', () => {
         expect(onFinish).toHaveBeenCalledOnce()
     })
 
-    test('a nonpositive explicit timeout disables the default whole-request timer', async () => {
+    test('a nonpositive explicit timeout disables the inactivity timer', async () => {
         vi.useFakeTimers()
         pluginFetch.mockImplementation(async () => pluginResponse(new ReadableStream<Uint8Array>({
             pull(controller) {
@@ -236,11 +251,11 @@ describe('fetchTauriHttpStream', () => {
             url: 'https://example.test/no-timeout',
             method: 'GET',
             headers: {},
-            requestTimeoutMs: 0,
+            idleTimeoutMs: 0,
         })
         expect(vi.getTimerCount()).toBe(0)
 
-        await vi.advanceTimersByTimeAsync(DEFAULT_REQUEST_TIMEOUT_MS + 1)
+        await vi.advanceTimersByTimeAsync(DEFAULT_IDLE_TIMEOUT_MS + 1)
         const reader = response.body!.getReader()
         expect(await reader.read()).toMatchObject({ done: false, value: new Uint8Array([1]) })
         await reader.cancel()
@@ -267,7 +282,7 @@ describe('fetchTauriHttpStream', () => {
                 headers: {},
                 body: new Uint8Array([3]),
                 signal: caller.controller.signal,
-                requestTimeoutMs: 100,
+                idleTimeoutMs: 100,
                 onFinish,
             })
             if (!alreadyAborted) caller.controller.abort()
@@ -361,7 +376,7 @@ describe('fetchTauriHttpStream', () => {
             method: 'GET',
             headers: {},
             signal: caller.controller.signal,
-            requestTimeoutMs: 1000,
+            idleTimeoutMs: 1000,
             onFinish,
         })
         const reader = response.body!.getReader()
@@ -409,7 +424,7 @@ describe('fetchTauriHttpStream', () => {
             method: 'GET',
             headers: {},
             signal: caller.controller.signal,
-            requestTimeoutMs: 1000,
+            idleTimeoutMs: 1000,
             onFinish,
         })).rejects.toBe(sentinel)
 
@@ -452,7 +467,7 @@ describe('fetchTauriHttpStream', () => {
             method: 'GET',
             headers: {},
             signal: caller.controller.signal,
-            requestTimeoutMs: 1000,
+            idleTimeoutMs: 1000,
             onFinish,
         })
 
