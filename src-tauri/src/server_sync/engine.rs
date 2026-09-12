@@ -789,7 +789,7 @@ impl PersistentStore {
                         let (payload, hash) = if matches!(remote, RecordVersion::Live { .. }) {
                             let base_candidates =
                                 self.server_base_candidates(&item.key, &cache, committed)?;
-                            transfer.download_record(&remote, &base_candidates)?;
+                            transfer.download_record(&remote, &base_candidates, &base_version)?;
                             let (payload, hash) = cache.restore(&remote)?;
                             let dependencies = projection::dependencies(&payload, &cache.cas)?;
                             let expected = cache.project(
@@ -1224,6 +1224,7 @@ impl PersistentStore {
                     transfer.download_record(
                         &remote,
                         &self.server_base_candidates(&item.key, cache, false)?,
+                        &self.server_base(&item.key)?.0,
                     )?;
                     let (payload, _) = cache.restore(&remote)?;
                     let position = match payload.record {
@@ -1359,8 +1360,11 @@ impl PersistentStore {
                 if !matches!(version, RecordVersion::Live { .. }) {
                     continue;
                 }
-                transfer
-                    .download_record(&version, &self.server_base_candidates(&key, cache, false)?)?;
+                transfer.download_record(
+                    &version,
+                    &self.server_base_candidates(&key, cache, false)?,
+                    &self.server_base(&key)?.0,
+                )?;
                 let (payload, hash) = cache.restore(&version)?;
                 let dependencies = projection::dependencies(&payload, &cache.cas)?;
                 let dirty = key_parts(&key, revision)?;

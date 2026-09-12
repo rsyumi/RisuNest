@@ -16,6 +16,8 @@ use std::{
     io::{Read, Seek, SeekFrom},
 };
 const CHUNK: usize = transfer::UPLOAD_CHUNK_BYTES;
+#[path = "transfer_references.rs"]
+mod references;
 
 /// Resume metadata contains only content identities and server staging IDs.
 /// Every resumed chunk lives in the verified cache CAS before its row is saved.
@@ -48,10 +50,9 @@ impl<'a> Transfer<'a> {
         &self,
         version: &risunest_sync_wire::RecordVersion,
         bases: &[String],
+        base_version: &risunest_sync_wire::RecordVersion,
     ) -> Result<Vec<String>> {
-        use risunest_sync_wire::descriptor::{
-            RecordDescriptor, ReferencePage, MAX_DESCRIPTOR_REFERENCES, MAX_TREE_DEPTH,
-        };
+        use risunest_sync_wire::descriptor::RecordDescriptor;
         let risunest_sync_wire::RecordVersion::Live {
             object_hash,
             descriptor_hash: Some(descriptor_hash),
@@ -68,45 +69,36 @@ impl<'a> Transfer<'a> {
         if descriptor.object_hash != *object_hash {
             return Err(SyncError::new("descriptor-record-mismatch", 409));
         }
-        let mut pending = descriptor
-            .dependency_root
-            .into_iter()
-            .chain(descriptor.relation_root)
-            .map(|h| (h, 0usize))
-            .collect::<Vec<_>>();
-        let mut seen = BTreeSet::new();
-        let mut dependencies = BTreeSet::new();
-        while !pending.is_empty() {
-            let current = std::mem::take(&mut pending);
-            self.download(
-                &current.iter().map(|(h, _)| h.clone()).collect::<Vec<_>>(),
-                bases,
-            )?;
-            for (hash, depth) in current {
-                if !seen.insert(hash.clone())
-                    || depth >= MAX_TREE_DEPTH
-                    || seen.len() > MAX_DESCRIPTOR_REFERENCES
-                {
-                    return Err(SyncError::new("invalid-descriptor-tree", 409));
-                }
-                let page: ReferencePage = canonical::decode(
-                    &self.cache.read(&hash, MAX_METADATA_BYTES)?,
-                    MAX_METADATA_BYTES,
-                )?;
-                page.validate()?;
-                match page {
-                    ReferencePage::Branches { children } => {
-                        pending.extend(children.into_iter().map(|h| (h, depth + 1)))
-                    }
-                    ReferencePage::Objects { hashes } => dependencies.extend(hashes),
-                    ReferencePage::Relations { .. } => (),
-                }
-                if dependencies.len() > MAX_DESCRIPTOR_REFERENCES {
-                    return Err(SyncError::new("invalid-descriptor-tree", 409));
-                }
-            }
-        }
-        self.download(&dependencies.into_iter().collect::<Vec<_>>(), bases)?;
+        let previous = if let risunest_sync_wire::RecordVersion::Live {
+            descriptor_hash: Some(hash),
+            ..
+        } = base_version
+        {
+            self.cache
+                .read(hash, MAX_METADATA_BYTES)
+                .ok()
+                .and_then(|bytes| {
+                    canonical::decode::<RecordDescriptor>(&bytes, MAX_METADATA_BYTES).ok()
+                })
+                .filter(|d| d.validate().is_ok())
+        } else {
+            None
+        };
+        let roots = [
+            (
+                descriptor.dependency_root,
+                previous.as_ref().and_then(|d| d.dependency_root.clone()),
+            ),
+            (
+                descriptor.relation_root,
+                previous.and_then(|d| d.relation_root),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(root, base)| root.map(|root| (root, base.into_iter().collect())))
+        .collect();
+        let dependencies = self.download_reference_tree(roots)?;
+        self.download(&dependencies, bases)?;
         self.cache.closure(version)
     }
     pub fn new(client: &'a ServerClient, cache: &'a Cache) -> Result<Self> {
@@ -356,6 +348,14 @@ impl<'a> Transfer<'a> {
         Ok(sizes)
     }
     pub fn download(&self, hashes: &[String], base_candidates: &[String]) -> Result<()> {
+        self.download_with_hints(hashes, base_candidates, &std::collections::BTreeMap::new())
+    }
+    fn download_with_hints(
+        &self,
+        hashes: &[String],
+        base_candidates: &[String],
+        hints: &std::collections::BTreeMap<String, Vec<String>>,
+    ) -> Result<()> {
         for page in hashes.chunks(1024) {
             let missing = page
                 .iter()
@@ -370,7 +370,8 @@ impl<'a> Transfer<'a> {
             }
             let mut requests = Vec::new();
             for target in &missing {
-                requests.push(serde_json::json!({"target":target,"bases":self.select_bases(target,None,base_candidates)?}));
+                let candidates = hints.get(target).map_or(base_candidates, Vec::as_slice);
+                requests.push(serde_json::json!({"target":target,"bases":self.select_bases(target,None,candidates)?}));
             }
             let reply = self.client.request(
                 Method::POST,
@@ -414,7 +415,8 @@ impl<'a> Transfer<'a> {
                         if hash != *target {
                             return Err(SyncError::new("transfer-target-mismatch", 502));
                         }
-                        if !self.download_delta(target, size, base_candidates)? {
+                        let candidates = hints.get(target).map_or(base_candidates, Vec::as_slice);
+                        if !self.download_delta(target, size, candidates)? {
                             self.download_large(target, size)?;
                         }
                         self.client.verified(size);

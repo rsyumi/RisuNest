@@ -2,6 +2,8 @@ use super::super::server_sync_engine::{CycleOptions, CycleResult};
 use super::*;
 use crate::server_sync::client::ServerConfig;
 use risunest_sync_server::{http, store::Store};
+#[path = "server_sync_matrix_tests.rs"]
+mod matrix;
 
 fn prepared() -> (tempfile::TempDir, PersistentStore) {
     let (directory, mut store, database) = open_fixture();
@@ -774,11 +776,21 @@ fn large_opaque_file_http_gate(size: u64) {
 #[test]
 #[ignore = "Explicit 100k owner manifest end-to-end HTTP acceptance gate"]
 fn server_sync_hundred_thousand_owner_entries_http_gate() {
+    owner_entries_http_gate(false);
+}
+
+#[test]
+#[ignore = "Explicit 100k unique CAS assets end-to-end HTTP acceptance gate"]
+fn server_sync_hundred_thousand_resolved_assets_http_gate() {
+    owner_entries_http_gate(true);
+}
+
+fn owner_entries_http_gate(resolved: bool) {
     use crate::asset_repository::owner_manifest_codec::{
         encode_owner_manifest, OwnerManifestEntry,
     };
     use crate::asset_repository::PayloadCas;
-    let directory = tempfile::tempdir().unwrap();
+    let mut directory = tempfile::tempdir().unwrap();
     let server = Arc::new(Store::init(directory.path()).unwrap());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -800,8 +812,8 @@ fn server_sync_hundred_thousand_owner_entries_http_gate() {
             .await
             .unwrap();
     });
-    let (_first_dir, mut first) = prepared();
-    let (_second_dir, mut second) = prepared();
+    let (mut first_dir, mut first) = prepared();
+    let (mut second_dir, mut second) = prepared();
     for store in [&mut first, &mut second] {
         let credential = server.add_device().unwrap();
         store
@@ -814,8 +826,26 @@ fn server_sync_hundred_thousand_owner_entries_http_gate() {
             .unwrap();
     }
 
+    if let Some(report) = std::env::var_os("RISUNEST_SYNTHETIC_OWNER_REPORT") {
+        use std::io::Write;
+        let mut report = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(report)
+            .unwrap();
+        let marker = "risunest-sync-server-synthetic-owner-v1";
+        for root in [directory.path(), first_dir.path(), second_dir.path()] {
+            fs::write(root.join(".risunest-synthetic-owner-fixture"), marker).unwrap();
+        }
+        report.write_all(&serde_json::to_vec(&json!({"marker":marker,"server":directory.path(),"first":first_dir.path(),"second":second_dir.path()})).unwrap()).unwrap();
+        report.sync_all().unwrap();
+        directory.disable_cleanup(true);
+        first_dir.disable_cleanup(true);
+        second_dir.disable_cleanup(true);
+    }
     // Establish the shared base before adding the large owner manifest. Two
     // independent nonempty libraries must otherwise ask for a conflict choice.
+    eprintln!("100k owner establishing base");
     assert_eq!(settle(&mut first).phase, "idle");
     assert_eq!(settle(&mut second).phase, "idle");
     let mut entries = (0..100_000)
@@ -828,6 +858,30 @@ fn server_sync_hundred_thousand_owner_entries_http_gate() {
             payload_hash: None,
         })
         .collect::<Vec<_>>();
+    if resolved {
+        use super::asset_object_catalog::AssetObjectRegistration;
+        let cas = PayloadCas::new(&first.repository_root).unwrap();
+        for (page, entries) in entries.chunks_mut(4096).enumerate() {
+            let mut registered = Vec::new();
+            for (offset, entry) in entries.iter_mut().enumerate() {
+                let index = page * 4096 + offset;
+                let bytes = format!("synthetic unique asset body {index:016}");
+                entry.payload_hash = Some(sha2::Sha256::digest(bytes.as_bytes()).into());
+                let object = cas.prepare_bytes(bytes.as_bytes()).unwrap();
+                registered.push(AssetObjectRegistration {
+                    object_hash: object.content_hash,
+                    byte_size: bytes.len() as u64,
+                });
+            }
+            if !registered.is_empty() {
+                first
+                    .asset_object_catalog()
+                    .register(&registered, 1)
+                    .unwrap();
+            }
+        }
+        eprintln!("100k unique synthetic CAS objects prepared");
+    }
     let commit_owner = |store: &mut PersistentStore, entries: &[OwnerManifestEntry]| {
         let generation = active_generation(&store.connection).unwrap();
         let raw: String = store
@@ -865,23 +919,39 @@ fn server_sync_hundred_thousand_owner_entries_http_gate() {
     };
     commit_owner(&mut first, &entries);
     assert_eq!(settle(&mut first).phase, "idle");
+    eprintln!("100k owner initial upload complete (resolved={resolved})");
     assert_eq!(settle(&mut second).phase, "idle");
+    eprintln!("100k owner initial download complete (resolved={resolved})");
     entries[50_000].tuple[0] = "edited".into();
     commit_owner(&mut first, &entries);
     counter.store(0, AtomicOrdering::Relaxed);
     let start = std::time::Instant::now();
+    eprintln!("100k owner warm upload starting");
     assert_eq!(settle(&mut first).phase, "idle");
     let upload = counter.swap(0, AtomicOrdering::Relaxed);
     let upload_ms = start.elapsed().as_millis();
     let start = std::time::Instant::now();
+    eprintln!("100k owner warm download starting");
     assert_eq!(settle(&mut second).phase, "idle");
     let download = counter.load(AtomicOrdering::Relaxed);
-    eprintln!("100k owner HTTP totals (D, upload bytes, download bytes, upload ms, download ms): (6, {upload}, {download}, {upload_ms}, {})",start.elapsed().as_millis());
+    eprintln!("100k owner HTTP totals (resolved={resolved}; D, upload bytes, download bytes, upload ms, download ms): (6, {upload}, {download}, {upload_ms}, {})",start.elapsed().as_millis());
     assert!(upload <= 16384 + 6, "owner upload {upload}");
     assert!(download <= 16384 + 6, "owner download {download}");
     let generation = active_generation(&second.connection).unwrap();
     let name:String=second.connection.query_row("SELECT json_extract(detail,'$.additionalAssets[50000][0]') FROM characters WHERE generation=?1 AND character_id='char-a'",[generation],|r|r.get(0)).unwrap();
     assert_eq!(name, "edited");
+    if resolved {
+        let cas = PayloadCas::new(&second.repository_root).unwrap();
+        for index in 0..entries.len() {
+            let expected = format!("synthetic unique asset body {index:016}");
+            assert_eq!(
+                cas.read_object(&risunest_sync_wire::hash(expected.as_bytes()))
+                    .unwrap()
+                    .unwrap(),
+                expected.as_bytes()
+            );
+        }
+    }
     task.abort();
     runtime.shutdown_timeout(Duration::from_secs(2));
 }
