@@ -1,0 +1,28 @@
+{
+  "name": "endpoint-registry",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.34.1",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "wrangler dev --local",
+    "db:migrate": "wrangler d1 migrations apply endpoint-registry --local",
+    "types": "wrangler types --strict-vars false",
+    "check": "pnpm run types && tsc --noEmit && tsc --noEmit -p tests/tsconfig.json && tsc --noEmit -p tsconfig.tools.json",
+    "test": "vitest run",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.1.0",
+    "@types/node": "^24.0.0",
+    "prettier": "3.9.6",
+    "typescript": "7.0.2",
+    "vitest": "^4.1.0",
+    "wrangler": "^4.129.0"
+  }
+}

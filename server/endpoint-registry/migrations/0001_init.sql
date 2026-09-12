@@ -1,0 +1,4 @@
+CREATE TABLE endpoints (
+  uuid TEXT PRIMARY KEY NOT NULL,
+  envelope TEXT NOT NULL
+) STRICT;
