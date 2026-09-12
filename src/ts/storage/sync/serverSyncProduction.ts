@@ -42,7 +42,45 @@ export interface ServerSyncBackup {
   createdAt: number;
   head: ServerHead;
   localRevision: number;
+  localBytes: number;
+  remoteBytes: number;
+  preservationScope: "library";
+  recoveryReady: boolean;
 }
+export interface ServerSyncBackupCursor {
+  createdAt: number;
+  id: string;
+}
+export interface ManagedServerSyncBackup extends ServerSyncBackup {
+  diskBytes: number;
+  deletable: boolean;
+  blockedReason: string | null;
+}
+export interface ServerSyncBackupInventory {
+  items: ManagedServerSyncBackup[];
+  next: ServerSyncBackupCursor | null;
+  completeCount: number;
+  completeBytes: number;
+  incompleteCount: number;
+  incompleteBytes: number;
+  diskBytes: number;
+}
+export interface ServerSyncCacheUsage {
+  totalBytes: number;
+  protectedBytes: number;
+  reclaimableBytes: number;
+  blockedReason: string | null;
+}
+export const getServerSyncBackupInventory = (before?: ServerSyncBackupCursor) =>
+  invoke<ServerSyncBackupInventory>("server_sync_backup_inventory", {
+    before: before ?? null,
+  });
+export const deleteServerSyncBackup = (id: string) =>
+  invoke<void>("server_sync_backup_delete", { id });
+export const getServerSyncCacheUsage = () =>
+  invoke<ServerSyncCacheUsage>("server_sync_cache_usage");
+export const cleanupServerSyncCache = () =>
+  invoke<ServerSyncCacheUsage>("server_sync_cache_cleanup");
 export const listServerSyncBackups = () =>
   invoke<ServerSyncBackup[]>("server_sync_backups");
 export async function restoreServerSyncBackup(
@@ -50,10 +88,19 @@ export async function restoreServerSyncBackup(
   side: "local" | "remote",
 ): Promise<void> {
   const { restoreLocalBackupFromNativeSource } = await import("../losslessBackupFileRouteProduction.svelte");
-  await restoreLocalBackupFromNativeSource(async () => ({
-    type: "desktopPath",
-    path: await invoke<string>("server_sync_backup_source", { id, side }),
-  }));
+  let lease: string | undefined;
+  try {
+    await restoreLocalBackupFromNativeSource(async () => {
+      const source = await invoke<{ path: string; lease: string }>(
+        "server_sync_backup_source",
+        { id, side },
+      );
+      lease = source.lease;
+      return { type: "desktopPath", path: source.path };
+    });
+  } finally {
+    if (lease) await invoke<void>("server_sync_backup_release", { lease });
+  }
 }
 export function startServerSync(): void {
   if (started || !isTauri) return;

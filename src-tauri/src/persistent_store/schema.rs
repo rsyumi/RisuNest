@@ -1,7 +1,7 @@
-use super::{logical_schema, StoreError, StoreResult};
+use super::{StoreError, StoreResult};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
-pub(super) const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 
 const ASSET_GC_MAINTENANCE_STATE_TABLE_SQL: &str = r#"
 CREATE TABLE asset_gc_maintenance_state (
@@ -46,95 +46,6 @@ CREATE INDEX asset_object_deletions_state
     ON asset_object_deletions (state, created_at_ms, object_hash)
 "#;
 
-const SYNC_DEVICE_TABLE_SQL: &str = r#"
-CREATE TABLE logical_sync_devices (
-    library_id TEXT NOT NULL CHECK (length(library_id) > 0),
-    device_id TEXT NOT NULL CHECK (length(device_id) BETWEEN 1 AND 1024),
-    status TEXT NOT NULL CHECK (status IN ('active', 'revoked', 'forgotten')),
-    acknowledged_generation_id TEXT NOT NULL CHECK (
-        length(acknowledged_generation_id) > 0
-    ),
-    acknowledged_manifest_hash TEXT NOT NULL CHECK (
-        length(acknowledged_manifest_hash) = 64
-        AND acknowledged_manifest_hash NOT GLOB '*[^0-9a-f]*'
-    ),
-    acknowledged_generation_sequence TEXT NOT NULL CHECK (
-        length(acknowledged_generation_sequence) BETWEEN 1 AND 64
-        AND acknowledged_generation_sequence NOT GLOB '*[^0-9]*'
-        AND (
-            acknowledged_generation_sequence = '0'
-            OR substr(acknowledged_generation_sequence, 1, 1) != '0'
-        )
-    ),
-    registered_at INTEGER NOT NULL CHECK (registered_at >= 0),
-    acknowledged_at INTEGER NOT NULL CHECK (acknowledged_at >= registered_at),
-    revoked_at INTEGER CHECK (revoked_at IS NULL OR revoked_at >= registered_at),
-    forgotten_at INTEGER CHECK (forgotten_at IS NULL OR forgotten_at >= registered_at),
-    CHECK (
-        (
-            status = 'active'
-            AND revoked_at IS NULL
-            AND forgotten_at IS NULL
-        )
-        OR (
-            status = 'revoked'
-            AND revoked_at IS NOT NULL
-            AND forgotten_at IS NULL
-        )
-        OR (
-            status = 'forgotten'
-            AND forgotten_at IS NOT NULL
-        )
-    ),
-    PRIMARY KEY (library_id, device_id)
-)
-"#;
-
-const SYNC_DEVICE_INDEX_SQL: &str = r#"
-CREATE INDEX logical_sync_devices_status
-    ON logical_sync_devices (library_id, status, device_id)
-"#;
-
-const SYNC_DEVICE_ACK_PROOF_TABLE_SQL: &str = r#"
-CREATE TABLE logical_sync_device_ack_proofs (
-    library_id TEXT NOT NULL CHECK (length(library_id) > 0),
-    device_id TEXT NOT NULL CHECK (length(device_id) BETWEEN 1 AND 1024),
-    shared_generation_id TEXT NOT NULL CHECK (length(shared_generation_id) > 0),
-    shared_manifest_hash TEXT NOT NULL CHECK (
-        length(shared_manifest_hash) = 64
-        AND shared_manifest_hash NOT GLOB '*[^0-9a-f]*'
-    ),
-    shared_generation_sequence TEXT NOT NULL CHECK (
-        length(shared_generation_sequence) BETWEEN 1 AND 64
-        AND shared_generation_sequence NOT GLOB '*[^0-9]*'
-        AND (
-            shared_generation_sequence = '0'
-            OR substr(shared_generation_sequence, 1, 1) != '0'
-        )
-    ),
-    local_generation_id TEXT NOT NULL CHECK (length(local_generation_id) > 0),
-    local_manifest_hash TEXT NOT NULL CHECK (
-        length(local_manifest_hash) = 64
-        AND local_manifest_hash NOT GLOB '*[^0-9a-f]*'
-    ),
-    local_generation_sequence TEXT NOT NULL CHECK (
-        length(local_generation_sequence) BETWEEN 1 AND 64
-        AND local_generation_sequence NOT GLOB '*[^0-9]*'
-        AND (
-            local_generation_sequence = '0'
-            OR substr(local_generation_sequence, 1, 1) != '0'
-        )
-    ),
-    verified_at INTEGER NOT NULL CHECK (verified_at >= 0),
-    PRIMARY KEY (library_id, device_id)
-)
-"#;
-
-const SYNC_DEVICE_ACK_PROOF_INDEX_SQL: &str = r#"
-CREATE INDEX logical_sync_device_ack_proofs_local_generation
-    ON logical_sync_device_ack_proofs (library_id, local_generation_id)
-"#;
-
 pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
     connection.execute_batch(
         "
@@ -150,7 +61,7 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
 
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     match version {
-        0 => create_v1(connection),
+        0 => create_schema(connection),
         SCHEMA_VERSION => validate_schema(connection),
         _ => Err(StoreError::Store {
             message: format!("unsupported persistent schema version {version}"),
@@ -158,7 +69,7 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
     }
 }
 
-fn create_v1(connection: &mut Connection) -> StoreResult<()> {
+fn create_schema(connection: &mut Connection) -> StoreResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
         "
@@ -317,10 +228,6 @@ fn create_v1(connection: &mut Connection) -> StoreResult<()> {
             ON asset_objects (created_at_ms, object_hash);
         ",
     )?;
-    transaction.execute_batch(SYNC_DEVICE_TABLE_SQL)?;
-    transaction.execute_batch(SYNC_DEVICE_INDEX_SQL)?;
-    transaction.execute_batch(SYNC_DEVICE_ACK_PROOF_TABLE_SQL)?;
-    transaction.execute_batch(SYNC_DEVICE_ACK_PROOF_INDEX_SQL)?;
     transaction.execute_batch(ASSET_OBJECT_DELETION_TABLE_SQL)?;
     transaction.execute_batch(ASSET_OBJECT_DELETION_INDEX_SQL)?;
     transaction.execute_batch(ASSET_ALIAS_REPLACEMENT_CANDIDATE_TABLE_SQL)?;
@@ -329,11 +236,6 @@ fn create_v1(connection: &mut Connection) -> StoreResult<()> {
         "INSERT INTO asset_gc_maintenance_state (singleton, catalog_cursor) VALUES (1, NULL)",
         [],
     )?;
-    logical_schema::create_logical_schema_strict(&transaction).map_err(|error| {
-        StoreError::Store {
-            message: error.to_string(),
-        }
-    })?;
     super::server_sync_outbox::create_schema(&transaction)?;
     validate_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -343,34 +245,6 @@ fn create_v1(connection: &mut Connection) -> StoreResult<()> {
 
 fn validate_schema(connection: &Connection) -> StoreResult<()> {
     super::server_sync_outbox::validate_schema(connection)?;
-    validate_object_sql(
-        connection,
-        "table",
-        "logical_sync_devices",
-        SYNC_DEVICE_TABLE_SQL,
-        "sync device registry table definition is invalid",
-    )?;
-    validate_object_sql(
-        connection,
-        "index",
-        "logical_sync_devices_status",
-        SYNC_DEVICE_INDEX_SQL,
-        "sync device registry status index definition is invalid",
-    )?;
-    validate_object_sql(
-        connection,
-        "table",
-        "logical_sync_device_ack_proofs",
-        SYNC_DEVICE_ACK_PROOF_TABLE_SQL,
-        "sync device acknowledgement proof table definition is invalid",
-    )?;
-    validate_object_sql(
-        connection,
-        "index",
-        "logical_sync_device_ack_proofs_local_generation",
-        SYNC_DEVICE_ACK_PROOF_INDEX_SQL,
-        "sync device acknowledgement proof index definition is invalid",
-    )?;
     validate_object_sql(
         connection,
         "table",

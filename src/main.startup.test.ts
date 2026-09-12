@@ -20,10 +20,6 @@ const deviceSettings = {
     performanceProfile: 'low-spec',
     androidKeepAliveDuringGeneration: false,
     nativeFileLogEnabled: true,
-    syncAutoListen: false,
-    syncListenMethod: 'lan',
-    syncFixedPort: 32145,
-    syncPublicBaseUrl: '',
 }
 
 describe('application startup performance profile', () => {

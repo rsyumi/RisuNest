@@ -34,8 +34,6 @@ vi.mock('./storage/androidRisuSaveRouteProduction.svelte', () => ({ registerAndr
 vi.mock('src/lang', () => ({ language: {} }))
 vi.mock('./platform', () => ({ isTauri: true, isTauriAndroid: false, isTauriDesktop: false }))
 vi.mock('./storage/deviceSettings', () => ({ getDeviceSettings: () => ({ nativeFileLogEnabled: false }) }))
-vi.mock('./storage/sync/deviceSyncProduction', () => ({ getProductionDeviceSyncController: vi.fn() }))
-vi.mock('./storage/sync/deviceSyncController', () => ({ startDeviceSyncAutoListen: vi.fn() }))
 vi.mock('./nativeLog', () => ({ setNativeLogFileEnabled: vi.fn() }))
 vi.mock('./storage/persistentStorageRuntime', () => ({
     initializePersistentStorage: vi.fn(), activateNativeAssetRepository: vi.fn(),

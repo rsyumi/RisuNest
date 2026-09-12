@@ -107,7 +107,7 @@ fn prepared_replacement_commits_activation_marker_with_new_revision() {
     let committed = store
         .finish_prepared_replace_with_app_kv(
             authorized,
-            "peerCloneActiveManifest",
+            "syntheticRestoreMarker",
             &json!({ "manifestId": "manifest-1", "revision": 2 }),
         )
         .expect("activate replacement and marker");
@@ -115,7 +115,7 @@ fn prepared_replacement_commits_activation_marker_with_new_revision() {
     assert_eq!(committed.revision, 2);
     assert_eq!(
         store
-            .get_app_kv("peerCloneActiveManifest")
+            .get_app_kv("syntheticRestoreMarker")
             .expect("read activation marker"),
         Some(json!({ "manifestId": "manifest-1", "revision": 2 }))
     );
@@ -143,9 +143,9 @@ fn prepared_replacement_rolls_back_when_activation_marker_write_fails() {
     store
         .connection
         .execute_batch(
-            "CREATE TRIGGER reject_peer_clone_marker
+            "CREATE TRIGGER reject_restore_marker
              BEFORE INSERT ON app_kv
-             WHEN NEW.key = 'peerCloneActiveManifest'
+             WHEN NEW.key = 'syntheticRestoreMarker'
              BEGIN
                  SELECT RAISE(ABORT, 'marker rejected');
              END;",
@@ -155,7 +155,7 @@ fn prepared_replacement_rolls_back_when_activation_marker_write_fails() {
     store
         .finish_prepared_replace_with_app_kv(
             authorized,
-            "peerCloneActiveManifest",
+            "syntheticRestoreMarker",
             &json!({ "manifestId": "manifest-1", "revision": 2 }),
         )
         .expect_err("marker failure must abort the replacement transaction");
@@ -167,7 +167,7 @@ fn prepared_replacement_rolls_back_when_activation_marker_write_fails() {
     );
     assert_eq!(
         store
-            .get_app_kv("peerCloneActiveManifest")
+            .get_app_kv("syntheticRestoreMarker")
             .expect("read absent activation marker"),
         None
     );

@@ -358,7 +358,7 @@ pub(super) fn validate_database(
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|_| invalid_manifest("source archive schema cannot be read"))?;
-    if version != 1 {
+    if version != i64::from(crate::persistent_store::SCHEMA_VERSION) {
         return Err(invalid_manifest(
             "source archive database schema is unsupported",
         ));

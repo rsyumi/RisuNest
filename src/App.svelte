@@ -39,6 +39,23 @@
     import NativeFileJobDialog from './lib/Others/NativeFileJobDialog.svelte';
     import LoadingIndicator from './lib/UI/GUI/LoadingIndicator.svelte';
 
+    import {
+        serverSyncNavigation,
+        serverSyncScreenRequest,
+    } from './ts/storage/sync/serverSyncDeepLink'
+    import { SettingsMenuIndex } from './ts/stores.svelte'
+
+    $effect(() => {
+        if (!isTauri || !$loadedStore) return
+        return serverSyncNavigation.subscribe((request) => {
+            serverSyncScreenRequest.set(request)
+            if (DBState.db.didFirstSetup && !$onboardingHold) {
+                SettingsMenuIndex.set(17)
+                settingsOpen.set(true)
+            }
+        })
+    })
+
     let startupElapsedSeconds = $state(0)
     $effect(() => {
         const startedAt = LoadingStatusState.startedAt

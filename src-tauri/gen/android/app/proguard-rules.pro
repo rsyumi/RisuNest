@@ -20,16 +20,5 @@
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
 
-# Kotlin symbols that src-tauri Rust code looks up by name over JNI
-# (JNIEnv::call_method / GetMethodID) need explicit keep rules: R8 renaming or
-# stripping them breaks the callback silently, because the native side clears
-# the pending exception and carries on (src-tauri/src/peer_sync/android_jni.rs).
-# Keep this list in sync with every call_method/find_class in src-tauri Rust.
-# The JNI entry points themselves (the `external fun` declarations on
-# PeerCloneNativeBridge and PeerSyncForegroundNativeBridge) are already kept by
-# the generated proguard-wry.pro `native <methods>` rule.
--keep interface io.github.rsyumi.risunest.PeerCloneNativeProgress { *; }
+# Native credential access uses this class by name through JNI.
 -keep class io.github.rsyumi.risunest.ServerSyncSecrets { *; }
--keepclassmembers class * implements io.github.rsyumi.risunest.PeerCloneNativeProgress {
-    void onProgress(long);
-}

@@ -6,7 +6,7 @@ import storageSource from './RisuNestStorageDashboard.svelte?raw'
 import englishSource from 'src/lang/en.ts?raw'
 import androidSource from './RisuNestAndroidPlatform.svelte?raw'
 import logSource from './RisuNestLogViewer.svelte?raw'
-import deviceSyncSource from './DeviceSyncSettings.svelte?raw'
+import serverSyncSource from '../ServerSync/ServerSyncConnection.svelte?raw'
 import segmentedSource from '../RisuNest/SegmentedButtons.svelte?raw'
 import toggleSource from '../RisuNest/SettingToggle.svelte?raw'
 import groupSource from '../RisuNest/SettingGroup.svelte?raw'
@@ -28,6 +28,8 @@ describe('RisuNest settings accessibility and copy', () => {
         expect(storageSource).toContain('aria-live="polite"')
         expect(backupSource).toContain('aria-live="polite"')
         expect(backupSource).not.toContain('console.error')
+        expect(serverSyncSource).toContain('aria-labelledby=')
+        expect(serverSyncSource).toContain('aria-live=')
     })
 
     it('uses the theme error token', () => {
@@ -35,7 +37,13 @@ describe('RisuNest settings accessibility and copy', () => {
     })
 
     it('renders every section through the shared group so headings and panels match', () => {
-        for (const source of [performanceSource, storageSource, backupSource, androidSource, logSource, deviceSyncSource]) {
+        for (const source of [
+            performanceSource,
+            storageSource,
+            backupSource,
+            androidSource,
+            logSource,
+        ]) {
             expect(source).toContain('<SettingGroup')
             expect(source).not.toMatch(/<h2\b/)
         }
@@ -63,10 +71,5 @@ describe('RisuNest settings accessibility and copy', () => {
         expect(logSource).toContain('<SettingToggle')
         expect(androidSource).toContain('<SettingToggle')
         expect(logSource).toContain('hover:bg-selected')
-    })
-
-    it('uses the specified English link action', () => {
-        expect(englishSource).toContain("newLink: 'Create new link'")
-        expect(englishSource).not.toContain("newLink: 'Create a new link'")
     })
 })

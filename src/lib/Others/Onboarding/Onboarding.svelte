@@ -11,10 +11,8 @@
         FolderOpen,
         Globe,
         Info,
-        Link as LinkIcon,
         LoaderCircle,
         MonitorSmartphone,
-        QrCode,
         Server,
         Smartphone,
         TriangleAlert,
@@ -48,20 +46,14 @@
         resolveExpectedOfficialAccountMessageUrl,
     } from 'src/ts/storage/officialAccountMessage'
     import { importRisuSaveFromSystemPicker } from 'src/ts/storage/risuSaveFileRouteProduction.svelte'
-    import { formatRisuNestStorageBytes } from 'src/ts/storage/risuNestStorageDashboard'
-    import { classifyDeviceSyncFailure, parseDeviceSyncUri } from 'src/ts/storage/sync/deviceSync'
-    import { getProductionDeviceSyncController } from 'src/ts/storage/sync/deviceSyncProduction'
-    import type { DeviceSyncControllerSnapshot } from 'src/ts/storage/sync/deviceSyncController'
     import { getNativeOfficialAccountFlow } from 'src/ts/storage/sync/nativeOfficialAccountFlow'
     import { DBState } from 'src/ts/stores.svelte'
 
     import {
         INITIAL_ONBOARDING_FLOW,
         goToOnboardingState,
-        onboardingCloneNext,
         onboardingStep,
         onboardingSummary,
-        type OnboardingClonePhase,
         type OnboardingState,
     } from './onboardingFlow'
     import { onboardingHold } from './onboardingGate'
@@ -94,16 +86,25 @@
         }
     }
 
+    import { serverSyncScreenRequest } from 'src/ts/storage/sync/serverSyncDeepLink'
+    let lastServerRequest: unknown
+    $effect(() => {
+        if (
+            !isTauri ||
+            !$serverSyncScreenRequest ||
+            lastServerRequest === $serverSyncScreenRequest
+        )
+            return
+        lastServerRequest = $serverSyncScreenRequest
+        flow = goToOnboardingState(flow, 'sync-hub')
+    })
+
     let flow = $state(INITIAL_ONBOARDING_FLOW)
     const step = $derived(onboardingStep(flow.state))
 
     let weaveCanvas = $state<HTMLCanvasElement | undefined>()
     let importBusy = $state(false)
     let accountBusy = $state(false)
-    let connectBusy = $state(false)
-    let connectError = $state<string | null>(null)
-    let awaitingClone = $state(false)
-    let linkInput = $state('')
     let loginOpen = $state(false)
     let loginUrl = $state('')
     let loginFrame = $state<HTMLIFrameElement | undefined>()
@@ -138,48 +139,6 @@
         }
     })
 
-    // Device sync is a native feature; the web build has no transport for it.
-    const controller = isTauri ? getProductionDeviceSyncController() : null
-    let syncSnapshot = $state<DeviceSyncControllerSnapshot | null>(controller?.snapshot() ?? null)
-    const cloneTarget = $derived(syncSnapshot?.targets.clone?.state.target)
-    const cloneSource = $derived(
-        syncSnapshot?.sources.find((source) => source.deviceId === syncSnapshot?.activeCloneSourceDeviceId),
-    )
-    const cloneReceived = $derived(cloneTarget?.completedBytes ?? 0)
-    const cloneTotal = $derived(cloneTarget?.totalBytes)
-    const clonePercent = $derived(
-        cloneTotal ? Math.min(100, Math.round((cloneReceived / Math.max(1, cloneTotal)) * 100)) : null,
-    )
-    const linkValid = $derived(parsesAsLink(linkInput))
-
-    /** The download screen's stages, in the same language as an import. */
-    const cloneRows = $derived.by((): StageRow[] => {
-        const phase = cloneTarget?.phase
-        const status = syncSnapshot?.targets.clone?.targetPhase
-        const labels = t.progress
-        const done = phase === 'completed'
-        // The native side reports the transfer complete before the renderer
-        // has activated it, so both readings count as applying.
-        const applying = !done && phase === 'downloading'
-            && (status === 'awaitingActivation' || status === 'completed')
-        const receiving = !done && phase === 'downloading' && !applying
-        const stopped = phase === 'failed' || phase === 'cancelled'
-        const state = (active: boolean, past: boolean): NativeFileJobDialogStageState =>
-            done || past ? 'done' : active ? (stopped ? 'stopped' : 'active') : 'pending'
-        return [
-            { stage: 'connect', label: labels.stageConnect, state: state(!receiving && !applying, receiving || applying), detail: '' },
-            {
-                stage: 'receive',
-                label: labels.stageReceive,
-                state: state(receiving, applying),
-                detail: receiving && cloneTotal
-                    ? `${formatRisuNestStorageBytes(cloneReceived)} / ${formatRisuNestStorageBytes(cloneTotal)}`
-                    : '',
-            },
-            { stage: 'apply', label: labels.stageApply, state: state(applying, false), detail: '' },
-        ]
-    })
-
     onMount(() => {
         // A restored database carries its own `didFirstSetup`; the hold keeps
         // this screen up until the reader presses start.
@@ -188,42 +147,14 @@
         // panel draws them while it is up, so the popup stays closed.
         nativeFileJobHost.set('onboarding')
         const stopWeave = weaveCanvas ? observeOnboardingWeave(weaveCanvas) : () => {}
-        const stopSync = controller?.subscribe((value) => {
-            syncSnapshot = value
-            settleClone(value.targets.clone?.state.target.phase)
-        }) ?? (() => {})
         return () => {
             stopWeave()
-            stopSync()
             nativeFileJobHost.set('dialog')
             onboardingHold.set(false)
         }
     })
 
-    function parsesAsLink(value: string): boolean {
-        if (!value.trim()) return false
-        try {
-            parseDeviceSyncUri(value)
-            return true
-        } catch {
-            return false
-        }
-    }
-
-    function syncFailureText(error: unknown): string {
-        const sync = strings.risuNest.sync
-        const code = classifyDeviceSyncFailure(error).code
-        if (code === 'registration-expired' || code === 'transport-changed') return sync.registrationExpired
-        if (code === 'peer-outdated') return sync.work.peerOutdated
-        if (code === 'transport-unavailable') return sync.errorTransportUnavailable
-        return sync.errorGeneric
-    }
-
     function goTo(state: OnboardingState): void {
-        // Moving by hand starts the link screens clean. A failed connection
-        // returns through goToOnboardingState and keeps its link and message.
-        linkInput = ''
-        connectError = null
         flow = goToOnboardingState(flow, state)
     }
 
@@ -290,60 +221,6 @@
         }
     }
 
-    async function connectDevice(): Promise<void> {
-        if (connectBusy || !linkValid || !controller) return
-        connectBusy = true
-        connectError = null
-        flow = goToOnboardingState(flow, 'sync-progress', 'device')
-        try {
-            controller.stageLink(linkInput)
-            await controller.claimStagedClone()
-            await controller.confirmCloneReplace()
-            // This resolves once the transfer has started. It runs natively
-            // from here on and the snapshot says how it ends.
-            await controller.downloadClone()
-            controller.clearStagedLink()
-            linkInput = ''
-            awaitingClone = true
-            settleClone(controller.snapshot().targets.clone?.state.target.phase)
-        } catch (error) {
-            connectError = syncFailureText(error)
-            flow = goToOnboardingState(flow, 'sync-device', 'device')
-        } finally {
-            connectBusy = false
-        }
-    }
-
-    /** Leaves the download screen once the clone reports a terminal phase. */
-    function settleClone(phase: OnboardingClonePhase | undefined): void {
-        if (!awaitingClone) return
-        const next = onboardingCloneNext(phase)
-        if (!next) return
-        awaitingClone = false
-        if (phase === 'failed') {
-            connectError = syncFailureText(
-                syncSnapshot?.workError ?? syncSnapshot?.targets.clone?.error ?? null,
-            )
-            // Android keeps a failed job until it is cancelled; the settings
-            // page does the same before dismissing one.
-            if (isTauriAndroid) void controller?.cancelClone().catch(() => {})
-        }
-        flow = goToOnboardingState(flow, next, 'device')
-    }
-
-    async function cancelDownload(): Promise<void> {
-        if (!await alertConfirm(t.progress.cancelConfirm)) return
-        try {
-            await controller?.cancelClone()
-        } catch (error) {
-            // A transfer that already ended is settled from the snapshot.
-            if (onboardingCloneNext(cloneTarget?.phase)) return
-            awaitingClone = false
-            connectError = syncFailureText(error)
-            flow = goToOnboardingState(flow, 'sync-device', 'device')
-        }
-    }
-
     function openAccountLogin(): void {
         loginUrl = hubURL + '/hub/login'
         loginOpen = true
@@ -405,29 +282,6 @@
     <button class="back" type="button" onclick={() => goTo(target)}>
         <ChevronLeft />{label}
     </button>
-{/snippet}
-
-{#snippet linkField(onConnect: () => void, disabled: boolean)}
-    <div class="connect">
-        <div class="field">
-            <LinkIcon />
-            <input
-                bind:value={linkInput}
-                placeholder={strings.risuNest.sync.work.linkPlaceholder}
-                aria-label={strings.risuNest.sync.work.linkLabel}
-                spellcheck="false"
-                autocomplete="off"
-            />
-            <button class="btn primary" type="button" disabled={disabled || !linkValid} onclick={onConnect}>
-                {t.device.connect}
-            </button>
-        </div>
-        {#if linkInput.trim() && !linkValid}
-            <p class="error" role="alert">{strings.risuNest.sync.work.linkInvalid}</p>
-        {:else if connectError}
-            <p class="error" role="alert">{connectError}</p>
-        {/if}
-    </div>
 {/snippet}
 
 {#snippet bar(percent: number | null, label: string)}
@@ -639,11 +493,6 @@
                         <h1>{t.sync.title}</h1>
                         <p class="lead">{t.sync.lead}</p>
                         <div class="rows">
-                            <button class="row" type="button" onclick={() => goTo('sync-device')}>
-                                <span class="ic"><QrCode /></span>
-                                <span class="tx"><b>{t.sync.deviceTitle}</b><small>{t.sync.deviceDesc}</small></span>
-                                <span class="chev"><ChevronRight /></span>
-                            </button>
                             <button class="row" type="button" onclick={() => goTo('sync-hub')}>
                                 <span class="ic"><Server /></span>
                                 <span class="tx"><b>{t.sync.hubTitle}</b><small>{t.sync.hubDesc}</small></span>
@@ -655,51 +504,11 @@
                                 <span class="chev"><ChevronRight /></span>
                             </button>
                         </div>
-                    {:else if flow.state === 'sync-device'}
-                        {@render back('sync', t.back)}
-                        <h1>{t.device.title}</h1>
-                        <ol class="howto">
-                            <li><span>{t.device.stepShare}</span></li>
-                            <li><span>{t.device.stepLink}</span></li>
-                            <li><span>{t.device.stepPaste}</span></li>
-                        </ol>
-                        {@render linkField(connectDevice, connectBusy)}
                     {:else if flow.state === 'sync-hub'}
                         {@render back('sync', t.back)}
                         <h1>{t.hub.title}</h1>
-                        <ol class="howto">
-                            <li><span>{t.hub.stepLink}</span></li>
-                            <li><span>{t.device.stepPaste}</span></li>
-                        </ol>
-                        {@render linkField(() => {}, false)}
-                    {:else if flow.state === 'sync-progress'}
-                        <h1>{t.progress.title}</h1>
-                        <p class="lead">{t.progress.lead}</p>
-                        <div class="file">
-                            {#if flow.path === 'hub'}<Server />{:else}<MonitorSmartphone />{/if}
-                            <span class="name">
-                                {flow.path === 'hub'
-                                    ? t.progress.server
-                                    : cloneSource?.name || strings.risuNest.sync.work.unknownDevice}
-                            </span>
-                        </div>
-                        {@render bar(clonePercent, strings.risuNest.sync.work.progressLabel)}
-                        <p class="meta">
-                            <span>{clonePercent === null ? '' : `${clonePercent}%`}</span>
-                            <span>
-                                {#if cloneTotal}
-                                    {t.progress.meta
-                                        .replace('{0}', formatRisuNestStorageBytes(cloneReceived))
-                                        .replace('{1}', formatRisuNestStorageBytes(cloneTotal))}
-                                {:else}
-                                    {t.progress.metaStarting}
-                                {/if}
-                            </span>
-                        </p>
-                        {@render stageList(cloneRows)}
-                        <div class="actions">
-                            <button class="btn ghost" type="button" onclick={cancelDownload}>{t.progress.cancel}</button>
-                        </div>
+                        <!-- A5 owns activation after the shared registration contract is verified. -->
+                        <p class="lead">{t.hub.stepLink}</p>
                     {:else if flow.state === 'sync-account'}
                         {@render back('sync', t.back)}
                         <h1>{t.account.title}</h1>
@@ -807,7 +616,7 @@
         opacity: 0.55;
         cursor: default;
     }
-    .onb :is(button, select, input):focus-visible {
+    .onb :is(button, select):focus-visible {
         outline: 2px solid var(--o-blue);
         outline-offset: 2px;
     }
@@ -1237,26 +1046,13 @@
         height: 16px;
         color: var(--o-faint);
     }
-    .field input {
-        flex: 1;
-        min-width: 0;
-        border: 0;
-        background: none;
-        color: var(--o-ink);
-        font: inherit;
-        font-size: 13.5px;
-        outline: none;
-    }
-    .field input::placeholder {
-        color: var(--o-faint);
-    }
     .error {
         margin: 0;
         font-size: 12.5px;
         color: var(--color-draculared);
     }
 
-    /* ── progress: imports and the clone download share one look ── */
+    /* ── progress: native file imports ── */
     .file {
         display: flex;
         flex-wrap: wrap;

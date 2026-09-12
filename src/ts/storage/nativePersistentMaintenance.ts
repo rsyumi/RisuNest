@@ -56,29 +56,6 @@ export interface NativeAssetGcResult {
     blockers: string[]
 }
 
-export interface NativePeerBackupInfo {
-    path: string
-    bytes: number
-    modifiedAt: number
-}
-
-export interface NativePeerTempUsage {
-    bytes: number
-    count: number
-}
-
-export type NativePeerBackupDeleteErrorCode = 'peer-backup-in-use' | 'peer-backup-delete-failed'
-
-export interface NativePeerBackupDeleteError {
-    code: NativePeerBackupDeleteErrorCode
-}
-
-export function isNativePeerBackupDeleteError(error: unknown): NativePeerBackupDeleteError | null {
-    if (!error || typeof error !== 'object' || Object.keys(error).length !== 1) return null
-    const code = (error as { code?: unknown }).code
-    return code === 'peer-backup-in-use' || code === 'peer-backup-delete-failed' ? { code } : null
-}
-
 export interface NativeSnapshotRestoreActions {
     choose(snapshots: readonly NativeSnapshotInfo[]): Promise<string | null>
     confirm(): Promise<boolean>
@@ -124,22 +101,6 @@ export function previewNativePersistentAssetGc(): Promise<NativeAssetGcResult> {
 
 export function executeNativePersistentAssetGc(): Promise<NativeAssetGcResult> {
     return invoke('pds_asset_gc_execute')
-}
-
-export function listPeerBackups(): Promise<NativePeerBackupInfo[]> {
-    return invoke('peer_backup_list')
-}
-
-export function removePeerBackup(path: string): Promise<void> {
-    return invoke('peer_backup_delete', { path })
-}
-
-export function getPeerTempUsage(): Promise<NativePeerTempUsage> {
-    return invoke('peer_temp_usage')
-}
-
-export function cleanupPeerTemp(): Promise<NativePeerTempUsage> {
-    return invoke('peer_temp_cleanup')
 }
 
 export async function requestNativePersistentSnapshotRestore(id: string): Promise<void> {

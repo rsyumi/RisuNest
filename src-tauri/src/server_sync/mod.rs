@@ -3,6 +3,7 @@ pub(crate) mod cache;
 pub(crate) mod client;
 pub(crate) mod commands;
 pub(crate) mod credentials;
+pub(crate) mod management;
 pub(crate) mod planner;
 pub(crate) mod remote;
 #[cfg(test)]

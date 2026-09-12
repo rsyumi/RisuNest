@@ -697,8 +697,13 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let mut store = PersistentStore::open(directory.path()).unwrap();
         let cas = PayloadCas::new(directory.path()).unwrap();
-        let mut job =
-            DurableCasJob::begin(directory.path(), "wrong-kind", CasJobKind::PeerClone, 1).unwrap();
+        let mut job = DurableCasJob::begin(
+            directory.path(),
+            "wrong-kind",
+            CasJobKind::LosslessImport,
+            1,
+        )
+        .unwrap();
         let manifest = owner_manifest();
         let manifest_hash = hex::encode(Sha256::digest(&manifest));
 

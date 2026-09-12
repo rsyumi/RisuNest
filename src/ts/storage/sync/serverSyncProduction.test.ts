@@ -7,8 +7,14 @@ const state = vi.hoisted(() => ({
   available: undefined as undefined | (() => boolean),
   revisionListener: undefined as undefined | (() => void),
   scheduler: { resume: vi.fn(), suspend: vi.fn(), localCommit: vi.fn() },
-  invoke: vi.fn(async () => "synthetic-backup-path"),
-  restore: vi.fn(async (source?: () => Promise<unknown>) => { if (source) await source(); }),
+  invoke: vi.fn(async (command: string) =>
+    command === "server_sync_backup_source"
+      ? { path: "synthetic-backup-path", lease: "synthetic-source-lease" }
+      : undefined,
+  ),
+  restore: vi.fn(async (source?: () => Promise<unknown>) => {
+    if (source) await source();
+  }),
   controller: {
     initialize: vi.fn(async () => {}),
     invalidateCompletion: vi.fn(),
@@ -81,14 +87,45 @@ describe("native server synchronization scheduling", () => {
     const { restoreServerSyncBackup } = await import("./serverSyncProduction");
     await restoreServerSyncBackup("backup-id", "remote");
     expect(state.restore).toHaveBeenCalledWith(expect.any(Function));
-    expect(state.invoke).toHaveBeenCalledWith("server_sync_backup_source", { id: "backup-id", side: "remote" });
+    expect(state.invoke).toHaveBeenCalledWith("server_sync_backup_source", {
+      id: "backup-id",
+      side: "remote",
+    });
+    expect(state.invoke).toHaveBeenCalledWith("server_sync_backup_release", {
+      lease: "synthetic-source-lease",
+    });
     expect(state.controller.pause).not.toHaveBeenCalled();
     expect(state.controller.synchronize).not.toHaveBeenCalled();
     // Rejection by the file route must occur before the native source is opened.
     state.invoke.mockClear();
     state.restore.mockRejectedValueOnce({ code: "server-sync-busy" });
-    await expect(restoreServerSyncBackup("backup-id", "local")).rejects.toMatchObject({ code: "server-sync-busy" });
+    await expect(
+      restoreServerSyncBackup("backup-id", "local"),
+    ).rejects.toMatchObject({ code: "server-sync-busy" });
     expect(state.invoke).not.toHaveBeenCalled();
+  });
+  it("keeps the native source pinned until restore or cancellation has settled", async () => {
+    let finish!: () => void;
+    state.restore.mockImplementationOnce(async (source) => {
+      await source!();
+      await new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      throw new Error("synthetic cancelled restore");
+    });
+    const { restoreServerSyncBackup } = await import("./serverSyncProduction");
+    const restoring = restoreServerSyncBackup("backup-id", "local");
+    await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+    expect(state.invoke).not.toHaveBeenCalledWith(
+      "server_sync_backup_release",
+      expect.anything(),
+    );
+    finish();
+    await expect(restoring).rejects.toThrow("synthetic cancelled restore");
+    expect(state.invoke).toHaveBeenLastCalledWith(
+      "server_sync_backup_release",
+      { lease: "synthetic-source-lease" },
+    );
   });
   it("starts once after initialization and connects durable saves, visibility, and network signals", async () => {
     const listeners = new Map<string, EventListener>();
@@ -128,7 +165,9 @@ describe("native server synchronization scheduling", () => {
     online.mockReturnValue(true);
     listeners.get("online")!(new Event("online"));
     expect(state.scheduler.resume).toHaveBeenCalledTimes(3);
-    const { resumeServerSyncAfterBackup } = await import("./serverSyncProduction");
+    const { resumeServerSyncAfterBackup } = await import(
+      "./serverSyncProduction"
+    );
     resumeServerSyncAfterBackup();
     expect(state.scheduler.resume).toHaveBeenCalledTimes(4);
   });

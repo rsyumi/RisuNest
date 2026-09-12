@@ -9,6 +9,7 @@ use crate::persistent_store::{
     PersistentStore,
 };
 use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -28,6 +29,7 @@ pub(crate) struct ServerSyncCommandState {
     cancelled: Mutex<Arc<AtomicBool>>,
     prepared: Mutex<Option<PreparedJob>>,
     verified_bytes: Mutex<Arc<std::sync::atomic::AtomicU64>>,
+    backup_sources: Mutex<BTreeMap<String, String>>,
 }
 struct Running<'a>(&'a ServerSyncCommandState);
 impl Drop for Running<'_> {
@@ -83,6 +85,129 @@ async fn blocking<T: Send + 'static>(
         .await
         .map_err(|_| SyncError::new("server-sync-worker-unavailable", 503))?
 }
+
+fn pinned_backups(state: &ServerSyncCommandState) -> Result<BTreeSet<String>> {
+    Ok(state
+        .backup_sources
+        .lock()
+        .map_err(|_| SyncError::new("server-sync-state-unavailable", 503))?
+        .values()
+        .cloned()
+        .collect())
+}
+fn management_block(store: &PersistentStore) -> Result<Option<&'static str>> {
+    Ok(store
+        .server_status()?
+        .operation_pending
+        .then_some("resolve-pending-operation-first"))
+}
+#[tauri::command]
+pub(crate) async fn server_sync_backup_inventory(
+    app: AppHandle,
+    before: Option<super::management::BackupCursor>,
+) -> Result<super::management::BackupInventory> {
+    blocking(move || {
+        let state = app.state::<ServerSyncCommandState>();
+        let store = job_store(&app)?;
+        let block =
+            if state.running.load(Ordering::Acquire) || state.require_no_preparation().is_err() {
+                Some("server-sync-busy")
+            } else {
+                management_block(&store)?
+            };
+        super::management::inventory(
+            store.repository_root(),
+            before.as_ref(),
+            block,
+            &pinned_backups(&state)?,
+        )
+    })
+    .await
+}
+#[tauri::command]
+pub(crate) async fn server_sync_backup_delete(app: AppHandle, id: String) -> Result<()> {
+    blocking(move || {
+        let _admission = claim_library(&app)?;
+        let state = app.state::<ServerSyncCommandState>();
+        let _running = state.claim()?;
+        state.require_no_preparation()?;
+        let store = job_store(&app)?;
+        super::management::delete_backup(
+            store.repository_root(),
+            &id,
+            management_block(&store)?,
+            &pinned_backups(&state)?,
+        )
+    })
+    .await
+}
+fn manage_cache(app: &AppHandle, clean: bool) -> Result<super::management::CacheUsage> {
+    let state = app.state::<ServerSyncCommandState>();
+    let _admission = if clean {
+        Some(claim_library(app)?)
+    } else {
+        None
+    };
+    let _running = if clean { Some(state.claim()?) } else { None };
+    if clean {
+        state.require_no_preparation()?;
+    }
+    let store = job_store(app)?;
+    let mut block = management_block(&store)?;
+    if !clean && (state.running.load(Ordering::Acquire) || state.require_no_preparation().is_err())
+    {
+        block = Some("server-sync-busy");
+    }
+    let backups = super::management::inventory(
+        store.repository_root(),
+        None,
+        block,
+        &pinned_backups(&state)?,
+    )?;
+    if backups.incomplete_count > 0 {
+        block = Some("incomplete-preservation");
+    }
+    if !pinned_backups(&state)?.is_empty() {
+        block = Some("backup-in-use");
+    }
+    let active = store.server_stored_config()?.map(|config| {
+        risunest_sync_wire::hash(format!("{}:{}", config.library_id, config.device_id).as_bytes())
+    });
+    let mut references = BTreeSet::new();
+    if block.is_none() {
+        if let Some(id) = &active {
+            let path = store.repository_root().join("server-sync").join(id);
+            if path.exists() {
+                let cache = super::cache::Cache {
+                    cas: crate::asset_repository::PayloadCas::new(&path)?,
+                };
+                match store.server_cache_references(&cache) {
+                    Ok(hashes) => references = hashes,
+                    Err(_) => block = Some("cache-references-unavailable"),
+                }
+            }
+        }
+    }
+    super::management::cache_usage(
+        store.repository_root(),
+        active.as_deref(),
+        &references,
+        block,
+        clean,
+    )
+}
+#[tauri::command]
+pub(crate) async fn server_sync_cache_usage(
+    app: AppHandle,
+) -> Result<super::management::CacheUsage> {
+    blocking(move || manage_cache(&app, false)).await
+}
+#[tauri::command]
+pub(crate) async fn server_sync_cache_cleanup(
+    app: AppHandle,
+) -> Result<super::management::CacheUsage> {
+    blocking(move || manage_cache(&app, true)).await
+}
 #[tauri::command]
 pub(crate) async fn server_sync_backups(app: AppHandle) -> Result<Vec<super::backups::Backup>> {
     blocking(move || {
@@ -96,7 +221,7 @@ pub(crate) async fn server_sync_backup_source(
     app: AppHandle,
     id: String,
     side: super::backups::Side,
-) -> Result<String> {
+) -> Result<BackupSource> {
     blocking(move || {
         let _admission = claim_library(&app)?;
         let state = app.state::<ServerSyncCommandState>();
@@ -105,11 +230,34 @@ pub(crate) async fn server_sync_backup_source(
         if store.server_status()?.operation_pending {
             return Err(SyncError::new("resolve-pending-operation-first", 409));
         }
-        super::backups::source(store.repository_root(), &id, side, || {
+        let path = super::backups::source(store.repository_root(), &id, side, || {
             cancelled.load(Ordering::Acquire)
-        })
+        })?;
+        let lease = uuid::Uuid::new_v4().to_string();
+        state
+            .backup_sources
+            .lock()
+            .map_err(|_| SyncError::new("server-sync-state-unavailable", 503))?
+            .insert(lease.clone(), id);
+        Ok(BackupSource { path, lease })
     })
     .await
+}
+
+#[derive(Serialize)]
+pub(crate) struct BackupSource {
+    path: String,
+    lease: String,
+}
+
+#[tauri::command]
+pub(crate) fn server_sync_backup_release(app: AppHandle, lease: String) -> Result<()> {
+    app.state::<ServerSyncCommandState>()
+        .backup_sources
+        .lock()
+        .map_err(|_| SyncError::new("server-sync-state-unavailable", 503))?
+        .remove(&lease);
+    Ok(())
 }
 
 #[derive(Serialize)]

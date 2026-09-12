@@ -27,9 +27,6 @@ export type NativeCasJobKind =
     | 'lossless-import'
     | 'card-or-module-content-import'
     | 'official-publication-or-export-preparation'
-    | 'peer-clone'
-    | 'android-clone'
-    | 'logical-delta-target'
     | 'cold-migration'
     | 'cold-direct-write'
 

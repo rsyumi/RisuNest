@@ -4,23 +4,13 @@ mod commit;
 pub(crate) mod export;
 #[cfg(feature = "native-kei-upload-pilot")]
 pub(crate) mod kei;
-pub(crate) mod logical_delta_source;
-mod logical_delta_target;
-#[allow(unused_imports)]
-pub(crate) use logical_delta_target::{
-    establish_logical_common_base, establish_logical_common_base_with_commit_intent,
-    LogicalDeltaConflict, LogicalDeltaConflictKind, LogicalDeltaConflictPolicy,
-    LogicalDeltaPlanResolution, PersistentLogicalDeltaTarget,
-};
-mod logical_index;
-pub(crate) use logical_index::PRODUCT_LOGICAL_LIBRARY_ID;
-mod logical_schema;
 mod owner_projection;
 mod preservation;
 mod query;
 mod record_apply;
 mod record_projection;
 mod schema;
+pub(crate) use schema::SCHEMA_VERSION;
 #[cfg(test)]
 mod schema_contract_tests;
 pub(crate) mod server_sync_apply;
@@ -31,19 +21,10 @@ pub(crate) mod server_sync_outbox;
 pub(crate) mod server_sync_projection;
 mod snapshot;
 mod snapshot_archive;
-mod sync_device_registry;
-#[cfg(test)]
-mod sync_device_registry_tests;
 
 pub(crate) use asset_object_catalog::{AssetObjectCatalog, AssetObjectCatalogPage};
 pub(crate) use commands::PersistentStoreState;
 pub(crate) use snapshot::RevisionReadLease;
-#[allow(unused_imports)]
-pub(crate) use sync_device_registry::{
-    RegisteredSyncDevice, RegisteredSyncDeviceStatus, SyncDeviceAckState, SyncGenerationIdentity,
-    TombstoneCollectionItem, TombstoneCollectionPage, VerifiedSharedAckLocalProof,
-    VerifiedSyncDeviceRegistration,
-};
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -1274,7 +1255,6 @@ impl PersistentStore {
         export::sweep_abandoned(&snapshots_dir)?;
         #[cfg(feature = "native-kei-upload-pilot")]
         kei::sweep_abandoned(&snapshots_dir);
-        logical_index::cleanup_abandoned_logical_staging(&mut connection)?;
         snapshot::sweep_temporary_generations(&mut connection)?;
         snapshot::checkpoint(&connection, CheckpointMode::Truncate)?;
 
@@ -1553,10 +1533,7 @@ impl PersistentStore {
         } else {
             commit
         };
-        let cas = logical_index::logical_index_is_active(&self.connection)?
-            .then(|| crate::asset_repository::PayloadCas::new(&self.repository_root))
-            .transpose()?;
-        commit::commit(&mut self.connection, cas.as_ref(), commit, asset_aliases)
+        commit::commit(&mut self.connection, commit, asset_aliases)
     }
 
     pub(crate) fn commit_asset_alias(
@@ -1564,10 +1541,7 @@ impl PersistentStore {
         alias: &AssetAlias,
         expected_revision: i64,
     ) -> StoreResult<RevisionResult> {
-        let cas = logical_index::logical_index_is_active(&self.connection)?
-            .then(|| crate::asset_repository::PayloadCas::new(&self.repository_root))
-            .transpose()?;
-        commit::commit_asset_alias(&mut self.connection, cas.as_ref(), alias, expected_revision)
+        commit::commit_asset_alias(&mut self.connection, alias, expected_revision)
     }
 
     pub(crate) fn delete_asset_alias(
@@ -1576,16 +1550,7 @@ impl PersistentStore {
         key: &str,
         expected_revision: i64,
     ) -> StoreResult<RevisionResult> {
-        let cas = logical_index::logical_index_is_active(&self.connection)?
-            .then(|| crate::asset_repository::PayloadCas::new(&self.repository_root))
-            .transpose()?;
-        commit::delete_asset_alias(
-            &mut self.connection,
-            cas.as_ref(),
-            kind,
-            key,
-            expected_revision,
-        )
+        commit::delete_asset_alias(&mut self.connection, kind, key, expected_revision)
     }
 
     pub(crate) fn commit_cold_alias(
@@ -1595,8 +1560,7 @@ impl PersistentStore {
     ) -> StoreResult<RevisionResult> {
         let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
         verify_cold_alias_object(&cas, alias)?;
-        let logical_cas = logical_index::logical_index_is_active(&self.connection)?.then_some(&cas);
-        commit::commit_cold_alias(&mut self.connection, logical_cas, alias, expected_revision)
+        commit::commit_cold_alias(&mut self.connection, alias, expected_revision)
     }
 
     pub(crate) fn delete_cold_alias(
@@ -1604,13 +1568,7 @@ impl PersistentStore {
         key: &str,
         expected_revision: i64,
     ) -> StoreResult<RevisionResult> {
-        let maintain_logical_index = logical_index::logical_index_is_active(&self.connection)?;
-        commit::delete_cold_alias(
-            &mut self.connection,
-            maintain_logical_index,
-            key,
-            expected_revision,
-        )
+        commit::delete_cold_alias(&mut self.connection, key, expected_revision)
     }
 
     pub(crate) fn activate_cold_payload_migration(
@@ -1621,8 +1579,7 @@ impl PersistentStore {
         for alias in &input.cold_aliases {
             verify_cold_alias_object(&cas, alias)?;
         }
-        let logical_cas = logical_index::logical_index_is_active(&self.connection)?.then_some(&cas);
-        commit::activate_cold_payload_migration(&mut self.connection, logical_cas, input)
+        commit::activate_cold_payload_migration(&mut self.connection, input)
     }
 
     pub(crate) fn replace_begin(&mut self) -> StoreResult<StagingResult> {
@@ -2730,35 +2687,7 @@ pub(super) fn active_generation(connection: &Connection) -> StoreResult<String> 
     Ok(serde_json::from_str(&value)?)
 }
 
-pub(super) fn generation_is_retained(
-    connection: &Connection,
-    generation: &str,
-) -> StoreResult<bool> {
-    let logical_schema_exists: bool = connection.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM sqlite_master
-            WHERE type = 'table' AND name = 'logical_sync_generations'
-         )",
-        [],
-        |row| row.get(0),
-    )?;
-    if !logical_schema_exists {
-        return Ok(false);
-    }
-    connection
-        .query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM logical_sync_generations
-                WHERE pds_generation = ?1 AND state = 'complete'
-             )",
-            [generation],
-            |row| row.get(0),
-        )
-        .map_err(Into::into)
-}
 #[cfg(test)]
 mod benchmark;
-#[cfg(test)]
-mod logical_delta_source_tests;
 #[cfg(test)]
 mod tests;
