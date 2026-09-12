@@ -9,7 +9,13 @@ export interface ServerHead {
   headId: string;
   minRetainedSeq: string;
 }
+export interface ServerDirectory {
+  baseUrl: string;
+  uuid: string;
+  key: string;
+}
 export interface ServerConfig {
+  directory?: ServerDirectory;
   endpoint: string;
   libraryId: string;
   deviceId: string;
@@ -43,11 +49,7 @@ export interface ServerCycleOptions {
   expectedHead?: ServerHead;
 }
 export type ServerSyncProgress =
-  | "saving"
-  | "preparing"
-  | "applying"
-  | "refreshing"
-  | "publishing";
+  "saving" | "preparing" | "applying" | "refreshing" | "publishing";
 type Prepared =
   | { kind: "report"; result: ServerCycle }
   | {

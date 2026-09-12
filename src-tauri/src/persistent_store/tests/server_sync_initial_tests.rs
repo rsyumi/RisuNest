@@ -21,6 +21,7 @@ fn empty_replicas_seed_and_receive_while_independent_libraries_require_compariso
         let device = server.add_device().unwrap();
         store
             .server_bind(&ServerConfig {
+                directory: None,
                 endpoint: endpoint.clone(),
                 library_id: device.library_id,
                 device_id: device.device_id,

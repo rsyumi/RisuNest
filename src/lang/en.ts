@@ -1850,6 +1850,22 @@ export const languageEnglish = {
             elapsed: (seconds: number) => `${seconds}s elapsed`,
         },
         serverSync: {
+            registrationCode: "Registration code",
+            registrationCodeHelp:
+                "Paste the code issued for this device, or scan its QR code. Review the server below before connecting.",
+            readRegistration: "Read code",
+            scanRegistration: "Scan QR code",
+            scanRegistrationHelp: "Point the camera at the registration QR code.",
+            cancelScan: "Cancel scanning",
+            registrationInvalid: "The registration code is invalid.",
+            cameraDenied:
+                "Camera permission was denied. You can paste the registration code instead.",
+            cameraUnavailable:
+                "The camera could not scan this code. Try again or paste the code.",
+            registrationBlocked:
+                "Disconnect the current server before importing a new registration.",
+            discardRegistration: "Clear registration input",
+            directoryEnabled: "Server address discovery enabled",
             backups: 'Conflict backups',
             backupHelp:
                 'Restore the complete library from either side of a conflict. The current library is backed up before replacement. Sync stays paused so you can check the restored contents before continuing.',

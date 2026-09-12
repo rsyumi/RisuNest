@@ -24,6 +24,7 @@ fn head(seq: u64) -> RemoteHead {
 fn bind(store: &mut PersistentStore) {
     store
         .server_bind(&ServerConfig {
+            directory: None,
             endpoint: "http://127.0.0.1:4319".into(),
             library_id: "library".into(),
             device_id: "device".into(),
@@ -62,6 +63,7 @@ fn server_sync_credentials_stay_outside_source_backups_and_allow_recovery_after_
     store
         .server_replace_registration(
             &ServerConfig {
+                directory: None,
                 endpoint: "http://127.0.0.1:4319".into(),
                 library_id: "library".into(),
                 device_id: "replacement".into(),
@@ -312,5 +314,54 @@ fn recovery_preserves_local_edits_and_bases_while_invalidating_old_operations() 
             .unwrap()
             .device_operation_seq,
         Sequence::from(1)
+    );
+}
+
+#[test]
+fn server_sync_address_cache_changes_only_endpoint_and_preserves_replica_state() {
+    let (_dir, mut store, _) = open_fixture();
+    bind(&mut store);
+    let config = store.server_config().unwrap().unwrap();
+    let pending = store
+        .server_reserve(
+            &head(0),
+            "b".repeat(64),
+            "stage-a".into(),
+            store.revision().unwrap(),
+        )
+        .unwrap();
+    let pending = serde_json::to_value(&pending).unwrap();
+    let before = serde_json::to_value(store.server_status().unwrap()).unwrap();
+    let revision = store.revision().unwrap();
+    let root = store.read_root(None).unwrap().value;
+    let mut verified = config.clone();
+    verified.endpoint = "https://new-sync.example".into();
+    store.server_cache_endpoint(&config, &verified).unwrap();
+    let mut after = serde_json::to_value(store.server_status().unwrap()).unwrap();
+    assert_eq!(after["endpoint"], verified.endpoint);
+    after["endpoint"] = before["endpoint"].clone();
+    assert_eq!(after, before);
+    assert_eq!(
+        serde_json::to_value(store.server_pending().unwrap().unwrap().intent).unwrap(),
+        pending
+    );
+    assert_eq!(store.revision().unwrap(), revision);
+    assert_eq!(store.read_root(None).unwrap().value, root);
+    assert_eq!(store.server_config().unwrap().unwrap().token, config.token);
+    assert_eq!(
+        store
+            .server_cache_endpoint(&config, &verified)
+            .unwrap_err()
+            .code,
+        "server-config-changed"
+    );
+    let mut stranger = verified.clone();
+    stranger.device_id = "different".into();
+    assert_eq!(
+        store
+            .server_cache_endpoint(&config, &stranger)
+            .unwrap_err()
+            .code,
+        "device-identity-mismatch"
     );
 }

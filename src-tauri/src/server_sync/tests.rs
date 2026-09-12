@@ -43,6 +43,7 @@ fn sparse_missing_targets_share_one_request_across_cached_inventory_pages() {
         axum::serve(listener, router).await.unwrap();
     });
     let client = ServerClient::new(ServerConfig {
+        directory: None,
         endpoint,
         library_id: credential.library_id,
         device_id: credential.device_id,
@@ -105,6 +106,7 @@ fn native_client_roundtrips_large_objects_and_exact_delta_against_daemon() {
             .unwrap();
     });
     let mut client = ServerClient::new(ServerConfig {
+        directory: None,
         endpoint,
         library_id: credential.library_id.clone(),
         device_id: credential.device_id.clone(),

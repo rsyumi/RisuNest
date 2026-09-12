@@ -23,6 +23,7 @@ fn separate_conversations_keep_local_views_and_alias_conflicts_preserve_both_sid
         let device = server.add_device().unwrap();
         store
             .server_bind(&ServerConfig {
+                directory: None,
                 endpoint: endpoint.clone(),
                 library_id: device.library_id,
                 device_id: device.device_id,

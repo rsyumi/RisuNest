@@ -49,3 +49,9 @@ impl From<crate::persistent_store::StoreError> for SyncError {
     }
 }
 pub(crate) type Result<T> = std::result::Result<T, SyncError>;
+
+impl From<risunest_sync_connect::ConnectError> for SyncError {
+    fn from(value: risunest_sync_connect::ConnectError) -> Self {
+        Self::new(value.0, 400)
+    }
+}

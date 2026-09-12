@@ -48,6 +48,45 @@ impl PersistentStore {
         })
         .transpose()
     }
+    /// Update only the address after an authenticated identity probe. Replica state is untouched.
+    pub(crate) fn server_cache_endpoint(
+        &mut self,
+        previous: &ServerConfig,
+        verified: &ServerConfig,
+    ) -> Result<()> {
+        if previous.endpoint == verified.endpoint {
+            return Ok(());
+        }
+        verified.validate()?;
+        if previous.library_id != verified.library_id
+            || previous.device_id != verified.device_id
+            || previous.token != verified.token
+        {
+            return Err(SyncError::new("device-identity-mismatch", 409));
+        }
+        let mut stored = self
+            .server_stored_config()?
+            .ok_or_else(|| SyncError::new("server-not-bound", 409))?;
+        let before = serde_json::to_string(&stored)
+            .map_err(|_| SyncError::new("invalid-local-server-config", 409))?;
+        if stored.endpoint != previous.endpoint
+            || stored.library_id != previous.library_id
+            || stored.device_id != previous.device_id
+        {
+            return Err(SyncError::new("server-config-changed", 409));
+        }
+        stored.endpoint = verified.endpoint.clone();
+        let after = serde_json::to_string(&stored)
+            .map_err(|_| SyncError::new("invalid-local-server-config", 409))?;
+        if self.connection.execute(
+            "UPDATE server_sync_state SET config=?1 WHERE singleton=1 AND config=?2",
+            params![after, before],
+        )? != 1
+        {
+            return Err(SyncError::new("server-config-changed", 409));
+        }
+        Ok(())
+    }
     pub(crate) fn server_bind(&mut self, config: &ServerConfig) -> Result<()> {
         config.validate()?;
         let root = self.repository_root().to_owned();

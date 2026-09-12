@@ -99,6 +99,7 @@ fn two_native_replicas_seed_publish_pull_and_preserve_same_key_conflicts() {
         let credential = server.add_device().unwrap();
         store
             .server_bind(&ServerConfig {
+                directory: None,
                 endpoint: endpoint.clone(),
                 library_id: credential.library_id,
                 device_id: credential.device_id,
@@ -551,6 +552,7 @@ fn server_sync_message_append_total_http_bytes_gate() {
         let credential = server.add_device().unwrap();
         store
             .server_bind(&ServerConfig {
+                directory: None,
                 endpoint: endpoint.clone(),
                 library_id: credential.library_id,
                 device_id: credential.device_id,
@@ -675,6 +677,7 @@ fn large_opaque_file_http_gate(size: u64) {
     });
     let credential = server.add_device().unwrap();
     let client = ServerClient::new(ServerConfig {
+        directory: None,
         endpoint,
         library_id: credential.library_id,
         device_id: credential.device_id,
@@ -825,6 +828,7 @@ fn owner_entries_http_gate(resolved: bool) {
         let credential = server.add_device().unwrap();
         store
             .server_bind(&ServerConfig {
+                directory: None,
                 endpoint: endpoint.clone(),
                 library_id: credential.library_id,
                 device_id: credential.device_id,

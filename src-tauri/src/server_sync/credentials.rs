@@ -11,6 +11,13 @@ pub(crate) struct StoredConfig {
     pub device_id: String,
     credential_id: String,
 }
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Secrets {
+    token: String,
+    directory: Option<risunest_sync_connect::Directory>,
+}
+
 fn unavailable() -> SyncError {
     SyncError::new("device-credential-unavailable", 409)
 }
@@ -23,17 +30,24 @@ impl StoredConfig {
             device_id: config.device_id.clone(),
             credential_id: uuid::Uuid::new_v4().to_string(),
         };
-        platform::write(root, &stored.credential_id, config.token.as_bytes())?;
+        let bytes = serde_json::to_vec(&Secrets {
+            token: config.token.clone(),
+            directory: config.directory.clone(),
+        })
+        .map_err(|_| unavailable())?;
+        platform::write(root, &stored.credential_id, &bytes)?;
         Ok(stored)
     }
     pub fn resolve(&self, root: &Path) -> Result<ServerConfig> {
         self.validate_id()?;
+        let secrets: Secrets = serde_json::from_slice(&platform::read(root, &self.credential_id)?)
+            .map_err(|_| unavailable())?;
         let config = ServerConfig {
+            directory: secrets.directory,
             endpoint: self.endpoint.clone(),
             library_id: self.library_id.clone(),
             device_id: self.device_id.clone(),
-            token: String::from_utf8(platform::read(root, &self.credential_id)?)
-                .map_err(|_| unavailable())?,
+            token: secrets.token,
         };
         config.validate()?;
         Ok(config)
@@ -79,12 +93,12 @@ mod platform {
     pub fn read(root: &Path, id: &str) -> Result<Vec<u8>> {
         let path = path(root, id);
         let metadata = fs::symlink_metadata(&path).map_err(|_| unavailable())?;
-        if !metadata.is_file() || metadata.len() > 4096 {
+        if !metadata.is_file() || metadata.len() > 16384 {
             return Err(unavailable());
         }
         let mut bytes = Vec::new();
-        fs::File::open(path)?.take(4097).read_to_end(&mut bytes)?;
-        if bytes.len() > 4096 {
+        fs::File::open(path)?.take(16385).read_to_end(&mut bytes)?;
+        if bytes.len() > 16384 {
             return Err(unavailable());
         }
         super::protection::transform(&bytes, false)
@@ -238,6 +252,10 @@ mod tests {
     fn credential_is_os_protected_separate_and_corruption_is_rejected() {
         let root = tempfile::tempdir().unwrap();
         let config = ServerConfig {
+            directory: Some(
+                risunest_sync_connect::generate_directory("https://registry.example".into())
+                    .unwrap(),
+            ),
             endpoint: "http://127.0.0.1:1".into(),
             library_id: "fixture".into(),
             device_id: "device".into(),
@@ -246,6 +264,13 @@ mod tests {
         let stored = StoredConfig::persist(root.path(), &config).unwrap();
         let text = serde_json::to_string(&stored).unwrap();
         assert!(!text.contains(&config.token));
+        let directory = config.directory.as_ref().unwrap();
+        assert!(!text.contains(&directory.key));
+        assert!(!text.contains(&directory.uuid));
+        assert_eq!(
+            stored.resolve(root.path()).unwrap().directory.unwrap().key,
+            directory.key
+        );
         assert_eq!(stored.resolve(root.path()).unwrap().token, config.token);
         let path = root
             .path()

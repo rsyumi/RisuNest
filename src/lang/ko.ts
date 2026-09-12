@@ -1662,6 +1662,22 @@ export const languageKorean = {
             elapsed: (seconds: number) => `${seconds}초 경과`,
         },
         serverSync: {
+            registrationCode: "등록 코드",
+            registrationCodeHelp:
+                "이 기기용으로 발급한 코드를 붙여넣거나 QR 코드를 스캔하세요. 아래 서버 정보를 확인한 뒤 연결합니다.",
+            readRegistration: "코드 읽기",
+            scanRegistration: "QR 코드 스캔",
+            scanRegistrationHelp: "등록 QR 코드가 카메라에 보이도록 맞춰 주세요.",
+            cancelScan: "스캔 취소",
+            registrationInvalid: "올바른 등록 코드가 아닙니다.",
+            cameraDenied:
+                "카메라 권한이 거부되었습니다. 등록 코드를 붙여넣어 연결할 수 있습니다.",
+            cameraUnavailable:
+                "카메라로 코드를 읽지 못했습니다. 다시 시도하거나 코드를 붙여넣어 주세요.",
+            registrationBlocked:
+                "새 등록 정보를 입력하려면 현재 서버 연결을 먼저 해제하세요.",
+            discardRegistration: "등록 입력 지우기",
+            directoryEnabled: "서버 주소 자동 검색 사용",
             backups: '충돌 백업',
             backupHelp:
                 '충돌 당시 한쪽의 전체 라이브러리를 복원합니다. 교체 전 현재 라이브러리도 백업합니다. 복원된 내용을 확인한 후 다시 동기화할 수 있도록 일시 중지 상태를 유지합니다.',

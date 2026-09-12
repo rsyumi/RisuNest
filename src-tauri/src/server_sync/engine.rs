@@ -503,7 +503,8 @@ impl PersistentStore {
         let mut client =
             ServerClient::with_cancellation(config.clone(), options.cancellation.clone())?;
         client.verified_bytes = options.verified_bytes.clone();
-        let identity_head = client.verified_head()?;
+        let identity_head = client.resolve_identity(false)?;
+        self.server_cache_endpoint(&config, client.config())?;
         let resume_may_commit = self
             .server_pending()?
             .is_some_and(|p| !p.phase.starts_with('{'));

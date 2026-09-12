@@ -42,6 +42,7 @@ fn reference_pages_http_gate(split: bool) {
             .unwrap();
     });
     let client = ServerClient::new(ServerConfig {
+        directory: None,
         endpoint,
         library_id: credential.library_id,
         device_id: credential.device_id,
@@ -219,6 +220,7 @@ fn server_sync_large_value_and_sequence_http_matrix() {
         let credential = server.add_device().unwrap();
         store
             .server_bind(&ServerConfig {
+                directory: None,
                 endpoint: endpoint.clone(),
                 library_id: credential.library_id,
                 device_id: credential.device_id,
