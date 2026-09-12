@@ -4,6 +4,8 @@ use crate::server_sync::client::ServerConfig;
 use risunest_sync_server::{http, store::Store};
 #[path = "server_sync_matrix_tests.rs"]
 mod matrix;
+#[path = "server_sync_semantic_tests.rs"]
+mod semantic;
 
 fn prepared() -> (tempfile::TempDir, PersistentStore) {
     let (directory, mut store, database) = open_fixture();
