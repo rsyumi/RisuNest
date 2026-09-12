@@ -6,8 +6,9 @@ publish = false
 
 [dependencies]
 risunest-sync-wire = { path = "../../crates/sync-wire" }
+risunest-sync-connect = { path = "../../crates/sync-connect" }
 axum = "0.8.9"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "io-util", "fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "io-util", "fs", "process", "sync"] }
 tokio-util = { version = "0.7", features = ["io"] }
 futures-util = "0.3"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
@@ -16,9 +17,11 @@ serde_json = "1"
 sha2 = "0.10"
 getrandom = "0.2"
 tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
+qrcode = { version = "0.14", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }

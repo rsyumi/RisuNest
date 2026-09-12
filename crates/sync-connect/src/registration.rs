@@ -36,6 +36,16 @@ pub fn validate_endpoint(value: &str, allow_loopback: bool) -> Result<Url> {
     {
         return Err(ConnectError("invalid-endpoint"));
     }
+    let authority = value
+        .split_once("://")
+        .ok_or(ConnectError("invalid-endpoint"))?
+        .1
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    if authority.contains('@') {
+        return Err(ConnectError("invalid-endpoint"));
+    }
     let mut url = Url::parse(value).map_err(|_| ConnectError("invalid-endpoint"))?;
     if !url.has_host()
         || !url.username().is_empty()

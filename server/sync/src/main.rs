@@ -1,7 +1,9 @@
-use risunest_sync_server::{config::Config, http, store::Store};
+use risunest_sync_server::{
+    config::Config, connection::ConnectionOptions, http, runtime::ConnectionRuntime, store::Store,
+};
 use std::{path::PathBuf, sync::Arc};
 
-const USAGE: &str = "risunest-sync-server <init|status|serve|maintain|backup|restore|restore-epoch|device add|device revoke ID> --data-dir ABSOLUTE_PATH [--backup-dir ABSOLUTE_PATH] [--listen 127.0.0.1:4319] [--https-proxy]\nAdministration commands require the daemon to be stopped. Backup and restore require a new destination directory. Serve is loopback-only; use a trusted HTTPS reverse proxy for remote clients.";
+const USAGE: &str = "risunest-sync-server <init|status|serve|maintain|backup|restore|restore-epoch|device add [--qr]|device revoke ID|connection configure|connection status|connection repost> --data-dir ABSOLUTE_PATH [--backup-dir ABSOLUTE_PATH] [--listen 127.0.0.1:4319] [--https-proxy]\nconnection configure: choose --endpoint HTTPS_URL or --cloudflared ABSOLUTE_EXECUTABLE, optionally --registry REGISTRY_URL.\nAdministration commands require the daemon to be stopped. Configured device add emits a private registration URI; --qr also displays its QR. Without connection configuration, manual credential JSON remains available. Backup and restore require a new destination directory. Serve is loopback-only.";
 
 #[tokio::main]
 async fn main() {
@@ -17,7 +19,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let command = args.next().unwrap();
-    let subcommand = if command == "device" {
+    let subcommand = if command == "device" || command == "connection" {
         Some(args.next().ok_or(USAGE)?)
     } else {
         None
@@ -31,6 +33,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut backup_dir = None;
     let mut listen = "127.0.0.1:4319".parse()?;
     let mut https_proxy = false;
+    let mut endpoint = None;
+    let mut cloudflared = None;
+    let mut registry_url = None;
+    let mut qr = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--data-dir" if data_dir.is_none() => {
@@ -41,6 +47,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 backup_dir = Some(PathBuf::from(args.next().ok_or(USAGE)?))
             }
             "--https-proxy" => https_proxy = true,
+            "--endpoint"
+                if command == "connection"
+                    && subcommand.as_deref() == Some("configure")
+                    && endpoint.is_none() =>
+            {
+                endpoint = Some(args.next().ok_or(USAGE)?)
+            }
+            "--cloudflared"
+                if command == "connection"
+                    && subcommand.as_deref() == Some("configure")
+                    && cloudflared.is_none() =>
+            {
+                cloudflared = Some(PathBuf::from(args.next().ok_or(USAGE)?))
+            }
+            "--registry"
+                if command == "connection"
+                    && subcommand.as_deref() == Some("configure")
+                    && registry_url.is_none() =>
+            {
+                registry_url = Some(args.next().ok_or(USAGE)?)
+            }
+            "--qr" if command == "device" && subcommand.as_deref() == Some("add") && !qr => {
+                qr = true
+            }
             _ => return Err(USAGE.into()),
         }
     }
@@ -59,6 +89,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "backup",
         "restore",
         "device",
+        "connection",
     ]
     .contains(&command.as_str())
     {
@@ -83,12 +114,53 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string(&store.head()?)?);
         }
         "device" => match subcommand.as_deref() {
-            Some("add") => println!("{}", serde_json::to_string(&store.add_device()?)?),
+            Some("add") => {
+                if store.connection_status()?.mode == "unconfigured" && !qr {
+                    println!("{}", serde_json::to_string(&store.add_device()?)?);
+                } else {
+                    let uri = store.issue_registration()?;
+                    let qr_text = if qr {
+                        Some(
+                            qrcode::QrCode::with_error_correction_level(
+                                uri.as_bytes(),
+                                qrcode::EcLevel::M,
+                            )
+                            .map_err(|_| {
+                                risunest_sync_server::Error::new("registration-qr-too-large", 413)
+                            })?
+                            .render::<qrcode::render::unicode::Dense1x2>()
+                            .quiet_zone(true)
+                            .build(),
+                        )
+                    } else {
+                        None
+                    };
+                    println!("{uri}");
+                    if let Some(text) = qr_text {
+                        println!("{text}");
+                    }
+                }
+            }
             Some("revoke") => store.revoke_device(&revoke.unwrap())?,
             _ => return Err(USAGE.into()),
         },
+        "connection" => {
+            match subcommand.as_deref() {
+                Some("configure") => store.configure_connection(ConnectionOptions {
+                    endpoint,
+                    cloudflared,
+                    registry_url,
+                })?,
+                Some("status") => (),
+                Some("repost") => store.request_republication()?,
+                _ => return Err(USAGE.into()),
+            }
+            println!("{}", serde_json::to_string(&store.connection_status()?)?);
+        }
         "serve" => {
             let listener = tokio::net::TcpListener::bind(config.listen).await?;
+            let origin = listener.local_addr()?;
+            let store = Arc::new(store);
             eprintln!(
                 "sync listener ready: {} ({})",
                 listener.local_addr()?,
@@ -98,9 +170,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "local development"
                 }
             );
-            axum::serve(listener, http::router(Arc::new(store)))
+            let runtime = ConnectionRuntime::start(store.clone(), origin)?;
+            let result = axum::serve(listener, http::router(store))
                 .with_graceful_shutdown(shutdown())
-                .await?;
+                .await;
+            runtime.shutdown().await;
+            result?;
         }
         _ => unreachable!(),
     }

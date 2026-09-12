@@ -43,7 +43,8 @@ $daemon = 'E:/Programming/Github/RisuNest/src-tauri/target/debug/risunest-sync-s
 
 `device add` prints a device ID, library ID, and 256-bit token once. Transfer this
 credential privately to its device. Only the token's SHA-256 verifier is stored
-on the server. Do not put credentials into URLs, logs, or library content.
+on the server. Keep credentials out of HTTP URLs, logs, and library content.
+The private registration URI below is an explicit credential transport.
 
 The app keeps only a credential reference in PDS. Windows protects a separate
 local file with user-scoped DPAPI; Android encrypts it with an Android Keystore
@@ -68,6 +69,62 @@ Configure a trusted HTTPS reverse proxy or Tunnel for remote clients and pass
 install a proxy, provide TLS, or enable public cleartext binding. Live HTTPS proxy
 verification remains pending. Keep the data directory on a local disk
 owned exclusively by the daemon user. Existing symlinks/junctions are rejected.
+
+## Registration and address discovery
+
+Configure an address while the daemon is stopped. An optional registry stores only
+an encrypted address. It does not receive the device token or decryption key.
+
+```powershell
+./risunest-sync-server.exe connection configure --data-dir $data --endpoint https://sync.example --registry https://registry.example
+./risunest-sync-server.exe device add --data-dir $data --qr
+./risunest-sync-server.exe connection status --data-dir $data
+```
+
+Omit `--registry` for a fixed address without discovery. Configured `device add`
+prints one reusable, device-specific `risunestlocal://sync-server/register#...`
+URI. `--qr` additionally renders that exact value as a terminal QR. Paste it or
+scan it in the app, review the prefilled fields, and explicitly connect. Treat the
+whole code as the device credential; it is not a one-time token. Oversized codes
+are rejected before allocating a device. Unconfigured `device add` continues to
+provide the manual four-field credential.
+
+For a daemon-owned Quick Tunnel, replace `--endpoint` with
+`--cloudflared ABSOLUTE_EXECUTABLE`. The operator supplies cloudflared; the daemon
+never downloads or updates it. Start `serve`, wait for Tunnel readiness, stop it,
+then issue a device code using the saved address. Restarting the Tunnel may change
+its address; the stable registry identity lets the app discover that change.
+Issuance before an address has been observed fails with
+`public-endpoint-not-ready`. A registry is recommended for changing addresses.
+Fixed/external mode never starts or terminates an external Tunnel.
+
+The daemon publishes after both a Quick Tunnel URL and an edge-registration log
+have been observed. It supervises its own child and bounds restart delays and log
+sizes. Normal shutdown reaps the child; on Windows a kill-on-close Job also covers
+abrupt daemon termination after child attachment. GUI subscribers do not own the
+runtime. Registry failure does not stop the sync listener. Same successful address
+means no periodic/restart POST; an uncertain POST reuses its persisted envelope.
+`connection repost` explicitly requests another publication without changing the
+registry identity. All CLI administration still requires the daemon to be stopped.
+
+The private `connection-state` file persists directory identity/key and publication
+state. Windows uses user-scoped DPAPI; Unix requires owner-only file permissions.
+It is operational configuration, outside library exports and the database/object
+backup. Preserve it separately with the same daemon OS account when restoring the
+same directory identity. Public status omits the UUID, key, device token, and code.
+Its endpoint is the last observed address, not a live reachability assertion.
+
+The management GUI/TUI can consume these Rust interfaces after acquiring Store's
+existing exclusive ownership:
+
+- Store: `configure_connection`, `connection_status`, `issue_registration`,
+  `request_republication`. Each new registration allocates a separate device.
+- ConnectionRuntime: start after binding the loopback listener; subscribe to
+  `tunnel` and `publication` watch channels; `publication_changed` wakes the
+  publisher after an explicit repost; `shutdown` stops owned tasks and child.
+- Configuration changes require restart in this iteration. Live administration,
+  service installation, GUI transport/authentication, and hot add/revoke belong to
+  the separate management application work. No public management listener is added.
 
 ## HTTP contract
 

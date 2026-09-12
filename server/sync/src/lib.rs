@@ -1,6 +1,12 @@
 pub mod config;
+pub mod connection;
 pub mod http;
+pub mod publication;
+pub mod runtime;
 pub mod store;
+pub mod tunnel;
+#[cfg(windows)]
+mod tunnel_job;
 
 #[derive(Debug)]
 pub struct Error {
@@ -38,3 +44,9 @@ impl From<risunest_sync_wire::WireError> for Error {
     }
 }
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl From<risunest_sync_connect::ConnectError> for Error {
+    fn from(value: risunest_sync_connect::ConnectError) -> Self {
+        Self::new(value.0, 400)
+    }
+}

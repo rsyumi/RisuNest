@@ -204,3 +204,11 @@ fn registry_wire_maximum_and_uuid_normalization() {
     );
     assert!(seal_endpoint(&config.uuid, &config.key, &(endpoint + "x")).is_err());
 }
+
+#[test]
+fn registration_matches_typescript_golden_vector() {
+    let vector: serde_json::Value =
+        serde_json::from_str(include_str!("registration-vector.json")).unwrap();
+    let value: Registration = serde_json::from_value(vector["registration"].clone()).unwrap();
+    assert_eq!(value.encode_uri().unwrap(), vector["uri"].as_str().unwrap());
+}

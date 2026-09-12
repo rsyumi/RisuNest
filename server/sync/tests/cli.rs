@@ -48,3 +48,36 @@ fn binary_rejects_public_cleartext_before_creating_storage() {
     assert!(!output.status.success());
     assert!(!target.exists());
 }
+
+#[test]
+fn configured_device_emits_parseable_uri_and_qr_without_status_secrets() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(cli(dir.path(), &["init"]).status.success());
+    assert!(cli(
+        dir.path(),
+        &[
+            "connection",
+            "configure",
+            "--endpoint",
+            "https://sync.example",
+            "--registry",
+            "https://registry.example"
+        ]
+    )
+    .status
+    .success());
+    let output = cli(dir.path(), &["device", "add", "--qr"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    let registration =
+        risunest_sync_connect::Registration::parse_uri(text.lines().next().unwrap()).unwrap();
+    assert!(text.lines().count() > 10);
+    let status = cli(dir.path(), &["connection", "status"]);
+    let status = String::from_utf8(status.stdout).unwrap();
+    assert!(!status.contains(&registration.token));
+    assert!(!status.contains(&registration.directory.unwrap().key));
+}
