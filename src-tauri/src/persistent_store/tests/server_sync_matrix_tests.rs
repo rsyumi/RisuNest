@@ -3,6 +3,16 @@ use super::*;
 #[test]
 #[ignore = "Explicit 100k reference control-page transfer gate, excluding opaque bodies"]
 fn server_sync_hundred_thousand_reference_pages_http_gate() {
+    reference_pages_http_gate(false);
+}
+
+#[test]
+#[ignore = "Explicit 100k reference parent split regression, excluding opaque bodies"]
+fn server_sync_hundred_thousand_reference_parent_split_http_gate() {
+    reference_pages_http_gate(true);
+}
+
+fn reference_pages_http_gate(split: bool) {
     use crate::server_sync::{cache::Cache, client::ServerClient, transfer::Transfer};
     use risunest_sync_wire::{descriptor::build_reference_tree, hash};
     let directory = tempfile::tempdir().unwrap();
@@ -45,6 +55,16 @@ fn server_sync_hundred_thousand_reference_pages_http_gate() {
     let mut values: Vec<_> = (0..100_000u64)
         .map(|n| hash(format!("synthetic unique asset body {n:016}").as_bytes()))
         .collect();
+    // Hashes of the three control/payload objects from the synthetic owner
+    // rename. Replacing them splits a parent before a changed first leaf.
+    let old_extra = [
+        "10ec1e97fe46bf63832247e1cf0bf62f85b010977f087390bb62e0b8aa5f7d83",
+        "15dcc14af31de88c886ce220573ec2b4940074973b849c31d1a3e624180913da",
+        "c05ef04bb545b19957053f6b7cc250a5d9ee672fb9285e8803b9ffaed35e2512",
+    ];
+    if split {
+        values.extend(old_extra.iter().map(|h| h.to_string()));
+    }
     values.sort();
     let (base_root, base) = build_reference_tree(&values, false).unwrap();
     for (digest, bytes) in &base {
@@ -52,8 +72,21 @@ fn server_sync_hundred_thousand_reference_pages_http_gate() {
         second.put(bytes).unwrap();
         server.put_object(&device, digest, bytes).unwrap();
     }
-    values.remove(50_000);
-    values.push(hash(b"synthetic changed owner segment"));
+    if split {
+        values.retain(|h| !old_extra.contains(&h.as_str()));
+        values.extend(
+            [
+                "183175a0b890f822693220d23288f1af0fd4240653ad364af933cdb2d7816680",
+                "4d7b7d341682f39790adc1227f9d7ca6cd14b45ef3b7eb7a92084b1fc5a3351b",
+                "c8db11617b38c3ab5567178dcebb54592839396dfa199e53657d90d55a45b29b",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+    } else {
+        values.remove(50_000);
+        values.push(hash(b"synthetic changed owner segment"));
+    }
     values.sort();
     let (changed_root, changed) = build_reference_tree(&values, false).unwrap();
     let base_hashes = base.iter().map(|(h, _)| h.clone()).collect::<Vec<_>>();
@@ -66,9 +99,15 @@ fn server_sync_hundred_thousand_reference_pages_http_gate() {
     }
     let targets = changed.iter().map(|(h, _)| h.clone()).collect::<Vec<_>>();
     counter.store(0, AtomicOrdering::Relaxed);
-    Transfer::new(&client, &first)
-        .unwrap()
-        .upload_with_leased_bases(&targets, &base_hashes, true)
+    let transfer = Transfer::new(&client, &first).unwrap();
+    let hints = transfer
+        .reference_tree_hints(vec![(
+            changed_root.clone().unwrap(),
+            vec![base_root.clone().unwrap()],
+        )])
+        .unwrap();
+    transfer
+        .upload_with_hints(&targets, &base_hashes, true, &hints)
         .unwrap();
     let upload = counter.swap(0, AtomicOrdering::Relaxed);
     Transfer::new(&client, &second)
@@ -84,7 +123,9 @@ fn server_sync_hundred_thousand_reference_pages_http_gate() {
             bytes
         );
     }
-    eprintln!("100k reference control pages: upload={upload}, download={download}");
+    eprintln!(
+        "100k reference control pages (parent split={split}): upload={upload}, download={download}"
+    );
     assert!(upload <= 16384 + 6, "reference upload {upload}");
     assert!(download <= 16384 + 6, "reference download {download}");
     task.abort();

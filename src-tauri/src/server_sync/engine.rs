@@ -1,5 +1,9 @@
 //! This adapter lives in PDS's module scope so SQLite state cannot leak through
 //! IPC. Network work uses a dedicated job-store connection and a frozen read lease.
+#[cfg(test)]
+#[path = "engine_promotion_tests.rs"]
+mod promotion_tests;
+
 use super::{
     asset_object_catalog::{AssetObjectCatalog, AssetObjectRegistration},
     server_sync_apply::{validate_remote, RemoteRecord, ReplicaAdvance, ValidatedRecords},
@@ -475,7 +479,8 @@ impl PersistentStore {
                     }
                 }
                 let bases = self.server_base_candidates(&key, transfer.cache, false)?;
-                transfer.upload_with_leased_bases(&unsent, &bases, base_lease)?;
+                let hints = transfer.record_reference_hints(&version, &base)?;
+                transfer.upload_with_hints(&unsent, &bases, base_lease, &hints)?;
             }
         }
         Ok(())
@@ -804,7 +809,9 @@ impl PersistentStore {
                                     409,
                                 ));
                             }
-                            self.promote_server_dependencies(&cache, &dependencies)?;
+                            self.promote_server_dependencies(&cache, &dependencies, || {
+                                client.ensure_active()
+                            })?;
                             (Some(payload), Some(hash))
                         } else {
                             (None, None)
@@ -1375,7 +1382,8 @@ impl PersistentStore {
                 {
                     return Err(SyncError::new("server-descriptor-semantics-mismatch", 409));
                 }
-                remote_store.promote_server_dependencies(cache, &dependencies)?;
+                remote_store
+                    .promote_server_dependencies(cache, &dependencies, || client.ensure_active())?;
                 records.push(validate_remote(
                     RemoteRecord {
                         key,
@@ -1445,36 +1453,58 @@ impl PersistentStore {
         scratch.close()?;
         Ok(())
     }
-    fn promote_server_dependencies(&mut self, cache: &Cache, hashes: &[String]) -> Result<()> {
-        let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
+    fn promote_server_dependencies(
+        &mut self,
+        cache: &Cache,
+        hashes: &[String],
+        check_active: impl Fn() -> Result<()>,
+    ) -> Result<()> {
         let native = PayloadCas::new(&self.repository_root)?;
-        for hash in hashes {
-            let size = cache
-                .cas
-                .stat_object(hash)?
-                .ok_or_else(|| SyncError::new("missing-downloaded-payload", 409))?;
-            self.connection.execute(
-                "INSERT INTO server_sync_objects VALUES(?1,?2,?3) ON CONFLICT(hash) DO NOTHING",
-                params![
-                    hash,
-                    size as i64,
-                    crate::asset_repository::object_physical_key(hash)
-                ],
-            )?;
-            if native.stat_object(hash)? != Some(size) {
-                let mut source = cache
-                    .cas
-                    .open_object(hash)?
-                    .ok_or_else(|| SyncError::new("missing-downloaded-payload", 409))?;
-                native.prepare_reader_expected(&mut source, hash, size)?;
+        for batch in hashes.chunks(256) {
+            check_active()?;
+            let registrations = batch
+                .iter()
+                .map(|hash| {
+                    let size = cache
+                        .cas
+                        .stat_object(hash)?
+                        .ok_or_else(|| SyncError::new("missing-downloaded-payload", 409))?;
+                    Ok(AssetObjectRegistration {
+                        object_hash: hash.clone(),
+                        byte_size: size,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
+            // Persist GC roots before copying any bytes. Batch metadata commits,
+            // but never hold a SQLite write transaction during object IO.
+            let tx = self.connection.transaction()?;
+            for object in &registrations {
+                tx.execute(
+                    "INSERT INTO server_sync_objects VALUES(?1,?2,?3) ON CONFLICT(hash) DO NOTHING",
+                    params![
+                        object.object_hash,
+                        object.byte_size as i64,
+                        crate::asset_repository::object_physical_key(&object.object_hash)
+                    ],
+                )?;
             }
-            AssetObjectCatalog::new(&mut self.connection).register(
-                &[AssetObjectRegistration {
-                    object_hash: hash.clone(),
-                    byte_size: size,
-                }],
-                0,
-            )?;
+            tx.commit()?;
+            for object in &registrations {
+                check_active()?;
+                if native.stat_object(&object.object_hash)? != Some(object.byte_size) {
+                    let mut source = cache
+                        .cas
+                        .open_object(&object.object_hash)?
+                        .ok_or_else(|| SyncError::new("missing-downloaded-payload", 409))?;
+                    native.prepare_reader_expected(
+                        &mut source,
+                        &object.object_hash,
+                        object.byte_size,
+                    )?;
+                }
+            }
+            AssetObjectCatalog::new(&mut self.connection).register(&registrations, 0)?;
         }
         Ok(())
     }

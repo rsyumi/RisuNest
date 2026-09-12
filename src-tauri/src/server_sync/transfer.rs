@@ -117,11 +117,26 @@ impl<'a> Transfer<'a> {
     }
     /// The caller may reuse a successfully renewed committed descriptor lease.
     /// It protects every candidate in that descriptor's verified closure.
+    #[cfg(test)]
     pub fn upload_with_leased_bases(
         &self,
         hashes: &[String],
         base_candidates: &[String],
         base_lease: bool,
+    ) -> Result<()> {
+        self.upload_with_hints(
+            hashes,
+            base_candidates,
+            base_lease,
+            &std::collections::BTreeMap::new(),
+        )
+    }
+    pub(crate) fn upload_with_hints(
+        &self,
+        hashes: &[String],
+        base_candidates: &[String],
+        base_lease: bool,
+        hints: &std::collections::BTreeMap<String, Vec<String>>,
     ) -> Result<()> {
         for page in hashes.chunks(1024) {
             let mut descriptors = Vec::with_capacity(page.len());
@@ -160,6 +175,7 @@ impl<'a> Transfer<'a> {
                 .collect::<Vec<_>>();
             let mut candidates = BTreeSet::new();
             for target in missing.missing.iter().filter(|_| !base_lease) {
+                let base_candidates = hints.get(target).map_or(base_candidates, Vec::as_slice);
                 let size = sizes[target.as_str()];
                 candidates.extend(if size > delta::MAX_TARGET_BYTES as u64 {
                     self.large_bases(target, size, base_candidates)?
@@ -181,6 +197,7 @@ impl<'a> Transfer<'a> {
             let mut used = 8usize;
             let mut materialized = 0usize;
             for target in &missing.missing {
+                let base_candidates = hints.get(target).map_or(base_candidates, Vec::as_slice);
                 let size = sizes[target.as_str()];
                 if size > delta::MAX_TARGET_BYTES as u64 {
                     self.upload_large(target, size, base_candidates)?;
@@ -356,17 +373,22 @@ impl<'a> Transfer<'a> {
         base_candidates: &[String],
         hints: &std::collections::BTreeMap<String, Vec<String>>,
     ) -> Result<()> {
-        for page in hashes.chunks(1024) {
-            let missing = page
-                .iter()
-                .filter_map(|h| match self.cache.cas.stat_object(h) {
-                    Ok(Some(_)) => None,
-                    Ok(None) => Some(Ok(h.clone())),
-                    Err(e) => Some(Err(SyncError::from(e))),
-                })
-                .collect::<Result<Vec<_>>>()?;
+        // Page the absent targets, not the full inventory. A few changed hashes
+        // scattered among 100k cached objects still belong to one request.
+        let mut absent = hashes.iter().filter_map(|h| {
+            if let Err(error) = self.client.ensure_active() {
+                return Some(Err(error));
+            }
+            match self.cache.cas.stat_object(h) {
+                Ok(Some(_)) => None,
+                Ok(None) => Some(Ok(h.clone())),
+                Err(e) => Some(Err(SyncError::from(e))),
+            }
+        });
+        loop {
+            let missing = absent.by_ref().take(1024).collect::<Result<Vec<_>>>()?;
             if missing.is_empty() {
-                continue;
+                break;
             }
             let mut requests = Vec::new();
             for target in &missing {
