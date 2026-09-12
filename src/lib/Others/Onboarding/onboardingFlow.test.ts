@@ -5,6 +5,7 @@ import {
     ONBOARDING_STATES,
     goToOnboardingState,
     onboardingBack,
+    onboardingCloneNext,
     onboardingStep,
     onboardingSummary,
     type OnboardingFlow,
@@ -70,10 +71,21 @@ describe('onboarding flow', () => {
         expect(goToOnboardingState({ state: 'sync-device', path: 'device' }, 'sync-progress').path).toBe('device')
     })
 
-    it('closes with the empty-setup sentence only for the skip path', () => {
+    it('names the closing sentence after the path that brought the data', () => {
         expect(onboardingSummary('fresh')).toBe('fresh')
-        for (const path of ['import', 'device', 'hub', 'account'] as const) {
+        expect(onboardingSummary('import')).toBe('import')
+        expect(onboardingSummary('device')).toBe('device')
+        for (const path of ['hub', 'account'] as const) {
             expect(onboardingSummary(path)).toBe('data')
         }
+    })
+
+    it('leaves the download screen only on a terminal clone phase', () => {
+        for (const phase of ['idle', 'joined', 'confirmed', 'downloading', undefined] as const) {
+            expect(onboardingCloneNext(phase)).toBeNull()
+        }
+        expect(onboardingCloneNext('completed')).toBe('done')
+        expect(onboardingCloneNext('failed')).toBe('sync-device')
+        expect(onboardingCloneNext('cancelled')).toBe('sync-device')
     })
 })

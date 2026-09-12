@@ -8,6 +8,8 @@
  * the names here say which server each one means.
  */
 
+import type { PeerCloneState } from 'src/ts/storage/sync/peerClone'
+
 export const ONBOARDING_STATES = [
     'home',
     'import',
@@ -99,6 +101,20 @@ export function goToOnboardingState(
 }
 
 /** Which closing sentence the last screen shows. */
-export function onboardingSummary(path: OnboardingPath): 'fresh' | 'data' {
-    return path === 'fresh' ? 'fresh' : 'data'
+export function onboardingSummary(path: OnboardingPath): 'fresh' | 'import' | 'device' | 'data' {
+    if (path === 'fresh' || path === 'import' || path === 'device') return path
+    return 'data'
+}
+
+export type OnboardingClonePhase = PeerCloneState['target']['phase']
+
+/**
+ * Where the download screen goes once the clone reports how it ended.
+ * Starting a download resolves at once; the transfer runs natively and only
+ * the snapshot says whether it finished, failed, or was cancelled.
+ */
+export function onboardingCloneNext(phase: OnboardingClonePhase | undefined): OnboardingState | null {
+    if (phase === 'completed') return 'done'
+    if (phase === 'failed' || phase === 'cancelled') return 'sync-device'
+    return null
 }

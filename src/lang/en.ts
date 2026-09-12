@@ -1882,12 +1882,9 @@ export const languageEnglish = {
             },
             import: {
                 title: 'Import a backup file',
-                lead: 'Choose a .risudat file exported from RisuAI, or a .bin file exported from PocketRisu.',
-                dropTitle: 'Drag and drop',
-                dropTitleMobile: 'Choose a backup file',
-                or: 'or',
+                lead: 'Choose a .risudat file exported from RisuNest, or a .bin file exported from RisuAI or PocketRisu.',
+                dropTitle: 'Choose a backup file',
                 choose: 'Choose file',
-                hintDesktop: 'You can also drag a backup file here from the file explorer.',
                 hintAndroid: 'Opening a backup file from a file manager also leads here.',
                 pocketTitle: 'PocketRisu / RisuAI backup (.bin)',
                 pocketDesc: 'Loads a risu-backup .bin file exported from either app.',
@@ -1945,6 +1942,8 @@ export const languageEnglish = {
             done: {
                 title: 'Ready',
                 fresh: 'Starting with empty settings.',
+                import: 'The backup file has been loaded.',
+                device: "The other device's data has been received.",
                 data: 'All your data is ready.',
                 start: 'Start RisuNest',
             },

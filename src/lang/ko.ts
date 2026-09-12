@@ -1694,12 +1694,9 @@ export const languageKorean = {
             },
             import: {
                 title: '백업 파일 가져오기',
-                lead: 'RisuAI에서 내보낸 .risudat 파일이나 PocketRisu에서 내보낸 .bin 파일을 선택해주세요.',
-                dropTitle: '드래그 앤 드랍',
-                dropTitleMobile: '백업 파일을 선택해주세요',
-                or: '또는',
+                lead: 'RisuNest에서 내보낸 .risudat 파일이나 RisuAI·PocketRisu에서 내보낸 .bin 파일을 선택해주세요.',
+                dropTitle: '백업 파일을 선택해주세요',
                 choose: '파일 선택',
-                hintDesktop: '파일 탐색기에서 백업 파일을 끌어다 놓아도 됩니다.',
                 hintAndroid: '파일 관리자에서 백업 파일을 열어도 여기로 이어집니다.',
                 pocketTitle: 'PocketRisu·RisuAI 백업(.bin)',
                 pocketDesc: '두 앱에서 내보낸 risu-backup .bin 파일을 불러옵니다.',
@@ -1757,6 +1754,8 @@ export const languageKorean = {
             done: {
                 title: '준비 완료',
                 fresh: '빈 설정으로 시작합니다.',
+                import: '백업 파일을 불러왔습니다.',
+                device: '다른 기기의 데이터를 받았습니다.',
                 data: '모든 데이터가 준비되었습니다.',
                 start: 'RisuNest 시작',
             },

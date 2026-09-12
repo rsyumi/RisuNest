@@ -48,10 +48,13 @@
     import {
         INITIAL_ONBOARDING_FLOW,
         goToOnboardingState,
+        onboardingCloneNext,
         onboardingStep,
         onboardingSummary,
+        type OnboardingClonePhase,
         type OnboardingState,
     } from './onboardingFlow'
+    import { onboardingHold } from './onboardingGate'
     import { observeOnboardingWeave } from './onboardingWeave'
 
     const UI_LANGUAGES = [
@@ -83,15 +86,13 @@
 
     let flow = $state(INITIAL_ONBOARDING_FLOW)
     const step = $derived(onboardingStep(flow.state))
-    // Dragging a file in only exists where there is a file manager to drag from.
-    const pointerCoarse = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches
-    const canDragAndDrop = !isTauriAndroid && !pointerCoarse
 
     let weaveCanvas = $state<HTMLCanvasElement | undefined>()
     let importBusy = $state(false)
     let accountBusy = $state(false)
     let connectBusy = $state(false)
     let connectError = $state<string | null>(null)
+    let awaitingClone = $state(false)
     let linkInput = $state('')
     let loginOpen = $state(false)
     let loginUrl = $state('')
@@ -112,11 +113,18 @@
     const linkValid = $derived(parsesAsLink(linkInput))
 
     onMount(() => {
+        // A restored database carries its own `didFirstSetup`; the hold keeps
+        // this screen up until the reader presses start.
+        onboardingHold.set(true)
         const stopWeave = weaveCanvas ? observeOnboardingWeave(weaveCanvas) : () => {}
-        const stopSync = controller?.subscribe((value) => { syncSnapshot = value }) ?? (() => {})
+        const stopSync = controller?.subscribe((value) => {
+            syncSnapshot = value
+            settleClone(value.targets.clone?.state.target.phase)
+        }) ?? (() => {})
         return () => {
             stopWeave()
             stopSync()
+            onboardingHold.set(false)
         }
     })
 
@@ -140,6 +148,10 @@
     }
 
     function goTo(state: OnboardingState): void {
+        // Moving by hand starts the link screens clean. A failed connection
+        // returns through goToOnboardingState and keeps its link and message.
+        linkInput = ''
+        connectError = null
         flow = goToOnboardingState(flow, state)
     }
 
@@ -162,6 +174,7 @@
 
     function finish(): void {
         DBState.db.didFirstSetup = true
+        onboardingHold.set(false)
     }
 
     /**
@@ -193,10 +206,13 @@
             controller.stageLink(linkInput)
             await controller.claimStagedClone()
             await controller.confirmCloneReplace()
+            // This resolves once the transfer has started. It runs natively
+            // from here on and the snapshot says how it ends.
             await controller.downloadClone()
             controller.clearStagedLink()
             linkInput = ''
-            flow = goToOnboardingState(flow, 'done', 'device')
+            awaitingClone = true
+            settleClone(controller.snapshot().targets.clone?.state.target.phase)
         } catch (error) {
             connectError = syncFailureText(error)
             flow = goToOnboardingState(flow, 'sync-device', 'device')
@@ -205,14 +221,34 @@
         }
     }
 
+    /** Leaves the download screen once the clone reports a terminal phase. */
+    function settleClone(phase: OnboardingClonePhase | undefined): void {
+        if (!awaitingClone) return
+        const next = onboardingCloneNext(phase)
+        if (!next) return
+        awaitingClone = false
+        if (phase === 'failed') {
+            connectError = syncFailureText(
+                syncSnapshot?.workError ?? syncSnapshot?.targets.clone?.error ?? null,
+            )
+            // Android keeps a failed job until it is cancelled; the settings
+            // page does the same before dismissing one.
+            if (isTauriAndroid) void controller?.cancelClone().catch(() => {})
+        }
+        flow = goToOnboardingState(flow, next, 'device')
+    }
+
     async function cancelDownload(): Promise<void> {
         if (!await alertConfirm(t.progress.cancelConfirm)) return
         try {
             await controller?.cancelClone()
-        } catch {
-            // A download that already ended leaves nothing to cancel.
+        } catch (error) {
+            // A transfer that already ended is settled from the snapshot.
+            if (onboardingCloneNext(cloneTarget?.phase)) return
+            awaitingClone = false
+            connectError = syncFailureText(error)
+            flow = goToOnboardingState(flow, 'sync-device', 'device')
         }
-        flow = goToOnboardingState(flow, 'sync-device', 'device')
     }
 
     function openAccountLogin(): void {
@@ -223,6 +259,7 @@
     async function restoreAccountBackup(): Promise<void> {
         if (accountBusy) return
         accountBusy = true
+        let restarting = false
         try {
             // The account snapshot, the same one the backup settings restore.
             // The versioned /hub/backup list is a rollback tool for readers
@@ -232,11 +269,14 @@
                 alertNormal(strings.risuNest.backup.officialMissing)
                 return
             }
-            flow = goToOnboardingState(flow, 'done', 'account')
+            // An activated snapshot restarts the app, so the button stays busy
+            // until the process goes. Anything else left the local data as is.
+            restarting = result.kind === 'activated'
+            if (!restarting) flow = goToOnboardingState(flow, 'done', 'account')
         } catch {
             alertError(strings.risuNest.backup.actionFailed)
         } finally {
-            accountBusy = false
+            if (!restarting) accountBusy = false
         }
     }
 </script>
@@ -249,7 +289,12 @@
     if (!message?.data?.vaild) return
     loginOpen = false
     const credential = { id: message.id, token: message.token, data: message.data }
-    DBState.db.account = await getNativeOfficialAccountFlow().login(credential)
+    try {
+        DBState.db.account = await getNativeOfficialAccountFlow().login(credential)
+    } catch {
+        alertError(strings.risuNest.backup.actionFailed)
+        return
+    }
     flow = goToOnboardingState(flow, 'sync-account-found', 'account')
 }}></svelte:window>
 
@@ -356,11 +401,9 @@
                     <p class="lead">{t.import.lead}</p>
                     <div class="drop">
                         <span class="ic"><FileDown /></span>
-                        <b>{canDragAndDrop ? t.import.dropTitle : t.import.dropTitleMobile}</b>
-                        {#if canDragAndDrop}<small>{t.import.or}</small>{/if}
+                        <b>{t.import.dropTitle}</b>
                         <button
-                            class="btn"
-                            class:primary={!canDragAndDrop}
+                            class="btn primary"
                             type="button"
                             disabled={importBusy}
                             onclick={() => runImport(importRisuSaveFromSystemPicker)}
@@ -368,10 +411,9 @@
                             <FolderOpen />{t.import.choose}
                         </button>
                     </div>
-                    <p class="hint">
-                        {#if isTauriAndroid}<Smartphone /><span>{t.import.hintAndroid}</span>
-                        {:else}<Info /><span>{t.import.hintDesktop}</span>{/if}
-                    </p>
+                    {#if isTauriAndroid}
+                        <p class="hint"><Smartphone /><span>{t.import.hintAndroid}</span></p>
+                    {/if}
                     <div class="detect">
                         <span class="ic"><FolderOpen /></span>
                         <div><b>{t.import.pocketTitle}</b><small>{t.import.pocketDesc}</small></div>
@@ -487,7 +529,7 @@
                     <div class="done">
                         <span class="check-ring"><Check /></span>
                         <h1>{t.done.title}</h1>
-                        <p class="lead flush">{onboardingSummary(flow.path) === 'fresh' ? t.done.fresh : t.done.data}</p>
+                        <p class="lead flush">{t.done[onboardingSummary(flow.path)]}</p>
                         <button class="btn primary big" type="button" onclick={finish}>
                             {t.done.start}<ArrowRight />
                         </button>
@@ -737,7 +779,7 @@
     }
     .row:hover {
         background: var(--o-hover);
-        border-color: #6272a4;
+        border-color: var(--color-borderc);
     }
     .row .ic {
         display: grid;
@@ -858,7 +900,7 @@
         align-items: center;
         gap: 6px;
         padding: 26px 18px;
-        border: 1.5px dashed #6272a4;
+        border: 1px solid var(--o-line);
         border-radius: 16px;
         background: rgba(59, 130, 246, 0.05);
         text-align: center;
@@ -875,10 +917,6 @@
     .drop b {
         font-size: 14.5px;
         font-weight: 600;
-    }
-    .drop small {
-        font-size: 12px;
-        color: var(--o-faint);
     }
     .drop .btn {
         margin-top: 4px;
