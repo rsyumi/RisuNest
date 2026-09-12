@@ -1,3 +1,4 @@
+pub(crate) mod admission;
 mod character_charx_export;
 mod character_json_export;
 mod character_png_export;
@@ -1038,6 +1039,7 @@ fn cleanup_errors_result(errors: Vec<String>) -> Result<(), String> {
 pub(crate) struct NativeFileJobState {
     root: PathBuf,
     registry: Arc<JobRegistry>,
+    pub(crate) admission: Arc<admission::Admission>,
     active_workers: Arc<AtomicUsize>,
     max_concurrent_jobs: usize,
     startup_warnings: Vec<NativeJobError>,
@@ -1083,6 +1085,7 @@ impl NativeFileJobState {
         Self {
             root,
             registry: Arc::new(JobRegistry::default()),
+            admission: Arc::new(admission::Admission::default()),
             active_workers: Arc::new(AtomicUsize::new(0)),
             max_concurrent_jobs,
             startup_warnings,
@@ -1505,6 +1508,10 @@ impl NativeFileJobState {
                 )
             })?
             .to_path_buf();
+        let admission = self
+            .admission
+            .file(false)
+            .map_err(|code| NativeJobError::new(code, "Another library operation is running"))?;
         let worker_permit =
             WorkerPermit::acquire(Arc::clone(&self.active_workers), self.max_concurrent_jobs)?;
         let warning_codes = self
@@ -1556,6 +1563,7 @@ impl NativeFileJobState {
         let root = self.root.clone();
         let registry = Arc::clone(&self.registry);
         std::thread::spawn(move || {
+            let _admission = admission;
             let outcome = content::prepare_content(
                 opened_source,
                 &display_name,
@@ -1622,6 +1630,33 @@ impl NativeFileJobState {
         mut task: NativeFileJobTask,
         require_restore_finalization: bool,
     ) -> Result<NativeFileJobStarted, NativeJobError> {
+        let exclusive = matches!(
+            task.kind(),
+            JobKind::ExportLosslessBackup
+                | JobKind::RestoreLosslessBackup
+                | JobKind::RestoreBlockRisuSave
+                | JobKind::RestoreLegacyLocalBackup
+                | JobKind::RestoreOfficialAccountSnapshot
+        );
+        let admission = self
+            .admission
+            .file(exclusive)
+            .map_err(|code| NativeJobError::new(code, "Another library operation is running"))?;
+        // Admission prevents a new server operation between this check and activation.
+        if let NativeFileJobTask::RestoreLossless { store, .. } = &task {
+            let status = store.server_status().map_err(|_| {
+                NativeJobError::new(
+                    "server-status-unavailable",
+                    "Cannot verify server operation state",
+                )
+            })?;
+            if status.operation_pending {
+                return Err(NativeJobError::new(
+                    "resolve-pending-operation-first",
+                    "Resolve the pending server operation before restoring",
+                ));
+            }
+        }
         let worker_permit =
             WorkerPermit::acquire(Arc::clone(&self.active_workers), self.max_concurrent_jobs)?;
         let kind = task.kind();
@@ -1714,6 +1749,7 @@ impl NativeFileJobState {
         let root = self.root.clone();
         let registry = Arc::clone(&self.registry);
         std::thread::spawn(move || {
+            let _admission = admission;
             let _worker_permit = worker_permit;
             let outcome = match task {
                 NativeFileJobTask::Restore {

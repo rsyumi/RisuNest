@@ -18,7 +18,11 @@ mod logical_schema;
 mod owner_projection;
 mod preservation;
 mod query;
+mod record_apply;
+mod record_projection;
 mod schema;
+#[cfg(test)]
+mod schema_contract_tests;
 pub(crate) mod server_sync_apply;
 #[path = "../server_sync/engine.rs"]
 pub(crate) mod server_sync_engine;

@@ -1,6 +1,7 @@
+import type { SyncMutationRuntime } from "./syncMutationRuntime";
 import { invoke } from '@tauri-apps/api/core'
 
-import type { PeerSyncInvoke, PeerSyncMutationRuntime } from './peerSyncShared'
+import type { PeerSyncInvoke } from './peerSyncShared'
 
 export type PeerClonePlatform = 'desktop' | 'web' | 'android'
 
@@ -25,7 +26,7 @@ export interface PeerCloneFacadeOptions {
     runtime?: PeerCloneReplacementRuntime
 }
 
-export type PeerCloneReplacementRuntime = PeerSyncMutationRuntime
+export type PeerCloneReplacementRuntime = SyncMutationRuntime
 
 export interface PeerCloneTargetStatus {
     phase: 'idle' | 'downloading' | 'cancelling' | 'awaitingActivation' | 'activating' | 'cancelled' | 'completed' | 'failed'

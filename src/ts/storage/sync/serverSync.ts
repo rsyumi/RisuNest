@@ -1,6 +1,6 @@
+import type { SyncMutationRuntime } from "./syncMutationRuntime";
 import { invoke } from "@tauri-apps/api/core";
 import type { PersistentDestructiveReplacementFence } from "../persistentDataRuntime";
-import type { PeerSyncMutationRuntime } from "./peerSyncShared";
 
 export interface ServerHead {
   libraryId: string;
@@ -81,7 +81,7 @@ export function serverSyncError(cause: unknown): ServerSyncError {
 }
 
 export function createServerSyncFacade(options: {
-  runtime: PeerSyncMutationRuntime;
+  runtime: SyncMutationRuntime;
   invoke?: NativeInvoke;
   restorePlugins?: () => Promise<void>;
   onProgress?: (phase: ServerSyncProgress) => void;

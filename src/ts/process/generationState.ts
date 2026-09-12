@@ -1,4 +1,5 @@
 import { get, writable, type Writable } from 'svelte/store'
+import { isLibraryFileOperationReserved } from '../storage/libraryFileOperation'
 
 let activeReservation: symbol | null = null
 const doingChatState = writable(false)
@@ -19,7 +20,7 @@ export interface GenerationReservation {
 }
 
 export function reserveGeneration(): GenerationReservation | null {
-    if (activeReservation || get(doingChat)) return null
+    if (activeReservation || get(doingChat) || isLibraryFileOperationReserved()) return null
     const token = Symbol('generation-reservation')
     activeReservation = token
     doingChat.set(true)

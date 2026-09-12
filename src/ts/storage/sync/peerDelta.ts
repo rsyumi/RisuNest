@@ -1,8 +1,9 @@
+import type { SyncMutationRuntime } from "./syncMutationRuntime";
 import { invoke } from '@tauri-apps/api/core'
 
 import type { PeerClonePlatform } from './peerClone'
 import { DeviceSyncError } from './deviceSync'
-import type { PeerSyncForegroundBridge, PeerSyncInvoke, PeerSyncMutationRuntime } from './peerSyncShared'
+import type { PeerSyncForegroundBridge, PeerSyncInvoke } from './peerSyncShared'
 
 export type PeerDeltaInvoke = PeerSyncInvoke
 
@@ -21,7 +22,7 @@ interface PeerDeltaTargetForegroundStatus {
     error?: string
 }
 
-export type PeerDeltaMutationRuntime = PeerSyncMutationRuntime
+export type PeerDeltaMutationRuntime = SyncMutationRuntime
 
 export interface PeerDeltaCapabilities {
     desktop: boolean

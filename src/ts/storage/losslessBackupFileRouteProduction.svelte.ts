@@ -1,3 +1,4 @@
+import { getServerSyncController, resumeServerSyncAfterBackup } from "./sync/serverSyncProduction";
 import { open, save } from '@tauri-apps/plugin-dialog'
 
 import { LoadLocalBackup, SaveLocalBackup } from '../drive/backuplocal'
@@ -12,6 +13,7 @@ import {
 } from './losslessBackupFileRoute'
 import { runSharedNativeFileOperation } from './nativeFileJobManager'
 import {
+    NativeFileJobError,
     runNativeLosslessBackupExport,
     runNativeLosslessBackupRestore,
     syntheticNativeFileJobStatus,
@@ -69,7 +71,15 @@ const productionDependencies: LosslessBackupFileRouteDependencies = {
             extensions: ['risulossless'],
         }],
     }),
-    runNativeRestore: runNativeLosslessBackupRestore,
+    runNativeRestore: (runtime, source, options) => getServerSyncController().withReplacement(() =>
+        runNativeLosslessBackupRestore(runtime, source, {
+            ...options,
+            beforeActivation: async () => {
+                await options.beforeActivation?.()
+                try { await getServerSyncController().confirmReplacement() }
+                catch { throw new NativeFileJobError('resolve-pending-operation-first', 'Confirm the synchronization outcome before restoring.') }
+            },
+        })),
     runNativeExport: runNativeLosslessBackupExport,
     reloadPluginsAfterRestore: loadPluginsAfterAuthoritativeRestore,
     saveLegacyBackup: async () => { await SaveLocalBackup() },
@@ -80,6 +90,7 @@ export function exportLocalBackupFromSystemPicker(
     options: NativeFileJobOptions = {},
 ) {
     if (!isTauri) return exportLocalBackupFromPicker(options, productionDependencies)
+    getServerSyncController().assertFileOperationAvailable()
     return runSharedNativeFileOperation('export', 'lossless-backup-export', ({ signal, onStatus }) =>
         exportLocalBackupFromPicker({
             ...options,
@@ -88,7 +99,7 @@ export function exportLocalBackupFromSystemPicker(
                 onStatus(status)
                 options.onStatus?.(status)
             },
-        }, productionDependencies))
+        }, productionDependencies), { format: "lossless-backup" }).finally(resumeServerSyncAfterBackup)
 }
 
 export function restoreLocalBackupFromSystemPicker(options: LosslessBackupRestoreOptions = {}) {
@@ -96,12 +107,12 @@ export function restoreLocalBackupFromSystemPicker(options: LosslessBackupRestor
 }
 
 export function restoreLocalBackupFromNativeSource(
-    source: NativeFileJobSource,
+    source: NativeFileJobSource | (() => Promise<NativeFileJobSource>),
     options: LosslessBackupRestoreOptions = {},
 ) {
     return restoreWithDependencies(options, {
         ...productionDependencies,
-        chooseNativeImport: async () => source,
+        chooseNativeImport: async () => typeof source === "function" ? source() : source,
     })
 }
 
@@ -110,6 +121,7 @@ function restoreWithDependencies(
     dependencies: LosslessBackupFileRouteDependencies,
 ) {
     if (!isTauri) return restoreLocalBackupFromPicker(options, dependencies)
+    getServerSyncController().assertFileOperationAvailable()
     return runSharedNativeFileOperation(
         'import',
         'lossless-backup-import',

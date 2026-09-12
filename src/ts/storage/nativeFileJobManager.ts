@@ -1,5 +1,7 @@
 import { Mutex } from '../mutex'
-import { writable } from 'svelte/store'
+import { get, writable } from 'svelte/store'
+import { doingChat } from '../process/generationState'
+import { reserveLibraryFileOperation } from './libraryFileOperation'
 
 import {
     NativeFileJobActivationCommittedError,
@@ -208,6 +210,16 @@ export function runSharedNativeFileOperation<T>(
             : Promise.reject(new NativeFileOperationBusyError())
     }
 
+    if (options.format === 'lossless-backup' && get(doingChat)) {
+        return Promise.reject(new NativeFileJobError(
+            'generation-active',
+            'A response is being generated. Finish or stop it before starting a backup or restore.',
+        ))
+    }
+    const releaseAdmission = options.format === 'lossless-backup'
+        ? reserveLibraryFileOperation()
+        : () => {}
+
     const controller = new AbortController()
     const presentation = options.presentation ?? 'inline'
     activeController = controller
@@ -223,7 +235,6 @@ export function runSharedNativeFileOperation<T>(
         partialWritesPossible: false,
     }
     if (presentation === 'dialog') nativeFileOperationOutcome.set(null)
-    publishActiveState()
 
     const settle = (settlement: Settlement) => {
         if (activeOperation !== promise) return
@@ -232,6 +243,7 @@ export function runSharedNativeFileOperation<T>(
         activeOperationKey = null
         activeController = null
         activeState = null
+        releaseAdmission()
         if (state?.presentation === 'dialog') {
             const outcome = outcomeFromSettlement(state, settlement, Date.now())
             if (outcome) nativeFileOperationOutcome.set(outcome)
@@ -239,23 +251,27 @@ export function runSharedNativeFileOperation<T>(
         publishActiveState()
     }
 
-    const promise: Promise<T> = operation({
+    let resolveOperation!: (value: T | PromiseLike<T>) => void
+    let rejectOperation!: (cause: unknown) => void
+    const promise = new Promise<T>((resolve, reject) => { resolveOperation = resolve; rejectOperation = reject })
+    activeOperation = promise
+    publishActiveState()
+    const context: SharedNativeFileOperationContext = {
         signal: controller.signal,
         onStatus: recordStatus,
         setBlocking: (blocking) => updateActiveState({ blocking }),
         setSource: (source) => updateActiveState({ source }),
         setPartialWritesPossible: (value) => updateActiveState({ partialWritesPossible: value }),
-    }).then(
-        (value) => {
-            settle({ value })
-            return value
-        },
-        (error: unknown) => {
-            settle({ error })
-            throw error
-        },
-    )
-    activeOperation = promise
+    }
+    try {
+        operation(context).then(
+            value => { settle({ value }); resolveOperation(value) },
+            error => { settle({ error }); rejectOperation(error) },
+        )
+    } catch (error) {
+        settle({ error })
+        rejectOperation(error)
+    }
     return promise
 }
 
@@ -264,6 +280,9 @@ export function runExternalAndroidNativeFileOperation<T>(
     operation: (context: SharedNativeFileOperationContext) => Promise<T>,
     options: SharedNativeFileOperationOptions = {},
 ): Promise<T> {
+    if (options.format === 'lossless-backup') {
+        return runSharedNativeFileOperation(kind, `external-android:${kind}`, operation, options)
+    }
     return externalAndroidOperationMutex.runExclusive(async () => {
         while (activeOperation) {
             try {

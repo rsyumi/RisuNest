@@ -8,9 +8,10 @@ const state = vi.hoisted(() => ({
   revisionListener: undefined as undefined | (() => void),
   scheduler: { resume: vi.fn(), suspend: vi.fn(), localCommit: vi.fn() },
   invoke: vi.fn(async () => "synthetic-backup-path"),
-  restore: vi.fn(async () => {}),
+  restore: vi.fn(async (source?: () => Promise<unknown>) => { if (source) await source(); }),
   controller: {
     initialize: vi.fn(async () => {}),
+    invalidateCompletion: vi.fn(),
     canAutoSync: vi.fn(() => true),
     synchronize: vi.fn(async () => {}),
     suspend: vi.fn(async () => {}),
@@ -76,26 +77,18 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 describe("native server synchronization scheduling", () => {
-  it("waits for cancellation, verifies the selected archive and restores through the lossless job", async () => {
+  it("resolves the selected ID inside the shared file route without automatically cancelling sync", async () => {
     const { restoreServerSyncBackup } = await import("./serverSyncProduction");
     await restoreServerSyncBackup("backup-id", "remote");
-    expect(state.controller.pause).toHaveBeenCalledTimes(1);
-    expect(state.controller.waitForIdle).toHaveBeenCalledTimes(1);
-    expect(state.invoke).toHaveBeenCalledWith("server_sync_backup_source", {
-      id: "backup-id",
-      side: "remote",
-    });
-    expect(state.restore).toHaveBeenCalledWith({
-      type: "desktopPath",
-      path: "synthetic-backup-path",
-    });
-    expect(state.controller.initialize).toHaveBeenCalledTimes(1);
+    expect(state.restore).toHaveBeenCalledWith(expect.any(Function));
+    expect(state.invoke).toHaveBeenCalledWith("server_sync_backup_source", { id: "backup-id", side: "remote" });
+    expect(state.controller.pause).not.toHaveBeenCalled();
     expect(state.controller.synchronize).not.toHaveBeenCalled();
-    state.controller.canRestore.mockReturnValue(false);
-    await expect(
-      restoreServerSyncBackup("backup-id", "local"),
-    ).rejects.toMatchObject({ code: "resolve-pending-operation-first" });
-    expect(state.restore).toHaveBeenCalledTimes(1);
+    // Rejection by the file route must occur before the native source is opened.
+    state.invoke.mockClear();
+    state.restore.mockRejectedValueOnce({ code: "server-sync-busy" });
+    await expect(restoreServerSyncBackup("backup-id", "local")).rejects.toMatchObject({ code: "server-sync-busy" });
+    expect(state.invoke).not.toHaveBeenCalled();
   });
   it("starts once after initialization and connects durable saves, visibility, and network signals", async () => {
     const listeners = new Map<string, EventListener>();
@@ -135,6 +128,9 @@ describe("native server synchronization scheduling", () => {
     online.mockReturnValue(true);
     listeners.get("online")!(new Event("online"));
     expect(state.scheduler.resume).toHaveBeenCalledTimes(3);
+    const { resumeServerSyncAfterBackup } = await import("./serverSyncProduction");
+    resumeServerSyncAfterBackup();
+    expect(state.scheduler.resume).toHaveBeenCalledTimes(4);
   });
   it("does not install a native scheduler in the browser build", async () => {
     state.native = false;

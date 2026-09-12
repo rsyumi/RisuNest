@@ -11,9 +11,7 @@ use super::{
 };
 use crate::{
     asset_repository::PayloadCas,
-    peer_sync::logical_delta::{
-        decode_logical_record_key, encode_logical_record_key, LogicalRecordLocator,
-    },
+    logical_records::{decode_logical_record_key, encode_logical_record_key, LogicalRecordLocator},
     server_sync::{
         cache::Cache,
         client::{response_error, ServerClient},
@@ -1144,7 +1142,7 @@ impl PersistentStore {
         transfer: &Transfer<'_>,
         revision: i64,
     ) -> Result<BTreeSet<String>> {
-        use crate::peer_sync::logical_delta::LogicalRecordEnvelope as Envelope;
+        use crate::logical_records::LogicalRecordEnvelope as Envelope;
         let mut groups = BTreeSet::new();
         let incoming_ordered:bool=self.connection.query_row("SELECT EXISTS(SELECT 1 FROM server_cycle_records WHERE action='apply' AND (key GLOB 'r1:plugin:*' OR key GLOB 'r1:preset:*' OR key GLOB 'r1:character:*' OR key GLOB 'r1:conversation:*'))",[],|r|r.get(0))?;
         if !incoming_ordered {

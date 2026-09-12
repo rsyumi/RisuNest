@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import {
     continueNativeOfficialPublication,
     NativeFileJobActivationCommittedError,
+    NativeFileJobError,
     runNativeOfficialAccountSnapshotRestore,
     runNativeBlockRisuSaveRestore,
     runNativeBlockRisuSaveExport,
@@ -792,7 +793,7 @@ describe('native file jobs', () => {
                 release: () => { events.push('fence-released') },
             }),
             { type: 'androidSpool', token: '2c4d33fe-2e29-4625-bb1e-c8d1084f9557' },
-            { afterRefresh: () => { events.push('plugins-reloaded') } },
+            { beforeActivation: () => { events.push('fresh-status') }, afterRefresh: () => { events.push('plugins-reloaded') } },
             {
                 isTauri: () => true,
                 invoke: async (command, args) => {
@@ -810,6 +811,7 @@ describe('native file jobs', () => {
         expect(result.revision).toBe(18)
         expect(result.recoveryPath).toContain('risulossless-recovery-')
         expect(events).toEqual([
+            'fresh-status',
             'fence-acquired',
             'refreshed',
             'plugins-reloaded',
@@ -2891,3 +2893,22 @@ describe('native file jobs', () => {
         expect(commands).toEqual(['native_file_job_status', 'native_file_job_forget'])
     })
 })
+
+it('cancels staged restore and waits for terminal settlement when the fresh precondition fails', async () => {
+    const calls: string[]=[];
+    const statuses=[{...status('waitingForInput'),phase:'awaiting-activation'},status('cancelled')];
+    const acquire=vi.fn();
+    await expect(runNativeLosslessBackupRestore(
+        restoreRuntime(17,{acquire}),
+        {type:'desktopPath',path:'C:\\synthetic\\backup.risulossless'},
+        {beforeActivation:()=>{throw new NativeFileJobError('resolve-pending-operation-first','pending')}},
+        {isTauri:()=>true,wait:async()=>{},invoke:async(command)=>{
+            calls.push(command);
+            if(command==='native_file_job_start')return {jobId:'staged'};
+            if(command==='native_file_job_status')return statuses.shift();
+            return true;
+        }},
+    )).rejects.toMatchObject({code:'resolve-pending-operation-first'});
+    expect(acquire).not.toHaveBeenCalled();
+    expect(calls).toEqual(['native_file_job_start','native_file_job_status','native_file_job_cancel','native_file_job_status','native_file_job_forget']);
+});

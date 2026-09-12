@@ -1,7 +1,8 @@
+import type { SyncMutationRuntime } from "./syncMutationRuntime";
 import { invoke } from '@tauri-apps/api/core'
 
 import { NativeFileJobActivationCommittedError } from '../nativeFileJobs'
-import type { PeerSyncInvoke, PeerSyncMutationRuntime } from './peerSyncShared'
+import type { PeerSyncInvoke } from './peerSyncShared'
 
 export type AndroidPeerCloneInvoke = PeerSyncInvoke
 
@@ -11,7 +12,7 @@ export interface AndroidPeerCloneBridge {
     cancel(jobId: string): boolean
 }
 
-export interface AndroidPeerCloneReplacementRuntime extends Omit<PeerSyncMutationRuntime, 'flushPendingData'> {
+export interface AndroidPeerCloneReplacementRuntime extends Omit<SyncMutationRuntime, 'flushPendingData'> {
     afterRefresh?(): void | Promise<void>
 }
 

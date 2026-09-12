@@ -372,6 +372,8 @@ export interface PreparedNativeContentReceipt extends PreparedNativeContentActiv
 }
 
 export interface NativeFileRestoreJobOptions extends NativeFileJobOptions {
+    /** Runs after staging and before taking the destructive replacement fence. */
+    beforeActivation?(): void | Promise<void>
     afterRefresh?(): void | Promise<void>
     onBlockingChange?(blocking: boolean): void
 }
@@ -1079,12 +1081,13 @@ async function runNativeReplacementRestore(
                 && !cancellationRequested
             ) {
                 try {
+                    await options.beforeActivation?.()
                     replacementFence = await runtime.acquireDestructiveReplacementFence(
                         mutationToken,
                     )
                 }
                 catch (error) {
-                    mutationConflict = new NativeFileJobError(
+                    mutationConflict = error instanceof NativeFileJobError ? error : new NativeFileJobError(
                         'revision-conflict',
                         error instanceof Error ? error.message : String(error),
                     )

@@ -1,6 +1,6 @@
 //! Semantic validation precedes the transaction which activates remote records.
 //! Cursor/base advancement and local outbox acknowledgement share that transaction.
-use super::logical_delta_target as rows;
+use super::record_apply as rows;
 use super::{
     active_generation, current_revision,
     server_sync_outbox::{acknowledge_keys, ServerDirtyKey},
@@ -12,12 +12,9 @@ use crate::{
         owner_manifest_codec::{decode_owner_manifest, encode_owner_manifest},
         PayloadCas,
     },
-    peer_sync::{
-        logical_delta::{
-            decode_asset_alias_metadata, decode_logical_record_key, encode_logical_record,
-            encode_logical_record_key, LogicalRecordEnvelope, LogicalRecordLocator,
-        },
-        PeerSyncError,
+    logical_records::{
+        decode_asset_alias_metadata, decode_logical_record_key, encode_logical_record,
+        encode_logical_record_key, LogicalRecordEnvelope, LogicalRecordLocator,
     },
 };
 use risunest_sync_wire::{RecordVersion, RemoteHead};
@@ -65,7 +62,7 @@ fn invalid<T>(message: &str) -> StoreResult<T> {
         message: message.into(),
     })
 }
-fn semantic(_: PeerSyncError) -> StoreError {
+fn semantic(_: StoreError) -> StoreError {
     StoreError::Validation {
         message: "Server record failed semantic validation".into(),
     }

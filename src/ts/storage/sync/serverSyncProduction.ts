@@ -7,7 +7,6 @@ import {
 } from "../persistentDataRuntime.svelte";
 import {
   createServerSyncFacade,
-  ServerSyncError,
   type ServerHead,
 } from "./serverSync";
 import { createServerSyncController } from "./serverSyncController";
@@ -34,6 +33,10 @@ export function getServerSyncController() {
   ));
 }
 let started = false;
+let activeScheduler: ReturnType<typeof createServerSyncScheduler> | undefined;
+/** A read-only file backup may outlive the scheduled timer. Resume the existing
+ * scheduler when it settles; restoring a library deliberately does not do this. */
+export function resumeServerSyncAfterBackup(): void { activeScheduler?.resume(); }
 export interface ServerSyncBackup {
   id: string;
   createdAt: number;
@@ -46,17 +49,11 @@ export async function restoreServerSyncBackup(
   id: string,
   side: "local" | "remote",
 ): Promise<void> {
-  const controller = getServerSyncController();
-  await controller.pause();
-  await controller.waitForIdle();
-  if (!controller.canRestore())
-    throw new ServerSyncError("resolve-pending-operation-first");
-  const path = await invoke<string>("server_sync_backup_source", { id, side });
-  const { restoreLocalBackupFromNativeSource } = await import(
-    "../losslessBackupFileRouteProduction.svelte"
-  );
-  await restoreLocalBackupFromNativeSource({ type: "desktopPath", path });
-  await controller.initialize();
+  const { restoreLocalBackupFromNativeSource } = await import("../losslessBackupFileRouteProduction.svelte");
+  await restoreLocalBackupFromNativeSource(async () => ({
+    type: "desktopPath",
+    path: await invoke<string>("server_sync_backup_source", { id, side }),
+  }));
 }
 export function startServerSync(): void {
   if (started || !isTauri) return;
@@ -65,7 +62,8 @@ export function startServerSync(): void {
   const scheduler = createServerSyncScheduler(controller, {
     available: () => document.visibilityState !== "hidden" && navigator.onLine,
   });
-  subscribeLocalPersistentRevision(() => scheduler.localCommit());
+  activeScheduler = scheduler;
+  subscribeLocalPersistentRevision(() => { controller.invalidateCompletion(); scheduler.localCommit(); });
   void controller.initialize().then(() => scheduler.resume());
   window.addEventListener("online", () => scheduler.resume());
   window.addEventListener("offline", () => scheduler.suspend());

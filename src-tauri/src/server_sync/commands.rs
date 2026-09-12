@@ -19,6 +19,8 @@ struct PreparedJob {
     id: String,
     store: PersistentStore,
     cycle: PreparedCycle,
+    // Drop after staged stores and cycle resources have settled.
+    _admission: crate::native_file_jobs::admission::Permit,
 }
 #[derive(Default)]
 pub(crate) struct ServerSyncCommandState {
@@ -63,6 +65,12 @@ impl ServerSyncCommandState {
         Ok(())
     }
 }
+fn claim_library(app: &AppHandle) -> Result<crate::native_file_jobs::admission::Permit> {
+    app.state::<crate::native_file_jobs::NativeFileJobState>()
+        .admission
+        .server()
+        .map_err(|code| SyncError::new(code, 409))
+}
 fn job_store(app: &AppHandle) -> Result<PersistentStore> {
     Ok(with_store_mut(app.state(), |store| {
         store.open_native_job_store()
@@ -90,6 +98,7 @@ pub(crate) async fn server_sync_backup_source(
     side: super::backups::Side,
 ) -> Result<String> {
     blocking(move || {
+        let _admission = claim_library(&app)?;
         let state = app.state::<ServerSyncCommandState>();
         let (_running, cancelled) = state.claim_preparation()?;
         let store = job_store(&app)?;
@@ -138,6 +147,7 @@ pub(crate) async fn server_sync_bind(
     config: ServerConfig,
 ) -> Result<ReplicaStatus> {
     blocking(move || {
+        let _admission = claim_library(&app)?;
         let state = app.state::<ServerSyncCommandState>();
         let _running = state.claim()?;
         state.require_no_preparation()?;
@@ -152,6 +162,7 @@ pub(crate) async fn server_sync_bind(
 #[tauri::command]
 pub(crate) async fn server_sync_unbind(app: AppHandle) -> Result<()> {
     blocking(move || {
+        let _admission = claim_library(&app)?;
         let state = app.state::<ServerSyncCommandState>();
         let _running = state.claim()?;
         state.require_no_preparation()?;
@@ -166,6 +177,7 @@ pub(crate) async fn server_sync_reregister(
     expected_revision: i64,
 ) -> Result<ReplicaStatus> {
     blocking(move || {
+        let _admission = claim_library(&app)?;
         let state = app.state::<ServerSyncCommandState>();
         let _running = state.claim()?;
         state.require_no_preparation()?;
@@ -208,6 +220,7 @@ pub(crate) async fn server_sync_reconcile(
     expected_revision: i64,
 ) -> Result<ReplicaStatus> {
     blocking(move || {
+        let _admission = claim_library(&app)?;
         let state = app.state::<ServerSyncCommandState>();
         let _running = state.claim()?;
         state.require_no_preparation()?;
@@ -228,6 +241,7 @@ pub(crate) async fn server_sync_prepare(
     mut options: CycleOptions,
 ) -> Result<PreparedReply> {
     blocking(move || {
+        let admission = claim_library(&app)?;
         let state = app.state::<ServerSyncCommandState>();
         let (_running, flag) = state.claim_preparation()?;
         state.require_no_preparation()?;
@@ -260,7 +274,12 @@ pub(crate) async fn server_sync_prepare(
                     .prepared
                     .lock()
                     .map_err(|_| SyncError::new("server-sync-state-unavailable", 503))? =
-                    Some(PreparedJob { id, store, cycle });
+                    Some(PreparedJob {
+                        id,
+                        _admission: admission,
+                        store,
+                        cycle,
+                    });
                 Ok(reply)
             }
         }

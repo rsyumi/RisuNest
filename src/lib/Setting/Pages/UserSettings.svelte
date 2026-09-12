@@ -29,6 +29,7 @@
     import { nativeFileOperation } from "src/ts/storage/risuSaveFileRouteProduction.svelte";
     import { alertPartialDestinationWarning, hasPartialDestinationWarning } from "src/ts/storage/risuSaveFileRoute";
     import { NativeFileJobActivationCommittedError, NativeFileJobError } from "src/ts/storage/nativeFileJobs";
+    import { NativeFileOperationBusyError } from "src/ts/storage/nativeFileJobManager";
     let openIframe = $state(false)
     let openIframeURL = $state('')
     const drivePopup = createHubPopupController()
@@ -47,6 +48,16 @@
     }
 
     function showRisuSaveError(error: unknown): void {
+        const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined
+        if(error instanceof NativeFileOperationBusyError) {
+            alertError(language.risuNest.backup.fileBusy)
+            return
+        }
+        const blocked = code === 'generation-active' ? language.risuNest.backup.generationBusy
+            : code === 'server-sync-busy' || code === 'library-operation-busy' ? language.risuNest.backup.syncBusy
+            : code === 'resolve-pending-operation-first' || code === 'server-status-unavailable' ? language.risuNest.backup.syncUnconfirmed
+            : undefined
+        if(blocked) { alertError(blocked); return }
         const partialDestinationMayRemain = hasPartialDestinationWarning(error)
         if(error instanceof DOMException && error.name === 'AbortError') {
             alertPartialDestinationWarning(error, language.screenshotPartialDestinationMayRemain, alertError)
@@ -69,7 +80,6 @@
             : language.risuNest.backup.actionFailed)
     }
     async function runLocalBackupOperation(kind: 'import' | 'export'): Promise<void> {
-        if(risuSaveOperation) return
         try {
             const result = kind === 'import'
                 ? await restoreLocalBackupFromSystemPicker()
@@ -96,6 +106,11 @@
         drivePopup.close()
     })
 </script>
+
+{#if risuSaveOperation !== null}
+    <p class="text-sm opacity-70">{language.risuNest.backup.fileBusy}</p>
+{/if}
+
 
 <svelte:window onmessage={async (e) => {
     const message = e.data?.msg

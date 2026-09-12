@@ -1,7 +1,7 @@
 use super::{server_sync_outbox::ServerDirtyKey, StoreError, StoreResult};
 use crate::{
     asset_repository::{owner_manifest_codec::decode_owner_manifest, PayloadCas},
-    peer_sync::logical_delta::{
+    logical_records::{
         decode_logical_record, encode_logical_record_key, LogicalRecordEnvelope,
         LogicalRecordLocator,
     },
@@ -136,13 +136,12 @@ pub(crate) fn project(
         message: "Invalid server record key".into(),
     })?;
     let mut derived_objects = std::collections::BTreeMap::new();
-    let bytes = super::logical_index::reconstruct_record_with_owner_objects(
+    let bytes = super::record_projection::reconstruct_record_with_owner_objects(
         db,
         cas,
-        "",
-        "",
         generation,
         &record_key,
+        Vec::new(),
         |bytes| {
             derived_objects.insert(risunest_sync_wire::hash(bytes), bytes.to_vec());
             Ok(())

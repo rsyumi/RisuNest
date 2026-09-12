@@ -6,6 +6,7 @@ mod cold_payload_codec;
 pub mod import_export_jobs;
 #[allow(dead_code)]
 mod local_backup;
+mod logical_records;
 #[allow(dead_code)]
 mod lossless_backup;
 #[allow(dead_code)]
@@ -26,6 +27,8 @@ mod publication_upload;
 mod regex_shadow;
 mod server_sync;
 mod trust_boundary;
+#[cfg(windows)]
+mod windows_process;
 
 use base64::{engine::general_purpose, Engine as _};
 use oauth2::basic::{BasicClient, BasicErrorResponseType, BasicTokenType};
@@ -442,7 +445,7 @@ struct PyServerState {
 struct PyServerProcess {
     child: std::process::Child,
     #[cfg(windows)]
-    _kill_on_close_job: peer_sync::tunnel::KillOnCloseJob,
+    _kill_on_close_job: windows_process::KillOnCloseJob,
 }
 
 #[cfg(desktop)]
@@ -495,7 +498,7 @@ fn run_py_server(handle: tauri::AppHandle, py_path: String) -> Result<(), String
 
     crate::nlog!("info", "starting Python server");
     #[cfg(windows)]
-    let kill_on_close_job = peer_sync::tunnel::KillOnCloseJob::create()
+    let kill_on_close_job = windows_process::KillOnCloseJob::create()
         .map_err(|error| format!("failed to create the Python server job object: {error}"))?;
     let child = py_server
         .arg("-m")

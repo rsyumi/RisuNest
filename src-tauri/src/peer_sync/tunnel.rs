@@ -1,23 +1,17 @@
+#[cfg(windows)]
+use crate::windows_process::KillOnCloseJob;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, Metadata};
 use std::io::Read;
 use std::net::{Ipv4Addr, SocketAddr};
-#[cfg(windows)]
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use url::Url;
-#[cfg(windows)]
-use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-};
 
 const OUTPUT_LIMIT: usize = 64 * 1024;
 const OUTPUT_CHANNEL_CHUNKS: usize = 16;
@@ -365,46 +359,6 @@ pub(crate) struct SystemTunnelProcess {
     _kill_on_close_job: KillOnCloseJob,
     output_rx: Receiver<Vec<u8>>,
     output: BoundedOutput,
-}
-
-#[cfg(windows)]
-pub(crate) struct KillOnCloseJob(OwnedHandle);
-
-#[cfg(windows)]
-impl KillOnCloseJob {
-    pub(crate) fn create() -> std::io::Result<Self> {
-        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-        if handle.is_null() {
-            return Err(std::io::Error::last_os_error());
-        }
-        let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let information_size = u32::try_from(std::mem::size_of_val(&limits))
-            .expect("job information size fits in u32");
-        let configured = unsafe {
-            SetInformationJobObject(
-                handle.as_raw_handle(),
-                JobObjectExtendedLimitInformation,
-                std::ptr::from_ref(&limits).cast(),
-                information_size,
-            )
-        };
-        if configured == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(Self(handle))
-    }
-
-    pub(crate) fn assign(&self, child: &Child) -> std::io::Result<()> {
-        let assigned =
-            unsafe { AssignProcessToJobObject(self.0.as_raw_handle(), child.as_raw_handle()) };
-        if assigned == 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
 }
 
 impl SystemTunnelProcess {

@@ -187,7 +187,7 @@ impl Cache {
     /// bodies reachable from an owner manifest are not a candidate inventory to
     /// stat and transmit on every small owner edit.
     pub fn base_candidates(&self, key: &str, version: &RecordVersion) -> Result<Vec<String>> {
-        use crate::peer_sync::logical_delta::{
+        use crate::logical_records::{
             decode_logical_record_key, LogicalRecordEnvelope as Envelope,
             LogicalRecordLocator as Locator,
         };
@@ -280,10 +280,10 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::peer_sync::logical_delta::LogicalRecordEnvelope;
+    use crate::logical_records::LogicalRecordEnvelope;
     #[test]
     fn candidate_inventory_excludes_a_hundred_thousand_opaque_dependencies() {
-        use crate::peer_sync::logical_delta::{encode_logical_record_key, LogicalRecordLocator};
+        use crate::logical_records::{encode_logical_record_key, LogicalRecordLocator};
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::open(dir.path()).unwrap();
         let payload = ServerPayload {

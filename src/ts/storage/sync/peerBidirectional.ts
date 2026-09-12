@@ -1,9 +1,10 @@
+import type { SyncMutationRuntime } from "./syncMutationRuntime";
 import { invoke } from '@tauri-apps/api/core'
 
 import type { PeerClonePlatform } from './peerClone'
-import type { PeerSyncForegroundBridge, PeerSyncInvoke, PeerSyncMutationRuntime } from './peerSyncShared'
+import type { PeerSyncForegroundBridge, PeerSyncInvoke } from './peerSyncShared'
 
-export type PeerBidirectionalMutationRuntime = PeerSyncMutationRuntime
+export type PeerBidirectionalMutationRuntime = SyncMutationRuntime
 
 export interface PeerBidirectionalCapabilities {
     desktop: boolean

@@ -1,3 +1,8 @@
+vi.mock('./sync/serverSyncProduction', () => ({ resumeServerSyncAfterBackup: vi.fn(), getServerSyncController: () => ({
+    assertFileOperationAvailable: vi.fn(),
+    confirmReplacement: vi.fn(),
+    withReplacement: async (operation: () => Promise<unknown>) => operation(),
+}) }))
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
@@ -35,7 +40,8 @@ vi.mock('../plugins/plugins.svelte', () => ({
 vi.mock('./persistentDataRuntime.svelte', () => ({
     getPersistentDataRuntime: () => mocks.runtime,
 }))
-vi.mock('./nativeFileJobs', () => ({
+vi.mock('./nativeFileJobs', async (original) => ({
+    ...(await original<object>()),
     runNativeLosslessBackupRestore: mocks.restore,
     runNativeLosslessBackupExport: mocks.export,
 }))
