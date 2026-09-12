@@ -2,6 +2,8 @@ use super::super::server_sync_engine::{CycleOptions, CycleResult};
 use super::*;
 use crate::server_sync::client::ServerConfig;
 use risunest_sync_server::{http, store::Store};
+#[path = "server_sync_initial_tests.rs"]
+mod initial;
 #[path = "server_sync_matrix_tests.rs"]
 mod matrix;
 #[path = "server_sync_semantic_tests.rs"]

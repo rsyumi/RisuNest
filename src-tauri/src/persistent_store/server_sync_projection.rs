@@ -66,6 +66,11 @@ pub(crate) fn project(
     generation: &str,
     key: &ServerDirtyKey,
 ) -> StoreResult<Option<ServerPayload>> {
+    // Revision zero contains only the store's uncommitted root placeholder.
+    // Advertising it as user content creates a false conflict on first receive.
+    if key.kind == "root" && key.revision == 0 {
+        return Ok(None);
+    }
     let locator = locator(key)?;
     let (table, column1, column2, value1, value2) = match &locator {
         LogicalRecordLocator::Root => ("root", "generation", None, generation, ""),
