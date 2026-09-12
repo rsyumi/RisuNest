@@ -2,6 +2,44 @@ use risunest_sync_wire::{canonical, descriptor::*, hash, MAX_METADATA_BYTES};
 use std::collections::BTreeMap;
 
 #[test]
+fn inserting_a_reference_preserves_pages_across_a_sorted_hash_inventory() {
+    let mut values: Vec<_> = (0..100_000u64)
+        .map(|n| hash(format!("synthetic unique asset body {n:016}").as_bytes()))
+        .collect();
+    values.sort();
+    let (_, original) = build_reference_tree(&values, false).unwrap();
+    let original: BTreeMap<_, _> = original.into_iter().collect();
+    for position in [1, 50_000, 99_998] {
+        let mut edited = values.clone();
+        edited.remove(position);
+        let (root, pages) = build_reference_tree(&edited, false).unwrap();
+        let changed = pages
+            .iter()
+            .filter(|(h, _)| !original.contains_key(h))
+            .count();
+        assert!(
+            changed <= 8,
+            "one deletion at {position} rebuilt {changed} pages"
+        );
+        let pages: BTreeMap<_, _> = pages.into_iter().collect();
+        let mut restored = Vec::new();
+        visit_reference_tree(
+            root.as_ref().unwrap(),
+            false,
+            |h| Ok(pages[h].clone()),
+            |v, page| {
+                if !page {
+                    restored.push(v.to_owned());
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(restored, edited);
+    }
+}
+
+#[test]
 fn half_million_dependencies_use_bounded_immutable_pages_and_small_root() {
     let values: Vec<_> = (0..500_000u64).map(|n| format!("{n:064x}")).collect();
     let (root, pages) = build_reference_tree(&values, false).unwrap();

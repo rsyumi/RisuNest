@@ -169,8 +169,12 @@ fn reference_boundary(value: &str, relations: bool) -> bool {
         value.to_owned()
     };
     digest
-        .get(..2)
-        .and_then(|prefix| u8::from_str_radix(prefix, 16).ok())
+        // Hash inventories are lexically sorted. Prefix bytes cluster at the
+        // beginning of a range, turning almost every later page into a fixed
+        // count page whose boundary shifts on insertion. Suffix bytes retain
+        // content-defined boundaries throughout the sorted inventory.
+        .get(62..64)
+        .and_then(|suffix| u8::from_str_radix(suffix, 16).ok())
         .is_some_and(|byte| byte & 127 == 0)
 }
 fn publish_leaf(
