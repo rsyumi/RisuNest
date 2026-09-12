@@ -715,24 +715,55 @@ impl<'a> Transfer<'a> {
             .cas
             .open_object(hash)?
             .ok_or_else(|| SyncError::new("cached-object-missing", 409))?;
-        for index in 0..size.div_ceil(CHUNK as u64) {
-            if verified.contains(&index) {
-                continue;
+        let mut missing = (0..size.div_ceil(CHUNK as u64)).filter(|i| !verified.contains(i));
+        loop {
+            let mut batch = Vec::with_capacity(2);
+            for index in missing.by_ref().take(2) {
+                self.client.ensure_active()?;
+                let offset = index * CHUNK as u64;
+                file.seek(SeekFrom::Start(offset))?;
+                let mut bytes = vec![0; ((size - offset).min(CHUNK as u64)) as usize];
+                file.read_exact(&mut bytes)?;
+                batch.push((format!("uploads/{id}/chunks/{index}"), bytes));
             }
-            let offset = index * CHUNK as u64;
-            file.seek(SeekFrom::Start(offset))?;
-            let mut bytes = vec![0; ((size - offset).min(CHUNK as u64)) as usize];
-            file.read_exact(&mut bytes)?;
-            let reply = self.client.request(
-                Method::PUT,
-                &format!("uploads/{id}/chunks/{index}"),
-                &[],
-                Some(bytes.clone()),
-                &[("x-content-sha256", risunest_sync_wire::hash(&bytes))],
-                MAX_METADATA_BYTES,
-            )?;
-            if reply.status != 204 {
-                return Err(response_error(reply));
+            if batch.is_empty() {
+                break;
+            }
+            let client = self.client;
+            let results = std::thread::scope(|scope| {
+                let workers: Vec<_> = batch
+                    .into_iter()
+                    .map(|(path, bytes)| {
+                        scope.spawn(move || {
+                            let digest = risunest_sync_wire::hash(&bytes);
+                            let reply = client.request(
+                                Method::PUT,
+                                &path,
+                                &[],
+                                Some(bytes),
+                                &[("x-content-sha256", digest)],
+                                MAX_METADATA_BYTES,
+                            )?;
+                            if reply.status != 204 {
+                                return Err(response_error(reply));
+                            }
+                            Ok(())
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|worker| {
+                        worker
+                            .join()
+                            .unwrap_or_else(|_| Err(SyncError::new("chunk-worker-failed", 500)))
+                    })
+                    .collect::<Vec<_>>()
+            });
+            // Join every request before returning. Accepted chunks remain in
+            // the server bitmap even when the other response is lost.
+            for result in results {
+                result?;
             }
         }
         let (status, result): (_, serde_json::Value) = self.client.json(
@@ -804,44 +835,92 @@ impl<'a> Transfer<'a> {
         if size > 1024 * 1024 * 1024 * 1024 {
             return Err(SyncError::new("object-too-large", 413));
         }
-        for index in 0..size.div_ceil(CHUNK as u64) {
-            let offset = index * CHUNK as u64;
-            let length = (size - offset).min(CHUNK as u64);
-            let cached: Option<(String, i64)> = self
-                .db
-                .query_row(
-                    "SELECT hash,size FROM chunks WHERE target=?1 AND part=?2",
-                    params![target, index as i64],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            if let Some((hash, stored)) = cached {
-                if stored >= 0 && stored as u64 == length && self.cache.read(&hash, CHUNK).is_ok() {
-                    continue;
+        let mut indices = 0..size.div_ceil(CHUNK as u64);
+        loop {
+            let mut batch = Vec::with_capacity(2);
+            for index in indices.by_ref() {
+                let offset = index * CHUNK as u64;
+                let length = (size - offset).min(CHUNK as u64);
+                let cached: Option<(String, i64)> = self
+                    .db
+                    .query_row(
+                        "SELECT hash,size FROM chunks WHERE target=?1 AND part=?2",
+                        params![target, index as i64],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((hash, stored)) = cached {
+                    if stored >= 0
+                        && stored as u64 == length
+                        && self.cache.read(&hash, CHUNK).is_ok()
+                    {
+                        continue;
+                    }
+                }
+                batch.push((index, offset, length));
+                if batch.len() == 2 {
+                    break;
                 }
             }
-            let end = offset + length - 1;
-            let reply = self.client.request(
-                Method::GET,
-                &format!("objects/{target}"),
-                &[],
-                None,
-                &[
-                    ("range", format!("bytes={offset}-{end}")),
-                    ("if-range", format!("\"{target}\"")),
-                ],
-                CHUNK,
-            )?;
-            if reply.status != 206 {
-                return Err(response_error(reply));
+            if batch.is_empty() {
+                break;
             }
-            if reply.content_range.as_deref() != Some(&format!("bytes {offset}-{end}/{size}"))
-                || reply.body.len() as u64 != length
-            {
-                return Err(SyncError::new("invalid-object-range", 502));
+            let client = self.client;
+            let results = std::thread::scope(|scope| {
+                let workers: Vec<_> = batch
+                    .into_iter()
+                    .map(|(index, offset, length)| {
+                        scope.spawn(move || {
+                            let end = offset + length - 1;
+                            let reply = client.request(
+                                Method::GET,
+                                &format!("objects/{target}"),
+                                &[],
+                                None,
+                                &[
+                                    ("range", format!("bytes={offset}-{end}")),
+                                    ("if-range", format!("\"{target}\"")),
+                                ],
+                                CHUNK,
+                            )?;
+                            if reply.status != 206 {
+                                return Err(response_error(reply));
+                            }
+                            if reply.content_range.as_deref()
+                                != Some(&format!("bytes {offset}-{end}/{size}"))
+                                || reply.body.len() as u64 != length
+                            {
+                                return Err(SyncError::new("invalid-object-range", 502));
+                            }
+                            Ok((index, length, reply.body))
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|worker| {
+                        worker
+                            .join()
+                            .unwrap_or_else(|_| Err(SyncError::new("chunk-worker-failed", 500)))
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let mut failure = None;
+            for result in results {
+                let stored = result.and_then(|(index, length, bytes)| {
+                    let hash = self.cache.put(&bytes)?;
+                    self.db.execute("INSERT INTO chunks VALUES(?1,?2,?3,?4) ON CONFLICT(target,part) DO UPDATE SET hash=excluded.hash,size=excluded.size",params![target,index as i64,hash,length as i64])?;
+                    Ok(())
+                });
+                if let Err(error) = stored {
+                    failure.get_or_insert(error);
+                }
             }
-            let hash = self.cache.put(&reply.body)?;
-            self.db.execute("INSERT INTO chunks VALUES(?1,?2,?3,?4) ON CONFLICT(target,part) DO UPDATE SET hash=excluded.hash,size=excluded.size",params![target,index as i64,hash,length as i64])?;
+            // Persist all verified successes, including those after a failed
+            // sibling, before the caller retries the remaining ranges.
+            if let Some(error) = failure {
+                return Err(error);
+            }
         }
         let mut reader = ChunkReader {
             transfer: self,
