@@ -51,9 +51,11 @@ dist.zip
 !/scripts/phase3AndroidSmoke.mjs
 !/scripts/phase3AndroidSmoke.test.ts
 !/scripts/realmBlocklist.mjs
+!/scripts/compatibleExport*.mjs
 .env
 /server/node/ssl/certificate
 .worktrees/
+/.tmp/
 temp
 .claude
 .codex

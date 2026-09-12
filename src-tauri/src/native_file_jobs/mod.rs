@@ -8,8 +8,11 @@ mod error;
 mod jpeg_asset;
 pub mod screenshot_output;
 
+mod backup_source;
 mod legacy_backup;
 mod lossless;
+mod portable;
+pub(crate) use backup_source::*;
 mod official_snapshot;
 mod risum_export;
 mod verified_read;
@@ -228,7 +231,22 @@ pub(crate) enum NativeFileJobStartRequest {
         destination: Option<String>,
         expected_revision: i64,
     },
+    ExportPortableBackup {
+        destination: Option<String>,
+        expected_revision: i64,
+        selection: portable::PortableSelection,
+    },
+    RestorePortableBackup {
+        source: JobSource,
+        expected_revision: i64,
+        selection: Option<portable::PortableSelection>,
+    },
     ExportLegacyLocalBackup {
+        destination: Option<String>,
+        expected_revision: i64,
+    },
+    ExportCompatibleLocalBackup {
+        target: legacy_backup::CompatibilityTarget,
         destination: Option<String>,
         expected_revision: i64,
     },
@@ -1231,6 +1249,54 @@ impl NativeFileJobState {
                     store,
                 }
             }
+            NativeFileJobStartRequest::ExportPortableBackup {
+                destination,
+                expected_revision,
+                selection,
+            } => {
+                let destination = destination.map(PathBuf::from);
+                if let Some(path) = destination.as_deref() {
+                    validate_desktop_destination(path)?;
+                }
+                let store =
+                    crate::persistent_store::commands::with_store_mut(app.state(), |store| {
+                        store.open_native_job_store()
+                    })
+                    .map_err(native_store_error)?;
+                NativeFileJobTask::ExportPortable {
+                    destination,
+                    expected_revision,
+                    store,
+                    selection,
+                    app,
+                }
+            }
+            NativeFileJobStartRequest::RestorePortableBackup {
+                source,
+                expected_revision,
+                selection,
+            } => {
+                let opened_source = match &source {
+                    JobSource::DesktopPath { .. } => Some(open_job_source(&self.root, &source)?),
+                    JobSource::AndroidSpool { token } => {
+                        parse_android_spool_token(token)?;
+                        None
+                    }
+                };
+                let store =
+                    crate::persistent_store::commands::with_store_mut(app.state(), |store| {
+                        store.open_native_job_store()
+                    })
+                    .map_err(native_store_error)?;
+                NativeFileJobTask::RestorePortable {
+                    opened_source,
+                    source,
+                    expected_revision,
+                    store,
+                    selection,
+                    app,
+                }
+            }
             NativeFileJobStartRequest::ExportLegacyLocalBackup {
                 destination,
                 expected_revision,
@@ -1245,6 +1311,27 @@ impl NativeFileJobState {
                     })
                     .map_err(native_store_error)?;
                 NativeFileJobTask::ExportLegacyLocalBackup {
+                    destination,
+                    expected_revision,
+                    store,
+                }
+            }
+            NativeFileJobStartRequest::ExportCompatibleLocalBackup {
+                target,
+                destination,
+                expected_revision,
+            } => {
+                let destination = destination.map(PathBuf::from);
+                if let Some(destination) = destination.as_deref() {
+                    validate_desktop_destination(destination)?;
+                }
+                let store =
+                    crate::persistent_store::commands::with_store_mut(app.state(), |store| {
+                        store.open_native_job_store()
+                    })
+                    .map_err(native_store_error)?;
+                NativeFileJobTask::ExportCompatibleLocalBackup {
+                    target,
                     destination,
                     expected_revision,
                     store,
@@ -1633,6 +1720,8 @@ impl NativeFileJobState {
         let exclusive = matches!(
             task.kind(),
             JobKind::ExportLosslessBackup
+                | JobKind::ExportPortableBackup
+                | JobKind::RestorePortableBackup
                 | JobKind::RestoreLosslessBackup
                 | JobKind::RestoreBlockRisuSave
                 | JobKind::RestoreLegacyLocalBackup
@@ -1643,7 +1732,9 @@ impl NativeFileJobState {
             .file(exclusive)
             .map_err(|code| NativeJobError::new(code, "Another library operation is running"))?;
         // Admission prevents a new server operation between this check and activation.
-        if let NativeFileJobTask::RestoreLossless { store, .. } = &task {
+        if let NativeFileJobTask::RestoreLossless { store, .. }
+        | NativeFileJobTask::RestorePortable { store, .. } = &task
+        {
             let status = store.server_status().map_err(|_| {
                 NativeJobError::new(
                     "server-status-unavailable",
@@ -1675,6 +1766,7 @@ impl NativeFileJobState {
                     && matches!(
                         kind,
                         JobKind::RestoreBlockRisuSave
+                            | JobKind::RestorePortableBackup
                             | JobKind::RestoreLosslessBackup
                             | JobKind::RestoreOfficialAccountSnapshot
                             | JobKind::RestoreLegacyLocalBackup
@@ -1698,6 +1790,11 @@ impl NativeFileJobState {
                     ..
                 }
                 | NativeFileJobTask::RestoreLossless {
+                    opened_source,
+                    source,
+                    ..
+                }
+                | NativeFileJobTask::RestorePortable {
                     opened_source,
                     source,
                     ..
@@ -1752,6 +1849,43 @@ impl NativeFileJobState {
             let _admission = admission;
             let _worker_permit = worker_permit;
             let outcome = match task {
+                NativeFileJobTask::ExportPortable {
+                    destination,
+                    expected_revision,
+                    store,
+                    selection,
+                    app,
+                } => portable::export_portable(
+                    destination.as_deref(),
+                    expected_revision,
+                    &owned_directory,
+                    &root.join("handoffs"),
+                    store,
+                    &job,
+                    Some((&app, &selection)),
+                ),
+                NativeFileJobTask::RestorePortable {
+                    opened_source,
+                    source,
+                    expected_revision,
+                    store,
+                    selection,
+                    app,
+                } => match opened_source {
+                    Some(input) => portable::restore_portable(
+                        input,
+                        matches!(source, JobSource::AndroidSpool { .. }),
+                        expected_revision,
+                        &owned_directory,
+                        store,
+                        &job,
+                        Some((&app, selection.as_ref())),
+                    ),
+                    None => Err(NativeJobError::new(
+                        "store-error",
+                        "portable input was not prepared",
+                    )),
+                },
                 NativeFileJobTask::Restore {
                     opened_source,
                     expected_revision,
@@ -1858,6 +1992,20 @@ impl NativeFileJobState {
                     expected_revision,
                     store,
                 } => legacy_backup::export_legacy_local_backup(
+                    destination.as_deref(),
+                    expected_revision,
+                    &owned_directory,
+                    &root.join("handoffs"),
+                    store,
+                    &job,
+                ),
+                NativeFileJobTask::ExportCompatibleLocalBackup {
+                    target,
+                    destination,
+                    expected_revision,
+                    store,
+                } => legacy_backup::export_compatible_local_backup(
+                    target,
                     destination.as_deref(),
                     expected_revision,
                     &owned_directory,
@@ -2247,6 +2395,21 @@ enum RestoreJobSink {
 }
 
 enum NativeFileJobTask {
+    ExportPortable {
+        destination: Option<PathBuf>,
+        expected_revision: i64,
+        store: crate::persistent_store::PersistentStore,
+        selection: portable::PortableSelection,
+        app: AppHandle,
+    },
+    RestorePortable {
+        opened_source: Option<OpenedJobSource>,
+        source: JobSource,
+        expected_revision: i64,
+        store: crate::persistent_store::PersistentStore,
+        selection: Option<portable::PortableSelection>,
+        app: AppHandle,
+    },
     Restore {
         opened_source: Option<OpenedJobSource>,
         source: JobSource,
@@ -2284,6 +2447,12 @@ enum NativeFileJobTask {
         app: AppHandle,
     },
     ExportLegacyLocalBackup {
+        destination: Option<PathBuf>,
+        expected_revision: i64,
+        store: crate::persistent_store::PersistentStore,
+    },
+    ExportCompatibleLocalBackup {
+        target: legacy_backup::CompatibilityTarget,
         destination: Option<PathBuf>,
         expected_revision: i64,
         store: crate::persistent_store::PersistentStore,
@@ -2330,6 +2499,8 @@ enum NativeFileJobTask {
 impl NativeFileJobTask {
     fn kind(&self) -> JobKind {
         match self {
+            Self::ExportPortable { .. } => JobKind::ExportPortableBackup,
+            Self::RestorePortable { .. } => JobKind::RestorePortableBackup,
             Self::Restore { .. } => JobKind::RestoreBlockRisuSave,
             Self::Export { .. } => JobKind::ExportBlockRisuSave,
             Self::RestoreLossless { .. } => JobKind::RestoreLosslessBackup,
@@ -2337,6 +2508,7 @@ impl NativeFileJobTask {
             Self::ExportLossless { .. } => JobKind::ExportLosslessBackup,
             Self::RestoreLegacyLocalBackup { .. } => JobKind::RestoreLegacyLocalBackup,
             Self::ExportLegacyLocalBackup { .. } => JobKind::ExportLegacyLocalBackup,
+            Self::ExportCompatibleLocalBackup { .. } => JobKind::ExportCompatibleLocalBackup,
             Self::ExportCharacterCharx { .. } => JobKind::ExportCharacterCharx,
             Self::ExportCharacterCard { .. } => JobKind::ExportCharacterCard,
             Self::ExportRisuModule { .. } => JobKind::ExportRisuModule,
@@ -2350,6 +2522,12 @@ impl NativeFileJobTask {
 
     fn expected_revision(&self) -> i64 {
         match self {
+            Self::ExportPortable {
+                expected_revision, ..
+            }
+            | Self::RestorePortable {
+                expected_revision, ..
+            } => *expected_revision,
             Self::Restore {
                 expected_revision, ..
             }
@@ -2369,6 +2547,9 @@ impl NativeFileJobTask {
                 expected_revision, ..
             }
             | Self::ExportLegacyLocalBackup {
+                expected_revision, ..
+            }
+            | Self::ExportCompatibleLocalBackup {
                 expected_revision, ..
             }
             | Self::ImportJpegAsset {
@@ -2587,6 +2768,23 @@ pub(crate) fn native_file_job_list(
 }
 
 #[tauri::command(async)]
+pub(crate) fn native_portable_select_sections(
+    state: State<'_, NativeFileJobState>,
+    job_id: String,
+    selection: portable::PortableSelection,
+) -> Result<(), NativeJobError> {
+    let job = state
+        .registry
+        .lookup(&job_id)
+        .map_err(|e| NativeJobError::new("store-error", e))?
+        .ok_or_else(|| {
+            NativeJobError::new("job-not-found", "Portable backup job is unavailable")
+        })?;
+    job.select_portable_sections(selection)
+        .map_err(|e| NativeJobError::new("invalid-selection", e))
+}
+
+#[tauri::command(async)]
 pub(crate) fn native_file_job_finalize(
     state: State<'_, NativeFileJobState>,
     job_id: String,
@@ -2613,9 +2811,38 @@ pub(crate) fn native_file_job_official_publication_retry(
 #[tauri::command(async)]
 pub(crate) fn native_file_job_forget(
     state: State<'_, NativeFileJobState>,
+    device: State<'_, crate::device_backup::DeviceBackupState>,
     job_id: String,
 ) -> Result<bool, NativeJobError> {
+    forget_device_session(&state, &device, &job_id)?;
     state.forget(&job_id)
+}
+
+fn forget_device_session(
+    state: &NativeFileJobState,
+    device: &crate::device_backup::DeviceBackupState,
+    job_id: &str,
+) -> Result<(), NativeJobError> {
+    let Some(job) = state
+        .registry
+        .lookup(job_id)
+        .map_err(|failure| NativeJobError::new("store-error", failure))?
+    else {
+        return Ok(());
+    };
+    let status = job.status();
+    if !status.state.is_terminal() {
+        return Err(NativeJobError::new(
+            "job-active",
+            "Cannot forget an active native file job",
+        ));
+    }
+    if let Some(id) = status.device_session_id {
+        device
+            .cleanup(&id)
+            .map_err(|failure| NativeJobError::new("cleanup-failed", failure.to_string()))?;
+    }
+    Ok(())
 }
 
 #[tauri::command(async)]
@@ -2624,6 +2851,20 @@ pub(crate) fn native_lossless_handoff_cleanup(
     path: String,
 ) -> Result<bool, NativeJobError> {
     cleanup_lossless_handoff_path(&state.root, Path::new(&path))
+}
+
+#[tauri::command(async)]
+pub(crate) fn native_portable_handoff_cleanup(
+    state: State<'_, NativeFileJobState>,
+    path: String,
+) -> Result<bool, NativeJobError> {
+    cleanup_handoff_path(
+        &state.root,
+        Path::new(&path),
+        "risunest-backup-",
+        ".risunest",
+        "portable backup",
+    )
 }
 
 #[tauri::command(async)]
@@ -2661,6 +2902,8 @@ pub(crate) fn native_risu_module_handoff_cleanup(
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum JobKind {
+    ExportPortableBackup,
+    RestorePortableBackup,
     RestoreBlockRisuSave,
     RestoreLosslessBackup,
     RestoreOfficialAccountSnapshot,
@@ -2668,6 +2911,7 @@ pub(crate) enum JobKind {
     ExportBlockRisuSave,
     ExportLosslessBackup,
     ExportLegacyLocalBackup,
+    ExportCompatibleLocalBackup,
     ExportCharacterCharx,
     ExportCharacterCard,
     ExportRisuModule,
@@ -2693,6 +2937,8 @@ pub(crate) enum JobState {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum JobPhase {
+    AwaitingBackupSelection,
+    AwaitingDeviceMaintenance,
     Queued,
     ReadingSource,
     AwaitingContentMapping,
@@ -2906,6 +3152,14 @@ pub(crate) struct JobStatus {
     pub(crate) prepared_content: Option<PreparedContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) publication_attempt: Option<OfficialPublicationAttemptResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) compatibility_report: Option<legacy_backup::CompatibilityReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) preservation_report: Option<crate::portable_backup::PreservationReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) device_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) restore_preview: Option<portable::RestorePreview>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -2960,6 +3214,7 @@ pub(crate) struct JobRegistry {
 
 #[derive(Default)]
 struct JobWaitState {
+    portable_selection: Option<portable::PortableSelection>,
     restore_finalized: bool,
     official_publication_retry: Option<OfficialPublicationRetryInput>,
 }
@@ -2998,6 +3253,7 @@ impl JobRegistry {
             matches!(
                 kind,
                 JobKind::RestoreBlockRisuSave
+                    | JobKind::RestorePortableBackup
                     | JobKind::RestoreLosslessBackup
                     | JobKind::RestoreOfficialAccountSnapshot
                     | JobKind::RestoreLegacyLocalBackup
@@ -3034,6 +3290,10 @@ impl JobRegistry {
                 error: None,
                 prepared_content: None,
                 publication_attempt: None,
+                compatibility_report: None,
+                preservation_report: None,
+                device_session_id: None,
+                restore_preview: None,
             }),
         });
         self.jobs
@@ -3157,6 +3417,143 @@ pub(crate) struct JobControl {
 }
 
 impl JobControl {
+    fn set_preservation_report(
+        &self,
+        report: crate::portable_backup::PreservationReport,
+    ) -> Result<(), String> {
+        let mut status = self
+            .status
+            .lock()
+            .map_err(|_| "native job mutex poisoned".to_owned())?;
+        if status.state.is_terminal() {
+            return Err("cannot change completed preservation report".into());
+        }
+        status.preservation_report = Some(report);
+        Ok(())
+    }
+    fn wait_for_portable_selection(
+        &self,
+        preview: portable::RestorePreview,
+    ) -> Result<portable::PortableSelection, String> {
+        {
+            let mut status = self
+                .status
+                .lock()
+                .map_err(|_| "native job mutex poisoned".to_owned())?;
+            if status.kind != JobKind::RestorePortableBackup
+                || status.state != JobState::Running
+                || status.phase != JobPhase::ReadingSource
+            {
+                return Err("portable preview requires reading job".into());
+            }
+            status.restore_preview = Some(preview);
+            status.state = JobState::WaitingForInput;
+            status.phase = JobPhase::AwaitingBackupSelection;
+        }
+        let mut wait = self
+            .wait_state
+            .lock()
+            .map_err(|_| "native job wait mutex poisoned".to_owned())?;
+        loop {
+            if self.is_cancel_requested() {
+                return Err("portable restore cancelled during selection".into());
+            }
+            if let Some(selection) = wait.portable_selection.take() {
+                return Ok(selection);
+            }
+            wait = self
+                .wait_changed
+                .wait(wait)
+                .map_err(|_| "native selection wait failed".to_owned())?;
+        }
+    }
+    fn select_portable_sections(
+        &self,
+        selection: portable::PortableSelection,
+    ) -> Result<(), String> {
+        let mut status = self
+            .status
+            .lock()
+            .map_err(|_| "native job mutex poisoned".to_owned())?;
+        if status.state != JobState::WaitingForInput
+            || status.phase != JobPhase::AwaitingBackupSelection
+            || self.is_cancel_requested()
+        {
+            return Err("portable selection is not pending".into());
+        }
+        let preview = status
+            .restore_preview
+            .as_ref()
+            .ok_or("portable preview missing")?;
+        if !selection.library && selection.device_sections.is_empty()
+            || selection.library && (!preview.library_included || preview.repair_required)
+            || selection
+                .device_sections
+                .iter()
+                .any(|s| !preview.device_sections.contains(s))
+            || selection
+                .device_sections
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                != selection.device_sections.len()
+        {
+            return Err("invalid portable restore selection".into());
+        }
+        self.wait_state
+            .lock()
+            .map_err(|_| "native job wait mutex poisoned".to_owned())?
+            .portable_selection = Some(selection);
+        status.state = JobState::Running;
+        status.phase = JobPhase::ReadingSource;
+        self.wait_changed.notify_all();
+        Ok(())
+    }
+    fn set_device_session(&self, id: &str) -> Result<(), String> {
+        let mut status = self
+            .status
+            .lock()
+            .map_err(|_| "native job mutex poisoned".to_owned())?;
+        if status.state != JobState::Running {
+            return Err("device maintenance requires running job".into());
+        }
+        status.device_session_id = Some(id.into());
+        status.phase = JobPhase::AwaitingDeviceMaintenance;
+        status.state = JobState::WaitingForInput;
+        Ok(())
+    }
+    fn leave_device_wait(&self, activating: bool) -> Result<(), String> {
+        let mut status = self
+            .status
+            .lock()
+            .map_err(|_| "native job mutex poisoned".to_owned())?;
+        if status.state != JobState::WaitingForInput
+            || status.phase != JobPhase::AwaitingDeviceMaintenance
+        {
+            return Err("device maintenance is not waiting".into());
+        }
+        status.state = JobState::Running;
+        status.phase = if activating {
+            JobPhase::ActivatingDatabase
+        } else {
+            JobPhase::WritingExport
+        };
+        Ok(())
+    }
+    pub(crate) fn set_compatibility_report(
+        &self,
+        report: legacy_backup::CompatibilityReport,
+    ) -> Result<(), String> {
+        let mut status = self
+            .status
+            .lock()
+            .map_err(|error| format!("native job status mutex poisoned: {error}"))?;
+        if status.state.is_terminal() {
+            return Err("native job report cannot change after completion".into());
+        }
+        status.compatibility_report = Some(report);
+        Ok(())
+    }
     pub(crate) fn id(&self) -> String {
         self.status().job_id
     }
@@ -3186,6 +3583,8 @@ impl JobControl {
             || (status.kind == JobKind::ExportCharacterCharx && status.state.is_terminal())
             || (status.kind == JobKind::ExportCharacterCard && status.state.is_terminal())
             || (status.kind == JobKind::ExportRisuModule && status.state.is_terminal())
+            || (status.kind == JobKind::ExportPortableBackup && status.state.is_terminal())
+            || (status.device_session_id.is_some() && status.state.is_terminal())
             || (status.kind == JobKind::OfficialPublicationUpload && status.state.is_terminal()))
     }
 
@@ -3231,6 +3630,7 @@ impl JobControl {
         if !matches!(
             status.kind,
             JobKind::RestoreBlockRisuSave
+                | JobKind::RestorePortableBackup
                 | JobKind::RestoreLosslessBackup
                 | JobKind::RestoreOfficialAccountSnapshot
                 | JobKind::RestoreLegacyLocalBackup
@@ -3279,6 +3679,7 @@ impl JobControl {
             if !matches!(
                 status.kind,
                 JobKind::RestoreBlockRisuSave
+                    | JobKind::RestorePortableBackup
                     | JobKind::RestoreLosslessBackup
                     | JobKind::RestoreOfficialAccountSnapshot
                     | JobKind::RestoreLegacyLocalBackup
@@ -3456,6 +3857,8 @@ impl JobControl {
             .lock()
             .map_err(|error| format!("native job status mutex poisoned: {error}"))?;
         let expected = match status.kind {
+            JobKind::RestorePortableBackup => JobPhase::ReadingSource,
+            JobKind::ExportPortableBackup => JobPhase::WritingExport,
             JobKind::RestoreBlockRisuSave => JobPhase::ReadingSource,
             JobKind::RestoreLosslessBackup => JobPhase::ReadingSource,
             JobKind::RestoreOfficialAccountSnapshot => JobPhase::ReadingSource,
@@ -3463,6 +3866,7 @@ impl JobControl {
             JobKind::ExportBlockRisuSave => JobPhase::WritingExport,
             JobKind::ExportLosslessBackup => JobPhase::WritingExport,
             JobKind::ExportLegacyLocalBackup => JobPhase::WritingExport,
+            JobKind::ExportCompatibleLocalBackup => JobPhase::WritingExport,
             JobKind::ExportCharacterCharx => JobPhase::WritingExport,
             JobKind::ExportCharacterCard => JobPhase::WritingExport,
             JobKind::ExportRisuModule => JobPhase::WritingExport,
@@ -3922,7 +4326,10 @@ impl JobPhase {
     fn rank(self) -> u8 {
         match self {
             Self::Queued => 0,
-            Self::ReadingSource | Self::WritingExport => 1,
+            Self::ReadingSource
+            | Self::WritingExport
+            | Self::AwaitingDeviceMaintenance
+            | Self::AwaitingBackupSelection => 1,
             Self::AwaitingContentMapping
             | Self::StagingDatabase
             | Self::PublishingDestination
@@ -4051,6 +4458,44 @@ mod tests {
             json!("C:\\app\\persistent\\recovery\\lossless-123.risudat")
         );
         assert!(encoded.get("bytes").is_none());
+    }
+
+    #[test]
+    fn compatible_backup_export_requires_target_and_uses_export_phase() {
+        for target in ["risuai", "pocketrisu"] {
+            for destination in [Value::Null, json!("C:\\chosen\\backup.bin")] {
+                let request: NativeFileJobStartRequest = serde_json::from_value(json!({
+                    "kind": "export-compatible-local-backup",
+                    "target": target,
+                    "destination": destination,
+                    "expectedRevision": 12,
+                }))
+                .unwrap();
+                assert!(matches!(
+                    request,
+                    NativeFileJobStartRequest::ExportCompatibleLocalBackup {
+                        expected_revision: 12,
+                        ..
+                    }
+                ));
+            }
+        }
+        for target in [Value::Null, json!("unknown")] {
+            assert!(serde_json::from_value::<NativeFileJobStartRequest>(json!({
+                "kind": "export-compatible-local-backup",
+                "target": target,
+                "expectedRevision": 12,
+            }))
+            .is_err());
+        }
+        let registry = JobRegistry::default();
+        let job = registry
+            .create_with_context(JobKind::ExportCompatibleLocalBackup, Some(12), Vec::new())
+            .unwrap();
+        assert!(job.start(JobPhase::ReadingSource).is_err());
+        job.start(JobPhase::WritingExport).unwrap();
+        assert_eq!(job.status().kind, JobKind::ExportCompatibleLocalBackup);
+        assert_eq!(job.status().phase, JobPhase::WritingExport);
     }
 
     #[test]
@@ -6360,6 +6805,44 @@ mod tests {
     }
 
     #[test]
+    fn device_job_cleanup_failure_keeps_the_terminal_receipt_for_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = NativeFileJobState::initialize(directory.path().to_owned());
+        let device = crate::device_backup::DeviceBackupState::initialize(
+            directory.path().join("device-backup"),
+        );
+        let pds = crate::persistent_store::PersistentStoreState::default();
+        device
+            .attach_maintenance_guard(pds.acquire_device_maintenance().unwrap())
+            .unwrap();
+        let job = state
+            .registry
+            .create(JobKind::ExportPortableBackup)
+            .unwrap();
+        job.start(JobPhase::WritingExport).unwrap();
+        let session = device
+            .create_session(
+                &job.id(),
+                crate::device_backup::Operation::Capture,
+                false,
+                &["local-storage".into()],
+                None,
+                None,
+            )
+            .unwrap();
+        job.set_device_session(&session).unwrap();
+        job.finish_failure("synthetic", "synthetic failure")
+            .unwrap();
+        assert_eq!(
+            forget_device_session(&state, &device, &job.id())
+                .unwrap_err()
+                .code,
+            "cleanup-failed"
+        );
+        assert!(state.registry.lookup(&job.id()).unwrap().is_some());
+        assert!(job.retains_terminal_receipt_until_forget().unwrap());
+    }
+    #[test]
     fn terminal_status_rejects_unbounded_results_and_sanitizes_errors() {
         let registry = JobRegistry::default();
         let success = registry.create(JobKind::RestoreBlockRisuSave).unwrap();
@@ -7024,6 +7507,15 @@ mod tests {
         let cleanup_for = |kind: &str| -> Cleanup {
             match kind {
                 "lossless-backup" => cleanup_lossless_handoff_path,
+                "portable-backup" => |root, path| {
+                    cleanup_handoff_path(
+                        root,
+                        path,
+                        "risunest-backup-",
+                        ".risunest",
+                        "portable backup",
+                    )
+                },
                 "legacy-backup" => cleanup_legacy_backup_handoff_path,
                 "character-charx" => cleanup_character_charx_handoff_path,
                 "character-card" => cleanup_character_card_handoff_path,
@@ -7032,7 +7524,7 @@ mod tests {
             }
         };
         let grammars = fixture["managedHandoffs"].as_array().unwrap();
-        assert_eq!(grammars.len(), 5, "grammar count drifted from the fixture");
+        assert_eq!(grammars.len(), 6, "grammar count drifted from the fixture");
 
         for grammar in grammars {
             let kind = grammar["kind"].as_str().unwrap();

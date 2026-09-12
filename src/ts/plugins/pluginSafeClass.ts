@@ -1,10 +1,5 @@
-import localforage from "localforage";
+import { pluginDeviceStorage as pluginStorage } from "./pluginDeviceStorage";
 import { toGetter } from "../globalApi.svelte";
-
-const pluginStorage = localforage.createInstance({
-    name: 'plugin',
-    storeName: 'plugin'
-})
 
 export class SafeLocalStorage {
     getItem(key: string): string | null {

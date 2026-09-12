@@ -10,7 +10,13 @@ function fixture() {
     endpoint: "http://localhost",
     libraryId: "library",
     deviceId: "device",
-    head: { libraryId: "library", epoch: "epoch", seq: "1", headId: "head", minRetainedSeq: "0" },
+    head: {
+      libraryId: "library",
+      epoch: "epoch",
+      seq: "1",
+      headId: "head",
+      minRetainedSeq: "0",
+    },
     dirtyRecords: 0,
     fullScan: false,
     registrationRequired: false,
@@ -18,7 +24,12 @@ function fixture() {
   };
   const facade = {
     status: vi.fn(async () => status),
-    cycle: vi.fn(async () => ({ phase: "idle", conflictCount: 0, localRevision: 3, head: status.head })),
+    cycle: vi.fn(async () => ({
+      phase: "idle",
+      conflictCount: 0,
+      localRevision: 3,
+      head: status.head,
+    })),
     cancel: vi.fn(async () => {}),
     needsRefresh: vi.fn(() => false),
     bind: vi.fn(async () => status),
@@ -33,11 +44,35 @@ function fixture() {
 }
 afterEach(() => vi.useRealTimers());
 describe("server sync controller", () => {
+  it("holds a restored library across initialization until an explicit sync action", async () => {
+    const { facade } = fixture();
+    const resumed = vi.fn();
+    const controller = createServerSyncController(
+      facade as unknown as ServerSyncFacade,
+      { initiallyPaused: true, onExplicitResume: resumed },
+    );
+    await controller.initialize();
+    expect(controller.snapshot().paused).toBe(true);
+    expect(controller.canAutoSync()).toBe(false);
+    expect(facade.cycle).not.toHaveBeenCalled();
+    expect(resumed).not.toHaveBeenCalled();
+    await controller.synchronize();
+    expect(resumed).toHaveBeenCalledOnce();
+    expect(controller.canAutoSync()).toBe(true);
+    controller.holdAutomaticSync();
+    expect(controller.canAutoSync()).toBe(false);
+  });
   it.each(["idle", "conflict"])(
     "keeps the %s result when progress publishes while the cycle awaits",
     async (phase) => {
       const { controller, facade } = fixture();
-      const result = { phase, conflictCount: phase === "conflict" ? 1 : 0, localRevision: 3, head: controller.snapshot().status?.head ?? (await facade.status()).head };
+      const result = {
+        phase,
+        conflictCount: phase === "conflict" ? 1 : 0,
+        localRevision: 3,
+        head:
+          controller.snapshot().status?.head ?? (await facade.status()).head,
+      };
       facade.cycle.mockImplementationOnce(async () => {
         controller.reportProgress("preparing");
         await Promise.resolve();
@@ -81,14 +116,24 @@ describe("server sync controller", () => {
     facade.cycle.mockRejectedValueOnce({ code: "server-unreachable" });
     await controller.synchronize();
     expect(controller.snapshot().lastSuccessAt).toBe(1000);
-    facade.cycle.mockResolvedValueOnce({ phase: "conflict", conflictCount: 1, localRevision: 3, head: controller.snapshot().status!.head! });
+    facade.cycle.mockResolvedValueOnce({
+      phase: "conflict",
+      conflictCount: 1,
+      localRevision: 3,
+      head: controller.snapshot().status!.head!,
+    });
     await controller.synchronize();
     expect(controller.snapshot().lastSuccessAt).toBe(1000);
   });
   it("holds conflicts for an explicit choice and forwards the preview fence", async () => {
     const { controller, facade } = fixture();
     await controller.initialize();
-    facade.cycle.mockResolvedValueOnce({ phase: "conflict", conflictCount: 2, localRevision: 3, head: controller.snapshot().status!.head! });
+    facade.cycle.mockResolvedValueOnce({
+      phase: "conflict",
+      conflictCount: 2,
+      localRevision: 3,
+      head: controller.snapshot().status!.head!,
+    });
     await controller.synchronize();
     expect(controller.canAutoSync()).toBe(false);
     const options = { resolution: "keep-local" as const, expectedRevision: 3 };
@@ -100,7 +145,12 @@ describe("server sync controller", () => {
     vi.useFakeTimers();
     const { controller, facade } = fixture();
     await controller.initialize();
-    facade.cycle.mockResolvedValue({ phase: "pending", conflictCount: 0, localRevision: 3, head: controller.snapshot().status!.head! });
+    facade.cycle.mockResolvedValue({
+      phase: "pending",
+      conflictCount: 0,
+      localRevision: 3,
+      head: controller.snapshot().status!.head!,
+    });
     const first = controller.synchronize();
     expect(controller.synchronize()).toBe(first);
     await vi.runAllTimersAsync();
@@ -153,109 +203,180 @@ describe("common completion and replacement contract", () => {
   it("unknown or failed native status never authorizes restoration", async () => {
     const { controller, facade } = fixture();
     expect(controller.canRestore()).toBe(false);
-    await controller.initialize(); expect(controller.canRestore()).toBe(true);
+    await controller.initialize();
+    expect(controller.canRestore()).toBe(true);
     facade.status.mockRejectedValue(new Error("offline local IPC"));
-    await controller.initialize(); expect(controller.canRestore()).toBe(false);
-    const apply = vi.fn(); await expect(controller.withReplacement(apply)).rejects.toThrow();
-    expect(apply).not.toHaveBeenCalled(); expect(controller.snapshot().replacing).toBe(false);
+    await controller.initialize();
+    expect(controller.canRestore()).toBe(false);
+    const apply = vi.fn();
+    await expect(controller.withReplacement(apply)).rejects.toThrow();
+    expect(apply).not.toHaveBeenCalled();
+    expect(controller.snapshot().replacing).toBe(false);
   });
   it.each([
-    { dirtyRecords: 1 }, { fullScan: true }, { operationPending: true },
-    { registrationRequired: true }, { reconciling: true }, { configured: false },
-    { localRevision: 4 }, { deviceId: "other" },
-  ])("does not complete an idle result with a new tail or changed status %o", async (patch) => {
-    const { controller, facade, status } = fixture();
-    facade.status.mockResolvedValueOnce(status).mockResolvedValueOnce({ ...status, ...patch });
-    await controller.synchronize(); expect(controller.snapshot().initialSyncComplete).toBe(false);
-    expect(controller.snapshot().lastSuccessAt).toBeUndefined();
-  });
+    { dirtyRecords: 1 },
+    { fullScan: true },
+    { operationPending: true },
+    { registrationRequired: true },
+    { reconciling: true },
+    { configured: false },
+    { localRevision: 4 },
+    { deviceId: "other" },
+  ])(
+    "does not complete an idle result with a new tail or changed status %o",
+    async (patch) => {
+      const { controller, facade, status } = fixture();
+      facade.status
+        .mockResolvedValueOnce(status)
+        .mockResolvedValueOnce({ ...status, ...patch });
+      await controller.synchronize();
+      expect(controller.snapshot().initialSyncComplete).toBe(false);
+      expect(controller.snapshot().lastSuccessAt).toBeUndefined();
+    },
+  );
   it("ties completion to a new attempt and clears the old result while retrying", async () => {
     const { controller, facade } = fixture();
-    await controller.synchronize(); expect(controller.snapshot().initialSyncComplete).toBe(true);
+    await controller.synchronize();
+    expect(controller.snapshot().initialSyncComplete).toBe(true);
     const first = controller.snapshot().attemptId;
     facade.cycle.mockImplementationOnce(async () => {
       expect(controller.snapshot().result).toBeUndefined();
       expect(controller.snapshot().initialSyncComplete).toBe(false);
       throw new Error("failed");
     });
-    await controller.synchronize(); expect(controller.snapshot().attemptId).toBeGreaterThan(first!);
+    await controller.synchronize();
+    expect(controller.snapshot().attemptId).toBeGreaterThan(first!);
     expect(controller.snapshot().initialSyncComplete).toBe(false);
     expect(controller.snapshot().result).toBeUndefined();
   });
   it("refresh failure and local commits invalidate completion", async () => {
     const { controller, facade } = fixture();
     facade.needsRefresh.mockReturnValue(true);
-    await controller.synchronize(); expect(controller.snapshot().refreshPending).toBe(true);
+    await controller.synchronize();
+    expect(controller.snapshot().refreshPending).toBe(true);
     expect(controller.snapshot().initialSyncComplete).toBe(false);
     facade.needsRefresh.mockReturnValue(false);
-    await controller.synchronize(); expect(controller.snapshot().initialSyncComplete).toBe(true);
-    controller.invalidateCompletion(); expect(controller.snapshot().initialSyncComplete).toBe(false);
+    await controller.synchronize();
+    expect(controller.snapshot().initialSyncComplete).toBe(true);
+    controller.invalidateCompletion();
+    expect(controller.snapshot().initialSyncComplete).toBe(false);
   });
   it("reserves replacement before awaits, preserves pause, and never automatically synchronizes", async () => {
     const { controller, facade, status } = fixture();
     await controller.pause();
     let release!: () => void;
-    facade.cancel.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
+    facade.cancel.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
     const apply = vi.fn(async () => "restored");
     const replacement = controller.withReplacement(apply);
     expect(controller.canAutoSync()).toBe(false);
-    await expect(controller.synchronize()).rejects.toMatchObject({ code: "library-operation-busy" });
+    await expect(controller.synchronize()).rejects.toMatchObject({
+      code: "library-operation-busy",
+    });
     expect(apply).not.toHaveBeenCalled();
-    release(); expect(await replacement).toBe("restored");
-    expect(controller.snapshot().paused).toBe(true); expect(facade.cycle).not.toHaveBeenCalled();
+    release();
+    expect(await replacement).toBe("restored");
+    expect(controller.snapshot().paused).toBe(true);
+    expect(facade.cycle).not.toHaveBeenCalled();
     expect(controller.snapshot().replacing).toBe(false);
     facade.status.mockResolvedValue({ ...status, operationPending: true });
-    await expect(controller.withReplacement(apply)).rejects.toMatchObject({ code: "resolve-pending-operation-first" });
+    await expect(controller.withReplacement(apply)).rejects.toMatchObject({
+      code: "resolve-pending-operation-first",
+    });
     expect(apply).toHaveBeenCalledTimes(1);
   });
   it("rejects a restore during an active cycle without automatically cancelling it", async () => {
     const { controller, facade } = fixture();
     let release!: () => void;
-    facade.cycle.mockImplementationOnce(async () => { await new Promise<void>(r => { release=r; }); return { phase:"pending",conflictCount:0,localRevision:3,head:null }; });
-    const cycle=controller.synchronize(); await vi.waitFor(() => expect(release).toBeDefined());
-    await expect(controller.withReplacement(vi.fn())).rejects.toMatchObject({ code:"resolve-pending-operation-first" });
-    expect(facade.cancel).not.toHaveBeenCalled(); await controller.pause(); release(); await cycle;
+    facade.cycle.mockImplementationOnce(async () => {
+      await new Promise<void>((r) => {
+        release = r;
+      });
+      return {
+        phase: "pending",
+        conflictCount: 0,
+        localRevision: 3,
+        head: null,
+      };
+    });
+    const cycle = controller.synchronize();
+    await vi.waitFor(() => expect(release).toBeDefined());
+    await expect(controller.withReplacement(vi.fn())).rejects.toMatchObject({
+      code: "resolve-pending-operation-first",
+    });
+    expect(facade.cancel).not.toHaveBeenCalled();
+    await controller.pause();
+    release();
+    await cycle;
   });
 });
 
 it("local commits retain conflict intent and the active attempt identity", async () => {
-  const { controller, facade, status }=fixture();
-  facade.cycle.mockImplementationOnce(async()=>{
+  const { controller, facade, status } = fixture();
+  facade.cycle.mockImplementationOnce(async () => {
     controller.invalidateCompletion();
-    expect(controller.snapshot().attemptIdentity?.deviceId).toBe(status.deviceId);
-    return {phase:"idle",conflictCount:0,localRevision:3,head:status.head};
+    expect(controller.snapshot().attemptIdentity?.deviceId).toBe(
+      status.deviceId,
+    );
+    return {
+      phase: "idle",
+      conflictCount: 0,
+      localRevision: 3,
+      head: status.head,
+    };
   });
-  await controller.synchronize();expect(controller.snapshot().initialSyncComplete).toBe(true);
-  facade.cycle.mockResolvedValueOnce({phase:"conflict",conflictCount:1,localRevision:3,head:status.head});
-  await controller.synchronize();controller.invalidateCompletion();
-  expect(controller.snapshot().result?.phase).toBe("conflict");expect(controller.canAutoSync()).toBe(false);
+  await controller.synchronize();
+  expect(controller.snapshot().initialSyncComplete).toBe(true);
+  facade.cycle.mockResolvedValueOnce({
+    phase: "conflict",
+    conflictCount: 1,
+    localRevision: 3,
+    head: status.head,
+  });
+  await controller.synchronize();
+  controller.invalidateCompletion();
+  expect(controller.snapshot().result?.phase).toBe("conflict");
+  expect(controller.canAutoSync()).toBe(false);
 });
 
 it("coalesces a reentrant observer onto the admitted attempt", async () => {
-  const {controller,facade}=fixture();
+  const { controller, facade } = fixture();
   let reentrant: Promise<void> | undefined;
-  const unsubscribe=controller.subscribe(snapshot=>{ if(snapshot.running && !reentrant) reentrant=controller.synchronize(); });
-  const first=controller.synchronize();expect(reentrant).toBe(first);await first;
-  expect(facade.cycle).toHaveBeenCalledTimes(1);unsubscribe();
+  const unsubscribe = controller.subscribe((snapshot) => {
+    if (snapshot.running && !reentrant) reentrant = controller.synchronize();
+  });
+  const first = controller.synchronize();
+  expect(reentrant).toBe(first);
+  await first;
+  expect(facade.cycle).toHaveBeenCalledTimes(1);
+  unsubscribe();
 });
-it("rechecks fresh native state immediately before replacement activation", async()=>{
-  const {controller,facade,status}=fixture();
-  await expect(controller.confirmReplacement()).rejects.toMatchObject({code:"replacement-not-reserved"});
-  await expect(controller.withReplacement(async()=>{
-    facade.status.mockResolvedValue({...status,operationPending:true});
-    await controller.confirmReplacement();
-    throw new Error("must not activate");
-  })).rejects.toMatchObject({code:"resolve-pending-operation-first"});
+it("rechecks fresh native state immediately before replacement activation", async () => {
+  const { controller, facade, status } = fixture();
+  await expect(controller.confirmReplacement()).rejects.toMatchObject({
+    code: "replacement-not-reserved",
+  });
+  await expect(
+    controller.withReplacement(async () => {
+      facade.status.mockResolvedValue({ ...status, operationPending: true });
+      await controller.confirmReplacement();
+      throw new Error("must not activate");
+    }),
+  ).rejects.toMatchObject({ code: "resolve-pending-operation-first" });
   expect(controller.snapshot().replacing).toBe(false);
 });
 
 it("allows local backup admission without a successful server status or network request", async () => {
-  const {controller,facade}=fixture();
+  const { controller, facade } = fixture();
   facade.status.mockRejectedValue(new Error("status unavailable"));
   await controller.initialize();
   expect(controller.canRestore()).toBe(false);
   facade.status.mockClear();
-  expect(()=>controller.assertFileOperationAvailable()).not.toThrow();
+  expect(() => controller.assertFileOperationAvailable()).not.toThrow();
   expect(facade.status).not.toHaveBeenCalled();
   expect(facade.cycle).not.toHaveBeenCalled();
   expect(facade.cancel).not.toHaveBeenCalled();

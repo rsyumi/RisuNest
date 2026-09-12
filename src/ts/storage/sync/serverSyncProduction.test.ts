@@ -38,8 +38,8 @@ vi.mock("../persistentDataRuntime.svelte", () => ({
   acquireDestructiveReplacementFence: vi.fn(),
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: state.invoke }));
-vi.mock("../losslessBackupFileRouteProduction.svelte", () => ({
-  restoreLocalBackupFromNativeSource: state.restore,
+vi.mock("../portableBackupFileRouteProduction.svelte", () => ({
+  restoreBackupFromNativeSource: state.restore,
 }));
 vi.mock("./serverSync", async (original) => ({
   ...(await original<object>()),
@@ -165,9 +165,8 @@ describe("native server synchronization scheduling", () => {
     online.mockReturnValue(true);
     listeners.get("online")!(new Event("online"));
     expect(state.scheduler.resume).toHaveBeenCalledTimes(3);
-    const { resumeServerSyncAfterBackup } = await import(
-      "./serverSyncProduction"
-    );
+    const { resumeServerSyncAfterBackup } =
+      await import("./serverSyncProduction");
     resumeServerSyncAfterBackup();
     expect(state.scheduler.resume).toHaveBeenCalledTimes(4);
   });

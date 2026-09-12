@@ -17,9 +17,12 @@ private const val MAX_DISPLAY_NAME_CHARS = 180
 private const val SPOOL_OWNERSHIP_FORMAT = "risunest-android-saf-spool"
 private const val SPOOL_STAGING_PREFIX = ".spooling-"
 private const val SPOOL_CLEANUP_PREFIX = ".cleanup-"
-private val NATIVE_FILE_JOB_SPOOL_SUFFIXES = listOf(
+private val BACKUP_SOURCE_SUFFIXES = listOf(
+  ".risunest",
   ".risudat",
-  ".risulossless",
+  ".bin",
+)
+private val NATIVE_FILE_JOB_SPOOL_SUFFIXES = BACKUP_SOURCE_SUFFIXES + listOf(
   ".charx",
   ".json",
   ".jpeg",
@@ -32,6 +35,11 @@ private val CANONICAL_TOKEN = Regex(
 )
 
 internal fun isCanonicalUuidV4(value: String): Boolean = CANONICAL_TOKEN.matches(value)
+
+internal fun isBackupSource(displayName: String): Boolean =
+  BACKUP_SOURCE_SUFFIXES.any { suffix ->
+    displayName.endsWith(suffix, ignoreCase = true)
+  }
 
 internal fun shouldUseNativeFileJobSpool(displayName: String): Boolean =
   NATIVE_FILE_JOB_SPOOL_SUFFIXES.any { suffix ->
@@ -46,6 +54,9 @@ private val MANAGED_LEGACY_BACKUP_NAME = Regex(
 )
 private val MANAGED_LOSSLESS_BACKUP_NAME = Regex(
   "risulossless-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\\.risulossless",
+)
+private val MANAGED_PORTABLE_BACKUP_NAME = Regex(
+  "risunest-backup-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\\.risunest",
 )
 private val MANAGED_CHARACTER_CHARX_NAME = Regex(
   "risu-charx-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\\.(?:charx|jpeg)",
@@ -485,6 +496,9 @@ private class ManagedHandoffKind(
 )
 
 private val MANAGED_HANDOFF_KINDS = listOf(
+  ManagedHandoffKind(MANAGED_PORTABLE_BACKUP_NAME, SafDestinationSourceKind.RISU_SAVE) { id ->
+    listOf("risunest-backup-$id.risunest")
+  },
   ManagedHandoffKind(MANAGED_LOSSLESS_BACKUP_NAME, SafDestinationSourceKind.RISU_SAVE) { id ->
     listOf("risulossless-$id.risulossless")
   },
@@ -686,9 +700,8 @@ internal fun safeSafDisplayName(name: String): String {
 internal fun safeSafDestinationName(name: String): String {
   val safe = safeSafDisplayName(name)
   return if (
-    safe.endsWith(".risudat", ignoreCase = true)
+    isBackupSource(safe)
     || safe.endsWith(".risulossless", ignoreCase = true)
-    || safe.endsWith(".bin", ignoreCase = true)
     || safe.endsWith(".zip", ignoreCase = true)
     || safe.endsWith(".charx", ignoreCase = true)
     || safe.endsWith(".jpeg", ignoreCase = true)

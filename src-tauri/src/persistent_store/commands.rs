@@ -11,7 +11,7 @@ use super::{
 };
 use serde_json::Value;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, State};
 
@@ -24,6 +24,117 @@ use crate::publication_upload::{
 pub(crate) struct PersistentStoreState {
     store: Mutex<Option<PersistentStore>>,
     snapshot_operations: Mutex<()>,
+    renderer_gate: Arc<RendererGate>,
+}
+
+#[derive(Default)]
+struct RendererGate {
+    state: Mutex<RendererGateState>,
+    drained: Condvar,
+}
+
+#[derive(Default)]
+struct RendererGateState {
+    maintenance_active: bool,
+    operations: usize,
+}
+
+/// Covers the entire native side effect, including work outside the SQLite lock.
+/// Maintenance closes admission first, then waits for these permits to drain.
+pub(crate) struct RendererOperationGuard {
+    gate: Arc<RendererGate>,
+}
+
+impl Drop for RendererOperationGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.operations -= 1;
+        if state.operations == 0 {
+            self.gate.drained.notify_all();
+        }
+    }
+}
+
+/// Native ownership survives renderer reloads. The device coordinator must retain
+/// this guard until its durable session is resolved, including after errors.
+/// Independent native job stores are excluded by the native job admission permit
+/// that the caller must acquire before this guard.
+pub(crate) struct DeviceMaintenanceGuard {
+    gate: Arc<RendererGate>,
+}
+
+impl Drop for DeviceMaintenanceGuard {
+    fn drop(&mut self) {
+        self.gate
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .maintenance_active = false;
+    }
+}
+
+fn renderer_gate_error() -> StoreError {
+    StoreError::Validation {
+        message: "persistent storage is unavailable during device backup maintenance".to_owned(),
+    }
+}
+
+impl PersistentStoreState {
+    pub(crate) fn admit_renderer_operation(&self) -> StoreResult<RendererOperationGuard> {
+        let mut state = self
+            .renderer_gate
+            .state
+            .lock()
+            .map_err(|error| StoreError::Store {
+                message: format!("persistent renderer admission mutex poisoned: {error}"),
+            })?;
+        if state.maintenance_active {
+            return Err(renderer_gate_error());
+        }
+        state.operations += 1;
+        Ok(RendererOperationGuard {
+            gate: Arc::clone(&self.renderer_gate),
+        })
+    }
+
+    pub(crate) fn acquire_device_maintenance(&self) -> StoreResult<DeviceMaintenanceGuard> {
+        let mut state = self
+            .renderer_gate
+            .state
+            .lock()
+            .map_err(|error| StoreError::Store {
+                message: format!("persistent renderer admission mutex poisoned: {error}"),
+            })?;
+        if state.maintenance_active {
+            return Err(renderer_gate_error());
+        }
+        state.maintenance_active = true;
+        while state.operations != 0 {
+            state = self
+                .renderer_gate
+                .drained
+                .wait(state)
+                .map_err(|error| StoreError::Store {
+                    message: format!("persistent renderer drain mutex poisoned: {error}"),
+                })?;
+        }
+        // No new operation can enter between draining and closing the store.
+        // Reopening after the guard is released refreshes the connection after
+        // native restore and discards leases owned by the previous renderer.
+        self.store
+            .lock()
+            .map_err(|error| StoreError::Store {
+                message: format!("persistent store mutex poisoned: {error}"),
+            })?
+            .take();
+        Ok(DeviceMaintenanceGuard {
+            gate: Arc::clone(&self.renderer_gate),
+        })
+    }
 }
 
 impl Default for PersistentStoreState {
@@ -31,6 +142,7 @@ impl Default for PersistentStoreState {
         Self {
             store: Mutex::new(None),
             snapshot_operations: Mutex::new(()),
+            renderer_gate: Arc::new(RendererGate::default()),
         }
     }
 }
@@ -58,6 +170,14 @@ fn with_store<T>(
     state: State<'_, PersistentStoreState>,
     operation: impl FnOnce(&PersistentStore) -> StoreResult<T>,
 ) -> StoreResult<T> {
+    with_store_mutex(&state, operation)
+}
+
+fn with_store_mutex<T>(
+    state: &PersistentStoreState,
+    operation: impl FnOnce(&PersistentStore) -> StoreResult<T>,
+) -> StoreResult<T> {
+    let _operation = state.admit_renderer_operation()?;
     let store = state.store.lock().map_err(|error| StoreError::Store {
         message: format!("persistent store mutex poisoned: {error}"),
     })?;
@@ -78,14 +198,15 @@ pub(crate) fn with_store_mut<T>(
     state: State<'_, PersistentStoreState>,
     operation: impl FnOnce(&mut PersistentStore) -> StoreResult<T>,
 ) -> StoreResult<T> {
-    with_store_mutex_mut(&state.store, operation)
+    with_store_mutex_mut(&state, operation)
 }
 
 fn with_store_mutex_mut<T>(
-    store: &Mutex<Option<PersistentStore>>,
+    state: &PersistentStoreState,
     operation: impl FnOnce(&mut PersistentStore) -> StoreResult<T>,
 ) -> StoreResult<T> {
-    let mut store = store.lock().map_err(|error| StoreError::Store {
+    let _operation = state.admit_renderer_operation()?;
+    let mut store = state.store.lock().map_err(|error| StoreError::Store {
         message: format!("persistent store mutex poisoned: {error}"),
     })?;
     let store = store.as_mut().ok_or_else(|| StoreError::Validation {
@@ -99,6 +220,9 @@ pub(crate) fn replace_commit_with_snapshot(
     staging_id: &str,
     expected_revision: Option<i64>,
 ) -> StoreResult<RevisionResult> {
+    let _operation = app
+        .state::<PersistentStoreState>()
+        .admit_renderer_operation()?;
     let prepared = with_store_mut(app.state(), |store| {
         store.prepare_replace_commit(staging_id, expected_revision)
     })?;
@@ -122,14 +246,22 @@ pub(crate) fn pds_open(
     app: AppHandle,
     state: State<'_, PersistentStoreState>,
 ) -> Result<PersistentStoreOpenResult, StoreError> {
-    let mut store = state.store.lock().map_err(|error| StoreError::Store {
-        message: format!("persistent store mutex poisoned: {error}"),
-    })?;
-
+    let _operation = state.admit_renderer_operation()?;
     let app_data_dir = crate::app_data_root::resolve(&app).map_err(|error| StoreError::Store {
         message: format!("failed to resolve application data directory: {error}"),
     })?;
-    open_persistent_store(&app_data_dir, &mut store)
+    open_renderer_persistent_store(&state, &app_data_dir)
+}
+
+fn open_renderer_persistent_store(
+    state: &PersistentStoreState,
+    app_data_dir: &Path,
+) -> StoreResult<PersistentStoreOpenResult> {
+    let _operation = state.admit_renderer_operation()?;
+    let mut store = state.store.lock().map_err(|error| StoreError::Store {
+        message: format!("persistent store mutex poisoned: {error}"),
+    })?;
+    open_persistent_store(app_data_dir, &mut store)
 }
 
 fn open_persistent_store(
@@ -612,10 +744,20 @@ pub(crate) async fn pds_kei_backup_upload(
     expected_account_id: String,
     token: String,
 ) -> Result<KeiUploadResult, StoreError> {
+    let operation = state.admit_renderer_operation()?;
     let prepared = with_store_mut(state, |store| {
         store.prepare_kei_upload(&lease, &url, &expected_account_id, &token)
     })?;
-    prepared.upload().await
+    // Keep admission with the native task even if its invoking renderer goes
+    // away while serialization or detached-reader checkpointing is running.
+    tauri::async_runtime::spawn(async move {
+        let _operation = operation;
+        prepared.upload().await
+    })
+    .await
+    .map_err(|error| StoreError::Store {
+        message: format!("failed to join KEI upload operation: {error}"),
+    })?
 }
 
 #[tauri::command(async)]
@@ -631,6 +773,7 @@ pub(crate) fn pds_snapshot_create(
     state: State<'_, PersistentStoreState>,
     reason: String,
 ) -> Result<SnapshotCreated, StoreError> {
+    let _operation = state.admit_renderer_operation()?;
     let snapshot_operation =
         state
             .snapshot_operations
@@ -818,6 +961,106 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn device_maintenance_blocks_renderer_writers_and_reopens_restored_store() {
+        let directory = tempdir().unwrap();
+        let state = PersistentStoreState::default();
+        open_renderer_persistent_store(&state, directory.path()).unwrap();
+        with_store_mutex(&state, |store| store.set_app_kv("synthetic", &json!(1))).unwrap();
+
+        let maintenance = state.acquire_device_maintenance().unwrap();
+        assert!(state.store.lock().unwrap().is_none());
+        assert!(state.admit_renderer_operation().is_err());
+        assert!(state.acquire_device_maintenance().is_err());
+        assert!(open_renderer_persistent_store(&state, directory.path()).is_err());
+        assert!(
+            with_store_mutex(&state, |store| { store.set_app_kv("synthetic", &json!(2)) }).is_err()
+        );
+        assert!(with_store_mutex_mut(&state, |store| store.replace_begin()).is_err());
+
+        // Only the maintenance worker's independent store can write while the
+        // renderer fence is held. A new renderer observes the completed result.
+        let native = PersistentStore::open(directory.path()).unwrap();
+        native.set_app_kv("synthetic", &json!(3)).unwrap();
+        drop(native);
+        drop(maintenance);
+        open_renderer_persistent_store(&state, directory.path()).unwrap();
+        assert_eq!(
+            with_store_mutex(&state, |store| store.get_app_kv("synthetic")).unwrap(),
+            Some(json!(3))
+        );
+    }
+
+    #[test]
+    fn device_recovery_fence_prevents_first_renderer_open() {
+        let directory = tempdir().unwrap();
+        let state = PersistentStoreState::default();
+        let maintenance = state.acquire_device_maintenance().unwrap();
+        for _ in 0..2 {
+            assert!(open_renderer_persistent_store(&state, directory.path()).is_err());
+            assert!(state.admit_renderer_operation().is_err());
+            assert!(!directory.path().join("persistent").exists());
+        }
+        drop(maintenance);
+        open_renderer_persistent_store(&state, directory.path()).unwrap();
+        assert!(directory.path().join("persistent").is_dir());
+    }
+
+    #[test]
+    fn device_maintenance_drains_admitted_writes_before_closing_store() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let directory = tempdir().unwrap();
+        let state = Arc::new(PersistentStoreState::default());
+        open_renderer_persistent_store(&state, directory.path()).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer_state = Arc::clone(&state);
+        let writer = thread::spawn(move || {
+            with_store_mutex_mut(&writer_state, |store| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                store.set_app_kv("drained-writer", &json!(true))
+            })
+            .unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let maintenance_state = Arc::clone(&state);
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let maintainer = thread::spawn(move || {
+            acquired_tx
+                .send(maintenance_state.acquire_device_maintenance().unwrap())
+                .unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !state.renderer_gate.state.lock().unwrap().maintenance_active {
+            assert!(
+                Instant::now() < deadline,
+                "maintenance admission did not close"
+            );
+            thread::yield_now();
+        }
+        assert!(state.admit_renderer_operation().is_err());
+        assert!(matches!(
+            acquired_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        let maintenance = acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        maintainer.join().unwrap();
+        assert!(state.store.lock().unwrap().is_none());
+        let native = PersistentStore::open(directory.path()).unwrap();
+        assert_eq!(
+            native.get_app_kv("drained-writer").unwrap(),
+            Some(json!(true))
+        );
+        drop(native);
+        drop(maintenance);
+    }
 
     #[test]
     fn task4_storage_command_errors_are_logged_masked_without_changing_returned_categories() {
@@ -1069,6 +1312,7 @@ mod tests {
                 PersistentStore::open(directory.path()).expect("open persistent store"),
             )),
             snapshot_operations: Mutex::new(()),
+            renderer_gate: Arc::new(RendererGate::default()),
         });
         let barrier = Arc::new(Barrier::new(3));
         let active = Arc::new(AtomicUsize::new(0));
@@ -1081,7 +1325,7 @@ mod tests {
             let maximum = Arc::clone(&maximum);
             workers.push(thread::spawn(move || {
                 barrier.wait();
-                with_store_mutex_mut(&state.store, |_| {
+                with_store_mutex_mut(&state, |_| {
                     let concurrent = active.fetch_add(1, Ordering::SeqCst) + 1;
                     maximum.fetch_max(concurrent, Ordering::SeqCst);
                     thread::sleep(Duration::from_millis(20));

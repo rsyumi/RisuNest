@@ -2179,10 +2179,7 @@ pub(super) fn delete_generation(
     generation: &str,
 ) -> StoreResult<()> {
     for (table, _) in GENERATION_TABLES.iter().rev() {
-        transaction.execute(
-            &format!("DELETE FROM {table} WHERE generation = ?1"),
-            [generation],
-        )?;
+        mutate_generation_rows(transaction, table, generation, None)?;
     }
     transaction.execute(
         "DELETE FROM snapshot_leases WHERE generation = ?1",
@@ -2193,10 +2190,42 @@ pub(super) fn delete_generation(
 
 fn move_generation(transaction: &Transaction<'_>, source: &str, target: &str) -> StoreResult<()> {
     for (table, _) in GENERATION_TABLES {
-        transaction.execute(
-            &format!("UPDATE {table} SET generation = ?2 WHERE generation = ?1"),
-            params![source, target],
-        )?;
+        mutate_generation_rows(transaction, table, source, Some(target))?;
+    }
+    Ok(())
+}
+
+// A bulk UPDATE/DELETE keeps a statement rollback journal containing the old pages.
+// Android's bundled SQLite forces that journal into memory, even with temp_store=FILE.
+// Bound each statement to one record while retaining the enclosing atomic transaction,
+// triggers, and final revision/marker commit. Only row IDs are buffered across statements.
+fn mutate_generation_rows(
+    transaction: &Transaction<'_>,
+    table: &str,
+    source: &str,
+    target: Option<&str>,
+) -> StoreResult<()> {
+    let mut select = transaction.prepare(&format!(
+        "SELECT rowid FROM {table} WHERE generation=?1 LIMIT 256"
+    ))?;
+    let sql = match target {
+        Some(_) => format!("UPDATE {table} SET generation=?3 WHERE rowid=?1 AND generation=?2"),
+        None => format!("DELETE FROM {table} WHERE rowid=?1 AND generation=?2"),
+    };
+    let mut mutate = transaction.prepare(&sql)?;
+    loop {
+        let rows = select
+            .query_map([source], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            match target {
+                Some(target) => mutate.execute(params![row, source, target])?,
+                None => mutate.execute(params![row, source])?,
+            };
+        }
     }
     Ok(())
 }

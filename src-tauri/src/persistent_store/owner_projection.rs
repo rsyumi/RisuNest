@@ -8,14 +8,14 @@ use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-pub(super) struct OwnerManifestProjector {
+pub(crate) struct OwnerManifestProjector {
     cas: Option<PayloadCas>,
     heads: HashMap<AssetOwnerLocator, AssetOwnerHead>,
     replacement_keys: HashMap<AssetOwnerLocator, Vec<String>>,
 }
 
 impl OwnerManifestProjector {
-    pub(super) fn from_snapshots_dir(
+    pub(crate) fn from_snapshots_dir(
         connection: &Connection,
         target: &ReadTarget,
         snapshots_dir: &Path,
@@ -28,7 +28,7 @@ impl OwnerManifestProjector {
         )
     }
 
-    pub(super) fn from_snapshots_dir_with_replacement_keys(
+    pub(crate) fn from_snapshots_dir_with_replacement_keys(
         connection: &Connection,
         target: &ReadTarget,
         snapshots_dir: &Path,
@@ -67,7 +67,7 @@ impl OwnerManifestProjector {
         }
     }
 
-    pub(super) fn project_database(&self, database: &mut Value) -> StoreResult<()> {
+    pub(crate) fn project_database(&self, database: &mut Value) -> StoreResult<()> {
         if self.cas.is_none() {
             return Ok(());
         }
@@ -96,7 +96,7 @@ impl OwnerManifestProjector {
         self.validate_character_owners(&character_ids)
     }
 
-    pub(super) fn project_root(&self, root: &mut Map<String, Value>) -> StoreResult<()> {
+    pub(crate) fn project_root(&self, root: &mut Map<String, Value>) -> StoreResult<()> {
         if self.cas.is_none() {
             return Ok(());
         }
@@ -139,7 +139,7 @@ impl OwnerManifestProjector {
         Ok(())
     }
 
-    pub(super) fn project_root_module(
+    pub(crate) fn project_root_module(
         &self,
         index: u64,
         module: &mut Map<String, Value>,
@@ -156,7 +156,7 @@ impl OwnerManifestProjector {
         self.apply_head(head, module, "assets").map(Some)
     }
 
-    pub(super) fn project_character(
+    pub(crate) fn project_character(
         &self,
         character_id: &str,
         character: &mut Map<String, Value>,
@@ -172,7 +172,7 @@ impl OwnerManifestProjector {
         Ok(None)
     }
 
-    pub(super) fn validate_character_owners(
+    pub(crate) fn validate_character_owners(
         &self,
         character_ids: &HashSet<String>,
     ) -> StoreResult<()> {

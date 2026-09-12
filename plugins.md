@@ -686,6 +686,10 @@ const deviceId = await Risuai.safeLocalStorage.getItem('device_id');
 
 `getLocalPluginStorage()` is also device-local and is not included in save snapshots or cross-device sync. Unlike `safeLocalStorage`, it accepts JSON-serializable values and is appropriate for structured device-only settings or caches. Its keys are shared under the safe local plugin-storage prefix, so use a stable plugin prefix and do not call `clear()` unless deleting every value in that local shared keyspace is intended.
 
+Native `.risunest` full file backups are a separate, selectable exception: plugin local storage, local plugin data, and raw IndexedDB databases whose names start with `safe_plugin_` are included by default. Restore selects the included areas by default and allows each area to be excluded. Selected areas are replaced in full, including removal of keys absent from the backup. An included empty area clears that area; an omitted or unselected area is left alone. These are shared storage areas, not per-plugin ownership boundaries.
+
+This does not change the plugin API storage scope, ordinary save snapshots, RisuAI/PocketRisu exports, or sync. Plugin permissions and OS-issued handles are not transferred. Unsupported structured-clone values prevent the selected area from completing backup or restore; they are never silently converted to JSON. Native maintenance pauses normal plugin startup through capture, application and any required rollback, and restoration results are acknowledged before normal startup resumes.
+
 `getLocalPluginStorage()` returns a `SafeLocalPluginStorage` instance: device-local storage that supports any JSON-serializable value (unlike `safeLocalStorage` which is strings-only), with generic type support:
 
 ```javascript

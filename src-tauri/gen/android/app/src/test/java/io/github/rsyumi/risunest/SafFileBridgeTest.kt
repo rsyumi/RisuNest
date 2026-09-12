@@ -981,6 +981,11 @@ class SafFileBridgeTest {
       safeSafDestinationName("risunest-2026-08-29T00-00-00-000Z.risulossless"),
     )
     assertEquals("risu-backup.bin", safeSafDestinationName("risu-backup.bin"))
+    assertEquals("backup.risunest", safeSafDestinationName("folder/backup.risunest"))
+    assertEquals("BACKUP.RISUNEST", safeSafDestinationName("BACKUP.RISUNEST"))
+    val longBackup = "b".repeat(181) + ".risunest"
+    assertEquals(180, safeSafDestinationName(longBackup).length)
+    assertTrue(safeSafDestinationName(longBackup).endsWith(".risunest"))
   }
 
   @Test

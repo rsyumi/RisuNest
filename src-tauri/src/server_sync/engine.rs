@@ -1317,7 +1317,7 @@ impl PersistentStore {
         revision: i64,
         head: &RemoteHead,
     ) -> Result<()> {
-        // Both complete packages must pass the existing lossless verifier before
+        // Both library-only packages must pass the portable archive verifier before
         // any live activation or server publication. A partial directory is not
         // a completed backup; only the final receipt makes it discoverable.
         struct Cancel<'a>(&'a ServerClient);
@@ -1337,13 +1337,11 @@ impl PersistentStore {
         std::fs::create_dir_all(scratch.path().join("local-staging"))?;
         std::fs::create_dir_all(scratch.path().join("remote-staging"))?;
         let cancel = Cancel(client);
-        let local_cas = PayloadCas::new(&self.repository_root)?;
-        let local = crate::lossless_backup::create_and_verify_lossless_backup_v1_report(
-            &root.join("local.risulossless"),
-            &scratch.path().join("local-staging"),
-            &local_cas,
+        let local = crate::portable_backup::create_verified_library_backup(
             self,
             revision,
+            &root.join("local.risunest"),
+            &scratch.path().join("local-staging"),
             &cancel,
         )
         .map_err(|_| SyncError::new("complete-local-backup-required", 409))?;
@@ -1433,12 +1431,11 @@ impl PersistentStore {
         })
         .map_err(|_| SyncError::new("backup-metadata", 409))?;
         remote_store.connection.execute("INSERT INTO cold_payload_authority(generation,value) VALUES(?1,?2) ON CONFLICT(generation) DO UPDATE SET value=excluded.value",params![generation,authority])?;
-        let remote = crate::lossless_backup::create_and_verify_lossless_backup_v1_report(
-            &root.join("remote.risulossless"),
-            &scratch.path().join("remote-staging"),
-            &remote_cas,
+        let remote = crate::portable_backup::create_verified_library_backup(
             &mut remote_store,
             remote_revision,
+            &root.join("remote.risunest"),
+            &scratch.path().join("remote-staging"),
             &cancel,
         )
         .map_err(|_| SyncError::new("complete-remote-backup-required", 409))?;
@@ -1446,7 +1443,7 @@ impl PersistentStore {
         if self.revision()? != revision {
             return Err(SyncError::new("local-revision-changed", 409));
         }
-        let receipt=serde_json::to_vec(&serde_json::json!({"head":head,"localRevision":revision,"localHash":local.archive_sha256,"remoteHash":remote.archive_sha256})).map_err(|_|SyncError::new("backup-receipt-encoding",409))?;
+        let receipt=serde_json::to_vec(&serde_json::json!({"format":"risunest-portable-backup","scope":"library","head":head,"localRevision":revision,"localHash":local,"remoteHash":remote})).map_err(|_|SyncError::new("backup-receipt-encoding",409))?;
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .write(true)

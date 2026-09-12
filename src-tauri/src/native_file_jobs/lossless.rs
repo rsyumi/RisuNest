@@ -360,7 +360,7 @@ fn copy_source_to_owned(
     Ok(path)
 }
 
-fn publish_owned_package(
+pub(super) fn publish_owned_package(
     source_root: &Path,
     source: &Path,
     destination_root: &Path,
@@ -403,7 +403,7 @@ fn publish_owned_package(
     })
 }
 
-fn finish_durable_job(
+pub(super) fn finish_durable_job(
     outcome: Result<JobResultSummary, NativeJobError>,
     durable: &mut DurableCasJob,
 ) -> Result<JobResultSummary, NativeJobError> {

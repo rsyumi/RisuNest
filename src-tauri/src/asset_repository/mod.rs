@@ -7,6 +7,7 @@ pub(crate) mod migration_gc;
 pub(crate) mod owner_manifest_codec;
 mod payload_cas;
 
+pub(crate) use payload_cas::exact_file_identity;
 pub use payload_cas::PayloadCas;
 #[allow(unused_imports)]
 pub use payload_cas::PreparedPayload;

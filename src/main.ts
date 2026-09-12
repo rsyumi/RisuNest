@@ -1,14 +1,6 @@
-import "./ts/polyfill";
-import "core-js/actual";
-import "katex/dist/katex.min.css";
-import "./ts/storage/deviceSettingsStartup";
-import "./ts/storage/database.svelte";
-import App from "./App.svelte";
-import { loadData } from "./ts/bootstrap";
-import { initHotkey } from "./ts/hotkey";
-import { preLoadCheck } from "./preload";
-import { mount } from "svelte";
-import { yieldToUi } from "./ts/ui/yieldToUi";
+// No normal app imports are allowed before the native device recovery gate.
+// Native navigation and writer checks precede every normal app initialization.
+import { deviceMaintenanceBeforeBootstrap } from "./ts/storage/deviceBackup/entry";
 
 window.addEventListener("vite:preloadError", (event) => {
   console.error("Chunk load error detected:", event);
@@ -17,13 +9,7 @@ window.addEventListener("vite:preloadError", (event) => {
   );
 });
 
-preLoadCheck();
-const app = mount(App, {
-  target: document.getElementById("app"),
-});
-document.getElementById("preloading")?.remove();
-void yieldToUi().then(() => {
-  loadData();
-  initHotkey();
-});
+const app = deviceMaintenanceBeforeBootstrap().then(
+  () => import("./normalMain"),
+);
 export default app;

@@ -25,22 +25,39 @@ export interface ServerSyncSnapshot {
   refreshPending?: boolean;
   replacing?: boolean;
 }
-export function createServerSyncController(facade: ServerSyncFacade) {
-  let state: ServerSyncSnapshot = { running: false, paused: false, error: "" };
+export function createServerSyncController(
+  facade: ServerSyncFacade,
+  controllerOptions: {
+    initiallyPaused?: boolean;
+    onExplicitResume?(): void;
+  } = {},
+) {
+  let state: ServerSyncSnapshot = {
+    running: false,
+    paused: controllerOptions.initiallyPaused ?? false,
+    error: "",
+  };
   let active: Promise<void> | undefined;
   let attemptSequence = 0;
   let statusFresh = false;
   let statusSequence = 0;
   const listeners = new Set<(snapshot: ServerSyncSnapshot) => void>();
   const publish = (): void => {
-    state = { ...state, refreshPending: facade.needsRefresh(), initialSyncComplete: Boolean(state.initialSyncComplete && !state.error && !facade.needsRefresh()) };
+    state = {
+      ...state,
+      refreshPending: facade.needsRefresh(),
+      initialSyncComplete: Boolean(
+        state.initialSyncComplete && !state.error && !facade.needsRefresh(),
+      ),
+    };
     for (const listener of listeners) listener(state);
   };
   const refreshStatus = async (): Promise<void> => {
     const request = ++statusSequence;
     statusFresh = false;
     const status = await facade.status();
-    if (request !== statusSequence) throw new ServerSyncError("server-status-changed");
+    if (request !== statusSequence)
+      throw new ServerSyncError("server-status-changed");
     statusFresh = true;
     state.status = status;
     publish();
@@ -61,7 +78,11 @@ export function createServerSyncController(facade: ServerSyncFacade) {
       await refreshStatus();
       const identity = state.status;
       if (identity?.endpoint && identity.libraryId && identity.deviceId) {
-        state.attemptIdentity = { endpoint: identity.endpoint, libraryId: identity.libraryId, deviceId: identity.deviceId };
+        state.attemptIdentity = {
+          endpoint: identity.endpoint,
+          libraryId: identity.libraryId,
+          deviceId: identity.deviceId,
+        };
       }
       // Bound each foreground invocation. The next scheduled run resumes
       // a persisted server job without creating a new logical operation.
@@ -80,14 +101,25 @@ export function createServerSyncController(facade: ServerSyncFacade) {
       const result = state.result;
       const identityNow = state.attemptIdentity;
       state.initialSyncComplete = Boolean(
-        !state.error && identityNow && status?.configured && result?.phase === "idle" &&
-        status.endpoint === identityNow.endpoint && status.libraryId === identityNow.libraryId &&
-        status.deviceId === identityNow.deviceId && !status.registrationRequired &&
-        !status.reconciling && !status.operationPending && !status.fullScan &&
-        status.dirtyRecords === 0 && !facade.needsRefresh() &&
-        status.localRevision === result.localRevision && status.head &&
-        status.head.libraryId === result.head?.libraryId && status.head.epoch === result.head?.epoch &&
-        status.head.seq === result.head?.seq && status.head.headId === result.head?.headId
+        !state.error &&
+        identityNow &&
+        status?.configured &&
+        result?.phase === "idle" &&
+        status.endpoint === identityNow.endpoint &&
+        status.libraryId === identityNow.libraryId &&
+        status.deviceId === identityNow.deviceId &&
+        !status.registrationRequired &&
+        !status.reconciling &&
+        !status.operationPending &&
+        !status.fullScan &&
+        status.dirtyRecords === 0 &&
+        !facade.needsRefresh() &&
+        status.localRevision === result.localRevision &&
+        status.head &&
+        status.head.libraryId === result.head?.libraryId &&
+        status.head.epoch === result.head?.epoch &&
+        status.head.seq === result.head?.seq &&
+        status.head.headId === result.head?.headId,
       );
       if (state.initialSyncComplete) state.lastSuccessAt = Date.now();
     } catch (cause) {
@@ -100,7 +132,8 @@ export function createServerSyncController(facade: ServerSyncFacade) {
     }
   };
   const requireAvailable = (): void => {
-    if (state.running || state.replacing || isLibraryFileOperationReserved()) throw new ServerSyncError("library-operation-busy");
+    if (state.running || state.replacing || isLibraryFileOperationReserved())
+      throw new ServerSyncError("library-operation-busy");
   };
   const invalidateCompletion = (): void => {
     state.initialSyncComplete = false;
@@ -108,23 +141,35 @@ export function createServerSyncController(facade: ServerSyncFacade) {
     state.attemptIdentity = undefined;
   };
   return {
+    holdAutomaticSync(): void {
+      state.paused = true;
+      publish();
+    },
     invalidateCompletion(): void {
       // A local commit invalidates completion, not the current conflict preview or attempt identity.
       state.initialSyncComplete = false;
       publish();
     },
     assertFileOperationAvailable(): void {
-      if (state.running || state.replacing || facade.needsRefresh()) throw new ServerSyncError("server-sync-busy");
+      if (state.running || state.replacing || facade.needsRefresh())
+        throw new ServerSyncError("server-sync-busy");
     },
     async confirmReplacement(): Promise<void> {
-      if (!state.replacing) throw new ServerSyncError("replacement-not-reserved");
+      if (!state.replacing)
+        throw new ServerSyncError("replacement-not-reserved");
       await refreshStatus();
-      if (!statusFresh || !state.status || state.status.operationPending || facade.needsRefresh()) {
+      if (
+        !statusFresh ||
+        !state.status ||
+        state.status.operationPending ||
+        facade.needsRefresh()
+      ) {
         throw new ServerSyncError("resolve-pending-operation-first");
       }
     },
     async withReplacement<T>(operation: () => Promise<T>): Promise<T> {
-      if (state.running || state.replacing || facade.needsRefresh()) throw new ServerSyncError("resolve-pending-operation-first");
+      if (state.running || state.replacing || facade.needsRefresh())
+        throw new ServerSyncError("resolve-pending-operation-first");
       // Reservation precedes asynchronous status/cancellation checks, without a PDS fence.
       state.replacing = true;
       invalidateCompletion();
@@ -132,13 +177,21 @@ export function createServerSyncController(facade: ServerSyncFacade) {
       try {
         await facade.cancel();
         await refreshStatus();
-        if (!statusFresh || !state.status || state.status.operationPending || facade.needsRefresh()) {
+        if (
+          !statusFresh ||
+          !state.status ||
+          state.status.operationPending ||
+          facade.needsRefresh()
+        ) {
           throw new ServerSyncError("resolve-pending-operation-first");
         }
         return await operation();
       } finally {
-        try { await refreshStatus(); }
-        catch (cause) { state.error = serverSyncError(cause).code; }
+        try {
+          await refreshStatus();
+        } catch (cause) {
+          state.error = serverSyncError(cause).code;
+        }
         state.replacing = false;
         publish();
       }
@@ -156,7 +209,10 @@ export function createServerSyncController(facade: ServerSyncFacade) {
     snapshot: () => state,
     waitForIdle: () => active ?? Promise.resolve(),
     canRestore: () =>
-      !state.running && !state.replacing && statusFresh && Boolean(state.status) &&
+      !state.running &&
+      !state.replacing &&
+      statusFresh &&
+      Boolean(state.status) &&
       !state.status?.operationPending &&
       !facade.needsRefresh(),
     subscribe(listener: (snapshot: ServerSyncSnapshot) => void): () => void {
@@ -182,6 +238,7 @@ export function createServerSyncController(facade: ServerSyncFacade) {
       state.status = status;
       state.lastSuccessAt = undefined;
       state.error = "";
+      controllerOptions.onExplicitResume?.();
       state.paused = false;
       publish();
     },
@@ -200,6 +257,7 @@ export function createServerSyncController(facade: ServerSyncFacade) {
       state.status = status;
       state.result = undefined;
       state.error = "";
+      controllerOptions.onExplicitResume?.();
       state.paused = false;
       publish();
     },
@@ -210,20 +268,32 @@ export function createServerSyncController(facade: ServerSyncFacade) {
       state.status = status;
       state.result = undefined;
       state.error = "";
+      controllerOptions.onExplicitResume?.();
       state.paused = false;
       publish();
     },
     synchronize(options: ServerCycleOptions = {}): Promise<void> {
       if (active) return active;
-      if (state.replacing || isLibraryFileOperationReserved()) return Promise.reject(new ServerSyncError("library-operation-busy"));
+      if (state.replacing || isLibraryFileOperationReserved())
+        return Promise.reject(new ServerSyncError("library-operation-busy"));
+      controllerOptions.onExplicitResume?.();
       state.paused = false;
       let complete!: () => void;
       let fail!: (cause: unknown) => void;
-      const attempt = new Promise<void>((resolve, reject) => { complete = resolve; fail = reject; });
+      const attempt = new Promise<void>((resolve, reject) => {
+        complete = resolve;
+        fail = reject;
+      });
       active = attempt;
       void synchronize(options).then(
-        () => { active = undefined; complete(); },
-        cause => { active = undefined; fail(cause); },
+        () => {
+          active = undefined;
+          complete();
+        },
+        (cause) => {
+          active = undefined;
+          fail(cause);
+        },
       );
       return attempt;
     },
@@ -248,17 +318,19 @@ export function createServerSyncController(facade: ServerSyncFacade) {
     canAutoSync: () =>
       Boolean(
         state.status?.configured &&
-          !state.status.registrationRequired &&
-          !state.running && !state.replacing && !isLibraryFileOperationReserved() &&
-          !state.paused &&
-          ![
-            "epoch-reconciliation-required",
-            "unauthorized",
-            "new-device-registration-required",
-            "device-credential-unavailable",
-          ].includes(state.error) &&
-          state.result?.phase !== "conflict" &&
-          !facade.needsRefresh(),
+        !state.status.registrationRequired &&
+        !state.running &&
+        !state.replacing &&
+        !isLibraryFileOperationReserved() &&
+        !state.paused &&
+        ![
+          "epoch-reconciliation-required",
+          "unauthorized",
+          "new-device-registration-required",
+          "device-credential-unavailable",
+        ].includes(state.error) &&
+        state.result?.phase !== "conflict" &&
+        !facade.needsRefresh(),
       ),
   };
 }

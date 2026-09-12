@@ -45,6 +45,7 @@
         isExpectedHubMessage,
         resolveExpectedOfficialAccountMessageUrl,
     } from 'src/ts/storage/officialAccountMessage'
+    import { restoreBackupFromSystemPicker } from 'src/ts/storage/portableBackupFileRouteProduction.svelte'
     import { importRisuSaveFromSystemPicker } from 'src/ts/storage/risuSaveFileRouteProduction.svelte'
     import { getNativeOfficialAccountFlow } from 'src/ts/storage/sync/nativeOfficialAccountFlow'
     import { DBState } from 'src/ts/stores.svelte'
@@ -112,7 +113,13 @@
     // The shared import dialog's view model, drawn in this panel instead of
     // the popup while the onboarding is up. `now` only feeds the elapsed time.
     let now = $state(Date.now())
-    const job = $derived(buildNativeFileJobDialogModel($nativeFileOperation, $nativeFileOperationOutcome, now))
+    const job = $derived(
+        buildNativeFileJobDialogModel(
+            $nativeFileOperation,
+            $nativeFileOperationOutcome,
+            now,
+        ),
+    )
     const jobShown = $derived(job.open && !job.compact)
     const jobTicking = $derived(jobShown && job.terminal === null)
     let jobDetailsOpen = $state(false)
@@ -128,7 +135,9 @@
     $effect(() => {
         if (!jobTicking) return
         now = Date.now()
-        const timer = setInterval(() => { now = Date.now() }, 1000)
+        const timer = setInterval(() => {
+            now = Date.now()
+        }, 1000)
         return () => clearInterval(timer)
     })
 
@@ -146,7 +155,9 @@
         // Backup restores report through the shared operation stores; this
         // panel draws them while it is up, so the popup stays closed.
         nativeFileJobHost.set('onboarding')
-        const stopWeave = weaveCanvas ? observeOnboardingWeave(weaveCanvas) : () => {}
+        const stopWeave = weaveCanvas
+            ? observeOnboardingWeave(weaveCanvas)
+            : () => {}
         return () => {
             stopWeave()
             nativeFileJobHost.set('dialog')
@@ -198,7 +209,8 @@
             await operation()
         } catch (error) {
             // The operation never starts for a slot that is already taken.
-            if (error instanceof NativeFileOperationBusyError) alertError(strings.risuNest.backup.actionFailed)
+            if (error instanceof NativeFileOperationBusyError)
+                alertError(strings.risuNest.backup.actionFailed)
         } finally {
             importBusy = false
         }
@@ -215,7 +227,9 @@
         try {
             await navigator.clipboard.writeText(details)
             jobDetailsCopied = true
-            setTimeout(() => { jobDetailsCopied = false }, 1500)
+            setTimeout(() => {
+                jobDetailsCopied = false
+            }, 1500)
         } catch {
             jobDetailsCopied = false
         }
@@ -251,22 +265,36 @@
     }
 </script>
 
-<svelte:window onmessage={async (event) => {
-    if (!loginOpen) return
-    const message = event.data?.msg
-    const expectedUrl = resolveExpectedOfficialAccountMessageUrl(message?.type, hubURL, loginUrl)
-    if (!isExpectedHubMessage(event, expectedUrl, loginFrame?.contentWindow)) return
-    if (!message?.data?.vaild) return
-    loginOpen = false
-    const credential = { id: message.id, token: message.token, data: message.data }
-    try {
-        DBState.db.account = await getNativeOfficialAccountFlow().login(credential)
-    } catch {
-        alertError(strings.risuNest.backup.actionFailed)
-        return
-    }
-    flow = goToOnboardingState(flow, 'sync-account-found', 'account')
-}}></svelte:window>
+<svelte:window
+    onmessage={async (event) => {
+        if (!loginOpen) return
+        const message = event.data?.msg
+        const expectedUrl = resolveExpectedOfficialAccountMessageUrl(
+            message?.type,
+            hubURL,
+            loginUrl,
+        )
+        if (
+            !isExpectedHubMessage(event, expectedUrl, loginFrame?.contentWindow)
+        )
+            return
+        if (!message?.data?.vaild) return
+        loginOpen = false
+        const credential = {
+            id: message.id,
+            token: message.token,
+            data: message.data,
+        }
+        try {
+            DBState.db.account =
+                await getNativeOfficialAccountFlow().login(credential)
+        } catch {
+            alertError(strings.risuNest.backup.actionFailed)
+            return
+        }
+        flow = goToOnboardingState(flow, 'sync-account-found', 'account')
+    }}
+/>
 
 {#snippet steps(place: 'top' | 'bottom')}
     <ol class="steps {place}">
@@ -293,7 +321,11 @@
         aria-valuemax={100}
         aria-valuenow={percent ?? undefined}
     >
-        <div class="fill" class:pulse={percent === null} style:width={percent === null ? '100%' : `${percent}%`}></div>
+        <div
+            class="fill"
+            class:pulse={percent === null}
+            style:width={percent === null ? '100%' : `${percent}%`}
+        ></div>
     </div>
 {/snippet}
 
@@ -308,7 +340,8 @@
                         {:else if row.state === 'stopped'}<XIcon />{/if}
                     </span>
                     <span class="label">{row.label}</span>
-                    {#if row.detail}<span class="detail">{row.detail}</span>{/if}
+                    {#if row.detail}<span class="detail">{row.detail}</span
+                        >{/if}
                 </li>
             {/each}
         </ol>
@@ -316,256 +349,429 @@
 {/snippet}
 
 <div class="onb-root" class:keep-all={DBState.db.language === 'ko'}>
-<div class="onb">
-    <aside class="brand">
-        <canvas bind:this={weaveCanvas} aria-hidden="true"></canvas>
-        <div class="brand-top">
-            <img class="wm" src="/wordmark-transparent.svg" alt="RisuNest" />
-            {@render steps('top')}
-        </div>
-        <div class="brand-copy">
-            <p class="eyebrow">{t.eyebrow}</p>
-            <h2>{t.brandTitle}</h2>
-            <p class="desc">{t.brandDesc}</p>
-        </div>
-        {@render steps('bottom')}
-    </aside>
+    <div class="onb">
+        <aside class="brand">
+            <canvas bind:this={weaveCanvas} aria-hidden="true"></canvas>
+            <div class="brand-top">
+                <img
+                    class="wm"
+                    src="/wordmark-transparent.svg"
+                    alt="RisuNest"
+                />
+                {@render steps('top')}
+            </div>
+            <div class="brand-copy">
+                <p class="eyebrow">{t.eyebrow}</p>
+                <h2>{t.brandTitle}</h2>
+                <p class="desc">{t.brandDesc}</p>
+            </div>
+            {@render steps('bottom')}
+        </aside>
 
-    <section class="panel">
-        {#if jobShown}
-            <div class="panel-in">
-                <h1>{job.title}</h1>
-                {#if job.terminal === null}
-                    <p class="lead">{t.import.warning}</p>
-                {/if}
-                {#if job.sourceName}
-                    <div class="file">
-                        <FileDown />
-                        <span class="name">{job.sourceName}</span>
-                        {#if job.sourceSize}<span class="dim">{job.sourceSize}</span>{/if}
-                        {#if job.subtitle}<span class="tag">{job.subtitle}</span>{/if}
-                    </div>
-                {/if}
-                {@render bar(job.indeterminate ? null : job.overallPercent ?? 0, strings.risuNest.importDialog.titleImport)}
-                <p class="meta">
-                    <span>{job.overallPercent !== null ? `${job.overallPercent}%` : job.terminal ? '' : strings.risuNest.importDialog.preparing}</span>
-                    <span>{job.overallText}</span>
-                    <span class="dim">{job.elapsed}</span>
-                </p>
-                {#if job.terminal}
-                    <p
-                        class="result"
-                        class:succeeded={job.terminal.state === 'succeeded'}
-                        class:failed={job.terminal.state === 'failed'}
-                        class:cancelled={job.terminal.state === 'cancelled'}
-                        role="status"
-                    >
-                        {job.terminal.summary}
+        <section class="panel">
+            {#if jobShown}
+                <div class="panel-in">
+                    <h1>{job.title}</h1>
+                    {#if job.terminal === null}
+                        <p class="lead">{t.import.warning}</p>
+                    {/if}
+                    {#if job.sourceName}
+                        <div class="file">
+                            <FileDown />
+                            <span class="name">{job.sourceName}</span>
+                            {#if job.sourceSize}<span class="dim"
+                                    >{job.sourceSize}</span
+                                >{/if}
+                            {#if job.subtitle}<span class="tag"
+                                    >{job.subtitle}</span
+                                >{/if}
+                        </div>
+                    {/if}
+                    {@render bar(
+                        job.indeterminate ? null : (job.overallPercent ?? 0),
+                        strings.risuNest.importDialog.titleImport,
+                    )}
+                    <p class="meta">
+                        <span
+                            >{job.overallPercent !== null
+                                ? `${job.overallPercent}%`
+                                : job.terminal
+                                  ? ''
+                                  : strings.risuNest.importDialog
+                                        .preparing}</span
+                        >
+                        <span>{job.overallText}</span>
+                        <span class="dim">{job.elapsed}</span>
                     </p>
-                    {#if job.terminal.reason}<p class="reason">{job.terminal.reason}</p>{/if}
-                {/if}
-                {@render stageList(job.stages)}
-                {#if job.currentItem}<p class="item">{job.currentItem}</p>{/if}
-                {#if job.counters.length > 0}
-                    <dl class="counts">
-                        {#each job.counters as counter (counter.key)}
-                            <div><dt>{counter.label}</dt><dd>{counter.value}</dd></div>
-                        {/each}
-                    </dl>
-                {/if}
-                {#if job.warnings.length > 0}
-                    <ul class="warnings">
-                        {#each job.warnings as warning}<li>{warning}</li>{/each}
-                    </ul>
-                {/if}
-                {#if job.terminal?.details}
-                    <div class="details">
-                        <button class="btn ghost" type="button" onclick={() => { jobDetailsOpen = !jobDetailsOpen }}>
-                            {strings.risuNest.importDialog.errorDetails}
-                        </button>
-                        {#if jobDetailsOpen}
-                            <div class="details-body">
+                    {#if job.terminal}
+                        <p
+                            class="result"
+                            class:succeeded={job.terminal.state === 'succeeded'}
+                            class:failed={job.terminal.state === 'failed'}
+                            class:cancelled={job.terminal.state === 'cancelled'}
+                            role="status"
+                        >
+                            {job.terminal.summary}
+                        </p>
+                        {#if job.terminal.reason}<p class="reason">
+                                {job.terminal.reason}
+                            </p>{/if}
+                    {/if}
+                    {@render stageList(job.stages)}
+                    {#if job.currentItem}<p class="item">
+                            {job.currentItem}
+                        </p>{/if}
+                    {#if job.counters.length > 0}
+                        <dl class="counts">
+                            {#each job.counters as counter (counter.key)}
+                                <div>
+                                    <dt>{counter.label}</dt>
+                                    <dd>{counter.value}</dd>
+                                </div>
+                            {/each}
+                        </dl>
+                    {/if}
+                    {#if job.warnings.length > 0}
+                        <ul class="warnings">
+                            {#each job.warnings as warning}<li>
+                                    {warning}
+                                </li>{/each}
+                        </ul>
+                    {/if}
+                    {#if job.terminal?.details}
+                        <div class="details">
+                            <button
+                                class="btn ghost"
+                                type="button"
+                                onclick={() => {
+                                    jobDetailsOpen = !jobDetailsOpen
+                                }}
+                            >
+                                {strings.risuNest.importDialog.errorDetails}
+                            </button>
+                            {#if jobDetailsOpen}
+                                <div class="details-body">
+                                    <button
+                                        class="copy"
+                                        type="button"
+                                        title={jobDetailsCopied
+                                            ? strings.risuNest.importDialog
+                                                  .copied
+                                            : strings.risuNest.importDialog
+                                                  .copyDetails}
+                                        aria-label={strings.risuNest
+                                            .importDialog.copyDetails}
+                                        onclick={copyJobDetails}
+                                    >
+                                        {#if jobDetailsCopied}<Check
+                                            />{:else}<Copy />{/if}
+                                    </button>
+                                    <pre>{job.terminal.details}</pre>
+                                </div>
+                            {/if}
+                        </div>
+                    {/if}
+                    <div class="actions">
+                        {#if job.cancelVisible}
+                            <button
+                                class="btn ghost"
+                                type="button"
+                                disabled={!job.cancelEnabled}
+                                onclick={cancelActiveNativeFileOperation}
+                            >
+                                {job.cancelLabel}
+                            </button>
+                            {#if job.cancelNote}<span class="dim"
+                                    >{job.cancelNote}</span
+                                >{/if}
+                        {/if}
+                        {#if job.closeVisible}
+                            {#if job.terminal?.state === 'succeeded'}
                                 <button
-                                    class="copy"
+                                    class="btn primary"
                                     type="button"
-                                    title={jobDetailsCopied ? strings.risuNest.importDialog.copied : strings.risuNest.importDialog.copyDetails}
-                                    aria-label={strings.risuNest.importDialog.copyDetails}
-                                    onclick={copyJobDetails}
+                                    onclick={continueAfterImport}
                                 >
-                                    {#if jobDetailsCopied}<Check />{:else}<Copy />{/if}
+                                    {t.import.next}<ArrowRight />
                                 </button>
-                                <pre>{job.terminal.details}</pre>
+                            {:else}
+                                <button
+                                    class="btn"
+                                    type="button"
+                                    onclick={dismissNativeFileOperationOutcome}
+                                >
+                                    {strings.risuNest.importDialog.close}
+                                </button>
+                            {/if}
+                        {/if}
+                    </div>
+                </div>
+            {:else}
+                {#key flow.state}
+                    <div class="panel-in">
+                        {#if flow.state === 'home'}
+                            <h1>{t.home.title}</h1>
+                            <p class="lead">{t.home.lead}</p>
+                            <div class="rows">
+                                <button
+                                    class="row primary"
+                                    type="button"
+                                    onclick={startFresh}
+                                >
+                                    <span class="ic"><ArrowRight /></span>
+                                    <span class="tx"
+                                        ><b>{t.home.freshTitle}</b><small
+                                            >{t.home.freshDesc}</small
+                                        ></span
+                                    >
+                                    <span class="chev"><ChevronRight /></span>
+                                </button>
+                                <button
+                                    class="row"
+                                    type="button"
+                                    onclick={() => goTo('import')}
+                                >
+                                    <span class="ic"><FileDown /></span>
+                                    <span class="tx"
+                                        ><b>{t.home.importTitle}</b><small
+                                            >{t.home.importDesc}</small
+                                        ></span
+                                    >
+                                    <span class="chev"><ChevronRight /></span>
+                                </button>
+                                <!-- Every sync route needs the native transports, so the web
+                                 build would open this on an empty screen. -->
+                                {#if isTauri}
+                                    <button
+                                        class="row"
+                                        type="button"
+                                        onclick={() => goTo('sync')}
+                                    >
+                                        <span class="ic"
+                                            ><MonitorSmartphone /></span
+                                        >
+                                        <span class="tx"
+                                            ><b>{t.home.syncTitle}</b><small
+                                                >{t.home.syncDesc}</small
+                                            ></span
+                                        >
+                                        <span class="chev"
+                                            ><ChevronRight /></span
+                                        >
+                                    </button>
+                                {/if}
+                            </div>
+                            <footer class="panel-foot">
+                                <label class="pill">
+                                    <Globe />
+                                    <span class="sr-only">{t.language}</span>
+                                    <select
+                                        value={DBState.db.language}
+                                        onchange={(event) =>
+                                            setLanguage(
+                                                event.currentTarget.value,
+                                            )}
+                                    >
+                                        {#each UI_LANGUAGES as option}
+                                            <option value={option.value}
+                                                >{option.label}</option
+                                            >
+                                        {/each}
+                                    </select>
+                                </label>
+                                <span>RisuNest {getVersionString()}</span>
+                            </footer>
+                        {:else if flow.state === 'import'}
+                            {@render back('home', t.backHome)}
+                            <h1>{t.import.title}</h1>
+                            <p class="lead">{t.import.lead}</p>
+                            <div class="drop">
+                                <span class="ic"><FileDown /></span>
+                                <b>{t.import.dropTitle}</b>
+                                <button
+                                    class="btn primary"
+                                    type="button"
+                                    disabled={importBusy}
+                                    onclick={() =>
+                                        runImport(
+                                            isTauri
+                                                ? restoreBackupFromSystemPicker
+                                                : importRisuSaveFromSystemPicker,
+                                        )}
+                                >
+                                    <FolderOpen />{t.import.choose}
+                                </button>
+                            </div>
+                            {#if isTauriAndroid}
+                                <p class="hint">
+                                    <Smartphone /><span
+                                        >{t.import.hintAndroid}</span
+                                    >
+                                </p>
+                            {/if}
+                            <div class="detect">
+                                <span class="ic"><FolderOpen /></span>
+                                <div>
+                                    <b>{t.import.pocketTitle}</b><small
+                                        >{t.import.pocketDesc}</small
+                                    >
+                                </div>
+                                <button
+                                    class="btn ghost"
+                                    type="button"
+                                    disabled={importBusy}
+                                    onclick={() =>
+                                        runImport(
+                                            isTauri
+                                                ? restoreBackupFromSystemPicker
+                                                : LoadLocalBackup,
+                                        )}
+                                >
+                                    {t.import.pocketAction}
+                                </button>
+                            </div>
+                            <p class="note warn">
+                                <TriangleAlert /><span>{t.import.warning}</span>
+                            </p>
+                        {:else if flow.state === 'sync'}
+                            {@render back('home', t.backHome)}
+                            <h1>{t.sync.title}</h1>
+                            <p class="lead">{t.sync.lead}</p>
+                            <div class="rows">
+                                <button
+                                    class="row"
+                                    type="button"
+                                    onclick={() => goTo('sync-hub')}
+                                >
+                                    <span class="ic"><Server /></span>
+                                    <span class="tx"
+                                        ><b>{t.sync.hubTitle}</b><small
+                                            >{t.sync.hubDesc}</small
+                                        ></span
+                                    >
+                                    <span class="chev"><ChevronRight /></span>
+                                </button>
+                                <button
+                                    class="row"
+                                    type="button"
+                                    onclick={() => goTo('sync-account')}
+                                >
+                                    <span class="ic"><Cloud /></span>
+                                    <span class="tx"
+                                        ><b>{t.sync.accountTitle}</b><small
+                                            >{t.sync.accountDesc}</small
+                                        ></span
+                                    >
+                                    <span class="chev"><ChevronRight /></span>
+                                </button>
+                            </div>
+                        {:else if flow.state === 'sync-hub'}
+                            {@render back('sync', t.back)}
+                            <h1>{t.hub.title}</h1>
+                            <!-- A5 owns activation after the shared registration contract is verified. -->
+                            <p class="lead">{t.hub.stepLink}</p>
+                        {:else if flow.state === 'sync-account'}
+                            {@render back('sync', t.back)}
+                            <h1>{t.account.title}</h1>
+                            <p class="lead">{t.account.lead}</p>
+                            <div class="actions">
+                                {#if DBState.db.account}
+                                    <button
+                                        class="btn primary big"
+                                        type="button"
+                                        onclick={() =>
+                                            goTo('sync-account-found')}
+                                    >
+                                        <User />{t.account.cont}
+                                    </button>
+                                {:else}
+                                    <button
+                                        class="btn primary big"
+                                        type="button"
+                                        onclick={openAccountLogin}
+                                    >
+                                        <User />{t.account.login}
+                                    </button>
+                                {/if}
+                            </div>
+                            <p class="hint spaced">
+                                <Info /><span>{t.account.hint}</span>
+                            </p>
+                        {:else if flow.state === 'sync-account-found'}
+                            {@render back('sync', t.back)}
+                            <h1>{t.accountFound.title}</h1>
+                            <div class="account">
+                                <span class="av"><User /></span>
+                                <span
+                                    >{t.account.signedIn.replace(
+                                        '{0}',
+                                        DBState.db.account?.id ?? '',
+                                    )}</span
+                                >
+                            </div>
+                            <div class="found">
+                                <span class="ic"><Cloud /></span>
+                                <div>
+                                    <b>{t.accountFound.cardTitle}</b><small
+                                        >{t.accountFound.cardDesc}</small
+                                    >
+                                </div>
+                            </div>
+                            <p class="note">
+                                <Info /><span>{t.accountFound.note}</span>
+                            </p>
+                            <div class="actions">
+                                <button
+                                    class="btn primary"
+                                    type="button"
+                                    disabled={accountBusy}
+                                    onclick={restoreAccountBackup}
+                                >
+                                    {t.accountFound.restore}
+                                </button>
+                                <button
+                                    class="btn ghost"
+                                    type="button"
+                                    disabled={accountBusy}
+                                    onclick={() => goTo('home')}
+                                >
+                                    {t.accountFound.other}
+                                </button>
+                            </div>
+                        {:else}
+                            <div class="done">
+                                <span class="check-ring"><Check /></span>
+                                <h1>{t.done.title}</h1>
+                                <p class="lead flush">
+                                    {t.done[onboardingSummary(flow.path)]}
+                                </p>
+                                <button
+                                    class="btn primary big"
+                                    type="button"
+                                    onclick={finish}
+                                >
+                                    {t.done.start}<ArrowRight />
+                                </button>
                             </div>
                         {/if}
                     </div>
-                {/if}
-                <div class="actions">
-                    {#if job.cancelVisible}
-                        <button class="btn ghost" type="button" disabled={!job.cancelEnabled} onclick={cancelActiveNativeFileOperation}>
-                            {job.cancelLabel}
-                        </button>
-                        {#if job.cancelNote}<span class="dim">{job.cancelNote}</span>{/if}
-                    {/if}
-                    {#if job.closeVisible}
-                        {#if job.terminal?.state === 'succeeded'}
-                            <button class="btn primary" type="button" onclick={continueAfterImport}>
-                                {t.import.next}<ArrowRight />
-                            </button>
-                        {:else}
-                            <button class="btn" type="button" onclick={dismissNativeFileOperationOutcome}>
-                                {strings.risuNest.importDialog.close}
-                            </button>
-                        {/if}
-                    {/if}
-                </div>
-            </div>
-        {:else}
-            {#key flow.state}
-                <div class="panel-in">
-                    {#if flow.state === 'home'}
-                        <h1>{t.home.title}</h1>
-                        <p class="lead">{t.home.lead}</p>
-                        <div class="rows">
-                            <button class="row primary" type="button" onclick={startFresh}>
-                                <span class="ic"><ArrowRight /></span>
-                                <span class="tx"><b>{t.home.freshTitle}</b><small>{t.home.freshDesc}</small></span>
-                                <span class="chev"><ChevronRight /></span>
-                            </button>
-                            <button class="row" type="button" onclick={() => goTo('import')}>
-                                <span class="ic"><FileDown /></span>
-                                <span class="tx"><b>{t.home.importTitle}</b><small>{t.home.importDesc}</small></span>
-                                <span class="chev"><ChevronRight /></span>
-                            </button>
-                            <!-- Every sync route needs the native transports, so the web
-                                 build would open this on an empty screen. -->
-                            {#if isTauri}
-                                <button class="row" type="button" onclick={() => goTo('sync')}>
-                                    <span class="ic"><MonitorSmartphone /></span>
-                                    <span class="tx"><b>{t.home.syncTitle}</b><small>{t.home.syncDesc}</small></span>
-                                    <span class="chev"><ChevronRight /></span>
-                                </button>
-                            {/if}
-                        </div>
-                        <footer class="panel-foot">
-                            <label class="pill">
-                                <Globe />
-                                <span class="sr-only">{t.language}</span>
-                                <select
-                                    value={DBState.db.language}
-                                    onchange={(event) => setLanguage(event.currentTarget.value)}
-                                >
-                                    {#each UI_LANGUAGES as option}
-                                        <option value={option.value}>{option.label}</option>
-                                    {/each}
-                                </select>
-                            </label>
-                            <span>RisuNest {getVersionString()}</span>
-                        </footer>
-                    {:else if flow.state === 'import'}
-                        {@render back('home', t.backHome)}
-                        <h1>{t.import.title}</h1>
-                        <p class="lead">{t.import.lead}</p>
-                        <div class="drop">
-                            <span class="ic"><FileDown /></span>
-                            <b>{t.import.dropTitle}</b>
-                            <button
-                                class="btn primary"
-                                type="button"
-                                disabled={importBusy}
-                                onclick={() => runImport(importRisuSaveFromSystemPicker)}
-                            >
-                                <FolderOpen />{t.import.choose}
-                            </button>
-                        </div>
-                        {#if isTauriAndroid}
-                            <p class="hint"><Smartphone /><span>{t.import.hintAndroid}</span></p>
-                        {/if}
-                        <div class="detect">
-                            <span class="ic"><FolderOpen /></span>
-                            <div><b>{t.import.pocketTitle}</b><small>{t.import.pocketDesc}</small></div>
-                            <button class="btn ghost" type="button" disabled={importBusy} onclick={() => runImport(LoadLocalBackup)}>
-                                {t.import.pocketAction}
-                            </button>
-                        </div>
-                        <p class="note warn"><TriangleAlert /><span>{t.import.warning}</span></p>
-                    {:else if flow.state === 'sync'}
-                        {@render back('home', t.backHome)}
-                        <h1>{t.sync.title}</h1>
-                        <p class="lead">{t.sync.lead}</p>
-                        <div class="rows">
-                            <button class="row" type="button" onclick={() => goTo('sync-hub')}>
-                                <span class="ic"><Server /></span>
-                                <span class="tx"><b>{t.sync.hubTitle}</b><small>{t.sync.hubDesc}</small></span>
-                                <span class="chev"><ChevronRight /></span>
-                            </button>
-                            <button class="row" type="button" onclick={() => goTo('sync-account')}>
-                                <span class="ic"><Cloud /></span>
-                                <span class="tx"><b>{t.sync.accountTitle}</b><small>{t.sync.accountDesc}</small></span>
-                                <span class="chev"><ChevronRight /></span>
-                            </button>
-                        </div>
-                    {:else if flow.state === 'sync-hub'}
-                        {@render back('sync', t.back)}
-                        <h1>{t.hub.title}</h1>
-                        <!-- A5 owns activation after the shared registration contract is verified. -->
-                        <p class="lead">{t.hub.stepLink}</p>
-                    {:else if flow.state === 'sync-account'}
-                        {@render back('sync', t.back)}
-                        <h1>{t.account.title}</h1>
-                        <p class="lead">{t.account.lead}</p>
-                        <div class="actions">
-                            {#if DBState.db.account}
-                                <button class="btn primary big" type="button" onclick={() => goTo('sync-account-found')}>
-                                    <User />{t.account.cont}
-                                </button>
-                            {:else}
-                                <button class="btn primary big" type="button" onclick={openAccountLogin}>
-                                    <User />{t.account.login}
-                                </button>
-                            {/if}
-                        </div>
-                        <p class="hint spaced"><Info /><span>{t.account.hint}</span></p>
-                    {:else if flow.state === 'sync-account-found'}
-                        {@render back('sync', t.back)}
-                        <h1>{t.accountFound.title}</h1>
-                        <div class="account">
-                            <span class="av"><User /></span>
-                            <span>{t.account.signedIn.replace('{0}', DBState.db.account?.id ?? '')}</span>
-                        </div>
-                        <div class="found">
-                            <span class="ic"><Cloud /></span>
-                            <div><b>{t.accountFound.cardTitle}</b><small>{t.accountFound.cardDesc}</small></div>
-                        </div>
-                        <p class="note"><Info /><span>{t.accountFound.note}</span></p>
-                        <div class="actions">
-                            <button class="btn primary" type="button" disabled={accountBusy} onclick={restoreAccountBackup}>
-                                {t.accountFound.restore}
-                            </button>
-                            <button class="btn ghost" type="button" disabled={accountBusy} onclick={() => goTo('home')}>
-                                {t.accountFound.other}
-                            </button>
-                        </div>
-                    {:else}
-                        <div class="done">
-                            <span class="check-ring"><Check /></span>
-                            <h1>{t.done.title}</h1>
-                            <p class="lead flush">{t.done[onboardingSummary(flow.path)]}</p>
-                            <button class="btn primary big" type="button" onclick={finish}>
-                                {t.done.start}<ArrowRight />
-                            </button>
-                        </div>
-                    {/if}
-                </div>
-            {/key}
-        {/if}
-    </section>
-</div>
+                {/key}
+            {/if}
+        </section>
+    </div>
 </div>
 
 {#if loginOpen}
     <div class="login-scrim">
-        <iframe bind:this={loginFrame} src={loginUrl} title={t.account.login}></iframe>
-        <button class="btn" type="button" onclick={() => { loginOpen = false }}>{strings.cancel}</button>
+        <iframe bind:this={loginFrame} src={loginUrl} title={t.account.login}
+        ></iframe>
+        <button
+            class="btn"
+            type="button"
+            onclick={() => {
+                loginOpen = false
+            }}>{strings.cancel}</button
+        >
     </div>
 {/if}
 
@@ -736,8 +942,14 @@
         animation: onboarding-rise 0.35s ease-out;
     }
     @keyframes onboarding-rise {
-        from { opacity: 0; transform: translateY(8px); }
-        to { opacity: 1; transform: none; }
+        from {
+            opacity: 0;
+            transform: translateY(8px);
+        }
+        to {
+            opacity: 1;
+            transform: none;
+        }
     }
     .panel h1 {
         margin: 0 0 6px;
@@ -796,7 +1008,9 @@
         border-radius: 14px;
         background: color-mix(in srgb, var(--o-ink) 2%, transparent);
         text-align: start;
-        transition: background 0.15s, border-color 0.15s;
+        transition:
+            background 0.15s,
+            border-color 0.15s;
     }
     .row:hover {
         background: var(--o-hover);
@@ -835,12 +1049,24 @@
         border-color: transparent;
         background:
             linear-gradient(#272b3d, #272b3d) padding-box,
-            linear-gradient(120deg, var(--o-teal), var(--o-blue), var(--o-indigo)) border-box;
+            linear-gradient(
+                    120deg,
+                    var(--o-teal),
+                    var(--o-blue),
+                    var(--o-indigo)
+                )
+                border-box;
     }
     .row.primary:hover {
         background:
             linear-gradient(#2d3148, #2d3148) padding-box,
-            linear-gradient(120deg, var(--o-teal), var(--o-blue), var(--o-indigo)) border-box;
+            linear-gradient(
+                    120deg,
+                    var(--o-teal),
+                    var(--o-blue),
+                    var(--o-indigo)
+                )
+                border-box;
     }
     .row.primary .ic {
         background: linear-gradient(135deg, var(--o-teal), var(--o-indigo));
@@ -1105,8 +1331,13 @@
         animation: onboarding-pulse 1.4s ease-in-out infinite;
     }
     @keyframes onboarding-pulse {
-        0%, 100% { opacity: 0.55; }
-        50% { opacity: 0.2; }
+        0%,
+        100% {
+            opacity: 0.55;
+        }
+        50% {
+            opacity: 0.2;
+        }
     }
     .meta {
         display: flex;
@@ -1182,7 +1413,9 @@
         animation: onboarding-spin 1s linear infinite;
     }
     @keyframes onboarding-spin {
-        to { transform: rotate(360deg); }
+        to {
+            transform: rotate(360deg);
+        }
     }
     .stages .label {
         min-width: 0;

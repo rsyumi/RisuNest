@@ -1,6 +1,74 @@
 use super::*;
 
 #[test]
+fn bounded_generation_replacement_rolls_back_deleted_and_partly_moved_batches() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = PersistentStore::open(directory.path()).unwrap();
+    let seed = stage_root(&mut store, "Original");
+    store.replace_commit(&seed, Some(0)).unwrap();
+    let stage = stage_root(&mut store, "Replacement");
+    for (generation, value) in [("revision-1", "1"), (stage.as_str(), "2")] {
+        let transaction = store.connection.transaction().unwrap();
+        for index in 0..513 {
+            transaction.execute(
+                "INSERT INTO plugin_storage(generation,storage_key,byte_size,ordinal,value) VALUES(?1,?2,1,?3,?4)",
+                params![generation, format!("synthetic-{index:04}"), index, value],
+            ).unwrap();
+        }
+        transaction.commit().unwrap();
+    }
+    store
+        .connection
+        .execute_batch(
+            "CREATE TRIGGER reject_later_batch BEFORE UPDATE ON plugin_storage
+         WHEN NEW.generation='revision-2' AND OLD.storage_key='synthetic-0300'
+         BEGIN SELECT RAISE(ABORT,'synthetic later batch failure'); END;",
+        )
+        .unwrap();
+    assert!(store.replace_commit(&stage, Some(1)).is_err());
+    assert_eq!(store.revision().unwrap(), 1);
+    for (generation, value) in [("revision-1", "1"), (stage.as_str(), "2")] {
+        let count: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM plugin_storage WHERE generation=?1 AND value=?2",
+                params![generation, value],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 513);
+    }
+    assert_eq!(
+        store
+            .connection
+            .query_row::<i64, _, _>(
+                "SELECT count(*) FROM plugin_storage WHERE generation='revision-2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        0
+    );
+    store
+        .connection
+        .execute_batch("DROP TRIGGER reject_later_batch")
+        .unwrap();
+    store.replace_commit(&stage, Some(1)).unwrap();
+    assert_eq!(store.revision().unwrap(), 2);
+    assert_eq!(
+        store
+            .connection
+            .query_row::<i64, _, _>(
+                "SELECT count(*) FROM plugin_storage WHERE generation='revision-2' AND value='2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        513
+    );
+}
+
+#[test]
 fn replacements_snapshot_only_nonzero_revisions_and_abort_on_snapshot_failure() {
     let directory = tempfile::tempdir().expect("create temporary directory");
     let mut store = PersistentStore::open(directory.path()).expect("open persistent store");

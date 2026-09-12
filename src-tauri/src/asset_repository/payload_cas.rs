@@ -669,7 +669,7 @@ fn exact_object_changed<T>() -> io::Result<T> {
 
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ExactFileIdentity {
+pub(crate) struct ExactFileIdentity {
     device: u64,
     inode: u64,
     byte_size: u64,
@@ -689,7 +689,7 @@ impl ExactFileIdentity {
 }
 
 #[cfg(unix)]
-fn exact_file_identity(file: &File) -> io::Result<ExactFileIdentity> {
+pub(crate) fn exact_file_identity(file: &File) -> io::Result<ExactFileIdentity> {
     let metadata = file.metadata()?;
     Ok(ExactFileIdentity {
         device: metadata.dev(),
@@ -706,7 +706,7 @@ fn exact_file_identity(file: &File) -> io::Result<ExactFileIdentity> {
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ExactFileIdentity {
+pub(crate) struct ExactFileIdentity {
     volume: u32,
     file_index: u64,
     byte_size: u64,
@@ -724,7 +724,7 @@ impl ExactFileIdentity {
 }
 
 #[cfg(windows)]
-fn exact_file_identity(file: &File) -> io::Result<ExactFileIdentity> {
+pub(crate) fn exact_file_identity(file: &File) -> io::Result<ExactFileIdentity> {
     use windows_sys::Win32::Storage::FileSystem::{
         GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
     };
@@ -752,7 +752,7 @@ fn exact_file_identity(file: &File) -> io::Result<ExactFileIdentity> {
 
 #[cfg(not(any(unix, windows)))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ExactFileIdentity {
+pub(crate) struct ExactFileIdentity {
     byte_size: u64,
     modified: Option<std::time::SystemTime>,
 }
@@ -765,7 +765,7 @@ impl ExactFileIdentity {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn exact_file_identity(file: &File) -> io::Result<ExactFileIdentity> {
+pub(crate) fn exact_file_identity(file: &File) -> io::Result<ExactFileIdentity> {
     let metadata = file.metadata()?;
     Ok(ExactFileIdentity {
         byte_size: metadata.len(),

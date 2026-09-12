@@ -127,6 +127,189 @@ pub(crate) fn rebuild_f0_v1(
     })
 }
 
+/// The raw portable path applies these same F0 scanners to one stored value at a time. Target
+/// membership is checked against its SQLite inventory, avoiding a materialized database graph.
+pub(crate) enum PortableFragment<'a> {
+    Root {
+        value: &'a Value,
+        selected_preset: Option<&'a Value>,
+    },
+    Preset {
+        value: &'a Value,
+        index: i64,
+    },
+    Plugin {
+        value: &'a Value,
+        key: &'a str,
+    },
+    Character {
+        value: &'a Value,
+        selected_chat: Option<&'a Value>,
+        has_chats: bool,
+    },
+    Conversation {
+        value: &'a Value,
+        character_id: &'a str,
+    },
+    Message {
+        value: &'a Value,
+        character_id: &'a str,
+        conversation_id: &'a str,
+        index: i64,
+    },
+    Cold {
+        value: &'a Value,
+        key: &'a str,
+    },
+}
+
+pub(crate) fn scan_portable_fragment(
+    fragment: PortableFragment<'_>,
+) -> Result<Vec<F0Reference>, F0Error> {
+    let indexes = ReferenceIndexes {
+        present: HashMap::new(),
+        expected_missing: HashSet::new(),
+        conversations_by_character: HashMap::new(),
+        folders_by_character: HashMap::new(),
+    };
+    let mut collector = GraphCollector::new(&indexes);
+    match fragment {
+        PortableFragment::Root {
+            value,
+            selected_preset,
+        } => {
+            scan_database_root(value, &mut collector)?;
+            if let Some(name) = selected_preset
+                .and_then(|v| v.get("name"))
+                .filter(|v| v.is_string())
+            {
+                if let Some(reference) = collector
+                    .references
+                    .iter_mut()
+                    .find(|r| r.owner_kind == "root" && r.source_path == "$.botPresetsId")
+                {
+                    reference.target_key = display_key(Some(name));
+                }
+            }
+            scan_database_collections(value, &mut collector)?;
+        }
+        PortableFragment::Preset { value, index } => {
+            let fallback = format!("#{index}");
+            let owner = Owner {
+                kind: "preset",
+                id: value
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&fallback),
+            };
+            collector.optional(
+                owner,
+                "$.image",
+                "asset",
+                value.get("image"),
+                object(&[("field", json_string("image"))]),
+            );
+            scan_inlays(value, owner, "$", &mut collector);
+        }
+        PortableFragment::Plugin { value, key } => scan_inlays(
+            value,
+            Owner {
+                kind: "plugin-storage",
+                id: key,
+            },
+            "$",
+            &mut collector,
+        ),
+        PortableFragment::Character {
+            value,
+            selected_chat,
+            has_chats,
+        } => {
+            scan_characters(&serde_json::json!({"characters":[value]}), &mut collector)?;
+            if has_chats {
+                let character_id = value
+                    .get("chaId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let index = value.get("chatPage");
+                let key = selected_chat
+                    .and_then(|v| v.get("id"))
+                    .filter(|v| v.is_string())
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(format!("#{}", display_template(index))));
+                collector.emit(
+                    Owner {
+                        kind: if value.get("type").and_then(Value::as_str) == Some("group") {
+                            "group"
+                        } else {
+                            "character"
+                        },
+                        id: character_id,
+                    },
+                    "$.chatPage",
+                    "conversation",
+                    Some(&key),
+                    object(&[
+                        ("characterId", json_string(character_id)),
+                        ("index", index.cloned().unwrap_or(Value::Null)),
+                    ]),
+                );
+            }
+        }
+        PortableFragment::Conversation {
+            value,
+            character_id,
+        } => {
+            scan_characters(
+                &serde_json::json!({"characters":[{"chaId":character_id,"chats":[value]}]}),
+                &mut collector,
+            )?;
+            collector
+                .references
+                .retain(|r| r.owner_kind == "conversation");
+        }
+        PortableFragment::Message {
+            value,
+            character_id,
+            conversation_id,
+            index,
+        } => {
+            let id = format!("{character_id}/{conversation_id}");
+            let owner = Owner {
+                kind: "conversation",
+                id: &id,
+            };
+            if index == 0 {
+                if let Some(data) = value
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .and_then(|v| v.strip_prefix(COLD_STORAGE_HEADER))
+                {
+                    collector.emit(
+                        owner,
+                        "$.message[0].data",
+                        "cold",
+                        Some(&json_string(data)),
+                        object(&[("encoding", json_string("cold-storage-header"))]),
+                    );
+                }
+            }
+            scan_inlays(value, owner, &format!("$.message[{index}]"), &mut collector);
+        }
+        PortableFragment::Cold { value, key } => {
+            let owner = Owner {
+                kind: "cold",
+                id: key,
+            };
+            if let Some(character) = value.get("character").and_then(Value::as_object) {
+                scan_character_assets(character, owner, "$.value.character", &mut collector);
+            }
+            scan_inlays(value, owner, "$.value", &mut collector);
+        }
+    }
+    Ok(collector.references)
+}
+
 #[derive(Clone, Copy)]
 struct Owner<'a> {
     kind: &'a str,
@@ -1508,6 +1691,106 @@ mod tests {
     };
     use serde_json::json;
     use std::{fs, io::Write};
+
+    #[test]
+    fn portable_fragments_preserve_the_complete_f0_reference_multiset() {
+        let database = json!({
+            "botPresetsId":0,"botPresets":[{"name":"preset","image":"assets/preset","prompt":"{{inlay::preset}}"}],
+            "selectedPersona":0,"personas":[{"id":"persona","icon":"assets/persona"}],
+            "modules":[{"id":"module","assets":[["label","assets/module","png"]]}],
+            "pluginCustomStorage":{"synthetic":"{{inlay::plugin}}"},
+            "characters":[
+                {"chaId":"character","type":"character","image":"assets/portrait","chatPage":0,"additionalAssets":[["one","assets/one","png"]],"chats":[{"id":"chat","name":"{{inlay::title}}","folderId":"folder","message":[{"role":"user","data":"{{inlay::first}} {{inlay::first}}"},{"role":"char","data":"{{inlay::second}}","swipes":["{{inlay::swipe}}"]}]}]},
+                {"chaId":"group","type":"group","characters":["character"],"chatPage":0,"chats":[{"id":"group-chat","message":[{"role":"char","data":"{{inlay::group}}"}]}]}
+            ]
+        });
+        let expected = rebuild_f0_v1(&database, &[], &[]).unwrap().references;
+        let mut root = database.clone();
+        for key in ["characters", "botPresets", "pluginCustomStorage"] {
+            root.as_object_mut().unwrap().remove(key);
+        }
+        let mut actual = scan_portable_fragment(PortableFragment::Root {
+            value: &root,
+            selected_preset: database["botPresets"].get(0),
+        })
+        .unwrap();
+        for (index, preset) in database["botPresets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            actual.extend(
+                scan_portable_fragment(PortableFragment::Preset {
+                    value: preset,
+                    index: index as i64,
+                })
+                .unwrap(),
+            );
+        }
+        for (key, value) in database["pluginCustomStorage"].as_object().unwrap() {
+            actual.extend(scan_portable_fragment(PortableFragment::Plugin { value, key }).unwrap());
+        }
+        for character in database["characters"].as_array().unwrap() {
+            let id = character["chaId"].as_str().unwrap();
+            let chats = character["chats"].as_array().unwrap();
+            let mut detail = character.clone();
+            detail.as_object_mut().unwrap().remove("chats");
+            actual.extend(
+                scan_portable_fragment(PortableFragment::Character {
+                    value: &detail,
+                    selected_chat: chats.first(),
+                    has_chats: !chats.is_empty(),
+                })
+                .unwrap(),
+            );
+            for chat in chats {
+                let mut detail = chat.clone();
+                detail.as_object_mut().unwrap().remove("message");
+                actual.extend(
+                    scan_portable_fragment(PortableFragment::Conversation {
+                        value: &detail,
+                        character_id: id,
+                    })
+                    .unwrap(),
+                );
+                for (index, message) in chat["message"].as_array().unwrap().iter().enumerate() {
+                    actual.extend(
+                        scan_portable_fragment(PortableFragment::Message {
+                            value: message,
+                            character_id: id,
+                            conversation_id: chat["id"].as_str().unwrap(),
+                            index: index as i64,
+                        })
+                        .unwrap(),
+                    );
+                }
+            }
+        }
+        // Membership is resolved by SQL in portable validation; occurrence restarts per fragment.
+        // The multiset retains repeated uses and every semantic field including source paths.
+        let normalize = |references: Vec<F0Reference>| {
+            let mut values = references
+                .into_iter()
+                .map(|r| {
+                    format!(
+                        "{:?}",
+                        (
+                            r.owner_kind,
+                            r.owner_id,
+                            r.source_path,
+                            r.target_kind,
+                            r.target_key,
+                            r.metadata
+                        )
+                    )
+                })
+                .collect::<Vec<_>>();
+            values.sort();
+            values
+        };
+        assert_eq!(normalize(actual), normalize(expected));
+    }
 
     #[test]
     fn decoded_database_semantics_ignore_irrelevant_source_bytes() {

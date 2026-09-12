@@ -13,6 +13,8 @@ use std::{
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Receipt {
+    format: String,
+    scope: String,
     head: RemoteHead,
     local_revision: i64,
     local_hash: String,
@@ -76,8 +78,8 @@ pub(super) fn inspect(root: &Path, id: &str) -> Result<Backup> {
             .as_millis() as u64,
         head: receipt.head,
         local_revision: receipt.local_revision,
-        local_bytes: size("local.risulossless")?,
-        remote_bytes: size("remote.risulossless")?,
+        local_bytes: size("local.risunest")?,
+        remote_bytes: size("remote.risunest")?,
         preservation_scope: "library",
         recovery_ready: true,
     })
@@ -95,6 +97,9 @@ fn receipt(directory: &Path) -> Result<Receipt> {
     let receipt: Receipt = serde_json::from_slice(&bytes)
         .map_err(|_| SyncError::new("invalid-backup-receipt", 409))?;
     receipt.head.validate()?;
+    if receipt.format != "risunest-portable-backup" || receipt.scope != "library" {
+        return Err(SyncError::new("invalid-backup-scope", 409));
+    }
     risunest_sync_wire::validate_hash(&receipt.local_hash)?;
     risunest_sync_wire::validate_hash(&receipt.remote_hash)?;
     Ok(receipt)
@@ -130,8 +135,8 @@ pub(crate) fn source(
     let directory = directory(root, id)?;
     let receipt = receipt(&directory)?;
     let (name, expected) = match side {
-        Side::Local => ("local.risulossless", receipt.local_hash),
-        Side::Remote => ("remote.risulossless", receipt.remote_hash),
+        Side::Local => ("local.risunest", receipt.local_hash),
+        Side::Remote => ("remote.risunest", receipt.remote_hash),
     };
     let path = directory.join(name);
     if std::fs::canonicalize(&path)? != path {

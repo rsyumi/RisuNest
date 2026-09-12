@@ -111,6 +111,10 @@ destination_controlled_writer!(
     SourceKind::LosslessBackup
 );
 destination_controlled_writer!(
+    write_portable_destination_controlled,
+    SourceKind::PortableBackup
+);
+destination_controlled_writer!(
     write_legacy_backup_destination_controlled,
     SourceKind::LegacyBackup
 );
@@ -234,6 +238,7 @@ enum SourceKind {
     RisuSave,
     ScreenshotOutput,
     LosslessBackup,
+    PortableBackup,
     LegacyBackup,
     CharacterCharX,
     CharacterCard,
@@ -251,6 +256,7 @@ impl SourceKind {
                 Some(&["archive.risulossless.part", "recovery.risulossless.part"])
             }
             Self::LegacyBackup => Some(&["archive.bin.part"]),
+            Self::PortableBackup => Some(&["archive.risunest.part", "recovery.risunest.part"]),
             Self::CharacterCharX => Some(&["character.charx", "character.jpeg"]),
             Self::CharacterCard => Some(&["character.json", "character.png"]),
             Self::RisuModule => Some(&["module.risum"]),

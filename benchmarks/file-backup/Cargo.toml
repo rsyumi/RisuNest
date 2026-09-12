@@ -1,0 +1,16 @@
+[package]
+name = "risunest-file-backup-comparison"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+zip = "0.6.6"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+sha2 = "0.10"
+tempfile = "3"
+serde_json = "1"
+
+[[bin]]
+name = "file-backup-comparison"
+path = "main.rs"

@@ -3,11 +3,19 @@ import { describe, expect, it } from 'vitest'
 import source from './UserSettings.svelte?raw'
 
 describe('UserSettings local backup route', () => {
-    it('routes the regular save and restore buttons through the production lossless caller', () => {
+    it('routes native full backup and restore through the common production caller and retains the web adapter', () => {
+        expect(source).toContain('exportPortableBackupFromSystemPicker')
+        expect(source).toContain('restoreBackupFromSystemPicker')
+        expect(source).toContain('exportRisuSaveFromSystemPicker')
+        expect(source).toContain('language.portableBackup.dbOnly')
         expect(source).toContain('exportLocalBackupFromSystemPicker')
         expect(source).toContain('restoreLocalBackupFromSystemPicker')
-        expect(source).toContain('await runLocalBackupOperation(\'export\')')
-        expect(source).toContain('await runLocalBackupOperation(\'import\')')
+        expect(source).toMatch(
+            /await runLocalBackupOperation\(["']export["']\)/,
+        )
+        expect(source).toMatch(
+            /await runLocalBackupOperation\(["']import["']\)/,
+        )
     })
 
     it('keeps upstream local backup, account, and Drive controls on this page', () => {
@@ -35,16 +43,24 @@ describe('UserSettings local backup route', () => {
 
     it('keeps official account actions behind the existing account gate', async () => {
         const backupSource = await import('./RisuNestBackupRestore.svelte?raw')
-        const snapshot = backupSource.default.indexOf('{language.restoreLocalSnapshot}')
-        const accountGate = backupSource.default.indexOf('{#if isTauri && DBState.db.account}')
-        const officialRestore = backupSource.default.indexOf('{language.risuNest.backup.officialRestore}')
+        const snapshot = backupSource.default.indexOf(
+            '{language.restoreLocalSnapshot}',
+        )
+        const accountGate = backupSource.default.indexOf(
+            '{#if isTauri && DBState.db.account}',
+        )
+        const officialRestore = backupSource.default.indexOf(
+            '{language.risuNest.backup.officialRestore}',
+        )
         expect(snapshot).toBeGreaterThan(-1)
         expect(accountGate).toBeGreaterThan(snapshot)
         expect(officialRestore).toBeGreaterThan(accountGate)
     })
 
     it('uses localized safe copy for official backup actions and native failures', async () => {
-        const backupSource = (await import('./RisuNestBackupRestore.svelte?raw')).default
+        const backupSource = (
+            await import('./RisuNestBackupRestore.svelte?raw')
+        ).default
 
         for (const key of [
             'officialRestoreConfirm',
@@ -53,10 +69,13 @@ describe('UserSettings local backup route', () => {
             'officialPublishConfirm',
             'officialPublished',
             'actionFailed',
-        ]) expect(backupSource).toContain(`language.risuNest.backup.${key}`)
+        ])
+            expect(backupSource).toContain(`language.risuNest.backup.${key}`)
 
         expect(backupSource).not.toContain('status.phase}')
         expect(backupSource).not.toContain('${status.phase}')
-        expect(backupSource).not.toContain("alertError(error instanceof Error ? error : String(error))")
+        expect(backupSource).not.toContain(
+            'alertError(error instanceof Error ? error : String(error))',
+        )
     })
 })

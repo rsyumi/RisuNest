@@ -6,8 +6,10 @@ import {
     NativeFileJobError,
     runNativeOfficialAccountSnapshotRestore,
     runNativeBlockRisuSaveRestore,
+    runNativeArchiveRestore,
     runNativeBlockRisuSaveExport,
     runNativeLegacyLocalBackupExport,
+    runNativeCompatibleLocalBackupExport,
     runNativeLegacyLocalBackupRestore,
     runNativeLosslessBackupExport,
     runNativeCharacterCharxExport,
@@ -56,7 +58,9 @@ function restoreRuntime(
         acquireDestructiveReplacementFence: async () => {
             await options.acquire?.()
             return {
-                refreshCommittedWorkingSet: async (committedRevision: number) => {
+                refreshCommittedWorkingSet: async (
+                    committedRevision: number,
+                ) => {
                     await options.refresh?.(committedRevision)
                 },
                 release: () => options.release?.(),
@@ -66,6 +70,72 @@ function restoreRuntime(
 }
 
 describe('native file jobs', () => {
+    it.each(['chooser', 'fence'])(
+        'cancels portable restore aborted during %s before native section approval',
+        async (point) => {
+            const abort = new AbortController()
+            const commands: string[] = []
+            const released = vi.fn()
+            let polled = false
+            const preview = {
+                ...status('waitingForInput'),
+                kind: 'restore-portable-backup' as const,
+                phase: 'awaiting-backup-selection' as const,
+                restorePreview: {
+                    libraryIncluded: true,
+                    repairRequired: false,
+                    deviceSections: ['local-storage'],
+                },
+            }
+            await expect(
+                runNativeArchiveRestore(
+                    restoreRuntime(3, {
+                        acquire() {
+                            if (point === 'fence') abort.abort()
+                        },
+                        release: released,
+                    }),
+                    {
+                        type: 'desktopPath',
+                        path: 'C:\\synthetic\\backup.risunest',
+                    },
+                    {
+                        signal: abort.signal,
+                        choosePortableSections: async () => {
+                            if (point === 'chooser') abort.abort()
+                            return {
+                                library: true,
+                                deviceSections: ['local-storage'],
+                            }
+                        },
+                    },
+                    {
+                        isTauri: () => true,
+                        wait: async () => {},
+                        invoke: async (command) => {
+                            commands.push(command)
+                            if (command === 'native_file_job_start')
+                                return { jobId: 'job-1' }
+                            if (command === 'native_file_job_status') {
+                                if (!polled) {
+                                    polled = true
+                                    return preview
+                                }
+                                return {
+                                    ...status('cancelled'),
+                                    kind: 'restore-portable-backup',
+                                }
+                            }
+                            return true
+                        },
+                    },
+                ),
+            ).rejects.toMatchObject({ name: 'AbortError' })
+            expect(commands).toContain('native_file_job_cancel')
+            expect(commands).not.toContain('native_portable_select_sections')
+            expect(released).toHaveBeenCalledTimes(point === 'fence' ? 1 : 0)
+        },
+    )
     it('exports one leased character CharX without payload bytes in IPC', async () => {
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
         const terminal: NativeFileJobStatus = {
@@ -94,7 +164,14 @@ describe('native file jobs', () => {
             data: {
                 name: 'Leased',
                 extensions: { risuai: {} },
-                assets: [{ type: 'icon', uri: 'ccdefault:', name: 'main', ext: 'png' }],
+                assets: [
+                    {
+                        type: 'icon',
+                        uri: 'ccdefault:',
+                        name: 'main',
+                        ext: 'png',
+                    },
+                ],
             },
         }
         const module = {
@@ -109,7 +186,10 @@ describe('native file jobs', () => {
         const result = await runNativeCharacterCharxExport(
             {
                 characterId: 'character-id',
-                destination: { type: 'desktopPath', path: 'C:\\chosen\\Leased.charx' },
+                destination: {
+                    type: 'desktopPath',
+                    path: 'C:\\chosen\\Leased.charx',
+                },
                 expectedRevision: 31,
                 card,
                 module,
@@ -119,7 +199,8 @@ describe('native file jobs', () => {
                 isTauri: () => true,
                 invoke: async (command, args) => {
                     calls.push([command, args])
-                    if (command === 'native_file_job_start') return { jobId: 'character-export' }
+                    if (command === 'native_file_job_start')
+                        return { jobId: 'character-export' }
                     if (command === 'native_file_job_status') return terminal
                     if (command === 'native_file_job_forget') return true
                     throw new Error(`Unexpected command: ${command}`)
@@ -131,16 +212,19 @@ describe('native file jobs', () => {
 
         expect(result).toEqual(terminal.result)
         expect(calls).toEqual([
-            ['native_file_job_start', {
-                request: {
-                    kind: 'export-character-charx',
-                    destination: 'C:\\chosen\\Leased.charx',
-                    expectedRevision: 31,
-                    characterId: 'character-id',
-                    card,
-                    module,
+            [
+                'native_file_job_start',
+                {
+                    request: {
+                        kind: 'export-character-charx',
+                        destination: 'C:\\chosen\\Leased.charx',
+                        expectedRevision: 31,
+                        characterId: 'character-id',
+                        card,
+                        module,
+                    },
                 },
-            }],
+            ],
             ['native_file_job_status', { jobId: 'character-export' }],
             ['native_file_job_forget', { jobId: 'character-export' }],
         ])
@@ -149,7 +233,8 @@ describe('native file jobs', () => {
 
     it('hands a managed character CharX export to Android SAF and cleans the native source', async () => {
         const events: string[] = []
-        const handoffPath = 'C:\\app\\native-file-jobs\\handoffs\\risu-charx-123e4567-e89b-42d3-a456-426614174002.charx'
+        const handoffPath =
+            'C:\\app\\native-file-jobs\\handoffs\\risu-charx-123e4567-e89b-42d3-a456-426614174002.charx'
         const terminal: NativeFileJobStatus = {
             jobId: 'character-export',
             kind: 'export-character-charx',
@@ -170,7 +255,10 @@ describe('native file jobs', () => {
         const result = await runNativeCharacterCharxExport(
             {
                 characterId: 'character-id',
-                destination: { type: 'androidSaf', suggestedName: 'Leased.charx' },
+                destination: {
+                    type: 'androidSaf',
+                    suggestedName: 'Leased.charx',
+                },
                 expectedRevision: 31,
                 card: { spec: 'chara_card_v3' },
                 module: {},
@@ -180,15 +268,19 @@ describe('native file jobs', () => {
                 isTauri: () => true,
                 invoke: async (command, args) => {
                     events.push(`${command}:${JSON.stringify(args ?? {})}`)
-                    if (command === 'native_file_job_start') return { jobId: 'character-export' }
+                    if (command === 'native_file_job_start')
+                        return { jobId: 'character-export' }
                     if (command === 'native_file_job_status') return terminal
-                    if (command === 'native_character_charx_handoff_cleanup') return undefined
+                    if (command === 'native_character_charx_handoff_cleanup')
+                        return undefined
                     if (command === 'native_file_job_forget') return true
                     throw new Error(`Unexpected command: ${command}`)
                 },
                 wait: async () => undefined,
                 copyToAndroidSaf: async (request) => {
-                    events.push(`saf:${request.sourcePath}:${request.suggestedName}`)
+                    events.push(
+                        `saf:${request.sourcePath}:${request.suggestedName}`,
+                    )
                     return {
                         bytes: 4096,
                         warningCodes: ['android-saf-provider-not-atomic'],
@@ -210,7 +302,8 @@ describe('native file jobs', () => {
 
     it('retains a successful Android CharX job when native source cleanup fails', async () => {
         const commands: string[] = []
-        const handoffPath = 'C:\\app\\native-file-jobs\\handoffs\\risu-charx-123e4567-e89b-42d3-a456-426614174005.charx'
+        const handoffPath =
+            'C:\\app\\native-file-jobs\\handoffs\\risu-charx-123e4567-e89b-42d3-a456-426614174005.charx'
         const terminal: NativeFileJobStatus = {
             jobId: 'character-export',
             kind: 'export-character-charx',
@@ -231,7 +324,10 @@ describe('native file jobs', () => {
         const result = await runNativeCharacterCharxExport(
             {
                 characterId: 'character-id',
-                destination: { type: 'androidSaf', suggestedName: 'Leased.charx' },
+                destination: {
+                    type: 'androidSaf',
+                    suggestedName: 'Leased.charx',
+                },
                 expectedRevision: 31,
                 card: { spec: 'chara_card_v3' },
                 module: {},
@@ -241,7 +337,8 @@ describe('native file jobs', () => {
                 isTauri: () => true,
                 invoke: async (command) => {
                     commands.push(command)
-                    if (command === 'native_file_job_start') return { jobId: 'character-export' }
+                    if (command === 'native_file_job_start')
+                        return { jobId: 'character-export' }
                     if (command === 'native_file_job_status') return terminal
                     if (command === 'native_character_charx_handoff_cleanup') {
                         throw new Error('handoff is still in use')
@@ -250,7 +347,10 @@ describe('native file jobs', () => {
                     throw new Error(`Unexpected command: ${command}`)
                 },
                 wait: async () => undefined,
-                copyToAndroidSaf: async () => ({ bytes: 4096, warningCodes: [] }),
+                copyToAndroidSaf: async () => ({
+                    bytes: 4096,
+                    warningCodes: [],
+                }),
             },
         )
 
@@ -264,7 +364,8 @@ describe('native file jobs', () => {
 
     it('rejects a short Android CharX handoff and still cleans both native receipts', async () => {
         const commands: string[] = []
-        const handoffPath = 'C:\\app\\native-file-jobs\\handoffs\\risu-charx-123e4567-e89b-42d3-a456-426614174003.charx'
+        const handoffPath =
+            'C:\\app\\native-file-jobs\\handoffs\\risu-charx-123e4567-e89b-42d3-a456-426614174003.charx'
         const terminal: NativeFileJobStatus = {
             jobId: 'character-export',
             kind: 'export-character-charx',
@@ -282,29 +383,42 @@ describe('native file jobs', () => {
             },
         }
 
-        await expect(runNativeCharacterCharxExport(
-            {
-                characterId: 'character-id',
-                destination: { type: 'androidSaf', suggestedName: 'Leased.charx' },
-                expectedRevision: 31,
-                card: { spec: 'chara_card_v3' },
-                module: {},
-            },
-            {},
-            {
-                isTauri: () => true,
-                invoke: async (command) => {
-                    commands.push(command)
-                    if (command === 'native_file_job_start') return { jobId: 'character-export' }
-                    if (command === 'native_file_job_status') return terminal
-                    if (command === 'native_character_charx_handoff_cleanup') return undefined
-                    if (command === 'native_file_job_forget') return true
-                    throw new Error(`Unexpected command: ${command}`)
+        await expect(
+            runNativeCharacterCharxExport(
+                {
+                    characterId: 'character-id',
+                    destination: {
+                        type: 'androidSaf',
+                        suggestedName: 'Leased.charx',
+                    },
+                    expectedRevision: 31,
+                    card: { spec: 'chara_card_v3' },
+                    module: {},
                 },
-                wait: async () => undefined,
-                copyToAndroidSaf: async () => ({ bytes: 2048, warningCodes: [] }),
-            },
-        )).rejects.toMatchObject({ code: 'length-mismatch' })
+                {},
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        commands.push(command)
+                        if (command === 'native_file_job_start')
+                            return { jobId: 'character-export' }
+                        if (command === 'native_file_job_status')
+                            return terminal
+                        if (
+                            command === 'native_character_charx_handoff_cleanup'
+                        )
+                            return undefined
+                        if (command === 'native_file_job_forget') return true
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
+                    copyToAndroidSaf: async () => ({
+                        bytes: 2048,
+                        warningCodes: [],
+                    }),
+                },
+            ),
+        ).rejects.toMatchObject({ code: 'length-mismatch' })
         expect(commands).toEqual([
             'native_file_job_start',
             'native_file_job_status',
@@ -315,7 +429,8 @@ describe('native file jobs', () => {
 
     it('hands a descriptor-only JSON character card to Android SAF and cleans both receipts', async () => {
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
-        const handoffPath = 'C:\\app\\native-file-jobs\\handoffs\\risu-character-card-123e4567-e89b-42d3-a456-426614174006.json'
+        const handoffPath =
+            'C:\\app\\native-file-jobs\\handoffs\\risu-character-card-123e4567-e89b-42d3-a456-426614174006.json'
         const terminal: NativeFileJobStatus = {
             jobId: 'json-export',
             kind: 'export-character-card',
@@ -351,9 +466,11 @@ describe('native file jobs', () => {
                 isTauri: () => true,
                 invoke: async (command, args) => {
                     calls.push([command, args])
-                    if (command === 'native_file_job_start') return { jobId: 'json-export' }
+                    if (command === 'native_file_job_start')
+                        return { jobId: 'json-export' }
                     if (command === 'native_file_job_status') return terminal
-                    if (command === 'native_character_card_handoff_cleanup') return undefined
+                    if (command === 'native_character_card_handoff_cleanup')
+                        return undefined
                     if (command === 'native_file_job_forget') return true
                     throw new Error(`Unexpected command: ${command}`)
                 },
@@ -368,13 +485,18 @@ describe('native file jobs', () => {
         expect(result.handoffPath).toBeUndefined()
         expect(result.warningCodes).toEqual(['android-saf-provider-not-atomic'])
         expect(calls).toEqual([
-            ['native_file_job_start', { request: {
-                kind: 'export-character-card',
-                expectedRevision: 44,
-                characterId: 'json-character',
-                format: 'json-card',
-                metadata,
-            } }],
+            [
+                'native_file_job_start',
+                {
+                    request: {
+                        kind: 'export-character-card',
+                        expectedRevision: 44,
+                        characterId: 'json-character',
+                        format: 'json-card',
+                        metadata,
+                    },
+                },
+            ],
             ['native_file_job_status', { jobId: 'json-export' }],
             ['native_character_card_handoff_cleanup', { path: handoffPath }],
             ['native_file_job_forget', { jobId: 'json-export' }],
@@ -385,46 +507,62 @@ describe('native file jobs', () => {
 
     it('hands an exact-index RISUM descriptor to Android SAF and cleans both receipts', async () => {
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
-        const handoffPath = 'C:\\app\\native-file-jobs\\handoffs\\risu-module-123e4567-e89b-42d3-a456-426614174006.risum'
-        const result = await runNativeRisuModuleExport({
-            moduleIndex: 7,
-            destination: { type: 'androidSaf', suggestedName: 'Module.risum' },
-            expectedRevision: 44,
-        }, {}, {
-            isTauri: () => true,
-            invoke: async (command, args) => {
-                calls.push([command, args])
-                if (command === 'native_file_job_start') return { jobId: 'risum-export' }
-                if (command === 'native_file_job_status') return {
-                    jobId: 'risum-export',
-                    kind: 'export-risu-module',
-                    state: 'succeeded',
-                    phase: 'complete',
-                    progress: { completedBytes: 9, completedItems: 3 },
-                    result: {
-                        revision: 44,
-                        sourceBytes: 9,
-                        sourceSha256: 'e'.repeat(64),
-                        characterCount: 0,
-                        presetCount: 0,
-                        warningCodes: [],
-                        handoffPath,
-                    },
-                }
-                if (command === 'native_risu_module_handoff_cleanup') return undefined
-                if (command === 'native_file_job_forget') return true
-                throw new Error(`Unexpected command: ${command}`)
+        const handoffPath =
+            'C:\\app\\native-file-jobs\\handoffs\\risu-module-123e4567-e89b-42d3-a456-426614174006.risum'
+        const result = await runNativeRisuModuleExport(
+            {
+                moduleIndex: 7,
+                destination: {
+                    type: 'androidSaf',
+                    suggestedName: 'Module.risum',
+                },
+                expectedRevision: 44,
             },
-            wait: async () => undefined,
-            copyToAndroidSaf: async () => ({ bytes: 9, warningCodes: [] }),
-        })
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command, args) => {
+                    calls.push([command, args])
+                    if (command === 'native_file_job_start')
+                        return { jobId: 'risum-export' }
+                    if (command === 'native_file_job_status')
+                        return {
+                            jobId: 'risum-export',
+                            kind: 'export-risu-module',
+                            state: 'succeeded',
+                            phase: 'complete',
+                            progress: { completedBytes: 9, completedItems: 3 },
+                            result: {
+                                revision: 44,
+                                sourceBytes: 9,
+                                sourceSha256: 'e'.repeat(64),
+                                characterCount: 0,
+                                presetCount: 0,
+                                warningCodes: [],
+                                handoffPath,
+                            },
+                        }
+                    if (command === 'native_risu_module_handoff_cleanup')
+                        return undefined
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+                copyToAndroidSaf: async () => ({ bytes: 9, warningCodes: [] }),
+            },
+        )
         expect(result.handoffPath).toBeUndefined()
         expect(calls).toEqual([
-            ['native_file_job_start', { request: {
-                kind: 'export-risu-module',
-                expectedRevision: 44,
-                moduleIndex: 7,
-            } }],
+            [
+                'native_file_job_start',
+                {
+                    request: {
+                        kind: 'export-risu-module',
+                        expectedRevision: 44,
+                        moduleIndex: 7,
+                    },
+                },
+            ],
             ['native_file_job_status', { jobId: 'risum-export' }],
             ['native_risu_module_handoff_cleanup', { path: handoffPath }],
             ['native_file_job_forget', { jobId: 'risum-export' }],
@@ -449,7 +587,8 @@ describe('native file jobs', () => {
                     characterCount: 4,
                     presetCount: 2,
                     warningCodes: [],
-                    recoveryPath: 'C:\\app\\persistent\\recovery\\risulossless-recovery-official.risulossless',
+                    recoveryPath:
+                        'C:\\app\\persistent\\recovery\\risulossless-recovery-official.risulossless',
                 }),
                 kind: 'restore-official-account-snapshot',
             },
@@ -457,22 +596,35 @@ describe('native file jobs', () => {
 
         const result = await runNativeOfficialAccountSnapshotRestore(
             restoreRuntime(11, {
-                acquire: () => { events.push('fence-acquired') },
-                refresh: () => { events.push('refreshed') },
-                release: () => { events.push('fence-released') },
+                acquire: () => {
+                    events.push('fence-acquired')
+                },
+                refresh: () => {
+                    events.push('refreshed')
+                },
+                release: () => {
+                    events.push('fence-released')
+                },
             }),
             {
                 baseUrl: 'https://hub.example',
                 credential: { kind: 'risu-auth', token: 'secret-token' },
             },
-            { afterRefresh: () => { events.push('plugins-reloaded') } },
+            {
+                afterRefresh: () => {
+                    events.push('plugins-reloaded')
+                },
+            },
             {
                 isTauri: () => true,
                 invoke: async (command, args) => {
                     calls.push([command, args])
-                    if (command === 'native_file_job_start') return { jobId: 'official-restore' }
-                    if (command === 'native_file_job_status') return statuses.shift()
-                    if (command === 'native_file_job_finalize') return 'requested'
+                    if (command === 'native_file_job_start')
+                        return { jobId: 'official-restore' }
+                    if (command === 'native_file_job_status')
+                        return statuses.shift()
+                    if (command === 'native_file_job_finalize')
+                        return 'requested'
                     if (command === 'native_file_job_forget') return true
                     throw new Error(`Unexpected command: ${command}`)
                 },
@@ -483,7 +635,9 @@ describe('native file jobs', () => {
         expect(result).toMatchObject({
             kind: 'activated',
             revision: 12,
-            recoveryPath: expect.stringContaining('risulossless-recovery-official'),
+            recoveryPath: expect.stringContaining(
+                'risulossless-recovery-official',
+            ),
         })
         expect(events).toEqual([
             'fence-acquired',
@@ -491,14 +645,17 @@ describe('native file jobs', () => {
             'plugins-reloaded',
             'fence-released',
         ])
-        expect(calls[0]).toEqual(['native_file_job_start', {
-            request: {
-                kind: 'restore-official-account-snapshot',
-                baseUrl: 'https://hub.example',
-                credential: { kind: 'risu-auth', token: 'secret-token' },
-                expectedRevision: 11,
+        expect(calls[0]).toEqual([
+            'native_file_job_start',
+            {
+                request: {
+                    kind: 'restore-official-account-snapshot',
+                    baseUrl: 'https://hub.example',
+                    credential: { kind: 'risu-auth', token: 'secret-token' },
+                    expectedRevision: 11,
+                },
             },
-        }])
+        ])
         expect(JSON.stringify(calls)).not.toContain('Uint8Array')
         expect(JSON.stringify(calls)).not.toContain('databaseBytes')
     })
@@ -518,17 +675,19 @@ describe('native file jobs', () => {
                 isTauri: () => true,
                 invoke: async (command) => {
                     commands.push(command)
-                    if (command === 'native_file_job_start') return { jobId: 'official-missing' }
-                    if (command === 'native_file_job_status') return {
-                        ...status('failed'),
-                        kind: 'restore-official-account-snapshot',
-                        state: 'failed',
-                        phase: 'complete',
-                        error: {
-                            code: 'remote-missing',
-                            message: 'No official account snapshot exists',
-                        },
-                    }
+                    if (command === 'native_file_job_start')
+                        return { jobId: 'official-missing' }
+                    if (command === 'native_file_job_status')
+                        return {
+                            ...status('failed'),
+                            kind: 'restore-official-account-snapshot',
+                            state: 'failed',
+                            phase: 'complete',
+                            error: {
+                                code: 'remote-missing',
+                                message: 'No official account snapshot exists',
+                            },
+                        }
                     if (command === 'native_file_job_forget') return true
                     throw new Error(`Unexpected command: ${command}`)
                 },
@@ -554,17 +713,19 @@ describe('native file jobs', () => {
             {
                 isTauri: () => true,
                 invoke: async (command) => {
-                    if (command === 'native_file_job_start') return { jobId: 'official-legacy' }
-                    if (command === 'native_file_job_status') return {
-                        ...status('failed'),
-                        kind: 'restore-official-account-snapshot',
-                        state: 'failed',
-                        phase: 'complete',
-                        error: {
-                            code: 'compatibility-required',
-                            message: 'Legacy snapshot requires preparation',
-                        },
-                    }
+                    if (command === 'native_file_job_start')
+                        return { jobId: 'official-legacy' }
+                    if (command === 'native_file_job_status')
+                        return {
+                            ...status('failed'),
+                            kind: 'restore-official-account-snapshot',
+                            state: 'failed',
+                            phase: 'complete',
+                            error: {
+                                code: 'compatibility-required',
+                                message: 'Legacy snapshot requires preparation',
+                            },
+                        }
                     if (command === 'native_file_job_forget') return true
                     throw new Error(`Unexpected command: ${command}`)
                 },
@@ -605,9 +766,12 @@ describe('native file jobs', () => {
                 isTauri: () => true,
                 invoke: async (command, args) => {
                     calls.push([command, args])
-                    if (command === 'native_file_job_start') return { jobId: 'legacy-restore' }
-                    if (command === 'native_file_job_status') return statuses.shift()
-                    if (command === 'native_file_job_finalize') return 'requested'
+                    if (command === 'native_file_job_start')
+                        return { jobId: 'legacy-restore' }
+                    if (command === 'native_file_job_status')
+                        return statuses.shift()
+                    if (command === 'native_file_job_finalize')
+                        return 'requested'
                     if (command === 'native_file_job_forget') return true
                     throw new Error(`Unexpected command: ${command}`)
                 },
@@ -616,15 +780,139 @@ describe('native file jobs', () => {
         )
 
         expect(result.revision).toBe(12)
-        expect(calls[0]).toEqual(['native_file_job_start', {
-            request: {
-                kind: 'restore-legacy-local-backup',
-                source: { type: 'desktopPath', path: 'C:\\chosen\\backup.bin' },
-                expectedRevision: 11,
+        expect(calls[0]).toEqual([
+            'native_file_job_start',
+            {
+                request: {
+                    kind: 'restore-legacy-local-backup',
+                    source: {
+                        type: 'desktopPath',
+                        path: 'C:\\chosen\\backup.bin',
+                    },
+                    expectedRevision: 11,
+                },
             },
-        }])
+        ])
         expect(JSON.stringify(calls)).not.toContain('Uint8Array')
     })
+
+    it.each(['risuai', 'pocketrisu'] as const)(
+        'exports %s with the flushed revision and reports losses through status',
+        async (target) => {
+            for (const destination of [
+                {
+                    type: 'desktopPath',
+                    path: 'C:\\chosen\\compatible.bin',
+                } as const,
+                {
+                    type: 'androidSaf',
+                    suggestedName: `${target}-backup.bin`,
+                } as const,
+            ]) {
+                const calls: Array<
+                    [string, Record<string, unknown> | undefined]
+                > = []
+                const onStatus = vi.fn()
+                const runtime = {
+                    revision: 20,
+                    flushPendingData: async () => {
+                        runtime.revision = 21
+                    },
+                }
+                const report = {
+                    target,
+                    preserved: [],
+                    converted: [],
+                    excluded: [
+                        {
+                            code: 'unsupported-field',
+                            items: '1',
+                            bytes: '0',
+                            affectedConversations:
+                                target === 'risuai' ? '1' : null,
+                        },
+                    ],
+                }
+                const handoffPath = 'C:\\app\\handoffs\\risu-backup-123.bin'
+                const copyToAndroidSaf = vi.fn(async () => ({
+                    bytes: 4096,
+                    warningCodes: [],
+                }))
+                const result = await runNativeCompatibleLocalBackupExport(
+                    runtime,
+                    target,
+                    destination,
+                    { onStatus },
+                    {
+                        isTauri: () => true,
+                        invoke: async (command, args) => {
+                            calls.push([command, args])
+                            if (command === 'native_file_job_start')
+                                return { jobId: 'compatible-export' }
+                            if (command === 'native_file_job_status')
+                                return {
+                                    ...status('succeeded', {
+                                        revision: 21,
+                                        sourceBytes: 4096,
+                                        sourceSha256: 'd'.repeat(64),
+                                        characterCount: 1,
+                                        presetCount: 0,
+                                        warningCodes: ['compatibility-losses'],
+                                        ...(destination.type === 'androidSaf'
+                                            ? { handoffPath }
+                                            : {}),
+                                    }),
+                                    jobId: 'compatible-export',
+                                    kind: 'export-compatible-local-backup',
+                                    compatibilityReport: report,
+                                } satisfies NativeFileJobStatus
+                            if (
+                                command ===
+                                    'native_legacy_backup_handoff_cleanup' ||
+                                command === 'native_file_job_forget'
+                            )
+                                return true
+                            throw new Error(`Unexpected command: ${command}`)
+                        },
+                        wait: async () => undefined,
+                        copyToAndroidSaf,
+                    },
+                )
+                expect(calls[0]).toEqual([
+                    'native_file_job_start',
+                    {
+                        request: {
+                            kind: 'export-compatible-local-backup',
+                            target,
+                            expectedRevision: 21,
+                            ...(destination.type === 'desktopPath'
+                                ? { destination: destination.path }
+                                : {}),
+                        },
+                    },
+                ])
+                expect(onStatus).toHaveBeenCalledWith(
+                    expect.objectContaining({ compatibilityReport: report }),
+                )
+                expect(result.revision).toBe(21)
+                expect(result.handoffPath).toBeUndefined()
+                if (destination.type === 'androidSaf') {
+                    expect(copyToAndroidSaf).toHaveBeenCalledWith(
+                        expect.objectContaining({
+                            sourcePath: handoffPath,
+                            suggestedName: destination.suggestedName,
+                        }),
+                    )
+                    expect(calls).toContainEqual([
+                        'native_legacy_backup_handoff_cleanup',
+                        { path: handoffPath },
+                    ])
+                } else {
+                    expect(copyToAndroidSaf).not.toHaveBeenCalled()
+                }
+            }
+        },
+    )
 
     it('exports a legacy local backup using only a destination path and revision over IPC', async () => {
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
@@ -641,14 +929,18 @@ describe('native file jobs', () => {
                 isTauri: () => true,
                 invoke: async (command, args) => {
                     calls.push([command, args])
-                    if (command === 'native_file_job_start') return { jobId: 'legacy-export' }
+                    if (command === 'native_file_job_start')
+                        return { jobId: 'legacy-export' }
                     if (command === 'native_file_job_status') {
                         return {
                             jobId: 'legacy-export',
                             kind: 'export-legacy-local-backup',
                             state: 'succeeded',
                             phase: 'complete',
-                            progress: { completedBytes: 4096, completedItems: 3 },
+                            progress: {
+                                completedBytes: 4096,
+                                completedItems: 3,
+                            },
                             result: {
                                 revision: 21,
                                 sourceBytes: 4096,
@@ -670,13 +962,16 @@ describe('native file jobs', () => {
         expect(result.sourceBytes).toBe(4096)
         expect(calls).toEqual([
             ['flush:native-legacy-local-backup-export', undefined],
-            ['native_file_job_start', {
-                request: {
-                    kind: 'export-legacy-local-backup',
-                    destination: 'C:\\chosen\\backup.bin',
-                    expectedRevision: 21,
+            [
+                'native_file_job_start',
+                {
+                    request: {
+                        kind: 'export-legacy-local-backup',
+                        destination: 'C:\\chosen\\backup.bin',
+                        expectedRevision: 21,
+                    },
                 },
-            }],
+            ],
             ['native_file_job_status', { jobId: 'legacy-export' }],
             ['native_file_job_forget', { jobId: 'legacy-export' }],
         ])
@@ -685,7 +980,10 @@ describe('native file jobs', () => {
 
     it('publishes a native legacy backup handoff through Android SAF without archive bytes over IPC', async () => {
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
-        const copyToAndroidSaf = vi.fn(async () => ({ bytes: 4096, warningCodes: [] }))
+        const copyToAndroidSaf = vi.fn(async () => ({
+            bytes: 4096,
+            warningCodes: [],
+        }))
 
         const result = await runNativeLegacyLocalBackupExport(
             { revision: 21, flushPendingData: async () => undefined },
@@ -695,14 +993,18 @@ describe('native file jobs', () => {
                 isTauri: () => true,
                 invoke: async (command, args) => {
                     calls.push([command, args])
-                    if (command === 'native_file_job_start') return { jobId: 'legacy-export' }
+                    if (command === 'native_file_job_start')
+                        return { jobId: 'legacy-export' }
                     if (command === 'native_file_job_status') {
                         return {
                             jobId: 'legacy-export',
                             kind: 'export-legacy-local-backup',
                             state: 'succeeded',
                             phase: 'complete',
-                            progress: { completedBytes: 4096, completedItems: 3 },
+                            progress: {
+                                completedBytes: 4096,
+                                completedItems: 3,
+                            },
                             result: {
                                 revision: 21,
                                 sourceBytes: 4096,
@@ -710,11 +1012,13 @@ describe('native file jobs', () => {
                                 characterCount: 2,
                                 presetCount: 1,
                                 warningCodes: [],
-                                handoffPath: 'C:\\app\\handoffs\\risu-backup.bin',
+                                handoffPath:
+                                    'C:\\app\\handoffs\\risu-backup.bin',
                             },
                         } satisfies NativeFileJobStatus
                     }
-                    if (command === 'native_legacy_backup_handoff_cleanup') return true
+                    if (command === 'native_legacy_backup_handoff_cleanup')
+                        return true
                     if (command === 'native_file_job_forget') return true
                     throw new Error(`Unexpected command: ${command}`)
                 },
@@ -724,39 +1028,56 @@ describe('native file jobs', () => {
         )
 
         expect(result.handoffPath).toBeUndefined()
-        expect(copyToAndroidSaf).toHaveBeenCalledWith(expect.objectContaining({
-            sourcePath: 'C:\\app\\handoffs\\risu-backup.bin',
-            suggestedName: 'risu-backup.bin',
-        }))
-        expect(calls[0]).toEqual(['native_file_job_start', {
-            request: { kind: 'export-legacy-local-backup', expectedRevision: 21 },
-        }])
+        expect(copyToAndroidSaf).toHaveBeenCalledWith(
+            expect.objectContaining({
+                sourcePath: 'C:\\app\\handoffs\\risu-backup.bin',
+                suggestedName: 'risu-backup.bin',
+            }),
+        )
+        expect(calls[0]).toEqual([
+            'native_file_job_start',
+            {
+                request: {
+                    kind: 'export-legacy-local-backup',
+                    expectedRevision: 21,
+                },
+            },
+        ])
         expect(JSON.stringify(calls)).not.toContain('Uint8Array')
     })
 
     it('keeps unavailable lossless backup capability as a structured native error', async () => {
         const calls: string[] = []
 
-        await expect(runNativeLosslessBackupExport(
-            {
-                revision: 5,
-                flushPendingData: async () => undefined,
-            },
-            { type: 'desktopPath', path: 'C:\\chosen\\backup.risulossless' },
-            {},
-            {
-                isTauri: () => true,
-                invoke: async (command) => {
-                    calls.push(command)
-                    throw {
-                        code: 'capability-unavailable',
-                        message: 'native lossless backup requires v2 asset and cold authority',
-                    }
+        await expect(
+            runNativeLosslessBackupExport(
+                {
+                    revision: 5,
+                    flushPendingData: async () => undefined,
                 },
-                wait: async () => undefined,
-                copyToAndroidSaf: async () => ({ bytes: 0, warningCodes: [] }),
-            },
-        )).rejects.toMatchObject({
+                {
+                    type: 'desktopPath',
+                    path: 'C:\\chosen\\backup.risulossless',
+                },
+                {},
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        calls.push(command)
+                        throw {
+                            code: 'capability-unavailable',
+                            message:
+                                'native lossless backup requires v2 asset and cold authority',
+                        }
+                    },
+                    wait: async () => undefined,
+                    copyToAndroidSaf: async () => ({
+                        bytes: 0,
+                        warningCodes: [],
+                    }),
+                },
+            ),
+        ).rejects.toMatchObject({
             name: 'NativeFileJobError',
             code: 'capability-unavailable',
         })
@@ -780,7 +1101,8 @@ describe('native file jobs', () => {
                     characterCount: 3,
                     presetCount: 2,
                     warningCodes: [],
-                    recoveryPath: 'C:\\app\\persistent\\recovery\\risulossless-recovery-123e4567-e89b-42d3-a456-426614174000.risulossless',
+                    recoveryPath:
+                        'C:\\app\\persistent\\recovery\\risulossless-recovery-123e4567-e89b-42d3-a456-426614174000.risulossless',
                 }),
                 kind: 'restore-lossless-backup',
             },
@@ -788,19 +1110,38 @@ describe('native file jobs', () => {
 
         const result = await runNativeLosslessBackupRestore(
             restoreRuntime(17, {
-                acquire: () => { events.push('fence-acquired') },
-                refresh: () => { events.push('refreshed') },
-                release: () => { events.push('fence-released') },
+                acquire: () => {
+                    events.push('fence-acquired')
+                },
+                refresh: () => {
+                    events.push('refreshed')
+                },
+                release: () => {
+                    events.push('fence-released')
+                },
             }),
-            { type: 'androidSpool', token: '2c4d33fe-2e29-4625-bb1e-c8d1084f9557' },
-            { beforeActivation: () => { events.push('fresh-status') }, afterRefresh: () => { events.push('plugins-reloaded') } },
+            {
+                type: 'androidSpool',
+                token: '2c4d33fe-2e29-4625-bb1e-c8d1084f9557',
+            },
+            {
+                beforeActivation: () => {
+                    events.push('fresh-status')
+                },
+                afterRefresh: () => {
+                    events.push('plugins-reloaded')
+                },
+            },
             {
                 isTauri: () => true,
                 invoke: async (command, args) => {
                     calls.push([command, args])
-                    if (command === 'native_file_job_start') return { jobId: 'lossless-restore' }
-                    if (command === 'native_file_job_status') return statuses.shift()
-                    if (command === 'native_file_job_finalize') return 'requested'
+                    if (command === 'native_file_job_start')
+                        return { jobId: 'lossless-restore' }
+                    if (command === 'native_file_job_status')
+                        return statuses.shift()
+                    if (command === 'native_file_job_finalize')
+                        return 'requested'
                     if (command === 'native_file_job_forget') return true
                     throw new Error(`Unexpected command: ${command}`)
                 },
@@ -818,16 +1159,19 @@ describe('native file jobs', () => {
             'fence-released',
         ])
         expect(calls).toEqual([
-            ['native_file_job_start', {
-                request: {
-                    kind: 'restore-lossless-backup',
-                    source: {
-                        type: 'androidSpool',
-                        token: '2c4d33fe-2e29-4625-bb1e-c8d1084f9557',
+            [
+                'native_file_job_start',
+                {
+                    request: {
+                        kind: 'restore-lossless-backup',
+                        source: {
+                            type: 'androidSpool',
+                            token: '2c4d33fe-2e29-4625-bb1e-c8d1084f9557',
+                        },
+                        expectedRevision: 17,
                     },
-                    expectedRevision: 17,
                 },
-            }],
+            ],
             ['native_file_job_status', { jobId: 'lossless-restore' }],
             ['native_file_job_finalize', { jobId: 'lossless-restore' }],
             ['native_file_job_status', { jobId: 'lossless-restore' }],
@@ -852,31 +1196,42 @@ describe('native file jobs', () => {
                     characterCount: 3,
                     presetCount: 2,
                     warningCodes: [],
-                    recoveryPath: 'C:\\app\\persistent\\recovery\\risulossless-recovery-123e4567-e89b-42d3-a456-426614174001.risulossless',
+                    recoveryPath:
+                        'C:\\app\\persistent\\recovery\\risulossless-recovery-123e4567-e89b-42d3-a456-426614174001.risulossless',
                 }),
                 kind: 'restore-lossless-backup',
             },
         ]
 
-        await expect(runNativeLosslessBackupRestore(
-            restoreRuntime(18, {
-                refresh: () => { throw new Error('refresh failed') },
-            }),
-            { type: 'desktopPath', path: 'C:\\chosen\\backup.risulossless' },
-            {},
-            {
-                isTauri: () => true,
-                invoke: async (command) => {
-                    commands.push(command)
-                    if (command === 'native_file_job_start') return { jobId: 'lossless-restore' }
-                    if (command === 'native_file_job_status') return statuses.shift()
-                    if (command === 'native_file_job_finalize') return 'requested'
-                    if (command === 'native_file_job_forget') return true
-                    throw new Error(`Unexpected command: ${command}`)
+        await expect(
+            runNativeLosslessBackupRestore(
+                restoreRuntime(18, {
+                    refresh: () => {
+                        throw new Error('refresh failed')
+                    },
+                }),
+                {
+                    type: 'desktopPath',
+                    path: 'C:\\chosen\\backup.risulossless',
                 },
-                wait: async () => undefined,
-            },
-        )).rejects.toMatchObject({
+                {},
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        commands.push(command)
+                        if (command === 'native_file_job_start')
+                            return { jobId: 'lossless-restore' }
+                        if (command === 'native_file_job_status')
+                            return statuses.shift()
+                        if (command === 'native_file_job_finalize')
+                            return 'requested'
+                        if (command === 'native_file_job_forget') return true
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
+                },
+            ),
+        ).rejects.toMatchObject({
             name: 'NativeFileJobActivationCommittedError',
             committedRevision: 19,
             recoveryRequired: true,
@@ -920,7 +1275,8 @@ describe('native file jobs', () => {
                 isTauri: () => true,
                 invoke: async (command, args) => {
                     calls.push([command, args])
-                    if (command === 'native_file_job_start') return { jobId: 'lossless-export' }
+                    if (command === 'native_file_job_start')
+                        return { jobId: 'lossless-export' }
                     if (command === 'native_file_job_status') return terminal
                     if (command === 'native_file_job_forget') return true
                     throw new Error(`Unexpected command: ${command}`)
@@ -933,13 +1289,16 @@ describe('native file jobs', () => {
         expect(result).toEqual(terminal.result)
         expect(calls).toEqual([
             ['flush:native-lossless-backup-export', undefined],
-            ['native_file_job_start', {
-                request: {
-                    kind: 'export-lossless-backup',
-                    destination: 'C:\\chosen\\backup.risulossless',
-                    expectedRevision: 22,
+            [
+                'native_file_job_start',
+                {
+                    request: {
+                        kind: 'export-lossless-backup',
+                        destination: 'C:\\chosen\\backup.risulossless',
+                        expectedRevision: 22,
+                    },
                 },
-            }],
+            ],
             ['native_file_job_status', { jobId: 'lossless-export' }],
             ['native_file_job_forget', { jobId: 'lossless-export' }],
         ])
@@ -949,7 +1308,8 @@ describe('native file jobs', () => {
     it('hands a managed lossless export to Android SAF and cleans the native source', async () => {
         const events: string[] = []
         const observedStatuses: NativeFileJobStatus[] = []
-        const handoffPath = 'C:\\app\\native-file-jobs\\handoffs\\risulossless-123e4567-e89b-42d3-a456-426614174002.risulossless'
+        const handoffPath =
+            'C:\\app\\native-file-jobs\\handoffs\\risulossless-123e4567-e89b-42d3-a456-426614174002.risulossless'
         const terminal: NativeFileJobStatus = {
             jobId: 'lossless-export',
             kind: 'export-lossless-backup',
@@ -978,15 +1338,19 @@ describe('native file jobs', () => {
                 isTauri: () => true,
                 invoke: async (command, args) => {
                     events.push(`${command}:${JSON.stringify(args ?? {})}`)
-                    if (command === 'native_file_job_start') return { jobId: 'lossless-export' }
+                    if (command === 'native_file_job_start')
+                        return { jobId: 'lossless-export' }
                     if (command === 'native_file_job_status') return terminal
-                    if (command === 'native_lossless_handoff_cleanup') return undefined
+                    if (command === 'native_lossless_handoff_cleanup')
+                        return undefined
                     if (command === 'native_file_job_forget') return true
                     throw new Error(`Unexpected command: ${command}`)
                 },
                 wait: async () => undefined,
                 copyToAndroidSaf: async (request) => {
-                    events.push(`saf:${request.sourcePath}:${request.suggestedName}`)
+                    events.push(
+                        `saf:${request.sourcePath}:${request.suggestedName}`,
+                    )
                     request.onProgress?.({
                         requestId: 'android-export',
                         operation: 'destination-copy',
@@ -1020,7 +1384,8 @@ describe('native file jobs', () => {
 
     it('rejects a short Android SAF handoff and still cleans both native receipts', async () => {
         const commands: string[] = []
-        const handoffPath = 'C:\\app\\native-file-jobs\\handoffs\\risulossless-123e4567-e89b-42d3-a456-426614174003.risulossless'
+        const handoffPath =
+            'C:\\app\\native-file-jobs\\handoffs\\risulossless-123e4567-e89b-42d3-a456-426614174003.risulossless'
         const terminal: NativeFileJobStatus = {
             jobId: 'lossless-export',
             kind: 'export-lossless-backup',
@@ -1038,24 +1403,32 @@ describe('native file jobs', () => {
             },
         }
 
-        await expect(runNativeLosslessBackupExport(
-            { revision: 22, flushPendingData: async () => undefined },
-            { type: 'androidSaf', suggestedName: 'backup.risulossless' },
-            {},
-            {
-                isTauri: () => true,
-                invoke: async (command) => {
-                    commands.push(command)
-                    if (command === 'native_file_job_start') return { jobId: 'lossless-export' }
-                    if (command === 'native_file_job_status') return terminal
-                    if (command === 'native_lossless_handoff_cleanup') return undefined
-                    if (command === 'native_file_job_forget') return true
-                    throw new Error(`Unexpected command: ${command}`)
+        await expect(
+            runNativeLosslessBackupExport(
+                { revision: 22, flushPendingData: async () => undefined },
+                { type: 'androidSaf', suggestedName: 'backup.risulossless' },
+                {},
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        commands.push(command)
+                        if (command === 'native_file_job_start')
+                            return { jobId: 'lossless-export' }
+                        if (command === 'native_file_job_status')
+                            return terminal
+                        if (command === 'native_lossless_handoff_cleanup')
+                            return undefined
+                        if (command === 'native_file_job_forget') return true
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
+                    copyToAndroidSaf: async () => ({
+                        bytes: 2048,
+                        warningCodes: [],
+                    }),
                 },
-                wait: async () => undefined,
-                copyToAndroidSaf: async () => ({ bytes: 2048, warningCodes: [] }),
-            },
-        )).rejects.toMatchObject({ code: 'length-mismatch' })
+            ),
+        ).rejects.toMatchObject({ code: 'length-mismatch' })
         expect(commands).toEqual([
             'native_file_job_start',
             'native_file_job_status',
@@ -1071,7 +1444,8 @@ describe('native file jobs', () => {
             kind: 'export-lossless-backup' as const,
             cleanupCommand: 'native_lossless_handoff_cleanup',
             suggestedName: 'backup.risulossless',
-            handoffPath: 'C:\\app\\native-file-jobs\\handoffs\\risulossless-123e4567-e89b-42d3-a456-426614174005.risulossless',
+            handoffPath:
+                'C:\\app\\native-file-jobs\\handoffs\\risulossless-123e4567-e89b-42d3-a456-426614174005.risulossless',
         },
         {
             label: 'legacy backup',
@@ -1079,59 +1453,63 @@ describe('native file jobs', () => {
             kind: 'export-legacy-local-backup' as const,
             cleanupCommand: 'native_legacy_backup_handoff_cleanup',
             suggestedName: 'risu-backup.bin',
-            handoffPath: 'C:\\app\\native-file-jobs\\handoffs\\risu-backup-123e4567-e89b-42d3-a456-426614174005.bin',
+            handoffPath:
+                'C:\\app\\native-file-jobs\\handoffs\\risu-backup-123e4567-e89b-42d3-a456-426614174005.bin',
         },
-    ])('retains a successful Android $label job when native source cleanup fails', async ({
-        run,
-        kind,
-        cleanupCommand,
-        suggestedName,
-        handoffPath,
-    }) => {
-        const commands: string[] = []
-        const terminal: NativeFileJobStatus = {
-            jobId: 'portable-export',
-            kind,
-            state: 'succeeded',
-            phase: 'complete',
-            progress: { completedBytes: 4096, completedItems: 3 },
-            result: {
-                revision: 22,
-                sourceBytes: 4096,
-                sourceSha256: 'b'.repeat(64),
-                characterCount: 3,
-                presetCount: 2,
-                warningCodes: [],
-                handoffPath,
-            },
-        }
-
-        const result = await run(
-            { revision: 22, flushPendingData: async () => undefined },
-            { type: 'androidSaf', suggestedName },
-            {},
-            {
-                isTauri: () => true,
-                invoke: async (command) => {
-                    commands.push(command)
-                    if (command === 'native_file_job_start') return { jobId: 'portable-export' }
-                    if (command === 'native_file_job_status') return terminal
-                    if (command === cleanupCommand) throw new Error('handoff is still in use')
-                    if (command === 'native_file_job_forget') return true
-                    throw new Error(`Unexpected command: ${command}`)
+    ])(
+        'retains a successful Android $label job when native source cleanup fails',
+        async ({ run, kind, cleanupCommand, suggestedName, handoffPath }) => {
+            const commands: string[] = []
+            const terminal: NativeFileJobStatus = {
+                jobId: 'portable-export',
+                kind,
+                state: 'succeeded',
+                phase: 'complete',
+                progress: { completedBytes: 4096, completedItems: 3 },
+                result: {
+                    revision: 22,
+                    sourceBytes: 4096,
+                    sourceSha256: 'b'.repeat(64),
+                    characterCount: 3,
+                    presetCount: 2,
+                    warningCodes: [],
+                    handoffPath,
                 },
-                wait: async () => undefined,
-                copyToAndroidSaf: async () => ({ bytes: 4096, warningCodes: [] }),
-            },
-        )
+            }
 
-        expect(result.warningCodes).toEqual(['cleanup-failed'])
-        expect(commands).toEqual([
-            'native_file_job_start',
-            'native_file_job_status',
-            cleanupCommand,
-        ])
-    })
+            const result = await run(
+                { revision: 22, flushPendingData: async () => undefined },
+                { type: 'androidSaf', suggestedName },
+                {},
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        commands.push(command)
+                        if (command === 'native_file_job_start')
+                            return { jobId: 'portable-export' }
+                        if (command === 'native_file_job_status')
+                            return terminal
+                        if (command === cleanupCommand)
+                            throw new Error('handoff is still in use')
+                        if (command === 'native_file_job_forget') return true
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
+                    copyToAndroidSaf: async () => ({
+                        bytes: 4096,
+                        warningCodes: [],
+                    }),
+                },
+            )
+
+            expect(result.warningCodes).toEqual(['cleanup-failed'])
+            expect(commands).toEqual([
+                'native_file_job_start',
+                'native_file_job_status',
+                cleanupCommand,
+            ])
+        },
+    )
 
     it('restores from a descriptor without sending file or database bytes through IPC', async () => {
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
@@ -1153,7 +1531,10 @@ describe('native file jobs', () => {
         const refreshed: number[] = []
         const runtime = restoreRuntime(3, {
             capture: () => {
-                calls.push(['capture:native-block-risu-save-restore', undefined])
+                calls.push([
+                    'capture:native-block-risu-save-restore',
+                    undefined,
+                ])
             },
             refresh: (revision) => {
                 refreshed.push(revision)
@@ -1169,10 +1550,15 @@ describe('native file jobs', () => {
                 invoke: async (command, args) => {
                     calls.push([command, args])
                     if (command === 'native_file_job_start') {
-                        return { jobId: 'job-1', warningCodes: ['cleanup-failed'] }
+                        return {
+                            jobId: 'job-1',
+                            warningCodes: ['cleanup-failed'],
+                        }
                     }
-                    if (command === 'native_file_job_status') return statuses.shift()
-                    if (command === 'native_file_job_finalize') return 'requested'
+                    if (command === 'native_file_job_status')
+                        return statuses.shift()
+                    if (command === 'native_file_job_finalize')
+                        return 'requested'
                     if (command === 'native_file_job_forget') return true
                     throw new Error(`Unexpected command: ${command}`)
                 },
@@ -1185,13 +1571,19 @@ describe('native file jobs', () => {
         expect(refreshed).toEqual([4])
         expect(calls).toEqual([
             ['capture:native-block-risu-save-restore', undefined],
-            ['native_file_job_start', {
-                request: {
-                    kind: 'restore-block-risu-save',
-                    source: { type: 'desktopPath', path: 'C:\\chosen\\backup.risudat' },
-                    expectedRevision: 3,
+            [
+                'native_file_job_start',
+                {
+                    request: {
+                        kind: 'restore-block-risu-save',
+                        source: {
+                            type: 'desktopPath',
+                            path: 'C:\\chosen\\backup.risudat',
+                        },
+                        expectedRevision: 3,
+                    },
                 },
-            }],
+            ],
             ['native_file_job_status', { jobId: 'job-1' }],
             ['native_file_job_status', { jobId: 'job-1' }],
             ['native_file_job_finalize', { jobId: 'job-1' }],
@@ -1212,16 +1604,22 @@ describe('native file jobs', () => {
                     throw new Error('cancelled restore must not refresh')
                 },
             }),
-            { type: 'androidSpool', token: '2c4d33fe-2e29-4625-bb1e-c8d1084f9557' },
+            {
+                type: 'androidSpool',
+                token: '2c4d33fe-2e29-4625-bb1e-c8d1084f9557',
+            },
             { signal: controller.signal },
             {
                 isTauri: () => true,
                 invoke: async (command) => {
                     commands.push(command)
-                    if (command === 'native_file_job_start') return { jobId: 'job-1' }
+                    if (command === 'native_file_job_start')
+                        return { jobId: 'job-1' }
                     if (command === 'native_file_job_status') {
                         statusCount++
-                        return statusCount === 1 ? status('running') : status('cancelled')
+                        return statusCount === 1
+                            ? status('running')
+                            : status('cancelled')
                     }
                     if (command === 'native_file_job_cancel') return 'requested'
                     if (command === 'native_file_job_forget') return true
@@ -1243,81 +1641,95 @@ describe('native file jobs', () => {
         ])
     })
 
-    it.each(['fence', 'blocking'] as const)('cancels before activation when aborted during %s acquisition', async (abortAt) => {
-        const controller = new AbortController()
-        const commands: string[] = []
-        const release = vi.fn()
-        const refresh = vi.fn()
-        let finishAcquisition!: () => void
-        let acquisitionStarted!: () => void
-        const acquired = new Promise<void>((resolve) => { acquisitionStarted = resolve })
-        const acquisition = new Promise<void>((resolve) => { finishAcquisition = resolve })
-        const statuses: NativeFileJobStatus[] = [
-            { ...status('waitingForInput'), phase: 'awaiting-activation' },
-            status('cancelled'),
-        ]
-        const result = runNativeBlockRisuSaveRestore(
-            restoreRuntime(2, {
-                acquire: async () => {
-                    acquisitionStarted()
-                    await acquisition
+    it.each(['fence', 'blocking'] as const)(
+        'cancels before activation when aborted during %s acquisition',
+        async (abortAt) => {
+            const controller = new AbortController()
+            const commands: string[] = []
+            const release = vi.fn()
+            const refresh = vi.fn()
+            let finishAcquisition!: () => void
+            let acquisitionStarted!: () => void
+            const acquired = new Promise<void>((resolve) => {
+                acquisitionStarted = resolve
+            })
+            const acquisition = new Promise<void>((resolve) => {
+                finishAcquisition = resolve
+            })
+            const statuses: NativeFileJobStatus[] = [
+                { ...status('waitingForInput'), phase: 'awaiting-activation' },
+                status('cancelled'),
+            ]
+            const result = runNativeBlockRisuSaveRestore(
+                restoreRuntime(2, {
+                    acquire: async () => {
+                        acquisitionStarted()
+                        await acquisition
+                    },
+                    refresh,
+                    release,
+                }),
+                { type: 'desktopPath', path: 'C:\\chosen\\backup.bin' },
+                {
+                    signal: controller.signal,
+                    onBlockingChange: (blocking) => {
+                        if (blocking && abortAt === 'blocking')
+                            controller.abort()
+                    },
                 },
-                refresh,
-                release,
-            }),
-            { type: 'desktopPath', path: 'C:\\chosen\\backup.bin' },
-            {
-                signal: controller.signal,
-                onBlockingChange: (blocking) => {
-                    if (blocking && abortAt === 'blocking') controller.abort()
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        commands.push(command)
+                        if (command === 'native_file_job_start')
+                            return { jobId: 'job-1' }
+                        if (command === 'native_file_job_status')
+                            return statuses.shift()
+                        if (command === 'native_file_job_cancel')
+                            return 'requested'
+                        if (command === 'native_file_job_finalize')
+                            return 'requested'
+                        if (command === 'native_file_job_forget') return true
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
                 },
-            },
-            {
-                isTauri: () => true,
-                invoke: async (command) => {
-                    commands.push(command)
-                    if (command === 'native_file_job_start') return { jobId: 'job-1' }
-                    if (command === 'native_file_job_status') return statuses.shift()
-                    if (command === 'native_file_job_cancel') return 'requested'
-                    if (command === 'native_file_job_finalize') return 'requested'
-                    if (command === 'native_file_job_forget') return true
-                    throw new Error(`Unexpected command: ${command}`)
-                },
-                wait: async () => undefined,
-            },
-        )
-        await acquired
-        if (abortAt === 'fence') controller.abort()
-        finishAcquisition()
-        await expect(result).rejects.toMatchObject({ name: 'AbortError' })
-        expect(commands).toEqual([
-            'native_file_job_start',
-            'native_file_job_status',
-            'native_file_job_cancel',
-            'native_file_job_status',
-            'native_file_job_forget',
-        ])
-        expect(refresh).not.toHaveBeenCalled()
-        expect(release).toHaveBeenCalledOnce()
-    })
+            )
+            await acquired
+            if (abortAt === 'fence') controller.abort()
+            finishAcquisition()
+            await expect(result).rejects.toMatchObject({ name: 'AbortError' })
+            expect(commands).toEqual([
+                'native_file_job_start',
+                'native_file_job_status',
+                'native_file_job_cancel',
+                'native_file_job_status',
+                'native_file_job_forget',
+            ])
+            expect(refresh).not.toHaveBeenCalled()
+            expect(release).toHaveBeenCalledOnce()
+        },
+    )
 
     it('does not start a native job when cancellation arrives during the flush', async () => {
         const controller = new AbortController()
         const commands: string[] = []
 
-        await expect(runNativeBlockRisuSaveRestore(
-            restoreRuntime(2, { capture: () => controller.abort() }),
-            { type: 'desktopPath', path: 'C:\\chosen\\backup.risudat' },
-            { signal: controller.signal },
-            {
-                isTauri: () => true,
-                invoke: async (command) => {
-                    commands.push(command)
-                    throw new Error(`Unexpected command: ${command}`)
+        await expect(
+            runNativeBlockRisuSaveRestore(
+                restoreRuntime(2, { capture: () => controller.abort() }),
+                { type: 'desktopPath', path: 'C:\\chosen\\backup.risudat' },
+                { signal: controller.signal },
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        commands.push(command)
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
                 },
-                wait: async () => undefined,
-            },
-        )).rejects.toMatchObject({ name: 'AbortError' })
+            ),
+        ).rejects.toMatchObject({ name: 'AbortError' })
         expect(commands).toEqual([])
     })
 
@@ -1327,23 +1739,25 @@ describe('native file jobs', () => {
         const commands: string[] = []
         const discarded: string[] = []
 
-        await expect(runNativeLosslessBackupRestore(
-            restoreRuntime(2, { capture: () => controller.abort() }),
-            { type: 'androidSpool', token },
-            { signal: controller.signal },
-            {
-                isTauri: () => true,
-                invoke: async (command) => {
-                    commands.push(command)
-                    throw new Error(`Unexpected command: ${command}`)
+        await expect(
+            runNativeLosslessBackupRestore(
+                restoreRuntime(2, { capture: () => controller.abort() }),
+                { type: 'androidSpool', token },
+                { signal: controller.signal },
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        commands.push(command)
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
+                    discardAndroidSource: (sourceToken) => {
+                        discarded.push(sourceToken)
+                        return true
+                    },
                 },
-                wait: async () => undefined,
-                discardAndroidSource: (sourceToken) => {
-                    discarded.push(sourceToken)
-                    return true
-                },
-            },
-        )).rejects.toMatchObject({ name: 'AbortError' })
+            ),
+        ).rejects.toMatchObject({ name: 'AbortError' })
         expect(discarded).toEqual([token])
         expect(commands).toEqual([])
     })
@@ -1354,22 +1768,24 @@ describe('native file jobs', () => {
         const discarded: string[] = []
         controller.abort()
 
-        await expect(runNativeLosslessBackupRestore(
-            restoreRuntime(2),
-            { type: 'androidSpool', token },
-            { signal: controller.signal },
-            {
-                isTauri: () => true,
-                invoke: async (command) => {
-                    throw new Error(`Unexpected command: ${command}`)
+        await expect(
+            runNativeLosslessBackupRestore(
+                restoreRuntime(2),
+                { type: 'androidSpool', token },
+                { signal: controller.signal },
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
+                    discardAndroidSource: (sourceToken) => {
+                        discarded.push(sourceToken)
+                        return true
+                    },
                 },
-                wait: async () => undefined,
-                discardAndroidSource: (sourceToken) => {
-                    discarded.push(sourceToken)
-                    return true
-                },
-            },
-        )).rejects.toMatchObject({ name: 'AbortError' })
+            ),
+        ).rejects.toMatchObject({ name: 'AbortError' })
         expect(discarded).toEqual([token])
     })
 
@@ -1377,22 +1793,24 @@ describe('native file jobs', () => {
         const controller = new AbortController()
         controller.abort()
 
-        await expect(runNativeLosslessBackupRestore(
-            restoreRuntime(2),
-            {
-                type: 'androidSpool',
-                token: '2c4d33fe-2e29-4625-bb1e-c8d1084f9557',
-            },
-            { signal: controller.signal },
-            {
-                isTauri: () => true,
-                invoke: async (command) => {
-                    throw new Error(`Unexpected command: ${command}`)
+        await expect(
+            runNativeLosslessBackupRestore(
+                restoreRuntime(2),
+                {
+                    type: 'androidSpool',
+                    token: '2c4d33fe-2e29-4625-bb1e-c8d1084f9557',
                 },
-                wait: async () => undefined,
-                discardAndroidSource: () => false,
-            },
-        )).rejects.toMatchObject({
+                { signal: controller.signal },
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
+                    discardAndroidSource: () => false,
+                },
+            ),
+        ).rejects.toMatchObject({
             name: 'NativeFileJobError',
             code: 'cleanup-failed',
         })
@@ -1402,24 +1820,26 @@ describe('native file jobs', () => {
         const controller = new AbortController()
         controller.abort()
 
-        await expect(runNativeLosslessBackupRestore(
-            restoreRuntime(2),
-            {
-                type: 'androidSpool',
-                token: '2c4d33fe-2e29-4625-bb1e-c8d1084f9557',
-            },
-            { signal: controller.signal },
-            {
-                isTauri: () => true,
-                invoke: async (command) => {
-                    throw new Error(`Unexpected command: ${command}`)
+        await expect(
+            runNativeLosslessBackupRestore(
+                restoreRuntime(2),
+                {
+                    type: 'androidSpool',
+                    token: '2c4d33fe-2e29-4625-bb1e-c8d1084f9557',
                 },
-                wait: async () => undefined,
-                discardAndroidSource: () => {
-                    throw new Error('bridge unavailable')
+                { signal: controller.signal },
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
+                    discardAndroidSource: () => {
+                        throw new Error('bridge unavailable')
+                    },
                 },
-            },
-        )).rejects.toMatchObject({
+            ),
+        ).rejects.toMatchObject({
             name: 'NativeFileJobError',
             code: 'cleanup-failed',
         })
@@ -1428,31 +1848,39 @@ describe('native file jobs', () => {
     it('cancels staged data instead of activating when a live edit invalidates the token', async () => {
         const commands: string[] = []
         const statuses = [
-            { ...status('waitingForInput'), phase: 'awaiting-activation' as const },
+            {
+                ...status('waitingForInput'),
+                phase: 'awaiting-activation' as const,
+            },
             status('cancelled'),
         ]
 
-        await expect(runNativeBlockRisuSaveRestore(
-            restoreRuntime(3, {
-                acquire: () => {
-                    throw new Error('mutation generation changed')
+        await expect(
+            runNativeBlockRisuSaveRestore(
+                restoreRuntime(3, {
+                    acquire: () => {
+                        throw new Error('mutation generation changed')
+                    },
+                }),
+                { type: 'desktopPath', path: 'C:\\chosen\\backup.risudat' },
+                undefined,
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        commands.push(command)
+                        if (command === 'native_file_job_start')
+                            return { jobId: 'job-1' }
+                        if (command === 'native_file_job_status')
+                            return statuses.shift()
+                        if (command === 'native_file_job_cancel')
+                            return 'requested'
+                        if (command === 'native_file_job_forget') return true
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
                 },
-            }),
-            { type: 'desktopPath', path: 'C:\\chosen\\backup.risudat' },
-            undefined,
-            {
-                isTauri: () => true,
-                invoke: async (command) => {
-                    commands.push(command)
-                    if (command === 'native_file_job_start') return { jobId: 'job-1' }
-                    if (command === 'native_file_job_status') return statuses.shift()
-                    if (command === 'native_file_job_cancel') return 'requested'
-                    if (command === 'native_file_job_forget') return true
-                    throw new Error(`Unexpected command: ${command}`)
-                },
-                wait: async () => undefined,
-            },
-        )).rejects.toMatchObject({ code: 'revision-conflict' })
+            ),
+        ).rejects.toMatchObject({ code: 'revision-conflict' })
 
         expect(commands).toEqual([
             'native_file_job_start',
@@ -1479,26 +1907,37 @@ describe('native file jobs', () => {
 
         await runNativeBlockRisuSaveRestore(
             restoreRuntime(8, {
-                acquire: () => { events.push('fence-acquired') },
-                refresh: () => { events.push('working-set-refreshed') },
+                acquire: () => {
+                    events.push('fence-acquired')
+                },
+                refresh: () => {
+                    events.push('working-set-refreshed')
+                },
                 release: () => events.push('fence-released'),
             }),
             { type: 'desktopPath', path: 'C:\\chosen\\backup.risudat' },
             {
-                afterRefresh: () => { events.push('plugins-reloaded') },
+                afterRefresh: () => {
+                    events.push('plugins-reloaded')
+                },
                 onStatus: (status) => {
                     observedPhases.push(status.phase)
-                    if (status.detail) events.push(`stage:${status.detail.stage}`)
+                    if (status.detail)
+                        events.push(`stage:${status.detail.stage}`)
                 },
             },
             {
                 isTauri: () => true,
                 invoke: async (command) => {
-                    if (command === 'native_file_job_start') return { jobId: 'job-1' }
+                    if (command === 'native_file_job_start')
+                        return { jobId: 'job-1' }
                     if (command === 'native_file_job_status') {
                         statusCount++
                         return statusCount === 1
-                            ? { ...status('waitingForInput'), phase: 'awaiting-activation' }
+                            ? {
+                                  ...status('waitingForInput'),
+                                  phase: 'awaiting-activation',
+                              }
                             : status('succeeded', committed)
                     }
                     if (command === 'native_file_job_finalize') {
@@ -1528,58 +1967,84 @@ describe('native file jobs', () => {
         expect(observedPhases).toContain('activating-database')
     })
 
-    it('retains a committed job and exposes recovery state when refreshing fails', async () => {
-        const commands: string[] = []
-        let statusCount = 0
-        const committed = {
-            revision: 9,
-            sourceBytes: 128,
-            sourceSha256: 'b'.repeat(64),
-            characterCount: 1,
-            presetCount: 0,
-            warningCodes: [],
-        }
+    it.each(['refresh', 'native-status', 'ui-status'])(
+        'retains a committed job and exposes recovery state when %s fails',
+        async (failurePoint) => {
+            const commands: string[] = []
+            let statusCount = 0
+            const committed = {
+                revision: 9,
+                sourceBytes: 128,
+                sourceSha256: 'b'.repeat(64),
+                characterCount: 1,
+                presetCount: 0,
+                warningCodes: [],
+            }
 
-        const promise = runNativeBlockRisuSaveRestore(
-            restoreRuntime(8, {
-                refresh: () => {
-                    throw new Error('refresh unavailable')
+            const promise = runNativeBlockRisuSaveRestore(
+                restoreRuntime(8, {
+                    refresh: () => {
+                        if (failurePoint === 'refresh')
+                            throw new Error('refresh unavailable')
+                    },
+                }),
+                { type: 'desktopPath', path: 'C:\\chosen\\backup.risudat' },
+                {
+                    onNativeStatus: (status) => {
+                        if (
+                            status.state === 'succeeded' &&
+                            failurePoint === 'native-status'
+                        )
+                            throw new Error('committed observer unavailable')
+                    },
+                    onStatus: (status) => {
+                        if (
+                            status.state === 'succeeded' &&
+                            failurePoint === 'ui-status'
+                        )
+                            throw new Error('committed UI unavailable')
+                    },
                 },
-            }),
-            { type: 'desktopPath', path: 'C:\\chosen\\backup.risudat' },
-            undefined,
-            {
-                isTauri: () => true,
-                invoke: async (command) => {
-                    commands.push(command)
-                    if (command === 'native_file_job_start') return { jobId: 'job-1' }
-                    if (command === 'native_file_job_status') {
-                        statusCount++
-                        return statusCount === 1
-                            ? { ...status('waitingForInput'), phase: 'awaiting-activation' }
-                            : status('succeeded', committed)
-                    }
-                    if (command === 'native_file_job_finalize') return 'requested'
-                    if (command === 'native_file_job_forget') return true
-                    throw new Error(`Unexpected command: ${command}`)
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        commands.push(command)
+                        if (command === 'native_file_job_start')
+                            return { jobId: 'job-1' }
+                        if (command === 'native_file_job_status') {
+                            statusCount++
+                            return statusCount === 1
+                                ? {
+                                      ...status('waitingForInput'),
+                                      phase: 'awaiting-activation',
+                                  }
+                                : status('succeeded', committed)
+                        }
+                        if (command === 'native_file_job_finalize')
+                            return 'requested'
+                        if (command === 'native_file_job_forget') return true
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
                 },
-                wait: async () => undefined,
-            },
-        )
+            )
 
-        await expect(promise).rejects.toEqual(expect.objectContaining({
-            name: 'NativeFileJobActivationCommittedError',
-            code: 'activation-committed-refresh-failed',
-            committedRevision: 9,
-            recoveryRequired: true,
-        } satisfies Partial<NativeFileJobActivationCommittedError>))
-        expect(commands).toEqual([
-            'native_file_job_start',
-            'native_file_job_status',
-            'native_file_job_finalize',
-            'native_file_job_status',
-        ])
-    })
+            await expect(promise).rejects.toEqual(
+                expect.objectContaining({
+                    name: 'NativeFileJobActivationCommittedError',
+                    code: 'activation-committed-refresh-failed',
+                    committedRevision: 9,
+                    recoveryRequired: true,
+                } satisfies Partial<NativeFileJobActivationCommittedError>),
+            )
+            expect(commands).toEqual([
+                'native_file_job_start',
+                'native_file_job_status',
+                'native_file_job_finalize',
+                'native_file_job_status',
+            ])
+        },
+    )
 
     it('keeps committed success when terminal acknowledgement fails', async () => {
         const commands: string[] = []
@@ -1601,16 +2066,24 @@ describe('native file jobs', () => {
                 isTauri: () => true,
                 invoke: async (command) => {
                     commands.push(command)
-                    if (command === 'native_file_job_start') return { jobId: 'job-1' }
+                    if (command === 'native_file_job_start')
+                        return { jobId: 'job-1' }
                     if (command === 'native_file_job_status') {
                         statusCount++
                         return statusCount === 1
-                            ? { ...status('waitingForInput'), phase: 'awaiting-activation' }
+                            ? {
+                                  ...status('waitingForInput'),
+                                  phase: 'awaiting-activation',
+                              }
                             : status('succeeded', committed)
                     }
-                    if (command === 'native_file_job_finalize') return 'requested'
+                    if (command === 'native_file_job_finalize')
+                        return 'requested'
                     if (command === 'native_file_job_forget') {
-                        throw { code: 'store-error', message: 'terminal acknowledgement failed' }
+                        throw {
+                            code: 'store-error',
+                            message: 'terminal acknowledgement failed',
+                        }
                     }
                     throw new Error(`Unexpected command: ${command}`)
                 },
@@ -1636,38 +2109,46 @@ describe('native file jobs', () => {
         const failed = status('failed')
         failed.error = { code: 'corrupt-input', message: 'invalid gzip data' }
 
-        await expect(runNativeBlockRisuSaveRestore(
-            restoreRuntime(3),
-            { type: 'desktopPath', path: 'C:\\chosen\\backup.risudat' },
-            undefined,
-            {
-                isTauri: () => true,
-                invoke: async (command) => {
-                    commands.push(command)
-                    if (command === 'native_file_job_start') return { jobId: 'job-1' }
-                    if (command === 'native_file_job_status') return failed
-                    if (command === 'native_file_job_forget') return true
-                    throw new Error(`Unexpected command: ${command}`)
+        await expect(
+            runNativeBlockRisuSaveRestore(
+                restoreRuntime(3),
+                { type: 'desktopPath', path: 'C:\\chosen\\backup.risudat' },
+                undefined,
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        commands.push(command)
+                        if (command === 'native_file_job_start')
+                            return { jobId: 'job-1' }
+                        if (command === 'native_file_job_status') return failed
+                        if (command === 'native_file_job_forget') return true
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
                 },
-                wait: async () => undefined,
-            },
-        )).rejects.toMatchObject({ code: 'corrupt-input' })
+            ),
+        ).rejects.toMatchObject({ code: 'corrupt-input' })
         expect(commands.at(-1)).toBe('native_file_job_forget')
     })
 
     it('preserves structured native command errors at the facade boundary', async () => {
-        await expect(runNativeBlockRisuSaveRestore(
-            restoreRuntime(1),
-            { type: 'desktopPath', path: 'C:\\missing\\backup.risudat' },
-            undefined,
-            {
-                isTauri: () => true,
-                invoke: async () => {
-                    throw { code: 'invalid-source', message: 'desktop source is unavailable' }
+        await expect(
+            runNativeBlockRisuSaveRestore(
+                restoreRuntime(1),
+                { type: 'desktopPath', path: 'C:\\missing\\backup.risudat' },
+                undefined,
+                {
+                    isTauri: () => true,
+                    invoke: async () => {
+                        throw {
+                            code: 'invalid-source',
+                            message: 'desktop source is unavailable',
+                        }
+                    },
+                    wait: async () => undefined,
                 },
-                wait: async () => undefined,
-            },
-        )).rejects.toMatchObject({
+            ),
+        ).rejects.toMatchObject({
             name: 'NativeFileJobError',
             code: 'invalid-source',
             message: 'desktop source is unavailable',
@@ -1679,7 +2160,9 @@ describe('native file jobs', () => {
         const observed: NativeFileJobStatus[] = []
         let revision = 11
         const runtime = {
-            get revision() { return revision },
+            get revision() {
+                return revision
+            },
             flushPendingData: async (reason: string) => {
                 calls.push([`flush:${reason}`, undefined])
                 revision = 12
@@ -1725,8 +2208,10 @@ describe('native file jobs', () => {
                 isTauri: () => true,
                 invoke: async (command, args) => {
                     calls.push([command, args])
-                    if (command === 'native_file_job_start') return { jobId: 'export-1' }
-                    if (command === 'native_file_job_status') return statuses.shift()
+                    if (command === 'native_file_job_start')
+                        return { jobId: 'export-1' }
+                    if (command === 'native_file_job_status')
+                        return statuses.shift()
                     if (command === 'native_file_job_forget') return true
                     throw new Error(`Unexpected command: ${command}`)
                 },
@@ -1738,14 +2223,17 @@ describe('native file jobs', () => {
         expect(observed).toEqual([running, succeeded])
         expect(calls).toEqual([
             ['flush:native-block-risu-save-export', undefined],
-            ['native_file_job_start', {
-                request: {
-                    kind: 'export-block-risu-save',
-                    destination: 'C:\\chosen\\backup.risudat',
-                    expectedRevision: 12,
-                    omitAccount: true,
+            [
+                'native_file_job_start',
+                {
+                    request: {
+                        kind: 'export-block-risu-save',
+                        destination: 'C:\\chosen\\backup.risudat',
+                        expectedRevision: 12,
+                        omitAccount: true,
+                    },
                 },
-            }],
+            ],
             ['native_file_job_status', { jobId: 'export-1' }],
             ['native_file_job_status', { jobId: 'export-1' }],
             ['native_file_job_forget', { jobId: 'export-1' }],
@@ -1755,7 +2243,9 @@ describe('native file jobs', () => {
 
     it('keeps the JavaScript facade bounded when native reports a 10 GiB export', async () => {
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
-        const collectGarbage = (globalThis as typeof globalThis & { gc?: () => void }).gc
+        const collectGarbage = (
+            globalThis as typeof globalThis & { gc?: () => void }
+        ).gc
         collectGarbage?.()
         const heapBefore = process.memoryUsage().heapUsed
         const tenGiB = 10 * 1024 * 1024 * 1024
@@ -1803,8 +2293,13 @@ describe('native file jobs', () => {
         )
 
         collectGarbage?.()
-        const heapDelta = Math.max(0, process.memoryUsage().heapUsed - heapBefore)
-        console.info(`[native-file-job-heap] declared=10GiB heapDelta=${heapDelta}`)
+        const heapDelta = Math.max(
+            0,
+            process.memoryUsage().heapUsed - heapBefore,
+        )
+        console.info(
+            `[native-file-job-heap] declared=10GiB heapDelta=${heapDelta}`,
+        )
         expect(result.sourceBytes).toBe(tenGiB)
         expect(JSON.stringify(calls).length).toBeLessThan(512)
         expect(JSON.stringify(calls)).not.toContain('Uint8Array')
@@ -1827,7 +2322,8 @@ describe('native file jobs', () => {
                 isTauri: () => true,
                 invoke: async (command) => {
                     commands.push(command)
-                    if (command === 'native_file_job_start') return { jobId: 'export-1' }
+                    if (command === 'native_file_job_start')
+                        return { jobId: 'export-1' }
                     if (command === 'native_file_job_status') {
                         statusCount++
                         return statusCount === 1
@@ -1836,14 +2332,20 @@ describe('native file jobs', () => {
                                   kind: 'export-block-risu-save',
                                   state: 'running',
                                   phase: 'writing-export',
-                                  progress: { completedBytes: 1, completedItems: 0 },
+                                  progress: {
+                                      completedBytes: 1,
+                                      completedItems: 0,
+                                  },
                               }
                             : {
                                   jobId: 'export-1',
                                   kind: 'export-block-risu-save',
                                   state: 'cancelled',
                                   phase: 'complete',
-                                  progress: { completedBytes: 1, completedItems: 0 },
+                                  progress: {
+                                      completedBytes: 1,
+                                      completedItems: 0,
+                                  },
                               }
                     }
                     if (command === 'native_file_job_cancel') return 'requested'
@@ -1937,12 +2439,15 @@ describe('native file jobs', () => {
         expect(outcome.receipt.jobId).toBe('publication-1')
         expect(outcome.receipt.result).toEqual(result)
         expect(calls).toEqual([
-            ['native_file_job_start', {
-                request: {
-                    kind: 'official-publication-upload',
-                    ...request,
+            [
+                'native_file_job_start',
+                {
+                    request: {
+                        kind: 'official-publication-upload',
+                        ...request,
+                    },
                 },
-            }],
+            ],
             ['native_file_job_status', { jobId: 'publication-1' }],
         ])
         expect(JSON.stringify(calls)).not.toContain('database')
@@ -1968,58 +2473,85 @@ describe('native file jobs', () => {
             credential: { kind: 'risu-auth' as const, token: 'legacy-secret' },
         }
 
-        await expect(runNativeOfficialPublicationAttempt(request, {}, {
-            isTauri: () => true,
-            invoke: async () => {
-                throw {
-                    code: 'capability-unavailable',
-                    message: 'publication jobs are unavailable',
-                }
-            },
-            wait: async () => undefined,
-        })).resolves.toBeNull()
+        await expect(
+            runNativeOfficialPublicationAttempt(
+                request,
+                {},
+                {
+                    isTauri: () => true,
+                    invoke: async () => {
+                        throw {
+                            code: 'capability-unavailable',
+                            message: 'publication jobs are unavailable',
+                        }
+                    },
+                    wait: async () => undefined,
+                },
+            ),
+        ).resolves.toBeNull()
 
-        await expect(runNativeOfficialPublicationAttempt(request, {}, {
-            isTauri: () => true,
-            invoke: async () => {
-                throw { code: 'invalid-request', message: 'invalid base URL' }
-            },
-            wait: async () => undefined,
-        })).rejects.toMatchObject({
+        await expect(
+            runNativeOfficialPublicationAttempt(
+                request,
+                {},
+                {
+                    isTauri: () => true,
+                    invoke: async () => {
+                        throw {
+                            code: 'invalid-request',
+                            message: 'invalid base URL',
+                        }
+                    },
+                    wait: async () => undefined,
+                },
+            ),
+        ).rejects.toMatchObject({
             name: 'NativeFileJobError',
             code: 'invalid-request',
         })
 
         const malformedStartCommands: string[] = []
-        await expect(runNativeOfficialPublicationAttempt(request, {}, {
-            isTauri: () => true,
-            invoke: async (command) => {
-                malformedStartCommands.push(command)
-                if (command === 'native_file_job_start') return {}
-                throw new Error(`Unexpected command: ${command}`)
-            },
-            wait: async () => undefined,
-        })).rejects.toMatchObject({
+        await expect(
+            runNativeOfficialPublicationAttempt(
+                request,
+                {},
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        malformedStartCommands.push(command)
+                        if (command === 'native_file_job_start') return {}
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
+                },
+            ),
+        ).rejects.toMatchObject({
             name: 'NativeFileJobError',
             code: 'invalid-result',
         })
         expect(malformedStartCommands).toEqual(['native_file_job_start'])
 
         let started = false
-        await expect(runNativeOfficialPublicationAttempt(request, {}, {
-            isTauri: () => true,
-            invoke: async (command) => {
-                if (command === 'native_file_job_start') {
-                    started = true
-                    return { jobId: 'publication-1' }
-                }
-                throw {
-                    code: 'capability-unavailable',
-                    message: 'status temporarily unavailable',
-                }
-            },
-            wait: async () => undefined,
-        })).rejects.toMatchObject({
+        await expect(
+            runNativeOfficialPublicationAttempt(
+                request,
+                {},
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        if (command === 'native_file_job_start') {
+                            started = true
+                            return { jobId: 'publication-1' }
+                        }
+                        throw {
+                            code: 'capability-unavailable',
+                            message: 'status temporarily unavailable',
+                        }
+                    },
+                    wait: async () => undefined,
+                },
+            ),
+        ).rejects.toMatchObject({
             name: 'NativeFileJobError',
             code: 'capability-unavailable',
         })
@@ -2031,77 +2563,94 @@ describe('native file jobs', () => {
         const commands: string[] = []
         controller.abort()
 
-        await expect(runNativeOfficialPublicationAttempt(
-            {
-                expectedRevision: 3,
-                lease: 'snapshot-publication-3',
-                accountId: 'account-1',
-                baseUrl: 'https://realm.example',
-                replacements: {},
-                session: null,
-                saveDate: '1777777777777',
-                credential: { kind: 'risu-auth', token: 'legacy-secret' },
-            },
-            { signal: controller.signal },
-            {
-                isTauri: () => true,
-                invoke: async (command) => {
-                    commands.push(command)
-                    throw new Error(`Unexpected command: ${command}`)
+        await expect(
+            runNativeOfficialPublicationAttempt(
+                {
+                    expectedRevision: 3,
+                    lease: 'snapshot-publication-3',
+                    accountId: 'account-1',
+                    baseUrl: 'https://realm.example',
+                    replacements: {},
+                    session: null,
+                    saveDate: '1777777777777',
+                    credential: { kind: 'risu-auth', token: 'legacy-secret' },
                 },
-                wait: async () => undefined,
-            },
-        )).rejects.toMatchObject({ name: 'AbortError' })
+                { signal: controller.signal },
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        commands.push(command)
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
+                },
+            ),
+        ).rejects.toMatchObject({ name: 'AbortError' })
         expect(commands).toEqual([])
     })
 
     it('requests publication cancellation once and waits for terminal cleanup', async () => {
         const controller = new AbortController()
         const commands: string[] = []
-        const states: NativeFileJobStatus['state'][] = ['running', 'cancelling', 'cancelled']
+        const states: NativeFileJobStatus['state'][] = [
+            'running',
+            'cancelling',
+            'cancelled',
+        ]
         let waitCount = 0
 
-        await expect(runNativeOfficialPublicationAttempt(
-            {
-                expectedRevision: 3,
-                lease: 'snapshot-publication-3',
-                accountId: 'account-1',
-                baseUrl: 'https://realm.example',
-                replacements: {},
-                session: null,
-                saveDate: '1777777777777',
-                credential: { kind: 'risu-auth', token: 'legacy-secret' },
-            },
-            { signal: controller.signal },
-            {
-                isTauri: () => true,
-                invoke: async (command) => {
-                    commands.push(command)
-                    if (command === 'native_file_job_start') {
-                        return { jobId: 'publication-1' }
-                    }
-                    if (command === 'native_file_job_status') {
-                        const state = states.shift() ?? 'cancelled'
-                        return {
-                            jobId: 'publication-1',
-                            kind: 'official-publication-upload',
-                            state,
-                            phase: state === 'cancelled' ? 'complete' : 'uploading-database',
-                            progress: { completedBytes: 64, completedItems: 0 },
+        await expect(
+            runNativeOfficialPublicationAttempt(
+                {
+                    expectedRevision: 3,
+                    lease: 'snapshot-publication-3',
+                    accountId: 'account-1',
+                    baseUrl: 'https://realm.example',
+                    replacements: {},
+                    session: null,
+                    saveDate: '1777777777777',
+                    credential: { kind: 'risu-auth', token: 'legacy-secret' },
+                },
+                { signal: controller.signal },
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        commands.push(command)
+                        if (command === 'native_file_job_start') {
+                            return { jobId: 'publication-1' }
                         }
-                    }
-                    if (command === 'native_file_job_cancel') {
-                        throw { code: 'store-error', message: 'cancel response was lost' }
-                    }
-                    if (command === 'native_file_job_forget') return true
-                    throw new Error(`Unexpected command: ${command}`)
+                        if (command === 'native_file_job_status') {
+                            const state = states.shift() ?? 'cancelled'
+                            return {
+                                jobId: 'publication-1',
+                                kind: 'official-publication-upload',
+                                state,
+                                phase:
+                                    state === 'cancelled'
+                                        ? 'complete'
+                                        : 'uploading-database',
+                                progress: {
+                                    completedBytes: 64,
+                                    completedItems: 0,
+                                },
+                            }
+                        }
+                        if (command === 'native_file_job_cancel') {
+                            throw {
+                                code: 'store-error',
+                                message: 'cancel response was lost',
+                            }
+                        }
+                        if (command === 'native_file_job_forget') return true
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => {
+                        waitCount++
+                        if (waitCount === 1) controller.abort()
+                    },
                 },
-                wait: async () => {
-                    waitCount++
-                    if (waitCount === 1) controller.abort()
-                },
-            },
-        )).rejects.toMatchObject({ name: 'AbortError' })
+            ),
+        ).rejects.toMatchObject({ name: 'AbortError' })
 
         expect(commands).toEqual([
             'native_file_job_start',
@@ -2161,7 +2710,10 @@ describe('native file jobs', () => {
                                 kind: 'official-publication-upload',
                                 state: 'running',
                                 phase: 'uploading-database',
-                                progress: { completedBytes: 64, completedItems: 0 },
+                                progress: {
+                                    completedBytes: 64,
+                                    completedItems: 0,
+                                },
                             }
                         }
                         return {
@@ -2169,7 +2721,10 @@ describe('native file jobs', () => {
                             kind: 'official-publication-upload',
                             state: 'succeeded',
                             phase: 'complete',
-                            progress: { completedBytes: 256, completedItems: 1 },
+                            progress: {
+                                completedBytes: 256,
+                                completedItems: 1,
+                            },
                             result,
                         }
                     }
@@ -2209,48 +2764,71 @@ describe('native file jobs', () => {
         }
         const failedCommands: string[] = []
 
-        await expect(runNativeOfficialPublicationAttempt(request, {}, {
-            isTauri: () => true,
-            invoke: async (command) => {
-                failedCommands.push(command)
-                if (command === 'native_file_job_start') return { jobId: 'publication-1' }
-                if (command === 'native_file_job_status') {
-                    return {
-                        jobId: 'publication-1',
-                        kind: 'official-publication-upload',
-                        state: 'failed',
-                        phase: 'complete',
-                        progress: { completedBytes: 0, completedItems: 0 },
-                        error: { code: 'publication-timeout', message: 'upload stalled' },
-                    }
-                }
-                if (command === 'native_file_job_forget') return true
-                throw new Error(`Unexpected command: ${command}`)
-            },
-            wait: async () => undefined,
-        })).rejects.toMatchObject({ code: 'publication-timeout' })
+        await expect(
+            runNativeOfficialPublicationAttempt(
+                request,
+                {},
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        failedCommands.push(command)
+                        if (command === 'native_file_job_start')
+                            return { jobId: 'publication-1' }
+                        if (command === 'native_file_job_status') {
+                            return {
+                                jobId: 'publication-1',
+                                kind: 'official-publication-upload',
+                                state: 'failed',
+                                phase: 'complete',
+                                progress: {
+                                    completedBytes: 0,
+                                    completedItems: 0,
+                                },
+                                error: {
+                                    code: 'publication-timeout',
+                                    message: 'upload stalled',
+                                },
+                            }
+                        }
+                        if (command === 'native_file_job_forget') return true
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
+                },
+            ),
+        ).rejects.toMatchObject({ code: 'publication-timeout' })
         expect(failedCommands.at(-1)).toBe('native_file_job_forget')
 
         const cancelledCommands: string[] = []
-        await expect(runNativeOfficialPublicationAttempt(request, {}, {
-            isTauri: () => true,
-            invoke: async (command) => {
-                cancelledCommands.push(command)
-                if (command === 'native_file_job_start') return { jobId: 'publication-2' }
-                if (command === 'native_file_job_status') {
-                    return {
-                        jobId: 'publication-2',
-                        kind: 'official-publication-upload',
-                        state: 'cancelled',
-                        phase: 'complete',
-                        progress: { completedBytes: 0, completedItems: 0 },
-                    }
-                }
-                if (command === 'native_file_job_forget') return true
-                throw new Error(`Unexpected command: ${command}`)
-            },
-            wait: async () => undefined,
-        })).rejects.toMatchObject({ name: 'AbortError' })
+        await expect(
+            runNativeOfficialPublicationAttempt(
+                request,
+                {},
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        cancelledCommands.push(command)
+                        if (command === 'native_file_job_start')
+                            return { jobId: 'publication-2' }
+                        if (command === 'native_file_job_status') {
+                            return {
+                                jobId: 'publication-2',
+                                kind: 'official-publication-upload',
+                                state: 'cancelled',
+                                phase: 'complete',
+                                progress: {
+                                    completedBytes: 0,
+                                    completedItems: 0,
+                                },
+                            }
+                        }
+                        if (command === 'native_file_job_forget') return true
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
+                },
+            ),
+        ).rejects.toMatchObject({ name: 'AbortError' })
         expect(cancelledCommands.at(-1)).toBe('native_file_job_forget')
     })
 
@@ -2272,45 +2850,54 @@ describe('native file jobs', () => {
 
         for (const mismatch of cases) {
             const commands: string[] = []
-            const attempt = runNativeOfficialPublicationAttempt(request, {}, {
-                isTauri: () => true,
-                invoke: async (command) => {
-                    commands.push(command)
-                    if (command === 'native_file_job_start') {
-                        return { jobId: 'publication-1' }
-                    }
-                    if (command === 'native_file_job_status') {
-                        return {
-                            jobId: 'publication-1',
-                            kind: 'official-publication-upload',
-                            state: 'succeeded',
-                            phase: 'complete',
-                            progress: { completedBytes: 128, completedItems: 1 },
-                            result: {
-                                revision: mismatch.revision,
-                                sourceBytes: 128,
-                                sourceSha256: 'a'.repeat(64),
-                                characterCount: 1,
-                                presetCount: 0,
-                                warningCodes: [],
-                                publication: {
-                                    kind: 'not-modified',
-                                    accountId: mismatch.accountId,
-                                    session: 'session-1',
-                                    saveDate: '1777777777777',
-                                    status: 304,
-                                    replacementKey: 'replacement-1',
-                                },
-                            },
+            const attempt = runNativeOfficialPublicationAttempt(
+                request,
+                {},
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        commands.push(command)
+                        if (command === 'native_file_job_start') {
+                            return { jobId: 'publication-1' }
                         }
-                    }
-                    if (command === 'native_file_job_forget') return true
-                    throw new Error(`Unexpected command: ${command}`)
+                        if (command === 'native_file_job_status') {
+                            return {
+                                jobId: 'publication-1',
+                                kind: 'official-publication-upload',
+                                state: 'succeeded',
+                                phase: 'complete',
+                                progress: {
+                                    completedBytes: 128,
+                                    completedItems: 1,
+                                },
+                                result: {
+                                    revision: mismatch.revision,
+                                    sourceBytes: 128,
+                                    sourceSha256: 'a'.repeat(64),
+                                    characterCount: 1,
+                                    presetCount: 0,
+                                    warningCodes: [],
+                                    publication: {
+                                        kind: 'not-modified',
+                                        accountId: mismatch.accountId,
+                                        session: 'session-1',
+                                        saveDate: '1777777777777',
+                                        status: 304,
+                                        replacementKey: 'replacement-1',
+                                    },
+                                },
+                            }
+                        }
+                        if (command === 'native_file_job_forget') return true
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
                 },
-                wait: async () => undefined,
-            })
+            )
 
-            await expect(attempt).rejects.toMatchObject({ code: 'invalid-result' })
+            await expect(attempt).rejects.toMatchObject({
+                code: 'invalid-result',
+            })
             expect(commands).not.toContain('native_file_job_forget')
         }
     })
@@ -2396,21 +2983,26 @@ describe('native file jobs', () => {
                 isTauri: () => true,
                 invoke: async (command, args) => {
                     calls.push([command, args])
-                    if (command === 'native_file_job_start') return { jobId: 'publication-1' }
-                    if (command === 'native_file_job_status') return {
-                        jobId: 'publication-1',
-                        kind: 'official-publication-upload',
-                        state: 'waitingForInput',
-                        phase: 'awaiting-publication-retry',
-                        progress: { completedBytes: 256, completedItems: 1 },
-                        publicationAttempt: {
-                            kind: 'reauthentication-needed',
-                            accountId: 'account-1',
-                            session: 'session-42',
-                            saveDate: '1000',
-                            status: 403,
-                        },
-                    }
+                    if (command === 'native_file_job_start')
+                        return { jobId: 'publication-1' }
+                    if (command === 'native_file_job_status')
+                        return {
+                            jobId: 'publication-1',
+                            kind: 'official-publication-upload',
+                            state: 'waitingForInput',
+                            phase: 'awaiting-publication-retry',
+                            progress: {
+                                completedBytes: 256,
+                                completedItems: 1,
+                            },
+                            publicationAttempt: {
+                                kind: 'reauthentication-needed',
+                                accountId: 'account-1',
+                                session: 'session-42',
+                                saveDate: '1000',
+                                status: 403,
+                            },
+                        }
                     throw new Error(`Unexpected command: ${command}`)
                 },
                 wait: async () => {
@@ -2465,15 +3057,22 @@ describe('native file jobs', () => {
                 isTauri: () => true,
                 invoke: async (command, args) => {
                     calls.push([command, args])
-                    if (command === 'native_file_job_official_publication_retry') return 'accepted'
-                    if (command === 'native_file_job_status') return {
-                        jobId: 'publication-1',
-                        kind: 'official-publication-upload',
-                        state: 'succeeded',
-                        phase: 'complete',
-                        progress: { completedBytes: 1024, completedItems: 2 },
-                        result,
-                    }
+                    if (
+                        command === 'native_file_job_official_publication_retry'
+                    )
+                        return 'accepted'
+                    if (command === 'native_file_job_status')
+                        return {
+                            jobId: 'publication-1',
+                            kind: 'official-publication-upload',
+                            state: 'succeeded',
+                            phase: 'complete',
+                            progress: {
+                                completedBytes: 1024,
+                                completedItems: 2,
+                            },
+                            result,
+                        }
                     throw new Error(`Unexpected command: ${command}`)
                 },
                 wait: async () => undefined,
@@ -2481,18 +3080,22 @@ describe('native file jobs', () => {
         )
 
         expect(outcome.kind).toBe('completed')
-        if (outcome.kind !== 'completed') throw new Error('Expected a completed publication')
+        if (outcome.kind !== 'completed')
+            throw new Error('Expected a completed publication')
         expect(outcome.receipt.result).toEqual(result)
         expect(calls).toEqual([
-            ['native_file_job_official_publication_retry', {
-                request: {
-                    jobId: 'publication-1',
-                    accountId: 'account-1',
-                    session: 'session-42',
-                    saveDate: '1001',
-                    credential: { kind: 'risu-auth', token: 'new-token' },
+            [
+                'native_file_job_official_publication_retry',
+                {
+                    request: {
+                        jobId: 'publication-1',
+                        accountId: 'account-1',
+                        session: 'session-42',
+                        saveDate: '1001',
+                        credential: { kind: 'risu-auth', token: 'new-token' },
+                    },
                 },
-            }],
+            ],
             ['native_file_job_status', { jobId: 'publication-1' }],
         ])
     })
@@ -2550,7 +3153,8 @@ describe('native file jobs', () => {
             isTauri: () => true,
             invoke: async (command: string, args?: Record<string, unknown>) => {
                 calls.push([command, args])
-                if (command === 'native_file_job_official_publication_retry') return 'accepted'
+                if (command === 'native_file_job_official_publication_retry')
+                    return 'accepted'
                 if (command === 'native_file_job_status') {
                     return statusPoll++ === 0 ? waiting : terminal
                 }
@@ -2580,7 +3184,9 @@ describe('native file jobs', () => {
                 saveDate: '1002',
                 credential: { kind: 'risu-auth', token: 'newer-token' },
                 expectedRevision: 0,
-            } as NativeOfficialPublicationRetryRequest & { expectedRevision: number },
+            } as NativeOfficialPublicationRetryRequest & {
+                expectedRevision: number
+            },
             { revision: 17, accountId: 'account-1' },
             {},
             dependencies,
@@ -2588,25 +3194,31 @@ describe('native file jobs', () => {
 
         expect(secondOutcome.kind).toBe('completed')
         expect(calls).toEqual([
-            ['native_file_job_official_publication_retry', {
-                request: {
-                    jobId: 'publication-1',
-                    accountId: 'account-1',
-                    session: 'session-42',
-                    saveDate: '1001',
-                    credential: { kind: 'risu-auth', token: 'new-token' },
+            [
+                'native_file_job_official_publication_retry',
+                {
+                    request: {
+                        jobId: 'publication-1',
+                        accountId: 'account-1',
+                        session: 'session-42',
+                        saveDate: '1001',
+                        credential: { kind: 'risu-auth', token: 'new-token' },
+                    },
                 },
-            }],
+            ],
             ['native_file_job_status', { jobId: 'publication-1' }],
-            ['native_file_job_official_publication_retry', {
-                request: {
-                    jobId: 'publication-1',
-                    accountId: 'account-1',
-                    session: 'session-43',
-                    saveDate: '1002',
-                    credential: { kind: 'risu-auth', token: 'newer-token' },
+            [
+                'native_file_job_official_publication_retry',
+                {
+                    request: {
+                        jobId: 'publication-1',
+                        accountId: 'account-1',
+                        session: 'session-43',
+                        saveDate: '1002',
+                        credential: { kind: 'risu-auth', token: 'newer-token' },
+                    },
                 },
-            }],
+            ],
             ['native_file_job_status', { jobId: 'publication-1' }],
         ])
     })
@@ -2616,34 +3228,41 @@ describe('native file jobs', () => {
         const commands: string[] = []
         controller.abort()
 
-        await expect(continueNativeOfficialPublication(
-            'publication-1',
-            {
-                accountId: 'account-1',
-                session: 'session-42',
-                saveDate: '1001',
-                credential: { kind: 'risu-auth', token: 'new-token' },
-            },
-            { revision: 17, accountId: 'account-1' },
-            { signal: controller.signal },
-            {
-                isTauri: () => true,
-                invoke: async (command) => {
-                    commands.push(command)
-                    if (command === 'native_file_job_cancel') return 'requested'
-                    if (command === 'native_file_job_status') return {
-                        jobId: 'publication-1',
-                        kind: 'official-publication-upload',
-                        state: 'cancelled',
-                        phase: 'complete',
-                        progress: { completedBytes: 512, completedItems: 1 },
-                    }
-                    if (command === 'native_file_job_forget') return true
-                    throw new Error(`Unexpected command: ${command}`)
+        await expect(
+            continueNativeOfficialPublication(
+                'publication-1',
+                {
+                    accountId: 'account-1',
+                    session: 'session-42',
+                    saveDate: '1001',
+                    credential: { kind: 'risu-auth', token: 'new-token' },
                 },
-                wait: async () => undefined,
-            },
-        )).rejects.toMatchObject({ name: 'AbortError' })
+                { revision: 17, accountId: 'account-1' },
+                { signal: controller.signal },
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        commands.push(command)
+                        if (command === 'native_file_job_cancel')
+                            return 'requested'
+                        if (command === 'native_file_job_status')
+                            return {
+                                jobId: 'publication-1',
+                                kind: 'official-publication-upload',
+                                state: 'cancelled',
+                                phase: 'complete',
+                                progress: {
+                                    completedBytes: 512,
+                                    completedItems: 1,
+                                },
+                            }
+                        if (command === 'native_file_job_forget') return true
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
+                },
+            ),
+        ).rejects.toMatchObject({ name: 'AbortError' })
 
         expect(commands).toEqual([
             'native_file_job_cancel',
@@ -2682,29 +3301,36 @@ describe('native file jobs', () => {
             },
         }
 
-        await expect(continueNativeOfficialPublication(
-            'publication-1',
-            {
-                accountId: 'account-1',
-                session: 'session-42',
-                saveDate: '1001',
-                credential: { kind: 'risu-auth', token: 'new-token' },
-            },
-            { revision: 17, accountId: 'account-1' },
-            { signal: controller.signal },
-            {
-                isTauri: () => true,
-                invoke: async (command) => {
-                    commands.push(command)
-                    if (command === 'native_file_job_cancel') return 'too-late'
-                    if (command === 'native_file_job_status') return terminal
-                    throw new Error(`Unexpected command: ${command}`)
+        await expect(
+            continueNativeOfficialPublication(
+                'publication-1',
+                {
+                    accountId: 'account-1',
+                    session: 'session-42',
+                    saveDate: '1001',
+                    credential: { kind: 'risu-auth', token: 'new-token' },
                 },
-                wait: async () => undefined,
-            },
-        )).rejects.toMatchObject({ name: 'AbortError' })
+                { revision: 17, accountId: 'account-1' },
+                { signal: controller.signal },
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        commands.push(command)
+                        if (command === 'native_file_job_cancel')
+                            return 'too-late'
+                        if (command === 'native_file_job_status')
+                            return terminal
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
+                },
+            ),
+        ).rejects.toMatchObject({ name: 'AbortError' })
 
-        expect(commands).toEqual(['native_file_job_cancel', 'native_file_job_status'])
+        expect(commands).toEqual([
+            'native_file_job_cancel',
+            'native_file_job_status',
+        ])
     })
 
     it('resumes an active publication as an unacknowledged terminal receipt', async () => {
@@ -2741,12 +3367,13 @@ describe('native file jobs', () => {
                 invoke: async (command) => {
                     commands.push(command)
                     if (command === 'native_file_job_status') {
-                        if (poll++ === 0) return {
-                            ...terminal,
-                            state: 'running',
-                            phase: 'uploading-database',
-                            result: undefined,
-                        }
+                        if (poll++ === 0)
+                            return {
+                                ...terminal,
+                                state: 'running',
+                                phase: 'uploading-database',
+                                result: undefined,
+                            }
                         return terminal
                     }
                     if (command === 'native_file_job_forget') return true
@@ -2757,7 +3384,10 @@ describe('native file jobs', () => {
         )
 
         expect(receipt?.result).toEqual(terminal.result)
-        expect(commands).toEqual(['native_file_job_status', 'native_file_job_status'])
+        expect(commands).toEqual([
+            'native_file_job_status',
+            'native_file_job_status',
+        ])
 
         await receipt?.acknowledge()
         expect(commands.at(-1)).toBe('native_file_job_forget')
@@ -2767,39 +3397,53 @@ describe('native file jobs', () => {
         const commands: string[] = []
         let poll = 0
 
-        await expect(resumeNativeOfficialPublication('publication-waiting', {}, {
-            isTauri: () => true,
-            invoke: async (command) => {
-                commands.push(command)
-                if (command === 'native_file_job_status') {
-                    if (poll++ === 0) return {
-                        jobId: 'publication-waiting',
-                        kind: 'official-publication-upload',
-                        state: 'waitingForInput',
-                        phase: 'awaiting-publication-retry',
-                        progress: { completedBytes: 128, completedItems: 1 },
-                        publicationAttempt: {
-                            kind: 'reauthentication-needed',
-                            accountId: 'account-1',
-                            session: 'session-1',
-                            saveDate: '1000',
-                            status: 403,
-                        },
-                    }
-                    return {
-                        jobId: 'publication-waiting',
-                        kind: 'official-publication-upload',
-                        state: 'cancelled',
-                        phase: 'complete',
-                        progress: { completedBytes: 128, completedItems: 1 },
-                    }
-                }
-                if (command === 'native_file_job_cancel') return 'requested'
-                if (command === 'native_file_job_forget') return true
-                throw new Error(`Unexpected command: ${command}`)
-            },
-            wait: async () => undefined,
-        })).resolves.toBeNull()
+        await expect(
+            resumeNativeOfficialPublication(
+                'publication-waiting',
+                {},
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        commands.push(command)
+                        if (command === 'native_file_job_status') {
+                            if (poll++ === 0)
+                                return {
+                                    jobId: 'publication-waiting',
+                                    kind: 'official-publication-upload',
+                                    state: 'waitingForInput',
+                                    phase: 'awaiting-publication-retry',
+                                    progress: {
+                                        completedBytes: 128,
+                                        completedItems: 1,
+                                    },
+                                    publicationAttempt: {
+                                        kind: 'reauthentication-needed',
+                                        accountId: 'account-1',
+                                        session: 'session-1',
+                                        saveDate: '1000',
+                                        status: 403,
+                                    },
+                                }
+                            return {
+                                jobId: 'publication-waiting',
+                                kind: 'official-publication-upload',
+                                state: 'cancelled',
+                                phase: 'complete',
+                                progress: {
+                                    completedBytes: 128,
+                                    completedItems: 1,
+                                },
+                            }
+                        }
+                        if (command === 'native_file_job_cancel')
+                            return 'requested'
+                        if (command === 'native_file_job_forget') return true
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
+                },
+            ),
+        ).resolves.toBeNull()
 
         expect(commands).toEqual([
             'native_file_job_status',
@@ -2835,31 +3479,36 @@ describe('native file jobs', () => {
                 },
             },
         }
-        const receipt = await resumeNativeOfficialPublication('publication-waiting', {}, {
-            isTauri: () => true,
-            invoke: async (command) => {
-                commands.push(command)
-                if (command === 'native_file_job_status') {
-                    if (poll++ === 0) return {
-                        ...terminal,
-                        state: 'waitingForInput' as const,
-                        phase: 'awaiting-publication-retry' as const,
-                        result: undefined,
-                        publicationAttempt: {
-                            kind: 'reauthentication-needed' as const,
-                            accountId: 'account-1',
-                            session: 'session-1',
-                            saveDate: '1000',
-                            status: 403,
-                        },
+        const receipt = await resumeNativeOfficialPublication(
+            'publication-waiting',
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    if (command === 'native_file_job_status') {
+                        if (poll++ === 0)
+                            return {
+                                ...terminal,
+                                state: 'waitingForInput' as const,
+                                phase: 'awaiting-publication-retry' as const,
+                                result: undefined,
+                                publicationAttempt: {
+                                    kind: 'reauthentication-needed' as const,
+                                    accountId: 'account-1',
+                                    session: 'session-1',
+                                    saveDate: '1000',
+                                    status: 403,
+                                },
+                            }
+                        return terminal
                     }
-                    return terminal
-                }
-                if (command === 'native_file_job_cancel') return 'too-late'
-                throw new Error(`Unexpected command: ${command}`)
+                    if (command === 'native_file_job_cancel') return 'too-late'
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
             },
-            wait: async () => undefined,
-        })
+        )
 
         expect(receipt?.result).toEqual(terminal.result)
         expect(commands).toEqual([
@@ -2872,43 +3521,80 @@ describe('native file jobs', () => {
     it('forgets a recovered failed publication without exposing an association receipt', async () => {
         const commands: string[] = []
 
-        await expect(resumeNativeOfficialPublication('publication-failed', {}, {
-            isTauri: () => true,
-            invoke: async (command) => {
-                commands.push(command)
-                if (command === 'native_file_job_status') return {
-                    jobId: 'publication-failed',
-                    kind: 'official-publication-upload',
-                    state: 'failed',
-                    phase: 'complete',
-                    progress: { completedBytes: 0, completedItems: 0 },
-                    error: { code: 'offline', message: 'offline' },
-                }
-                if (command === 'native_file_job_forget') return true
-                throw new Error(`Unexpected command: ${command}`)
-            },
-            wait: async () => undefined,
-        })).resolves.toBeNull()
+        await expect(
+            resumeNativeOfficialPublication(
+                'publication-failed',
+                {},
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        commands.push(command)
+                        if (command === 'native_file_job_status')
+                            return {
+                                jobId: 'publication-failed',
+                                kind: 'official-publication-upload',
+                                state: 'failed',
+                                phase: 'complete',
+                                progress: {
+                                    completedBytes: 0,
+                                    completedItems: 0,
+                                },
+                                error: { code: 'offline', message: 'offline' },
+                            }
+                        if (command === 'native_file_job_forget') return true
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
+                },
+            ),
+        ).resolves.toBeNull()
 
-        expect(commands).toEqual(['native_file_job_status', 'native_file_job_forget'])
+        expect(commands).toEqual([
+            'native_file_job_status',
+            'native_file_job_forget',
+        ])
     })
 })
 
 it('cancels staged restore and waits for terminal settlement when the fresh precondition fails', async () => {
-    const calls: string[]=[];
-    const statuses=[{...status('waitingForInput'),phase:'awaiting-activation'},status('cancelled')];
-    const acquire=vi.fn();
-    await expect(runNativeLosslessBackupRestore(
-        restoreRuntime(17,{acquire}),
-        {type:'desktopPath',path:'C:\\synthetic\\backup.risulossless'},
-        {beforeActivation:()=>{throw new NativeFileJobError('resolve-pending-operation-first','pending')}},
-        {isTauri:()=>true,wait:async()=>{},invoke:async(command)=>{
-            calls.push(command);
-            if(command==='native_file_job_start')return {jobId:'staged'};
-            if(command==='native_file_job_status')return statuses.shift();
-            return true;
-        }},
-    )).rejects.toMatchObject({code:'resolve-pending-operation-first'});
-    expect(acquire).not.toHaveBeenCalled();
-    expect(calls).toEqual(['native_file_job_start','native_file_job_status','native_file_job_cancel','native_file_job_status','native_file_job_forget']);
-});
+    const calls: string[] = []
+    const statuses = [
+        { ...status('waitingForInput'), phase: 'awaiting-activation' },
+        status('cancelled'),
+    ]
+    const acquire = vi.fn()
+    await expect(
+        runNativeLosslessBackupRestore(
+            restoreRuntime(17, { acquire }),
+            { type: 'desktopPath', path: 'C:\\synthetic\\backup.risulossless' },
+            {
+                beforeActivation: () => {
+                    throw new NativeFileJobError(
+                        'resolve-pending-operation-first',
+                        'pending',
+                    )
+                },
+            },
+            {
+                isTauri: () => true,
+                wait: async () => {},
+                invoke: async (command) => {
+                    calls.push(command)
+                    if (command === 'native_file_job_start')
+                        return { jobId: 'staged' }
+                    if (command === 'native_file_job_status')
+                        return statuses.shift()
+                    return true
+                },
+            },
+        ),
+    ).rejects.toMatchObject({ code: 'resolve-pending-operation-first' })
+    expect(acquire).not.toHaveBeenCalled()
+    expect(calls).toEqual([
+        'native_file_job_start',
+        'native_file_job_status',
+        'native_file_job_cancel',
+        'native_file_job_status',
+        'native_file_job_forget',
+    ])
+})

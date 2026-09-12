@@ -10,10 +10,146 @@ import {
     pickAndroidLegacyBackupSource,
     pickAndroidContentSource,
     pickAndroidLosslessBackupSource,
+    pickAndroidBackupSource,
     type AndroidSafDestinationEvent,
 } from './androidSafBridge'
 
 describe('Android SAF bridge', () => {
+    it.each(['complete.RISUNEST', 'compatible.BIN', 'block.RISUDAT'])(
+        'picks %s through the common backup picker without transferring bytes to JavaScript',
+        async (displayName) => {
+            const listeners = new Map<string, Set<(event: Event) => void>>()
+            const onSource = vi.fn()
+            const onProgress = vi.fn()
+            const pickLosslessSource = vi.fn((requestId: string) =>
+                queueMicrotask(() => {
+                    for (const listener of listeners.get('risu-android-saf-progress') ?? []) {
+                        listener(
+                            new CustomEvent('risu-android-saf-progress', {
+                                detail: {
+                                    requestId,
+                                    operation: 'source-copy',
+                                    copiedBytes: 2048,
+                                    totalBytes: 4_294_967_296,
+                                    token: null,
+                                },
+                            }),
+                        )
+                    }
+                    for (const listener of listeners.get('risu-android-lossless-source-picked') ??
+                        []) {
+                        listener(
+                            new CustomEvent('risu-android-lossless-source-picked', {
+                                detail: {
+                                    requestId,
+                                    ready: [
+                                        {
+                                            token: '11111111-1111-4111-8111-111111111111',
+                                            displayName,
+                                            bytes: 4_294_967_296,
+                                        },
+                                    ],
+                                    failures: [],
+                                },
+                            }),
+                        )
+                    }
+                }),
+            )
+            const source = await pickAndroidBackupSource(
+                { onSource, onProgress },
+                {
+                    createRequestId: () => 'common-backup-picker',
+                    bridge: { copyExport: vi.fn(), pickLosslessSource },
+                    addEventListener: (name, listener) => {
+                        const registered = listeners.get(name) ?? new Set()
+                        registered.add(listener)
+                        listeners.set(name, registered)
+                    },
+                    removeEventListener: (name, listener) => listeners.get(name)?.delete(listener),
+                },
+            )
+            expect(source).toEqual({
+                type: 'androidSpool',
+                token: '11111111-1111-4111-8111-111111111111',
+            })
+            expect(pickLosslessSource).toHaveBeenCalledExactlyOnceWith('common-backup-picker')
+            expect(onSource).toHaveBeenCalledExactlyOnceWith({ displayName, bytes: 4_294_967_296 })
+            expect(onProgress).toHaveBeenCalledExactlyOnceWith(
+                expect.objectContaining({ copiedBytes: 2048, totalBytes: 4_294_967_296 }),
+            )
+            expect([...listeners.values()].every((registered) => registered.size === 0)).toBe(true)
+        },
+    )
+
+    it.each(['old.risulossless', 'card.charx', 'backup.risunest.exe'])(
+        'discards unsupported common-picker source %s',
+        async (displayName) => {
+            const listeners = new Set<(event: Event) => void>()
+            const discardSource = vi.fn(() => true)
+            const selected = pickAndroidBackupSource(
+                {},
+                {
+                    createRequestId: () => 'common-backup-rejected',
+                    bridge: {
+                        copyExport: vi.fn(),
+                        discardSource,
+                        pickLosslessSource: (requestId) =>
+                            queueMicrotask(() => {
+                                for (const listener of listeners)
+                                    listener(
+                                        new CustomEvent('risu-android-lossless-source-picked', {
+                                            detail: {
+                                                requestId,
+                                                ready: [
+                                                    {
+                                                        token: '11111111-1111-4111-8111-111111111111',
+                                                        displayName,
+                                                        bytes: 16,
+                                                    },
+                                                ],
+                                                failures: [],
+                                            },
+                                        }),
+                                    )
+                            }),
+                    },
+                    addEventListener: (_name, listener) => listeners.add(listener),
+                    removeEventListener: (_name, listener) => listeners.delete(listener),
+                },
+            )
+            await expect(selected).rejects.toMatchObject({ code: 'unsupported-format' })
+            expect(discardSource).toHaveBeenCalledExactlyOnceWith(
+                '11111111-1111-4111-8111-111111111111',
+            )
+            expect(listeners.size).toBe(0)
+        },
+    )
+
+    it('routes all current backup suffixes and excludes previous RisuNest archives from open-with restore', async () => {
+        const restore = vi.fn(async (_input: { source: unknown; displayName: string }) => undefined)
+        const unsupported = vi.fn()
+        const names = ['backup.RISUNEST', 'legacy.BIN', 'block.RISUDAT', 'previous.risulossless']
+        await consumeAndroidSpoolBatch(
+            {
+                requestId: 'common-open-with',
+                ready: names.map((displayName, index) => ({
+                    token: String(index),
+                    displayName,
+                    bytes: 10,
+                })),
+                failures: [],
+            },
+            { restore, unsupported },
+        )
+        expect(restore.mock.calls.map(([input]) => input.displayName)).toEqual(names.slice(0, 3))
+        expect(unsupported).toHaveBeenCalledExactlyOnceWith({
+            token: '3',
+            displayName: names[3],
+            bytes: 10,
+        })
+    })
+
     it('reports SAF file jobs enabled only when the native bridge is installed', () => {
         expect(isAndroidSafFileJobsEnabled(undefined)).toBe(false)
         expect(isAndroidSafFileJobsEnabled({})).toBe(true)

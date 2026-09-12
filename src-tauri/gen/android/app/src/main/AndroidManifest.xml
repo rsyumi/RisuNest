@@ -70,6 +70,9 @@
                 <data android:pathPattern=".*\\.risum" />
                 <data android:pathPattern=".*\\.risup" />
                 <data android:pathPattern=".*\\.charx" />
+                <data android:pathPattern=".*\\.risunest" />
+                <data android:pathPattern=".*\\.risudat" />
+                <data android:pathPattern=".*\\.bin" />
             </intent-filter>
             
             <!-- tauri-file-associations. AUTO-GENERATED. DO NOT REMOVE. -->

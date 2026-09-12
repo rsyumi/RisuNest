@@ -5,10 +5,11 @@ fn backup(root: &Path, index: u128, complete: bool) -> (String, u64) {
     let id = uuid::Uuid::from_u128(index).to_string();
     let directory = root.join("server-sync/backups").join(&id);
     fs::create_dir_all(&directory).unwrap();
-    fs::write(directory.join("local.risulossless"), b"synthetic local").unwrap();
-    fs::write(directory.join("remote.risulossless"), b"synthetic remote").unwrap();
+    fs::write(directory.join("local.risunest"), b"synthetic local").unwrap();
+    fs::write(directory.join("remote.risunest"), b"synthetic remote").unwrap();
     if complete {
         fs::write(directory.join("complete.json"), serde_json::to_vec(&json!({
+            "format": "risunest-portable-backup", "scope": "library",
             "head": { "libraryId":"library", "epoch":"epoch", "seq":"0", "headId":"a".repeat(64), "minRetainedSeq":"0" },
             "localRevision": 1,
             "localHash": risunest_sync_wire::hash(b"synthetic local"),

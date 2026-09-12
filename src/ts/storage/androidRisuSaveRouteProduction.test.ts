@@ -1,6 +1,16 @@
 import { describe, expect, it, vi } from 'vitest'
 
-vi.mock('src/lang', () => ({ language: {} }))
+const backupMocks = vi.hoisted(() => ({
+    restore: vi.fn(),
+    externalManager: vi.fn(),
+}))
+
+vi.mock('src/lang', () => ({
+    language: {
+        risuSaveCleanupWarning: 'cleanup warning',
+        risuSaveImportComplete: 'restore complete',
+    },
+}))
 vi.mock('../alert', () => ({
     alertConfirm: vi.fn(),
     alertError: vi.fn(),
@@ -13,19 +23,78 @@ vi.mock('../plugins/plugins.svelte', () => ({
 vi.mock('./persistentDataRuntime.svelte', () => ({
     getPersistentDataRuntime: vi.fn(),
 }))
+vi.mock('./portableBackupFileRouteProduction.svelte', () => ({
+    restoreBackupFromNativeSource: backupMocks.restore,
+}))
+vi.mock('./nativeFileJobManager', () => ({
+    runExternalAndroidNativeFileOperation: backupMocks.externalManager,
+}))
+
+import { alertConfirm, alertNormal } from '../alert'
 
 import {
     createAndroidOpenedSpoolDispatcher,
     dispatchAndroidOpenedSpoolBatch,
     importAndroidOpenedPreparedContent,
+    restoreAndroidOpenedBackupSource,
     type AndroidOpenedSpoolDispatchDependencies,
 } from './androidRisuSaveRouteProduction.svelte'
-import type {
-    PreparedNativeContent,
-    PreparedNativeContentReceipt,
-} from './nativeFileJobs'
+import type { PreparedNativeContent, PreparedNativeContentReceipt } from './nativeFileJobs'
 
 describe('Android opened spool production route', () => {
+    it.each(['backup.RISUNEST', 'compatible.BIN', 'block.RISUDAT'])(
+        'delegates %s token and source metadata to the common restore owner without nesting operations',
+        async (displayName) => {
+            backupMocks.restore.mockReset()
+            backupMocks.externalManager.mockClear()
+            vi.mocked(alertConfirm).mockClear()
+            vi.mocked(alertNormal).mockClear()
+            const onSource = vi.fn()
+            const source = {
+                type: 'androidSpool' as const,
+                token: '11111111-1111-4111-8111-111111111111',
+            }
+            backupMocks.restore.mockImplementation(async (factory) => {
+                expect(
+                    await factory({
+                        signal: new AbortController().signal,
+                        onStatus: vi.fn(),
+                        onSource,
+                    }),
+                ).toEqual(source)
+                return { warningCodes: [] }
+            })
+
+            await restoreAndroidOpenedBackupSource({ source, displayName })
+
+            expect(backupMocks.restore).toHaveBeenCalledExactlyOnceWith(expect.any(Function))
+            expect(onSource).toHaveBeenCalledExactlyOnceWith({ name: displayName })
+            expect(backupMocks.externalManager).not.toHaveBeenCalled()
+            expect(alertConfirm).not.toHaveBeenCalled()
+            expect(alertNormal).toHaveBeenCalledExactlyOnceWith('restore complete')
+        },
+    )
+
+    it('does not announce completion or discard source ownership after common restore cancellation', async () => {
+        backupMocks.restore.mockReset().mockResolvedValue(null)
+        vi.mocked(alertNormal).mockClear()
+        await restoreAndroidOpenedBackupSource({
+            source: { type: 'androidSpool', token: '11111111-1111-4111-8111-111111111111' },
+            displayName: 'cancelled.risunest',
+        })
+        expect(alertNormal).not.toHaveBeenCalled()
+    })
+
+    it('preserves the committed cleanup warning from the common restore result', async () => {
+        backupMocks.restore.mockReset().mockResolvedValue({ warningCodes: ['cleanup-failed'] })
+        vi.mocked(alertNormal).mockClear()
+        await restoreAndroidOpenedBackupSource({
+            source: { type: 'androidSpool', token: '11111111-1111-4111-8111-111111111111' },
+            displayName: 'restored.risunest',
+        })
+        expect(alertNormal).toHaveBeenCalledExactlyOnceWith('cleanup warning')
+    })
+
     it('keeps the inactive content capability fallback out of the restore discard path', async () => {
         const enqueueRestore = vi.fn(async () => undefined)
         const importCharacter = vi.fn(async () => ({

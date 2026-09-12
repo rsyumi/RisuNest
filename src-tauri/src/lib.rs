@@ -3,6 +3,7 @@ mod android_commit_transport;
 mod app_data_root;
 mod asset_repository;
 mod cold_payload_codec;
+pub(crate) mod device_backup;
 pub mod import_export_jobs;
 #[allow(dead_code)]
 mod local_backup;
@@ -20,6 +21,7 @@ mod opened_files;
 #[cfg(windows)]
 mod persistent_commit_transport;
 mod persistent_store;
+mod portable_backup;
 #[cfg(feature = "official-publication-upload-pilot")]
 mod publication_upload;
 #[cfg(any(test, target_os = "windows", target_os = "android"))]
@@ -535,8 +537,18 @@ pub fn run() {
             .manage(android_commit_transport::native_state().clone())
             .on_page_load(|webview, payload| {
                 if webview.label() == "main"
+                    && matches!(payload.event(), tauri::webview::PageLoadEvent::Finished)
+                {
+                    if let Some(state) = webview.try_state::<device_backup::DeviceBackupState>() {
+                        state.main_document_finished();
+                    }
+                }
+                if webview.label() == "main"
                     && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
                 {
+                    if let Some(state) = webview.try_state::<device_backup::DeviceBackupState>() {
+                        state.main_document_started();
+                    }
                     webview
                         .state::<android_commit_transport::AndroidCommitState>()
                         .reset();
@@ -547,9 +559,39 @@ pub fn run() {
     {
         builder = builder.on_page_load(|webview, payload| {
             if webview.label() == "main"
+                && matches!(payload.event(), tauri::webview::PageLoadEvent::Finished)
+            {
+                if let Some(state) = webview.try_state::<device_backup::DeviceBackupState>() {
+                    state.main_document_finished();
+                }
+            }
+            if webview.label() == "main"
                 && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
             {
+                if let Some(state) = webview.try_state::<device_backup::DeviceBackupState>() {
+                    state.main_document_started();
+                }
                 let _ = webview.with_webview(|_| persistent_commit_transport::reset());
+            }
+        });
+    }
+
+    #[cfg(not(any(windows, target_os = "android")))]
+    {
+        builder = builder.on_page_load(|webview, payload| {
+            if webview.label() == "main"
+                && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
+            {
+                if let Some(state) = webview.try_state::<device_backup::DeviceBackupState>() {
+                    state.main_document_started();
+                }
+            }
+            if webview.label() == "main"
+                && matches!(payload.event(), tauri::webview::PageLoadEvent::Finished)
+            {
+                if let Some(state) = webview.try_state::<device_backup::DeviceBackupState>() {
+                    state.main_document_finished();
+                }
             }
         });
     }
@@ -572,12 +614,27 @@ pub fn run() {
     let app = builder
         .setup(move |app| {
             let app_data_dir = app_data_root::resolve(app)?;
+            let device_backup =
+                device_backup::DeviceBackupState::initialize(app_data_dir.join("device-backup"));
             setup_native_log_state.configure_file_path(&app_data_dir);
             app.manage(setup_native_log_state.clone());
-            native_media::recover_inlay_writes(&app_data_dir).map_err(std::io::Error::other)?;
             let state = native_file_jobs::NativeFileJobState::initialize(
                 app_data_dir.join("native-file-jobs"),
             );
+            // Recover device state before opening the PDS or permitting other
+            // native writers. Initialization failures also keep these gates shut.
+            let device_recovery_pending = !matches!(device_backup.is_blocking(), Ok(false));
+            if device_recovery_pending {
+                let admission = state.admission.file(true).map_err(std::io::Error::other)?;
+                device_backup.attach_startup_admission(admission)?;
+                let guard = app
+                    .state::<persistent_store::PersistentStoreState>()
+                    .acquire_device_maintenance()?;
+                device_backup.attach_maintenance_guard(guard)?;
+            } else {
+                native_media::recover_inlay_writes(&app_data_dir).map_err(std::io::Error::other)?;
+            }
+            app.manage(device_backup);
             app.manage(state);
             app.manage(
                 native_file_jobs::screenshot_output::ScreenshotOutputState::initialize(
@@ -668,6 +725,25 @@ pub fn run() {
             asset_repository::commands::asset_cas_job_seal_prepared_content,
             asset_repository::commands::asset_cas_job_release,
             native_file_jobs::native_file_job_start,
+            device_backup::native_device_backup_bootstrap,
+            device_backup::native_device_backup_section_begin,
+            device_backup::native_device_backup_row_append,
+            device_backup::native_device_backup_row_append_from_blob,
+            device_backup::native_device_backup_section_finish,
+            device_backup::native_device_backup_section_list,
+            device_backup::native_device_backup_row_read,
+            device_backup::native_device_backup_row_read_bytes,
+            device_backup::native_device_backup_blob_begin,
+            device_backup::native_device_backup_blob_append,
+            device_backup::native_device_backup_blob_finish,
+            device_backup::native_device_backup_blob_read,
+            device_backup::native_device_backup_prepared,
+            device_backup::native_device_backup_section_intent,
+            device_backup::native_device_backup_section_complete,
+            device_backup::native_device_backup_finish_device,
+            device_backup::native_device_backup_recovery_complete,
+            device_backup::native_device_backup_fail,
+            device_backup::native_device_backup_retry_recovery,
             native_file_jobs::native_content_source_metadata,
             native_file_jobs::native_file_job_status,
             native_file_jobs::native_file_job_list,
@@ -676,6 +752,9 @@ pub fn run() {
             native_file_jobs::native_file_job_official_publication_retry,
             native_file_jobs::native_file_job_forget,
             native_file_jobs::native_lossless_handoff_cleanup,
+            native_file_jobs::native_portable_handoff_cleanup,
+            native_file_jobs::native_portable_select_sections,
+            native_file_jobs::native_backup_source_format,
             native_file_jobs::native_legacy_backup_handoff_cleanup,
             native_file_jobs::native_character_charx_handoff_cleanup,
             native_file_jobs::native_character_card_handoff_cleanup,
