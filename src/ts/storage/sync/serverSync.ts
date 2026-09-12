@@ -35,6 +35,7 @@ export interface ServerStatus {
   operationPending: boolean;
 }
 export interface ServerCycle {
+  endpoint: string;
   phase: "idle" | "pending" | "conflict";
   localRevision: number;
   head: ServerHead;

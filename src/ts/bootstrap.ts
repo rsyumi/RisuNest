@@ -19,7 +19,8 @@ import { loadPlugins, loadPluginsAfterAuthoritativeRestore, pluginCompatibility 
 import { shouldProjectScalableWorkingSet } from "./plugins/pluginCompatibility";
 import { alertConfirm, alertError, alertInput, alertLogin, alertMd, alertNormal, alertSelect, alertTOS, waitAlert } from "./alert";
 import { checkDriverInit } from "./drive/drive";
-import { characterURLImport, hubURL } from "./characterCards";
+import { characterURLImport, downloadRisuHub, hubURL } from "./characterCards";
+import { initializeNativeLocalUrls } from "./nativeLocalUrls";
 import { loadRisuAccountData } from "./drive/accounter";
 import { decodeRisuSave } from "./storage/risuSave";
 import { updateAnimationSpeed } from "./gui/animation";
@@ -618,6 +619,10 @@ export async function loadData() {
                 setUsingSw(false)
             }
         }
+        if (isTauri)
+            void initializeNativeLocalUrls((id) => {
+                if (getDatabase().didFirstSetup) void downloadRisuHub(id)
+            })
         if (getDatabase().didFirstSetup) void characterURLImport()
 
         await transition('format-update', language.risuNest.startup.data)

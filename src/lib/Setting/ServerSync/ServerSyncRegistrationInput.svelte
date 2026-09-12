@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { language } from "src/lang";
   import { isTauriAndroid } from "src/ts/platform";
   import { modalNavigation } from "src/ts/ui/modalNavigation";
@@ -81,8 +81,11 @@
   }
   onMount(() => {
     const unsubscribe = serverRegistrationInbox.changed.subscribe(() => {
-      const config = serverRegistrationInbox.take();
-      if (config) accept(config);
+      void tick().then(() => {
+        if (!mounted) return;
+        const config = serverRegistrationInbox.take();
+        if (config) accept(config);
+      });
     });
     const hidden = () => {
       if (document.hidden && camera) scanner.cancel();
@@ -92,7 +95,7 @@
       mounted = false;
       code = "";
       scanner.cancel();
-      serverRegistrationInbox.clear();
+      serverRegistrationInbox.releaseConsumed();
       unsubscribe();
       document.removeEventListener("visibilitychange", hidden);
       document.documentElement.classList.remove("risunest-qr-scanning");

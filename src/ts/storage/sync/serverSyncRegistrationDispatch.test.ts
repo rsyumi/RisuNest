@@ -26,3 +26,22 @@ it("invalid input never opens navigation or survives in the inbox", async () => 
   expect(navigate).not.toHaveBeenCalled();
   expect(inbox.take()).toBeUndefined();
 });
+
+it("holds a pending event across outgoing-view cleanup until navigation has settled", async () => {
+  const inbox = createRegistrationInbox();
+  let received: unknown;
+  let unsubscribe = () => {};
+  await receiveServerRegistration(
+    vector.uri,
+    () => {
+      inbox.releaseConsumed();
+      unsubscribe = inbox.changed.subscribe(() => {
+        received = inbox.take() ?? received;
+      });
+      expect(received).toBeUndefined();
+    },
+    inbox,
+  );
+  expect(received).toEqual(vector.registration);
+  unsubscribe();
+});

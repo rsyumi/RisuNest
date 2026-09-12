@@ -1,3 +1,4 @@
+import { parseRisuLocalUrl } from "../../risuLocalUrl";
 import { writable } from "svelte/store";
 import {
   validateServerSyncEndpoint,
@@ -14,9 +15,9 @@ export function parseServerSyncDeepLink(
   value: string,
 ): ServerSyncNavigation | null {
   try {
-    const url = new URL(value);
+    const url = parseRisuLocalUrl(value);
     if (
-      url.protocol !== "risunestlocal:" ||
+      !url ||
       url.hostname !== "sync-server" ||
       url.pathname !== "/connect" ||
       url.username ||

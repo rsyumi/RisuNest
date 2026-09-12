@@ -1849,22 +1849,22 @@ export const languageEnglish = {
             elapsed: (seconds: number) => `${seconds}s elapsed`,
         },
         serverSync: {
-            registrationCode: "Registration code",
+            registrationCode: 'Registration code',
             registrationCodeHelp:
-                "Paste the code issued for this device, or scan its QR code. Review the server below before connecting.",
-            readRegistration: "Read code",
-            scanRegistration: "Scan QR code",
-            scanRegistrationHelp: "Point the camera at the registration QR code.",
-            cancelScan: "Cancel scanning",
-            registrationInvalid: "The registration code is invalid.",
+                'Paste the code issued for this device, or scan its QR code. Review the server below before connecting.',
+            readRegistration: 'Read code',
+            scanRegistration: 'Scan QR code',
+            scanRegistrationHelp: 'Point the camera at the registration QR code.',
+            cancelScan: 'Cancel scanning',
+            registrationInvalid: 'The registration code is invalid.',
             cameraDenied:
-                "Camera permission was denied. You can paste the registration code instead.",
+                'Camera permission was denied. You can paste the registration code instead.',
             cameraUnavailable:
-                "The camera could not scan this code. Try again or paste the code.",
+                'The camera could not scan this code. Try again or paste the code.',
             registrationBlocked:
-                "Disconnect the current server before importing a new registration.",
-            discardRegistration: "Clear registration input",
-            directoryEnabled: "Server address discovery enabled",
+                'Disconnect the current server before importing a new registration.',
+            discardRegistration: 'Clear registration input',
+            directoryEnabled: 'Server address discovery enabled',
             management: {
                 title: 'Server sync storage',
                 disk: 'Local disk usage',
@@ -2223,7 +2223,7 @@ export const languageEnglish = {
             },
             sync: {
                 title: 'Choose how to sync.',
-                lead: 'Pick a RisuNest device, a sync server, or your RisuAI account.',
+                lead: 'Choose a RisuNest sync server or your RisuAI account.',
                 hubTitle: 'From a sync server',
                 hubDesc:
                     'Receives data from a RisuNest sync server. Connect with a QR code or a link.',

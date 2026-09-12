@@ -6,6 +6,7 @@ import { parseServerRegistration } from "./serverSyncRegistration";
 /** One transient owner. Navigation sees only a revision, never a URI or credential. */
 export function createRegistrationInbox() {
   let pending: ServerConfig | undefined;
+  let ready = false;
   let revision = 0;
   let fingerprint: string | undefined;
   const changed = writable(0);
@@ -21,16 +22,23 @@ export function createRegistrationInbox() {
       if (next === fingerprint) return false;
       fingerprint = next;
       pending = parsed;
+      ready = notify;
       if (notify) changed.set(++revision);
       return true;
     },
     flush(): void {
+      ready = true;
       changed.set(++revision);
     },
     take(): ServerConfig | undefined {
+      if (!ready) return undefined;
       const value = pending;
       pending = undefined;
       return value;
+    },
+    releaseConsumed(): void {
+      // An outgoing view must not discard a new event awaiting navigation.
+      if (!pending) fingerprint = undefined;
     },
     clear(): void {
       pending = undefined;

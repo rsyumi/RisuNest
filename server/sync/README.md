@@ -95,7 +95,10 @@ never downloads or updates it. Start `serve`, wait for Tunnel readiness, stop it
 then issue a device code using the saved address. Restarting the Tunnel may change
 its address; the stable registry identity lets the app discover that change.
 Issuance before an address has been observed fails with
-`public-endpoint-not-ready`. A registry is recommended for changing addresses.
+`public-endpoint-not-ready`. Offline managed-mode issuance requires a registry
+(`managed-registration-needs-directory` otherwise), so a code remains usable after
+the next Tunnel start. A future live management caller can issue against its
+current running endpoint through the domain API.
 Fixed/external mode never starts or terminates an external Tunnel.
 
 The daemon publishes after both a Quick Tunnel URL and an edge-registration log

@@ -1661,22 +1661,22 @@ export const languageKorean = {
             elapsed: (seconds: number) => `${seconds}초 경과`,
         },
         serverSync: {
-            registrationCode: "등록 코드",
+            registrationCode: '등록 코드',
             registrationCodeHelp:
-                "이 기기용으로 발급한 코드를 붙여넣거나 QR 코드를 스캔하세요. 아래 서버 정보를 확인한 뒤 연결합니다.",
-            readRegistration: "코드 읽기",
-            scanRegistration: "QR 코드 스캔",
-            scanRegistrationHelp: "등록 QR 코드가 카메라에 보이도록 맞춰 주세요.",
-            cancelScan: "스캔 취소",
-            registrationInvalid: "올바른 등록 코드가 아닙니다.",
+                '이 기기용으로 발급한 코드를 붙여넣거나 QR 코드를 스캔하세요. 아래 서버 정보를 확인한 뒤 연결합니다.',
+            readRegistration: '코드 읽기',
+            scanRegistration: 'QR 코드 스캔',
+            scanRegistrationHelp: '등록 QR 코드가 카메라에 보이도록 맞춰 주세요.',
+            cancelScan: '스캔 취소',
+            registrationInvalid: '올바른 등록 코드가 아닙니다.',
             cameraDenied:
-                "카메라 권한이 거부되었습니다. 등록 코드를 붙여넣어 연결할 수 있습니다.",
+                '카메라 권한이 거부되었습니다. 등록 코드를 붙여넣어 연결할 수 있습니다.',
             cameraUnavailable:
-                "카메라로 코드를 읽지 못했습니다. 다시 시도하거나 코드를 붙여넣어 주세요.",
+                '카메라로 코드를 읽지 못했습니다. 다시 시도하거나 코드를 붙여넣어 주세요.',
             registrationBlocked:
-                "새 등록 정보를 입력하려면 현재 서버 연결을 먼저 해제하세요.",
-            discardRegistration: "등록 입력 지우기",
-            directoryEnabled: "서버 주소 자동 검색 사용",
+                '새 등록 정보를 입력하려면 현재 서버 연결을 먼저 해제하세요.',
+            discardRegistration: '등록 입력 지우기',
+            directoryEnabled: '서버 주소 자동 검색 사용',
             management: {
                 title: '서버 동기화 저장 공간',
                 disk: '로컬 디스크 사용량',
@@ -2036,7 +2036,7 @@ export const languageKorean = {
             },
             sync: {
                 title: '동기화 방식을 선택해주세요.',
-                lead: 'RisuNest 기기, 동기화 서버, RisuAI 계정 중에서 선택합니다.',
+                lead: 'RisuNest 동기화 서버 또는 RisuAI 계정을 선택합니다.',
                 hubTitle: '동기화 서버에서',
                 hubDesc:
                     'RisuNest 동기화 서버에서 데이터를 받아옵니다. QR 코드나 링크로 연결할 수 있습니다.',

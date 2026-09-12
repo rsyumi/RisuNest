@@ -52,6 +52,7 @@ pub(crate) struct CycleOptions {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CycleResult {
+    pub endpoint: String,
     pub phase: String,
     pub local_revision: i64,
     pub head: RemoteHead,
@@ -516,6 +517,7 @@ impl PersistentStore {
         let transfer = Transfer::new(&client, &cache)?;
         if self.resume_server_operation(&client, &transfer)? {
             return Ok(Preparation::Report(CycleResult {
+                endpoint: client.config().endpoint.clone(),
                 phase: "pending".into(),
                 local_revision: self.revision()?,
                 head: client.head()?,
@@ -745,6 +747,7 @@ impl PersistentStore {
         if conflict_count > 0 {
             if options.resolution.is_none() {
                 return Ok(Preparation::Report(CycleResult {
+                    endpoint: client.config().endpoint.clone(),
                     phase: "conflict".into(),
                     local_revision: revision,
                     head: through,
@@ -948,6 +951,7 @@ impl PersistentStore {
         }
         if ready.proposals == 0 && ready.scope_fences.is_empty() {
             return Ok(CycleResult {
+                endpoint: client.config().endpoint.clone(),
                 phase: "idle".into(),
                 local_revision: next_revision,
                 head: through.clone(),
@@ -967,6 +971,7 @@ impl PersistentStore {
             &ready.scope_fences,
         )?;
         Ok(CycleResult {
+            endpoint: client.config().endpoint.clone(),
             phase: "pending".into(),
             local_revision: next_revision,
             head: through.clone(),
