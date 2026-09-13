@@ -8,6 +8,9 @@ export interface IOSNativeState {
   expiredTasks: string[];
   foreground: boolean;
   backgroundMode: "limited" | "continued";
+  continuedRegistered: boolean;
+  continuedErrorCode: number | null;
+  backgroundRefreshStatus: number;
 }
 
 export const getIOSNativeState = () =>

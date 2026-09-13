@@ -24,6 +24,7 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
     private var continuedPending: String?
     private var progress: [String: Int64] = [:]
     private var continuedRegistered = false
+    private var continuedErrorCode: Int?
     private var taskIdentifier: String { Bundle.main.bundleIdentifier! + ".generation" }
 
     private var dataRoot: URL {
@@ -93,6 +94,9 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
                     "expiredTasks": Array(self.expired),
                     "foreground": UIApplication.shared.applicationState == .active,
                     "backgroundMode": !self.continued.isEmpty || self.continuedPending != nil ? "continued" : "limited",
+                    "continuedRegistered": self.continuedRegistered,
+                    "continuedErrorCode": self.continuedErrorCode.map { $0 as Any } ?? NSNull(),
+                    "backgroundRefreshStatus": UIApplication.shared.backgroundRefreshStatus.rawValue,
                 ])
             }
         }
@@ -124,6 +128,7 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
                 return
             }
             self.tasks[id] = task
+            self.continuedErrorCode = nil
             var mode = "limited"
             #if compiler(>=6.2)
             if #available(iOS 26.0, *), self.continuedRegistered,
@@ -136,6 +141,7 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
                     mode = "continued"
                 } catch {
                     self.continuedPending = nil
+                    self.continuedErrorCode = (error as NSError).code
                     NSLog("RisuNest continued processing rejected: code=%ld refresh=%ld", (error as NSError).code, UIApplication.shared.backgroundRefreshStatus.rawValue)
                 }
             }

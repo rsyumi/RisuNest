@@ -22,6 +22,9 @@ const state = (
   notifications: false,
   notificationStatus: 0,
   backgroundMode: "limited",
+  continuedRegistered: false,
+  continuedErrorCode: null,
+  backgroundRefreshStatus: 2,
 });
 function harness() {
   return {
