@@ -496,6 +496,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "risunest-external-storage-wasm"
+version = "0.1.0"
+dependencies = [
+ "risunest-external-storage-format",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

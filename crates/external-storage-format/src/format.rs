@@ -79,14 +79,47 @@ impl Descriptor {
 }
 /// Fingerprints intentionally exclude packing, locators, nonces and timestamps.
 pub fn fingerprint(scope: &[u8; 32], entries: &BTreeMap<String, [u8; 32]>) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut digest = Sha256::new();
-    digest.update(b"risunest.external-fingerprint/v1\0");
-    digest.update(scope);
+    let mut digest = FingerprintBuilder::new(scope);
     for (key, content) in entries {
-        digest.update((key.len() as u64).to_le_bytes());
-        digest.update(key.as_bytes());
-        digest.update(content);
+        digest
+            .push(key, content)
+            .expect("BTreeMap keys are unique and sorted");
     }
-    digest.finalize().into()
+    digest.finish()
+}
+
+pub struct FingerprintBuilder {
+    digest: sha2::Sha256,
+    previous: Option<String>,
+}
+impl FingerprintBuilder {
+    pub fn new(scope: &[u8; 32]) -> Self {
+        use sha2::Digest;
+        let mut digest = sha2::Sha256::new();
+        digest.update(b"risunest.external-fingerprint/v1\0");
+        digest.update(scope);
+        Self {
+            digest,
+            previous: None,
+        }
+    }
+    pub fn push(&mut self, key: &str, content: &[u8; 32]) -> super::Result<()> {
+        use sha2::Digest;
+        if self
+            .previous
+            .as_deref()
+            .is_some_and(|previous| previous >= key)
+        {
+            return Err(super::FormatError("fingerprint-order"));
+        }
+        self.digest.update((key.len() as u64).to_le_bytes());
+        self.digest.update(key.as_bytes());
+        self.digest.update(content);
+        self.previous = Some(key.into());
+        Ok(())
+    }
+    pub fn finish(self) -> [u8; 32] {
+        use sha2::Digest;
+        self.digest.finalize().into()
+    }
 }

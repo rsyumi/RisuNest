@@ -54,6 +54,7 @@ dist.zip
 !/scripts/compatibleExport*.mjs
 !/scripts/linux-native-tests.sh
 !/scripts/linux-package-smoke.py
+!/scripts/testExternalStorageCore.ps1
 .env
 /server/node/ssl/certificate
 .worktrees/

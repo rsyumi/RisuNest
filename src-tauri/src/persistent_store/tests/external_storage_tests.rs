@@ -327,9 +327,396 @@ fn external_schema_rejects_missing_trigger_without_migration() {
     assert!(PersistentStore::open(dir.path()).is_err());
 }
 
+fn receive(store: &mut PersistentStore) -> selection::CaptureIdentity {
+    let identity = selection::identity(&store.connection).unwrap();
+    let tx = store.connection.transaction().unwrap();
+    external::prepare_receive(
+        &tx,
+        &external::ReceiveIntent {
+            job_id: "receive",
+            connection_id: "synthetic-connection",
+            repository_id: "repository",
+            snapshot_id: "remote-snapshot",
+            commit_id: "remote-commit",
+            authenticated_head: "verified-head",
+            identity: &identity,
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    identity
+}
+
+#[test]
+fn external_receive_activation_base_and_phase_rollback_and_reopen_together() {
+    let (dir, mut store, _) = open_fixture();
+    select_external(&mut store);
+    let before = receive(&mut store);
+    let stage = stage_root(&mut store, "synthetic-remote");
+    let prepared = store
+        .prepare_replace_commit(&stage, Some(before.revision))
+        .unwrap();
+    // Fail after the generation switch would have happened, during base write.
+    store.connection.execute_batch("CREATE TRIGGER synthetic_base_failure BEFORE INSERT ON external_storage_bases BEGIN SELECT RAISE(ABORT,'synthetic'); END").unwrap();
+    assert!(store.finish_external_receive(prepared, "receive").is_err());
+    assert_eq!(selection::identity(&store.connection).unwrap(), before);
+    assert_eq!(count(&store, "external_storage_bases"), 0);
+    let phase: String = store
+        .connection
+        .query_row(
+            "SELECT phase FROM external_storage_jobs WHERE id='receive'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(phase, "ready");
+    store
+        .connection
+        .execute_batch("DROP TRIGGER synthetic_base_failure")
+        .unwrap();
+    drop(store);
+    let mut store = PersistentStore::open(dir.path()).unwrap();
+    assert_eq!(selection::identity(&store.connection).unwrap(), before);
+    let phase: String = store
+        .connection
+        .query_row(
+            "SELECT phase FROM external_storage_jobs WHERE id='receive'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(phase, "ready");
+    // PDS intentionally removes abandoned staging on open. The retained verified
+    // download is staged again by the receive coordinator before another apply.
+    let stage = stage_root(&mut store, "synthetic-remote");
+    let prepared = store
+        .prepare_replace_commit(&stage, Some(before.revision))
+        .unwrap();
+    store.finish_external_receive(prepared, "receive").unwrap();
+    drop(store);
+    let store = PersistentStore::open(dir.path()).unwrap();
+    let after = selection::identity(&store.connection).unwrap();
+    assert_eq!(after.revision, before.revision + 1);
+    assert_eq!(after.library_epoch, before.library_epoch);
+    assert_ne!(after.generation, before.generation);
+    assert!(
+        !selection::read(&store.connection)
+            .unwrap()
+            .decision_required
+    );
+    let (base, snapshot, phase): (String,String,String) = store.connection.query_row(
+        "SELECT identity,snapshot_id,(SELECT phase FROM external_storage_jobs WHERE id='receive') FROM external_storage_bases",
+        [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+    ).unwrap();
+    assert_eq!(
+        serde_json::from_str::<selection::CaptureIdentity>(&base).unwrap(),
+        after
+    );
+    assert_eq!(snapshot, "remote-snapshot");
+    assert_eq!(phase, "complete");
+}
+
+#[test]
+fn external_receive_rechecks_revision_and_target_before_activation() {
+    for change_target in [false, true] {
+        let (_dir, mut store, _) = open_fixture();
+        select_external(&mut store);
+        let before = receive(&mut store);
+        let stage = stage_root(&mut store, "synthetic-remote");
+        let prepared = store
+            .prepare_replace_commit(&stage, Some(before.revision))
+            .unwrap();
+        if change_target {
+            let tx = store.connection.transaction().unwrap();
+            selection::select(&tx, &before.selection_epoch, &selection::SyncTarget::None).unwrap();
+            tx.commit().unwrap();
+        } else {
+            edit(&mut store, 42);
+        }
+        let current = selection::identity(&store.connection).unwrap();
+        assert!(store.finish_external_receive(prepared, "receive").is_err());
+        assert_eq!(selection::identity(&store.connection).unwrap(), current);
+        assert_eq!(count(&store, "external_storage_bases"), 0);
+    }
+}
+
+fn capture_fixture() -> (tempfile::TempDir, PersistentStore, Value) {
+    let (directory, store, database) = open_fixture();
+    let generation = active_generation(&store.connection).unwrap();
+    // This synthetic library has a complete empty alias inventory. Its missing
+    // fixture images are explicitly absent, not undiscovered legacy files.
+    let authority=json!({"format":"v2","migrationId":"synthetic-external","compatibilityHash":"a".repeat(64)}).to_string();
+    for table in ["asset_repository_authority", "cold_payload_authority"] {
+        store
+            .connection
+            .execute(
+                &format!("UPDATE {table} SET value=?2 WHERE generation=?1"),
+                params![generation, authority],
+            )
+            .unwrap();
+    }
+    (directory, store, database)
+}
+
+#[test]
+fn external_capture_refuses_to_omit_unresolved_legacy_asset_storage() {
+    use crate::external_storage::capture::CaptureCatalog;
+    struct Never;
+    impl crate::local_backup::CancellationProbe for Never {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+    let (directory, mut store, _) = open_fixture();
+    let mut catalog = CaptureCatalog::create(
+        &directory.path().join("capture"),
+        &directory.path().join("objects"),
+        None,
+    )
+    .unwrap();
+    let prepared = store
+        .prepare_content_capture("legacy", "consumer", 1)
+        .unwrap();
+    assert_eq!(
+        prepared
+            .project(&mut catalog, &Never)
+            .unwrap_err()
+            .to_string(),
+        "Canonical asset authority required before external capture"
+    );
+    assert!(catalog.manifest().is_err());
+    assert_eq!(count(&store, "external_storage_captures"), 0);
+}
+
+#[test]
+fn external_capture_projects_only_changed_records_at_the_reserved_snapshot() {
+    use super::super::content_capture::ContentCaptureSink;
+    use crate::external_storage::capture::CaptureCatalog;
+    use crate::logical_records::{decode_logical_record, LogicalRecordEnvelope};
+    struct Never;
+    impl crate::local_backup::CancellationProbe for Never {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+    let (directory, mut store, _) = capture_fixture();
+    let objects = directory.path().join("external-storage/objects");
+    let mut full = CaptureCatalog::create(
+        &directory.path().join("external-storage/full"),
+        &objects,
+        None,
+    )
+    .unwrap();
+    let prepared = store
+        .prepare_content_capture("full", "consumer", 1)
+        .unwrap();
+    assert!(store.active_readers.detached_asset_roots().is_err());
+    assert!(prepared.project(&mut full, &Never).unwrap() > 1);
+    assert!(full.remove_record("root").is_err());
+    prepared
+        .register(&mut store, &full, &[1; 32], "logical-v1")
+        .unwrap();
+    assert!(count(&store, "external_storage_content_cache") > 1);
+    assert!(store.active_readers.detached_asset_roots().is_ok());
+    let (digest, path, _) = full.manifest().unwrap();
+    let mut delta = CaptureCatalog::create(
+        &directory.path().join("external-storage/delta"),
+        &objects,
+        Some((path, &digest)),
+    )
+    .unwrap();
+    edit(&mut store, 2);
+    let prepared = store
+        .prepare_content_capture("delta", "consumer", 2)
+        .unwrap();
+    edit(&mut store, 3);
+    assert_eq!(prepared.project(&mut delta, &Never).unwrap(), 1);
+    assert!(!delta.rebuilt);
+    let changed: i64 = delta
+        .db
+        .query_row("SELECT count(*) FROM delta", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(changed, 1);
+    let keys: Vec<(String, String)> = delta
+        .db
+        .prepare("SELECT key,hash FROM records ORDER BY key")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let mut saw_root = false;
+    for (_, hash) in keys {
+        let bytes = fs::read(objects.join(hash)).unwrap();
+        if let LogicalRecordEnvelope::Root { value, .. } = decode_logical_record(&bytes).unwrap() {
+            assert_eq!(value["synthetic"], json!(2));
+            saw_root = true;
+        }
+    }
+    assert!(saw_root);
+    prepared
+        .register(&mut store, &delta, &[1; 32], "logical-v1")
+        .unwrap();
+    assert_eq!(count(&store, "content_capture_reservations"), 0);
+    assert_eq!(count(&store, "external_storage_capture_files"), 2);
+    let lease = store.acquire_revision(3).unwrap().lease;
+    assert_eq!(
+        changes::page(store.revision_leases.get(&lease).unwrap(), 2, None, 128)
+            .unwrap()
+            .len(),
+        1
+    );
+    store.release_revision(&lease).unwrap();
+}
+
+#[test]
+fn external_capture_rejects_mismatched_cache_and_releases_gc_guard_on_cancel() {
+    use crate::external_storage::capture::CaptureCatalog;
+    struct Cancel(bool);
+    impl crate::local_backup::CancellationProbe for Cancel {
+        fn is_cancelled(&self) -> bool {
+            self.0
+        }
+    }
+    let (directory, mut store, _) = capture_fixture();
+    cursor(&mut store, "consumer", 1);
+    let mut empty = CaptureCatalog::create(
+        &directory.path().join("empty"),
+        &directory.path().join("objects"),
+        None,
+    )
+    .unwrap();
+    let prepared = store
+        .prepare_content_capture("bad-cache", "consumer", 1)
+        .unwrap();
+    assert!(prepared
+        .project(&mut empty, &Cancel(false))
+        .unwrap_err()
+        .to_string()
+        .contains("Capture cache requires rebuild"));
+    assert_eq!(
+        prepared
+            .project(&mut empty, &Cancel(true))
+            .unwrap_err()
+            .to_string(),
+        "External capture cancelled"
+    );
+    assert!(empty.manifest().is_err());
+    drop(prepared);
+    assert!(store.active_readers.detached_asset_roots().is_ok());
+    store.abandon_content_capture("bad-cache").unwrap();
+    assert_eq!(count(&store, "external_storage_captures"), 0);
+    assert_eq!(count(&store, "content_capture_reservations"), 0);
+}
+
+#[test]
+fn external_capture_registration_failure_does_not_advance_cache_or_cursor() {
+    use crate::external_storage::capture::CaptureCatalog;
+    struct Never;
+    impl crate::local_backup::CancellationProbe for Never {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+    let (directory, mut store, _) = capture_fixture();
+    let mut catalog = CaptureCatalog::create(
+        &directory.path().join("external-storage/job"),
+        &directory.path().join("external-storage/objects"),
+        None,
+    )
+    .unwrap();
+    let prepared = store
+        .prepare_content_capture("register-failure", "consumer", 1)
+        .unwrap();
+    prepared.project(&mut catalog, &Never).unwrap();
+    store.connection.execute_batch("CREATE TRIGGER synthetic_capture_failure BEFORE INSERT ON external_storage_capture_files BEGIN SELECT RAISE(ABORT,'synthetic'); END").unwrap();
+    assert!(prepared
+        .register(&mut store, &catalog, &[1; 32], "logical-v1")
+        .is_err());
+    for table in [
+        "external_storage_captures",
+        "external_storage_content_cache",
+        "content_change_consumers",
+        "external_storage_capture_files",
+    ] {
+        assert_eq!(count(&store, table), 0);
+    }
+    assert_eq!(count(&store, "content_capture_reservations"), 1);
+    assert!(store.active_readers.detached_asset_roots().is_ok());
+    store
+        .connection
+        .execute_batch("DROP TRIGGER synthetic_capture_failure")
+        .unwrap();
+    store.abandon_content_capture("register-failure").unwrap();
+    drop(store);
+    let mut store = PersistentStore::open(directory.path()).unwrap();
+    let prepared = store
+        .prepare_content_capture("retry", "consumer", 1)
+        .unwrap();
+    prepared
+        .register(&mut store, &catalog, &[1; 32], "logical-v1")
+        .unwrap();
+    assert_eq!(count(&store, "external_storage_captures"), 1);
+    assert_eq!(count(&store, "content_capture_reservations"), 0);
+}
+
+#[test]
+fn external_capture_keeps_deleted_source_payload_pinned_after_reopen() {
+    use crate::external_storage::capture::{registered_roots, CaptureCatalog};
+    struct Never;
+    impl crate::local_backup::CancellationProbe for Never {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+    let (directory, mut store, _) = capture_fixture();
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
+    let payload = cas
+        .prepare_bytes(b"synthetic-external-capture-asset")
+        .unwrap();
+    let alias = AssetAlias {
+        key: "assets/synthetic.bin".into(),
+        object_hash: Some(payload.content_hash.clone()),
+        kind: "asset".into(),
+        size: payload.byte_size as i64,
+        mime: "application/octet-stream".into(),
+        name: "synthetic".into(),
+        ext: "bin".into(),
+        inlay_type: None,
+        width: None,
+        height: None,
+        metadata: json!({}),
+    };
+    store.commit_asset_alias(&alias, 1).unwrap();
+    let mut catalog = CaptureCatalog::create(
+        &directory.path().join("external-storage/job"),
+        &directory.path().join("external-storage/objects"),
+        None,
+    )
+    .unwrap();
+    let prepared = store
+        .prepare_content_capture("asset-capture", "consumer", 2)
+        .unwrap();
+    prepared.project(&mut catalog, &Never).unwrap();
+    prepared
+        .register(&mut store, &catalog, &[1; 32], "logical-v1")
+        .unwrap();
+    store.delete_asset_alias("asset", &alias.key, 2).unwrap();
+    drop(store);
+    let store = PersistentStore::open(directory.path()).unwrap();
+    let roots = registered_roots(&store.connection, directory.path()).unwrap();
+    assert!(roots.object_hashes.contains(&payload.content_hash));
+    // A damaged registered catalog must stop GC instead of dropping its pins.
+    let (_, path, _) = catalog.manifest().unwrap();
+    let path = path.to_path_buf();
+    drop(catalog);
+    fs::write(path, b"synthetic-corrupt-catalog").unwrap();
+    assert!(registered_roots(&store.connection, directory.path()).is_err());
+}
+
 #[test]
 fn external_backup_consumers_share_capture_but_cancel_and_device_identity_are_independent() {
-    let (dir, mut store, _) = open_fixture();
+    let (dir, mut store, _) = capture_fixture();
     let identity = selection::identity(&store.connection).unwrap();
     let tx = store.connection.transaction().unwrap();
     let first = external::register_capture(

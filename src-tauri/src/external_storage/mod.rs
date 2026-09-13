@@ -3,6 +3,7 @@
 pub(crate) mod admission;
 pub(crate) mod auth;
 pub(crate) mod capabilities;
+pub(crate) mod capture;
 pub(crate) mod contract;
 pub(crate) mod http;
 pub(crate) mod providers;

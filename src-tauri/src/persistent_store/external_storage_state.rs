@@ -10,6 +10,7 @@ CREATE TABLE external_storage_jobs(id TEXT PRIMARY KEY,connection_id TEXT NOT NU
 CREATE TABLE external_storage_bases(connection_id TEXT PRIMARY KEY,repository_id TEXT NOT NULL,snapshot_id TEXT NOT NULL,commit_id TEXT NOT NULL,head_observation TEXT NOT NULL,identity TEXT NOT NULL);
 CREATE TABLE external_storage_captures(id TEXT PRIMARY KEY,identity TEXT NOT NULL,scope_id TEXT NOT NULL,codec_id TEXT NOT NULL,device_capture_id TEXT NOT NULL,manifest_hash TEXT NOT NULL CHECK(length(manifest_hash)=64 AND manifest_hash NOT GLOB '*[^0-9a-f]*'),UNIQUE(identity,scope_id,codec_id,device_capture_id));
 CREATE TABLE external_storage_capture_refs(capture_id TEXT NOT NULL,job_id TEXT NOT NULL,PRIMARY KEY(capture_id,job_id));
+CREATE TABLE external_storage_capture_files(capture_id TEXT PRIMARY KEY,catalog_path TEXT NOT NULL,file_hash TEXT NOT NULL CHECK(length(file_hash)=64 AND file_hash NOT GLOB '*[^0-9a-f]*'));
 CREATE TABLE external_storage_content_cache(consumer_id TEXT NOT NULL,generation TEXT NOT NULL,kind TEXT NOT NULL,key1 TEXT NOT NULL,key2 TEXT NOT NULL,content_hash TEXT NOT NULL CHECK(length(content_hash)=64 AND content_hash NOT GLOB '*[^0-9a-f]*'),byte_size INTEGER NOT NULL CHECK(byte_size>=0),PRIMARY KEY(consumer_id,generation,kind,key1,key2));
 "#;
 
@@ -43,6 +44,96 @@ fn invalid(message: &str) -> StoreError {
     StoreError::Validation {
         message: message.into(),
     }
+}
+
+/// A verified remote snapshot selected for normal sync receive. For restore
+/// jobs, capture_id identifies this remote snapshot, not a local capture/pin.
+/// Network authentication and full staged payload validation precede activation.
+pub(crate) struct ReceiveIntent<'a> {
+    pub job_id: &'a str,
+    pub connection_id: &'a str,
+    pub repository_id: &'a str,
+    pub snapshot_id: &'a str,
+    pub commit_id: &'a str,
+    pub authenticated_head: &'a str,
+    pub identity: &'a CaptureIdentity,
+}
+
+pub(crate) fn prepare_receive(tx: &Transaction<'_>, intent: &ReceiveIntent<'_>) -> StoreResult<()> {
+    sync_selection::require_publish(tx, intent.identity, intent.connection_id)?;
+    if sync_selection::identity(tx)? != *intent.identity {
+        return Err(invalid("Local revision changed before remote receive"));
+    }
+    sync_selection::require_no_pending_publication(tx)?;
+    if [
+        intent.job_id,
+        intent.repository_id,
+        intent.snapshot_id,
+        intent.commit_id,
+        intent.authenticated_head,
+    ]
+    .iter()
+    .any(|value| value.is_empty())
+    {
+        return Err(invalid("Incomplete remote receive intent"));
+    }
+    let busy: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM external_storage_jobs WHERE connection_id=?1 AND phase NOT IN ('complete','cancelled','stale','historyPending'))",
+        [intent.connection_id], |r| r.get(0),
+    )?;
+    if busy {
+        return Err(invalid("Destination already has an active job"));
+    }
+    tx.execute(
+        "INSERT INTO external_storage_jobs VALUES(?1,?2,?3,?4,?5,'restore',NULL,?6,?7,'ready')",
+        params![
+            intent.job_id,
+            intent.connection_id,
+            intent.repository_id,
+            intent.snapshot_id,
+            serde_json::to_string(intent.identity)?,
+            intent.authenticated_head,
+            intent.commit_id
+        ],
+    )?;
+    Ok(())
+}
+
+/// Called only inside the SAME transaction that switches the staged generation.
+pub(super) fn begin_receive_activation(tx: &Transaction<'_>, job: &str) -> StoreResult<()> {
+    let (connection, encoded, phase): (String,String,String) = tx.query_row(
+        "SELECT connection_id,identity,phase FROM external_storage_jobs WHERE id=?1 AND role='restore'",
+        [job], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+    )?;
+    let identity: CaptureIdentity = serde_json::from_str(&encoded)?;
+    sync_selection::require_publish(tx, &identity, &connection)?;
+    sync_selection::require_no_pending_publication(tx)?;
+    if phase != "ready" || sync_selection::identity(tx)? != identity {
+        return Err(invalid("Remote receive became stale"));
+    }
+    tx.execute(
+        "UPDATE external_storage_jobs SET phase='applying' WHERE id=?1",
+        [job],
+    )?;
+    Ok(())
+}
+
+pub(super) fn finish_receive_activation(tx: &Transaction<'_>, job: &str) -> StoreResult<()> {
+    let (connection,repository,snapshot,commit,observation): (String,String,String,String,String) = tx.query_row(
+        "SELECT connection_id,repository_id,capture_id,commit_id,expected_head FROM external_storage_jobs WHERE id=?1 AND role='restore' AND phase='applying'",
+        [job], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+    )?;
+    let identity = serde_json::to_string(&sync_selection::identity(tx)?)?;
+    tx.execute("INSERT INTO external_storage_bases VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(connection_id) DO UPDATE SET repository_id=excluded.repository_id,snapshot_id=excluded.snapshot_id,commit_id=excluded.commit_id,head_observation=excluded.head_observation,identity=excluded.identity",
+        params![connection,repository,snapshot,commit,observation,identity])?;
+    tx.execute(
+        "UPDATE external_storage_jobs SET phase='complete' WHERE id=?1",
+        [job],
+    )?;
+    // Local-only immutable backup captures remain valid, but any other prepared
+    // sync job was based on the generation just replaced.
+    tx.execute("UPDATE external_storage_jobs SET phase='stale' WHERE id!=?1 AND role!='backup' AND phase IN ('preparing','ready')", [job])?;
+    Ok(())
 }
 
 pub(crate) struct PublishIntent<'a> {

@@ -1,0 +1,17 @@
+[package]
+name = "risunest-external-storage-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Keep the ABI artifact separate from the reusable rlib. Mixed rlib/cdylib
+# output has an unqualified rlib filename and can overwrite a different feature
+# resolution when standalone and Tauri builds share the required Cargo target.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+risunest-external-storage-format = { path = "../external-storage-format" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
