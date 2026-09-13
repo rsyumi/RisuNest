@@ -111,7 +111,7 @@ vi.mock('./stores.svelte', () => ({
 }))
 vi.mock('./alert', () => ({
     alertConfirm: vi.fn(), alertError: vi.fn(), alertInput: vi.fn(), alertLogin: vi.fn(), alertMd: vi.fn(),
-    alertNormal: vi.fn(), alertSelect: vi.fn(), alertTOS: vi.fn(), waitAlert: vi.fn(),
+    alertNormal: vi.fn(), alertSelect: vi.fn(), alertTOS: vi.fn(), alertRisuServiceTOS: vi.fn(), waitAlert: vi.fn(),
 }))
 vi.mock('./characterCards', () => ({ characterURLImport: vi.fn(), hubURL: 'https://hub.invalid' }))
 vi.mock('./storage/androidSafBridge', () => ({ isAndroidSafFileJobsEnabled: vi.fn(() => false) }))

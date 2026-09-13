@@ -47,7 +47,7 @@ vi.mock('./alert', () => ({
     alertMd: vi.fn(),
     alertNormal: vi.fn(),
     alertStore: { set: vi.fn() },
-    alertTOS: vi.fn(),
+    alertTOS: vi.fn(), alertRisuServiceTOS: vi.fn(),
     alertWait: vi.fn(),
 }))
 vi.mock('./util', () => ({
