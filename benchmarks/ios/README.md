@@ -22,16 +22,24 @@ macOS with Xcode. It produces:
   verification app. This is not a distribution-signed or TestFlight build.
 - `testlab-package.json`: source provenance, Xcode, target, size and SHA-256.
 
-The script verifies arm64/iphoneos and ad-hoc signatures locally. Firebase
-re-signs submitted apps. The first submitted package (source `d94ec8296`, Xcode
-26.2) was accepted and passed all four UI tests on iPad 10/iOS 16.6 and iPhone SE
-3/iOS 26.3. Each later package still requires its own device validation. No
-Firebase SDK or credentials are added to the product.
+The script verifies arm64/iphoneos, ad-hoc signatures and the compiled continued
+processing API when selecting Xcode 26 or later. Firebase re-signs submitted
+apps. Inspect each app's `DTSDKName` and `DTXcodeBuild` as well: the controller's
+Xcode version alone does not prove which toolchain Tauri's nested build used.
+Each package requires its own device validation. No Firebase SDK or credentials
+are added to the product.
 
 The device-core test additionally measures alternating JSON and worker/raw
 storage commits, exact Unicode and revision contracts, native regex against its
 JavaScript oracle, and tokenizer results. It attaches measurements instead of
 asserting a speedup: simulator trials showed inconsistent storage timing gains.
+
+`testNetworkReachability` is a diagnostic comparison using only the public
+Ollama model-list endpoint, without credentials or retained response bodies.
+It records URLSession status/numeric errors in the runner, and reqwest status,
+fixed error categories and numeric OS errors in the app before and during a
+generation lease. A completed diagnostic test is not a successful Cloud test;
+the separate live Cloud tests still require streaming, storage and cleanup.
 
 After Firebase is configured, inspect its current device and Xcode catalog:
 

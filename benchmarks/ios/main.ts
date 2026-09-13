@@ -54,7 +54,29 @@ async function main() {
   if (phase === "cloud" || phase === "cloud-cancel")
     await userStart("Start live request");
   if (phase === "background-ui") await userStart("Start background work");
-  if (phase === "cloud" || phase === "cloud-cancel") {
+  if (phase === "network") {
+    const before = await invoke("ios_bench_network_probe");
+    await userStart("Start network background work");
+    const lease = await beginIOSGeneration();
+    const initialState = await getIOSNativeState();
+    let during;
+    try {
+      during = await invoke("ios_bench_network_probe");
+    } finally {
+      await lease.dispose();
+    }
+    const result = {
+      before,
+      during,
+      initialState,
+      state: await getIOSNativeState(),
+    };
+    const measured = document.createElement("pre");
+    measured.textContent = "network-result:" + JSON.stringify(result);
+    document.getElementById("benchmark")!.append(measured);
+    await report("network", result);
+    await report("complete", { passed: true });
+  } else if (phase === "cloud" || phase === "cloud-cancel") {
     const { cloudContract } = await import("./cloudContracts");
     await report("cloud", await cloudContract(phase === "cloud-cancel"));
     await report("complete", { passed: true });

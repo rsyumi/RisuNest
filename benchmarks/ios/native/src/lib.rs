@@ -1,5 +1,14 @@
 use std::io::Write;
 use tauri::Manager;
+mod network_probe;
+
+#[tauri::command]
+async fn ios_bench_network_probe() -> Result<serde_json::Value, &'static str> {
+    if ios_bench_phase() != "network" {
+        return Err("Network verification phase required");
+    }
+    Ok(network_probe::probe().await)
+}
 
 #[tauri::command]
 fn ios_bench_phase() -> String {
@@ -25,7 +34,8 @@ fn benchmark_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send
         ios_bench_phase,
         ios_bench_report,
         ios_bench_stream_url,
-        ios_bench_cloud_key
+        ios_bench_cloud_key,
+        ios_bench_network_probe
     ]
 }
 

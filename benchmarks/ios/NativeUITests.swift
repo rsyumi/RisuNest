@@ -1,6 +1,42 @@
 import XCTest
 
 final class NativeUITests: XCTestCase {
+    func testNetworkReachability() throws {
+        continueAfterFailure = false
+        // Independent URLSession control in the XCTest runner, without a key/body.
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 15
+        configuration.timeoutIntervalForResource = 20
+        let session = URLSession(configuration: configuration)
+        let received = expectation(description: "Public endpoint connectivity control")
+        session.dataTask(with: URL(string: "https://ollama.com/api/tags")!) { _, response, error in
+            let diagnostic: [String: Any] = [
+                "status": (response as? HTTPURLResponse)?.statusCode as Any? ?? NSNull(),
+                "errorCode": error.map { ($0 as NSError).code as Any } ?? NSNull(),
+            ]
+            let data = try! JSONSerialization.data(withJSONObject: diagnostic, options: [.sortedKeys])
+            let attachment = XCTAttachment(string: "network-control:" + String(data: data, encoding: .utf8)!)
+            attachment.lifetime = .keepAlways
+            self.add(attachment)
+            received.fulfill()
+        }.resume()
+        wait(for: [received], timeout: 25)
+        session.invalidateAndCancel()
+        let app = XCUIApplication(bundleIdentifier: "io.github.rsyumi.risunest.ios.bench")
+        app.launchEnvironment["RISUNEST_IOS_PHASE"] = "network"
+        app.launch()
+        let start = app.webViews.buttons["Start network background work"]
+        XCTAssertTrue(start.waitForExistence(timeout: 60))
+        start.tap()
+        let result = app.webViews.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "network-result:")).firstMatch
+        XCTAssertTrue(result.waitForExistence(timeout: 60))
+        let measurement = XCTAttachment(string: result.value as? String ?? result.label)
+        measurement.lifetime = .keepAlways
+        add(measurement)
+        // This test collects connectivity evidence; Cloud tests enforce completion.
+        XCTAssertTrue(app.webViews.staticTexts["passed"].waitForExistence(timeout: 10))
+    }
+
     private func liveCloud(cancel: Bool) throws {
         continueAfterFailure = false
         guard let key = ProcessInfo.processInfo.environment["RISUNEST_IOS_CLOUD_KEY"], !key.isEmpty else {
@@ -13,7 +49,16 @@ final class NativeUITests: XCTestCase {
         let start = app.webViews.buttons["Start live request"]
         XCTAssertTrue(start.waitForExistence(timeout: 30))
         start.tap()
-        XCTAssertTrue(app.webViews.staticTexts["cloud-streaming"].waitForExistence(timeout: 90))
+        let result = app.webViews.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "cloud-result:")).firstMatch
+        let streaming = app.webViews.staticTexts["cloud-streaming"]
+        let opened = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in streaming.exists || result.exists }, object: nil)
+        wait(for: [opened], timeout: 90)
+        if result.exists {
+            let measurement = XCTAttachment(string: result.value as? String ?? result.label)
+            measurement.lifetime = .keepAlways
+            add(measurement)
+        }
+        XCTAssertTrue(streaming.exists, "Cloud must begin streaming before the transition/cancellation")
         if cancel {
             app.webViews.buttons["Cancel live request"].tap()
         } else {
@@ -23,9 +68,8 @@ final class NativeUITests: XCTestCase {
             wait(for: [elapsed], timeout: 25)
             app.activate()
         }
-        let result = app.webViews.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "cloud-result:")).firstMatch
         XCTAssertTrue(result.waitForExistence(timeout: 200))
-        let measurement = XCTAttachment(string: result.label)
+        let measurement = XCTAttachment(string: result.value as? String ?? result.label)
         measurement.lifetime = .keepAlways
         add(measurement)
         XCTAssertTrue(app.webViews.staticTexts["passed"].waitForExistence(timeout: 10))
