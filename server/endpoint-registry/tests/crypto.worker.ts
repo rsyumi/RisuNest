@@ -64,7 +64,7 @@ it("matches the independent Node/OpenSSL AES-GCM golden vector in workerd Web Cr
   expect(await decrypt(vector.envelope)).toBe(vector.plaintext);
 });
 
-it("roundtrips encrypted URLs while storing only UUID and opaque bytes", async () => {
+it("roundtrips encrypted URLs while storing only UUID, opaque bytes and timestamp", async () => {
   const url = `https://registry.invalid/endpoints/${vector.uuid}`;
   const response = await exports.default.fetch(url, {
     method: "POST",
@@ -76,7 +76,11 @@ it("roundtrips encrypted URLs while storing only UUID and opaque bytes", async (
   expect(await decrypt(await fetched.text())).toBe(vector.plaintext);
   const stored = await env.DB.prepare("SELECT * FROM endpoints").all();
   expect(stored.results).toEqual([
-    { uuid: vector.uuid, envelope: vector.envelope },
+    {
+      uuid: vector.uuid,
+      envelope: vector.envelope,
+      updated_at: expect.any(Number),
+    },
   ]);
 });
 

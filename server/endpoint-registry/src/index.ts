@@ -38,17 +38,18 @@ async function handle(request: Request, env: Env): Promise<Response> {
   // A retry may rewrite identical bytes; it never creates a second record.
   const saved = await env.DB.prepare(
     `
-    INSERT INTO endpoints (uuid, envelope)
-    SELECT ?1, ?2
+    INSERT INTO endpoints (uuid, envelope, updated_at)
+    SELECT ?1, ?2, ?4
     WHERE CASE
       WHEN EXISTS (SELECT 1 FROM endpoints WHERE uuid = ?1) THEN 1
       ELSE (SELECT COUNT(*) FROM endpoints) < ?3
     END
-    ON CONFLICT(uuid) DO UPDATE SET envelope = excluded.envelope
+    ON CONFLICT(uuid) DO UPDATE SET
+      envelope = excluded.envelope, updated_at = excluded.updated_at
     RETURNING uuid
   `,
   )
-    .bind(uuid, envelope, maxRecords)
+    .bind(uuid, envelope, maxRecords, Date.now())
     .first<{ uuid: string }>();
   return saved === null
     ? failure("registry-full", 503)
@@ -56,6 +57,17 @@ async function handle(request: Request, env: Env): Promise<Response> {
 }
 
 export default {
+  async scheduled(controller: ScheduledController, env: Env): Promise<void> {
+    const cutoff = controller.scheduledTime - 30 * 24 * 60 * 60 * 1000;
+    try {
+      await env.DB.prepare("DELETE FROM endpoints WHERE updated_at <= ?1")
+        .bind(cutoff)
+        .run();
+    } catch {
+      // Report a failed invocation without exposing D1 exceptions or row data.
+      throw new Error("endpoint-cleanup-failed");
+    }
+  },
   async fetch(request: Request, env: Env): Promise<Response> {
     let response: Response;
     try {

@@ -85,8 +85,9 @@ Error bodies never contain request values or underlying D1 exceptions. Cloudflar
 platform failures before Worker execution, including exhausted Worker quota, can
 return their own non-JSON errors. Clients must handle these as service failures.
 
-A repeated POST leaves the same stored value. Anyone knowing a UUID can overwrite
-it, with no owner credential. An old valid envelope can be posted again. There
+A repeated POST leaves the same envelope and refreshes its update timestamp.
+Anyone knowing a UUID can overwrite it, with no owner credential. An old valid
+envelope can be posted again. There
 is no freshness/replay guarantee, device-specific lookup revocation or automatic
 deletion/expiry on shutdown. The record describes the last completed write, not
 whether a server is online. No older RisuNest registry formats are supported.
@@ -131,10 +132,25 @@ app reconnect/cache behavior remain for the daemon/client work.
 
 ## Storage and operation
 
-D1 has one product table: `endpoints(uuid TEXT PRIMARY KEY, envelope TEXT)`.
+D1 has one product table:
+`endpoints(uuid TEXT PRIMARY KEY, envelope TEXT, updated_at INTEGER)`.
 Wrangler additionally manages its migration bookkeeping table. A single atomic
 conditional upsert checks capacity and writes, so concurrent inserts cannot
 exceed the cap or partially replace a value.
+
+Each successful POST records the server's Unix timestamp in milliseconds in
+`updated_at`, including retries with the same envelope. GET and failed POSTs do
+not refresh it. A daily Cron Trigger at 00:00 UTC deletes rows whose last update
+was at least 30 days before the scheduled time, using an `updated_at` index.
+With successful daily runs, deletion occurs between 30 and 31 days after the
+last update. Until cleanup, old rows remain readable and count toward capacity.
+Failed cleanup invocations report a generic error; the next daily run retries
+all eligible rows. Publishers must POST again within 30 days to retain a record,
+even if their endpoint URL has not changed. Client GETs do not keep it alive.
+
+The pre-release initial schema is updated in place. Previously initialized local
+development databases need a fresh synthetic database; rerunning an already
+applied migration does not add the column. No old-schema migration is provided.
 
 `MAX_RECORDS` is a JSON integer from 1 through 10000, default 10000. Existing UUIDs
 can still be updated at capacity. Lowering the setting does not evict records;
@@ -144,8 +160,9 @@ of this admission setting.
 New UUID admission counts existing rows; updating an existing UUID skips that
 count. This deliberately keeps the schema to one table. New-registration bursts
 can consume D1 read quota well before the storage cap. Count queries, primary-key
-index writes, failed capacity checks and repeated POSTs must be included in the
-budget; do not equate one HTTP request with one billed row.
+index writes (including the timestamp index), daily cleanup, failed capacity
+checks and repeated POSTs must be included in the budget; do not equate one HTTP
+request with one billed row.
 
 As checked on 2026-09-13, the Free plan includes 100,000 Worker requests/day and
 10 ms HTTP CPU time; D1 includes 5 million rows read/day, 100,000 rows written/day
@@ -198,7 +215,7 @@ The D1 `remote: false` setting keeps development local; it does not substitute
 a local DB when the Worker is deployed. Do not enable remote bindings for tests.
 
 Keep shared settings (entry point, compatibility date/flags, bindings, migration
-path and operational defaults) aligned across `wrangler.local.jsonc`,
+path, Cron schedule and operational defaults) aligned across `wrangler.local.jsonc`,
 `wrangler.example.jsonc` and your ignored `wrangler.jsonc` when changing them.
 These are complete configurations, not automatically merged overrides.
 Commit source, migrations, the local configuration and deployment template;

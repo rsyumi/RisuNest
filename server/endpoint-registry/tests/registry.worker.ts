@@ -1,5 +1,5 @@
 import { env, exports } from "cloudflare:workers";
-import { applyD1Migrations } from "cloudflare:test";
+import { applyD1Migrations, createScheduledController } from "cloudflare:test";
 import { beforeAll, beforeEach, afterEach, expect, it, vi } from "vitest";
 import worker from "../src/index";
 import { MAX_BODY_BYTES, MAX_ENVELOPE_BYTES } from "../src/protocol";
@@ -49,7 +49,99 @@ it("stores and retrieves the exact opaque envelope without caching", async () =>
   expect(fetched.headers.get("cache-control")).toBe("no-store");
   expect(await fetched.text()).toBe(body);
   const stored = await env.DB.prepare("SELECT * FROM endpoints").all();
-  expect(stored.results).toEqual([{ uuid: UUID, envelope: body }]);
+  expect(stored.results).toEqual([
+    { uuid: UUID, envelope: body, updated_at: expect.any(Number) },
+  ]);
+  const timestamp = stored.results[0]!.updated_at as number;
+  expect(Number.isInteger(timestamp)).toBe(true);
+  expect(Math.abs(Date.now() - timestamp)).toBeLessThan(60_000);
+});
+
+it("refreshes the timestamp on identical POSTs but not GET or rejected POSTs", async () => {
+  await post();
+  const oldTime = Date.now() - 29 * 24 * 60 * 60 * 1000;
+  await env.DB.prepare("UPDATE endpoints SET updated_at = ?1 WHERE uuid = ?2")
+    .bind(oldTime, UUID)
+    .run();
+  const readTime = async () =>
+    env.DB.prepare("SELECT updated_at FROM endpoints WHERE uuid = ?1")
+      .bind(UUID)
+      .first<number>("updated_at");
+  expect((await exports.default.fetch(endpoint())).status).toBe(200);
+  expect((await post("invalid")).status).toBe(400);
+  expect(await readTime()).toBe(oldTime);
+  const before = Date.now();
+  expect((await post()).status).toBe(204);
+  expect(await readTime()).toBeGreaterThanOrEqual(before);
+  expect(await readTime()).toBeLessThanOrEqual(Date.now());
+});
+
+it("deletes at the 30-day boundary, preserves newer rows and frees capacity", async () => {
+  const scheduledTime = Date.now();
+  const cutoff = scheduledTime - 30 * 24 * 60 * 60 * 1000;
+  const ids = Array.from({ length: 3 }, () => crypto.randomUUID());
+  for (const [i, offset] of [-1, 0, 1].entries()) {
+    await env.DB.prepare(
+      "INSERT INTO endpoints (uuid, envelope, updated_at) VALUES (?1, ?2, ?3)",
+    )
+      .bind(ids[i]!, opaque(), cutoff + offset)
+      .run();
+  }
+  expect((await post()).status).toBe(503);
+  // Expired rows remain readable until the scheduled cleanup runs.
+  expect((await exports.default.fetch(endpoint(ids[0]!))).status).toBe(200);
+  await worker.scheduled(createScheduledController({ scheduledTime }), env);
+  expect(await count()).toBe(1);
+  for (const id of ids.slice(0, 2)) {
+    expect((await exports.default.fetch(endpoint(id))).status).toBe(404);
+  }
+  expect((await exports.default.fetch(endpoint(ids[2]!))).status).toBe(200);
+  expect((await post()).status).toBe(204);
+  await worker.scheduled(createScheduledController({ scheduledTime }), env);
+  expect(await count()).toBe(2);
+});
+
+it("preserves a refreshed row and allows reposting after cleanup", async () => {
+  await post();
+  const scheduledTime = Date.now();
+  await env.DB.prepare("UPDATE endpoints SET updated_at = ?1")
+    .bind(scheduledTime - 31 * 24 * 60 * 60 * 1000)
+    .run();
+  expect((await post()).status).toBe(204);
+  await worker.scheduled(createScheduledController({ scheduledTime }), env);
+  expect(await count()).toBe(1);
+  await worker.scheduled(
+    createScheduledController({
+      scheduledTime: Date.now() + 31 * 24 * 60 * 60 * 1000,
+    }),
+    env,
+  );
+  expect(await count()).toBe(0);
+  expect((await post()).status).toBe(204);
+  expect(await (await exports.default.fetch(endpoint())).text()).toBe(opaque());
+});
+
+it("reports cleanup failures without leaking D1 details and recovers next run", async () => {
+  await post();
+  await env.DB.exec("UPDATE endpoints SET updated_at = 0");
+  const prepare = vi.spyOn(env.DB, "prepare").mockImplementation(() => {
+    throw new Error("synthetic-private-db-detail");
+  });
+  const errorLog = vi.spyOn(console, "error");
+  await expect(
+    worker.scheduled(
+      createScheduledController({ scheduledTime: Date.now() }),
+      env,
+    ),
+  ).rejects.toThrow(/^endpoint-cleanup-failed$/);
+  expect(errorLog).not.toHaveBeenCalled();
+  prepare.mockRestore();
+  expect(await count()).toBe(1);
+  await worker.scheduled(
+    createScheduledController({ scheduledTime: Date.now() }),
+    env,
+  );
+  expect(await count()).toBe(0);
 });
 
 it("normalizes UUID case without redirecting or creating another record", async () => {
@@ -221,6 +313,7 @@ it("atomically bounds concurrent registrations but allows updates at capacity", 
 
 it("a real SQL write failure leaves the entire old value intact", async () => {
   await post();
+  const before = await env.DB.prepare("SELECT * FROM endpoints").all();
   await env.DB.exec(
     "CREATE TRIGGER reject_write BEFORE UPDATE ON endpoints BEGIN SELECT RAISE(ABORT, 'synthetic-private-db-detail'); END;",
   );
@@ -229,6 +322,9 @@ it("a real SQL write failure leaves the entire old value intact", async () => {
   expect(response.headers.get("retry-after")).toBe("60");
   expect(await response.json()).toEqual({ error: "storage-unavailable" });
   expect(await (await exports.default.fetch(endpoint())).text()).toBe(opaque());
+  expect(
+    (await env.DB.prepare("SELECT * FROM endpoints").all()).results,
+  ).toEqual(before.results);
 });
 
 it("returns bounded errors on D1 outages without leaking or logging exceptions", async () => {
