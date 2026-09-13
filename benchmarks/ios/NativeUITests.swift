@@ -1,6 +1,25 @@
 import XCTest
 
 final class NativeUITests: XCTestCase {
+    func testAppTransition() throws {
+        continueAfterFailure = false
+        let app = XCUIApplication(bundleIdentifier: "io.github.rsyumi.risunest.ios.bench")
+        app.launchEnvironment["RISUNEST_IOS_PHASE"] = "background"
+        app.launch()
+        XCTAssertTrue(app.webViews.staticTexts["background-ready"].waitForExistence(timeout: 30))
+        XCUIDevice.shared.press(.home)
+        let elapsed = expectation(description: "Observe a ten second app transition")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { elapsed.fulfill() }
+        wait(for: [elapsed], timeout: 15)
+        app.activate()
+        let result = app.webViews.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "background-result:")).firstMatch
+        XCTAssertTrue(result.waitForExistence(timeout: 60))
+        let measurement = XCTAttachment(string: result.label)
+        measurement.lifetime = .keepAlways
+        add(measurement)
+        XCTAssertTrue(app.webViews.staticTexts["passed"].exists)
+    }
+
     func testProductKeyboard() throws {
         continueAfterFailure = false
         let app = XCUIApplication(bundleIdentifier: "io.github.rsyumi.risunest.ios.bench")

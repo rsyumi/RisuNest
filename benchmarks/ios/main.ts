@@ -107,6 +107,7 @@ async function main() {
     await invoke("pds_open");
     const lease = await beginIOSGeneration();
     await report("background-ready", { state: await getIOSNativeState() });
+    document.getElementById("status")!.textContent = "background-ready";
     let tick = 0;
     const gapsMs: number[] = [];
     let previous = performance.now();
@@ -128,6 +129,16 @@ async function main() {
       aborted: lease.signal?.aborted,
       state: await getIOSNativeState(),
     });
+    const measured = document.createElement("pre");
+    measured.textContent =
+      "background-result:" +
+      JSON.stringify({
+        tick,
+        aborted: lease.signal?.aborted,
+        maxGapMs: Math.max(...gapsMs),
+        state: await getIOSNativeState(),
+      });
+    document.getElementById("benchmark")!.append(measured);
     await report("complete", { passed: true });
   } else throw new Error("Unknown verification phase");
   document.getElementById("status")!.textContent = "passed";
