@@ -147,6 +147,18 @@ fn remote_apply_cursor_base_and_outbox_are_atomic_and_preserve_local_tail() {
         json!({"synthetic":"remote","statics":{"messages":912}})
     );
     assert_eq!(store.server_status().unwrap().dirty_records, 0);
+    let external_revision: i64 = store
+        .connection
+        .query_row(
+            "SELECT revision FROM content_changes WHERE kind='root'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        external_revision, 3,
+        "remote apply must notify external backup without redirtying the server"
+    );
     assert_eq!(store.server_status().unwrap().head, Some(head(1)));
     store
         .commit(&WorkingSetCommit {

@@ -152,6 +152,11 @@ impl PersistentStore {
             local.extend(root.object_hashes);
             local.extend(root.manifest_hashes);
         }
+        // External captures require complete local payloads through publication,
+        // even when the source alias was removed by a later edit.
+        local.extend(crate::external_storage::capture::registered_roots(
+            &self.connection, &self.repository_root,
+        )?.object_hashes);
         // Archive SQLite holds only metadata. Cache the role list by immutable
         // snapshot ID so later cleanups do not reconstruct each historical DB.
         let archive = snapshot_archive::Archive::open(&self.snapshots_dir)?;

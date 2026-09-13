@@ -1165,7 +1165,6 @@ fn replace_mapped_string(value: Option<&mut Value>, replacements: &HashMap<Strin
     }
 }
 
-#[cfg(feature = "native-official-publication")]
 fn validate_pinned_account(
     root: &Map<String, Value>,
     expected_account_id: &str,

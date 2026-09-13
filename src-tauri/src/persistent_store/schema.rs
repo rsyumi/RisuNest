@@ -237,6 +237,9 @@ fn create_schema(connection: &mut Connection) -> StoreResult<()> {
         [],
     )?;
     super::server_sync_outbox::create_schema(&transaction)?;
+    super::content_change_index::create_schema(&transaction)?;
+    super::sync_selection::create_schema(&transaction)?;
+    super::external_storage_state::create_schema(&transaction)?;
     validate_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
@@ -245,6 +248,8 @@ fn create_schema(connection: &mut Connection) -> StoreResult<()> {
 
 fn validate_schema(connection: &Connection) -> StoreResult<()> {
     super::server_sync_outbox::validate_schema(connection)?;
+    super::content_change_index::validate_schema(connection)?;
+    super::external_storage_state::validate_schema(connection)?;
     validate_object_sql(
         connection,
         "table",

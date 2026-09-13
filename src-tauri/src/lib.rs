@@ -8,6 +8,7 @@ pub mod import_export_jobs;
 #[allow(dead_code)]
 mod local_backup;
 mod logical_records;
+mod external_storage;
 #[allow(dead_code)]
 #[allow(dead_code)]
 mod lossless_f0;

@@ -133,6 +133,8 @@ mod replacement_tests;
 #[path = "tests/schema_migration_tests.rs"]
 mod schema_migration_tests;
 mod server_sync_apply_tests;
+#[path = "tests/external_storage_tests.rs"]
+mod external_storage_tests;
 mod server_sync_engine_tests;
 #[path = "tests/server_sync_outbox_tests.rs"]
 mod server_sync_outbox_tests;
