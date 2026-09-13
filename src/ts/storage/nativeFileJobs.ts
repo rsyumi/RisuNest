@@ -29,6 +29,22 @@ export type NativeFileJobState =
     | 'failed'
     | 'cancelled'
 
+export type NativeCompatibilityTarget = 'risuai' | 'pocketrisu'
+
+export interface NativeCompatibilityReportItem {
+    code: string
+    items: string
+    bytes: string
+    affectedConversations: string | null
+}
+
+export interface NativeCompatibilityReport {
+    target: NativeCompatibilityTarget
+    preserved: NativeCompatibilityReportItem[]
+    converted: NativeCompatibilityReportItem[]
+    excluded: NativeCompatibilityReportItem[]
+}
+
 export interface NativeFileJobResult {
     revision: number
     sourceBytes: number
@@ -44,20 +60,19 @@ export interface NativeFileJobResult {
 export interface NativeOfficialAccountSnapshotRestoreRequest {
     baseUrl: string
     credential:
-        | { kind: 'risu-auth'; token: string }
-        | { kind: 'bearer'; token: string }
+        { kind: 'risu-auth'; token: string } | { kind: 'bearer'; token: string }
 }
 
 export type NativeOfficialAccountSnapshotRestoreResult =
     | { kind: 'missing' }
     | { kind: 'compatibility-fallback' }
     | {
-        kind: 'activated'
-        revision: number
-        sourceSha256: string
-        recoveryPath?: string
-        warningCodes: string[]
-    }
+          kind: 'activated'
+          revision: number
+          sourceSha256: string
+          recoveryPath?: string
+          warningCodes: string[]
+      }
 
 interface PreparedContentAssetDescriptorBase {
     referenceKey?: string
@@ -81,8 +96,7 @@ export interface PreparedRisumContentAssetDescriptor extends PreparedContentAsse
 }
 
 export type PreparedContentAssetDescriptor =
-    | PreparedCardContentAssetDescriptor
-    | PreparedRisumContentAssetDescriptor
+    PreparedCardContentAssetDescriptor | PreparedRisumContentAssetDescriptor
 
 export type PreparedRisumOwnerHead =
     | { present: false; manifestHash: null; entryCount: 0 }
@@ -90,7 +104,12 @@ export type PreparedRisumOwnerHead =
 
 export interface PreparedNativeContent {
     casSessionId: string
-    format: 'json-card' | 'png-card' | 'charx-card' | 'appended-charx-jpeg' | 'risu-module'
+    format:
+        | 'json-card'
+        | 'png-card'
+        | 'charx-card'
+        | 'appended-charx-jpeg'
+        | 'risu-module'
     metadata: Record<string, unknown>
     assets: PreparedContentAssetDescriptor[]
     portraitLogicalId?: string
@@ -123,7 +142,9 @@ export type NativeOfficialPublicationAttemptResult =
           replacementKey: string
       })
     | (NativeOfficialPublicationCommonResult & { kind: 'auth-warning' })
-    | (NativeOfficialPublicationCommonResult & { kind: 'reauthentication-needed' })
+    | (NativeOfficialPublicationCommonResult & {
+          kind: 'reauthentication-needed'
+      })
 
 export interface NativeOfficialPublicationRequest {
     expectedRevision: number
@@ -207,10 +228,7 @@ export interface NativeFileJobDetail {
 
 /** Which user-facing import a dialog-presented operation belongs to. */
 export type NativeFileOperationFormat =
-    | 'risu-save'
-    | 'local-backup'
-    | 'lossless-backup'
-    | 'content'
+    'risu-save' | 'local-backup' | 'lossless-backup' | 'content'
 
 /**
  * Resolves the stage a status describes. Statuses carrying `detail` name it
@@ -258,7 +276,10 @@ export function syntheticNativeFileJobStatus(
         kind: base.kind,
         state: base.state ?? 'running',
         phase: base.phase ?? 'reading-source',
-        progress: { ...(base.progress ?? { completedBytes: 0, completedItems: 0 }), ...progress },
+        progress: {
+            ...(base.progress ?? { completedBytes: 0, completedItems: 0 }),
+            ...progress,
+        },
         ...(base.warningCodes ? { warningCodes: base.warningCodes } : {}),
         ...(base.result ? { result: base.result } : {}),
         detail: {
@@ -266,7 +287,10 @@ export function syntheticNativeFileJobStatus(
             stageUnit: 'items',
             ...detailPatch,
             stage,
-            counts: { ...(base.detail?.counts ?? emptyNativeImportCounts()), ...counts },
+            counts: {
+                ...(base.detail?.counts ?? emptyNativeImportCounts()),
+                ...counts,
+            },
         },
     }
 }
@@ -299,18 +323,25 @@ export interface NativeFileJobStatus {
         | 'export-risu-module'
         | 'restore-legacy-local-backup'
         | 'export-legacy-local-backup'
+        | 'export-compatible-local-backup'
+        | 'export-portable-backup'
+        | 'restore-portable-backup'
         | 'prepare-content-import'
         | 'import-jpeg-asset'
         | 'kei-backup-upload'
         | 'restore-official-account-snapshot'
         | 'official-publication-upload'
     expectedRevision?: number
+    deviceSessionId?: string
+    restorePreview?: NativePortableRestorePreview
     warningCodes?: string[]
     state: NativeFileJobState
     phase:
         | 'queued'
         | 'reading-source'
         | 'awaiting-content-mapping'
+        | 'awaiting-device-maintenance'
+        | 'awaiting-backup-selection'
         | 'staging-database'
         | 'awaiting-activation'
         | 'activating-database'
@@ -328,6 +359,14 @@ export interface NativeFileJobStatus {
         totalItems?: number
     }
     detail?: NativeFileJobDetail
+    compatibilityReport?: NativeCompatibilityReport
+    preservationReport?: {
+        files: string
+        bytes: string
+        reason: 'not-required-by-library'
+        deletable: boolean
+        path: string
+    }
     publicationAttempt?: NativeOfficialPublicationAttemptResult
     result?: NativeFileJobResult
     preparedContent?: PreparedNativeContent
@@ -335,6 +374,16 @@ export interface NativeFileJobStatus {
         code: string
         message: string
     }
+}
+
+export interface NativePortableSelection {
+    library: boolean
+    deviceSections: string[]
+}
+export interface NativePortableRestorePreview {
+    libraryIncluded: boolean
+    repairRequired: boolean
+    deviceSections: string[]
 }
 
 export interface NativeBlockRestoreRuntime {
@@ -352,13 +401,17 @@ export interface NativeBlockRestoreRuntime {
 }
 
 export interface NativeFileJobOptions {
+    onStarted?(jobId: string): void | Promise<void>
+    onNativeStatus?(status: NativeFileJobStatus): void | Promise<void>
     signal?: AbortSignal
     pollIntervalMs?: number
     onStatus?(status: NativeFileJobStatus): void
 }
 
 export interface PreparedNativeContentActivationLifecycle {
-    prepareOwnerManifestAndSeal(bytes: Uint8Array): Promise<PreparedImmutablePayload>
+    prepareOwnerManifestAndSeal(
+        bytes: Uint8Array,
+    ): Promise<PreparedImmutablePayload>
     sealPreparedContent?(): Promise<void>
     abortPreparedContent?(): Promise<void>
 }
@@ -423,13 +476,17 @@ export interface NativeFileJobDependencies {
 }
 
 export interface NativeLosslessBackupDependencies extends NativeFileJobDependencies {
-    copyToAndroidSaf(request: AndroidSafDestinationRequest): Promise<AndroidSafDestinationResult>
+    copyToAndroidSaf(
+        request: AndroidSafDestinationRequest,
+    ): Promise<AndroidSafDestinationResult>
 }
 
 const productionDependencies: NativeFileJobDependencies = {
     isTauri: () => isTauri,
-    invoke: (command, args) => args === undefined ? invoke(command) : invoke(command, args),
-    wait: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+    invoke: (command, args) =>
+        args === undefined ? invoke(command) : invoke(command, args),
+    wait: (milliseconds) =>
+        new Promise((resolve) => setTimeout(resolve, milliseconds)),
     discardAndroidSource: (token) => discardAndroidSafSource(token),
 }
 
@@ -439,7 +496,10 @@ const productionLosslessDependencies: NativeLosslessBackupDependencies = {
 }
 
 export class NativeFileJobError extends Error {
-    constructor(readonly code: string, message: string) {
+    constructor(
+        readonly code: string,
+        message: string,
+    ) {
         super(message)
         this.name = 'NativeFileJobError'
     }
@@ -465,9 +525,11 @@ function abortError(): Error {
 }
 
 export function isTerminalJob(status: NativeFileJobStatus): boolean {
-    return status.state === 'succeeded'
-        || status.state === 'failed'
-        || status.state === 'cancelled'
+    return (
+        status.state === 'succeeded' ||
+        status.state === 'failed' ||
+        status.state === 'cancelled'
+    )
 }
 
 function mergeWarningCodes(
@@ -487,12 +549,11 @@ function preparedContentError(message: string): NativeFileJobError {
     return new NativeFileJobError('invalid-prepared-content', message)
 }
 
-function requiredDescriptorString(
-    value: unknown,
-    field: string,
-): string {
+function requiredDescriptorString(value: unknown, field: string): string {
     if (typeof value !== 'string' || value.length === 0) {
-        throw preparedContentError(`Prepared content asset ${field} must be a nonempty string`)
+        throw preparedContentError(
+            `Prepared content asset ${field} must be a nonempty string`,
+        )
     }
     return value
 }
@@ -952,15 +1013,14 @@ async function invokeNative(
 ): Promise<unknown> {
     try {
         return await dependencies.invoke(command, args)
-    }
-    catch (error) {
+    } catch (error) {
         if (
-            typeof error === 'object'
-            && error !== null
-            && 'code' in error
-            && typeof error.code === 'string'
-            && 'message' in error
-            && typeof error.message === 'string'
+            typeof error === 'object' &&
+            error !== null &&
+            'code' in error &&
+            typeof error.code === 'string' &&
+            'message' in error &&
+            typeof error.message === 'string'
         ) {
             throw new NativeFileJobError(error.code, error.message)
         }
@@ -977,13 +1037,20 @@ async function pollNativeFileJobUntilTerminal(
     while (true) {
         if (options.signal?.aborted && !cancellationRequested) {
             cancellationRequested = true
-            await invokeNative(dependencies, 'native_file_job_cancel', { jobId })
+            await invokeNative(dependencies, 'native_file_job_cancel', {
+                jobId,
+            })
         }
-        const status = await invokeNative(dependencies, 'native_file_job_status', {
-            jobId,
-        }) as NativeFileJobStatus
+        const status = (await invokeNative(
+            dependencies,
+            'native_file_job_status',
+            {
+                jobId,
+            },
+        )) as NativeFileJobStatus
         options.onStatus?.(status)
         if (isTerminalJob(status)) return status
+        await options.onNativeStatus?.(status)
         await dependencies.wait(options.pollIntervalMs ?? 100)
     }
 }
@@ -996,9 +1063,9 @@ function abortBeforeNativeRestoreStart(
     let discarded = source.type !== 'androidSpool'
     if (source.type === 'androidSpool') {
         try {
-            discarded = dependencies.discardAndroidSource?.(source.token) === true
-        }
-        catch {}
+            discarded =
+                dependencies.discardAndroidSource?.(source.token) === true
+        } catch {}
     }
     if (!discarded) {
         throw new NativeFileJobError(
@@ -1013,21 +1080,27 @@ async function runNativeReplacementRestore(
     kind:
         | 'restore-block-risu-save'
         | 'restore-lossless-backup'
+        | 'restore-portable-backup'
         | 'restore-legacy-local-backup'
         | 'restore-official-account-snapshot',
     mutationReason: string,
     runtime: NativeBlockRestoreRuntime,
     source: NativeFileJobSource | NativeOfficialAccountSnapshotRestoreRequest,
-    options: NativeFileRestoreJobOptions = {},
+    options: NativeFileRestoreJobOptions & {
+        choosePortableSections?(
+            preview: NativePortableRestorePreview,
+        ): Promise<NativePortableSelection | null>
+    } = {},
     dependencies: NativeFileJobDependencies = productionDependencies,
 ): Promise<NativeFileJobResult> {
-    const operation = kind === 'restore-lossless-backup'
-        ? 'Native lossless backup restore'
-        : kind === 'restore-official-account-snapshot'
-            ? 'Native official account snapshot restore'
-        : kind === 'restore-legacy-local-backup'
-            ? 'Native legacy local backup restore'
-        : 'Native block RisuSave restore'
+    const operation =
+        kind === 'restore-lossless-backup'
+            ? 'Native lossless backup restore'
+            : kind === 'restore-official-account-snapshot'
+              ? 'Native official account snapshot restore'
+              : kind === 'restore-legacy-local-backup'
+                ? 'Native legacy local backup restore'
+                : 'Native block RisuSave restore'
     if (!dependencies.isTauri()) {
         throw new Error(`${operation} requires Tauri`)
     }
@@ -1035,33 +1108,39 @@ async function runNativeReplacementRestore(
         abortBeforeNativeRestoreStart(source, dependencies)
     }
 
-    const mutationToken = await runtime.capturePersistentMutationToken(
-        mutationReason,
-    )
+    const mutationToken =
+        await runtime.capturePersistentMutationToken(mutationReason)
     if (options.signal?.aborted) {
         abortBeforeNativeRestoreStart(source, dependencies)
     }
-    const request = kind === 'restore-official-account-snapshot'
-        ? {
-            kind,
-            ...(source as NativeOfficialAccountSnapshotRestoreRequest),
-            expectedRevision: mutationToken.revision,
-        }
-        : {
-            kind,
-            source: source as NativeFileJobSource,
-            expectedRevision: mutationToken.revision,
-        }
-    const started = await invokeNative(dependencies, 'native_file_job_start', { request }) as {
+    const request =
+        kind === 'restore-official-account-snapshot'
+            ? {
+                  kind,
+                  ...(source as NativeOfficialAccountSnapshotRestoreRequest),
+                  expectedRevision: mutationToken.revision,
+              }
+            : {
+                  kind,
+                  source: source as NativeFileJobSource,
+                  expectedRevision: mutationToken.revision,
+              }
+    const started = (await invokeNative(dependencies, 'native_file_job_start', {
+        request,
+    })) as {
         jobId: string
         warningCodes?: string[]
     }
     let cancellationRequested = false
     let terminal: NativeFileJobStatus | undefined
     let mutationConflict: NativeFileJobError | undefined
-    let replacementFence: Awaited<ReturnType<
-        NativeBlockRestoreRuntime['acquireDestructiveReplacementFence']
-    >> | undefined
+    let replacementFence:
+        | Awaited<
+              ReturnType<
+                  NativeBlockRestoreRuntime['acquireDestructiveReplacementFence']
+              >
+          >
+        | undefined
     try {
         while (!terminal) {
             if (options.signal?.aborted && !cancellationRequested) {
@@ -1070,27 +1149,112 @@ async function runNativeReplacementRestore(
                     jobId: started.jobId,
                 })
             }
-            const status = await invokeNative(dependencies, 'native_file_job_status', {
-                jobId: started.jobId,
-            }) as NativeFileJobStatus
-            options.onStatus?.(status)
+            const status = (await invokeNative(
+                dependencies,
+                'native_file_job_status',
+                {
+                    jobId: started.jobId,
+                },
+            )) as NativeFileJobStatus
+            if (['succeeded', 'failed', 'cancelled'].includes(status.state))
+                terminal = status
+            try {
+                await options.onNativeStatus?.(status)
+                options.onStatus?.(status)
+            } catch (error) {
+                if (status.state === 'succeeded' && status.result)
+                    throw new NativeFileJobActivationCommittedError(
+                        status.result.revision,
+                        error,
+                    )
+                throw error
+            }
             if (
-                status.state === 'waitingForInput'
-                && status.phase === 'awaiting-activation'
-                && !replacementFence
-                && !cancellationRequested
+                kind === 'restore-portable-backup' &&
+                status.state === 'waitingForInput' &&
+                status.phase === 'awaiting-backup-selection'
+            ) {
+                if (!status.restorePreview || !options.choosePortableSections)
+                    throw new NativeFileJobError(
+                        'selection-unavailable',
+                        'Backup section selection is unavailable',
+                    )
+                const selection = await options.choosePortableSections(
+                    status.restorePreview,
+                )
+                if (!selection || options.signal?.aborted) {
+                    cancellationRequested = true
+                    await invokeNative(dependencies, 'native_file_job_cancel', {
+                        jobId: started.jobId,
+                    })
+                    continue
+                }
+                if (selection.deviceSections.length) {
+                    await options.beforeActivation?.()
+                    replacementFence =
+                        await runtime.acquireDestructiveReplacementFence(
+                            mutationToken,
+                        )
+                    options.onBlockingChange?.(true)
+                }
+                if (options.signal?.aborted) {
+                    cancellationRequested = true
+                    await invokeNative(dependencies, 'native_file_job_cancel', {
+                        jobId: started.jobId,
+                    })
+                    continue
+                }
+                await invokeNative(
+                    dependencies,
+                    'native_portable_select_sections',
+                    { jobId: started.jobId, selection },
+                )
+            }
+            if (
+                kind === 'restore-portable-backup' &&
+                status.state === 'waitingForInput' &&
+                status.phase === 'awaiting-device-maintenance'
+            ) {
+                const { handlePortableDeviceMaintenanceStatus } =
+                    await import('./deviceBackup/job')
+                await handlePortableDeviceMaintenanceStatus(
+                    { ...status, kind },
+                    {
+                        flushedRevision: mutationToken.revision,
+                        assertHeld() {
+                            if (!replacementFence)
+                                throw new Error(
+                                    'Device restore ownership was released',
+                                )
+                        },
+                    },
+                    {
+                        invoke: dependencies.invoke as import('./deviceBackup/nativeSpool').DeviceNativeInvoke,
+                    },
+                )
+            }
+            if (
+                status.state === 'waitingForInput' &&
+                status.phase === 'awaiting-activation' &&
+                !replacementFence &&
+                !cancellationRequested
             ) {
                 try {
                     await options.beforeActivation?.()
-                    replacementFence = await runtime.acquireDestructiveReplacementFence(
-                        mutationToken,
-                    )
-                }
-                catch (error) {
-                    mutationConflict = error instanceof NativeFileJobError ? error : new NativeFileJobError(
-                        'revision-conflict',
-                        error instanceof Error ? error.message : String(error),
-                    )
+                    replacementFence =
+                        await runtime.acquireDestructiveReplacementFence(
+                            mutationToken,
+                        )
+                } catch (error) {
+                    mutationConflict =
+                        error instanceof NativeFileJobError
+                            ? error
+                            : new NativeFileJobError(
+                                  'revision-conflict',
+                                  error instanceof Error
+                                      ? error.message
+                                      : String(error),
+                              )
                     cancellationRequested = true
                     await invokeNative(dependencies, 'native_file_job_cancel', {
                         jobId: started.jobId,
@@ -1115,9 +1279,9 @@ async function runNativeReplacementRestore(
                 })
             }
             if (
-                status.state === 'succeeded'
-                || status.state === 'failed'
-                || status.state === 'cancelled'
+                status.state === 'succeeded' ||
+                status.state === 'failed' ||
+                status.state === 'cancelled'
             ) {
                 terminal = status
                 break
@@ -1127,7 +1291,10 @@ async function runNativeReplacementRestore(
 
         if (terminal.state === 'succeeded') {
             if (!terminal.result) {
-                throw new NativeFileJobError('missing-result', `${operation} returned no result`)
+                throw new NativeFileJobError(
+                    'missing-result',
+                    `${operation} returned no result`,
+                )
             }
             if (!replacementFence) {
                 throw new NativeFileJobError(
@@ -1136,44 +1303,65 @@ async function runNativeReplacementRestore(
                 )
             }
             try {
-                options.onStatus?.(syntheticNativeFileJobStatus(terminal, 'refreshing-app'))
-                await replacementFence.refreshCommittedWorkingSet(terminal.result.revision)
-                options.onStatus?.(syntheticNativeFileJobStatus(terminal, 'reloading-plugins'))
+                options.onStatus?.(
+                    syntheticNativeFileJobStatus(terminal, 'refreshing-app'),
+                )
+                await replacementFence.refreshCommittedWorkingSet(
+                    terminal.result.revision,
+                )
+                options.onStatus?.(
+                    syntheticNativeFileJobStatus(terminal, 'reloading-plugins'),
+                )
                 await options.afterRefresh?.()
-            }
-            catch (error) {
-                throw new NativeFileJobActivationCommittedError(terminal.result.revision, error)
+            } catch (error) {
+                throw new NativeFileJobActivationCommittedError(
+                    terminal.result.revision,
+                    error,
+                )
             }
             const committedResult = {
                 ...terminal.result,
-                warningCodes: mergeWarningCodes(started.warningCodes, terminal.result.warningCodes),
+                warningCodes: mergeWarningCodes(
+                    started.warningCodes,
+                    terminal.result.warningCodes,
+                ),
             }
             try {
                 await invokeNative(dependencies, 'native_file_job_forget', {
                     jobId: started.jobId,
                 })
-            }
-            catch {
-                committedResult.warningCodes = withCleanupFailedWarning(committedResult.warningCodes)
+            } catch {
+                committedResult.warningCodes = withCleanupFailedWarning(
+                    committedResult.warningCodes,
+                )
             }
             return committedResult
         }
 
-        const error = mutationConflict ?? (terminal.state === 'cancelled'
-            ? abortError()
-            : new NativeFileJobError(
-                terminal.error?.code ?? 'restore-failed',
-                terminal.error?.message ?? `${operation} failed`,
-            ))
+        const error =
+            mutationConflict ??
+            (terminal.state === 'cancelled'
+                ? abortError()
+                : new NativeFileJobError(
+                      terminal.error?.code ?? 'restore-failed',
+                      terminal.error?.message ?? `${operation} failed`,
+                  ))
         try {
             await invokeNative(dependencies, 'native_file_job_forget', {
                 jobId: started.jobId,
             })
-        }
-        catch {}
+        } catch {}
         throw error
-    }
-    finally {
+    } catch (error) {
+        if (!terminal) {
+            try {
+                await invokeNative(dependencies, 'native_file_job_cancel', {
+                    jobId: started.jobId,
+                })
+            } catch {}
+        }
+        throw error
+    } finally {
         replacementFence?.release()
         options.onBlockingChange?.(false)
     }
@@ -1211,6 +1399,26 @@ export function runNativeLosslessBackupRestore(
     )
 }
 
+export function runNativeArchiveRestore(
+    runtime: NativeBlockRestoreRuntime,
+    source: NativeFileJobSource,
+    options: NativeFileRestoreJobOptions & {
+        choosePortableSections(
+            preview: NativePortableRestorePreview,
+        ): Promise<NativePortableSelection | null>
+    },
+    dependencies: NativeFileJobDependencies = productionDependencies,
+): Promise<NativeFileJobResult> {
+    return runNativeReplacementRestore(
+        'restore-portable-backup',
+        'native-portable-restore',
+        runtime,
+        source,
+        options,
+        dependencies,
+    )
+}
+
 export async function runNativeOfficialAccountSnapshotRestore(
     runtime: NativeBlockRestoreRuntime,
     request: NativeOfficialAccountSnapshotRestoreRequest,
@@ -1227,12 +1435,17 @@ export async function runNativeOfficialAccountSnapshotRestore(
             options,
             dependencies,
         )
-    }
-    catch (error) {
-        if (error instanceof NativeFileJobError && error.code === 'remote-missing') {
+    } catch (error) {
+        if (
+            error instanceof NativeFileJobError &&
+            error.code === 'remote-missing'
+        ) {
             return { kind: 'missing' }
         }
-        if (error instanceof NativeFileJobError && error.code === 'compatibility-required') {
+        if (
+            error instanceof NativeFileJobError &&
+            error.code === 'compatibility-required'
+        ) {
             return { kind: 'compatibility-fallback' }
         }
         throw error
@@ -1279,26 +1492,36 @@ export async function runNativeBlockRisuSaveExport(
     await runtime.flushPendingData('native-block-risu-save-export')
     if (options.signal?.aborted) throw abortError()
     const expectedRevision = runtime.revision
-    const started = await invokeNative(dependencies, 'native_file_job_start', {
+    const started = (await invokeNative(dependencies, 'native_file_job_start', {
         request: {
             kind: 'export-block-risu-save',
             destination,
             expectedRevision,
             omitAccount: options.omitAccount ?? false,
         },
-    }) as { jobId: string; warningCodes?: string[] }
-    const terminal = await pollNativeFileJobUntilTerminal(started.jobId, options, dependencies)
+    })) as { jobId: string; warningCodes?: string[] }
+    const terminal = await pollNativeFileJobUntilTerminal(
+        started.jobId,
+        options,
+        dependencies,
+    )
 
     let outcomeFailed = false
     let committedResult: NativeFileJobResult | undefined
     try {
         if (terminal.state === 'succeeded') {
             if (!terminal.result) {
-                throw new NativeFileJobError('missing-result', 'Native export returned no result')
+                throw new NativeFileJobError(
+                    'missing-result',
+                    'Native export returned no result',
+                )
             }
             committedResult = {
                 ...terminal.result,
-                warningCodes: mergeWarningCodes(started.warningCodes, terminal.result.warningCodes),
+                warningCodes: mergeWarningCodes(
+                    started.warningCodes,
+                    terminal.result.warningCodes,
+                ),
             }
             return committedResult
         }
@@ -1308,20 +1531,20 @@ export async function runNativeBlockRisuSaveExport(
             terminal.error?.code ?? 'export-failed',
             terminal.error?.message ?? 'Native block RisuSave export failed',
         )
-    }
-    catch (error) {
+    } catch (error) {
         outcomeFailed = true
         throw error
-    }
-    finally {
+    } finally {
         try {
-            await invokeNative(dependencies, 'native_file_job_forget', { jobId: started.jobId })
-        }
-        catch (error) {
+            await invokeNative(dependencies, 'native_file_job_forget', {
+                jobId: started.jobId,
+            })
+        } catch (error) {
             if (committedResult) {
-                committedResult.warningCodes = withCleanupFailedWarning(committedResult.warningCodes)
-            }
-            else if (!outcomeFailed) throw error
+                committedResult.warningCodes = withCleanupFailedWarning(
+                    committedResult.warningCodes,
+                )
+            } else if (!outcomeFailed) throw error
         }
     }
 }
@@ -1351,10 +1574,25 @@ async function runNativeManagedExport(
     }
     if (options.signal?.aborted) throw abortError()
     const request = await spec.prepareRequest()
-    const started = await invokeNative(dependencies, 'native_file_job_start', {
+    const started = (await invokeNative(dependencies, 'native_file_job_start', {
         request,
-    }) as { jobId: string; warningCodes?: string[] }
-    const terminal = await pollNativeFileJobUntilTerminal(started.jobId, options, dependencies)
+    })) as { jobId: string; warningCodes?: string[] }
+    let terminal: NativeFileJobStatus
+    try {
+        await options.onStarted?.(started.jobId)
+        terminal = await pollNativeFileJobUntilTerminal(
+            started.jobId,
+            options,
+            dependencies,
+        )
+    } catch (error) {
+        try {
+            await invokeNative(dependencies, 'native_file_job_cancel', {
+                jobId: started.jobId,
+            })
+        } catch {}
+        throw error
+    }
 
     let outcomeFailed = false
     let result: NativeFileJobResult | undefined
@@ -1376,7 +1614,10 @@ async function runNativeManagedExport(
         }
         result = {
             ...terminal.result,
-            warningCodes: mergeWarningCodes(started.warningCodes, terminal.result.warningCodes),
+            warningCodes: mergeWarningCodes(
+                started.warningCodes,
+                terminal.result.warningCodes,
+            ),
         }
         if (spec.destination.type === 'androidSaf') {
             managedSource = result.handoffPath
@@ -1393,20 +1634,26 @@ async function runNativeManagedExport(
                 signal: options.signal,
                 ...(spec.relaySafCopyProgress
                     ? {
-                        onProgress: (progress) => options.onStatus?.({
-                            ...terminal,
-                            state: 'running',
-                            phase: 'publishing-destination',
-                            progress: {
-                                completedBytes: progress.copiedBytes,
-                                ...(progress.totalBytes === null
-                                    ? { totalBytes: committedResult.sourceBytes }
-                                    : { totalBytes: progress.totalBytes }),
-                                completedItems: 0,
-                                totalItems: 1,
-                            },
-                        }),
-                    }
+                          onProgress: (progress) =>
+                              options.onStatus?.({
+                                  ...terminal,
+                                  state: 'running',
+                                  phase: 'publishing-destination',
+                                  progress: {
+                                      completedBytes: progress.copiedBytes,
+                                      ...(progress.totalBytes === null
+                                          ? {
+                                                totalBytes:
+                                                    committedResult.sourceBytes,
+                                            }
+                                          : {
+                                                totalBytes: progress.totalBytes,
+                                            }),
+                                      completedItems: 0,
+                                      totalItems: 1,
+                                  },
+                              }),
+                      }
                     : {}),
             })
             if (published.bytes !== result.sourceBytes) {
@@ -1425,34 +1672,35 @@ async function runNativeManagedExport(
             }
         }
         return result
-    }
-    catch (error) {
+    } catch (error) {
         outcomeFailed = true
         throw error
-    }
-    finally {
+    } finally {
         if (managedSource) {
             try {
                 await invokeNative(dependencies, spec.handoffCleanupCommand, {
                     path: managedSource,
                 })
-            }
-            catch {
+            } catch {
                 handoffCleanupFailed = true
                 if (result && !outcomeFailed) {
-                    result.warningCodes = withCleanupFailedWarning(result.warningCodes)
+                    result.warningCodes = withCleanupFailedWarning(
+                        result.warningCodes,
+                    )
                 }
             }
         }
         if (!handoffCleanupFailed) {
             try {
-                await invokeNative(dependencies, 'native_file_job_forget', { jobId: started.jobId })
-            }
-            catch (error) {
+                await invokeNative(dependencies, 'native_file_job_forget', {
+                    jobId: started.jobId,
+                })
+            } catch (error) {
                 if (result && !outcomeFailed) {
-                    result.warningCodes = withCleanupFailedWarning(result.warningCodes)
-                }
-                else if (!outcomeFailed) throw error
+                    result.warningCodes = withCleanupFailedWarning(
+                        result.warningCodes,
+                    )
+                } else if (!outcomeFailed) throw error
             }
         }
     }
@@ -1463,23 +1711,27 @@ export function runNativeCharacterCharxExport(
     options: NativeFileJobOptions = {},
     dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
 ): Promise<NativeFileJobResult> {
-    return runNativeManagedExport({
-        operation: 'Native character CharX export',
-        safLengthMismatchLabel: 'character CharX',
-        handoffCleanupCommand: 'native_character_charx_handoff_cleanup',
-        destination: input.destination,
-        prepareRequest: () => ({
-            kind: 'export-character-charx',
-            ...(input.destination.type === 'desktopPath'
-                ? { destination: input.destination.path }
-                : {}),
-            expectedRevision: input.expectedRevision,
-            characterId: input.characterId,
-            ...(input.container ? { container: input.container } : {}),
-            card: input.card,
-            module: input.module,
-        }),
-    }, options, dependencies)
+    return runNativeManagedExport(
+        {
+            operation: 'Native character CharX export',
+            safLengthMismatchLabel: 'character CharX',
+            handoffCleanupCommand: 'native_character_charx_handoff_cleanup',
+            destination: input.destination,
+            prepareRequest: () => ({
+                kind: 'export-character-charx',
+                ...(input.destination.type === 'desktopPath'
+                    ? { destination: input.destination.path }
+                    : {}),
+                expectedRevision: input.expectedRevision,
+                characterId: input.characterId,
+                ...(input.container ? { container: input.container } : {}),
+                card: input.card,
+                module: input.module,
+            }),
+        },
+        options,
+        dependencies,
+    )
 }
 
 export function runNativeCharacterCardExport(
@@ -1487,22 +1739,26 @@ export function runNativeCharacterCardExport(
     options: NativeFileJobOptions = {},
     dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
 ): Promise<NativeFileJobResult> {
-    return runNativeManagedExport({
-        operation: 'Native character card export',
-        safLengthMismatchLabel: 'character card',
-        handoffCleanupCommand: 'native_character_card_handoff_cleanup',
-        destination: input.destination,
-        prepareRequest: () => ({
-            kind: 'export-character-card',
-            ...(input.destination.type === 'desktopPath'
-                ? { destination: input.destination.path }
-                : {}),
-            expectedRevision: input.expectedRevision,
-            characterId: input.characterId,
-            format: input.format,
-            metadata: input.metadata,
-        }),
-    }, options, dependencies)
+    return runNativeManagedExport(
+        {
+            operation: 'Native character card export',
+            safLengthMismatchLabel: 'character card',
+            handoffCleanupCommand: 'native_character_card_handoff_cleanup',
+            destination: input.destination,
+            prepareRequest: () => ({
+                kind: 'export-character-card',
+                ...(input.destination.type === 'desktopPath'
+                    ? { destination: input.destination.path }
+                    : {}),
+                expectedRevision: input.expectedRevision,
+                characterId: input.characterId,
+                format: input.format,
+                metadata: input.metadata,
+            }),
+        },
+        options,
+        dependencies,
+    )
 }
 
 export function runNativeRisuModuleExport(
@@ -1510,20 +1766,24 @@ export function runNativeRisuModuleExport(
     options: NativeFileJobOptions = {},
     dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
 ): Promise<NativeFileJobResult> {
-    return runNativeManagedExport({
-        operation: 'Native RISUM export',
-        safLengthMismatchLabel: 'RISUM',
-        handoffCleanupCommand: 'native_risu_module_handoff_cleanup',
-        destination: input.destination,
-        prepareRequest: () => ({
-            kind: 'export-risu-module',
-            ...(input.destination.type === 'desktopPath'
-                ? { destination: input.destination.path }
-                : {}),
-            expectedRevision: input.expectedRevision,
-            moduleIndex: input.moduleIndex,
-        }),
-    }, options, dependencies)
+    return runNativeManagedExport(
+        {
+            operation: 'Native RISUM export',
+            safLengthMismatchLabel: 'RISUM',
+            handoffCleanupCommand: 'native_risu_module_handoff_cleanup',
+            destination: input.destination,
+            prepareRequest: () => ({
+                kind: 'export-risu-module',
+                ...(input.destination.type === 'desktopPath'
+                    ? { destination: input.destination.path }
+                    : {}),
+                expectedRevision: input.expectedRevision,
+                moduleIndex: input.moduleIndex,
+            }),
+        },
+        options,
+        dependencies,
+    )
 }
 
 export function runNativeLegacyLocalBackupExport(
@@ -1547,8 +1807,34 @@ export function runNativeLegacyLocalBackupExport(
     )
 }
 
+export function runNativeCompatibleLocalBackupExport(
+    runtime: {
+        readonly revision: number
+        flushPendingData(reason: string): Promise<void>
+    },
+    target: NativeCompatibilityTarget,
+    destination: NativeLegacyLocalBackupDestination,
+    options: NativeFileJobOptions = {},
+    dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
+): Promise<NativeFileJobResult> {
+    return runNativePortableBackupExport(
+        'export-compatible-local-backup',
+        'native-compatible-local-backup-export',
+        'Native compatible local backup export',
+        'native_legacy_backup_handoff_cleanup',
+        runtime,
+        destination,
+        options,
+        dependencies,
+        target,
+    )
+}
+
 function runNativePortableBackupExport(
-    kind: 'export-lossless-backup' | 'export-legacy-local-backup',
+    kind:
+        | 'export-lossless-backup'
+        | 'export-legacy-local-backup'
+        | 'export-compatible-local-backup',
     flushReason: string,
     operation: string,
     handoffCleanupCommand: string,
@@ -1559,29 +1845,36 @@ function runNativePortableBackupExport(
     destination: NativeLosslessBackupDestination,
     options: NativeFileJobOptions = {},
     dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
+    target?: NativeCompatibilityTarget,
 ): Promise<NativeFileJobResult> {
-    return runNativeManagedExport({
-        operation,
-        safLengthMismatchLabel: operation,
-        handoffCleanupCommand,
-        destination,
-        relaySafCopyProgress: true,
-        prepareRequest: async () => {
-            await runtime.flushPendingData(flushReason)
-            if (options.signal?.aborted) throw abortError()
-            const expectedRevision = runtime.revision
-            return destination.type === 'desktopPath'
-                ? {
-                    kind,
-                    destination: destination.path,
-                    expectedRevision,
-                }
-                : {
-                    kind,
-                    expectedRevision,
-                }
+    return runNativeManagedExport(
+        {
+            operation,
+            safLengthMismatchLabel: operation,
+            handoffCleanupCommand,
+            destination,
+            relaySafCopyProgress: true,
+            prepareRequest: async () => {
+                await runtime.flushPendingData(flushReason)
+                if (options.signal?.aborted) throw abortError()
+                const expectedRevision = runtime.revision
+                return destination.type === 'desktopPath'
+                    ? {
+                          kind,
+                          destination: destination.path,
+                          expectedRevision,
+                          ...(target ? { target } : {}),
+                      }
+                    : {
+                          kind,
+                          expectedRevision,
+                          ...(target ? { target } : {}),
+                      }
+            },
         },
-    }, options, dependencies)
+        options,
+        dependencies,
+    )
 }
 
 export function runNativeLosslessBackupExport(
@@ -1605,6 +1898,131 @@ export function runNativeLosslessBackupExport(
     )
 }
 
+export async function runNativeArchiveExport(
+    runtime: NativeBlockRestoreRuntime & {
+        readonly revision: number
+        flushPendingData(reason: string): Promise<void>
+    },
+    destination: NativeLosslessBackupDestination,
+    selection: NativePortableSelection,
+    options: NativeFileJobOptions = {},
+    dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
+): Promise<NativeFileJobResult> {
+    let held = true
+    let expectedRevision = runtime.revision
+    let fence:
+        | Awaited<
+              ReturnType<
+                  NativeBlockRestoreRuntime['acquireDestructiveReplacementFence']
+              >
+          >
+        | undefined
+    let intent:
+        import('./deviceBackup/job').PortableExportIntentStore | undefined
+    let startedId: string | undefined
+    let completed = false
+    const hasDevice = selection.deviceSections.length > 0
+    try {
+        const result = await runNativeManagedExport(
+            {
+                operation: 'RisuNest backup',
+                safLengthMismatchLabel: 'RisuNest backup',
+                handoffCleanupCommand: 'native_portable_handoff_cleanup',
+                destination,
+                relaySafCopyProgress: true,
+                prepareRequest: async () => {
+                    if (hasDevice) {
+                        const module = await import('./deviceBackup/job')
+                        intent = module.createPortableExportIntentStore()
+                        if (intent.read())
+                            throw new NativeFileJobError(
+                                'publication-pending',
+                                'Finish the previous backup save before starting another',
+                            )
+                        const token =
+                            await runtime.capturePersistentMutationToken(
+                                'native-portable-export',
+                            )
+                        expectedRevision = token.revision
+                        fence =
+                            await runtime.acquireDestructiveReplacementFence(
+                                token,
+                            )
+                    } else {
+                        await runtime.flushPendingData('native-portable-export')
+                        expectedRevision = runtime.revision
+                    }
+                    return {
+                        kind: 'export-portable-backup',
+                        expectedRevision,
+                        selection,
+                        ...(destination.type === 'desktopPath'
+                            ? { destination: destination.path }
+                            : {}),
+                    }
+                },
+            },
+            {
+                ...options,
+                onStarted: async (jobId) => {
+                    startedId = jobId
+                    if (hasDevice) {
+                        const module = await import('./deviceBackup/job')
+                        module.rememberPortableExport(
+                            jobId,
+                            destination,
+                            intent,
+                        )
+                    }
+                    await options.onStarted?.(jobId)
+                },
+                onNativeStatus: async (status) => {
+                    await options.onNativeStatus?.(status)
+                    if (hasDevice && status.kind === 'export-portable-backup') {
+                        const module = await import('./deviceBackup/job')
+                        await module.handlePortableDeviceMaintenanceStatus(
+                            { ...status, kind: status.kind },
+                            {
+                                flushedRevision: expectedRevision,
+                                assertHeld() {
+                                    if (!held || !fence)
+                                        throw new Error(
+                                            'Device capture ownership was released',
+                                        )
+                                },
+                            },
+                            {
+                                invoke: dependencies.invoke as import('./deviceBackup/nativeSpool').DeviceNativeInvoke,
+                            },
+                        )
+                    }
+                },
+            },
+            dependencies,
+        )
+        completed = !result.warningCodes.includes('cleanup-failed')
+        return result
+    } catch (error) {
+        if (startedId && intent) {
+            try {
+                // Only a confirmed absence clears a failed pre-restart operation. A retained
+                // handoff or unknown native status remains available to publication recovery.
+                const pending = (await invokeNative(
+                    dependencies,
+                    'native_file_job_list',
+                )) as NativeFileJobStatus[]
+                if (!pending.some((job) => job.jobId === startedId))
+                    intent.clear(startedId)
+            } catch {}
+        }
+        throw error
+    } finally {
+        held = false
+        fence?.release()
+        if (completed && startedId) intent?.clear(startedId)
+    }
+}
+
 export async function prepareNativeContentImport(
     source: NativeFileJobSource,
     displayName: string,
@@ -1616,31 +2034,33 @@ export async function prepareNativeContentImport(
     }
     if (options.signal?.aborted) throw abortError()
 
-    const started = await invokeNative(dependencies, 'native_file_job_start', {
+    const started = (await invokeNative(dependencies, 'native_file_job_start', {
         request: {
             kind: 'prepare-content-import',
             source,
             displayName,
         },
-    }) as { jobId: string; warningCodes?: string[] }
+    })) as { jobId: string; warningCodes?: string[] }
     let cancellationRequested = false
 
     const forget = async (): Promise<void> => {
-        await invokeNative(dependencies, 'native_file_job_forget', { jobId: started.jobId })
+        await invokeNative(dependencies, 'native_file_job_forget', {
+            jobId: started.jobId,
+        })
     }
     const forgetBestEffort = async (): Promise<void> => {
         try {
             await forget()
-        }
-        catch {}
+        } catch {}
     }
-    const releaseAndForget = async (outcome: 'committed' | 'aborted'): Promise<void> => {
+    const releaseAndForget = async (
+        outcome: 'committed' | 'aborted',
+    ): Promise<void> => {
         let releaseFailed = false
         let releaseError: unknown
         try {
             await releaseCasJob(started.jobId, outcome, dependencies.invoke)
-        }
-        catch (error) {
+        } catch (error) {
             releaseFailed = true
             releaseError = error
         }
@@ -1648,8 +2068,7 @@ export async function prepareNativeContentImport(
         let forgetError: unknown
         try {
             await forget()
-        }
-        catch (error) {
+        } catch (error) {
             forgetFailed = true
             forgetError = error
         }
@@ -1659,19 +2078,24 @@ export async function prepareNativeContentImport(
     const abortAndForgetBestEffort = async (): Promise<void> => {
         try {
             await releaseAndForget('aborted')
-        }
-        catch {}
+        } catch {}
     }
     const cancelAndDrain = async (reportStatus = true): Promise<void> => {
         if (!cancellationRequested) {
             cancellationRequested = true
-            await invokeNative(dependencies, 'native_file_job_cancel', { jobId: started.jobId })
+            await invokeNative(dependencies, 'native_file_job_cancel', {
+                jobId: started.jobId,
+            })
         }
         let terminal: NativeFileJobStatus
         while (true) {
-            const status = await invokeNative(dependencies, 'native_file_job_status', {
-                jobId: started.jobId,
-            }) as NativeFileJobStatus
+            const status = (await invokeNative(
+                dependencies,
+                'native_file_job_status',
+                {
+                    jobId: started.jobId,
+                },
+            )) as NativeFileJobStatus
             if (reportStatus) options.onStatus?.(status)
             if (isTerminalJob(status)) {
                 terminal = status
@@ -1692,13 +2116,18 @@ export async function prepareNativeContentImport(
                 cleanupAttempted = true
                 throw abortError()
             }
-            const status = await invokeNative(dependencies, 'native_file_job_status', {
-                jobId: started.jobId,
-            }) as NativeFileJobStatus
+            const status = (await invokeNative(
+                dependencies,
+                'native_file_job_status',
+                {
+                    jobId: started.jobId,
+                },
+            )) as NativeFileJobStatus
             lastStatus = status
             options.onStatus?.(status)
             if (options.signal?.aborted) {
-                if (status.state === 'succeeded') await abortAndForgetBestEffort()
+                if (status.state === 'succeeded')
+                    await abortAndForgetBestEffort()
                 else if (isTerminalJob(status)) await forgetBestEffort()
                 else await cancelAndDrain()
                 cleanupAttempted = true
@@ -1716,16 +2145,26 @@ export async function prepareNativeContentImport(
             if (status.state === 'failed') {
                 const error = new NativeFileJobError(
                     status.error?.code ?? 'content-prepare-failed',
-                    status.error?.message ?? 'Native content preparation failed',
+                    status.error?.message ??
+                        'Native content preparation failed',
                 )
                 await forgetBestEffort()
                 cleanupAttempted = true
                 throw error
             }
 
-            const content = validatePreparedContent(status.preparedContent, started.jobId)
-            let lifecycleState: 'unfinalized' | 'finalizing' | 'finalized' | 'settling' | 'settled' = 'unfinalized'
-            let finalizerOperation: Promise<PreparedImmutablePayload> | undefined
+            const content = validatePreparedContent(
+                status.preparedContent,
+                started.jobId,
+            )
+            let lifecycleState:
+                | 'unfinalized'
+                | 'finalizing'
+                | 'finalized'
+                | 'settling'
+                | 'settled' = 'unfinalized'
+            let finalizerOperation:
+                Promise<PreparedImmutablePayload> | undefined
             let cancellationDuringFinalize = false
             let settlement: Promise<void> | undefined
             const settle = (operation: () => Promise<void>): Promise<void> => {
@@ -1736,7 +2175,9 @@ export async function prepareNativeContentImport(
                 })
                 return settlement
             }
-            const prepareOwnerManifestAndSeal = async (bytes: Uint8Array): Promise<PreparedImmutablePayload> => {
+            const prepareOwnerManifestAndSeal = async (
+                bytes: Uint8Array,
+            ): Promise<PreparedImmutablePayload> => {
                 if (lifecycleState !== 'unfinalized') {
                     throw new Error('Native content can only be finalized once')
                 }
@@ -1749,22 +2190,19 @@ export async function prepareNativeContentImport(
                 let prepared: PreparedImmutablePayload
                 try {
                     prepared = await finalizerOperation
-                }
-                catch (error) {
+                } catch (error) {
                     if (!cancellationDuringFinalize) {
                         settle(() => releaseAndForget('aborted'))
                     }
                     try {
                         await settlement
-                    }
-                    catch {}
+                    } catch {}
                     throw error
                 }
                 if (cancellationDuringFinalize) {
                     try {
                         await settlement
-                    }
-                    catch {}
+                    } catch {}
                     throw abortError()
                 }
                 lifecycleState = 'finalized'
@@ -1786,16 +2224,18 @@ export async function prepareNativeContentImport(
                 }))
                 try {
                     await finalizerOperation
-                }
-                catch (error) {
-                    if (!cancellationDuringFinalize) settle(() => releaseAndForget('aborted'))
-                    try { await settlement }
-                    catch {}
+                } catch (error) {
+                    if (!cancellationDuringFinalize)
+                        settle(() => releaseAndForget('aborted'))
+                    try {
+                        await settlement
+                    } catch {}
                     throw error
                 }
                 if (cancellationDuringFinalize) {
-                    try { await settlement }
-                    catch {}
+                    try {
+                        await settlement
+                    } catch {}
                     throw abortError()
                 }
                 lifecycleState = 'finalized'
@@ -1803,7 +2243,9 @@ export async function prepareNativeContentImport(
             const confirmActivated = async (): Promise<void> => {
                 if (lifecycleState === 'settled') return
                 if (lifecycleState !== 'finalized') {
-                    throw new Error('Native content activation cannot be confirmed before finalizing')
+                    throw new Error(
+                        'Native content activation cannot be confirmed before finalizing',
+                    )
                 }
                 await settle(() => releaseAndForget('committed'))
             }
@@ -1815,8 +2257,7 @@ export async function prepareNativeContentImport(
                     await settle(async () => {
                         try {
                             await finalizerOperation
-                        }
-                        catch {}
+                        } catch {}
                         await releaseAndForget('aborted')
                     })
                     return
@@ -1831,8 +2272,7 @@ export async function prepareNativeContentImport(
                     await settle(async () => {
                         try {
                             await finalizerOperation
-                        }
-                        catch {}
+                        } catch {}
                         await releaseAndForget('aborted')
                     })
                     return
@@ -1846,7 +2286,10 @@ export async function prepareNativeContentImport(
             return {
                 jobId: started.jobId,
                 content,
-                warningCodes: mergeWarningCodes(started.warningCodes, status.warningCodes),
+                warningCodes: mergeWarningCodes(
+                    started.warningCodes,
+                    status.warningCodes,
+                ),
                 prepareOwnerManifestAndSeal,
                 sealPreparedContent,
                 abortPreparedContent,
@@ -1854,20 +2297,16 @@ export async function prepareNativeContentImport(
                 cancel,
             }
         }
-    }
-    catch (error) {
+    } catch (error) {
         if (!cleanupAttempted) {
             if (lastStatus?.state === 'succeeded') {
                 await abortAndForgetBestEffort()
-            }
-            else if (lastStatus && isTerminalJob(lastStatus)) {
+            } else if (lastStatus && isTerminalJob(lastStatus)) {
                 await forgetBestEffort()
-            }
-            else {
+            } else {
                 try {
                     await cancelAndDrain(false)
-                }
-                catch {}
+                } catch {}
             }
         }
         throw error
@@ -1885,12 +2324,13 @@ function assertOfficialPublicationResult(
     }
     const result = value as Record<string, unknown>
     if (
-        !isBoundedString(result.accountId, 512, false)
-        || (result.session !== null && !isBoundedString(result.session, 4_096, true))
-        || !isBoundedString(result.saveDate, 128, false)
-        || !Number.isInteger(result.status)
-        || (result.status as number) < 100
-        || (result.status as number) > 599
+        !isBoundedString(result.accountId, 512, false) ||
+        (result.session !== null &&
+            !isBoundedString(result.session, 4_096, true)) ||
+        !isBoundedString(result.saveDate, 128, false) ||
+        !Number.isInteger(result.status) ||
+        (result.status as number) < 100 ||
+        (result.status as number) > 599
     ) {
         throw new NativeFileJobError(
             'invalid-result',
@@ -1900,9 +2340,10 @@ function assertOfficialPublicationResult(
     switch (result.kind) {
         case 'written':
             if (
-                isBoundedString(result.replacementKey, 4_096, false)
-                && (result.warning === null || isBoundedString(result.warning, 4_096, true))
-                && typeof result.reloadSession === 'boolean'
+                isBoundedString(result.replacementKey, 4_096, false) &&
+                (result.warning === null ||
+                    isBoundedString(result.warning, 4_096, true)) &&
+                typeof result.reloadSession === 'boolean'
             ) {
                 return result as unknown as NativeOfficialPublicationAttemptResult
             }
@@ -1922,16 +2363,24 @@ function assertOfficialPublicationResult(
     )
 }
 
-function isBoundedString(value: unknown, maximumLength: number, allowEmpty: boolean): value is string {
-    return typeof value === 'string'
-        && value.length <= maximumLength
-        && (allowEmpty || value.length > 0)
+function isBoundedString(
+    value: unknown,
+    maximumLength: number,
+    allowEmpty: boolean,
+): value is string {
+    return (
+        typeof value === 'string' &&
+        value.length <= maximumLength &&
+        (allowEmpty || value.length > 0)
+    )
 }
 
 function areBoundedWarningCodes(value: unknown): value is string[] {
-    return Array.isArray(value)
-        && value.length <= 64
-        && value.every((code) => isBoundedString(code, 128, false))
+    return (
+        Array.isArray(value) &&
+        value.length <= 64 &&
+        value.every((code) => isBoundedString(code, 128, false))
+    )
 }
 
 function createOfficialPublicationReceipt(
@@ -1951,26 +2400,31 @@ function createOfficialPublicationReceipt(
             'Native official publication returned no result',
         )
     }
-    const publication = assertOfficialPublicationResult(terminal.result.publication)
+    const publication = assertOfficialPublicationResult(
+        terminal.result.publication,
+    )
     if (
-        terminal.jobId !== expected.jobId
-        || terminal.kind !== 'official-publication-upload'
-        || (expected.revision !== undefined && terminal.result.revision !== expected.revision)
-        || (expected.accountId !== undefined && publication.accountId !== expected.accountId)
-        || (expected.saveDate !== undefined && publication.saveDate !== expected.saveDate)
-        || !Number.isSafeInteger(terminal.result.revision)
-        || terminal.result.revision < 0
-        || !Number.isSafeInteger(terminal.result.sourceBytes)
-        || terminal.result.sourceBytes < 0
-        || typeof terminal.result.sourceSha256 !== 'string'
-        || !/^[0-9a-f]{64}$/.test(terminal.result.sourceSha256)
-        || !Number.isSafeInteger(terminal.result.characterCount)
-        || terminal.result.characterCount < 0
-        || !Number.isSafeInteger(terminal.result.presetCount)
-        || terminal.result.presetCount < 0
-        || !areBoundedWarningCodes(startWarningCodes)
-        || !areBoundedWarningCodes(terminal.warningCodes ?? [])
-        || !areBoundedWarningCodes(terminal.result.warningCodes)
+        terminal.jobId !== expected.jobId ||
+        terminal.kind !== 'official-publication-upload' ||
+        (expected.revision !== undefined &&
+            terminal.result.revision !== expected.revision) ||
+        (expected.accountId !== undefined &&
+            publication.accountId !== expected.accountId) ||
+        (expected.saveDate !== undefined &&
+            publication.saveDate !== expected.saveDate) ||
+        !Number.isSafeInteger(terminal.result.revision) ||
+        terminal.result.revision < 0 ||
+        !Number.isSafeInteger(terminal.result.sourceBytes) ||
+        terminal.result.sourceBytes < 0 ||
+        typeof terminal.result.sourceSha256 !== 'string' ||
+        !/^[0-9a-f]{64}$/.test(terminal.result.sourceSha256) ||
+        !Number.isSafeInteger(terminal.result.characterCount) ||
+        terminal.result.characterCount < 0 ||
+        !Number.isSafeInteger(terminal.result.presetCount) ||
+        terminal.result.presetCount < 0 ||
+        !areBoundedWarningCodes(startWarningCodes) ||
+        !areBoundedWarningCodes(terminal.warningCodes ?? []) ||
+        !areBoundedWarningCodes(terminal.result.warningCodes)
     ) {
         throw new NativeFileJobError(
             'invalid-result',
@@ -1995,13 +2449,19 @@ function createOfficialPublicationReceipt(
         result,
         acknowledge: async () => {
             if (acknowledged) return
-            acknowledgement ??= invokeNative(dependencies, 'native_file_job_forget', {
-                jobId: terminal.jobId,
-            }).then(() => {
-                acknowledged = true
-            }).finally(() => {
-                acknowledgement = undefined
-            })
+            acknowledgement ??= invokeNative(
+                dependencies,
+                'native_file_job_forget',
+                {
+                    jobId: terminal.jobId,
+                },
+            )
+                .then(() => {
+                    acknowledged = true
+                })
+                .finally(() => {
+                    acknowledgement = undefined
+                })
             await acknowledgement
         },
     }
@@ -2029,22 +2489,27 @@ export async function runNativeOfficialPublicationAttempt(
 
     let started: { jobId: string; warningCodes?: string[] }
     try {
-        const value = await invokeNative(dependencies, 'native_file_job_start', {
-            request: {
-                kind: 'official-publication-upload',
-                ...request,
+        const value = await invokeNative(
+            dependencies,
+            'native_file_job_start',
+            {
+                request: {
+                    kind: 'official-publication-upload',
+                    ...request,
+                },
             },
-        })
+        )
         if (
-            !value
-            || typeof value !== 'object'
-            || !('jobId' in value)
-            || typeof value.jobId !== 'string'
-            || value.jobId.length === 0
-            || ('warningCodes' in value && (
-                !Array.isArray(value.warningCodes)
-                || value.warningCodes.some((code) => typeof code !== 'string')
-            ))
+            !value ||
+            typeof value !== 'object' ||
+            !('jobId' in value) ||
+            typeof value.jobId !== 'string' ||
+            value.jobId.length === 0 ||
+            ('warningCodes' in value &&
+                (!Array.isArray(value.warningCodes) ||
+                    value.warningCodes.some(
+                        (code) => typeof code !== 'string',
+                    )))
         ) {
             throw new NativeFileJobError(
                 'invalid-result',
@@ -2052,22 +2517,30 @@ export async function runNativeOfficialPublicationAttempt(
             )
         }
         started = value as unknown as typeof started
-    }
-    catch (error) {
-        if (error instanceof NativeFileJobError && error.code === 'capability-unavailable') {
+    } catch (error) {
+        if (
+            error instanceof NativeFileJobError &&
+            error.code === 'capability-unavailable'
+        ) {
             return null
         }
         throw error
     }
-    return await pollNativeOfficialPublication(started.jobId, {
-        jobId: started.jobId,
-        revision: request.expectedRevision,
-        accountId: request.accountId,
-        saveDate: request.saveDate,
-    }, options, dependencies, {
-        startWarningCodes: started.warningCodes,
-        terminalFailure: 'throw',
-    })
+    return await pollNativeOfficialPublication(
+        started.jobId,
+        {
+            jobId: started.jobId,
+            revision: request.expectedRevision,
+            accountId: request.accountId,
+            saveDate: request.saveDate,
+        },
+        options,
+        dependencies,
+        {
+            startWarningCodes: started.warningCodes,
+            terminalFailure: 'throw',
+        },
+    )
 }
 
 export async function continueNativeOfficialPublication(
@@ -2088,21 +2561,31 @@ export async function continueNativeOfficialPublication(
         throw cancelledNativeOfficialPublicationAbortError()
     }
 
-    await invokeNative(dependencies, 'native_file_job_official_publication_retry', {
-        request: {
-            jobId,
-            accountId: request.accountId,
-            session: request.session,
-            saveDate: request.saveDate,
-            credential: request.credential,
+    await invokeNative(
+        dependencies,
+        'native_file_job_official_publication_retry',
+        {
+            request: {
+                jobId,
+                accountId: request.accountId,
+                session: request.session,
+                saveDate: request.saveDate,
+                credential: request.credential,
+            },
         },
-    })
-    const outcome = await pollNativeOfficialPublication(jobId, {
+    )
+    const outcome = await pollNativeOfficialPublication(
         jobId,
-        revision: expected.revision,
-        accountId: expected.accountId,
-        saveDate: request.saveDate,
-    }, options, dependencies, { terminalFailure: 'throw' })
+        {
+            jobId,
+            revision: expected.revision,
+            accountId: expected.accountId,
+            saveDate: request.saveDate,
+        },
+        options,
+        dependencies,
+        { terminalFailure: 'throw' },
+    )
     if (!outcome) {
         throw new NativeFileJobError(
             'publication-failed',
@@ -2125,8 +2608,7 @@ async function requestNativeOfficialPublicationCancellation(
 ): Promise<void> {
     try {
         await invokeNative(dependencies, 'native_file_job_cancel', { jobId })
-    }
-    catch {}
+    } catch {}
 }
 
 async function pollNativeOfficialPublication(
@@ -2150,37 +2632,55 @@ async function pollNativeOfficialPublication(
     while (true) {
         if (options.signal?.aborted && !cancellationRequested) {
             cancellationRequested = true
-            await requestNativeOfficialPublicationCancellation(jobId, dependencies)
+            await requestNativeOfficialPublicationCancellation(
+                jobId,
+                dependencies,
+            )
         }
-        const status = await invokeNative(dependencies, 'native_file_job_status', {
-            jobId,
-        }) as NativeFileJobStatus
+        const status = (await invokeNative(
+            dependencies,
+            'native_file_job_status',
+            {
+                jobId,
+            },
+        )) as NativeFileJobStatus
         options.onStatus?.(status)
-        if (status.jobId !== jobId || status.kind !== 'official-publication-upload') {
+        if (
+            status.jobId !== jobId ||
+            status.kind !== 'official-publication-upload'
+        ) {
             throw new NativeFileJobError(
                 'invalid-result',
                 'Native official publication returned a mismatched job',
             )
         }
         if (
-            status.state === 'waitingForInput'
-            && status.phase === 'awaiting-publication-retry'
+            status.state === 'waitingForInput' &&
+            status.phase === 'awaiting-publication-retry'
         ) {
             if (behavior.cancelWhenWaiting && !cancellationRequested) {
                 cancellationRequested = true
-                await requestNativeOfficialPublicationCancellation(jobId, dependencies)
+                await requestNativeOfficialPublicationCancellation(
+                    jobId,
+                    dependencies,
+                )
             }
             if (!cancellationRequested) {
-                const publication = assertOfficialPublicationResult(status.publicationAttempt)
+                const publication = assertOfficialPublicationResult(
+                    status.publicationAttempt,
+                )
                 if (
-                    publication.kind !== 'reauthentication-needed'
-                    || publication.status !== 403
-                    || (expected.accountId !== undefined
-                        && publication.accountId !== expected.accountId)
-                    || (expected.saveDate !== undefined
-                        && publication.saveDate !== expected.saveDate)
+                    publication.kind !== 'reauthentication-needed' ||
+                    publication.status !== 403 ||
+                    (expected.accountId !== undefined &&
+                        publication.accountId !== expected.accountId) ||
+                    (expected.saveDate !== undefined &&
+                        publication.saveDate !== expected.saveDate)
                 ) {
-                    await requestNativeOfficialPublicationCancellation(jobId, dependencies)
+                    await requestNativeOfficialPublicationCancellation(
+                        jobId,
+                        dependencies,
+                    )
                     throw new NativeFileJobError(
                         'invalid-result',
                         'Native official publication returned mismatched retry metadata',
@@ -2206,20 +2706,25 @@ async function pollNativeOfficialPublication(
             }
         }
         if (status.state === 'failed' || status.state === 'cancelled') {
-            const error = status.state === 'cancelled'
-                ? abortError()
-                : new NativeFileJobError(
-                    status.error?.code ?? 'publication-failed',
-                    status.error?.message ?? 'Native official publication failed',
-                )
+            const error =
+                status.state === 'cancelled'
+                    ? abortError()
+                    : new NativeFileJobError(
+                          status.error?.code ?? 'publication-failed',
+                          status.error?.message ??
+                              'Native official publication failed',
+                      )
             let forgotten = false
             try {
-                await invokeNative(dependencies, 'native_file_job_forget', { jobId })
+                await invokeNative(dependencies, 'native_file_job_forget', {
+                    jobId,
+                })
                 forgotten = true
-            }
-            catch {}
+            } catch {}
             if (behavior.terminalFailure === 'return-null') return null
-            throw forgotten ? drainedNativeOfficialPublicationError(error) : error
+            throw forgotten
+                ? drainedNativeOfficialPublicationError(error)
+                : error
         }
         await dependencies.wait(options.pollIntervalMs ?? 100)
     }

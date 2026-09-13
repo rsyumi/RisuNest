@@ -4,7 +4,9 @@ mod commit;
 pub(crate) mod export;
 #[cfg(feature = "native-kei-upload-pilot")]
 pub(crate) mod kei;
-mod owner_projection;
+pub(crate) mod owner_projection;
+pub(crate) mod portable;
+pub(crate) mod portable_validation;
 mod preservation;
 mod query;
 mod record_apply;

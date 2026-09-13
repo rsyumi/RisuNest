@@ -29,7 +29,37 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
 
+mod compatible_assets;
+mod compatible_export;
+mod compatible_projection;
 mod pocket_risu;
+pub(crate) use compatible_export::export_compatible_local_backup;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum CompatibilityTarget {
+    #[serde(rename = "risuai")]
+    RisuAi,
+    #[serde(rename = "pocketrisu")]
+    PocketRisu,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CompatibilityReportItem {
+    pub(crate) code: String,
+    pub(crate) items: String,
+    pub(crate) bytes: String,
+    pub(crate) affected_conversations: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CompatibilityReport {
+    pub(crate) target: CompatibilityTarget,
+    pub(crate) preserved: Vec<CompatibilityReportItem>,
+    pub(crate) converted: Vec<CompatibilityReportItem>,
+    pub(crate) excluded: Vec<CompatibilityReportItem>,
+}
 #[cfg(test)]
 mod pocket_risu_tests;
 

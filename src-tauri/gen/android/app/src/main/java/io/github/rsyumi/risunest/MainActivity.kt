@@ -859,13 +859,13 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
             requestId,
             SafSpoolBatch(
               emptyList(),
-              listOf(SafSpoolFailure("backup.risulossless", "source-busy")),
+              listOf(SafSpoolFailure("backup.risunest", "source-busy")),
             ),
           )
         },
         startPicker = {
           pendingLosslessSource = PendingLosslessSource(requestId, cancellation)
-          losslessSourcePicker.launch(arrayOf("application/octet-stream"))
+          losslessSourcePicker.launch(arrayOf("*/*"))
         },
       )
     }
@@ -1113,7 +1113,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
           val (displayName, totalBytes) = resolveSourceMetadata(uri)
           contentResolverSource(uri, displayName, totalBytes)
         }
-        if (!source.displayName.endsWith(".risulossless", ignoreCase = true)) {
+        if (!isBackupSource(source.displayName)) {
           SafSpoolBatch(
             emptyList(),
             listOf(SafSpoolFailure(source.displayName, "unsupported-source")),
@@ -1139,7 +1139,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       } catch (error: Exception) {
         SafSpoolBatch(
           emptyList(),
-          listOf(SafSpoolFailure("backup.risulossless", "source-copy-failed")),
+          listOf(SafSpoolFailure("backup.risunest", "source-copy-failed")),
         )
       }
       if (!copyContext.isActive) return@launch

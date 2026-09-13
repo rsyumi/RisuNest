@@ -91,7 +91,7 @@ export async function consumeAndroidSpoolBatch(
     for (const failure of batch.failures) consumer.failed?.(failure)
     for (const source of batch.ready) {
         const lowerName = source.displayName.toLocaleLowerCase('en-US')
-        if (!lowerName.endsWith('.risudat') && !lowerName.endsWith('.risulossless')) {
+        if (!['.risunest', '.risudat', '.bin'].some((extension) => lowerName.endsWith(extension))) {
             consumer.unsupported(source)
             continue
         }
@@ -375,6 +375,24 @@ export function pickAndroidLosslessBackupSource(
         acceptExtension: '.risulossless',
         cancelMessage: 'Android lossless backup selection was cancelled',
     }, options, dependencies)
+}
+
+/** The native picker name is retained as an Android bridge command, not a file-format fallback. */
+export function pickAndroidBackupSource(
+    options: AndroidSafSourcePickerOptions = {},
+    dependencies: AndroidSafSourcePickerDependencies = productionDependencies,
+): Promise<NativeFileJobSource | null> {
+    return pickAndroidSpoolSource(
+        {
+            eventName: LOSSLESS_SOURCE_EVENT,
+            pickMethod: 'pickLosslessSource',
+            pickerUnavailableMessage: 'Android backup picker is unavailable',
+            acceptExtension: ['.risunest', '.risudat', '.bin'],
+            cancelMessage: 'Android backup selection was cancelled',
+        },
+        options,
+        dependencies,
+    )
 }
 
 export function pickAndroidLegacyBackupSource(

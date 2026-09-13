@@ -44,6 +44,24 @@ function fixture() {
 }
 afterEach(() => vi.useRealTimers());
 describe("server sync controller", () => {
+  it("holds a restored library across initialization until an explicit sync action", async () => {
+    const { facade } = fixture();
+    const resumed = vi.fn();
+    const controller = createServerSyncController(
+      facade as unknown as ServerSyncFacade,
+      { initiallyPaused: true, onExplicitResume: resumed },
+    );
+    await controller.initialize();
+    expect(controller.snapshot().paused).toBe(true);
+    expect(controller.canAutoSync()).toBe(false);
+    expect(facade.cycle).not.toHaveBeenCalled();
+    expect(resumed).not.toHaveBeenCalled();
+    await controller.synchronize();
+    expect(resumed).toHaveBeenCalledOnce();
+    expect(controller.canAutoSync()).toBe(true);
+    controller.holdAutomaticSync();
+    expect(controller.canAutoSync()).toBe(false);
+  });
   it.each(["idle", "conflict"])(
     "keeps the %s result when progress publishes while the cycle awaits",
     async (phase) => {

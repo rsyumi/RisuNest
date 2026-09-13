@@ -1,0 +1,8 @@
+{
+  "build": {
+    "beforeBuildCommand": "node node_modules/vite/bin/vite.js build --mode agent --config benchmarks/device-backup/vite.config.ts --outDir .tmp/device-webview-android/frontend",
+    "frontendDist": "../.tmp/device-webview-android/frontend"
+  },
+  "bundle": { "active": false },
+  "app": { "windows": [{ "title": "RisuNest synthetic device backup smoke" }] }
+}

@@ -179,6 +179,7 @@ describe('native file job bootstrap reconciliation', () => {
     it.each([
         ['export-block-risu-save', 'export-1'],
         ['export-legacy-local-backup', 'legacy-export-1'],
+        ['export-compatible-local-backup', 'compatible-export-1'],
         ['export-character-charx', 'charx-export-1'],
         ['kei-backup-upload', 'kei-1'],
     ] as const)('returns without waiting for an active %s job and cleans it up in the background', async (kind, jobId) => {
@@ -286,35 +287,42 @@ describe('native file job bootstrap reconciliation', () => {
         expect(calls).toEqual(['native_file_job_list'])
     })
 
-    it('preserves a legacy backup handoff still owned by persisted Android SAF state', async () => {
-        const calls: string[] = []
-        const exportId = '123e4567-e89b-42d3-a456-426614174004'
-        const handoffPath = `C:\\app\\native-file-jobs\\handoffs\\risu-backup-${exportId}.bin`
-        const androidSafExportId = vi.fn(() => exportId)
-        const dependencies = {
-            invoke: vi.fn(async (command: string) => {
-                calls.push(command)
-                if (command === 'native_file_job_list') return [{
-                    ...restoreStatus('legacy-export', 'succeeded', 'complete'),
-                    kind: 'export-legacy-local-backup' as const,
-                    result: {
-                        ...restoreStatus('legacy-export', 'succeeded', 'complete').result!,
-                        handoffPath,
-                    },
-                }]
-                if (command === 'native_file_job_forget') return true
-                throw new Error(`Unexpected command: ${command}`)
-            }),
-            wait: vi.fn(async () => undefined),
-            androidSafExportId,
-        }
+    it.each(['export-legacy-local-backup', 'export-compatible-local-backup'] as const)(
+        'preserves a %s handoff still owned by persisted Android SAF state',
+        async (kind) => {
+            const calls: string[] = []
+            const exportId = '123e4567-e89b-42d3-a456-426614174004'
+            const handoffPath = `C:\\app\\native-file-jobs\\handoffs\\risu-backup-${exportId}.bin`
+            const androidSafExportId = vi.fn(() => exportId)
+            const dependencies = {
+                invoke: vi.fn(async (command: string) => {
+                    calls.push(command)
+                    if (command === 'native_file_job_list')
+                        return [
+                            {
+                                ...restoreStatus('legacy-export', 'succeeded', 'complete'),
+                                kind,
+                                result: {
+                                    ...restoreStatus('legacy-export', 'succeeded', 'complete')
+                                        .result!,
+                                    handoffPath,
+                                },
+                            },
+                        ]
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                }),
+                wait: vi.fn(async () => undefined),
+                androidSafExportId,
+            }
 
-        await expect(reconcileNativeRestoresBeforeBootstrap(dependencies)).resolves.toEqual([])
-        await vi.waitFor(() => {
-            expect(androidSafExportId).toHaveBeenCalledOnce()
-        })
-        expect(calls).toEqual(['native_file_job_list'])
-    })
+            await expect(reconcileNativeRestoresBeforeBootstrap(dependencies)).resolves.toEqual([])
+            await vi.waitFor(() => {
+                expect(androidSafExportId).toHaveBeenCalledOnce()
+            })
+            expect(calls).toEqual(['native_file_job_list'])
+        },
+    )
 
     it('cleans an abandoned Android legacy backup handoff before forgetting its terminal job', async () => {
         let resumePolling!: () => void
@@ -616,6 +624,12 @@ describe('native file job bootstrap reconciliation', () => {
         [
             'export-legacy-local-backup',
             'legacy-export',
+            'risu-backup-123e4567-e89b-42d3-a456-426614174004.bin',
+            'native_legacy_backup_handoff_cleanup',
+        ],
+        [
+            'export-compatible-local-backup',
+            'compatible-export',
             'risu-backup-123e4567-e89b-42d3-a456-426614174004.bin',
             'native_legacy_backup_handoff_cleanup',
         ],

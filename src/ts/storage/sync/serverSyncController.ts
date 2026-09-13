@@ -25,8 +25,18 @@ export interface ServerSyncSnapshot {
   refreshPending?: boolean;
   replacing?: boolean;
 }
-export function createServerSyncController(facade: ServerSyncFacade) {
-  let state: ServerSyncSnapshot = { running: false, paused: false, error: "" };
+export function createServerSyncController(
+  facade: ServerSyncFacade,
+  controllerOptions: {
+    initiallyPaused?: boolean;
+    onExplicitResume?(): void;
+  } = {},
+) {
+  let state: ServerSyncSnapshot = {
+    running: false,
+    paused: controllerOptions.initiallyPaused ?? false,
+    error: "",
+  };
   let active: Promise<void> | undefined;
   let attemptSequence = 0;
   let statusFresh = false;
@@ -145,6 +155,10 @@ export function createServerSyncController(facade: ServerSyncFacade) {
     state.attemptIdentity = undefined;
   };
   return {
+    holdAutomaticSync(): void {
+      state.paused = true;
+      publish();
+    },
     invalidateCompletion(): void {
       // A local commit invalidates completion, not the current conflict preview or attempt identity.
       state.initialSyncComplete = false;
@@ -238,6 +252,7 @@ export function createServerSyncController(facade: ServerSyncFacade) {
       state.status = status;
       state.lastSuccessAt = undefined;
       state.error = "";
+      controllerOptions.onExplicitResume?.();
       state.paused = false;
       publish();
     },
@@ -256,6 +271,7 @@ export function createServerSyncController(facade: ServerSyncFacade) {
       state.status = status;
       state.result = undefined;
       state.error = "";
+      controllerOptions.onExplicitResume?.();
       state.paused = false;
       publish();
     },
@@ -266,6 +282,7 @@ export function createServerSyncController(facade: ServerSyncFacade) {
       state.status = status;
       state.result = undefined;
       state.error = "";
+      controllerOptions.onExplicitResume?.();
       state.paused = false;
       publish();
     },
@@ -273,6 +290,7 @@ export function createServerSyncController(facade: ServerSyncFacade) {
       if (active) return active;
       if (state.replacing || isLibraryFileOperationReserved())
         return Promise.reject(new ServerSyncError("library-operation-busy"));
+      controllerOptions.onExplicitResume?.();
       state.paused = false;
       let complete!: () => void;
       let fail!: (cause: unknown) => void;

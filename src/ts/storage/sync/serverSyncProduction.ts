@@ -5,10 +5,7 @@ import {
   capturePersistentMutationToken,
   acquireDestructiveReplacementFence,
 } from "../persistentDataRuntime.svelte";
-import {
-  createServerSyncFacade,
-  type ServerHead,
-} from "./serverSync";
+import { createServerSyncFacade, type ServerHead } from "./serverSync";
 import { createServerSyncController } from "./serverSyncController";
 import { createServerSyncScheduler } from "./serverSyncScheduler";
 import { subscribeLocalPersistentRevision } from "../persistentRevisionEvents";
@@ -30,13 +27,26 @@ export function getServerSyncController() {
         ).loadPluginsAfterAuthoritativeRestore();
       },
     }),
+    {
+      initiallyPaused:
+        localStorage.getItem("risuNestServerSyncRestoreHold") === "true",
+      onExplicitResume: () =>
+        localStorage.removeItem("risuNestServerSyncRestoreHold"),
+    },
   ));
+}
+/** A restored library waits for an explicit sync action, including across maintenance reloads. */
+export function holdServerSyncAfterRestore(): void {
+  localStorage.setItem("risuNestServerSyncRestoreHold", "true");
+  getServerSyncController().holdAutomaticSync();
 }
 let started = false;
 let activeScheduler: ReturnType<typeof createServerSyncScheduler> | undefined;
 /** A read-only file backup may outlive the scheduled timer. Resume the existing
  * scheduler when it settles; restoring a library deliberately does not do this. */
-export function resumeServerSyncAfterBackup(): void { activeScheduler?.resume(); }
+export function resumeServerSyncAfterBackup(): void {
+  activeScheduler?.resume();
+}
 export interface ServerSyncBackup {
   id: string;
   createdAt: number;
@@ -87,10 +97,11 @@ export async function restoreServerSyncBackup(
   id: string,
   side: "local" | "remote",
 ): Promise<void> {
-  const { restoreLocalBackupFromNativeSource } = await import("../losslessBackupFileRouteProduction.svelte");
+  const { restoreBackupFromNativeSource } =
+    await import("../portableBackupFileRouteProduction.svelte");
   let lease: string | undefined;
   try {
-    await restoreLocalBackupFromNativeSource(async () => {
+    await restoreBackupFromNativeSource(async () => {
       const source = await invoke<{ path: string; lease: string }>(
         "server_sync_backup_source",
         { id, side },
@@ -110,7 +121,10 @@ export function startServerSync(): void {
     available: () => document.visibilityState !== "hidden" && navigator.onLine,
   });
   activeScheduler = scheduler;
-  subscribeLocalPersistentRevision(() => { controller.invalidateCompletion(); scheduler.localCommit(); });
+  subscribeLocalPersistentRevision(() => {
+    controller.invalidateCompletion();
+    scheduler.localCommit();
+  });
   void controller.initialize().then(() => scheduler.resume());
   window.addEventListener("online", () => scheduler.resume());
   window.addEventListener("offline", () => scheduler.suspend());

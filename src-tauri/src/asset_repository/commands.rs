@@ -82,6 +82,10 @@ pub(crate) async fn asset_cas_job_begin(
     kind: CasJobKind,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _operation = app
+            .state::<PersistentStoreState>()
+            .admit_renderer_operation()
+            .map_err(|error| error.to_string())?;
         let root = repository_root(&app)?;
         let session_id = uuid::Uuid::new_v4().to_string();
         let job = DurableCasJob::begin(&root, &session_id, kind, now_ms()?)
@@ -105,6 +109,10 @@ pub(crate) async fn asset_cas_job_prepare(
     role: CasObjectRole,
 ) -> Result<PreparedPayload, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _operation = app
+            .state::<PersistentStoreState>()
+            .admit_renderer_operation()
+            .map_err(|error| error.to_string())?;
         with_recovered_job(&app, &session_id, |job, cas| {
             job.prepare_bytes(cas, &data, role)
         })
@@ -122,6 +130,10 @@ pub(crate) async fn asset_cas_job_pin_existing(
     role: CasObjectRole,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _operation = app
+            .state::<PersistentStoreState>()
+            .admit_renderer_operation()
+            .map_err(|error| error.to_string())?;
         with_recovered_job(&app, &session_id, |job, cas| {
             job.pin_existing(cas, &content_hash, byte_size, role)
         })
@@ -133,6 +145,10 @@ pub(crate) async fn asset_cas_job_pin_existing(
 #[tauri::command(async)]
 pub(crate) async fn asset_cas_job_seal(app: AppHandle, session_id: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _operation = app
+            .state::<PersistentStoreState>()
+            .admit_renderer_operation()
+            .map_err(|error| error.to_string())?;
         let root = repository_root(&app)?;
         let state = app.state::<DurableCasJobState>();
         let mut jobs = state
@@ -160,6 +176,10 @@ pub(crate) async fn asset_cas_job_release(
     outcome: CasReleaseOutcome,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _operation = app
+            .state::<PersistentStoreState>()
+            .admit_renderer_operation()
+            .map_err(|error| error.to_string())?;
         let root = repository_root(&app)?;
         let state = app.state::<DurableCasJobState>();
         let mut jobs = state
@@ -188,6 +208,10 @@ pub(crate) async fn asset_cas_read_object(
 ) -> Result<Option<Vec<u8>>, String> {
     let root = repository_root(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
+        let _operation = app
+            .state::<PersistentStoreState>()
+            .admit_renderer_operation()
+            .map_err(|error| error.to_string())?;
         PayloadCas::new(&root)
             .and_then(|cas| cas.read_object(&content_hash))
             .map_err(|error| error.to_string())
@@ -205,6 +229,10 @@ pub(crate) async fn asset_cas_read_object_range(
 ) -> Result<Option<Vec<u8>>, String> {
     let root = repository_root(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
+        let _operation = app
+            .state::<PersistentStoreState>()
+            .admit_renderer_operation()
+            .map_err(|error| error.to_string())?;
         PayloadCas::new(&root)
             .and_then(|cas| cas.read_object_range(&content_hash, start, end_exclusive))
             .map_err(|error| error.to_string())
@@ -220,6 +248,10 @@ pub(crate) async fn asset_cas_stat_object(
 ) -> Result<Option<u64>, String> {
     let root = repository_root(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
+        let _operation = app
+            .state::<PersistentStoreState>()
+            .admit_renderer_operation()
+            .map_err(|error| error.to_string())?;
         PayloadCas::new(&root)
             .and_then(|cas| cas.stat_object(&content_hash))
             .map_err(|error| error.to_string())
@@ -369,6 +401,10 @@ pub(crate) async fn asset_cas_job_finalize_content(
         })
         .collect::<Vec<_>>();
     tauri::async_runtime::spawn_blocking(move || {
+        let _operation = app
+            .state::<PersistentStoreState>()
+            .admit_renderer_operation()
+            .map_err(|error| error.to_string())?;
         let root = repository_root(&app)?;
         let cas = PayloadCas::new(&root).map_err(|error| error.to_string())?;
         let state = app.state::<DurableCasJobState>();
@@ -467,6 +503,10 @@ pub(crate) async fn asset_cas_job_seal_prepared_content(
 ) -> Result<(), String> {
     let native_jobs = NativeFileJobState::clone(&native_jobs);
     tauri::async_runtime::spawn_blocking(move || {
+        let _operation = app
+            .state::<PersistentStoreState>()
+            .admit_renderer_operation()
+            .map_err(|error| error.to_string())?;
         let root = repository_root(&app)?;
         let state = app.state::<DurableCasJobState>();
         let mut jobs = state

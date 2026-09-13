@@ -28,20 +28,23 @@ const productionDependencies: NativeFileJobRecoveryDependencies = {
 // SafFileBridge regexes and the Rust handoff cleanup naming; the alignment is
 // pinned by the shared taxonomy golden fixture
 // (tests/fixtures/nativeFileTaxonomyV1Golden.json).
-export const ANDROID_SAF_HANDOFF_ID_PATTERNS: Partial<
-    Record<NativeFileJobStatus['kind'], RegExp>
-> = {
-    'export-lossless-backup':
-        /(?:^|[\\/])risulossless-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.risulossless$/,
-    'export-legacy-local-backup':
-        /(?:^|[\\/])risu-backup-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.bin$/,
-    'export-character-charx':
-        /(?:^|[\\/])risu-charx-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.(?:charx|jpeg)$/,
-    'export-character-card':
-        /(?:^|[\\/])risu-character-card-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.(?:json|png)$/,
-    'export-risu-module':
-        /(?:^|[\\/])risu-module-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.risum$/,
-}
+export const ANDROID_SAF_HANDOFF_ID_PATTERNS: Partial<Record<NativeFileJobStatus['kind'], RegExp>> =
+    {
+        'export-portable-backup':
+            /(?:^|[\\/])risunest-backup-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.risunest$/,
+        'export-lossless-backup':
+            /(?:^|[\\/])risulossless-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.risulossless$/,
+        'export-legacy-local-backup':
+            /(?:^|[\\/])risu-backup-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.bin$/,
+        'export-compatible-local-backup':
+            /(?:^|[\\/])risu-backup-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.bin$/,
+        'export-character-charx':
+            /(?:^|[\\/])risu-charx-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.(?:charx|jpeg)$/,
+        'export-character-card':
+            /(?:^|[\\/])risu-character-card-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.(?:json|png)$/,
+        'export-risu-module':
+            /(?:^|[\\/])risu-module-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.risum$/,
+    }
 
 function androidSafHandoffId(status: NativeFileJobStatus): string | null {
     const path = status.result?.handoffPath
@@ -64,6 +67,10 @@ async function reconcileRestore(
     let status = initial
     let finalized = false
     while (!isTerminal(status)) {
+        if(status.kind==='restore-portable-backup'&&status.phase==='awaiting-backup-selection') {
+            await dependencies.invoke('native_file_job_cancel',{jobId:status.jobId})
+        }
+        else
         if (
             status.state === 'waitingForInput'
             && status.phase === 'awaiting-activation'
@@ -106,29 +113,29 @@ async function reconcileExportInBackground(
                 path: status.result.handoffPath,
             })
             retainNativeJob = false
-        }
-        else if (status.kind === 'export-legacy-local-backup' && status.result?.handoffPath) {
+        } else if (
+            (status.kind === 'export-legacy-local-backup' ||
+                status.kind === 'export-compatible-local-backup') &&
+            status.result?.handoffPath
+        ) {
             retainNativeJob = true
             await dependencies.invoke('native_legacy_backup_handoff_cleanup', {
                 path: status.result.handoffPath,
             })
             retainNativeJob = false
-        }
-        else if (status.kind === 'export-character-charx' && status.result?.handoffPath) {
+        } else if (status.kind === 'export-character-charx' && status.result?.handoffPath) {
             retainNativeJob = true
             await dependencies.invoke('native_character_charx_handoff_cleanup', {
                 path: status.result.handoffPath,
             })
             retainNativeJob = false
-        }
-        else if (status.kind === 'export-character-card' && status.result?.handoffPath) {
+        } else if (status.kind === 'export-character-card' && status.result?.handoffPath) {
             retainNativeJob = true
             await dependencies.invoke('native_character_card_handoff_cleanup', {
                 path: status.result.handoffPath,
             })
             retainNativeJob = false
-        }
-        else if (status.kind === 'export-risu-module' && status.result?.handoffPath) {
+        } else if (status.kind === 'export-risu-module' && status.result?.handoffPath) {
             retainNativeJob = true
             await dependencies.invoke('native_risu_module_handoff_cleanup', {
                 path: status.result.handoffPath,
@@ -177,6 +184,7 @@ export async function reconcileNativeFileJobsBeforeBootstrap(
             case 'restore-block-risu-save':
             case 'restore-lossless-backup':
             case 'restore-official-account-snapshot':
+            case 'restore-portable-backup':
             case 'restore-legacy-local-backup': {
                 if (options.reconcileRestores === false) break
                 const terminal = isTerminal(job) ? job : await reconcileRestore(job, dependencies)
@@ -190,9 +198,14 @@ export async function reconcileNativeFileJobsBeforeBootstrap(
                 }
                 break
             }
+            case 'export-portable-backup':
+                // The app-owned export intent resumes publication after the
+                // maintenance navigation. Never discard its SAF handoff here.
+                break
             case 'export-block-risu-save':
             case 'export-lossless-backup':
             case 'export-legacy-local-backup':
+            case 'export-compatible-local-backup':
             case 'export-character-charx':
             case 'export-character-card':
             case 'export-risu-module':

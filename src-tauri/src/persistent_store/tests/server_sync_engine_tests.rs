@@ -255,8 +255,33 @@ fn two_native_replicas_seed_publish_pull_and_preserve_same_key_conflicts() {
         .collect::<std::io::Result<Vec<_>>>()
         .unwrap();
     assert_eq!(backups.len(), 1);
-    for name in ["local.risulossless", "remote.risulossless", "complete.json"] {
+    for name in ["local.risunest", "remote.risunest", "complete.json"] {
         assert!(backups[0].path().join(name).is_file());
+    }
+    for name in ["local.risunest", "remote.risunest"] {
+        let archive = crate::portable_backup::VerifiedArchive::open(
+            std::fs::File::open(backups[0].path().join(name)).unwrap(),
+            &backups[0].path(),
+            &crate::local_backup::NeverCancelled,
+        )
+        .unwrap();
+        assert!(archive.manifest.library_included);
+        assert!(!archive.manifest.device_included);
+        assert!(!archive.manifest.repair_required);
+        archive
+            .validate_library(&crate::local_backup::NeverCancelled)
+            .unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let mut restored = PersistentStore::open(scratch.path()).unwrap();
+        let stage = restored
+            .stage_portable_records(&archive.db, &crate::local_backup::NeverCancelled)
+            .unwrap();
+        let prepared = restored
+            .prepare_replace_commit(&stage.staging_id, Some(0))
+            .unwrap();
+        let snapshot = prepared.create_snapshot().unwrap();
+        restored.finish_prepared_replace(snapshot).unwrap();
+        assert_eq!(restored.revision().unwrap(), 1);
     }
     let listed = crate::server_sync::backups::list(&second.repository_root).unwrap();
     assert_eq!(listed.len(), 1);

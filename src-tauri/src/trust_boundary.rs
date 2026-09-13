@@ -8,6 +8,32 @@ use std::fs::Metadata;
 use std::io;
 use std::path::Path;
 
+/// Open a regular source without following a final symlink/reparse point. Callers that spool
+/// mutable data compare handle identity and modification metadata before and after the copy.
+pub(crate) fn open_regular_source(path: &Path) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || is_link_like(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "source is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 /// A byte of the canonical lowercase hexadecimal alphabet.
 pub(crate) fn is_lower_hex_byte(byte: u8) -> bool {
     byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)

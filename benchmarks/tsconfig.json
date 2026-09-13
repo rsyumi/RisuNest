@@ -5,6 +5,7 @@
     "./tokenizer/*.ts",
     "./streaming/**/*.ts",
     "./streaming/**/*.svelte",
+    "./device-backup/**/*.ts",
     "../src/**/*.d.ts"
   ],
   "exclude": ["**/dist/**"]

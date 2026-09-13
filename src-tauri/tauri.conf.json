@@ -14,9 +14,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": [
-      "src-python/*"
-    ],
+    "resources": ["src-python/*"],
     "targets": ["deb", "rpm", "appimage", "nsis", "app", "dmg"],
     "createUpdaterArtifacts": false,
     "windows": {
@@ -26,9 +24,7 @@
     },
     "fileAssociations": [
       {
-        "ext": [
-          "risum", "risup", "charx"
-        ],
+        "ext": ["risum", "risup", "charx", "risunest", "risudat", "bin"],
         "mimeType": "application/octet-stream"
       }
     ]

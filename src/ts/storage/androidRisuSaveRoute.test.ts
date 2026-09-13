@@ -89,28 +89,33 @@ describe('Android RisuSave spool route', () => {
         expect(deps.discard).toHaveBeenCalledWith(source)
     })
 
-    it('passes a lossless backup spool to the native restore selector', async () => {
-        const deps = dependencies()
-        const route = createAndroidRisuSaveSpoolRoute(deps)
+    it.each(['complete.RISUNEST', 'compatible.BIN'])(
+        'passes %s to the native restore selector',
+        async (displayName) => {
+            const deps = dependencies()
+            const route = createAndroidRisuSaveSpoolRoute(deps)
 
-        await route.enqueue({
-            requestId: 'request-lossless',
-            ready: [{
-                token: '44444444-4444-4444-8444-444444444444',
-                displayName: 'complete.RISULOSSLESS',
-                bytes: 4096,
-            }],
-            failures: [],
-        })
+            await route.enqueue({
+                requestId: 'request-lossless',
+                ready: [
+                    {
+                        token: '44444444-4444-4444-8444-444444444444',
+                        displayName,
+                        bytes: 4096,
+                    },
+                ],
+                failures: [],
+            })
 
-        expect(deps.restore).toHaveBeenCalledExactlyOnceWith({
-            source: {
-                type: 'androidSpool',
-                token: '44444444-4444-4444-8444-444444444444',
-            },
-            displayName: 'complete.RISULOSSLESS',
-        })
-    })
+            expect(deps.restore).toHaveBeenCalledExactlyOnceWith({
+                source: {
+                    type: 'androidSpool',
+                    token: '44444444-4444-4444-8444-444444444444',
+                },
+                displayName,
+            })
+        },
+    )
 
     it('reports unsupported sources, spool failures, and restore errors without stopping the queue', async () => {
         const deps = dependencies()

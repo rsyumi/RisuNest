@@ -13,7 +13,6 @@ const pageSource = normalizeNewlines(pageRawSource)
 const backupRestoreSource = normalizeNewlines(backupRestoreRawSource)
 const tauriLibSource = normalizeNewlines(tauriLibRawSource)
 
-
 describe('RisuNest settings navigation', () => {
     it('places RisuNest before plugin-added entries', () => {
         expect(settingsSource).toContain('Wrench')
@@ -45,17 +44,35 @@ describe('RisuNest settings navigation', () => {
             'RisuNestAndroidPlatform',
             'RisuNestLogViewer',
         ]
-        const positions = groups.map((group) => pageSource.lastIndexOf(`<${group}`))
+        const positions = groups.map((group) =>
+            pageSource.lastIndexOf(`<${group}`),
+        )
 
         expect(positions.every((position) => position >= 0)).toBe(true)
-        expect(positions).toEqual([...positions].sort((left, right) => left - right))
-        expect(pageSource).toContain('{#if isTauri}\n        <RisuNestStorageDashboard />')
-        expect(pageSource).toContain('{#if isTauriAndroid}\n        <RisuNestAndroidPlatform />')
-        expect(pageSource).toContain('{#if isTauri}\n        <RisuNestLogViewer />')
+        expect(positions).toEqual(
+            [...positions].sort((left, right) => left - right),
+        )
+        expect(pageSource).toContain(
+            '{#if isTauri}\n        <RisuNestStorageDashboard />',
+        )
+        expect(pageSource).toContain(
+            '{#if isTauriAndroid}\n        <RisuNestAndroidPlatform />',
+        )
+        expect(pageSource).toContain(
+            '{#if isTauri}\n        <RisuNestLogViewer />',
+        )
     })
 
     it('offers a section shortcut for every group on the page', () => {
-        for (const id of ['risunest-perf', 'risunest-streaming', 'risunest-inlay', 'risunest-storage', 'risunest-backup', 'risunest-platform', 'risunest-diag']) {
+        for (const id of [
+            'risunest-perf',
+            'risunest-streaming',
+            'risunest-inlay',
+            'risunest-storage',
+            'risunest-backup',
+            'risunest-platform',
+            'risunest-diag',
+        ]) {
             expect(pageSource).toContain(`'${id}'`)
         }
         expect(pageSource).toContain('scrollIntoView')
@@ -65,19 +82,49 @@ describe('RisuNest settings navigation', () => {
 describe('RisuNest backup and restore layout', () => {
     it('groups actions into file, restore, and official account rows', () => {
         for (const group of ['groupFiles', 'groupRestore', 'groupAccount']) {
-            expect(backupRestoreSource).toContain(`{language.risuNest.backup.${group}}`)
-            expect(languageEnglish.risuNest.backup[group as keyof typeof languageEnglish.risuNest.backup]).toEqual(expect.any(String))
-            expect(languageKorean.risuNest.backup[group as keyof typeof languageKorean.risuNest.backup]).toEqual(expect.any(String))
+            expect(backupRestoreSource).toContain(
+                `{language.risuNest.backup.${group}}`,
+            )
+            expect(
+                languageEnglish.risuNest.backup[
+                    group as keyof typeof languageEnglish.risuNest.backup
+                ],
+            ).toEqual(expect.any(String))
+            expect(
+                languageKorean.risuNest.backup[
+                    group as keyof typeof languageKorean.risuNest.backup
+                ],
+            ).toEqual(expect.any(String))
         }
         expect(backupRestoreSource).toContain('data-backup-group')
         expect(backupRestoreSource).not.toContain('className="mt-2"')
-        expect(backupRestoreSource.indexOf('{language.risuNest.backup.groupFiles}')).toBeLessThan(backupRestoreSource.indexOf('{language.risuNest.backup.groupRestore}'))
-        expect(backupRestoreSource.indexOf('{language.risuNest.backup.groupRestore}')).toBeLessThan(backupRestoreSource.indexOf('{language.risuNest.backup.groupAccount}'))
+        expect(
+            backupRestoreSource.indexOf(
+                '{language.risuNest.backup.groupFiles}',
+            ),
+        ).toBeLessThan(
+            backupRestoreSource.indexOf(
+                '{language.risuNest.backup.groupRestore}',
+            ),
+        )
+        expect(
+            backupRestoreSource.indexOf(
+                '{language.risuNest.backup.groupRestore}',
+            ),
+        ).toBeLessThan(
+            backupRestoreSource.indexOf(
+                '{language.risuNest.backup.groupAccount}',
+            ),
+        )
     })
 
     it('keeps local snapshot restore above PocketRisu restore', () => {
-        const localSnapshotRestore = backupRestoreSource.indexOf('{language.restoreLocalSnapshot}</Button>')
-        const pocketRisuRestore = backupRestoreSource.indexOf('{language.loadPocketRisuBackup}</Button>')
+        const localSnapshotRestore = backupRestoreSource.search(
+            /\{language\.restoreLocalSnapshot\}<\/Button\s*>/,
+        )
+        const pocketRisuRestore = backupRestoreSource.search(
+            /\{language\.loadPocketRisuBackup\}<\/Button\s*>/,
+        )
 
         expect(localSnapshotRestore).toBeGreaterThanOrEqual(0)
         expect(pocketRisuRestore).toBeGreaterThanOrEqual(0)
@@ -86,8 +133,13 @@ describe('RisuNest backup and restore layout', () => {
 })
 
 describe('RisuNest native command integration', () => {
-    const handlerStart = tauriLibSource.indexOf('.invoke_handler(tauri::generate_handler![')
-    const handlerEnd = tauriLibSource.indexOf('])\n        .build(', handlerStart)
+    const handlerStart = tauriLibSource.indexOf(
+        '.invoke_handler(tauri::generate_handler![',
+    )
+    const handlerEnd = tauriLibSource.indexOf(
+        '])\n        .build(',
+        handlerStart,
+    )
     const handlerSource = tauriLibSource.slice(handlerStart, handlerEnd)
     const commands = [
         'pds_storage_stats',
@@ -100,7 +152,9 @@ describe('RisuNest native command integration', () => {
     ]
 
     it.each(commands)('registers %s exactly once', (command) => {
-        expect(handlerSource.match(new RegExp(`\\b${command}\\b`, 'g')) ?? []).toHaveLength(1)
+        expect(
+            handlerSource.match(new RegExp(`\\b${command}\\b`, 'g')) ?? [],
+        ).toHaveLength(1)
     })
 
     it('keeps server commands and Python cleanup without a peer runtime', () => {
@@ -120,18 +174,37 @@ describe('RisuNest native command integration', () => {
     })
 })
 describe('RisuNest startup failure language schema', () => {
-    const required = ['title', 'schemaUnsupported', 'storeOpen', 'unknown', 'restart', 'copyDetails', 'copied', 'dataPathWindows', 'dataPathAndroid', 'stage']
+    const required = [
+        'title',
+        'schemaUnsupported',
+        'storeOpen',
+        'unknown',
+        'restart',
+        'copyDetails',
+        'copied',
+        'dataPathWindows',
+        'dataPathAndroid',
+        'stage',
+    ]
 
-    it.each([languageEnglish, languageKorean])('contains every startup recovery string', (translation) => {
-        for (const key of required) {
-            expect(translation.risuNest.boot[key as keyof typeof translation.risuNest.boot])
-                .toEqual(expect.any(String))
-        }
-    })
+    it.each([languageEnglish, languageKorean])(
+        'contains every startup recovery string',
+        (translation) => {
+            for (const key of required) {
+                expect(
+                    translation.risuNest.boot[
+                        key as keyof typeof translation.risuNest.boot
+                    ],
+                ).toEqual(expect.any(String))
+            }
+        },
+    )
 
     it('names the Windows data folder the user has to clear', () => {
         for (const translation of [languageEnglish, languageKorean]) {
-            expect(translation.risuNest.boot.dataPathWindows).toContain('%APPDATA%\\RisuNest\\')
+            expect(translation.risuNest.boot.dataPathWindows).toContain(
+                '%APPDATA%\\RisuNest\\',
+            )
         }
     })
 })

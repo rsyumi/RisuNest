@@ -29,10 +29,13 @@ class MainActivityBehaviorTest {
   fun `native SAF routing spools only restore and recognized character candidates`() {
     assertEquals(true, shouldUseNativeFileJobSpool("backup.risudat"))
     assertEquals(true, shouldUseNativeFileJobSpool("BACKUP.RISUDAT"))
-    assertEquals(true, shouldUseNativeFileJobSpool("backup.risulossless"))
+    assertEquals(true, shouldUseNativeFileJobSpool("backup.risunest"))
+    assertEquals(true, shouldUseNativeFileJobSpool("backup.bin"))
+    assertEquals(true, shouldUseNativeFileJobSpool("BACKUP.BIN"))
     assertEquals(true, shouldUseNativeFileJobSpool("card.PnG"))
     assertEquals(true, shouldUseNativeFileJobSpool("module.RiSuM"))
-    assertEquals(true, shouldUseNativeFileJobSpool("BACKUP.RISULOSSLESS"))
+    assertEquals(true, shouldUseNativeFileJobSpool("BACKUP.RISUNEST"))
+    assertEquals(false, shouldUseNativeFileJobSpool("backup.risulossless"))
     assertEquals(true, shouldUseNativeFileJobSpool("character.charx"))
     assertEquals(true, shouldUseNativeFileJobSpool("character.json"))
     assertEquals(true, shouldUseNativeFileJobSpool("character.jpg"))
@@ -62,6 +65,29 @@ class MainActivityBehaviorTest {
     assertEquals(true, risum.endsWith(".RISUM"))
     assertEquals(true, shouldUseNativeFileJobSpool(risum))
     assertEquals(true, shouldUseNativeFileJobSpool(risuSave))
+    for (suffix in listOf(".risunest", ".RISUDAT", ".BiN")) {
+      val backup = safeSafDisplayName("b".repeat(181) + suffix)
+      assertEquals(180, backup.length)
+      assertEquals(true, backup.endsWith(suffix))
+      assertEquals(true, isBackupSource(backup))
+      assertEquals(true, shouldUseNativeFileJobSpool(backup))
+    }
+  }
+
+  @Test
+  fun `common backup picker accepts only current backup suffixes`() {
+    val accepted = listOf(
+      "backup.risunest", "BACKUP.RISUNEST", "backup.risudat", "BACKUP.RISUDAT", "backup.bin", "BACKUP.BIN",
+    )
+    for (name in accepted) {
+      assertEquals(name, true, isBackupSource(name))
+    }
+    val rejected = listOf(
+      "backup.risulossless", "backup.zip", "backup.risunest.txt", "backup.risudat.bin.exe", "backup", "character.charx",
+    )
+    for (name in rejected) {
+      assertEquals(name, false, isBackupSource(name))
+    }
   }
 
   @Test
@@ -442,7 +468,7 @@ class MainActivityBehaviorTest {
         ready = listOf(
           SafSpoolReady(
             token = "22222222-2222-4222-8222-222222222222",
-            displayName = "backup.risulossless",
+            displayName = "backup.risunest",
             bytes = 9,
             totalBytes = 9,
           ),
@@ -453,7 +479,7 @@ class MainActivityBehaviorTest {
 
     assertEquals(true, script.contains("risu-android-lossless-source-picked"))
     assertEquals(true, script.contains("\"requestId\":\"11111111-1111-4111-8111-111111111111\""))
-    assertEquals(true, script.contains("backup.risulossless"))
+    assertEquals(true, script.contains("backup.risunest"))
     assertEquals(false, script.contains("tauriOpenedFileSpools"))
     assertEquals(false, script.contains("risu-android-spool-ready"))
   }
@@ -466,7 +492,7 @@ class MainActivityBehaviorTest {
         ready = listOf(
           SafSpoolReady(
             token = "22222222-2222-4222-8222-222222222222",
-            displayName = "backup.risulossless",
+            displayName = "backup.risunest",
             bytes = 9,
             totalBytes = 9,
           ),
@@ -485,7 +511,7 @@ class MainActivityBehaviorTest {
       ready = listOf(
         SafSpoolReady(
           token = "22222222-2222-4222-8222-222222222222",
-          displayName = "backup.risulossless",
+          displayName = "backup.risunest",
           bytes = 9,
           totalBytes = 9,
         ),

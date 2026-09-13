@@ -1,9 +1,8 @@
 import { Mutex } from '../mutex'
 import { language } from 'src/lang'
 
-import { alertConfirm, alertError, alertNormal } from '../alert'
+import { alertError, alertNormal } from '../alert'
 import { isTauriAndroid } from '../platform'
-import { loadPluginsAfterAuthoritativeRestore } from '../plugins/plugins.svelte'
 import {
     acknowledgeAndroidSafExport,
     discardAndroidSafSource,
@@ -17,22 +16,22 @@ import {
     isAndroidNativeContentSpool,
     type AndroidSpoolReady,
 } from './androidSafBridge'
-import { createAndroidRisuSaveSpoolRoute } from './androidRisuSaveRoute'
+import {
+    createAndroidRisuSaveSpoolRoute,
+    type AndroidRisuSaveRestoreInput,
+} from './androidRisuSaveRoute'
 import { runExternalAndroidNativeFileOperation } from './nativeFileJobManager'
 import type { NativeAndroidCharacterSpoolResult } from './nativeCharacterFileRoute'
 import {
     NativeFileJobActivationCommittedError,
     NativeFileJobError,
     prepareNativeContentImport,
-    runNativeBlockRisuSaveRestore,
-    runNativeLosslessBackupRestore,
     type NativeFileJobOptions,
     type NativeFileJobSource,
     type PreparedNativeContent,
     type PreparedNativeContentReceipt,
 } from './nativeFileJobs'
 import { runNativePreparedContentRoute } from './nativePreparedContentRoute'
-import { getPersistentDataRuntime } from './persistentDataRuntime.svelte'
 import { listenRecoveredAndroidRisuSavePublications } from './risuSaveFileRoute'
 
 let disposeSpoolListener: (() => void) | undefined
@@ -221,6 +220,25 @@ function showDestinationRequired(source: AndroidSpoolReady): void {
     alertError(`${source.displayName}: destination-required`)
 }
 
+/** The common restore entry owns confirmation, the shared operation, and source cleanup. */
+export async function restoreAndroidOpenedBackupSource({
+    source,
+    displayName,
+}: AndroidRisuSaveRestoreInput): Promise<void> {
+    const { restoreBackupFromNativeSource } =
+        await import('./portableBackupFileRouteProduction.svelte')
+    const result = await restoreBackupFromNativeSource(async ({ onSource }) => {
+        onSource({ name: displayName })
+        return source
+    })
+    if (!result) return
+    alertNormal(
+        result.warningCodes.includes('cleanup-failed')
+            ? language.risuSaveCleanupWarning
+            : language.risuSaveImportComplete,
+    )
+}
+
 export function registerAndroidRisuSaveRoute(): void {
     if (!isTauriAndroid || !isAndroidSafFileJobsEnabled() || disposeSpoolListener) return
 
@@ -240,35 +258,13 @@ export function registerAndroidRisuSaveRoute(): void {
     )
 
     const route = createAndroidRisuSaveSpoolRoute({
-        confirmRestore: async () =>
-            await alertConfirm(language.risuSaveImportConfirm)
-            && await alertConfirm(language.backupLoadConfirm2),
+        confirmRestore: async () => true,
         discard: (source) => {
             if (!discardAndroidSafSource(source.token)) {
                 alertError(`${source.displayName}: discard-failed`)
             }
         },
-        restore: async ({ source, displayName }) => {
-            const lossless = displayName.toLocaleLowerCase('en-US').endsWith('.risulossless')
-            const result = await runExternalAndroidNativeFileOperation(
-                'import',
-                ({ signal, onStatus, setBlocking }) => (lossless
-                    ? runNativeLosslessBackupRestore
-                    : runNativeBlockRisuSaveRestore)(
-                    getPersistentDataRuntime(),
-                    source,
-                    {
-                        signal,
-                        onStatus,
-                        onBlockingChange: setBlocking,
-                        afterRefresh: loadPluginsAfterAuthoritativeRestore,
-                    },
-                ),
-            )
-            alertNormal(result.warningCodes.includes('cleanup-failed')
-                ? language.risuSaveCleanupWarning
-                : language.risuSaveImportComplete)
-        },
+        restore: restoreAndroidOpenedBackupSource,
         unsupported: showUnsupportedSpool,
         failed: showSpoolFailure,
         onError: (_source, error) => showRestoreError(error),

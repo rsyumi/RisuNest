@@ -3,11 +3,12 @@
     "version": 1,
     "uuid": "0f9d2c4a-1b2c-4d3e-8f4a-5b6c7d8e9f0a",
     "spoolSuffixes": {
-        "database": [".risudat", ".risulossless"],
+        "database": [".risunest", ".risudat", ".bin"],
         "content": [".charx", ".json", ".jpeg", ".jpg", ".png", ".risum"]
     },
     "handoffDirectory": "native-file-jobs/handoffs",
     "managedHandoffs": [
+        { "kind": "portable-backup", "prefix": "risunest-backup-", "suffixes": [".risunest"] },
         { "kind": "lossless-backup", "prefix": "risulossless-", "suffixes": [".risulossless"] },
         { "kind": "legacy-backup", "prefix": "risu-backup-", "suffixes": [".bin"] },
         { "kind": "character-charx", "prefix": "risu-charx-", "suffixes": [".charx", ".jpeg"] },

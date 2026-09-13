@@ -1,4 +1,91 @@
 export const languageEnglish = {
+    compatibilityBackupReport: {
+        items: 'Items',
+        bytes: 'Bytes',
+        conversations: 'Affected conversations',
+        none: 'None',
+        otherCategory: 'Other compatibility changes',
+        scopeNote:
+            'Categories can overlap. Conversation counts are not added together. Byte counts cover measured file payloads; structural changes may show 0 B.',
+        categories: {
+            characters: 'Characters',
+            presets: 'Presets',
+            conversations: 'Conversations',
+            'attachment-files': 'Attachment files',
+            'owner-asset-arrays-rehydrated':
+                'Restored character and module asset lists',
+            'asset-paths-remapped': 'Renamed attachment paths',
+            'inlay-ids-remapped': 'Renamed inlay identifiers',
+            'cold-ids-remapped': 'Renamed archived-data identifiers',
+            'converted-inlay-extension': 'Changed inlay file extensions',
+            'converted-inlay-sidecars': 'Generated inlay metadata files',
+            'converted-inlay-provenance': 'Converted inlay origin metadata',
+            'converted-cold-character': 'Expanded archived characters',
+            'converted-cold-chat': 'Expanded archived conversations',
+            'converted-interrupted-reroll':
+                'Recovered interrupted regenerations',
+            'converted-swipes': 'Converted alternative replies',
+            'risuai-inlays-excluded': 'Inlay files unsupported by RisuAI',
+            'inlay-codec-playback-unverified': 'Inlay playback not verified',
+            'asset-playback-unverified': 'Attachment playback not verified',
+            'opaque-plugin-asset-references-unverified':
+                'Plugin attachment references not verified',
+            'opaque-plugin-inlay-references-unverified':
+                'Plugin inlay references not verified',
+            'opaque-plugin-reference':
+                'Plugin references requiring manual review',
+            'unsupported-group-cold-payload': 'Unsupported archived group data',
+            'group-provenance-owner-excluded':
+                'Excluded group ownership metadata',
+            'unsupported-groups': 'Unsupported group chats',
+            'toggle-preset-prompt-name-unmatched':
+                'Toggle preset prompts without matching names',
+            'unavailable-persona-binding': 'Unavailable persona bindings',
+            'unsupported-inlay-references': 'Unsupported inlay references',
+            'unsupported-option-value': 'Unsupported setting values',
+            'unsupported-structural-field': 'Unsupported data fields',
+            'unsupported-tuple-elements': 'Unsupported list fields',
+            'unrepresentable-reroll-candidates':
+                'Alternative replies unavailable in the target',
+            'invalid-reroll-candidates': 'Invalid alternative replies',
+            'reroll-candidate-metadata': 'Alternative reply metadata',
+            'unsupported-reroll-candidates': 'Unsupported alternative replies',
+            'unsupported-cold-wrapper-field':
+                'Unsupported archived-data metadata',
+        },
+    },
+    portableBackup: {
+        preservedSourceHelp:
+            'These files are kept separately because the restored library does not need them. They do not sync automatically and can be deleted from the source preservation area.',
+        title: 'RisuNest backup',
+        export: 'Full backup (.risunest)',
+        restore: 'Restore backup file',
+        library: 'Library and attachments',
+        device: 'Device plugin data',
+        localStorage: 'Plugin local storage',
+        localData: 'Plugin local data',
+        database: 'Plugin database',
+        settings: 'Device settings',
+        chooseExport: 'Choose what to back up',
+        chooseRestore: 'Choose what to restore',
+        helpExport:
+            'Selected device data is captured after restarting the app into maintenance mode.',
+        helpRestore:
+            'Selected areas replace the data on this device, including keys that exist only here. Unselected areas stay unchanged.',
+        repair: 'This file preserves damaged source data. Its library cannot be activated until repaired.',
+        continue: 'Continue',
+        cancel: 'Cancel',
+        dbOnly: 'Database only (.risudat)',
+        risuai: 'Export for RisuAI (.bin)',
+        pocket: 'Export for PocketRisu (.bin)',
+        report: 'Compatibility export report',
+        preserved: 'Preserved',
+        converted: 'Converted',
+        excluded: 'Excluded',
+        unknown: 'Not determined',
+        saved: 'Backup file saved.',
+        restored: 'Selected backup areas restored.',
+    },
     previousResponseCandidate: 'Previous response',
     nextResponseCandidate: 'Next response',
 
