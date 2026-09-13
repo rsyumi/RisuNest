@@ -17,6 +17,7 @@ use crate::persistent_store::{
     AssetAlias, AssetOwnerHead, AssetOwnerLocator, AssetRepositoryAuthorityState, ColdAlias,
     ColdPayloadAuthorityState, PersistentStore, RevisionResult, StagingResult, StoreResult,
 };
+use crate::server_sync::residency::RemotePayloadAccess;
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
@@ -418,6 +419,7 @@ pub(crate) fn export_legacy_local_backup(
             } else {
                 CasObjectRole::DirectObject
             };
+            cas.open_available_object(hash).map_err(io_job_error)?;
             pins.pin_existing(&cas, hash, size as u64, role)
                 .map_err(io_job_error)?;
         }
@@ -666,7 +668,7 @@ fn prepare_owner_export_projection(
             )
         })?;
         let size = cas
-            .stat_object(hash)
+            .stat_available_object(hash)
             .map_err(io_job_error)?
             .ok_or_else(|| {
                 NativeJobError::new("invalid-source", "legacy backup owner manifest is missing")
@@ -709,7 +711,7 @@ fn prepare_owner_export_projection(
                     key.clone()
                 } else {
                     let size = cas
-                        .stat_object(&payload_hash)
+                        .stat_available_object(&payload_hash)
                         .map_err(io_job_error)?
                         .ok_or_else(|| {
                             NativeJobError::new(
@@ -750,7 +752,7 @@ fn read_owner_manifest(
 ) -> Result<Vec<owner_manifest_codec::OwnerManifestEntry>, NativeJobError> {
     check_cancelled(cancellation).map_err(local_backup_error)?;
     let file = cas
-        .open_object(hash)
+        .open_available_object(hash)
         .map_err(io_job_error)?
         .ok_or_else(|| {
             NativeJobError::new("invalid-source", "legacy backup owner manifest is missing")

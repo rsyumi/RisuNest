@@ -11,13 +11,14 @@ import type {
     AssetObjectUrlResolver,
     DurableAssetWriteSessionFactory,
     NewInlayImageEncoder,
+    RemoteAssetReader,
 } from './assetRepository'
 import {
     objectPhysicalKey,
     type ImmutablePayloadCas,
     type PreparedImmutablePayload,
 } from './payloadCas'
-import { createTauriCasObjectUrl } from './platformBlobStore'
+import { createTauriCasObjectUrl, getNativeMediaEndpoint } from './platformBlobStore'
 
 type InvokeCommand = (command: string, args?: Record<string, unknown>) => Promise<unknown>
 
@@ -207,11 +208,38 @@ export function createNativeImmutablePayloadCas(
 export function createNativeAssetObjectUrlResolver(): AssetObjectUrlResolver {
     return {
         async resolveObjectUrl(input) {
-            return createTauriCasObjectUrl(input)
+            return createTauriCasObjectUrl(input, await getNativeMediaEndpoint())
         },
     }
 }
 
+export function createNativeRemoteAssetReader(
+    invokeCommand: InvokeCommand = invoke,
+): RemoteAssetReader {
+    return {
+        async statObject(contentHash) {
+            objectPhysicalKey(contentHash)
+            const result = await invokeCommand('asset_remote_stat_object', {
+                contentHash,
+            })
+            return result === null
+                ? null
+                : safeSize(result, 'Native remote asset stat')
+        },
+        async readObject(contentHash, range) {
+            objectPhysicalKey(contentHash)
+            if (range) validateBlobReadRange(range)
+            const result = await invokeCommand('asset_remote_read_object', {
+                contentHash,
+                start: range?.start ?? null,
+                endExclusive: range?.endExclusive ?? null,
+            })
+            return result === null
+                ? null
+                : bytes(result, 'Native remote asset read')
+        },
+    }
+}
 interface NativeEncodedInlayImage {
     data: unknown
     metadata: InlayBlobMetadata

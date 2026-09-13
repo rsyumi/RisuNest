@@ -280,11 +280,13 @@ fn resolve_blob(root: &Path, uri: &str, physical_key: String) -> Option<Resolved
         .join("blobstore")
         .join("metadata")
         .join(format!("{}.json", hex::encode(logical_key.as_bytes())));
+    reject_link_components(root, &metadata_path)?;
     let blob_metadata: BlobMetadata =
         serde_json::from_slice(&fs::read(metadata_path).ok()?).ok()?;
     let payload_path = physical_key
         .split('/')
         .fold(root.to_path_buf(), |path, segment| path.join(segment));
+    reject_link_components(root, &payload_path)?;
     let file_metadata = fs::metadata(&payload_path).ok()?;
     if !file_metadata.is_file()
         || blob_metadata.key != logical_key
@@ -302,6 +304,17 @@ fn resolve_blob(root: &Path, uri: &str, physical_key: String) -> Option<Resolved
         validator: etag(modified, file_metadata.len()),
         cache_control: "no-cache",
     })
+}
+
+fn reject_link_components(root: &Path, path: &Path) -> Option<()> {
+    let mut current = root.to_path_buf();
+    for part in path.strip_prefix(root).ok()?.components() {
+        current.push(part);
+        if crate::trust_boundary::is_link_like(&fs::symlink_metadata(&current).ok()?) {
+            return None;
+        }
+    }
+    Some(())
 }
 
 fn etag(modified: SystemTime, size: u64) -> String {
@@ -1173,26 +1186,37 @@ fn base_response(status: StatusCode) -> tauri::http::response::Builder {
         .header(header::ACCESS_CONTROL_EXPOSE_HEADERS, EXPOSED_HEADERS)
 }
 
-pub(crate) fn not_found() -> Response<Vec<u8>> {
-    base_response(StatusCode::NOT_FOUND)
-        .body(Vec::new())
-        .unwrap()
+fn not_found() -> Response<Option<std::io::Take<File>>> {
+    base_response(StatusCode::NOT_FOUND).body(None).unwrap()
 }
 
-pub(crate) fn respond(root: &Path, request: Request<Vec<u8>>) -> Response<Vec<u8>> {
+fn prepare_response(root: &Path, request: Request<()>) -> Response<Option<std::io::Take<File>>> {
     if request.method() != Method::GET && request.method() != Method::HEAD {
         return base_response(StatusCode::METHOD_NOT_ALLOWED)
             .header(header::ALLOW, "GET, HEAD")
-            .body(Vec::new())
+            .body(None)
             .unwrap();
     }
     let uri = request.uri().to_string();
     let Some(physical_key) = decode_physical_key(&uri) else {
         return not_found();
     };
+    // Open while cleanup is excluded; the opened handle then owns the read
+    // lifetime without holding a repository lock during a network transfer.
+    let Ok(_guard) = crate::asset_repository::coordinator::lock_repository_mutation() else {
+        return base_response(StatusCode::SERVICE_UNAVAILABLE)
+            .body(None)
+            .unwrap();
+    };
     let Some(blob) = resolve_blob(root, &uri, physical_key) else {
         return not_found();
     };
+    let Ok(mut file) = crate::trust_boundary::open_regular_source(&blob.payload_path) else {
+        return not_found();
+    };
+    if file.metadata().ok().map(|metadata| metadata.len()) != Some(blob.size) {
+        return not_found();
+    }
     let validator = blob.validator.clone();
     if request
         .headers()
@@ -1203,16 +1227,21 @@ pub(crate) fn respond(root: &Path, request: Request<Vec<u8>>) -> Response<Vec<u8
         return base_response(StatusCode::NOT_MODIFIED)
             .header(header::ETAG, validator)
             .header(header::CACHE_CONTROL, blob.cache_control)
-            .body(Vec::new())
+            .body(None)
             .unwrap();
     }
 
-    let Some(range) = parse_range(request.headers().get(header::RANGE), blob.size) else {
+    let range_header = request.headers().get(header::RANGE).filter(|_| {
+        request.headers().get(header::IF_RANGE).is_none_or(|value| {
+            !validator.starts_with("W/") && value.to_str().ok() == Some(&validator)
+        })
+    });
+    let Some(range) = parse_range(range_header, blob.size) else {
         return base_response(StatusCode::RANGE_NOT_SATISFIABLE)
             .header(header::CONTENT_RANGE, format!("bytes */{}", blob.size))
             .header(header::ETAG, validator)
             .header(header::CACHE_CONTROL, blob.cache_control)
-            .body(Vec::new())
+            .body(None)
             .unwrap();
     };
     let (status, start, end) = match range {
@@ -1232,20 +1261,27 @@ pub(crate) fn respond(root: &Path, request: Request<Vec<u8>>) -> Response<Vec<u8
         );
     }
     if request.method() == Method::HEAD || length == 0 {
-        return builder.body(Vec::new()).unwrap();
+        return builder.body(None).unwrap();
     }
-    let Ok(mut file) = File::open(blob.payload_path) else {
-        return not_found();
-    };
     if file.seek(SeekFrom::Start(start)).is_err() {
         return not_found();
     }
-    let mut body = vec![0; length as usize];
-    if file.read_exact(&mut body).is_err() {
-        return not_found();
-    }
-    builder.body(body).unwrap()
+    builder.body(Some(file.take(length))).unwrap()
 }
+
+// Byte collection exists only in tests, never in the WebView serving path.
+#[cfg(test)]
+fn respond(root: &Path, request: Request<Vec<u8>>) -> Response<Vec<u8>> {
+    prepare_response(root, request.map(|_| ())).map(|body| {
+        let mut bytes = Vec::new();
+        if let Some(mut reader) = body {
+            reader.read_to_end(&mut bytes).unwrap();
+        }
+        bytes
+    })
+}
+
+pub(crate) mod streaming;
 
 #[cfg(test)]
 mod tests;

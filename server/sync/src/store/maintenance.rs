@@ -109,6 +109,7 @@ impl Store {
         tx.execute("UPDATE library SET head=?1", [json(&head)?])?;
         tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS gc_roots(hash TEXT PRIMARY KEY); DELETE FROM gc_roots;
             INSERT OR IGNORE INTO gc_roots SELECT hash FROM object_leases;
+            INSERT OR IGNORE INTO gc_roots SELECT hash FROM object_custody;
             INSERT OR IGNORE INTO gc_roots SELECT hash FROM uploads WHERE expires>unixepoch();
             INSERT OR IGNORE INTO gc_roots SELECT hash FROM upload_delta_bases;
             INSERT OR IGNORE INTO gc_roots SELECT hash FROM download_delta_bases;

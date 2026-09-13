@@ -1,8 +1,17 @@
 import localforage from 'localforage'
 import {
-    BaseDirectory, SeekMode, exists, mkdir, open, readDir, readFile, remove, stat, writeFile,
+    BaseDirectory,
+    SeekMode,
+    exists,
+    mkdir,
+    open,
+    readDir,
+    readFile,
+    remove,
+    stat,
+    writeFile,
 } from '@tauri-apps/plugin-fs'
-import { convertFileSrc, invoke } from '@tauri-apps/api/core'
+import { invoke } from '@tauri-apps/api/core'
 import { isTauri } from '../platform'
 import {
     createKeyValueBlobStore,
@@ -31,17 +40,42 @@ export function physicalBlobKeys(logicalKey: string) {
 
 export function createTauriNativeMediaUrl(
     physicalKey: string,
-    converter: (path: string, protocol?: string) => string = convertFileSrc,
+    baseUrl: string,
 ): string {
-    return converter(logicalKeyHex(physicalKey), 'risuasset')
+    if (!/^http:\/\/127\.0\.0\.1:[1-9][0-9]*\/[a-f0-9]{32}\/$/.test(baseUrl)) {
+        throw new TypeError('Invalid native media endpoint')
+    }
+    return `${baseUrl}${logicalKeyHex(physicalKey)}`
 }
+
+export function createNativeMediaEndpointProvider(
+    invokeCommand: (command: string) => Promise<unknown> = invoke,
+): () => Promise<string> {
+    let pending: Promise<string> | undefined
+    return () =>
+        (pending ??= invokeCommand('native_media_base_url')
+            .then((value) => {
+                if (typeof value !== 'string')
+                    throw new TypeError('Invalid native media endpoint')
+                createTauriNativeMediaUrl('assets/validation', value)
+                return value
+            })
+            .catch((error) => {
+                pending = undefined
+                throw error
+            }))
+}
+
+export const getNativeMediaEndpoint = createNativeMediaEndpointProvider()
 
 export function createTauriCasObjectUrl(
     input: { contentHash: string; mime: string; size: number },
-    converter: (path: string, protocol?: string) => string = convertFileSrc,
+    baseUrl: string,
 ): string {
     if (!Number.isSafeInteger(input.size) || input.size < 0) {
-        throw new RangeError('CAS object size must be a nonnegative safe integer')
+        throw new RangeError(
+            'CAS object size must be a nonnegative safe integer',
+        )
     }
     if (input.mime.length === 0 || !/^[\x20-\x7e]+$/.test(input.mime)) {
         throw new TypeError('CAS object MIME must be a nonempty header value')
@@ -50,7 +84,7 @@ export function createTauriCasObjectUrl(
         mime: input.mime,
         size: input.size.toString(),
     })
-    return `${createTauriNativeMediaUrl(objectPhysicalKey(input.contentHash), converter)}?${query}`
+    return `${createTauriNativeMediaUrl(objectPhysicalKey(input.contentHash), baseUrl)}?${query}`
 }
 
 const blobKeyMapper: BlobPhysicalKeyMapper = {
@@ -215,7 +249,7 @@ export function createTauriBlobBackend(dependencies?: TauriBlobBackendDependenci
         remove: (key: string) => remove(key, { baseDir: BaseDirectory.AppData }),
         size: async (key: string) => (await stat(key, { baseDir: BaseDirectory.AppData })).size,
         open: (key: string) => open(key, { read: true, baseDir: BaseDirectory.AppData }),
-        resolveUrl: async (key: string) => createTauriNativeMediaUrl(key),
+        resolveUrl: async (key: string) => createTauriNativeMediaUrl(key, await getNativeMediaEndpoint()),
     }
     return {
         async write(key, value) {

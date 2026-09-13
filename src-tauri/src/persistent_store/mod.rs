@@ -1,4 +1,5 @@
 pub(crate) mod asset_object_catalog;
+pub(crate) mod asset_residency;
 pub(crate) mod commands;
 mod commit;
 pub(crate) mod export;
@@ -2090,7 +2091,9 @@ impl PersistentStore {
         now_ms: i64,
         minimum_grace_ms: i64,
     ) -> StoreResult<crate::asset_repository::migration_gc::AssetGcDryRunPage> {
-        use crate::asset_repository::migration_gc::{dry_run_mark_and_sweep, AssetGcDryRunPage};
+        use crate::asset_repository::migration_gc::{
+            dry_run_mark_and_sweep_with_remote, AssetGcDryRunPage,
+        };
 
         let persistent_dir = self
             .snapshots_dir
@@ -2104,9 +2107,17 @@ impl PersistentStore {
         let cas = crate::asset_repository::PayloadCas::new(repository_root)?;
         let roots = self.collect_asset_gc_roots(&cas, false, true)?;
         let candidates = self.query_asset_object_catalog(limit, cursor)?;
-        let report =
-            dry_run_mark_and_sweep(&cas, candidates.items, roots, now_ms, minimum_grace_ms)
-                .map_err(StoreError::from)?;
+        let residency = crate::server_sync::residency::Residency::open(repository_root)
+            .map_err(|error| std::io::Error::other(error.code))?;
+        let report = dry_run_mark_and_sweep_with_remote(
+            &cas,
+            candidates.items,
+            roots,
+            now_ms,
+            minimum_grace_ms,
+            |hash| residency.gc_size(hash),
+        )
+        .map_err(StoreError::from)?;
         Ok(AssetGcDryRunPage {
             report,
             next_cursor: candidates.next_cursor,
@@ -2220,17 +2231,20 @@ impl PersistentStore {
         ) -> StoreResult<()>,
     ) -> StoreResult<crate::asset_repository::migration_gc::AssetGcDryRunPage> {
         use crate::asset_repository::migration_gc::{
-            dry_run_mark_and_sweep, AssetGcDeleteHookPoint, AssetGcDryRunPage,
+            dry_run_mark_and_sweep_with_remote, AssetGcDeleteHookPoint, AssetGcDryRunPage,
         };
 
         let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
         let initial_candidates = self.query_asset_object_catalog(limit, cursor)?;
-        let initial_report = dry_run_mark_and_sweep(
+        let residency = crate::server_sync::residency::Residency::open(&self.repository_root)
+            .map_err(|error| std::io::Error::other(error.code))?;
+        let initial_report = dry_run_mark_and_sweep_with_remote(
             &cas,
             initial_candidates.items.clone(),
             self.collect_asset_gc_roots(&cas, false, false)?,
             now_ms,
             minimum_grace_ms,
+            |hash| residency.gc_size(hash),
         )?;
         if !initial_report.blockers.is_empty() {
             return Ok(AssetGcDryRunPage {
@@ -2255,12 +2269,13 @@ impl PersistentStore {
                 message: "asset object catalog page changed before final GC recheck".to_owned(),
             });
         }
-        let mut report = dry_run_mark_and_sweep(
+        let mut report = dry_run_mark_and_sweep_with_remote(
             &cas,
             final_candidates.items.clone(),
             self.collect_asset_gc_roots(&cas, true, false)?,
             now_ms,
             minimum_grace_ms,
+            |hash| residency.gc_size(hash),
         )?;
         if !report.blockers.is_empty() {
             return Ok(AssetGcDryRunPage {

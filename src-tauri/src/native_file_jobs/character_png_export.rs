@@ -8,6 +8,7 @@ use crate::persistent_store::{
     export::{self, destination},
     PreparedRisuSaveExport, StoreResult,
 };
+use crate::server_sync::residency::RemotePayloadAccess;
 use base64::{engine::general_purpose::STANDARD, write::EncoderWriter, Engine as _};
 use image::ImageEncoder;
 use serde_json::Value;
@@ -503,7 +504,7 @@ fn read_verified_object(
     job: &JobControl,
 ) -> Result<Vec<u8>, NativeJobError> {
     let mut source = repository
-        .open_object(hash)
+        .open_available_object(hash)
         .map_err(io_error)?
         .ok_or_else(|| invalid_input("pinned character asset payload is missing"))?;
     super::verified_read::read_verified_bytes(
@@ -534,7 +535,7 @@ fn write_asset_text_chunk(
             Some(hash),
             Box::new(
                 repository
-                    .open_object(hash)
+                    .open_available_object(hash)
                     .map_err(io_error)?
                     .ok_or_else(|| invalid_input("pinned character asset payload is missing"))?,
             ),

@@ -30,6 +30,7 @@ struct App {
     wait_slots: Arc<Semaphore>,
     buffers: Arc<Semaphore>,
     materializers: Arc<Semaphore>,
+    media_slots: Arc<Semaphore>,
     devices: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     _lifetime: Arc<()>,
 }
@@ -97,6 +98,7 @@ pub fn router(store: Arc<Store>) -> Router {
         wait_slots: Arc::new(Semaphore::new(8)),
         buffers: Arc::new(Semaphore::new(4)),
         materializers: Arc::new(Semaphore::new(1)),
+        media_slots: Arc::new(Semaphore::new(16)),
         devices: Arc::new(Mutex::new(HashMap::new())),
         _lifetime: lifetime,
     };
@@ -113,6 +115,12 @@ pub fn router(store: Arc<Store>) -> Router {
             get(checkpoint_page).delete(release_checkpoint),
         )
         .route("/objects/pins", post(pin_objects))
+        .route(
+            "/objects/retention",
+            post(retain_objects).get(retained_objects),
+        )
+        .route("/objects/retention/release", post(release_retained_objects))
+        .route("/media/access", post(media_access))
         .route("/scopes", get(scope))
         .route("/objects/missing", post(missing))
         .route("/objects/batch", post(download_batch))
@@ -143,6 +151,7 @@ pub fn router(store: Arc<Store>) -> Router {
         .route("/acks", post(ack))
         .layer(DefaultBodyLimit::max(batch::MAX_BATCH_BYTES))
         .route_layer(middleware::from_fn_with_state(app.clone(), authorize))
+        .route("/media/{token}", get(media))
         .with_state(app)
 }
 impl IntoResponse for Error {
@@ -431,8 +440,26 @@ async fn object(
     Path(digest): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response> {
-    let tag = format!("\"{digest}\"");
+    let tag_digest = digest.clone();
     let (file, total) = blocking(move || app.store.open_object(&digest)).await?;
+    object_response(
+        file,
+        total,
+        &tag_digest,
+        "application/octet-stream",
+        headers,
+    )
+    .await
+}
+
+async fn object_response(
+    file: std::fs::File,
+    total: u64,
+    digest: &str,
+    mime: &str,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let tag = format!("\"{digest}\"");
     let mut response;
     if header(&headers, "if-none-match") == Some(&tag) {
         response = StatusCode::NOT_MODIFIED.into_response();
@@ -476,9 +503,98 @@ async fn object(
     response
         .headers_mut()
         .insert("accept-ranges", "bytes".parse().unwrap());
+    response.headers_mut().insert(
+        "content-type",
+        mime.parse()
+            .map_err(|_| Error::new("invalid-media-mime", 400))?,
+    );
+    Ok(response)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MediaAccessRequest {
+    epoch: String,
+    requests: Vec<risunest_sync_connect::media::MediaRequest>,
+}
+async fn media_access(
+    State(app): State<App>,
+    Extension(device): Extension<Device>,
+    body: Bytes,
+) -> Result<Response> {
+    let request: MediaAccessRequest = canonical::decode(&body, MAX_METADATA_BYTES)?;
+    blocking(move || {
+        Ok(Json(
+            app.store
+                .media_access(&device, &request.epoch, &request.requests)?,
+        )
+        .into_response())
+    })
+    .await
+}
+
+async fn media(
+    State(app): State<App>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    use crate::store::MediaResponse;
+    use futures_util::StreamExt;
+    let permit = app
+        .media_slots
+        .try_acquire_owned()
+        .map_err(|_| Error::new("media-busy", 429))?;
+    let resolved = blocking(move || app.store.resolve_media(&token)).await?;
+    let mut response = match resolved {
+        MediaResponse::Refresh(url) => {
+            let mut response = StatusCode::TEMPORARY_REDIRECT.into_response();
+            response.headers_mut().insert(
+                "location",
+                url.parse()
+                    .map_err(|_| Error::new("invalid-media-refresh", 503))?,
+            );
+            response
+                .headers_mut()
+                .insert("cache-control", "no-store".parse().unwrap());
+            response
+        }
+        MediaResponse::File {
+            file,
+            size,
+            hash,
+            mime,
+            max_age,
+        } => {
+            let mut response = object_response(file, size, &hash, &mime, headers).await?;
+            response.headers_mut().insert(
+                "cache-control",
+                format!("private, max-age={max_age}").parse().unwrap(),
+            );
+            let (parts, body) = response.into_parts();
+            Response::from_parts(
+                parts,
+                axum::body::Body::from_stream(body.into_data_stream().map(move |item| {
+                    let _ = &permit;
+                    item
+                })),
+            )
+        }
+    };
     response
         .headers_mut()
-        .insert("content-type", "application/octet-stream".parse().unwrap());
+        .insert("access-control-allow-origin", "*".parse().unwrap());
+    response.headers_mut().insert(
+        "access-control-expose-headers",
+        "Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag"
+            .parse()
+            .unwrap(),
+    );
+    response
+        .headers_mut()
+        .insert("x-content-type-options", "nosniff".parse().unwrap());
+    response
+        .headers_mut()
+        .insert("referrer-policy", "no-referrer".parse().unwrap());
     Ok(response)
 }
 
@@ -804,6 +920,66 @@ async fn release_checkpoint(
     Path(id): Path<String>,
 ) -> Result<StatusCode> {
     blocking(move || app.store.release_checkpoint(&device, &id)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RetainRequest {
+    epoch: String,
+    objects: Vec<crate::store::ObjectIdentity>,
+}
+async fn retain_objects(
+    State(app): State<App>,
+    Extension(device): Extension<Device>,
+    body: Bytes,
+) -> Result<Response> {
+    let request: RetainRequest = canonical::decode(&body, MAX_METADATA_BYTES)?;
+    blocking(move || {
+        Ok(Json(
+            app.store
+                .retain_objects(&device, &request.epoch, &request.objects)?,
+        )
+        .into_response())
+    })
+    .await
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RetentionQuery {
+    epoch: String,
+    after: Option<String>,
+}
+async fn retained_objects(
+    State(app): State<App>,
+    Extension(device): Extension<Device>,
+    Query(query): Query<RetentionQuery>,
+) -> Result<Response> {
+    blocking(move || {
+        Ok(Json(
+            app.store
+                .retained_objects(&device, &query.epoch, query.after.as_deref())?,
+        )
+        .into_response())
+    })
+    .await
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReleaseRetentionRequest {
+    epoch: String,
+    objects: Vec<crate::store::RetentionRelease>,
+}
+async fn release_retained_objects(
+    State(app): State<App>,
+    Extension(device): Extension<Device>,
+    body: Bytes,
+) -> Result<StatusCode> {
+    let request: ReleaseRetentionRequest = canonical::decode(&body, MAX_METADATA_BYTES)?;
+    blocking(move || {
+        app.store
+            .release_retained_objects(&device, &request.epoch, &request.objects)
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn pin_objects(

@@ -1959,6 +1959,28 @@ export const languageEnglish = {
                 'Disconnect the current server before importing a new registration.',
             discardRegistration: 'Clear registration input',
             directoryEnabled: 'Server address discovery enabled',
+            residency: {
+                title: 'Assets on this device',
+                description:
+                    'Choose separately for each device. Keep files on a PC, or load media directly from the server on a mobile device.',
+                full: 'Keep all files locally',
+                remote: 'Use remote files',
+                selected: 'Current policy',
+                local: 'Local files',
+                remoteOnly: 'Stored only on the server',
+                offlineReady: 'All tracked files are available offline.',
+                onlineNeeded:
+                    'An internet connection is needed for files stored only on the server.',
+                unavailable: 'Files with no available copy',
+                cleanupNote:
+                    'Changing to remote mode keeps existing files. Cleanup uploads and verifies files before removing local copies. Files needed by local snapshots remain on the server until those snapshots are deleted and cleanup runs. Attachments read for export or AI requests are downloaded and can be cleared again.',
+                clean: 'Clear local copies',
+                refresh: 'Refresh',
+                cancel: 'Cancel',
+                working:
+                    'Processing files… Cancellation takes effect after the current request.',
+                freed: 'Local space cleared',
+            },
             management: {
                 title: 'Server sync storage',
                 disk: 'Local disk usage',

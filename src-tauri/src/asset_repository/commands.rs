@@ -260,6 +260,63 @@ pub(crate) async fn asset_cas_stat_object(
     .map_err(|error| format!("failed to join CAS stat operation: {error}"))?
 }
 
+#[tauri::command(async)]
+pub(crate) async fn asset_remote_stat_object(
+    app: AppHandle,
+    content_hash: String,
+) -> Result<Option<u64>, String> {
+    let root = repository_root(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::server_sync::residency::Residency::open(&root)
+            .and_then(|store| store.object(&content_hash, None))
+            .map(|object| object.map(|object| object.size))
+            .map_err(|error| error.code)
+    })
+    .await
+    .map_err(|_| "remote-stat-unavailable".to_owned())?
+}
+
+#[tauri::command(async)]
+pub(crate) async fn asset_remote_read_object(
+    app: AppHandle,
+    content_hash: String,
+    start: Option<u64>,
+    end_exclusive: Option<u64>,
+) -> Result<Option<Vec<u8>>, String> {
+    let root = repository_root(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::io::{Read, Seek, SeekFrom};
+        let _operation = app
+            .state::<PersistentStoreState>()
+            .admit_renderer_operation()
+            .map_err(|error| error.to_string())?;
+        if start.is_some() != end_exclusive.is_some()
+            || start
+                .zip(end_exclusive)
+                .is_some_and(|(start, end)| start > end)
+        {
+            return Err("invalid-asset-range".into());
+        }
+        let Some(mut file) = crate::server_sync::residency::open_or_hydrate(&root, &content_hash)
+            .map_err(|error| error.code)?
+        else {
+            return Ok(None);
+        };
+        let size = file.metadata().map_err(|error| error.to_string())?.len();
+        let from = start.unwrap_or(0).min(size);
+        let to = end_exclusive.unwrap_or(size).min(size);
+        file.seek(SeekFrom::Start(from))
+            .map_err(|error| error.to_string())?;
+        let mut bytes = Vec::new();
+        file.take(to - from)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        Ok(Some(bytes))
+    })
+    .await
+    .map_err(|_| "remote-read-unavailable".to_owned())?
+}
+
 fn finalize_content_job(
     job: &mut DurableCasJob,
     cas: &PayloadCas,

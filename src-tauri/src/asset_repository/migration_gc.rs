@@ -514,6 +514,18 @@ pub fn dry_run_mark_and_sweep(
     now_ms: i64,
     minimum_grace_ms: i64,
 ) -> io::Result<AssetGcDryRunReport> {
+    dry_run_mark_and_sweep_with_remote(cas, candidates, roots, now_ms, minimum_grace_ms, |_| {
+        Ok(None)
+    })
+}
+pub(crate) fn dry_run_mark_and_sweep_with_remote(
+    cas: &PayloadCas,
+    candidates: impl IntoIterator<Item = AssetGcCandidate>,
+    roots: impl IntoIterator<Item = AssetRootSet>,
+    now_ms: i64,
+    minimum_grace_ms: i64,
+    remote: impl Fn(&str) -> io::Result<Option<u64>>,
+) -> io::Result<AssetGcDryRunReport> {
     if now_ms < 0 || minimum_grace_ms < 0 {
         return invalid_data("asset GC timestamps must be nonnegative");
     }
@@ -557,7 +569,7 @@ pub fn dry_run_mark_and_sweep(
         }
     }
     for hash in &marked_hashes {
-        if cas.stat_object(hash)?.is_none() {
+        if cas.stat_object(hash)?.is_none() && remote(hash)?.is_none() {
             return invalid_data("marked CAS object is missing");
         }
     }
@@ -571,11 +583,19 @@ pub fn dry_run_mark_and_sweep(
         if candidate.created_at_ms < 0 || !seen_candidates.insert(candidate.object_hash.clone()) {
             return invalid_data("asset GC candidate is invalid or duplicated");
         }
-        let actual_size = cas.stat_object(&candidate.object_hash)?.ok_or_else(|| {
-            io::Error::new(ErrorKind::InvalidData, "asset GC candidate is missing")
-        })?;
+        let physical = cas.stat_object(&candidate.object_hash)?;
+        let actual_size = physical
+            .or(remote(&candidate.object_hash)?)
+            .ok_or_else(|| {
+                io::Error::new(ErrorKind::InvalidData, "asset GC candidate is missing")
+            })?;
         if actual_size != candidate.byte_size {
             return invalid_data("asset GC candidate size mismatch");
+        }
+        // Server custody cleanup owns removal of remote-only catalog entries.
+        // Physical GC must not claim disk space was freed for these entries.
+        if physical.is_none() {
+            continue;
         }
         if retain_all_objects {
             marked_hashes.insert(candidate.object_hash);

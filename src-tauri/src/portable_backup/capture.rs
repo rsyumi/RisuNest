@@ -22,6 +22,23 @@ pub(crate) fn capture_library(
     probe: &dyn CancellationProbe,
 ) -> Result<CapturedLibrary> {
     check(probe)?;
+    store
+        .hydrate_registered_remote_assets(|| {
+            if probe.is_cancelled() {
+                Err(crate::server_sync::SyncError::new("cancelled", 409))
+            } else {
+                Ok(())
+            }
+        })
+        .map_err(|error| {
+            if error.code == "cancelled" {
+                Error::Cancelled
+            } else {
+                Error::Io(std::io::Error::other(
+                    "complete remote asset download required before backup",
+                ))
+            }
+        })?;
     let lease = store.acquire_revision(revision)?.lease;
     let outcome = (|| {
         let mut catalog = Catalog::create(job_directory, env!("CARGO_PKG_VERSION"), revision)?;

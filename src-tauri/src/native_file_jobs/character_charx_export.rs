@@ -8,6 +8,7 @@ use super::{
 use crate::asset_repository::{owner_manifest_codec::OwnerManifestEntry, PayloadCas};
 use crate::persistent_store::export::{self, destination};
 use crate::persistent_store::{PreparedRisuSaveExport, RevisionReadLease, StoreResult};
+use crate::server_sync::residency::RemotePayloadAccess;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
@@ -261,7 +262,7 @@ where
             }
             EmbeddedAssetSource::ManifestOccurrence { key, hash } => {
                 let size = repository
-                    .stat_object(hash)
+                    .stat_available_object(hash)
                     .map_err(io_error)?
                     .ok_or_else(|| {
                         invalid_input(format!("pinned character asset is missing: {key}"))
@@ -303,7 +304,7 @@ where
             .map_err(zip_error)?;
         let copied = if let Some(hash) = hash {
             let source_file = repository
-                .open_object(&hash)
+                .open_available_object(&hash)
                 .map_err(io_error)?
                 .ok_or_else(|| {
                     invalid_input(format!("pinned character asset is missing: {key}"))
@@ -479,7 +480,7 @@ fn create_appended_jpeg_source(
                 )));
             }
             let source = repository
-                .open_object(&hash)
+                .open_available_object(&hash)
                 .map_err(io_error)?
                 .ok_or_else(|| {
                     invalid_input(format!("pinned character portrait is missing: {key}"))

@@ -20,6 +20,138 @@ struct Server {
 }
 
 #[tokio::test]
+async fn scoped_media_urls_serve_get_head_and_range_without_device_credentials() {
+    use risunest_sync_connect::media::{MediaAccess, MediaObject, MediaRequest, MediaSigner};
+    let server = Server::start().await;
+    let bytes = b"0123456789";
+    server.upload(&server.a, bytes).await;
+    let head = server.head(&server.a).await;
+    let object = MediaObject {
+        hash: hash(bytes),
+        size: 10.into(),
+        mime: "image/custom".into(),
+    };
+    let refresh = MediaSigner::new(&[3; 32])
+        .unwrap()
+        .refresh_url("http://127.0.0.1:12345", &object)
+        .unwrap();
+    let body = serde_json::json!({"epoch":head.epoch,"requests":[MediaRequest {object:object.clone(),refresh_url:refresh}]});
+    assert_eq!(
+        server
+            .client
+            .post(format!("{}/media/access", server.base))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let grants: Vec<MediaAccess> = server
+        .auth(
+            server.client.post(format!("{}/media/access", server.base)),
+            &server.a,
+        )
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(grants.len(), 1);
+    let url = format!("{}/media/{}", server.base, grants[0].token);
+    let head = server.client.head(&url).send().await.unwrap();
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(head.headers()["content-length"], "10");
+    assert_eq!(head.headers()["content-type"], "image/custom");
+    assert!(head.bytes().await.unwrap().is_empty());
+    let get = server
+        .client
+        .get(&url)
+        .header("origin", "http://tauri.localhost")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(get.headers()["access-control-allow-origin"], "*");
+    assert_eq!(get.bytes().await.unwrap().as_ref(), bytes);
+    let range = server
+        .client
+        .get(&url)
+        .header("range", "bytes=3-6")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(range.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(range.headers()["content-range"], "bytes 3-6/10");
+    assert_eq!(range.bytes().await.unwrap().as_ref(), b"3456");
+    assert_eq!(
+        server.client.post(&url).send().await.unwrap().status(),
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+    server.store.revoke_device(&server.a.device_id).unwrap();
+    assert_eq!(
+        server.client.get(&url).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn retention_http_is_authenticated_and_releases_only_its_exact_id() {
+    let server = Server::start().await;
+    let bytes = b"synthetic custody HTTP";
+    server.upload(&server.a, bytes).await;
+    let head = server.head(&server.a).await;
+    let body = serde_json::json!({"epoch":head.epoch,"objects":[{"hash":hash(bytes),"size":bytes.len().to_string()}]});
+    let url = format!("{}/objects/retention", server.base);
+    assert_eq!(
+        server
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let retained: serde_json::Value = server
+        .auth(server.client.post(&url), &server.a)
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let release = serde_json::json!({"epoch":head.epoch,"objects":[{"deviceId":server.a.device_id,"hash":hash(bytes),"retentionId":retained[0]["retentionId"]}]});
+    let response = server
+        .auth(server.client.post(format!("{}/release", url)), &server.a)
+        .json(&release)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let listed: serde_json::Value = server
+        .auth(server.client.get(&url), &server.a)
+        .query(&[("epoch", head.epoch)])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["objects"], serde_json::json!([]));
+}
+
+#[tokio::test]
 async fn bounded_bulk_buffers_leave_head_available_and_release_after_completion() {
     let server = Server::start().await;
     let third = server.store.add_device().unwrap();

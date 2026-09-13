@@ -6,6 +6,7 @@ import {
     createCompleteTypedAssetRepository,
     type CompleteAssetAliasStore,
     type DurableAssetWriteSessionFactory,
+    type RemoteAssetReader,
 } from './assetRepository'
 import type { ImmutablePayloadCas } from './payloadCas'
 import type { AssetAlias, AssetAliasIdentity } from './persistentDataStore'
@@ -61,6 +62,7 @@ function createLegacy() {
 }
 
 function createFacade(input: {
+    remote?: RemoteAssetReader
     store?: CompleteAssetAliasStore
     cas?: ImmutablePayloadCas
     legacyFallback?: boolean
@@ -89,6 +91,7 @@ function createFacade(input: {
         },
     }))
     const options = {
+        remote: input.remote,
         store,
         cas,
         legacy,
@@ -110,6 +113,49 @@ function createFacade(input: {
 }
 
 describe('complete AssetRepository BlobStore facade', () => {
+    it('resolves a remote asset without fetching its bytes and validates full byte reads', async () => {
+        const { hashPayloadBytes } = await import('./payloadCas')
+        const data = new Uint8Array([4, 2, 9, 8])
+        const hash = await hashPayloadBytes(data)
+        const alias = assetAlias({ objectHash: hash })
+        const remote = {
+            statObject: vi.fn(async () => 4),
+            readObject: vi.fn(async () => data),
+        }
+        const { facade, typed, cas, legacy } = createFacade({
+            remote,
+            store: createStore({
+                readAssetAlias: vi.fn(async () => ({ revision: 10, value: alias })),
+            }),
+        })
+        expect(await facade.resolveUrl(alias.key)).toBe('risuasset://cas-object')
+        expect(remote.readObject).not.toHaveBeenCalled()
+        expect((await typed.stat({ kind: 'asset', key: alias.key }))?.size).toBe(4)
+        expect(await cas.statObject(hash)).toBeNull()
+        expect(await facade.read(alias.key)).toEqual(data)
+        expect(legacy.read).not.toHaveBeenCalled()
+        remote.readObject.mockResolvedValue(new Uint8Array([1, 1, 1, 1]))
+        await expect(facade.read(alias.key)).rejects.toThrow(
+            'Remote asset identity mismatch',
+        )
+    })
+    it('rejects mismatched remote size and short range responses', async () => {
+        const alias = assetAlias()
+        const remote = {
+            statObject: vi.fn(async () => 5),
+            readObject: vi.fn(async () => new Uint8Array([1])),
+        }
+        const { facade } = createFacade({
+            remote,
+            store: createStore({
+                readAssetAlias: vi.fn(async () => ({ revision: 10, value: alias })),
+            }),
+        })
+        await expect(facade.resolveUrl(alias.key)).rejects.toThrow('size mismatch')
+        await expect(
+            facade.read(alias.key, { start: 1, endExclusive: 3 }),
+        ).rejects.toThrow('Remote asset identity mismatch')
+    })
     it('keeps same-key opposite-kind aliases independently reachable through the typed core', async () => {
         const key = 'shared-key'
         const asset = assetAlias({ key, size: 1 })
@@ -545,13 +591,13 @@ describe('complete AssetRepository BlobStore facade', () => {
             readAssetAlias: vi.fn(async () => ({ revision: 3, value: alias })),
         })
         const cas = createCas({ statObject: vi.fn(async () => 4) })
-        const converter = vi.fn(
-            (path: string, protocol?: string) => `${protocol}://localhost/${path}`,
-        )
+        const endpoint =
+            'http://127.0.0.1:12345/0123456789abcdef0123456789abcdef/'
         const { facade, resolveObjectUrl } = createFacade({
             store,
             cas,
-            resolveObjectUrl: async (input) => createTauriCasObjectUrl(input, converter),
+            resolveObjectUrl: async (input) =>
+                createTauriCasObjectUrl(input, endpoint),
         })
 
         const url = await facade.resolveUrl('assets/avatar.PNG')
@@ -577,10 +623,16 @@ describe('complete AssetRepository BlobStore facade', () => {
         const { facade } = createFacade({
             store,
             cas,
-            resolveObjectUrl: async (input) => createTauriCasObjectUrl(input),
+            resolveObjectUrl: async (input) =>
+                createTauriCasObjectUrl(
+                    input,
+                    'http://127.0.0.1:12345/0123456789abcdef0123456789abcdef/',
+                ),
         })
 
-        await expect(facade.resolveUrl('assets/photo.bin')).rejects.toThrow('MIME')
+        await expect(facade.resolveUrl('assets/photo.bin')).rejects.toThrow(
+            'MIME',
+        )
         expect(alias.mime).toBe('image/png\0text/html')
     })
 

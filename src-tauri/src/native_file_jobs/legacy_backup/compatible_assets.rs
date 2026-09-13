@@ -1,5 +1,6 @@
 //! Target attachment materialization. Only verified, job-owned files reach the writer.
 use super::*;
+use crate::server_sync::residency::RemotePayloadAccess;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -214,7 +215,7 @@ fn copy_verified(
     pins.pin_existing(cas, hash, expected, role)
         .map_err(io_job_error)?;
     let mut source = cas
-        .open_object(hash)
+        .open_available_object(hash)
         .map_err(io_job_error)?
         .ok_or_else(|| invalid_source("attachment object is missing"))?;
     let mut output = std::fs::OpenOptions::new()
@@ -482,7 +483,7 @@ pub(super) fn prepare(
             .as_deref()
             .ok_or_else(|| invalid_source("owner manifest hash is missing"))?;
         let size = cas
-            .stat_object(hash)
+            .stat_available_object(hash)
             .map_err(io_job_error)?
             .ok_or_else(|| invalid_source("owner manifest is missing"))?;
         if size > MAX_OWNER_MANIFEST_BYTES {
@@ -514,7 +515,7 @@ pub(super) fn prepare(
                 let path =
                     owned_directory.join(format!("compatible-owner-{}.entry", payload_keys.len()));
                 let size = cas
-                    .stat_object(&hash)
+                    .stat_available_object(&hash)
                     .map_err(io_job_error)?
                     .ok_or_else(|| invalid_source("owner attachment object is missing"))?;
                 copy_verified(cas, pins, &hash, size, role(&hash), &path, cancellation)?;
@@ -537,7 +538,7 @@ pub(super) fn prepare(
                 && unverified_owner_payloads.insert(hash.clone())
             {
                 let size = cas
-                    .stat_object(&hash)
+                    .stat_available_object(&hash)
                     .map_err(io_job_error)?
                     .ok_or_else(|| invalid_source("owner attachment object is missing"))?;
                 loss(&mut result, "asset-playback-unverified", size);

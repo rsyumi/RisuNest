@@ -113,6 +113,10 @@ impl PersistentStore {
         {
             return Err(SyncError::new("server-config-changed", 409));
         }
+        if self.repository_root.join("asset-residency.sqlite").exists() {
+            crate::server_sync::residency::Residency::open(&self.repository_root)?
+                .replace_access_config(&stored)?;
+        }
         Ok(())
     }
     pub(crate) fn server_bind(&mut self, config: &ServerConfig) -> Result<()> {
@@ -146,6 +150,9 @@ impl PersistentStore {
     /// Disconnect keeps PDS and cached immutable bytes. An unresolved operation
     /// must first be reconciled with its receipt so it cannot be forgotten.
     pub(crate) fn server_unbind(&mut self) -> Result<()> {
+        if self.asset_residency_status()?.has_remote_or_missing() {
+            return Err(SyncError::new("download-all-assets-before-unbind", 409));
+        }
         let stored = self.server_stored_config()?;
         let tx = self
             .connection
@@ -301,6 +308,8 @@ impl PersistentStore {
             Ok(())
         })();
         if outcome.is_ok() && replacement.is_some() {
+            crate::server_sync::residency::Residency::open(&root)?
+                .replace_access_config(replacement.as_ref().unwrap())?;
             if let Some(previous) = previous {
                 let _ = previous.remove(&root);
             }

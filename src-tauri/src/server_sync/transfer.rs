@@ -52,6 +52,23 @@ impl<'a> Transfer<'a> {
         bases: &[String],
         base_version: &risunest_sync_wire::RecordVersion,
     ) -> Result<Vec<String>> {
+        self.download_record_inner(version, bases, base_version, false)
+    }
+    pub fn download_record_metadata(
+        &self,
+        version: &risunest_sync_wire::RecordVersion,
+        bases: &[String],
+        base_version: &risunest_sync_wire::RecordVersion,
+    ) -> Result<Vec<String>> {
+        self.download_record_inner(version, bases, base_version, true)
+    }
+    fn download_record_inner(
+        &self,
+        version: &risunest_sync_wire::RecordVersion,
+        bases: &[String],
+        base_version: &risunest_sync_wire::RecordVersion,
+        metadata_only: bool,
+    ) -> Result<Vec<String>> {
         use risunest_sync_wire::descriptor::RecordDescriptor;
         let risunest_sync_wire::RecordVersion::Live {
             object_hash,
@@ -98,7 +115,26 @@ impl<'a> Transfer<'a> {
         .filter_map(|(root, base)| root.map(|root| (root, base.into_iter().collect())))
         .collect();
         let dependencies = self.download_reference_tree(roots)?;
-        self.download(&dependencies, bases)?;
+        if metadata_only {
+            let (payload, _) = self.cache.restore_with(version, |hash, limit| {
+                self.download(&[hash.to_owned()], bases)?;
+                self.cache.read(hash, limit)
+            })?;
+            use crate::logical_records::LogicalRecordEnvelope as Envelope;
+            let local = match &payload.record {
+                Envelope::Root { owner_heads, .. } | Envelope::Character { owner_heads, .. } => {
+                    owner_heads
+                        .iter()
+                        .filter_map(|h| h.manifest_hash.clone())
+                        .collect()
+                }
+                Envelope::Cold { object_hash, .. } => object_hash.iter().cloned().collect(),
+                _ => Vec::new(),
+            };
+            self.download(&local, bases)?;
+        } else {
+            self.download(&dependencies, bases)?;
+        }
         self.cache.closure(version)
     }
     pub fn new(client: &'a ServerClient, cache: &'a Cache) -> Result<Self> {

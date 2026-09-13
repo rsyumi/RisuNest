@@ -6,7 +6,10 @@ mod promotion_tests;
 
 use super::{
     asset_object_catalog::{AssetObjectCatalog, AssetObjectRegistration},
-    server_sync_apply::{validate_remote, RemoteRecord, ReplicaAdvance, ValidatedRecords},
+    server_sync_apply::{
+        validate_remote, validate_remote_with_residency, RemoteRecord, ReplicaAdvance,
+        ValidatedRecords,
+    },
     server_sync_outbox as outbox, server_sync_projection as projection, PersistentStore,
 };
 use crate::{
@@ -425,6 +428,7 @@ impl PersistentStore {
         }
     }
     fn upload_pending_objects(&self, transfer: &Transfer<'_>) -> Result<()> {
+        let mut remote_context = None;
         self.connection.execute_batch("CREATE TEMP TABLE IF NOT EXISTS server_upload_objects(hash TEXT PRIMARY KEY); DELETE FROM server_upload_objects;")?;
         let mut after = String::new();
         loop {
@@ -478,8 +482,35 @@ impl PersistentStore {
                     }
                 }
                 let bases = self.server_base_candidates(&key, transfer.cache, false)?;
+                let mut local = Vec::new();
+                let mut remote = Vec::new();
+                for hash in unsent {
+                    if transfer.cache.cas.stat_object(&hash)?.is_none() {
+                        if remote_context.is_none() {
+                            let residency = crate::server_sync::residency::Residency::open(
+                                &self.repository_root,
+                            )?;
+                            let stored = self
+                                .server_stored_config()?
+                                .ok_or_else(|| SyncError::new("server-not-bound", 409))?;
+                            let head = transfer.client.head()?;
+                            let context = crate::server_sync::residency::Residency::context_id(
+                                &stored,
+                                &head.epoch,
+                            );
+                            remote_context = Some((residency, context));
+                        }
+                        let (residency, context) = remote_context.as_ref().unwrap();
+                        if residency.confirms(&hash, None, context)? {
+                            remote.push(hash);
+                            continue;
+                        }
+                    }
+                    local.push(hash);
+                }
+                transfer.pin(&remote)?;
                 let hints = transfer.record_reference_hints(&version, &base)?;
-                transfer.upload_with_hints(&unsent, &bases, base_lease, &hints)?;
+                transfer.upload_with_hints(&local, &bases, base_lease, &hints)?;
             }
         }
         Ok(())
@@ -787,6 +818,14 @@ impl PersistentStore {
             }
         }
         let clear_acknowledged = clear && scope_fences.is_empty();
+        let mut residency = crate::server_sync::residency::Residency::open(&self.repository_root)?;
+        let remote_assets =
+            residency.policy()? == crate::server_sync::residency::AssetPolicy::Remote;
+        let stored_config = self
+            .server_stored_config()?
+            .ok_or_else(|| SyncError::new("server-not-bound", 409))?;
+        let custody_context =
+            crate::server_sync::residency::Residency::context_id(&stored_config, &through.epoch);
         let mut records = ValidatedRecords::new()?;
         let mut bases = Vec::new();
         let mut acknowledged = Vec::new();
@@ -807,7 +846,19 @@ impl PersistentStore {
                         let (payload, hash) = if matches!(remote, RecordVersion::Live { .. }) {
                             let base_candidates =
                                 self.server_base_candidates(&item.key, &cache, committed)?;
-                            transfer.download_record(&remote, &base_candidates, &base_version)?;
+                            if remote_assets {
+                                transfer.download_record_metadata(
+                                    &remote,
+                                    &base_candidates,
+                                    &base_version,
+                                )?;
+                            } else {
+                                transfer.download_record(
+                                    &remote,
+                                    &base_candidates,
+                                    &base_version,
+                                )?;
+                            }
                             let (payload, hash) = cache.restore(&remote)?;
                             let dependencies = projection::dependencies(&payload, &cache.cas)?;
                             let expected = cache.project(
@@ -822,16 +873,48 @@ impl PersistentStore {
                                     409,
                                 ));
                             }
-                            self.promote_server_dependencies(&cache, &dependencies, || {
-                                client.ensure_active()
-                            })?;
+                            if remote_assets {
+                                use crate::logical_records::LogicalRecordEnvelope as Envelope;
+                                let expected = match &payload.record {
+                                    Envelope::Asset {
+                                        object_hash: Some(hash),
+                                        size,
+                                        ..
+                                    }
+                                    | Envelope::Inlay {
+                                        object_hash: Some(hash),
+                                        size,
+                                        ..
+                                    } => Some((hash, *size)),
+                                    _ => None,
+                                };
+                                let identities = dependencies
+                                    .iter()
+                                    .map(|hash| {
+                                        Ok((
+                                            hash.clone(),
+                                            expected
+                                                .filter(|(candidate, _)| *candidate == hash)
+                                                .map(|(_, size)| size)
+                                                .or(cache.cas.stat_object(hash)?),
+                                        ))
+                                    })
+                                    .collect::<Result<Vec<_>>>()?;
+                                residency.retain(&client, &stored_config, &through, &identities)?;
+                            }
+                            self.promote_server_dependencies_with_residency(
+                                &cache,
+                                &dependencies,
+                                remote_assets.then_some((&residency, custody_context.as_str())),
+                                || client.ensure_active(),
+                            )?;
                             (Some(payload), Some(hash))
                         } else {
                             (None, None)
                         };
                         // Semantic validation is done against the original shared
                         // envelope, then the row writer preserves local view fields.
-                        records.push(validate_remote(
+                        records.push(validate_remote_with_residency(
                             RemoteRecord {
                                 key: item.key.clone(),
                                 version: remote.clone(),
@@ -839,6 +922,16 @@ impl PersistentStore {
                                 local_hash: hash.clone(),
                             },
                             &PayloadCas::new(&self.repository_root)?,
+                            |hash, size| {
+                                if !remote_assets {
+                                    return Ok(false);
+                                }
+                                residency
+                                    .confirms(hash, size, &custody_context)
+                                    .map_err(|_| super::StoreError::Validation {
+                                        message: "Remote custody unavailable".into(),
+                                    })
+                            },
                         )?)?;
                         acknowledged.push(dirty);
                         hash
@@ -1116,6 +1209,21 @@ impl PersistentStore {
                         }
                         for hash in &dependencies {
                             if cache.cas.stat_object(hash)?.is_none() {
+                                if cas.stat_object(hash)?.is_none() {
+                                    let residency = crate::server_sync::residency::Residency::open(
+                                        &self.repository_root,
+                                    )?;
+                                    let config = self
+                                        .server_stored_config()?
+                                        .ok_or_else(|| SyncError::new("server-not-bound", 409))?;
+                                    if let Some(proof) = residency.object(hash, None)? {
+                                        if proof.config.library_id == config.library_id
+                                            && proof.config.device_id == config.device_id
+                                        {
+                                            continue;
+                                        }
+                                    }
+                                }
                                 let mut source = cas
                                     .open_object(hash)?
                                     .ok_or_else(|| SyncError::new("missing-local-payload", 409))?;
@@ -1243,7 +1351,7 @@ impl PersistentStore {
                 self.connection
                     .execute("DELETE FROM server_cycle_order WHERE key=?1", [&item.key])?;
                 if matches!(remote, RecordVersion::Live { .. }) {
-                    transfer.download_record(
+                    transfer.download_record_metadata(
                         &remote,
                         &self.server_base_candidates(&item.key, cache, false)?,
                         &self.server_base(&item.key)?.0,
@@ -1471,16 +1579,31 @@ impl PersistentStore {
         hashes: &[String],
         check_active: impl Fn() -> Result<()>,
     ) -> Result<()> {
+        self.promote_server_dependencies_with_residency(cache, hashes, None, check_active)
+    }
+    fn promote_server_dependencies_with_residency(
+        &mut self,
+        cache: &Cache,
+        hashes: &[String],
+        remote: Option<(&crate::server_sync::residency::Residency, &str)>,
+        check_active: impl Fn() -> Result<()>,
+    ) -> Result<()> {
         let native = PayloadCas::new(&self.repository_root)?;
         for batch in hashes.chunks(256) {
             check_active()?;
             let registrations = batch
                 .iter()
                 .map(|hash| {
-                    let size = cache
-                        .cas
-                        .stat_object(hash)?
-                        .ok_or_else(|| SyncError::new("missing-downloaded-payload", 409))?;
+                    let size = match cache.cas.stat_object(hash)? {
+                        Some(size) => size,
+                        None => remote
+                            .and_then(|(residency, context)| {
+                                residency.object(hash, Some(context)).transpose()
+                            })
+                            .transpose()?
+                            .map(|object| object.size)
+                            .ok_or_else(|| SyncError::new("missing-downloaded-payload", 409))?,
+                    };
                     Ok(AssetObjectRegistration {
                         object_hash: hash.clone(),
                         byte_size: size,
@@ -1505,6 +1628,15 @@ impl PersistentStore {
             for object in &registrations {
                 check_active()?;
                 if native.stat_object(&object.object_hash)? != Some(object.byte_size) {
+                    if cache.cas.stat_object(&object.object_hash)?.is_none()
+                        && remote.is_some_and(|(residency, context)| {
+                            residency
+                                .confirms(&object.object_hash, Some(object.byte_size), context)
+                                .unwrap_or(false)
+                        })
+                    {
+                        continue;
+                    }
                     let mut source = cache
                         .cas
                         .open_object(&object.object_hash)?
