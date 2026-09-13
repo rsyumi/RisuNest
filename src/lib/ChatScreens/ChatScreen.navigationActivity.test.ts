@@ -19,10 +19,25 @@ vi.mock('src/ts/stores.svelte', () => ({
             textScreenRounded: false,
             textScreenBorder: '',
             classicMaxWidth: false,
+            characters: [
+                {
+                    chaId: 'synthetic',
+                    chatPage: 0,
+                    viewScreen: 'none',
+                    chats: [{ id: 'chat', message: [] }],
+                },
+            ],
         },
     },
     CharEmotion: writable('plain'),
-    selectedCharID: writable(-1),
+    selectedCharID: writable(0),
+}))
+
+vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
+    getPersistentDataRuntime: () => ({
+        captureSelectedConversationTarget: () => null,
+        subscribeActiveConversationViewportSource: () => () => {},
+    }),
 }))
 
 vi.mock('../../lang', () => ({

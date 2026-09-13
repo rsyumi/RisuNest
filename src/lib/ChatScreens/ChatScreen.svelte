@@ -11,6 +11,7 @@
     import BackgroundDom from "./BackgroundDom.svelte";
     import SideBarArrow from "../UI/GUI/SideBarArrow.svelte";
     import ModuleChatMenu from "../Setting/Pages/Module/ModuleChatMenu.svelte";
+    import SelectedConversationEditor from "../SideBars/SelectedConversationEditor.svelte";
     import LoadingIndicator from '../UI/GUI/LoadingIndicator.svelte';
     import { language } from '../../lang';
     import { navigationActivity } from '../../ts/ui/navigationActivity';
@@ -92,11 +93,31 @@
     {/if}
     {#if openChatList}
         <div class="absolute inset-0 z-40">
-            <ChatList close={() => {openChatList = false}}/>
+            <SelectedConversationEditor
+                close={() => {
+                    openChatList = false;
+                }}
+            >
+                <ChatList
+                    close={() => {
+                        openChatList = false;
+                    }}
+                />
+            </SelectedConversationEditor>
         </div>
     {:else if openModuleList}
         <div class="absolute inset-0 z-40">
-            <ModuleChatMenu close={() => {openModuleList = false}}/>
+            <SelectedConversationEditor
+                close={() => {
+                    openModuleList = false;
+                }}
+            >
+                <ModuleChatMenu
+                    close={() => {
+                        openModuleList = false;
+                    }}
+                />
+            </SelectedConversationEditor>
         </div>
     {/if}
 </div>

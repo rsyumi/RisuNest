@@ -37,6 +37,7 @@
     getCharImage,
   } from "../../ts/characters";
     import CharConfig from "./CharConfig.svelte";
+    import SelectedConversationEditor from "./SelectedConversationEditor.svelte";
     import { language } from "../../lang";
     import isEqual from "lodash/isEqual";
     import SidebarAvatar from "./SidebarAvatar.svelte";
@@ -934,7 +935,9 @@
         <span class="text-xs text-textcolor2">Select a bot to start chatting</span>
       </div>
     {:else if DBState.db.characters[$selectedCharID]?.chaId === '§playground'}
-      <SideChatList bind:chara={ DBState.db.characters[$selectedCharID]} />
+      <SelectedConversationEditor active={!hidden}>
+        <SideChatList bind:chara={DBState.db.characters[$selectedCharID]} />
+      </SelectedConversationEditor>
     {:else if $ConnectionOpenStore}
       <div class="flex flex-col">
         <h1 class="text-xl">{language.connectionOpen}</h1>
@@ -974,9 +977,13 @@
       {:else if devTool}
         <DevTool />
       {:else if $botMakerMode}
-        <CharConfig />
+        <SelectedConversationEditor active={!hidden}>
+          <CharConfig />
+        </SelectedConversationEditor>
       {:else}
-        <SideChatList bind:chara={ DBState.db.characters[$selectedCharID]} />
+        <SelectedConversationEditor active={!hidden}>
+          <SideChatList bind:chara={DBState.db.characters[$selectedCharID]} />
+        </SelectedConversationEditor>
       {/if}
     {/if}
   {/if}

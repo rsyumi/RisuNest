@@ -4,6 +4,7 @@
     import MobileCharacters from "./MobileCharacters.svelte";
     import ChatScreen from "../ChatScreens/ChatScreen.svelte";
     import CharConfig from "../SideBars/CharConfig.svelte";
+    import SelectedConversationEditor from "../SideBars/SelectedConversationEditor.svelte";
     import { WrenchIcon } from "@lucide/svelte";
     import { language } from "src/lang";
     import SideChatList from "../SideBars/SideChatList.svelte";
@@ -44,9 +45,13 @@
     {#if $MobileSideBar > 0}
         <div class="w-full flex flex-col p-2 mt-2 h-full">
             {#if $MobileSideBar === 1}
-                <SideChatList bind:chara={DBState.db.characters[$selectedCharID]} />
+                <SelectedConversationEditor>
+                    <SideChatList bind:chara={DBState.db.characters[$selectedCharID]} />
+                </SelectedConversationEditor>
             {:else if $MobileSideBar === 2}
-                <CharConfig />
+                <SelectedConversationEditor>
+                    <CharConfig />
+                </SelectedConversationEditor>
             {:else if $MobileSideBar === 3}
                 <DevTool />
             {/if}
