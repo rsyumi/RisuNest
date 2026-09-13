@@ -16,7 +16,8 @@ function setup() {
     return { body };
   });
   const window = { fetch };
-  runInNewContext(script, { window, TextEncoder });
+  // Tauri appends this source directly after an IIFE without a semicolon.
+  runInNewContext(";(function () {})()\n" + script, { window, TextEncoder });
   return { window, fetch };
 }
 

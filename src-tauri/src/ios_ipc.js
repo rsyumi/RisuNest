@@ -2,7 +2,8 @@
 // bytes across Tauri IPC, including decomposed text in storage and tokenization.
 // Install with Tauri's main-frame invoke initialization hook. Authentication,
 // capability checks, serialization and response handling remain owned by Tauri.
-(() => {
+// A block also separates this from Tauri's preceding, unterminated IIFE.
+{
   const originalFetch = window.fetch.bind(window);
   window.fetch = (input, init) => {
     if (
@@ -17,4 +18,4 @@
     }
     return originalFetch(input, init);
   };
-})();
+}

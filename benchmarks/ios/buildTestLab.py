@@ -70,6 +70,9 @@ def main():
     binary = product / product_info["CFBundleExecutable"]
     body = binary.read_bytes()
     assert all(marker not in body for marker in [b"ios_bench_phase", b"ios_bench_report", b"RISUNEST_IOS_PHASE"]), "Test code in product"
+    xcode_major = int(subprocess.check_output(["xcodebuild", "-version"], text=True).split()[1].split('.')[0])
+    if xcode_major >= 26:
+        assert b"BGContinuedProcessingTaskRequest" in body, "Selected Xcode must compile continued processing support"
     del body
     sign_and_verify(product)
 
