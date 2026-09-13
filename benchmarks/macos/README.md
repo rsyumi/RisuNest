@@ -30,7 +30,7 @@ Those generated files are ignored. The separate Cargo lock retains the product's
 dependency versions. The harness adds only its own package, with no automation
 server dependency or remote control listener.
 
-The controller runs four process phases:
+The controller runs five process phases:
 
 1. Contracts: JSON/Worker saves, malformed/stale rejection, exact Unicode/revision
    readback, native regex/JS oracle, literal tokenizer IDs/errors and batched
@@ -42,6 +42,8 @@ The controller runs four process phases:
    a synthetic character, edit a message and verify rendering/native persistence,
    then exit through the product bootstrap's lifecycle listener.
 4. App restart: verify the edited product message survived quit and restart.
+5. Streaming: reuse the existing Svelte streaming suite for thought display,
+   split/nested tags, final regex effects, cancellation and update cadence.
 
 Reports contain synthetic assertions, timings and hashes. Persistence samples
 record the commands actually used, so small inputs remaining on JSON cannot be

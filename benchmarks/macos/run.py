@@ -64,7 +64,7 @@ def run_phase(app, phase, artifacts, fixtures):
             if process.returncode != 0:
                 raise RuntimeError(f'{phase}: app exited {process.returncode}')
             result = records(report)
-            required = {'contracts': {'persistence', 'regex', 'tokenizer', 'reload', 'closed', 'reopened', 'finder', 'quit-cancelled', 'quit-saved'}, 'restart': {'restart'}, 'app': {'app'}, 'app-restart': {'app-restart'}}[phase]
+            required = {'contracts': {'persistence', 'regex', 'tokenizer', 'reload', 'closed', 'reopened', 'finder', 'quit-cancelled', 'quit-saved'}, 'restart': {'restart'}, 'app': {'app'}, 'app-restart': {'app-restart'}, 'streaming': {'streaming'}}[phase]
             stages = {entry['stage'] for entry in result}
             if not required <= stages or 'failure' in stages:
                 raise RuntimeError(f'{phase}: incomplete results {stages}')
@@ -98,7 +98,7 @@ def main():
     fixtures = [fixture_root / 'synthetic 한글 # %.risup', fixture_root / 'synthetic-two.risum']
     for fixture in fixtures:
         fixture.write_text('synthetic file association fixture')
-    results = {phase: run_phase(app, phase, artifacts, fixtures) for phase in ['contracts', 'restart', 'app', 'app-restart']}
+    results = {phase: run_phase(app, phase, artifacts, fixtures) for phase in ['contracts', 'restart', 'app', 'app-restart', 'streaming']}
     (artifacts / 'result.json').write_text(json.dumps({'passed': True, 'phases': results}, indent=2))
     print('Mac WKWebView contracts, restart and product app passed', flush=True)
 

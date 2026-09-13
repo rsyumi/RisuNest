@@ -323,6 +323,20 @@ async function main() {
     );
     await report("app-restart", { passed: true });
     await invoke("macos_bench_quit");
+  } else if (phase === "streaming") {
+    document.getElementById("benchmark")!.remove();
+    await import("../streaming/main");
+    const api = (
+      window as unknown as {
+        __streamingSmoke: {
+          run(): Promise<{ passed: boolean; assertion?: string }>;
+        };
+      }
+    ).__streamingSmoke;
+    const result = await api.run();
+    check(result.passed, `streaming suite: ${result.assertion ?? "failed"}`);
+    await report("streaming", result);
+    await invoke("macos_bench_quit");
   } else {
     throw new Error("Unknown isolated Mac harness phase");
   }
