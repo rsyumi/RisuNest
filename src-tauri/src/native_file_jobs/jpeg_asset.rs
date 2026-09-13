@@ -359,7 +359,6 @@ fn import_jpeg_asset_with_before_commit(
             preset_count: 0,
             warning_codes: Vec::new(),
             handoff_path: None,
-            recovery_path: None,
             publication: None,
         })
     })();

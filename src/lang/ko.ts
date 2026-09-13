@@ -67,7 +67,7 @@ export const languageKorean = {
         helpExport:
             '선택한 기기 데이터는 앱을 유지보수 모드로 재시작한 뒤 캡처합니다.',
         helpRestore:
-            '선택한 영역은 이 기기에만 있는 키를 포함해 교체됩니다. 선택하지 않은 영역은 유지됩니다.',
+            '선택한 영역은 이 기기에만 있는 키를 포함해 교체됩니다. 선택하지 않은 영역은 유지됩니다. 자동 백업은 남기지 않습니다. 기존 데이터를 보관하려면 먼저 직접 백업하세요.',
         repair: '손상된 원본을 보존한 파일입니다. 라이브러리는 수리 후 활성화할 수 있습니다.',
         continue: '계속',
         cancel: '취소',
@@ -841,7 +841,7 @@ export const languageKorean = {
     "files": "파일",
     "backupConfirm": "정말로 백업을 저장하시겠습니까?",
     "backupLoadConfirm": "정말로 백업을 불러오시겠습니까? 현재 데이터가 모두 사라집니다!",
-    "backupLoadConfirm2": "정말로, 정말로 백업을 불러오시겠습니까? 현재 데이터가 모두 사라집니다!",
+    "backupLoadConfirm2": "현재 데이터가 백업의 데이터로 교체됩니다. 자동 백업은 만들지 않습니다. 기존 데이터를 보관하려면 취소 후 직접 백업하세요. 계속할까요?",
     "importRisuSave": "RisuSave 파일 가져오기",
     "exportRisuSave": "RisuSave 파일 내보내기",
     "risuSaveImportConfirm": "선택한 RisuSave 파일로 현재 데이터베이스를 교체하시겠습니까?",
@@ -1945,7 +1945,7 @@ export const languageKorean = {
             officialRestore: '백업 복원',
             officialCancel: '백업 업로드 취소',
             officialRestoreConfirm:
-                '공식 계정 백업으로 이 기기의 데이터를 교체할까요?',
+                '공식 계정 백업으로 이 기기의 데이터를 교체할까요? 자동 백업은 만들지 않으므로, 기존 데이터를 보관하려면 먼저 직접 백업하세요.',
             officialRestoreInlayWarning:
                 '공식 스냅샷에는 별도로 저장된 채팅 첨부가 포함되지 않습니다. 연결된 이미지, 오디오, 동영상, 서명은 복원되지 않을 수 있습니다. 백업을 복원한 뒤 앱이 다시 시작됩니다. 계속할까요?',
             officialMissing:
@@ -1963,8 +1963,6 @@ export const languageKorean = {
             localBackupRestored: '로컬 백업을 복원했습니다.',
             sourcePreserved:
                 '원본 DB와 파일을 보존했습니다. 이 보존용 백업으로 라이브러리를 교체하려면 데이터 복구가 먼저 필요합니다.',
-            recoverySourcePreserved:
-                '백업을 복원했습니다. 교체 전 데이터는 원본 보존용 백업에 담았으며, 이를 다시 사용하려면 데이터 복구가 필요합니다.',
             sourceRepairRequired:
                 '원본 보존 백업을 검증했지만 라이브러리를 교체하려면 데이터 복구가 필요합니다. 현재 데이터는 변경하지 않았습니다.',
         },
@@ -1972,7 +1970,7 @@ export const languageKorean = {
             titleImport: '가져오기',
             titleRisuSave: 'RisuSave 가져오기',
             titleLocalBackup: '로컬 백업 가져오기',
-            titleLossless: 'RisuNest 백업 가져오기',
+            titleBackup: 'RisuNest 백업 가져오기',
             formatPocketRisu: 'PocketRisu 백업',
             formatRisuAi: 'RisuAI 백업',
             elapsed: '경과 {0}',

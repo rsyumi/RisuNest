@@ -1,7 +1,4 @@
-use super::{
-    lossless::create_official_snapshot_recovery, restore, JobControl, JobPhase, JobResultSummary,
-    NativeJobError, OpenedJobSource,
-};
+use super::{restore, JobControl, JobPhase, JobResultSummary, NativeJobError, OpenedJobSource};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -40,7 +37,6 @@ pub(crate) fn restore_official_snapshot(
     request: OfficialSnapshotRestoreRequest,
     expected_revision: i64,
     owned_directory: &Path,
-    store: crate::persistent_store::PersistentStore,
     job: &JobControl,
     sink: &dyn restore::ReplacementSink,
 ) -> Result<JobResultSummary, NativeJobError> {
@@ -55,39 +51,13 @@ pub(crate) fn restore_official_snapshot(
         ));
     };
     require_native_prepared_format(&mut source)?;
-    let recovery = std::cell::RefCell::new(Some(store));
-    let recovery_path = std::cell::RefCell::new(None::<std::path::PathBuf>);
-    let outcome = restore::restore_started_risu_save_with_pre_activation(
+    restore::restore_started_risu_save(
         source,
         expected_revision,
         job,
         sink,
         restore::RestoreProgressScale::default(),
-        || {
-            let store = recovery
-                .borrow_mut()
-                .take()
-                .ok_or_else(|| NativeJobError::new("store-error", "recovery store was reused"))?;
-            let path =
-                create_official_snapshot_recovery(owned_directory, store, expected_revision, job)?;
-            *recovery_path.borrow_mut() = Some(path.clone());
-            Ok(Some(path.to_string_lossy().into_owned()))
-        },
-    );
-    match outcome {
-        Ok(result) => Ok(result),
-        Err(error) => match recovery_path.into_inner() {
-            None => Err(error),
-            Some(path) => match fs::remove_file(path) {
-                Ok(()) => Err(error),
-                Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => Err(error),
-                Err(cleanup) => Err(NativeJobError::new(
-                    "cleanup-failed",
-                    format!("{}; recovery cleanup failed: {cleanup}", error.message),
-                )),
-            },
-        },
-    }
+    )
 }
 
 fn require_native_prepared_format(source: &mut OpenedJobSource) -> Result<(), NativeJobError> {

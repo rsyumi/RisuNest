@@ -52,9 +52,6 @@ private val MANAGED_EXPORT_NAME = Regex(
 private val MANAGED_LEGACY_BACKUP_NAME = Regex(
   "risu-backup-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\\.bin",
 )
-private val MANAGED_LOSSLESS_BACKUP_NAME = Regex(
-  "risulossless-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\\.risulossless",
-)
 private val MANAGED_PORTABLE_BACKUP_NAME = Regex(
   "risunest-backup-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\\.risunest",
 )
@@ -499,9 +496,6 @@ private val MANAGED_HANDOFF_KINDS = listOf(
   ManagedHandoffKind(MANAGED_PORTABLE_BACKUP_NAME, SafDestinationSourceKind.RISU_SAVE) { id ->
     listOf("risunest-backup-$id.risunest")
   },
-  ManagedHandoffKind(MANAGED_LOSSLESS_BACKUP_NAME, SafDestinationSourceKind.RISU_SAVE) { id ->
-    listOf("risulossless-$id.risulossless")
-  },
   ManagedHandoffKind(MANAGED_LEGACY_BACKUP_NAME, SafDestinationSourceKind.LEGACY_BACKUP) { id ->
     listOf("risu-backup-$id.bin")
   },
@@ -701,7 +695,6 @@ internal fun safeSafDestinationName(name: String): String {
   val safe = safeSafDisplayName(name)
   return if (
     isBackupSource(safe)
-    || safe.endsWith(".risulossless", ignoreCase = true)
     || safe.endsWith(".zip", ignoreCase = true)
     || safe.endsWith(".charx", ignoreCase = true)
     || safe.endsWith(".jpeg", ignoreCase = true)
@@ -789,17 +782,17 @@ private fun sourcePickedScript(eventName: String, requestId: String, batch: SafS
   return "window.dispatchEvent(new CustomEvent('$eventName',{detail:$detail}));"
 }
 
-internal fun androidLosslessSourcePickedScript(requestId: String, batch: SafSpoolBatch): String =
-  sourcePickedScript("risu-android-lossless-source-picked", requestId, batch)
+internal fun androidBackupSourcePickedScript(requestId: String, batch: SafSpoolBatch): String =
+  sourcePickedScript("risu-android-backup-source-picked", requestId, batch)
 
-internal fun androidLosslessSourceResultScript(
+internal fun androidBackupSourceResultScript(
   requestId: String,
   batch: SafSpoolBatch,
   restored: Boolean,
 ): String = if (restored) {
   androidSpoolBatchScript(requestId, batch)
 } else {
-  androidLosslessSourcePickedScript(requestId, batch)
+  androidBackupSourcePickedScript(requestId, batch)
 }
 
 internal fun androidLegacyBackupSourcePickedScript(

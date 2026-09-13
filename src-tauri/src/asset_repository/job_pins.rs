@@ -21,7 +21,6 @@ pub(crate) const MAX_DURABLE_CAS_JOB_PINS: usize = 100_000;
 pub(crate) enum CasJobKind {
     DirectAssetOrInlayWrite,
     LocalBackupRestore,
-    LosslessImport,
     CardOrModuleContentImport,
     OfficialPublicationOrExportPreparation,
     ColdMigration,
@@ -1335,8 +1334,8 @@ mod tests {
         let prepared = cas.prepare_bytes(b"same object").expect("prepare object");
         let mut job = DurableCasJob::begin(
             directory.path(),
-            "lossless-import-1",
-            CasJobKind::LosslessImport,
+            "backup-import-1",
+            CasJobKind::LocalBackupRestore,
             1,
         )
         .expect("begin peer job");
@@ -1372,10 +1371,10 @@ mod tests {
             .is_err());
         drop(job);
 
-        let reopened = DurableCasJob::open(directory.path(), "lossless-import-1")
+        let reopened = DurableCasJob::open(directory.path(), "backup-import-1")
             .expect("reopen job by session id");
         assert_eq!(reopened.pin_count(), 1);
-        assert_eq!(reopened.kind(), CasJobKind::LosslessImport);
+        assert_eq!(reopened.kind(), CasJobKind::LocalBackupRestore);
     }
 
     #[test]
@@ -1385,7 +1384,7 @@ mod tests {
         let mut job = DurableCasJob::begin(
             directory.path(),
             "released-job",
-            CasJobKind::LosslessImport,
+            CasJobKind::LocalBackupRestore,
             1,
         )
         .expect("begin releasable job");
@@ -1416,7 +1415,7 @@ mod tests {
         let mut job = DurableCasJob::begin(
             directory.path(),
             "release-retry-job",
-            CasJobKind::LosslessImport,
+            CasJobKind::LocalBackupRestore,
             1,
         )
         .expect("begin release retry job");
@@ -1451,7 +1450,7 @@ mod tests {
         let mut job = DurableCasJob::begin(
             directory.path(),
             "collector-cleanup-job",
-            CasJobKind::LosslessImport,
+            CasJobKind::LocalBackupRestore,
             1,
         )
         .expect("begin collector cleanup job");
@@ -1492,7 +1491,7 @@ mod tests {
         let mut job = DurableCasJob::begin(
             directory.path(),
             "coordinated-release-retry",
-            CasJobKind::LosslessImport,
+            CasJobKind::LocalBackupRestore,
             1,
         )
         .expect("begin coordinated release retry job");

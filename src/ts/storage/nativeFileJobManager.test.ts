@@ -354,27 +354,63 @@ describe('common library file admission', () => {
         try {
             for (const kind of ['export', 'import'] as const) {
                 const work=vi.fn(async()=>1);
-                await expect(runSharedNativeFileOperation(kind, kind, work, {format:'lossless-backup'})).rejects.toMatchObject({code:'generation-active'});
+                await expect(
+                    runSharedNativeFileOperation(kind, kind, work, {
+                        format: 'library-backup',
+                    }),
+                ).rejects.toMatchObject({ code: 'generation-active' })
                 expect(work).not.toHaveBeenCalled(); expect(get(doingChat)).toBe(true);
             }
         } finally { generation.release() }
     });
     it('retains admission until actual settlement after a cancel request', async () => {
         let finish!: () => void;
-        const backup=runSharedNativeFileOperation('export','backup',()=>new Promise<void>(r=>{finish=r}),{format:'lossless-backup'});
+        const backup = runSharedNativeFileOperation(
+            'export',
+            'backup',
+            () =>
+                new Promise<void>((r) => {
+                    finish = r
+                }),
+            { format: 'library-backup' },
+        )
         expect(reserveGeneration()).toBeNull();
         cancelActiveNativeFileOperation(); expect(isLibraryFileOperationReserved()).toBe(true);
-        await expect(runSharedNativeFileOperation('import','restore',async()=>1,{format:'lossless-backup'})).rejects.toBeInstanceOf(NativeFileOperationBusyError);
+        await expect(
+            runSharedNativeFileOperation('import', 'restore', async () => 1, {
+                format: 'library-backup',
+            }),
+        ).rejects.toBeInstanceOf(NativeFileOperationBusyError)
         finish(); await backup; expect(isLibraryFileOperationReserved()).toBe(false);
         const generation=reserveGeneration();expect(generation).not.toBeNull();generation?.release();
     });
     it('releases admission on a synchronous callback failure and rejects reentrant different jobs', async () => {
-        await expect(runSharedNativeFileOperation('export','backup',()=>{throw new Error('capture failed')},{format:'lossless-backup'})).rejects.toThrow('capture failed');
+        await expect(
+            runSharedNativeFileOperation(
+                'export',
+                'backup',
+                () => {
+                    throw new Error('capture failed')
+                },
+                { format: 'library-backup' },
+            ),
+        ).rejects.toThrow('capture failed')
         expect(isLibraryFileOperationReserved()).toBe(false);
-        await runSharedNativeFileOperation('export','backup',async()=>{
-            await expect(runSharedNativeFileOperation('import','other',async()=>1)).rejects.toBeInstanceOf(NativeFileOperationBusyError);
-            return 1;
-        },{format:'lossless-backup'});
+        await runSharedNativeFileOperation(
+            'export',
+            'backup',
+            async () => {
+                await expect(
+                    runSharedNativeFileOperation(
+                        'import',
+                        'other',
+                        async () => 1,
+                    ),
+                ).rejects.toBeInstanceOf(NativeFileOperationBusyError)
+                return 1
+            },
+            { format: 'library-backup' },
+        )
     });
 });
 
@@ -382,6 +418,10 @@ it('does not queue a known backup delivered by Android while another file job ru
     let finish!: () => void;
     const active=runSharedNativeFileOperation('import','other',()=>new Promise<void>(r=>{finish=r}));
     const backup=vi.fn(async()=>1);
-    await expect(runExternalAndroidNativeFileOperation('export',backup,{format:'lossless-backup'})).rejects.toBeInstanceOf(NativeFileOperationBusyError);
+    await expect(
+        runExternalAndroidNativeFileOperation('export', backup, {
+            format: 'library-backup',
+        }),
+    ).rejects.toBeInstanceOf(NativeFileOperationBusyError)
     finish();await active;await Promise.resolve();expect(backup).not.toHaveBeenCalled();
 });

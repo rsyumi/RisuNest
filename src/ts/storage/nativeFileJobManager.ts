@@ -210,15 +210,18 @@ export function runSharedNativeFileOperation<T>(
             : Promise.reject(new NativeFileOperationBusyError())
     }
 
-    if (options.format === 'lossless-backup' && get(doingChat)) {
-        return Promise.reject(new NativeFileJobError(
-            'generation-active',
-            'A response is being generated. Finish or stop it before starting a backup or restore.',
-        ))
+    if (options.format === 'library-backup' && get(doingChat)) {
+        return Promise.reject(
+            new NativeFileJobError(
+                'generation-active',
+                'A response is being generated. Finish or stop it before starting a backup or restore.',
+            ),
+        )
     }
-    const releaseAdmission = options.format === 'lossless-backup'
-        ? reserveLibraryFileOperation()
-        : () => {}
+    const releaseAdmission =
+        options.format === 'library-backup'
+            ? reserveLibraryFileOperation()
+            : () => {}
 
     const controller = new AbortController()
     const presentation = options.presentation ?? 'inline'
@@ -280,8 +283,13 @@ export function runExternalAndroidNativeFileOperation<T>(
     operation: (context: SharedNativeFileOperationContext) => Promise<T>,
     options: SharedNativeFileOperationOptions = {},
 ): Promise<T> {
-    if (options.format === 'lossless-backup') {
-        return runSharedNativeFileOperation(kind, `external-android:${kind}`, operation, options)
+    if (options.format === 'library-backup') {
+        return runSharedNativeFileOperation(
+            kind,
+            `external-android:${kind}`,
+            operation,
+            options,
+        )
     }
     return externalAndroidOperationMutex.runExclusive(async () => {
         while (activeOperation) {

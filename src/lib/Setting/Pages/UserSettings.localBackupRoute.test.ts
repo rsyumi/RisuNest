@@ -62,8 +62,11 @@ describe('UserSettings local backup route', () => {
         expect(source).toContain('restoreBackupFromSystemPicker')
         expect(source).toContain('exportRisuSaveFromSystemPicker')
         expect(source).toContain('language.portableBackup.dbOnly')
-        expect(source).toContain('exportLocalBackupFromSystemPicker')
-        expect(source).toContain('restoreLocalBackupFromSystemPicker')
+        expect(source).toContain('SaveLocalBackup()')
+        expect(source).toContain('LoadLocalBackup()')
+        expect(source).toMatch(
+            /isTauri[\s\S]*?restoreBackupFromSystemPicker\(\)[\s\S]*?LoadLocalBackup\(\)/,
+        )
         expect(source).toMatch(
             /await runLocalBackupOperation\(["']export["']\)/,
         )
@@ -83,7 +86,6 @@ describe('UserSettings local backup route', () => {
 
         for (const control of [
             'runRisuSaveOperation',
-            'LoadLocalBackup()',
             'restoreNativePersistentSnapshot',
             'openSyncConflictBackups()',
             'getNativeOfficialAccountFlow().publish',

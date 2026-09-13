@@ -38,7 +38,7 @@ export interface DeviceMaintenanceSession {
     | "continue"
     | "await-library"
     | "await-capture"
-    | "await-recovery"
+    | "await-native-preparation"
     | "await-source"
     | "await-navigation";
 }
@@ -206,8 +206,8 @@ export async function runDeviceMaintenance(
             "AbortError",
           );
         await invoke("native_device_backup_prepared", args);
-        // The native job publishes the complete pre-replacement recovery file
-        // while the maintenance barrier still protects the captured old state.
+        // Wait until the native job has validated and staged the incoming library.
+        // Rollback spools remain protected by the maintenance barrier.
         while (true) {
           const decision = await refresh();
           if (decision.session?.sessionId !== session.sessionId)
@@ -215,14 +215,12 @@ export async function runDeviceMaintenance(
               "Native restore ownership changed before application",
             );
           if (decision.session.phase === "prepared") break;
-          if (decision.session.action !== "await-recovery") {
+          if (decision.session.action !== "await-native-preparation") {
             bootstrap = decision;
             continue sessionLoop;
           }
           environment.signal?.throwIfAborted();
-          view.progress(
-            "Saving the recovery backup before replacing selected data.",
-          );
+          view.progress("Preparing the selected backup before replacing data.");
           await dependencies.wait(100);
         }
         for (const section of staged) {

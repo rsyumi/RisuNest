@@ -14,7 +14,8 @@ const mocks = vi.hoisted(() => ({
     installLocalBackup: vi.fn(),
     replacePersistentDatabase: vi.fn(),
     publishCurrentOfficialRevision: vi.fn(),
-    withFlushedRisuSaveExport: vi.fn(),
+    flushPendingData: vi.fn(),
+    capturePersistentMutationToken: vi.fn(),
     runtime: { store: {}, revision: 7, flushPendingData: vi.fn() },
 }))
 
@@ -42,16 +43,14 @@ vi.mock('../database.svelte', () => ({
 }))
 vi.mock('../databaseRestore', () => ({ installLocalBackup: mocks.installLocalBackup }))
 vi.mock('../persistentDataRuntime.svelte', () => ({
-    getPersistentDataRuntime: () => mocks.runtime,
+    flushPendingData: mocks.flushPendingData,
+    capturePersistentMutationToken: mocks.capturePersistentMutationToken,
     replacePersistentDatabase: mocks.replacePersistentDatabase,
     publishCurrentOfficialRevision: mocks.publishCurrentOfficialRevision,
 }))
 vi.mock('../risuSave', () => ({
     decodeRisuSave: mocks.decodeRisuSave,
     encodeRisuSaveLegacy: vi.fn(() => new Uint8Array([99])),
-}))
-vi.mock('../risuSaveStoreAdapter', () => ({
-    withFlushedRisuSaveExport: mocks.withFlushedRisuSaveExport,
 }))
 vi.mock('./syncConflictBackup', () => ({
     getSyncConflictBackupStore: () => mocks.backupStore,
@@ -81,14 +80,10 @@ describe('openSyncConflictBackups', () => {
         mocks.installLocalBackup.mockReset().mockImplementation(async (database, dependencies) => {
             await dependencies.replaceDatabase(database, 'local-backup')
         })
-        mocks.withFlushedRisuSaveExport.mockReset().mockImplementation(
-            async (_runtime, _reason, callback) => callback({
-                revision: 7,
-                mutationGeneration: 9,
-                collectBytes: vi.fn(async () => new Uint8Array([7, 8, 9])),
-                countCharacters: vi.fn(async () => 2),
-            }),
-        )
+        mocks.flushPendingData.mockReset().mockResolvedValue(undefined)
+        mocks.capturePersistentMutationToken
+            .mockReset()
+            .mockResolvedValue({ revision: 7, mutationGeneration: 9 })
     })
 
     it('pins the authoritative local revision before restoring the selected backup', async () => {
@@ -96,16 +91,13 @@ describe('openSyncConflictBackups', () => {
 
         await openSyncConflictBackups()
 
-        expect(mocks.withFlushedRisuSaveExport).toHaveBeenCalledWith(
-            mocks.runtime,
-            'sync-conflict-restore-safety-backup',
-            expect.any(Function),
+        expect(mocks.flushPendingData).toHaveBeenCalledWith(
+            'sync-conflict-restore',
         )
-        expect(mocks.backupStore.save).toHaveBeenCalledWith({
-            side: 'local',
-            bytes: new Uint8Array([7, 8, 9]),
-            characterCount: 2,
-        })
+        expect(mocks.capturePersistentMutationToken).toHaveBeenCalledWith(
+            'sync-conflict-restore',
+        )
+        expect(mocks.backupStore.save).not.toHaveBeenCalled()
         expect(mocks.alertSelect).toHaveBeenCalledWith(
             [expect.stringContaining('database only, no assets/cold/inlays')],
             'backups',

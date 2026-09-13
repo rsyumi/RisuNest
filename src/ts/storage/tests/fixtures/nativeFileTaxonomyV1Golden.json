@@ -8,12 +8,31 @@
     },
     "handoffDirectory": "native-file-jobs/handoffs",
     "managedHandoffs": [
-        { "kind": "portable-backup", "prefix": "risunest-backup-", "suffixes": [".risunest"] },
-        { "kind": "lossless-backup", "prefix": "risulossless-", "suffixes": [".risulossless"] },
-        { "kind": "legacy-backup", "prefix": "risu-backup-", "suffixes": [".bin"] },
-        { "kind": "character-charx", "prefix": "risu-charx-", "suffixes": [".charx", ".jpeg"] },
-        { "kind": "character-card", "prefix": "risu-character-card-", "suffixes": [".json", ".png"] },
-        { "kind": "risu-module", "prefix": "risu-module-", "suffixes": [".risum"] }
+      {
+        "kind": "portable-backup",
+        "prefix": "risunest-backup-",
+        "suffixes": [".risunest"]
+      },
+      {
+        "kind": "legacy-backup",
+        "prefix": "risu-backup-",
+        "suffixes": [".bin"]
+      },
+      {
+        "kind": "character-charx",
+        "prefix": "risu-charx-",
+        "suffixes": [".charx", ".jpeg"]
+      },
+      {
+        "kind": "character-card",
+        "prefix": "risu-character-card-",
+        "suffixes": [".json", ".png"]
+      },
+      {
+        "kind": "risu-module",
+        "prefix": "risu-module-",
+        "suffixes": [".risum"]
+      }
     ],
     "risuSaveExport": {
         "directory": "persistent/exports",

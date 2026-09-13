@@ -3,12 +3,12 @@ import { alertConfirm, alertError, alertNormal, alertSelect } from '../../alert'
 import type { Database } from '../database.svelte'
 import { installLocalBackup } from '../databaseRestore'
 import {
-    getPersistentDataRuntime,
+    flushPendingData,
+    capturePersistentMutationToken,
     publishCurrentOfficialRevision,
     replacePersistentDatabase,
 } from '../persistentDataRuntime.svelte'
 import { decodeRisuSave } from '../risuSave'
-import { withFlushedRisuSaveExport } from '../risuSaveStoreAdapter'
 import {
     getSyncConflictBackupStore,
     type SyncConflictBackupEntry,
@@ -46,21 +46,10 @@ export async function openSyncConflictBackups(): Promise<void> {
         alertError('Invalid sync conflict backup')
         return
     }
-    const current = await withFlushedRisuSaveExport(
-        getPersistentDataRuntime(),
-        'sync-conflict-restore-safety-backup',
-        async (pinned) => ({
-            revision: pinned.revision,
-            mutationGeneration: pinned.mutationGeneration,
-            bytes: await pinned.collectBytes(),
-            characterCount: await pinned.countCharacters(),
-        }),
+    await flushPendingData('sync-conflict-restore')
+    const current = await capturePersistentMutationToken(
+        'sync-conflict-restore',
     )
-    await store.save({
-        side: 'local',
-        bytes: current.bytes,
-        characterCount: current.characterCount,
-    })
     await installLocalBackup(decoded, {
         replaceDatabase: (database, reason) => replacePersistentDatabase(database, reason, {
             authoritative: true,

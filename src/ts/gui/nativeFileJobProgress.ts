@@ -69,10 +69,8 @@ export function nativeFileJobTitle(
             return language.portableBackup.export
         case 'export-compatible-local-backup':
             return language.portableBackup.report
-        case 'restore-lossless-backup':
         case 'restore-legacy-local-backup':
             return language.loadBackupLocal
-        case 'export-lossless-backup':
         case 'export-legacy-local-backup':
             return language.saveBackupLocal
         default:

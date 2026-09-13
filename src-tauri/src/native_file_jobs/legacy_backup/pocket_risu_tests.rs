@@ -104,7 +104,7 @@ impl StrictLocalBackupDatabaseRestore for Import<'_> {
         if self.fail_database {
             std::fs::write(database.staged_path.as_ref().unwrap(), b"invalid database").unwrap();
         }
-        let result = restore::restore_started_risu_save_with_pre_activation(
+        let result = restore::restore_started_risu_save(
             OpenedJobSource {
                 file: open_staged(database)?,
                 total_bytes: database.byte_length,
@@ -113,7 +113,6 @@ impl StrictLocalBackupDatabaseRestore for Import<'_> {
             self.job,
             &sink,
             restore::RestoreProgressScale::default(),
-            || Ok(None),
         );
         sink.durable
             .lock()

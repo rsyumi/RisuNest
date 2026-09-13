@@ -170,6 +170,32 @@ describe("native server synchronization scheduling", () => {
     resumeServerSyncAfterBackup();
     expect(state.scheduler.resume).toHaveBeenCalledTimes(4);
   });
+  it("cleans in the background, coalesces concurrent attempts, and retries after failure", async () => {
+    const { startServerSync, resumeServerSyncAfterBackup } = await import(
+      "./serverSyncProduction"
+    );
+    let reject!: (reason: unknown) => void;
+    state.invoke.mockImplementationOnce(
+      () =>
+        new Promise((_, failure) => {
+          reject = failure;
+        }),
+    );
+    startServerSync();
+    await Promise.resolve();
+    expect(state.invoke).toHaveBeenCalledWith("server_sync_backup_cleanup");
+    expect(state.scheduler.resume).toHaveBeenCalledTimes(1);
+    resumeServerSyncAfterBackup();
+    expect(state.invoke).toHaveBeenCalledTimes(1);
+    expect(state.scheduler.resume).toHaveBeenCalledTimes(2);
+    reject(new Error("synthetic busy"));
+    await vi.waitFor(() => expect(state.invoke).toHaveBeenCalledTimes(1));
+    await Promise.resolve();
+    await Promise.resolve();
+    resumeServerSyncAfterBackup();
+    expect(state.invoke).toHaveBeenCalledTimes(2);
+    expect(state.controller.pause).not.toHaveBeenCalled();
+  });
   it("does not install a native scheduler in the browser build", async () => {
     state.native = false;
     const interval = vi.spyOn(globalThis, "setInterval");

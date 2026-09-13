@@ -118,7 +118,7 @@ export async function exportPortableBackupFromSystemPicker(
                 joined.dispose()
             }
         },
-        { format: 'lossless-backup' },
+        { format: 'library-backup' },
     ).finally(resumeServerSyncAfterBackup)
 }
 
@@ -298,6 +298,6 @@ export async function restoreBackupFromNativeSource(
                     discardAndroidSafSource(input.token)
             }
         },
-        { presentation: 'dialog', format: 'lossless-backup' },
+        { presentation: 'dialog', format: 'library-backup' },
     )
 }

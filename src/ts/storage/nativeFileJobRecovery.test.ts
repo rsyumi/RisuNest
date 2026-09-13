@@ -220,23 +220,40 @@ describe('native file job bootstrap reconciliation', () => {
         let resumePolling!: () => void
         const pollingGate = new Promise<void>((resolve) => resumePolling = resolve)
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
-        const handoffPath = 'C:\\app\\native-file-jobs\\handoffs\\risulossless-123e4567-e89b-42d3-a456-426614174004.risulossless'
+        const handoffPath =
+            'C:\\app\\native-file-jobs\\handoffs\\risu-backup-123e4567-e89b-42d3-a456-426614174004.bin'
         const dependencies = {
             invoke: vi.fn(async (command: string, args?: Record<string, unknown>) => {
                 calls.push([command, args])
-                if (command === 'native_file_job_list') return [{
-                    ...restoreStatus('lossless-export', 'running', 'writing-export'),
-                    kind: 'export-lossless-backup' as const,
-                }]
+                if (command === 'native_file_job_list')
+                    return [
+                        {
+                            ...restoreStatus(
+                                'lossless-export',
+                                'running',
+                                'writing-export',
+                            ),
+                            kind: 'export-legacy-local-backup' as const,
+                        },
+                    ]
                 if (command === 'native_file_job_status') return {
-                    ...restoreStatus('lossless-export', 'succeeded', 'complete'),
-                    kind: 'export-lossless-backup' as const,
+                    ...restoreStatus(
+                        'lossless-export',
+                        'succeeded',
+                        'complete',
+                    ),
+                    kind: 'export-legacy-local-backup' as const,
                     result: {
-                        ...restoreStatus('lossless-export', 'succeeded', 'complete').result!,
+                        ...restoreStatus(
+                            'lossless-export',
+                            'succeeded',
+                            'complete',
+                        ).result!,
                         handoffPath,
                     },
                 }
-                if (command === 'native_lossless_handoff_cleanup') return undefined
+                if (command === 'native_legacy_backup_handoff_cleanup')
+                    return undefined
                 if (command === 'native_file_job_forget') return true
                 throw new Error(`Unexpected command: ${command}`)
             }),
@@ -251,7 +268,7 @@ describe('native file job bootstrap reconciliation', () => {
             expect(calls).toEqual([
                 ['native_file_job_list', undefined],
                 ['native_file_job_status', { jobId: 'lossless-export' }],
-                ['native_lossless_handoff_cleanup', { path: handoffPath }],
+                ['native_legacy_backup_handoff_cleanup', { path: handoffPath }],
                 ['native_file_job_forget', { jobId: 'lossless-export' }],
             ])
         })
@@ -260,19 +277,30 @@ describe('native file job bootstrap reconciliation', () => {
     it('preserves a lossless handoff still owned by persisted Android SAF state', async () => {
         const calls: string[] = []
         const exportId = '123e4567-e89b-42d3-a456-426614174004'
-        const handoffPath = `C:\\app\\native-file-jobs\\handoffs\\risulossless-${exportId}.risulossless`
+        const handoffPath = `C:\\app\\native-file-jobs\\handoffs\\risu-backup-${exportId}.bin`
         const androidSafExportId = vi.fn(() => exportId)
         const dependencies = {
             invoke: vi.fn(async (command: string) => {
                 calls.push(command)
-                if (command === 'native_file_job_list') return [{
-                    ...restoreStatus('lossless-export', 'succeeded', 'complete'),
-                    kind: 'export-lossless-backup' as const,
-                    result: {
-                        ...restoreStatus('lossless-export', 'succeeded', 'complete').result!,
-                        handoffPath,
-                    },
-                }]
+                if (command === 'native_file_job_list')
+                    return [
+                        {
+                            ...restoreStatus(
+                                'lossless-export',
+                                'succeeded',
+                                'complete',
+                            ),
+                            kind: 'export-legacy-local-backup' as const,
+                            result: {
+                                ...restoreStatus(
+                                    'lossless-export',
+                                    'succeeded',
+                                    'complete',
+                                ).result!,
+                                handoffPath,
+                            },
+                        },
+                    ]
                 if (command === 'native_file_job_forget') return true
                 throw new Error(`Unexpected command: ${command}`)
             }),
@@ -616,10 +644,10 @@ describe('native file job bootstrap reconciliation', () => {
 
     it.each([
         [
-            'export-lossless-backup',
+            'export-legacy-local-backup',
             'lossless-export',
-            'risulossless-123e4567-e89b-42d3-a456-426614174004.risulossless',
-            'native_lossless_handoff_cleanup',
+            'risu-backup-123e4567-e89b-42d3-a456-426614174004.bin',
+            'native_legacy_backup_handoff_cleanup',
         ],
         [
             'export-legacy-local-backup',
@@ -633,51 +661,68 @@ describe('native file job bootstrap reconciliation', () => {
             'risu-backup-123e4567-e89b-42d3-a456-426614174004.bin',
             'native_legacy_backup_handoff_cleanup',
         ],
-    ] as const)('retries %s handoff cleanup on the next bootstrap before forgetting the job', async (
-        kind,
-        jobId,
-        fileName,
-        cleanupCommand,
-    ) => {
-        const calls: string[] = []
-        const handoffPath = `C:\\app\\native-file-jobs\\handoffs\\${fileName}`
-        let cleanupAttempts = 0
-        const log = vi.spyOn(console, 'error').mockImplementation(() => undefined)
-        const dependencies = {
-            invoke: vi.fn(async (command: string) => {
-                calls.push(command)
-                if (command === 'native_file_job_list') return [{
-                    ...restoreStatus(jobId, 'succeeded', 'complete'),
-                    kind,
-                    result: {
-                        ...restoreStatus(jobId, 'succeeded', 'complete').result!,
-                        handoffPath,
-                    },
-                }]
-                if (command === cleanupCommand) {
-                    cleanupAttempts += 1
-                    if (cleanupAttempts === 1) throw new Error('handoff is still in use')
-                    return undefined
-                }
-                if (command === 'native_file_job_forget') return true
-                throw new Error(`Unexpected command: ${command}`)
-            }),
-            wait: vi.fn(async () => undefined),
-        }
+    ] as const)(
+        'retries %s handoff cleanup on the next bootstrap before forgetting the job',
+        async (kind, jobId, fileName, cleanupCommand) => {
+            const calls: string[] = []
+            const handoffPath = `C:\\app\\native-file-jobs\\handoffs\\${fileName}`
+            let cleanupAttempts = 0
+            const log = vi
+                .spyOn(console, 'error')
+                .mockImplementation(() => undefined)
+            const dependencies = {
+                invoke: vi.fn(async (command: string) => {
+                    calls.push(command)
+                    if (command === 'native_file_job_list')
+                        return [
+                            {
+                                ...restoreStatus(
+                                    jobId,
+                                    'succeeded',
+                                    'complete',
+                                ),
+                                kind,
+                                result: {
+                                    ...restoreStatus(
+                                        jobId,
+                                        'succeeded',
+                                        'complete',
+                                    ).result!,
+                                    handoffPath,
+                                },
+                            },
+                        ]
+                    if (command === cleanupCommand) {
+                        cleanupAttempts += 1
+                        if (cleanupAttempts === 1)
+                            throw new Error('handoff is still in use')
+                        return undefined
+                    }
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                }),
+                wait: vi.fn(async () => undefined),
+            }
 
-        try {
-            await expect(reconcileNativeRestoresBeforeBootstrap(dependencies)).resolves.toEqual([])
-            await vi.waitFor(() => expect(cleanupAttempts).toBe(1))
-            expect(calls).not.toContain('native_file_job_forget')
+            try {
+                await expect(
+                    reconcileNativeRestoresBeforeBootstrap(dependencies),
+                ).resolves.toEqual([])
+                await vi.waitFor(() => expect(cleanupAttempts).toBe(1))
+                expect(calls).not.toContain('native_file_job_forget')
 
-            await expect(reconcileNativeRestoresBeforeBootstrap(dependencies)).resolves.toEqual([])
-            await vi.waitFor(() => expect(calls).toContain('native_file_job_forget'))
-            expect(cleanupAttempts).toBe(2)
-        }
-        finally {
-            log.mockRestore()
-        }
-    })
+                await expect(
+                    reconcileNativeRestoresBeforeBootstrap(dependencies),
+                ).resolves.toEqual([])
+                await vi.waitFor(() =>
+                    expect(calls).toContain('native_file_job_forget'),
+                )
+                expect(cleanupAttempts).toBe(2)
+            } finally {
+                log.mockRestore()
+            }
+        },
+    )
 
     it('returns every publication job for late reconciliation without touching it early', async () => {
         const calls: string[] = []

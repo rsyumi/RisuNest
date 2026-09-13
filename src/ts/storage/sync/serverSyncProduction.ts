@@ -46,6 +46,7 @@ let activeScheduler: ReturnType<typeof createServerSyncScheduler> | undefined;
  * scheduler when it settles; restoring a library deliberately does not do this. */
 export function resumeServerSyncAfterBackup(): void {
   activeScheduler?.resume();
+  if (activeScheduler) cleanupDeletedBackups();
 }
 export interface ServerSyncBackup {
   id: string;
@@ -85,8 +86,27 @@ export const getServerSyncBackupInventory = (before?: ServerSyncBackupCursor) =>
   invoke<ServerSyncBackupInventory>("server_sync_backup_inventory", {
     before: before ?? null,
   });
-export const deleteServerSyncBackup = (id: string) =>
-  invoke<void>("server_sync_backup_delete", { id });
+let deletionCleanup: Promise<void> | undefined;
+function cleanupDeletedBackups(): void {
+  if (!isTauri || deletionCleanup) return;
+  // Native admission rejects busy attempts. Retry on the next safe lifecycle
+  // signal, without cancelling work or making startup depend on cleanup.
+  deletionCleanup = invoke("server_sync_backup_cleanup")
+    .then(
+      () => {},
+      () => {},
+    )
+    .finally(() => {
+      deletionCleanup = undefined;
+    });
+}
+export const deleteServerSyncBackup = async (id: string) => {
+  try {
+    await invoke<void>("server_sync_backup_delete", { id });
+  } finally {
+    cleanupDeletedBackups();
+  }
+};
 export const getServerSyncCacheUsage = () =>
   invoke<ServerSyncCacheUsage>("server_sync_cache_usage");
 export const cleanupServerSyncCache = () =>
@@ -125,11 +145,11 @@ export function startServerSync(): void {
     controller.invalidateCompletion();
     scheduler.localCommit();
   });
-  void controller.initialize().then(() => scheduler.resume());
-  window.addEventListener("online", () => scheduler.resume());
+  void controller.initialize().then(() => resumeServerSyncAfterBackup());
+  window.addEventListener("online", () => resumeServerSyncAfterBackup());
   window.addEventListener("offline", () => scheduler.suspend());
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") scheduler.suspend();
-    else scheduler.resume();
+    else resumeServerSyncAfterBackup();
   });
 }

@@ -217,3 +217,49 @@ fn cache_management_rejects_a_linked_cache_root_and_keeps_external_files() {
     }
     assert!(external.cas.open_object(&hash).unwrap().is_some());
 }
+
+#[test]
+fn automatic_cleanup_only_removes_canonical_tombstones_and_retries_failures() {
+    let root = tempfile::tempdir().unwrap();
+    let (id, _) = backup(root.path(), 1, true);
+    let (pinned_id, _) = backup(root.path(), 2, true);
+    let (complete, complete_size) = backup(root.path(), 3, true);
+    let (incomplete, incomplete_size) = backup(root.path(), 4, false);
+    let base = root.path().join("server-sync/backups");
+    for id in [&id, &pinned_id] {
+        let path = base.join(format!(".deleting-{id}"));
+        fs::rename(base.join(id), &path).unwrap();
+        fs::remove_file(path.join("complete.json")).unwrap();
+    }
+    let invalid = base.join(".deleting-invalid");
+    fs::create_dir(&invalid).unwrap();
+    fs::write(invalid.join("keep"), b"unapproved").unwrap();
+    assert!(cleanup_deleted_backups(root.path(), Some("busy"), &BTreeSet::new()).is_err());
+    let first =
+        cleanup_deleted_backups(root.path(), None, &BTreeSet::from([pinned_id.clone()])).unwrap();
+    assert_eq!((first.removed, first.failed), (1, 1));
+    assert!(!base.join(format!(".deleting-{id}")).exists());
+    let second = cleanup_deleted_backups(root.path(), None, &BTreeSet::new()).unwrap();
+    assert_eq!((second.removed, second.failed), (1, 0));
+    let third = cleanup_deleted_backups(root.path(), None, &BTreeSet::new()).unwrap();
+    assert_eq!((third.removed, third.failed), (0, 0));
+    assert_eq!(tree_bytes(&base.join(complete)).unwrap(), complete_size);
+    assert_eq!(tree_bytes(&base.join(incomplete)).unwrap(), incomplete_size);
+    assert_eq!(fs::read(invalid.join("keep")).unwrap(), b"unapproved");
+}
+
+#[test]
+fn automatic_cleanup_refuses_links_without_blocking_other_tombstones() {
+    let root = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    fs::write(external.path().join("keep"), b"external").unwrap();
+    let (id, _) = backup(root.path(), 1, true);
+    let base = root.path().join("server-sync/backups");
+    fs::rename(base.join(&id), base.join(format!(".deleting-{id}"))).unwrap();
+    let linked = base.join(format!(".deleting-{}", uuid::Uuid::from_u128(2)));
+    directory_link(external.path(), &linked);
+    let result = cleanup_deleted_backups(root.path(), None, &BTreeSet::new()).unwrap();
+    assert_eq!((result.removed, result.failed), (1, 1));
+    assert_eq!(fs::read(external.path().join("keep")).unwrap(), b"external");
+    assert!(linked.exists());
+}

@@ -243,7 +243,6 @@ where
             preset_count: 0,
             warning_codes: Vec::new(),
             handoff_path,
-            recovery_path: None,
             publication: None,
         })
     })();

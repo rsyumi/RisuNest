@@ -399,7 +399,6 @@ pub(crate) fn export_compatible_local_backup(
             handoff_path: destination_path
                 .is_none()
                 .then(|| output.to_string_lossy().into_owned()),
-            recovery_path: None,
             publication: None,
         })
     })();

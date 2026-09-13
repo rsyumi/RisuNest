@@ -84,6 +84,13 @@ const STAGE_ORDER: DialogStageId[] = [
 
 /** Stages shown as pending from the start; optional stages appear only once observed. */
 const EXPECTED_STAGES: Record<NativeFileOperationFormat, DialogStageId[]> = {
+    'library-backup': [
+        'reading-database',
+        'finalizing-staging',
+        'activating',
+        'refreshing-app',
+        'reloading-plugins',
+    ],
     content: ['reading-archive', 'preparing-attachments', 'finalizing-staging'],
     'local-backup': [
         'reading-archive',
@@ -95,13 +102,6 @@ const EXPECTED_STAGES: Record<NativeFileOperationFormat, DialogStageId[]> = {
         'reloading-plugins',
     ],
     'risu-save': [
-        'reading-database',
-        'finalizing-staging',
-        'activating',
-        'refreshing-app',
-        'reloading-plugins',
-    ],
-    'lossless-backup': [
         'reading-database',
         'finalizing-staging',
         'activating',
@@ -184,10 +184,10 @@ function formatOf(
     switch (status?.kind) {
         case 'restore-block-risu-save':
             return 'risu-save'
+        case 'restore-portable-backup':
+            return 'library-backup'
         case 'restore-legacy-local-backup':
             return 'local-backup'
-        case 'restore-lossless-backup':
-            return 'lossless-backup'
         default:
             return undefined
     }
@@ -198,10 +198,10 @@ function titleOf(format: NativeFileOperationFormat | undefined): string {
     switch (format) {
         case 'risu-save':
             return copy.titleRisuSave
+        case 'library-backup':
+            return copy.titleBackup
         case 'local-backup':
             return copy.titleLocalBackup
-        case 'lossless-backup':
-            return copy.titleLossless
         default:
             return copy.titleImport
     }

@@ -530,7 +530,6 @@ pub(crate) fn export_legacy_local_backup(
             preset_count: database.preset_count,
             warning_codes: Vec::new(),
             handoff_path: is_handoff.then(|| destination_path.to_string_lossy().into_owned()),
-            recovery_path: None,
             publication: None,
         })
     })();
@@ -933,7 +932,7 @@ impl StrictLocalBackupDatabaseRestore for LegacyDatabaseRestore<'_> {
             durable: Mutex::new(durable),
             migration_id: format!("legacy-backup-{}", self.job.id()),
         };
-        let result = restore::restore_started_risu_save_with_pre_activation(
+        let result = restore::restore_started_risu_save(
             OpenedJobSource {
                 file,
                 total_bytes: database.byte_length,
@@ -942,7 +941,6 @@ impl StrictLocalBackupDatabaseRestore for LegacyDatabaseRestore<'_> {
             self.job,
             &sink,
             self.progress.restore_scale(),
-            || Ok(None),
         );
         match result {
             Ok(summary) => {

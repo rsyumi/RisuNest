@@ -185,12 +185,38 @@ fn new_pins(store: &PersistentStore, kind: CasJobKind) -> Result<DurableCasJob, 
     )
     .map_err(error)
 }
+pub(super) fn finish_durable_job(
+    outcome: Result<JobResultSummary, NativeJobError>,
+    durable: &mut DurableCasJob,
+) -> Result<JobResultSummary, NativeJobError> {
+    let release_outcome = if outcome.is_ok() {
+        CasReleaseOutcome::Committed
+    } else {
+        CasReleaseOutcome::Aborted
+    };
+    match (outcome, durable.release(release_outcome)) {
+        (Ok(mut result), Err(_)) => {
+            result.warning_codes.push("cleanup-failed".into());
+            Ok(result)
+        }
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(error), Err(cleanup)) => Err(NativeJobError::new(
+            "cleanup-failed",
+            format!(
+                "{}; durable CAS job release failed: {cleanup}",
+                error.message
+            ),
+        )),
+        (Err(error), Ok(())) => Err(error),
+    }
+}
+
 fn finish_pins(
     outcome: Result<JobResultSummary, NativeJobError>,
     pins: &mut DurableCasJob,
 ) -> Result<JobResultSummary, NativeJobError> {
     if pins.is_sealed() {
-        return super::lossless::finish_durable_job(outcome, pins);
+        return finish_durable_job(outcome, pins);
     }
     // Read-only exports did not install CAS objects. Their temporary pins are released without
     // claiming an object-store commit or registering previously unowned source objects.
@@ -367,7 +393,6 @@ pub(crate) fn export_portable(
                 vec![]
             },
             handoff_path: handoff,
-            recovery_path: None,
             publication: None,
         })
     })();
@@ -484,58 +509,9 @@ pub(crate) fn restore_portable(
                     .import_from_archive(id, &archive, &probe)
                     .map_err(error)?;
                 wait_device(&coordinator, id, job, |session| {
-                    session.phase == "awaiting-recovery-publication"
+                    session.phase == "awaiting-native-preparation"
                 })?;
             }
-            let recovery = store.repository_root().join("persistent/recovery");
-            fs::create_dir_all(&recovery).map_err(error)?;
-            let recovery_path = recovery.join(format!(
-                "risunest-recovery-{}.risunest",
-                uuid::Uuid::new_v4()
-            ));
-            let mut recovery_pins =
-                new_pins(&store, CasJobKind::OfficialPublicationOrExportPreparation)?;
-            let recovered = (|| {
-                let captured = if selection.library {
-                    capture(&mut store, revision, owned, &mut recovery_pins, &probe)?
-                } else {
-                    let catalog = Catalog::create(owned, env!("CARGO_PKG_VERSION"), revision)
-                        .map_err(error)?;
-                    catalog
-                        .db
-                        .execute(
-                            "UPDATE backup_info SET value='false' WHERE key='libraryIncluded'",
-                            [],
-                        )
-                        .map_err(error)?;
-                    portable_backup::CapturedLibrary {
-                        catalog,
-                        repair_required: false,
-                    }
-                };
-                if let (Some((app, _)), Some(id)) = (device, session.as_deref()) {
-                    app.state::<DeviceBackupState>()
-                        .export_to_catalog(id, Spool::Rollback, &captured.catalog, &probe)
-                        .map_err(error)?;
-                }
-                let candidate = owned.join("recovery.risunest.part");
-                drop(write_verified(
-                    captured.catalog,
-                    captured.repair_required,
-                    &candidate,
-                    owned,
-                    &probe,
-                )?);
-                publish(&candidate, &recovery_path, owned, job)?;
-                Ok::<_, NativeJobError>(())
-            })();
-            let released = recovery_pins
-                .release(CasReleaseOutcome::Aborted)
-                .map_err(error);
-            recovered?;
-            released?;
-            // Incoming CAS files cannot contaminate the physical inventory of the old library.
-            // Its verified recovery archive has been published before any incoming installation.
             if selection.library {
                 let inventory = portable_backup::RestoreInventory::build(&archive, owned, &probe)
                     .map_err(error)?;
@@ -587,14 +563,11 @@ pub(crate) fn restore_portable(
                 let prepared = store
                     .prepare_replace_commit(&stage.staging_id, Some(revision))
                     .map_err(super::error::store_error)?;
-                let authorized = prepared
-                    .create_snapshot()
-                    .map_err(super::error::store_error)?;
                 if let (Some((app, _)), Some(id)) = (device, session.as_deref()) {
                     let coordinator = app.state::<DeviceBackupState>();
                     let (key, marker) = coordinator.commit_marker(id).map_err(error)?;
                     match store.finish_prepared_replace_with_app_kv(
-                        authorized,
+                        prepared,
                         &key,
                         &serde_json::to_value(marker).map_err(error)?,
                     ) {
@@ -611,7 +584,7 @@ pub(crate) fn restore_portable(
                         }
                     }
                 } else {
-                    let result = store.finish_prepared_replace(authorized).map_err(error)?;
+                    let result = store.finish_prepared_replace(prepared).map_err(error)?;
                     committed = true;
                     result.revision
                 }
@@ -627,7 +600,6 @@ pub(crate) fn restore_portable(
                 preset_count: if selection.library { counts.1 } else { 0 },
                 warning_codes,
                 handoff_path: None,
-                recovery_path: Some(recovery_path.to_string_lossy().into_owned()),
                 publication: None,
             })
         })();
@@ -761,6 +733,173 @@ mod tests {
             .unwrap();
         store.replace_commit(&stage.staging_id, Some(0)).unwrap();
         store
+    }
+
+    fn add_test_aliases(root: &Path, hash: &str, size: usize, count: usize) {
+        let mut db = rusqlite::Connection::open(root.join("persistent/persistent.db")).unwrap();
+        let generation: String = serde_json::from_str(
+            &db.query_row::<String, _, _>(
+                "SELECT value FROM meta WHERE key='activeGeneration'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let tx = db.transaction().unwrap();
+        for index in 0..count {
+            tx.execute("INSERT INTO asset_aliases(generation,logical_key,object_hash,kind,size,mime,name,ext,inlay_type,width,height,metadata) VALUES(?1,?2,?3,'asset',?4,'application/octet-stream','','',NULL,NULL,NULL,'{}')",rusqlite::params![generation, format!("assets/synthetic-{index}.bin"),hash,size as i64]).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    fn test_archive(root: &Path, with_asset: bool) -> (std::path::PathBuf, u64, Option<String>) {
+        let source = root.join("source");
+        let jobs = root.join("export-job");
+        fs::create_dir(&jobs).unwrap();
+        let store = library(&source);
+        let hash = with_asset.then(|| {
+            let payload = b"synthetic incoming object";
+            let prepared = PayloadCas::new(&source)
+                .unwrap()
+                .prepare_bytes(payload)
+                .unwrap();
+            add_test_aliases(&source, &prepared.content_hash, payload.len(), 1);
+            prepared.content_hash
+        });
+        let job = super::super::JobRegistry::default()
+            .create_internal(
+                super::super::JobKind::ExportPortableBackup,
+                Some(1),
+                vec![],
+                false,
+            )
+            .unwrap();
+        let result =
+            export_portable(None, 1, &jobs, &root.join("handoffs"), store, &job, None).unwrap();
+        (
+            result.handoff_path.unwrap().into(),
+            result.source_bytes,
+            hash,
+        )
+    }
+
+    #[test]
+    fn restore_does_not_read_or_back_up_one_hundred_thousand_existing_asset_references() {
+        let directory = tempfile::tempdir().unwrap();
+        let (path, bytes, _) = test_archive(directory.path(), false);
+        let target = directory.path().join("target");
+        let store = library(&target);
+        let payload = b"synthetic old payload stays untouched";
+        let prepared = PayloadCas::new(&target)
+            .unwrap()
+            .prepare_bytes(payload)
+            .unwrap();
+        add_test_aliases(&target, &prepared.content_hash, payload.len(), 100_000);
+        let object = target.join(&prepared.physical_key);
+        #[cfg(windows)]
+        let locked = {
+            use std::os::windows::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&object)
+                .unwrap()
+        };
+        let jobs = directory.path().join("restore-job");
+        fs::create_dir(&jobs).unwrap();
+        let job = super::super::JobRegistry::default()
+            .create_internal(
+                super::super::JobKind::RestorePortableBackup,
+                Some(1),
+                vec![],
+                false,
+            )
+            .unwrap();
+        let result = restore_portable(
+            OpenedJobSource {
+                file: File::open(path).unwrap(),
+                total_bytes: bytes,
+            },
+            true,
+            1,
+            &jobs,
+            store,
+            &job,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.revision, 2);
+        #[cfg(windows)]
+        drop(locked);
+        assert_eq!(fs::read(&object).unwrap(), payload);
+        assert!(!target.join("persistent/recovery").exists());
+        let store = PersistentStore::open(&target).unwrap();
+        assert!(store.snapshot_list().unwrap().is_empty());
+        let db = rusqlite::Connection::open(target.join("persistent/persistent.db")).unwrap();
+        assert_eq!(
+            db.query_row::<i64, _, _>("SELECT count(*) FROM asset_aliases", [], |r| r.get(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn failed_restore_preserves_old_database_and_existing_objects_without_recovery_archive() {
+        for corrupt_existing in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (path, bytes, hash) = test_archive(directory.path(), true);
+            let hash = hash.unwrap();
+            let target = directory.path().join("target");
+            let store = library(&target);
+            let before = store.read_root(None).unwrap().value;
+            let object = target
+                .join("assets-v2/objects")
+                .join(&hash[..2])
+                .join(&hash[2..]);
+            fs::create_dir_all(object.parent().unwrap()).unwrap();
+            let payload: &[u8] = if corrupt_existing {
+                b"synthetic damaged object"
+            } else {
+                b"synthetic incoming object"
+            };
+            fs::write(&object, payload).unwrap();
+            add_test_aliases(&target, &hash, payload.len(), 1);
+            if !corrupt_existing {
+                let db =
+                    rusqlite::Connection::open(target.join("persistent/persistent.db")).unwrap();
+                db.execute_batch("CREATE TRIGGER reject_replacement BEFORE DELETE ON root WHEN OLD.generation='revision-1' BEGIN SELECT RAISE(ABORT,'synthetic commit failure'); END;").unwrap();
+            }
+            let jobs = directory.path().join("restore-job");
+            fs::create_dir(&jobs).unwrap();
+            let job = super::super::JobRegistry::default()
+                .create_internal(
+                    super::super::JobKind::RestorePortableBackup,
+                    Some(1),
+                    vec![],
+                    false,
+                )
+                .unwrap();
+            assert!(restore_portable(
+                OpenedJobSource {
+                    file: File::open(path).unwrap(),
+                    total_bytes: bytes
+                },
+                true,
+                1,
+                &jobs,
+                store,
+                &job,
+                None
+            )
+            .is_err());
+            assert_eq!(fs::read(&object).unwrap(), payload);
+            let store = PersistentStore::open(&target).unwrap();
+            assert_eq!(store.revision().unwrap(), 1);
+            assert_eq!(store.read_root(None).unwrap().value, before);
+            assert!(store.snapshot_list().unwrap().is_empty());
+            assert!(!target.join("persistent/recovery").exists());
+        }
     }
     #[test]
     fn native_portable_stale_revision_aborts_without_changing_library() {
@@ -903,7 +1042,7 @@ mod tests {
         }
     }
     #[test]
-    fn native_portable_restore_keeps_unclassified_files_out_of_cas_and_old_recovery() {
+    fn native_portable_restore_keeps_unclassified_files_out_of_cas() {
         use sha2::{Digest, Sha256};
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source");
@@ -968,20 +1107,7 @@ mod tests {
             .stat_object(&hash)
             .unwrap()
             .is_none());
-        let recovery = VerifiedArchive::open(
-            File::open(result.recovery_path.unwrap()).unwrap(),
-            &restore_jobs,
-            &NeverCancelled,
-        )
-        .unwrap();
-        assert_eq!(
-            recovery
-                .db
-                .query_row::<i64, _, _>("SELECT count(*) FROM objects", [], |r| r.get(0))
-                .unwrap(),
-            0
-        );
-        drop(recovery);
+        assert!(!target.join("persistent/recovery").exists());
         let mut target_store = PersistentStore::open(&target).unwrap();
         let mut pins = new_pins(
             &target_store,
@@ -1004,7 +1130,7 @@ mod tests {
         pins.release(CasReleaseOutcome::Aborted).unwrap();
     }
     #[test]
-    fn native_portable_export_restore_preserves_sql_and_publishes_recovery_before_activation() {
+    fn native_portable_export_restore_preserves_sql_without_recovery_backup() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source");
         let target = directory.path().join("target");
@@ -1064,7 +1190,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restored.revision, target_revision + 1);
-        assert!(Path::new(restored.recovery_path.as_ref().unwrap()).is_file());
+        assert!(!target.join("persistent/recovery").exists());
+        assert!(PersistentStore::open(&target)
+            .unwrap()
+            .snapshot_list()
+            .unwrap()
+            .is_empty());
         let mut store = PersistentStore::open(&target).unwrap();
         let mut pins =
             new_pins(&store, CasJobKind::OfficialPublicationOrExportPreparation).unwrap();

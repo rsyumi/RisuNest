@@ -12,7 +12,6 @@ mod query;
 mod record_apply;
 mod record_projection;
 mod schema;
-pub(crate) use schema::SCHEMA_VERSION;
 #[cfg(test)]
 mod schema_contract_tests;
 pub(crate) mod server_sync_apply;
@@ -865,13 +864,6 @@ pub(crate) struct StagingResult {
     pub(crate) staging_id: String,
 }
 
-pub(crate) fn materialized_asset_owner_entries<'a>(
-    database: &'a Value,
-    owner: &AssetOwnerLocator,
-) -> StoreResult<Option<&'a Vec<Value>>> {
-    commit::staged_owner_entries(database, owner)
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SnapshotInfo {
@@ -967,13 +959,6 @@ pub(crate) struct PersistentStorageStats {
 }
 
 pub(crate) struct PreparedReplaceCommit {
-    staging_id: String,
-    revision: i64,
-    database_path: PathBuf,
-    snapshots_dir: PathBuf,
-}
-
-pub(crate) struct SnapshotAuthorizedReplaceCommit {
     staging_id: String,
     revision: i64,
 }
@@ -1178,28 +1163,6 @@ fn combine_publication_cleanup_error(
         Err(cleanup) => StoreError::Store {
             message: format!("{primary}; official publication {operation} failed: {cleanup}"),
         },
-    }
-}
-
-impl PreparedReplaceCommit {
-    pub(crate) fn create_snapshot(self) -> StoreResult<SnapshotAuthorizedReplaceCommit> {
-        if self.revision > 0 {
-            let connection = Connection::open(&self.database_path)?;
-            connection.execute_batch("PRAGMA busy_timeout = 5000")?;
-            let created = snapshot::create(&connection, &self.snapshots_dir, "pre-replace")?;
-            drop(connection);
-            let snapshot_revision = created.revision;
-            if snapshot_revision != self.revision {
-                return Err(StoreError::RevisionConflict {
-                    expected: self.revision,
-                    actual: snapshot_revision,
-                });
-            }
-        }
-        Ok(SnapshotAuthorizedReplaceCommit {
-            staging_id: self.staging_id,
-            revision: self.revision,
-        })
     }
 }
 
@@ -1668,8 +1631,7 @@ impl PersistentStore {
         expected_revision: Option<i64>,
     ) -> StoreResult<RevisionResult> {
         let prepared = self.prepare_replace_commit(staging_id, expected_revision)?;
-        let authorized = prepared.create_snapshot()?;
-        self.finish_prepared_replace(authorized)
+        self.finish_prepared_replace(prepared)
     }
 
     fn verify_staged_cold_payload_objects(&self, staging_id: &str) -> StoreResult<()> {
@@ -1707,14 +1669,12 @@ impl PersistentStore {
         Ok(PreparedReplaceCommit {
             staging_id: staging_id.to_owned(),
             revision,
-            database_path: self.database_path.clone(),
-            snapshots_dir: self.snapshots_dir.clone(),
         })
     }
 
     pub(crate) fn finish_prepared_replace(
         &mut self,
-        prepared: SnapshotAuthorizedReplaceCommit,
+        prepared: PreparedReplaceCommit,
     ) -> StoreResult<RevisionResult> {
         self.verify_staged_cold_payload_objects(&prepared.staging_id)?;
         commit::replace_commit(
@@ -1726,7 +1686,7 @@ impl PersistentStore {
 
     pub(crate) fn finish_prepared_replace_with_app_kv(
         &mut self,
-        prepared: SnapshotAuthorizedReplaceCommit,
+        prepared: PreparedReplaceCommit,
         key: &str,
         value: &Value,
     ) -> StoreResult<RevisionResult> {

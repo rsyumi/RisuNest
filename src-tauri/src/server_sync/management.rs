@@ -205,6 +205,58 @@ pub(crate) fn delete_backup(
     Ok(())
 }
 
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DeletionCleanup {
+    pub removed: u64,
+    pub failed: u64,
+}
+
+/// Only durable deletion tombstones authorize unattended removal. Unfinished
+/// backups have no such authorization and must remain untouched.
+pub(crate) fn cleanup_deleted_backups(
+    root: &Path,
+    blocked: Option<&str>,
+    pinned: &BTreeSet<String>,
+) -> Result<DeletionCleanup> {
+    require_unblocked(blocked)?;
+    let mut result = DeletionCleanup::default();
+    let Some(server) = server_root(root)? else {
+        return Ok(result);
+    };
+    let Some(entries) = children(&server.join("backups"))? else {
+        return Ok(result);
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                result.failed += 1;
+                continue;
+            }
+        };
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(".deleting-"))
+        else {
+            continue;
+        };
+        if !uuid::Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == id) {
+            continue;
+        }
+        if !checked_metadata(&entry.path()).is_ok_and(|metadata| metadata.is_dir()) {
+            result.failed += 1;
+            continue;
+        }
+        match delete_backup(root, id, blocked, pinned) {
+            Ok(()) => result.removed += 1,
+            Err(_) => result.failed += 1,
+        }
+    }
+    Ok(result)
+}
+
 fn cache_object_hash(root: &Path, file: &Path) -> Option<String> {
     let parts = file
         .strip_prefix(root)

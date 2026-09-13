@@ -226,19 +226,7 @@ pub(crate) fn replace_commit_with_snapshot(
     let prepared = with_store_mut(app.state(), |store| {
         store.prepare_replace_commit(staging_id, expected_revision)
     })?;
-    let state = app.state::<PersistentStoreState>();
-    let snapshot_operation =
-        state
-            .snapshot_operations
-            .lock()
-            .map_err(|error| StoreError::Store {
-                message: format!("persistent snapshot mutex poisoned: {error}"),
-            })?;
-    let authorized = prepared.create_snapshot()?;
-    drop(snapshot_operation);
-    with_store_mut(app.state(), |store| {
-        store.finish_prepared_replace(authorized)
-    })
+    with_store_mut(app.state(), |store| store.finish_prepared_replace(prepared))
 }
 
 #[tauri::command(async)]
@@ -1387,7 +1375,7 @@ mod tests {
         let mut released = DurableCasJob::begin(
             directory.path(),
             "preview-released-job",
-            CasJobKind::LosslessImport,
+            CasJobKind::LocalBackupRestore,
             0,
         )
         .expect("begin released journal fixture");

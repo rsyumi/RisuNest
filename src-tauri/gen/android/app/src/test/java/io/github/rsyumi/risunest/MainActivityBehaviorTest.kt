@@ -461,8 +461,8 @@ class MainActivityBehaviorTest {
   }
 
   @Test
-  fun `lossless source picker uses its dedicated event without changing opened file state`() {
-    val script = androidLosslessSourcePickedScript(
+  fun `backup source picker uses its dedicated event without changing opened file state`() {
+    val script = androidBackupSourcePickedScript(
       requestId = "11111111-1111-4111-8111-111111111111",
       batch = SafSpoolBatch(
         ready = listOf(
@@ -477,7 +477,7 @@ class MainActivityBehaviorTest {
       ),
     )
 
-    assertEquals(true, script.contains("risu-android-lossless-source-picked"))
+    assertEquals(true, script.contains("risu-android-backup-source-picked"))
     assertEquals(true, script.contains("\"requestId\":\"11111111-1111-4111-8111-111111111111\""))
     assertEquals(true, script.contains("backup.risunest"))
     assertEquals(false, script.contains("tauriOpenedFileSpools"))
@@ -485,7 +485,7 @@ class MainActivityBehaviorTest {
   }
 
   @Test
-  fun `lossless source replay retains the general opened file spool event`() {
+  fun `backup source replay retains the general opened file spool event`() {
     val script = androidSpoolBatchScript(
       requestId = "11111111-1111-4111-8111-111111111111",
       batch = SafSpoolBatch(
@@ -502,11 +502,11 @@ class MainActivityBehaviorTest {
     )
 
     assertEquals(true, script.contains("risu-android-spool-ready"))
-    assertEquals(false, script.contains("risu-android-lossless-source-picked"))
+    assertEquals(false, script.contains("risu-android-backup-source-picked"))
   }
 
   @Test
-  fun `restored lossless picker result uses the general replayable spool event`() {
+  fun `restored backup picker result uses the general replayable spool event`() {
     val batch = SafSpoolBatch(
       ready = listOf(
         SafSpoolReady(
@@ -519,12 +519,12 @@ class MainActivityBehaviorTest {
       failures = emptyList(),
     )
 
-    val restored = androidLosslessSourceResultScript(
+    val restored = androidBackupSourceResultScript(
       "11111111-1111-4111-8111-111111111111",
       batch,
       restored = true,
     )
-    val live = androidLosslessSourceResultScript(
+    val live = androidBackupSourceResultScript(
       "11111111-1111-4111-8111-111111111111",
       batch,
       restored = false,
@@ -532,8 +532,8 @@ class MainActivityBehaviorTest {
 
     assertEquals(true, restored.contains("risu-android-spool-ready"))
     assertEquals(true, restored.contains("tauriOpenedFileSpools"))
-    assertEquals(false, restored.contains("risu-android-lossless-source-picked"))
-    assertEquals(true, live.contains("risu-android-lossless-source-picked"))
+    assertEquals(false, restored.contains("risu-android-backup-source-picked"))
+    assertEquals(true, live.contains("risu-android-backup-source-picked"))
     assertEquals(false, live.contains("risu-android-spool-ready"))
   }
 

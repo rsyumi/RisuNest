@@ -53,7 +53,6 @@ export interface NativeFileJobResult {
     presetCount: number
     warningCodes: string[]
     handoffPath?: string
-    recoveryPath?: string
     publication?: NativeOfficialPublicationAttemptResult
 }
 
@@ -70,7 +69,6 @@ export type NativeOfficialAccountSnapshotRestoreResult =
           kind: 'activated'
           revision: number
           sourceSha256: string
-          recoveryPath?: string
           warningCodes: string[]
       }
 
@@ -228,7 +226,10 @@ export interface NativeFileJobDetail {
 
 /** Which user-facing import a dialog-presented operation belongs to. */
 export type NativeFileOperationFormat =
-    'risu-save' | 'local-backup' | 'lossless-backup' | 'content'
+    | 'risu-save'
+    | 'local-backup'
+    | 'library-backup'
+    | 'content'
 
 /**
  * Resolves the stage a status describes. Statuses carrying `detail` name it
@@ -316,8 +317,6 @@ export interface NativeFileJobStatus {
     kind:
         | 'restore-block-risu-save'
         | 'export-block-risu-save'
-        | 'restore-lossless-backup'
-        | 'export-lossless-backup'
         | 'export-character-charx'
         | 'export-character-card'
         | 'export-risu-module'
@@ -462,11 +461,11 @@ export type NativeCharacterCharxExportDestination =
     | { type: 'desktopPath'; path: string }
     | { type: 'androidSaf'; suggestedName: string }
 
-export type NativeLosslessBackupDestination =
+export type NativeBackupDestination =
     | { type: 'desktopPath'; path: string }
     | { type: 'androidSaf'; suggestedName: string }
 
-export type NativeLegacyLocalBackupDestination = NativeLosslessBackupDestination
+export type NativeLegacyLocalBackupDestination = NativeBackupDestination
 
 export interface NativeFileJobDependencies {
     isTauri(): boolean
@@ -475,7 +474,8 @@ export interface NativeFileJobDependencies {
     discardAndroidSource?(token: string): boolean
 }
 
-export interface NativeLosslessBackupDependencies extends NativeFileJobDependencies {
+export interface NativeBackupExportDependencies
+    extends NativeFileJobDependencies {
     copyToAndroidSaf(
         request: AndroidSafDestinationRequest,
     ): Promise<AndroidSafDestinationResult>
@@ -490,7 +490,7 @@ const productionDependencies: NativeFileJobDependencies = {
     discardAndroidSource: (token) => discardAndroidSafSource(token),
 }
 
-const productionLosslessDependencies: NativeLosslessBackupDependencies = {
+const productionBackupExportDependencies: NativeBackupExportDependencies = {
     ...productionDependencies,
     copyToAndroidSaf: (request) => copyNativeExportToAndroidSaf(request),
 }
@@ -1079,7 +1079,6 @@ function abortBeforeNativeRestoreStart(
 async function runNativeReplacementRestore(
     kind:
         | 'restore-block-risu-save'
-        | 'restore-lossless-backup'
         | 'restore-portable-backup'
         | 'restore-legacy-local-backup'
         | 'restore-official-account-snapshot',
@@ -1094,13 +1093,11 @@ async function runNativeReplacementRestore(
     dependencies: NativeFileJobDependencies = productionDependencies,
 ): Promise<NativeFileJobResult> {
     const operation =
-        kind === 'restore-lossless-backup'
-            ? 'Native lossless backup restore'
-            : kind === 'restore-official-account-snapshot'
-              ? 'Native official account snapshot restore'
-              : kind === 'restore-legacy-local-backup'
-                ? 'Native legacy local backup restore'
-                : 'Native block RisuSave restore'
+        kind === 'restore-official-account-snapshot'
+            ? 'Native official account snapshot restore'
+            : kind === 'restore-legacy-local-backup'
+              ? 'Native legacy local backup restore'
+              : 'Native block RisuSave restore'
     if (!dependencies.isTauri()) {
         throw new Error(`${operation} requires Tauri`)
     }
@@ -1215,8 +1212,9 @@ async function runNativeReplacementRestore(
                 status.state === 'waitingForInput' &&
                 status.phase === 'awaiting-device-maintenance'
             ) {
-                const { handlePortableDeviceMaintenanceStatus } =
-                    await import('./deviceBackup/job')
+                const { handlePortableDeviceMaintenanceStatus } = await import(
+                    './deviceBackup/job'
+                )
                 await handlePortableDeviceMaintenanceStatus(
                     { ...status, kind },
                     {
@@ -1383,21 +1381,6 @@ export function runNativeBlockRisuSaveRestore(
     )
 }
 
-export function runNativeLosslessBackupRestore(
-    runtime: NativeBlockRestoreRuntime,
-    source: NativeFileJobSource,
-    options: NativeFileRestoreJobOptions = {},
-    dependencies: NativeFileJobDependencies = productionDependencies,
-): Promise<NativeFileJobResult> {
-    return runNativeReplacementRestore(
-        'restore-lossless-backup',
-        'native-lossless-backup-restore',
-        runtime,
-        source,
-        options,
-        dependencies,
-    )
-}
 
 export function runNativeArchiveRestore(
     runtime: NativeBlockRestoreRuntime,
@@ -1454,7 +1437,6 @@ export async function runNativeOfficialAccountSnapshotRestore(
         kind: 'activated',
         revision: result.revision,
         sourceSha256: result.sourceSha256,
-        recoveryPath: result.recoveryPath,
         warningCodes: result.warningCodes,
     }
 }
@@ -1567,7 +1549,7 @@ interface NativeManagedExportSpec {
 async function runNativeManagedExport(
     spec: NativeManagedExportSpec,
     options: NativeFileJobOptions,
-    dependencies: NativeLosslessBackupDependencies,
+    dependencies: NativeBackupExportDependencies,
 ): Promise<NativeFileJobResult> {
     if (!dependencies.isTauri()) {
         throw new Error(`${spec.operation} requires Tauri`)
@@ -1709,7 +1691,7 @@ async function runNativeManagedExport(
 export function runNativeCharacterCharxExport(
     input: NativeCharacterCharxExportInput,
     options: NativeFileJobOptions = {},
-    dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
+    dependencies: NativeBackupExportDependencies = productionBackupExportDependencies,
 ): Promise<NativeFileJobResult> {
     return runNativeManagedExport(
         {
@@ -1737,7 +1719,7 @@ export function runNativeCharacterCharxExport(
 export function runNativeCharacterCardExport(
     input: NativeCharacterCardExportInput,
     options: NativeFileJobOptions = {},
-    dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
+    dependencies: NativeBackupExportDependencies = productionBackupExportDependencies,
 ): Promise<NativeFileJobResult> {
     return runNativeManagedExport(
         {
@@ -1764,7 +1746,7 @@ export function runNativeCharacterCardExport(
 export function runNativeRisuModuleExport(
     input: NativeRisuModuleExportInput,
     options: NativeFileJobOptions = {},
-    dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
+    dependencies: NativeBackupExportDependencies = productionBackupExportDependencies,
 ): Promise<NativeFileJobResult> {
     return runNativeManagedExport(
         {
@@ -1793,7 +1775,7 @@ export function runNativeLegacyLocalBackupExport(
     },
     destination: NativeLegacyLocalBackupDestination,
     options: NativeFileJobOptions = {},
-    dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
+    dependencies: NativeBackupExportDependencies = productionBackupExportDependencies,
 ): Promise<NativeFileJobResult> {
     return runNativePortableBackupExport(
         'export-legacy-local-backup',
@@ -1815,7 +1797,7 @@ export function runNativeCompatibleLocalBackupExport(
     target: NativeCompatibilityTarget,
     destination: NativeLegacyLocalBackupDestination,
     options: NativeFileJobOptions = {},
-    dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
+    dependencies: NativeBackupExportDependencies = productionBackupExportDependencies,
 ): Promise<NativeFileJobResult> {
     return runNativePortableBackupExport(
         'export-compatible-local-backup',
@@ -1831,10 +1813,7 @@ export function runNativeCompatibleLocalBackupExport(
 }
 
 function runNativePortableBackupExport(
-    kind:
-        | 'export-lossless-backup'
-        | 'export-legacy-local-backup'
-        | 'export-compatible-local-backup',
+    kind: 'export-legacy-local-backup' | 'export-compatible-local-backup',
     flushReason: string,
     operation: string,
     handoffCleanupCommand: string,
@@ -1842,9 +1821,9 @@ function runNativePortableBackupExport(
         readonly revision: number
         flushPendingData(reason: string): Promise<void>
     },
-    destination: NativeLosslessBackupDestination,
+    destination: NativeBackupDestination,
     options: NativeFileJobOptions = {},
-    dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
+    dependencies: NativeBackupExportDependencies = productionBackupExportDependencies,
     target?: NativeCompatibilityTarget,
 ): Promise<NativeFileJobResult> {
     return runNativeManagedExport(
@@ -1877,36 +1856,16 @@ function runNativePortableBackupExport(
     )
 }
 
-export function runNativeLosslessBackupExport(
-    runtime: {
-        readonly revision: number
-        flushPendingData(reason: string): Promise<void>
-    },
-    destination: NativeLosslessBackupDestination,
-    options: NativeFileJobOptions = {},
-    dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
-): Promise<NativeFileJobResult> {
-    return runNativePortableBackupExport(
-        'export-lossless-backup',
-        'native-lossless-backup-export',
-        'Native lossless backup export',
-        'native_lossless_handoff_cleanup',
-        runtime,
-        destination,
-        options,
-        dependencies,
-    )
-}
 
 export async function runNativeArchiveExport(
     runtime: NativeBlockRestoreRuntime & {
         readonly revision: number
         flushPendingData(reason: string): Promise<void>
     },
-    destination: NativeLosslessBackupDestination,
+    destination: NativeBackupDestination,
     selection: NativePortableSelection,
     options: NativeFileJobOptions = {},
-    dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
+    dependencies: NativeBackupExportDependencies = productionBackupExportDependencies,
 ): Promise<NativeFileJobResult> {
     let held = true
     let expectedRevision = runtime.revision
@@ -1918,7 +1877,8 @@ export async function runNativeArchiveExport(
           >
         | undefined
     let intent:
-        import('./deviceBackup/job').PortableExportIntentStore | undefined
+        | import('./deviceBackup/job').PortableExportIntentStore
+        | undefined
     let startedId: string | undefined
     let completed = false
     const hasDevice = selection.deviceSections.length > 0

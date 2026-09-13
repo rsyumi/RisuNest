@@ -458,20 +458,20 @@ impl DeviceBackupState {
         spool::verify_blobs(connection, id, Spool::Source)?;
         spool::verify_blobs(connection, id, Spool::Rollback)?;
         connection.execute(
-            "UPDATE sessions SET phase='awaiting-recovery-publication' WHERE id=?1",
+            "UPDATE sessions SET phase='awaiting-native-preparation' WHERE id=?1",
             [id],
         )?;
         Ok(())
     }
 
-    /// Native-only: the verified replacement recovery archive is published.
+    /// Native-only: the incoming library is validated and its objects are staged.
     pub(crate) fn allow_device_apply(&self, id: &str) -> Result<()> {
         let mut inner = self.lock()?;
         let connection = inner.connection.as_mut().unwrap();
         let session = active_session_for(connection, id)?;
         require(
-            session.phase == "awaiting-recovery-publication",
-            "Restore is not awaiting recovery publication",
+            session.phase == "awaiting-native-preparation",
+            "Restore is not awaiting native preparation",
         )?;
         connection.execute("UPDATE sessions SET phase='prepared' WHERE id=?1", [id])?;
         Ok(())
@@ -707,7 +707,7 @@ impl DeviceBackupState {
                     | "capturing"
                     | "device-captured"
                     | "capture-complete"
-                    | "awaiting-recovery-publication"
+                    | "awaiting-native-preparation"
             )
         {
             "rolled-back"
@@ -916,7 +916,7 @@ fn session_for(connection: &Connection, id: &str) -> Result<Session> {
         "recovery-required" => "recovery-required",
         "committing-library" => "await-library",
         "device-captured" => "await-capture",
-        "awaiting-recovery-publication" => "await-recovery",
+        "awaiting-native-preparation" => "await-native-preparation",
         "capture-complete" | "rolled-back" => "complete",
         _ => "continue",
     }

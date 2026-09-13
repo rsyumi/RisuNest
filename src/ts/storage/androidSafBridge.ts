@@ -1,7 +1,7 @@
 import type { NativeFileJobSource } from './nativeFileJobs'
 
 const SPOOL_EVENT = 'risu-android-spool-ready'
-const LOSSLESS_SOURCE_EVENT = 'risu-android-lossless-source-picked'
+const BACKUP_SOURCE_EVENT = 'risu-android-backup-source-picked'
 const LEGACY_BACKUP_SOURCE_EVENT = 'risu-android-legacy-backup-source-picked'
 const DESTINATION_EVENT = 'risu-android-saf-destination'
 const PROGRESS_EVENT = 'risu-android-saf-progress'
@@ -144,7 +144,7 @@ export interface AndroidSafJavascriptBridge {
     ): void
     cancelExport?(requestId: string): boolean | void
     cancelSource?(requestId: string): void
-    pickLosslessSource?(requestId: string): void
+    pickBackupSource?(requestId: string): void
     pickContentSource?(requestId: string): void
     pickLegacyBackupSource?(requestId: string): void
     discardSource?(token: string): boolean
@@ -223,7 +223,7 @@ export class AndroidSafSourceError extends Error {
 interface AndroidSafSourcePickerConfig {
     eventName: string
     pickMethod:
-        | 'pickLosslessSource'
+        | 'pickBackupSource'
         | 'pickLegacyBackupSource'
         | 'pickContentSource'
     pickerUnavailableMessage: string
@@ -364,18 +364,6 @@ function pickAndroidSpoolSource(
     })
 }
 
-export function pickAndroidLosslessBackupSource(
-    options: AndroidSafSourcePickerOptions = {},
-    dependencies: AndroidSafSourcePickerDependencies = productionDependencies,
-): Promise<NativeFileJobSource | null> {
-    return pickAndroidSpoolSource({
-        eventName: LOSSLESS_SOURCE_EVENT,
-        pickMethod: 'pickLosslessSource',
-        pickerUnavailableMessage: 'Android lossless backup picker is unavailable',
-        acceptExtension: '.risulossless',
-        cancelMessage: 'Android lossless backup selection was cancelled',
-    }, options, dependencies)
-}
 
 /** The native picker name is retained as an Android bridge command, not a file-format fallback. */
 export function pickAndroidBackupSource(
@@ -384,8 +372,8 @@ export function pickAndroidBackupSource(
 ): Promise<NativeFileJobSource | null> {
     return pickAndroidSpoolSource(
         {
-            eventName: LOSSLESS_SOURCE_EVENT,
-            pickMethod: 'pickLosslessSource',
+            eventName: BACKUP_SOURCE_EVENT,
+            pickMethod: 'pickBackupSource',
             pickerUnavailableMessage: 'Android backup picker is unavailable',
             acceptExtension: ['.risunest', '.risudat', '.bin'],
             cancelMessage: 'Android backup selection was cancelled',

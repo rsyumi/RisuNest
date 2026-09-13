@@ -59,8 +59,8 @@ private const val RENDERER_RECOVERY_MARKER = "renderer-recovery-warning"
 private const val SAF_PROGRESS_INTERVAL_MILLIS = 100L
 private const val OPENED_FILE_INTENT_CONSUMED = "io.github.rsyumi.risunest.OPENED_FILE_INTENT_CONSUMED"
 private const val OPENED_FILE_FINGERPRINT_STATE = "risu.opened-file-fingerprint"
-private const val LOSSLESS_SOURCE_REQUEST_STATE = "risu.lossless-source-request"
-private const val LOSSLESS_SOURCE_CANCELLED_STATE = "risu.lossless-source-cancelled"
+private const val BACKUP_SOURCE_REQUEST_STATE = "risu.backup-source-request"
+private const val BACKUP_SOURCE_CANCELLED_STATE = "risu.backup-source-cancelled"
 private const val CONTENT_SOURCE_STATE = "risu.content-source"
 private const val LEGACY_BACKUP_SOURCE_REQUEST_STATE = "risu.legacy-backup-source-request"
 private const val LEGACY_BACKUP_SOURCE_CANCELLED_STATE = "risu.legacy-backup-source-cancelled"
@@ -302,7 +302,7 @@ private data class PendingSafDestination(
   val cancellation: AtomicBoolean,
 )
 
-private data class PendingLosslessSource(
+private data class PendingBackupSource(
   val requestId: String,
   val cancellation: AtomicBoolean,
   val restored: Boolean = false,
@@ -482,7 +482,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   private val safPickerSlot = SafDestinationSlot()
   private val safDestinationStateLock = Any()
   private var consumedOpenedFileFingerprint: String? = null
-  private var pendingLosslessSource: PendingLosslessSource? = null
+  private var pendingBackupSource: PendingBackupSource? = null
   private val safDestinationStateStore by lazy {
     SafDestinationStateStore(
       File(dataDir, "native-file-jobs/android-saf-destination.json"),
@@ -493,9 +493,9 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     ActivityResultContracts.CreateDocument("application/octet-stream"),
     ::onSafDestinationSelected,
   )
-  private val losslessSourcePicker = registerForActivityResult(
+  private val backupSourcePicker = registerForActivityResult(
     ActivityResultContracts.OpenDocument(),
-    ::onLosslessSourceSelected,
+    ::onBackupSourceSelected,
   )
   private val legacyBackupSourcePicker = registerForActivityResult(
     ActivityResultContracts.OpenDocument(),
@@ -539,13 +539,13 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   override fun onCreate(savedInstanceState: Bundle?) {
     consumedOpenedFileFingerprint = savedInstanceState?.getString(OPENED_FILE_FINGERPRINT_STATE)
     savedInstanceState?.let { state ->
-      state.getString(LOSSLESS_SOURCE_REQUEST_STATE)
+      state.getString(BACKUP_SOURCE_REQUEST_STATE)
         ?.takeIf(::isCanonicalUuidV4)
         ?.let { requestId ->
           val cancellation = AtomicBoolean(
-            state.getBoolean(LOSSLESS_SOURCE_CANCELLED_STATE, false),
+            state.getBoolean(BACKUP_SOURCE_CANCELLED_STATE, false),
           )
-          pendingLosslessSource = PendingLosslessSource(requestId, cancellation, restored = true)
+          pendingBackupSource = PendingBackupSource(requestId, cancellation, restored = true)
           safSourceCancellations[requestId] = cancellation
           safPickerSlot.acquireRestored()
         }
@@ -682,9 +682,9 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     consumedOpenedFileFingerprint?.let {
       outState.putString(OPENED_FILE_FINGERPRINT_STATE, it)
     }
-    pendingLosslessSource?.let { pending ->
-      outState.putString(LOSSLESS_SOURCE_REQUEST_STATE, pending.requestId)
-      outState.putBoolean(LOSSLESS_SOURCE_CANCELLED_STATE, pending.cancellation.get())
+    pendingBackupSource?.let { pending ->
+      outState.putString(BACKUP_SOURCE_REQUEST_STATE, pending.requestId)
+      outState.putBoolean(BACKUP_SOURCE_CANCELLED_STATE, pending.cancellation.get())
     }
     pendingLegacyBackupSource?.let { pending ->
       outState.putBoolean(CONTENT_SOURCE_STATE, pending.content)
@@ -709,7 +709,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     safSourceCancellations.values.forEach { it.set(true) }
     safDestinationCancellations.values.forEach { it.set(true) }
     pendingSafDestination = null
-    pendingLosslessSource = null
+    pendingBackupSource = null
     pendingLegacyBackupSource = null
     safScope.cancel()
     mainHandler.removeCallbacksAndMessages(null)
@@ -847,7 +847,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
 
   private inner class SafBridge {
     @JavascriptInterface
-    fun pickLosslessSource(requestId: String) {
+    fun pickBackupSource(requestId: String) {
       if (!isCanonicalUuidV4(requestId)) return
       val cancellation = AtomicBoolean(false)
       safSourcePickFlow.begin(
@@ -855,7 +855,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         registerRequest = { safSourceCancellations.putIfAbsent(requestId, cancellation) == null },
         releaseSlot = safPickerSlot::release,
         dispatchBusy = {
-          dispatchLosslessSourceBatch(
+          dispatchBackupSourceBatch(
             requestId,
             SafSpoolBatch(
               emptyList(),
@@ -864,8 +864,8 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
           )
         },
         startPicker = {
-          pendingLosslessSource = PendingLosslessSource(requestId, cancellation)
-          losslessSourcePicker.launch(arrayOf("*/*"))
+          pendingBackupSource = PendingBackupSource(requestId, cancellation)
+          backupSourcePicker.launch(arrayOf("*/*"))
         },
       )
     }
@@ -1097,11 +1097,11 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     )
   }
 
-  private fun onLosslessSourceSelected(uri: Uri?) {
-    val pending = pendingLosslessSource ?: return
-    pendingLosslessSource = null
+  private fun onBackupSourceSelected(uri: Uri?) {
+    val pending = pendingBackupSource ?: return
+    pendingBackupSource = null
     if (uri == null) {
-      finishLosslessSourcePick(pending, SafSpoolBatch(emptyList(), emptyList()))
+      finishBackupSourcePick(pending, SafSpoolBatch(emptyList(), emptyList()))
       return
     }
     safScope.launch {
@@ -1155,12 +1155,12 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       } else {
         batch
       }
-      finishLosslessSourcePick(pending, terminalBatch)
+      finishBackupSourcePick(pending, terminalBatch)
     }
   }
 
-  private fun finishLosslessSourcePick(
-    pending: PendingLosslessSource,
+  private fun finishBackupSourcePick(
+    pending: PendingBackupSource,
     batch: SafSpoolBatch,
   ) {
     safSourceCancellations.remove(pending.requestId, pending.cancellation)
@@ -1169,13 +1169,13 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     }
     safPickerSlot.release()
     lifecycleWebView?.evaluateJavascript(
-      androidLosslessSourceResultScript(pending.requestId, batch, pending.restored),
+      androidBackupSourceResultScript(pending.requestId, batch, pending.restored),
       null,
     )
   }
 
-  private fun dispatchLosslessSourceBatch(requestId: String, batch: SafSpoolBatch) {
-    lifecycleWebView?.evaluateJavascript(androidLosslessSourcePickedScript(requestId, batch), null)
+  private fun dispatchBackupSourceBatch(requestId: String, batch: SafSpoolBatch) {
+    lifecycleWebView?.evaluateJavascript(androidBackupSourcePickedScript(requestId, batch), null)
   }
 
   private fun onLegacyBackupSourceSelected(uri: Uri?) {

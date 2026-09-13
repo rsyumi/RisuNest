@@ -125,6 +125,24 @@ pub(crate) async fn server_sync_backup_inventory(
     .await
 }
 #[tauri::command]
+pub(crate) async fn server_sync_backup_cleanup(
+    app: AppHandle,
+) -> Result<super::management::DeletionCleanup> {
+    blocking(move || {
+        let _admission = claim_library(&app)?;
+        let state = app.state::<ServerSyncCommandState>();
+        let _running = state.claim()?;
+        state.require_no_preparation()?;
+        let store = job_store(&app)?;
+        super::management::cleanup_deleted_backups(
+            store.repository_root(),
+            management_block(&store)?,
+            &pinned_backups(&state)?,
+        )
+    })
+    .await
+}
+#[tauri::command]
 pub(crate) async fn server_sync_backup_delete(app: AppHandle, id: String) -> Result<()> {
     blocking(move || {
         let _admission = claim_library(&app)?;

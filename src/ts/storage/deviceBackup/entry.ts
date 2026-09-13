@@ -36,7 +36,7 @@ function maintenanceView(
     },
     reviewReplacement(sections) {
       message.textContent =
-        "The selected areas will be replaced. The previous state is preserved for rollback. Keys absent from the backup will be removed.";
+        "The selected areas will be replaced, and keys absent from the backup will be removed. No automatic backup is kept after restoration. Temporary recovery data is kept only until the operation finishes.";
       details.replaceChildren(
         ...sections.map((section) => {
           const item = document.createElement("li");

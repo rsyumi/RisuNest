@@ -814,17 +814,17 @@ class SafFileBridgeTest {
   }
 
   @Test
-  fun `destination source accepts only exact app-owned lossless backup handoffs`() {
+  fun `destination source accepts only exact app-owned portable backup handoffs`() {
     val appData = temporaryDirectory()
     val handoffs = appData.resolve("native-file-jobs/handoffs")
     handoffs.mkdirs()
     val id = "99999999-9999-4999-8999-999999999999"
-    val source = handoffs.resolve("risulossless-$id.risulossless")
+    val source = handoffs.resolve("risunest-backup-$id.risunest")
     source.writeBytes(byteArrayOf(1, 2, 3))
-    val outside = appData.resolve("outside/risulossless-$id.risulossless")
+    val outside = appData.resolve("outside/risunest-backup-$id.risunest")
     outside.parentFile!!.mkdirs()
     outside.writeBytes(byteArrayOf(9))
-    val unrelated = handoffs.resolve("manual.risulossless").apply { writeBytes(byteArrayOf(8)) }
+    val unrelated = handoffs.resolve("manual.risunest").apply { writeBytes(byteArrayOf(8)) }
 
     assertEquals(source.canonicalFile, resolveManagedExportSource(appData, source.path))
     assertEquals(id, managedExportId(source))
@@ -977,8 +977,8 @@ class SafFileBridgeTest {
     assertEquals("character.png", safeSafDestinationName("character.png"))
     assertEquals("module.risum", safeSafDestinationName("module.risum"))
     assertEquals(
-      "risunest-2026-08-29T00-00-00-000Z.risulossless",
-      safeSafDestinationName("risunest-2026-08-29T00-00-00-000Z.risulossless"),
+      "risunest-2026-08-29T00-00-00-000Z.risunest",
+      safeSafDestinationName("risunest-2026-08-29T00-00-00-000Z.risunest"),
     )
     assertEquals("risu-backup.bin", safeSafDestinationName("risu-backup.bin"))
     assertEquals("backup.risunest", safeSafDestinationName("folder/backup.risunest"))

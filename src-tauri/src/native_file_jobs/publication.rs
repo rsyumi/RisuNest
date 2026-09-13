@@ -195,7 +195,6 @@ pub(super) fn run_job(
             preset_count: payload.preset_count,
             warning_codes: Vec::new(),
             handoff_path: None,
-            recovery_path: None,
             publication: Some(publication),
         })
     });

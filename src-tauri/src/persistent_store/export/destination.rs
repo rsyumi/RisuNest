@@ -107,10 +107,6 @@ destination_controlled_writer!(
     SourceKind::ScreenshotOutput
 );
 destination_controlled_writer!(
-    write_lossless_destination_controlled,
-    SourceKind::LosslessBackup
-);
-destination_controlled_writer!(
     write_portable_destination_controlled,
     SourceKind::PortableBackup
 );
@@ -237,7 +233,6 @@ fn write_desktop_destination_with_commit<F: DestinationFileSystem>(
 enum SourceKind {
     RisuSave,
     ScreenshotOutput,
-    LosslessBackup,
     PortableBackup,
     LegacyBackup,
     CharacterCharX,
@@ -252,11 +247,8 @@ impl SourceKind {
         match self {
             Self::RisuSave => None,
             Self::ScreenshotOutput => Some(&["archive.zip.part"]),
-            Self::LosslessBackup => {
-                Some(&["archive.risulossless.part", "recovery.risulossless.part"])
-            }
             Self::LegacyBackup => Some(&["archive.bin.part"]),
-            Self::PortableBackup => Some(&["archive.risunest.part", "recovery.risunest.part"]),
+            Self::PortableBackup => Some(&["archive.risunest.part"]),
             Self::CharacterCharX => Some(&["character.charx", "character.jpeg"]),
             Self::CharacterCard => Some(&["character.json", "character.png"]),
             Self::RisuModule => Some(&["module.risum"]),

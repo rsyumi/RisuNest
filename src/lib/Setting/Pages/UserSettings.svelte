@@ -14,7 +14,11 @@
     import { isTauri, isNodeServer } from "src/ts/platform";
     import { unMigrationAccount } from "src/ts/storage/accountStorage";
     import { checkDriver } from "src/ts/drive/drive";
-    import { SavePartialLocalBackup } from "src/ts/drive/backuplocal";
+    import {
+        SavePartialLocalBackup,
+        SaveLocalBackup,
+        LoadLocalBackup,
+    } from "src/ts/drive/backuplocal";
     import Button from "src/lib/UI/GUI/Button.svelte";
     import { exportAsDataset } from "src/ts/storage/exportAsDataset";
     import { loginToSionyw, testSionywLogin } from "src/ts/sionyw";
@@ -25,10 +29,6 @@
         isExpectedHubMessage,
         resolveExpectedOfficialAccountMessageUrl,
     } from "src/ts/storage/officialAccountMessage";
-    import {
-        exportLocalBackupFromSystemPicker,
-        restoreLocalBackupFromSystemPicker,
-    } from "src/ts/storage/losslessBackupFileRouteProduction.svelte";
     import {
         exportPortableBackupFromSystemPicker,
         restoreBackupFromSystemPicker,
@@ -134,19 +134,17 @@
                     ? await restoreBackupFromSystemPicker()
                     : await exportPortableBackupFromSystemPicker()
                 : kind === "import"
-                  ? await restoreLocalBackupFromSystemPicker()
-                  : await exportLocalBackupFromSystemPicker();
+                  ? await LoadLocalBackup()
+                  : await SaveLocalBackup();
             if (!result || ("mode" in result && result.mode === "legacy"))
                 return;
             const message = result.warningCodes.includes(
                 "source-preserved-repair-required",
             )
                 ? language.risuNest.backup.sourcePreserved
-                : result.warningCodes.includes("recovery-source-preserved")
-                  ? language.risuNest.backup.recoverySourcePreserved
-                  : kind === "import"
-                    ? language.risuNest.backup.localBackupRestored
-                    : language.risuNest.backup.localBackupSaved;
+                : kind === "import"
+                  ? language.risuNest.backup.localBackupRestored
+                  : language.risuNest.backup.localBackupSaved;
             alertNormal(
                 result.warningCodes.includes("cleanup-failed")
                     ? `${message} ${language.risuSaveCleanupWarning}`

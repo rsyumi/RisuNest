@@ -279,7 +279,7 @@ fn two_native_replicas_seed_publish_pull_and_preserve_same_key_conflicts() {
         let prepared = restored
             .prepare_replace_commit(&stage.staging_id, Some(0))
             .unwrap();
-        let snapshot = prepared.create_snapshot().unwrap();
+        let snapshot = prepared;
         restored.finish_prepared_replace(snapshot).unwrap();
         assert_eq!(restored.revision().unwrap(), 1);
     }

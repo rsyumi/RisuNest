@@ -749,7 +749,10 @@ fn native_publication_gates_precede_acknowledgement_and_first_device_intent() {
     restore.source_ready(&id).unwrap();
     section(&restore, &id, Spool::Rollback, "{}");
     restore.prepared(&id).unwrap();
-    assert_eq!(restore.session(&id).unwrap().action, "await-recovery");
+    assert_eq!(
+        restore.session(&id).unwrap().action,
+        "await-native-preparation"
+    );
     assert!(restore.section_intent(&id, SECTION, false).is_err());
     restore.allow_device_apply(&id).unwrap();
     restore.section_intent(&id, SECTION, false).unwrap();

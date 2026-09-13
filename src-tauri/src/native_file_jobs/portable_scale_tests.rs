@@ -12,12 +12,7 @@ fn native_portable_scale_acceptance() {
     let mode = std::env::var("RISUNEST_BACKUP_SCALE").expect("explicit synthetic scale scenario");
     assert!(matches!(
         mode.as_str(),
-        "database-1g"
-            | "database-probe"
-            | "files-100k"
-            | "payload-4g"
-            | "portable-small"
-            | "baseline-small"
+        "database-1g" | "database-probe" | "files-100k" | "payload-4g" | "portable-small"
     ));
     let work = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -147,14 +142,9 @@ fn native_portable_scale_acceptance() {
     );
     let store = PersistentStore::open(&source).unwrap();
     let registry = super::super::JobRegistry::default();
-    let baseline = mode == "baseline-small";
     let job = registry
         .create_internal(
-            if baseline {
-                super::super::JobKind::ExportLosslessBackup
-            } else {
-                super::super::JobKind::ExportPortableBackup
-            },
+            super::super::JobKind::ExportPortableBackup,
             Some(revision),
             vec![],
             false,
@@ -162,69 +152,16 @@ fn native_portable_scale_acceptance() {
         .unwrap();
     let start = Instant::now();
     let exported = measure("export", &job, || {
-        if baseline {
-            super::super::lossless::export_lossless_backup(
-                None, revision, &jobs, &handoffs, store, &job,
-            )
-        } else {
-            export_portable(None, revision, &jobs, &handoffs, store, &job, None)
-        }
+        export_portable(None, revision, &jobs, &handoffs, store, &job, None)
     })
     .unwrap();
     let export_ms = start.elapsed().as_millis();
     assert!(
-        exported
-            .warning_codes
-            .iter()
-            .all(|code| baseline && code == "expected-missing-reference"),
+        exported.warning_codes.iter().all(|_| false),
         "export warnings: {:?}",
         exported.warning_codes
     );
     let archive_path = std::path::PathBuf::from(exported.handoff_path.unwrap());
-    if baseline {
-        let target_store = scale_library(&target, &mode);
-        let target_revision = target_store.revision().unwrap();
-        let restore_job = registry
-            .create_internal(
-                super::super::JobKind::RestoreLosslessBackup,
-                Some(target_revision),
-                vec![],
-                false,
-            )
-            .unwrap();
-        let start = Instant::now();
-        let result = measure("restore", &restore_job, || {
-            super::super::lossless::restore_lossless_backup(
-                OpenedJobSource {
-                    file: File::open(archive_path).unwrap(),
-                    total_bytes: exported.source_bytes,
-                },
-                target_revision,
-                &restore_jobs,
-                target_store,
-                &restore_job,
-            )
-        })
-        .unwrap();
-        let restore_ms = start.elapsed().as_millis();
-        assert!(
-            result
-                .warning_codes
-                .iter()
-                .all(|code| code == "expected-missing-reference"),
-            "restore warnings: {:?}",
-            result.warning_codes
-        );
-        let restored = Connection::open(target.join("persistent/persistent.db")).unwrap();
-        assert_eq!(
-            restored
-                .query_row::<i64, _, _>("SELECT count(*) FROM asset_aliases", [], |r| r.get(0))
-                .unwrap(),
-            2000
-        );
-        println!("SCALE result mode={mode} sourceDbBytes={source_db_bytes} archiveBytes={} exportMs={export_ms} restoreMs={restore_ms} peakWorkingSetBytes={:?} retainedBytes={}",exported.source_bytes,peak_working_set(),tree_bytes(directory.path()));
-        return;
-    }
     let archive =
         VerifiedArchive::open(File::open(&archive_path).unwrap(), &jobs, &NeverCancelled).unwrap();
     let expected = digest_raw_tables(&archive.db, &NeverCancelled).unwrap();
@@ -240,8 +177,7 @@ fn native_portable_scale_acceptance() {
             .prepare_replace_commit(&stage.staging_id, Some(revision))
             .unwrap();
         println!("MEMORY afterPrepare={:?}", peak_working_set());
-        let authorized = prepared.create_snapshot().unwrap();
-        println!("MEMORY afterSnapshot={:?}", peak_working_set());
+        let authorized = prepared;
         target_store.finish_prepared_replace(authorized).unwrap();
         println!("MEMORY afterCommit={:?}", peak_working_set());
         return;

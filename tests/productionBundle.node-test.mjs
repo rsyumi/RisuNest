@@ -104,3 +104,32 @@ test("rejects removed peer transport modules but preserves upstream PeerJS", () 
     assertProductionBundle([chunk({}, "window.RisuPeerCloneBridge = {}")]),
   );
 });
+
+ test("rejects retired backup modules, commands, and magic in product chunks and maps", () => {
+   for (const id of [
+     "/src/ts/storage/losslessBackupFileRoute.ts",
+     "/src/ts/storage/losslessBackupFileRouteProduction.svelte.ts",
+   ]) {
+     assert.throws(
+       () => assertProductionBundle([chunk({ [id]: {} })]),
+       /module/,
+     );
+     assert.throws(
+       () => assertProductionBundle([chunk(), map([id])]),
+       /source/,
+     );
+   }
+   for (const marker of [
+     "RISUNESTLOSSLESS",
+     ".risulossless",
+     "restore-lossless-backup",
+     "export-lossless-backup",
+     "native_lossless_handoff_cleanup",
+   ]) {
+     assert.throws(() => assertProductionBundle([chunk({}, marker)]), /marker/);
+     assert.throws(
+       () => assertProductionBundle([chunk(), map(["/src/main.ts"], [marker])]),
+       /source text/,
+     );
+   }
+ });

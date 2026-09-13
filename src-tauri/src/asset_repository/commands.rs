@@ -740,7 +740,7 @@ mod tests {
         let mut job = DurableCasJob::begin(
             directory.path(),
             "wrong-kind",
-            CasJobKind::LosslessImport,
+            CasJobKind::LocalBackupRestore,
             1,
         )
         .unwrap();

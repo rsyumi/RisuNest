@@ -71,7 +71,7 @@ export const languageEnglish = {
         helpExport:
             'Selected device data is captured after restarting the app into maintenance mode.',
         helpRestore:
-            'Selected areas replace the data on this device, including keys that exist only here. Unselected areas stay unchanged.',
+            'Selected areas replace the data on this device, including keys that exist only here. Unselected areas stay unchanged. No automatic backup will be kept. Back up your current data first if you want to keep it.',
         repair: 'This file preserves damaged source data. Its library cannot be activated until repaired.',
         continue: 'Continue',
         cancel: 'Cancel',
@@ -984,7 +984,7 @@ export const languageEnglish = {
     files: "Files",
     backupConfirm: "Do you really want to save backup?",
     backupLoadConfirm: "Do you really want to load backup? All datas will be lost!",
-    backupLoadConfirm2: "Do you really, really want to load backup? All datas will be lost!",
+    backupLoadConfirm2: "Your current data will be replaced by the backup. No automatic backup will be created. To keep your current data, cancel and back it up first. Continue?",
     importRisuSave: "Import RisuSave file",
     exportRisuSave: "Export RisuSave file",
     risuSaveImportConfirm: "Replace the current database with the selected RisuSave file?",
@@ -2137,7 +2137,7 @@ export const languageEnglish = {
             officialRestore: 'Restore backup',
             officialCancel: 'Cancel backup upload',
             officialRestoreConfirm:
-                'Replace local data with the official account backup?',
+                'Replace local data with the official account backup? No automatic backup will be created. Back up your current data first if you want to keep it.',
             officialRestoreInlayWarning:
                 'Official snapshots do not include separate chat attachments. Referenced images, audio, video, and signatures may not be restored. The app will restart after restoring the backup. Continue?',
             officialMissing:
@@ -2155,8 +2155,6 @@ export const languageEnglish = {
             localBackupRestored: 'Local backup restored.',
             sourcePreserved:
                 'The original database and files were saved. This source archive requires data repair before it can replace a library.',
-            recoverySourcePreserved:
-                'The backup was restored. The previous data was saved in a source archive that requires repair before it can be used again.',
             sourceRepairRequired:
                 'The source archive was verified, but data repair is required before it can replace a library. Your current data has not changed.',
         },
@@ -2164,7 +2162,7 @@ export const languageEnglish = {
             titleImport: 'Import',
             titleRisuSave: 'Import RisuSave',
             titleLocalBackup: 'Import local backup',
-            titleLossless: 'Import RisuNest backup',
+            titleBackup: 'Import RisuNest backup',
             formatPocketRisu: 'PocketRisu backup',
             formatRisuAi: 'RisuAI backup',
             elapsed: 'Elapsed {0}',

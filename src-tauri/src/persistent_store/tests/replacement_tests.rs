@@ -69,53 +69,24 @@ fn bounded_generation_replacement_rolls_back_deleted_and_partly_moved_batches() 
 }
 
 #[test]
-fn replacements_snapshot_only_nonzero_revisions_and_abort_on_snapshot_failure() {
-    let directory = tempfile::tempdir().expect("create temporary directory");
-    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+fn replacements_do_not_create_or_require_recovery_snapshots() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = PersistentStore::open(directory.path()).unwrap();
     let seed = stage_root(&mut store, "Seed");
-    store
-        .replace_commit(&seed, Some(0))
-        .expect("activate revision one");
-    assert!(store
-        .snapshot_list()
-        .expect("list seed snapshots")
-        .is_empty());
-
-    let replacement = stage_root(&mut store, "Revision two");
-    store
-        .replace_commit(&replacement, Some(1))
-        .expect("activate protected replacement");
-    let snapshots = store.snapshot_list().expect("list pre-replace snapshots");
-    assert_eq!(snapshots.len(), 1);
-    let (_capture, snapshot) = reconstruct_snapshot(&store, &snapshots[0].id);
-    let revision: String = snapshot
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'currentRevision'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("read snapshotted revision");
-    assert_eq!(revision, "1");
-    drop(snapshot);
-
-    let failed = stage_root(&mut store, "Must not activate");
-    for entry in fs::read_dir(snapshots_dir(&directory)).expect("read snapshots directory") {
-        let path = entry.expect("read snapshot entry").path();
-        fs::remove_file(path).expect("remove snapshot file");
-    }
-    fs::remove_dir(snapshots_dir(&directory)).expect("remove snapshots directory");
-    fs::write(snapshots_dir(&directory), b"blocks directory creation")
-        .expect("block snapshot directory");
-    assert!(store.replace_commit(&failed, Some(2)).is_err());
-    assert_eq!(store.revision().expect("read preserved revision"), 2);
-    assert_eq!(
-        store.read_root(None).expect("read preserved root").value["username"],
-        "Revision two"
-    );
+    store.replace_commit(&seed, Some(0)).unwrap();
+    let replacement = stage_root(&mut store, "Replacement");
+    store.replace_commit(&replacement, Some(1)).unwrap();
+    assert!(store.snapshot_list().unwrap().is_empty());
+    store.snapshots_dir = directory.path().join("blocked-snapshots");
+    fs::write(&store.snapshots_dir, b"unavailable snapshot directory").unwrap();
+    let replacement = stage_root(&mut store, "Final");
+    store.replace_commit(&replacement, Some(2)).unwrap();
+    assert_eq!(store.revision().unwrap(), 3);
+    assert_eq!(store.read_root(None).unwrap().value["username"], "Final");
 }
 
 #[test]
-fn prepared_replacement_rechecks_revision_after_snapshot_before_activation() {
+fn prepared_replacement_rechecks_revision_before_activation() {
     let directory = tempfile::tempdir().expect("create temporary directory");
     let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
     let seed = stage_root(&mut store, "Seed");
@@ -127,9 +98,7 @@ fn prepared_replacement_rechecks_revision_after_snapshot_before_activation() {
     let prepared = store
         .prepare_replace_commit(&replacement, Some(1))
         .expect("prepare replacement");
-    let authorized = prepared
-        .create_snapshot()
-        .expect("create snapshot on dedicated connection");
+    let authorized = prepared;
 
     let competing = stage_root(&mut store, "Competing revision");
     store
@@ -168,9 +137,7 @@ fn prepared_replacement_commits_activation_marker_with_new_revision() {
     let prepared = store
         .prepare_replace_commit(&replacement, Some(1))
         .expect("prepare replacement");
-    let authorized = prepared
-        .create_snapshot()
-        .expect("create snapshot on dedicated connection");
+    let authorized = prepared;
 
     let committed = store
         .finish_prepared_replace_with_app_kv(
@@ -205,9 +172,7 @@ fn prepared_replacement_rolls_back_when_activation_marker_write_fails() {
     let prepared = store
         .prepare_replace_commit(&replacement, Some(1))
         .expect("prepare replacement");
-    let authorized = prepared
-        .create_snapshot()
-        .expect("create snapshot on dedicated connection");
+    let authorized = prepared;
     store
         .connection
         .execute_batch(

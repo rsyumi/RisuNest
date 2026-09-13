@@ -11,11 +11,9 @@ import {
     runNativeLegacyLocalBackupExport,
     runNativeCompatibleLocalBackupExport,
     runNativeLegacyLocalBackupRestore,
-    runNativeLosslessBackupExport,
     runNativeCharacterCharxExport,
     runNativeCharacterCardExport,
     runNativeRisuModuleExport,
-    runNativeLosslessBackupRestore,
     runNativeOfficialPublicationAttempt,
     resumeNativeOfficialPublication,
     type NativeFileJobStatus,
@@ -587,8 +585,6 @@ describe('native file jobs', () => {
                     characterCount: 4,
                     presetCount: 2,
                     warningCodes: [],
-                    recoveryPath:
-                        'C:\\app\\persistent\\recovery\\risulossless-recovery-official.risulossless',
                 }),
                 kind: 'restore-official-account-snapshot',
             },
@@ -635,9 +631,6 @@ describe('native file jobs', () => {
         expect(result).toMatchObject({
             kind: 'activated',
             revision: 12,
-            recoveryPath: expect.stringContaining(
-                'risulossless-recovery-official',
-            ),
         })
         expect(events).toEqual([
             'fence-acquired',
@@ -1046,18 +1039,18 @@ describe('native file jobs', () => {
         expect(JSON.stringify(calls)).not.toContain('Uint8Array')
     })
 
-    it('keeps unavailable lossless backup capability as a structured native error', async () => {
+    it('keeps unavailable legacy backup capability as a structured native error', async () => {
         const calls: string[] = []
 
         await expect(
-            runNativeLosslessBackupExport(
+            runNativeLegacyLocalBackupExport(
                 {
                     revision: 5,
                     flushPendingData: async () => undefined,
                 },
                 {
                     type: 'desktopPath',
-                    path: 'C:\\chosen\\backup.risulossless',
+                    path: 'C:\\chosen\\backup.bin',
                 },
                 {},
                 {
@@ -1067,7 +1060,7 @@ describe('native file jobs', () => {
                         throw {
                             code: 'capability-unavailable',
                             message:
-                                'native lossless backup requires v2 asset and cold authority',
+                                'native legacy backup requires v2 asset and cold authority',
                         }
                     },
                     wait: async () => undefined,
@@ -1084,13 +1077,13 @@ describe('native file jobs', () => {
         expect(calls).toEqual(['native_file_job_start'])
     })
 
-    it('restores a lossless package through the existing destructive replacement fence', async () => {
+    it('restores a compatible package through the existing destructive replacement fence', async () => {
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
         const events: string[] = []
         const statuses: NativeFileJobStatus[] = [
             {
                 ...status('waitingForInput'),
-                kind: 'restore-lossless-backup',
+                kind: 'restore-legacy-local-backup',
                 phase: 'awaiting-activation',
             },
             {
@@ -1101,14 +1094,12 @@ describe('native file jobs', () => {
                     characterCount: 3,
                     presetCount: 2,
                     warningCodes: [],
-                    recoveryPath:
-                        'C:\\app\\persistent\\recovery\\risulossless-recovery-123e4567-e89b-42d3-a456-426614174000.risulossless',
                 }),
-                kind: 'restore-lossless-backup',
+                kind: 'restore-legacy-local-backup',
             },
         ]
 
-        const result = await runNativeLosslessBackupRestore(
+        const result = await runNativeLegacyLocalBackupRestore(
             restoreRuntime(17, {
                 acquire: () => {
                     events.push('fence-acquired')
@@ -1150,7 +1141,7 @@ describe('native file jobs', () => {
         )
 
         expect(result.revision).toBe(18)
-        expect(result.recoveryPath).toContain('risulossless-recovery-')
+
         expect(events).toEqual([
             'fresh-status',
             'fence-acquired',
@@ -1163,7 +1154,7 @@ describe('native file jobs', () => {
                 'native_file_job_start',
                 {
                     request: {
-                        kind: 'restore-lossless-backup',
+                        kind: 'restore-legacy-local-backup',
                         source: {
                             type: 'androidSpool',
                             token: '2c4d33fe-2e29-4625-bb1e-c8d1084f9557',
@@ -1180,12 +1171,12 @@ describe('native file jobs', () => {
         expect(JSON.stringify(calls)).not.toContain('Uint8Array')
     })
 
-    it('retains a committed lossless restore when renderer refresh fails', async () => {
+    it('retains a committed backup restore when renderer refresh fails', async () => {
         const commands: string[] = []
         const statuses: NativeFileJobStatus[] = [
             {
                 ...status('waitingForInput'),
-                kind: 'restore-lossless-backup',
+                kind: 'restore-legacy-local-backup',
                 phase: 'awaiting-activation',
             },
             {
@@ -1196,15 +1187,13 @@ describe('native file jobs', () => {
                     characterCount: 3,
                     presetCount: 2,
                     warningCodes: [],
-                    recoveryPath:
-                        'C:\\app\\persistent\\recovery\\risulossless-recovery-123e4567-e89b-42d3-a456-426614174001.risulossless',
                 }),
-                kind: 'restore-lossless-backup',
+                kind: 'restore-legacy-local-backup',
             },
         ]
 
         await expect(
-            runNativeLosslessBackupRestore(
+            runNativeLegacyLocalBackupRestore(
                 restoreRuntime(18, {
                     refresh: () => {
                         throw new Error('refresh failed')
@@ -1212,7 +1201,7 @@ describe('native file jobs', () => {
                 }),
                 {
                     type: 'desktopPath',
-                    path: 'C:\\chosen\\backup.risulossless',
+                    path: 'C:\\chosen\\backup.bin',
                 },
                 {},
                 {
@@ -1239,11 +1228,11 @@ describe('native file jobs', () => {
         expect(commands).not.toContain('native_file_job_forget')
     })
 
-    it('exports a complete lossless package to a desktop destination without bytes in IPC', async () => {
+    it('exports a complete compatible package to a desktop destination without bytes in IPC', async () => {
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
         const terminal: NativeFileJobStatus = {
             jobId: 'lossless-export',
-            kind: 'export-lossless-backup',
+            kind: 'export-legacy-local-backup',
             state: 'succeeded',
             phase: 'complete',
             progress: {
@@ -1262,14 +1251,14 @@ describe('native file jobs', () => {
             },
         }
 
-        const result = await runNativeLosslessBackupExport(
+        const result = await runNativeLegacyLocalBackupExport(
             {
                 revision: 22,
                 flushPendingData: async (reason) => {
                     calls.push([`flush:${reason}`, undefined])
                 },
             },
-            { type: 'desktopPath', path: 'C:\\chosen\\backup.risulossless' },
+            { type: 'desktopPath', path: 'C:\\chosen\\backup.bin' },
             {},
             {
                 isTauri: () => true,
@@ -1288,13 +1277,13 @@ describe('native file jobs', () => {
 
         expect(result).toEqual(terminal.result)
         expect(calls).toEqual([
-            ['flush:native-lossless-backup-export', undefined],
+            ['flush:native-legacy-local-backup-export', undefined],
             [
                 'native_file_job_start',
                 {
                     request: {
-                        kind: 'export-lossless-backup',
-                        destination: 'C:\\chosen\\backup.risulossless',
+                        kind: 'export-legacy-local-backup',
+                        destination: 'C:\\chosen\\backup.bin',
                         expectedRevision: 22,
                     },
                 },
@@ -1305,14 +1294,14 @@ describe('native file jobs', () => {
         expect(JSON.stringify(calls)).not.toContain('Uint8Array')
     })
 
-    it('hands a managed lossless export to Android SAF and cleans the native source', async () => {
+    it('hands a managed backup export to Android SAF and cleans the native source', async () => {
         const events: string[] = []
         const observedStatuses: NativeFileJobStatus[] = []
         const handoffPath =
-            'C:\\app\\native-file-jobs\\handoffs\\risulossless-123e4567-e89b-42d3-a456-426614174002.risulossless'
+            'C:\\app\\native-file-jobs\\handoffs\\risu-backup-123e4567-e89b-42d3-a456-426614174002.bin'
         const terminal: NativeFileJobStatus = {
             jobId: 'lossless-export',
-            kind: 'export-lossless-backup',
+            kind: 'export-legacy-local-backup',
             state: 'succeeded',
             phase: 'complete',
             progress: {
@@ -1330,9 +1319,9 @@ describe('native file jobs', () => {
             },
         }
 
-        const result = await runNativeLosslessBackupExport(
+        const result = await runNativeLegacyLocalBackupExport(
             { revision: 22, flushPendingData: async () => undefined },
-            { type: 'androidSaf', suggestedName: 'backup.risulossless' },
+            { type: 'androidSaf', suggestedName: 'backup.bin' },
             { onStatus: (status) => observedStatuses.push(status) },
             {
                 isTauri: () => true,
@@ -1341,7 +1330,7 @@ describe('native file jobs', () => {
                     if (command === 'native_file_job_start')
                         return { jobId: 'lossless-export' }
                     if (command === 'native_file_job_status') return terminal
-                    if (command === 'native_lossless_handoff_cleanup')
+                    if (command === 'native_legacy_backup_handoff_cleanup')
                         return undefined
                     if (command === 'native_file_job_forget') return true
                     throw new Error(`Unexpected command: ${command}`)
@@ -1374,10 +1363,10 @@ describe('native file jobs', () => {
             progress: { completedBytes: 2048, totalBytes: 4096 },
         })
         expect(events).toEqual([
-            'native_file_job_start:{"request":{"kind":"export-lossless-backup","expectedRevision":22}}',
+            'native_file_job_start:{"request":{"kind":"export-legacy-local-backup","expectedRevision":22}}',
             'native_file_job_status:{"jobId":"lossless-export"}',
-            `saf:${handoffPath}:backup.risulossless`,
-            `native_lossless_handoff_cleanup:{"path":"${handoffPath.replaceAll('\\', '\\\\')}"}`,
+            `saf:${handoffPath}:backup.bin`,
+            `native_legacy_backup_handoff_cleanup:{"path":"${handoffPath.replaceAll('\\', '\\\\')}"}`,
             'native_file_job_forget:{"jobId":"lossless-export"}',
         ])
     })
@@ -1385,10 +1374,10 @@ describe('native file jobs', () => {
     it('rejects a short Android SAF handoff and still cleans both native receipts', async () => {
         const commands: string[] = []
         const handoffPath =
-            'C:\\app\\native-file-jobs\\handoffs\\risulossless-123e4567-e89b-42d3-a456-426614174003.risulossless'
+            'C:\\app\\native-file-jobs\\handoffs\\risu-backup-123e4567-e89b-42d3-a456-426614174003.bin'
         const terminal: NativeFileJobStatus = {
             jobId: 'lossless-export',
-            kind: 'export-lossless-backup',
+            kind: 'export-legacy-local-backup',
             state: 'succeeded',
             phase: 'complete',
             progress: { completedBytes: 4096, completedItems: 1 },
@@ -1404,9 +1393,9 @@ describe('native file jobs', () => {
         }
 
         await expect(
-            runNativeLosslessBackupExport(
+            runNativeLegacyLocalBackupExport(
                 { revision: 22, flushPendingData: async () => undefined },
-                { type: 'androidSaf', suggestedName: 'backup.risulossless' },
+                { type: 'androidSaf', suggestedName: 'backup.bin' },
                 {},
                 {
                     isTauri: () => true,
@@ -1416,7 +1405,7 @@ describe('native file jobs', () => {
                             return { jobId: 'lossless-export' }
                         if (command === 'native_file_job_status')
                             return terminal
-                        if (command === 'native_lossless_handoff_cleanup')
+                        if (command === 'native_legacy_backup_handoff_cleanup')
                             return undefined
                         if (command === 'native_file_job_forget') return true
                         throw new Error(`Unexpected command: ${command}`)
@@ -1432,20 +1421,20 @@ describe('native file jobs', () => {
         expect(commands).toEqual([
             'native_file_job_start',
             'native_file_job_status',
-            'native_lossless_handoff_cleanup',
+            'native_legacy_backup_handoff_cleanup',
             'native_file_job_forget',
         ])
     })
 
     it.each([
         {
-            label: 'lossless backup',
-            run: runNativeLosslessBackupExport,
-            kind: 'export-lossless-backup' as const,
-            cleanupCommand: 'native_lossless_handoff_cleanup',
-            suggestedName: 'backup.risulossless',
+            label: 'legacy backup',
+            run: runNativeLegacyLocalBackupExport,
+            kind: 'export-legacy-local-backup' as const,
+            cleanupCommand: 'native_legacy_backup_handoff_cleanup',
+            suggestedName: 'backup.bin',
             handoffPath:
-                'C:\\app\\native-file-jobs\\handoffs\\risulossless-123e4567-e89b-42d3-a456-426614174005.risulossless',
+                'C:\\app\\native-file-jobs\\handoffs\\risu-backup-123e4567-e89b-42d3-a456-426614174005.bin',
         },
         {
             label: 'legacy backup',
@@ -1740,7 +1729,7 @@ describe('native file jobs', () => {
         const discarded: string[] = []
 
         await expect(
-            runNativeLosslessBackupRestore(
+            runNativeLegacyLocalBackupRestore(
                 restoreRuntime(2, { capture: () => controller.abort() }),
                 { type: 'androidSpool', token },
                 { signal: controller.signal },
@@ -1769,7 +1758,7 @@ describe('native file jobs', () => {
         controller.abort()
 
         await expect(
-            runNativeLosslessBackupRestore(
+            runNativeLegacyLocalBackupRestore(
                 restoreRuntime(2),
                 { type: 'androidSpool', token },
                 { signal: controller.signal },
@@ -1794,7 +1783,7 @@ describe('native file jobs', () => {
         controller.abort()
 
         await expect(
-            runNativeLosslessBackupRestore(
+            runNativeLegacyLocalBackupRestore(
                 restoreRuntime(2),
                 {
                     type: 'androidSpool',
@@ -1821,7 +1810,7 @@ describe('native file jobs', () => {
         controller.abort()
 
         await expect(
-            runNativeLosslessBackupRestore(
+            runNativeLegacyLocalBackupRestore(
                 restoreRuntime(2),
                 {
                     type: 'androidSpool',
@@ -3564,9 +3553,9 @@ it('cancels staged restore and waits for terminal settlement when the fresh prec
     ]
     const acquire = vi.fn()
     await expect(
-        runNativeLosslessBackupRestore(
+        runNativeLegacyLocalBackupRestore(
             restoreRuntime(17, { acquire }),
-            { type: 'desktopPath', path: 'C:\\synthetic\\backup.risulossless' },
+            { type: 'desktopPath', path: 'C:\\synthetic\\backup.bin' },
             {
                 beforeActivation: () => {
                     throw new NativeFileJobError(

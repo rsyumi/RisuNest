@@ -65,8 +65,12 @@ describe('nativeFileJobProgress', () => {
     })
 
     it('names local backup jobs as local backups rather than RisuSave', () => {
-        expect(nativeFileJobTitle('import', status({ kind: 'restore-lossless-backup' })))
-            .toBe(languageEnglish.loadBackupLocal)
+        expect(
+            nativeFileJobTitle(
+                'import',
+                status({ kind: 'restore-legacy-local-backup' }),
+            ),
+        ).toBe(languageEnglish.loadBackupLocal)
         expect(nativeFileJobTitle('export', status({ kind: 'export-legacy-local-backup' })))
             .toBe(languageEnglish.saveBackupLocal)
         expect(nativeFileJobTitle('import', status({ kind: 'restore-block-risu-save' })))

@@ -9,7 +9,6 @@ pub mod import_export_jobs;
 mod local_backup;
 mod logical_records;
 #[allow(dead_code)]
-mod lossless_backup;
 #[allow(dead_code)]
 mod lossless_f0;
 pub mod native_file_jobs;
@@ -675,6 +674,7 @@ pub fn run() {
             server_sync::commands::server_sync_backups,
             server_sync::commands::server_sync_backup_inventory,
             server_sync::commands::server_sync_backup_delete,
+            server_sync::commands::server_sync_backup_cleanup,
             server_sync::commands::server_sync_backup_release,
             server_sync::commands::server_sync_cache_usage,
             server_sync::commands::server_sync_cache_cleanup,
@@ -753,7 +753,6 @@ pub fn run() {
             native_file_jobs::native_file_job_cancel,
             native_file_jobs::native_file_job_official_publication_retry,
             native_file_jobs::native_file_job_forget,
-            native_file_jobs::native_lossless_handoff_cleanup,
             native_file_jobs::native_portable_handoff_cleanup,
             native_file_jobs::native_portable_select_sections,
             native_file_jobs::native_backup_source_format,

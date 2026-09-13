@@ -112,10 +112,6 @@ fn table_columns(
         .expect("collect table columns")
 }
 
-fn snapshots_dir(directory: &tempfile::TempDir) -> PathBuf {
-    directory.path().join("persistent/snapshots")
-}
-
 fn stage_root(store: &mut PersistentStore, username: &str) -> String {
     let staging = store.replace_begin().expect("begin staged replacement");
     store
