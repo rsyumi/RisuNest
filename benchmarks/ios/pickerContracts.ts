@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { appDataDir, documentDir, join } from "@tauri-apps/api/path";
 import { mkdir, writeFile } from "@tauri-apps/plugin-fs";
 import { exportIOSFile, pickIOSFile } from "../../src/ts/storage/iosFiles";
@@ -57,6 +58,10 @@ export async function installPickerContracts() {
     return (await getIOSNativeState()).notifications
       ? "notifications-allowed"
       : "notifications-denied";
+  });
+  action("Open synthetic link", async () => {
+    await openUrl("https://ios-synthetic.invalid/");
+    return "link-opened";
   });
   status.textContent = "ui-ready";
 }

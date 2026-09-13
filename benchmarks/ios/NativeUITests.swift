@@ -24,6 +24,10 @@ final class NativeUITests: XCTestCase {
         XCTAssertTrue(allow.waitForExistence(timeout: 15))
         allow.tap()
         XCTAssertTrue(app.webViews.staticTexts["notifications-allowed"].waitForExistence(timeout: 10))
+        app.webViews.buttons["Open synthetic link"].tap()
+        let safari = XCUIApplication(bundleIdentifier: "com.apple.mobilesafari")
+        XCTAssertTrue(safari.wait(for: .runningForeground, timeout: 15))
+        app.activate()
         let attachment = XCTAttachment(screenshot: app.screenshot())
         attachment.lifetime = .keepAlways
         add(attachment)

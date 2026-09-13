@@ -89,7 +89,7 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
                     "activeTasks": Array(Set(self.tasks.keys).union(self.continued.keys)),
                     "expiredTasks": Array(self.expired),
                     "foreground": UIApplication.shared.applicationState == .active,
-                    "backgroundMode": self.continuedRegistered ? "continued" : "limited",
+                    "backgroundMode": !self.continued.isEmpty || self.continuedPending != nil ? "continued" : "limited",
                 ])
             }
         }
@@ -155,7 +155,7 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
         }
     }
 
-    @objc func reset_generation(_ invoke: Invoke) {
+    @objc func resetGeneration(_ invoke: Invoke) {
         DispatchQueue.main.async {
             for task in self.tasks.values { UIApplication.shared.endBackgroundTask(task) }
             for task in self.continued.values { task.setTaskCompleted(success: false) }
@@ -169,7 +169,7 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
         }
     }
 
-    @objc func generation_progress(_ invoke: Invoke) throws {
+    @objc func generationProgress(_ invoke: Invoke) throws {
         let args = try invoke.parseArgs(ProgressArgs.self)
         guard (0...3).contains(args.completed) else { invoke.reject("Invalid generation progress"); return }
         DispatchQueue.main.async {
@@ -186,7 +186,7 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
         }
     }
 
-    @objc func request_notifications(_ invoke: Invoke) {
+    @objc func requestNotifications(_ invoke: Invoke) {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, error in
             if let error = error { invoke.reject(error.localizedDescription) }
             else { invoke.resolve(["granted": granted]) }
@@ -206,7 +206,7 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
         }
     }
 
-    @objc func open_settings(_ invoke: Invoke) {
+    @objc func openSettings(_ invoke: Invoke) {
         DispatchQueue.main.async {
             UIApplication.shared.open(URL(string: UIApplication.openSettingsURLString)!, options: [:]) { opened in
                 invoke.resolve(["opened": opened])
@@ -227,7 +227,7 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
         presenter.present(picker, animated: true)
     }
 
-    @objc func pick_file(_ invoke: Invoke) {
+    @objc func pickFile(_ invoke: Invoke) {
         DispatchQueue.main.async {
             guard self.pickerCall == nil else { invoke.reject("A file picker is already open"); return }
             self.exporting = false
@@ -246,7 +246,7 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
         return resolved
     }
 
-    @objc func export_file(_ invoke: Invoke) throws {
+    @objc func exportFile(_ invoke: Invoke) throws {
         let args = try invoke.parseArgs(ExportArgs.self)
         DispatchQueue.main.async {
             guard self.pickerCall == nil else { invoke.reject("A file picker is already open"); return }
@@ -285,7 +285,7 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
         }
     }
 
-    @objc func discard_file(_ invoke: Invoke) throws {
+    @objc func discardFile(_ invoke: Invoke) throws {
         let args = try invoke.parseArgs(PathArgs.self)
         do {
             let file = try ownedFile(args.path, under: staging)

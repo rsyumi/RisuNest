@@ -20,7 +20,13 @@
     "fs:allow-read",
     {
       "identifier": "fs:scope",
-      "allow": ["$APPDATA", "$APPDATA/*", "$APPDATA/**/*"]
+      "allow": [
+        "$APPDATA",
+        "$APPDATA/*",
+        "$APPDATA/**/*",
+        "$DOCUMENT",
+        "$DOCUMENT/**/*"
+      ]
     },
     "dialog:allow-open",
     "dialog:allow-save",
@@ -39,7 +45,8 @@
       ]
     },
     "os:default",
-    "shell:allow-open",
+    "opener:allow-open-url",
+    "opener:allow-default-urls",
     "deep-link:default",
     "barcode-scanner:allow-scan",
     "barcode-scanner:allow-cancel",

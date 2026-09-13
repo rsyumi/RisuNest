@@ -263,7 +263,13 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
     let mut builder = tauri::Builder::default();
     #[cfg(target_os = "ios")]
     {
-        builder = builder.manage(ios_lifecycle::RestartState::default());
+        builder = builder
+            .manage(ios_lifecycle::RestartState::default())
+            .plugin(tauri_plugin_opener::init());
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        builder = builder.plugin(tauri_plugin_shell::init());
     }
     #[cfg(windows)]
     {
@@ -413,7 +419,6 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         .manage(server_sync::commands::ServerSyncCommandState::default())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_deep_link::init())
-        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_os::init())

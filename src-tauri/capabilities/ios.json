@@ -39,7 +39,8 @@
       ]
     },
     "os:default",
-    "shell:allow-open",
+    "opener:allow-open-url",
+    "opener:allow-default-urls",
     "deep-link:default",
     "barcode-scanner:allow-scan",
     "barcode-scanner:allow-cancel",
