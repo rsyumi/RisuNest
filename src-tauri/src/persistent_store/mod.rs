@@ -2,6 +2,10 @@ pub(crate) mod asset_object_catalog;
 pub(crate) mod asset_residency;
 pub(crate) mod commands;
 mod commit;
+pub(crate) mod content_change_index;
+mod content_locators;
+pub(crate) mod external_storage_state;
+pub(crate) mod sync_selection;
 pub(crate) mod export;
 #[cfg(feature = "native-kei-upload-pilot")]
 pub(crate) mod kei;

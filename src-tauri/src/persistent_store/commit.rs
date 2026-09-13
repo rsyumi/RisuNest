@@ -25,7 +25,9 @@ fn incremental_commit<T>(
     let revision = actual_revision + 1;
     let generation = active;
     super::server_sync_outbox::begin_mutation(&transaction, &generation, revision)?;
+    super::content_change_index::begin_mutation(&transaction, &generation, revision, "local")?;
     body(&transaction, &generation, prepared)?;
+    super::content_change_index::finish_mutation(&transaction)?;
     super::server_sync_outbox::finish_mutation(&transaction)?;
     set_active(&transaction, revision, &generation)?;
     transaction.commit()?;
@@ -1349,6 +1351,8 @@ pub(super) fn replace_commit_with_app_kv(
     delete_generation(&transaction, &active)?;
     move_generation(&transaction, staging_id, &generation)?;
     super::server_sync_outbox::full_replacement(&transaction)?;
+    super::content_change_index::full_replacement(&transaction, &generation, revision)?;
+    super::sync_selection::replaced(&transaction)?;
     set_active(&transaction, revision, &generation)?;
     if let Some((key, value)) = serialized_app_kv {
         transaction.execute(

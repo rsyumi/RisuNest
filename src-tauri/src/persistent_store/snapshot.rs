@@ -181,7 +181,10 @@ fn prepare_restore_candidate(persistent_dir: &Path, target: &Path) -> StoreResul
     let result = (|| -> StoreResult<()> {
         let mut connection = Connection::open(&candidate)?;
         super::schema::initialize(&mut connection)?;
-        super::server_sync_outbox::restored_copy(&connection)?;
+        let transaction = connection.transaction()?;
+        super::server_sync_outbox::restored_copy(&transaction)?;
+        super::sync_selection::restored_copy(&transaction)?;
+        transaction.commit()?;
         let _ = super::query::materialize(&connection, None)?;
         let integrity: String =
             connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;

@@ -525,6 +525,7 @@ impl PersistentStore {
         }
     }
     pub(crate) fn server_prepare_cycle(&mut self, options: &CycleOptions) -> Result<Preparation> {
+        super::sync_selection::require_server(&self.connection)?;
         let config = self
             .server_config()?
             .ok_or_else(|| SyncError::new("server-not-bound", 409))?;
@@ -1013,6 +1014,7 @@ impl PersistentStore {
         Ok(revision)
     }
     pub(crate) fn server_publish_cycle(&mut self, ready: &PreparedCycle) -> Result<CycleResult> {
+        super::sync_selection::require_server(&self.connection)?;
         let next_revision = ready
             .activated
             .ok_or_else(|| SyncError::new("cycle-not-activated", 409))?;

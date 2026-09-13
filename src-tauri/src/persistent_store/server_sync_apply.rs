@@ -269,6 +269,7 @@ impl PersistentStore {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::sync_selection::require_server(&tx)?;
         let actual = current_revision(&tx)?;
         if actual != expected_revision {
             return Err(StoreError::RevisionConflict {
@@ -327,6 +328,7 @@ impl PersistentStore {
                 })?
         };
         let generation = active;
+        super::content_change_index::begin_mutation(&tx, &generation, revision, "server")?;
         let mut touched = BTreeSet::new();
         records.visit(false, |item| {
             if let LogicalRecordLocator::Character { character_id }
@@ -450,6 +452,7 @@ impl PersistentStore {
             "UPDATE server_sync_state SET head=?1 WHERE singleton=1",
             [serde_json::to_string(next_head)?],
         )?;
+        super::content_change_index::finish_mutation(&tx)?;
         super::commit::set_active(&tx, revision, &generation)?;
         tx.commit()?;
         Ok(revision)

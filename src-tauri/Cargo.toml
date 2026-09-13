@@ -17,6 +17,8 @@ axum = "0.8.9"
 tempfile = "3"
 risunest-sync-wire = { path = "../crates/sync-wire" }
 risunest-sync-connect = { path = "../crates/sync-connect" }
+risunest-external-storage-format = { path = "../crates/external-storage-format" }
+zeroize = "1"
 tauri = { version = "2.11.5", features = ["protocol-asset", "devtools"] }
 rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
 ryu-js = { version = "1.0.3", optional = true }

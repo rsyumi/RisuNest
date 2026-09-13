@@ -23,37 +23,7 @@ CREATE TABLE server_sync_remote_dirty(key TEXT PRIMARY KEY);
 CREATE TABLE server_sync_remote_cursor(singleton INTEGER PRIMARY KEY CHECK(singleton=1),head TEXT NOT NULL,cursor TEXT,complete INTEGER NOT NULL DEFAULT 0);
 "#;
 
-// SQL expressions use only schema-owned identifiers, never input values.
-fn tracked_tables() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
-    vec![
-        ("root", "'root'", "''", "''"),
-        ("bot_presets", "'preset'", "ROW.preset_id", "''"),
-        ("characters", "'character'", "ROW.character_id", "''"),
-        (
-            "conversations",
-            "'conversation'",
-            "ROW.character_id",
-            "ROW.conversation_id",
-        ),
-        (
-            "messages",
-            "'conversation'",
-            "ROW.character_id",
-            "ROW.conversation_id",
-        ),
-        ("plugin_storage", "'plugin'", "ROW.storage_key", "''"),
-        ("asset_aliases", "ROW.kind", "ROW.logical_key", "''"),
-        ("cold_aliases", "'cold'", "ROW.key", "''"),
-        (
-            "asset_owner_heads",
-            "'owner'",
-            "ROW.owner_kind",
-            "ROW.owner_locator",
-        ),
-        ("asset_repository_authority", "'full'", "''", "''"),
-        ("cold_payload_authority", "'full'", "''", "''"),
-    ]
-}
+use super::content_locators::tracked_tables;
 fn trigger_sql(table: &str, event: &str, kind: &str, key1: &str, key2: &str) -> String {
     let row = if event == "DELETE" { "OLD" } else { "NEW" };
     let kind = kind.replace("ROW", row);
