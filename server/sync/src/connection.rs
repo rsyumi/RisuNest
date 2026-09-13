@@ -63,6 +63,7 @@ pub(crate) struct ConnectionState {
     pub cloudflared: Option<PathBuf>,
     pub directory: Option<Directory>,
     pub last_published: Option<String>,
+    pub last_published_at: i64,
     pub pending: Option<PendingPublication>,
 }
 impl ConnectionState {

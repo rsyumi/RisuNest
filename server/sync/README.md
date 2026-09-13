@@ -106,7 +106,10 @@ have been observed. It supervises its own child and bounds restart delays and lo
 sizes. Normal shutdown reaps the child; on Windows a kill-on-close Job also covers
 abrupt daemon termination after child attachment. GUI subscribers do not own the
 runtime. Registry failure does not stop the sync listener. Same successful address
-means no periodic/restart POST; an uncertain POST reuses its persisted envelope.
+is reposted seven days after the last successful publication, checked every
+minute. The successful timestamp survives restarts; an uncertain POST reuses its
+persisted envelope. The pre-release connection-state format changed in place;
+older state is rejected and is not migrated automatically.
 `connection repost` explicitly requests another publication without changing the
 registry identity. All CLI administration still requires the daemon to be stopped.
 

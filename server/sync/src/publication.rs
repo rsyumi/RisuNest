@@ -88,7 +88,13 @@ impl Publisher {
             match outcome {
                 Ok(_) => {
                     failures = 0;
-                    tokio::select! { _ = changed.notified() => (), _ = stop.changed() => return }
+                    // Check persisted renewal time without making an HTTP request
+                    // until the seven-day interval has elapsed.
+                    tokio::select! {
+                        _ = changed.notified() => (),
+                        _ = tokio::time::sleep(Duration::from_secs(60)) => (),
+                        _ = stop.changed() => return,
+                    }
                 }
                 Err(error) if error.code == "publication-superseded" => continue,
                 Err(error) => {
