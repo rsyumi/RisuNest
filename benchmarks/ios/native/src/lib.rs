@@ -7,6 +7,15 @@ fn ios_bench_phase() -> String {
 }
 
 #[tauri::command]
+fn ios_bench_stream_url() -> String {
+    std::env::var("RISUNEST_IOS_STREAM_URL").expect("synthetic stream endpoint")
+}
+
+fn benchmark_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
+    tauri::generate_handler![ios_bench_phase, ios_bench_report, ios_bench_stream_url]
+}
+
+#[tauri::command]
 fn ios_bench_report(
     app: tauri::AppHandle,
     stage: String,
@@ -34,7 +43,7 @@ fn ios_bench_report(
 pub extern "C" fn ios_bench_start() {
     let result = std::panic::catch_unwind(|| {
         let product = risunest_lib::invoke_handler();
-        let benchmark = tauri::generate_handler![ios_bench_phase, ios_bench_report];
+        let benchmark = benchmark_handler();
         let app = risunest_lib::builder()
             .invoke_handler(move |invoke| {
                 if invoke.message.command().starts_with("ios_bench_") {

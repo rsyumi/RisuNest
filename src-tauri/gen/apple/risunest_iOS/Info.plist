@@ -44,5 +44,13 @@
 	<string>Scan a QR code you choose to connect RisuNest.</string>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<false/>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>io.github.rsyumi.risunest.generation</string>
+	</array>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>processing</string>
+	</array>
 </dict>
 </plist>

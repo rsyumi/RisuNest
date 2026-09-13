@@ -43,6 +43,8 @@ targets:
         UILaunchStoryboardName: LaunchScreen
         NSCameraUsageDescription: Scan a QR code you choose to connect RisuNest.
         LSSupportsOpeningDocumentsInPlace: false
+        BGTaskSchedulerPermittedIdentifiers: [io.github.rsyumi.risunest.generation]
+        UIBackgroundModes: [processing]
         UIRequiredDeviceCapabilities: [arm64, metal]
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait

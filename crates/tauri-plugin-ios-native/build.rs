@@ -10,6 +10,7 @@ fn main() {
         "export_file",
         "discard_file",
         "publication",
+        "generation_progress",
     ])
     .ios_path("ios")
     .build();

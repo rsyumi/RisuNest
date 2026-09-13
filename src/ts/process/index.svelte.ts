@@ -162,6 +162,7 @@ function hasMismatchedActiveConversationSession(): boolean {
 }
 
 interface GenerationCompletionLifecycle {
+    onProgress?(completed: number): void
     responseCompleted: boolean
     reroll: boolean
     responseApplied: boolean
@@ -222,7 +223,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
         enteredGeneration = true
         generationKeepAliveAcquired = beginAndroidGenerationKeepAlive()
-        iosGeneration = await beginIOSGeneration(arg.signal);
+        iosGeneration = await beginIOSGeneration(arg.signal)
+        lifecycle.onProgress = iosGeneration.progress;
         const result = await sendChatInternal(
           chatProcessIndex,
           { ...arg, signal: iosGeneration.signal },
@@ -242,6 +244,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             lifecycle.acknowledgementAttempted = true
             try {
                 await acknowledgeGenerationCompletion()
+                lifecycle.onProgress?.(3)
             } catch (acknowledgeError) {
                 console.error(acknowledgeError)
             }
@@ -249,7 +252,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         completeLease?.release()
         endAndroidGenerationKeepAlive(generationKeepAliveAcquired)
         await iosGeneration
-          ?.dispose()
+          ?.dispose(generationReturned && lifecycle.responseCompleted && !iosGeneration.signal?.aborted)
           .catch((error) =>
             console.error("iOS generation cleanup failed", error),
           );
@@ -1838,6 +1841,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
         if (lifecycle.reroll) return
         lifecycle.acknowledgementAttempted = true
         await acknowledgeGenerationCompletion()
+        lifecycle.onProgress?.(3)
     }
     
     const responseApplication = await applyGenerationResponse({
@@ -1913,12 +1917,14 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
             trimIncompleteResponse: trimUntilPunctuation,
             markResponseApplied: () => {
                 lifecycle.responseApplied = true
+                lifecycle.onProgress?.(1)
             },
             onProviderFailure: throwError,
         },
     })
     if (!responseApplication) return false
     lifecycle.responseCompleted = true
+    lifecycle.onProgress?.(2)
     result = responseApplication.result
     emoChanged = responseApplication.emoChanged
     resendChat = responseApplication.resendChat

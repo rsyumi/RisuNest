@@ -54,6 +54,7 @@
     "ios-native:allow-pick-file",
     "ios-native:allow-export-file",
     "ios-native:allow-discard-file",
-    "ios-native:allow-publication"
+    "ios-native:allow-publication",
+    "ios-native:allow-generation-progress"
   ]
 }

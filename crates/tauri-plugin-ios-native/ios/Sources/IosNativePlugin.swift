@@ -3,8 +3,10 @@ import UIKit
 import UserNotifications
 import UniformTypeIdentifiers
 import WebKit
+import BackgroundTasks
 
-private struct EndArgs: Decodable { let id: String }
+private struct EndArgs: Decodable { let id: String; let success: Bool? }
+private struct ProgressArgs: Decodable { let id: String; let completed: Int64 }
 private struct PathArgs: Decodable { let path: String }
 private struct ExportArgs: Decodable { let sourcePath: String; let suggestedName: String; let requestId: String }
 private struct NotificationArgs: Decodable { let body: String }
@@ -18,6 +20,11 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
     private var exportCopy: URL?
     private var exporting = false
     private var publicationId: String?
+    private var continued: [String: BGTask] = [:]
+    private var continuedPending: String?
+    private var progress: [String: Int64] = [:]
+    private var continuedRegistered = false
+    private var taskIdentifier: String { Bundle.main.bundleIdentifier! + ".generation" }
 
     private var dataRoot: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -27,6 +34,27 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
 
     override func load(webview: WKWebView) {
         webView = webview
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            continuedRegistered = BGTaskScheduler.shared.register(forTaskWithIdentifier: taskIdentifier, using: .main) { [weak self] task in
+                guard let self = self, let id = self.continuedPending,
+                      let task = task as? BGContinuedProcessingTask else { task.setTaskCompleted(success: false); return }
+                self.continuedPending = nil
+                self.continued[id] = task
+                task.progress.totalUnitCount = 3
+                task.progress.completedUnitCount = self.progress[id] ?? 0
+                task.expirationHandler = { [weak self] in
+                    DispatchQueue.main.async {
+                        guard let self = self, let current = self.continued.removeValue(forKey: id) else { return }
+                        self.expired.insert(id)
+                        if let assertion = self.tasks.removeValue(forKey: id) { UIApplication.shared.endBackgroundTask(assertion) }
+                        self.emit("expired", id: id)
+                        current.setTaskCompleted(success: false)
+                    }
+                }
+            }
+        }
+        #endif
         for (name, event) in [
             (UIApplication.didEnterBackgroundNotification, "background"),
             (UIApplication.didBecomeActiveNotification, "active"),
@@ -58,10 +86,10 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
                 invoke.resolve([
                     "notifications": settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional,
                     "notificationStatus": settings.authorizationStatus.rawValue,
-                    "activeTasks": Array(self.tasks.keys),
+                    "activeTasks": Array(Set(self.tasks.keys).union(self.continued.keys)),
                     "expiredTasks": Array(self.expired),
                     "foreground": UIApplication.shared.applicationState == .active,
-                    "backgroundMode": "limited",
+                    "backgroundMode": self.continuedRegistered ? "continued" : "limited",
                 ])
             }
         }
@@ -76,6 +104,14 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
             }
             let task = UIApplication.shared.beginBackgroundTask(withName: "RisuNest generation") { [weak self] in
                 guard let self = self, let task = self.tasks.removeValue(forKey: id) else { return }
+                if self.continued[id] != nil {
+                    UIApplication.shared.endBackgroundTask(task)
+                    return
+                }
+                if self.continuedPending == id {
+                    BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: self.taskIdentifier)
+                    self.continuedPending = nil
+                }
                 self.expired.insert(id)
                 self.emit("expired", id: id)
                 UIApplication.shared.endBackgroundTask(task)
@@ -85,7 +121,20 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
                 return
             }
             self.tasks[id] = task
-            invoke.resolve(["id": id, "mode": "limited"])
+            var mode = "limited"
+            #if compiler(>=6.2)
+            if #available(iOS 26.0, *), self.continuedRegistered,
+               self.continued.isEmpty, self.continuedPending == nil {
+                let request = BGContinuedProcessingTaskRequest(identifier: self.taskIdentifier, title: "RisuNest", subtitle: "Generating a response")
+                request.strategy = .fail
+                self.continuedPending = id
+                do {
+                    try BGTaskScheduler.shared.submit(request)
+                    mode = "continued"
+                } catch { self.continuedPending = nil }
+            }
+            #endif
+            invoke.resolve(["id": id, "mode": mode])
         }
     }
 
@@ -95,7 +144,30 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
             if let task = self.tasks.removeValue(forKey: args.id) {
                 UIApplication.shared.endBackgroundTask(task)
             }
+            if let task = self.continued.removeValue(forKey: args.id) { task.setTaskCompleted(success: args.success == true) }
+            if self.continuedPending == args.id {
+                BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: self.taskIdentifier)
+                self.continuedPending = nil
+            }
+            self.progress.removeValue(forKey: args.id)
             self.expired.remove(args.id)
+            invoke.resolve()
+        }
+    }
+
+    @objc func generation_progress(_ invoke: Invoke) throws {
+        let args = try invoke.parseArgs(ProgressArgs.self)
+        guard (0...3).contains(args.completed) else { invoke.reject("Invalid generation progress"); return }
+        DispatchQueue.main.async {
+            if self.tasks[args.id] != nil || self.continued[args.id] != nil {
+                let completed = max(self.progress[args.id] ?? 0, args.completed)
+                self.progress[args.id] = completed
+                #if compiler(>=6.2)
+                if #available(iOS 26.0, *), let task = self.continued[args.id] as? BGContinuedProcessingTask {
+                    task.progress.completedUnitCount = completed
+                }
+                #endif
+            }
             invoke.resolve()
         }
     }
