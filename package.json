@@ -40,6 +40,8 @@
     "android:build:release:aab": "tauri android build --aab --target aarch64 --ci",
     "windows:build": "tauri build --target x86_64-pc-windows-msvc --bundles nsis",
     "windows:build:agent": "tauri build --target x86_64-pc-windows-msvc --bundles nsis --config src-tauri/tauri.agent.conf.json",
+    "linux:build": "tauri build --target x86_64-unknown-linux-gnu --bundles deb,appimage -- --locked",
+    "linux:build:agent": "tauri build --target x86_64-unknown-linux-gnu --bundles deb,appimage --config src-tauri/tauri.agent.conf.json -- --locked",
     "buildsite": "vite build --outDir dist",
     "runserver": "node server/node/server.cjs",
     "sync": "node electron/sync",
@@ -47,6 +49,7 @@
     "hono:build": "vite build --sourcemap && node server/hono/src/utils/postbuild.js",
     "benchmark:tokenizer:build:agent": "vite build --mode agent --config benchmarks/tokenizer/vite.config.ts",
     "benchmark:streaming:build:agent": "vite build --mode agent --config benchmarks/streaming/vite.config.ts",
+    "benchmark:linux:build:agent": "vite build --mode agent --config benchmarks/linux/vite.config.ts",
     "benchmark:streaming:android:agent": "tauri android build --debug --apk --target x86_64 --ci --config benchmarks/streaming/tauri.conf.json",
     "check:production-bundle": "node tests/productionBundle.mjs",
     "check:benchmark-harnesses": "svelte-check --tsconfig benchmarks/tsconfig.json"

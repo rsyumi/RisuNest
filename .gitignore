@@ -52,6 +52,8 @@ dist.zip
 !/scripts/phase3AndroidSmoke.test.ts
 !/scripts/realmBlocklist.mjs
 !/scripts/compatibleExport*.mjs
+!/scripts/linux-native-tests.sh
+!/scripts/linux-package-smoke.py
 .env
 /server/node/ssl/certificate
 .worktrees/

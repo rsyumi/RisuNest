@@ -26,6 +26,7 @@ function harness(
     options: {
         windows?: boolean
         android?: boolean
+        linux?: boolean
         unsupported?: boolean
         fail?: string
         ack?: number
@@ -50,7 +51,11 @@ function harness(
         if (command === 'pds_commit_shared_open') {
             if (options.unsupported) return null
             listener!({
-                additionalData: { kind: 'pds-commit', requestId: args.requestId, id: 'session' },
+                additionalData: {
+                    kind: 'pds-commit',
+                    requestId: args.requestId,
+                    id: 'session',
+                },
                 getBuffer: () => buffer,
             })
             return { id: 'session', capacity: buffer.byteLength }
@@ -65,6 +70,7 @@ function harness(
     const transport = new NativeCommitTransport({
         windows: () => options.windows ?? true,
         android: () => options.android ?? false,
+        linux: () => options.linux ?? false,
         invoke,
         encode,
         shared: () => webview,
@@ -73,6 +79,51 @@ function harness(
 }
 
 describe('native commit transport', () => {
+    it('encodes Linux large saves and submits raw bytes without touching shared buffers', async () => {
+        const h = harness({ windows: false, linux: true })
+        await expect(h.transport.commit(fixture())).resolves.toEqual({
+            revision: 2,
+        })
+        expect(h.encode).toHaveBeenCalledExactlyOnceWith(fixture())
+        expect(h.invoke).toHaveBeenCalledExactlyOnceWith(
+            'pds_commit_raw',
+            new Uint8Array([1, 2, 3, 4, 5]),
+        )
+        expect(h.webview.addEventListener).not.toHaveBeenCalled()
+    })
+
+    it('keeps small Linux saves on JSON and only falls back before raw submission', async () => {
+        const h = harness({ windows: false, linux: true })
+        await h.transport.commit(fixture(false))
+        expect(h.encode).not.toHaveBeenCalled()
+        expect(h.invoke).toHaveBeenCalledExactlyOnceWith('pds_commit', fixture(false))
+        h.invoke.mockClear()
+        h.encode.mockRejectedValueOnce(new DOMException('Cannot clone', 'DataCloneError'))
+        await h.transport.commit(fixture())
+        expect(h.invoke).toHaveBeenCalledExactlyOnceWith('pds_commit', fixture())
+    })
+
+    it('does not replay an ambiguous Linux raw commit and allows the next queued save', async () => {
+        const h = harness({ windows: false, linux: true, fail: 'pds_commit_raw' })
+        await expect(h.transport.commit(fixture())).rejects.toThrow('native failed')
+        expect(h.invoke).toHaveBeenCalledTimes(1)
+        expect(h.invoke.mock.calls[0][0]).toBe('pds_commit_raw')
+        await expect(h.transport.commit(fixture(false))).resolves.toEqual({
+            revision: 2,
+        })
+    })
+
+    it('does not turn the Windows shared-buffer budget into a Linux save limit', async () => {
+        const h = harness({ windows: false, linux: true })
+        const bytes = new Uint8Array(64 * 1024 * 1024 + 1)
+        h.encode.mockResolvedValueOnce(bytes)
+        await h.transport.commit(fixture())
+        expect(h.invoke).toHaveBeenCalledTimes(1)
+        expect(h.invoke.mock.calls[0][0]).toBe('pds_commit_raw')
+        expect(h.invoke.mock.calls[0][1]).toBe(bytes)
+        expect(h.webview.addEventListener).not.toHaveBeenCalled()
+    })
+
     it('falls back before submission for non-cloneable values, but propagates encoding failures', async () => {
         const h = harness()
         h.encode.mockRejectedValueOnce(new DOMException('Cannot clone', 'DataCloneError'))
@@ -90,7 +141,9 @@ describe('native commit transport', () => {
             throw new Error('Detached')
         })
         await expect(h.transport.commit(fixture())).rejects.toThrow('Detached')
-        expect(h.invoke).toHaveBeenLastCalledWith('pds_commit_shared_cancel', { id: 'session' })
+        expect(h.invoke).toHaveBeenLastCalledWith('pds_commit_shared_cancel', {
+            id: 'session',
+        })
         expect(
             h.invoke.mock.calls.filter(([command]) => command === 'pds_commit_shared_finish'),
         ).toHaveLength(1)
@@ -134,7 +187,11 @@ describe('native commit transport', () => {
         expect(h.invoke).toHaveBeenCalledExactlyOnceWith('pds_commit', fixture())
     })
     it('preserves Android clone fallback, errors and queue recovery', async () => {
-        const h = harness({ windows: false, android: true, fail: 'pds_commit_android_finish' })
+        const h = harness({
+            windows: false,
+            android: true,
+            fail: 'pds_commit_android_finish',
+        })
         h.encode.mockRejectedValueOnce(new DOMException('Cannot clone', 'DataCloneError'))
         await h.transport.commit(fixture())
         h.encode.mockResolvedValueOnce(new TextEncoder().encode('{}'))
@@ -171,7 +228,9 @@ describe('native commit transport', () => {
             await expect(h.transport.commit(fixture())).rejects.toThrow('native failed')
             expect(h.invoke.mock.calls.map(([command]) => command)).not.toContain('pds_commit_raw')
             expect(h.webview.releaseBuffer).toHaveBeenCalledOnce()
-            expect(h.invoke).toHaveBeenCalledWith('pds_commit_shared_cancel', { id: 'session' })
+            expect(h.invoke).toHaveBeenCalledWith('pds_commit_shared_cancel', {
+                id: 'session',
+            })
             await h.transport.commit(fixture(false))
             expect(h.invoke).toHaveBeenLastCalledWith('pds_commit', fixture(false))
         },

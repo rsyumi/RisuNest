@@ -29,6 +29,7 @@ test("rejects a test module in a dynamic chunk and a test framework", () => {
   for (const id of [
     "/src/foo.test.ts",
     "/benchmarks/streaming/fixture.ts",
+    "/benchmarks/linux/main.ts",
     "/tests/support/helper.ts",
     "/node_modules/vitest/dist/index.js",
   ]) {
@@ -47,18 +48,23 @@ test("rejects a test module in a dynamic chunk and a test framework", () => {
   }
 });
 test("rejects a worker asset containing a benchmark interface", () => {
-  assert.throws(
-    () =>
-      assertProductionBundle([
-        chunk(),
-        {
-          type: "asset",
-          fileName: "assets/worker.js",
-          source: "window.__streamingSmoke = {}",
-        },
-      ]),
-    /Verification marker/,
-  );
+  for (const source of [
+    "window.__streamingSmoke = {}",
+    "window.__RISUNEST_LINUX_BENCHMARK__ = {}",
+  ]) {
+    assert.throws(
+      () =>
+        assertProductionBundle([
+          chunk(),
+          {
+            type: "asset",
+            fileName: "assets/worker.js",
+            source,
+          },
+        ]),
+      /Verification marker/,
+    );
+  }
 });
 test("rejects test modules and removed test helpers in source maps", () => {
   assert.throws(
@@ -105,34 +111,31 @@ test("rejects removed peer transport modules but preserves upstream PeerJS", () 
   );
 });
 
- test("rejects retired backup modules, commands, and magic in product chunks and maps", () => {
-   for (const id of [
-     "/src/ts/storage/losslessBackupFileRoute.ts",
-     "/src/ts/storage/losslessBackupFileRouteProduction.svelte.ts",
-   ]) {
-     assert.throws(
-       () => assertProductionBundle([chunk({ [id]: {} })]),
-       /module/,
-     );
-     assert.throws(
-       () => assertProductionBundle([chunk(), map([id])]),
-       /source/,
-     );
-   }
-   for (const marker of [
-     "RISUNESTLOSSLESS",
-     ".risulossless",
-     "restore-lossless-backup",
-     "export-lossless-backup",
-     "native_lossless_handoff_cleanup",
-   ]) {
-     assert.throws(() => assertProductionBundle([chunk({}, marker)]), /marker/);
-     assert.throws(
-       () => assertProductionBundle([chunk(), map(["/src/main.ts"], [marker])]),
-       /source text/,
-     );
-   }
- });
+test("rejects retired backup modules, commands, and magic in product chunks and maps", () => {
+  for (const id of [
+    "/src/ts/storage/losslessBackupFileRoute.ts",
+    "/src/ts/storage/losslessBackupFileRouteProduction.svelte.ts",
+  ]) {
+    assert.throws(
+      () => assertProductionBundle([chunk({ [id]: {} })]),
+      /module/,
+    );
+    assert.throws(() => assertProductionBundle([chunk(), map([id])]), /source/);
+  }
+  for (const marker of [
+    "RISUNESTLOSSLESS",
+    ".risulossless",
+    "restore-lossless-backup",
+    "export-lossless-backup",
+    "native_lossless_handoff_cleanup",
+  ]) {
+    assert.throws(() => assertProductionBundle([chunk({}, marker)]), /marker/);
+    assert.throws(
+      () => assertProductionBundle([chunk(), map(["/src/main.ts"], [marker])]),
+      /source text/,
+    );
+  }
+});
 
 test("rejects retired GGUF code while preserving Pyodide scripting", () => {
   assertProductionBundle([

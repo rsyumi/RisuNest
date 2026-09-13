@@ -5,6 +5,7 @@
     "./tokenizer/*.ts",
     "./streaming/**/*.ts",
     "./streaming/**/*.svelte",
+    "./linux/**/*.ts",
     "./device-backup/**/*.ts",
     "../src/**/*.d.ts"
   ],

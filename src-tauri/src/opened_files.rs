@@ -1,7 +1,7 @@
 //! Desktop file association delivery.
 //!
-//! The installer registers the `risum`, `risup` and `charx` associations, so opening one of
-//! those files launches `RisuNest.exe <path>`, or hands the path to the already running instance
+//! The installer registers Risu file associations, so opening one of
+//! those files launches the app with a path, or hands the path to the already running instance
 //! through the single instance plugin. Both entry points park the paths here and the frontend
 //! drains them once with `opened_files_take`, so a file is never delivered twice.
 
@@ -52,7 +52,9 @@ impl OpenedFilesState {
 }
 
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
-    value.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    value
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Records the files a second launch carried and wakes the running frontend.
@@ -119,9 +121,28 @@ where
 fn normalize_opened_file(arg: &OsStr, launch_directory: Option<&Path>) -> Option<PathBuf> {
     let text = arg.to_string_lossy();
     let trimmed = text.trim();
-    if trimmed.is_empty() || trimmed.starts_with('-') || has_url_scheme(trimmed) {
+    if trimmed.is_empty() || trimmed.starts_with('-') {
         return None;
     }
+    // Linux desktop launchers using %U may deliver local files as encoded URLs.
+    // Keep all other protocols with the deep-link plugin and only grant local files.
+    #[cfg(target_os = "linux")]
+    let file_url_path = if has_url_scheme(trimmed) {
+        let uri = url::Url::parse(trimmed).ok()?;
+        if uri.scheme() != "file" || uri.query().is_some() || uri.fragment().is_some() {
+            return None;
+        }
+        Some(uri.to_file_path().ok()?)
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    if has_url_scheme(trimmed) {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    let path = file_url_path.as_deref().unwrap_or_else(|| Path::new(arg));
+    #[cfg(not(target_os = "linux"))]
     let path = Path::new(arg);
     let path = if path.is_absolute() {
         path.to_path_buf()
@@ -155,15 +176,64 @@ fn has_url_scheme(value: &str) -> bool {
         .chars()
         .next()
         .is_some_and(|first| first.is_ascii_alphabetic())
-        && scheme
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.'))
+        && scheme.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_file_urls_decode_and_deduplicate_with_plain_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let card = directory.path().join("synthetic 한글 # %.charx");
+        std::fs::write(&card, b"synthetic fixture").unwrap();
+        let uri = url::Url::from_file_path(&card).unwrap();
+        assert_eq!(
+            normalize_opened_file(OsStr::new(uri.as_str()), None),
+            Some(std::fs::canonicalize(&card).unwrap())
+        );
+        let collected = collect_opened_files(
+            [
+                OsString::from("RisuNest"),
+                OsString::from(uri.as_str()),
+                card.clone().into_os_string(),
+            ],
+            None,
+        );
+        assert_eq!(collected, vec![std::fs::canonicalize(card).unwrap()]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_file_urls_reject_remote_hosts_queries_fragments_and_missing_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let card = directory.path().join("synthetic.charx");
+        std::fs::write(&card, b"synthetic fixture").unwrap();
+        let uri = url::Url::from_file_path(&card).unwrap();
+        let mut remote = uri.clone();
+        remote.set_host(Some("example.invalid")).unwrap();
+        for value in [
+            remote.to_string(),
+            format!("{uri}?query"),
+            format!("{uri}#fragment"),
+            url::Url::from_file_path(directory.path())
+                .unwrap()
+                .to_string(),
+            url::Url::from_file_path(directory.path().join("missing.charx"))
+                .unwrap()
+                .to_string(),
+        ] {
+            assert!(
+                normalize_opened_file(OsStr::new(&value), None).is_none(),
+                "{value}"
+            );
+        }
+    }
 
     #[test]
     fn opened_files_keep_only_existing_files_after_the_executable() {
