@@ -42,6 +42,7 @@ targets:
         LSRequiresIPhoneOS: true
         UILaunchStoryboardName: LaunchScreen
         NSCameraUsageDescription: Scan a QR code you choose to connect RisuNest.
+        NSLocalNetworkUsageDescription: Connect to a local AI provider or RisuNest sync server that you choose.
         LSSupportsOpeningDocumentsInPlace: false
         BGTaskSchedulerPermittedIdentifiers: [io.github.rsyumi.risunest.generation]
         UIBackgroundModes: [processing]

@@ -6,5 +6,11 @@
   "app": {
     "windows": [{ "label": "main", "title": "iOS synthetic verification" }]
   },
-  "bundle": { "iOS": { "minimumSystemVersion": "16.4" } }
+  "bundle": {
+    "icon": [
+      "../../../src-tauri/icons/128x128.png",
+      "../../../src-tauri/icons/icon.ico"
+    ],
+    "iOS": { "minimumSystemVersion": "16.4" }
+  }
 }
