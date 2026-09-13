@@ -1,5 +1,26 @@
 use super::*;
 
+#[test]
+fn cancelled_waiter_leaves_the_active_hydration_lock_intact() {
+    let lock = std::sync::Mutex::new(());
+    let active = lock.lock().unwrap();
+    let waiting = std::cell::Cell::new(false);
+    let result = lock_with_check(&lock, &|| {
+        if waiting.replace(true) {
+            Err(SyncError::new("cancelled", 409))
+        } else {
+            Ok(())
+        }
+    });
+    assert!(matches!(result, Err(error) if error.code == "cancelled"));
+    assert!(matches!(
+        lock.try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    ));
+    drop(active);
+    assert!(lock_with_check(&lock, &|| Ok(())).is_ok());
+}
+
 fn config(device: &str) -> StoredConfig {
     serde_json::from_value(serde_json::json!({
         "endpoint":"http://127.0.0.1:8123/", "libraryId":"library", "deviceId":device,

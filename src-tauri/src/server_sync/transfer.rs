@@ -24,6 +24,7 @@ mod references;
 pub(crate) struct Transfer<'a> {
     pub client: &'a ServerClient,
     pub cache: &'a Cache,
+    check: Option<&'a dyn Fn() -> Result<()>>,
     db: Connection,
     base_sizes: std::cell::RefCell<Option<(Vec<String>, Vec<(String, u64)>)>>,
 }
@@ -143,9 +144,23 @@ impl<'a> Transfer<'a> {
         Ok(Self {
             client,
             cache,
+            check: None,
             db,
             base_sizes: std::cell::RefCell::new(None),
         })
+    }
+    /// Job cancellation is borrowed by the coordinating thread. Chunk workers
+    /// finish their bounded requests before the next batch is admitted.
+    pub(crate) fn with_check(mut self, check: &'a dyn Fn() -> Result<()>) -> Self {
+        self.check = Some(check);
+        self
+    }
+    fn ensure_active(&self) -> Result<()> {
+        self.client.ensure_active()?;
+        if let Some(check) = self.check {
+            check()?;
+        }
+        Ok(())
     }
     #[cfg(test)]
     pub fn upload(&self, hashes: &[String], base_candidates: &[String]) -> Result<()> {
@@ -175,6 +190,7 @@ impl<'a> Transfer<'a> {
         hints: &std::collections::BTreeMap<String, Vec<String>>,
     ) -> Result<()> {
         for page in hashes.chunks(1024) {
+            self.ensure_active()?;
             let mut descriptors = Vec::with_capacity(page.len());
             let mut sizes = std::collections::BTreeMap::new();
             for hash in page {
@@ -233,6 +249,7 @@ impl<'a> Transfer<'a> {
             let mut used = 8usize;
             let mut materialized = 0usize;
             for target in &missing.missing {
+                self.ensure_active()?;
                 let base_candidates = hints.get(target).map_or(base_candidates, Vec::as_slice);
                 let size = sizes[target.as_str()];
                 if size > delta::MAX_TARGET_BYTES as u64 {
@@ -299,9 +316,10 @@ impl<'a> Transfer<'a> {
             }
             self.send_frames(&frames)?;
         }
-        Ok(())
+        self.ensure_active()
     }
     fn send_frames(&self, frames: &[Frame]) -> Result<()> {
+        self.ensure_active()?;
         if frames.is_empty() {
             return Ok(());
         }
@@ -323,10 +341,11 @@ impl<'a> Transfer<'a> {
                 Frame::FullRequired { .. } => 0,
             });
         }
-        Ok(())
+        self.ensure_active()
     }
     pub fn pin(&self, hashes: &[String]) -> Result<()> {
         for page in hashes.chunks(1024) {
+            self.ensure_active()?;
             let reply = self.client.request(
                 Method::POST,
                 "objects/pins",
@@ -339,7 +358,7 @@ impl<'a> Transfer<'a> {
                 return Err(response_error(reply));
             }
         }
-        Ok(())
+        self.ensure_active()
     }
     fn select_bases(
         &self,
@@ -412,7 +431,7 @@ impl<'a> Transfer<'a> {
         // Page the absent targets, not the full inventory. A few changed hashes
         // scattered among 100k cached objects still belong to one request.
         let mut absent = hashes.iter().filter_map(|h| {
-            if let Err(error) = self.client.ensure_active() {
+            if let Err(error) = self.ensure_active() {
                 return Some(Err(error));
             }
             match self.cache.cas.stat_object(h) {
@@ -447,6 +466,7 @@ impl<'a> Transfer<'a> {
                 return Err(SyncError::new("transfer-count-mismatch", 502));
             }
             for (target, frame) in missing.iter().zip(frames) {
+                self.ensure_active()?;
                 match frame {
                     Frame::Full(bytes) => {
                         if hash(&bytes) != *target {
@@ -482,7 +502,7 @@ impl<'a> Transfer<'a> {
                 }
             }
         }
-        Ok(())
+        self.ensure_active()
     }
     fn large_bases(&self, target: &str, size: u64, candidates: &[String]) -> Result<Vec<String>> {
         let mut ranked = Vec::new();
@@ -559,9 +579,7 @@ impl<'a> Transfer<'a> {
                 size,
             },
             || {
-                self.client
-                    .ensure_active()
-                    .map_err(|_| WireError("cancelled"))?;
+                self.ensure_active().map_err(|_| WireError("cancelled"))?;
                 if started.elapsed() > std::time::Duration::from_secs(120) {
                     return Err(WireError("delta-budget"));
                 }
@@ -611,6 +629,7 @@ impl<'a> Transfer<'a> {
         risunest_sync_wire::validate_id(&started.job_id)?;
         let path = format!("object-deltas/{}", started.job_id);
         loop {
+            self.ensure_active()?;
             let reply = self.client.request(
                 Method::GET,
                 &path,
@@ -619,6 +638,7 @@ impl<'a> Transfer<'a> {
                 &[],
                 risunest_sync_wire::batch::MAX_BATCH_BYTES,
             )?;
+            self.ensure_active()?;
             match reply.status {
                 202 => continue,
                 204 => {
@@ -653,14 +673,12 @@ impl<'a> Transfer<'a> {
                     let mut temporary =
                         tempfile::NamedTempFile::new_in(self.cache.cas.repository_root())?;
                     stream_delta::apply(&recipe, &mut sources, &mut temporary, || {
-                        self.client
-                            .ensure_active()
-                            .map_err(|_| WireError("cancelled"))
+                        self.ensure_active().map_err(|_| WireError("cancelled"))
                     })?;
                     temporary.seek(SeekFrom::Start(0))?;
-                    self.cache
-                        .cas
-                        .prepare_reader_expected(&mut temporary, target, size)?;
+                    prepare_checked(&self.cache.cas, &mut temporary, target, size, &|| {
+                        self.ensure_active()
+                    })?;
                     let released = self.client.request(
                         Method::DELETE,
                         &path,
@@ -679,6 +697,7 @@ impl<'a> Transfer<'a> {
         }
     }
     fn upload_large(&self, hash: &str, size: u64, base_candidates: &[String]) -> Result<()> {
+        self.ensure_active()?;
         let cached: Option<(String, String)> = self
             .db
             .query_row("SELECT id,size FROM uploads WHERE hash=?1", [hash], |r| {
@@ -692,6 +711,7 @@ impl<'a> Transfer<'a> {
         let mut after = None;
         if let Some(upload_id) = id.as_ref() {
             loop {
+                self.ensure_active()?;
                 let query = after
                     .as_ref()
                     .map(|s: &Sequence| vec![("after", s.as_str().to_owned())])
@@ -777,7 +797,7 @@ impl<'a> Transfer<'a> {
         loop {
             let mut batch = Vec::with_capacity(2);
             for index in missing.by_ref().take(2) {
-                self.client.ensure_active()?;
+                self.ensure_active()?;
                 let offset = index * CHUNK as u64;
                 file.seek(SeekFrom::Start(offset))?;
                 let mut bytes = vec![0; ((size - offset).min(CHUNK as u64)) as usize];
@@ -820,6 +840,7 @@ impl<'a> Transfer<'a> {
             });
             // Join every request before returning. Accepted chunks remain in
             // the server bitmap even when the other response is lost.
+            self.ensure_active()?;
             for result in results {
                 result?;
             }
@@ -848,6 +869,7 @@ impl<'a> Transfer<'a> {
     }
     fn wait_upload(&self, id: &str, hash: &str, size: u64) -> Result<()> {
         loop {
+            self.ensure_active()?;
             let (_, progress): (_, UploadProgress) = self.client.json(
                 Method::GET,
                 &format!("uploads/{id}"),
@@ -855,6 +877,7 @@ impl<'a> Transfer<'a> {
                 None::<&()>,
                 &[],
             )?;
+            self.ensure_active()?;
             if progress.upload_id != id
                 || progress.manifest.hash != hash
                 || progress.manifest.size != Sequence::from(size)
@@ -885,7 +908,7 @@ impl<'a> Transfer<'a> {
             if !progress.finishing {
                 return Err(SyncError::new("upload-finalization-interrupted", 409));
             }
-            self.client.ensure_active()?;
+            self.ensure_active()?;
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
     }
@@ -895,8 +918,10 @@ impl<'a> Transfer<'a> {
         }
         let mut indices = 0..size.div_ceil(CHUNK as u64);
         loop {
+            self.ensure_active()?;
             let mut batch = Vec::with_capacity(2);
             for index in indices.by_ref() {
+                self.ensure_active()?;
                 let offset = index * CHUNK as u64;
                 let length = (size - offset).min(CHUNK as u64);
                 let cached: Option<(String, i64)> = self
@@ -976,6 +1001,7 @@ impl<'a> Transfer<'a> {
             }
             // Persist all verified successes, including those after a failed
             // sibling, before the caller retries the remaining ranges.
+            self.ensure_active()?;
             if let Some(error) = failure {
                 return Err(error);
             }
@@ -987,13 +1013,38 @@ impl<'a> Transfer<'a> {
             count: size.div_ceil(CHUNK as u64),
             chunk: std::io::Cursor::new(Vec::new()),
         };
-        self.cache
-            .cas
-            .prepare_reader_expected(&mut reader, target, size)?;
+        prepare_checked(&self.cache.cas, &mut reader, target, size, &|| {
+            self.ensure_active()
+        })?;
         self.db
             .execute("DELETE FROM chunks WHERE target=?1", [target])?;
         Ok(())
     }
+}
+
+/// Preserve the job's cancellation error across the CAS streaming I/O boundary.
+pub(crate) fn prepare_checked(
+    cas: &crate::asset_repository::PayloadCas,
+    reader: &mut impl Read,
+    hash: &str,
+    size: u64,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    struct Checked<'a, R> {
+        reader: R,
+        check: &'a dyn Fn() -> Result<()>,
+    }
+    impl<R: Read> Read for Checked<'_, R> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            (self.check)().map_err(|error| std::io::Error::other(error.code))?;
+            self.reader.read(buffer)
+        }
+    }
+    check()?;
+    let outcome = cas.prepare_reader_expected(&mut Checked { reader, check }, hash, size);
+    check()?;
+    outcome?;
+    Ok(())
 }
 struct ChunkReader<'a, 'b> {
     transfer: &'a Transfer<'b>,

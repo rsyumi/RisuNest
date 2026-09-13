@@ -273,9 +273,18 @@ mod tests;
 /// temporary transfer CAS is discarded after promotion, including chunk files.
 /// Display URLs never call this path.
 pub(crate) fn open_or_hydrate(root: &Path, digest: &str) -> Result<Option<std::fs::File>> {
+    open_or_hydrate_with_check(root, digest, &|| Ok(()))
+}
+
+pub(crate) fn open_or_hydrate_with_check(
+    root: &Path,
+    digest: &str,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<Option<std::fs::File>> {
     use std::sync::{Arc, Mutex, OnceLock, Weak};
     static IN_FLIGHT: OnceLock<Mutex<std::collections::HashMap<PathBuf, Weak<Mutex<()>>>>> =
         OnceLock::new();
+    check()?;
     validate_hash(digest)?;
     let root = std::fs::canonicalize(root)?;
     let key = root.join(digest);
@@ -293,9 +302,7 @@ pub(crate) fn open_or_hydrate(root: &Path, digest: &str) -> Result<Option<std::f
             lock
         }
     };
-    let _hydrating = lock
-        .lock()
-        .map_err(|_| SyncError::new("hydration-unavailable", 503))?;
+    let _hydrating = lock_with_check(&lock, check)?;
     let cas = crate::asset_repository::PayloadCas::new(&root)?;
     {
         let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
@@ -309,23 +316,42 @@ pub(crate) fn open_or_hydrate(root: &Path, digest: &str) -> Result<Option<std::f
     // Byte consumers share one transfer budget. Each Transfer can already use
     // parallel chunks; unrelated attachments must not multiply those buffers.
     static TRANSFER_BUDGET: Mutex<()> = Mutex::new(());
-    let _budget = TRANSFER_BUDGET
-        .lock()
-        .map_err(|_| SyncError::new("hydration-unavailable", 503))?;
+    let _budget = lock_with_check(&TRANSFER_BUDGET, check)?;
     let mut client = super::client::ServerClient::new(proof.config.resolve(&root)?)?;
     client.resolve_identity(false)?;
+    check()?;
     let directory = tempfile::Builder::new()
         .prefix("asset-hydration-")
         .tempdir_in(&root)?;
     let cache = super::cache::Cache::open(directory.path())?;
-    super::transfer::Transfer::new(&client, &cache)?.download(&[digest.to_owned()], &[])?;
+    super::transfer::Transfer::new(&client, &cache)?
+        .with_check(check)
+        .download(&[digest.to_owned()], &[])?;
     let mut file = cache
         .cas
         .open_object(digest)?
         .ok_or_else(|| SyncError::new("hydration-incomplete", 502))?;
     let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
-    cas.prepare_reader_expected(&mut file, digest, proof.size)?;
+    super::transfer::prepare_checked(&cas, &mut file, digest, proof.size, check)?;
     Ok(cas.open_object(digest)?)
+}
+
+fn lock_with_check<'a>(
+    lock: &'a std::sync::Mutex<()>,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<std::sync::MutexGuard<'a, ()>> {
+    loop {
+        check()?;
+        match lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(SyncError::new("hydration-unavailable", 503));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
 }
 
 /// Explicit byte-consumer adapter. Ordinary PayloadCas::stat_object continues

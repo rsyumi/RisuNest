@@ -5,7 +5,7 @@ use crate::{
     asset_repository::{object_physical_key, PayloadCas},
     server_sync::{
         client::ServerClient,
-        residency::{open_or_hydrate, AssetPolicy, Residency},
+        residency::{open_or_hydrate_with_check, AssetPolicy, Residency},
         Result, SyncError,
     },
 };
@@ -49,22 +49,61 @@ impl PersistentStore {
             return Ok(());
         }
         let residency = Residency::open(&self.repository_root)?;
-        let mut cursor = String::new();
+        let hydrate = |hash: &str| -> Result<()> {
+            check()?;
+            if residency.object(hash, None)?.is_some() {
+                open_or_hydrate_with_check(&self.repository_root, hash, &check)?
+                    .ok_or_else(|| SyncError::new("required-asset-unavailable", 409))?;
+            }
+            Ok(())
+        };
+        let mut cursor = None;
         loop {
-            let page = residency.page(&cursor)?;
-            if page.is_empty() {
+            check()?;
+            // Custody records outlive physical GC. Preserve catalog files even
+            // without references, but do not revive deleted catalog entries.
+            let page = self.query_asset_object_catalog(128, cursor.as_deref())?;
+            for object in page.items {
+                hydrate(&object.object_hash)?;
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
                 break;
             }
-            for (next, hash, _) in page {
-                cursor = next;
-                check()?;
-                if residency.object(&hash, None)?.is_some() {
-                    open_or_hydrate(&self.repository_root, &hash)?
-                        .ok_or_else(|| SyncError::new("required-asset-unavailable", 409))?;
+        }
+        // Restoring an older snapshot can roll back the live catalog while
+        // newer retained snapshots still own remote payloads. GC protects these
+        // roots independently of catalog membership; backup must do the same.
+        let roots = snapshot_archive::Archive::open(&self.snapshots_dir)?.roots()?;
+        let cas = PayloadCas::new(&self.repository_root)?;
+        let mut historical = BTreeSet::new();
+        let mut manifests = BTreeSet::new();
+        for root in roots {
+            historical.extend(root.object_hashes);
+            manifests.extend(root.manifest_hashes);
+        }
+        for manifest in manifests {
+            hydrate(&manifest)?;
+            // Missing or damaged local files remain for the backup's existing
+            // preservation path. Only verified manifests supply dependencies.
+            if let Some(bytes) = cas.read_object(&manifest)? {
+                if risunest_sync_wire::hash(&bytes) == manifest {
+                    if let Ok(entries) =
+                        crate::asset_repository::owner_manifest_codec::decode_owner_manifest(&bytes)
+                    {
+                        historical.extend(
+                            entries
+                                .into_iter()
+                                .filter_map(|entry| entry.payload_hash.map(hex::encode)),
+                        );
+                    }
                 }
             }
         }
-        Ok(())
+        for hash in historical {
+            hydrate(&hash)?;
+        }
+        check()
     }
     fn residency_inventory(&self, residency: &Residency, guarded: bool) -> Result<Inventory> {
         let cas = PayloadCas::new(&self.repository_root)?;
@@ -182,6 +221,7 @@ impl PersistentStore {
         policy: AssetPolicy,
         check: impl Fn() -> Result<()>,
     ) -> Result<ResidencyStatus> {
+        check()?;
         let residency = Residency::open(&self.repository_root)?;
         if policy == AssetPolicy::Remote && self.server_stored_config()?.is_none() {
             return Err(SyncError::new("server-not-bound", 409));
@@ -191,17 +231,20 @@ impl PersistentStore {
             let inventory = self.residency_inventory(&residency, false)?;
             for hash in inventory.referenced {
                 check()?;
-                if open_or_hydrate(&self.repository_root, &hash)?.is_none() {
+                if open_or_hydrate_with_check(&self.repository_root, &hash, &check)?.is_none() {
                     return Err(SyncError::new("required-asset-unavailable", 409));
                 }
             }
         }
-        self.asset_residency_status()
+        let status = self.asset_residency_status()?;
+        check()?;
+        Ok(status)
     }
     pub(crate) fn asset_residency_evict(
         &self,
         check: impl Fn() -> Result<()>,
     ) -> Result<ResidencyStatus> {
+        check()?;
         let mut residency = Residency::open(&self.repository_root)?;
         if residency.policy()? != AssetPolicy::Remote {
             return Err(SyncError::new("remote-asset-policy-required", 409));
@@ -214,6 +257,7 @@ impl PersistentStore {
             .ok_or_else(|| SyncError::new("server-not-bound", 409))?;
         let mut client = ServerClient::new(config.resolve(&self.repository_root)?)?;
         let head = client.resolve_identity(false)?;
+        check()?;
         config.endpoint = client.config().endpoint.clone();
         let inventory = self.residency_inventory(&residency, false)?;
         let candidates = inventory
@@ -264,14 +308,14 @@ impl PersistentStore {
                 let mut file = cas
                     .open_object(&hash)?
                     .ok_or_else(|| SyncError::new("asset-changed", 409))?;
-                cache.cas.prepare_reader_expected(&mut file, &hash, size)?;
-                crate::server_sync::transfer::Transfer::new(&client, &cache)?.upload_with_hints(
-                    &[hash],
-                    &[],
-                    false,
-                    &Default::default(),
+                crate::server_sync::transfer::prepare_checked(
+                    &cache.cas, &mut file, &hash, size, &check,
                 )?;
+                crate::server_sync::transfer::Transfer::new(&client, &cache)?
+                    .with_check(&check)
+                    .upload_with_hints(&[hash], &[], false, &Default::default())?;
             }
+            check()?;
             residency.retain(
                 &client,
                 &config,
@@ -313,6 +357,7 @@ impl PersistentStore {
         }
         self.asset_residency_release_unused(&check)?;
         let mut status = self.asset_residency_status()?;
+        check()?;
         status.evicted_bytes = evicted;
         Ok(status)
     }
@@ -362,9 +407,11 @@ impl PersistentStore {
                 }
             }
             for objects in releases.values() {
+                check()?;
                 let mut client =
                     ServerClient::new(objects[0].config.resolve(&self.repository_root)?)?;
                 let head = client.resolve_identity(false)?;
+                check()?;
                 let reply=client.request(reqwest::Method::POST,"objects/retention/release",&[],
                     Some(risunest_sync_wire::canonical::encode(&serde_json::json!({"epoch":head.epoch,"objects":objects.iter().map(|object|serde_json::json!({"deviceId":object.device_id,"hash":object.hash,"retentionId":object.retention_id})).collect::<Vec<_>>()}))?),&[],risunest_sync_wire::MAX_METADATA_BYTES)?;
                 if reply.status != 204 {
@@ -375,6 +422,6 @@ impl PersistentStore {
                 }
             }
         }
-        Ok(())
+        check()
     }
 }
