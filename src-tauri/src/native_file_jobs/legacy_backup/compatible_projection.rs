@@ -291,7 +291,10 @@ fn project_node(
                     project_node(schema, branch.as_str().unwrap_or(""), value, depth + 1)
                 {
                     let cost: u64 = candidate.1 .0.values().sum();
-                    if best.as_ref().is_none_or(|b| cost < b.1 .0.values().sum()) {
+                    if best
+                        .as_ref()
+                        .is_none_or(|b| cost < b.1 .0.values().sum::<u64>())
+                    {
                         best = Some(candidate);
                     }
                 }

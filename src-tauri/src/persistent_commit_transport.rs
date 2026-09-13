@@ -1,13 +1,9 @@
 //! Windows-only transport for large commits. Store/revision semantics stay in persistent_store.
-use crate::persistent_store::{
-    commands::with_store_mut, AssetAlias, RevisionResult, StoreError, StoreResult, WorkingSetCommit,
-};
-use serde::{Deserialize, Serialize};
+use crate::persistent_commit_raw::commit_bytes;
+use crate::persistent_store::{RevisionResult, StoreError, StoreResult};
+use serde::Serialize;
 use std::cell::RefCell;
-use tauri::{
-    ipc::{InvokeBody, Request},
-    AppHandle, Manager, WebviewWindow,
-};
+use tauri::{AppHandle, WebviewWindow};
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     ICoreWebView2Environment12, ICoreWebView2SharedBuffer, ICoreWebView2_17,
     COREWEBVIEW2_SHARED_BUFFER_ACCESS_READ_WRITE,
@@ -34,20 +30,6 @@ fn guard(window: &WebviewWindow) -> StoreResult<()> {
         return Err(invalid("commit transport requires the main webview"));
     }
     Ok(())
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Envelope {
-    commit: WorkingSetCommit,
-    asset_aliases: Vec<AssetAlias>,
-}
-fn commit_bytes(app: &AppHandle, bytes: &[u8]) -> StoreResult<RevisionResult> {
-    let envelope: Envelope =
-        serde_json::from_slice(bytes).map_err(|_| invalid("invalid commit envelope JSON"))?;
-    with_store_mut(app.state(), |store| {
-        store.commit_with_asset_aliases(&envelope.commit, &envelope.asset_aliases)
-    })
 }
 
 struct Transfer {
@@ -249,19 +231,6 @@ pub(crate) async fn pds_commit_shared_cancel(window: WebviewWindow, id: String) 
         })
         .map_err(native_error)?;
     receiver.await.map_err(native_error)
-}
-
-#[tauri::command(async)]
-pub(crate) fn pds_commit_raw(
-    app: AppHandle,
-    window: WebviewWindow,
-    request: Request<'_>,
-) -> StoreResult<RevisionResult> {
-    guard(&window)?;
-    match request.body() {
-        InvokeBody::Raw(bytes) => commit_bytes(&app, bytes),
-        _ => Err(invalid("expected a raw commit body")),
-    }
 }
 
 /// Called on main-page navigation so an interrupted producer cannot retain a lease.

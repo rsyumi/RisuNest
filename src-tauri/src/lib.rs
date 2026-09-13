@@ -17,13 +17,20 @@ mod native_media;
 mod native_tokenizer;
 #[cfg(desktop)]
 mod opened_files;
+#[cfg(any(windows, target_os = "linux"))]
+mod persistent_commit_raw;
 #[cfg(windows)]
 mod persistent_commit_transport;
 mod persistent_store;
 mod portable_backup;
 #[cfg(feature = "official-publication-upload-pilot")]
 mod publication_upload;
-#[cfg(any(test, target_os = "windows", target_os = "android"))]
+#[cfg(any(
+    test,
+    target_os = "windows",
+    target_os = "android",
+    target_os = "linux"
+))]
 mod regex_shadow;
 mod server_sync;
 mod trust_boundary;
@@ -363,7 +370,7 @@ pub fn run() {
                         .join("screenshot-output"),
                 ),
             );
-            #[cfg(any(target_os = "windows", target_os = "android"))]
+            #[cfg(any(target_os = "windows", target_os = "android", target_os = "linux"))]
             app.manage(regex_shadow::RegexCancellationRegistry::default());
             Ok(())
         })
@@ -507,8 +514,8 @@ pub fn run() {
             android_commit_transport::pds_commit_android_finish,
             #[cfg(target_os = "android")]
             android_commit_transport::pds_commit_android_cancel,
-            #[cfg(windows)]
-            persistent_commit_transport::pds_commit_raw,
+            #[cfg(any(windows, target_os = "linux"))]
+            persistent_commit_raw::pds_commit_raw,
             #[cfg(windows)]
             persistent_commit_transport::pds_commit_shared_open,
             #[cfg(windows)]
@@ -545,9 +552,9 @@ pub fn run() {
             persistent_store::commands::pds_get_app_kv,
             persistent_store::commands::pds_set_app_kv,
             persistent_store::commands::pds_remove_app_kv,
-            #[cfg(any(target_os = "windows", target_os = "android"))]
+            #[cfg(any(target_os = "windows", target_os = "android", target_os = "linux"))]
             regex_shadow::regex_execute_batch,
-            #[cfg(any(target_os = "windows", target_os = "android"))]
+            #[cfg(any(target_os = "windows", target_os = "android", target_os = "linux"))]
             regex_shadow::regex_cancel_batch,
         ])
         .build(tauri::generate_context!())

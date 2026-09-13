@@ -4,7 +4,7 @@ import { defineConfig, mergeConfig, type Plugin } from "vite";
 import productConfig from "../vite.config";
 
 // Harnesses consume the product's compiler/plugins; product builds do not load this file.
-export function harnessConfig(name: "streaming" | "tokenizer") {
+export function harnessConfig(name: "streaming" | "tokenizer" | "linux") {
   return defineConfig(async (environment) => {
     if (environment.mode !== "agent")
       throw new Error("Harnesses require --mode agent");
@@ -17,7 +17,7 @@ export function harnessConfig(name: "streaming" | "tokenizer") {
       transformIndexHtml: {
         order: "pre",
         handler(html) {
-          if (name === "streaming")
+          if (name !== "tokenizer")
             return readFileSync(path.join(directory, "index.html"), "utf8");
           if (!html.includes('src="/src/main.ts"'))
             throw new Error("Product HTML entry changed");

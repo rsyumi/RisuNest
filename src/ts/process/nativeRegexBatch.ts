@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
+import { platform } from '@tauri-apps/plugin-os'
 
 import type { RegexExecutionPlan, RegexExecutionResult } from './regexExecutionPlan'
 import { classifyRegexSafePlan, type RegexSafePlan } from './regexSafePlan'
@@ -21,10 +22,7 @@ export interface NativeRegexBatchOptions {
 }
 
 export interface NativeRegexBatchDependencies {
-    invoke(
-        command: string,
-        args: Record<string, unknown>,
-    ): Promise<unknown>
+    invoke(command: string, args: Record<string, unknown>): Promise<unknown>
     createRequestId?(): string
 }
 
@@ -38,12 +36,14 @@ const productionDependencies: NativeRegexBatchDependencies = {
 }
 
 export function isNativeRegexTauriRuntime(
-    userAgent = typeof navigator === 'undefined' ? '' : navigator.userAgent,
-    tauriInternals = (globalThis as typeof globalThis & {
-        __TAURI_INTERNALS__?: unknown
-    }).__TAURI_INTERNALS__,
+    os?: string,
+    tauriInternals = (
+        globalThis as typeof globalThis & {
+            __TAURI_INTERNALS__?: unknown
+        }
+    ).__TAURI_INTERNALS__,
 ): boolean {
-    return Boolean(tauriInternals) && /Windows|Android/i.test(userAgent)
+    return Boolean(tauriInternals) && ['windows', 'android', 'linux'].includes(os ?? platform())
 }
 
 const productionRouteDependencies: NativeRegexBatchRouteDependencies = {
@@ -64,10 +64,10 @@ function abortReason(signal: AbortSignal): unknown {
 
 function assertResult(value: unknown): NativeRegexBatchResult {
     if (
-        typeof value !== 'object'
-        || value === null
-        || typeof (value as NativeRegexBatchResult).data !== 'string'
-        || !Array.isArray((value as NativeRegexBatchResult).errors)
+        typeof value !== 'object' ||
+        value === null ||
+        typeof (value as NativeRegexBatchResult).data !== 'string' ||
+        !Array.isArray((value as NativeRegexBatchResult).errors)
     ) {
         throw new Error('Native regex batch returned an invalid result')
     }
@@ -85,27 +85,36 @@ export async function executeNativeRegexBatch(
     }
 
     const requestId = dependencies.createRequestId?.() ?? globalThis.crypto.randomUUID()
-    const invocation = dependencies.invoke('regex_execute_batch', { requestId, plan, input })
+    const invocation = dependencies.invoke('regex_execute_batch', {
+        requestId,
+        plan,
+        input,
+    })
     let abortListener: (() => void) | undefined
-    const response = options.signal === undefined
-        ? await invocation
-        : await Promise.race([
-            invocation,
-            new Promise<never>((_resolve, reject) => {
-                abortListener = () => {
-                    void dependencies.invoke('regex_cancel_batch', { requestId }).catch(() => {})
-                    reject(abortReason(options.signal!))
-                }
-                options.signal!.addEventListener('abort', abortListener, { once: true })
-                if (options.signal!.aborted) {
-                    abortListener()
-                }
-            }),
-        ]).finally(() => {
-            if (abortListener !== undefined) {
-                options.signal!.removeEventListener('abort', abortListener)
-            }
-        })
+    const response =
+        options.signal === undefined
+            ? await invocation
+            : await Promise.race([
+                  invocation,
+                  new Promise<never>((_resolve, reject) => {
+                      abortListener = () => {
+                          void dependencies
+                              .invoke('regex_cancel_batch', { requestId })
+                              .catch(() => {})
+                          reject(abortReason(options.signal!))
+                      }
+                      options.signal!.addEventListener('abort', abortListener, {
+                          once: true,
+                      })
+                      if (options.signal!.aborted) {
+                          abortListener()
+                      }
+                  }),
+              ]).finally(() => {
+                  if (abortListener !== undefined) {
+                      options.signal!.removeEventListener('abort', abortListener)
+                  }
+              })
 
     if (options.signal?.aborted) {
         throw abortReason(options.signal)
@@ -125,8 +134,8 @@ export async function tryExecuteNativeRegexBatch(
     dependencies: NativeRegexBatchRouteDependencies = productionRouteDependencies,
 ): Promise<RegexExecutionResult | undefined> {
     if (
-        !dependencies.isSupportedTauri()
-        || executionPlan.entries.length !== NATIVE_REGEX_BATCH_RULES
+        !dependencies.isSupportedTauri() ||
+        executionPlan.entries.length !== NATIVE_REGEX_BATCH_RULES
     ) {
         return undefined
     }

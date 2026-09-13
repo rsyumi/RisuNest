@@ -54,6 +54,7 @@ export interface SharedWebview {
 export interface CommitTransportDependencies {
     windows(): boolean
     android?(): boolean
+    linux?(): boolean
     androidBinary?(): AndroidBinaryCommitBridge | null
     invoke<T>(command: string, args?: Record<string, unknown> | Uint8Array): Promise<T>
     encode(input: CommitEnvelope): Promise<Uint8Array>
@@ -73,8 +74,9 @@ export class NativeCommitTransport {
     private async send(input: CommitEnvelope): Promise<{ revision: number }> {
         const deps = this.dependencies
         const android = deps.android?.() ?? false
+        const linux = deps.linux?.() ?? false
         if (
-            (!android && !deps.windows()) ||
+            (!android && !linux && !deps.windows()) ||
             !isLargeCommit(input, android ? ANDROID_LARGE_COMMIT_SIZE : LARGE_COMMIT_BYTES)
         )
             return deps.invoke('pds_commit', { ...input })
@@ -98,6 +100,7 @@ export class NativeCommitTransport {
                 deps.androidBinary ? deps.androidBinary() : getAndroidBinaryCommitBridge(),
             )
         }
+        if (linux) return deps.invoke('pds_commit_raw', bytes)
         const webview = deps.shared()
         if (!webview || bytes.byteLength > MAX_SHARED_COMMIT_BYTES)
             return deps.invoke('pds_commit_raw', bytes)
@@ -148,7 +151,7 @@ export class NativeCommitTransport {
                 throw new Error('Invalid persistence shared buffer')
             }
             const shared = new Uint8Array(buffer)
-            for (let offset = 0; offset < bytes.byteLength; ) {
+            for (let offset = 0; offset < bytes.byteLength;) {
                 const length = Math.min(shared.length, bytes.byteLength - offset)
                 shared.set(bytes.subarray(offset, offset + length))
                 const ack = await deps.invoke<number>('pds_commit_shared_chunk', {
@@ -215,6 +218,9 @@ export function encodeNativeCommit(input: CommitEnvelope): Promise<Uint8Array> {
 }
 
 export const nativeCommitTransport = new NativeCommitTransport({
+    linux: () =>
+        Boolean((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) &&
+        platform() === 'linux',
     android: () =>
         Boolean((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) &&
         platform() === 'android',

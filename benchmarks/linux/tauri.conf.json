@@ -1,0 +1,8 @@
+{
+  "identifier": "io.github.rsyumi.risunest.linux.bench",
+  "build": {
+    "beforeBuildCommand": "pnpm benchmark:linux:build:agent",
+    "frontendDist": "../benchmarks/linux/dist"
+  },
+  "bundle": { "active": false }
+}

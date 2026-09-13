@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { pathToFileURL } from "node:url";
 
 const forbiddenMarkers = [
+  "__RISUNEST_LINUX_BENCHMARK__",
   "__RISUNEST_TOKENIZER_BENCHMARK__",
   "__streamingSmoke",
   "__testResponsesAPI",
