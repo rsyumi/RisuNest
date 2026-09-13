@@ -82,7 +82,7 @@ async function persistence() {
     shared: () => undefined,
   });
   for (const size of [1024 * 1024, 6 * 1024 * 1024]) {
-    const unit = '합성🐿️\\"\n';
+    const unit = '합성🐿️\\"\n cafe\u0301 A\u030a \u1100\u1161';
     const body = unit.repeat(
       Math.floor(size / new TextEncoder().encode(unit).length),
     );

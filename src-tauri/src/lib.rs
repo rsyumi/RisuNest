@@ -264,6 +264,7 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
     #[cfg(target_os = "ios")]
     {
         builder = builder
+            .append_invoke_initialization_script(include_str!("ios_ipc.js"))
             .manage(ios_lifecycle::RestartState::default())
             .plugin(tauri_plugin_opener::init());
     }
