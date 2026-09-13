@@ -47,8 +47,9 @@ The controller runs five process phases:
 
 Reports contain synthetic assertions, timings and hashes. Persistence samples
 record the commands actually used, so small inputs remaining on JSON cannot be
-mistaken for raw-IPC measurements. Warmups are excluded and measured orders
-alternate. Frame gaps on a hosted VM are observations, not physical-device FPS.
+mistaken for raw-IPC measurements. Warmups are excluded. Persistence and tokenizer
+measurements alternate order; regex measures JavaScript before native each time.
+Frame gaps on a hosted VM are observations, not physical-device FPS.
 
 Memory artifacts separate the app process tree's RSS from system-wide WebKit
 service RSS, with a prelaunch baseline. launchd-owned WebKit processes cannot be
