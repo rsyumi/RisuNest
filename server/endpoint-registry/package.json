@@ -8,12 +8,13 @@
     "node": ">=22.12.0"
   },
   "scripts": {
-    "dev": "wrangler dev --local",
-    "db:migrate": "wrangler d1 migrations apply endpoint-registry --local",
-    "types": "wrangler types --strict-vars false",
+    "dev": "wrangler dev --local --config wrangler.local.jsonc",
+    "db:migrate": "wrangler d1 migrations apply endpoint-registry --local --config wrangler.local.jsonc",
+    "types": "wrangler types --strict-vars false --config wrangler.local.jsonc",
     "check": "pnpm run types && tsc --noEmit && tsc --noEmit -p tests/tsconfig.json && tsc --noEmit -p tsconfig.tools.json",
     "test": "vitest run",
-    "build": "wrangler deploy --dry-run --outdir dist",
+    "build": "wrangler deploy --dry-run --outdir dist --config wrangler.local.jsonc",
+    "build:deploy": "wrangler deploy --dry-run --outdir dist --config wrangler.jsonc",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
   },

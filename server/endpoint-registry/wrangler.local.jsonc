@@ -1,4 +1,5 @@
 {
+  // Committed local development and verification configuration.
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "endpoint-registry",
   "main": "src/index.ts",

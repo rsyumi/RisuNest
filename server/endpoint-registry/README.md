@@ -21,6 +21,9 @@ The default local address is `http://localhost:8787`. Local D1 state persists un
 `.wrangler/state/`. The zero database ID is an explicit local placeholder.
 No Cloudflare login or remote database is needed for these commands.
 
+`dev`, `db:migrate`, `types`, `build`, and the test configuration explicitly use
+the committed `wrangler.local.jsonc`. They do not load deployment configuration.
+
 Verification:
 
 ```powershell
@@ -175,14 +178,31 @@ again. The registry has no key recovery, ownership recovery or listing API.
 No cloud resources are created by this implementation or its local checks.
 There is deliberately no deploy npm script. When deployment is requested:
 
-1. Create the D1 database with `pnpm exec wrangler d1 create endpoint-registry`.
-2. Replace the zero `database_id` in `wrangler.jsonc` with the returned ID.
+1. Copy the committed template with
+   `Copy-Item wrangler.example.jsonc wrangler.jsonc` (first setup only).
+   `wrangler.jsonc` is ignored by Git and holds actual deployment values.
+2. Create the D1 database with
+   `pnpm exec wrangler d1 create endpoint-registry --config wrangler.jsonc`
+   and set `database_id` in `wrangler.jsonc` to the returned ID.
 3. Select the public address explicitly: enable `workers_dev`, or configure a
-   custom domain route. Preview URLs remain disabled.
+   custom domain route in `wrangler.jsonc`. Set the Worker/database names and
+   account ID if needed. Preview URLs remain disabled.
 4. Apply the migration with
-   `pnpm exec wrangler d1 migrations apply endpoint-registry --remote`.
-5. Rerun checks and dry-run, then use `pnpm exec wrangler deploy`.
+   `pnpm exec wrangler d1 migrations apply DB --remote --config wrangler.jsonc`.
+5. Rerun the local verification commands above, then run `pnpm run build:deploy`
+   to dry-run the actual deployment configuration. Deploy with
+   `pnpm exec wrangler deploy --config wrangler.jsonc`.
 6. Verify synthetic POST/GET and the real D1 row costs and quota settings.
 
 The D1 `remote: false` setting keeps development local; it does not substitute
 a local DB when the Worker is deployed. Do not enable remote bindings for tests.
+
+Keep shared settings (entry point, compatibility date/flags, bindings, migration
+path and operational defaults) aligned across `wrangler.local.jsonc`,
+`wrangler.example.jsonc` and your ignored `wrangler.jsonc` when changing them.
+These are complete configurations, not automatically merged overrides.
+Commit source, migrations, the local configuration and deployment template;
+keep actual resource IDs and domains in `wrangler.jsonc`. Keep API tokens out
+of all configuration files; authenticate Wrangler separately. Local Worker
+secrets belong in ignored `.dev.vars` files and deployed secrets are configured
+with Wrangler's secret commands.

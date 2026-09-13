@@ -1,0 +1,26 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  // Copy to wrangler.jsonc and fill in deployment-specific values.
+  "name": "endpoint-registry",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-03",
+  "compatibility_flags": ["nodejs_compat"],
+  // Enable workers_dev or add your custom domain route before deploying.
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": {
+    "enabled": false,
+  },
+  "vars": {
+    "MAX_RECORDS": 10000,
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "endpoint-registry",
+      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      "migrations_dir": "migrations",
+      "remote": false,
+    },
+  ],
+}
