@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-risunest">
+    <comment>RisuNest data</comment>
+    <glob pattern="*.risum"/>
+    <glob pattern="*.risup"/>
+    <glob pattern="*.charx"/>
+    <glob pattern="*.risunest"/>
+    <glob pattern="*.risudat"/>
+  </mime-type>
+</mime-info>

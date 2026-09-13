@@ -40,6 +40,8 @@
     "android:build:release:aab": "tauri android build --aab --target aarch64 --ci",
     "windows:build": "tauri build --target x86_64-pc-windows-msvc --bundles nsis",
     "windows:build:agent": "tauri build --target x86_64-pc-windows-msvc --bundles nsis --config src-tauri/tauri.agent.conf.json",
+    "linux:build": "tauri build --target x86_64-unknown-linux-gnu --bundles deb,appimage -- --locked",
+    "linux:build:agent": "tauri build --target x86_64-unknown-linux-gnu --bundles deb,appimage --config src-tauri/tauri.agent.conf.json -- --locked",
     "buildsite": "vite build --outDir dist",
     "runserver": "node server/node/server.cjs",
     "sync": "node electron/sync",

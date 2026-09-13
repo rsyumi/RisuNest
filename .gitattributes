@@ -1,3 +1,5 @@
 # Keep local .gitignore changes when merging upstream.
 .gitignore merge=ours
 src-tauri/gen/android/app/src/main/AndroidManifest.xml -whitespace
+scripts/linux-*.sh text eol=lf
+scripts/linux-*.py text eol=lf

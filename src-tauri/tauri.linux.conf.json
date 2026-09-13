@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["deb", "appimage"],
+    "category": "Utility",
+    "shortDescription": "AI chat with a native local data store",
+    "licenseFile": "../LICENSE",
+    "fileAssociations": [
+      {
+        "ext": ["risum", "risup", "charx", "risunest", "risudat"],
+        "mimeType": "application/x-risunest"
+      }
+    ],
+    "linux": {
+      "deb": {
+        "desktopTemplate": "linux/RisuNest.desktop.hbs",
+        "depends": [
+          "libc6 (>= 2.39)",
+          "libssl3t64",
+          "libdbus-1-3",
+          "libgcc-s1"
+        ],
+        "files": {
+          "/usr/share/doc/risu-nest/copyright": "../LICENSE",
+          "/usr/share/mime/packages/io.github.rsyumi.risunest.xml": "linux/risunest.xml"
+        }
+      },
+      "appimage": {
+        "bundleMediaFramework": true,
+        "files": {
+          "/usr/share/mime/packages/io.github.rsyumi.risunest.xml": "linux/risunest.xml"
+        }
+      }
+    }
+  }
+}

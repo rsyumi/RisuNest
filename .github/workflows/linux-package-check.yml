@@ -1,0 +1,68 @@
+name: Linux package check
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/**"
+      - "src-tauri/**"
+      - "crates/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "vite.config.ts"
+      - "scripts/linux-*"
+      - ".github/workflows/linux-package-check.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+      VITE_RISU_LEGAL_CONFIGURED: "TRUE"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ubuntu-24.04-linux-package
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev patchelf desktop-file-utils shared-mime-info libfuse2t64 dbus-x11 gnome-keyring xdg-utils
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: dbus-run-session -- bash scripts/linux-native-tests.sh
+      - name: Build agent packages
+        run: pnpm linux:build:agent
+      - name: Inspect Debian package
+        shell: bash
+        run: |
+          package=$(find "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/bundle/deb" -maxdepth 1 -name '*.deb' -print -quit)
+          test -n "$package"
+          dpkg-deb --info "$package"
+          dpkg-deb --field "$package" Depends | grep -F 'libc6 (>= 2.39)'
+          dpkg-deb --extract "$package" "$RUNNER_TEMP/risunest-deb"
+          find "$RUNNER_TEMP/risunest-deb/usr/share/applications" -name '*.desktop' -exec desktop-file-validate {} +
+          grep -Fx 'Exec=RisuNest %U' "$RUNNER_TEMP/risunest-deb/usr/share/applications/RisuNest.desktop"
+          test -f "$RUNNER_TEMP/risunest-deb/usr/share/mime/packages/io.github.rsyumi.risunest.xml"
+          test -f "$RUNNER_TEMP/risunest-deb/usr/share/doc/risu-nest/copyright"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: risunest-ubuntu-24.04-x86_64-agent
+          if-no-files-found: error
+          path: |
+            src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
+            src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
