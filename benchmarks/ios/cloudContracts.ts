@@ -33,6 +33,10 @@ export async function cloudContract(cancelExpected: boolean) {
   let finished = false;
   let transportFinished = false;
   let outcome = "failed";
+  let stage = "opening";
+  let failure: Record<string, unknown> | null = null;
+  let beforeCleanup: Awaited<ReturnType<typeof getIOSNativeState>> | null =
+    null;
   const client = new Ollama({
     host: "https://ollama.com",
     headers: { Authorization: "Bearer " + key },
@@ -69,6 +73,7 @@ export async function cloudContract(cancelExpected: boolean) {
       ],
       options: { num_predict: 8192 },
     });
+    stage = "reading";
     for await (const chunk of stream) {
       const now = performance.now();
       maxGapMs = Math.max(maxGapMs, now - previous);
@@ -78,10 +83,12 @@ export async function cloudContract(cancelExpected: boolean) {
       text += chunk.message?.content ?? "";
       finished ||= chunk.done === true;
       lease.progress(2);
+      stage = "saving";
       await invoke("pds_set_app_kv", {
         key: "ios-synthetic-cloud",
         value: text,
       });
+      stage = "reading";
       if (text.length)
         document.getElementById("status")!.textContent = "cloud-streaming";
     }
@@ -94,8 +101,30 @@ export async function cloudContract(cancelExpected: boolean) {
         : lease.signal?.aborted
           ? "expired"
           : "incomplete";
-  } catch {
+  } catch (error) {
     // SDK/HTTP errors may contain request details. Report only a fixed category.
+    const message =
+      error instanceof Error
+        ? error.message
+        : typeof error === "string"
+          ? error
+          : "";
+    const categories = [
+      ["json", /json|unexpected.*(?:token|end)|parse/i],
+      ["resource", /resource|bad.*rid/i],
+      ["cancelled", /cancel|abort/i],
+      ["network", /network|load failed|fetch|connection|response body|stream/i],
+      ["storage", /sqlite|database|checkpoint|revision/i],
+      ["timeout", /timeout|timed out/i],
+    ] as const;
+    failure = {
+      stage,
+      type: error instanceof Error ? error.constructor.name : typeof error,
+      categories: categories
+        .filter(([, pattern]) => pattern.test(message))
+        .map(([name]) => name),
+      messageLength: message.length,
+    };
     outcome = controller.signal.aborted
       ? controller.signal.reason === "timeout"
         ? "timeout"
@@ -106,6 +135,7 @@ export async function cloudContract(cancelExpected: boolean) {
   } finally {
     clearTimeout(watchdog);
     document.removeEventListener("visibilitychange", visibility);
+    beforeCleanup = await getIOSNativeState().catch(() => null);
     // The SDK stops at done:true without necessarily consuming HTTP EOF.
     controller.abort();
     requestScope.dispose();
@@ -129,6 +159,8 @@ export async function cloudContract(cancelExpected: boolean) {
     events,
     transportFinished,
     savedExact: saved === text,
+    failure,
+    beforeCleanup,
   };
   const measured = document.createElement("pre");
   measured.textContent = "cloud-result:" + JSON.stringify(result);

@@ -53,6 +53,9 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
                     }
                 }
             }
+            if !continuedRegistered {
+                NSLog("RisuNest continued processing registration unavailable")
+            }
         }
         #endif
         for (name, event) in [
@@ -131,7 +134,10 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
                 do {
                     try BGTaskScheduler.shared.submit(request)
                     mode = "continued"
-                } catch { self.continuedPending = nil }
+                } catch {
+                    self.continuedPending = nil
+                    NSLog("RisuNest continued processing rejected: code=%ld refresh=%ld", (error as NSError).code, UIApplication.shared.backgroundRefreshStatus.rawValue)
+                }
             }
             #endif
             invoke.resolve(["id": id, "mode": mode])
