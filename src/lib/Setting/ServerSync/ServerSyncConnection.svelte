@@ -1,6 +1,12 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import ServerSyncStorage from "./ServerSyncStorage.svelte";
+  import ServerSyncRegistrationInput from "./ServerSyncRegistrationInput.svelte";
+  import { serverRegistrationInbox } from "src/ts/storage/sync/serverSyncRegistrationInbox";
+  import type {
+    ServerConfig,
+    ServerDirectory,
+  } from "src/ts/storage/sync/serverSync";
   import { language } from "src/lang";
   import { getServerSyncController } from "src/ts/storage/sync/serverSyncProduction";
   import { serverSyncError } from "src/ts/storage/sync/serverSync";
@@ -25,6 +31,8 @@
   let libraryId = $state("");
   let deviceId = $state("");
   let token = $state("");
+  let directory = $state<ServerDirectory | undefined>();
+  let inputRevision = $state(0);
   let connecting = $state(false);
   let pausing = $state(false);
   let actionError = $state("");
@@ -40,6 +48,7 @@
     libraryId = initialNavigation.libraryId ?? "";
     deviceId = "";
     token = "";
+    directory = undefined;
     replacing = false;
   });
   $effect(() => {
@@ -86,6 +95,7 @@
     // Startup owns initialization; mounting a view must preserve its attempt.
     return () => {
       token = "";
+      directory = undefined;
       unsubscribe();
     };
   });
@@ -99,10 +109,14 @@
         libraryId: validateServerSyncId(libraryId.trim()),
         deviceId: validateServerSyncId(deviceId.trim()),
         token: token.trim(),
+        ...(directory ? { directory: $state.snapshot(directory) } : {}),
       };
       if (replacing) await controller.reregister(config);
       else await controller.bind(config);
       token = "";
+      directory = undefined;
+      serverRegistrationInbox.clear();
+      inputRevision++;
       replacing = false;
       await controller.synchronize();
     } catch (cause) {
@@ -110,6 +124,26 @@
     } finally {
       connecting = false;
     }
+  }
+  function acceptRegistration(config: ServerConfig): void {
+    if (busy || (snapshot.status?.configured && !replacing)) return;
+    endpoint = config.endpoint;
+    libraryId = config.libraryId;
+    deviceId = config.deviceId;
+    token = config.token;
+    directory = config.directory;
+    actionError = "";
+  }
+  function discardRegistration(): void {
+    endpoint = "";
+    libraryId = "";
+    deviceId = "";
+    token = "";
+    directory = undefined;
+    replacing = false;
+    actionError = "";
+    serverRegistrationInbox.clear();
+    inputRevision++;
   }
   async function pause(): Promise<void> {
     if (pausing) return;
@@ -230,6 +264,8 @@
           endpoint = snapshot.status?.endpoint ?? "";
           libraryId = snapshot.status?.libraryId ?? "";
           deviceId = "";
+          token = "";
+          directory = undefined;
           replacing = true;
         }}>{text.reregister}</button
       >
@@ -243,6 +279,13 @@
       >
     {/if}
   {/if}
+  {#key inputRevision}
+    <ServerSyncRegistrationInput
+      available={!snapshot.status?.configured || replacing}
+      {busy}
+      onRegistration={acceptRegistration}
+    />
+  {/key}
   {#if !snapshot.status?.configured || replacing}
     {#if replacing}<p class="text-sm opacity-75">{text.reregisterHelp}</p>{/if}
     <form
@@ -295,6 +338,15 @@
         /></label
       >
       <p class="text-sm opacity-75">{text.credentialsHelp}</p>
+      {#if directory}<p class="text-sm opacity-75">
+          {text.directoryEnabled}: {directory.baseUrl}
+        </p>{/if}
+      <button
+        type="button"
+        class="action border border-darkborderc hover:bg-selected justify-self-start"
+        disabled={busy}
+        onclick={discardRegistration}>{text.discardRegistration}</button
+      >
       <button
         class="action bg-darkbutton border border-darkborderc hover:bg-selected justify-self-start"
         type="submit"

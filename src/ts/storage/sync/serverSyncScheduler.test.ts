@@ -25,6 +25,7 @@ function fixture() {
     operationPending: false,
   };
   const result: ServerCycle = {
+    endpoint: "http://localhost",
     phase: "idle",
     localRevision: 0,
     head,

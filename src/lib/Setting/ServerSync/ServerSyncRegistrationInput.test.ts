@@ -41,7 +41,9 @@ describe("registration form input", () => {
     });
     await tick();
     expect(onRegistration).not.toHaveBeenCalled();
+    await vi.waitFor(() =>
+      expect(target.querySelector("[role=status]")).not.toBeNull(),
+    );
     expect(serverRegistrationInbox.take()).toBeUndefined();
-    expect(target.querySelector("[role=status]")).not.toBeNull();
   });
 });

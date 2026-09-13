@@ -115,7 +115,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "device" => match subcommand.as_deref() {
             Some("add") => {
-                if store.connection_status()?.mode == "unconfigured" && !qr {
+                let connection = store.connection_status()?;
+                // Offline issuance outlives this process; a Quick Tunnel changes on restart.
+                if connection.mode == "managed" && !connection.directory_enabled {
+                    return Err(risunest_sync_server::Error::new(
+                        "managed-registration-needs-directory",
+                        409,
+                    )
+                    .into());
+                }
+                if connection.mode == "unconfigured" && !qr {
                     println!("{}", serde_json::to_string(&store.add_device()?)?);
                 } else {
                     let uri = store.issue_registration()?;

@@ -19,11 +19,8 @@ import { CharXImporter, CharXWriter } from "./process/processzip"
 import { exportModuleLegacy, readModule, type RisuModule } from "./process/modules"
 import { readFile } from "@tauri-apps/plugin-fs"
 import { open } from "@tauri-apps/plugin-dialog"
-import { getCurrent, onOpenUrl } from '@tauri-apps/plugin-deep-link';
 import { REALM_HUB_URL, REALM_NIGHTLY_HUB_URL, REALM_NODE_PROXY_BASE, REALM_SITE_URL } from "./realmEndpoints"
-import { dispatchRisuLocalUrl } from "./deepLinkDispatcher"
 import { registerOpenedFileListeners } from "./openedFiles"
-import { serverSyncNavigation } from './storage/sync/serverSyncDeepLink'
 import { importDesktopNativeCharacterPath } from './storage/nativeCharacterFileRoute'
 import type { NativeFileJobOptions, NativeFileJobSource } from './storage/nativeFileJobs'
 import {
@@ -714,25 +711,6 @@ export async function characterURLImport() {
         }
         return true
     })
-
-    if (isTauri) {
-        const handleUrls = (urls: string[]) => {
-            for (const url of urls) {
-                dispatchRisuLocalUrl(url, {
-                    onRealm: (id) => void downloadRisuHub(id),
-                    onServerSync: (uri) => {
-                        serverSyncNavigation.receive(uri)
-                    },
-                })
-            }
-        }
-        try {
-            handleUrls((await getCurrent()) ?? [])
-            await onOpenUrl(handleUrls)
-        } catch (error) {
-            console.warn('Failed to initialize deep links:', error)
-        }
-    }
 
     async function importFile(name: string, data: Uint8Array) {
         if (

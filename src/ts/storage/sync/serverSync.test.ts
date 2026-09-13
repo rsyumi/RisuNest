@@ -9,6 +9,7 @@ const head = {
   minRetainedSeq: "0",
 };
 const result: ServerCycle = {
+  endpoint: "http://localhost",
   phase: "idle",
   localRevision: 8,
   head,

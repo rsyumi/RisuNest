@@ -34,7 +34,8 @@ describe('dispatchRisuLocalUrl', () => {
 
     it('does not recognize v1 clone links', () => {
         const handlers = { onRealm: vi.fn(), onServerSync: vi.fn() }
-        const legacy = 'risunestlocal://peer-clone/v1?endpoint=http%3A%2F%2F192.168.1.2%3A1234&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=secret'
+        const legacy =
+            'risunestlocal://peer-clone/v1?endpoint=http%3A%2F%2F192.168.1.2%3A1234&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=secret'
 
         expect(dispatchRisuLocalUrl(legacy, handlers)).toBe(false)
         expect(
@@ -47,10 +48,33 @@ describe('dispatchRisuLocalUrl', () => {
     it('ignores unknown and malformed links', () => {
         const handlers = { onRealm: vi.fn(), onServerSync: vi.fn() }
 
-        expect(dispatchRisuLocalUrl('https://example.com/realm/card-1', handlers)).toBe(false)
+        expect(
+            dispatchRisuLocalUrl('https://example.com/realm/card-1', handlers),
+        ).toBe(false)
         expect(dispatchRisuLocalUrl('not a url', handlers)).toBe(false)
-        expect(dispatchRisuLocalUrl('risunestlocal://realm/%E0%A4%A', handlers)).toBe(false)
+        expect(
+            dispatchRisuLocalUrl('risunestlocal://realm/%E0%A4%A', handlers),
+        ).toBe(false)
         expect(handlers.onRealm).not.toHaveBeenCalled()
         expect(handlers.onServerSync).not.toHaveBeenCalled()
     })
+})
+
+it('routes strict private registration separately from public navigation', async () => {
+    const vector = (
+        await import('../../crates/sync-connect/tests/registration-vector.json')
+    ).default
+    const handlers = {
+        onRealm: vi.fn(),
+        onServerSync: vi.fn(),
+        onServerRegistration: vi.fn(),
+    }
+    expect(dispatchRisuLocalUrl(vector.uri, handlers)).toBe(true)
+    expect(handlers.onServerRegistration).toHaveBeenCalledExactlyOnceWith(
+        vector.uri,
+    )
+    expect(handlers.onServerSync).not.toHaveBeenCalled()
+    expect(handlers.onRealm).not.toHaveBeenCalled()
+    expect(dispatchRisuLocalUrl(vector.uri + '=', handlers)).toBe(false)
+    expect(handlers.onServerRegistration).toHaveBeenCalledOnce()
 })

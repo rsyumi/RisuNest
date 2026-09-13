@@ -81,3 +81,28 @@ fn configured_device_emits_parseable_uri_and_qr_without_status_secrets() {
     assert!(!status.contains(&registration.token));
     assert!(!status.contains(&registration.directory.unwrap().key));
 }
+
+#[test]
+fn offline_managed_registration_requires_directory_before_issuing_a_device() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(cli(dir.path(), &["init"]).status.success());
+    let executable = std::env::current_exe().unwrap();
+    assert!(cli(
+        dir.path(),
+        &[
+            "connection",
+            "configure",
+            "--cloudflared",
+            executable.to_str().unwrap()
+        ]
+    )
+    .status
+    .success());
+    let output = cli(dir.path(), &["device", "add"]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap().trim(),
+        "managed-registration-needs-directory"
+    );
+}

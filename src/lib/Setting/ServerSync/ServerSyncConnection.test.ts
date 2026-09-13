@@ -31,6 +31,9 @@ vi.mock("src/lang", async () => ({
   language: (await import("src/lang/en")).languageEnglish,
 }));
 vi.mock("src/ts/alert", () => ({ alertConfirm: vi.fn() }));
+import { serverRegistrationInbox } from "src/ts/storage/sync/serverSyncRegistrationInbox";
+import { receiveServerRegistration } from "src/ts/storage/sync/serverSyncRegistrationDispatch";
+import vector from "../../../../crates/sync-connect/tests/registration-vector.json";
 import ServerSyncConnection from "./ServerSyncConnection.svelte";
 
 let target: HTMLDivElement;
@@ -42,6 +45,7 @@ const idle = (): ServerSyncSnapshot => ({
 });
 beforeEach(() => {
   vi.clearAllMocks();
+  serverRegistrationInbox.clear();
   state.controller.snapshot.mockReturnValue(idle());
   target = document.createElement("div");
   document.body.append(target);
@@ -64,7 +68,7 @@ describe("shared server connection view", () => {
       },
     });
     await tick();
-    const inputs = [...target.querySelectorAll("input")];
+    const inputs = [...target.querySelectorAll<HTMLInputElement>("form input")];
     expect(inputs.map((input) => input.value)).toEqual([
       "https://example.test/",
       "lib",
@@ -109,10 +113,12 @@ describe("shared server connection view", () => {
     component = mount(ServerSyncConnection, { target });
     await tick();
     const values = ["https://example.test", "lib", "device", "a".repeat(64)];
-    [...target.querySelectorAll("input")].forEach((input, index) => {
-      input.value = values[index];
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-    });
+    [...target.querySelectorAll<HTMLInputElement>("form input")].forEach(
+      (input, index) => {
+        input.value = values[index];
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      },
+    );
     target
       .querySelector("form")!
       .dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
@@ -126,7 +132,8 @@ describe("shared server connection view", () => {
       token: "a".repeat(64),
     });
     expect(
-      target.querySelector<HTMLInputElement>('input[type="password"]')!.value,
+      target.querySelector<HTMLInputElement>('form input[type="password"]')!
+        .value,
     ).toBe("");
   });
   it("keeps controls busy until an explicit pause has settled", async () => {
@@ -169,4 +176,100 @@ describe("shared server connection view", () => {
     component = undefined;
     expect(state.controller.pause).not.toHaveBeenCalled();
   });
+});
+
+it("receives a cold registration after mounting, submits directory only explicitly, and discards secrets", async () => {
+  await receiveServerRegistration(vector.uri, () => {
+    component = mount(ServerSyncConnection, {
+      target,
+      props: { initialNavigation: {} },
+    });
+  });
+  await tick();
+  const inputs = [...target.querySelectorAll<HTMLInputElement>("form input")];
+  expect(inputs.map((input) => input.value)).toEqual([
+    vector.registration.endpoint,
+    vector.registration.libraryId,
+    vector.registration.deviceId,
+    vector.registration.token,
+  ]);
+  expect(target.textContent).toContain(vector.registration.directory.baseUrl);
+  expect(target.textContent).not.toContain(vector.registration.directory.key);
+  expect(state.controller.bind).not.toHaveBeenCalled();
+  target
+    .querySelector("form")!
+    .dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+  await vi.waitFor(() =>
+    expect(state.controller.bind).toHaveBeenCalledExactlyOnceWith({
+      ...vector.registration,
+      endpoint: "https://sync.example/base/",
+    }),
+  );
+  await tick();
+  expect(inputs.at(-1)!.value).toBe("");
+  expect(target.textContent).not.toContain(
+    vector.registration.directory.baseUrl,
+  );
+  expect(serverRegistrationInbox.take()).toBeUndefined();
+});
+it("clears an imported credential without connecting and accepts a deliberate reimport", async () => {
+  component = mount(ServerSyncConnection, { target });
+  await tick();
+  await receiveServerRegistration(vector.uri, () => {});
+  await tick();
+  [...target.querySelectorAll("button")]
+    .find((button) => button.textContent?.includes("Clear registration input"))!
+    .click();
+  await tick();
+  expect(
+    [...target.querySelectorAll<HTMLInputElement>("form input")].map(
+      (input) => input.value,
+    ),
+  ).toEqual(["", "", "", ""]);
+  expect(target.textContent).not.toContain(
+    vector.registration.directory.baseUrl,
+  );
+  expect(state.controller.bind).not.toHaveBeenCalled();
+  expect(await receiveServerRegistration(vector.uri, () => {})).toBe(true);
+});
+it("rejects OS registration for an existing identity without an implicit replacement", async () => {
+  state.controller.snapshot.mockReturnValue({
+    ...idle(),
+    status: {
+      configured: true,
+      endpoint: "https://bound.test/",
+      libraryId: "bound",
+      deviceId: "device",
+    },
+  });
+  component = mount(ServerSyncConnection, { target });
+  await tick();
+  await receiveServerRegistration(vector.uri, () => {});
+  await tick();
+  expect(target.textContent).toContain("https://bound.test/");
+  expect(target.textContent).toContain("Disconnect the current server");
+  expect(state.controller.bind).not.toHaveBeenCalled();
+  expect(state.controller.reregister).not.toHaveBeenCalled();
+  expect(serverRegistrationInbox.take()).toBeUndefined();
+});
+
+it("retains cold-start credentials until local startup mounts the public destination", async () => {
+  await receiveServerRegistration(vector.uri, () => {});
+  component = mount(ServerSyncConnection, {
+    target,
+    props: { initialNavigation: {} },
+  });
+  await tick();
+  await tick();
+  expect(
+    [...target.querySelectorAll<HTMLInputElement>("form input")].map(
+      (input) => input.value,
+    ),
+  ).toEqual([
+    vector.registration.endpoint,
+    vector.registration.libraryId,
+    vector.registration.deviceId,
+    vector.registration.token,
+  ]);
+  expect(state.controller.bind).not.toHaveBeenCalled();
 });
