@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+# Installer builds run directly under Task Scheduler without a console window.
+windows-background = []
+
 [dependencies]
 risunest-sync-wire = { path = "../../crates/sync-wire" }
 risunest-sync-connect = { path = "../../crates/sync-connect" }

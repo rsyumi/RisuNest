@@ -1,0 +1,17 @@
+{
+  "bundle": {
+    "active": true,
+    "externalBin": [
+      "binaries/risunest-sync-server",
+      "binaries/risunest-sync-manager",
+      "binaries/cloudflared"
+    ],
+    "resources": ["binaries/CLOUDFLARED-LICENSE"],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "installerHooks": "../../install/windows.nsh"
+      }
+    }
+  }
+}

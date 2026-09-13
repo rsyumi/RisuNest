@@ -1,0 +1,7 @@
+/gui/dist/
+/gui/node_modules/
+/gui/src-tauri/binaries/
+/gui/src-tauri/gen/
+/gui/tests/preview/node_modules/
+/release/
+/.test-output/

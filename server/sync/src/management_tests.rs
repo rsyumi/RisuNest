@@ -87,6 +87,103 @@ fn bad_registration_input_allocates_no_device() {
 }
 
 #[tokio::test]
+async fn live_revoke_cancels_reserved_work_without_removing_committed_data() {
+    use risunest_sync_wire::{hash, ChangeSet, CommitIntent, RecordChange, RecordVersion};
+    let root = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(Store::init(root.path()).unwrap());
+    let credential = store.add_device().unwrap();
+    let device = store
+        .authenticate(&credential.library_id, &credential.token)
+        .unwrap();
+    store
+        .put_object(&device, &hash(b"synthetic"), b"synthetic")
+        .unwrap();
+    let intent = |key: &str, seq: u64| {
+        let staged = store
+            .stage_changes(
+                &device,
+                &ChangeSet {
+                    changes: vec![RecordChange {
+                        key: key.into(),
+                        before: RecordVersion::Absent,
+                        after: RecordVersion::Live {
+                            object_hash: hash(b"synthetic"),
+                            descriptor_hash: None,
+                        },
+                    }],
+                    read_fences: vec![],
+                    scope_fences: vec![],
+                },
+            )
+            .unwrap();
+        CommitIntent {
+            device_operation_seq: seq.into(),
+            expected_head: store.head().unwrap(),
+            changes_digest: staged.changes_digest,
+            staged_changes_id: staged.staged_changes_id,
+        }
+    };
+    let committed = intent("committed", 1);
+    let receipt = store
+        .commit(&device, &committed, &committed.expected_head.etag())
+        .unwrap();
+    let head = store.head().unwrap();
+    let pending = intent("pending", 2);
+    store
+        .submit_commit(&device, &pending, &pending.expected_head.etag())
+        .unwrap();
+    assert!(store.managed_devices().unwrap()[0].pending);
+    let manager =
+        crate::management::Management::start(store.clone(), "127.0.0.1:4320".parse().unwrap())
+            .await
+            .unwrap();
+    let discovery = crate::management::discovery::Discovery::load(root.path()).unwrap();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://{}", discovery.address);
+    let status: serde_json::Value = client
+        .get(format!("{base}/status"))
+        .bearer_auth(&discovery.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(client
+        .post(format!("{base}/devices/{}/revoke", credential.device_id))
+        .bearer_auth(&discovery.token)
+        .json(&serde_json::json!({"revision":status["revision"]}))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+    assert!(store
+        .authenticate(&credential.library_id, &credential.token)
+        .is_err());
+    assert!(store.run_pending_commit().unwrap());
+    assert!(!store.managed_devices().unwrap()[0].pending);
+    assert_eq!(store.head().unwrap(), head);
+    let db = rusqlite::Connection::open_with_flags(
+        root.path().join("metadata.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let persisted: String = db
+        .query_row(
+            "SELECT body FROM receipts WHERE operation=?1",
+            [&receipt.operation_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&persisted).unwrap(),
+        serde_json::to_value(&receipt).unwrap()
+    );
+    manager.close().await;
+}
+
+#[tokio::test]
 async fn management_http_auth_revision_and_live_issuance() {
     let root = tempfile::tempdir().unwrap();
     let store = std::sync::Arc::new(Store::init(root.path()).unwrap());

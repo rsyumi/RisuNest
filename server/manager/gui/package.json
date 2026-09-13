@@ -1,0 +1,30 @@
+{
+  "name": "risunest-sync-manager-gui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev:agent": "vite --mode agent --host 127.0.0.1 --port 14320 --strictPort",
+    "build:agent": "vite build --mode agent",
+    "check": "svelte-check --tsconfig tsconfig.json",
+    "tauri": "tauri",
+    "tauri:dev:agent": "tauri dev",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "dependencies": {
+    "svelte": "^5.0.0",
+    "@tauri-apps/api": "2.11.1",
+    "@lucide/svelte": "^0.562.0"
+  },
+  "devDependencies": {
+    "vite": "8.0.3",
+    "@sveltejs/vite-plugin-svelte": "7.0.0",
+    "typescript": "^5.0.0",
+    "svelte-check": "4.3.5",
+    "@tauri-apps/cli": "2.11.4",
+    "vitest": "4.1.0",
+    "happy-dom": "^20.0.0",
+    "prettier": "3.6.2",
+    "prettier-plugin-svelte": "3.4.0"
+  }
+}

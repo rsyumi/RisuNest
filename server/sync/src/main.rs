@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(windows, feature = "windows-background"),
+    windows_subsystem = "windows"
+)]
+
 use risunest_sync_server::{
     config::Config, connection::ConnectionOptions, http, management::Management, store::Store,
 };
