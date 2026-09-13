@@ -170,43 +170,85 @@ pub fn decrypt(
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RecoveryEnvelope {
+    pub schema: String,
     pub repository_id: String,
-    pub connection_metadata: String,
     pub salt: [u8; 16],
-    pub memory_kib: u32,
-    pub iterations: u32,
     pub wrapped_key: Vec<u8>,
+}
+const RECOVERY_SCHEMA: &str = "risunest.recovery/v1";
+pub const MAX_RECOVERY_BYTES: usize = 64 * 1024;
+
+/// An app-generated 128-bit secret. Never serialize or debug-print this value.
+pub struct RecoveryCode(Zeroizing<[u8; 16]>);
+impl RecoveryCode {
+    pub fn generate() -> Result<Self> {
+        let mut bytes = Zeroizing::new([0; 16]);
+        getrandom::getrandom(bytes.as_mut()).map_err(|_| FormatError("randomness-unavailable"))?;
+        Ok(Self(bytes))
+    }
+    /// Ten groups of four hex digits: 128 secret bits plus a 32-bit typo checksum.
+    pub fn expose(&self) -> Zeroizing<String> {
+        let checksum = super::content_identity::hash(self.0.as_ref());
+        let mut raw = Zeroizing::new(hex::encode(self.0.as_ref()));
+        raw.push_str(&hex::encode(&checksum[..4]));
+        let mut text = Zeroizing::new(String::with_capacity(49));
+        for (index, byte) in raw.bytes().enumerate() {
+            if index > 0 && index % 4 == 0 {
+                text.push('-');
+            }
+            text.push(char::from(byte));
+        }
+        text
+    }
+    pub fn parse(text: &str) -> Result<Self> {
+        if text.len() != 49 {
+            return Err(FormatError("invalid-recovery-code"));
+        }
+        let mut digits = Zeroizing::new(String::with_capacity(40));
+        for (index, byte) in text.bytes().enumerate() {
+            if index % 5 == 4 {
+                if byte != b'-' {
+                    return Err(FormatError("invalid-recovery-code"));
+                }
+            } else if byte.is_ascii_hexdigit() {
+                digits.push(char::from(byte));
+            } else {
+                return Err(FormatError("invalid-recovery-code"));
+            }
+        }
+        let mut decoded = Zeroizing::new([0; 20]);
+        hex::decode_to_slice(digits.as_bytes(), decoded.as_mut())
+            .map_err(|_| FormatError("invalid-recovery-code"))?;
+        if super::content_identity::hash(&decoded[..16])[..4] != decoded[16..] {
+            return Err(FormatError("invalid-recovery-code"));
+        }
+        let mut secret = Zeroizing::new([0; 16]);
+        secret.copy_from_slice(&decoded[..16]);
+        Ok(Self(secret))
+    }
+}
+
+/// Only returned after authenticating the entire independent recovery envelope.
+pub struct RecoveredConnection {
+    pub root: Zeroizing<[u8; 32]>,
+    pub connection_metadata: Zeroizing<String>,
 }
 impl RecoveryEnvelope {
     fn binding(&self) -> Result<Vec<u8>> {
-        if self.repository_id.is_empty()
+        if self.schema != RECOVERY_SCHEMA
+            || self.repository_id.is_empty()
             || self.repository_id.len() > 128
-            || self.connection_metadata.len() > 8192
-            || !(16 * 1024..=64 * 1024).contains(&self.memory_kib)
-            || !(2..=4).contains(&self.iterations)
         {
             return Err(FormatError("invalid-recovery-envelope"));
         }
-        serde_json::to_vec(&(
-            "risunest.recovery/v1",
-            &self.repository_id,
-            &self.connection_metadata,
-            self.salt,
-            self.memory_kib,
-            self.iterations,
-        ))
-        .map_err(|_| FormatError("invalid-recovery-envelope"))
+        serde_json::to_vec(&(&self.schema, &self.repository_id, self.salt))
+            .map_err(|_| FormatError("invalid-recovery-envelope"))
     }
-    fn wrapping_key(&self, password: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+    fn wrapping_key(&self, code: &RecoveryCode) -> Result<Zeroizing<[u8; 32]>> {
         self.binding()?;
-        if password.is_empty() || password.len() > 1024 {
-            return Err(FormatError("invalid-recovery-secret"));
-        }
-        let params = argon2::Params::new(self.memory_kib, self.iterations, 1, Some(32))
-            .map_err(|_| FormatError("invalid-kdf-parameters"))?;
         let mut key = Zeroizing::new([0; 32]);
-        argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
-            .hash_password_into(password, &self.salt, key.as_mut())
+        hkdf::Hkdf::<sha2::Sha256>::new(Some(&self.salt), code.0.as_ref())
+            .expand(&self.binding()?, key.as_mut())
             .map_err(|_| FormatError("key-derivation-failed"))?;
         Ok(key)
     }
@@ -214,34 +256,57 @@ impl RecoveryEnvelope {
         repository_id: String,
         connection_metadata: String,
         root: &[u8; 32],
-        password: &[u8],
+        code: &RecoveryCode,
     ) -> Result<Self> {
+        let connection_metadata = Zeroizing::new(connection_metadata);
+        if connection_metadata.len() > 8192 {
+            return Err(FormatError("invalid-recovery-envelope"));
+        }
         let mut result = Self {
+            schema: RECOVERY_SCHEMA.into(),
             repository_id,
-            connection_metadata,
             salt: [0; 16],
-            memory_kib: 32 * 1024,
-            iterations: 2,
             wrapped_key: Vec::new(),
         };
         getrandom::getrandom(&mut result.salt)
             .map_err(|_| FormatError("randomness-unavailable"))?;
-        let key = result.wrapping_key(password)?;
+        let key = result.wrapping_key(code)?;
         let binding = result.binding()?;
+        let mut body = Zeroizing::new(Vec::with_capacity(32 + connection_metadata.len()));
+        body.extend_from_slice(root);
+        body.extend_from_slice(connection_metadata.as_bytes());
         encrypt(
-            &mut std::io::Cursor::new(root),
+            &mut std::io::Cursor::new(body.as_slice()),
             &mut result.wrapped_key,
             &key,
             &binding,
-            32,
+            body.len() as u64,
         )?;
         Ok(result)
     }
-    pub fn recover(&self, repository_id: &str, password: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
-        if self.repository_id != repository_id || self.wrapped_key.len() > 1024 {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.binding()?;
+        let bytes =
+            serde_json::to_vec(self).map_err(|_| FormatError("invalid-recovery-envelope"))?;
+        if bytes.len() > MAX_RECOVERY_BYTES {
             return Err(FormatError("invalid-recovery-envelope"));
         }
-        let key = self.wrapping_key(password)?;
+        Ok(bytes)
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_RECOVERY_BYTES {
+            return Err(FormatError("invalid-recovery-envelope"));
+        }
+        let value: Self =
+            serde_json::from_slice(bytes).map_err(|_| FormatError("invalid-recovery-envelope"))?;
+        value.binding()?;
+        Ok(value)
+    }
+    pub fn recover(&self, repository_id: &str, code: &RecoveryCode) -> Result<RecoveredConnection> {
+        if self.repository_id != repository_id || self.wrapped_key.len() > 16 * 1024 {
+            return Err(FormatError("invalid-recovery-envelope"));
+        }
+        let key = self.wrapping_key(code)?;
         let binding = self.binding()?;
         let mut root = Zeroizing::new(Vec::new());
         decrypt(
@@ -249,13 +314,19 @@ impl RecoveryEnvelope {
             &mut *root,
             &key,
             &binding,
-            32,
+            32 + 8192,
         )?;
         let bytes: [u8; 32] = root
-            .as_slice()
+            .get(..32)
+            .ok_or(FormatError("invalid-root-key"))?
             .try_into()
             .map_err(|_| FormatError("invalid-root-key"))?;
-        Ok(Zeroizing::new(bytes))
+        let metadata = std::str::from_utf8(&root[32..])
+            .map_err(|_| FormatError("invalid-recovery-envelope"))?;
+        Ok(RecoveredConnection {
+            root: Zeroizing::new(bytes),
+            connection_metadata: Zeroizing::new(metadata.into()),
+        })
     }
 }
 
@@ -315,32 +386,53 @@ mod tests {
     }
     #[test]
     fn recovery_is_independent_of_original_os_and_authenticates_connection_metadata() {
+        let code = RecoveryCode::generate().unwrap();
+        let recovered_code = RecoveryCode::parse(&code.expose()).unwrap();
         let envelope = RecoveryEnvelope::protect(
             "synthetic-repository".into(),
             "https://synthetic.invalid/folder".into(),
             &[9; 32],
-            b"synthetic recovery password",
+            &code,
         )
         .unwrap();
-        let encoded = serde_json::to_vec(&envelope).unwrap();
-        let mut imported: RecoveryEnvelope = serde_json::from_slice(&encoded).unwrap();
+        let encoded = envelope.encode().unwrap();
+        assert!(!String::from_utf8_lossy(&encoded).contains("synthetic.invalid"));
+        let mut imported = RecoveryEnvelope::decode(&encoded).unwrap();
         assert_eq!(
             *imported
-                .recover("synthetic-repository", b"synthetic recovery password")
-                .unwrap(),
+                .recover("synthetic-repository", &recovered_code)
+                .unwrap()
+                .root,
             [9; 32]
         );
-        assert!(imported.recover("synthetic-repository", b"wrong").is_err());
+        assert_eq!(
+            &*imported
+                .recover("synthetic-repository", &code)
+                .unwrap()
+                .connection_metadata,
+            "https://synthetic.invalid/folder"
+        );
         assert!(imported
-            .recover("another-repository", b"synthetic recovery password")
+            .recover("synthetic-repository", &RecoveryCode::generate().unwrap())
             .is_err());
-        imported.connection_metadata = "https://changed.invalid".into();
-        assert!(imported
-            .recover("synthetic-repository", b"synthetic recovery password")
-            .is_err());
-        imported.memory_kib = u32::MAX;
-        assert!(imported
-            .recover("synthetic-repository", b"synthetic recovery password")
-            .is_err());
+        assert!(imported.recover("another-repository", &code).is_err());
+        imported.salt[0] ^= 1;
+        assert!(imported.recover("synthetic-repository", &code).is_err());
+        let mut old: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        old["memoryKib"] = u32::MAX.into();
+        assert!(RecoveryEnvelope::decode(&serde_json::to_vec(&old).unwrap()).is_err());
+        assert!(RecoveryEnvelope::decode(&vec![b' '; MAX_RECOVERY_BYTES + 1]).is_err());
+    }
+    #[test]
+    fn recovery_code_rejects_passwords_typos_and_noncanonical_grouping() {
+        let code = RecoveryCode::generate().unwrap();
+        let text = code.expose();
+        assert!(RecoveryCode::parse(&text.to_uppercase()).is_ok());
+        for bad in ["password", "123456", &text.replace('-', "")] {
+            assert!(RecoveryCode::parse(bad).is_err());
+        }
+        let mut typo = text.as_bytes().to_vec();
+        typo[0] = if typo[0] == b'0' { b'1' } else { b'0' };
+        assert!(RecoveryCode::parse(std::str::from_utf8(&typo).unwrap()).is_err());
     }
 }

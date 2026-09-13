@@ -1,258 +1,7 @@
 use super::{capabilities::*, contract::*, publication::*, quota::*, registry::Registry};
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-fn capabilities(cas: bool) -> Capabilities {
-    Capabilities {
-        immutable_create: Evidence::Synthetic,
-        direct_complete_read: Evidence::Synthetic,
-        atomic_create_head: if cas {
-            Evidence::Synthetic
-        } else {
-            Evidence::Unverified
-        },
-        conditional_head_update: if cas {
-            Evidence::Synthetic
-        } else {
-            Evidence::Unverified
-        },
-        stable_head_replace: Evidence::Synthetic,
-        head_read_after_write: Evidence::Synthetic,
-        head_retry_control: Evidence::Synthetic,
-        ..Default::default()
-    }
-}
-
-#[derive(Default)]
-struct FakeState {
-    objects: BTreeMap<String, (Vec<u8>, u64)>,
-    next_version: u64,
-    lose_response: bool,
-}
-struct FakeProvider {
-    state: Mutex<FakeState>,
-    cas: bool,
-}
-impl FakeProvider {
-    fn new(cas: bool) -> Self {
-        Self {
-            state: Mutex::new(FakeState::default()),
-            cas,
-        }
-    }
-    fn write(
-        &self,
-        locator: &RemoteLocator,
-        expected: Option<&ExpectedHead>,
-        bytes: &[u8],
-    ) -> Result<HeadReceipt> {
-        if expected.is_some() && !self.cas {
-            return Err(ProviderError::new(ErrorKind::Unsupported));
-        }
-        let mut state = self.state.lock().unwrap();
-        let previous = state.objects.get(&locator.object);
-        if let Some(expected) = expected {
-            let matches = match (expected, previous) {
-                (ExpectedHead::Absent, None) => true,
-                (ExpectedHead::Exact(token), Some((_, v))) => token.0 == v.to_string(),
-                _ => false,
-            };
-            if !matches {
-                return Err(ProviderError::new(ErrorKind::PreconditionFailed));
-            }
-        }
-        state.next_version += 1;
-        let version = state.next_version;
-        state
-            .objects
-            .insert(locator.object.clone(), (bytes.into(), version));
-        if std::mem::take(&mut state.lose_response) {
-            return Err(ProviderError::new(ErrorKind::Transient));
-        }
-        Ok(HeadReceipt {
-            version: Some(VersionToken(version.to_string())),
-            complete: true,
-        })
-    }
-}
-impl Provider for FakeProvider {
-    fn open_repository<'a>(
-        &'a self,
-        _: &'a ConnectionConfig,
-        _: &'a SecretRef,
-        _: OpenMode,
-        c: &'a Cancellation,
-    ) -> ProviderFuture<'a, (RepositoryHandle, Capabilities)> {
-        Box::pin(async move {
-            c.check()?;
-            Ok((repository(), capabilities(self.cas)))
-        })
-    }
-    fn read_object<'a>(
-        &'a self,
-        r: &'a RepositoryHandle,
-        l: &'a RemoteLocator,
-        unchanged: Option<&'a VersionToken>,
-        sink: &'a mut dyn TransferSink,
-        c: &'a Cancellation,
-    ) -> ProviderFuture<'a, ReadReceipt> {
-        Box::pin(async move {
-            use tokio::io::AsyncWriteExt;
-            c.check()?;
-            l.validate_for(r)?;
-            let (bytes, version) = self
-                .state
-                .lock()
-                .unwrap()
-                .objects
-                .get(&l.object)
-                .cloned()
-                .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
-            let token = VersionToken(version.to_string());
-            if unchanged == Some(&token) {
-                return Ok(ReadReceipt::NotModified(token));
-            }
-            let hash = risunest_sync_wire::hash(&bytes);
-            let mut writer = sink.open(0, bytes.len() as u64, c).await?;
-            writer
-                .write_all(&bytes)
-                .await
-                .map_err(|_| ProviderError::new(ErrorKind::Transient))?;
-            writer
-                .shutdown()
-                .await
-                .map_err(|_| ProviderError::new(ErrorKind::Transient))?;
-            drop(writer);
-            sink.finish(bytes.len() as u64, &hash).await?;
-            Ok(ReadReceipt::Body(ObjectReceipt {
-                locator: l.clone(),
-                byte_length: bytes.len() as u64,
-                version: Some(token),
-                checksum: None,
-                complete: true,
-            }))
-        })
-    }
-    fn create_object<'a>(
-        &'a self,
-        r: &'a RepositoryHandle,
-        intent: &'a ObjectIntent,
-        source: &'a dyn TransferSource,
-        _: Option<&'a ResumeState>,
-        c: &'a Cancellation,
-    ) -> ProviderFuture<'a, ObjectReceipt> {
-        Box::pin(async move {
-            use tokio::io::AsyncReadExt;
-            c.check()?;
-            intent.validate(r)?;
-            if intent.byte_length > 1024 * 1024 || source.byte_length() != intent.byte_length {
-                return Err(ProviderError::new(ErrorKind::FileTooLarge));
-            }
-            let mut bytes = Vec::new();
-            source
-                .open(0, intent.byte_length, c)
-                .await?
-                .take(intent.byte_length + 1)
-                .read_to_end(&mut bytes)
-                .await
-                .map_err(|_| ProviderError::new(ErrorKind::Transient))?;
-            if bytes.len() as u64 != intent.byte_length
-                || risunest_sync_wire::hash(&bytes) != intent.sha256
-            {
-                return Err(ProviderError::new(ErrorKind::Corrupt));
-            }
-            let locator = RemoteLocator {
-                connection_identity: r.connection_identity.clone(),
-                collection: None,
-                object: intent.object_id.clone(),
-            };
-            let receipt = {
-                let mut state = self.state.lock().unwrap();
-                if let Some((old, _)) = state.objects.get(&intent.object_id) {
-                    if old != &bytes {
-                        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
-                    }
-                } else {
-                    state.next_version += 1;
-                    let v = state.next_version;
-                    state.objects.insert(intent.object_id.clone(), (bytes, v));
-                }
-                let (_, v) = state.objects.get(&intent.object_id).unwrap();
-                ObjectReceipt {
-                    locator,
-                    byte_length: intent.byte_length,
-                    version: Some(VersionToken(v.to_string())),
-                    checksum: None,
-                    complete: true,
-                }
-            };
-            Ok(receipt)
-        })
-    }
-    fn compare_exchange_head<'a>(
-        &'a self,
-        r: &'a RepositoryHandle,
-        l: &'a RemoteLocator,
-        e: &'a ExpectedHead,
-        h: &'a HeadBytes,
-        c: &'a Cancellation,
-    ) -> ProviderFuture<'a, HeadReceipt> {
-        Box::pin(async move {
-            c.check()?;
-            l.validate_for(r)?;
-            self.write(l, Some(e), h.as_bytes())
-        })
-    }
-    fn replace_head<'a>(
-        &'a self,
-        r: &'a RepositoryHandle,
-        l: &'a RemoteLocator,
-        h: &'a HeadBytes,
-        c: &'a Cancellation,
-    ) -> ProviderFuture<'a, HeadReceipt> {
-        Box::pin(async move {
-            c.check()?;
-            l.validate_for(r)?;
-            self.write(l, None, h.as_bytes())
-        })
-    }
-    fn list_objects<'a>(
-        &'a self,
-        _: &'a RepositoryHandle,
-        _: Collection,
-        _: Option<&'a str>,
-        _: u16,
-        _: &'a Cancellation,
-    ) -> ProviderFuture<'a, ObjectPage> {
-        Box::pin(async { Err(ProviderError::new(ErrorKind::Unsupported)) })
-    }
-    fn reconcile_upload<'a>(
-        &'a self,
-        _: &'a RepositoryHandle,
-        _: &'a ObjectIntent,
-        _: &'a ResumeState,
-        _: &'a Cancellation,
-    ) -> ProviderFuture<'a, UploadResolution> {
-        Box::pin(async { Ok(UploadResolution::RestartRequired) })
-    }
-    fn request_cost(&self, _: ProviderOperation) -> Vec<RequestCost> {
-        Vec::new()
-    }
-}
-fn repository() -> RepositoryHandle {
-    RepositoryHandle {
-        repository_id: "synthetic-repository".into(),
-        connection_identity: "synthetic-account/root".into(),
-        context: Box::new(()),
-    }
-}
-fn locator() -> RemoteLocator {
-    RemoteLocator {
-        connection_identity: repository().connection_identity,
-        collection: None,
-        object: "head".into(),
-    }
-}
+use super::fake::{capabilities, locator, repository, FakeProvider};
 fn observation(commit: &str) -> HeadObservation {
     HeadObservation {
         commit_id: commit.into(),
@@ -527,5 +276,82 @@ fn bounded_spool_round_trip_is_idempotent_and_rejects_corruption_and_overrun() {
         assert!(limited.finish(4, &digest).await.is_err());
         cancel.cancel();
         assert!(source.open(0, 1, &cancel).await.is_err());
+    });
+}
+
+#[test]
+fn fake_snapshot_discovery_and_lost_upload_reconcile_use_complete_immutable_objects() {
+    use super::transfer::SpoolSource;
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synthetic-snapshot");
+        std::fs::write(&path, b"synthetic-snapshot").unwrap();
+        let digest = risunest_sync_wire::hash(b"synthetic-snapshot");
+        let source = SpoolSource::verified(&path, 18, &digest).unwrap();
+        let provider = FakeProvider::new(true);
+        let repository = repository();
+        let cancel = Cancellation::default();
+        let mut intent = ObjectIntent {
+            repository_id: repository.repository_id.clone(),
+            job_id: "synthetic-job".into(),
+            object_id: "snapshot-a".into(),
+            role: ObjectRole::Snapshot,
+            byte_length: 18,
+            sha256: digest,
+        };
+        provider.state.lock().unwrap().lose_response = true;
+        assert_eq!(
+            provider
+                .create_object(&repository, &intent, &source, None, &cancel)
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::Transient
+        );
+        let resume = ResumeState {
+            sealed_state: SecretRef("synthetic-only".into()),
+            confirmed_offset: 0,
+            expires_at_ms: None,
+        };
+        assert!(matches!(
+            provider
+                .reconcile_upload(&repository, &intent, &resume, &cancel)
+                .await
+                .unwrap(),
+            UploadResolution::Complete(_)
+        ));
+        provider
+            .create_object(&repository, &intent, &source, None, &cancel)
+            .await
+            .unwrap();
+        intent.object_id = "snapshot-b".into();
+        provider
+            .create_object(&repository, &intent, &source, None, &cancel)
+            .await
+            .unwrap();
+        let first = provider
+            .list_objects(&repository, Collection::Snapshots, None, 1, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(first.objects[0].locator.object, "snapshot-a");
+        let second = provider
+            .list_objects(
+                &repository,
+                Collection::Snapshots,
+                first.next_cursor.as_deref(),
+                1,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.objects[0].locator.object, "snapshot-b");
+        assert!(second.next_cursor.is_none());
+        assert!(provider
+            .list_objects(&repository, Collection::BackupPoints, None, 10, &cancel)
+            .await
+            .unwrap()
+            .objects
+            .is_empty());
+        assert_eq!(provider.state.lock().unwrap().next_version, 2);
     });
 }

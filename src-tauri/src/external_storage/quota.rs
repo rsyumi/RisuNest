@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Bucket {
     pub limit: u64,
     pub used: u64,
@@ -13,6 +14,7 @@ pub(crate) struct Bucket {
     pub last_reset_ms: Option<u64>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct QuotaLedger {
     buckets: BTreeMap<String, Bucket>,
 }

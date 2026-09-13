@@ -39,6 +39,15 @@ pub struct Descriptor {
     pub publication_strategy: Option<Strategy>,
 }
 impl Descriptor {
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > 64 * 1024 {
+            return Err(FormatError("invalid-descriptor"));
+        }
+        let descriptor: Self =
+            serde_json::from_slice(bytes).map_err(|_| FormatError("invalid-descriptor"))?;
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
     pub fn new(repository_id: String, scope: Scope, strategy: Option<Strategy>) -> Result<Self> {
         let descriptor = Self {
             schema: SCHEMA.into(),
@@ -53,6 +62,7 @@ impl Descriptor {
     }
     pub fn validate(&self) -> Result<()> {
         if self.schema != SCHEMA
+            || !self.encrypted
             || self.repository_id.is_empty()
             || self.repository_id.len() > 128
             || self.scope_id != self.scope.id()
@@ -86,6 +96,28 @@ pub fn fingerprint(scope: &[u8; 32], entries: &BTreeMap<String, [u8; 32]>) -> [u
             .expect("BTreeMap keys are unique and sorted");
     }
     digest.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn encryption_is_required_for_every_repository() {
+        let scope = Scope {
+            library: true,
+            referenced_assets: true,
+            device_settings: false,
+            device_plugins: false,
+        };
+        for strategy in [None, Some(Strategy::Cas), Some(Strategy::Sequential)] {
+            let mut descriptor =
+                Descriptor::new("synthetic".into(), scope.clone(), strategy).unwrap();
+            descriptor.encrypted = false;
+            assert!(Descriptor::decode(&serde_json::to_vec(&descriptor).unwrap()).is_err());
+            assert!(descriptor.validate().is_err());
+            assert!(descriptor.require_scope(&scope.id()).is_err());
+        }
+    }
 }
 
 pub struct FingerprintBuilder {

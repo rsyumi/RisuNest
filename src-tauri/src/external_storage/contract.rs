@@ -146,16 +146,33 @@ impl ObjectIntent {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct Cancellation(Arc<AtomicBool>);
+pub(crate) struct Cancellation(Arc<CancelState>);
+#[derive(Default)]
+struct CancelState {
+    cancelled: AtomicBool,
+    notify: tokio::sync::Notify,
+}
 impl Cancellation {
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.cancelled.store(true, Ordering::Release);
+        self.0.notify.notify_waiters();
     }
     pub fn check(&self) -> Result<()> {
-        if self.0.load(Ordering::Acquire) {
+        if self.0.cancelled.load(Ordering::Acquire) {
             Err(ProviderError::new(ErrorKind::Cancelled))
         } else {
             Ok(())
+        }
+    }
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.0.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.check().is_err() {
+                return;
+            }
+            notified.await;
         }
     }
 }
