@@ -5,6 +5,7 @@ import { BufferToText, selectSingleFile } from "../util";
 import { alertError } from "../alert";
 import { isLite } from "../lite";
 import { CustomCSSStore, DBState, SafeModeStore } from "../stores.svelte";
+import { scheduleWindowsAppearance } from "./windowsAppearance";
 
 export interface ColorScheme{
     bgcolor: string;
@@ -282,6 +283,7 @@ export function updateColorScheme(){
         document.documentElement.style.setProperty("--risu-theme-darkborderc", colorScheme.darkBorderc);
         document.documentElement.style.setProperty("--risu-theme-darkbutton", colorScheme.darkbutton);
         ColorSchemeTypeStore.set(colorScheme.type)
+        scheduleWindowsAppearance(colorScheme);
     } catch (error) {}
 }
 
@@ -410,4 +412,5 @@ export function updateTextThemeAndCSS(){
     else{
         CustomCSSStore.set('')
     }
+    scheduleWindowsAppearance();
 }
