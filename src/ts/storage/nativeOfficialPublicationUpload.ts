@@ -25,8 +25,11 @@ type NativeOfficialPublicationAttemptResult =
           kind: 'not-modified'
           replacementKey: string
       })
-    | (NativeOfficialPublicationCommonResult & { kind: 'auth-warning' })
-    | (NativeOfficialPublicationCommonResult & { kind: 'reauthentication-needed' })
+    | (NativeOfficialPublicationCommonResult & { kind: 'auth-warning'; warning: string | null })
+    | (NativeOfficialPublicationCommonResult & {
+          kind: 'reauthentication-needed'
+          warning: string | null
+      })
 
 export type NativeOfficialPublicationResult =
     | {
@@ -43,7 +46,7 @@ export type NativeOfficialPublicationResult =
           status: number
           bytesUploaded: number
       }
-    | { kind: 'auth-warning'; status: number; bytesUploaded: number }
+    | { kind: 'auth-warning'; status: number; bytesUploaded: number; warning: string | null }
 
 export interface NativeOfficialPublicationFileUploaderDependencies {
     baseUrl: string
@@ -53,6 +56,7 @@ export interface NativeOfficialPublicationFileUploaderDependencies {
     reauthenticate(): Promise<void>
     getSession(): string | null
     setSession(session: string): void
+    onWarning?(warning: string): void
 }
 
 function assertAttemptResult(value: unknown): NativeOfficialPublicationAttemptResult {
@@ -68,6 +72,13 @@ function assertAttemptResult(value: unknown): NativeOfficialPublicationAttemptRe
         || typeof result.bytesUploaded !== 'number'
     ) {
         throw new Error('Native official publication returned an invalid result')
+    }
+    if (
+        (result.kind === 'auth-warning' || result.kind === 'reauthentication-needed') &&
+        result.warning !== null &&
+        typeof result.warning !== 'string'
+    ) {
+        throw new Error('Native official publication returned an invalid warning')
     }
     return result as NativeOfficialPublicationAttemptResult
 }
@@ -103,6 +114,9 @@ export class NativeOfficialPublicationFileUploader {
                     `Native official publication uploaded ${result.bytesUploaded} bytes, expected ${file.bytes}`,
                 )
             }
+            if (result.kind !== 'not-modified' && result.warning) {
+                this.dependencies.onWarning?.(result.warning)
+            }
             if (result.kind === 'reauthentication-needed') {
                 await this.dependencies.reauthenticate()
                 continue
@@ -129,6 +143,7 @@ export class NativeOfficialPublicationFileUploader {
                 kind: result.kind,
                 status: result.status,
                 bytesUploaded: result.bytesUploaded,
+                warning: result.warning,
             }
         }
     }

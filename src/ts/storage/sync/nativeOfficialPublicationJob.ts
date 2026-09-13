@@ -103,6 +103,7 @@ export function createNativeOfficialPublicationJobPublisher(
                         return {
                             kind: 'reauthentication-needed',
                             session: outcome.session,
+                            warning: outcome.warning,
                         }
                     }
                     pendingJobId = null
@@ -113,6 +114,7 @@ export function createNativeOfficialPublicationJobPublisher(
                         return {
                             kind: 'auth-warning',
                             session: publication.session,
+                            warning: publication.warning,
                         }
                     }
                     if (publication.kind === 'reauthentication-needed') {

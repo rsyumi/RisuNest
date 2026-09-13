@@ -2895,6 +2895,7 @@ describe('native file jobs', () => {
         const commands: string[] = []
         const publication = {
             kind: 'reauthentication-needed' as const,
+            warning: 'please sign in',
             accountId: 'account-1',
             session: null,
             saveDate: '1777777777777',
@@ -2986,6 +2987,7 @@ describe('native file jobs', () => {
                             },
                             publicationAttempt: {
                                 kind: 'reauthentication-needed',
+                                warning: 'please sign in',
                                 accountId: 'account-1',
                                 session: 'session-42',
                                 saveDate: '1000',
@@ -3002,6 +3004,7 @@ describe('native file jobs', () => {
 
         expect(outcome).toEqual({
             kind: 'waiting-for-reauthentication',
+            warning: 'please sign in',
             jobId: 'publication-1',
             accountId: 'account-1',
             session: 'session-42',
@@ -3106,6 +3109,7 @@ describe('native file jobs', () => {
             progress: { completedBytes: 512, completedItems: 1 },
             publicationAttempt: {
                 kind: 'reauthentication-needed' as const,
+                warning: null,
                 accountId: 'account-1',
                 session: 'session-43',
                 saveDate: '1001',
@@ -3161,6 +3165,7 @@ describe('native file jobs', () => {
 
         expect(firstOutcome).toEqual({
             kind: 'waiting-for-reauthentication',
+            warning: null,
             jobId: 'publication-1',
             accountId: 'account-1',
             session: 'session-43',
@@ -3407,6 +3412,7 @@ describe('native file jobs', () => {
                                     },
                                     publicationAttempt: {
                                         kind: 'reauthentication-needed',
+                                        warning: null,
                                         accountId: 'account-1',
                                         session: 'session-1',
                                         saveDate: '1000',
@@ -3484,6 +3490,7 @@ describe('native file jobs', () => {
                                 result: undefined,
                                 publicationAttempt: {
                                     kind: 'reauthentication-needed' as const,
+                                    warning: null,
                                     accountId: 'account-1',
                                     session: 'session-1',
                                     saveDate: '1000',

@@ -12,7 +12,10 @@
     import { alertConfirm, alertError, alertNormal } from "src/ts/alert";
     import { forageStorage } from "src/ts/globalApi.svelte";
     import { isTauri, isNodeServer } from "src/ts/platform";
-    import { unMigrationAccount } from "src/ts/storage/accountStorage";
+    import {
+        unMigrationAccount,
+        accountUnmigrationBusy,
+    } from "src/ts/storage/accountStorage";
     import { checkDriver } from "src/ts/drive/drive";
     import {
         SavePartialLocalBackup,
@@ -369,9 +372,11 @@
         <h1 class="text-3xl font-black min-w-0">
             Risu Account{#if DBState.db.account}
                 <button
-                    disabled={isTauri && nativeAccountBusy}
+                    disabled={(isTauri && nativeAccountBusy) ||
+                        $accountUnmigrationBusy}
                     class="bg-selected p-1 text-sm font-light rounded-md hover:bg-blue-500 transition-colors float-right"
                     onclick={async () => {
+                        if ($accountUnmigrationBusy) return;
                         if (isTauri) {
                             if (nativeAccountBusy) return;
                             await runNativeAccountOperation(() =>
@@ -381,7 +386,14 @@
                             DBState.db.account.useSync ||
                             forageStorage.isAccount
                         ) {
-                            unMigrationAccount();
+                            try {
+                                await unMigrationAccount();
+                            } catch (error) {
+                                alertError(
+                                    `${language.accountUnmigration.failed}\n${error instanceof Error ? error.message : String(error)}`,
+                                );
+                            }
+                            return;
                         }
                         DBState.db.account = undefined;
                     }}>{language.logout}</button
@@ -429,17 +441,28 @@
                     >{language.googleDriveConnected}</span
                 >
             {/if}
-            <div class="flex items-center mt-2">
+            <fieldset
+                disabled={$accountUnmigrationBusy}
+                class="flex items-center mt-2"
+            >
                 {#if DBState.db.account.useSync || forageStorage.isAccount}
-                    <Check
-                        check={true}
-                        name={language.SaveDataInAccount}
-                        onChange={(v) => {
-                            if (v) {
-                                unMigrationAccount();
-                            }
-                        }}
-                    />
+                    {#key $accountUnmigrationBusy}
+                        <Check
+                            check={true}
+                            name={language.SaveDataInAccount}
+                            onChange={async (v) => {
+                                if (!v && !$accountUnmigrationBusy) {
+                                    try {
+                                        await unMigrationAccount();
+                                    } catch (error) {
+                                        alertError(
+                                            `${language.accountUnmigration.failed}\n${error instanceof Error ? error.message : String(error)}`,
+                                        );
+                                    }
+                                }
+                            }}
+                        />
+                    {/key}
                 {:else}
                     <Check
                         check={false}
@@ -452,7 +475,7 @@
                         }}
                     />
                 {/if}
-            </div>
+            </fieldset>
         {/if}
     {:else}
         <span>{language.notLoggedIn}</span>

@@ -15,6 +15,7 @@ describe('NativeOfficialPublicationFileUploader', () => {
         const invoke = vi.fn()
             .mockResolvedValueOnce({
                 kind: 'reauthentication-needed',
+                warning: 'please sign in',
                 session: 'session-42',
                 saveDate: '1000',
                 status: 403,
@@ -33,10 +34,10 @@ describe('NativeOfficialPublicationFileUploader', () => {
         const reauthenticate = vi.fn(async () => {
             credential = { kind: 'risu-auth', token: 'new-token' }
         })
-        const now = vi.fn()
-            .mockReturnValueOnce(1000)
-            .mockReturnValueOnce(1001)
+        const now = vi.fn().mockReturnValueOnce(1000).mockReturnValueOnce(1001)
+        const onWarning = vi.fn()
         const uploader = new NativeOfficialPublicationFileUploader({
+            onWarning,
             baseUrl: 'https://account.invalid',
             credential: () => credential,
             invoke,
@@ -62,6 +63,7 @@ describe('NativeOfficialPublicationFileUploader', () => {
 
         expect(reauthenticate).toHaveBeenCalledOnce()
         expect(sharedSession).toBe('session-42')
+        expect(onWarning).toHaveBeenCalledWith('please sign in')
         expect(invoke.mock.calls).toEqual([
             ['official_publication_upload_file', {
                 request: {
@@ -92,6 +94,7 @@ describe('NativeOfficialPublicationFileUploader', () => {
             credential: () => ({ kind: 'risu-auth', token: 'token' }),
             invoke: vi.fn(async () => ({
                 kind: 'auth-warning',
+                warning: 'quota exceeded',
                 session: 'session-1',
                 saveDate: '1000',
                 status: 403,
@@ -105,8 +108,12 @@ describe('NativeOfficialPublicationFileUploader', () => {
             },
         })
 
-        await expect(uploader.upload({ path: 'snapshot.risudat', bytes: 21 }))
-            .resolves.toEqual({ kind: 'auth-warning', status: 403, bytesUploaded: 21 })
+        await expect(uploader.upload({ path: 'snapshot.risudat', bytes: 21 })).resolves.toEqual({
+            kind: 'auth-warning',
+            status: 403,
+            bytesUploaded: 21,
+            warning: 'quota exceeded',
+        })
         expect(reauthenticate).not.toHaveBeenCalled()
         expect(sharedSession).toBe('session-1')
     })

@@ -993,6 +993,13 @@ export const languageEnglish = {
     risuSaveExportComplete: "RisuSave export completed.",
     risuSaveCleanupWarning: "The operation completed, but a temporary native file could not be cleaned up. It will be retried at startup.",
     risuSaveRevisionConflict: "The database changed while the operation was starting. Please try again.",
+    accountUnmigration: {
+        preparing: "Preparing to store account data locally",
+        cold: "Downloading and verifying archived data",
+        assets: "Downloading and verifying assets",
+        finishing: "Finishing the switch to local storage",
+        failed: "Could not finish switching to local storage. If data changed during the operation, wait for other work to finish and try again.",
+    },
     cancelRisuSaveOperation: "Cancel RisuSave operation",
     loadPocketRisuBackup: "Import PocketRisu Backup",
     pocketRisuImportConfirm: "This imports a backup file exported from PocketRisu, including its inlay media. Current data will be replaced. Continue?",

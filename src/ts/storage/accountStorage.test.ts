@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AccountNativeOfficialWriteAttemptContext } from './accountStorage'
 import type { NativeOfficialAccountFlow } from './sync/nativeOfficialAccountFlow'
+import {
+    SaveCoordinator,
+    makeDatabase,
+    makeStore,
+    captureRoot,
+} from './saveCoordinator.testSupport'
 
 const mocks = vi.hoisted(() => {
     const cache = new Map<string, unknown>()
@@ -42,6 +48,7 @@ const mocks = vi.hoisted(() => {
         replacePersistentDatabase: vi.fn(),
         runtime: { revision: 11 },
         isTauri: false,
+        alertSet: vi.fn(),
     }
 })
 
@@ -55,7 +62,7 @@ vi.mock('./database.svelte', () => ({
 vi.mock('../alert', () => ({
     alertLogin: mocks.alertLogin,
     alertNormalWait: mocks.alertNormalWait,
-    alertStore: { set: vi.fn() },
+    alertStore: { set: mocks.alertSet },
 }))
 vi.mock('../globalApi.svelte', () => ({
     forageStorage: { keys: vi.fn() },
@@ -64,7 +71,17 @@ vi.mock('../globalApi.svelte', () => ({
 }))
 vi.mock('../sionyw', () => ({ fetchProtectedResource: mocks.fetchProtectedResource }))
 vi.mock('../util', () => ({ sleep: mocks.sleep }))
-vi.mock('src/lang', () => ({ language: { activeTabChange: 'active tab changed' } }))
+vi.mock('src/lang', () => ({
+    language: {
+        activeTabChange: 'active tab changed',
+        accountUnmigration: {
+            preparing: 'Preparing local data',
+            cold: 'Checking cold data',
+            assets: 'Checking assets',
+            finishing: 'Disabling account sync',
+        },
+    },
+}))
 vi.mock('./databaseRestore', async (importOriginal) => ({
     ...await importOriginal<typeof import('./databaseRestore')>(),
     completeAccountUnmigration: mocks.completeAccountUnmigration,
@@ -110,6 +127,7 @@ async function loadStorage() {
 }
 
 beforeEach(() => {
+    mocks.alertSet.mockClear()
     vi.resetModules()
     mocks.fetchProtectedResource.mockReset()
     mocks.alertLogin.mockReset().mockResolvedValue('new-token')
@@ -172,6 +190,170 @@ function cancellableResponse(
 }
 
 describe('AccountStorage structured wire contract', () => {
+    it('keeps a newer edit and account access when an unmigration download outlives its snapshot', async () => {
+        vi.useFakeTimers()
+        const database = makeDatabase()
+        database.account = mocks.database.account as typeof database.account
+        const store = makeStore()
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: vi.fn(),
+        })
+        coordinator.initialize(11)
+        mocks.materializePersistentDatabaseSnapshotWithRevision.mockResolvedValue({
+            database: structuredClone(database),
+            revision: 11,
+            mutationGeneration: 0,
+        })
+        const actual =
+            await vi.importActual<typeof import('./databaseRestore')>('./databaseRestore')
+        mocks.completeAccountUnmigration.mockImplementation(actual.completeAccountUnmigration)
+        mocks.replacePersistentDatabase.mockImplementation((candidate, reason, options) =>
+            coordinator.replacePersistentDatabase(candidate, reason, options),
+        )
+        mocks.getColdStorageItem.mockResolvedValue({ character: database.characters[0] })
+        mocks.getUncleanablesSync.mockReturnValue(['assets/remote.png'])
+        let finishDownload!: (value: Response) => void
+        mocks.fetchProtectedResource.mockImplementation(
+            () =>
+                new Promise((resolve) => {
+                    finishDownload = resolve
+                }),
+        )
+        localStorage.setItem('accountst', 'able')
+        localStorage.setItem('fallbackRisuToken', JSON.stringify(database.account))
+        const { unMigrationAccount } = await loadStorage()
+        const operation = unMigrationAccount()
+        const rejection = expect(operation).rejects.toThrow('mutation generation')
+        await vi.waitFor(() => expect(mocks.fetchProtectedResource).toHaveBeenCalledOnce())
+        database.username = 'Newer local edit'
+        coordinator.markPersistentDataDirty(1)
+        finishDownload(response(Uint8Array.of(7)))
+        await rejection
+        expect(database.username).toBe('Newer local edit')
+        expect(database.account?.useSync).toBe(true)
+        expect(mocks.database.account.useSync).toBe(true)
+        expect(store.replaceFromDatabase).not.toHaveBeenCalled()
+        expect(localStorage.getItem('accountst')).toBe('able')
+        expect(localStorage.getItem('fallbackRisuToken')).not.toBeNull()
+        expect(mocks.blobAssets.get('assets/remote.png')).toEqual(Uint8Array.of(7))
+    })
+
+    it('can retry a failed download and clears markers only after successful replacement', async () => {
+        const actual =
+            await vi.importActual<typeof import('./databaseRestore')>('./databaseRestore')
+        mocks.completeAccountUnmigration.mockImplementation(actual.completeAccountUnmigration)
+        mocks.getColdStorageItem.mockResolvedValue({ character: {} })
+        mocks.getUncleanablesSync.mockReturnValue(['assets/retry.png'])
+        mocks.fetchProtectedResource
+            .mockRejectedValueOnce(new Error('offline'))
+            .mockResolvedValueOnce(response(Uint8Array.of(8)))
+        localStorage.setItem('accountst', 'able')
+        localStorage.setItem('dosync', 'sync')
+        localStorage.setItem('fallbackRisuToken', JSON.stringify(mocks.database.account))
+        const reload = vi.spyOn(location, 'reload').mockImplementation(() => undefined)
+        mocks.replacePersistentDatabase.mockImplementation(async (candidate) => {
+            expect(candidate.account).toBeNull()
+            expect(localStorage.getItem('accountst')).toBe('able')
+            expect(mocks.blobAssets.get('assets/retry.png')).toEqual(Uint8Array.of(8))
+        })
+        const { unMigrationAccount } = await loadStorage()
+        await expect(unMigrationAccount()).rejects.toThrow('offline')
+        expect(localStorage.getItem('accountst')).toBe('able')
+        expect(reload).not.toHaveBeenCalled()
+        await unMigrationAccount()
+        expect(localStorage.getItem('accountst')).toBeNull()
+        expect(localStorage.getItem('dosync')).toBe('avoid')
+        expect(localStorage.getItem('fallbackRisuToken')).toBeNull()
+        expect(reload).toHaveBeenCalledOnce()
+        reload.mockRestore()
+    })
+    it.each([true, false])(
+        'publishes JSON warnings on 403 before auth handling (warn header: %s)',
+        async (warn) => {
+            mocks.fetchProtectedResource
+                .mockResolvedValueOnce(response(JSON.stringify({ sessionNumber: 1 })))
+                .mockResolvedValueOnce(
+                    response(
+                        JSON.stringify({ warning: 'account quota', reloadSession: true }),
+                        403,
+                        {
+                            'content-type': 'application/json; charset=utf-8',
+                            ...(warn ? { 'x-risu-status': 'warn' } : {}),
+                        },
+                    ),
+                )
+                .mockResolvedValueOnce(response('database/database.bin'))
+            const { AccountStorage, AccountWarning } = await loadStorage()
+            const warnings: string[] = []
+            const unsubscribe = AccountWarning.subscribe((value) => warnings.push(value))
+            const result = await new AccountStorage().writeItem(
+                'database/database.bin',
+                Uint8Array.of(1),
+            )
+            unsubscribe()
+            expect(warnings).toEqual(['', 'account quota'])
+            expect(result.kind).toBe(warn ? 'auth-warning' : 'written')
+            expect(mocks.alertLogin).toHaveBeenCalledTimes(warn ? 0 : 1)
+            expect(mocks.cachedForage.setItem).toHaveBeenCalledTimes(warn ? 0 : 2)
+            expect(mocks.alertNormalWait).not.toHaveBeenCalled()
+        },
+    )
+
+    it.each(['auth-warning', 'reauthentication-needed'] as const)(
+        'publishes a native %s warning before returning or retrying',
+        async (kind) => {
+            const { AccountStorage, AccountWarning } = await loadStorage()
+            const warnings: string[] = []
+            const unsubscribe = AccountWarning.subscribe((value) => warnings.push(value))
+            const attempt = vi
+                .fn()
+                .mockResolvedValueOnce({ kind, session: 'session', warning: 'native quota' })
+                .mockResolvedValueOnce({
+                    kind: 'written',
+                    session: 'session',
+                    replacementKey: 'database/database.bin',
+                    receipt: {},
+                })
+            await new AccountStorage().writeOfficialDatabaseFromNative(attempt)
+            unsubscribe()
+            expect(warnings).toEqual(['', 'native quota'])
+            expect(attempt).toHaveBeenCalledTimes(kind === 'auth-warning' ? 1 : 2)
+        },
+    )
+
+    it('shares an in-flight unmigration, shows progress, and preserves account markers after a conflict', async () => {
+        let fail!: (error: Error) => void
+        mocks.completeAccountUnmigration.mockImplementation(
+            () =>
+                new Promise((_resolve, reject) => {
+                    fail = reject
+                }),
+        )
+        localStorage.setItem('accountst', 'able')
+        localStorage.setItem('dosync', 'sync')
+        localStorage.setItem('fallbackRisuToken', JSON.stringify(mocks.database.account))
+        const { unMigrationAccount, accountUnmigrationBusy } = await loadStorage()
+        const busy: boolean[] = []
+        const unsubscribe = accountUnmigrationBusy.subscribe((value) => busy.push(value))
+        const first = unMigrationAccount()
+        const second = unMigrationAccount()
+        expect(first).toBe(second)
+        expect(mocks.alertSet).toHaveBeenCalledWith({ type: 'wait', msg: 'Preparing local data' })
+        const rejection = expect(first).rejects.toThrow('Expected mutation generation')
+        await vi.waitFor(() => expect(mocks.completeAccountUnmigration).toHaveBeenCalledOnce())
+        fail(new Error('Expected mutation generation'))
+        await rejection
+        expect(localStorage.getItem('accountst')).toBe('able')
+        expect(localStorage.getItem('dosync')).toBe('sync')
+        expect(localStorage.getItem('fallbackRisuToken')).not.toBeNull()
+        expect(mocks.database.account.useSync).toBe(true)
+        expect(mocks.alertSet).toHaveBeenLastCalledWith({ type: 'none', msg: '' })
+        expect(busy).toEqual([false, true, false])
+        unsubscribe()
+    })
     it('passes a safe credential, save date, session, and signal to a native database attempt', async () => {
         const signal = new AbortController().signal
         const attempt = vi.fn(async () => ({

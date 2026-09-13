@@ -55,12 +55,14 @@ pub(crate) enum OfficialPublicationUploadResult {
         save_date: String,
         status: u16,
         bytes_uploaded: u64,
+        warning: Option<String>,
     },
     ReauthenticationNeeded {
         session: String,
         save_date: String,
         status: u16,
         bytes_uploaded: u64,
+        warning: Option<String>,
     },
 }
 
@@ -279,12 +281,26 @@ pub(crate) async fn upload_open_file_attempt(
         });
     }
     if status == 403 {
+        let warning = if json_response {
+            let bytes = response_bytes(response).await?;
+            serde_json::from_slice::<Value>(&bytes)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("warning")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+        } else {
+            None
+        };
         return Ok(if warning_status {
             OfficialPublicationUploadResult::AuthWarning {
                 session,
                 save_date: request.save_date,
                 status,
                 bytes_uploaded,
+                warning,
             }
         } else {
             OfficialPublicationUploadResult::ReauthenticationNeeded {
@@ -292,6 +308,7 @@ pub(crate) async fn upload_open_file_attempt(
                 save_date: request.save_date,
                 status,
                 bytes_uploaded,
+                warning,
             }
         });
     }
@@ -539,6 +556,7 @@ mod tests {
                     save_date: "1725000000123".to_owned(),
                     status: 403,
                     bytes_uploaded: 8,
+                    warning: None,
                 },
             ),
             (
@@ -552,6 +570,7 @@ mod tests {
                     save_date: "1725000000123".to_owned(),
                     status: 403,
                     bytes_uploaded: 8,
+                    warning: None,
                 },
             ),
             (
@@ -738,6 +757,43 @@ mod tests {
                 OfficialPublicationUploadResult::Written { .. } => "written",
             };
             assert_eq!(actual_kind, expected_kind);
+        }
+    }
+
+    #[test]
+    fn forbidden_json_keeps_warning_text_on_both_authentication_outcomes() {
+        let directory = TempDir::new().unwrap();
+        let source = directory.path().join("snapshot.risudat");
+        std::fs::write(&source, b"snapshot").unwrap();
+        for warn in [false, true] {
+            let headers: &[(&str, &str)] = if warn {
+                &[
+                    ("content-type", "application/json"),
+                    ("x-risu-status", "warn"),
+                ]
+            } else {
+                &[("content-type", "application/json")]
+            };
+            let (base_url, _, server) = mock_server(vec![MockResponse {
+                status: 403,
+                headers,
+                body: br#"{"warning":"quota","reloadSession":true}"#,
+            }]);
+            let mut input = request(base_url, &source);
+            input.session = Some("existing".to_owned());
+            let result = tauri::async_runtime::block_on(upload_file_attempt(input)).unwrap();
+            server.join().unwrap();
+            let value = serde_json::to_value(result).unwrap();
+            assert_eq!(value["warning"], "quota");
+            assert_eq!(
+                value["kind"],
+                if warn {
+                    "auth-warning"
+                } else {
+                    "reauthentication-needed"
+                }
+            );
+            assert!(value.get("reloadSession").is_none());
         }
     }
 }

@@ -189,6 +189,7 @@ describe('native official publication recovery', () => {
                 ...base.result,
                 publication: {
                     kind: 'reauthentication-needed',
+                    warning: 'please sign in again',
                     accountId: 'account-1',
                     session: null,
                     saveDate: '1700000000001',
@@ -205,6 +206,7 @@ describe('native official publication recovery', () => {
                 ...mismatchBase.result,
                 publication: {
                     kind: 'auth-warning',
+                    warning: null,
                     accountId: 'account-2',
                     session: 'session-3',
                     saveDate: '1700000000002',
@@ -235,7 +237,10 @@ describe('native official publication recovery', () => {
         expect(mismatchAcknowledge).toHaveBeenCalledOnce()
         expect(adoptPublishedRevision).not.toHaveBeenCalled()
         expect(adoptRecoveredOfficialWrite).toHaveBeenCalledOnce()
-        expect(adoptRecoveredOfficialWrite).toHaveBeenCalledWith({ session: null })
+        expect(adoptRecoveredOfficialWrite).toHaveBeenCalledWith({
+            session: null,
+            warning: 'please sign in again',
+        })
         expect(recovery.hasPending()).toBe(false)
     })
 })

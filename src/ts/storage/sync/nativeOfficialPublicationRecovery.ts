@@ -60,6 +60,7 @@ export function createNativeOfficialPublicationRecovery(
             if (authenticationOutcome) {
                 dependencies.account.adoptRecoveredOfficialWrite({
                     session: publication.session,
+                    warning: publication.warning,
                 })
                 await receipt.acknowledge()
                 pending.delete(jobId)

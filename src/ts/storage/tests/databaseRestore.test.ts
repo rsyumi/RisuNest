@@ -177,8 +177,10 @@ describe('account unmigration resource materialization', () => {
         const localCold = new Map<string, unknown>([['cold-local', { message: ['local'] }]])
         const assetWrites: string[] = []
         const coldWrites: string[] = []
+        const onProgress = vi.fn()
 
         await materializeAccountUnmigrationResources({
+            onProgress,
             coldKeys: ['cold-local', 'cold-remote'],
             collectAssetKeys: () => ['assets/local.png', 'assets/remote.png'],
             isValidCold: (value) => typeof value === 'object' && value !== null,
@@ -204,6 +206,14 @@ describe('account unmigration resource materialization', () => {
         expect(coldWrites).toEqual(['cold-remote'])
         expect(localAssets.get('assets/remote.png')).toEqual(new Uint8Array([9, 8]))
         expect(localCold.get('cold-remote')).toEqual({ message: ['remote'] })
+        expect(onProgress.mock.calls).toEqual([
+            ['cold', 0, 2],
+            ['cold', 1, 2],
+            ['cold', 2, 2],
+            ['assets', 0, 2],
+            ['assets', 1, 2],
+            ['assets', 2, 2],
+        ])
     })
 
     it('fails before transition when a copied payload cannot be verified', async () => {

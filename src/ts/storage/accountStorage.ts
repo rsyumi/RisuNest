@@ -51,15 +51,15 @@ export interface AccountNativeOfficialWriteAttemptContext {
 
 export type AccountNativeOfficialWriteAttemptResult<T> =
     | {
-        kind: 'written' | 'not-modified'
-        session: string | null
-        replacementKey: string
-        warning?: string | null
-        reloadSession?: boolean
-        receipt: T
-    }
-    | { kind: 'auth-warning'; session: string | null }
-    | { kind: 'reauthentication-needed'; session: string | null }
+          kind: 'written' | 'not-modified'
+          session: string | null
+          replacementKey: string
+          warning?: string | null
+          reloadSession?: boolean
+          receipt: T
+      }
+    | { kind: 'auth-warning'; session: string | null; warning?: string | null }
+    | { kind: 'reauthentication-needed'; session: string | null; warning?: string | null }
 
 export type AccountNativeOfficialWriteResult<T> =
     | {
@@ -142,7 +142,7 @@ function waitForever(): Promise<never> {
 }
 
 function publishAccountWarning(warning: string | null | undefined): void {
-    if (!warning || seenWarnings.includes(warning)) return
+    if (typeof warning !== 'string' || !warning || seenWarnings.includes(warning)) return
     seenWarnings.push(warning)
     AccountWarning.set(warning)
 }
@@ -235,9 +235,17 @@ export class AccountStorage{
                 await cacheDatabaseWrite(this.databaseCache, key, value, saveDate)
                 return { kind: 'not-modified', replacementKey: key }
             }
-            if(da.status === 403){
-                await discardResponseBody(da)
-                if(da.headers.get('x-risu-status') === 'warn'){
+            if (da.status === 403) {
+                if (isJsonResponse(da)) {
+                    // A malformed warning must not change the authentication outcome.
+                    const text = await getDaText()
+                    try {
+                        publishAccountWarning(JSON.parse(text)?.warning)
+                    } catch {}
+                } else {
+                    await discardResponseBody(da)
+                }
+                if (da.headers.get('x-risu-status') === 'warn') {
                     return { kind: 'auth-warning' }
                 }
                 await this.reauthenticate(options.signal)
@@ -280,12 +288,12 @@ export class AccountStorage{
             })
             if (result === null) return null
             if (result.session !== null) risuSession = result.session
+            publishAccountWarning(result.warning)
             if (result.kind === 'reauthentication-needed') {
                 await this.reauthenticate(options.signal)
                 continue
             }
             if (result.kind === 'auth-warning') return { kind: 'auth-warning' }
-            publishAccountWarning(result.warning)
             return {
                 kind: result.kind,
                 replacementKey: result.replacementKey,
@@ -429,13 +437,28 @@ export class AccountStorage{
     listItem = this.keys
 }
 
-export async function unMigrationAccount() {
+export const accountUnmigrationBusy = writable(false)
+let accountUnmigration: Promise<void> | null = null
+
+export function unMigrationAccount(): Promise<void> {
     if (isTauri) {
-        throw new Error('Account unmigration is only available on the web')
+        return Promise.reject(new Error('Account unmigration is only available on the web'))
     }
-    const snapshot = await materializePersistentDatabaseSnapshotWithRevision(
-        'account-unmigration',
-    )
+    if (accountUnmigration) return accountUnmigration
+    accountUnmigration = Promise.resolve()
+        .then(performAccountUnmigration)
+        .finally(() => {
+            accountUnmigration = null
+            accountUnmigrationBusy.set(false)
+            alertStore.set({ type: 'none', msg: '' })
+        })
+    accountUnmigrationBusy.set(true)
+    alertStore.set({ type: 'wait', msg: language.accountUnmigration.preparing })
+    return accountUnmigration
+}
+
+async function performAccountUnmigration(): Promise<void> {
+    const snapshot = await materializePersistentDatabaseSnapshotWithRevision('account-unmigration')
     const db = snapshot.database
     const expectedRevision = snapshot.revision
     const expectedMutationGeneration = snapshot.mutationGeneration
@@ -455,56 +478,67 @@ export async function unMigrationAccount() {
     const coldKeys = await listColdDataKeys(db)
 
     await completeAccountUnmigration(db, {
-        prepareResources: () => materializeAccountUnmigrationResources({
-            coldKeys,
-            collectAssetKeys: (selectedCold) => {
-                const chars = db.characters.map((character) => {
-                    if (!character.coldstorage) return character
-                    const selected = selectedCold.get(character.coldstorage) as {
-                        character?: typeof character
-                    } | undefined
-                    return selected?.character?.chaId === character.chaId
-                        ? selected.character
-                        : character
-                })
-                return selectLegacyBackupAssetKeys(
-                    getUncleanablesSync(db, 'pure', { chars }),
-                )
-            },
-            isValidCold: isColdStorageBackupData,
-            readLocalAsset: (key) => blobStore.read(key),
-            readRemoteAsset: async (key) => {
-                const result = await accountStorage.readItem(key)
-                return result.kind === 'missing' ? null : result.bytes
-            },
-            writeLocalAsset: async (key, bytes) => {
-                const name = key.replace(/\\/g, '/').split('/').pop() ?? key
-                await storeActiveAsset(blobStore, key, bytes, {
-                    kind: 'asset',
-                    mime: '',
-                    name,
-                    ext: name.split('.').pop() ?? '',
-                })
-            },
-            readLocalCold: (key) => getColdStorageItem(key, { accountFallback: true }),
-            readRemoteCold: async (key) => {
-                const value = await getAccountColdStorageItem(key)
-                if (value !== null && !isColdStorageBackupData(value)) {
-                    throw new Error(`Invalid account cold payload: ${key}`)
-                }
-                return value
-            },
-            writeLocalCold: async (key, value) => {
-                if (!await setLocalColdStorageItem(key, value)) {
-                    throw new Error(`Failed to write local cold payload: ${key}`)
-                }
-            },
-        }),
-        replaceDatabase: (database, reason) => replacePersistentDatabase(database, reason, {
-            authoritative: true,
-            expectedRevision,
-            expectedMutationGeneration,
-        }),
+        prepareResources: () =>
+            materializeAccountUnmigrationResources({
+                coldKeys,
+                onProgress: (stage, completed, total) => {
+                    alertStore.set({
+                        type: 'wait',
+                        msg: `${language.accountUnmigration[stage]} (${completed}/${total})`,
+                    })
+                },
+                collectAssetKeys: (selectedCold) => {
+                    const chars = db.characters.map((character) => {
+                        if (!character.coldstorage) return character
+                        const selected = selectedCold.get(character.coldstorage) as
+                            | {
+                                  character?: typeof character
+                              }
+                            | undefined
+                        return selected?.character?.chaId === character.chaId
+                            ? selected.character
+                            : character
+                    })
+                    return selectLegacyBackupAssetKeys(getUncleanablesSync(db, 'pure', { chars }))
+                },
+                isValidCold: isColdStorageBackupData,
+                readLocalAsset: (key) => blobStore.read(key),
+                readRemoteAsset: async (key) => {
+                    const result = await accountStorage.readItem(key)
+                    return result.kind === 'missing' ? null : result.bytes
+                },
+                writeLocalAsset: async (key, bytes) => {
+                    const name = key.replace(/\\/g, '/').split('/').pop() ?? key
+                    await storeActiveAsset(blobStore, key, bytes, {
+                        kind: 'asset',
+                        mime: '',
+                        name,
+                        ext: name.split('.').pop() ?? '',
+                    })
+                },
+                readLocalCold: (key) => getColdStorageItem(key, { accountFallback: true }),
+                readRemoteCold: async (key) => {
+                    const value = await getAccountColdStorageItem(key)
+                    if (value !== null && !isColdStorageBackupData(value)) {
+                        throw new Error(`Invalid account cold payload: ${key}`)
+                    }
+                    return value
+                },
+                writeLocalCold: async (key, value) => {
+                    if (!(await setLocalColdStorageItem(key, value))) {
+                        throw new Error(`Failed to write local cold payload: ${key}`)
+                    }
+                },
+            }),
+        replaceDatabase: (database, reason) => {
+            alertStore.set({ type: 'wait', msg: language.accountUnmigration.finishing })
+            // Keep the snapshot guards: concurrent edits must survive a failed transition.
+            return replacePersistentDatabase(database, reason, {
+                authoritative: true,
+                expectedRevision,
+                expectedMutationGeneration,
+            })
+        },
         finalize: () => {
             alertStore.set({ type: "none", msg: "" })
             localStorage.setItem('dosync', 'avoid')

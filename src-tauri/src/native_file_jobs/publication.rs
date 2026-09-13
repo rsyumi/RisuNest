@@ -299,7 +299,7 @@ async fn upload_attempt(
     let warning_status =
         response.headers().get("x-risu-status") == Some(&HeaderValue::from_static("warn"));
     let json_response = is_json_response(&response);
-    if matches!(status, 304 | 403) {
+    if status == 304 || (status == 403 && !json_response) {
         return classify_response(
             status,
             warning_status,
@@ -310,7 +310,7 @@ async fn upload_attempt(
             save_date,
         );
     }
-    if !(200..300).contains(&status) {
+    if status != 403 && !(200..300).contains(&status) {
         return Err(NativeJobError::new(
             "http-status",
             format!("official publication server returned HTTP {status}"),
@@ -498,12 +498,30 @@ fn classify_response(
         });
     }
     if status == 403 {
+        // Warning content is optional; malformed JSON still follows the 403 auth path.
+        let warning = if json_response {
+            bytes
+                .as_deref()
+                .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+                .and_then(|value| {
+                    value
+                        .get("warning")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+        } else {
+            None
+        };
+        if let Some(warning) = &warning {
+            validate_string(warning, MAX_PRIVATE_STRING_BYTES, true, "warning")?;
+        }
         return Ok(if warning_status {
             OfficialPublicationAttemptResult::AuthWarning {
                 account_id: account_id.to_owned(),
                 session,
                 save_date: save_date.to_owned(),
                 status,
+                warning,
             }
         } else {
             OfficialPublicationAttemptResult::ReauthenticationNeeded {
@@ -511,6 +529,7 @@ fn classify_response(
                 session,
                 save_date: save_date.to_owned(),
                 status,
+                warning,
             }
         });
     }
@@ -1007,6 +1026,42 @@ mod tests {
     }
 
     #[test]
+    fn forbidden_json_preserves_warning_without_changing_authentication_outcome() {
+        for warning_status in [false, true] {
+            for (body, expected) in [
+                (
+                    br#"{"warning":"quota","reloadSession":true}"#.as_slice(),
+                    Some("quota"),
+                ),
+                (b"not-json".as_slice(), None),
+                (br#"{"warning":42}"#.as_slice(), None),
+            ] {
+                let result = classify_response(
+                    403,
+                    warning_status,
+                    true,
+                    Some(body.to_vec()),
+                    "account-1",
+                    None,
+                    "date",
+                )
+                .unwrap();
+                let value = serde_json::to_value(result).unwrap();
+                assert_eq!(
+                    value["kind"],
+                    if warning_status {
+                        "auth-warning"
+                    } else {
+                        "reauthentication-needed"
+                    }
+                );
+                assert_eq!(value["warning"], serde_json::to_value(expected).unwrap());
+                assert!(value.get("reloadSession").is_none());
+            }
+        }
+    }
+
+    #[test]
     fn written_response_and_errors_are_bounded_without_echoing_credentials() {
         let error = classify_response(
             200,
@@ -1414,6 +1469,48 @@ mod tests {
         cancellation.join().unwrap();
         server.join().unwrap();
         payload.cleanup().unwrap();
+    }
+
+    #[test]
+    fn upload_reads_json_warnings_for_both_403_authentication_outcomes() {
+        for warning_status in [false, true] {
+            let (_directory, payload) = publication_payload();
+            let mut headers = vec![("Content-Type", "application/json; charset=utf-8".to_owned())];
+            if warning_status {
+                headers.push(("x-risu-status", "warn".to_owned()));
+            }
+            let (base_url, server) = mock_server(vec![MockResponse {
+                status: 403,
+                headers,
+                body: br#"{"warning":"quota","reloadSession":true}"#.to_vec(),
+            }]);
+            let result = tauri::async_runtime::block_on(upload_attempt(
+                &build_client().unwrap(),
+                &payload,
+                &base_url,
+                "account-1",
+                Some("session".to_owned()),
+                "date",
+                &OfficialPublicationCredential::RisuAuth {
+                    token: "token".to_owned(),
+                },
+                running_job(),
+            ))
+            .unwrap();
+            let value = serde_json::to_value(result).unwrap();
+            assert_eq!(value["warning"], "quota");
+            assert_eq!(
+                value["kind"],
+                if warning_status {
+                    "auth-warning"
+                } else {
+                    "reauthentication-needed"
+                }
+            );
+            assert!(value.get("reloadSession").is_none());
+            assert_eq!(server.join().unwrap().len(), 1);
+            payload.cleanup().unwrap();
+        }
     }
 
     #[test]

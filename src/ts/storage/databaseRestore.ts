@@ -31,6 +31,7 @@ interface AccountUnmigrationResourceDependencies {
     readLocalCold(key: string): Promise<unknown | null>
     readRemoteCold(key: string): Promise<unknown | null>
     writeLocalCold(key: string, value: unknown): Promise<void>
+    onProgress?(stage: 'cold' | 'assets', completed: number, total: number): void
 }
 
 function equalBytes(left: Uint8Array | null, right: Uint8Array): boolean {
@@ -42,13 +43,17 @@ export async function materializeAccountUnmigrationResources(
     dependencies: AccountUnmigrationResourceDependencies,
 ): Promise<void> {
     const selectedCold = new Map<string, unknown>()
-    for (const key of dependencies.coldKeys) {
+    const coldKeys = [...new Set(dependencies.coldKeys)]
+    let completed = 0
+    dependencies.onProgress?.('cold', completed, coldKeys.length)
+    for (const key of coldKeys) {
         const local = await dependencies.readLocalCold(key)
         if (local !== null) {
             if (!dependencies.isValidCold(local)) {
                 throw new Error(`Invalid local cold payload: ${key}`)
             }
             selectedCold.set(key, local)
+            dependencies.onProgress?.('cold', ++completed, coldKeys.length)
             continue
         }
         const remote = await dependencies.readRemoteCold(key)
@@ -62,16 +67,24 @@ export async function materializeAccountUnmigrationResources(
             throw new Error(`Failed to verify local cold payload: ${key}`)
         }
         selectedCold.set(key, verified)
+        dependencies.onProgress?.('cold', ++completed, coldKeys.length)
     }
 
-    for (const key of dependencies.collectAssetKeys(selectedCold)) {
-        if (await dependencies.readLocalAsset(key)) continue
+    const assetKeys = [...new Set(dependencies.collectAssetKeys(selectedCold))]
+    completed = 0
+    dependencies.onProgress?.('assets', completed, assetKeys.length)
+    for (const key of assetKeys) {
+        if (await dependencies.readLocalAsset(key)) {
+            dependencies.onProgress?.('assets', ++completed, assetKeys.length)
+            continue
+        }
         const remote = await dependencies.readRemoteAsset(key)
         if (!remote) throw new Error(`Missing account asset: ${key}`)
         await dependencies.writeLocalAsset(key, remote)
         if (!equalBytes(await dependencies.readLocalAsset(key), remote)) {
             throw new Error(`Failed to verify local asset: ${key}`)
         }
+        dependencies.onProgress?.('assets', ++completed, assetKeys.length)
     }
 }
 

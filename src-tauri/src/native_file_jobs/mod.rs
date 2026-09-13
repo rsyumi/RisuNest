@@ -152,12 +152,14 @@ pub(crate) enum OfficialPublicationAttemptResult {
         session: Option<String>,
         save_date: String,
         status: u16,
+        warning: Option<String>,
     },
     ReauthenticationNeeded {
         account_id: String,
         session: Option<String>,
         save_date: String,
         status: u16,
+        warning: Option<String>,
     },
 }
 
@@ -4109,15 +4111,20 @@ fn validate_official_publication_attempt(
             session,
             save_date,
             status,
+            warning,
         }
         | OfficialPublicationAttemptResult::ReauthenticationNeeded {
             account_id,
             session,
             save_date,
             status,
+            warning,
         } => {
             if *status != 403 {
                 return Err("official publication authentication status is invalid".to_owned());
+            }
+            if let Some(warning) = warning {
+                validate_bounded_publication_string(warning, 4096, true, "warning")?;
             }
             (account_id, session, save_date, status)
         }
@@ -4340,6 +4347,7 @@ mod tests {
             session: Some("stale-session".to_owned()),
             save_date: "stale-date".to_owned(),
             status: 403,
+            warning: None,
         }
     }
 

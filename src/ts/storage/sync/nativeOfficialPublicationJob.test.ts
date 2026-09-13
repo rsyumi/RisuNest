@@ -67,6 +67,7 @@ function receipt(
 
 function accountHarness() {
     const completeReload = vi.fn(async () => undefined)
+    const warnings: Array<string | null | undefined> = []
     const account: Pick<AccountStorage, 'writeOfficialDatabaseFromNative'> = {
         async writeOfficialDatabaseFromNative<T>(
             attempt: AccountNativeOfficialWriteAttempt<T>,
@@ -79,6 +80,7 @@ function accountHarness() {
                 signal: options?.signal,
             })
             if (attempted === null) return null
+            warnings.push(attempted.warning)
             if (attempted.kind === 'auth-warning') return { kind: 'auth-warning' }
             if (attempted.kind === 'reauthentication-needed') {
                 attempted = await attempt({
@@ -101,7 +103,7 @@ function accountHarness() {
             }
         },
     }
-    return { account, completeReload }
+    return { account, completeReload, warnings }
 }
 
 describe('native official publication job publisher', () => {
@@ -168,13 +170,17 @@ describe('native official publication job publisher', () => {
 
     it('acknowledges consumed auth outcomes and returns capability fallback before a job exists', async () => {
         const authAcknowledge = vi.fn(async () => undefined)
-        const authReceipt = receipt({
-            kind: 'auth-warning',
-            accountId: 'account-1',
-            session: null,
-            saveDate: '1700000000000',
-            status: 403,
-        }, authAcknowledge)
+        const authReceipt = receipt(
+            {
+                kind: 'auth-warning',
+                warning: 'quota exceeded',
+                accountId: 'account-1',
+                session: null,
+                saveDate: '1700000000000',
+                status: 403,
+            },
+            authAcknowledge,
+        )
         const authHarness = accountHarness()
         const authPublisher = createNativeOfficialPublicationJobPublisher({
             ...authHarness,
@@ -192,6 +198,7 @@ describe('native official publication job publisher', () => {
             resourceReplacements: {},
         })).rejects.toThrow('authorization warning')
         expect(authAcknowledge).toHaveBeenCalledOnce()
+        expect(authHarness.warnings).toEqual(['quota exceeded'])
 
         const unavailableHarness = accountHarness()
         const unavailable = createNativeOfficialPublicationJobPublisher({
@@ -221,6 +228,7 @@ describe('native official publication job publisher', () => {
         })
         const runAttempt = vi.fn(async (_request: NativeOfficialPublicationRequest) => ({
             kind: 'waiting-for-reauthentication' as const,
+            warning: 'please sign in',
             jobId: 'publication-1',
             accountId: 'account-1',
             session: 'session-42',
@@ -246,6 +254,7 @@ describe('native official publication job publisher', () => {
             resourceReplacements: { 'asset://old': 'asset://new' },
         })
 
+        expect(harness.warnings).toEqual(['please sign in'])
         expect(runAttempt).toHaveBeenCalledOnce()
         expect(runAttempt.mock.calls[0][0]).toMatchObject({
             lease: 'snapshot-publication-1',
@@ -289,6 +298,7 @@ describe('native official publication job publisher', () => {
             baseUrl: 'https://hub.invalid',
             runAttempt: vi.fn(async () => ({
                 kind: 'waiting-for-reauthentication' as const,
+                warning: null,
                 jobId: 'publication-1',
                 accountId: 'account-1',
                 session: 'session-42',
@@ -319,6 +329,7 @@ describe('native official publication job publisher', () => {
             baseUrl: 'https://hub.invalid',
             runAttempt: vi.fn(async () => ({
                 kind: 'waiting-for-reauthentication' as const,
+                warning: null,
                 jobId: 'publication-1',
                 accountId: 'account-1',
                 session: 'session-42',
@@ -395,6 +406,7 @@ describe('native official publication job publisher', () => {
             baseUrl: 'https://hub.invalid',
             runAttempt: vi.fn(async () => ({
                 kind: 'waiting-for-reauthentication' as const,
+                warning: null,
                 jobId: 'publication-1',
                 accountId: 'account-1',
                 session: 'session-42',
@@ -453,6 +465,7 @@ describe('native official publication job publisher', () => {
             baseUrl: 'https://hub.invalid',
             runAttempt: vi.fn(async () => ({
                 kind: 'waiting-for-reauthentication' as const,
+                warning: null,
                 jobId: 'publication-1',
                 accountId: 'account-1',
                 session: 'session-42',

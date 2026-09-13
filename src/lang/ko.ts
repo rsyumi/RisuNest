@@ -850,6 +850,13 @@ export const languageKorean = {
     "risuSaveExportComplete": "RisuSave 내보내기가 완료되었습니다.",
     "risuSaveCleanupWarning": "작업은 완료되었지만 네이티브 임시 파일을 정리하지 못했습니다. 앱 시작 시 다시 정리합니다.",
     "risuSaveRevisionConflict": "작업을 시작하는 동안 데이터베이스가 변경되었습니다. 다시 시도해주세요.",
+    accountUnmigration: {
+        preparing: "계정 데이터를 로컬에 저장할 준비 중",
+        cold: "보관된 데이터 다운로드 및 검증 중",
+        assets: "자산 다운로드 및 검증 중",
+        finishing: "로컬 저장소로 전환 마무리 중",
+        failed: "로컬 저장소로 전환을 완료하지 못했습니다. 작업 중 데이터가 변경되었다면 다른 작업이 끝난 후 다시 시도해주세요.",
+    },
     "cancelRisuSaveOperation": "RisuSave 작업 취소",
     "loadPocketRisuBackup": "PocketRisu 백업 가져오기",
     "pocketRisuImportConfirm": "PocketRisu에서 내보낸 백업 파일을 인레이 미디어까지 포함해 가져옵니다. 현재 데이터가 교체됩니다. 계속하시겠습니까?",

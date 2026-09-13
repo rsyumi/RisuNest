@@ -139,9 +139,10 @@ export type NativeOfficialPublicationAttemptResult =
           kind: 'not-modified'
           replacementKey: string
       })
-    | (NativeOfficialPublicationCommonResult & { kind: 'auth-warning' })
+    | (NativeOfficialPublicationCommonResult & { kind: 'auth-warning'; warning: string | null })
     | (NativeOfficialPublicationCommonResult & {
           kind: 'reauthentication-needed'
+          warning: string | null
       })
 
 export interface NativeOfficialPublicationRequest {
@@ -169,6 +170,7 @@ export interface NativeOfficialPublicationReceipt {
 export type NativeOfficialPublicationRunResult =
     | {
           kind: 'waiting-for-reauthentication'
+          warning: string | null
           jobId: string
           accountId: string
           session: string | null
@@ -2315,7 +2317,10 @@ function assertOfficialPublicationResult(
             break
         case 'auth-warning':
         case 'reauthentication-needed':
-            return result as unknown as NativeOfficialPublicationAttemptResult
+            if (result.warning === null || isBoundedString(result.warning, 4_096, true)) {
+                return result as unknown as NativeOfficialPublicationAttemptResult
+            }
+            break
     }
     throw new NativeFileJobError(
         'invalid-result',
@@ -2648,6 +2653,7 @@ async function pollNativeOfficialPublication(
                 }
                 return {
                     kind: 'waiting-for-reauthentication',
+                    warning: publication.warning,
                     jobId,
                     accountId: publication.accountId,
                     session: publication.session,
