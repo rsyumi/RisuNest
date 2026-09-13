@@ -55,8 +55,12 @@ export interface CommitTransportDependencies {
     windows(): boolean
     android?(): boolean
     linux?(): boolean
+    macos?(): boolean
     androidBinary?(): AndroidBinaryCommitBridge | null
-    invoke<T>(command: string, args?: Record<string, unknown> | Uint8Array): Promise<T>
+    invoke<T>(
+        command: string,
+        args?: Record<string, unknown> | Uint8Array,
+    ): Promise<T>
     encode(input: CommitEnvelope): Promise<Uint8Array>
     shared(): SharedWebview | undefined
 }
@@ -74,10 +78,14 @@ export class NativeCommitTransport {
     private async send(input: CommitEnvelope): Promise<{ revision: number }> {
         const deps = this.dependencies
         const android = deps.android?.() ?? false
-        const linux = deps.linux?.() ?? false
+        const rawDesktop =
+            (deps.linux?.() ?? false) || (deps.macos?.() ?? false)
         if (
-            (!android && !linux && !deps.windows()) ||
-            !isLargeCommit(input, android ? ANDROID_LARGE_COMMIT_SIZE : LARGE_COMMIT_BYTES)
+            (!android && !rawDesktop && !deps.windows()) ||
+            !isLargeCommit(
+                input,
+                android ? ANDROID_LARGE_COMMIT_SIZE : LARGE_COMMIT_BYTES,
+            )
         )
             return deps.invoke('pds_commit', { ...input })
         let bytes: Uint8Array
@@ -100,7 +108,7 @@ export class NativeCommitTransport {
                 deps.androidBinary ? deps.androidBinary() : getAndroidBinaryCommitBridge(),
             )
         }
-        if (linux) return deps.invoke('pds_commit_raw', bytes)
+        if (rawDesktop) return deps.invoke('pds_commit_raw', bytes)
         const webview = deps.shared()
         if (!webview || bytes.byteLength > MAX_SHARED_COMMIT_BYTES)
             return deps.invoke('pds_commit_raw', bytes)
@@ -218,16 +226,29 @@ export function encodeNativeCommit(input: CommitEnvelope): Promise<Uint8Array> {
 }
 
 export const nativeCommitTransport = new NativeCommitTransport({
+    macos: () =>
+        Boolean(
+            (window as Window & { __TAURI_INTERNALS__?: unknown })
+                .__TAURI_INTERNALS__,
+        ) && platform() === 'macos',
     linux: () =>
-        Boolean((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) &&
-        platform() === 'linux',
+        Boolean(
+            (window as Window & { __TAURI_INTERNALS__?: unknown })
+                .__TAURI_INTERNALS__,
+        ) && platform() === 'linux',
     android: () =>
-        Boolean((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) &&
-        platform() === 'android',
+        Boolean(
+            (window as Window & { __TAURI_INTERNALS__?: unknown })
+                .__TAURI_INTERNALS__,
+        ) && platform() === 'android',
     windows: () =>
-        Boolean((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) &&
-        platform() === 'windows',
+        Boolean(
+            (window as Window & { __TAURI_INTERNALS__?: unknown })
+                .__TAURI_INTERNALS__,
+        ) && platform() === 'windows',
     invoke,
     encode: encodeNativeCommit,
-    shared: () => (window as Window & { chrome?: { webview?: SharedWebview } }).chrome?.webview,
+    shared: () =>
+        (window as Window & { chrome?: { webview?: SharedWebview } }).chrome
+            ?.webview,
 })

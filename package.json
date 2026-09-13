@@ -52,7 +52,10 @@
     "benchmark:linux:build:agent": "vite build --mode agent --config benchmarks/linux/vite.config.ts",
     "benchmark:streaming:android:agent": "tauri android build --debug --apk --target x86_64 --ci --config benchmarks/streaming/tauri.conf.json",
     "check:production-bundle": "node tests/productionBundle.mjs",
-    "check:benchmark-harnesses": "svelte-check --tsconfig benchmarks/tsconfig.json"
+    "check:benchmark-harnesses": "svelte-check --tsconfig benchmarks/tsconfig.json",
+    "benchmark:macos:build:agent": "vite build --mode agent --config benchmarks/macos/vite.config.ts",
+    "macos:build:agent": "tauri build --bundles app --config src-tauri/tauri.agent.conf.json -- --locked",
+    "macos:build": "tauri build --bundles app -- --locked"
   },
   "dependencies": {
     "@adobe/css-tools": "4.4.4",

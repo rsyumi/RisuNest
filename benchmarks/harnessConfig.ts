@@ -4,7 +4,9 @@ import { defineConfig, mergeConfig, type Plugin } from "vite";
 import productConfig from "../vite.config";
 
 // Harnesses consume the product's compiler/plugins; product builds do not load this file.
-export function harnessConfig(name: "streaming" | "tokenizer" | "linux") {
+export function harnessConfig(
+  name: "streaming" | "tokenizer" | "linux" | "macos",
+) {
   return defineConfig(async (environment) => {
     if (environment.mode !== "agent")
       throw new Error("Harnesses require --mode agent");

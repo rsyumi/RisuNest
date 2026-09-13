@@ -1,0 +1,17 @@
+[package]
+name = "risunest-macos-bench"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = "2.6.3"
+
+[dependencies]
+risunest = { path = "../../../src-tauri" }
+tauri = { version = "2.11.5", features = ["protocol-asset"] }
+serde_json = "1"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol", "risunest/custom-protocol"]
+

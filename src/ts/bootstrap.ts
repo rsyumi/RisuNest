@@ -78,6 +78,7 @@ import {
     publishCurrentOfficialRevision,
 } from "./storage/persistentDataRuntime.svelte";
 import { registerLifecycleCommitListeners } from "./storage/lifecycleCommit";
+import { platform as nativePlatform } from '@tauri-apps/plugin-os'
 import { resolveBlobStore } from "./storage/platformBlobStore";
 import {
     OfficialAccountSnapshotAdapter,
@@ -137,6 +138,7 @@ export { assignIds } from "./storage/databasePreparation";
 
 const appWindow = isTauri ? getCurrentWebviewWindow() : null
 let disposeLifecycleCommitListeners: (() => void) | undefined
+let disposeMacosLifecycle: (() => void) | undefined
 let disposeAndroidScreenshotRecovery: (() => void) | undefined
 
 function registerAndroidScreenshotPublicationRecovery() {
@@ -601,6 +603,36 @@ export async function loadData() {
             hasPendingSync: () => hasPendingOfficialPublication(),
             confirmExit: () => alertConfirm(language.exitSyncPendingWarning),
         })
+
+        if (
+            isTauriDesktop &&
+            nativePlatform() === 'macos' &&
+            !disposeMacosLifecycle
+        ) {
+            const { registerMacosLifecycle } = await import(
+                './storage/macosLifecycle'
+            )
+            const { flushPendingData } = await import(
+                './storage/persistentDataRuntime.svelte'
+            )
+            const { checkpointNativePersistentStore } = await import(
+                './storage/nativePersistentMaintenance'
+            )
+            disposeMacosLifecycle = await registerMacosLifecycle({
+                flush: () => flushPendingData('exit'),
+                checkpoint: () => checkpointNativePersistentStore('truncate'),
+                confirmExitWithoutSaving: () =>
+                    alertConfirm(
+                        'Saving failed. Choose Yes to exit without saving, or No to keep the app open and retry.',
+                    ),
+                sync: {
+                    isSyncActive: () => forageStorage.isAccount,
+                    hasPendingSync: () => hasPendingOfficialPublication(),
+                    confirmExit: () =>
+                        alertConfirm(language.exitSyncPendingWarning),
+                },
+            })
+        }
 
         if (isTauriDesktop) {
             await transition('update-check', language.risuNest.startup.update)
