@@ -16,7 +16,7 @@ pnpm benchmark:macos:build:agent
 node benchmarks/macos/prepare.mjs
 export CARGO_TARGET_DIR="$PWD/src-tauri/target"
 export APPLE_SIGNING_IDENTITY=-
-(cd benchmarks/macos/native && pnpm exec tauri build --ci --bundles app -- --locked)
+(cd benchmarks/macos/native && node ../../../node_modules/@tauri-apps/cli/tauri.js build --ci --bundles app -- --locked)
 python3 benchmarks/macos/run.py \
   --app "$CARGO_TARGET_DIR/release/bundle/macos/RisuNest Mac Bench.app" \
   --artifacts artifacts/wkwebview
@@ -30,7 +30,7 @@ Those generated files are ignored. The separate Cargo lock retains the product's
 dependency versions. The harness adds only its own package, with no automation
 server dependency or remote control listener.
 
-The controller runs three process phases:
+The controller runs four process phases:
 
 1. Contracts: JSON/Worker saves, malformed/stale rejection, exact Unicode/revision
    readback, native regex/JS oracle, literal tokenizer IDs/errors and batched
@@ -38,8 +38,10 @@ The controller runs three process phases:
    LaunchServices actions reopen the hidden window and deliver Finder file URLs.
    A failed save cancels quit, then a successful save/checkpoint permits quit.
 2. Restart: the same synthetic profile must retain the final revision and hash.
-3. App: mount the ordinary Svelte product entry, await the native runtime and
-   rendered UI, then exit through the product bootstrap's lifecycle listener.
+3. App: mount the ordinary Svelte product entry, await interactive startup, open
+   a synthetic character, edit a message and verify rendering/native persistence,
+   then exit through the product bootstrap's lifecycle listener.
+4. App restart: verify the edited product message survived quit and restart.
 
 Reports contain synthetic assertions, timings and hashes. Persistence samples
 record the commands actually used, so small inputs remaining on JSON cannot be

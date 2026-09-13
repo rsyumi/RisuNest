@@ -317,9 +317,16 @@ export interface PersistentDataRuntime {
     ): Promise<void>
     markPersistentDataDirty(estimatedBytes: number): void
     flushPendingData(reason: string): Promise<void>
+    flushPendingDataLocally(reason: string): Promise<void>
     acknowledgeGenerationCompletion(): Promise<void>
-    commitCharacterAddition(request: CharacterAdditionRequest, reason: string): Promise<void>
-    activateCharacter(id: string, options?: CharacterActivationOptions): Promise<boolean>
+    commitCharacterAddition(
+        request: CharacterAdditionRequest,
+        reason: string,
+    ): Promise<void>
+    activateCharacter(
+        id: string,
+        options?: CharacterActivationOptions,
+    ): Promise<boolean>
     activateConversation(id: string): Promise<boolean>
     getActiveConversationSession(): ActiveConversationSession | null
     getSelectedConversationMode(): 'complete' | 'windowed' | null
@@ -333,7 +340,9 @@ export interface PersistentDataRuntime {
         reason: string,
         target?: SelectedConversationTarget | null,
     ): Promise<CompleteConversationLease>
-    tryDemoteSelectedConversation(target?: SelectedConversationTarget | null): boolean
+    tryDemoteSelectedConversation(
+        target?: SelectedConversationTarget | null,
+    ): boolean
     refreshSelectedConversationAfterReplacement(
         target: SelectedConversationTarget,
         expectedSession: ActiveConversationSession,
@@ -356,7 +365,10 @@ export interface PersistentDataRuntime {
         reason: string,
         mutations: readonly PluginStorageMutation[],
     ): Promise<void>
-    mutatePersistentPresets(reason: string, mutate: PersistentPresetMutation): Promise<void>
+    mutatePersistentPresets(
+        reason: string,
+        mutate: PersistentPresetMutation,
+    ): Promise<void>
     appendPersistentRootModule(
         reason: string,
         input: import('./saveCoordinator').PersistentRootModuleAppend,
@@ -396,7 +408,10 @@ export interface PersistentDataRuntime {
         createOrMutate: PersistentCompleteCharacterUpsert,
         options?: PersistentCompleteCharacterUpsertOptions,
     ): Promise<boolean>
-    readPersistentCharacterDetail(characterId: string, reason: string): Promise<CharacterDetail | null>
+    readPersistentCharacterDetail(
+        characterId: string,
+        reason: string,
+    ): Promise<CharacterDetail | null>
     readPersistentCompleteCharacter(
         characterId: string,
         reason: string,
@@ -415,7 +430,9 @@ export interface PersistentDataRuntime {
         characterId: string,
         reason: string,
     ): Promise<PersistentSelectedConversation | null>
-    capturePersistentMutationToken(reason: string): Promise<PersistentMutationToken>
+    capturePersistentMutationToken(
+        reason: string,
+    ): Promise<PersistentMutationToken>
     acquireDestructiveReplacementFence(
         expected: PersistentMutationToken,
     ): Promise<PersistentDestructiveReplacementFence>
@@ -694,20 +711,25 @@ export function createPersistentDataRuntime(
             return coordinator.revision
         },
         getStorageAuthorityEpoch: () => coordinator.storageAuthorityEpoch,
-        initializeActiveWorkingSet: (database) => workingSet.initializeActiveWorkingSet(database),
+        initializeActiveWorkingSet: (database) =>
+            workingSet.initializeActiveWorkingSet(database),
         refreshActiveWorkingSetFromStore: (revision) =>
             refreshCommittedWorkingSet(revision),
-        runStorageOnlyMutation: (operation) => coordinator.runStorageOnlyMutation(operation),
+        runStorageOnlyMutation: (operation) =>
+            coordinator.runStorageOnlyMutation(operation),
         markPersistentDataDirty: (estimatedBytes) =>
             coordinator.markPersistentDataDirty(estimatedBytes),
         flushPendingData: (reason) => coordinator.flushPendingData(reason),
+        flushPendingDataLocally: (reason) =>
+            coordinator.flushPendingDataLocally(reason),
         acknowledgeGenerationCompletion: () =>
             coordinator.flushPendingDataLocally('generation-completion'),
         commitCharacterAddition: (request, reason) =>
             coordinator.commitCharacterAddition(request, reason),
         activateCharacter,
         activateConversation: (id) => workingSet.activateConversation(id),
-        getActiveConversationSession: () => workingSet.activeConversationSession,
+        getActiveConversationSession: () =>
+            workingSet.activeConversationSession,
         getSelectedConversationMode: () => workingSet.selectedConversationMode,
         getActiveConversationViewportSource: () =>
             workingSet.activeConversationViewportSource,
@@ -721,12 +743,22 @@ export function createPersistentDataRuntime(
             workingSet.acquireCompleteConversation(reason, target ?? undefined),
         tryDemoteSelectedConversation: (target) =>
             workingSet.tryDemoteSelectedConversation(target ?? undefined),
-        refreshSelectedConversationAfterReplacement: (target, expectedSession) =>
-            workingSet.refreshSelectedConversationAfterReplacement(target, expectedSession),
-        invalidateActiveConversationSession: () => workingSet.invalidateActiveConversationSession(),
+        refreshSelectedConversationAfterReplacement: (
+            target,
+            expectedSession,
+        ) =>
+            workingSet.refreshSelectedConversationAfterReplacement(
+                target,
+                expectedSession,
+            ),
+        invalidateActiveConversationSession: () =>
+            workingSet.invalidateActiveConversationSession(),
         deactivateActiveWorkingSet: () => workingSet.deactivate(),
         reconcileActiveCharacterIds: (database, selectedCharacterId) =>
-            workingSet.reconcileActiveCharacterIds(database, selectedCharacterId),
+            workingSet.reconcileActiveCharacterIds(
+                database,
+                selectedCharacterId,
+            ),
         getNavigationGeneration: () => workingSet.navigationGenerationToken,
         fenceNavigation: () => workingSet.fenceNavigation(),
         invalidateNavigation: () => workingSet.invalidateNavigation(),
@@ -753,28 +785,61 @@ export function createPersistentDataRuntime(
             coordinator.mutatePersistentPresets(reason, mutate),
         appendPersistentRootModule: (reason, input, signal) =>
             coordinator.appendPersistentRootModule(reason, input, signal),
-        mutateConversationBinding: (characterId, conversationId, patch, publish) =>
-            coordinator.mutateConversationBinding(characterId, conversationId, patch, publish),
+        mutateConversationBinding: (
+            characterId,
+            conversationId,
+            patch,
+            publish,
+        ) =>
+            coordinator.mutateConversationBinding(
+                characterId,
+                conversationId,
+                patch,
+                publish,
+            ),
         mutatePersistentCharacterDetail: (characterId, reason, mutate) =>
-            coordinator.mutatePersistentCharacterDetail(characterId, reason, mutate),
+            coordinator.mutatePersistentCharacterDetail(
+                characterId,
+                reason,
+                mutate,
+            ),
         deletePersistentCharacterWithGroupReferences: (characterId, reason) =>
-            coordinator.deletePersistentCharacterWithGroupReferences(characterId, reason),
-        replacePersistentCompleteCharacter: (characterId, reason, mutate, options) =>
-            coordinator.replacePersistentCompleteCharacter(characterId, reason, mutate, options),
+            coordinator.deletePersistentCharacterWithGroupReferences(
+                characterId,
+                reason,
+            ),
+        replacePersistentCompleteCharacter: (
+            characterId,
+            reason,
+            mutate,
+            options,
+        ) =>
+            coordinator.replacePersistentCompleteCharacter(
+                characterId,
+                reason,
+                mutate,
+                options,
+            ),
         replacePersistentConversation: (
             characterId,
             conversationId,
             reason,
             replacement,
             options,
-        ) => coordinator.replacePersistentConversation(
+        ) =>
+            coordinator.replacePersistentConversation(
+                characterId,
+                conversationId,
+                reason,
+                replacement,
+                options,
+            ),
+        upsertPersistentCompleteCharacter: (
             characterId,
-            conversationId,
             reason,
-            replacement,
+            createOrMutate,
             options,
-        ),
-        upsertPersistentCompleteCharacter: (characterId, reason, createOrMutate, options) =>
+        ) =>
             coordinator.upsertPersistentCompleteCharacter(
                 characterId,
                 reason,
@@ -786,21 +851,32 @@ export function createPersistentDataRuntime(
         readPersistentCompleteCharacter: (characterId, reason) =>
             coordinator.readPersistentCompleteCharacter(characterId, reason),
         readPersistentConversation: (characterId, conversationId, reason) =>
-            coordinator.readPersistentConversation(characterId, conversationId, reason),
+            coordinator.readPersistentConversation(
+                characterId,
+                conversationId,
+                reason,
+            ),
         readPersistentConversationAt: (characterId, orderedPosition, reason) =>
-            coordinator.readPersistentConversationAt(characterId, orderedPosition, reason),
+            coordinator.readPersistentConversationAt(
+                characterId,
+                orderedPosition,
+                reason,
+            ),
         readPersistentSelectedConversation: (characterId, reason) =>
             coordinator.readPersistentSelectedConversation(characterId, reason),
         capturePersistentMutationToken: (reason) =>
             coordinator.capturePersistentMutationToken(reason),
         async acquireDestructiveReplacementFence(expected) {
-            const owner = await coordinator.acquireDestructiveReplacementFence(expected)
+            const owner =
+                await coordinator.acquireDestructiveReplacementFence(expected)
             let released = false
             return {
                 refreshCommittedWorkingSet(revision, options) {
                     if (released) {
                         return Promise.reject(
-                            new Error('Destructive persistent replacement fence was released'),
+                            new Error(
+                                'Destructive persistent replacement fence was released',
+                            ),
                         )
                     }
                     return refreshCommittedWorkingSet(revision, owner, options)
@@ -813,20 +889,30 @@ export function createPersistentDataRuntime(
             }
         },
         async acquireCommittedWorkingSetRefreshFence() {
-            const owner = await coordinator.acquireCommittedWorkingSetRefreshFence()
+            const owner =
+                await coordinator.acquireCommittedWorkingSetRefreshFence()
             let released = false
             return {
                 async refreshCommittedWorkingSet(minimumRevision, options) {
                     if (released) {
-                        throw new Error('Destructive persistent replacement fence was released')
+                        throw new Error(
+                            'Destructive persistent replacement fence was released',
+                        )
                     }
                     coordinator.assertDestructiveReplacementFence(owner)
                     const latest = await dependencies.store.readRoot()
                     coordinator.assertDestructiveReplacementFence(owner)
                     if (latest.revision < minimumRevision) {
-                        throw new RevisionConflictError(minimumRevision, latest.revision)
+                        throw new RevisionConflictError(
+                            minimumRevision,
+                            latest.revision,
+                        )
                     }
-                    return refreshCommittedWorkingSet(latest.revision, owner, options)
+                    return refreshCommittedWorkingSet(
+                        latest.revision,
+                        owner,
+                        options,
+                    )
                 },
                 release() {
                     if (released) return
@@ -838,33 +924,54 @@ export function createPersistentDataRuntime(
         materializePersistentDatabaseSnapshot: (reason) =>
             coordinator.materializePersistentDatabaseSnapshot(reason),
         materializePersistentDatabaseSnapshotWithRevision: (reason) =>
-            coordinator.materializePersistentDatabaseSnapshotWithRevision(reason),
+            coordinator.materializePersistentDatabaseSnapshotWithRevision(
+                reason,
+            ),
         materializeMaximumCompatibilityWorkingSet: () =>
             installMaximumCompatibilityWorkingSet({
-                getSelectedCharacterId: dependencies.state.getSelectedCharacterId,
+                getSelectedCharacterId:
+                    dependencies.state.getSelectedCharacterId,
                 getSelectedConversationId: () =>
                     dependencies.state.getSelectedConversationId?.() ?? null,
-                flushPendingData: () => coordinator.flushPendingData('plugin-maximum-compatibility'),
+                flushPendingData: () =>
+                    coordinator.flushPendingData(
+                        'plugin-maximum-compatibility',
+                    ),
                 getRevision: () => coordinator.revision,
                 getMutationGeneration: () => coordinator.mutationGeneration,
-                getNavigationGeneration: () => workingSet.navigationGenerationToken,
-                acquireRevision: (revision) => dependencies.store.acquireRevision(revision),
+                getNavigationGeneration: () =>
+                    workingSet.navigationGenerationToken,
+                acquireRevision: (revision) =>
+                    dependencies.store.acquireRevision(revision),
                 installCompleteDatabase: (database) => {
                     workingSet.invalidateNavigation()
-                    const installDatabase = dependencies.state.installCompleteDatabase
-                        ?? dependencies.state.replaceDatabase
+                    const installDatabase =
+                        dependencies.state.installCompleteDatabase ??
+                        dependencies.state.replaceDatabase
                     installDatabase(database)
                 },
                 restoreSelection: (characterId, conversationId) =>
-                    dependencies.state.restoreSelection?.(characterId, conversationId),
-                adoptMaterializedDatabase: (revision, mutationGeneration, database) =>
-                    coordinator.adoptMaterializedDatabase(revision, mutationGeneration, database),
+                    dependencies.state.restoreSelection?.(
+                        characterId,
+                        conversationId,
+                    ),
+                adoptMaterializedDatabase: (
+                    revision,
+                    mutationGeneration,
+                    database,
+                ) =>
+                    coordinator.adoptMaterializedDatabase(
+                        revision,
+                        mutationGeneration,
+                        database,
+                    ),
             }),
         async releaseInactiveWorkingSet(canRelease, isCurrent) {
             const token = await coordinator.capturePersistentMutationToken(
                 'plugin-scalable-working-set',
             )
-            const selectedCharacterId = dependencies.state.getSelectedCharacterId() ?? null
+            const selectedCharacterId =
+                dependencies.state.getSelectedCharacterId() ?? null
             const selectedConversationId =
                 dependencies.state.getSelectedConversationId?.() ?? null
             const navigationGeneration = workingSet.navigationGenerationToken
@@ -888,7 +995,8 @@ export function createPersistentDataRuntime(
                     (dependencies.state.getSelectedCharacterId() ?? null) ||
                 selectedConversationId !==
                     (dependencies.state.getSelectedConversationId?.() ?? null)
-            ) return false
+            )
+                return false
             workingSet.invalidateNavigation()
             const activeCharacterIds = workingSet.reconcileActiveCharacterIds(
                 database,
@@ -899,7 +1007,10 @@ export function createPersistentDataRuntime(
                 activeCharacterIds,
                 true,
             )
-            dependencies.state.restoreSelection?.(selectedCharacterId, selectedConversationId)
+            dependencies.state.restoreSelection?.(
+                selectedCharacterId,
+                selectedConversationId,
+            )
             const resident = dependencies.state.captureSelectedCharacter()
             if (
                 resident &&
@@ -908,10 +1019,13 @@ export function createPersistentDataRuntime(
                     token.mutationGeneration,
                     resident,
                 )
-            ) return false
+            )
+                return false
             return true
         },
-        publishCurrentOfficialRevision: () => coordinator.publishCurrentOfficialRevision(),
-        hasPendingOfficialPublication: () => coordinator.hasPendingOfficialPublication,
+        publishCurrentOfficialRevision: () =>
+            coordinator.publishCurrentOfficialRevision(),
+        hasPendingOfficialPublication: () =>
+            coordinator.hasPendingOfficialPublication,
     }
 }

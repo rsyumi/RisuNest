@@ -612,14 +612,14 @@ export async function loadData() {
             const { registerMacosLifecycle } = await import(
                 './storage/macosLifecycle'
             )
-            const { flushPendingData } = await import(
+            const { flushPendingDataLocally } = await import(
                 './storage/persistentDataRuntime.svelte'
             )
             const { checkpointNativePersistentStore } = await import(
                 './storage/nativePersistentMaintenance'
             )
             disposeMacosLifecycle = await registerMacosLifecycle({
-                flush: () => flushPendingData('exit'),
+                flush: () => flushPendingDataLocally('exit'),
                 checkpoint: () => checkpointNativePersistentStore('truncate'),
                 confirmExitWithoutSaving: () =>
                     alertConfirm(
