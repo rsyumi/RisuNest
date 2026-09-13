@@ -1,5 +1,6 @@
 pub const SCHEMA: &str = r#"
 CREATE TABLE library (singleton INTEGER PRIMARY KEY CHECK(singleton=1), head TEXT NOT NULL);
+CREATE TABLE media_secret(singleton INTEGER PRIMARY KEY CHECK(singleton=1),key BLOB NOT NULL CHECK(length(key)=32));
 CREATE TABLE devices (
  id TEXT PRIMARY KEY, verifier TEXT NOT NULL UNIQUE, revoked INTEGER NOT NULL DEFAULT 0,
  watermark TEXT NOT NULL DEFAULT '0', ack TEXT NOT NULL DEFAULT '0',
@@ -7,6 +8,7 @@ CREATE TABLE devices (
 );
 CREATE TABLE objects (hash TEXT PRIMARY KEY, size INTEGER NOT NULL CHECK(size>=0));
 CREATE TABLE object_leases(device TEXT NOT NULL REFERENCES devices(id),hash TEXT NOT NULL REFERENCES objects(hash),expires INTEGER NOT NULL,PRIMARY KEY(device,hash));
+CREATE TABLE object_custody(device TEXT NOT NULL REFERENCES devices(id),hash TEXT NOT NULL REFERENCES objects(hash),retention_id TEXT NOT NULL,PRIMARY KEY(device,hash));
 CREATE TABLE object_trash(hash TEXT PRIMARY KEY);
 CREATE TABLE transfer_recipes(id TEXT PRIMARY KEY,body BLOB NOT NULL,expires INTEGER NOT NULL);
 CREATE TABLE read_pins(id TEXT PRIMARY KEY,device TEXT NOT NULL REFERENCES devices(id),after_seq TEXT NOT NULL,through TEXT NOT NULL,expires INTEGER NOT NULL);
@@ -54,5 +56,5 @@ CREATE TABLE changes (
  PRIMARY KEY(seq,ordinal)
 );
 CREATE INDEX changes_cursor ON changes(length(seq),seq,ordinal);
-PRAGMA user_version=7;
+PRAGMA user_version=8;
 "#;

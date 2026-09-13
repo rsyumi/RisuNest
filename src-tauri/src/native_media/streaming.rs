@@ -1,11 +1,13 @@
 //! File-backed loopback transport. Neither the response planner nor this
 //! transport collects a complete media body in native or JavaScript memory.
+use crate::server_sync::media::MediaProvider;
 use axum::{
     body::Body,
     extract::State,
     http::{header, Request, Response, StatusCode},
     Router,
 };
+use risunest_sync_connect::media::{MediaObject, REFRESH_PATH};
 use std::{io, net::Ipv4Addr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
@@ -19,6 +21,7 @@ struct Files {
     authority: String,
     prefix: String,
     slots: Arc<Semaphore>,
+    remote: Arc<MediaProvider>,
 }
 
 pub(crate) struct MediaServer {
@@ -41,17 +44,26 @@ impl Drop for MediaServer {
 }
 
 impl MediaServer {
+    #[cfg(test)]
+    pub(crate) fn test_base_url(&self) -> &str {
+        &self.base_url
+    }
     pub(crate) fn start(root: PathBuf) -> io::Result<Self> {
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;
         let authority = listener.local_addr()?.to_string();
         let prefix = format!("/{}/", uuid::Uuid::new_v4().simple());
         let base_url = format!("http://{authority}{prefix}");
+        let remote = Arc::new(
+            MediaProvider::new(root.clone(), format!("http://{authority}"))
+                .map_err(|_| io::Error::other("media capability unavailable"))?,
+        );
         let state = Files {
             root,
             authority,
             prefix,
             slots: Arc::new(Semaphore::new(MAX_TRANSFERS)),
+            remote,
         };
         let task = tauri::async_runtime::spawn(async move {
             let Ok(listener) = tokio::net::TcpListener::from_std(listener) else {
@@ -95,17 +107,45 @@ async fn serve(State(state): State<Files>, request: Request<Body>) -> Response<B
     {
         return empty(StatusCode::NOT_FOUND);
     }
-    let Some(path) = request
+    let path = request
         .uri()
         .path_and_query()
-        .and_then(|p| p.as_str().strip_prefix(&state.prefix))
-    else {
-        return empty(StatusCode::NOT_FOUND);
-    };
-    if path.len() > 8192 {
+        .map(|p| p.as_str())
+        .unwrap_or("");
+    if path.len() > 16384 {
         return empty(StatusCode::NOT_FOUND);
     }
-    let Ok(uri) = format!("http://risuasset.localhost/{path}").parse() else {
+    let (uri, remote, refresh) = if let Some(token) = path.strip_prefix(REFRESH_PATH) {
+        let Ok(object) = state.remote.verify_refresh(token) else {
+            return empty(StatusCode::NOT_FOUND);
+        };
+        let key = format!(
+            "assets-v2/objects/{}/{}",
+            &object.hash[..2],
+            &object.hash[2..]
+        );
+        let mut url =
+            url::Url::parse(&format!("http://risuasset.localhost/{}", hex::encode(key))).unwrap();
+        url.query_pairs_mut()
+            .append_pair("mime", &object.mime)
+            .append_pair("size", object.size.as_str());
+        (url.to_string(), Some(object), true)
+    } else if let Some(path) = path.strip_prefix(&state.prefix) {
+        let uri = format!("http://risuasset.localhost/{path}");
+        let remote = super::decode_physical_key(&uri)
+            .and_then(|key| super::cas_content_hash(&key))
+            .and_then(|hash| {
+                super::cas_descriptor(&uri).map(|(mime, size)| MediaObject {
+                    hash,
+                    mime,
+                    size: size.into(),
+                })
+            });
+        (uri, remote, false)
+    } else {
+        return empty(StatusCode::NOT_FOUND);
+    };
+    let Ok(uri) = uri.parse() else {
         return empty(StatusCode::NOT_FOUND);
     };
     let permit =
@@ -115,13 +155,36 @@ async fn serve(State(state): State<Files>, request: Request<Body>) -> Response<B
         };
     let mut request = request.map(|_| ());
     *request.uri_mut() = uri;
-    let response =
-        match tokio::task::spawn_blocking(move || super::prepare_response(&state.root, request))
-            .await
-        {
-            Ok(response) => response,
-            Err(_) => return empty(StatusCode::INTERNAL_SERVER_ERROR),
-        };
+    let response = match tokio::task::spawn_blocking(move || {
+        let response = super::prepare_response(&state.root, request);
+        if response.status() == StatusCode::NOT_FOUND {
+            if let Some(object) = remote {
+                return match state.remote.url(&object, refresh) {
+                    Ok(url) => Response::builder()
+                        .status(StatusCode::TEMPORARY_REDIRECT)
+                        .header(header::LOCATION, url)
+                        .header(header::CACHE_CONTROL, "no-store")
+                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                        .body(None)
+                        .unwrap(),
+                    Err(error) => Response::builder()
+                        .status(
+                            StatusCode::from_u16(error.status).unwrap_or(StatusCode::BAD_GATEWAY),
+                        )
+                        .header(header::CACHE_CONTROL, "no-store")
+                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                        .body(None)
+                        .unwrap(),
+                };
+            }
+        }
+        response
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => return empty(StatusCode::INTERNAL_SERVER_ERROR),
+    };
     let (mut parts, reader) = response.into_parts();
     parts
         .headers

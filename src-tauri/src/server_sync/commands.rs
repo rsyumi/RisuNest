@@ -299,6 +299,49 @@ pub(crate) async fn server_sync_status(app: AppHandle) -> Result<ReplicaStatus> 
     blocking(move || job_store(&app)?.server_status()).await
 }
 #[tauri::command]
+pub(crate) async fn server_sync_asset_status(
+    app: AppHandle,
+) -> Result<crate::persistent_store::asset_residency::ResidencyStatus> {
+    blocking(move || job_store(&app)?.asset_residency_status()).await
+}
+#[tauri::command]
+pub(crate) async fn server_sync_asset_policy(
+    app: AppHandle,
+    policy: super::residency::AssetPolicy,
+) -> Result<crate::persistent_store::asset_residency::ResidencyStatus> {
+    blocking(move || {
+        let _admission = claim_library(&app)?;
+        let state = app.state::<ServerSyncCommandState>();
+        let (_running, cancelled) = state.claim_preparation()?;
+        job_store(&app)?.asset_residency_set_policy(policy, || {
+            if cancelled.load(Ordering::Acquire) {
+                Err(SyncError::new("cancelled", 409))
+            } else {
+                Ok(())
+            }
+        })
+    })
+    .await
+}
+#[tauri::command]
+pub(crate) async fn server_sync_asset_evict(
+    app: AppHandle,
+) -> Result<crate::persistent_store::asset_residency::ResidencyStatus> {
+    blocking(move || {
+        let _admission = claim_library(&app)?;
+        let state = app.state::<ServerSyncCommandState>();
+        let (_running, cancelled) = state.claim_preparation()?;
+        job_store(&app)?.asset_residency_evict(|| {
+            if cancelled.load(Ordering::Acquire) {
+                Err(SyncError::new("cancelled", 409))
+            } else {
+                Ok(())
+            }
+        })
+    })
+    .await
+}
+#[tauri::command]
 pub(crate) fn server_sync_verified_bytes(app: AppHandle) -> Result<String> {
     let state = app.state::<ServerSyncCommandState>();
     let counter = state

@@ -7,6 +7,7 @@ use std::fs::OpenOptions;
 mod initial;
 #[path = "server_sync_matrix_tests.rs"]
 mod matrix;
+mod residency;
 #[path = "server_sync_retained_fixture_tests.rs"]
 mod retained_fixture;
 #[path = "server_sync_semantic_tests.rs"]

@@ -8,6 +8,7 @@ use crate::persistent_store::{
     export::{self, destination},
     PreparedRisuSaveExport, RevisionReadLease, StoreResult,
 };
+use crate::server_sync::residency::RemotePayloadAccess;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
@@ -320,7 +321,7 @@ fn write_projected_risum(
                         .map(hex::encode)
                         .ok_or_else(|| invalid_input("RISUM occurrence has no native payload"))?;
                     let size = repository
-                        .stat_object(&hash)
+                        .stat_available_object(&hash)
                         .map_err(io_error)?
                         .ok_or_else(|| invalid_input("RISUM occurrence payload is missing"))?;
                     (hash, size)
@@ -386,7 +387,7 @@ fn write_verified_rpack_object(
     job: &JobControl,
 ) -> Result<(), NativeJobError> {
     let mut input = repository
-        .open_object(hash)
+        .open_available_object(hash)
         .map_err(io_error)?
         .ok_or_else(|| invalid_input("RISUM payload is missing"))?;
     let mut copied = 0_u64;

@@ -3,7 +3,7 @@ use super::{client::ServerConfig, Result, SyncError};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct StoredConfig {
     pub endpoint: String,

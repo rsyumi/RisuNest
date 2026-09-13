@@ -10,6 +10,10 @@ mod checkpoints;
 mod descriptors;
 mod journal;
 mod maintenance;
+mod media;
+pub use media::MediaResponse;
+mod retention;
+pub use retention::{ObjectIdentity, RetainedObject, RetentionPage, RetentionRelease};
 mod objects;
 mod schema;
 mod scopes;
@@ -43,6 +47,7 @@ pub struct Store {
     upload_job_gate: Mutex<()>,
     download_job_gate: Mutex<()>,
     connection_gate: Mutex<()>,
+    media_signer: risunest_sync_connect::media::MediaSigner,
     _owner: File,
 }
 
@@ -148,11 +153,15 @@ impl Store {
                 min_retained_seq: 0.into(),
             };
             tx.execute("INSERT INTO library VALUES(1,?1)", [json(&head)?])?;
+            tx.execute(
+                "INSERT INTO media_secret VALUES(1,?1)",
+                [risunest_sync_connect::media::generate_key()?.as_slice()],
+            )?;
             tx.commit()?;
             objects::sync_directory(&root)?;
         } else {
             let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            if version != 7 {
+            if version != 8 {
                 return Err(Error::new("incompatible-store", 409));
             }
         }
@@ -169,6 +178,11 @@ impl Store {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
         read_db.busy_timeout(std::time::Duration::from_secs(5))?;
+        let media_key: Vec<u8> =
+            db.query_row("SELECT key FROM media_secret WHERE singleton=1", [], |r| {
+                r.get(0)
+            })?;
+        let media_signer = risunest_sync_connect::media::MediaSigner::new(&media_key)?;
         let store = Self {
             root,
             db: Mutex::new(db),
@@ -177,6 +191,7 @@ impl Store {
             upload_job_gate: Mutex::new(()),
             download_job_gate: Mutex::new(()),
             connection_gate: Mutex::new(()),
+            media_signer,
             _owner: owner,
         };
         store

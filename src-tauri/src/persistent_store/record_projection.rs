@@ -83,15 +83,19 @@ pub(super) fn load_owner_heads(
     Ok(heads)
 }
 
-pub(super) fn resolve_owner_heads(
+fn resolve_owner_heads_with_sizes(
     connection: &Connection,
     cas: &PayloadCas,
     generation: &str,
     value: &Value,
     character_id: Option<&str>,
+    size: &dyn Fn(&str) -> StoreResult<u64>,
 ) -> StoreResult<Vec<ValidatedOwnerHead>> {
-    let mut heads =
-        validate_owner_heads(cas, load_owner_heads(connection, generation, character_id)?)?;
+    let mut heads = validate_owner_heads_with_sizes(
+        cas,
+        load_owner_heads(connection, generation, character_id)?,
+        size,
+    )?;
     for (owner, parent, property) in owner_parents(value, character_id) {
         if heads.iter().any(|head| head.head.owner == owner) {
             continue;
@@ -132,7 +136,7 @@ pub(super) fn resolve_owner_heads(
             ).optional()?.flatten();
             let payload_hash = hash
                 .map(|hash| -> StoreResult<[u8; 32]> {
-                    dependencies.insert(hash.clone(), require_cas_size(cas, &hash)?);
+                    dependencies.insert(hash.clone(), size(&hash)?);
                     hex::decode(&hash)
                         .ok()
                         .and_then(|bytes| bytes.try_into().ok())
@@ -224,9 +228,10 @@ pub(super) fn owner_parents<'a>(
     parents
 }
 
-pub(super) fn validate_owner_heads(
+fn validate_owner_heads_with_sizes(
     cas: &PayloadCas,
     heads: Vec<LogicalOwnerHead>,
+    size: &dyn Fn(&str) -> StoreResult<u64>,
 ) -> StoreResult<Vec<ValidatedOwnerHead>> {
     let mut validated = Vec::with_capacity(heads.len());
     for head in heads {
@@ -260,7 +265,7 @@ pub(super) fn validate_owner_heads(
             ));
             if let Some(payload_hash) = entry.payload_hash {
                 let hash = hex::encode(payload_hash);
-                let size = require_cas_size(cas, &hash)?;
+                let size = size(&hash)?;
                 if dependencies
                     .insert(hash, size)
                     .is_some_and(|old| old != size)
@@ -453,13 +458,6 @@ pub(super) fn strip_character_owner_property(
     strip_owner_property(detail, "additionalAssets", head, false)
 }
 
-pub(super) fn require_cas_size(cas: &PayloadCas, hash: &str) -> StoreResult<u64> {
-    cas.stat_object(hash)?
-        .ok_or_else(|| StoreError::Validation {
-            message: format!("referenced CAS object {hash} is missing"),
-        })
-}
-
 pub(super) fn reconstruct_record_with_owner_objects(
     connection: &Connection,
     cas: &PayloadCas,
@@ -467,6 +465,7 @@ pub(super) fn reconstruct_record_with_owner_objects(
     record_key: &str,
     message_page_hashes: Vec<String>,
     mut derived: impl FnMut(&[u8]) -> StoreResult<()>,
+    size: &dyn Fn(&str) -> StoreResult<u64>,
 ) -> StoreResult<Vec<u8>> {
     let locator = decode_logical_record_key(record_key).map_err(codec_error)?;
     let envelope = match locator {
@@ -478,8 +477,14 @@ pub(super) fn reconstruct_record_with_owner_objects(
                 "root record source is missing",
             )?;
             let mut value: Value = serde_json::from_str(&raw)?;
-            let mut owner_heads =
-                resolve_owner_heads(connection, cas, pds_generation, &value, None)?;
+            let mut owner_heads = resolve_owner_heads_with_sizes(
+                connection,
+                cas,
+                pds_generation,
+                &value,
+                None,
+                size,
+            )?;
             for head in &owner_heads {
                 if let Some(bytes) = &head.derived_manifest {
                     derived(bytes)?;
@@ -532,12 +537,13 @@ pub(super) fn reconstruct_record_with_owner_objects(
                 .optional()?
                 .ok_or_else(|| missing_source("character"))?;
             let mut detail: Value = serde_json::from_str(&raw)?;
-            let mut owner_heads = resolve_owner_heads(
+            let mut owner_heads = resolve_owner_heads_with_sizes(
                 connection,
                 cas,
                 pds_generation,
                 &detail,
                 Some(&character_id),
+                size,
             )?;
             for head in &owner_heads {
                 if let Some(bytes) = &head.derived_manifest {

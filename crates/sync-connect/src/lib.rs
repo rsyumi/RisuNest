@@ -1,5 +1,6 @@
 //! Registration and opaque endpoint discovery shared by the daemon and native app.
 mod directory;
+pub mod media;
 mod registration;
 
 pub use directory::{

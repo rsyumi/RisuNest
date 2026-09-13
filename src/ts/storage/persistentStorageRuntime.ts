@@ -25,6 +25,7 @@ import {
 } from './assetRepositoryRuntime'
 import {
     createNativeAssetObjectUrlResolver,
+    createNativeRemoteAssetReader,
     createNativeDurableAssetWriteSessionFactory,
     createNativeDurableCasJobSessionFactory,
     createNativeImmutablePayloadCas,
@@ -112,6 +113,7 @@ async function installRepositorySelections(
             legacy: input.legacy,
             cas: input.createAssetCas(),
             objectUrls: createNativeAssetObjectUrlResolver(),
+            remote: createNativeRemoteAssetReader(),
             newInlayImages: createNativeNewInlayImageEncoder(),
             writeSessions: createNativeDurableAssetWriteSessionFactory(),
         })

@@ -110,6 +110,13 @@ impl Cache {
         })
     }
     pub fn restore(&self, version: &RecordVersion) -> Result<(ServerPayload, String)> {
+        self.restore_with(version, |hash, limit| self.read(hash, limit))
+    }
+    pub fn restore_with(
+        &self,
+        version: &RecordVersion,
+        mut read: impl FnMut(&str, usize) -> Result<Vec<u8>>,
+    ) -> Result<(ServerPayload, String)> {
         let RecordVersion::Live { object_hash, .. } = version else {
             return Err(SyncError::new("record-is-not-live", 409));
         };
@@ -123,10 +130,7 @@ impl Cache {
         let mut bytes = Vec::new();
         payload::restore(
             &object.payload,
-            |hash| {
-                self.read(hash, payload::MAX_CHUNK)
-                    .map_err(|_| WireError("cached-payload-invalid"))
-            },
+            |hash| read(hash, payload::MAX_CHUNK).map_err(|_| WireError("cached-payload-invalid")),
             &mut bytes,
         )?;
         let payload: ServerPayload = serde_json::from_slice(&bytes)

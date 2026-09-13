@@ -1760,6 +1760,26 @@ export const languageKorean = {
                 '새 등록 정보를 입력하려면 현재 서버 연결을 먼저 해제하세요.',
             discardRegistration: '등록 입력 지우기',
             directoryEnabled: '서버 주소 자동 검색 사용',
+            residency: {
+                title: '이 기기의 에셋 보관',
+                description:
+                    '기기마다 따로 선택합니다. PC에는 파일을 모두 보관하고, 모바일에서는 서버의 미디어를 바로 불러올 수 있습니다.',
+                full: '모든 파일 로컬 보관',
+                remote: '원격 파일 사용',
+                selected: '현재 정책',
+                local: '로컬 파일',
+                remoteOnly: '서버에만 보관된 파일',
+                offlineReady: '확인된 파일을 모두 오프라인에서 사용할 수 있습니다.',
+                onlineNeeded: '서버에만 있는 파일을 사용하려면 인터넷 연결이 필요합니다.',
+                unavailable: '사용 가능한 사본이 없는 파일',
+                cleanupNote:
+                    '원격 모드로 바꿔도 기존 파일은 남습니다. 로컬 정리는 파일을 서버에 업로드하고 확인한 뒤 사본을 지웁니다. 로컬 스냅샷에 필요한 파일은 해당 스냅샷을 삭제하고 정리할 때까지 서버에 보존합니다. 내보내기나 AI 요청에 사용한 첨부파일은 내려받으며, 이후 다시 정리할 수 있습니다.',
+                clean: '로컬 사본 정리',
+                refresh: '새로 고침',
+                cancel: '취소',
+                working: '파일 처리 중… 현재 요청이 끝나면 취소됩니다.',
+                freed: '확보한 로컬 공간',
+            },
             management: {
                 title: '서버 동기화 저장 공간',
                 disk: '로컬 디스크 사용량',

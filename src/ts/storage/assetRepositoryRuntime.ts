@@ -11,6 +11,7 @@ import {
     type DurableAssetWriteSessionFactory,
     type NewInlayImageEncoder,
     type PreparedCompleteAssetWrite,
+    type RemoteAssetReader,
 } from './assetRepository'
 import { selectAssetRepositoryAuthority } from './assetRepositoryAuthority'
 import type { ImmutablePayloadCas } from './payloadCas'
@@ -27,6 +28,7 @@ function typedLegacyReader(legacy: BlobStore): AssetAliasLegacyReader {
 }
 
 export function createNativeV2BlobStore(input: {
+    remote?: RemoteAssetReader
     store: PersistentDataStore
     legacy: BlobStore
     cas: ImmutablePayloadCas
@@ -35,6 +37,7 @@ export function createNativeV2BlobStore(input: {
     writeSessions: DurableAssetWriteSessionFactory
 }): CompleteAssetRepositoryBlobStore {
     return createCompleteAssetRepositoryBlobStore({
+        remote: input.remote,
         store: input.store,
         cas: input.cas,
         legacy: typedLegacyReader(input.legacy),

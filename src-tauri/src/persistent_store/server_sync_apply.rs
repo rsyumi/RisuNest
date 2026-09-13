@@ -71,8 +71,15 @@ fn semantic(_: StoreError) -> StoreError {
 /// Requires dependencies in verified local CAS before returning a record that
 /// can be applied. Error messages never include received payload strings.
 pub(crate) fn validate_remote(
+    record: RemoteRecord,
+    cas: &PayloadCas,
+) -> StoreResult<ValidatedRecord> {
+    validate_remote_with_residency(record, cas, |_, _| Ok(false))
+}
+pub(crate) fn validate_remote_with_residency(
     mut record: RemoteRecord,
     cas: &PayloadCas,
+    remote: impl Fn(&str, Option<u64>) -> StoreResult<bool>,
 ) -> StoreResult<ValidatedRecord> {
     record
         .version
@@ -129,7 +136,9 @@ pub(crate) fn validate_remote(
                             let mut tuples = Vec::with_capacity(entries.len());
                             for entry in entries {
                                 if let Some(hash) = entry.payload_hash {
-                                    if cas.stat_object(&hex::encode(hash))?.is_none() {
+                                    if cas.stat_object(&hex::encode(hash))?.is_none()
+                                        && !remote(&hex::encode(hash), None)?
+                                    {
                                         return invalid("Missing server owner payload");
                                     }
                                 }
@@ -179,7 +188,10 @@ pub(crate) fn validate_remote(
                     metadata,
                 } => {
                     if let Some(hash) = object_hash {
-                        if cas.stat_object(hash)? != Some(*size) {
+                        if cas.stat_object(hash)? != Some(*size)
+                            && (matches!(locator, LogicalRecordLocator::Cold { .. })
+                                || !remote(hash, Some(*size))?)
+                        {
                             return invalid("Server payload size differs from alias");
                         }
                     }

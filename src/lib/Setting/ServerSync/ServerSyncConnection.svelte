@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import ServerSyncStorage from "./ServerSyncStorage.svelte";
+  import ServerAssetResidency from "./ServerAssetResidency.svelte";
   import ServerSyncRegistrationInput from "./ServerSyncRegistrationInput.svelte";
   import { serverRegistrationInbox } from "src/ts/storage/sync/serverSyncRegistrationInbox";
   import type {
@@ -392,6 +393,7 @@
       backupsVisible = !backupsVisible;
     }}>{text.backups}</button
   >
+  {#if snapshot.status?.configured}<ServerAssetResidency />{/if}
   {#if backupsVisible}<ServerSyncStorage />{/if}
 </section>
 

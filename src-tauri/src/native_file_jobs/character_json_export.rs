@@ -1,3 +1,4 @@
+use crate::server_sync::residency::RemotePayloadAccess;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -875,7 +876,7 @@ fn cas_source(
                 ))
             })?;
             let size = repository
-                .stat_object(&hash)
+                .stat_available_object(&hash)
                 .map_err(io_error)?
                 .ok_or_else(|| {
                     invalid_input(format!("pinned character asset is missing: {key}"))
@@ -1004,7 +1005,7 @@ fn write_data_uri<W: Write>(
             } => (
                 Box::new(
                     repository
-                        .open_object(hash)
+                        .open_available_object(hash)
                         .map_err(io_error)?
                         .ok_or_else(|| {
                             invalid_input(format!("pinned character asset is missing: {key}"))

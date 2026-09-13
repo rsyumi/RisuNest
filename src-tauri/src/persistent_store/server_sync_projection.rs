@@ -136,6 +136,7 @@ pub(crate) fn project(
         message: "Invalid server record key".into(),
     })?;
     let mut derived_objects = std::collections::BTreeMap::new();
+    let residency = std::cell::OnceCell::new();
     let bytes = super::record_projection::reconstruct_record_with_owner_objects(
         db,
         cas,
@@ -145,6 +146,28 @@ pub(crate) fn project(
         |bytes| {
             derived_objects.insert(risunest_sync_wire::hash(bytes), bytes.to_vec());
             Ok(())
+        },
+        &|hash| {
+            if let Some(size) = cas.stat_object(hash)? {
+                return Ok(size);
+            }
+            let residency = residency
+                .get_or_init(|| {
+                    crate::server_sync::residency::Residency::open(cas.repository_root())
+                })
+                .as_ref()
+                .map_err(|_| StoreError::Validation {
+                    message: "Remote owner custody unavailable".into(),
+                })?;
+            residency
+                .object(hash, None)
+                .map_err(|_| StoreError::Validation {
+                    message: "Remote owner custody unavailable".into(),
+                })?
+                .map(|object| object.size)
+                .ok_or_else(|| StoreError::Validation {
+                    message: "Owner payload is unavailable locally and remotely".into(),
+                })
         },
     )?;
     let mut record = decode_logical_record(&bytes).map_err(|_| StoreError::Validation {

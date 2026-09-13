@@ -29,7 +29,13 @@ import type {
     Versioned,
 } from './persistentDataStore'
 
-export type AssetAliasPayloadSource = 'cas' | 'legacy' | 'missing'
+export type AssetAliasPayloadSource = 'cas' | 'remote' | 'legacy' | 'missing'
+
+/** Remote availability is distinct from physical CAS existence. */
+export interface RemoteAssetReader {
+    statObject(hash: string): Promise<number | null>
+    readObject(hash: string, range?: BlobReadRange): Promise<Uint8Array | null>
+}
 
 export interface AssetAliasRead {
     alias: AssetAlias
@@ -67,6 +73,7 @@ interface TypedAssetRepositoryReader {
 }
 
 interface TypedAssetRepositoryReaderOptions {
+    remote?: RemoteAssetReader
     reader: Pick<AssetAliasCatalog, 'readAssetAlias'>
     cas: ImmutablePayloadCas
     legacy: AssetAliasLegacyReader
@@ -161,6 +168,28 @@ function createTypedAssetRepositoryReader(
                     }
                 }
             }
+            if (alias.objectHash !== null && options.remote) {
+                const data = await options.remote.readObject(alias.objectHash, range)
+                if (data !== null) {
+                    const expectedSize = range
+                        ? Math.max(
+                              0,
+                              Math.min(range.endExclusive, alias.size) -
+                                  Math.min(range.start, alias.size),
+                          )
+                        : alias.size
+                    if (
+                        data.byteLength !== expectedSize ||
+                        (!range && (await hashPayloadBytes(data)) !== alias.objectHash)
+                    ) {
+                        throw new Error(`Remote asset identity mismatch for ${key}`)
+                    }
+                    return {
+                        revision: versioned.revision,
+                        value: { alias, data, source: 'remote' },
+                    }
+                }
+            }
             if (
                 options.legacyFallback
                 && (alias.objectHash === null || options.legacyFallback === true)
@@ -220,6 +249,17 @@ function createTypedAssetRepositoryReader(
                     return {
                         revision: versioned.revision,
                         value: { alias, objectSize, source: 'cas' },
+                    }
+                }
+            }
+            if (alias.objectHash !== null && options.remote) {
+                const objectSize = await options.remote.statObject(alias.objectHash)
+                if (objectSize !== null) {
+                    if (objectSize !== alias.size)
+                        throw new Error(`Remote asset size mismatch for ${key}`)
+                    return {
+                        revision: versioned.revision,
+                        value: { alias, objectSize, source: 'remote' },
                     }
                 }
             }
@@ -290,6 +330,7 @@ export interface DurableAssetWriteSessionFactory {
 }
 
 export interface CompleteAssetRepositoryBlobStoreOptions {
+    remote?: RemoteAssetReader
     store: CompleteAssetAliasStore
     cas: ImmutablePayloadCas
     legacy: AssetAliasLegacyReader
@@ -378,6 +419,7 @@ export function createCompleteTypedAssetRepository(
         throw new RangeError('Asset alias list page size must be a positive safe integer')
     }
     const repository = createTypedAssetRepositoryReader({
+        remote: options.remote,
         reader: options.store,
         cas: options.cas,
         legacy: options.legacy,
@@ -555,6 +597,7 @@ export function createCompleteTypedAssetRepository(
                 return await options.legacy.resolveUrl?.(identity) ?? null
             }
             const size = await options.cas.statObject(alias.objectHash)
+                ?? await options.remote?.statObject(alias.objectHash) ?? null
             if (size === null) return null
             if (size !== alias.size) {
                 throw new Error(`Asset alias size mismatch for ${identity.key}`)

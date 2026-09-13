@@ -5,6 +5,8 @@ use tempfile::TempDir;
 
 #[cfg(windows)]
 mod desktop_probe;
+#[cfg(windows)]
+mod redirect_probe;
 
 fn fixture(size: u64) -> (TempDir, Files, String) {
     let root = TempDir::new().unwrap();
@@ -27,6 +29,9 @@ fn fixture(size: u64) -> (TempDir, Files, String) {
         authority: "127.0.0.1:12345".into(),
         prefix: "/0123456789abcdef0123456789abcdef/".into(),
         slots: Arc::new(Semaphore::new(MAX_TRANSFERS)),
+        remote: Arc::new(
+            MediaProvider::new(root.path().to_path_buf(), "http://127.0.0.1:12345".into()).unwrap(),
+        ),
     };
     let path = format!("{}{}", state.prefix, hex::encode("assets/stream.bin"));
     (root, state, path)
