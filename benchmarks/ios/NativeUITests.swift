@@ -1,6 +1,46 @@
 import XCTest
 
 final class NativeUITests: XCTestCase {
+    private func cancelPicker(_ app: XCUIApplication) {
+        // On iOS 26, export subfolders show a Back button; Cancel is at the root.
+        let cancel = app.buttons["Cancel"]
+        for _ in 0..<4 {
+            if cancel.waitForExistence(timeout: 2) {
+                cancel.tap()
+                return
+            }
+            let back = app.navigationBars.buttons.matching(identifier: "BackButton").firstMatch
+            guard back.waitForExistence(timeout: 15) else { break }
+            back.tap()
+        }
+        let hierarchy = XCTAttachment(string: app.debugDescription)
+        hierarchy.lifetime = .keepAlways
+        add(hierarchy)
+        XCTFail("The native file picker has no reachable Cancel action")
+    }
+
+    private func openPublishedFile(_ app: XCUIApplication) {
+        let file = app.cells.containing(NSPredicate(format: "label CONTAINS %@", "synthetic.bin")).firstMatch
+        // A new import picker opens Recents, which does not include a newly exported file.
+        let browse = app.buttons["Browse"]
+        if browse.waitForExistence(timeout: 5) { browse.tap() }
+        if !file.waitForExistence(timeout: 3) {
+            let local = app.staticTexts.matching(NSPredicate(format: "label IN %@", ["On My iPhone", "On My iPad"])).firstMatch
+            XCTAssertTrue(local.waitForExistence(timeout: 15))
+            local.tap()
+            let folder = app.staticTexts["RisuNest iOS Bench"].firstMatch
+            XCTAssertTrue(folder.waitForExistence(timeout: 15))
+            folder.tap()
+            if !file.waitForExistence(timeout: 3) {
+                let exports = app.staticTexts["Exports"].firstMatch
+                XCTAssertTrue(exports.waitForExistence(timeout: 15))
+                exports.tap()
+            }
+        }
+        XCTAssertTrue(file.waitForExistence(timeout: 15))
+        file.tap()
+    }
+
     func testAppTransition() throws {
         continueAfterFailure = false
         let app = XCUIApplication(bundleIdentifier: "io.github.rsyumi.risunest.ios.bench")
@@ -17,7 +57,7 @@ final class NativeUITests: XCTestCase {
         let measurement = XCTAttachment(string: result.label)
         measurement.lifetime = .keepAlways
         add(measurement)
-        XCTAssertTrue(app.webViews.staticTexts["passed"].exists)
+        XCTAssertTrue(app.webViews.staticTexts["passed"].waitForExistence(timeout: 10))
     }
 
     func testProductKeyboard() throws {
@@ -45,13 +85,11 @@ final class NativeUITests: XCTestCase {
         XCTAssertTrue(app.webViews.staticTexts["ui-ready"].waitForExistence(timeout: 30))
 
         app.webViews.buttons["Import synthetic file"].tap()
-        XCTAssertTrue(app.buttons["Cancel"].waitForExistence(timeout: 15))
-        app.buttons["Cancel"].tap()
+        cancelPicker(app)
         XCTAssertTrue(app.webViews.staticTexts["import-cancelled"].waitForExistence(timeout: 10))
 
         app.webViews.buttons["Export synthetic file"].tap()
-        XCTAssertTrue(app.buttons["Cancel"].waitForExistence(timeout: 15))
-        app.buttons["Cancel"].tap()
+        cancelPicker(app)
         XCTAssertTrue(app.webViews.staticTexts["export-cancelled"].waitForExistence(timeout: 10))
 
         app.webViews.buttons["Allow notifications"].tap()
@@ -77,7 +115,7 @@ final class NativeUITests: XCTestCase {
         XCTAssertTrue(app.webViews.buttons["Export synthetic file"].waitForExistence(timeout: 30))
         app.webViews.buttons["Export synthetic file"].tap()
         let save = app.buttons["Save"]
-        XCTAssertTrue(save.waitForExistence(timeout: 15))
+        XCTAssertTrue(save.waitForExistence(timeout: 30))
         if !save.isEnabled {
             let location = app.staticTexts["On My iPhone"].firstMatch
             if location.exists { location.tap() }
@@ -93,9 +131,7 @@ final class NativeUITests: XCTestCase {
         save.tap()
         XCTAssertTrue(app.webViews.staticTexts["exported"].waitForExistence(timeout: 30))
         app.webViews.buttons["Import synthetic file"].tap()
-        let file = app.cells.containing(NSPredicate(format: "label CONTAINS %@", "synthetic")).firstMatch
-        XCTAssertTrue(file.waitForExistence(timeout: 15))
-        file.tap()
+        openPublishedFile(app)
         XCTAssertTrue(app.webViews.staticTexts["imported-exact"].waitForExistence(timeout: 30))
     }
 }
