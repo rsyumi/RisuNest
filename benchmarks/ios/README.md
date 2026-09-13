@@ -23,9 +23,15 @@ macOS with Xcode. It produces:
 - `testlab-package.json`: source provenance, Xcode, target, size and SHA-256.
 
 The script verifies arm64/iphoneos and ad-hoc signatures locally. Firebase
-re-signs submitted apps, but acceptance of this preparation package must still be
-verified in the configured project. Do not call a successful package build a
-successful device test. No Firebase SDK or credentials are added to the product.
+re-signs submitted apps. The first submitted package (source `d94ec8296`, Xcode
+26.2) was accepted and passed all four UI tests on iPad 10/iOS 16.6 and iPhone SE
+3/iOS 26.3. Each later package still requires its own device validation. No
+Firebase SDK or credentials are added to the product.
+
+The device-core test additionally measures alternating JSON and worker/raw
+storage commits, exact Unicode and revision contracts, native regex against its
+JavaScript oracle, and tokenizer results. It attaches measurements instead of
+asserting a speedup: simulator trials showed inconsistent storage timing gains.
 
 After Firebase is configured, inspect its current device and Xcode catalog:
 

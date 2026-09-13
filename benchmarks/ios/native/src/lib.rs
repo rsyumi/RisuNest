@@ -11,8 +11,22 @@ fn ios_bench_stream_url() -> String {
     std::env::var("RISUNEST_IOS_STREAM_URL").expect("synthetic stream endpoint")
 }
 
+#[tauri::command]
+fn ios_bench_cloud_key() -> Result<String, &'static str> {
+    let phase = ios_bench_phase();
+    if phase != "cloud" && phase != "cloud-cancel" {
+        return Err("Live verification phase required");
+    }
+    std::env::var("RISUNEST_IOS_CLOUD_KEY").map_err(|_| "Live credential unavailable")
+}
+
 fn benchmark_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
-    tauri::generate_handler![ios_bench_phase, ios_bench_report, ios_bench_stream_url]
+    tauri::generate_handler![
+        ios_bench_phase,
+        ios_bench_report,
+        ios_bench_stream_url,
+        ios_bench_cloud_key
+    ]
 }
 
 #[tauri::command]

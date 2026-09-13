@@ -1,6 +1,49 @@
 import XCTest
 
 final class NativeUITests: XCTestCase {
+    private func liveCloud(cancel: Bool) throws {
+        continueAfterFailure = false
+        guard let key = ProcessInfo.processInfo.environment["RISUNEST_IOS_CLOUD_KEY"], !key.isEmpty else {
+            throw XCTSkip("Live Cloud credential not supplied")
+        }
+        let app = XCUIApplication(bundleIdentifier: "io.github.rsyumi.risunest.ios.bench")
+        app.launchEnvironment["RISUNEST_IOS_PHASE"] = cancel ? "cloud-cancel" : "cloud"
+        app.launchEnvironment["RISUNEST_IOS_CLOUD_KEY"] = key
+        app.launch()
+        XCTAssertTrue(app.webViews.staticTexts["cloud-streaming"].waitForExistence(timeout: 90))
+        if cancel {
+            app.webViews.buttons["Cancel live request"].tap()
+        } else {
+            XCUIDevice.shared.press(.home)
+            let elapsed = expectation(description: "Observe real cloud streaming during app transition")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 20) { elapsed.fulfill() }
+            wait(for: [elapsed], timeout: 25)
+            app.activate()
+        }
+        let result = app.webViews.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "cloud-result:")).firstMatch
+        XCTAssertTrue(result.waitForExistence(timeout: 200))
+        let measurement = XCTAttachment(string: result.label)
+        measurement.lifetime = .keepAlways
+        add(measurement)
+        XCTAssertTrue(app.webViews.staticTexts["passed"].waitForExistence(timeout: 10))
+    }
+
+    func testLiveCloudTransition() throws { try liveCloud(cancel: false) }
+    func testLiveCloudCancellation() throws { try liveCloud(cancel: true) }
+
+    func testDeviceCore() throws {
+        continueAfterFailure = false
+        let app = XCUIApplication(bundleIdentifier: "io.github.rsyumi.risunest.ios.bench")
+        app.launchEnvironment["RISUNEST_IOS_PHASE"] = "device-core"
+        app.launch()
+        let result = app.webViews.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "device-core-result:")).firstMatch
+        XCTAssertTrue(result.waitForExistence(timeout: 420))
+        let measurement = XCTAttachment(string: result.label)
+        measurement.lifetime = .keepAlways
+        add(measurement)
+        XCTAssertTrue(app.webViews.staticTexts["passed"].waitForExistence(timeout: 10))
+    }
+
     private func cancelPicker(_ app: XCUIApplication) {
         // On iOS 26, export subfolders show a Back button; Cancel is at the root.
         let cancel = app.buttons["Cancel"]

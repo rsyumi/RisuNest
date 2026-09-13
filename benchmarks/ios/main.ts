@@ -32,7 +32,22 @@ async function main() {
   installIOSPersistenceLifecycle(async () => {
     await invoke("pds_checkpoint", { mode: "passive" });
   });
-  if (phase === "contracts") {
+  if (phase === "cloud" || phase === "cloud-cancel") {
+    const { cloudContract } = await import("./cloudContracts");
+    await report("cloud", await cloudContract(phase === "cloud-cancel"));
+    await report("complete", { passed: true });
+  } else if (phase === "device-core") {
+    const result = {
+      persistence: await persistence(),
+      regex: await regex(),
+      tokenizer: await tokenizer(),
+    };
+    await report("device-core", result);
+    const measured = document.createElement("pre");
+    measured.textContent = "device-core-result:" + JSON.stringify(result);
+    document.getElementById("benchmark")!.append(measured);
+    await report("complete", { passed: true });
+  } else if (phase === "contracts") {
     await report("persistence", await persistence());
     await report("regex", await regex());
     await report("streaming", await streaming());
@@ -106,7 +121,8 @@ async function main() {
   } else if (phase === "background") {
     await invoke("pds_open");
     const lease = await beginIOSGeneration();
-    await report("background-ready", { state: await getIOSNativeState() });
+    const initialState = await getIOSNativeState();
+    await report("background-ready", { state: initialState });
     document.getElementById("status")!.textContent = "background-ready";
     let tick = 0;
     const gapsMs: number[] = [];
@@ -124,6 +140,7 @@ async function main() {
     }
     await lease.dispose();
     await report("background-result", {
+      initialState,
       tick,
       gapsMs,
       aborted: lease.signal?.aborted,
@@ -133,6 +150,7 @@ async function main() {
     measured.textContent =
       "background-result:" +
       JSON.stringify({
+        initialState,
         tick,
         aborted: lease.signal?.aborted,
         maxGapMs: Math.max(...gapsMs),
