@@ -14,6 +14,18 @@ import { persistence, reload, regex, guard, check, pause } from "./contracts";
 
 const report = (stage: string, result: unknown) =>
   invoke("ios_bench_report", { stage, result });
+async function userStart(label: string) {
+  await new Promise<void>((resolve) => {
+    const button = document.createElement("button");
+    button.textContent = label;
+    button.style.cssText = "display:block;padding:24px;margin:16px";
+    button.onclick = () => {
+      button.remove();
+      resolve();
+    };
+    document.getElementById("benchmark")!.append(button);
+  });
+}
 async function main() {
   await guard();
   check(isTauriIOS && !isTauriDesktop, "iOS runtime classification");
@@ -38,6 +50,10 @@ async function main() {
   installIOSPersistenceLifecycle(async () => {
     await invoke("pds_checkpoint", { mode: "passive" });
   });
+  // Continued processing requires a user action; XCTest performs an actual tap.
+  if (phase === "cloud" || phase === "cloud-cancel")
+    await userStart("Start live request");
+  if (phase === "background-ui") await userStart("Start background work");
   if (phase === "cloud" || phase === "cloud-cancel") {
     const { cloudContract } = await import("./cloudContracts");
     await report("cloud", await cloudContract(phase === "cloud-cancel"));
@@ -128,7 +144,7 @@ async function main() {
       state: await getIOSNativeState(),
     });
     await report("complete", { passed: true });
-  } else if (phase === "background") {
+  } else if (phase === "background" || phase === "background-ui") {
     await invoke("pds_open");
     const lease = await beginIOSGeneration();
     const initialState = await getIOSNativeState();

@@ -10,6 +10,9 @@ final class NativeUITests: XCTestCase {
         app.launchEnvironment["RISUNEST_IOS_PHASE"] = cancel ? "cloud-cancel" : "cloud"
         app.launchEnvironment["RISUNEST_IOS_CLOUD_KEY"] = key
         app.launch()
+        let start = app.webViews.buttons["Start live request"]
+        XCTAssertTrue(start.waitForExistence(timeout: 30))
+        start.tap()
         XCTAssertTrue(app.webViews.staticTexts["cloud-streaming"].waitForExistence(timeout: 90))
         if cancel {
             app.webViews.buttons["Cancel live request"].tap()
@@ -95,8 +98,11 @@ final class NativeUITests: XCTestCase {
     func testAppTransition() throws {
         continueAfterFailure = false
         let app = XCUIApplication(bundleIdentifier: "io.github.rsyumi.risunest.ios.bench")
-        app.launchEnvironment["RISUNEST_IOS_PHASE"] = "background"
+        app.launchEnvironment["RISUNEST_IOS_PHASE"] = "background-ui"
         app.launch()
+        let start = app.webViews.buttons["Start background work"]
+        XCTAssertTrue(start.waitForExistence(timeout: 30))
+        start.tap()
         XCTAssertTrue(app.webViews.staticTexts["background-ready"].waitForExistence(timeout: 30))
         XCUIDevice.shared.press(.home)
         let elapsed = expectation(description: "Observe a ten second app transition")
