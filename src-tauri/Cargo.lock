@@ -4450,6 +4450,7 @@ dependencies = [
  "axum",
  "futures-util",
  "getrandom 0.2.17",
+ "libc",
  "qrcode",
  "reqwest 0.12.28",
  "risunest-sync-connect",
