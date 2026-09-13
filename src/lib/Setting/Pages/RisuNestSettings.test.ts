@@ -133,14 +133,20 @@ describe('RisuNest backup and restore layout', () => {
 })
 
 describe('RisuNest native command integration', () => {
-    const handlerStart = tauriLibSource.indexOf(
-        '.invoke_handler(tauri::generate_handler![',
-    )
+    const handlerStart = tauriLibSource.indexOf('pub fn invoke_handler()')
     const handlerEnd = tauriLibSource.indexOf(
-        '])\n        .build(',
+        'pub fn handle_run_event(',
         handlerStart,
     )
     const handlerSource = tauriLibSource.slice(handlerStart, handlerEnd)
+    it('connects the shared command router to the product builder', () => {
+        expect(handlerStart).toBeGreaterThan(0)
+        expect(handlerEnd).toBeGreaterThan(handlerStart)
+        expect(handlerSource).toContain('tauri::generate_handler![')
+        expect(tauriLibSource.slice(0, handlerStart)).toContain(
+            '.invoke_handler(invoke_handler())',
+        )
+    })
     const commands = [
         'pds_storage_stats',
         'pds_snapshot_delete',

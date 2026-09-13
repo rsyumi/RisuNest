@@ -331,6 +331,8 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             if webview.label() == "main"
                 && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
             {
+                #[cfg(target_os = "macos")]
+                macos_lifecycle::document_started(webview.app_handle());
                 if let Some(state) = webview.try_state::<device_backup::DeviceBackupState>() {
                     state.main_document_started();
                 }

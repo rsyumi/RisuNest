@@ -37,6 +37,7 @@ def run_phase(app, phase, artifacts, fixtures):
     binary = app / 'Contents/MacOS/risunest-macos-bench'
     samples = []
     handled = set()
+    (artifacts / f'{phase}-baseline-memory.json').write_text(json.dumps(memory_sample(-1), indent=2))
     with (artifacts / f'{phase}.log').open('w') as log:
         process = subprocess.Popen([str(binary)], env=environment, stdout=log, stderr=subprocess.STDOUT)
         try:
@@ -54,6 +55,8 @@ def run_phase(app, phase, artifacts, fixtures):
                         subprocess.run(['open', '-a', str(app)], check=True)
                     if stage == 'reopened':
                         subprocess.run(['open', '-a', str(app), *map(str, fixtures)], check=True)
+                    if stage == 'app':
+                        subprocess.run(['screencapture', '-x', str(artifacts / 'app.png')], check=False)
                 samples.append(memory_sample(process.pid))
                 if time.monotonic() > deadline:
                     raise TimeoutError(f'{phase}: native app timeout, stages={sorted(handled)}')
@@ -61,7 +64,7 @@ def run_phase(app, phase, artifacts, fixtures):
             if process.returncode != 0:
                 raise RuntimeError(f'{phase}: app exited {process.returncode}')
             result = records(report)
-            required = {'contracts': {'persistence', 'regex', 'tokenizer', 'reload', 'closed', 'reopened', 'finder', 'quit-cancelled', 'quit-saved'}, 'restart': {'restart'}, 'app': {'app'}}[phase]
+            required = {'contracts': {'persistence', 'regex', 'tokenizer', 'reload', 'closed', 'reopened', 'finder', 'quit-cancelled', 'quit-saved'}, 'restart': {'restart'}, 'app': {'app'}, 'app-restart': {'app-restart'}}[phase]
             stages = {entry['stage'] for entry in result}
             if not required <= stages or 'failure' in stages:
                 raise RuntimeError(f'{phase}: incomplete results {stages}')
@@ -95,7 +98,7 @@ def main():
     fixtures = [fixture_root / 'synthetic 한글 # %.risup', fixture_root / 'synthetic-two.risum']
     for fixture in fixtures:
         fixture.write_text('synthetic file association fixture')
-    results = {phase: run_phase(app, phase, artifacts, fixtures) for phase in ['contracts', 'restart', 'app']}
+    results = {phase: run_phase(app, phase, artifacts, fixtures) for phase in ['contracts', 'restart', 'app', 'app-restart']}
     (artifacts / 'result.json').write_text(json.dumps({'passed': True, 'phases': results}, indent=2))
     print('Mac WKWebView contracts, restart and product app passed', flush=True)
 

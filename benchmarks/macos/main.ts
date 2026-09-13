@@ -241,6 +241,16 @@ async function main() {
     await invoke("macos_bench_quit");
   } else if (phase === "app") {
     document.getElementById("benchmark")!.remove();
+    // This profile is entirely synthetic; preseed completed local onboarding.
+    const opened = await invoke<{ revision: number }>("pds_open");
+    await invoke("pds_commit", {
+      commit: {
+        expectedRevision: opened.revision,
+        rootMutations: [{ type: "set", key: "didFirstSetup", value: true }],
+      },
+      assetAliases: [],
+    });
+    localStorage.setItem("tos4", "true");
     const app = await import("../../src/main");
     await app.default;
     const { getPersistentDataRuntime } = await import(
@@ -250,17 +260,68 @@ async function main() {
       try {
         return (
           Boolean(getPersistentDataRuntime().store) &&
+          performance.getEntriesByName("boot:interactive").length > 0 &&
           document.getElementById("app")!.textContent!.length > 100
         );
       } catch {
         return false;
       }
     }, "product Svelte app did not initialize");
-    await pause(2000);
+    const { DBState } = await import("../../src/ts/stores.svelte");
+    const { changeChar } = await import("../../src/ts/characters");
+    const { tick } = await import("svelte");
+    const index = DBState.db.characters.findIndex(
+      (character) => character.chaId === "char-a",
+    );
+    check(
+      index >= 0 && (await changeChar(index)),
+      "open synthetic character in product UI",
+    );
+    const character = DBState.db.characters[index];
+    const chat = character.chats[character.chatPage];
+    const last = chat.message.at(-1)!;
+    const marker = "macos-synthetic-ui-edit 🐿️";
+    last.data = marker;
+    await tick();
+    await getPersistentDataRuntime().flushPendingData("macos-ui-smoke");
+    await until(
+      async () => document.getElementById("app")!.textContent!.includes(marker),
+      "edited synthetic message did not render in product chat",
+    );
+    const persisted = await invoke<{
+      revision: number;
+      value: { message: { data: string }[] };
+    }>("pds_read_conversation", {
+      characterId: "char-a",
+      conversationId: chat.id,
+    });
+    check(
+      persisted.value.message.at(-1)?.data === marker,
+      "product working-set edit persisted through Rust",
+    );
+    localStorage.setItem(
+      "macos-app-expected",
+      JSON.stringify({ conversationId: chat.id, marker }),
+    );
     await report("app", {
       passed: true,
       renderedTextLength: document.getElementById("app")!.textContent!.length,
+      revision: persisted.revision,
     });
+    await pause(2000);
+    await invoke("macos_bench_quit");
+  } else if (phase === "app-restart") {
+    await invoke("pds_open");
+    const expected = JSON.parse(localStorage.getItem("macos-app-expected")!);
+    const saved = await invoke<{ value: { message: { data: string }[] } }>(
+      "pds_read_conversation",
+      { characterId: "char-a", conversationId: expected.conversationId },
+    );
+    check(
+      saved.value.message.at(-1)?.data === expected.marker,
+      "product UI edit survives quit and restart",
+    );
+    await report("app-restart", { passed: true });
     await invoke("macos_bench_quit");
   } else {
     throw new Error("Unknown isolated Mac harness phase");

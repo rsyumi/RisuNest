@@ -11,7 +11,7 @@ it('adds Command on Mac while preserving saved Ctrl bindings', () => {
     expect(shortcutModifier({ ctrlKey: false, metaKey: false }, 'macos')).toBe(
         false,
     )
-    for (const os of ['windows', 'linux', 'android', 'ios']) {
+    for (const os of ['windows', 'linux', 'android', 'ios'] as const) {
         expect(shortcutModifier({ ctrlKey: false, metaKey: true }, os)).toBe(
             false,
         )

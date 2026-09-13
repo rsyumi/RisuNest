@@ -9,6 +9,11 @@ struct ExitDecision {
 }
 
 impl ExitDecision {
+    fn document_started(&mut self) {
+        self.ready = false;
+        self.pending = None;
+    }
+
     fn request(&mut self, code: i32) -> Option<String> {
         if !self.ready || self.allowed || self.pending.is_some() {
             return None;
@@ -33,6 +38,17 @@ pub(crate) struct ExitState(Mutex<ExitDecision>);
 
 #[cfg(target_os = "macos")]
 use tauri::{Emitter, Manager};
+
+#[cfg(target_os = "macos")]
+pub(crate) fn document_started(app: &tauri::AppHandle) {
+    if let Some(state) = app.try_state::<ExitState>() {
+        state
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .document_started();
+    }
+}
 
 #[cfg(target_os = "macos")]
 #[tauri::command]
@@ -151,5 +167,19 @@ mod tests {
         assert_ne!(first, next);
         assert!(state.respond(&first, true).is_err());
         assert_eq!(state.respond(&next, true).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn reloading_drops_the_departed_documents_quit_token() {
+        let mut state = ExitDecision {
+            ready: true,
+            ..Default::default()
+        };
+        let departed = state.request(0).unwrap();
+        state.document_started();
+        assert!(!state.ready);
+        assert!(state.respond(&departed, true).is_err());
+        state.ready = true;
+        assert!(state.request(0).is_some());
     }
 }
