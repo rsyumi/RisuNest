@@ -27,6 +27,8 @@ mod publication_upload;
 mod regex_shadow;
 mod server_sync;
 mod trust_boundary;
+#[cfg(windows)]
+mod windows_appearance;
 
 use base64::{engine::general_purpose, Engine as _};
 use oauth2::basic::{BasicClient, BasicErrorResponseType, BasicTokenType};
@@ -250,6 +252,20 @@ pub fn run() {
     let native_log_state = native_log::global_state();
     let setup_native_log_state = native_log_state.clone();
     let mut builder = tauri::Builder::default();
+    #[cfg(windows)]
+    {
+        use tauri_plugin_window_state::StateFlags;
+        builder = builder
+            .plugin(
+                tauri_plugin_window_state::Builder::default()
+                    .with_state_flags(
+                        StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED,
+                    )
+                    .with_filter(|label| label == "main")
+                    .build(),
+            )
+            .plugin(windows_appearance::init());
+    }
     #[cfg(target_os = "android")]
     {
         builder = builder
@@ -549,6 +565,8 @@ pub fn run() {
             regex_shadow::regex_execute_batch,
             #[cfg(any(target_os = "windows", target_os = "android"))]
             regex_shadow::regex_cancel_batch,
+            #[cfg(windows)]
+            windows_appearance::windows_set_appearance,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

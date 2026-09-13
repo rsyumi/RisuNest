@@ -86,7 +86,7 @@ regex = "1.13.1"
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.38.2"
-windows = { version = "0.61.3", features = ["Win32_System_Com"] }
+windows = { version = "0.61.3", features = ["Win32_System_Com", "Win32_Graphics_Dwm", "Win32_UI_Accessibility", "Win32_UI_WindowsAndMessaging"] }
 # Trust internal HTTPS endpoints whose CA is installed in the Windows store.
 # Keep the default public roots and certificate/hostname verification enabled.
 tauri-plugin-http = { version = "2.5.9", features = ["rustls-tls-native-roots"] }
@@ -96,6 +96,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
 ] }
+tauri-plugin-window-state = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
