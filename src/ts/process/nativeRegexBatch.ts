@@ -43,7 +43,10 @@ export function isNativeRegexTauriRuntime(
         }
     ).__TAURI_INTERNALS__,
 ): boolean {
-    return Boolean(tauriInternals) && ['windows', 'android', 'linux'].includes(os ?? platform())
+    return (
+        Boolean(tauriInternals) &&
+        ['windows', 'android', 'linux', 'ios'].includes(os ?? platform())
+    )
 }
 
 const productionRouteDependencies: NativeRegexBatchRouteDependencies = {

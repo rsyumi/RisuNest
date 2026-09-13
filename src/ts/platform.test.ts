@@ -40,9 +40,21 @@ const cases: Array<[string, boolean, string, ExpectedRuntime]> = [
 ]
 
 const originalTauriInternals = (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__
+const originalPlatform = Object.getOwnPropertyDescriptor(navigator, 'platform')
+const originalTouch = Object.getOwnPropertyDescriptor(
+    navigator,
+    'maxTouchPoints',
+)
 const originalUserAgent = Object.getOwnPropertyDescriptor(navigator, 'userAgent')
 
 afterEach(() => {
+    for (const [key, descriptor] of [
+        ['platform', originalPlatform],
+        ['maxTouchPoints', originalTouch],
+    ] as const) {
+        if (descriptor) Object.defineProperty(navigator, key, descriptor)
+        else Reflect.deleteProperty(navigator, key)
+    }
     const windowWithTauri = window as Window & { __TAURI_INTERNALS__?: unknown }
     if (originalTauriInternals === undefined) {
         delete windowWithTauri.__TAURI_INTERNALS__
@@ -59,6 +71,28 @@ afterEach(() => {
 })
 
 describe('runtime classification', () => {
+    it('classifies an iPad desktop user agent as iOS, not desktop', async () => {
+        vi.resetModules()
+        Object.defineProperty(navigator, 'platform', {
+            configurable: true,
+            value: 'MacIntel',
+        })
+        Object.defineProperty(navigator, 'maxTouchPoints', {
+            configurable: true,
+            value: 5,
+        })
+        Object.defineProperty(navigator, 'userAgent', {
+            configurable: true,
+            value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15)',
+        })
+        ;(
+            window as Window & { __TAURI_INTERNALS__?: unknown }
+        ).__TAURI_INTERNALS__ = {}
+        const runtime = await import('./platform')
+        expect(runtime.isTauriIOS).toBe(true)
+        expect(runtime.isTauriMobile).toBe(true)
+        expect(runtime.isTauriDesktop).toBe(false)
+    })
     it.each(cases)('%s classifies Tauri and mobile runtime', async (_name, tauri, userAgent, expected) => {
         vi.resetModules()
         const windowWithTauri = window as Window & { __TAURI_INTERNALS__?: unknown }

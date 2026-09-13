@@ -82,7 +82,7 @@ tauri-plugin-updater = "2.10.1"
 getrandom = "0.2.15"
 reqwest = { version = "0.11.16", features = ["blocking", "json"] }
 
-[target.'cfg(any(windows, target_os = "android", target_os = "linux"))'.dependencies]
+[target.'cfg(any(windows, target_os = "android", target_os = "linux", target_os = "ios"))'.dependencies]
 regex = "1.13.1"
 
 [target.'cfg(windows)'.dependencies]
@@ -108,8 +108,13 @@ security-framework = "2.11.1"
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
 
-[target.'cfg(target_os = "android")'.dependencies]
+[target.'cfg(target_os = "ios")'.dependencies]
+tauri-plugin-ios-native = { path = "../crates/tauri-plugin-ios-native" }
+
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 tauri-plugin-barcode-scanner = { path = "../crates/tauri-plugin-barcode-scanner" }
+
+[target.'cfg(target_os = "android")'.dependencies]
 getrandom = "0.2.15"
 jni = "0.21.1"
 reqwest = { version = "0.11.16", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }

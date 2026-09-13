@@ -21,7 +21,11 @@ const m = vi.hoisted(() => ({
 }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: m.invoke }))
 vi.mock('@tauri-apps/plugin-dialog', () => ({ open: m.open, save: m.save }))
-vi.mock('../platform', () => ({ isTauri: true, isTauriAndroid: false }))
+vi.mock('../platform', () => ({
+    isTauri: true,
+    isTauriAndroid: false,
+    isTauriIOS: false,
+}))
 vi.mock('../alert', () => ({ alertConfirm: m.confirm, alertNormal: vi.fn() }))
 vi.mock('../plugins/plugins.svelte', () => ({
     loadPluginsAfterAuthoritativeRestore: m.after,

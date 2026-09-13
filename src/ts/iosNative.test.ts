@@ -1,0 +1,85 @@
+import { describe, expect, it, vi } from 'vitest'
+import { beginIOSGeneration, type IOSNativeState } from './iosNative'
+
+const state = (
+    activeTasks: string[] = ['lease'],
+    expiredTasks: string[] = [],
+): IOSNativeState => ({
+    activeTasks,
+    expiredTasks,
+    foreground: true,
+    notifications: false,
+    notificationStatus: 0,
+    backgroundMode: 'limited',
+})
+function harness() {
+    return {
+        enabled: () => true,
+        begin: vi.fn(async () => ({ id: 'lease' })),
+        end: vi.fn(async () => {}),
+        state: vi.fn(async () => state()),
+        events: new EventTarget(),
+    }
+}
+describe('iOS generation lifecycle', () => {
+    it('preserves the caller cancellation and releases exactly once', async () => {
+        const deps = harness()
+        const caller = new AbortController()
+        const lease = await beginIOSGeneration(caller.signal, deps)
+        caller.abort('user-cancel')
+        expect(lease.signal?.reason).toBe('user-cancel')
+        await lease.dispose()
+        await lease.dispose()
+        expect(deps.end).toHaveBeenCalledExactlyOnceWith('lease')
+    })
+    it('expires only its own generation and removes the listener on release', async () => {
+        const deps = harness()
+        const lease = await beginIOSGeneration(undefined, deps)
+        deps.events.dispatchEvent(
+            new CustomEvent('risunest-ios-lifecycle', {
+                detail: { event: 'expired', id: 'other' },
+            }),
+        )
+        expect(lease.signal?.aborted).toBe(false)
+        deps.events.dispatchEvent(
+            new CustomEvent('risunest-ios-lifecycle', {
+                detail: { event: 'expired', id: 'lease' },
+            }),
+        )
+        expect(lease.signal?.aborted).toBe(true)
+        await lease.dispose()
+        deps.events.dispatchEvent(
+            new CustomEvent('risunest-ios-lifecycle', {
+                detail: { event: 'active' },
+            }),
+        )
+        expect(deps.state).not.toHaveBeenCalled()
+    })
+    it('detects an expiration event missed while WebKit was suspended', async () => {
+        const deps = harness()
+        deps.state.mockResolvedValue(state([], ['lease']))
+        const lease = await beginIOSGeneration(undefined, deps)
+        deps.events.dispatchEvent(
+            new CustomEvent('risunest-ios-lifecycle', {
+                detail: { event: 'active' },
+            }),
+        )
+        await vi.waitFor(() => expect(lease.signal?.aborted).toBe(true))
+        await lease.dispose()
+    })
+    it('allows foreground work when the OS rejects additional runtime', async () => {
+        const deps = harness()
+        deps.begin.mockRejectedValue(new Error('unavailable'))
+        const lease = await beginIOSGeneration(undefined, deps)
+        expect(lease.signal?.aborted).toBe(false)
+        await lease.dispose()
+        expect(deps.end).not.toHaveBeenCalled()
+    })
+    it('does not touch native commands on other platforms', async () => {
+        const deps = { ...harness(), enabled: () => false }
+        const controller = new AbortController()
+        const lease = await beginIOSGeneration(controller.signal, deps)
+        expect(lease.signal).toBe(controller.signal)
+        expect(deps.begin).not.toHaveBeenCalled()
+    })
+})

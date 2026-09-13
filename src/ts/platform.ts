@@ -20,7 +20,9 @@ export const isTauri: boolean = !!(window as Window & { __TAURI_INTERNALS__?: un
 export const isNodeServer: boolean = !!(globalThis as typeof globalThis & { __NODE__?: boolean }).__NODE__
 export const isWeb: boolean = !isTauri && !isNodeServer && location.hostname === 'risuai.xyz'
 export const isAndroid: boolean = /Android/i.test(browserNavigator.userAgent)
-export const isMobile: boolean = /Android|iPhone|iPad|iPod|webOS/i.test(browserNavigator.userAgent);
+export const isMobile: boolean =
+  /Android|webOS/i.test(browserNavigator.userAgent) || isIOS();
+export const isTauriIOS = isTauri && isIOS();
 export const isTauriAndroid = isTauri && isAndroid
 export const isTauriMobile = isTauri && isMobile
 export const isTauriDesktop = isTauri && !isMobile

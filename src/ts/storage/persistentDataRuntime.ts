@@ -317,6 +317,7 @@ export interface PersistentDataRuntime {
     ): Promise<void>
     markPersistentDataDirty(estimatedBytes: number): void
     flushPendingData(reason: string): Promise<void>
+    flushPendingDataLocally(reason: string): Promise<void>
     acknowledgeGenerationCompletion(): Promise<void>
     commitCharacterAddition(request: CharacterAdditionRequest, reason: string): Promise<void>
     activateCharacter(id: string, options?: CharacterActivationOptions): Promise<boolean>
@@ -701,6 +702,8 @@ export function createPersistentDataRuntime(
         markPersistentDataDirty: (estimatedBytes) =>
             coordinator.markPersistentDataDirty(estimatedBytes),
         flushPendingData: (reason) => coordinator.flushPendingData(reason),
+        flushPendingDataLocally: (reason) =>
+            coordinator.flushPendingDataLocally(reason),
         acknowledgeGenerationCompletion: () =>
             coordinator.flushPendingDataLocally('generation-completion'),
         commitCharacterAddition: (request, reason) =>

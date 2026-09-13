@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
 vi.mock('@tauri-apps/plugin-process', () => ({ relaunch: mocks.relaunch }))
 vi.mock('../platform', () => ({
+    isTauriIOS: false,
     get isTauriMobile() {
         return mocks.isTauriMobile
     },

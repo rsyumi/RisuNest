@@ -12,8 +12,13 @@ const state = vi.hoisted(() => ({
 }))
 
 vi.mock('./platform', () => ({
-    get isTauri() { return state.isTauri },
-    get isTauriMobile() { return state.isTauriMobile },
+    isTauriIOS: false,
+    get isTauri() {
+        return state.isTauri
+    },
+    get isTauriMobile() {
+        return state.isTauriMobile
+    },
     isNodeServer: false,
 }))
 vi.mock('./storage/platformBlobStore', () => ({

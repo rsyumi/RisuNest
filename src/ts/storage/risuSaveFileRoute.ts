@@ -40,7 +40,7 @@ type FileRouteRuntime = Pick<
 >
 
 export interface RisuSaveFileRouteDependencies {
-    platform(): 'native-desktop' | 'native-android' | 'web'
+    platform(): 'native-desktop' | 'native-ios' | 'native-android' | 'web'
     runtime(): FileRouteRuntime
     chooseNativeImport(): Promise<string | null>
     chooseNativeExport(defaultName: string): Promise<string | null>
@@ -403,13 +403,15 @@ export async function importRisuSaveFromPicker(
     dependencies: RisuSaveFileRouteDependencies,
 ): Promise<RisuSaveFileRouteResult | null> {
     const runtime = dependencies.runtime()
-    if (dependencies.platform() === 'native-desktop') {
+    if (['native-desktop', 'native-ios'].includes(dependencies.platform())) {
         const path = await dependencies.chooseNativeImport()
         if (!path) return null
         if (options.onSource) {
-            options.onSource(dependencies.describeNativeSource
-                ? await dependencies.describeNativeSource(path)
-                : { name: basenameOf(path) })
+            options.onSource(
+                dependencies.describeNativeSource
+                    ? await dependencies.describeNativeSource(path)
+                    : { name: basenameOf(path) },
+            )
         }
         let result: NativeFileJobResult
         try {
@@ -424,8 +426,7 @@ export async function importRisuSaveFromPicker(
                     afterRefresh: dependencies.reloadPluginsAfterNativeRestore,
                 },
             )
-        }
-        catch (error) {
+        } catch (error) {
             if (isNativeCompatibilityFallback(error)) {
                 announceWebReselect(options)
                 return importWithWebCodec(runtime, options, dependencies)
@@ -451,7 +452,7 @@ export async function exportRisuSaveFromPicker(
     if (platform === 'native-android') {
         return exportThroughAndroidSaf(dependencies.runtime(), name, options, dependencies)
     }
-    if (platform === 'native-desktop') {
+    if (platform === 'native-desktop' || platform === 'native-ios') {
         const destination = await dependencies.chooseNativeExport(name)
         if (!destination) return null
         let result: NativeFileJobResult
@@ -466,10 +467,13 @@ export async function exportRisuSaveFromPicker(
                     omitAccount: options.omitAccount ?? false,
                 },
             )
-        }
-        catch (error) {
+        } catch (error) {
             if (isCapabilityUnavailable(error)) {
-                return exportWithWebCodec(name, options.omitAccount ?? false, dependencies)
+                return exportWithWebCodec(
+                    name,
+                    options.omitAccount ?? false,
+                    dependencies,
+                )
             }
             throw error
         }

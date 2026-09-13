@@ -1,3 +1,4 @@
+import { exportIOSFile, getIOSPublication } from "../iosFiles";
 import {
   AndroidSafDestinationError,
   acknowledgeAndroidSafExport,
@@ -82,7 +83,7 @@ const pendingKey = "risuNestPortableExportIntent";
 export interface PendingPortableExport {
   schema: "risunest.portable-export-intent/v1";
   jobId: string;
-  publication: "desktop" | "android-saf";
+  publication: "desktop" | "android-saf" | "ios-files";
   suggestedName?: string;
   phase: "waiting-native" | "publishing" | "published";
   requestId?: string;
@@ -104,9 +105,9 @@ function validateIntent(
     intent.schema !== "risunest.portable-export-intent/v1" ||
     typeof intent.jobId !== "string" ||
     !/^[A-Za-z0-9_-]{1,128}$/.test(intent.jobId) ||
-    !["desktop", "android-saf"].includes(intent.publication) ||
+    !["desktop", "android-saf", "ios-files"].includes(intent.publication) ||
     !["waiting-native", "publishing", "published"].includes(intent.phase) ||
-    (intent.publication === "android-saf" &&
+    (["android-saf", "ios-files"].includes(intent.publication) &&
       (typeof intent.suggestedName !== "string" ||
         !intent.suggestedName.endsWith(".risunest") ||
         intent.suggestedName.length > 255 ||
@@ -161,14 +162,20 @@ export function createPortableExportIntentStore(
 export function rememberPortableExport(
   jobId: string,
   destination:
-    { type: "desktopPath" } | { type: "androidSaf"; suggestedName: string },
+    | { type: "desktopPath" }
+    | { type: "androidSaf" | "iosFiles"; suggestedName: string },
   store: PortableExportIntentStore = createPortableExportIntentStore(),
 ): void {
   store.write({
     schema: "risunest.portable-export-intent/v1",
     jobId,
-    publication: destination.type === "androidSaf" ? "android-saf" : "desktop",
-    ...(destination.type === "androidSaf"
+    publication:
+      destination.type === "iosFiles"
+        ? "ios-files"
+        : destination.type === "androidSaf"
+          ? "android-saf"
+          : "desktop",
+    ...(destination.type !== "desktopPath"
       ? { suggestedName: destination.suggestedName }
       : {}),
     phase: "waiting-native",
@@ -248,6 +255,36 @@ export async function resumePendingPortableExport(
         ...new Set([...result.warningCodes, ...intent.publicationWarningCodes]),
       ],
     };
+  if (intent.publication === "ios-files" && intent.phase !== "published") {
+    if (!result.handoffPath)
+      throw new PortableExportNeedsAttention(
+        "missing-ios-handoff",
+        intent.jobId,
+      );
+    const continuing = intent.phase === "publishing";
+    if (!continuing) {
+      intent = {
+        ...intent,
+        phase: "publishing",
+        requestId: crypto.randomUUID(),
+      };
+      dependencies.store.write(intent);
+    }
+    const publication = continuing
+      ? await getIOSPublication(intent.requestId!)
+      : await exportIOSFile({
+          sourcePath: result.handoffPath,
+          suggestedName: intent.suggestedName!,
+          requestId: intent.requestId,
+        });
+    if (!publication || publication.bytes !== result.sourceBytes)
+      throw new PortableExportNeedsAttention(
+        "ios-publication-unconfirmed",
+        intent.jobId,
+      );
+    intent = { ...intent, phase: "published", publicationWarningCodes: [] };
+    dependencies.store.write(intent);
+  }
   if (intent.publication === "android-saf" && intent.phase !== "published") {
     if (!result.handoffPath)
       throw new PortableExportNeedsAttention(

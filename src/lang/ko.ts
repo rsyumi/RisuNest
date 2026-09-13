@@ -2061,6 +2061,8 @@ export const languageKorean = {
             warningUnknown: '경고: {0}',
         },
         platform: {
+            iosNotificationsHelp: '디스플레이 설정에서 완료 알림을 켤 수 있습니다. 대화 내용 없이 완료 메시지만 표시합니다.',
+            iosBackgroundHelp: '생성 중에는 추가 실행 시간을 요청합니다. 앱 전환·잠금 후 iOS가 작업을 중단할 수 있으며, 시간이 만료되면 생성을 취소하고 앱이 실행될 수 있을 때 부분 응답을 저장합니다.',
             title: '플랫폼',
             notifications: '알림',
             notificationsHelp: '응답 생성 진행 상황을 알림으로 보여줍니다.',

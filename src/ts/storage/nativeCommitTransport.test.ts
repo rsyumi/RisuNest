@@ -27,6 +27,7 @@ function harness(
         windows?: boolean
         android?: boolean
         linux?: boolean
+        ios?: boolean
         unsupported?: boolean
         fail?: string
         ack?: number
@@ -45,7 +46,8 @@ function harness(
     const buffer = new ArrayBuffer(3)
     const invoke = vi.fn(async (command: string, args: any) => {
         if (options.fail === command) throw new Error('native failed')
-        if (command === 'pds_commit_android_open') return { capacity: 32 * 1024 }
+        if (command === 'pds_commit_android_open')
+            return { capacity: 32 * 1024 }
         if (command === 'pds_commit_android_chunk')
             return args.offset + new TextEncoder().encode(args.chunk).length
         if (command === 'pds_commit_shared_open') {
@@ -71,6 +73,7 @@ function harness(
         windows: () => options.windows ?? true,
         android: () => options.android ?? false,
         linux: () => options.linux ?? false,
+        ios: () => options.ios ?? false,
         invoke,
         encode,
         shared: () => webview,
@@ -79,50 +82,76 @@ function harness(
 }
 
 describe('native commit transport', () => {
-    it('encodes Linux large saves and submits raw bytes without touching shared buffers', async () => {
-        const h = harness({ windows: false, linux: true })
-        await expect(h.transport.commit(fixture())).resolves.toEqual({
-            revision: 2,
-        })
-        expect(h.encode).toHaveBeenCalledExactlyOnceWith(fixture())
-        expect(h.invoke).toHaveBeenCalledExactlyOnceWith(
-            'pds_commit_raw',
-            new Uint8Array([1, 2, 3, 4, 5]),
-        )
-        expect(h.webview.addEventListener).not.toHaveBeenCalled()
-    })
+    it.each(['linux', 'ios'] as const)(
+        'encodes %s large saves and submits raw bytes without touching shared buffers',
+        async (os) => {
+            const h = harness({ windows: false, [os]: true })
+            await expect(h.transport.commit(fixture())).resolves.toEqual({
+                revision: 2,
+            })
+            expect(h.encode).toHaveBeenCalledExactlyOnceWith(fixture())
+            expect(h.invoke).toHaveBeenCalledExactlyOnceWith(
+                'pds_commit_raw',
+                new Uint8Array([1, 2, 3, 4, 5]),
+            )
+            expect(h.webview.addEventListener).not.toHaveBeenCalled()
+        },
+    )
 
-    it('keeps small Linux saves on JSON and only falls back before raw submission', async () => {
-        const h = harness({ windows: false, linux: true })
-        await h.transport.commit(fixture(false))
-        expect(h.encode).not.toHaveBeenCalled()
-        expect(h.invoke).toHaveBeenCalledExactlyOnceWith('pds_commit', fixture(false))
-        h.invoke.mockClear()
-        h.encode.mockRejectedValueOnce(new DOMException('Cannot clone', 'DataCloneError'))
-        await h.transport.commit(fixture())
-        expect(h.invoke).toHaveBeenCalledExactlyOnceWith('pds_commit', fixture())
-    })
+    it.each(['linux', 'ios'] as const)(
+        'keeps small %s saves on JSON and only falls back before raw submission',
+        async (os) => {
+            const h = harness({ windows: false, [os]: true })
+            await h.transport.commit(fixture(false))
+            expect(h.encode).not.toHaveBeenCalled()
+            expect(h.invoke).toHaveBeenCalledExactlyOnceWith(
+                'pds_commit',
+                fixture(false),
+            )
+            h.invoke.mockClear()
+            h.encode.mockRejectedValueOnce(
+                new DOMException('Cannot clone', 'DataCloneError'),
+            )
+            await h.transport.commit(fixture())
+            expect(h.invoke).toHaveBeenCalledExactlyOnceWith(
+                'pds_commit',
+                fixture(),
+            )
+        },
+    )
 
-    it('does not replay an ambiguous Linux raw commit and allows the next queued save', async () => {
-        const h = harness({ windows: false, linux: true, fail: 'pds_commit_raw' })
-        await expect(h.transport.commit(fixture())).rejects.toThrow('native failed')
-        expect(h.invoke).toHaveBeenCalledTimes(1)
-        expect(h.invoke.mock.calls[0][0]).toBe('pds_commit_raw')
-        await expect(h.transport.commit(fixture(false))).resolves.toEqual({
-            revision: 2,
-        })
-    })
+    it.each(['linux', 'ios'] as const)(
+        'does not replay an ambiguous %s raw commit and allows the next queued save',
+        async (os) => {
+            const h = harness({
+                windows: false,
+                [os]: true,
+                fail: 'pds_commit_raw',
+            })
+            await expect(h.transport.commit(fixture())).rejects.toThrow(
+                'native failed',
+            )
+            expect(h.invoke).toHaveBeenCalledTimes(1)
+            expect(h.invoke.mock.calls[0][0]).toBe('pds_commit_raw')
+            await expect(h.transport.commit(fixture(false))).resolves.toEqual({
+                revision: 2,
+            })
+        },
+    )
 
-    it('does not turn the Windows shared-buffer budget into a Linux save limit', async () => {
-        const h = harness({ windows: false, linux: true })
-        const bytes = new Uint8Array(64 * 1024 * 1024 + 1)
-        h.encode.mockResolvedValueOnce(bytes)
-        await h.transport.commit(fixture())
-        expect(h.invoke).toHaveBeenCalledTimes(1)
-        expect(h.invoke.mock.calls[0][0]).toBe('pds_commit_raw')
-        expect(h.invoke.mock.calls[0][1]).toBe(bytes)
-        expect(h.webview.addEventListener).not.toHaveBeenCalled()
-    })
+    it.each(['linux', 'ios'] as const)(
+        'does not turn the Windows shared-buffer budget into a %s save limit',
+        async (os) => {
+            const h = harness({ windows: false, [os]: true })
+            const bytes = new Uint8Array(64 * 1024 * 1024 + 1)
+            h.encode.mockResolvedValueOnce(bytes)
+            await h.transport.commit(fixture())
+            expect(h.invoke).toHaveBeenCalledTimes(1)
+            expect(h.invoke.mock.calls[0][0]).toBe('pds_commit_raw')
+            expect(h.invoke.mock.calls[0][1]).toBe(bytes)
+            expect(h.webview.addEventListener).not.toHaveBeenCalled()
+        },
+    )
 
     it('falls back before submission for non-cloneable values, but propagates encoding failures', async () => {
         const h = harness()

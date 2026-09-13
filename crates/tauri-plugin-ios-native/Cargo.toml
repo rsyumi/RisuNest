@@ -1,0 +1,11 @@
+[package]
+name = "tauri-plugin-ios-native"
+version = "0.1.0"
+edition = "2021"
+links = "tauri-plugin-ios-native"
+
+[dependencies]
+tauri = "2.11.5"
+
+[build-dependencies]
+tauri-plugin = { version = "2.6.3", features = ["build"] }

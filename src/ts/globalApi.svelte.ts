@@ -46,7 +46,8 @@ import {
     replaceDatabaseRootResources,
 } from "./process/coldstorageData";
 import { collectExactPluginStorageAssetReferences } from "./drive/backupAssets";
-import { isTauri, isTauriMobile, isNodeServer } from "./platform";
+import { downloadIOSFile } from "./storage/iosFiles";
+import { isTauriIOS, isTauri, isTauriMobile, isNodeServer } from "./platform";
 import { isLocalNetworkUrl } from "./network/localNetwork";
 import { decodeProxyJobWsChunk, formatProxyStreamErrorMessage, parseProxyJobWsEvent } from "./network/proxyJobWs";
 import { getNodeServerProxyAuth } from "./storage/nodeStorage";
@@ -119,6 +120,7 @@ export async function downloadFile(name: string, dat: Uint8Array | ArrayBuffer |
         a.remove()
     }
 
+    if (isTauriIOS) return downloadIOSFile(name, data);
     if (isTauriMobile) {
         // Android resolves the download directory to app private storage the user cannot browse,
         // so exports go through the system picker instead.

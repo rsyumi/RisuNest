@@ -4,14 +4,16 @@ export interface NativeContentExportRuntime {
 }
 
 export interface NativeContentExportPickerDependencies {
-    isDesktop(): boolean
-    isAndroid(): boolean
-    runtime(): NativeContentExportRuntime
+  isDesktop(): boolean;
+  isAndroid(): boolean;
+  isIOS?(): boolean;
+  runtime(): NativeContentExportRuntime;
 }
 
 export type NativeContentExportDestination =
-    | { type: 'desktopPath'; path: string }
-    | { type: 'androidSaf'; suggestedName: string }
+  | { type: "desktopPath"; path: string }
+  | { type: "androidSaf"; suggestedName: string }
+  | { type: "iosFiles"; suggestedName: string };
 
 export type NativeContentExportPickerFlow =
     /** Neither desktop nor Android: callers fall back to the compatibility path. */
@@ -37,7 +39,12 @@ export async function prepareNativeContentExportFromPicker(
     options: { signal?: AbortSignal },
     dependencies: NativeContentExportPickerDependencies,
 ): Promise<NativeContentExportPickerFlow> {
-    if (!dependencies.isDesktop() && !dependencies.isAndroid()) return { kind: 'unsupported' }
+    if (
+      !dependencies.isDesktop() &&
+      !dependencies.isAndroid() &&
+      !dependencies.isIOS?.()
+    )
+      return { kind: "unsupported" };
     const destination = dependencies.isDesktop()
         ? await input.chooseDestination()
         : undefined
@@ -48,10 +55,13 @@ export async function prepareNativeContentExportFromPicker(
         throw new DOMException('Native file job was cancelled', 'AbortError')
     }
     return {
-        kind: 'ready',
-        destination: destination
-            ? { type: 'desktopPath', path: destination }
-            : { type: 'androidSaf', suggestedName: input.suggestedName },
-        expectedRevision: runtime.revision,
-    }
+      kind: "ready",
+      destination: destination
+        ? { type: "desktopPath", path: destination }
+        : {
+            type: dependencies.isIOS?.() ? "iosFiles" : "androidSaf",
+            suggestedName: input.suggestedName,
+          },
+      expectedRevision: runtime.revision,
+    };
 }

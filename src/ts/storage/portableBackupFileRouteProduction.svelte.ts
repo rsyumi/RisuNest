@@ -2,7 +2,8 @@ import { invoke } from '@tauri-apps/api/core'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import { language } from 'src/lang'
 import { alertConfirm, alertNormal } from '../alert'
-import { isTauri, isTauriAndroid } from '../platform'
+import { pickIOSFile, discardIOSFile } from './iosFiles'
+import { isTauriIOS, isTauri, isTauriAndroid } from '../platform'
 import { loadPluginsAfterAuthoritativeRestore } from '../plugins/plugins.svelte'
 import {
     discardAndroidSafSource,
@@ -86,24 +87,27 @@ export async function exportPortableBackupFromSystemPicker(
                 if (!selection) return null
                 checkSignal(joined.signal)
                 const suggestedName = `risunest-${new Date().toISOString().replace(/[:.]/g, '-')}.risunest`
-                const path = isTauriAndroid
-                    ? null
-                    : await save({
-                          defaultPath: suggestedName,
-                          filters: [
-                              {
-                                  name: 'RisuNest Backup',
-                                  extensions: ['risunest'],
-                              },
-                          ],
-                      })
-                if (!isTauriAndroid && !path) return null
+                const path =
+                    isTauriAndroid || isTauriIOS
+                        ? null
+                        : await save({
+                              defaultPath: suggestedName,
+                              filters: [
+                                  {
+                                      name: 'RisuNest Backup',
+                                      extensions: ['risunest'],
+                                  },
+                              ],
+                          })
+                if (!isTauriAndroid && !isTauriIOS && !path) return null
                 checkSignal(joined.signal)
                 return await runNativeArchiveExport(
                     getPersistentDataRuntime(),
-                    isTauriAndroid
-                        ? { type: 'androidSaf', suggestedName }
-                        : { type: 'desktopPath', path: path! },
+                    isTauriIOS
+                        ? { type: 'iosFiles', suggestedName }
+                        : isTauriAndroid
+                          ? { type: 'androidSaf', suggestedName }
+                          : { type: 'desktopPath', path: path! },
                     selection,
                     {
                         ...options,
@@ -125,7 +129,15 @@ export async function exportPortableBackupFromSystemPicker(
 export function restoreBackupFromSystemPicker(
     options: BackupRestoreOptions = {},
 ) {
+    let pickedIOSPath: string | undefined
     return restoreBackupFromNativeSource(async (context) => {
+        if (isTauriIOS) {
+            const picked = await pickIOSFile(context.signal)
+            if (!picked) return null
+            pickedIOSPath = picked.path
+            context.onSource({ name: picked.name, bytes: picked.bytes })
+            return { type: 'desktopPath', path: picked.path }
+        }
         if (isTauriAndroid)
             return pickAndroidBackupSource({
                 signal: context.signal,
@@ -162,7 +174,12 @@ export function restoreBackupFromSystemPicker(
         if (typeof path !== 'string') return null
         context.onSource(await describeDesktopSource(path))
         return { type: 'desktopPath', path }
-    }, options)
+    }, options).finally(async () => {
+        if (pickedIOSPath)
+            await discardIOSFile(pickedIOSPath).catch((error) =>
+                console.error('iOS import cleanup failed', error),
+            )
+    })
 }
 
 export async function restoreBackupFromNativeSource(

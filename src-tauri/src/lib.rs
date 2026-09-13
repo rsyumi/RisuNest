@@ -5,6 +5,8 @@ mod asset_repository;
 mod cold_payload_codec;
 pub(crate) mod device_backup;
 pub mod import_export_jobs;
+#[cfg(target_os = "ios")]
+mod ios_lifecycle;
 #[allow(dead_code)]
 mod local_backup;
 mod logical_records;
@@ -17,7 +19,7 @@ mod native_media;
 mod native_tokenizer;
 #[cfg(desktop)]
 mod opened_files;
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "ios"))]
 mod persistent_commit_raw;
 #[cfg(windows)]
 mod persistent_commit_transport;
@@ -29,7 +31,8 @@ mod publication_upload;
     test,
     target_os = "windows",
     target_os = "android",
-    target_os = "linux"
+    target_os = "linux",
+    target_os = "ios"
 ))]
 mod regex_shadow;
 mod server_sync;
@@ -253,12 +256,15 @@ fn check_auth(fpath: String, auth: String) -> bool {
     }
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
+pub fn builder() -> tauri::Builder<tauri::Wry> {
     native_log::install_panic_hook();
     let native_log_state = native_log::global_state();
     let setup_native_log_state = native_log_state.clone();
     let mut builder = tauri::Builder::default();
+    #[cfg(target_os = "ios")]
+    {
+        builder = builder.manage(ios_lifecycle::RestartState::default());
+    }
     #[cfg(windows)]
     {
         use tauri_plugin_window_state::StateFlags;
@@ -324,6 +330,8 @@ pub fn run() {
             if webview.label() == "main"
                 && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
             {
+                #[cfg(target_os = "ios")]
+                ios_lifecycle::main_document_started(webview.app_handle());
                 if let Some(state) = webview.try_state::<device_backup::DeviceBackupState>() {
                     state.main_document_started();
                 }
@@ -352,10 +360,12 @@ pub fn run() {
             .plugin(tauri_plugin_updater::Builder::new().build());
     }
 
-    let app = builder
+    builder
         .setup(move |app| {
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_os = "ios"))]
             app.handle().plugin(tauri_plugin_barcode_scanner::init())?;
+            #[cfg(target_os = "ios")]
+            app.handle().plugin(tauri_plugin_ios_native::init())?;
             let app_data_dir = app_data_root::resolve(app)?;
             let device_backup =
                 device_backup::DeviceBackupState::initialize(app_data_dir.join("device-backup"));
@@ -389,7 +399,12 @@ pub fn run() {
                         .join("screenshot-output"),
                 ),
             );
-            #[cfg(any(target_os = "windows", target_os = "android", target_os = "linux"))]
+            #[cfg(any(
+                target_os = "windows",
+                target_os = "android",
+                target_os = "linux",
+                target_os = "ios"
+            ))]
             app.manage(regex_shadow::RegexCancellationRegistry::default());
             Ok(())
         })
@@ -403,183 +418,203 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_fs::init())
-        .invoke_handler(tauri::generate_handler![
-            native_media::streaming::native_media_base_url,
-            server_sync::commands::server_sync_status,
-            server_sync::commands::server_sync_asset_status,
-            server_sync::commands::server_sync_asset_policy,
-            server_sync::commands::server_sync_asset_evict,
-            server_sync::commands::server_sync_verified_bytes,
-            server_sync::commands::server_sync_backups,
-            server_sync::commands::server_sync_backup_inventory,
-            server_sync::commands::server_sync_backup_delete,
-            server_sync::commands::server_sync_backup_cleanup,
-            server_sync::commands::server_sync_backup_release,
-            server_sync::commands::server_sync_cache_usage,
-            server_sync::commands::server_sync_cache_cleanup,
-            server_sync::commands::server_sync_backup_source,
-            server_sync::commands::server_sync_bind,
-            server_sync::commands::server_sync_reregister,
-            server_sync::commands::server_sync_reconcile,
-            server_sync::commands::server_sync_unbind,
-            server_sync::commands::server_sync_prepare,
-            server_sync::commands::server_sync_activate,
-            server_sync::commands::server_sync_publish,
-            server_sync::commands::server_sync_cancel,
-            greet,
-            native_request,
-            check_auth,
-            #[cfg(desktop)]
-            opened_files::opened_files_take,
-            persistent_store::commands::pds_storage_stats,
-            persistent_store::commands::pds_snapshot_delete,
-            persistent_store::commands::pds_asset_gc_preview,
-            persistent_store::commands::pds_asset_gc_execute,
-            native_log::native_log_tail,
-            native_log::native_log_error,
-            native_log::native_log_file_path,
-            native_log::native_log_set_file_enabled,
-            oauth_login,
-            native_tokenizer::tokenize_batch,
-            native_media::native_media_write_inlay_image,
-            native_media::native_media_encode_inlay_image,
-            asset_repository::commands::asset_cas_read_object,
-            asset_repository::commands::asset_cas_read_object_range,
-            asset_repository::commands::asset_cas_stat_object,
-            asset_repository::commands::asset_remote_stat_object,
-            asset_repository::commands::asset_remote_read_object,
-            asset_repository::commands::asset_cas_job_begin,
-            asset_repository::commands::asset_cas_job_prepare,
-            asset_repository::commands::asset_cas_job_pin_existing,
-            asset_repository::commands::asset_cas_job_seal,
-            asset_repository::commands::asset_cas_job_finalize_content,
-            asset_repository::commands::asset_cas_job_seal_prepared_content,
-            asset_repository::commands::asset_cas_job_release,
-            native_file_jobs::native_file_job_start,
-            device_backup::native_device_backup_bootstrap,
-            device_backup::native_device_backup_section_begin,
-            device_backup::native_device_backup_row_append,
-            device_backup::native_device_backup_row_append_from_blob,
-            device_backup::native_device_backup_section_finish,
-            device_backup::native_device_backup_section_list,
-            device_backup::native_device_backup_row_read,
-            device_backup::native_device_backup_row_read_bytes,
-            device_backup::native_device_backup_blob_begin,
-            device_backup::native_device_backup_blob_append,
-            device_backup::native_device_backup_blob_finish,
-            device_backup::native_device_backup_blob_read,
-            device_backup::native_device_backup_prepared,
-            device_backup::native_device_backup_section_intent,
-            device_backup::native_device_backup_section_complete,
-            device_backup::native_device_backup_finish_device,
-            device_backup::native_device_backup_recovery_complete,
-            device_backup::native_device_backup_fail,
-            device_backup::native_device_backup_retry_recovery,
-            native_file_jobs::native_content_source_metadata,
-            native_file_jobs::native_file_job_status,
-            native_file_jobs::native_file_job_list,
-            native_file_jobs::native_file_job_finalize,
-            native_file_jobs::native_file_job_cancel,
-            native_file_jobs::native_file_job_official_publication_retry,
-            native_file_jobs::native_file_job_forget,
-            native_file_jobs::native_portable_handoff_cleanup,
-            native_file_jobs::native_portable_select_sections,
-            native_file_jobs::native_backup_source_format,
-            native_file_jobs::native_legacy_backup_handoff_cleanup,
-            native_file_jobs::native_character_charx_handoff_cleanup,
-            native_file_jobs::native_character_card_handoff_cleanup,
-            native_file_jobs::native_risu_module_handoff_cleanup,
-            native_file_jobs::screenshot_output::native_file_job_screenshot_output_start,
-            native_file_jobs::screenshot_output::native_file_job_screenshot_output_append,
-            native_file_jobs::screenshot_output::native_file_job_screenshot_output_publish,
-            native_file_jobs::screenshot_output::native_file_job_screenshot_output_cancel,
-            native_file_jobs::screenshot_output::native_file_job_screenshot_output_release,
-            persistent_store::commands::pds_open,
-            persistent_store::commands::pds_asset_gc_maintenance,
-            persistent_store::commands::pds_read_root,
-            persistent_store::commands::pds_query_presets,
-            persistent_store::commands::pds_read_preset,
-            persistent_store::commands::pds_query_characters,
-            persistent_store::commands::pds_read_character,
-            persistent_store::commands::pds_query_conversations,
-            persistent_store::commands::pds_read_conversation,
-            persistent_store::commands::pds_read_conversation_metadata,
-            persistent_store::commands::pds_read_conversation_window,
-            persistent_store::commands::pds_query_plugin_storage,
-            persistent_store::commands::pds_read_plugin_storage,
-            persistent_store::commands::pds_read_asset_alias,
-            persistent_store::commands::pds_read_asset_aliases_by_keys,
-            persistent_store::commands::pds_list_asset_aliases,
-            persistent_store::commands::pds_read_asset_repository_authority,
-            persistent_store::commands::pds_read_asset_owner_head,
-            persistent_store::commands::pds_read_cold_payload_authority,
-            persistent_store::commands::pds_read_cold_alias,
-            persistent_store::commands::pds_list_cold_aliases,
-            persistent_store::commands::pds_commit_asset_alias,
-            persistent_store::commands::pds_delete_asset_alias,
-            persistent_store::commands::pds_commit_cold_alias,
-            persistent_store::commands::pds_delete_cold_alias,
-            persistent_store::commands::pds_activate_cold_payload_migration,
-            persistent_store::commands::pds_commit,
-            #[cfg(target_os = "android")]
-            android_commit_transport::pds_commit_android_open,
-            #[cfg(target_os = "android")]
-            android_commit_transport::pds_commit_android_chunk,
-            #[cfg(target_os = "android")]
-            android_commit_transport::pds_commit_android_finish,
-            #[cfg(target_os = "android")]
-            android_commit_transport::pds_commit_android_cancel,
-            #[cfg(any(windows, target_os = "linux"))]
-            persistent_commit_raw::pds_commit_raw,
-            #[cfg(windows)]
-            persistent_commit_transport::pds_commit_shared_open,
-            #[cfg(windows)]
-            persistent_commit_transport::pds_commit_shared_chunk,
-            #[cfg(windows)]
-            persistent_commit_transport::pds_commit_shared_finish,
-            #[cfg(windows)]
-            persistent_commit_transport::pds_commit_shared_cancel,
-            persistent_store::commands::pds_replace_begin,
-            persistent_store::commands::pds_replace_put_root,
-            persistent_store::commands::pds_replace_put_presets,
-            persistent_store::commands::pds_replace_add_characters,
-            persistent_store::commands::pds_replace_put_asset_aliases,
-            persistent_store::commands::pds_replace_put_asset_owner_heads,
-            persistent_store::commands::pds_replace_put_asset_repository_authority,
-            persistent_store::commands::pds_replace_put_cold_payload_authority,
-            persistent_store::commands::pds_replace_preserve_repositories,
-            persistent_store::commands::pds_replace_put_cold_aliases,
-            persistent_store::commands::pds_replace_commit,
-            persistent_store::commands::pds_replace_abort,
-            persistent_store::commands::pds_materialize,
-            persistent_store::commands::pds_acquire_revision,
-            persistent_store::commands::pds_release_revision,
-            persistent_store::commands::pds_export_risu_save,
-            persistent_store::commands::pds_export_risu_save_cleanup,
-            #[cfg(feature = "official-publication-upload-pilot")]
-            persistent_store::commands::official_publication_upload_file,
-            #[cfg(feature = "native-kei-upload-pilot")]
-            persistent_store::commands::pds_kei_backup_upload,
-            persistent_store::commands::pds_checkpoint,
-            persistent_store::commands::pds_snapshot_create,
-            persistent_store::commands::pds_snapshot_list,
-            persistent_store::commands::pds_snapshot_restore_request,
-            persistent_store::commands::pds_get_app_kv,
-            persistent_store::commands::pds_set_app_kv,
-            persistent_store::commands::pds_remove_app_kv,
-            #[cfg(any(target_os = "windows", target_os = "android", target_os = "linux"))]
-            regex_shadow::regex_execute_batch,
-            #[cfg(any(target_os = "windows", target_os = "android", target_os = "linux"))]
-            regex_shadow::regex_cancel_batch,
-            #[cfg(windows)]
-            windows_appearance::windows_set_appearance,
-        ])
+        .invoke_handler(invoke_handler())
+}
+
+pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
+    tauri::generate_handler![
+        #[cfg(target_os = "ios")]
+        ios_lifecycle::ios_prepare_restart,
+        native_media::streaming::native_media_base_url,
+        server_sync::commands::server_sync_status,
+        server_sync::commands::server_sync_asset_status,
+        server_sync::commands::server_sync_asset_policy,
+        server_sync::commands::server_sync_asset_evict,
+        server_sync::commands::server_sync_verified_bytes,
+        server_sync::commands::server_sync_backups,
+        server_sync::commands::server_sync_backup_inventory,
+        server_sync::commands::server_sync_backup_delete,
+        server_sync::commands::server_sync_backup_cleanup,
+        server_sync::commands::server_sync_backup_release,
+        server_sync::commands::server_sync_cache_usage,
+        server_sync::commands::server_sync_cache_cleanup,
+        server_sync::commands::server_sync_backup_source,
+        server_sync::commands::server_sync_bind,
+        server_sync::commands::server_sync_reregister,
+        server_sync::commands::server_sync_reconcile,
+        server_sync::commands::server_sync_unbind,
+        server_sync::commands::server_sync_prepare,
+        server_sync::commands::server_sync_activate,
+        server_sync::commands::server_sync_publish,
+        server_sync::commands::server_sync_cancel,
+        greet,
+        native_request,
+        check_auth,
+        #[cfg(desktop)]
+        opened_files::opened_files_take,
+        persistent_store::commands::pds_storage_stats,
+        persistent_store::commands::pds_snapshot_delete,
+        persistent_store::commands::pds_asset_gc_preview,
+        persistent_store::commands::pds_asset_gc_execute,
+        native_log::native_log_tail,
+        native_log::native_log_error,
+        native_log::native_log_file_path,
+        native_log::native_log_set_file_enabled,
+        oauth_login,
+        native_tokenizer::tokenize_batch,
+        native_media::native_media_write_inlay_image,
+        native_media::native_media_encode_inlay_image,
+        asset_repository::commands::asset_cas_read_object,
+        asset_repository::commands::asset_cas_read_object_range,
+        asset_repository::commands::asset_cas_stat_object,
+        asset_repository::commands::asset_remote_stat_object,
+        asset_repository::commands::asset_remote_read_object,
+        asset_repository::commands::asset_cas_job_begin,
+        asset_repository::commands::asset_cas_job_prepare,
+        asset_repository::commands::asset_cas_job_pin_existing,
+        asset_repository::commands::asset_cas_job_seal,
+        asset_repository::commands::asset_cas_job_finalize_content,
+        asset_repository::commands::asset_cas_job_seal_prepared_content,
+        asset_repository::commands::asset_cas_job_release,
+        native_file_jobs::native_file_job_start,
+        device_backup::native_device_backup_bootstrap,
+        device_backup::native_device_backup_section_begin,
+        device_backup::native_device_backup_row_append,
+        device_backup::native_device_backup_row_append_from_blob,
+        device_backup::native_device_backup_section_finish,
+        device_backup::native_device_backup_section_list,
+        device_backup::native_device_backup_row_read,
+        device_backup::native_device_backup_row_read_bytes,
+        device_backup::native_device_backup_blob_begin,
+        device_backup::native_device_backup_blob_append,
+        device_backup::native_device_backup_blob_finish,
+        device_backup::native_device_backup_blob_read,
+        device_backup::native_device_backup_prepared,
+        device_backup::native_device_backup_section_intent,
+        device_backup::native_device_backup_section_complete,
+        device_backup::native_device_backup_finish_device,
+        device_backup::native_device_backup_recovery_complete,
+        device_backup::native_device_backup_fail,
+        device_backup::native_device_backup_retry_recovery,
+        native_file_jobs::native_content_source_metadata,
+        native_file_jobs::native_file_job_status,
+        native_file_jobs::native_file_job_list,
+        native_file_jobs::native_file_job_finalize,
+        native_file_jobs::native_file_job_cancel,
+        native_file_jobs::native_file_job_official_publication_retry,
+        native_file_jobs::native_file_job_forget,
+        native_file_jobs::native_portable_handoff_cleanup,
+        native_file_jobs::native_portable_select_sections,
+        native_file_jobs::native_backup_source_format,
+        native_file_jobs::native_legacy_backup_handoff_cleanup,
+        native_file_jobs::native_character_charx_handoff_cleanup,
+        native_file_jobs::native_character_card_handoff_cleanup,
+        native_file_jobs::native_risu_module_handoff_cleanup,
+        native_file_jobs::screenshot_output::native_file_job_screenshot_output_start,
+        native_file_jobs::screenshot_output::native_file_job_screenshot_output_append,
+        native_file_jobs::screenshot_output::native_file_job_screenshot_output_publish,
+        native_file_jobs::screenshot_output::native_file_job_screenshot_output_cancel,
+        native_file_jobs::screenshot_output::native_file_job_screenshot_output_release,
+        persistent_store::commands::pds_open,
+        persistent_store::commands::pds_asset_gc_maintenance,
+        persistent_store::commands::pds_read_root,
+        persistent_store::commands::pds_query_presets,
+        persistent_store::commands::pds_read_preset,
+        persistent_store::commands::pds_query_characters,
+        persistent_store::commands::pds_read_character,
+        persistent_store::commands::pds_query_conversations,
+        persistent_store::commands::pds_read_conversation,
+        persistent_store::commands::pds_read_conversation_metadata,
+        persistent_store::commands::pds_read_conversation_window,
+        persistent_store::commands::pds_query_plugin_storage,
+        persistent_store::commands::pds_read_plugin_storage,
+        persistent_store::commands::pds_read_asset_alias,
+        persistent_store::commands::pds_read_asset_aliases_by_keys,
+        persistent_store::commands::pds_list_asset_aliases,
+        persistent_store::commands::pds_read_asset_repository_authority,
+        persistent_store::commands::pds_read_asset_owner_head,
+        persistent_store::commands::pds_read_cold_payload_authority,
+        persistent_store::commands::pds_read_cold_alias,
+        persistent_store::commands::pds_list_cold_aliases,
+        persistent_store::commands::pds_commit_asset_alias,
+        persistent_store::commands::pds_delete_asset_alias,
+        persistent_store::commands::pds_commit_cold_alias,
+        persistent_store::commands::pds_delete_cold_alias,
+        persistent_store::commands::pds_activate_cold_payload_migration,
+        persistent_store::commands::pds_commit,
+        #[cfg(target_os = "android")]
+        android_commit_transport::pds_commit_android_open,
+        #[cfg(target_os = "android")]
+        android_commit_transport::pds_commit_android_chunk,
+        #[cfg(target_os = "android")]
+        android_commit_transport::pds_commit_android_finish,
+        #[cfg(target_os = "android")]
+        android_commit_transport::pds_commit_android_cancel,
+        #[cfg(any(windows, target_os = "linux", target_os = "ios"))]
+        persistent_commit_raw::pds_commit_raw,
+        #[cfg(windows)]
+        persistent_commit_transport::pds_commit_shared_open,
+        #[cfg(windows)]
+        persistent_commit_transport::pds_commit_shared_chunk,
+        #[cfg(windows)]
+        persistent_commit_transport::pds_commit_shared_finish,
+        #[cfg(windows)]
+        persistent_commit_transport::pds_commit_shared_cancel,
+        persistent_store::commands::pds_replace_begin,
+        persistent_store::commands::pds_replace_put_root,
+        persistent_store::commands::pds_replace_put_presets,
+        persistent_store::commands::pds_replace_add_characters,
+        persistent_store::commands::pds_replace_put_asset_aliases,
+        persistent_store::commands::pds_replace_put_asset_owner_heads,
+        persistent_store::commands::pds_replace_put_asset_repository_authority,
+        persistent_store::commands::pds_replace_put_cold_payload_authority,
+        persistent_store::commands::pds_replace_preserve_repositories,
+        persistent_store::commands::pds_replace_put_cold_aliases,
+        persistent_store::commands::pds_replace_commit,
+        persistent_store::commands::pds_replace_abort,
+        persistent_store::commands::pds_materialize,
+        persistent_store::commands::pds_acquire_revision,
+        persistent_store::commands::pds_release_revision,
+        persistent_store::commands::pds_export_risu_save,
+        persistent_store::commands::pds_export_risu_save_cleanup,
+        #[cfg(feature = "official-publication-upload-pilot")]
+        persistent_store::commands::official_publication_upload_file,
+        #[cfg(feature = "native-kei-upload-pilot")]
+        persistent_store::commands::pds_kei_backup_upload,
+        persistent_store::commands::pds_checkpoint,
+        persistent_store::commands::pds_snapshot_create,
+        persistent_store::commands::pds_snapshot_list,
+        persistent_store::commands::pds_snapshot_restore_request,
+        persistent_store::commands::pds_get_app_kv,
+        persistent_store::commands::pds_set_app_kv,
+        persistent_store::commands::pds_remove_app_kv,
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "android",
+            target_os = "linux",
+            target_os = "ios"
+        ))]
+        regex_shadow::regex_execute_batch,
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "android",
+            target_os = "linux",
+            target_os = "ios"
+        ))]
+        regex_shadow::regex_cancel_batch,
+        #[cfg(windows)]
+        windows_appearance::windows_set_appearance,
+    ]
+}
+
+pub fn handle_run_event(_app: &tauri::AppHandle, _event: tauri::RunEvent) {}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    builder()
         .build(tauri::generate_context!())
-        .expect("error while building tauri application");
-    let app_data_dir =
-        app_data_root::resolve(&app).expect("error while resolving tauri app data directory");
-    native_log_state.configure_file_path(&app_data_dir);
-    app.run(|_app, _event| {});
+        .expect("error while building tauri application")
+        .run(handle_run_event);
 }
 
 fn header_map_to_json(header_map: &HeaderMap) -> serde_json::Value {

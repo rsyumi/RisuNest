@@ -43,12 +43,16 @@ describe('native regex batch adapter', () => {
         ['Windows Tauri', 'windows', {}, true],
         ['Android Tauri', 'android', {}, true],
         ['Linux Tauri', 'linux', {}, true],
+        ['iOS Tauri', 'ios', {}, true],
         ['macOS Tauri', 'macos', {}, false],
         ['browser Web', 'linux', undefined, false],
         ['unknown Tauri', 'unknown', {}, false],
-    ] as const)('detects the supported %s runtime', (_name, os, tauriInternals, expected) => {
-        expect(isNativeRegexTauriRuntime(os, tauriInternals)).toBe(expected)
-    })
+    ] as const)(
+        'detects the supported %s runtime',
+        (_name, os, tauriInternals, expected) => {
+            expect(isNativeRegexTauriRuntime(os, tauriInternals)).toBe(expected)
+        },
+    )
 
     it('returns a complete ordered batch result from the Tauri command', async () => {
         const invoke = vi.fn(async () => ({ data: 'bbb', errors: [] }))

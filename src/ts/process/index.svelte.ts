@@ -75,6 +75,8 @@ import {
     type CompleteConversationLease,
 } from '../storage/activeWorkingSet.svelte'
 import { beginAndroidGenerationKeepAlive, endAndroidGenerationKeepAlive } from '../androidGenerationKeepAlive'
+import { beginIOSGeneration, notifyIOSGenerationComplete } from "../iosNative";
+import { isTauriIOS } from "../platform";
 
 export { doingChat } from './generationState'
 
@@ -169,9 +171,13 @@ interface GenerationCompletionLifecycle {
 export async function notifyGenerationCompletion(result: string): Promise<void> {
     if (DBState.db.notification) {
         try {
-            if (await Notification.requestPermission() === 'granted') {
-                const notification = new Notification('RisuNest', { body: result })
-                notification.onclick = () => window.focus()
+            if (isTauriIOS) {
+              await notifyIOSGenerationComplete();
+            } else if ((await Notification.requestPermission()) === "granted") {
+              const notification = new Notification("RisuNest", {
+                body: result,
+              });
+              notification.onclick = () => window.focus();
             }
         } catch {}
     }
@@ -201,6 +207,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     let enteredGeneration = false
     let generationReturned = false
     let generationKeepAliveAcquired = false
+    let iosGeneration:
+      | Awaited<ReturnType<typeof beginIOSGeneration>>
+      | undefined;
     try {
         const target = captureSelectedConversationTarget()
         if (target) {
@@ -213,7 +222,13 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
         enteredGeneration = true
         generationKeepAliveAcquired = beginAndroidGenerationKeepAlive()
-        const result = await sendChatInternal(chatProcessIndex, arg, lifecycle, reservation)
+        iosGeneration = await beginIOSGeneration(arg.signal);
+        const result = await sendChatInternal(
+          chatProcessIndex,
+          { ...arg, signal: iosGeneration.signal },
+          lifecycle,
+          reservation,
+        );
         generationReturned = true
         return result
     } catch (error) {
@@ -233,6 +248,11 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
         completeLease?.release()
         endAndroidGenerationKeepAlive(generationKeepAliveAcquired)
+        await iosGeneration
+          ?.dispose()
+          .catch((error) =>
+            console.error("iOS generation cleanup failed", error),
+          );
         ownedReservation?.release({
             preserveBusy: enteredGeneration && !generationReturned,
         })

@@ -41,6 +41,8 @@ targets:
       properties:
         LSRequiresIPhoneOS: true
         UILaunchStoryboardName: LaunchScreen
+        NSCameraUsageDescription: Scan a QR code you choose to connect RisuNest.
+        LSSupportsOpeningDocumentsInPlace: false
         UIRequiredDeviceCapabilities: [arm64, metal]
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait

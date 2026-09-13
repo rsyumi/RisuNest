@@ -1,3 +1,4 @@
+import { exportIOSFile } from './iosFiles'
 import { MAX_CONTENT_METADATA_BYTES } from './contentImportLimits'
 import { invoke } from '@tauri-apps/api/core'
 
@@ -462,10 +463,12 @@ export interface NativeRisuModuleExportInput {
 export type NativeCharacterCharxExportDestination =
     | { type: 'desktopPath'; path: string }
     | { type: 'androidSaf'; suggestedName: string }
+    | { type: 'iosFiles'; suggestedName: string }
 
 export type NativeBackupDestination =
     | { type: 'desktopPath'; path: string }
     | { type: 'androidSaf'; suggestedName: string }
+    | { type: 'iosFiles'; suggestedName: string }
 
 export type NativeLegacyLocalBackupDestination = NativeBackupDestination
 
@@ -476,8 +479,8 @@ export interface NativeFileJobDependencies {
     discardAndroidSource?(token: string): boolean
 }
 
-export interface NativeBackupExportDependencies
-    extends NativeFileJobDependencies {
+export interface NativeBackupExportDependencies extends NativeFileJobDependencies {
+    copyToIOSFiles?: typeof exportIOSFile
     copyToAndroidSaf(
         request: AndroidSafDestinationRequest,
     ): Promise<AndroidSafDestinationResult>
@@ -494,6 +497,7 @@ const productionDependencies: NativeFileJobDependencies = {
 
 const productionBackupExportDependencies: NativeBackupExportDependencies = {
     ...productionDependencies,
+    copyToIOSFiles: exportIOSFile,
     copyToAndroidSaf: (request) => copyNativeExportToAndroidSaf(request),
 }
 
@@ -1603,16 +1607,28 @@ async function runNativeManagedExport(
                 terminal.result.warningCodes,
             ),
         }
-        if (spec.destination.type === 'androidSaf') {
+        if (
+            spec.destination.type === 'androidSaf' ||
+            spec.destination.type === 'iosFiles'
+        ) {
             managedSource = result.handoffPath
             if (!managedSource) {
                 throw new NativeFileJobError(
                     'missing-handoff',
-                    `${spec.operation} returned no Android handoff path`,
+                    `${spec.operation} returned no native handoff path`,
                 )
             }
             const committedResult = result
-            const published = await dependencies.copyToAndroidSaf({
+            const publish =
+                spec.destination.type === 'iosFiles'
+                    ? dependencies.copyToIOSFiles
+                    : dependencies.copyToAndroidSaf
+            if (!publish)
+                throw new NativeFileJobError(
+                    'unsupported',
+                    'iOS file publication is unavailable',
+                )
+            const published = await publish({
                 sourcePath: managedSource,
                 suggestedName: spec.destination.suggestedName,
                 signal: options.signal,
@@ -1643,7 +1659,7 @@ async function runNativeManagedExport(
             if (published.bytes !== result.sourceBytes) {
                 throw new NativeFileJobError(
                     'length-mismatch',
-                    `Android SAF ${spec.safLengthMismatchLabel} length differs from its native source`,
+                    `Published ${spec.safLengthMismatchLabel} length differs from its native source`,
                 )
             }
             const { handoffPath: _handoffPath, ...publishedResult } = result
