@@ -571,6 +571,8 @@ pub fn run() {
 
     let app = builder
         .setup(move |app| {
+            #[cfg(target_os = "android")]
+            app.handle().plugin(tauri_plugin_barcode_scanner::init())?;
             let app_data_dir = app_data_root::resolve(app)?;
             setup_native_log_state.configure_file_path(&app_data_dir);
             app.manage(setup_native_log_state.clone());

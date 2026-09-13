@@ -1,5 +1,6 @@
 mod backup;
 mod commits;
+mod connection;
 pub use backup::BackupManifest;
 mod jobs;
 pub use jobs::CommitSubmission;
@@ -39,6 +40,7 @@ pub struct Store {
     objects_gate: Mutex<()>,
     upload_job_gate: Mutex<()>,
     download_job_gate: Mutex<()>,
+    connection_gate: Mutex<()>,
     _owner: File,
 }
 
@@ -172,6 +174,7 @@ impl Store {
             objects_gate: Mutex::new(()),
             upload_job_gate: Mutex::new(()),
             download_job_gate: Mutex::new(()),
+            connection_gate: Mutex::new(()),
             _owner: owner,
         };
         store

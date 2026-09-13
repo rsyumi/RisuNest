@@ -27,9 +27,18 @@ internal object ServerSyncSecrets {
     }.generateKey()
   }
 
+  // Must match the native protected-file bound, including nonce and GCM tag.
+  private const val MAX_ENVELOPE_BYTES = 16384
+  internal fun validatePlaintextSize(size: Int) {
+    require(size in 1..(MAX_ENVELOPE_BYTES - 28))
+  }
+  internal fun validateEnvelopeSize(size: Int) {
+    require(size in 29..MAX_ENVELOPE_BYTES)
+  }
+
   @JvmStatic
   fun seal(input: ByteArray): ByteArray {
-    require(input.size == 64)
+    validatePlaintextSize(input.size)
     val cipher = Cipher.getInstance("AES/GCM/NoPadding")
     cipher.init(Cipher.ENCRYPT_MODE, key())
     check(cipher.iv.size == 12)
@@ -38,7 +47,7 @@ internal object ServerSyncSecrets {
 
   @JvmStatic
   fun open(input: ByteArray): ByteArray {
-    require(input.size == 92)
+    validateEnvelopeSize(input.size)
     val cipher = Cipher.getInstance("AES/GCM/NoPadding")
     cipher.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, input.copyOfRange(0, 12)))
     return cipher.doFinal(input, 12, input.size - 12)

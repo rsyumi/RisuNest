@@ -52,6 +52,7 @@ pub(crate) struct CycleOptions {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CycleResult {
+    pub endpoint: String,
     pub phase: String,
     pub local_revision: i64,
     pub head: RemoteHead,
@@ -503,7 +504,8 @@ impl PersistentStore {
         let mut client =
             ServerClient::with_cancellation(config.clone(), options.cancellation.clone())?;
         client.verified_bytes = options.verified_bytes.clone();
-        let identity_head = client.verified_head()?;
+        let identity_head = client.resolve_identity(false)?;
+        self.server_cache_endpoint(&config, client.config())?;
         let resume_may_commit = self
             .server_pending()?
             .is_some_and(|p| !p.phase.starts_with('{'));
@@ -515,6 +517,7 @@ impl PersistentStore {
         let transfer = Transfer::new(&client, &cache)?;
         if self.resume_server_operation(&client, &transfer)? {
             return Ok(Preparation::Report(CycleResult {
+                endpoint: client.config().endpoint.clone(),
                 phase: "pending".into(),
                 local_revision: self.revision()?,
                 head: client.head()?,
@@ -744,6 +747,7 @@ impl PersistentStore {
         if conflict_count > 0 {
             if options.resolution.is_none() {
                 return Ok(Preparation::Report(CycleResult {
+                    endpoint: client.config().endpoint.clone(),
                     phase: "conflict".into(),
                     local_revision: revision,
                     head: through,
@@ -947,6 +951,7 @@ impl PersistentStore {
         }
         if ready.proposals == 0 && ready.scope_fences.is_empty() {
             return Ok(CycleResult {
+                endpoint: client.config().endpoint.clone(),
                 phase: "idle".into(),
                 local_revision: next_revision,
                 head: through.clone(),
@@ -966,6 +971,7 @@ impl PersistentStore {
             &ready.scope_fences,
         )?;
         Ok(CycleResult {
+            endpoint: client.config().endpoint.clone(),
             phase: "pending".into(),
             local_revision: next_revision,
             head: through.clone(),

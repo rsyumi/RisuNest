@@ -30,11 +30,22 @@
     "dialog:allow-confirm",
     {
       "identifier": "http:default",
-      "allow": [{ "url": "https://*:*" }, { "url": "http://*:*" }]
+      "allow": [
+        {
+          "url": "https://*:*"
+        },
+        {
+          "url": "http://*:*"
+        }
+      ]
     },
     "os:default",
     "process:default",
     "shell:allow-open",
-    "deep-link:default"
+    "deep-link:default",
+    "barcode-scanner:allow-scan",
+    "barcode-scanner:allow-cancel",
+    "barcode-scanner:allow-check-permissions",
+    "barcode-scanner:allow-request-permissions"
   ]
 }

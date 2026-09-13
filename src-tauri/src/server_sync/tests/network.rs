@@ -261,6 +261,7 @@ fn run_case(
         .unwrap();
     });
     let client = ServerClient::new(ServerConfig {
+        directory: None,
         endpoint,
         library_id: device.library_id,
         device_id: device.device_id,

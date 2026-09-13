@@ -87,6 +87,7 @@
     }
 
     import { serverSyncScreenRequest } from 'src/ts/storage/sync/serverSyncDeepLink'
+    import ServerSyncConnection from 'src/lib/Setting/ServerSync/ServerSyncConnection.svelte'
     let lastServerRequest: unknown
     $effect(() => {
         if (
@@ -507,8 +508,15 @@
                     {:else if flow.state === 'sync-hub'}
                         {@render back('sync', t.back)}
                         <h1>{t.hub.title}</h1>
-                        <!-- A5 owns activation after the shared registration contract is verified. -->
-                        <p class="lead">{t.hub.stepLink}</p>
+                        {#if isTauri}
+                            <ServerSyncConnection
+                                origin="onboarding"
+                                initialNavigation={$serverSyncScreenRequest}
+                                onInitialSyncComplete={() => goTo('done')}
+                            />
+                        {:else}
+                            <p class="lead">{t.hub.stepLink}</p>
+                        {/if}
                     {:else if flow.state === 'sync-account'}
                         {@render back('sync', t.back)}
                         <h1>{t.account.title}</h1>

@@ -1,0 +1,14 @@
+{
+  "registration": {
+    "endpoint": "https://sync.example/base",
+    "libraryId": "library",
+    "deviceId": "device",
+    "token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "directory": {
+      "baseUrl": "https://registry.example",
+      "uuid": "12345678-1234-4234-9234-123456789abc",
+      "key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    }
+  },
+  "uri": "risunestlocal://sync-server/register#eyJlbmRwb2ludCI6Imh0dHBzOi8vc3luYy5leGFtcGxlL2Jhc2UiLCJsaWJyYXJ5SWQiOiJsaWJyYXJ5IiwiZGV2aWNlSWQiOiJkZXZpY2UiLCJ0b2tlbiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEiLCJkaXJlY3RvcnkiOnsiYmFzZVVybCI6Imh0dHBzOi8vcmVnaXN0cnkuZXhhbXBsZSIsInV1aWQiOiIxMjM0NTY3OC0xMjM0LTQyMzQtOTIzNC0xMjM0NTY3ODlhYmMiLCJrZXkiOiJBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBIn19"
+}

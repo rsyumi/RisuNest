@@ -4,43 +4,7 @@ use risunest_sync_wire::{canonical, RemoteHead, MAX_METADATA_BYTES};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{io::Read, time::Duration};
 
-/// Credentials remain native local configuration, outside sync projections.
-/// Deliberately no Debug implementation or URL/query credential transport.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ServerConfig {
-    pub endpoint: String,
-    pub library_id: String,
-    pub device_id: String,
-    pub token: String,
-}
-impl ServerConfig {
-    pub fn validate(&self) -> Result<Url> {
-        risunest_sync_wire::validate_id(&self.library_id)?;
-        risunest_sync_wire::validate_id(&self.device_id)?;
-        if self.token.len() != 64 || !self.token.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(SyncError::new("invalid-device-token", 400));
-        }
-        let mut url =
-            Url::parse(&self.endpoint).map_err(|_| SyncError::new("invalid-endpoint", 400))?;
-        if !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
-            return Err(SyncError::new("invalid-endpoint", 400));
-        }
-        let loopback = matches!(url.host(),Some(url::Host::Ipv4(ip)) if ip.is_loopback())
-            || matches!(url.host(),Some(url::Host::Ipv6(ip)) if ip.is_loopback())
-            || url.host_str() == Some("localhost");
-        if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
-            return Err(SyncError::new("https-required", 400));
-        }
-        let path = format!("{}/", url.path().trim_end_matches('/'));
-        url.set_path(&path);
-        Ok(url)
-    }
-}
+pub(crate) use risunest_sync_connect::Registration as ServerConfig;
 pub(crate) struct ServerClient {
     http: Client,
     url: Url,
@@ -62,18 +26,79 @@ struct Identity {
     operation_pending: bool,
 }
 impl ServerClient {
-    pub fn verified_head(&self) -> Result<risunest_sync_wire::RemoteHead> {
-        self.identity().map(|identity| identity.head)
-    }
-    pub fn verify_identity(&self) -> Result<()> {
-        self.identity().map(|_| ())
-    }
-    pub fn verify_new_identity(&self) -> Result<()> {
-        let identity = self.identity()?;
-        if identity.operation_watermark != 0.into() || identity.operation_pending {
-            return Err(SyncError::new("new-device-registration-required", 409));
+    /// Resolve only at an identity GET boundary. Never replay a mutation on a new URL.
+    pub fn resolve_identity(&mut self, new_registration: bool) -> Result<RemoteHead> {
+        let verify = |client: &Self| -> Result<RemoteHead> {
+            let identity = client.identity()?;
+            if new_registration
+                && (identity.operation_watermark != 0.into() || identity.operation_pending)
+            {
+                return Err(SyncError::new("new-device-registration-required", 409));
+            }
+            Ok(identity.head)
+        };
+        let original = match verify(self) {
+            Ok(head) => return Ok(head),
+            Err(error) => error,
+        };
+        if matches!(
+            original.code.as_str(),
+            "cancelled" | "new-device-registration-required"
+        ) {
+            return Err(original);
         }
-        Ok(())
+        let Some(directory) = &self.config.directory else {
+            return Err(original);
+        };
+        self.ensure_active()?;
+        // A separate unauthenticated request. Device and library headers are never sent.
+        let response = self
+            .http
+            .get(directory.record_url()?)
+            .header("accept-encoding", "identity")
+            .header("cache-control", "no-cache")
+            .timeout(Duration::from_secs(15))
+            .send()
+            .map_err(|_| SyncError::new("directory-unreachable", 503))?;
+        if response.status().as_u16() != 200 {
+            return Err(SyncError::new("directory-response-error", 503));
+        }
+        let limit = risunest_sync_connect::MAX_ENVELOPE_TEXT;
+        if response
+            .headers()
+            .get("content-encoding")
+            .is_some_and(|v| v != "identity")
+            || response.content_length().is_some_and(|v| v > limit as u64)
+        {
+            return Err(SyncError::new("invalid-directory-envelope", 502));
+        }
+        let mut bytes = Vec::new();
+        response
+            .take(limit as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| SyncError::new("directory-incomplete-response", 503))?;
+        if bytes.len() > limit {
+            return Err(SyncError::new("invalid-directory-envelope", 502));
+        }
+        let envelope = std::str::from_utf8(&bytes)
+            .map_err(|_| SyncError::new("invalid-directory-envelope", 502))?;
+        let endpoint =
+            risunest_sync_connect::open_endpoint(&directory.uuid, &directory.key, envelope)?;
+        if risunest_sync_connect::validate_endpoint(&endpoint, false)? == self.url {
+            return Err(original);
+        }
+        self.ensure_active()?;
+        let mut config = self.config.clone();
+        config.endpoint = endpoint;
+        let mut candidate = Self::with_cancellation(config, self.cancelled.clone())?;
+        candidate.http = self.http.clone();
+        candidate.verified_bytes = self.verified_bytes.clone();
+        let head = verify(&candidate)?;
+        *self = candidate;
+        Ok(head)
+    }
+    pub fn config(&self) -> &ServerConfig {
+        &self.config
     }
     fn identity(&self) -> Result<Identity> {
         let (_, identity): (_, Identity) =
@@ -259,6 +284,7 @@ mod tests {
     use super::*;
     fn config(endpoint: &str) -> ServerConfig {
         ServerConfig {
+            directory: None,
             endpoint: endpoint.into(),
             library_id: "library".into(),
             device_id: "device".into(),
@@ -286,3 +312,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "directory_tests.rs"]
+mod directory_tests;

@@ -35,6 +35,7 @@ function complete(): ServerSyncSnapshot {
       operationPending: false,
     },
     result: {
+      endpoint: identity.endpoint,
       phase: "idle",
       localRevision: 3,
       head,

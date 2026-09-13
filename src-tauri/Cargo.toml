@@ -15,6 +15,7 @@ tauri-build = { version = "2.6.3", features = [] }
 [dependencies]
 tempfile = "3"
 risunest-sync-wire = { path = "../crates/sync-wire" }
+risunest-sync-connect = { path = "../crates/sync-connect" }
 tauri = { version = "2.11.5", features = ["protocol-asset", "devtools"] }
 rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
 ryu-js = { version = "1.0.3", optional = true }
@@ -109,6 +110,7 @@ security-framework = "2.11.1"
 keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
+tauri-plugin-barcode-scanner = { path = "../crates/tauri-plugin-barcode-scanner" }
 getrandom = "0.2.15"
 jni = "0.21.1"
 reqwest = { version = "0.11.16", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
@@ -117,6 +119,8 @@ reqwest = { version = "0.11.16", default-features = false, features = ["blocking
 reqwest = { version = "0.11.16", features = ["blocking", "json", "stream"] }
 
 [dev-dependencies]
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tiny_http = "0.12.0"
 risunest-sync-server = { path = "../server/sync" }
 axum = "0.8.9"
