@@ -10,6 +10,8 @@ import { risuSaveFixtureDatabase } from '../storage/tests/risuSaveFixtures'
 import { OfficialAccountSnapshotAdapter } from '../storage/sync/officialAccountSnapshot'
 
 const state = vi.hoisted(() => ({
+    ios: false,
+    restartNativeApp: vi.fn(async () => undefined),
     alertError: vi.fn(),
     alertInput: vi.fn(async () => 'drive-token'),
     alertSelect: vi.fn(async () => '0'),
@@ -65,6 +67,11 @@ vi.mock('../storage/platformBlobStore', () => ({
 vi.mock('src/ts/platform', () => ({
     isNodeServer: false,
     isTauri: true,
+    get isTauriIOS() { return state.ios },
+}))
+
+vi.mock('../storage/nativePersistentMaintenance', () => ({
+    restartNativeApp: state.restartNativeApp,
 }))
 
 vi.mock('../../lang', () => ({
@@ -161,6 +168,7 @@ function driveDatabase(coldKey: string): Database {
 describe('Drive restore cold snapshot assets', () => {
     beforeEach(() => {
         vi.clearAllMocks()
+        state.ios = false
         state.localCold.clear()
         state.officialCold.clear()
         state.blobStore = null
@@ -171,7 +179,8 @@ describe('Drive restore cold snapshot assets', () => {
         state.restoreEvents = []
     })
 
-    it('materializes the selected Drive cold asset before publishing the accepted revision', async () => {
+    it.each([false, true])('materializes the selected Drive cold asset before publishing the accepted revision (iOS: %s)', async (ios) => {
+        state.ios = ios
         const coldKey = '85cc96bc-d6c5-4cee-9a7f-48ae292e58ac'
         const database = driveDatabase(coldKey)
         const pluginAssetKey = 'assets/plugin-drive-restore.bin'
@@ -276,6 +285,10 @@ describe('Drive restore cold snapshot assets', () => {
 
         const { checkDriver } = await import('./drive')
         await checkDriver('loadtauri')
+
+        expect(state.restartNativeApp).toHaveBeenCalledTimes(ios ? 1 : 0)
+        const { relaunch } = await import('@tauri-apps/plugin-process')
+        expect(relaunch).toHaveBeenCalledTimes(ios ? 0 : 1)
 
         expect(localAssets.get('assets/drive-only.png')).toEqual(driveAsset)
         expect(localAssets.get(pluginAssetKey)).toEqual(pluginAsset)

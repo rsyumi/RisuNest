@@ -56,5 +56,10 @@ final class NativeUITests: XCTestCase {
         XCTAssertTrue(save.isEnabled)
         save.tap()
         XCTAssertTrue(app.webViews.staticTexts["exported"].waitForExistence(timeout: 30))
+        app.webViews.buttons["Import synthetic file"].tap()
+        let file = app.cells.containing(NSPredicate(format: "label CONTAINS %@", "synthetic")).firstMatch
+        XCTAssertTrue(file.waitForExistence(timeout: 15))
+        file.tap()
+        XCTAssertTrue(app.webViews.staticTexts["imported-exact"].waitForExistence(timeout: 30))
     }
 }

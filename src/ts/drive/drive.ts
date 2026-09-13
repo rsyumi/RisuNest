@@ -11,7 +11,8 @@ import {
     scanPinnedBackupRecords,
     writeBackupAsset,
 } from "./backupAssets";
-import { isTauri } from "src/ts/platform"
+import { isTauri, isTauriIOS } from "src/ts/platform"
+import { restartNativeApp } from "../storage/nativePersistentMaintenance";
 import { language } from "../../lang";
 import { relaunch } from '@tauri-apps/plugin-process';
 import { sleep } from "../util";
@@ -377,10 +378,11 @@ async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<voi
                     type: "wait",
                     msg: "Success, Refreshing your app."
                 })
-                if(isTauri){
+                if (isTauriIOS) {
+                    await restartNativeApp()
+                } else if (isTauri) {
                     await relaunch()
-                }
-                else{
+                } else {
                     location.search = ''
                 }
             },

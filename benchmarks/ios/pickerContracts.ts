@@ -1,8 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { appDataDir, documentDir, join } from "@tauri-apps/api/path";
-import { mkdir, writeFile } from "@tauri-apps/plugin-fs";
-import { exportIOSFile, pickIOSFile } from "../../src/ts/storage/iosFiles";
+import { mkdir, readFile, writeFile } from "@tauri-apps/plugin-fs";
+import {
+  discardIOSFile,
+  exportIOSFile,
+  getIOSPublication,
+  pickIOSFile,
+} from "../../src/ts/storage/iosFiles";
 import {
   requestIOSNotifications,
   getIOSNativeState,
@@ -42,15 +47,34 @@ export async function installPickerContracts() {
     };
     document.body.append(button);
   };
-  action("Import synthetic file", async () =>
-    (await pickIOSFile()) ? "imported" : "import-cancelled",
-  );
+  action("Import synthetic file", async () => {
+    const picked = await pickIOSFile();
+    if (!picked) return "import-cancelled";
+    try {
+      const actual = await readFile(picked.path);
+      const expected = [0, 1, 127, 128, 254, 255];
+      if (
+        picked.bytes !== expected.length ||
+        actual.length !== expected.length ||
+        !actual.every((byte, index) => byte === expected[index])
+      ) {
+        throw new Error("Incorrect imported binary content");
+      }
+      return "imported-exact";
+    } finally {
+      await discardIOSFile(picked.path);
+    }
+  });
   action("Export synthetic file", async () => {
+    const requestId = crypto.randomUUID();
     const result = await exportIOSFile({
       sourcePath: path,
       suggestedName: "synthetic.bin",
+      requestId,
     });
     if (result.bytes !== 6) throw new Error("Incorrect publication length");
+    if ((await getIOSPublication(requestId))?.bytes !== 6)
+      throw new Error("Missing durable publication receipt");
     return "exported";
   });
   action("Allow notifications", async () => {
