@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { isTauriIOS } from "../../platform";
 import { alertNormal, alertSelect } from "../../alert";
 import {
   createPortableExportIntentStore,
@@ -53,7 +54,10 @@ async function recover(): Promise<void> {
       rememberPortableExport(
         job.jobId,
         status.result?.handoffPath
-          ? { type: "androidSaf", suggestedName: "RisuNest backup.risunest" }
+          ? {
+              type: isTauriIOS ? "iosFiles" : "androidSaf",
+              suggestedName: "RisuNest backup.risunest",
+            }
           : { type: "desktopPath" },
         store,
       );

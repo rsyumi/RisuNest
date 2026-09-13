@@ -11,6 +11,7 @@ fn main() {
         "discard_file",
         "publication",
         "generation_progress",
+        "reset_generation",
     ])
     .ios_path("ios")
     .build();

@@ -155,6 +155,20 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
         }
     }
 
+    @objc func reset_generation(_ invoke: Invoke) {
+        DispatchQueue.main.async {
+            for task in self.tasks.values { UIApplication.shared.endBackgroundTask(task) }
+            for task in self.continued.values { task.setTaskCompleted(success: false) }
+            if self.continuedPending != nil { BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: self.taskIdentifier) }
+            self.tasks.removeAll()
+            self.continued.removeAll()
+            self.continuedPending = nil
+            self.progress.removeAll()
+            self.expired.removeAll()
+            invoke.resolve()
+        }
+    }
+
     @objc func generation_progress(_ invoke: Invoke) throws {
         let args = try invoke.parseArgs(ProgressArgs.self)
         guard (0...3).contains(args.completed) else { invoke.reject("Invalid generation progress"); return }
@@ -275,6 +289,10 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
         let args = try invoke.parseArgs(PathArgs.self)
         do {
             let file = try ownedFile(args.path, under: staging)
+            guard UUID(uuidString: file.deletingLastPathComponent().lastPathComponent) != nil,
+                  file.deletingLastPathComponent().deletingLastPathComponent() == staging.resolvingSymlinksInPath() else {
+                invoke.reject("Expected a staged import or export file"); return
+            }
             try FileManager.default.removeItem(at: file)
             invoke.resolve()
         } catch { invoke.reject(error.localizedDescription) }
@@ -285,7 +303,9 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
         guard UUID(uuidString: args.id) != nil else { invoke.reject("Invalid publication identifier"); return }
         let receipt = staging.appendingPathComponent("receipts/\(args.id).json")
         guard FileManager.default.fileExists(atPath: receipt.path) else { invoke.resolve(["state": "unknown"]); return }
-        let result = try JSONSerialization.jsonObject(with: Data(contentsOf: receipt)) as! [String: Any]
+        guard let result = try JSONSerialization.jsonObject(with: Data(contentsOf: receipt)) as? [String: Any] else {
+            invoke.reject("Invalid publication receipt"); return
+        }
         invoke.resolve(result)
     }
 

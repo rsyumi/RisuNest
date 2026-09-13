@@ -1,5 +1,16 @@
-import { describe, expect, it, vi } from "vitest";
-import { beginIOSGeneration, type IOSNativeState } from "./iosNative";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+const { invoke } = vi.hoisted(() => ({ invoke: vi.fn(async () => undefined) }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke }));
+vi.mock("./platform", () => ({ isTauriIOS: true }));
+import {
+  beginIOSGeneration,
+  initializeIOSNative,
+  installIOSPersistenceLifecycle,
+  type IOSNativeState,
+} from "./iosNative";
+beforeEach(() => {
+  invoke.mockClear();
+});
 
 const state = (
   activeTasks: string[] = ["lease"],
@@ -22,6 +33,39 @@ function harness() {
   };
 }
 describe("iOS generation lifecycle", () => {
+  it("resets previous renderer work before initialization completes", async () => {
+    await initializeIOSNative();
+    expect(invoke).toHaveBeenCalledExactlyOnceWith(
+      "plugin:ios-native|reset_generation",
+    );
+  });
+  it("retains the background save assertion until local persistence settles", async () => {
+    let finish!: () => void;
+    const flush = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const remove = installIOSPersistenceLifecycle(flush);
+    try {
+      window.dispatchEvent(
+        new CustomEvent("risunest-ios-lifecycle", {
+          detail: { event: "background", id: "save-lease" },
+        }),
+      );
+      await vi.waitFor(() => expect(flush).toHaveBeenCalledOnce());
+      expect(invoke).not.toHaveBeenCalled();
+      finish();
+      await vi.waitFor(() =>
+        expect(invoke).toHaveBeenCalledWith("plugin:ios-native|end", {
+          id: "save-lease",
+        }),
+      );
+    } finally {
+      remove();
+    }
+  });
   it("reports actual progress in order and releases only after pending progress", async () => {
     const calls: string[] = [];
     const deps = {

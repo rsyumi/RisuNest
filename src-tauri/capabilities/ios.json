@@ -55,6 +55,7 @@
     "ios-native:allow-export-file",
     "ios-native:allow-discard-file",
     "ios-native:allow-publication",
-    "ios-native:allow-generation-progress"
+    "ios-native:allow-generation-progress",
+    "ios-native:allow-reset-generation"
   ]
 }

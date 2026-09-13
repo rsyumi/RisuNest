@@ -1,4 +1,5 @@
 import { streaming, tokenizer, snapshotRestore } from "./runtimeContracts";
+import { installPickerContracts } from "./pickerContracts";
 import { invoke } from "@tauri-apps/api/core";
 import { appDataDir, join } from "@tauri-apps/api/path";
 import { mkdir, readFile, writeFile, remove } from "@tauri-apps/plugin-fs";
@@ -6,6 +7,7 @@ import {
   beginIOSGeneration,
   getIOSNativeState,
   installIOSPersistenceLifecycle,
+  initializeIOSNative,
 } from "../../src/ts/iosNative";
 import { isTauriIOS, isTauriDesktop } from "../../src/ts/platform";
 import { persistence, reload, regex, guard, check, pause } from "./contracts";
@@ -16,6 +18,11 @@ async function main() {
   await guard();
   check(isTauriIOS && !isTauriDesktop, "iOS runtime classification");
   const phase = await invoke<string>("ios_bench_phase");
+  await initializeIOSNative();
+  if (phase === "ui") {
+    await installPickerContracts();
+    return;
+  }
   installIOSPersistenceLifecycle(async () => {
     await invoke("pds_checkpoint", { mode: "passive" });
   });
@@ -66,6 +73,13 @@ async function main() {
       passed: true,
       state: await getIOSNativeState(),
     });
+    const obsolete = await beginIOSGeneration();
+    await initializeIOSNative();
+    check(
+      (await getIOSNativeState()).activeTasks.length === 0,
+      "new main document releases obsolete generation",
+    );
+    await obsolete.dispose();
     await report("complete", { passed: true });
   } else if (phase === "reload") {
     await report("reload", await reload());

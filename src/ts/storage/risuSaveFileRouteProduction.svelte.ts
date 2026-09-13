@@ -69,15 +69,12 @@ const productionDependencies: RisuSaveFileRouteDependencies = {
         })
     },
     chooseWebImport: () => selectFileByDom(['risudat'], 'single'),
-    runNativeImport: async (runtime, source, options) => {
-        try {
-            return await runNativeBlockRisuSaveRestore(runtime, source, options)
-        } finally {
-            if (isTauriIOS && source.type === 'desktopPath')
-                await discardIOSFile(source.path).catch((error) =>
-                    console.error('iOS import cleanup failed', error),
-                )
-        }
+    runNativeImport: runNativeBlockRisuSaveRestore,
+    cleanupNativeImport: async (path) => {
+        if (isTauriIOS)
+            await discardIOSFile(path).catch((error) =>
+                console.error('iOS import cleanup failed', error),
+            )
     },
     runNativeExport: async (runtime, destination, options) => {
         try {

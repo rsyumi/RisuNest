@@ -101,7 +101,7 @@ import {
     describeScreenshotPublicationError,
     listenRecoveredAndroidScreenshotPublications,
 } from "./nativeScreenshotArchiveWriter";
-import { installIOSPersistenceLifecycle } from "./iosNative";
+import { initializeIOSNative, installIOSPersistenceLifecycle } from "./iosNative";
 import { restartNativeApp, schedulePeriodicNativeSnapshot } from "./storage/nativePersistentMaintenance";
 import { yieldToUi } from './ui/yieldToUi'
 import {
@@ -690,6 +690,7 @@ export async function loadData() {
             MobileGUI.set(true)
         }
         registerAndroidScreenshotPublicationRecovery()
+        await initializeIOSNative()
         LoadingStatusState.startedAt = null
         loadedStore.set(true)
         performance.mark('boot:interactive')

@@ -43,6 +43,7 @@ export interface RisuSaveFileRouteDependencies {
     platform(): 'native-desktop' | 'native-ios' | 'native-android' | 'web'
     runtime(): FileRouteRuntime
     chooseNativeImport(): Promise<string | null>
+    cleanupNativeImport?(path: string): Promise<void>
     chooseNativeExport(defaultName: string): Promise<string | null>
     chooseWebImport(): Promise<FileLike[] | null>
     runNativeImport(
@@ -406,37 +407,42 @@ export async function importRisuSaveFromPicker(
     if (['native-desktop', 'native-ios'].includes(dependencies.platform())) {
         const path = await dependencies.chooseNativeImport()
         if (!path) return null
-        if (options.onSource) {
-            options.onSource(
-                dependencies.describeNativeSource
-                    ? await dependencies.describeNativeSource(path)
-                    : { name: basenameOf(path) },
-            )
-        }
-        let result: NativeFileJobResult
         try {
-            result = await dependencies.runNativeImport(
-                runtime,
-                { type: 'desktopPath', path },
-                {
-                    signal: options.signal,
-                    pollIntervalMs: options.pollIntervalMs,
-                    onStatus: options.onStatus,
-                    onBlockingChange: options.onBlockingChange,
-                    afterRefresh: dependencies.reloadPluginsAfterNativeRestore,
-                },
-            )
-        } catch (error) {
-            if (isNativeCompatibilityFallback(error)) {
-                announceWebReselect(options)
-                return importWithWebCodec(runtime, options, dependencies)
+            if (options.onSource) {
+                options.onSource(
+                    dependencies.describeNativeSource
+                        ? await dependencies.describeNativeSource(path)
+                        : { name: basenameOf(path) },
+                )
             }
-            throw error
-        }
-        return {
-            mode: 'native',
-            warningCodes: result.warningCodes,
-            bytes: result.sourceBytes,
+            let result: NativeFileJobResult
+            try {
+                result = await dependencies.runNativeImport(
+                    runtime,
+                    { type: 'desktopPath', path },
+                    {
+                        signal: options.signal,
+                        pollIntervalMs: options.pollIntervalMs,
+                        onStatus: options.onStatus,
+                        onBlockingChange: options.onBlockingChange,
+                        afterRefresh:
+                            dependencies.reloadPluginsAfterNativeRestore,
+                    },
+                )
+            } catch (error) {
+                if (isNativeCompatibilityFallback(error)) {
+                    announceWebReselect(options)
+                    return importWithWebCodec(runtime, options, dependencies)
+                }
+                throw error
+            }
+            return {
+                mode: 'native',
+                warningCodes: result.warningCodes,
+                bytes: result.sourceBytes,
+            }
+        } finally {
+            await dependencies.cleanupNativeImport?.(path)
         }
     }
 

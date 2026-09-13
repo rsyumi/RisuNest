@@ -12,6 +12,10 @@ export interface IOSNativeState {
 
 export const getIOSNativeState = () =>
   invoke<IOSNativeState>("plugin:ios-native|state");
+/** A new main document cannot retain work owned by the previous renderer. */
+export async function initializeIOSNative(): Promise<void> {
+  if (isTauriIOS) await invoke("plugin:ios-native|reset_generation");
+}
 export const requestIOSNotifications = () =>
   invoke<{ granted: boolean }>("plugin:ios-native|request_notifications");
 export const openIOSSettings = () =>
@@ -133,7 +137,8 @@ export function installIOSPersistenceLifecycle(
     const detail = (event as CustomEvent<{ event: string; id?: string }>)
       .detail;
     if (detail?.event === "background") save(detail.id);
-    else if (detail?.event === "expired") save();
+    else if (detail?.event === "expired" || detail?.event === "memory-warning")
+      save();
   };
   document.addEventListener("visibilitychange", visibility);
   window.addEventListener("risunest-ios-lifecycle", native);
