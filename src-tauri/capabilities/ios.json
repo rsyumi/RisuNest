@@ -1,0 +1,45 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "ios-capability",
+  "windows": ["main"],
+  "platforms": ["iOS"],
+  "permissions": [
+    "core:default",
+    "fs:allow-read-file",
+    "fs:allow-write-file",
+    "fs:allow-write",
+    "fs:allow-read-dir",
+    "fs:allow-copy-file",
+    "fs:allow-mkdir",
+    "fs:allow-remove",
+    "fs:allow-rename",
+    "fs:allow-exists",
+    "fs:allow-stat",
+    "fs:allow-open",
+    "fs:allow-seek",
+    "fs:allow-read",
+    {
+      "identifier": "fs:scope",
+      "allow": ["$APPDATA", "$APPDATA/*", "$APPDATA/**/*"]
+    },
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "dialog:allow-message",
+    "dialog:allow-ask",
+    "dialog:allow-confirm",
+    {
+      "identifier": "http:default",
+      "allow": [
+        {
+          "url": "https://*:*"
+        },
+        {
+          "url": "http://*:*"
+        }
+      ]
+    },
+    "os:default",
+    "shell:allow-open",
+    "deep-link:default"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "security": {
+      "assetProtocol": {
+        "scope": ["asset", "$APPDATA", "$APPDATA/*", "$APPDATA/**/*"]
+      }
+    }
+  },
+  "bundle": {
+    "resources": [],
+    "createUpdaterArtifacts": false,
+    "iOS": { "minimumSystemVersion": "16.4" }
+  }
+}

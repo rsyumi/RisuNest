@@ -52,7 +52,9 @@
     "benchmark:linux:build:agent": "vite build --mode agent --config benchmarks/linux/vite.config.ts",
     "benchmark:streaming:android:agent": "tauri android build --debug --apk --target x86_64 --ci --config benchmarks/streaming/tauri.conf.json",
     "check:production-bundle": "node tests/productionBundle.mjs",
-    "check:benchmark-harnesses": "svelte-check --tsconfig benchmarks/tsconfig.json"
+    "check:benchmark-harnesses": "svelte-check --tsconfig benchmarks/tsconfig.json",
+    "ios:init:agent": "tauri ios init --ci --skip-targets-install --config src-tauri/tauri.agent.conf.json",
+    "ios:build:simulator:agent": "tauri ios build --ci --target aarch64-sim --no-sign --config src-tauri/tauri.agent.conf.json"
   },
   "dependencies": {
     "@adobe/css-tools": "4.4.4",
