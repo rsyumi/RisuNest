@@ -10,8 +10,18 @@ tauri-build = "2.6.3"
 risunest = { path = "../../../src-tauri" }
 tauri = { version = "2.11.5", features = ["protocol-asset"] }
 serde_json = "1"
+# Cargo only forwards plugin permission metadata to direct dependents.
+# These are the same plugins/versions already used by the product builder.
+tauri-plugin-deep-link = "2.4.9"
+tauri-plugin-fs = "2.5.1"
+tauri-plugin-os = "2.3.2"
+tauri-plugin-dialog = "2.7.2"
+tauri-plugin-process = "2.3.1"
+tauri-plugin-shell = "2.3.5"
+tauri-plugin-http = "2.5.9"
+tauri-plugin-updater = "2.10.1"
+tauri-plugin-single-instance = { version = "2.4.3", features = ["deep-link"] }
 
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol", "risunest/custom-protocol"]
-

@@ -34,14 +34,18 @@ fn macos_bench_quit(app: tauri::AppHandle) {
     app.exit(0);
 }
 
-fn main() {
-    let product = risunest_lib::invoke_handler();
-    let benchmark = tauri::generate_handler![
+fn benchmark_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
+    tauri::generate_handler![
         macos_bench_phase,
         macos_bench_report,
         macos_bench_events,
         macos_bench_quit,
-    ];
+    ]
+}
+
+fn main() {
+    let product = risunest_lib::invoke_handler();
+    let benchmark = benchmark_handler();
     let app = risunest_lib::builder()
         .manage(Events::default())
         .invoke_handler(move |invoke| {
@@ -59,7 +63,9 @@ fn main() {
     );
     app.run(|app, event| {
         let name = match &event {
+            #[cfg(target_os = "macos")]
             tauri::RunEvent::Opened { .. } => Some("opened"),
+            #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen { .. } => Some("reopen"),
             tauri::RunEvent::ExitRequested { .. } => Some("quit"),
             tauri::RunEvent::WindowEvent {

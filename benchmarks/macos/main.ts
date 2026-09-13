@@ -61,9 +61,15 @@ async function tokenizer() {
       try {
         await invokeNativeTokenizerBatch(route, [text], "ids");
       } catch (error) {
-        const value = error as { code?: string };
+        const value = error as {
+          code?: string;
+          special_token?: string;
+          index?: number;
+        };
         check(
-          value.code === entry.error!.code,
+          value.code === entry.error!.code &&
+            value.special_token === entry.error!.token &&
+            value.index === 0,
           `${entry.name}: special token error category`,
         );
         rejected = true;
