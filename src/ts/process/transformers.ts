@@ -1,8 +1,16 @@
-import type { SummarizationOutput, TextToAudioPipeline, FeatureExtractionPipeline, TextGenerationConfig, TextGenerationOutput, ImageToTextOutput } from '@huggingface/transformers';
-import { unzip } from 'fflate';
-import { loadAsset, saveAsset } from 'src/ts/globalApi.svelte';
-import { selectSingleFile, asBuffer  } from 'src/ts/util';
-import { v4 } from 'uuid';
+import type {
+    SummarizationOutput,
+    TextToAudioPipeline,
+    FeatureExtractionPipeline,
+    TextGenerationConfig,
+    TextGenerationOutput,
+    ImageToTextOutput,
+} from '@huggingface/transformers'
+import { unzip } from 'fflate'
+import { loadAsset, saveAsset } from 'src/ts/globalApi.svelte'
+import { selectSingleFile, asBuffer } from 'src/ts/util'
+import { v4 } from 'uuid'
+import type { PreTrainedTokenizer } from '@huggingface/transformers'
 let tfCache: Cache = null
 let tfLoaded = false
 let tfMap: { [key: string]: string } = {}
@@ -33,6 +41,28 @@ async function initTransformers() {
     }
     tfLoaded = true
     console.log('transformers loaded')
+}
+
+let textTokenizer:
+    | { model: string; loaded: Promise<PreTrainedTokenizer> }
+    | undefined
+
+export async function tokenizeTransformers(
+    text: string,
+    model: string,
+): Promise<number[]> {
+    await initTransformers()
+    const { AutoTokenizer } = await import('@huggingface/transformers')
+    if (textTokenizer?.model !== model) {
+        const loaded = AutoTokenizer.from_pretrained(model)
+        textTokenizer = { model, loaded }
+        // Keep one model resident and allow a failed download to be retried.
+        void loaded.catch(() => {
+            if (textTokenizer?.loaded === loaded) textTokenizer = undefined
+        })
+    }
+    const tokenizer = await textTokenizer.loaded
+    return tokenizer.encode(text)
 }
 
 export const runTransformers = async (baseText: string, model: string, config: TextGenerationConfig, device: 'webgpu' | 'wasm' = 'wasm') => {

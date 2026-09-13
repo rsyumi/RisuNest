@@ -1311,14 +1311,25 @@
             {/if}
 
             {#if DBState.db.useAutoSuggestions}
-                <Suggestion messageInput={(msg)=>messageInput=(
-                    (DBState.db.subModel === "textgen_webui" || DBState.db.subModel === "mancer" || DBState.db.subModel.startsWith('local_')) && DBState.db.autoSuggestClean
-                    ? msg.replace(/ +\(.+?\) *$| - [^"'*]*?$/, '')
-                    : msg
-                )} {send} readLatestMessages={(signal) =>
-                    readSelectedConversationLatestTail(persistentRuntime, 10, signal)
-                } writeSuggestions={writeSelectedConversationSuggestions}
-                getNavigationGeneration={() => persistentRuntime.getNavigationGeneration()}/>
+                <Suggestion
+                    messageInput={(msg) =>
+                        (messageInput =
+                            (DBState.db.subModel === 'textgen_webui' ||
+                                DBState.db.subModel === 'mancer') &&
+                            DBState.db.autoSuggestClean
+                                ? msg.replace(/ +\(.+?\) *$| - [^"'*]*?$/, '')
+                                : msg)}
+                    {send}
+                    readLatestMessages={(signal) =>
+                        readSelectedConversationLatestTail(
+                            persistentRuntime,
+                            10,
+                            signal,
+                        )}
+                    writeSuggestions={writeSelectedConversationSuggestions}
+                    getNavigationGeneration={() =>
+                        persistentRuntime.getNavigationGeneration()}
+                />
             {/if}
 
             {#if chatPanelStore.length > 0}

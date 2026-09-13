@@ -4,7 +4,7 @@ import { type groupChat, type character, type Chat, getCurrentCharacter, getData
 import type { MultiModal, OpenAIChat } from "./process/index.svelte";
 import { supportsInlayImage } from "./process/files/inlays";
 import { risuChatParser } from "./parser/parser.svelte";
-import { tokenizeGGUFModel } from "./process/models/local";
+import { tokenizeTransformers } from "./process/transformers";
 import { globalFetch } from "./globalApi.svelte";
 import { getModelInfo, LLMTokenizer, type LLMModel } from "./model/modellist";
 import { pluginV2 } from "./plugins/plugins.svelte";
@@ -186,7 +186,12 @@ export async function encode(data:string):Promise<(number[]|Uint32Array|Int32Arr
         } else if(modelInfo.tokenizer === LLMTokenizer.Llama){
             result = await tokenizeWebTokenizers(data, 'llama');
         } else if(modelInfo.tokenizer === LLMTokenizer.Local){
-            result = await tokenizeGGUFModel(data);
+            if (!db.aiModel.startsWith("hf:::")) {
+                throw new Error(
+                    "Local tokenization requires a Hugging Face model (hf:::).",
+                );
+            }
+            result = await tokenizeTransformers(data, db.aiModel.slice(5));
         } else if(modelInfo.tokenizer === LLMTokenizer.tiktokenO200Base){
             result = await tikJS(data, 'o200k_base');
         } else if(modelInfo.tokenizer === LLMTokenizer.GoogleCloud && db.googleClaudeTokenizing){

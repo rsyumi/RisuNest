@@ -108,7 +108,10 @@
                 }
             ]
 
-            if(DBState.db.subModel === "textgen_webui" || DBState.db.subModel === 'mancer' || DBState.db.subModel.startsWith('local_')){
+            if (
+                DBState.db.subModel === 'textgen_webui' ||
+                DBState.db.subModel === 'mancer'
+            ) {
                 promptbody = [
                     {
                         role: 'system',

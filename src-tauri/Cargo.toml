@@ -27,7 +27,6 @@ base64 = "0.21.0"
 cap-primitives = "4.0.3"
 darling = "0.20.3"
 zip = "0.6.6"
-tar = "0.4.40"
 eventsource-client = "0.12.2"
 futures = "0.3.30"
 url = "2.2"
@@ -96,8 +95,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
-    "Win32_System_JobObjects",
-    "Win32_System_Threading",
 ] }
 
 [target.'cfg(unix)'.dependencies]

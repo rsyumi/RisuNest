@@ -27,8 +27,6 @@ mod publication_upload;
 mod regex_shadow;
 mod server_sync;
 mod trust_boundary;
-#[cfg(windows)]
-mod windows_process;
 
 use base64::{engine::general_purpose, Engine as _};
 use oauth2::basic::{BasicClient, BasicErrorResponseType, BasicTokenType};
@@ -41,15 +39,9 @@ use oauth2::{
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-#[cfg(desktop)]
-use std::io::Write;
 use std::path::Path;
-#[cfg(desktop)]
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-#[cfg(desktop)]
-use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Emitter, Listener, Manager};
 
 #[tauri::command]
@@ -252,278 +244,6 @@ fn check_auth(fpath: String, auth: String) -> bool {
     }
 }
 
-#[cfg(desktop)]
-#[tauri::command]
-async fn install_python(path: String) -> bool {
-    //get python embeddable depending on os
-    let os = std::env::consts::OS;
-    let url;
-    let py_path = Path::new(&path).join("python");
-    if !py_path.exists() {
-        std::fs::create_dir_all(&py_path).unwrap();
-    }
-    let zip_path: std::path::PathBuf = Path::new(&path).join("python.zip");
-
-    crate::nlog!("info", "installing embedded Python");
-    if os == "windows" {
-        url = "https://www.python.org/ftp/python/3.11.7/python-3.11.7-embed-amd64.zip".to_string()
-    } else {
-        crate::nlog!("warn", "embedded Python install is unsupported on this OS");
-        return false;
-    }
-
-    //download python embeddable
-    let mut resp = reqwest::get(&url).await.unwrap();
-    let mut out = std::fs::File::create(&zip_path).unwrap();
-    let mut content = Vec::new();
-    while let Some(chunk) = resp.chunk().await.unwrap() {
-        content.extend_from_slice(&chunk);
-    }
-    out.write_all(&content).unwrap();
-
-    //extract python embeddable
-
-    use zip::ZipArchive;
-
-    if os == "windows" {
-        let mut zipf = ZipArchive::new(std::fs::File::open(&zip_path).unwrap()).unwrap();
-        zipf.extract(&py_path).unwrap();
-    } else if os == "linux" {
-        let mut tarf = tar::Archive::new(std::fs::File::open(&zip_path).unwrap());
-        tarf.unpack(&py_path).unwrap();
-    } else if os == "macos" {
-        let mut zipf = zip::ZipArchive::new(std::fs::File::open(&zip_path).unwrap()).unwrap();
-        zipf.extract(&py_path).unwrap();
-    } else {
-        crate::nlog!(
-            "warn",
-            "embedded Python extraction is unsupported on this OS"
-        );
-        return false;
-    }
-
-    let py_exec_path = py_path.join("python.exe");
-
-    //check python is installed
-    let mut py = Command::new(py_exec_path);
-    let output = py.arg("--version").output();
-    match output {
-        Ok(o) => {
-            let res = String::from_utf8(o.stdout).unwrap();
-            if !res.starts_with("Python ") {
-                return false;
-            }
-            crate::nlog!("info", "embedded Python version check completed");
-            return true;
-        }
-        Err(e) => {
-            crate::nlog!("warn", "embedded Python version check failed: {e}");
-            return false;
-        }
-    }
-}
-
-#[cfg(desktop)]
-#[tauri::command]
-async fn install_pip(path: String) -> bool {
-    let py_path = Path::new(&path).join("python");
-    let py_exec_path = py_path.join("python.exe");
-    let get_pip_url = "https://bootstrap.pypa.io/get-pip.py";
-    let mut resp = reqwest::get(get_pip_url).await.unwrap();
-    let get_pip_path = Path::new(&path).join("get-pip.py");
-    let mut out = std::fs::File::create(&get_pip_path).unwrap();
-    let mut content = Vec::new();
-    while let Some(chunk) = resp.chunk().await.unwrap() {
-        content.extend_from_slice(&chunk);
-    }
-    out.write_all(&content).unwrap();
-
-    let mut py = Command::new(py_exec_path);
-    let output = py.arg(get_pip_path).output();
-    match output {
-        Ok(o) => {
-            let res = String::from_utf8(o.stdout).unwrap();
-            crate::nlog!("info", "pip installer completed");
-            if !res.starts_with("Python ") {
-                return false;
-            }
-            return true;
-        }
-        Err(e) => {
-            crate::nlog!("warn", "pip installer failed: {e}");
-            return false;
-        }
-    }
-}
-
-#[cfg(desktop)]
-#[tauri::command]
-fn check_requirements_local() -> String {
-    let mut py = Command::new("python");
-    let output = py.arg("--version").output();
-    match output {
-        Ok(o) => {
-            let res = String::from_utf8(o.stdout).unwrap();
-            if !res.starts_with("Python ") {
-                return "Python is not installed".to_string();
-            }
-            crate::nlog!("info", "Python availability check completed");
-        }
-        Err(e) => {
-            crate::nlog!("warn", "Python availability check failed: {e}");
-            return "Python is not installed, or not loadable".to_string();
-        }
-    }
-
-    let mut git = Command::new("git");
-    let output = git.arg("--version").output();
-    match output {
-        Ok(o) => {
-            let res = String::from_utf8(o.stdout).unwrap();
-            if !res.starts_with("git version ") {
-                return "Git is not installed".to_string();
-            }
-            crate::nlog!("info", "Git availability check completed");
-        }
-        Err(e) => {
-            crate::nlog!("warn", "Git availability check failed: {e}");
-            return "Git is not installed, or not loadable".to_string();
-        }
-    }
-
-    return "success".to_string();
-}
-
-#[cfg(desktop)]
-#[tauri::command]
-fn post_py_install(path: String) {
-    let py_path = Path::new(&path).join("python");
-    let py_pth_path = py_path.join("python311._pth");
-    //uncomment python libs
-    let mut py_pth = std::fs::read_to_string(&py_pth_path).unwrap();
-    py_pth = py_pth.replace("#import site", "import site");
-    std::fs::write(&py_pth_path, py_pth).unwrap();
-
-    //create "completed" file
-    let completed_path = py_path.join("completed.txt");
-    std::fs::write(&completed_path, "python311").unwrap();
-}
-
-#[cfg(desktop)]
-#[tauri::command]
-fn install_py_dependencies(path: String, dependency: String) -> Result<(), String> {
-    crate::nlog!("info", "installing Python dependency");
-    let py_path = Path::new(&path).join("python");
-    let py_exec_path = py_path.join("python.exe");
-    let mut py = Command::new(py_exec_path);
-    let output = py
-        .arg("-m")
-        .arg("pip")
-        .arg("install")
-        .arg(dependency)
-        .output();
-    match output {
-        Ok(_) => {
-            crate::nlog!("info", "Python dependency installation completed");
-            return Ok(());
-        }
-        Err(e) => {
-            crate::nlog!("warn", "Python dependency installation failed: {e}");
-            return Err(e.to_string());
-        }
-    }
-}
-
-/// The local Python server child, kept so it can be killed when the app exits.
-#[cfg(desktop)]
-#[derive(Default)]
-struct PyServerState {
-    process: Mutex<Option<PyServerProcess>>,
-}
-
-#[cfg(desktop)]
-struct PyServerProcess {
-    child: std::process::Child,
-    #[cfg(windows)]
-    _kill_on_close_job: windows_process::KillOnCloseJob,
-}
-
-#[cfg(desktop)]
-impl PyServerState {
-    fn store(&self, process: PyServerProcess) {
-        let mut guard = self
-            .process
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(previous) = guard.replace(process) {
-            terminate_py_server(previous);
-        }
-    }
-
-    fn shutdown(&self) {
-        let taken = self
-            .process
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        if let Some(process) = taken {
-            terminate_py_server(process);
-        }
-    }
-}
-
-#[cfg(desktop)]
-fn terminate_py_server(mut process: PyServerProcess) {
-    if let Err(error) = process.child.kill() {
-        crate::nlog!("warn", "Python server termination failed: {error}");
-    }
-    let _ = process.child.wait();
-}
-
-#[cfg(desktop)]
-#[tauri::command]
-fn run_py_server(handle: tauri::AppHandle, py_path: String) -> Result<(), String> {
-    let py_exec_path = Path::new(&py_path).join("python").join("python.exe");
-    let server_path = handle
-        .path()
-        .resolve("src-python/run.py", BaseDirectory::Resource)
-        .map_err(|error| format!("failed to resolve the Python server resource: {error}"))?;
-    let working_directory = server_path
-        .parent()
-        .ok_or_else(|| "the Python server resource has no parent directory".to_string())?;
-
-    let mut py_server = Command::new(&py_exec_path);
-    //set working directory to server path
-    py_server.current_dir(working_directory);
-
-    crate::nlog!("info", "starting Python server");
-    #[cfg(windows)]
-    let kill_on_close_job = windows_process::KillOnCloseJob::create()
-        .map_err(|error| format!("failed to create the Python server job object: {error}"))?;
-    let child = py_server
-        .arg("-m")
-        .arg("uvicorn")
-        .arg("--port")
-        .arg("10026")
-        .arg("main:app")
-        .spawn()
-        .map_err(|error| {
-            crate::nlog!("warn", "Python server start failed: {error}");
-            format!("failed to start the Python server: {error}")
-        })?;
-    #[cfg(windows)]
-    if let Err(error) = kill_on_close_job.assign(&child) {
-        crate::nlog!("warn", "Python server job assignment failed: {error}");
-    }
-    handle.state::<PyServerState>().store(PyServerProcess {
-        child,
-        #[cfg(windows)]
-        _kill_on_close_job: kill_on_close_job,
-    });
-    crate::nlog!("info", "Python server started");
-    Ok(())
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     native_log::install_panic_hook();
@@ -599,7 +319,6 @@ pub fn run() {
     {
         builder = builder
             .manage(opened_files::OpenedFilesState::from_launch_arguments())
-            .manage(PyServerState::default())
             .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
                 let _ = app
                     .get_webview_window("main")
@@ -690,18 +409,6 @@ pub fn run() {
             greet,
             native_request,
             check_auth,
-            #[cfg(desktop)]
-            check_requirements_local,
-            #[cfg(desktop)]
-            install_python,
-            #[cfg(desktop)]
-            install_pip,
-            #[cfg(desktop)]
-            post_py_install,
-            #[cfg(desktop)]
-            run_py_server,
-            #[cfg(desktop)]
-            install_py_dependencies,
             #[cfg(desktop)]
             opened_files::opened_files_take,
             persistent_store::commands::pds_storage_stats,
@@ -848,19 +555,7 @@ pub fn run() {
     let app_data_dir =
         app_data_root::resolve(&app).expect("error while resolving tauri app data directory");
     native_log_state.configure_file_path(&app_data_dir);
-    app.run(|app, event| {
-        #[cfg(desktop)]
-        if run_event_requires_python_shutdown(&event) {
-            app.state::<PyServerState>().shutdown();
-        }
-        #[cfg(not(desktop))]
-        let _ = (app, event);
-    });
-}
-
-#[cfg(desktop)]
-fn run_event_requires_python_shutdown(event: &tauri::RunEvent) -> bool {
-    matches!(event, tauri::RunEvent::Exit)
+    app.run(|_app, _event| {});
 }
 
 fn header_map_to_json(header_map: &HeaderMap) -> serde_json::Value {
@@ -897,18 +592,5 @@ mod header_map_tests {
         );
         // Invalid UTF-8 bytes degrade to replacement characters instead of panicking.
         assert_eq!(json["x-latin1"], "\u{FFFD}t\u{FFFD}");
-    }
-}
-
-#[cfg(all(test, desktop))]
-mod tests {
-    #[test]
-    fn python_shutdown_is_requested_only_for_the_final_exit_event() {
-        assert!(super::run_event_requires_python_shutdown(
-            &tauri::RunEvent::Exit
-        ));
-        assert!(!super::run_event_requires_python_shutdown(
-            &tauri::RunEvent::Ready
-        ));
     }
 }

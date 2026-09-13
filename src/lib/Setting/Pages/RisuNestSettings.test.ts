@@ -157,7 +157,7 @@ describe('RisuNest native command integration', () => {
         ).toHaveLength(1)
     })
 
-    it('keeps server commands and Python cleanup without a peer runtime', () => {
+    it('keeps server commands without a peer runtime', () => {
         expect(tauriLibSource).not.toContain('peer_sync')
         for (const command of [
             'server_sync_bind',
@@ -170,7 +170,6 @@ describe('RisuNest native command integration', () => {
                 handlerSource.match(new RegExp(`\\b${command}\\b`, 'g')) ?? [],
             ).toHaveLength(1)
         }
-        expect(tauriLibSource).toContain('run_event_requires_python_shutdown')
     })
 })
 describe('RisuNest startup failure language schema', () => {

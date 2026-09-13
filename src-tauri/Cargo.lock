@@ -4402,7 +4402,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "tar",
  "tauri",
  "tauri-build",
  "tauri-plugin-barcode-scanner",

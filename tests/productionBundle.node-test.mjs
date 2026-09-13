@@ -133,3 +133,34 @@ test("rejects removed peer transport modules but preserves upstream PeerJS", () 
      );
    }
  });
+
+test("rejects retired GGUF code while preserving Pyodide scripting", () => {
+  assertProductionBundle([
+    chunk({ "/src/ts/process/pyworker.ts": {} }, "loadPyodide()"),
+  ]);
+  const local = "/src/ts/process/models/local.ts";
+  assert.throws(
+    () => assertProductionBundle([chunk({ [local]: {} })]),
+    /module/,
+  );
+  assert.throws(
+    () => assertProductionBundle([chunk(), map([local])]),
+    /source/,
+  );
+  for (const marker of [
+    "install_python",
+    "install_pip",
+    "post_py_install",
+    "install_py_dependencies",
+    "run_py_server",
+    "check_requirements_local",
+    "localhost:10026",
+    "tokenizeGGUFModel",
+  ]) {
+    assert.throws(() => assertProductionBundle([chunk({}, marker)]), /marker/);
+    assert.throws(
+      () => assertProductionBundle([chunk(), map(["/src/main.ts"], [marker])]),
+      /source text/,
+    );
+  }
+});

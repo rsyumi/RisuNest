@@ -18,6 +18,14 @@ const forbiddenMarkers = [
   "native_lossless_handoff_cleanup",
   "restore-lossless-backup",
   "export-lossless-backup",
+  "install_python",
+  "install_pip",
+  "post_py_install",
+  "install_py_dependencies",
+  "run_py_server",
+  "check_requirements_local",
+  "localhost:10026",
+  "tokenizeGGUFModel",
 ];
 
 export function isVerificationModule(id) {
@@ -39,7 +47,8 @@ function isRemovedModule(id) {
       normalized,
     ) ||
     /\/DeviceSyncSettings\.svelte$/.test(normalized) ||
-    /\/losslessBackupFileRoute[^/]*$/.test(normalized)
+    /\/losslessBackupFileRoute[^/]*$/.test(normalized) ||
+    /\/src\/ts\/process\/models\/local\.ts$/.test(normalized)
   );
 }
 

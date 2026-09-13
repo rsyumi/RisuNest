@@ -14,7 +14,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["src-python/*"],
+    "resources": [],
     "targets": ["deb", "rpm", "appimage", "nsis", "app", "dmg"],
     "createUpdaterArtifacts": false,
     "windows": {

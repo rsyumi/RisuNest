@@ -4,6 +4,9 @@ const harness = vi.hoisted(() => ({
     nativeBatch: vi.fn(),
     nativeCountBatch: vi.fn(),
     useTokenizerCaching: false,
+    aiModel: 'gpt-4',
+    modelTokenizer: 1,
+    transformersTokenizer: vi.fn(),
 }))
 
 vi.mock('./tokenizer/nativeTokenizerProduction', () => ({
@@ -14,7 +17,7 @@ vi.mock('./tokenizer/nativeTokenizerProduction', () => ({
 vi.mock('./storage/database.svelte', () => ({
     getCurrentCharacter: vi.fn(),
     getDatabase: () => ({
-        aiModel: 'gpt-4',
+        aiModel: harness.aiModel,
         currentPluginProvider: '',
         customTokenizer: 'tik',
         googleClaudeTokenizing: false,
@@ -23,11 +26,15 @@ vi.mock('./storage/database.svelte', () => ({
 }))
 
 vi.mock('./process/files/inlays', () => ({ supportsInlayImage: () => false }))
-vi.mock('./parser/parser.svelte', () => ({ risuChatParser: (text: string) => text }))
-vi.mock('./process/models/local', () => ({ tokenizeGGUFModel: vi.fn() }))
+vi.mock('./parser/parser.svelte', () => ({
+    risuChatParser: (text: string) => text,
+}))
+vi.mock('./process/transformers', () => ({
+    tokenizeTransformers: harness.transformersTokenizer,
+}))
 vi.mock('./globalApi.svelte', () => ({ globalFetch: vi.fn() }))
 vi.mock('./model/modellist', () => ({
-    getModelInfo: () => ({ tokenizer: 1 }),
+    getModelInfo: () => ({ tokenizer: harness.modelTokenizer }),
     LLMTokenizer: {
         Unknown: 0,
         tiktokenCl100kBase: 1,
@@ -57,6 +64,40 @@ describe('chat tokenizer native count batching', () => {
     beforeEach(() => {
         harness.nativeCountBatch.mockReset()
         harness.useTokenizerCaching = false
+        harness.aiModel = 'gpt-4'
+        harness.modelTokenizer = 1
+        harness.transformersTokenizer.mockReset()
+    })
+
+    it.each([
+        'Xenova/opt-350m',
+        'Xenova/tiny-random-mistral',
+        'Xenova/gpt2-large-conversational',
+        'synthetic/custom-model',
+    ])(
+        'tokenizes the WebLLM model %s without the removed GGUF server',
+        async (model) => {
+            harness.aiModel = `hf:::${model}`
+            harness.modelTokenizer = 12
+            harness.transformersTokenizer.mockResolvedValue([101, 42, 102])
+
+            await expect(encode('synthetic prompt')).resolves.toEqual([
+                101, 42, 102,
+            ])
+            expect(
+                harness.transformersTokenizer,
+            ).toHaveBeenCalledExactlyOnceWith('synthetic prompt', model)
+        },
+    )
+
+    it('rejects a non-Hugging-Face local tokenizer instead of loading it as a model', async () => {
+        harness.aiModel = 'local_C:/synthetic/model.gguf'
+        harness.modelTokenizer = 12
+
+        await expect(encode('synthetic prompt')).rejects.toThrow(
+            'Local tokenization requires a Hugging Face model (hf:::).',
+        )
+        expect(harness.transformersTokenizer).not.toHaveBeenCalled()
     })
 
     it('counts a large homogeneous prompt batch with one native invocation', async () => {
