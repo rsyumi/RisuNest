@@ -1,6 +1,9 @@
 pub mod config;
 pub mod connection;
 pub mod http;
+pub mod management;
+#[cfg(test)]
+mod management_tests;
 pub mod publication;
 pub mod runtime;
 pub mod store;

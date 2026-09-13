@@ -17,7 +17,7 @@ use std::{
 const MAX_STATE_BYTES: usize = 32768;
 
 impl Store {
-    fn read_connection(&self) -> Result<ConnectionState> {
+    pub(super) fn read_connection(&self) -> Result<ConnectionState> {
         let path = self.root.join("connection-state");
         check_path(&path)?;
         let metadata = match fs::symlink_metadata(&path) {
@@ -75,8 +75,10 @@ impl Store {
             .map_err(|_| Error::new("connection-state-unavailable", 503))?;
         let mut state = self.read_connection()?;
         let same_mode = state.cloudflared == options.cloudflared;
-        let directory_changed =
-            state.directory.as_ref().map(|d| &d.base_url) != options.registry_url.as_ref();
+        let directory_changed = state.directory_enabled != options.registry_url.is_some()
+            || (options.registry_url.is_some()
+                && state.directory.as_ref().map(|d| &d.base_url) != options.registry_url.as_ref());
+        state.directory_enabled = options.registry_url.is_some();
         state.directory = match options.registry_url {
             Some(url) => Some(match state.directory.take() {
                 Some(mut directory) => {
@@ -85,7 +87,7 @@ impl Store {
                 }
                 None => generate_directory(url)?,
             }),
-            None => None,
+            None => state.directory.take(),
         };
         let endpoint = if options.cloudflared.is_some() && same_mode {
             state.endpoint.clone()
@@ -108,7 +110,7 @@ impl Store {
             .lock()
             .map_err(|_| Error::new("connection-state-unavailable", 503))?;
         let state = self.read_connection()?;
-        let publication = if state.directory.is_none() {
+        let publication = if !state.directory_enabled {
             "disabled"
         } else if state.endpoint.is_none() {
             "waiting-for-address"
@@ -126,7 +128,7 @@ impl Store {
                 "unconfigured"
             },
             endpoint: state.endpoint,
-            directory_enabled: state.directory.is_some(),
+            directory_enabled: state.directory_enabled,
             publication,
         })
     }
@@ -160,6 +162,9 @@ impl Store {
             .lock()
             .map_err(|_| Error::new("connection-state-unavailable", 503))?;
         let mut state = self.read_connection()?;
+        if !state.directory_enabled {
+            return Ok(None);
+        }
         let (Some(directory), Some(endpoint)) = (state.directory.clone(), state.endpoint.clone())
         else {
             return Ok(None);
@@ -189,7 +194,8 @@ impl Store {
             .directory
             .as_ref()
             .ok_or(Error::new("publication-superseded", 409))?;
-        if current.base_url != sent.directory.base_url
+        if !state.directory_enabled
+            || current.base_url != sent.directory.base_url
             || current.uuid != sent.directory.uuid
             || current.key != sent.directory.key
             || state
@@ -208,13 +214,26 @@ impl Store {
             .lock()
             .map_err(|_| Error::new("connection-state-unavailable", 503))?;
         let mut state = self.read_connection()?;
-        if state.directory.is_none() {
+        if !state.directory_enabled {
             return Err(Error::new("directory-not-configured", 409));
         }
         state.last_published = None;
         self.write_connection(&state)
     }
     pub fn issue_registration(&self) -> Result<String> {
+        self.issue_registration_inner("", None)
+    }
+    pub fn issue_named_registration(&self, name: &str, request: &str) -> Result<String> {
+        if name.trim().is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control)
+        {
+            return Err(Error::new("invalid-device-name", 400));
+        }
+        if request.len() != 64 || !request.bytes().all(|v| v.is_ascii_hexdigit()) {
+            return Err(Error::new("invalid-registration-request", 400));
+        }
+        self.issue_registration_inner(name.trim(), Some(request))
+    }
+    fn issue_registration_inner(&self, name: &str, request: Option<&str>) -> Result<String> {
         let _gate = self
             .connection_gate
             .lock()
@@ -228,10 +247,14 @@ impl Store {
             library_id: self.head()?.library_id,
             device_id: "0".repeat(64),
             token: "0".repeat(64),
-            directory: state.directory,
+            directory: if state.directory_enabled {
+                state.directory
+            } else {
+                None
+            },
         };
         registration.encode_uri()?; // Reject size/validation before allocating a device.
-        let issued = self.add_device()?;
+        let issued = self.add_named_device(name, request)?;
         registration.device_id = issued.device_id;
         registration.token = issued.token;
         registration.encode_uri().map_err(Into::into)
@@ -239,12 +262,12 @@ impl Store {
 }
 
 #[cfg(not(windows))]
-fn protect(bytes: &[u8], _: bool) -> Result<Vec<u8>> {
+pub(crate) fn protect(bytes: &[u8], _: bool) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
 #[cfg(windows)]
-fn protect(bytes: &[u8], seal: bool) -> Result<Vec<u8>> {
+pub(crate) fn protect(bytes: &[u8], seal: bool) -> Result<Vec<u8>> {
     use windows_sys::Win32::{
         Foundation::LocalFree,
         Security::Cryptography::{
