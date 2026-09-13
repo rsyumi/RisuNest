@@ -283,11 +283,36 @@ async function main() {
       index >= 0 && (await changeChar(index)),
       "open synthetic character in product UI",
     );
-    const character = DBState.db.characters[index];
-    const chat = character.chats[character.chatPage];
-    const last = chat.message.at(-1)!;
     const marker = "macos-synthetic-ui-edit 🐿️";
-    last.data = marker;
+    const runtime = getPersistentDataRuntime();
+    const lease = await runtime.acquireCompleteConversation("edit-message");
+    let conversationId: string;
+    try {
+      const { captureChatMessageTarget, saveCapturedChatMessage } =
+        await import("../../src/ts/chatMessageUi");
+      const context = {
+        captureCurrent: () => {
+          const character = DBState.db.characters[index];
+          return {
+            character,
+            conversation: character.chats[character.chatPage],
+          };
+        },
+        getCurrentSession: () => runtime.getActiveConversationSession(),
+      };
+      conversationId = lease.session.conversationId;
+      const target = captureChatMessageTarget({
+        ...context,
+        absoluteIndex: lease.session.totalMessages - 1,
+      });
+      check(target, "capture product message edit target");
+      check(
+        saveCapturedChatMessage(target, context, marker).saved,
+        "product message edit accepted",
+      );
+    } finally {
+      lease.release();
+    }
     await tick();
     await getPersistentDataRuntime().flushPendingData("macos-ui-smoke");
     await until(
@@ -299,7 +324,7 @@ async function main() {
       value: { message: { data: string }[] };
     }>("pds_read_conversation", {
       characterId: "char-a",
-      conversationId: chat.id,
+      conversationId,
     });
     check(
       persisted.value.message.at(-1)?.data === marker,
@@ -307,7 +332,7 @@ async function main() {
     );
     localStorage.setItem(
       "macos-app-expected",
-      JSON.stringify({ conversationId: chat.id, marker }),
+      JSON.stringify({ conversationId, marker }),
     );
     await report("app", {
       passed: true,
@@ -350,6 +375,7 @@ async function main() {
 void main().catch(async (error) => {
   await report("failure", {
     message: error instanceof Error ? error.message : String(error),
+    stack: error instanceof Error ? error.stack : undefined,
   });
   // The controller records the failure and terminates this isolated process.
 });
