@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "RisuNest Sync",
+  "version": "0.1.0",
+  "identifier": "io.github.rsyumi.risunest.sync-manager",
+  "build": {
+    "beforeDevCommand": "pnpm run dev:agent",
+    "beforeBuildCommand": "pnpm run build:agent",
+    "devUrl": "http://localhost:14320",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "RisuNest Sync",
+        "width": 980,
+        "height": 780,
+        "minWidth": 720,
+        "minHeight": 560,
+        "transparent": true,
+        "visible": false,
+        "windowEffects": {
+          "effects": ["acrylic", "sidebar"],
+          "state": "active"
+        }
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; frame-src 'none'"
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["icons/icon.png", "icons/icon.ico", "icons/icon.icns"],
+    "windows": { "nsis": { "installMode": "currentUser" } },
+    "macOS": { "minimumSystemVersion": "13.0" }
+  }
+}

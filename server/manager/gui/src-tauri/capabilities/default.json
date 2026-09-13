@@ -1,0 +1,6 @@
+{
+  "identifier": "manager-window",
+  "description": "Local sync management window",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

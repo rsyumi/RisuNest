@@ -2,7 +2,8 @@ pub const SCHEMA: &str = r#"
 CREATE TABLE library (singleton INTEGER PRIMARY KEY CHECK(singleton=1), head TEXT NOT NULL);
 CREATE TABLE devices (
  id TEXT PRIMARY KEY, verifier TEXT NOT NULL UNIQUE, revoked INTEGER NOT NULL DEFAULT 0,
- watermark TEXT NOT NULL DEFAULT '0', ack TEXT NOT NULL DEFAULT '0'
+ watermark TEXT NOT NULL DEFAULT '0', ack TEXT NOT NULL DEFAULT '0',
+ name TEXT NOT NULL DEFAULT '', registration_request TEXT UNIQUE
 );
 CREATE TABLE objects (hash TEXT PRIMARY KEY, size INTEGER NOT NULL CHECK(size>=0));
 CREATE TABLE object_leases(device TEXT NOT NULL REFERENCES devices(id),hash TEXT NOT NULL REFERENCES objects(hash),expires INTEGER NOT NULL,PRIMARY KEY(device,hash));
@@ -53,5 +54,5 @@ CREATE TABLE changes (
  PRIMARY KEY(seq,ordinal)
 );
 CREATE INDEX changes_cursor ON changes(length(seq),seq,ordinal);
-PRAGMA user_version=6;
+PRAGMA user_version=7;
 "#;

@@ -1,7 +1,9 @@
 mod backup;
 mod commits;
 mod connection;
+pub(crate) mod management;
 pub use backup::BackupManifest;
+pub use management::{ManagedDevice, ManagementConnection};
 mod jobs;
 pub use jobs::CommitSubmission;
 mod checkpoints;
@@ -150,7 +152,7 @@ impl Store {
             objects::sync_directory(&root)?;
         } else {
             let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            if version != 6 {
+            if version != 7 {
                 return Err(Error::new("incompatible-store", 409));
             }
         }
@@ -235,13 +237,30 @@ impl Store {
         )?)
     }
     pub fn add_device(&self) -> Result<DeviceCredential> {
+        self.add_named_device("", None)
+    }
+    pub(super) fn add_named_device(
+        &self,
+        name: &str,
+        request: Option<&str>,
+    ) -> Result<DeviceCredential> {
         let token = random_id()?;
         let device_id = random_id()?;
         let db = self.db()?;
+        if let Some(request) = request {
+            let exists: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM devices WHERE registration_request=?1)",
+                [request],
+                |r| r.get(0),
+            )?;
+            if exists {
+                return Err(Error::new("registration-already-issued", 409));
+            }
+        }
         let library_id = Self::read_head(&db)?.library_id;
         db.execute(
-            "INSERT INTO devices(id,verifier) VALUES(?1,?2)",
-            params![device_id, hash(token.as_bytes())],
+            "INSERT INTO devices(id,verifier,name,registration_request) VALUES(?1,?2,?3,?4)",
+            params![device_id, hash(token.as_bytes()), name, request],
         )?;
         Ok(DeviceCredential {
             device_id,

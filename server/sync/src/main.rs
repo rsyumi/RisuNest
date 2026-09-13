@@ -1,5 +1,10 @@
+#![cfg_attr(
+    all(windows, feature = "windows-background"),
+    windows_subsystem = "windows"
+)]
+
 use risunest_sync_server::{
-    config::Config, connection::ConnectionOptions, http, runtime::ConnectionRuntime, store::Store,
+    config::Config, connection::ConnectionOptions, http, management::Management, store::Store,
 };
 use std::{path::PathBuf, sync::Arc};
 
@@ -179,11 +184,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "local development"
                 }
             );
-            let runtime = ConnectionRuntime::start(store.clone(), origin)?;
+            let management = Management::start(store.clone(), origin).await?;
+            let mut stopped = management.shutdown_receiver();
             let result = axum::serve(listener, http::router(store))
-                .with_graceful_shutdown(shutdown())
+                .with_graceful_shutdown(async move {
+                    tokio::select! { _ = shutdown() => (), _ = stopped.changed() => () }
+                })
                 .await;
-            runtime.shutdown().await;
+            management.close().await;
             result?;
         }
         _ => unreachable!(),

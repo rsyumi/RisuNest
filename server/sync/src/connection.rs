@@ -58,6 +58,7 @@ pub(crate) struct PendingPublication {
 #[derive(Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ConnectionState {
+    pub directory_enabled: bool,
     pub endpoint: Option<String>,
     pub cloudflared: Option<PathBuf>,
     pub directory: Option<Directory>,
@@ -67,7 +68,7 @@ pub(crate) struct ConnectionState {
 impl ConnectionState {
     pub fn validate(&self) -> Result<()> {
         if let Some(endpoint) = &self.endpoint {
-            validate_endpoint(endpoint, self.directory.is_none())?;
+            validate_endpoint(endpoint, !self.directory_enabled)?;
         }
         if let Some(path) = &self.cloudflared {
             if !path.is_absolute() {
@@ -76,6 +77,9 @@ impl ConnectionState {
         }
         if let Some(directory) = &self.directory {
             directory.validate()?;
+        }
+        if self.directory_enabled && self.directory.is_none() {
+            return Err(Error::new("invalid-connection-state", 409));
         }
         if let Some(last) = &self.last_published {
             validate_endpoint(last, false)?;

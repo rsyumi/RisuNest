@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+# Installer builds run directly under Task Scheduler without a console window.
+windows-background = []
+
 [dependencies]
 risunest-sync-wire = { path = "../../crates/sync-wire" }
 risunest-sync-connect = { path = "../../crates/sync-connect" }
@@ -22,6 +26,9 @@ qrcode = { version = "0.14", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
