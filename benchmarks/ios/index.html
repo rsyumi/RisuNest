@@ -1,15 +1,20 @@
 <!doctype html>
 <html>
   <head>
+    <meta charset="UTF-8" />
     <meta
       name="viewport"
       content="width=device-width,initial-scale=1,viewport-fit=cover"
     />
     <title>RisuNest iOS verification</title>
+    <link rel="stylesheet" href="/src/styles.css" />
   </head>
   <body>
-    <div id="motion">Synthetic data only</div>
-    <div id="status">Starting</div>
+    <div id="app"></div>
+    <div id="benchmark">
+      <div id="motion">Synthetic data only</div>
+      <div id="status">Starting</div>
+    </div>
     <script type="module" src="/benchmarks/ios/main.ts"></script>
   </body>
 </html>

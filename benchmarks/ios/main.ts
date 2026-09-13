@@ -19,6 +19,12 @@ async function main() {
   check(isTauriIOS && !isTauriDesktop, "iOS runtime classification");
   const phase = await invoke<string>("ios_bench_phase");
   await initializeIOSNative();
+  if (phase === "app" || phase === "app-restart") {
+    const { productApp } = await import("./productContracts");
+    await report(phase, await productApp(phase === "app-restart"));
+    await report("complete", { passed: true });
+    return;
+  }
   if (phase === "ui") {
     await installPickerContracts();
     return;
@@ -127,6 +133,7 @@ async function main() {
   document.getElementById("status")!.textContent = "passed";
 }
 void main().catch(async (error) => {
-  document.getElementById("status")!.textContent = "failed";
+  const status = document.getElementById("status");
+  if (status) status.textContent = "failed";
   await report("failure", { message: String(error) });
 });
