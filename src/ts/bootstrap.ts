@@ -622,9 +622,7 @@ export async function loadData() {
                 flush: () => flushPendingDataLocally('exit'),
                 checkpoint: () => checkpointNativePersistentStore('truncate'),
                 confirmExitWithoutSaving: () =>
-                    alertConfirm(
-                        'Saving failed. Choose Yes to exit without saving, or No to keep the app open and retry.',
-                    ),
+                    alertConfirm(language.risuNest.exitSaveFailedWarning),
                 sync: {
                     isSyncActive: () => forageStorage.isAccount,
                     hasPendingSync: () => hasPendingOfficialPublication(),

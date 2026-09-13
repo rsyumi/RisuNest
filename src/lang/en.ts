@@ -1919,6 +1919,8 @@ export const languageEnglish = {
     skipSavingAssetsOnWebSync: "Skip Saving Assets on Web Sync",
     applyAdditionalParamsToAll: "Apply Additional Parameters to All Models",
     risuNest: {
+        exitSaveFailedWarning:
+            'Saving failed. Choose Yes to exit without saving, or No to keep the app open and retry.',
         streaming: {
             title: 'Streaming',
             thoughtMode: 'Thoughts while streaming',

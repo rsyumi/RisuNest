@@ -1727,6 +1727,8 @@ export const languageKorean = {
     nanoGPTManualInput: "수동 입력",
     nanoGPTManualModelSelect: "수동 모델 선택",
     risuNest: {
+        exitSaveFailedWarning:
+            '저장에 실패했습니다. 저장하지 않고 종료하려면 예를, 앱을 열어 두고 다시 시도하려면 아니오를 선택하세요.',
         streaming: {
             title: '스트리밍',
             thoughtMode: '생성 중 추론 표시',
