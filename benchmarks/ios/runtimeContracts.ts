@@ -69,7 +69,14 @@ export async function tokenizer() {
       check(
         result.mode === "ids" &&
           JSON.stringify(result.ids[0]) === JSON.stringify(entry.ids),
-        "exact native tokenizer IDs",
+        "exact native tokenizer IDs: " +
+          JSON.stringify({
+            case: entry.name,
+            expectedLength: entry.ids.length,
+            actualLength: result.mode === "ids" ? result.ids[0].length : null,
+            expected: entry.ids.slice(0, 32),
+            actual: result.mode === "ids" ? result.ids[0].slice(0, 32) : [],
+          }),
       );
     } else {
       let rejected = false;
