@@ -65,7 +65,7 @@ pub(super) fn validate_locator_envelope(
             if required_string(detail, "chaId", "logical character detail")? != character_id {
                 return validation("logical character ID differs from its encoded key");
             }
-            required_string(detail, "name", "logical character detail")?;
+            required_display_name(detail, "logical character detail")?;
             if detail.contains_key("chats") {
                 return validation("logical character detail contains separated conversations");
             }
@@ -80,7 +80,7 @@ pub(super) fn validate_locator_envelope(
             if required_string(detail, "id", "logical conversation detail")? != conversation_id {
                 return validation("logical conversation ID differs from its encoded key");
             }
-            required_string(detail, "name", "logical conversation detail")?;
+            required_display_name(detail, "logical conversation detail")?;
             if detail.contains_key("message") {
                 return validation("logical conversation detail contains separated messages");
             }
@@ -524,7 +524,7 @@ pub(super) fn apply_record_rows(
             },
         ) => {
             let object = json_object(detail, "logical character detail")?;
-            let name = required_string(object, "name", "logical character detail")?;
+            let name = required_display_name(object, "logical character detail")?;
             let conversation_count: i64 = transaction
                 .query_row(
                     "SELECT COUNT(*) FROM conversations
@@ -610,7 +610,7 @@ pub(super) fn apply_record_rows(
                 return validation("logical conversation parent character is absent");
             }
             let object = json_object(detail, "logical conversation detail")?;
-            let name = required_string(object, "name", "logical conversation detail")?;
+            let name = required_display_name(object, "logical conversation detail")?;
             transaction
                 .execute(
                     "DELETE FROM messages
@@ -808,6 +808,17 @@ fn json_object_mut<'a>(
     value
         .as_object_mut()
         .ok_or_else(|| record_validation(format!("{context} must be an object")))
+}
+
+// Match local commits: display names may be empty, but must still be strings.
+fn required_display_name<'a>(
+    object: &'a Map<String, Value>,
+    context: &str,
+) -> Result<&'a str, StoreError> {
+    object
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| record_validation(format!("{context} requires name")))
 }
 
 fn required_string<'a>(

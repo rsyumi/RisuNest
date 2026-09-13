@@ -1774,7 +1774,7 @@ fn put_character_records(
 ) -> StoreResult<()> {
     let object = object(detail, "Character detail")?;
     let character_id = required_string(detail, "chaId", "Character detail")?;
-    let name = required_string(detail, "name", "Character detail")?;
+    let name = required_display_name(detail, "Character detail")?;
     let image = object.get("image").and_then(Value::as_str);
     let recent_at = object
         .get("lastInteraction")
@@ -1830,7 +1830,7 @@ fn put_conversation(
 ) -> StoreResult<()> {
     let object = object(conversation, "Conversation")?;
     let conversation_id = required_string(conversation, "id", "Conversation")?;
-    let name = required_string(conversation, "name", "Conversation")?;
+    let name = required_display_name(conversation, "Conversation")?;
     let messages = object
         .get("message")
         .and_then(Value::as_array)
@@ -2092,7 +2092,7 @@ fn apply_conversation_mutation(
                 Some(value) => value.clone(),
                 None => serde_json::from_str(&existing_detail)?,
             };
-            let name = required_string(&detail, "name", "Conversation")?;
+            let name = required_display_name(&detail, "Conversation")?;
             let recent_at = detail
                 .get("lastDate")
                 .and_then(Value::as_i64)
@@ -2256,6 +2256,14 @@ fn object<'a>(value: &'a Value, context: &str) -> StoreResult<&'a Map<String, Va
     value
         .as_object()
         .ok_or_else(|| validation(format!("{context} must be a JSON object")))
+}
+
+// Upstream allows unnamed characters, groups, and conversations. IDs remain nonempty.
+fn required_display_name<'a>(value: &'a Value, context: &str) -> StoreResult<&'a str> {
+    value
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| validation(format!("{context} requires name")))
 }
 
 fn required_string<'a>(value: &'a Value, key: &str, context: &str) -> StoreResult<&'a str> {

@@ -126,6 +126,8 @@ mod asset_alias_tests;
 mod asset_catalog_gc_tests;
 #[path = "tests/cold_payload_tests.rs"]
 mod cold_payload_tests;
+#[path = "tests/display_name_tests.rs"]
+mod display_name_tests;
 #[path = "tests/replacement_tests.rs"]
 mod replacement_tests;
 #[path = "tests/schema_migration_tests.rs"]
