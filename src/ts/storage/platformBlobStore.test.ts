@@ -10,6 +10,7 @@ import {
     createTauriCasObjectUrl,
     createTauriBlobStore,
     createTauriNativeMediaUrl,
+    createNativeMediaEndpointProvider,
     getBlobStore,
     physicalBlobKeys,
     readBlobForFacade,
@@ -26,7 +27,8 @@ function memoryBackend() {
     return {
         values,
         backend: {
-            write: async (key: string, value: Uint8Array) => void values.set(key, value.slice()),
+            write: async (key: string, value: Uint8Array) =>
+                void values.set(key, value.slice()),
             read: async (key: string) => values.get(key)?.slice() ?? null,
             keys: async () => [...values.keys()],
             remove: async (key: string) => void values.delete(key),
@@ -36,37 +38,65 @@ function memoryBackend() {
 
 function deferred() {
     let resolve!: () => void
-    const promise = new Promise<void>((done) => { resolve = done })
+    const promise = new Promise<void>((done) => {
+        resolve = done
+    })
     return { promise, resolve }
 }
 
 describe('platform BlobStore', () => {
+    const endpoint = 'http://127.0.0.1:12345/0123456789abcdef0123456789abcdef/'
+    test('encodes physical keys into a scoped loopback endpoint without AppData paths', () => {
+        expect(
+            createTauriNativeMediaUrl('assets/folder/photo.jpg', endpoint),
+        ).toBe(`${endpoint}6173736574732f666f6c6465722f70686f746f2e6a7067`)
+        expect(() =>
+            createTauriNativeMediaUrl('assets/a', 'https://outside.invalid/'),
+        ).toThrow('endpoint')
+    })
 
-    test('encodes physical keys into the risuasset protocol without exposing AppData paths', () => {
-        const convert = vi.fn((path: string, protocol?: string) => `${protocol}://${path}`)
-        expect(createTauriNativeMediaUrl('assets/folder/photo.jpg', convert)).toBe(
-            'risuasset://6173736574732f666f6c6465722f70686f746f2e6a7067',
-        )
-        expect(convert).toHaveBeenCalledWith('6173736574732f666f6c6465722f70686f746f2e6a7067', 'risuasset')
+    test('coalesces endpoint requests and retries failed native initialization', async () => {
+        const invoke = vi
+            .fn()
+            .mockRejectedValueOnce(new Error('unavailable'))
+            .mockResolvedValue(endpoint)
+        const get = createNativeMediaEndpointProvider(invoke)
+        await expect(get()).rejects.toThrow('unavailable')
+        expect(await Promise.all([get(), get(), get()])).toEqual([
+            endpoint,
+            endpoint,
+            endpoint,
+        ])
+        expect(invoke).toHaveBeenCalledTimes(2)
+        expect(invoke).toHaveBeenLastCalledWith('native_media_base_url')
     })
 
     test('builds an exact native CAS URL from the alias hash, MIME, and size', () => {
-        const convert = vi.fn((path: string, protocol?: string) => `${protocol}://localhost/${path}`)
         const hash = 'ab'.repeat(32)
 
-        expect(createTauriCasObjectUrl({
-            contentHash: hash,
-            mime: 'image/custom; profile=exact',
-            size: 42,
-        }, convert)).toBe(
-            `risuasset://localhost/${Buffer.from(`assets-v2/objects/ab/${hash.slice(2)}`).toString('hex')}`
-            + '?mime=image%2Fcustom%3B+profile%3Dexact&size=42',
+        expect(
+            createTauriCasObjectUrl(
+                {
+                    contentHash: hash,
+                    mime: 'image/custom; profile=exact',
+                    size: 42,
+                },
+                endpoint,
+            ),
+        ).toBe(
+            `${endpoint}${Buffer.from(`assets-v2/objects/ab/${hash.slice(2)}`).toString('hex')}` +
+                '?mime=image%2Fcustom%3B+profile%3Dexact&size=42',
         )
-        expect(() => createTauriCasObjectUrl({
-            contentHash: hash,
-            mime: 'image/png\0text/html',
-            size: 42,
-        }, convert)).toThrow('MIME')
+        expect(() =>
+            createTauriCasObjectUrl(
+                {
+                    contentHash: hash,
+                    mime: 'image/png\0text/html',
+                    size: 42,
+                },
+                endpoint,
+            ),
+        ).toThrow('MIME')
     })
 
     test('Tauri BlobStore mutates original payloads without native cleanup commands', async () => {

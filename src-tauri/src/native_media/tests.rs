@@ -50,7 +50,7 @@ fn write_cas_object(root: &Path, bytes: &[u8]) -> (String, String) {
     (hash, physical_key)
 }
 
-fn write_blob(root: &Path, logical_key: &str, bytes: &[u8], mime: &str) {
+pub(super) fn write_blob(root: &Path, logical_key: &str, bytes: &[u8], mime: &str) {
     let physical_key = if logical_key.starts_with("assets/") {
         logical_key.to_owned()
     } else {

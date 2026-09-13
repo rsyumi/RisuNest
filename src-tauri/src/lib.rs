@@ -636,6 +636,9 @@ pub fn run() {
                 native_media::recover_inlay_writes(&app_data_dir).map_err(std::io::Error::other)?;
             }
             app.manage(device_backup);
+            app.manage(native_media::streaming::MediaServerState::initialize(
+                app_data_dir.clone(),
+            ));
             app.manage(state);
             app.manage(
                 native_file_jobs::screenshot_output::ScreenshotOutputState::initialize(
@@ -648,16 +651,6 @@ pub fn run() {
             app.manage(regex_shadow::RegexCancellationRegistry::default());
             Ok(())
         })
-        .register_asynchronous_uri_scheme_protocol("risuasset", |context, request, responder| {
-            let root = app_data_root::resolve(context.app_handle());
-            tauri::async_runtime::spawn_blocking(move || {
-                let response = match root {
-                    Ok(root) => native_media::respond(&root, request),
-                    Err(_) => native_media::not_found(),
-                };
-                responder.respond(response);
-            });
-        })
         .manage(asset_repository::commands::DurableCasJobState::default())
         .manage(persistent_store::PersistentStoreState::default())
         .manage(server_sync::commands::ServerSyncCommandState::default())
@@ -669,6 +662,7 @@ pub fn run() {
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
+            native_media::streaming::native_media_base_url,
             server_sync::commands::server_sync_status,
             server_sync::commands::server_sync_verified_bytes,
             server_sync::commands::server_sync_backups,

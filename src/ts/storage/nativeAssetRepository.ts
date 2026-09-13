@@ -17,7 +17,7 @@ import {
     type ImmutablePayloadCas,
     type PreparedImmutablePayload,
 } from './payloadCas'
-import { createTauriCasObjectUrl } from './platformBlobStore'
+import { createTauriCasObjectUrl, getNativeMediaEndpoint } from './platformBlobStore'
 
 type InvokeCommand = (command: string, args?: Record<string, unknown>) => Promise<unknown>
 
@@ -207,7 +207,7 @@ export function createNativeImmutablePayloadCas(
 export function createNativeAssetObjectUrlResolver(): AssetObjectUrlResolver {
     return {
         async resolveObjectUrl(input) {
-            return createTauriCasObjectUrl(input)
+            return createTauriCasObjectUrl(input, await getNativeMediaEndpoint())
         },
     }
 }

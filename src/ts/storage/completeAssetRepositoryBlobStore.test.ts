@@ -545,13 +545,13 @@ describe('complete AssetRepository BlobStore facade', () => {
             readAssetAlias: vi.fn(async () => ({ revision: 3, value: alias })),
         })
         const cas = createCas({ statObject: vi.fn(async () => 4) })
-        const converter = vi.fn(
-            (path: string, protocol?: string) => `${protocol}://localhost/${path}`,
-        )
+        const endpoint =
+            'http://127.0.0.1:12345/0123456789abcdef0123456789abcdef/'
         const { facade, resolveObjectUrl } = createFacade({
             store,
             cas,
-            resolveObjectUrl: async (input) => createTauriCasObjectUrl(input, converter),
+            resolveObjectUrl: async (input) =>
+                createTauriCasObjectUrl(input, endpoint),
         })
 
         const url = await facade.resolveUrl('assets/avatar.PNG')
@@ -577,10 +577,16 @@ describe('complete AssetRepository BlobStore facade', () => {
         const { facade } = createFacade({
             store,
             cas,
-            resolveObjectUrl: async (input) => createTauriCasObjectUrl(input),
+            resolveObjectUrl: async (input) =>
+                createTauriCasObjectUrl(
+                    input,
+                    'http://127.0.0.1:12345/0123456789abcdef0123456789abcdef/',
+                ),
         })
 
-        await expect(facade.resolveUrl('assets/photo.bin')).rejects.toThrow('MIME')
+        await expect(facade.resolveUrl('assets/photo.bin')).rejects.toThrow(
+            'MIME',
+        )
         expect(alias.mime).toBe('image/png\0text/html')
     })
 

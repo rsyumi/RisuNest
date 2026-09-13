@@ -13,6 +13,7 @@ edition = "2021"
 tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
+axum = "0.8.9"
 tempfile = "3"
 risunest-sync-wire = { path = "../crates/sync-wire" }
 risunest-sync-connect = { path = "../crates/sync-connect" }
@@ -41,7 +42,7 @@ tauri-plugin-shell = "2.3.5"
 # Native callers may supply Cookie, Origin, Referer and other HTTP headers.
 tauri-plugin-http = { version = "2.5.9", features = ["unsafe-headers"] }
 oauth2 = "5.0.0"
-tokio = { version = "1.47.1", features = ["net", "rt", "time"] }
+tokio = { version = "1.47.1", features = ["net", "rt", "time", "fs", "io-util", "sync"] }
 tokio-util = { version = "0.7.19", features = ["io"], optional = true }
 libc = { version = "0.2", optional = true }
 hex = "0.4.3"
@@ -119,11 +120,12 @@ reqwest = { version = "0.11.16", default-features = false, features = ["blocking
 reqwest = { version = "0.11.16", features = ["blocking", "json", "stream"] }
 
 [dev-dependencies]
+wry = "=0.55.1"
+tao = "0.35.3"
 rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tiny_http = "0.12.0"
 risunest-sync-server = { path = "../server/sync" }
-axum = "0.8.9"
 tokio = { version = "1", features = ["rt-multi-thread", "net"] }
 tauri = { version = "2.11.5", features = ["test"] }
 regex = "1.13.1"
