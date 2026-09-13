@@ -6,6 +6,7 @@ const exclude = [
   '**/node_modules/**',
   '**/dist/**',
   '**/.git/**',
+  '**/.tmp/**',
   '**/.worktrees/**',
   '**/.superpowers/**',
   '**/docs/research/**',
