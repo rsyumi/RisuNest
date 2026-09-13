@@ -37,7 +37,15 @@ final class NativeUITests: XCTestCase {
         app.launchEnvironment["RISUNEST_IOS_PHASE"] = "device-core"
         app.launch()
         let result = app.webViews.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "device-core-result:")).firstMatch
-        XCTAssertTrue(result.waitForExistence(timeout: 420))
+        let failure = app.webViews.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "verification-error:")).firstMatch
+        let completed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in result.exists || failure.exists }, object: nil)
+        wait(for: [completed], timeout: 420)
+        if failure.exists {
+            let diagnostic = XCTAttachment(string: failure.label)
+            diagnostic.lifetime = .keepAlways
+            add(diagnostic)
+        }
+        XCTAssertTrue(result.exists)
         let measurement = XCTAttachment(string: result.label)
         measurement.lifetime = .keepAlways
         add(measurement)

@@ -18,6 +18,12 @@ async function main() {
   await guard();
   check(isTauriIOS && !isTauriDesktop, "iOS runtime classification");
   const phase = await invoke<string>("ios_bench_phase");
+  if (phase !== "app" && phase !== "app-restart") {
+    // Product CSS gives the empty app root a full viewport of height.
+    // Keep native-contract status/results visible to older WebKit accessibility.
+    document.getElementById("app")!.style.display = "none";
+    document.body.style.color = "var(--risu-theme-textcolor)";
+  }
   await initializeIOSNative();
   if (phase === "app" || phase === "app-restart") {
     const { productApp } = await import("./productContracts");
@@ -37,9 +43,13 @@ async function main() {
     await report("cloud", await cloudContract(phase === "cloud-cancel"));
     await report("complete", { passed: true });
   } else if (phase === "device-core") {
+    const persistenceResult = await persistence();
+    document.getElementById("status")!.textContent = "core-regex";
+    const regexResult = await regex();
+    document.getElementById("status")!.textContent = "core-tokenizer";
     const result = {
-      persistence: await persistence(),
-      regex: await regex(),
+      persistence: persistenceResult,
+      regex: regexResult,
       tokenizer: await tokenizer(),
     };
     await report("device-core", result);
@@ -164,5 +174,14 @@ async function main() {
 void main().catch(async (error) => {
   const status = document.getElementById("status");
   if (status) status.textContent = "failed";
-  await report("failure", { message: String(error) });
+  const phase = await invoke<string>("ios_bench_phase").catch(() => "unknown");
+  const message = phase.startsWith("cloud")
+    ? "Live cloud contract failed"
+    : error instanceof Error
+      ? error.message
+      : JSON.stringify(error);
+  const detail = document.createElement("pre");
+  detail.textContent = "verification-error:" + message;
+  document.getElementById("benchmark")?.append(detail);
+  await report("failure", { message });
 });

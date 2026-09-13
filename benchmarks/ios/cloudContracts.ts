@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { Ollama } from "ollama/dist/browser.mjs";
 import { fetchTauriHttpStream } from "../../src/ts/network/tauriHttpStream";
+import { createRequestAbortScope } from "../../src/ts/network/requestAbortScope";
 import { beginIOSGeneration, getIOSNativeState } from "../../src/ts/iosNative";
 import { check } from "./contracts";
 
@@ -9,6 +10,7 @@ export async function cloudContract(cancelExpected: boolean) {
   const key = await invoke<string>("ios_bench_cloud_key");
   const controller = new AbortController();
   const lease = await beginIOSGeneration(controller.signal);
+  const requestScope = createRequestAbortScope(lease.signal);
   const initialState = await getIOSNativeState();
   const started = performance.now();
   const events: { event: string; ms: number }[] = [];
@@ -34,21 +36,23 @@ export async function cloudContract(cancelExpected: boolean) {
   const client = new Ollama({
     host: "https://ollama.com",
     headers: { Authorization: "Bearer " + key },
-    fetch: async (input: RequestInfo | URL, init: RequestInit = {}) => {
-      // Same native transport and Ollama SDK parser used by the product.
-      const response = await fetchTauriHttpStream({
-        url: String(input),
-        method: init.method ?? "POST",
-        headers: Object.fromEntries(new Headers(init.headers).entries()),
-        body: new TextEncoder().encode(String(init.body)),
-        signal: lease.signal,
-        onFinish: () => {
-          transportFinished = true;
-        },
-      });
-      check(response.ok, "Cloud HTTP request rejected");
-      return response;
-    },
+    fetch: requestScope.fetch(
+      async (input: RequestInfo | URL, init: RequestInit = {}) => {
+        // Same native transport and Ollama SDK parser used by the product.
+        const response = await fetchTauriHttpStream({
+          url: String(input),
+          method: init.method ?? "POST",
+          headers: Object.fromEntries(new Headers(init.headers).entries()),
+          body: new TextEncoder().encode(String(init.body)),
+          signal: init.signal ?? undefined,
+          onFinish: () => {
+            transportFinished = true;
+          },
+        });
+        check(response.ok, "Cloud HTTP request rejected");
+        return response;
+      },
+    ),
   });
   try {
     await invoke("pds_open");
@@ -104,6 +108,7 @@ export async function cloudContract(cancelExpected: boolean) {
     document.removeEventListener("visibilitychange", visibility);
     // The SDK stops at done:true without necessarily consuming HTTP EOF.
     controller.abort();
+    requestScope.dispose();
     await lease.dispose(finished);
     client.abort();
   }
