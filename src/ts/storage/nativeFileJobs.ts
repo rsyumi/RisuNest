@@ -246,7 +246,11 @@ export function resolveNativeFileJobStage(
     if (status.detail) return status.detail.stage
     switch (status.phase) {
         case 'reading-source':
-            return format === 'local-backup' || format === 'content'
+            // The common picker admits every backup as a library backup, so the
+            // reported job kind, not the admission format, tells an archive apart.
+            return status.kind === 'restore-legacy-local-backup' ||
+                format === 'local-backup' ||
+                format === 'content'
                 ? 'reading-archive'
                 : 'reading-database'
         case 'staging-database':
