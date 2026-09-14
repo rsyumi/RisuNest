@@ -187,6 +187,27 @@ fn with_store_mutex<T>(
     operation(store)
 }
 
+fn with_snapshot_directory<T>(
+    state: &PersistentStoreState,
+    operation: impl FnOnce(&Path) -> StoreResult<T>,
+) -> StoreResult<T> {
+    let _operation = state.admit_renderer_operation()?;
+    let directory = {
+        let store = state.store.lock().map_err(|error| StoreError::Store {
+            message: format!("persistent store mutex poisoned: {error}"),
+        })?;
+        store
+            .as_ref()
+            .ok_or_else(|| StoreError::Validation {
+                message: "persistent store has not been opened".to_owned(),
+            })?
+            .snapshots_dir
+            .clone()
+    };
+    // Archive owns its cross-process lock; listing does not need the live database.
+    operation(&directory)
+}
+
 fn finish_storage_command<T>(command: &'static str, result: StoreResult<T>) -> StoreResult<T> {
     result.map_err(|error| {
         crate::nlog!("error", "{command} failed: {error}");
@@ -784,7 +805,7 @@ pub(crate) fn pds_snapshot_create(
 pub(crate) fn pds_snapshot_list(
     state: State<'_, PersistentStoreState>,
 ) -> Result<Vec<SnapshotInfo>, StoreError> {
-    with_store(state, PersistentStore::snapshot_list)
+    with_snapshot_directory(&state, super::snapshot::list)
 }
 
 #[tauri::command(async)]
@@ -949,6 +970,27 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn snapshot_directory_operation_releases_live_store_but_retains_renderer_admission() {
+        let directory = tempdir().unwrap();
+        let state = PersistentStoreState::default();
+        assert!(with_snapshot_directory(&state, super::super::snapshot::list).is_err());
+        open_renderer_persistent_store(&state, directory.path()).unwrap();
+        with_snapshot_directory(&state, |path| {
+            assert_eq!(path, directory.path().join("persistent/snapshots"));
+            assert!(state.store.try_lock().is_ok());
+            assert_eq!(state.renderer_gate.state.lock().unwrap().operations, 1);
+            let archive = super::super::snapshot_archive::Archive::open(path)?;
+            assert!(archive.list()?.is_empty());
+            with_store_mutex(&state, |store| store.set_app_kv("synthetic", &json!(1)))
+        })
+        .unwrap();
+        assert_eq!(state.renderer_gate.state.lock().unwrap().operations, 0);
+        let maintenance = state.acquire_device_maintenance().unwrap();
+        assert!(with_snapshot_directory(&state, super::super::snapshot::list).is_err());
+        drop(maintenance);
+    }
 
     #[test]
     fn device_maintenance_blocks_renderer_writers_and_reopens_restored_store() {
