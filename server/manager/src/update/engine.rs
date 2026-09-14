@@ -728,8 +728,14 @@ async fn run_inner_locked(root: &Path, server: &Path, mode: RunMode) -> Result<R
                 .arg(server)
                 .args(["update", "recover-helper", &std::process::id().to_string()])
                 .arg(&install);
-            platform::spawn_update_helper(root, &mut command)?;
-            wait_for_helper_ready(root).await?;
+            let helper_started = match platform::spawn_update_helper(root, &mut command) {
+                Ok(_) => wait_for_helper_ready(root).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = helper_started {
+                platform::cleanup_update_helpers(root)?;
+                return Err(error);
+            }
             return Ok(RunOutcome::Started(transaction.target_version));
         }
     }
@@ -1028,7 +1034,6 @@ async fn run_inner_locked(root: &Path, server: &Path, mode: RunMode) -> Result<R
         Err(error) => Err(error),
     };
     if let Err(error) = helper_started {
-        #[cfg(target_os = "macos")]
         let helper_cleanup = platform::cleanup_update_helpers(root);
         if cancel_prepared_after_shutdown(root, server, &transaction)
             .await
@@ -1036,7 +1041,6 @@ async fn run_inner_locked(root: &Path, server: &Path, mode: RunMode) -> Result<R
         {
             return Err("update-rollback-restart-failed".into());
         }
-        #[cfg(target_os = "macos")]
         helper_cleanup?;
         return Err(error);
     }

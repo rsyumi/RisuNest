@@ -215,9 +215,11 @@ pub fn finish_update_helper(root: &Path, task_name: &str) -> Result<()> {
 }
 
 pub fn cleanup_update_helpers(root: &Path) -> Result<()> {
+    #[cfg(windows)]
+    return windows::cleanup_update_helpers(root);
     #[cfg(target_os = "macos")]
     return cleanup_macos_update_helpers(root);
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         let _ = root;
         Ok(())

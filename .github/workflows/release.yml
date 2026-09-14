@@ -321,6 +321,7 @@ jobs:
           RISUNEST_TEST_MANAGER: ${{ format('{0}/{1}/release/risunest-sync-manager.exe', env.CARGO_TARGET_DIR, matrix.target) }}
         run: |
           $tests = @(
+            'no_claim_helper_task_is_removed_without_consuming_recovery_state',
             'helper_replaces_and_restarts_an_isolated_live_server',
             'helper_verifies_a_stopped_replacement_then_restores_stopped_intent',
             'interrupted_files_recovery_outlives_the_active_installed_manager',

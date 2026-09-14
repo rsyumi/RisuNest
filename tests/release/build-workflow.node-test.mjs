@@ -141,8 +141,9 @@ test("raw Sync release binaries require the embedded update public key", () => {
   assert.match(syncBuild, /node server\/manager\/install\/build\.mjs/);
 });
 
-test("Windows release gates run every scheduled update lifecycle test exactly", () => {
+test("Windows release gates run every detached update helper lifecycle test exactly", () => {
   for (const name of [
+    "no_claim_helper_task_is_removed_without_consuming_recovery_state",
     "helper_replaces_and_restarts_an_isolated_live_server",
     "helper_verifies_a_stopped_replacement_then_restores_stopped_intent",
     "interrupted_files_recovery_outlives_the_active_installed_manager",

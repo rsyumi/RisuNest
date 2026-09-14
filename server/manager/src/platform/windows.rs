@@ -1,6 +1,21 @@
 use super::*;
 use std::io::Write;
 
+const HELPER_TASK_DESCRIPTION: &str = "RisuNest update helper";
+
+fn helper_task_prefix(root: &Path) -> String {
+    format!("{}-update-helper-", instance_name(root))
+}
+
+fn valid_helper_task(root: &Path, task_name: &str) -> bool {
+    let prefix = helper_task_prefix(root);
+    task_name.starts_with(&prefix)
+        && task_name.len() == prefix.len() + 64
+        && task_name[prefix.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn quote_argument(value: &str) -> String {
     if !value.is_empty()
         && !value
@@ -76,14 +91,8 @@ pub(super) fn spawn_update_helper(root: &Path, command: &mut Command) -> Result<
 }
 
 pub(super) fn finish_update_helper(root: &Path, task_name: &str) -> Result<()> {
-    const REMOVE: &str = r#"$ErrorActionPreference='Stop';$s=New-Object -ComObject 'Schedule.Service';$s.Connect();$s.GetFolder('\').DeleteTask($env:RISUNEST_HELPER_TASK,0)"#;
-    let prefix = format!("{}-update-helper-", instance_name(root));
-    if !task_name.starts_with(&prefix)
-        || task_name.len() != prefix.len() + 64
-        || !task_name[prefix.len()..]
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    const REMOVE: &str = r#"$ErrorActionPreference='Stop';$s=New-Object -ComObject 'Schedule.Service';$s.Connect();$f=$s.GetFolder('\');try{$t=$f.GetTask($env:RISUNEST_HELPER_TASK)}catch{$r=$_.Exception;while($r.InnerException){$r=$r.InnerException};if($r.HResult -eq -2147024894 -or $r.HResult -eq -2147024893){exit 0};throw};if($t.Definition.RegistrationInfo.Description -ne $env:RISUNEST_HELPER_DESCRIPTION){throw 'unexpected helper task owner'};$f.DeleteTask($env:RISUNEST_HELPER_TASK,0)"#;
+    if !valid_helper_task(root, task_name) {
         return Err("update-helper-task-invalid".into());
     }
     let status = process("powershell.exe")
@@ -95,6 +104,31 @@ pub(super) fn finish_update_helper(root: &Path, task_name: &str) -> Result<()> {
             REMOVE,
         ])
         .env("RISUNEST_HELPER_TASK", task_name)
+        .env("RISUNEST_HELPER_DESCRIPTION", HELPER_TASK_DESCRIPTION)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| "update-helper-task-cleanup-failed".to_owned())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("update-helper-task-cleanup-failed".into())
+    }
+}
+
+pub(super) fn cleanup_update_helpers(root: &Path) -> Result<()> {
+    const CLEAN: &str = r#"$ErrorActionPreference='Stop';$s=New-Object -ComObject 'Schedule.Service';$s.Connect();$f=$s.GetFolder('\');foreach($t in @($f.GetTasks(1))){$n=$t.Name;if(!$n.StartsWith($env:RISUNEST_HELPER_PREFIX,[StringComparison]::Ordinal)){continue};$x=$n.Substring($env:RISUNEST_HELPER_PREFIX.Length);if($x.Length -ne 64 -or $x -cnotmatch '^[0-9a-f]{64}$'){continue};if($t.Definition.RegistrationInfo.Description -ne $env:RISUNEST_HELPER_DESCRIPTION){continue};foreach($i in @($t.GetInstances(0))){$i.Stop()};$f.DeleteTask($n,0)}"#;
+    let status = process("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            CLEAN,
+        ])
+        .env("RISUNEST_HELPER_PREFIX", helper_task_prefix(root))
+        .env("RISUNEST_HELPER_DESCRIPTION", HELPER_TASK_DESCRIPTION)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

@@ -451,6 +451,29 @@ fn scheduled_harness_action(name: &str, action: &str, arguments: &str) -> Result
 }
 
 #[cfg(windows)]
+fn register_synthetic_task(name: &str, description: &str) -> Result<(), String> {
+    const REGISTER: &str = r#"$ErrorActionPreference='Stop';$service=New-Object -ComObject 'Schedule.Service';$service.Connect();$folder=$service.GetFolder('\');$sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value;$definition=$service.NewTask(0);$definition.RegistrationInfo.Description=$env:RISUNEST_TEST_TASK_DESCRIPTION;$definition.Principal.UserId=$sid;$definition.Principal.LogonType=3;$definition.Principal.RunLevel=0;$definition.Settings.Enabled=$true;$action=$definition.Actions.Create(0);$action.Path='cmd.exe';$action.Arguments='/d /c exit 0';$null=$folder.RegisterTaskDefinition($env:RISUNEST_TEST_TASK_NAME,$definition,6,$sid,$null,3,$null)"#;
+    let output = platform::process("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            REGISTER,
+        ])
+        .env("RISUNEST_TEST_TASK_NAME", name)
+        .env("RISUNEST_TEST_TASK_DESCRIPTION", description)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|_| "scheduled-harness-unavailable")?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err("scheduled-harness-operation-failed".into())
+    }
+}
+
+#[cfg(windows)]
 fn remove_transient_helper_tasks(root: &Path) -> Result<(), String> {
     const CLEAN: &str = r#"$ErrorActionPreference='Stop';$service=New-Object -ComObject 'Schedule.Service';$service.Connect();$folder=$service.GetFolder('\');foreach($task in $folder.GetTasks(1)){if($task.Name.StartsWith($env:RISUNEST_TEST_TASK_PREFIX,[StringComparison]::Ordinal)){if($task.Definition.RegistrationInfo.Description -ne 'RisuNest update helper'){throw 'unexpected helper task ownership'};$folder.DeleteTask($task.Name,0)}}"#;
     let output = platform::process("powershell.exe")
@@ -500,6 +523,58 @@ fn transient_helper_task_count(root: &Path) -> Result<usize, String> {
         .ok()
         .and_then(|value| value.trim().parse().ok())
         .ok_or("transient-helper-task-status-invalid".into())
+}
+
+#[cfg(windows)]
+fn owned_transient_helper_task_count(root: &Path) -> Result<usize, String> {
+    const COUNT: &str = r#"$ErrorActionPreference='Stop';$service=New-Object -ComObject 'Schedule.Service';$service.Connect();$folder=$service.GetFolder('\');$count=0;foreach($task in $folder.GetTasks(1)){$name=$task.Name;if(!$name.StartsWith($env:RISUNEST_TEST_TASK_PREFIX,[StringComparison]::Ordinal)){continue};$suffix=$name.Substring($env:RISUNEST_TEST_TASK_PREFIX.Length);if($suffix.Length -eq 64 -and $suffix -cmatch '^[0-9a-f]{64}$' -and $task.Definition.RegistrationInfo.Description -eq 'RisuNest update helper'){$count++}};[Console]::Out.Write($count)"#;
+    let output = platform::process("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            COUNT,
+        ])
+        .env(
+            "RISUNEST_TEST_TASK_PREFIX",
+            format!("{}-update-helper-", platform::instance_name(root)),
+        )
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|_| "transient-helper-task-status-unavailable")?;
+    if !output.status.success() {
+        return Err("transient-helper-task-status-failed".into());
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .ok_or("transient-helper-task-status-invalid".into())
+}
+
+#[cfg(windows)]
+fn scheduled_task_exists(name: &str) -> Result<bool, String> {
+    const EXISTS: &str = r#"$ErrorActionPreference='Stop';$service=New-Object -ComObject 'Schedule.Service';$service.Connect();$folder=$service.GetFolder('\');try{$null=$folder.GetTask($env:RISUNEST_TEST_TASK_NAME);[Console]::Out.Write('true')}catch{$reason=$_.Exception;while($reason.InnerException){$reason=$reason.InnerException};if($reason.HResult -eq -2147024894 -or $reason.HResult -eq -2147024893){[Console]::Out.Write('false');exit 0};throw}"#;
+    let output = platform::process("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            EXISTS,
+        ])
+        .env("RISUNEST_TEST_TASK_NAME", name)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|_| "scheduled-task-status-unavailable")?;
+    if !output.status.success() {
+        return Err("scheduled-task-status-failed".into());
+    }
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err("scheduled-task-status-invalid".into()),
+    }
 }
 
 #[cfg(windows)]
@@ -1271,6 +1346,92 @@ fn spawn_update_helper_subprocess() {
         std::thread::sleep(Duration::from_millis(25));
     }
     drop(parent_lock);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires the current-user Task Scheduler and creates only synthetic temporary tasks"]
+fn no_claim_helper_task_is_removed_without_consuming_recovery_state() {
+    let fixture = prepared_file_transaction(true);
+    let other_instance = tempfile::tempdir().unwrap();
+    let mut transaction = InstallTransaction::load(&fixture.root, &fixture.install)
+        .unwrap()
+        .unwrap();
+    transaction.apply(&fixture.root).unwrap();
+    let foreign_task = format!(
+        "{}-update-helper-{}",
+        platform::instance_name(&fixture.root),
+        "f".repeat(64)
+    );
+    let invalid_suffix_task = format!(
+        "{}-update-helper-invalid",
+        platform::instance_name(&fixture.root)
+    );
+    let other_instance_task = format!(
+        "{}-update-helper-{}",
+        platform::instance_name(other_instance.path()),
+        "e".repeat(64)
+    );
+    register_synthetic_task(&foreign_task, "RisuNest foreign helper").unwrap();
+    register_synthetic_task(&invalid_suffix_task, "RisuNest update helper").unwrap();
+    register_synthetic_task(&other_instance_task, "RisuNest update helper").unwrap();
+
+    let result = (|| -> Result<(), String> {
+        let _lock = try_lock(&fixture.root)?;
+        let mut command = Command::new("powershell.exe");
+        command.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "exit 0",
+        ]);
+        let pid = platform::spawn_update_helper(&fixture.root, &mut command)?;
+        platform::wait_for_parent_exit(pid, Duration::from_secs(5))?;
+        if helper_lock_active(&fixture.root)? {
+            return Err("short-lived helper unexpectedly claimed helper.lock".into());
+        }
+        if owned_transient_helper_task_count(&fixture.root)? != 1 {
+            return Err("no-claim helper task was not retained before cleanup".into());
+        }
+        platform::cleanup_update_helpers(&fixture.root)?;
+        if owned_transient_helper_task_count(&fixture.root)? != 0 {
+            return Err("owned no-claim helper task remains after cleanup".into());
+        }
+        for (task, kind) in [
+            (&foreign_task, "same-prefix foreign-description"),
+            (&invalid_suffix_task, "same-prefix invalid-suffix"),
+            (&other_instance_task, "other-instance owned"),
+        ] {
+            if !scheduled_task_exists(task)? {
+                return Err(format!("cleanup removed a {kind} task"));
+            }
+        }
+        let recovered = InstallTransaction::load(&fixture.root, &fixture.install)?
+            .ok_or("cleanup consumed the recovery journal")?;
+        if recovered.phase != TransactionPhase::Installed
+            || fs::read(fixture.install.join("bin/server"))
+                .map_err(|_| "installed fixture read failed")?
+                != b"new-server"
+        {
+            return Err("cleanup mutated the installed transaction".into());
+        }
+        Ok(())
+    })();
+
+    let foreign_cleanup = scheduled_harness_action(&foreign_task, "remove", "");
+    let invalid_cleanup = scheduled_harness_action(&invalid_suffix_task, "remove", "");
+    let other_cleanup = scheduled_harness_action(&other_instance_task, "remove", "");
+    let owned_cleanup = platform::cleanup_update_helpers(&fixture.root);
+    result.unwrap_or_else(|error| {
+        panic!(
+            "no-claim helper cleanup failed at {error}; foreign cleanup={foreign_cleanup:?}; invalid cleanup={invalid_cleanup:?}; other cleanup={other_cleanup:?}; owned cleanup={owned_cleanup:?}"
+        )
+    });
+    foreign_cleanup.unwrap();
+    invalid_cleanup.unwrap();
+    other_cleanup.unwrap();
+    owned_cleanup.unwrap();
 }
 
 #[cfg(windows)]
