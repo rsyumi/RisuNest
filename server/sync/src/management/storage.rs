@@ -109,5 +109,5 @@ fn available(path: &Path) -> Option<u64> {
         return None;
     }
     let stat = unsafe { stat.assume_init() };
-    (stat.f_bavail as u64).checked_mul(stat.f_frsize as u64)
+    stat.f_bavail.checked_mul(stat.f_frsize)
 }
