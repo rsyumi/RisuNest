@@ -342,20 +342,10 @@ interface NativeEncodedInlayImage {
     metadata: InlayBlobMetadata
 }
 
-function sourceInlayMime(data: Uint8Array): { mime: string, ext: string } | null {
-    if (data.byteLength >= 8 && data.slice(0, 8).every((byte, index) => byte === [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a][index])) {
-        return { mime: 'image/png', ext: 'png' }
-    }
-    if (data.byteLength >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) return { mime: 'image/jpeg', ext: 'jpg' }
-    if (data.byteLength >= 12 && new TextDecoder().decode(data.subarray(0, 4)) === 'RIFF'
-        && new TextDecoder().decode(data.subarray(8, 12)) === 'WEBP') return { mime: 'image/webp', ext: 'webp' }
-    return null
-}
-
-function expectedNativeInlayOutput(options: InlayEncodeOptions, source: Uint8Array): { mime: string, ext: string } | null {
+function requestedNativeInlayOutput(options: InlayEncodeOptions): { mime: string, ext: string } | null {
     if (options.format === 'webp') return { mime: 'image/webp', ext: 'webp' }
     if (options.format === 'png') return { mime: 'image/png', ext: 'png' }
-    return sourceInlayMime(source)
+    return null
 }
 
 export function createNativeNewInlayImageEncoder(
@@ -364,7 +354,7 @@ export function createNativeNewInlayImageEncoder(
     return {
         async encodeNewInlayImage(key, data, input) {
             const options = normalizeInlayEncodeOptions(input.options ?? defaultInlayEncodeOptions)
-            const expected = expectedNativeInlayOutput(options, data)
+            const requested = requestedNativeInlayOutput(options)
             const result = await invokeWithBoundedNativeMediaInput<NativeEncodedInlayImage>(
                 invokeCommand,
                 {
@@ -388,12 +378,12 @@ export function createNativeNewInlayImageEncoder(
                         || metadata === null
                         || metadata.kind !== 'inlay'
                         || metadata.key !== key
-                        || !expected
-                        || metadata.mime !== expected.mime
-                        || metadata.ext !== expected.ext
+                        || typeof metadata.mime !== 'string'
+                        || metadata.mime.length === 0
+                        || typeof metadata.ext !== 'string'
                         || metadata.inlayType !== 'image'
-                        || !Number.isSafeInteger(metadata.width)
-                        || !Number.isSafeInteger(metadata.height)
+                        || (metadata.width !== undefined && !Number.isSafeInteger(metadata.width))
+                        || (metadata.height !== undefined && !Number.isSafeInteger(metadata.height))
                     ) {
                         throw new TypeError('Native Inlay encoder returned invalid metadata')
                     }
@@ -402,6 +392,13 @@ export function createNativeNewInlayImageEncoder(
             )
             if (encoded.metadata.size !== encoded.data.byteLength) {
                 throw new TypeError('Native Inlay encoder size does not match its bytes')
+            }
+            // Either the format that was asked for, or the source kept exactly as it was.
+            const asRequested = requested !== null
+                && encoded.metadata.mime === requested.mime
+                && encoded.metadata.ext === requested.ext
+            if (!asRequested && encoded.data.byteLength !== data.byteLength) {
+                throw new TypeError('Native Inlay encoder returned neither the requested format nor the original image')
             }
             return {
                 data: encoded.data,

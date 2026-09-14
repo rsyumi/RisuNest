@@ -126,7 +126,12 @@
     </table>
 {/snippet}
 
-<SettingGroup id="risunest-inlay-inventory" title={strings.inventoryTitle} divide={false}>
+<SettingGroup
+    id="risunest-inlay-inventory"
+    title={strings.inventoryTitle}
+    description={isTauri ? undefined : strings.animationWebOnly}
+    divide={false}
+>
     {#snippet actions()}
         {#if inventory}
             <Button size="sm" styled="outlined" disabled={loading || optimizing} onclick={load}>{loading ? language.loading : strings.inventoryRefresh}</Button>

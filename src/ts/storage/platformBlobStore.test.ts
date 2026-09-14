@@ -136,14 +136,14 @@ describe('platform BlobStore', () => {
         const source = Uint8Array.of(1, 2, 3)
 
         const pending = store.putNewInlayImage!('image-id', source, {
-            name: 'source.png', options: { format: 'original', quality: 85, maxDimension: 0, skipReencode: false },
+            name: 'source.png', options: { format: 'original', quality: 85, maxDimension: 0, skipReencode: false, animationMaxFps: 0 },
         })
         source[0] = 9
 
         await expect(pending).resolves.toEqual(metadata)
         expect(invoke).toHaveBeenCalledWith('native_media_write_inlay_image', {
             id: 'image-id', data: [1, 2, 3], name: 'source.png',
-            options: { format: 'original', quality: 85, maxDimension: 0, skipReencode: false },
+            options: { format: 'original', quality: 85, maxDimension: 0, skipReencode: false, animationMaxFps: 0 },
         })
     })
 
@@ -196,13 +196,13 @@ describe('platform BlobStore', () => {
             name: 'source.png',
             options: {
                 format: 'original', quality: 85,
-                maxDimension: Number.MAX_SAFE_INTEGER, skipReencode: false,
+                maxDimension: Number.MAX_SAFE_INTEGER, skipReencode: false, animationMaxFps: 0,
             },
         })
 
         expect(invoke).toHaveBeenCalledWith('native_media_write_inlay_image', {
             id: 'image-id', data: [1, 2, 3], name: 'source.png',
-            options: { format: 'original', quality: 85, maxDimension: 4_294_967_295, skipReencode: false },
+            options: { format: 'original', quality: 85, maxDimension: 4_294_967_295, skipReencode: false, animationMaxFps: 0 },
         })
     })
 

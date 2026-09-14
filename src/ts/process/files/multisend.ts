@@ -6,7 +6,7 @@ import { downloadFile } from 'src/ts/globalApi.svelte';
 import { isTauri } from "src/ts/platform"
 import { HypaProcesser } from '../memory/hypamemory';
 import { BufferToText as BufferToText, selectMultipleFile } from 'src/ts/util';
-import { postInlayAsset, UnsupportedAnimatedInlayError } from './inlays';
+import { InlayInputTooLargeError, postInlayAsset } from './inlays';
 import { alertError } from 'src/ts/alert';
 import { language } from 'src/lang';
 import {
@@ -344,8 +344,8 @@ export async function postChatFile(query:string|{
                 try {
                     postData = await postInlayAsset(file)
                 } catch (error) {
-                    if (error instanceof UnsupportedAnimatedInlayError) {
-                        alertError(language.risuNest.inlay.unsupportedAnimated)
+                    if (error instanceof InlayInputTooLargeError) {
+                        alertError(language.risuNest.inlay.tooLarge)
                         continue
                     }
                     throw error

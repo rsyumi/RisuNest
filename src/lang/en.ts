@@ -2123,8 +2123,15 @@ export const languageEnglish = {
             optimizeProgress: 'Working on {done} of {total}',
             optimizeDone: 'Converted {converted} and saved {saved}. Left alone {skipped}, failed {failed}.',
             optimizeSelected: 'Convert selected',
-            unsupportedAnimated:
-                "GIF and animated images can't be attached yet.",
+            animationMaxFps: 'Maximum animation frame rate',
+            animationMaxFpsKeep: 'Keep original',
+            animationMaxFpsHelp: 'Lower values save space but make motion rougher.',
+            animationStillFrame: 'Send only the first scene of an animation to the AI',
+            animationStillFrameHelp:
+                'Turn this off to send the moving file itself. Some models refuse it or read a single scene.',
+            animationWebOnly:
+                'This device stores animations as they are instead of compressing them again.',
+            tooLarge: "This file is too large to attach.",
         },
         storage: {
             snapshotSizeNote:

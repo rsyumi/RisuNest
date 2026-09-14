@@ -89,4 +89,33 @@ export const risuNestInlaySettingsItems: SettingItem[] = [
 export const risuNestSettingsItems: SettingItem[] = [
     ...risuNestStreamingSettingsItems,
     ...risuNestInlaySettingsItems,
+    {
+        id: 'risunest.inlay.animationFps',
+        type: 'select',
+        labelKey: 'risuNest.inlay.animationMaxFps',
+        helpKey: 'risuNest.inlay.animationMaxFpsHelp',
+        bindKey: 'risunestInlayAnimationMaxFps',
+        getValue: (db) => String(db.risunestInlayAnimationMaxFps ?? 0),
+        setValue: (db, value: string) => {
+            db.risunestInlayAnimationMaxFps = normalizeInlayEncodeOptions({
+                animationMaxFps: Number(value),
+            }).animationMaxFps
+        },
+        condition: (ctx) => ctx.db.risunestInlayFormat !== 'original',
+        options: {
+            selectOptions: [
+                { value: '0', labelKey: 'risuNest.inlay.animationMaxFpsKeep' },
+                { value: '24', label: '24' },
+                { value: '15', label: '15' },
+                { value: '12', label: '12' },
+            ],
+        },
+    },
+    {
+        id: 'risunest.inlay.animationStillFrame',
+        type: 'check',
+        labelKey: 'risuNest.inlay.animationStillFrame',
+        helpKey: 'risuNest.inlay.animationStillFrameHelp',
+        bindKey: 'risunestInlayAnimationStillFrame',
+    },
 ]

@@ -128,7 +128,7 @@ describe('native asset repository adapters', () => {
         await expect(encoder.encodeNewInlayImage(
             'inlay-id',
             Uint8Array.of(1, 2),
-            { name: 'Image', options: { format: 'png', quality: 12, maxDimension: 256, skipReencode: true } },
+            { name: 'Image', options: { format: 'png', quality: 12, maxDimension: 256, skipReencode: true, animationMaxFps: 0 } },
         )).resolves.toEqual({
             data: Uint8Array.of(4, 5, 6),
             metadata: {
@@ -144,7 +144,7 @@ describe('native asset repository adapters', () => {
         expect(invoke).toHaveBeenCalledOnce()
         expect(invoke).toHaveBeenCalledWith('native_media_encode_inlay_image', {
             id: 'inlay-id', data: [1, 2], name: 'Image',
-            options: { format: 'png', quality: 12, maxDimension: 256, skipReencode: true },
+            options: { format: 'png', quality: 12, maxDimension: 256, skipReencode: true, animationMaxFps: 0 },
         })
     })
 
@@ -183,7 +183,7 @@ describe('native asset repository adapters', () => {
         await expect(createNativeNewInlayImageEncoder(invoke).encodeNewInlayImage(
             'large-inlay',
             source,
-            { name: 'large.png', options: { format: 'png', quality: 85, maxDimension: 0, skipReencode: false } },
+            { name: 'large.png', options: { format: 'png', quality: 85, maxDimension: 0, skipReencode: false, animationMaxFps: 0 } },
         )).resolves.toMatchObject({ data: output })
 
         expect(invoke.mock.calls.map(([command]) => command)).toEqual([
@@ -219,13 +219,16 @@ describe('native asset repository adapters', () => {
             name: 'original.png',
             options: {
                 format: 'original', quality: Number.NaN,
-                maxDimension: Number.MAX_SAFE_INTEGER, skipReencode: true,
+                maxDimension: Number.MAX_SAFE_INTEGER, skipReencode: true, animationMaxFps: 0,
             },
         })
 
         expect(invoke).toHaveBeenCalledWith('native_media_encode_inlay_image', {
             id: 'original-id', data: Array.from(source), name: 'original.png',
-            options: { format: 'original', quality: 85, maxDimension: 4_294_967_295, skipReencode: true },
+            options: {
+                format: 'original', quality: 85, maxDimension: 4_294_967_295,
+                skipReencode: true, animationMaxFps: 0,
+            },
         })
     })
 
@@ -233,7 +236,7 @@ describe('native asset repository adapters', () => {
         ['webp', 'image/png', 'png'],
         ['png', 'image/webp', 'webp'],
         ['original', 'image/webp', 'png'],
-    ] as const)('rejects a native %s response with a mismatched MIME and extension pair', async (format, mime, ext) => {
+    ] as const)('rejects a native %s response that is neither the requested format nor the original image', async (format, mime, ext) => {
         const encoder = createNativeNewInlayImageEncoder(async () => ({
             data: [4],
             outputSize: 1,
@@ -243,9 +246,31 @@ describe('native asset repository adapters', () => {
             },
         }))
 
-        await expect(encoder.encodeNewInlayImage('inlay-id', Uint8Array.of(1), {
-            name: 'Image', options: { format, quality: 85, maxDimension: 0, skipReencode: false },
-        })).rejects.toThrow('invalid metadata')
+        await expect(encoder.encodeNewInlayImage('inlay-id', Uint8Array.of(1, 2, 3), {
+            name: 'Image', options: { format, quality: 85, maxDimension: 0, skipReencode: false, animationMaxFps: 0 },
+        })).rejects.toThrow('neither the requested format nor the original image')
+    })
+
+    it('accepts a native response that kept the original image, with or without its size', async () => {
+        const source = Uint8Array.of(0x47, 0x49, 0x46, 0x38)
+        const encoder = createNativeNewInlayImageEncoder(async () => ({
+            data: Array.from(source),
+            outputSize: source.byteLength,
+            metadata: {
+                key: 'kept', kind: 'inlay', size: source.byteLength, mime: 'image/gif',
+                name: 'loop.gif', ext: 'gif', inlayType: 'image',
+            },
+        }))
+
+        await expect(encoder.encodeNewInlayImage('kept', source, {
+            name: 'loop.gif', options: { format: 'webp', quality: 85, maxDimension: 0, skipReencode: false, animationMaxFps: 0 },
+        })).resolves.toEqual({
+            data: source,
+            metadata: {
+                kind: 'inlay', mime: 'image/gif', name: 'loop.gif', ext: 'gif',
+                inlayType: 'image', width: undefined, height: undefined,
+            },
+        })
     })
 
     it('exposes a native-only durable CAS pin session without catalog enumeration', async () => {

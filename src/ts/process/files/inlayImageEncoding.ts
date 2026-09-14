@@ -1,8 +1,5 @@
 import { asBuffer } from "../../util";
-import { isTauri } from "../../platform";
-import type { InlayBlobMetadata, InlayEncodeOptions } from "../../storage/blobStore";
-import type { NewInlayImageEncoder } from "../../storage/assetRepository";
-import { createNativeNewInlayImageEncoder } from "../../storage/nativeAssetRepository";
+import type { InlayEncodeOptions } from "../../storage/blobStore";
 
 export function isGifImage(data: Uint8Array): boolean {
     return data.byteLength >= 6 && new TextDecoder().decode(data.subarray(0, 6)).startsWith('GIF8')
@@ -46,6 +43,46 @@ export function isAnimatedInlayImage(data: Uint8Array): boolean {
     return isGifImage(data) || isAnimatedWebP(data) || isAnimatedPng(data)
 }
 
+/**
+ * Images the browser stores exactly as they arrived. Animations would lose every
+ * frame but one, and AVIF is left to the decoder that can already display it.
+ */
+export function keepsBrowserOriginal(data: Uint8Array): boolean {
+    return isAnimatedInlayImage(data) || hasAvifBrand(data)
+}
+
+export function hasAvifBrand(data: Uint8Array): boolean {
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+    const text = new TextDecoder()
+    for (let offset = 0; offset + 8 <= data.byteLength;) {
+        const size32 = view.getUint32(offset)
+        const type = text.decode(data.subarray(offset + 4, offset + 8))
+        let headerSize = 8
+        let boxSize = size32
+        if (size32 === 1) {
+            if (offset + 16 > data.byteLength) return false
+            const high = view.getUint32(offset + 8)
+            const low = view.getUint32(offset + 12)
+            boxSize = high * 0x1_0000_0000 + low
+            headerSize = 16
+        } else if (size32 === 0) {
+            boxSize = data.byteLength - offset
+        }
+        if (!Number.isSafeInteger(boxSize) || boxSize < headerSize || offset + boxSize > data.byteLength) return false
+        if (type === 'ftyp') {
+            const brandsStart = offset + headerSize
+            if (brandsStart + 8 > offset + boxSize) return false
+            for (let brandOffset = brandsStart; brandOffset + 4 <= offset + boxSize; brandOffset += brandOffset === brandsStart ? 8 : 4) {
+                const brand = text.decode(data.subarray(brandOffset, brandOffset + 4)).toLowerCase()
+                if (brand === 'avif' || brand === 'avis') return true
+            }
+            return false
+        }
+        offset += boxSize
+    }
+    return false
+}
+
 export function inlayImageSignature(data: Uint8Array): { mime: string, ext: string } | null {
     const isPng = data.byteLength >= 8
         && data.slice(0, 8).every((value, index) => value === [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a][index])
@@ -55,6 +92,7 @@ export function inlayImageSignature(data: Uint8Array): { mime: string, ext: stri
         && new TextDecoder().decode(data.subarray(0, 4)) === 'RIFF'
         && new TextDecoder().decode(data.subarray(8, 12)) === 'WEBP') return { mime: 'image/webp', ext: 'webp' }
     if (isGifImage(data)) return { mime: 'image/gif', ext: 'gif' }
+    if (hasAvifBrand(data)) return { mime: 'image/avif', ext: 'avif' }
     return null
 }
 
@@ -121,15 +159,15 @@ export async function decodeInlayImageBitmap(data: Uint8Array, mime?: string): P
 }
 
 /**
- * Re-encodes stored inlay bytes without writing them. Animated images keep their
- * original bytes instead: the canvas encoder would drop every frame but the first.
+ * Re-encodes stored inlay bytes without writing them. Animations and AVIF keep
+ * their original bytes: the canvas encoder would drop every frame but the first.
  */
 export async function encodeInlayImageBytes(
     data: Uint8Array,
     options: InlayEncodeOptions,
     mime?: string,
 ): Promise<CanvasEncodedInlayImage> {
-    if (isAnimatedInlayImage(data)) throw new Error('This device cannot re-encode animated Inlay images')
+    if (keepsBrowserOriginal(data)) throw new Error('This device cannot re-encode this Inlay image')
     const bitmap = await decodeInlayImageBitmap(data, mime)
     try {
         if (options.format === 'original') {
@@ -143,26 +181,22 @@ export async function encodeInlayImageBytes(
     }
 }
 
-function webInlayImageEncoder(): NewInlayImageEncoder {
-    return {
-        async encodeNewInlayImage(key, data, input) {
-            const options = input.options ?? { format: 'webp', quality: 85, maxDimension: 0, skipReencode: true }
-            const encoded = await encodeInlayImageBytes(data, options)
-            const metadata: Omit<InlayBlobMetadata, 'key' | 'size'> = {
-                kind: 'inlay',
-                inlayType: 'image',
-                mime: encoded.mime,
-                name: input.name,
-                ext: encoded.ext,
-                width: encoded.width,
-                height: encoded.height,
-            }
-            return { data: encoded.data, metadata }
-        },
-    }
-}
-
-/** The encoder that re-encodes without writing, native where one exists. */
-export function resolveInlayImageEncoder(): NewInlayImageEncoder {
-    return isTauri ? createNativeNewInlayImageEncoder() : webInlayImageEncoder()
+/**
+ * The type stored bytes keep when they are saved untouched. The signature decides,
+ * and a file name extension fills in for bytes nothing recognizes.
+ */
+export function preservedInlayOutput(data: Uint8Array, nameOrExt: string): { mime: string, ext: string } {
+    const signature = inlayImageSignature(data)
+    if (signature) return signature
+    const ext = (nameOrExt.includes('.') ? nameOrExt.split('.').at(-1)! : nameOrExt)
+        .replace(/^\.+/, '')
+        .toLowerCase()
+    const mime = ext === 'png' ? 'image/png'
+        : ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg'
+            : ext === 'webp' ? 'image/webp'
+                : ext === 'gif' ? 'image/gif'
+                    : ext === 'avif' ? 'image/avif'
+                        : ext === 'bmp' ? 'image/bmp'
+                            : 'application/octet-stream'
+    return { mime, ext }
 }

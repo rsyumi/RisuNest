@@ -82,12 +82,12 @@ describe('runInlayOptimization', () => {
         }))
 
         await runInlayOptimization([asset('a', 'png', 1000)], deps({ encoder: { encodeNewInlayImage } }), {
-            options: { format: 'original', quality: 70, maxDimension: 2048, skipReencode: true },
+            options: { format: 'original', quality: 70, maxDimension: 2048, skipReencode: true, animationMaxFps: 0 },
         })
 
         expect(encodeNewInlayImage).toHaveBeenCalledWith('a', expect.any(Uint8Array), {
             name: 'a.png',
-            options: { format: 'webp', quality: 70, maxDimension: 2048, skipReencode: false },
+            options: { format: 'webp', quality: 70, maxDimension: 2048, skipReencode: false, animationMaxFps: 0 },
         })
     })
 

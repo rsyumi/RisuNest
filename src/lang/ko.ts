@@ -1930,8 +1930,15 @@ export const languageKorean = {
             optimizeProgress: '{done} / {total} 처리 중',
             optimizeDone: '{converted}개를 바꿔 {saved}를 줄였습니다. 그대로 둔 것 {skipped}개, 실패 {failed}개.',
             optimizeSelected: '선택 항목 최적화',
-            unsupportedAnimated:
-                'GIF와 애니메이션 이미지는 아직 첨부할 수 없습니다.',
+            animationMaxFps: '애니메이션 최대 프레임 속도',
+            animationMaxFpsKeep: '원본 유지',
+            animationMaxFpsHelp: '낮출수록 용량이 줄지만 움직임이 거칠어집니다.',
+            animationStillFrame: '애니메이션은 첫 장면만 AI에 보내기',
+            animationStillFrameHelp:
+                '끄면 움직이는 파일을 그대로 보냅니다. 모델에 따라 거절되거나 한 장면만 인식합니다.',
+            animationWebOnly:
+                '이 기기에서는 애니메이션을 다시 압축하지 않고 원본 그대로 저장합니다.',
+            tooLarge: '파일이 너무 커서 첨부할 수 없습니다.',
         },
         storage: {
             snapshotSizeNote:
