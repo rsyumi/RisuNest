@@ -52,6 +52,43 @@ Single-condition options use `--name=value`:
 | `config=<isolated config>`              | Reuse a binary only if its live native identity matches this config                            |
 | `rebuild=true`                          | Rebuild while retaining that isolated identity                                                 |
 | `fresh=true`                            | Move the previous synthetic store into a retained sibling before creating a fresh fixture      |
+| `hostMetrics=true`                      | Sample isolated WAL size every 100 ms and Windows process working sets after timed UI work     |
+
+Host metrics report WAL allocated file size, not physical write traffic. Memory
+includes the native process working set, its peak since process launch, and the
+sum of working sets of its currently live descendants (shared pages can be
+counted more than once). It is an end-of-sample observation, not a peak of the
+whole process tree. The PowerShell query runs after UI timing is collected.
+The instrumented frontend is built to `.tmp/startup-benchmark-dist`; the normal
+product `dist` is not used for observation code.
+
+`m0-summary.mjs <result.json>` validates measured interactions and a successful
+local commit in every sample before reporting platform-specific OFF distributions. Twenty samples per group make
+P99 the maximum observation, not a precise tail estimate.
+
+`android-device.mjs` is a separate physical-device runner. It requires an explicit
+ADB path and serial. Its first run with `--provision=true --apk=<agent benchmark APK>`
+refuses an already installed RisuNest package, installs the supplied synthetic
+benchmark APK, and records a device/APK ownership marker. Further runs require
+that marker, the matching local ownership record and the installed APK hash.
+Supply `--revision=<40-character build revision>` for provenance. `--prepare=true`
+recreates synthetic data in an owned install. `--resumeSeed=true` resumes offline
+asset preparation only from its recorded, successfully committed seed.
+Preparation has a separate ten-minute bound; measured interaction limits are unchanged.
+It never uses the existing
+emulator-only runner or relaxes that runner's device/server restrictions.
+
+The physical-device run uses 500 characters, 100,000 tiny synthetic CAS objects,
+16 generated images and about 100 MiB of logical data. Offline file preparation
+uses only the new, owned installation. Keep the test device unlocked. Android
+memory reports app-process PSS/RSS separately; it does not claim renderer or
+whole-device memory coverage. Android WAL observations are operation-boundary
+sizes, not the Windows 100 ms sampled peak. Keep debug Android results separate
+from Windows release results.
+
+The physical-device runner remains experimental until a complete run passes.
+A device that cannot finish startup has no latency or memory baseline, even when
+synthetic DB creation succeeded. Do not count failed preparation as measured samples.
 
 Use separate result files for every run. Output contains allowlisted numbers,
 fixed stage names and success flags, plus build provenance. It never stores

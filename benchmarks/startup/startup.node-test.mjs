@@ -2,8 +2,145 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { maxConcurrentResources, sanitizeMetrics, percentile } from './metrics.mjs'
-import { assertSyntheticProfile, seedExpression, syntheticPng } from './fixture.mjs'
+import {
+    addSyntheticAssets,
+    assertSyntheticProfile,
+    seedExpression,
+    syntheticPng,
+} from './fixture.mjs'
+import { DatabaseSync } from 'node:sqlite'
 import { instrumentSource } from './observe.mjs'
+import { observeWal } from './host-metrics.mjs'
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { startupInstrumentation } from './android-observation.mjs'
+import { spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+
+test('M0 summary rejects a missing per-sample commit even when aggregate count is sufficient', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'risunest-m0-summary-'))
+    const file = path.join(directory, 'result.json')
+    try {
+        const row = (kind) => ({
+            kind,
+            warmup: false,
+            interaction: {
+                success: true,
+                failure: null,
+                inputAccepted: true,
+                scrollImmediateChanged: true,
+                inputMs: 1,
+                scrollMs: 2,
+            },
+            stabilizationTimeout: false,
+            calls: [{ command: 'pds_commit', success: true, ms: 3 }],
+            longTasks: [],
+            usedHeapBytes: 1024,
+            host: {
+                memory: { appPssBytes: 2048, appRssBytes: 4096 },
+                wal: { startBytes: 0, endBytes: 0 },
+            },
+        })
+        const input = {
+            platform: 'android-arm64',
+            samples: ['reload', 'restart'].flatMap((kind) =>
+                Array.from({ length: 20 }, () => row(kind)),
+            ),
+        }
+        const summarize = () =>
+            spawnSync(
+                process.execPath,
+                [fileURLToPath(new URL('./m0-summary.mjs', import.meta.url)), file],
+                { encoding: 'utf8', windowsHide: true },
+            )
+        await writeFile(file, JSON.stringify(input))
+        const valid = summarize()
+        assert.equal(valid.status, 0, valid.stderr)
+        assert.equal(JSON.parse(valid.stdout).groups.reload.samples, 20)
+        input.samples[1].calls.push(...input.samples[0].calls)
+        input.samples[0].calls = []
+        await writeFile(file, JSON.stringify(input))
+        assert.notEqual(summarize().status, 0)
+        input.samples = input.samples.slice(1)
+        await writeFile(file, JSON.stringify(input))
+        assert.notEqual(summarize().status, 0)
+    } finally {
+        await rm(directory, { recursive: true, force: true })
+    }
+})
+
+test('Android combined observer preserves IPC results and records completion', async () => {
+    const response = { revision: 17 }
+    const window = { fetch() {}, __TAURI_INTERNALS__: { invoke: async () => response } }
+    const run = new Function(
+        'window',
+        'localStorage',
+        'document',
+        'PerformanceObserver',
+        startupInstrumentation('android'),
+    )
+    run(
+        window,
+        { getItem: () => 'false' },
+        { addEventListener() {} },
+        class {
+            observe() {}
+        },
+    )
+    assert.equal(await window.__TAURI_INTERNALS__.invoke('pds_open'), response)
+    assert.equal(window.__startupMetrics.firstRevision, 17)
+    assert.equal(window.__startupMetrics.calls[0].success, true)
+    assert.ok(Number.isFinite(window.__startupMetrics.calls[0].ms))
+})
+
+test('asset counts reject a replacement generation with no aliases', async () => {
+    const parent = await mkdtemp(path.join(os.tmpdir(), 'risunest-catalog-test-'))
+    const identifier = 'RisuNest.phase3benchmark.r0123456789ab.catalogtest'
+    const root = path.join(parent, identifier)
+    await mkdir(path.join(root, 'persistent'), { recursive: true })
+    const file = path.join(root, 'persistent/persistent.db')
+    try {
+        const db = new DatabaseSync(file)
+        db.exec(`CREATE TABLE meta(key TEXT,value TEXT);
+            INSERT INTO meta VALUES('activeGeneration','1');
+            CREATE TABLE asset_objects(object_hash TEXT,byte_size INTEGER,created_at_ms INTEGER);
+            CREATE TABLE asset_aliases(generation INTEGER,logical_key TEXT,object_hash TEXT,kind TEXT,size INTEGER,mime TEXT,name TEXT,ext TEXT);`)
+        db.close()
+        const first = await addSyntheticAssets(root, identifier, 2)
+        assert.equal(first.objects, 2)
+        assert.equal(first.aliases, 2)
+        const replaced = new DatabaseSync(file)
+        replaced.exec("UPDATE meta SET value='2' WHERE key='activeGeneration'")
+        replaced.close()
+        await assert.rejects(addSyntheticAssets(root, identifier, 2), /catalog counts/)
+    } finally {
+        await rm(parent, { recursive: true, force: true })
+    }
+})
+
+test('WAL observer rejects ordinary profiles and measures only synthetic file sizes', async () => {
+    await assert.rejects(observeWal('C:/test/RisuNest', 'RisuNest'))
+    const parent = await mkdtemp(path.join(os.tmpdir(), 'risunest-wal-test-'))
+    const identifier = 'RisuNest.phase3benchmark.r0123456789ab.waltest'
+    const root = path.join(parent, identifier)
+    try {
+        await mkdir(path.join(root, 'persistent'), { recursive: true })
+        const finish = await observeWal(root, identifier)
+        try {
+            await writeFile(path.join(root, 'persistent/persistent.db-wal'), new Uint8Array(8192))
+            const measured = await finish()
+            assert.equal(measured.startBytes, 0)
+            assert.equal(measured.endBytes, 8192)
+            assert.equal(measured.peakBytes, 8192)
+            assert.deepEqual(await finish(), measured)
+        } finally {
+            await finish()
+        }
+    } finally {
+        await rm(parent, { recursive: true, force: true })
+    }
+})
 
 test('refuses ordinary and mismatched profiles before fixture IO', () => {
     assert.throws(() => assertSyntheticProfile('C:/test/RisuNest', 'RisuNest'))
@@ -34,7 +171,12 @@ test('allowlisted projection removes body, path, identifier, and exception senti
         operations: [{ stage: 'canonical', ms: 3, body: sentinel }],
         phases: [{ stage: sentinel, ms: 1 }],
         active: { [sentinel]: 1 },
-        interaction: { selectionMs: 1, inputMs: sentinel, success: true, text: sentinel },
+        interaction: {
+            selectionMs: 1,
+            inputMs: sentinel,
+            success: true,
+            text: sentinel,
+        },
     })
     assert.equal(JSON.stringify(output).includes(sentinel), false)
     assert.equal(output.calls.length, 1)
