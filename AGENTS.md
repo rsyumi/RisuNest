@@ -2,7 +2,7 @@
 
 RisuNest is a cross-platform AI chat application, a fork of RisuAI focused on large-library performance and native app targets. Stack: Svelte 5 + TypeScript, Tauri 2 (Rust backend; generated Android project in `src-tauri/gen/android`), Vite 8, Tailwind CSS 4, pnpm. It lets users chat with many AI models through one interface, with themes, plugins, custom assets, and advanced memory systems.
 
-Platform priorities: Android and Windows first; macOS, iOS, and Linux second. Every target keeps the Svelte WebView UI; a native Rust data core or Compose UI is adopted only when measurements justify it.
+Platform targets: Windows, macOS, Linux, Android, and iOS, all equal. A feature, and the optimization behind it, belongs on all five; when a task cannot build one platform's equivalent, record the gap instead of letting the platforms diverge. Every target keeps the Svelte WebView UI; a native Rust data core or Compose UI is adopted only when measurements justify it. The web build only has to stay error-free: a feature that is easy natively but unavailable on the web is skipped, disabled, or guarded there, never worked around and never held back for web parity.
 
 ## Fork Scope
 
@@ -24,6 +24,7 @@ Platform priorities: Android and Windows first; macOS, iOS, and Linux second. Ev
 - `pnpm test` runs the Vitest suite, `pnpm check` type-checks, `pnpm check:plugin-dts` compiles the plugin API declarations, `pnpm check:production-bundle` builds product bundles and proves they contain no verification code, `pnpm check:benchmark-harnesses` type-checks `benchmarks/`. `pnpm benchmark:phase1` runs the deterministic regex benchmark with fixed output hashes; the other `benchmark:*` scripts are documented in their harness README. Android JVM tests live under `src-tauri/gen/android` (Gradle).
 - `package.json` keeps the upstream RisuAI scripts first, then RisuNest additions grouped by area: Vite variants (`tauribuild:*`, `dev:agent`, `build:agent`), checks and tests, desktop (`desktop:*:agent`, `windows:*`, `linux:*`, `macos:*`), `android:*`, `ios:*`, `benchmark:*`. Name a new script `<area>:<action>[:<variant>]`, hyphenate multi-word segments, and add the `:agent` suffix for the agent variant. `tauribuild*` are the Vite steps that `beforeBuildCommand` runs; a harness keeps its own Vite build inline in its Tauri config or runner as `pnpm exec vite build ...` instead of adding a script.
 - The repository has no formatter. Match the style of the surrounding file, and run `pnpm check` and the tests relevant to the changed area before committing or submitting a pull request.
+- Platform parity is not a per-task test matrix. A shared-path change is verified by `pnpm check` and the tests for the changed area; build or run a platform only when the change reaches platform-conditional code (`isTauri`, `isMobile`, `isAndroid`, `isIOS`, `isNodeServer`), `src-tauri` Rust, or the Android/iOS project files, and then only the platforms that code serves. Never run all five targets for one task.
 
 ## RisuRealm
 
