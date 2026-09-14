@@ -80,7 +80,10 @@ vi.mock('src/ts/process/modules', () => ({
 vi.mock('src/ts/plugins/plugins.svelte', () => ({
     pluginV2: { editdisplay: new Set() },
 }))
-vi.mock('src/ts/alert', () => ({ alertInput: vi.fn() }))
+vi.mock('src/ts/alert', () => ({
+    alertError: vi.fn(),
+    alertInput: vi.fn(),
+}))
 vi.mock('src/lang', () => ({
     language: {
         expandAll: 'Expand all',

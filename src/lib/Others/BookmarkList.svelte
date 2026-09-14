@@ -7,7 +7,7 @@
     import { findCharacterbyId, getUserName, getUserIcon } from "src/ts/util";
     import { createSimpleCharacter, bookmarkListOpen, DBState, selectedCharID, ScrollToMessageStore } from "src/ts/stores.svelte";
     import { language } from "src/lang";
-    import { alertInput } from "src/ts/alert";
+    import { alertError, alertInput } from "src/ts/alert";
     import {
         acquireCompleteConversation,
         captureSelectedConversationTarget,
@@ -20,6 +20,10 @@
         renameCapturedBookmark,
         type CapturedChatMessageTarget,
     } from "src/ts/chatMessageUi";
+    import {
+        renameBookmarkWithFeedback,
+        reportFailedBookmarkOperation,
+    } from './bookmarkOperation';
 
     const close = () => $bookmarkListOpen = false;
     let chara = $derived(DBState.db.characters[$selectedCharID]);
@@ -120,13 +124,26 @@
     }
 
     async function editName(target: CapturedChatMessageTarget) {
-        await renameCapturedBookmark(target, chatMessageContext, (currentName) =>
-            alertInput(language.bookmarkAskNameOrCancel, [], currentName),
+        await renameBookmarkWithFeedback(
+            (requestName) => renameCapturedBookmark(
+                target,
+                chatMessageContext,
+                requestName,
+            ),
+            (currentName) => alertInput(
+                language.bookmarkAskNameOrCancel,
+                [],
+                currentName,
+            ),
+            () => alertError(language.bookmarkActionFailed),
         );
     }
 
     async function removeBookmark(target: CapturedChatMessageTarget) {
-        await removeCapturedBookmark(target, chatMessageContext);
+        await reportFailedBookmarkOperation(
+            () => removeCapturedBookmark(target, chatMessageContext),
+            () => alertError(language.bookmarkActionFailed),
+        );
     }
 
     function goToChat(target: CapturedChatMessageTarget) {

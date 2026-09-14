@@ -35,7 +35,6 @@
     } from 'src/ts/storage/nativeFileJobs'
     import {
         cancelActiveNativeFileOperation,
-        NativeFileOperationBusyError,
     } from 'src/ts/storage/nativeFileJobManager'
     import { nativeFileJobProgressText } from 'src/ts/gui/nativeFileJobProgress'
 
@@ -94,8 +93,7 @@
                 if (isTauri) await restoreBackupFromSystemPicker()
                 else await importRisuSaveFromSystemPicker()
             } catch (error) {
-                if (error instanceof NativeFileOperationBusyError)
-                    alertError(language.risuNest.backup.actionFailed)
+                showRisuSaveError(error)
             }
             return
         }

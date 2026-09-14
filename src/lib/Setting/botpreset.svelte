@@ -20,6 +20,7 @@
     import { ShowRealmFrameStore } from "src/ts/stores.svelte";
     import PromptDiffModal from "../Others/PromptDiffModal.svelte";
     import { RISU_PRESET_DRAG_TYPE } from "src/ts/dragTypes";
+    import { reportPresetOperation } from './presetOperation';
 
     let editMode = $state(false)
     let isDragging = $state(false)
@@ -48,6 +49,12 @@
         e.dataTransfer.setData(RISU_PRESET_DRAG_TYPE, index.toString());
     }
 
+    async function runPresetOperation(operation: () => Promise<unknown>): Promise<boolean> {
+        return reportPresetOperation(operation, () =>
+            alertError(language.presetActionFailed),
+        )
+    }
+
     async function handlePresetDrop(targetIndex: number, e: DragEvent) {
         if (!isPresetDrag(e)) {
             return;
@@ -56,7 +63,7 @@
         e.stopPropagation();
         const sourceIndex = parseInt(e.dataTransfer?.getData(RISU_PRESET_DRAG_TYPE) || '0');
         if (sourceIndex === targetIndex) return
-        await movePreset(sourceIndex, targetIndex);
+        await runPresetOperation(() => movePreset(sourceIndex, targetIndex));
     }
 
 
@@ -138,8 +145,7 @@
             
             <button onclick={async () => {
                 if(!editMode){
-                    await changeToPreset(i)
-                    close()
+                    if (await runPresetOperation(() => changeToPreset(i))) close()
                 }
             }} 
             class="flex items-center text-textcolor border-t-1 border-solid border-0 border-darkborderc p-2 cursor-pointer" 
@@ -191,7 +197,11 @@
             }}>
                 {#if editMode}
                     <TextInput value={preset.name} onchange={async (event) => {
-                        await renamePreset(i, event.currentTarget.value)
+                        const input = event.currentTarget
+                        const renamed = await runPresetOperation(() =>
+                            renamePreset(i, input.value),
+                        )
+                        if (!renamed) input.value = preset.name
                     }} placeholder="string" padding={false}/>
                 {:else}
                     {#if i < 9}
@@ -218,7 +228,7 @@
                     {/if}
                     <div class="text-textcolor2 hover:text-green-500 cursor-pointer mr-2" role="button" tabindex="0" onclick={async (e) => {
                         e.stopPropagation()
-                        await copyPreset(i)
+                        await runPresetOperation(() => copyPreset(i))
                     }} onkeydown={(e) => {
                         if(e.key === 'Enter' && e.currentTarget instanceof HTMLElement){
                             e.currentTarget.click()
@@ -252,7 +262,7 @@
                         }
                         const d = await alertConfirm(`${language.removeConfirm}${preset.name}`)
                         if(d){
-                            await removePreset(i)
+                            await runPresetOperation(() => removePreset(i))
                         }
                     }} onkeydown={(e) => {
                         if(e.key === 'Enter' && e.currentTarget instanceof HTMLElement){
@@ -294,7 +304,7 @@
             <button class="text-textcolor2 hover:text-green-500 cursor-pointer mr-1" onclick={async () => {
                 const newPreset = structuredClone(prebuiltPresets.OAI2)
                 newPreset.name = `New Preset`
-                await addPreset(newPreset)
+                await runPresetOperation(() => addPreset(newPreset))
             }}>
                 <PlusIcon/>
             </button>

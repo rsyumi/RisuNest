@@ -34,7 +34,6 @@
     import { prebuiltPresets } from 'src/ts/process/templates/templates'
     import { setPreset } from 'src/ts/storage/database.svelte'
     import {
-        NativeFileOperationBusyError,
         cancelActiveNativeFileOperation,
         dismissNativeFileOperationOutcome,
         nativeFileJobHost,
@@ -52,6 +51,7 @@
 
     import {
         INITIAL_ONBOARDING_FLOW,
+        accountRestoreApplied,
         goToOnboardingState,
         onboardingStep,
         onboardingSummary,
@@ -208,10 +208,9 @@
         importBusy = true
         try {
             await operation()
-        } catch (error) {
-            // The operation never starts for a slot that is already taken.
-            if (error instanceof NativeFileOperationBusyError)
-                alertError(strings.risuNest.backup.actionFailed)
+        } catch {
+            // Preflight failures happen before the shared operation panel exists.
+            alertError(strings.risuNest.backup.actionFailed)
         } finally {
             importBusy = false
         }
@@ -254,10 +253,13 @@
                 alertNormal(strings.risuNest.backup.officialMissing)
                 return
             }
+            if (!accountRestoreApplied(result.kind)) {
+                alertNormal(t.accountFound.notRestored)
+                return
+            }
             // An activated snapshot restarts the app, so the button stays busy
-            // until the process goes. Anything else left the local data as is.
-            restarting = result.kind === 'activated'
-            if (!restarting) flow = goToOnboardingState(flow, 'done', 'account')
+            // until the process goes.
+            restarting = true
         } catch {
             alertError(strings.risuNest.backup.actionFailed)
         } finally {
@@ -806,6 +808,7 @@
         --o-btn: var(--color-darkbutton);
         --o-blue: var(--color-primary-500);
         --o-ok: var(--color-success-500);
+        --o-warn: var(--color-danger-400);
         /* The logo gradient. Onboarding-only, not part of the theme. */
         --o-teal: #22c8c6;
         --o-indigo: #6e7cf8;
@@ -1056,7 +1059,7 @@
     .row.primary {
         border-color: transparent;
         background:
-            linear-gradient(#272b3d, #272b3d) padding-box,
+            linear-gradient(var(--o-panel), var(--o-panel)) padding-box,
             linear-gradient(
                     120deg,
                     var(--o-teal),
@@ -1067,7 +1070,11 @@
     }
     .row.primary:hover {
         background:
-            linear-gradient(#2d3148, #2d3148) padding-box,
+            linear-gradient(
+                    color-mix(in srgb, var(--o-panel) 82%, var(--o-hover)),
+                    color-mix(in srgb, var(--o-panel) 82%, var(--o-hover))
+                )
+                padding-box,
             linear-gradient(
                     120deg,
                     var(--o-teal),
@@ -1133,7 +1140,7 @@
         color: #fff;
     }
     .btn.primary:hover:not(:disabled) {
-        background: #2f6fe0;
+        background: var(--color-primary-600);
     }
     .btn.ghost {
         background: transparent;
@@ -1469,10 +1476,10 @@
     .warnings {
         margin: 0 0 16px;
         padding: 10px 12px 10px 28px;
-        border: 1px solid rgba(246, 196, 83, 0.35);
+        border: 1px solid color-mix(in srgb, var(--o-warn) 35%, transparent);
         border-radius: 10px;
         font-size: 12.5px;
-        color: #f6c453;
+        color: var(--o-warn);
     }
     .details {
         display: flex;
@@ -1587,8 +1594,8 @@
     }
     .note.warn {
         margin-top: 16px;
-        background: rgba(246, 196, 83, 0.08);
-        color: #f6c453;
+        background: color-mix(in srgb, var(--o-warn) 8%, transparent);
+        color: var(--o-warn);
     }
 
     /* ── done ── */

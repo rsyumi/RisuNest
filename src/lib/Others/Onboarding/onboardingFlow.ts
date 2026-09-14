@@ -92,3 +92,10 @@ export function onboardingSummary(
     if (path === 'fresh' || path === 'import') return path
     return 'data'
 }
+
+export function accountRestoreApplied(
+    result: OfficialPullResult['kind'],
+): boolean {
+    return result === 'activated'
+}
+import type { OfficialPullResult } from 'src/ts/storage/sync/officialAccountSnapshot'

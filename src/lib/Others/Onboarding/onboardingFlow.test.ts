@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import {
     INITIAL_ONBOARDING_FLOW,
     ONBOARDING_STATES,
+    accountRestoreApplied,
     goToOnboardingState,
     onboardingBack,
     onboardingStep,
@@ -68,5 +69,12 @@ describe('onboarding flow', () => {
         for (const path of ['hub', 'account'] as const) {
             expect(onboardingSummary(path)).toBe('data')
         }
+    })
+
+    it('advances account restore only after a snapshot was activated', () => {
+        expect(accountRestoreApplied('activated')).toBe(true)
+        expect(accountRestoreApplied('missing')).toBe(false)
+        expect(accountRestoreApplied('unchanged')).toBe(false)
+        expect(accountRestoreApplied('kept-local')).toBe(false)
     })
 })
