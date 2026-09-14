@@ -84,7 +84,7 @@ pub(crate) struct InlayEncodeOptions {
     max_dimension: u32,
     skip_reencode: bool,
     /// Frames per second an animation is thinned down to, or 0 to keep the original rate.
-    #[serde(default, deserialize_with = "deserialize_inlay_animation_fps")]
+    #[serde(deserialize_with = "deserialize_inlay_animation_fps")]
     animation_max_fps: u32,
 }
 

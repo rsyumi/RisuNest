@@ -1056,6 +1056,7 @@ fn native_options_clamp_max_dimension_before_original_mode_ignores_it() {
             "quality": 85,
             "maxDimension": input,
             "skipReencode": false,
+            "animationMaxFps": 0,
         }))
         .unwrap();
         assert_eq!(options.max_dimension, expected);
@@ -1074,10 +1075,27 @@ fn native_options_clamp_webp_quality_to_the_encoder_range() {
             "quality": input,
             "maxDimension": 0,
             "skipReencode": false,
+            "animationMaxFps": 0,
         }))
         .unwrap();
 
         assert_eq!(options.quality, expected);
+    }
+}
+
+#[test]
+fn native_options_clamp_the_animation_frame_rate() {
+    for (input, expected) in [(0u32, 0u32), (12, 12), (240, 240), (1000, 240)] {
+        let options: InlayEncodeOptions = serde_json::from_value(json!({
+            "format": "webp",
+            "quality": 85,
+            "maxDimension": 0,
+            "skipReencode": false,
+            "animationMaxFps": input,
+        }))
+        .unwrap();
+
+        assert_eq!(options.animation_max_fps, expected);
     }
 }
 
