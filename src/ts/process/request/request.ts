@@ -1,4 +1,5 @@
 import { Ollama } from 'ollama/dist/browser.mjs';
+import { createRequestAbortScope } from '../../network/requestAbortScope';
 import { language } from "../../../lang";
 import { fetchNative, globalFetch } from "../../globalApi.svelte";
 import { getModelInfo, LLMFlags, LLMFormat, type LLMModel } from "../../model/modellist";
@@ -1184,46 +1185,69 @@ async function requestOllama(arg:RequestDataArgumentExtended):Promise<requestDat
         }
     }
 
+    const requestScope = createRequestAbortScope(arg.abortSignal)
     const ollama = new Ollama({
         host: isCloud ? 'https://ollama.com' : db.ollamaURL,
         headers: Object.keys(customHeaders).length > 0 ? customHeaders : undefined,
-        fetch: isCloud ? ollamaCloudFetch : undefined
+        fetch: requestScope.fetch(isCloud ? ollamaCloudFetch : fetch),
     })
 
-    if(!arg.useStreaming){
+    if (!arg.useStreaming) {
         requestBody.stream = false
-        const response: any = await ollama.chat(requestBody)
-
-        const result = formatThinkingOutput(response.message?.thinking ?? '', response.message?.content ?? '')
-        return {
-            type: 'success',
-            result: unstringlizeChat(result, formated, arg.currentChar?.name ?? ''),
-            model: arg.aiModel
+        try {
+            const response: any = await ollama.chat(requestBody)
+            const result = formatThinkingOutput(response.message?.thinking ?? '', response.message?.content ?? '')
+            return {
+                type: 'success',
+                result: unstringlizeChat(result, formated, arg.currentChar?.name ?? ''),
+                model: arg.aiModel,
+            }
+        } finally {
+            requestScope.dispose()
         }
     }
 
     requestBody.stream = true
-    const response: any = await ollama.chat(requestBody)
+    let response: any
+    try {
+        response = await ollama.chat(requestBody)
+    } catch (error) {
+        requestScope.dispose()
+        throw error
+    }
 
+    let cancelled = false
     const readableStream = new ReadableStream<StreamResponseChunk>({
-        async start(controller){
+        async start(controller) {
             let content = ''
             let thinking = ''
-            for await(const chunk of response){
-                thinking += chunk.message?.thinking ?? ''
-                content += chunk.message?.content ?? ''
-                controller.enqueue({
-                    "0": formatThinkingOutput(thinking, content)
-                })
+            try {
+                for await (const chunk of response) {
+                    if (cancelled) break
+                    thinking += chunk.message?.thinking ?? ''
+                    content += chunk.message?.content ?? ''
+                    controller.enqueue({
+                        '0': formatThinkingOutput(thinking, content),
+                    })
+                }
+                if (!cancelled) controller.close()
+            } catch (error) {
+                if (!cancelled) controller.error(error)
+            } finally {
+                requestScope.dispose()
             }
-            controller.close()
-        }
+        },
+        cancel() {
+            cancelled = true
+            requestScope.dispose()
+            response.abort()
+        },
     })
 
     return {
         type: 'streaming',
         result: readableStream,
-        model: arg.aiModel
+        model: arg.aiModel,
     }
 }
 

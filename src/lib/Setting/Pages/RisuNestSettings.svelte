@@ -1,11 +1,12 @@
 <script lang="ts">
     import { language } from 'src/lang'
     import { risuNestSettingsItems } from 'src/ts/setting/risuNestSettingsData'
-    import { isTauri, isTauriAndroid } from 'src/ts/platform'
+    import { isTauri, isTauriAndroid, isTauriIOS } from 'src/ts/platform'
     import RisuNestSettingRows from '../RisuNest/RisuNestSettingRows.svelte'
     import RisuNestPerformanceSettings from './RisuNestPerformanceSettings.svelte'
     import RisuNestStorageDashboard from './RisuNestStorageDashboard.svelte'
     import RisuNestBackupRestore from './RisuNestBackupRestore.svelte'
+    import RisuNestIOSPlatform from './RisuNestIOSPlatform.svelte'
     import RisuNestAndroidPlatform from './RisuNestAndroidPlatform.svelte'
     import RisuNestLogViewer from './RisuNestLogViewer.svelte'
     import ServerSyncSettings from './ServerSyncSettings.svelte'
@@ -17,7 +18,7 @@
         ...(isTauri ? [{ id: 'risunest-server-sync', label: language.risuNest.serverSync.title }] : []),
         ...(isTauri ? [{ id: 'risunest-storage', label: language.risuNest.storage.title }] : []),
         { id: 'risunest-backup', label: language.risuNest.backup.title },
-        ...(isTauriAndroid ? [{ id: 'risunest-platform', label: language.risuNest.platform.title }] : []),
+        ...(isTauriAndroid || isTauriIOS ? [{ id: 'risunest-platform', label: language.risuNest.platform.title }] : []),
         ...(isTauri ? [{ id: 'risunest-diag', label: language.risuNest.diag.title }] : []),
     ]
 
@@ -42,6 +43,9 @@
         <RisuNestStorageDashboard />
     {/if}
     <RisuNestBackupRestore />
+    {#if isTauriIOS}
+        <RisuNestIOSPlatform />
+    {/if}
     {#if isTauriAndroid}
         <RisuNestAndroidPlatform />
     {/if}

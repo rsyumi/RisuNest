@@ -83,6 +83,21 @@ function dependencies(platform: 'native-desktop' | 'web'): RisuSaveFileRouteDepe
 }
 
 describe('RisuSave picker route', () => {
+    it('releases an owned import even when source inspection fails before the native job', async () => {
+        const deps = dependencies('native-desktop')
+        deps.platform = () => 'native-ios'
+        deps.cleanupNativeImport = vi.fn(async () => {})
+        deps.describeNativeSource = vi.fn(async () => {
+            throw new Error('source inspection failed')
+        })
+        await expect(
+            importRisuSaveFromPicker({ onSource: vi.fn() }, deps),
+        ).rejects.toThrow('source inspection failed')
+        expect(deps.runNativeImport).not.toHaveBeenCalled()
+        expect(deps.cleanupNativeImport).toHaveBeenCalledExactlyOnceWith(
+            'C:\\chosen\\source.risudat',
+        )
+    })
     function installAndroidExport(
         deps: RisuSaveFileRouteDependencies,
         input: {

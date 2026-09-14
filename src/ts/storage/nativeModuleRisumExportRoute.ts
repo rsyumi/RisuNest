@@ -1,6 +1,6 @@
 import { save } from '@tauri-apps/plugin-dialog'
 
-import { isTauriAndroid, isTauriDesktop } from '../platform'
+import { isTauriIOS, isTauriAndroid, isTauriDesktop } from '../platform'
 import type { RisuModule } from '../process/modules'
 import { getDatabase } from './database.svelte'
 import {
@@ -20,6 +20,7 @@ interface NativeRisumExportRuntime {
 interface NativeModuleRisumExportRouteDependencies {
     isDesktop(): boolean
     isAndroid(): boolean
+    isIOS?(): boolean
     chooseDestination(suggestedName: string): Promise<string | null>
     runtime(): NativeRisumExportRuntime
     modules(): RisuModule[]
@@ -32,10 +33,12 @@ interface NativeModuleRisumExportRouteDependencies {
 const productionDependencies: NativeModuleRisumExportRouteDependencies = {
     isDesktop: () => isTauriDesktop,
     isAndroid: () => isTauriAndroid,
-    chooseDestination: (suggestedName) => save({
-        defaultPath: suggestedName,
-        filters: [{ name: 'Risu module', extensions: ['risum'] }],
-    }),
+    isIOS: () => isTauriIOS,
+    chooseDestination: (suggestedName) =>
+        save({
+            defaultPath: suggestedName,
+            filters: [{ name: 'Risu module', extensions: ['risum'] }],
+        }),
     runtime: getPersistentDataRuntime,
     modules: () => getDatabase().modules,
     runExport: runNativeRisuModuleExport,

@@ -53,6 +53,8 @@
     "benchmark:streaming:android:agent": "tauri android build --debug --apk --target x86_64 --ci --config benchmarks/streaming/tauri.conf.json",
     "check:production-bundle": "node tests/productionBundle.mjs",
     "check:benchmark-harnesses": "svelte-check --tsconfig benchmarks/tsconfig.json",
+    "ios:init:agent": "tauri ios init --ci --skip-targets-install --config src-tauri/tauri.agent.conf.json",
+    "ios:build:simulator:agent": "tauri ios build --ci --target aarch64-sim --no-sign --config src-tauri/tauri.agent.conf.json",
     "benchmark:macos:build:agent": "vite build --mode agent --config benchmarks/macos/vite.config.ts",
     "macos:build:agent": "tauri build --bundles app --config src-tauri/tauri.agent.conf.json -- --locked",
     "macos:build": "tauri build --bundles app -- --locked"
@@ -78,6 +80,7 @@
     "@tauri-apps/plugin-dialog": "2.7.2",
     "@tauri-apps/plugin-fs": "2.5.1",
     "@tauri-apps/plugin-http": "2.5.9",
+    "@tauri-apps/plugin-opener": "^2.5.5",
     "@tauri-apps/plugin-os": "2.3.2",
     "@tauri-apps/plugin-process": "2.3.1",
     "@tauri-apps/plugin-shell": "2.3.5",

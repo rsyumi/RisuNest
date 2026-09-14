@@ -40,9 +40,10 @@ type FileRouteRuntime = Pick<
 >
 
 export interface RisuSaveFileRouteDependencies {
-    platform(): 'native-desktop' | 'native-android' | 'web'
+    platform(): 'native-desktop' | 'native-ios' | 'native-android' | 'web'
     runtime(): FileRouteRuntime
     chooseNativeImport(): Promise<string | null>
+    cleanupNativeImport?(path: string): Promise<void>
     chooseNativeExport(defaultName: string): Promise<string | null>
     chooseWebImport(): Promise<FileLike[] | null>
     runNativeImport(
@@ -403,39 +404,45 @@ export async function importRisuSaveFromPicker(
     dependencies: RisuSaveFileRouteDependencies,
 ): Promise<RisuSaveFileRouteResult | null> {
     const runtime = dependencies.runtime()
-    if (dependencies.platform() === 'native-desktop') {
+    if (['native-desktop', 'native-ios'].includes(dependencies.platform())) {
         const path = await dependencies.chooseNativeImport()
         if (!path) return null
-        if (options.onSource) {
-            options.onSource(dependencies.describeNativeSource
-                ? await dependencies.describeNativeSource(path)
-                : { name: basenameOf(path) })
-        }
-        let result: NativeFileJobResult
         try {
-            result = await dependencies.runNativeImport(
-                runtime,
-                { type: 'desktopPath', path },
-                {
-                    signal: options.signal,
-                    pollIntervalMs: options.pollIntervalMs,
-                    onStatus: options.onStatus,
-                    onBlockingChange: options.onBlockingChange,
-                    afterRefresh: dependencies.reloadPluginsAfterNativeRestore,
-                },
-            )
-        }
-        catch (error) {
-            if (isNativeCompatibilityFallback(error)) {
-                announceWebReselect(options)
-                return importWithWebCodec(runtime, options, dependencies)
+            if (options.onSource) {
+                options.onSource(
+                    dependencies.describeNativeSource
+                        ? await dependencies.describeNativeSource(path)
+                        : { name: basenameOf(path) },
+                )
             }
-            throw error
-        }
-        return {
-            mode: 'native',
-            warningCodes: result.warningCodes,
-            bytes: result.sourceBytes,
+            let result: NativeFileJobResult
+            try {
+                result = await dependencies.runNativeImport(
+                    runtime,
+                    { type: 'desktopPath', path },
+                    {
+                        signal: options.signal,
+                        pollIntervalMs: options.pollIntervalMs,
+                        onStatus: options.onStatus,
+                        onBlockingChange: options.onBlockingChange,
+                        afterRefresh:
+                            dependencies.reloadPluginsAfterNativeRestore,
+                    },
+                )
+            } catch (error) {
+                if (isNativeCompatibilityFallback(error)) {
+                    announceWebReselect(options)
+                    return importWithWebCodec(runtime, options, dependencies)
+                }
+                throw error
+            }
+            return {
+                mode: 'native',
+                warningCodes: result.warningCodes,
+                bytes: result.sourceBytes,
+            }
+        } finally {
+            await dependencies.cleanupNativeImport?.(path)
         }
     }
 
@@ -451,7 +458,7 @@ export async function exportRisuSaveFromPicker(
     if (platform === 'native-android') {
         return exportThroughAndroidSaf(dependencies.runtime(), name, options, dependencies)
     }
-    if (platform === 'native-desktop') {
+    if (platform === 'native-desktop' || platform === 'native-ios') {
         const destination = await dependencies.chooseNativeExport(name)
         if (!destination) return null
         let result: NativeFileJobResult
@@ -466,10 +473,13 @@ export async function exportRisuSaveFromPicker(
                     omitAccount: options.omitAccount ?? false,
                 },
             )
-        }
-        catch (error) {
+        } catch (error) {
             if (isCapabilityUnavailable(error)) {
-                return exportWithWebCodec(name, options.omitAccount ?? false, dependencies)
+                return exportWithWebCodec(
+                    name,
+                    options.omitAccount ?? false,
+                    dependencies,
+                )
             }
             throw error
         }

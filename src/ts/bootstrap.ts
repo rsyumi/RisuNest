@@ -102,6 +102,7 @@ import {
     describeScreenshotPublicationError,
     listenRecoveredAndroidScreenshotPublications,
 } from "./nativeScreenshotArchiveWriter";
+import { initializeIOSNative, installIOSPersistenceLifecycle } from "./iosNative";
 import { restartNativeApp, schedulePeriodicNativeSnapshot } from "./storage/nativePersistentMaintenance";
 import { yieldToUi } from './ui/yieldToUi'
 import {
@@ -719,6 +720,7 @@ export async function loadData() {
             MobileGUI.set(true)
         }
         registerAndroidScreenshotPublicationRecovery()
+        await initializeIOSNative()
         LoadingStatusState.startedAt = null
         loadedStore.set(true)
         performance.mark('boot:interactive')
@@ -728,7 +730,12 @@ export async function loadData() {
         registerModelDynamic()
         await saveDb()
         registerAndroidRisuSaveRoute()
-        if (isTauri) schedulePeriodicNativeSnapshot()
+        if (isTauri) {
+          schedulePeriodicNativeSnapshot();
+          installIOSPersistenceLifecycle((reason) =>
+            runtime.flushPendingDataLocally(reason),
+          );
+        }
         moduleUpdate()
         if (fullDatabaseResident) cleanChunks()
         void alertTOS().then((accepted) => {

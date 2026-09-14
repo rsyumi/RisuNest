@@ -75,6 +75,8 @@ import {
     type CompleteConversationLease,
 } from '../storage/activeWorkingSet.svelte'
 import { beginAndroidGenerationKeepAlive, endAndroidGenerationKeepAlive } from '../androidGenerationKeepAlive'
+import { beginIOSGeneration, notifyIOSGenerationComplete } from "../iosNative";
+import { isTauriIOS } from "../platform";
 
 export { doingChat } from './generationState'
 
@@ -160,6 +162,7 @@ function hasMismatchedActiveConversationSession(): boolean {
 }
 
 interface GenerationCompletionLifecycle {
+    onProgress?(completed: number): void
     responseCompleted: boolean
     reroll: boolean
     responseApplied: boolean
@@ -169,9 +172,13 @@ interface GenerationCompletionLifecycle {
 export async function notifyGenerationCompletion(result: string): Promise<void> {
     if (DBState.db.notification) {
         try {
-            if (await Notification.requestPermission() === 'granted') {
-                const notification = new Notification('RisuNest', { body: result })
-                notification.onclick = () => window.focus()
+            if (isTauriIOS) {
+              await notifyIOSGenerationComplete();
+            } else if ((await Notification.requestPermission()) === "granted") {
+              const notification = new Notification("RisuNest", {
+                body: result,
+              });
+              notification.onclick = () => window.focus();
             }
         } catch {}
     }
@@ -201,6 +208,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     let enteredGeneration = false
     let generationReturned = false
     let generationKeepAliveAcquired = false
+    let iosGeneration:
+      | Awaited<ReturnType<typeof beginIOSGeneration>>
+      | undefined;
     try {
         const target = captureSelectedConversationTarget()
         if (target) {
@@ -213,7 +223,14 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
         enteredGeneration = true
         generationKeepAliveAcquired = beginAndroidGenerationKeepAlive()
-        const result = await sendChatInternal(chatProcessIndex, arg, lifecycle, reservation)
+        iosGeneration = await beginIOSGeneration(arg.signal)
+        lifecycle.onProgress = iosGeneration.progress;
+        const result = await sendChatInternal(
+          chatProcessIndex,
+          { ...arg, signal: iosGeneration.signal },
+          lifecycle,
+          reservation,
+        );
         generationReturned = true
         return result
     } catch (error) {
@@ -227,12 +244,18 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             lifecycle.acknowledgementAttempted = true
             try {
                 await acknowledgeGenerationCompletion()
+                lifecycle.onProgress?.(3)
             } catch (acknowledgeError) {
                 console.error(acknowledgeError)
             }
         }
         completeLease?.release()
         endAndroidGenerationKeepAlive(generationKeepAliveAcquired)
+        await iosGeneration
+          ?.dispose(generationReturned && lifecycle.responseCompleted && !iosGeneration.signal?.aborted)
+          .catch((error) =>
+            console.error("iOS generation cleanup failed", error),
+          );
         ownedReservation?.release({
             preserveBusy: enteredGeneration && !generationReturned,
         })
@@ -1818,6 +1841,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
         if (lifecycle.reroll) return
         lifecycle.acknowledgementAttempted = true
         await acknowledgeGenerationCompletion()
+        lifecycle.onProgress?.(3)
     }
     
     const responseApplication = await applyGenerationResponse({
@@ -1893,12 +1917,14 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
             trimIncompleteResponse: trimUntilPunctuation,
             markResponseApplied: () => {
                 lifecycle.responseApplied = true
+                lifecycle.onProgress?.(1)
             },
             onProviderFailure: throwError,
         },
     })
     if (!responseApplication) return false
     lifecycle.responseCompleted = true
+    lifecycle.onProgress?.(2)
     result = responseApplication.result
     emoChanged = responseApplication.emoChanged
     resendChat = responseApplication.resendChat

@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { relaunch } from '@tauri-apps/plugin-process'
-import { isTauriMobile } from '../platform'
+import { isTauriIOS, isTauriMobile } from '../platform'
 
 const PERIODIC_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000
 const PERIODIC_SNAPSHOT_CHECK_INTERVAL_MS = 60 * 60 * 1000
@@ -108,6 +108,11 @@ export async function requestNativePersistentSnapshotRestore(id: string): Promis
 }
 
 export async function restartNativeApp(): Promise<void> {
+    if (isTauriIOS) {
+        await invoke('ios_prepare_restart')
+        window.location.reload()
+        return
+    }
     if (!isTauriMobile) {
         await relaunch()
         return

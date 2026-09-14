@@ -1,6 +1,6 @@
 import { save } from '@tauri-apps/plugin-dialog'
 
-import { isTauriAndroid, isTauriDesktop } from '../platform'
+import { isTauriIOS, isTauriAndroid, isTauriDesktop } from '../platform'
 import type { CharacterDetail, DataRevision } from './persistentDataStore'
 import { getPersistentDataStore } from './persistentDataStoreFactory'
 import { readPinnedCharacterDetail } from './persistentRecordIterator'
@@ -28,12 +28,16 @@ interface NativeCharacterCardExportRuntime {
 interface NativeCharacterCardExportRouteDependencies {
     isDesktop(): boolean
     isAndroid(): boolean
+    isIOS?(): boolean
     chooseDestination(
         suggestedName: string,
         format: NativeCharacterCardPickerInput['format'],
     ): Promise<string | null>
     runtime(): NativeCharacterCardExportRuntime
-    readCharacter(characterId: string, revision: DataRevision): Promise<CharacterDetail>
+    readCharacter(
+        characterId: string,
+        revision: DataRevision,
+    ): Promise<CharacterDetail>
     runExport(
         input: NativeCharacterCardExportInput,
         options?: NativeFileJobOptions,
@@ -43,16 +47,27 @@ interface NativeCharacterCardExportRouteDependencies {
 const productionDependencies: NativeCharacterCardExportRouteDependencies = {
     isDesktop: () => isTauriDesktop,
     isAndroid: () => isTauriAndroid,
-    chooseDestination: (suggestedName, format) => save({
-        defaultPath: suggestedName,
-        filters: [{
-            name: format === 'json-card' ? 'JSON character card' : 'PNG character card',
-            extensions: [format === 'json-card' ? 'json' : 'png'],
-        }],
-    }),
+    isIOS: () => isTauriIOS,
+    chooseDestination: (suggestedName, format) =>
+        save({
+            defaultPath: suggestedName,
+            filters: [
+                {
+                    name:
+                        format === 'json-card'
+                            ? 'JSON character card'
+                            : 'PNG character card',
+                    extensions: [format === 'json-card' ? 'json' : 'png'],
+                },
+            ],
+        }),
     runtime: getPersistentDataRuntime,
     readCharacter: (characterId, revision) =>
-        readPinnedCharacterDetail(getPersistentDataStore(), characterId, revision),
+        readPinnedCharacterDetail(
+            getPersistentDataStore(),
+            characterId,
+            revision,
+        ),
     runExport: runNativeCharacterCardExport,
 }
 

@@ -12,6 +12,7 @@ import { v4 as uuidv4, v4 } from 'uuid';
 import { appDataDir, join } from "@tauri-apps/api/path";
 import { get } from "svelte/store";
 import { open } from '@tauri-apps/plugin-shell'
+import { openUrl } from '@tauri-apps/plugin-opener'
 import streamSaver from 'streamsaver';
 import { type Database, defaultSdDataFunc, getDatabase, appVer, getCurrentCharacter, type character, type groupChat, appSubVer } from "./storage/database.svelte";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -46,7 +47,8 @@ import {
     replaceDatabaseRootResources,
 } from "./process/coldstorageData";
 import { collectExactPluginStorageAssetReferences } from "./drive/backupAssets";
-import { isTauri, isTauriMobile, isNodeServer } from "./platform";
+import { downloadIOSFile } from "./storage/iosFiles";
+import { isTauriIOS, isTauri, isTauriMobile, isNodeServer } from "./platform";
 import { isLocalNetworkUrl } from "./network/localNetwork";
 import { decodeProxyJobWsChunk, formatProxyStreamErrorMessage, parseProxyJobWsEvent } from "./network/proxyJobWs";
 import { getNodeServerProxyAuth } from "./storage/nodeStorage";
@@ -119,6 +121,7 @@ export async function downloadFile(name: string, dat: Uint8Array | ArrayBuffer |
         a.remove()
     }
 
+    if (isTauriIOS) return downloadIOSFile(name, data);
     if (isTauriMobile) {
         // Android resolves the download directory to app private storage the user cannot browse,
         // so exports go through the system picker instead.
@@ -949,7 +952,10 @@ export function getFetchLogs() {
  * @param {string} url - The URL to open.
  */
 export function openURL(url: string) {
-    if (isTauri) {
+    if (isTauriIOS) {
+        void openUrl(url).catch((error) => alertError(String(error)))
+    }
+    else if (isTauri) {
         open(url)
     }
     else {

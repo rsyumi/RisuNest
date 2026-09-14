@@ -4,12 +4,13 @@ mod app_data_root;
 mod asset_repository;
 mod cold_payload_codec;
 pub(crate) mod device_backup;
+mod external_storage;
 pub mod import_export_jobs;
+#[cfg(target_os = "ios")]
+mod ios_lifecycle;
 #[allow(dead_code)]
 mod local_backup;
 mod logical_records;
-mod external_storage;
-#[allow(dead_code)]
 #[allow(dead_code)]
 mod lossless_f0;
 #[cfg(any(test, target_os = "macos"))]
@@ -20,7 +21,7 @@ mod native_media;
 mod native_tokenizer;
 #[cfg(desktop)]
 mod opened_files;
-#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[cfg(any(windows, target_os = "linux", target_os = "ios", target_os = "macos"))]
 mod persistent_commit_raw;
 #[cfg(windows)]
 mod persistent_commit_transport;
@@ -33,6 +34,7 @@ mod publication_upload;
     target_os = "windows",
     target_os = "android",
     target_os = "linux",
+    target_os = "ios",
     target_os = "macos"
 ))]
 mod regex_shadow;
@@ -263,6 +265,17 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
     let native_log_state = native_log::global_state();
     let setup_native_log_state = native_log_state.clone();
     let mut builder = tauri::Builder::default();
+    #[cfg(target_os = "ios")]
+    {
+        builder = builder
+            .append_invoke_initialization_script(include_str!("ios_ipc.js"))
+            .manage(ios_lifecycle::RestartState::default())
+            .plugin(tauri_plugin_opener::init());
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        builder = builder.plugin(tauri_plugin_shell::init());
+    }
     #[cfg(windows)]
     {
         use tauri_plugin_window_state::StateFlags;
@@ -332,6 +345,8 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             if webview.label() == "main"
                 && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
             {
+                #[cfg(target_os = "ios")]
+                ios_lifecycle::main_document_started(webview.app_handle());
                 #[cfg(target_os = "macos")]
                 macos_lifecycle::document_started(webview.app_handle());
                 if let Some(state) = webview.try_state::<device_backup::DeviceBackupState>() {
@@ -368,8 +383,10 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
 
     builder
         .setup(move |app| {
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_os = "ios"))]
             app.handle().plugin(tauri_plugin_barcode_scanner::init())?;
+            #[cfg(target_os = "ios")]
+            app.handle().plugin(tauri_plugin_ios_native::init())?;
             let app_data_dir = app_data_root::resolve(app)?;
             let device_backup =
                 device_backup::DeviceBackupState::initialize(app_data_dir.join("device-backup"));
@@ -407,6 +424,7 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
                 target_os = "windows",
                 target_os = "android",
                 target_os = "linux",
+                target_os = "ios",
                 target_os = "macos"
             ))]
             app.manage(regex_shadow::RegexCancellationRegistry::default());
@@ -417,7 +435,6 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         .manage(server_sync::commands::ServerSyncCommandState::default())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_deep_link::init())
-        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_os::init())
@@ -428,6 +445,8 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
 /// The product command router, reusable by alternative native entries.
 pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
+        #[cfg(target_os = "ios")]
+        ios_lifecycle::ios_prepare_restart,
         #[cfg(target_os = "macos")]
         macos_lifecycle::macos_lifecycle_ready,
         #[cfg(target_os = "macos")]
@@ -557,7 +576,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         android_commit_transport::pds_commit_android_finish,
         #[cfg(target_os = "android")]
         android_commit_transport::pds_commit_android_cancel,
-        #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+        #[cfg(any(windows, target_os = "linux", target_os = "ios", target_os = "macos"))]
         persistent_commit_raw::pds_commit_raw,
         #[cfg(windows)]
         persistent_commit_transport::pds_commit_shared_open,
@@ -599,6 +618,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
             target_os = "windows",
             target_os = "android",
             target_os = "linux",
+            target_os = "ios",
             target_os = "macos"
         ))]
         regex_shadow::regex_execute_batch,
@@ -606,6 +626,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
             target_os = "windows",
             target_os = "android",
             target_os = "linux",
+            target_os = "ios",
             target_os = "macos"
         ))]
         regex_shadow::regex_cancel_batch,

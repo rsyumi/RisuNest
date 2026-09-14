@@ -1,0 +1,16 @@
+{
+  "productName": "RisuNest iOS Bench",
+  "version": "0.1.0",
+  "identifier": "io.github.rsyumi.risunest.ios.bench",
+  "build": { "frontendDist": "../dist" },
+  "app": {
+    "windows": [{ "label": "main", "title": "iOS synthetic verification" }]
+  },
+  "bundle": {
+    "icon": [
+      "../../../src-tauri/icons/128x128.png",
+      "../../../src-tauri/icons/icon.ico"
+    ],
+    "iOS": { "minimumSystemVersion": "16.4" }
+  }
+}

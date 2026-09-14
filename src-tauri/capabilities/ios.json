@@ -1,0 +1,62 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "ios-capability",
+  "windows": ["main"],
+  "platforms": ["iOS"],
+  "permissions": [
+    "core:default",
+    "fs:allow-read-file",
+    "fs:allow-write-file",
+    "fs:allow-write",
+    "fs:allow-read-dir",
+    "fs:allow-copy-file",
+    "fs:allow-mkdir",
+    "fs:allow-remove",
+    "fs:allow-rename",
+    "fs:allow-exists",
+    "fs:allow-stat",
+    "fs:allow-open",
+    "fs:allow-seek",
+    "fs:allow-read",
+    {
+      "identifier": "fs:scope",
+      "allow": ["$APPDATA", "$APPDATA/*", "$APPDATA/**/*"]
+    },
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "dialog:allow-message",
+    "dialog:allow-ask",
+    "dialog:allow-confirm",
+    {
+      "identifier": "http:default",
+      "allow": [
+        {
+          "url": "https://*:*"
+        },
+        {
+          "url": "http://*:*"
+        }
+      ]
+    },
+    "os:default",
+    "opener:allow-open-url",
+    "opener:allow-default-urls",
+    "deep-link:default",
+    "barcode-scanner:allow-scan",
+    "barcode-scanner:allow-cancel",
+    "barcode-scanner:allow-check-permissions",
+    "barcode-scanner:allow-request-permissions",
+    "ios-native:allow-state",
+    "ios-native:allow-begin",
+    "ios-native:allow-end",
+    "ios-native:allow-request-notifications",
+    "ios-native:allow-notify",
+    "ios-native:allow-open-settings",
+    "ios-native:allow-pick-file",
+    "ios-native:allow-export-file",
+    "ios-native:allow-discard-file",
+    "ios-native:allow-publication",
+    "ios-native:allow-generation-progress",
+    "ios-native:allow-reset-generation"
+  ]
+}

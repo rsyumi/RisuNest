@@ -1,6 +1,6 @@
 import { save } from '@tauri-apps/plugin-dialog'
 
-import { isTauriAndroid, isTauriDesktop } from '../platform'
+import { isTauriIOS, isTauriAndroid, isTauriDesktop } from '../platform'
 import type { CharacterDetail, DataRevision } from './persistentDataStore'
 import { getPersistentDataStore } from './persistentDataStoreFactory'
 import { readPinnedCharacterDetail } from './persistentRecordIterator'
@@ -31,12 +31,16 @@ interface NativeCharacterCharxExportRuntime {
 interface NativeCharacterCharxExportRouteDependencies {
     isDesktop(): boolean
     isAndroid(): boolean
+    isIOS?(): boolean
     chooseDestination(
         suggestedName: string,
         container: NativeCharacterCharxPickerInput['container'],
     ): Promise<string | null>
     runtime(): NativeCharacterCharxExportRuntime
-    readCharacter(characterId: string, revision: DataRevision): Promise<CharacterDetail>
+    readCharacter(
+        characterId: string,
+        revision: DataRevision,
+    ): Promise<CharacterDetail>
     runExport(
         input: NativeCharacterCharxExportInput,
         options?: NativeFileJobOptions,
@@ -46,15 +50,23 @@ interface NativeCharacterCharxExportRouteDependencies {
 const productionDependencies: NativeCharacterCharxExportRouteDependencies = {
     isDesktop: () => isTauriDesktop,
     isAndroid: () => isTauriAndroid,
-    chooseDestination: (suggestedName, container) => save({
-        defaultPath: suggestedName,
-        filters: [container === 'appended-charx-jpeg'
-            ? { name: 'CharX JPEG', extensions: ['jpeg'] }
-            : { name: 'CharX', extensions: ['charx'] }],
-    }),
+    isIOS: () => isTauriIOS,
+    chooseDestination: (suggestedName, container) =>
+        save({
+            defaultPath: suggestedName,
+            filters: [
+                container === 'appended-charx-jpeg'
+                    ? { name: 'CharX JPEG', extensions: ['jpeg'] }
+                    : { name: 'CharX', extensions: ['charx'] },
+            ],
+        }),
     runtime: getPersistentDataRuntime,
     readCharacter: (characterId, revision) =>
-        readPinnedCharacterDetail(getPersistentDataStore(), characterId, revision),
+        readPinnedCharacterDetail(
+            getPersistentDataStore(),
+            characterId,
+            revision,
+        ),
     runExport: runNativeCharacterCharxExport,
 }
 
