@@ -219,7 +219,16 @@ jobs:
         with: { node-version: "24", package-manager-cache: false }
       - uses: dtolnay/rust-toolchain@1.97.1
         with: { targets: aarch64-apple-ios-sim }
-      - run: sudo xcode-select -s /Applications/Xcode_16.4.app
+      - name: Select the verified iOS toolchain
+        shell: bash
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+        run: |
+          set -euo pipefail
+          test -d "$DEVELOPER_DIR"
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          printf '%s\n' "$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin" >> "$GITHUB_PATH"
+          xcodebuild -version
       - run: pnpm install --frozen-lockfile
       - name: Run Rust test inventory in an iOS simulator
         shell: bash
@@ -272,6 +281,9 @@ jobs:
       - run: cargo test --manifest-path crates/sync-wire/Cargo.toml --release --locked --target ${{ matrix.target }}
       - run: cargo test --manifest-path server/sync/Cargo.toml --release --locked --target ${{ matrix.target }}
       - run: cargo test --manifest-path server/manager/Cargo.toml --release --locked --target ${{ matrix.target }}
+      - name: Run synthetic Linux installer success and rollback checks
+        if: runner.os == 'Linux'
+        run: bash server/manager/install/install.test.sh
       - name: Build native process harness executables
         run: |
           cargo build --manifest-path server/sync/Cargo.toml --release --locked --target ${{ matrix.target }}
@@ -533,7 +545,16 @@ jobs:
         with: { node-version: "24", package-manager-cache: false }
       - uses: dtolnay/rust-toolchain@1.97.1
         with: { targets: aarch64-apple-ios }
-      - run: sudo xcode-select -s /Applications/Xcode_16.4.app
+      - name: Select the verified iPhoneOS toolchain
+        shell: bash
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+        run: |
+          set -euo pipefail
+          test -d "$DEVELOPER_DIR"
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          printf '%s\n' "$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin" >> "$GITHUB_PATH"
+          xcodebuild -version
       - run: pnpm install --frozen-lockfile
       - name: Build unsigned iPhoneOS ARM64 IPA
         shell: bash
@@ -645,6 +666,10 @@ jobs:
           vendor_sha=$(node -p "require('./vendor/vendor.json').executableSha256")
           node server/manager/install/package.mjs --native-build release-work/native/native-build.json --raw-archive "$raw" --release-input release-input.json --output release-work/packages --cloudflared-sha256 "$vendor_sha"
           node scripts/release/build.mjs --release-input release-input.json --leg "sync_${OS}_${ARCH}" --assets-json release-work/packages/assets.json --output release-out --public-key "$RISUNEST_UPDATE_PUBLIC_KEY"
+      - name: Run synthetic Windows NSIS install failure and rollback checks
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh -NoProfile -File server/manager/install/windows.test.ps1
       - name: Upload final assets to draft
         if: inputs.publish == true
         env: { GITHUB_TOKEN: "${{ github.token }}" }
@@ -682,6 +707,17 @@ jobs:
         with: { version: "10.34.1" }
       - uses: actions/setup-node@v6
         with: { node-version: "24", package-manager-cache: false }
+      - uses: dtolnay/rust-toolchain@1.97.1
+        if: inputs.product == 'sync'
+      - uses: actions/cache/restore@v5
+        if: inputs.product == 'sync'
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+          key: release-cargo-1.97.1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src-tauri/Cargo.lock', 'crates/sync-wire/Cargo.lock', 'server/sync/Cargo.lock', 'server/manager/Cargo.lock', 'server/manager/gui/src-tauri/Cargo.lock') }}
+          restore-keys: release-cargo-1.97.1-${{ runner.os }}-${{ runner.arch }}-
       - run: pnpm install --frozen-lockfile
       - name: Download build inventories
         uses: actions/download-artifact@v4
@@ -706,6 +742,12 @@ jobs:
           SOURCE_COMMIT: ${{ needs.source.outputs.source_commit }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+      - name: Prove all managed Sync packages with the production Rust extractor
+        if: inputs.product == 'sync'
+        run: >-
+          node scripts/release/runtime-parity.mjs
+          --product-manifest release-manifest/product-manifest.json
+          --assets-dir collected
       - name: Publish verified stable release
         if: inputs.publish == true
         shell: bash

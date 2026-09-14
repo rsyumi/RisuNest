@@ -40,3 +40,20 @@ test("release caches retain downloads without unpacked dependency trees", () => 
   assert.equal((cacheWorkflow.match(/uses: actions\/cache\/save@v5/g) ?? []).length, 2);
   assert.doesNotMatch(savedPaths, /src-tauri\/target|node_modules/);
 });
+
+test("iPhoneOS production uses the lab-verified Xcode and Tauri IPA path", () => {
+  assert.equal((workflow.match(/\/Applications\/Xcode_26\.3\.app\/Contents\/Developer/g) ?? []).length, 2);
+  assert.doesNotMatch(workflow, /Xcode_16\.4|ios build[^\n]*--archive-only/);
+  assert.match(workflow, /tauri ios build[^\n]*--no-sign/);
+});
+
+test("Windows installer failure checks run after the job has cached NSIS", () => {
+  const packageStep = workflow.indexOf("node server/manager/install/package.mjs");
+  const installerTest = workflow.indexOf("server/manager/install/windows.test.ps1");
+  assert(packageStep >= 0 && installerTest > packageStep);
+});
+
+test("both native installer rollback harnesses are required release gates", () => {
+  assert.match(workflow, /if: runner\.os == 'Linux'\n\s+run: bash server\/manager\/install\/install\.test\.sh/);
+  assert.match(workflow, /if: matrix\.os == 'windows'\n\s+shell: pwsh\n\s+run: pwsh -NoProfile -File server\/manager\/install\/windows\.test\.ps1/);
+});
