@@ -4,7 +4,7 @@ use super::{
 };
 use crate::persistent_store::{
     commands::with_store_mut,
-    server_sync_engine::{CycleOptions, CycleResult, Preparation, PreparedCycle},
+    server_sync_engine::{CycleItemCounter, CycleOptions, CycleResult, Preparation, PreparedCycle},
     server_sync_journal::ReplicaStatus,
     PersistentStore,
 };
@@ -29,8 +29,15 @@ pub(crate) struct ServerSyncCommandState {
     cancelled: Mutex<Arc<AtomicBool>>,
     prepared: Mutex<Option<PreparedJob>>,
     verified_bytes: Mutex<Arc<std::sync::atomic::AtomicU64>>,
+    cycle_items: Mutex<Arc<CycleItemCounter>>,
     retryable_failure: Arc<Mutex<Option<String>>>,
     backup_sources: Mutex<BTreeMap<String, String>>,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CycleItemCounts {
+    done: u64,
+    total: u64,
 }
 struct Running<'a>(&'a ServerSyncCommandState);
 impl Drop for Running<'_> {
@@ -352,6 +359,18 @@ pub(crate) fn server_sync_verified_bytes(app: AppHandle) -> Result<String> {
     Ok(counter.load(Ordering::Relaxed).to_string())
 }
 #[tauri::command]
+pub(crate) fn server_sync_progress_counts(app: AppHandle) -> Result<CycleItemCounts> {
+    let state = app.state::<ServerSyncCommandState>();
+    let counter = state
+        .cycle_items
+        .lock()
+        .map_err(|_| SyncError::new("server-sync-state-unavailable", 503))?;
+    Ok(CycleItemCounts {
+        done: counter.done.load(Ordering::Relaxed),
+        total: counter.total.load(Ordering::Relaxed),
+    })
+}
+#[tauri::command]
 pub(crate) fn server_sync_retryable_failure(app: AppHandle) -> Result<Option<String>> {
     Ok(app
         .state::<ServerSyncCommandState>()
@@ -472,6 +491,12 @@ pub(crate) async fn server_sync_prepare(
             .lock()
             .map_err(|_| SyncError::new("server-sync-state-unavailable", 503))? = counter.clone();
         options.verified_bytes = Some(counter);
+        let items = Arc::new(CycleItemCounter::default());
+        *state
+            .cycle_items
+            .lock()
+            .map_err(|_| SyncError::new("server-sync-state-unavailable", 503))? = items.clone();
+        options.cycle_items = Some(items);
         *state
             .retryable_failure
             .lock()

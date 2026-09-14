@@ -17,6 +17,7 @@ export function getServerSyncController() {
       onProgress: (phase) => controller?.reportProgress(phase),
       onVerifiedBytes: (bytes) => controller?.reportVerifiedBytes(bytes),
       onRetryableFailure: (code) => controller?.reportRetryableFailure(code),
+      onCycleItems: (items) => controller?.reportCycleItems(items),
       runtime: {
         flushPendingData,
         capturePersistentMutationToken,

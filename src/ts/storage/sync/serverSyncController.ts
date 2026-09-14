@@ -4,6 +4,7 @@ import {
   ServerSyncError,
   type ServerConfig,
   type ServerCycle,
+  type ServerCycleItems,
   type ServerCycleOptions,
   type ServerStatus,
   type ServerSyncFacade,
@@ -19,8 +20,13 @@ export interface ServerSyncSnapshot {
   lastSuccessAt?: number;
   progress?: ServerSyncProgress;
   verifiedBytes?: string;
+  /** Throughput of the current attempt, from successive byte samples. */
+  bytesPerSecond?: number;
+  cycleItems?: ServerCycleItems;
   retryableFailure?: string;
   attemptId?: number;
+  /** Wall-clock start of the current attempt, for the elapsed time. */
+  attemptStartedAt?: number;
   attemptIdentity?: { endpoint: string; libraryId: string; deviceId: string };
   initialSyncComplete?: boolean;
   refreshPending?: boolean;
@@ -42,6 +48,7 @@ export function createServerSyncController(
   let attemptSequence = 0;
   let statusFresh = false;
   let statusSequence = 0;
+  let byteSample: { at: number; bytes: bigint } | undefined;
   const listeners = new Set<(snapshot: ServerSyncSnapshot) => void>();
   const publish = (): void => {
     state = {
@@ -68,13 +75,17 @@ export function createServerSyncController(
   ): Promise<void> => {
     state.running = true;
     state.attemptId = ++attemptSequence;
+    state.attemptStartedAt = Date.now();
     state.attemptIdentity = undefined;
     state.initialSyncComplete = false;
     state.result = undefined;
     state.progress = undefined;
     state.verifiedBytes = undefined;
+    state.bytesPerSecond = undefined;
+    state.cycleItems = undefined;
     state.retryableFailure = undefined;
     state.error = "";
+    byteSample = undefined;
     publish();
     try {
       await refreshStatus();
@@ -144,7 +155,10 @@ export function createServerSyncController(
     } finally {
       state.running = false;
       state.progress = undefined;
+      state.bytesPerSecond = undefined;
+      state.cycleItems = undefined;
       state.retryableFailure = undefined;
+      state.attemptStartedAt = undefined;
       publish();
     }
   };
@@ -216,6 +230,25 @@ export function createServerSyncController(
     reportVerifiedBytes(verifiedBytes: string): void {
       if (!state.running) return;
       state.verifiedBytes = verifiedBytes;
+      const now = Date.now();
+      const bytes = BigInt(verifiedBytes);
+      if (byteSample && now > byteSample.at) {
+        const rate =
+          (Number(bytes - byteSample.bytes) * 1000) / (now - byteSample.at);
+        // Smooth the one-second samples so the rate does not flicker.
+        state.bytesPerSecond = Math.max(
+          0,
+          state.bytesPerSecond === undefined
+            ? rate
+            : (state.bytesPerSecond + rate) / 2,
+        );
+      }
+      byteSample = { at: now, bytes };
+      publish();
+    },
+    reportCycleItems(items: ServerCycleItems): void {
+      if (!state.running) return;
+      state.cycleItems = items;
       publish();
     },
     reportRetryableFailure(code: string | undefined): void {
