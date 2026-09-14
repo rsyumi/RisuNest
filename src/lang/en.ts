@@ -1960,7 +1960,7 @@ export const languageEnglish = {
             discardRegistration: 'Clear registration input',
             directoryEnabled: 'Server address discovery enabled',
             residency: {
-                title: 'Assets on this device',
+                title: 'Asset storage',
                 description:
                     'Choose separately for each device. Keep files on a PC, or load media directly from the server on a mobile device.',
                 full: 'Keep all files locally',

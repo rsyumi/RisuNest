@@ -1768,7 +1768,7 @@ export const languageKorean = {
             discardRegistration: '등록 입력 지우기',
             directoryEnabled: '서버 주소 자동 검색 사용',
             residency: {
-                title: '이 기기의 에셋 보관',
+                title: '에셋 보관 방식',
                 description:
                     '기기마다 따로 선택합니다. PC에는 파일을 모두 보관하고, 모바일에서는 서버의 미디어를 바로 불러올 수 있습니다.',
                 full: '모든 파일 로컬 보관',
