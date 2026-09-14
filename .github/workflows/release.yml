@@ -193,14 +193,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
         with: { targets: aarch64-linux-android,x86_64-linux-android }
       - run: pnpm install --frozen-lockfile
-      - name: Restore required generated Android build files
+      - name: Verify the committed Android shell
         shell: bash
         run: |
           set -euo pipefail
-          required=(src-tauri/gen/android/tauri.settings.gradle src-tauri/gen/android/app/tauri.build.gradle.kts src-tauri/gen/android/app/tauri.properties src-tauri/gen/android/app/proguard-tauri.pro)
-          missing=false
-          for path in "${required[@]}"; do test -f "$path" || missing=true; done
-          if test "$missing" = true; then pnpm android:init; fi
+          required=(
+            src-tauri/gen/android/settings.gradle
+            src-tauri/gen/android/app/build.gradle.kts
+            src-tauri/gen/android/buildSrc/src/main/java/io/github/rsyumi/risunest/kotlin/BuildTask.kt
+            src-tauri/gen/android/gradle/wrapper/gradle-wrapper.jar
+            src-tauri/gen/android/app/src/main/java/io/github/rsyumi/risunest/MainActivity.kt
+          )
+          for path in "${required[@]}"; do test -f "$path"; done
+          git diff --exit-code -- src-tauri/gen/android
+      - name: Generate Android build files through a real agent build
+        shell: bash
+        run: |
+          set -euo pipefail
+          export NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
+          pnpm exec -- tauri android build --debug --apk --target aarch64 --ci --config src-tauri/tauri.agent.conf.json -- --locked
           git diff --exit-code -- src-tauri/gen/android
       - run: chmod +x src-tauri/gen/android/gradlew
       - working-directory: src-tauri/gen/android
@@ -301,6 +312,29 @@ jobs:
           ./server/manager/tests/windows-startup.ps1
           -Manager "$env:CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-manager.exe"
           -Server "$env:CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-server.exe"
+      - name: Run Windows scheduled update success and recovery lifecycle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RISUNEST_TEST_SERVER: ${{ format('{0}/{1}/release/risunest-sync-server.exe', env.CARGO_TARGET_DIR, matrix.target) }}
+          RISUNEST_TEST_MANAGER: ${{ format('{0}/{1}/release/risunest-sync-manager.exe', env.CARGO_TARGET_DIR, matrix.target) }}
+        run: |
+          $tests = @(
+            'helper_replaces_and_restarts_an_isolated_live_server',
+            'helper_verifies_a_stopped_replacement_then_restores_stopped_intent',
+            'interrupted_files_recovery_outlives_the_active_installed_manager',
+            'helper_recovers_the_live_server_when_its_parent_does_not_exit',
+            'helper_rolls_back_a_corrupt_live_replacement_and_restarts_the_old_server',
+            'installer_guard_records_restart_failure_after_accepted_corrupt_server_start'
+          )
+          foreach ($test in $tests) {
+            $output = & cargo test --manifest-path server/manager/Cargo.toml --release --locked --target '${{ matrix.target }}' --test update_helper $test -- --ignored --exact --nocapture 2>&1 |
+              Tee-Object -FilePath "$env:RUNNER_TEMP/$test.log"
+            if ($LASTEXITCODE -ne 0) { throw "$test failed." }
+            if (($output | Out-String) -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') {
+              throw "$test did not execute exactly one passing test."
+            }
+          }
       - name: Run Linux systemd, TUI and installer lifecycle
         if: runner.os == 'Linux'
         run: |
@@ -435,9 +469,9 @@ jobs:
           set -euo pipefail
           mkdir -p release-work release-out
           node scripts/release/tauri-config.mjs --release-input release-input.json --output "$RUNNER_TEMP/release-tauri.json"
-          pnpm exec tauri build --target "$TARGET" --no-bundle --config "$RUNNER_TEMP/release-tauri.json" -- --locked
+          pnpm exec -- tauri build --target "$TARGET" --no-bundle --config "$RUNNER_TEMP/release-tauri.json" -- --locked
           cp "$CARGO_TARGET_DIR/$TARGET/release/$EXECUTABLE" release-work/app-binary
-          pnpm exec tauri build --target "$TARGET" --bundles "$BUNDLES" --config "$RUNNER_TEMP/release-tauri.json" -- --locked
+          pnpm exec -- tauri build --target "$TARGET" --bundles "$BUNDLES" --config "$RUNNER_TEMP/release-tauri.json" -- --locked
           node scripts/release/package-app.mjs --kind desktop --os "$OS" --arch "$ARCH" --bundle-dir "$CARGO_TARGET_DIR/$TARGET/release/bundle" --binary release-work/app-binary --release-input release-input.json --output release-work/packages
           node scripts/release/build.mjs --release-input release-input.json --leg "desktop_${OS}_${ARCH}" --assets-json release-work/packages/assets.json --output release-out --public-key "$RISUNEST_UPDATE_PUBLIC_KEY"
       - name: Upload final assets to draft
@@ -478,14 +512,18 @@ jobs:
         with: { targets: aarch64-linux-android }
       - run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358'
       - run: pnpm install --frozen-lockfile
-      - name: Initialize generated Android files without changing tracked sources
+      - name: Verify the committed Android shell
         shell: bash
         run: |
           set -euo pipefail
-          required=(src-tauri/gen/android/tauri.settings.gradle src-tauri/gen/android/app/tauri.build.gradle.kts src-tauri/gen/android/app/tauri.properties src-tauri/gen/android/app/proguard-tauri.pro)
-          missing=false
-          for path in "${required[@]}"; do test -f "$path" || missing=true; done
-          if test "$missing" = true; then pnpm android:init; fi
+          required=(
+            src-tauri/gen/android/settings.gradle
+            src-tauri/gen/android/app/build.gradle.kts
+            src-tauri/gen/android/buildSrc/src/main/java/io/github/rsyumi/risunest/kotlin/BuildTask.kt
+            src-tauri/gen/android/gradle/wrapper/gradle-wrapper.jar
+            src-tauri/gen/android/app/src/main/java/io/github/rsyumi/risunest/MainActivity.kt
+          )
+          for path in "${required[@]}"; do test -f "$path"; done
           git diff --exit-code -- src-tauri/gen/android
       - name: Configure release keystore
         env:
@@ -506,8 +544,10 @@ jobs:
           set -euo pipefail
           mkdir -p release-work release-out
           export NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
+          export PATH="$ANDROID_HOME/build-tools/36.0.0:$PATH"
           node scripts/release/tauri-config.mjs --release-input release-input.json --output "$RUNNER_TEMP/release-tauri.json"
-          pnpm exec tauri android build --apk --target aarch64 --ci --config "$RUNNER_TEMP/release-tauri.json" -- --locked
+          pnpm exec -- tauri android build --apk --target aarch64 --ci --config "$RUNNER_TEMP/release-tauri.json" -- --locked
+          git diff --exit-code -- src-tauri/gen/android
           apk_count=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' | wc -l | tr -d ' ')
           test "$apk_count" -eq 1
           apk=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' -print -quit)
@@ -565,7 +605,7 @@ jobs:
           set -euo pipefail
           mkdir -p release-work release-out
           node scripts/release/tauri-config.mjs --release-input release-input.json --output "$RUNNER_TEMP/release-tauri.json"
-          pnpm exec tauri ios build --ci --target aarch64 --no-sign --config "$RUNNER_TEMP/release-tauri.json" -- --locked
+          pnpm exec -- tauri ios build --ci --target aarch64 --no-sign --config "$RUNNER_TEMP/release-tauri.json" -- --locked
           ipa_count=$(find src-tauri/gen/apple -type f -name '*.ipa' | wc -l | tr -d ' ')
           test "$ipa_count" -eq 1
           ipa=$(find src-tauri/gen/apple -type f -name '*.ipa' -print -quit)
@@ -648,6 +688,7 @@ jobs:
       - name: Build console, background and GUI executables once
         shell: bash
         env:
+          RISUNEST_UPDATE_PUBLIC_KEY: ${{ secrets.RISUNEST_UPDATE_PUBLIC_KEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
           TARGET: ${{ matrix.target }}
@@ -655,6 +696,7 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
+          test -n "$RISUNEST_UPDATE_PUBLIC_KEY"
           mkdir -p release-work/native release-work/raw release-work/packages release-out
           version=$(node -p "require('./release-input.json').version")
           node server/manager/install/build.mjs --target "$TARGET" --output release-work/native --registry-url "$RISUNEST_DEFAULT_REGISTRY_URL" --version "$version"
@@ -666,6 +708,16 @@ jobs:
           vendor_sha=$(node -p "require('./vendor/vendor.json').executableSha256")
           node server/manager/install/package.mjs --native-build release-work/native/native-build.json --raw-archive "$raw" --release-input release-input.json --output release-work/packages --cloudflared-sha256 "$vendor_sha"
           node scripts/release/build.mjs --release-input release-input.json --leg "sync_${OS}_${ARCH}" --assets-json release-work/packages/assets.json --output release-out --public-key "$RISUNEST_UPDATE_PUBLIC_KEY"
+      - name: Install, reinstall and roll back the produced Linux managed package
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo loginctl enable-linger "$USER"
+          test "$(loginctl show-user "$USER" --property=Linger --value)" = yes
+          systemctl --user daemon-reload
+          managed=$(node -e "const path=require('node:path'); const matches=require('./release-work/packages/assets.json').filter((asset) => asset.download.variant === 'managed' && asset.download.os === 'linux' && asset.download.arch === process.argv[1] && asset.download.format === 'tar.gz'); if (matches.length !== 1) throw new Error('Expected one managed Linux archive.'); process.stdout.write(path.resolve(matches[0].path));" "${{ matrix.arch }}")
+          bash server/manager/install/managed-install.integration.test.sh "$managed"
       - name: Run synthetic Windows NSIS install failure and rollback checks
         if: matrix.os == 'windows'
         shell: pwsh
