@@ -33,7 +33,10 @@
   let selected = $state<Device | null>(null);
   let uri = $state("");
   let svg = $state("");
+  let connectionDirty = $state(false);
+  let updating = $state(false);
   let dialogElement: HTMLDialogElement;
+  let automaticUpdateRetryAfter = 0;
   const navigation = [
     { id: "overview", label: "개요", icon: LayoutDashboard },
     { id: "devices", label: "기기", icon: MonitorSmartphone },
@@ -56,12 +59,33 @@
   }
   async function loadEnvironment() {
     try {
-      environment = await backend.environment();
+      const next = await backend.environment();
+      environment = next;
+      if (
+        next.updateSettings.policy === "automatic" &&
+        next.updateStatus.phase === "deferred" &&
+        [
+          "management-active",
+          "management-app-open-or-install-locked",
+        ].includes(next.updateStatus.reason ?? "") &&
+        !busy &&
+        !updating &&
+        dialog === null &&
+        !connectionDirty &&
+        Date.now() >= automaticUpdateRetryAfter
+      ) {
+        automaticUpdateRetryAfter = Date.now() + 60 * 60 * 1000;
+        queueMicrotask(() => void checkUpdate(true));
+      }
     } catch {
       notice = "실행 설정을 확인하지 못했습니다.";
     }
   }
   function navigate(id: string) {
+    if (id !== page && connectionDirty) {
+      notice = "적용하지 않은 연결 설정을 적용하거나 다시 불러온 뒤 이동하세요.";
+      return;
+    }
     page = id;
     if (id === "settings") void loadEnvironment();
   }
@@ -75,11 +99,13 @@
       if (!stopped) timer = setTimeout(poll, 3000);
     }
     let timer: ReturnType<typeof setTimeout>;
+    const environmentTimer = setInterval(() => void loadEnvironment(), 15000);
     void poll();
     void loadEnvironment();
     return () => {
       stopped = true;
       clearTimeout(timer);
+      clearInterval(environmentTimer);
       uri = "";
       svg = "";
     };
@@ -205,6 +231,68 @@
       busy = false;
     }
   }
+  async function updatePolicy(policy: "automatic" | "notify" | "off") {
+    busy = true;
+    notice = "";
+    try {
+      await backend.updatePolicy(policy);
+      await loadEnvironment();
+      notice = "업데이트 정책과 예약 확인 설정을 변경했습니다.";
+    } catch (error) {
+      notice = message(error);
+      await loadEnvironment();
+    } finally {
+      busy = false;
+    }
+  }
+  function deferredUpdateMessage(reason?: string): string {
+    if (reason === "management-active")
+      return "관리 작업이 끝난 뒤 다시 확인하세요.";
+    if (reason === "management-app-open-or-install-locked")
+      return "다른 관리 앱을 닫거나 설치 잠금이 해제된 뒤 다시 확인하세요.";
+    if (reason === "server-busy")
+      return "서버 작업이 끝난 뒤 업데이트를 다시 확인합니다.";
+    return `업데이트가 연기되었습니다${reason ? `: ${reason}` : "."}`;
+  }
+  async function checkUpdate(automatic = false) {
+    if (busy || updating || dialog !== null || connectionDirty) {
+      if (!automatic)
+        notice = "진행 중인 작업이나 적용하지 않은 설정을 마친 뒤 업데이트를 확인하세요.";
+      return;
+    }
+    updating = true;
+    busy = true;
+    let exitingForUpdate = false;
+    notice = automatic
+      ? "관리 앱을 종료하고 예약된 업데이트를 안전하게 적용합니다."
+      : "업데이트를 확인하고 있습니다.";
+    try {
+      const outcome = await backend.updateCheck(automatic);
+      if (outcome.result === "started") {
+        exitingForUpdate = true;
+        notice = "관리 앱을 종료하고 적용합니다.";
+      } else if (outcome.result === "available") {
+        notice = `Sync ${outcome.value ?? "새 버전"} 업데이트를 사용할 수 있습니다.`;
+      } else if (outcome.result === "deferred") {
+        notice = deferredUpdateMessage(outcome.value);
+      } else if (outcome.result === "skipped") {
+        notice = "예약된 업데이트 확인 시간이 아직 되지 않았습니다.";
+      } else if (outcome.result === "completed") {
+        notice = `Sync ${outcome.value ?? "새 버전"} 업데이트를 완료했습니다.`;
+      } else {
+        notice = "현재 최신 버전입니다.";
+      }
+      await loadEnvironment();
+    } catch (error) {
+      notice = message(error);
+      await loadEnvironment();
+    } finally {
+      if (!exitingForUpdate) {
+        busy = false;
+        updating = false;
+      }
+    }
+  }
 </script>
 
 <div class="app-shell" class:mac={environment?.platform === "macos"}>
@@ -295,6 +383,7 @@
           busy={busy || !connected}
           {mutate}
           {copy}
+          activity={(active) => (connectionDirty = active)}
         />{/if}
     {/if}
     {#if page === "settings"}
@@ -302,6 +391,48 @@
         서버 실행 상태와 로그인 시 자동 실행 여부를 관리합니다.
       </p>
       <section class="card settings-group">
+        <div class="setting">
+          <div class="setting-heading">
+            <h2>Sync 업데이트</h2>
+            <span class="pill">{environment?.updateStatus.phase ?? "idle"}</span>
+          </div>
+          <label
+            >업데이트 정책<select
+              aria-label="업데이트 정책"
+              value={environment?.updateSettings.policy ?? "automatic"}
+              disabled={busy || !environment || !!environment.updateScheduleError}
+              onchange={(e) =>
+                updatePolicy(
+                  e.currentTarget.value as "automatic" | "notify" | "off",
+                )}
+              ><option value="automatic">안전할 때 자동 적용</option><option
+                value="notify">새 버전만 알림</option
+              ><option value="off">예약 확인 끄기</option></select
+            ></label
+          >
+          <p>
+            관리 화면을 닫아도 예약 확인이 실행됩니다. 자동 적용은 작업이
+            없고 서버가 안전하게 종료될 때만 진행합니다.
+          </p>
+          {#if environment?.updateStatus.targetVersion}<p>
+              대상 버전: {environment.updateStatus.targetVersion}
+            </p>{/if}
+          {#if environment?.updateStatus.reason}<p class="warning">
+              마지막 결과: {environment.updateStatus.reason}
+            </p>{/if}
+          {#if environment?.updateScheduleError}<p class="warning">
+              예약 업데이트 상태를 확인하지 못했습니다.
+            </p>{/if}
+          <div class="actions">
+            <button
+              disabled={busy || updating || dialog !== null || connectionDirty}
+              onclick={() => void checkUpdate(false)}
+              >{environment?.updateSettings.policy === "notify"
+                ? "업데이트 확인"
+                : "업데이트 확인 및 적용"}</button
+            >
+          </div>
+        </div>
         <div class="setting">
           <div class="setting-heading">
             <h2>로그인 시 서버 자동 실행</h2>

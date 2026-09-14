@@ -1,11 +1,53 @@
 use crate::Result;
 use risunest_sync_server::management::discovery::Discovery;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::{path::PathBuf, time::Duration};
 
 pub struct Client {
     root: PathBuf,
     http: reqwest::Client,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DurablePending {
+    pub commit_jobs: u64,
+    pub upload_jobs: u64,
+    pub download_jobs: u64,
+    pub staged_changes: u64,
+    pub uploads: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceStatus {
+    pub revision: String,
+    pub state: String,
+    pub idle_for_seconds: u64,
+    pub idle_threshold_seconds: u64,
+    pub idle_eligible: bool,
+    pub active_requests: u64,
+    pub active_background_jobs: u64,
+    pub durable_pending: DurablePending,
+    pub drained: bool,
+    pub lease_expires_in_seconds: Option<u64>,
+    pub lease_duration_seconds: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceLease {
+    #[serde(flatten)]
+    pub status: MaintenanceStatus,
+    pub lease_token: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LeaseRequest<'a> {
+    revision: &'a str,
+    lease_token: &'a str,
 }
 impl Client {
     pub fn new(root: PathBuf) -> Result<Self> {
@@ -20,6 +62,86 @@ impl Client {
     }
     pub async fn status(&self) -> Result<Value> {
         self.send("status", None).await
+    }
+    pub async fn maintenance(&self) -> Result<MaintenanceStatus> {
+        let locator = Discovery::load(&self.root).map_err(|e| e.code.to_owned())?;
+        self.maintenance_with_locator(&locator).await
+    }
+    pub(crate) async fn maintenance_with_locator(
+        &self,
+        locator: &Discovery,
+    ) -> Result<MaintenanceStatus> {
+        let value = self.send_with_locator("maintenance", None, locator).await?;
+        serde_json::from_value(value).map_err(|_| "invalid-maintenance-response".into())
+    }
+    pub async fn acquire_maintenance(&self, revision: &str) -> Result<MaintenanceLease> {
+        let locator = Discovery::load(&self.root).map_err(|e| e.code.to_owned())?;
+        self.acquire_maintenance_with_locator(&locator, revision)
+            .await
+    }
+    pub(crate) async fn acquire_maintenance_with_locator(
+        &self,
+        locator: &Discovery,
+        revision: &str,
+    ) -> Result<MaintenanceLease> {
+        let value = self
+            .mutate_with_locator("maintenance/acquire", json!({"revision":revision}), locator)
+            .await?;
+        serde_json::from_value(value).map_err(|_| "invalid-maintenance-response".into())
+    }
+    pub async fn renew_maintenance(
+        &self,
+        revision: &str,
+        lease_token: &str,
+    ) -> Result<MaintenanceStatus> {
+        let locator = Discovery::load(&self.root).map_err(|e| e.code.to_owned())?;
+        self.maintenance_lease_action_with_locator(&locator, "renew", revision, lease_token)
+            .await
+    }
+    pub async fn release_maintenance(
+        &self,
+        revision: &str,
+        lease_token: &str,
+    ) -> Result<MaintenanceStatus> {
+        let locator = Discovery::load(&self.root).map_err(|e| e.code.to_owned())?;
+        self.maintenance_lease_action_with_locator(&locator, "release", revision, lease_token)
+            .await
+    }
+    pub async fn shutdown_maintenance(&self, revision: &str, lease_token: &str) -> Result<Value> {
+        let locator = Discovery::load(&self.root).map_err(|e| e.code.to_owned())?;
+        self.shutdown_maintenance_with_locator(&locator, revision, lease_token)
+            .await
+    }
+    pub(crate) async fn shutdown_maintenance_with_locator(
+        &self,
+        locator: &Discovery,
+        revision: &str,
+        lease_token: &str,
+    ) -> Result<Value> {
+        let body = serde_json::to_value(LeaseRequest {
+            revision,
+            lease_token,
+        })
+        .map_err(|_| "invalid-maintenance-request".to_owned())?;
+        self.mutate_with_locator("maintenance/shutdown", body, locator)
+            .await
+    }
+    pub(crate) async fn maintenance_lease_action_with_locator(
+        &self,
+        locator: &Discovery,
+        action: &str,
+        revision: &str,
+        lease_token: &str,
+    ) -> Result<MaintenanceStatus> {
+        let body = serde_json::to_value(LeaseRequest {
+            revision,
+            lease_token,
+        })
+        .map_err(|_| "invalid-maintenance-request".to_owned())?;
+        let value = self
+            .mutate_with_locator(&format!("maintenance/{action}"), body, locator)
+            .await?;
+        serde_json::from_value(value).map_err(|_| "invalid-maintenance-response".into())
     }
     pub(crate) async fn status_with_locator(&self, locator: &Discovery) -> Result<Value> {
         self.send_with_locator("status", None, locator).await
@@ -42,6 +164,10 @@ impl Client {
             "tunnel/start",
             "tunnel/stop",
             "tunnel/restart",
+            "maintenance/acquire",
+            "maintenance/renew",
+            "maintenance/release",
+            "maintenance/shutdown",
         ]
         .contains(&path)
             || path
@@ -142,10 +268,9 @@ mod tests {
                 let count = stream.read(&mut request).unwrap();
                 let request = String::from_utf8_lossy(&request[..count]);
                 assert!(request.starts_with(method));
-                assert!(request.to_ascii_lowercase().contains(&format!(
-                    "authorization: bearer {}",
-                    "a".repeat(64)
-                )));
+                assert!(request
+                    .to_ascii_lowercase()
+                    .contains(&format!("authorization: bearer {}", "a".repeat(64))));
                 write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -160,11 +285,7 @@ mod tests {
         std::fs::write(temp.path().join("management-session"), b"replacement").unwrap();
 
         client
-            .mutate_with_locator(
-                "shutdown",
-                json!({"revision":status["revision"]}),
-                &locator,
-            )
+            .mutate_with_locator("shutdown", json!({"revision":status["revision"]}), &locator)
             .await
             .unwrap();
         server.join().unwrap();

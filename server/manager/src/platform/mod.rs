@@ -1,3 +1,4 @@
+use crate::update::UpdatePolicy;
 use crate::Result;
 pub mod gui;
 use serde::Serialize;
@@ -10,9 +11,17 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartupStatus {
+    pub registered: bool,
+    pub enabled: bool,
+    pub action_matches: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateScheduleStatus {
     pub registered: bool,
     pub enabled: bool,
     pub action_matches: bool,
@@ -42,6 +51,16 @@ pub fn server_executable() -> Result<PathBuf> {
         "risunest-sync-server.exe"
     } else {
         "risunest-sync-server"
+    };
+    Ok(current.parent().ok_or("executable-unavailable")?.join(name))
+}
+
+pub fn manager_executable() -> Result<PathBuf> {
+    let current = std::env::current_exe().map_err(|_| "executable-unavailable")?;
+    let name = if cfg!(windows) {
+        "risunest-sync-manager.exe"
+    } else {
+        "risunest-sync-manager"
     };
     Ok(current.parent().ok_or("executable-unavailable")?.join(name))
 }
@@ -80,6 +99,12 @@ pub fn initialize(root: &Path, executable: &Path) -> Result<()> {
 pub fn start(root: &Path, executable: &Path) -> Result<()> {
     initialize(root, executable)?;
     let state = startup(root, executable, "status")?;
+    #[cfg(target_os = "macos")]
+    let state = if state.registered && !state.action_matches {
+        startup(root, executable, "install")?
+    } else {
+        state
+    };
     if state.registered && state.action_matches {
         startup(root, executable, "start")?;
     } else {
@@ -130,6 +155,132 @@ pub fn startup(root: &Path, executable: &Path, action: &str) -> Result<StartupSt
     #[cfg(unix)]
     {
         unix::startup(root, executable, action)
+    }
+}
+
+pub fn spawn_update_helper(root: &Path, command: &mut Command) -> Result<u32> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        let program = command.get_program().to_owned();
+        let arguments = command
+            .get_args()
+            .map(|value| value.to_owned())
+            .collect::<Vec<_>>();
+        #[cfg(target_os = "macos")]
+        let mut launcher = {
+            let mut value = process("launchctl");
+            value
+                .args([
+                    "submit",
+                    "-l",
+                    &format!(
+                        "io.github.rsyumi.{}-apply-{}",
+                        instance_name(root),
+                        std::process::id()
+                    ),
+                    "--",
+                ])
+                .arg(program)
+                .args(arguments);
+            value
+        };
+        #[cfg(not(target_os = "macos"))]
+        let mut launcher = {
+            let mut value = process("systemd-run");
+            value
+                .args(["--user", "--collect", "--quiet", "--unit"])
+                .arg(format!("{}-update-apply", instance_name(root)))
+                .arg(program)
+                .args(arguments);
+            value
+        };
+        let output = launcher
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|_| "update-helper-start-failed".to_owned())?;
+        if !output.status.success() {
+            return Err("update-helper-start-failed".into());
+        }
+        return Ok(0);
+    }
+    #[cfg(windows)]
+    windows::spawn_update_helper(root, command)
+}
+
+pub fn finish_update_helper(root: &Path, task_name: &str) -> Result<()> {
+    #[cfg(windows)]
+    return windows::finish_update_helper(root, task_name);
+    #[cfg(not(windows))]
+    {
+        let _ = (root, task_name);
+        Err("update-helper-task-invalid".into())
+    }
+}
+
+pub fn wait_for_parent_exit(process_id: u32, timeout: std::time::Duration) -> Result<()> {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::Threading::{OpenProcess, WaitForSingleObject},
+        };
+        let handle = OpenProcess(0x00100000, 0, process_id);
+        if handle.is_null() {
+            return Ok(());
+        }
+        let milliseconds = timeout.as_millis().min(u32::MAX as u128) as u32;
+        let result = WaitForSingleObject(handle, milliseconds);
+        CloseHandle(handle);
+        match result {
+            0 => Ok(()),
+            0x00000102 => Err("update-parent-exit-timeout".into()),
+            _ => Err("update-parent-wait-failed".into()),
+        }
+    }
+    #[cfg(unix)]
+    {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if unsafe { libc::kill(process_id as i32, 0) } != 0 {
+                let error = std::io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(libc::ESRCH) => return Ok(()),
+                    Some(libc::EPERM) => {}
+                    _ => return Err("update-parent-wait-failed".into()),
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("update-parent-exit-timeout".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+}
+
+pub fn update_schedule(
+    root: &Path,
+    manager: &Path,
+    server: &Path,
+    policy: UpdatePolicy,
+    action: &str,
+) -> Result<UpdateScheduleStatus> {
+    if !["status", "install", "remove"].contains(&action) {
+        return Err("invalid-update-schedule-action".into());
+    }
+    if !root.is_absolute() || !manager.is_absolute() || !server.is_absolute() {
+        return Err("absolute-path-required".into());
+    }
+    #[cfg(windows)]
+    {
+        windows::update_schedule(root, manager, server, policy, action)
+    }
+    #[cfg(unix)]
+    {
+        unix::update_schedule(root, manager, server, policy, action)
     }
 }
 
