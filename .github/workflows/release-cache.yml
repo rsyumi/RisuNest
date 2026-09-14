@@ -65,7 +65,7 @@ jobs:
         run: |
           set -euo pipefail
           pnpm fetch --frozen-lockfile
-          pnpm --dir server/manager/gui fetch --frozen-lockfile
+          pnpm --dir server/manager/gui --ignore-workspace fetch --frozen-lockfile
           cargo fetch --manifest-path src-tauri/Cargo.toml --locked --target "${{ matrix.target }}"
           cargo fetch --manifest-path crates/sync-wire/Cargo.toml --locked --target "${{ matrix.target }}"
           cargo fetch --manifest-path server/sync/Cargo.toml --locked --target "${{ matrix.target }}"

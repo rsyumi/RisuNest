@@ -41,6 +41,14 @@ test("release caches retain downloads without unpacked dependency trees", () => 
   assert.doesNotMatch(savedPaths, /src-tauri\/target|node_modules/);
 });
 
+test("the independent Sync GUI lockfile bypasses outer workspace discovery", () => {
+  assert.match(workflow, /pnpm --dir server\/manager\/gui --ignore-workspace install --frozen-lockfile/);
+  assert.match(workflow, /pnpm --dir server\/manager\/gui --ignore-workspace check/);
+  assert.match(workflow, /pnpm --dir server\/manager\/gui --ignore-workspace test/);
+  assert.match(cacheWorkflow, /pnpm --dir server\/manager\/gui --ignore-workspace fetch --frozen-lockfile/);
+  assert.doesNotMatch(workflow, /pnpm install --dir server\/manager\/gui/);
+});
+
 test("iPhoneOS production uses the lab-verified Xcode and Tauri IPA path", () => {
   assert.equal((workflow.match(/\/Applications\/Xcode_26\.3\.app\/Contents\/Developer/g) ?? []).length, 2);
   assert.doesNotMatch(workflow, /Xcode_16\.4|ios build[^\n]*--archive-only/);

@@ -366,9 +366,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
       - name: Install native GUI test dependencies
         run: sudo apt-get update && sudo apt-get install -y pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev
-      - run: pnpm install --dir server/manager/gui --frozen-lockfile
-      - run: pnpm --dir server/manager/gui check
-      - run: pnpm --dir server/manager/gui test
+      - run: pnpm --dir server/manager/gui --ignore-workspace install --frozen-lockfile
+      - run: pnpm --dir server/manager/gui --ignore-workspace check
+      - run: pnpm --dir server/manager/gui --ignore-workspace test
       - run: cargo test --manifest-path server/manager/gui/src-tauri/Cargo.toml --release --locked
 
   prepare-draft:
@@ -681,7 +681,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Install Sync GUI dependencies
         if: matrix.os != 'linux'
-        run: pnpm install --dir server/manager/gui --frozen-lockfile
+        run: pnpm --dir server/manager/gui --ignore-workspace install --frozen-lockfile
       - name: Fetch and verify pinned cloudflared
         shell: bash
         run: |
