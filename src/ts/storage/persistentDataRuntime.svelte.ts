@@ -369,14 +369,6 @@ export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapte
         releaseInactiveCharacter(id) {
             workingSetResidency.releaseCharacterToCatalog(getDatabase(), id)
         },
-        releaseInactiveCharacters(selectedId, activeIds) {
-            const database = getDatabase()
-            for (const character of [...database.characters]) {
-                if (character.chaId !== selectedId && !activeIds?.has(character.chaId)) {
-                    workingSetResidency.releaseCharacterToCatalog(database, character.chaId)
-                }
-            }
-        },
     }
 }
 

@@ -92,7 +92,14 @@ export async function acquireCurrentPersistentRevision(
             try {
                 assertCurrent(dependencies, generation, signal)
             } catch (error) {
-                await releasePersistentRevisionLease(lease)
+                try {
+                    await releasePersistentRevisionLease(lease)
+                } catch (releaseError) {
+                    console.error(
+                        'Persistent conversation revision release failed after current-read validation failed',
+                        releaseError,
+                    )
+                }
                 throw error
             }
             return lease

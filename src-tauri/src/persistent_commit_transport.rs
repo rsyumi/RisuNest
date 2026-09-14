@@ -34,11 +34,12 @@ fn guard(window: &WebviewWindow) -> StoreResult<()> {
 
 struct Transfer {
     id: String,
+    request_id: String,
     total: usize,
     bytes: Vec<u8>,
 }
 impl Transfer {
-    fn new(total: usize) -> StoreResult<Self> {
+    fn new(request_id: String, total: usize) -> StoreResult<Self> {
         if total == 0 || total > MAX_BYTES {
             return Err(invalid("invalid shared commit size"));
         }
@@ -46,6 +47,7 @@ impl Transfer {
         bytes.try_reserve_exact(total).map_err(native_error)?;
         Ok(Self {
             id: uuid::Uuid::new_v4().to_string(),
+            request_id,
             total,
             bytes,
         })
@@ -71,6 +73,21 @@ impl Transfer {
 struct Pool {
     buffer: ICoreWebView2SharedBuffer,
     transfer: Option<Transfer>,
+}
+
+fn cancel_transfer(transfer: &mut Option<Transfer>, request_id: &str) {
+    if transfer
+        .as_ref()
+        .is_some_and(|transfer| transfer.request_id == request_id)
+    {
+        *transfer = None;
+    }
+}
+
+impl Pool {
+    fn cancel_request(&mut self, request_id: &str) {
+        cancel_transfer(&mut self.transfer, request_id);
+    }
 }
 impl Drop for Pool {
     fn drop(&mut self) {
@@ -119,7 +136,7 @@ pub(crate) async fn pds_commit_shared_open(
                 if pool.is_none() { *pool = Some(Pool { buffer: environment.CreateSharedBuffer(CAPACITY as u64).map_err(native_error)?, transfer: None }); }
                 let pool = pool.as_mut().unwrap();
                 // Reserve payload memory only after acquiring the single producer slot.
-                let transfer = Transfer::new(total_bytes)?;
+                let transfer = Transfer::new(request_id.clone(), total_bytes)?;
                 let metadata = serde_json::json!({ "kind": "pds-commit", "requestId": request_id, "id": transfer.id }).to_string();
                 let metadata: Vec<u16> = metadata.encode_utf16().chain(Some(0)).collect();
                 view.PostSharedBufferToScript(&pool.buffer, COREWEBVIEW2_SHARED_BUFFER_ACCESS_READ_WRITE, PCWSTR(metadata.as_ptr())).map_err(native_error)?;
@@ -211,20 +228,17 @@ pub(crate) async fn pds_commit_shared_finish(
 }
 
 #[tauri::command]
-pub(crate) async fn pds_commit_shared_cancel(window: WebviewWindow, id: String) -> StoreResult<()> {
+pub(crate) async fn pds_commit_shared_cancel(
+    window: WebviewWindow,
+    request_id: String,
+) -> StoreResult<()> {
     guard(&window)?;
     let (sender, receiver) = futures::channel::oneshot::channel();
     window
         .with_webview(move |_| {
             POOL.with(|slot| {
                 if let Some(pool) = slot.borrow_mut().as_mut() {
-                    if pool
-                        .transfer
-                        .as_ref()
-                        .is_some_and(|transfer| transfer.id == id)
-                    {
-                        pool.transfer = None;
-                    }
+                    pool.cancel_request(&request_id);
                 }
             });
             let _ = sender.send(());
@@ -245,9 +259,9 @@ mod tests {
     use super::*;
     #[test]
     fn rejects_invalid_ranges_and_requires_complete_ordered_payload() {
-        assert!(Transfer::new(0).is_err());
-        assert!(Transfer::new(MAX_BYTES + 1).is_err());
-        let mut transfer = Transfer::new(10).unwrap();
+        assert!(Transfer::new("request".to_owned(), 0).is_err());
+        assert!(Transfer::new("request".to_owned(), MAX_BYTES + 1).is_err());
+        let mut transfer = Transfer::new("request".to_owned(), 10).unwrap();
         let id = transfer.id.clone();
         for (token, offset, length) in [
             ("stale", 0, 1),
@@ -267,5 +281,24 @@ mod tests {
         transfer.ready(&id).unwrap();
         assert!(transfer.ready("stale").is_err());
         assert!(transfer.validate_chunk(&id, 10, 1).is_err());
+    }
+
+    #[test]
+    fn request_cleanup_cancels_only_the_matching_open_attempt() {
+        let first_request = uuid::Uuid::new_v4().to_string();
+        let mut active = Some(Transfer::new(first_request.clone(), 10).unwrap());
+        let internal_id = active.as_ref().unwrap().id.clone();
+
+        cancel_transfer(&mut active, "unknown-request");
+        assert!(active.is_some());
+        cancel_transfer(&mut active, &internal_id);
+        assert!(active.is_some());
+        cancel_transfer(&mut active, &first_request);
+        assert!(active.is_none());
+
+        let second_request = uuid::Uuid::new_v4().to_string();
+        active = Some(Transfer::new(second_request, 10).unwrap());
+        cancel_transfer(&mut active, &first_request);
+        assert!(active.is_some());
     }
 }

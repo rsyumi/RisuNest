@@ -1,10 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import type { Chat, Database, character } from './database.svelte'
+import { createConversationSummaryStubFromChat } from './conversationResidency'
 import { captureResidentPersistentCharacter } from './persistentDataRuntime'
-import {
-    isConversationSummaryStub,
-    WorkingSetResidencyRegistry,
-} from './workingSetResidency'
+import { WorkingSetResidencyRegistry } from './workingSetResidency'
 import {
     createCatalogCharacterStub,
     createCatalogPresetWorkingSet,
@@ -35,20 +33,15 @@ function characterWithChats(chats: Chat[]): character {
 }
 
 describe('WorkingSetResidencyRegistry', () => {
-    it('pins the selected conversation while releasing a nonselected body to its summary', () => {
+    it('pins the selected conversation while allowing a nonselected body to be released', () => {
         const registry = new WorkingSetResidencyRegistry()
         const selected = chat('selected')
         const inactive = chat('inactive')
         const value = characterWithChats([selected, inactive])
         registry.pinSelectedConversation('char-a', 'selected')
 
-        expect(registry.releaseConversationToSummary(value, 'selected')).toBe(false)
-        expect(registry.releaseConversationToSummary(value, 'inactive')).toBe(true)
-
-        expect(value.chats[0]).toBe(selected)
-        expect(value.chats[0].message).toEqual([{ role: 'user', data: 'selected' }])
-        expect(isConversationSummaryStub(value.chats[1])).toBe(true)
-        expect(value.chats[1]).toMatchObject({ id: 'inactive', name: 'inactive', message: [] })
+        expect(registry.canReleaseConversation(value, 'selected')).toBe(false)
+        expect(registry.canReleaseConversation(value, 'inactive')).toBe(true)
     })
 
     it('keeps only the latest character detail resident across repeated visits', () => {
@@ -175,23 +168,6 @@ describe('WorkingSetResidencyRegistry', () => {
         expect(registry.isCharacterReleased('char-a')).toBe(false)
     })
 
-    it('keeps the entire character resident while any conversation is streaming', () => {
-        const registry = new WorkingSetResidencyRegistry()
-        const settled = chat('settled')
-        const streaming = chat('streaming', { streaming: true })
-        const alreadyEmpty = chat('empty', { empty: true })
-        const value = characterWithChats([settled, streaming, alreadyEmpty])
-        const chatKeys = value.chats.map((entry) => Object.keys(entry).sort())
-
-        expect(registry.releaseCharacterMessages(value)).toBe(false)
-
-        expect(settled.message).toEqual([{ role: 'user', data: 'settled' }])
-        expect(streaming.message).toEqual([{ role: 'user', data: 'streaming' }])
-        expect(alreadyEmpty.message).toEqual([])
-        expect(value.chats.map((entry) => Object.keys(entry).sort())).toEqual(chatKeys)
-        expect(registry.isCharacterReleased('char-a')).toBe(false)
-    })
-
     it('blocks release immediately when eviction is disabled', () => {
         const registry = new WorkingSetResidencyRegistry()
         const value = characterWithChats([chat('settled')])
@@ -199,9 +175,7 @@ describe('WorkingSetResidencyRegistry', () => {
         registry.setEvictionAllowed(false)
 
         expect(registry.allowsEviction).toBe(false)
-        expect(registry.releaseCharacterMessages(value)).toBe(false)
-        expect(value.chats[0].message).toEqual([{ role: 'user', data: 'settled' }])
-        expect(registry.isCharacterReleased('char-a')).toBe(false)
+        expect(registry.canReleaseConversation(value, 'settled')).toBe(false)
     })
 
     it('tracks boot catalog stubs by stable ID until exact hydration replaces them', () => {
@@ -219,7 +193,8 @@ describe('WorkingSetResidencyRegistry', () => {
         const value = characterWithChats([chat('settled')])
         const database = { characters: [value] } as never
 
-        registry.releaseCharacterMessages(value)
+        value.chats[0].message = []
+        registry.markCharacterReleased('char-a')
 
         expect(captureResidentPersistentCharacter(database, 'char-a', registry)).toBeNull()
         registry.markCharacterHydrated('char-a')
@@ -250,7 +225,12 @@ describe('WorkingSetResidencyRegistry', () => {
             botPresets: [],
         } as unknown as Database
         registry.pinSelectedConversation('char-a', 'selected')
-        expect(registry.releaseConversationToSummary(complete, 'inactive')).toBe(true)
+        complete.chats[1] = createConversationSummaryStubFromChat(
+            complete.chaId,
+            complete.chats[1],
+            1,
+        )
+        registry.markConversationReleased('char-a', 'inactive')
 
         expect(hasIncompletePersistentWorkingSet(database, registry)).toBe(true)
     })

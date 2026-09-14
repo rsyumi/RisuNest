@@ -649,7 +649,7 @@ impl AsyncRead for JobPayloadReader {
     ) -> Poll<io::Result<()>> {
         if self.job.is_cancel_requested() {
             return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Interrupted,
+                io::ErrorKind::Other,
                 "KEI backup upload cancelled",
             )));
         }
@@ -688,7 +688,7 @@ impl<W: Write, F: Fn() -> bool> Write for CancellableWriter<W, F> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         if (self.is_cancelled)() {
             return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
+                io::ErrorKind::Other,
                 "KEI backup serialization cancelled",
             ));
         }
@@ -698,7 +698,7 @@ impl<W: Write, F: Fn() -> bool> Write for CancellableWriter<W, F> {
     fn flush(&mut self) -> io::Result<()> {
         if (self.is_cancelled)() {
             return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
+                io::ErrorKind::Other,
                 "KEI backup serialization cancelled",
             ));
         }
@@ -1137,11 +1137,12 @@ fn write_stored_value(writer: &mut impl Write, serialized: &str) -> StoreResult<
 mod tests {
     use super::{
         await_upload_with_job_control, run_job, set_job_phase, set_job_progress,
-        write_canonical_value, ControlledUploadError,
+        write_canonical_value, CancellableWriter, ControlledUploadError,
     };
     use crate::native_file_jobs::{JobKind, JobPhase, JobProgress, JobRegistry};
     use crate::persistent_store::{AssetAlias, PersistentStore, WorkingSetCommit};
     use serde_json::json;
+    use std::cell::Cell;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener};
@@ -1150,6 +1151,28 @@ mod tests {
     use std::time::Duration;
 
     const EXPECTED_PAYLOAD: &str = "{\"token\":\"secret-token\",\"database\":{\"account\":{\"data\":{},\"id\":\"account-1\",\"kei\":true,\"token\":\"secret-token\"},\"botPresets\":[{\"a\":1,\"name\":\"preset\",\"z\":2}],\"characters\":[{\"a\":1,\"chaId\":\"char-1\",\"chats\":[{\"id\":\"chat-1\",\"message\":[{\"chatId\":\"message-1\",\"data\":\"hello\",\"role\":\"user\"}],\"name\":\"Chat\",\"note\":\"\"}],\"name\":\"Char\",\"type\":\"character\",\"z\":2}],\"pluginCustomStorage\":{\"2\":\"index\",\"beta\":{\"a\":1,\"z\":2},\"alpha\":\"first\"},\"z\":{\"2\":\"two\",\"10\":\"ten\",\"a\":\"line\\n\",\"b\":2}}}";
+
+    #[test]
+    fn cancellation_writer_stops_write_all_without_retrying_into_output() {
+        let cancellation_checks = Cell::new(0);
+        let mut writer = CancellableWriter {
+            inner: Vec::new(),
+            is_cancelled: || {
+                let checks = cancellation_checks.get() + 1;
+                cancellation_checks.set(checks);
+                checks <= 3
+            },
+        };
+
+        let error = writer
+            .write_all(b"synthetic payload")
+            .expect_err("cancelled writer must stop");
+
+        assert_ne!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(error.to_string(), "KEI backup serialization cancelled");
+        assert_eq!(cancellation_checks.get(), 1);
+        assert!(writer.inner.is_empty());
+    }
 
     fn open_store_with_fixture() -> (tempfile::TempDir, PersistentStore, String) {
         let directory = tempfile::tempdir().expect("create temp directory");

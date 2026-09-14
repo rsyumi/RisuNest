@@ -1263,6 +1263,37 @@ describe('SaveCoordinator', () => {
         expect(onLocalRevision).toHaveBeenCalledWith(8)
     })
 
+    it('persists an undefined plugin value as a deletion in a compatibility working set', async () => {
+        const database = makeDatabase()
+        database.pluginCustomStorage = { alpha: 'existing' }
+        const commit = vi.fn(async ({ expectedRevision }) => ({
+            revision: expectedRevision + 1,
+        }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            capturePluginStorage: () => database.pluginCustomStorage,
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            publishPluginStorageWorkingSet: (storage) => {
+                database.pluginCustomStorage = storage
+            },
+        })
+        coordinator.initialize(7, database)
+
+        await coordinator.mutatePersistentPluginStorage('undefined-plugin-value', [
+            { type: 'set', key: 'alpha', value: undefined },
+        ])
+
+        expect(commit).toHaveBeenCalledWith({
+            expectedRevision: 7,
+            pluginStorage: [{ type: 'delete', key: 'alpha' }],
+        })
+        expect(database.pluginCustomStorage).toEqual({})
+        await expect(coordinator.flushPendingData('after-undefined')).resolves.toBeUndefined()
+        expect(commit).toHaveBeenCalledOnce()
+    })
+
     it('does not hydrate plugin values into an incomplete scalable working set', async () => {
         const database = makeDatabase()
         const publishPluginStorageWorkingSet = vi.fn()

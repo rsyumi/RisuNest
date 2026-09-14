@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { Chat, Database, character } from './database.svelte'
 import type { PersistentDataStore } from './persistentDataStore'
 import { RevisionConflictError } from './persistentDataStore'
+import { canonicalJson } from './saveCoordinator'
 import {
     ActiveConversationSession,
     cloneConversationMetadata,
@@ -15,6 +16,10 @@ import {
 } from './saveCoordinator.testSupport'
 
 describe('SaveCoordinator', () => {
+    it('rejects top-level values that JSON cannot serialize', () => {
+        expect(() => canonicalJson(undefined)).toThrow(TypeError)
+    })
+
     it('initializes large plugin baselines once and retains exact later mutation detection', async () => {
         const database = makeDatabase()
         const payload = 'synthetic-large-plugin:'.repeat(50000)
@@ -929,6 +934,51 @@ describe('SaveCoordinator', () => {
         ])
         expect(onPersistenceStarted).not.toHaveBeenCalled()
         expect(onPersisted).not.toHaveBeenCalled()
+    })
+
+    it('retires unprojectable evidence after persisting that conversation through fallback', async () => {
+        const database = makeChattyDatabase()
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        let session!: ActiveConversationSession
+        const onFallbackPersisted = vi.fn((event) => {
+            session.acknowledgeFallbackPersisted(
+                event.sessionToken,
+                event.sessionVersion,
+                event.revision,
+            )
+        })
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            onConversationMutationFallbackPersisted: onFallbackPersisted,
+        })
+        coordinator.initialize(2)
+        const conversation = database.characters[0].chats[1]
+        session = new ActiveConversationSession({
+            characterId: 'char-a',
+            conversationId: 'two',
+            conversation,
+            storeRevision: 2,
+            onMutation: (event) => coordinator.recordActiveConversationMutation(event),
+        })
+
+        session.append({ role: 'user', data: 'session append' })
+        conversation.message[0].data = 'untracked live edit'
+        coordinator.markPersistentDataDirty(1)
+        await coordinator.flushPendingData('same-conversation-fallback')
+
+        expect(commit.mock.calls[0][0].conversations).toEqual([
+            expect.objectContaining({
+                characterId: 'char-a',
+                conversationId: 'two',
+            }),
+        ])
+        expect(onFallbackPersisted).toHaveBeenCalledOnce()
+        expect(session.residencyFallbackActive).toBe(true)
+        expect(session.persistedVersion).toBe(1)
+        expect(coordinator.hasPendingPersistenceWork).toBe(false)
     })
 
     it('acknowledges only the covered session prefix from a mixed fallback commit', async () => {
@@ -2219,6 +2269,7 @@ describe('SaveCoordinator', () => {
             expect(publish).toHaveBeenCalledOnce()
             expect(handle.dispose).not.toHaveBeenCalled()
             expect(coordinator.hasPendingOfficialPublication).toBe(true)
+            expect(coordinator.pendingBytes).toBe(0)
 
             await vi.advanceTimersByTimeAsync(2_999)
             expect(publish).toHaveBeenCalledOnce()
@@ -2227,6 +2278,48 @@ describe('SaveCoordinator', () => {
             expect(pin).toHaveBeenCalledOnce()
             expect(publish).toHaveBeenCalledTimes(2)
             expect(handle.dispose).toHaveBeenCalledOnce()
+            expect(coordinator.hasPendingOfficialPublication).toBe(false)
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
+    it('rearms an official publication retry when its timer fires during a replacement fence', async () => {
+        vi.useFakeTimers()
+        try {
+            const database = makeDatabase()
+            const publish = vi.fn()
+                .mockRejectedValueOnce(new Error('offline'))
+                .mockResolvedValueOnce(undefined)
+            const onBackgroundError = vi.fn()
+            const coordinator = new SaveCoordinator({
+                store: makeStore(vi.fn(async ({ expectedRevision }) => ({
+                    revision: expectedRevision + 1,
+                }))),
+                captureRoot: () => captureRoot(database),
+                captureSelectedCharacter: () => database.characters[0],
+                replaceDatabase: () => undefined,
+                officialPublisher: {
+                    pin: vi.fn(async () => ({
+                        publish,
+                        dispose: vi.fn(async () => undefined),
+                    })),
+                },
+                onBackgroundError,
+            })
+            coordinator.initialize(1)
+            database.username = 'Pending publication'
+            coordinator.markPersistentDataDirty(1)
+            await expect(coordinator.flushPendingData('initial')).rejects.toThrow('offline')
+            const fence = await coordinator.acquireCommittedWorkingSetRefreshFence()
+
+            await vi.advanceTimersByTimeAsync(3_000)
+
+            expect(publish).toHaveBeenCalledOnce()
+            expect(onBackgroundError).toHaveBeenCalledOnce()
+            coordinator.releaseDestructiveReplacementFence(fence)
+            await vi.advanceTimersByTimeAsync(3_000)
+            expect(publish).toHaveBeenCalledTimes(2)
             expect(coordinator.hasPendingOfficialPublication).toBe(false)
         } finally {
             vi.useRealTimers()

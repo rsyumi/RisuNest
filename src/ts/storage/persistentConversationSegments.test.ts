@@ -146,4 +146,63 @@ describe('PinnedPersistentConversation', () => {
             limit: 1,
         }))?.value.messages).toEqual([message(129)])
     })
+
+    it('preserves an open failure when releasing its revision fails', async () => {
+        const { imported, store } = await createStore()
+        const acquireRevision = store.acquireRevision.bind(store)
+        const releaseError = new Error('release failed')
+        let cleanup: (() => Promise<void>) | undefined
+        vi.spyOn(store, 'acquireRevision').mockImplementationOnce(async (revision) => {
+            const lease = await acquireRevision(revision)
+            cleanup = lease.release.bind(lease)
+            lease.release = vi.fn(async () => { throw releaseError })
+            return lease
+        })
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+        await expect(openPinnedPersistentConversation({
+            store,
+            characterId: 'char-a',
+            conversationId: 'missing',
+            revision: imported.revision,
+        })).rejects.toThrow('Conversation missing was not found for char-a')
+        expect(consoleError).toHaveBeenCalledWith(
+            'Persistent conversation revision release failed after open failed',
+            releaseError,
+        )
+
+        await cleanup?.()
+        consoleError.mockRestore()
+    })
+
+    it('preserves range validation when closing its revision fails', async () => {
+        const { imported, store } = await createStore()
+        const acquireRevision = store.acquireRevision.bind(store)
+        const releaseError = new Error('release failed')
+        let cleanup: (() => Promise<void>) | undefined
+        vi.spyOn(store, 'acquireRevision').mockImplementationOnce(async (revision) => {
+            const lease = await acquireRevision(revision)
+            cleanup = lease.release.bind(lease)
+            lease.release = vi.fn(async () => { throw releaseError })
+            return lease
+        })
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+        await expect(commitStrictConversationReplaceRange({
+            store,
+            characterId: 'char-a',
+            conversationId: 'conv-long',
+            expectedRevision: imported.revision,
+            start: 131,
+            deleteCount: 0,
+            messages: [],
+        })).rejects.toThrow('start exceeds')
+        expect(consoleError).toHaveBeenCalledWith(
+            'Persistent conversation revision release failed after range validation failed',
+            releaseError,
+        )
+
+        await cleanup?.()
+        consoleError.mockRestore()
+    })
 })

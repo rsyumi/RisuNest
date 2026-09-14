@@ -116,6 +116,7 @@ export interface SaveCoordinatorDependencies {
         event: ActiveConversationMutationEvent,
     ): ConversationMutationPersistenceHandle | null | undefined
     onConversationMutationPersisted?(event: PersistedConversationMutationEvent): void
+    onConversationMutationFallbackPersisted?(event: PersistedConversationMutationEvent): void
     onPersistenceIdle?(): void
     onFlushPromise?(promise: Promise<void> | null): void
     onBackgroundError?(error: unknown): void
@@ -1177,9 +1178,9 @@ export class SaveCoordinator {
             const published = this.capture()
             this.presetsBaseline = published.presetsCanonical
             this.dependencies.onLocalRevision?.(committed.revision)
-            await this.finishExplicitCommit(committed.revision)
             this.pendingByteCount = 0
             this.lastBackgroundErrorMessage = null
+            await this.finishExplicitCommit(committed.revision)
         })
     }
 
@@ -1342,7 +1343,17 @@ export class SaveCoordinator {
             if (mutations.length === 0) return
             const revision = this.revision
             const baseline = this.pluginStorageBaselineEntries
-            const committedMutations = canonicalClone(mutations) as PluginStorageMutation[]
+            const committedMutations = mutations.map((mutation): PluginStorageMutation => {
+                if (mutation.type === 'clear') return { type: 'clear' }
+                if (mutation.type === 'delete' || mutation.value === undefined) {
+                    return { type: 'delete', key: mutation.key }
+                }
+                return {
+                    type: 'set',
+                    key: mutation.key,
+                    value: canonicalClone(mutation.value),
+                }
+            })
             const readLiveStorage = () =>
                 this.dependencies.capturePluginStorage
                     ? this.dependencies.capturePluginStorage()
@@ -2440,7 +2451,19 @@ export class SaveCoordinator {
                             committedConversationKeys.has(
                                 `${event.characterId}\u0000${event.conversationId}`,
                             ),
-                    ) ?? []
+                        ) ?? []
+                const persistedConversationMutationSet = new Set(
+                    persistedConversationMutations,
+                )
+                const fallbackPersistedConversationMutations =
+                    pendingConversationMutations.filter(
+                        (pending) =>
+                            !persistedConversationMutationSet.has(pending) &&
+                            (pending.event.characterId === replacedCharacterId ||
+                                committedConversationKeys.has(
+                                    `${pending.event.characterId}\u0000${pending.event.conversationId}`,
+                                )),
+                    )
                 const persistenceHandles: ConversationMutationPersistenceHandle[] = []
                 for (const { event } of persistedConversationMutations) {
                     try {
@@ -2488,6 +2511,12 @@ export class SaveCoordinator {
                     if (persistedConversationMutations.length > 0) {
                         this.acknowledgeConversationMutations(
                             persistedConversationMutations,
+                            committed.revision,
+                        )
+                    }
+                    if (fallbackPersistedConversationMutations.length > 0) {
+                        this.acknowledgeFallbackConversationMutations(
+                            fallbackPersistedConversationMutations,
                             committed.revision,
                         )
                     }
@@ -2553,6 +2582,7 @@ export class SaveCoordinator {
                     (currentAddition.pending.locallyAdded &&
                         currentAddition.canonical === currentAddition.pending.baseline))
             ) {
+                this.pendingByteCount = 0
                 if (publishOfficial && this.pendingPublicationRevision !== null) {
                     const delay = this.officialPublishDelayMs()
                     if (delay <= 0) {
@@ -2561,7 +2591,6 @@ export class SaveCoordinator {
                     }
                     this.armOfficialPublishRetry(delay)
                     this.pendingCharacterAddition = null
-                    this.pendingByteCount = 0
                     return
                 }
                 if (
@@ -2572,7 +2601,6 @@ export class SaveCoordinator {
                     this.armOfficialPublishRetry(this.officialPublishDelayMs())
                 }
                 this.pendingCharacterAddition = null
-                this.pendingByteCount = 0
                 this.lastBackgroundErrorMessage = null
                 return
             }
@@ -2683,14 +2711,13 @@ export class SaveCoordinator {
         }
 
         this.dependencies.onLocalRevision?.(replaced.revision)
-        if (options.publishOfficial) await this.finishExplicitCommit(replaced.revision)
-
         if (this.dirtyGeneration === capturedGeneration) {
             this.cancelDebounce()
             this.pendingByteCount = 0
         } else if (!this.flushPromise && !this.additionPromise) {
             this.armDebounce()
         }
+        if (options.publishOfficial) await this.finishExplicitCommit(replaced.revision)
     }
 
     private async readCompleteCharacter(
@@ -3722,6 +3749,29 @@ export class SaveCoordinator {
         }
     }
 
+    private acknowledgeFallbackConversationMutations(
+        persisted: readonly PendingConversationMutation[],
+        revision: DataRevision,
+    ): void {
+        const persistedSet = new Set(persisted)
+        this.pendingConversationMutations = this.pendingConversationMutations.filter(
+            (pending) => !persistedSet.has(pending),
+        )
+        for (const pending of persisted) {
+            try {
+                this.dependencies.onConversationMutationFallbackPersisted?.({
+                    characterId: pending.event.characterId,
+                    conversationId: pending.event.conversationId,
+                    sessionToken: pending.event.sessionToken,
+                    sessionVersion: pending.event.sessionVersion,
+                    revision,
+                })
+            } catch (error) {
+                this.reportBackgroundError(error)
+            }
+        }
+    }
+
     /**
      * Builds conversation-level mutations when only chat content changed for the tracked
      * selected character. Returns null whenever a full character replacement is required:
@@ -4052,7 +4102,14 @@ export class SaveCoordinator {
     }
 
     private startBackgroundFlush(reason: string): void {
-        void this.flushPendingData(reason).catch((error) => this.reportBackgroundError(error))
+        try {
+            void this.flushPendingData(reason).catch((error) => this.reportBackgroundError(error))
+        } catch (error) {
+            this.reportBackgroundError(error)
+            if (this.hasPendingOfficialPublication) {
+                this.armOfficialPublishRetry(OFFICIAL_PUBLISH_MIN_INTERVAL_MS)
+            }
+        }
     }
 
     private reportBackgroundError(error: unknown): void {

@@ -290,7 +290,6 @@ export interface PersistentDataRuntimeStateAdapter {
     canDeactivateWorkingSet?(): boolean
     canDeactivateCharacter?(id: string): boolean
     releaseInactiveCharacter?(id: string): void
-    releaseInactiveCharacters?(selectedId: string | null, activeIds?: ReadonlySet<string>): void
 }
 
 export interface PersistentDataRuntimeDependencies {
@@ -599,6 +598,9 @@ export function createPersistentDataRuntime(
             workingSet.beginConversationMutationPersistence(event),
         onConversationMutationPersisted: (event) => {
             workingSet.acknowledgeConversationMutationPersisted(event)
+        },
+        onConversationMutationFallbackPersisted: (event) => {
+            workingSet.acknowledgeConversationMutationFallbackPersisted(event)
         },
         onPersistenceIdle: () => workingSet.scheduleSelectedConversationDemotion(),
         onFlushPromise: dependencies.onFlushPromise,

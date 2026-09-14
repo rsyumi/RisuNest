@@ -769,7 +769,6 @@ describe('selected conversation eviction correctness corpus', () => {
             ['../process/files/inlays', { getInlayAsset: vi.fn(async () => null) }],
             ['../process/models/modelString', { getGenerationModelString: () => 'test-model' }],
             ['../process/inlayScreen', { runInlayScreen: (_char: unknown, data: string) => ({ text: data }) }],
-            ['../process/prereroll', { addRerolls: vi.fn() }],
             ['../process/transformers', { runImageEmbedding: vi.fn() }],
             ['../process/memory/hanuraiMemory', { hanuraiMemory: vi.fn() }],
             ['../process/memory/hypav2', { hypaMemoryV2: vi.fn() }],

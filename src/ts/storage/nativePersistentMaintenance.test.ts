@@ -119,6 +119,19 @@ describe('native persistent maintenance', () => {
         await expect(createPeriodicNativeSnapshotIfDue()).resolves.toEqual(created)
     })
 
+    it('creates a periodic snapshot when the newest archive timestamp is in the future', async () => {
+        const now = 2_000_000_000
+        const created = { path: 'clock-recovered.db', bytes: 512, durationMs: 4 }
+        mocks.invoke
+            .mockResolvedValueOnce([{ path: 'future.db', bytes: 1, modifiedAt: now + 7 * 24 * 60 * 60 * 1000 }])
+            .mockResolvedValueOnce(created)
+
+        await expect(createPeriodicNativeSnapshotIfDue(now)).resolves.toEqual(created)
+        expect(mocks.invoke).toHaveBeenLastCalledWith('pds_snapshot_create', {
+            reason: 'periodic',
+        })
+    })
+
     it('registers one idle callback plus the hourly re-check and runs maintenance', async () => {
         let idleCallback: (() => void) | undefined
         const requestIdleCallback = vi.fn((callback: () => void) => {

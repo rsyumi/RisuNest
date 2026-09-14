@@ -249,7 +249,14 @@ export async function openPinnedPersistentConversation(
             options.signal,
         )
     } catch (error) {
-        await releasePersistentRevisionLease(lease)
+        try {
+            await releasePersistentRevisionLease(lease)
+        } catch (releaseError) {
+            console.error(
+                'Persistent conversation revision release failed after open failed',
+                releaseError,
+            )
+        }
         throw error
     }
 }
@@ -266,6 +273,7 @@ export async function commitStrictConversationReplaceRange(
         revision: options.expectedRevision,
         signal: options.signal,
     })
+    let validationFailed = false
     try {
         if (options.start > reader.totalMessages) {
             throw new RangeError('Conversation replace-range start exceeds the current message count')
@@ -273,8 +281,19 @@ export async function commitStrictConversationReplaceRange(
         if (options.deleteCount > reader.totalMessages - options.start) {
             throw new RangeError('Conversation replace-range deleteCount exceeds the current message count')
         }
+    } catch (error) {
+        validationFailed = true
+        throw error
     } finally {
-        await reader.close()
+        try {
+            await reader.close()
+        } catch (closeError) {
+            if (!validationFailed) throw closeError
+            console.error(
+                'Persistent conversation revision release failed after range validation failed',
+                closeError,
+            )
+        }
     }
     assertNotCancelled(options.signal)
     return options.store.commit({

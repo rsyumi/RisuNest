@@ -30,7 +30,6 @@ export interface PluginStorageStore {
     snapshot(): Promise<Record<string, unknown>>
     mutate(mutations: readonly PluginStorageMutation[]): Promise<void>
     invalidate(): void
-    preloadCompatibility(): Promise<void>
     preloadCompatibilityValues(storage: Record<string, unknown>): void
     setEvictionAllowed(allowed: boolean): void
     synchronizeCompatibilityStorage(storage: Record<string, unknown>): void
@@ -350,10 +349,15 @@ export function createPluginStorageStore(
     const mutate = async (mutations: readonly PluginStorageMutation[]) => {
         await initialize()
         if (mutations.length === 0) return
+        const normalized = mutations.map((mutation): PluginStorageMutation =>
+            mutation.type === 'set' && mutation.value === undefined
+                ? { type: 'delete', key: mutation.key }
+                : mutation,
+        )
         const expectedAuthorityGeneration = authorityGeneration
-        await dependencies.mutate([...mutations])
+        await dependencies.mutate(normalized)
         if (expectedAuthorityGeneration !== authorityGeneration) return
-        for (const mutation of mutations) applyCommittedMutation(mutation)
+        for (const mutation of normalized) applyCommittedMutation(mutation)
     }
 
     const orderedKeys = (): string[] => Object.keys(
@@ -409,25 +413,6 @@ export function createPluginStorageStore(
         },
         mutate,
         invalidate,
-        async preloadCompatibility() {
-            await initialize()
-            authorityGeneration++
-            lifecycleGeneration++
-            pendingReads.clear()
-            keyGenerations.clear()
-            cache.setBudgetEnforcement(false)
-            const lease = await acquirePinnedPluginStorageLease()
-            await withPersistentRevisionLease(lease, async (reader) => {
-                const pinnedCatalog = await reader.queryPluginStorage()
-                index.clear()
-                cache.clear()
-                for (const item of pinnedCatalog.items) {
-                    index.set(item.key, item)
-                    const record = await reader.readPluginStorage(item.key)
-                    if (record) putCached(item.key, record.value, item.byteSize)
-                }
-            })
-        },
         preloadCompatibilityValues(storage) {
             cache.setBudgetEnforcement(false)
             replaceCachedStorage(storage)

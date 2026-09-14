@@ -128,13 +128,13 @@ mod asset_catalog_gc_tests;
 mod cold_payload_tests;
 #[path = "tests/display_name_tests.rs"]
 mod display_name_tests;
+#[path = "tests/external_storage_tests.rs"]
+mod external_storage_tests;
 #[path = "tests/replacement_tests.rs"]
 mod replacement_tests;
 #[path = "tests/schema_migration_tests.rs"]
 mod schema_migration_tests;
 mod server_sync_apply_tests;
-#[path = "tests/external_storage_tests.rs"]
-mod external_storage_tests;
 mod server_sync_engine_tests;
 #[path = "tests/server_sync_outbox_tests.rs"]
 mod server_sync_outbox_tests;

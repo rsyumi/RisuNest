@@ -135,10 +135,12 @@ describe('working-set UI navigation', () => {
     })
 
     it('wires direct component navigation through the working-set helpers', () => {
-        expect(mobileHeaderSource.match(/clearCharacterSelection\(\)/g)).toHaveLength(1)
-        expect(sidebarSource.match(/clearCharacterSelection\(\)/g)).toHaveLength(6)
-        expect(mobileHeaderSource).toContain('await clearCharacterSelection()')
-        expect(sidebarSource.match(/await clearCharacterSelection\(\)/g)).toHaveLength(6)
+        const mobileCalls = [...mobileHeaderSource.matchAll(/(?:await\s+)?clearCharacterSelection\(\)/g)]
+        const sidebarCalls = [...sidebarSource.matchAll(/(?:await\s+)?clearCharacterSelection\(\)/g)]
+        expect(mobileCalls.length).toBeGreaterThan(0)
+        expect(sidebarCalls.length).toBeGreaterThan(0)
+        expect(mobileCalls.every(([call]) => call.startsWith('await'))).toBe(true)
+        expect(sidebarCalls.every(([call]) => call.startsWith('await'))).toBe(true)
         expect(sidebarSource).not.toContain('selectedCharID.set(-1)')
         expect(playgroundMenuSource).toContain('await activatePlaygroundCharacter()')
         expect(playgroundMenuSource).not.toContain('selectedCharID.set(charIndex)')

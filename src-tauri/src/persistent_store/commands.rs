@@ -102,26 +102,9 @@ impl PersistentStoreState {
     }
 
     pub(crate) fn acquire_device_maintenance(&self) -> StoreResult<DeviceMaintenanceGuard> {
-        let mut state = self
-            .renderer_gate
-            .state
-            .lock()
-            .map_err(|error| StoreError::Store {
-                message: format!("persistent renderer admission mutex poisoned: {error}"),
-            })?;
-        if state.maintenance_active {
-            return Err(renderer_gate_error());
-        }
-        state.maintenance_active = true;
-        while state.operations != 0 {
-            state = self
-                .renderer_gate
-                .drained
-                .wait(state)
-                .map_err(|error| StoreError::Store {
-                    message: format!("persistent renderer drain mutex poisoned: {error}"),
-                })?;
-        }
+        let maintenance = self
+            .try_acquire_renderer_maintenance()?
+            .ok_or_else(renderer_gate_error)?;
         // No new operation can enter between draining and closing the store.
         // Reopening after the guard is released refreshes the connection after
         // native restore and discards leases owned by the previous renderer.
@@ -131,9 +114,47 @@ impl PersistentStoreState {
                 message: format!("persistent store mutex poisoned: {error}"),
             })?
             .take();
-        Ok(DeviceMaintenanceGuard {
+        Ok(maintenance)
+    }
+
+    fn try_acquire_renderer_maintenance(&self) -> StoreResult<Option<DeviceMaintenanceGuard>> {
+        let mut state = self
+            .renderer_gate
+            .state
+            .lock()
+            .map_err(|error| StoreError::Store {
+                message: format!("persistent renderer admission mutex poisoned: {error}"),
+            })?;
+        if state.maintenance_active {
+            return Ok(None);
+        }
+        state.maintenance_active = true;
+        let maintenance = DeviceMaintenanceGuard {
             gate: Arc::clone(&self.renderer_gate),
-        })
+        };
+        while state.operations != 0 {
+            state = self
+                .renderer_gate
+                .drained
+                .wait(state)
+                .map_err(|error| StoreError::Store {
+                    message: format!("persistent renderer drain mutex poisoned: {error}"),
+                })?;
+        }
+        Ok(Some(maintenance))
+    }
+
+    pub(crate) fn reset_renderer_session(&self) -> StoreResult<()> {
+        let Some(_maintenance) = self.try_acquire_renderer_maintenance()? else {
+            return Ok(());
+        };
+        let mut store = self.store.lock().map_err(|error| StoreError::Store {
+            message: format!("persistent store mutex poisoned: {error}"),
+        })?;
+        if let Some(store) = store.as_mut() {
+            store.release_all_revision_leases()?;
+        }
+        Ok(())
     }
 }
 
@@ -177,7 +198,20 @@ fn with_store_mutex<T>(
     state: &PersistentStoreState,
     operation: impl FnOnce(&PersistentStore) -> StoreResult<T>,
 ) -> StoreResult<T> {
-    let _operation = state.admit_renderer_operation()?;
+    let operation_guard = state.admit_renderer_operation()?;
+    with_store_mutex_admitted(state, &operation_guard, operation)
+}
+
+fn with_store_mutex_admitted<T>(
+    state: &PersistentStoreState,
+    operation_guard: &RendererOperationGuard,
+    operation: impl FnOnce(&PersistentStore) -> StoreResult<T>,
+) -> StoreResult<T> {
+    if !operation_guard.belongs_to(state) {
+        return Err(StoreError::Validation {
+            message: "renderer operation permit belongs to another persistent store".to_owned(),
+        });
+    }
     let store = state.store.lock().map_err(|error| StoreError::Store {
         message: format!("persistent store mutex poisoned: {error}"),
     })?;
@@ -185,6 +219,12 @@ fn with_store_mutex<T>(
         message: "persistent store has not been opened".to_owned(),
     })?;
     operation(store)
+}
+
+impl RendererOperationGuard {
+    fn belongs_to(&self, state: &PersistentStoreState) -> bool {
+        Arc::ptr_eq(&self.gate, &state.renderer_gate)
+    }
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -227,7 +267,28 @@ fn with_store_mutex_mut<T>(
     state: &PersistentStoreState,
     operation: impl FnOnce(&mut PersistentStore) -> StoreResult<T>,
 ) -> StoreResult<T> {
-    let _operation = state.admit_renderer_operation()?;
+    let operation_guard = state.admit_renderer_operation()?;
+    with_store_mutex_mut_admitted(state, &operation_guard, operation)
+}
+
+pub(crate) fn with_store_mut_admitted<T>(
+    state: State<'_, PersistentStoreState>,
+    operation_guard: &RendererOperationGuard,
+    operation: impl FnOnce(&mut PersistentStore) -> StoreResult<T>,
+) -> StoreResult<T> {
+    with_store_mutex_mut_admitted(&state, operation_guard, operation)
+}
+
+fn with_store_mutex_mut_admitted<T>(
+    state: &PersistentStoreState,
+    operation_guard: &RendererOperationGuard,
+    operation: impl FnOnce(&mut PersistentStore) -> StoreResult<T>,
+) -> StoreResult<T> {
+    if !operation_guard.belongs_to(state) {
+        return Err(StoreError::Validation {
+            message: "renderer operation permit belongs to another persistent store".to_owned(),
+        });
+    }
     let mut store = state.store.lock().map_err(|error| StoreError::Store {
         message: format!("persistent store mutex poisoned: {error}"),
     })?;
@@ -242,13 +303,14 @@ pub(crate) fn replace_commit_with_snapshot(
     staging_id: &str,
     expected_revision: Option<i64>,
 ) -> StoreResult<RevisionResult> {
-    let _operation = app
-        .state::<PersistentStoreState>()
-        .admit_renderer_operation()?;
-    let prepared = with_store_mut(app.state(), |store| {
+    let state = app.state::<PersistentStoreState>();
+    let operation_guard = state.admit_renderer_operation()?;
+    let prepared = with_store_mutex_mut_admitted(&state, &operation_guard, |store| {
         store.prepare_replace_commit(staging_id, expected_revision)
     })?;
-    with_store_mut(app.state(), |store| store.finish_prepared_replace(prepared))
+    with_store_mutex_mut_admitted(&state, &operation_guard, |store| {
+        store.finish_prepared_replace(prepared)
+    })
 }
 
 #[tauri::command(async)]
@@ -256,18 +318,32 @@ pub(crate) fn pds_open(
     app: AppHandle,
     state: State<'_, PersistentStoreState>,
 ) -> Result<PersistentStoreOpenResult, StoreError> {
-    let _operation = state.admit_renderer_operation()?;
+    let operation_guard = state.admit_renderer_operation()?;
     let app_data_dir = crate::app_data_root::resolve(&app).map_err(|error| StoreError::Store {
         message: format!("failed to resolve application data directory: {error}"),
     })?;
-    open_renderer_persistent_store(&state, &app_data_dir)
+    open_renderer_persistent_store_admitted(&state, &operation_guard, &app_data_dir)
 }
 
+#[cfg(test)]
 fn open_renderer_persistent_store(
     state: &PersistentStoreState,
     app_data_dir: &Path,
 ) -> StoreResult<PersistentStoreOpenResult> {
-    let _operation = state.admit_renderer_operation()?;
+    let operation_guard = state.admit_renderer_operation()?;
+    open_renderer_persistent_store_admitted(state, &operation_guard, app_data_dir)
+}
+
+fn open_renderer_persistent_store_admitted(
+    state: &PersistentStoreState,
+    operation_guard: &RendererOperationGuard,
+    app_data_dir: &Path,
+) -> StoreResult<PersistentStoreOpenResult> {
+    if !operation_guard.belongs_to(state) {
+        return Err(StoreError::Validation {
+            message: "renderer operation permit belongs to another persistent store".to_owned(),
+        });
+    }
     let mut store = state.store.lock().map_err(|error| StoreError::Store {
         message: format!("persistent store mutex poisoned: {error}"),
     })?;
@@ -717,7 +793,24 @@ pub(crate) fn pds_export_risu_save(
     lease: String,
     omit_account: bool,
 ) -> Result<ExportedRisuSave, StoreError> {
-    with_store(state, |store| store.export_risu_save(&lease, omit_account))
+    let operation_guard = state.admit_renderer_operation()?;
+    let prepared = with_store_mutex_mut_admitted(&state, &operation_guard, |store| {
+        store.detach_risu_save_export(&lease)
+    })?;
+    let outcome = prepared.create_attached_export(omit_account);
+    let reattach = with_store_mutex_mut_admitted(&state, &operation_guard, |store| {
+        store.reattach_risu_save_export(prepared)
+    });
+    match (outcome, reattach) {
+        (Ok(exported), Ok(())) => Ok(exported),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(reattach_error)) => Err(StoreError::Store {
+            message: format!(
+                "{error}; failed to reattach revision lease after native export: {reattach_error}"
+            ),
+        }),
+    }
 }
 
 #[tauri::command(async)]
@@ -755,7 +848,7 @@ pub(crate) async fn pds_kei_backup_upload(
     token: String,
 ) -> Result<KeiUploadResult, StoreError> {
     let operation = state.admit_renderer_operation()?;
-    let prepared = with_store_mut(state, |store| {
+    let prepared = with_store_mutex_mut_admitted(&state, &operation, |store| {
         store.prepare_kei_upload(&lease, &url, &expected_account_id, &token)
     })?;
     // Keep admission with the native task even if its invoking renderer goes
@@ -863,14 +956,16 @@ fn asset_gc_result(
 pub(crate) fn pds_asset_gc_preview(
     state: State<'_, PersistentStoreState>,
 ) -> Result<AssetGcMaintenanceResult, StoreError> {
+    let operation_guard = state.admit_renderer_operation()?;
     finish_storage_command(
         "pds_asset_gc_preview",
-        with_store(state, pds_asset_gc_preview_all),
+        pds_asset_gc_preview_all(&state, &operation_guard),
     )
 }
 
 fn pds_asset_gc_preview_all(
-    store: &PersistentStore,
+    state: &PersistentStoreState,
+    operation_guard: &RendererOperationGuard,
 ) -> Result<AssetGcMaintenanceResult, StoreError> {
     let now = current_time_ms()?;
     let mut cursor = None;
@@ -882,7 +977,9 @@ fn pds_asset_gc_preview_all(
         blockers: Vec::new(),
     };
     loop {
-        let page = store.asset_gc_dry_run(128, cursor.as_deref(), now, 7 * 24 * 60 * 60 * 1_000)?;
+        let page = with_store_mutex_admitted(state, operation_guard, |store| {
+            store.asset_gc_dry_run(128, cursor.as_deref(), now, 7 * 24 * 60 * 60 * 1_000)
+        })?;
         let page_result = asset_gc_result(page.report);
         result.candidate_count += page_result.candidate_count;
         result.candidate_bytes += page_result.candidate_bytes;
@@ -899,14 +996,16 @@ fn pds_asset_gc_preview_all(
 pub(crate) fn pds_asset_gc_execute(
     state: State<'_, PersistentStoreState>,
 ) -> Result<AssetGcMaintenanceResult, StoreError> {
+    let operation_guard = state.admit_renderer_operation()?;
     finish_storage_command(
         "pds_asset_gc_execute",
-        with_store_mut(state, pds_asset_gc_execute_all),
+        pds_asset_gc_execute_all(&state, &operation_guard),
     )
 }
 
 fn pds_asset_gc_execute_all(
-    store: &mut PersistentStore,
+    state: &PersistentStoreState,
+    operation_guard: &RendererOperationGuard,
 ) -> Result<AssetGcMaintenanceResult, StoreError> {
     let now = current_time_ms()?;
     let mut cursor = None;
@@ -918,13 +1017,7 @@ fn pds_asset_gc_execute_all(
         blockers: Vec::new(),
     };
     loop {
-        let page = store.asset_gc_delete_page_with_hook(
-            128,
-            cursor.as_deref(),
-            now,
-            7 * 24 * 60 * 60 * 1_000,
-            |_| Ok(()),
-        )?;
+        let page = pds_asset_gc_execute_page(state, operation_guard, cursor.as_deref(), now)?;
         let page_result = asset_gc_result(page.report);
         result.candidate_count += page_result.candidate_count;
         result.candidate_bytes += page_result.candidate_bytes;
@@ -937,6 +1030,17 @@ fn pds_asset_gc_execute_all(
         }
     }
     Ok(result)
+}
+
+fn pds_asset_gc_execute_page(
+    state: &PersistentStoreState,
+    operation_guard: &RendererOperationGuard,
+    cursor: Option<&str>,
+    now: i64,
+) -> StoreResult<crate::asset_repository::migration_gc::AssetGcDryRunPage> {
+    with_store_mutex_mut_admitted(state, operation_guard, |store| {
+        store.asset_gc_delete_page_with_hook(128, cursor, now, 7 * 24 * 60 * 60 * 1_000, |_| Ok(()))
+    })
 }
 
 #[tauri::command(async)]
@@ -1011,6 +1115,9 @@ mod tests {
         assert!(state.store.lock().unwrap().is_none());
         assert!(state.admit_renderer_operation().is_err());
         assert!(state.acquire_device_maintenance().is_err());
+        state
+            .reset_renderer_session()
+            .expect("active maintenance already owns renderer cleanup");
         assert!(open_renderer_persistent_store(&state, directory.path()).is_err());
         assert!(
             with_store_mutex(&state, |store| { store.set_app_kv("synthetic", &json!(2)) }).is_err()
@@ -1098,6 +1205,96 @@ mod tests {
         );
         drop(native);
         drop(maintenance);
+    }
+
+    #[test]
+    fn admitted_operation_can_finish_after_maintenance_closes_new_admission() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let directory = tempdir().unwrap();
+        let state = Arc::new(PersistentStoreState::default());
+        open_renderer_persistent_store(&state, directory.path()).unwrap();
+        let operation_guard = state.admit_renderer_operation().unwrap();
+        let maintenance_state = Arc::clone(&state);
+        let (maintenance_tx, maintenance_rx) = mpsc::channel();
+        let maintainer = thread::spawn(move || {
+            maintenance_tx
+                .send(maintenance_state.acquire_device_maintenance().unwrap())
+                .unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !state.renderer_gate.state.lock().unwrap().maintenance_active {
+            assert!(
+                Instant::now() < deadline,
+                "maintenance admission did not close"
+            );
+            thread::yield_now();
+        }
+
+        assert!(with_store_mutex_mut(&state, |_| Ok(())).is_err());
+        with_store_mutex_mut_admitted(&state, &operation_guard, |store| {
+            store.set_app_kv("admitted-operation", &json!(true))
+        })
+        .expect("existing permit must finish its store work");
+        assert!(matches!(
+            maintenance_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        drop(operation_guard);
+        let maintenance = maintenance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        maintainer.join().unwrap();
+        let native = PersistentStore::open(directory.path()).unwrap();
+        assert_eq!(
+            native.get_app_kv("admitted-operation").unwrap(),
+            Some(json!(true))
+        );
+        drop(native);
+        drop(maintenance);
+    }
+
+    #[test]
+    fn failed_maintenance_acquisition_reopens_renderer_admission() {
+        use std::thread;
+
+        let state = Arc::new(PersistentStoreState::default());
+        let poison_state = Arc::clone(&state);
+        assert!(thread::spawn(move || {
+            let _store = poison_state.store.lock().unwrap();
+            panic!("synthetic store mutex poison");
+        })
+        .join()
+        .is_err());
+
+        assert!(state.acquire_device_maintenance().is_err());
+        assert!(!state.renderer_gate.state.lock().unwrap().maintenance_active);
+        drop(
+            state
+                .admit_renderer_operation()
+                .expect("failed maintenance must reopen admission"),
+        );
+    }
+
+    #[test]
+    fn renderer_session_reset_releases_leases_without_closing_the_store() {
+        let directory = tempdir().unwrap();
+        let state = PersistentStoreState::default();
+        open_renderer_persistent_store(&state, directory.path()).unwrap();
+        let lease = with_store_mutex_mut(&state, |store| store.acquire_revision(0)).unwrap();
+
+        state.reset_renderer_session().unwrap();
+
+        with_store_mutex(&state, |store| {
+            assert_eq!(store.active_readers.active_count(), 0);
+            assert!(matches!(
+                store.read_root(Some(&lease.lease)),
+                Err(StoreError::SnapshotReleased)
+            ));
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
@@ -1284,7 +1481,14 @@ mod tests {
                     .revision,
                 0
             );
-            assert!(pds_asset_gc_preview_all(slot.as_ref().unwrap()).is_err());
+            let state = PersistentStoreState {
+                store: Mutex::new(slot.take()),
+                ..PersistentStoreState::default()
+            };
+            let operation_guard = state.admit_renderer_operation().unwrap();
+            assert!(pds_asset_gc_preview_all(&state, &operation_guard).is_err());
+            drop(operation_guard);
+            slot = state.store.into_inner().unwrap();
         }
     }
 
@@ -1444,7 +1648,15 @@ mod tests {
             .map(|payload| payload.byte_size)
             .sum::<u64>();
 
-        let result = pds_asset_gc_preview_all(&store).expect("preview every command page");
+        let state = PersistentStoreState {
+            store: Mutex::new(Some(store)),
+            ..PersistentStoreState::default()
+        };
+        let operation_guard = state.admit_renderer_operation().unwrap();
+        let result =
+            pds_asset_gc_preview_all(&state, &operation_guard).expect("preview every command page");
+        drop(operation_guard);
+        let store = state.store.into_inner().unwrap().unwrap();
 
         assert_eq!(result.candidate_count, total);
         assert_eq!(result.candidate_bytes, expected_bytes);
@@ -1497,8 +1709,44 @@ mod tests {
             .map(|payload| payload.byte_size)
             .sum::<u64>();
 
-        let result = pds_asset_gc_execute_all(&mut store).expect("execute every command page");
+        let state = PersistentStoreState {
+            store: Mutex::new(Some(store)),
+            ..PersistentStoreState::default()
+        };
+        let operation_guard = state.admit_renderer_operation().unwrap();
+        let observed_pages = std::cell::Cell::new(0);
+        let now = current_time_ms().unwrap();
+        let mut cursor = None;
+        let mut result = AssetGcMaintenanceResult {
+            candidate_count: 0,
+            candidate_bytes: 0,
+            deleted_count: 0,
+            deleted_bytes: 0,
+            blockers: Vec::new(),
+        };
+        loop {
+            let page = pds_asset_gc_execute_page(&state, &operation_guard, cursor.as_deref(), now)
+                .expect("execute command page");
+            assert!(
+                state.store.try_lock().is_ok(),
+                "store lock must be released between GC pages"
+            );
+            observed_pages.set(observed_pages.get() + 1);
+            let page_result = asset_gc_result(page.report);
+            result.candidate_count += page_result.candidate_count;
+            result.candidate_bytes += page_result.candidate_bytes;
+            result.deleted_count += page_result.deleted_count;
+            result.deleted_bytes += page_result.deleted_bytes;
+            result.blockers.extend(page_result.blockers);
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        drop(operation_guard);
+        let store = state.store.into_inner().unwrap().unwrap();
 
+        assert!(observed_pages.get() >= 2);
         assert_eq!(result.candidate_count, total);
         assert_eq!(result.candidate_bytes, expected_bytes);
         assert_eq!(result.deleted_count, total);

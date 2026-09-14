@@ -140,25 +140,6 @@ describe('plugin storage V3 residency', () => {
         ])
     })
 
-    it('preloads every key for compatibility and keeps values while eviction is disabled', async () => {
-        const { storage, store, readPluginStorage } = harness({
-            alpha: { byteSize: 6, value: 'alpha' },
-            beta: { byteSize: 6, value: 'beta' },
-        })
-
-        await storage.preloadCompatibility()
-        readPluginStorage.mockClear()
-
-        await expect(storage.getItem('alpha')).resolves.toBe('alpha')
-        await expect(storage.getItem('beta')).resolves.toBe('beta')
-        expect(readPluginStorage).not.toHaveBeenCalled()
-        expect(store.acquireRevision).toHaveBeenCalledWith(4)
-
-        storage.setEvictionAllowed(true)
-        await storage.getItem('alpha')
-        expect(readPluginStorage).toHaveBeenCalledWith('alpha')
-    })
-
     it('applies mutations through the authoritative revision path and updates the cache', async () => {
         const { storage, mutate, readPluginStorage } = harness(
             { alpha: { byteSize: 6, value: 'alpha' } },
@@ -180,11 +161,24 @@ describe('plugin storage V3 residency', () => {
         expect(readPluginStorage).not.toHaveBeenCalled()
     })
 
+    it('normalizes an undefined set value to a deletion before commit and cache update', async () => {
+        const { storage, mutate, readPluginStorage } = harness(
+            { alpha: { byteSize: 6, value: 'alpha' } },
+            100,
+        )
+
+        await storage.setItem('alpha', undefined)
+
+        expect(mutate).toHaveBeenCalledWith([{ type: 'delete', key: 'alpha' }])
+        await expect(storage.getItem('alpha')).resolves.toBeNull()
+        expect(readPluginStorage).not.toHaveBeenCalled()
+    })
+
     it('keeps the preloaded V3 cache coherent with synchronous compatibility mutations', async () => {
         const { storage, readPluginStorage } = harness({
             alpha: { byteSize: 6, value: 'alpha' },
         })
-        await storage.preloadCompatibility()
+        storage.preloadCompatibilityValues({ alpha: 'alpha' })
         readPluginStorage.mockClear()
 
         storage.synchronizeCompatibilityMutation({
@@ -393,28 +387,6 @@ describe('plugin storage V3 residency', () => {
         } as any)
 
         await expect(storage.snapshot()).resolves.toEqual({ zero: 0 })
-        expect(release).toHaveBeenCalledTimes(2)
-    })
-
-    it('preserves a compatibility preload failure when both release attempts fail', async () => {
-        const { storage, store } = harness({ broken: { byteSize: 1, value: 1 } }, 1)
-        const primaryError = new Error('plugin value unavailable')
-        const release = vi.fn(async () => {
-            throw new Error('release unavailable')
-        })
-        vi.mocked(store.acquireRevision).mockResolvedValueOnce({
-            revision: 4,
-            queryPluginStorage: async () => ({
-                revision: 4,
-                items: [{ key: 'broken', byteSize: 1 }],
-            }),
-            readPluginStorage: async () => {
-                throw primaryError
-            },
-            release,
-        } as any)
-
-        await expect(storage.preloadCompatibility()).rejects.toBe(primaryError)
         expect(release).toHaveBeenCalledTimes(2)
     })
 

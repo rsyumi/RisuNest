@@ -405,6 +405,31 @@ describe('plugin database access', () => {
         expect(harness.materializeDatabaseSnapshot).not.toHaveBeenCalled()
     })
 
+    it('retries opening the projector store after a transient failure', async () => {
+        const harness = createHarness()
+        const durable = makeCharacter('active')
+        const transient = new Error('synthetic projector open failure')
+        vi.mocked(harness.store.open)
+            .mockRejectedValueOnce(transient)
+            .mockResolvedValue(undefined)
+        harness.pinnedDatabases.push(makeFullObjectDatabase([durable]))
+        vi.mocked(getPersistentDataStore).mockReturnValue(harness.store)
+        const projector = createProductionPluginChatOutputProjector(structuredClone)
+        const input = {
+            characterId: 'active',
+            conversationId: 'active-chat-a',
+            liveCharacter: durable,
+            liveConversation: durable.chats[0],
+        }
+
+        await expect(projector(input)).rejects.toBe(transient)
+        await expect(projector(input)).resolves.toMatchObject({
+            chat: { id: 'active-chat-a' },
+        })
+
+        expect(harness.store.open).toHaveBeenCalledTimes(2)
+    })
+
     it('merges active and trash configured order before resolving an index', async () => {
         const harness = createHarness()
         harness.pinnedDatabases.push(makeFullObjectDatabase([
@@ -942,12 +967,26 @@ describe('plugin database access', () => {
             }),
         ).toEqual({ ...conversationWindow, revision: 4 })
         expect(harness.snapshot).not.toHaveBeenCalled()
-        expect(harness.store.open).toHaveBeenCalledTimes(1)
+        expect(harness.store.open).toHaveBeenCalledTimes(3)
         expect(harness.store.readRoot).not.toHaveBeenCalled()
         expect(harness.store.readCharacter).not.toHaveBeenCalled()
         expect(harness.store.readConversation).not.toHaveBeenCalled()
         expect(harness.store.materializeDatabase).not.toHaveBeenCalled()
         expect(harness.store.acquireRevision).not.toHaveBeenCalled()
+    })
+
+    it('retries opening the store after a transient query failure', async () => {
+        const harness = createHarness()
+        const transient = new Error('synthetic open failure')
+        vi.mocked(harness.store.open)
+            .mockRejectedValueOnce(transient)
+            .mockResolvedValue(undefined)
+
+        await expect(harness.access.queryCharacters()).rejects.toBe(transient)
+        await expect(harness.access.queryCharacters()).resolves.toEqual(characterPage)
+
+        expect(harness.store.open).toHaveBeenCalledTimes(2)
+        expect(harness.store.queryCharacters).toHaveBeenCalledOnce()
     })
 
     it('finishes each flush before the matching persistent query begins', async () => {

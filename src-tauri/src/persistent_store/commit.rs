@@ -1338,7 +1338,13 @@ pub(super) fn replace_commit_from_external(
     expected_revision: i64,
     job: &str,
 ) -> StoreResult<RevisionResult> {
-    replace_commit_transaction(connection, staging_id, Some(expected_revision), None, Some(job))
+    replace_commit_transaction(
+        connection,
+        staging_id,
+        Some(expected_revision),
+        None,
+        Some(job),
+    )
 }
 
 fn replace_commit_transaction(
@@ -2279,8 +2285,34 @@ pub(super) fn set_active(
 
 fn without_field(value: &Value, field: &str) -> StoreResult<Value> {
     let mut object = object(value, "JSON object")?.clone();
-    object.remove(field);
+    object.shift_remove(field);
     Ok(Value::Object(object))
+}
+
+#[cfg(test)]
+mod ordered_removal_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn without_field_preserves_the_order_of_remaining_keys() {
+        let value = json!({
+            "a": 1,
+            "removed": true,
+            "b": 2,
+            "c": 3,
+        });
+
+        let result = without_field(&value, "removed").unwrap();
+        let keys = result
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+
+        assert_eq!(keys, ["a", "b", "c"]);
+    }
 }
 
 fn object<'a>(value: &'a Value, context: &str) -> StoreResult<&'a Map<String, Value>> {

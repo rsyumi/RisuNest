@@ -861,7 +861,7 @@ impl<F: Fn() -> bool> Write for CancellationAwareWriter<'_, F> {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         if (self.is_cancelled)() {
             return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
+                std::io::ErrorKind::Other,
                 EXPORT_CANCELLED_MESSAGE,
             ));
         }
@@ -871,7 +871,7 @@ impl<F: Fn() -> bool> Write for CancellationAwareWriter<'_, F> {
     fn flush(&mut self) -> std::io::Result<()> {
         if (self.is_cancelled)() {
             return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
+                std::io::ErrorKind::Other,
                 EXPORT_CANCELLED_MESSAGE,
             ));
         }
@@ -1204,12 +1204,39 @@ mod tests {
     };
     use flate2::read::GzDecoder;
     use serde_json::{json, Value};
+    use std::cell::Cell;
     use std::collections::HashMap;
     use std::fs;
     use std::io::Read;
     use tempfile::TempDir;
 
     const HEADER: &[u8] = b"RISUSAVE\0";
+
+    #[test]
+    fn cancellation_writer_stops_write_all_without_retrying_into_output() {
+        let directory = TempDir::new().unwrap();
+        let mut file = File::create(directory.path().join("cancelled.bin")).unwrap();
+        let cancellation_checks = Cell::new(0);
+        let is_cancelled = || {
+            let checks = cancellation_checks.get() + 1;
+            cancellation_checks.set(checks);
+            checks <= 3
+        };
+        let mut writer = CancellationAwareWriter {
+            file: &mut file,
+            is_cancelled: &is_cancelled,
+        };
+
+        let error = writer
+            .write_all(b"synthetic payload")
+            .expect_err("cancelled writer must stop");
+
+        assert_ne!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(error.to_string(), EXPORT_CANCELLED_MESSAGE);
+        assert_eq!(cancellation_checks.get(), 1);
+        drop(writer);
+        assert_eq!(file.stream_position().unwrap(), 0);
+    }
 
     #[test]
     fn risusave_export_naming_matches_the_shared_taxonomy_golden_fixture() {

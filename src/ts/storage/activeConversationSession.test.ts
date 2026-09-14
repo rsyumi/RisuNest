@@ -373,6 +373,25 @@ describe('ActiveConversationSession', () => {
         expect(session.version).toBe(0)
     })
 
+    it.each([
+        ['null', null],
+        ['empty', ''],
+    ])('assigns a usable ID when bookmarking a message with a %s ID', (_label, chatId) => {
+        const conversation = chat()
+        conversation.message[1].chatId = chatId as unknown as string
+        const { session } = createSession(conversation)
+
+        session.setBookmark(session.locate(1), {
+            bookmarked: true,
+            messageId: 'assigned-id',
+        })
+
+        expect(conversation.message[1].chatId).toBe('assigned-id')
+        expect(conversation.bookmarks).toEqual(['assigned-id'])
+        session.setBookmark(session.locate(1), { bookmarked: false })
+        expect(conversation.bookmarks).toEqual([])
+    })
+
     it('does not replace bookmark metadata identities for ordinary message commands', () => {
         const conversation = chat()
         conversation.bookmarks = ['duplicate']
@@ -1336,11 +1355,20 @@ describe('ActiveConversationSession', () => {
             measureMessage: () => -1,
         })
 
-        expect(() => session.readRange(0, 1)).not.toThrow()
-        expect(session.readRange(0, 1).messages).toEqual(conversation.message)
-        expect(session.residencyFallbackActive).toBe(true)
-        expect(session.residentIntervals).toEqual([])
-        expect(session.materializeCompatibilityArray()).toBe(conversation.message)
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+        try {
+            expect(() => session.readRange(0, 1)).not.toThrow()
+            expect(session.readRange(0, 1).messages).toEqual(conversation.message)
+            expect(session.residencyFallbackActive).toBe(true)
+            expect(session.residentIntervals).toEqual([])
+            expect(session.materializeCompatibilityArray()).toBe(conversation.message)
+            expect(consoleError).toHaveBeenCalledWith(
+                'Active conversation residency failed; using compatibility fallback',
+                expect.any(RangeError),
+            )
+        } finally {
+            consoleError.mockRestore()
+        }
     })
 
     it('materializes a detached complete compatibility snapshot and releases it to budget', () => {

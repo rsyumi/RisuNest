@@ -2,12 +2,11 @@ pub(crate) mod asset_object_catalog;
 pub(crate) mod asset_residency;
 pub(crate) mod commands;
 mod commit;
-pub(crate) mod content_change_index;
 pub(crate) mod content_capture;
+pub(crate) mod content_change_index;
 mod content_locators;
-pub(crate) mod external_storage_state;
-pub(crate) mod sync_selection;
 pub(crate) mod export;
+pub(crate) mod external_storage_state;
 #[cfg(feature = "native-kei-upload-pilot")]
 pub(crate) mod kei;
 pub(crate) mod owner_projection;
@@ -28,12 +27,13 @@ pub(crate) mod server_sync_outbox;
 pub(crate) mod server_sync_projection;
 mod snapshot;
 mod snapshot_archive;
+pub(crate) mod sync_selection;
 
 pub(crate) use asset_object_catalog::{AssetObjectCatalog, AssetObjectCatalogPage};
 pub(crate) use commands::PersistentStoreState;
 pub(crate) use snapshot::RevisionReadLease;
 
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(feature = "native-official-publication")]
@@ -1032,6 +1032,20 @@ impl PreparedRisuSaveExport {
         checkpoint_after_detached_release(&self.database_path, &active_readers)
     }
 
+    pub(crate) fn create_attached_export(
+        &self,
+        omit_account: bool,
+    ) -> StoreResult<export::ExportedRisuSave> {
+        let reader = self.reader()?;
+        export::create(
+            &reader.connection,
+            &self.snapshots_dir,
+            &reader.target,
+            &self.lease,
+            omit_account,
+        )
+    }
+
     pub(crate) fn cleanup_file(&self, path: &Path) -> StoreResult<()> {
         export::cleanup(&self.snapshots_dir, path)
     }
@@ -1170,6 +1184,18 @@ fn combine_publication_cleanup_error(
             message: format!("{primary}; official publication {operation} failed: {cleanup}"),
         },
     }
+}
+
+pub(crate) fn register_asset_objects_at_root(
+    repository_root: &Path,
+    objects: &[asset_object_catalog::AssetObjectRegistration],
+    created_at_ms: i64,
+) -> StoreResult<()> {
+    let database_path = repository_root.join("persistent").join("persistent.db");
+    let mut connection =
+        Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    connection.busy_timeout(Duration::from_secs(5))?;
+    AssetObjectCatalog::new(&mut connection).register(objects, created_at_ms)
 }
 
 impl PersistentStore {
@@ -1748,6 +1774,28 @@ impl PersistentStore {
         self.checkpoint_after_release()
     }
 
+    pub(crate) fn release_all_revision_leases(&mut self) -> StoreResult<()> {
+        let mut first_error = None;
+        for (_, reader) in self.revision_leases.drain() {
+            if let Err(error) = snapshot::close_revision(reader) {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        let checkpoint = self.checkpoint_after_release();
+        match (first_error, checkpoint) {
+            (None, result) => result,
+            (Some(error), Ok(())) => Err(error),
+            (Some(error), Err(checkpoint_error)) => Err(StoreError::Store {
+                message: format!(
+                    "{error}; checkpoint after renderer lease cleanup failed: {checkpoint_error}"
+                ),
+            }),
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn export_risu_save(
         &self,
         lease: &str,
@@ -1780,6 +1828,48 @@ impl PersistentStore {
             database_path: self.database_path.clone(),
             reader: Some(reader),
         })
+    }
+
+    pub(crate) fn detach_risu_save_export(
+        &mut self,
+        lease: &str,
+    ) -> StoreResult<PreparedRisuSaveExport> {
+        if !lease.starts_with("snapshot-") {
+            return Err(StoreError::Validation {
+                message: "revision lease must be a snapshot lease".to_owned(),
+            });
+        }
+        let reader = self
+            .revision_leases
+            .get(lease)
+            .ok_or(StoreError::SnapshotReleased)?;
+        reader.publish_detached_asset_roots()?;
+        let reader = self
+            .revision_leases
+            .remove(lease)
+            .ok_or(StoreError::SnapshotReleased)?;
+        Ok(PreparedRisuSaveExport {
+            revision: reader.target.revision,
+            lease: lease.to_owned(),
+            snapshots_dir: self.snapshots_dir.clone(),
+            database_path: self.database_path.clone(),
+            reader: Some(reader),
+        })
+    }
+
+    pub(crate) fn reattach_risu_save_export(
+        &mut self,
+        mut prepared: PreparedRisuSaveExport,
+    ) -> StoreResult<()> {
+        if self.revision_leases.contains_key(&prepared.lease) {
+            return Err(StoreError::Validation {
+                message: "revision lease was replaced while its export was detached".to_owned(),
+            });
+        }
+        let lease = prepared.lease.clone();
+        let reader = prepared.take_reader()?;
+        self.revision_leases.insert(lease, reader);
+        Ok(())
     }
 
     #[cfg(feature = "native-official-publication")]
@@ -2411,7 +2501,8 @@ impl PersistentStore {
         }
         roots.extend(self.active_readers.detached_asset_roots()?);
         roots.push(crate::external_storage::capture::registered_roots(
-            &self.connection, &self.repository_root,
+            &self.connection,
+            &self.repository_root,
         )?);
         roots.extend(snapshot_archive::Archive::open(&self.snapshots_dir)?.roots()?);
         roots.extend(collect_staged_migration_roots(&self.repository_root)?);

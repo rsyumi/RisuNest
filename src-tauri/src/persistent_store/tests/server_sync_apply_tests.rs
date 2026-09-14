@@ -252,6 +252,46 @@ fn operation_identity_survives_reopen_staging_changes_and_terminal_receipts() {
         .server_reserve(&head(1), "b".repeat(64), "stage-d".into(), 1)
         .is_err());
 }
+#[test]
+fn expired_operation_history_drops_only_the_obsolete_attempt_and_keeps_local_work() {
+    let (_dir, mut store, _) = open_fixture();
+    bind(&mut store);
+    store
+        .commit(&WorkingSetCommit {
+            root: Some(json!({"synthetic":"still-dirty"})),
+            ..empty_working_set_commit(1)
+        })
+        .unwrap();
+    let root = store.read_root(None).unwrap().value;
+    let dirty = store.server_status().unwrap().dirty_records;
+    store
+        .server_reserve(
+            &head(0),
+            "b".repeat(64),
+            "expired-stage".into(),
+            store.revision().unwrap(),
+        )
+        .unwrap();
+
+    store.server_abandon_expired_operation().unwrap();
+
+    assert!(store.server_pending().unwrap().is_none());
+    assert_eq!(store.server_status().unwrap().dirty_records, dirty);
+    assert_eq!(store.read_root(None).unwrap().value, root);
+    assert!(!store.server_status().unwrap().registration_required);
+    assert_eq!(
+        store
+            .server_reserve(
+                &head(0),
+                "c".repeat(64),
+                "replacement-stage".into(),
+                store.revision().unwrap(),
+            )
+            .unwrap()
+            .device_operation_seq,
+        Sequence::from(2)
+    );
+}
 
 #[test]
 fn recovery_preserves_local_edits_and_bases_while_invalidating_old_operations() {

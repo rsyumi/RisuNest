@@ -824,7 +824,7 @@ export class ActiveConversationTransaction {
             this.sourceLocatorRegistry,
         )
         const messageId = options.bookmarked
-            ? message.chatId ?? options.messageId
+            ? message.chatId || options.messageId
             : message.chatId
         if (!messageId) {
             if (!options.bookmarked) return this.locate(locator.absoluteIndex)
@@ -833,7 +833,7 @@ export class ActiveConversationTransaction {
 
         let replacement: Message | undefined
         if (options.bookmarked) {
-            if (message.chatId === undefined) {
+            if (!message.chatId) {
                 const nextMessages = this.currentMessages.slice()
                 replacement = {
                     ...safeStructuredClone(message),
@@ -2046,13 +2046,26 @@ export class ActiveConversationSession {
         if (!this.compatibilityFallback) {
             try {
                 this.residency.acknowledgePersisted(sessionVersion, revision)
-            } catch {
-                this.activateCompatibilityFallback(this.conversation.message.length)
+            } catch (error) {
+                this.activateCompatibilityFallback(this.conversation.message.length, { error })
             }
         }
         this.persistedSessionVersion = sessionVersion
         this.currentStoreRevision = revision
         return true
+    }
+
+    acknowledgeFallbackPersisted(
+        sessionToken: ConversationSessionToken,
+        sessionVersion: number,
+        revision: DataRevision,
+    ): boolean {
+        this.assertActive()
+        if (sessionToken !== this.locatorRegistry.sessionToken) {
+            throw new MessageLocatorMismatchError('Conversation persistence belongs to another session')
+        }
+        this.activateCompatibilityFallback(this.conversation.message.length)
+        return this.acknowledgePersisted(sessionToken, sessionVersion, revision)
     }
 
     materializeCompatibilitySnapshot(): ActiveConversationCompatibilitySnapshot {
@@ -2095,8 +2108,8 @@ export class ActiveConversationSession {
         let pin: ConversationRangePin
         try {
             pin = this.residency.pinRange(startIndex, endIndex, 'background')
-        } catch {
-            this.activateCompatibilityFallback(this.conversation.message.length)
+        } catch (error) {
+            this.activateCompatibilityFallback(this.conversation.message.length, { error })
             return
         }
         try {
@@ -2115,8 +2128,8 @@ export class ActiveConversationSession {
                     ),
                 })
             }
-        } catch {
-            this.activateCompatibilityFallback(this.conversation.message.length)
+        } catch (error) {
+            this.activateCompatibilityFallback(this.conversation.message.length, { error })
         } finally {
             pin.release()
         }
@@ -2181,8 +2194,8 @@ export class ActiveConversationSession {
                 for (const mutation of event.mutations) {
                     this.residency.recordReplaceRange(mutation)
                 }
-            } catch {
-                this.activateCompatibilityFallback(this.conversation.message.length)
+            } catch (error) {
+                this.activateCompatibilityFallback(this.conversation.message.length, { error })
             }
         }
         this.notifySubscribers(event)
@@ -2198,8 +2211,17 @@ export class ActiveConversationSession {
         }
     }
 
-    private activateCompatibilityFallback(expectedMessageCount: number): void {
+    private activateCompatibilityFallback(
+        expectedMessageCount: number,
+        failure?: { error: unknown },
+    ): void {
         if (this.compatibilityFallback) return
+        if (failure) {
+            console.error(
+                'Active conversation residency failed; using compatibility fallback',
+                failure.error,
+            )
+        }
         this.compatibilityFallback = true
         this.compatibilityBaselineMessageCount = expectedMessageCount
         this.residency.discardResidentState()

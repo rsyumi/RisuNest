@@ -180,10 +180,11 @@ export class NativeCommitTransport {
             try {
                 if (buffer) webview.releaseBuffer(buffer)
             } finally {
-                if (nativeId)
-                    await deps
-                        .invoke('pds_commit_shared_cancel', { id: nativeId })
-                        .catch(() => undefined)
+                try {
+                    await deps.invoke('pds_commit_shared_cancel', { requestId })
+                } catch (cleanupError) {
+                    console.error('Persistence shared commit cleanup failed', cleanupError)
+                }
             }
         }
     }

@@ -18,7 +18,11 @@ function canonicalize(value: unknown): unknown {
 }
 
 export function canonicalJson(value: unknown): string {
-    return JSON.stringify(canonicalize(value))
+    const serialized = JSON.stringify(canonicalize(value))
+    if (serialized === undefined) {
+        throw new TypeError('Canonical JSON value is not serializable')
+    }
+    return serialized
 }
 
 export function canonicalClone<T>(value: T): T {
@@ -586,6 +590,7 @@ export class PluginStorageBaseline {
         for (const mutation of mutations) {
             if (mutation.type === 'clear') this.entries.clear()
             else if (mutation.type === 'delete') this.entries.delete(mutation.key)
+            else if (mutation.value === undefined) this.entries.delete(mutation.key)
             else this.entries.set(mutation.key, canonicalJson(mutation.value))
         }
         this.serialized = undefined
@@ -641,6 +646,8 @@ export function applyPluginStorageMutationsInPlace(
         if (mutation.type === 'clear') {
             for (const key of Object.keys(next)) delete next[key]
         } else if (mutation.type === 'delete') {
+            delete next[mutation.key]
+        } else if (mutation.value === undefined) {
             delete next[mutation.key]
         } else {
             const value = canonicalClone(mutation.value)

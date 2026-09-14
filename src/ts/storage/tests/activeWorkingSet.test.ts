@@ -912,6 +912,54 @@ describe('ActiveWorkingSet', () => {
         expect([...harness.workingSet.activeCharacterIds]).toEqual([])
     })
 
+    it('keeps the selected conversation target current when leave becomes blocked during flush', async () => {
+        const harness = makeHarness(makeLease({
+            characterId: 'char-a',
+            chats: [makeChat('chat-a')],
+        }), { hydrateFullCharacter: true })
+        await harness.workingSet.activateCharacter('char-a')
+        const flushing = deferred<void>()
+        harness.coordinator.flushPendingData.mockReturnValueOnce(flushing.promise)
+
+        const leaving = harness.workingSet.deactivate()
+        harness.setWorkingSetReleaseAllowed(false)
+        flushing.resolve()
+
+        await expect(leaving).resolves.toBe(false)
+        harness.setWorkingSetReleaseAllowed(true)
+        const target = harness.workingSet.captureSelectedConversationTarget()
+        expect(target).not.toBeNull()
+        const lease = await harness.workingSet.acquireCompleteConversation(
+            'after-blocked-leave',
+            target!,
+        )
+        lease.release()
+    })
+
+    it('keeps the selected conversation target current when activation becomes blocked during flush', async () => {
+        const harness = makeHarness(makeLease({
+            characterId: 'char-a',
+            chats: [makeChat('chat-a'), makeChat('chat-b')],
+        }), { hydrateFullCharacter: true })
+        await harness.workingSet.activateCharacter('char-a')
+        const flushing = deferred<void>()
+        harness.coordinator.flushPendingData.mockReturnValueOnce(flushing.promise)
+
+        const activating = harness.workingSet.activateConversation('chat-b')
+        harness.setWorkingSetActivationAllowed(false)
+        flushing.resolve()
+
+        await expect(activating).resolves.toBe(false)
+        harness.setWorkingSetActivationAllowed(true)
+        const target = harness.workingSet.captureSelectedConversationTarget()
+        expect(target).not.toBeNull()
+        const lease = await harness.workingSet.acquireCompleteConversation(
+            'after-blocked-activation',
+            target!,
+        )
+        lease.release()
+    })
+
     it('keeps the active character resident while generation is busy before streaming starts', async () => {
         const harness = makeHarness(makeLease({ characterId: 'char-a' }))
         await harness.workingSet.activateCharacter('char-a')
@@ -1748,6 +1796,13 @@ describe('ActiveWorkingSet', () => {
             { role: 'user', data: 'unsaved' },
             { role: 'char', data: 'pending command' },
         ])
+        const currentTarget = workingSet.captureSelectedConversationTarget()
+        expect(currentTarget).not.toBeNull()
+        const currentLease = await workingSet.acquireCompleteConversation(
+            'after-failed-activation',
+            currentTarget!,
+        )
+        currentLease.release()
     })
 
     it('keeps a streaming previous body pinned while selecting the hydrated target', async () => {

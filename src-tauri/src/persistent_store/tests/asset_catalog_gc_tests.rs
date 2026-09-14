@@ -215,6 +215,42 @@ fn asset_object_catalog_is_idempotent_conflict_safe_and_stably_paged() {
 }
 
 #[test]
+fn direct_asset_object_registration_uses_the_initialized_store_database() {
+    use super::asset_object_catalog::AssetObjectRegistration;
+
+    let directory = tempfile::tempdir().expect("create direct registration directory");
+    let store = PersistentStore::open(directory.path()).expect("initialize persistent store");
+    let registration = AssetObjectRegistration {
+        object_hash: "ab".repeat(32),
+        byte_size: 42,
+    };
+
+    super::super::register_asset_objects_at_root(directory.path(), &[registration.clone()], 17)
+        .expect("register through direct database connection");
+
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT byte_size, created_at_ms FROM asset_objects WHERE object_hash = ?1",
+                [&registration.object_hash],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .expect("read directly registered object"),
+        (42, 17)
+    );
+}
+
+#[test]
+fn direct_asset_object_registration_does_not_create_a_missing_database() {
+    let directory = tempfile::tempdir().expect("create missing database directory");
+    let database_path = directory.path().join("persistent").join("persistent.db");
+
+    assert!(super::super::register_asset_objects_at_root(directory.path(), &[], 0).is_err());
+    assert!(!database_path.exists());
+}
+
+#[test]
 fn asset_object_catalog_revives_a_recreated_deleted_hash_transactionally() {
     use super::asset_object_catalog::AssetObjectRegistration;
 

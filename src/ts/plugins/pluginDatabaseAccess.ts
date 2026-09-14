@@ -523,7 +523,9 @@ export function createPluginDatabaseAccess(
     dependencies: PluginDatabaseAccessDependencies,
 ): PluginDatabaseAccess {
     let openPromise: Promise<void> | undefined
-    const openStore = () => (openPromise ??= dependencies.store.open())
+    const openStore = () => (openPromise ??= dependencies.store.open().finally(() => {
+        openPromise = undefined
+    }))
     const acquireCurrentRevisionReader = (): Promise<PersistentRevisionLease> =>
         acquireCurrentRevisionWithRetry(
             (revision) => dependencies.store.acquireRevision(revision),
@@ -1196,7 +1198,9 @@ export function createProductionPluginChatOutputProjector(
     let openPromise: Promise<void> | undefined
     return async (input) => {
         const persistentStore = store ??= getPersistentDataStore()
-        await (openPromise ??= persistentStore.open())
+        await (openPromise ??= persistentStore.open().finally(() => {
+            openPromise = undefined
+        }))
         const lease = await acquireCurrentRevisionWithRetry(
             (revision) => persistentStore.acquireRevision(revision),
             async () => (await persistentStore.readRoot()).revision,

@@ -1,8 +1,5 @@
 import type { Database, character, groupChat } from './database.svelte'
-import {
-    createConversationSummaryStubFromChat,
-    isConversationSummaryStub,
-} from './conversationResidency'
+import { isConversationSummaryStub } from './conversationResidency'
 import {
     createCatalogCharacterStub,
     getCatalogCharacterMetadata,
@@ -43,24 +40,6 @@ export class WorkingSetResidencyRegistry {
     pinSelectedConversation(characterId: string, conversationId: string): void {
         this.selectedConversationIds.set(characterId, conversationId)
         this.markConversationHydrated(characterId, conversationId)
-    }
-
-    releaseConversationToSummary(
-        character: CompleteCharacter,
-        conversationId: string,
-    ): boolean {
-        if (!this.canReleaseConversation(character, conversationId)) return false
-        const index = character.chats.findIndex((conversation) => conversation.id === conversationId)
-        if (index < 0) return false
-        const conversation = character.chats[index]
-        if (isConversationSummaryStub(conversation)) return false
-        character.chats[index] = createConversationSummaryStubFromChat(
-            character.chaId,
-            conversation,
-            index,
-        )
-        this.markConversationReleased(character.chaId, conversationId)
-        return true
     }
 
     markConversationReleased(characterId: string, conversationId: string): void {
@@ -130,19 +109,6 @@ export class WorkingSetResidencyRegistry {
         })
         this.markCharacterReleased(id)
         return true
-    }
-
-    releaseCharacterMessages(character: CompleteCharacter): boolean {
-        if (!this.evictionAllowed) return false
-        if (character.chats.some((chat) => chat.isStreaming)) return false
-        let released = false
-        for (const chat of character.chats) {
-            if (!Array.isArray(chat.message)) continue
-            chat.message = []
-            released = true
-        }
-        if (released) this.markCharacterReleased(character.chaId)
-        return released
     }
 
     markCharacterReleased(id: string): void {

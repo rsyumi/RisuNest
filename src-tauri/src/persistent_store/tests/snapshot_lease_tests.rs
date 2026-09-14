@@ -956,6 +956,64 @@ fn active_lease_rejects_truncate_and_final_release_truncates_the_wal() {
 }
 
 #[test]
+fn renderer_session_release_closes_every_attached_lease_and_truncates_the_wal() {
+    let (directory, mut store, _) = open_fixture();
+    store
+        .connection
+        .execute_batch("PRAGMA wal_autocheckpoint = 0")
+        .expect("disable automatic checkpoints");
+    let first = store.acquire_revision(1).expect("acquire first reader");
+    let second = store.acquire_revision(1).expect("acquire second reader");
+    store
+        .set_app_kv("after-session-readers", &json!(true))
+        .expect("append WAL frame after readers");
+
+    store
+        .release_all_revision_leases()
+        .expect("release renderer session readers");
+
+    assert_eq!(store.active_readers.active_count(), 0);
+    assert!(matches!(
+        store.read_root(Some(&first.lease)),
+        Err(StoreError::SnapshotReleased)
+    ));
+    assert!(matches!(
+        store.read_root(Some(&second.lease)),
+        Err(StoreError::SnapshotReleased)
+    ));
+    let database_path = directory.path().join("persistent/persistent.db");
+    let wal_path = PathBuf::from(format!("{}-wal", database_path.display()));
+    assert_eq!(fs::metadata(wal_path).expect("read final WAL").len(), 0);
+}
+
+#[test]
+fn attached_export_can_leave_the_store_lock_and_restore_the_same_lease() {
+    let (_directory, mut store, _) = open_fixture();
+    let lease = store.acquire_revision(1).expect("acquire export reader");
+
+    let prepared = store
+        .detach_risu_save_export(&lease.lease)
+        .expect("detach export reader");
+    assert!(matches!(
+        store.read_root(Some(&lease.lease)),
+        Err(StoreError::SnapshotReleased)
+    ));
+    assert_eq!(prepared.reader().unwrap().target.revision, 1);
+    let exported = prepared
+        .create_attached_export(false)
+        .expect("export through detached attached reader");
+
+    store
+        .reattach_risu_save_export(prepared)
+        .expect("reattach export reader");
+    assert_eq!(store.read_root(Some(&lease.lease)).unwrap().revision, 1);
+    store
+        .cleanup_risu_save_export(Path::new(&exported.path))
+        .unwrap();
+    store.release_revision(&lease.lease).unwrap();
+}
+
+#[test]
 fn detached_export_reader_rejects_truncate_until_it_is_released() {
     let (directory, mut store, _) = open_fixture();
     store
@@ -987,6 +1045,28 @@ fn detached_export_reader_rejects_truncate_until_it_is_released() {
     let database_path = directory.path().join("persistent/persistent.db");
     let wal_path = PathBuf::from(format!("{}-wal", database_path.display()));
     assert_eq!(fs::metadata(wal_path).expect("read final WAL").len(), 0);
+}
+
+#[test]
+fn renderer_session_release_does_not_close_a_detached_native_job_reader() {
+    let (_directory, mut store, _) = open_fixture();
+    let mut prepared = store
+        .prepare_risu_save_export(1)
+        .expect("prepare detached native job reader");
+    let attached = store.acquire_revision(1).expect("acquire renderer reader");
+
+    store
+        .release_all_revision_leases()
+        .expect("release renderer readers");
+
+    assert_eq!(store.active_readers.active_count(), 1);
+    assert!(matches!(
+        store.read_root(Some(&attached.lease)),
+        Err(StoreError::SnapshotReleased)
+    ));
+    assert_eq!(prepared.reader().unwrap().target.revision, 1);
+    prepared.release_reader().unwrap();
+    assert_eq!(store.active_readers.active_count(), 0);
 }
 
 #[test]

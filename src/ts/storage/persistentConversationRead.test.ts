@@ -224,3 +224,28 @@ it('releases a lease acquired after cancellation', async () => {
     await expect(reading).rejects.toBeInstanceOf(PersistentConversationReadCancelledError)
     expect(harness.release).toHaveBeenCalledOnce()
 })
+
+it('preserves cancellation when releasing the just-acquired lease fails', async () => {
+    const harness = createHarness([{ role: 'user', data: 'one' } as Message])
+    const releaseError = new Error('release failed')
+    harness.release.mockRejectedValue(releaseError)
+    const pendingLease = deferred<Awaited<ReturnType<typeof harness.store.acquireRevision>>>()
+    vi.mocked(harness.store.acquireRevision).mockImplementationOnce(() => pendingLease.promise)
+    const controller = new AbortController()
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+    const reading = harness.read(controller.signal)
+    await vi.waitFor(() => expect(harness.store.acquireRevision).toHaveBeenCalledOnce())
+    controller.abort()
+    pendingLease.resolve(
+        harness.lease as unknown as Awaited<ReturnType<typeof harness.store.acquireRevision>>,
+    )
+
+    await expect(reading).rejects.toBeInstanceOf(PersistentConversationReadCancelledError)
+    expect(harness.release).toHaveBeenCalledTimes(2)
+    expect(consoleError).toHaveBeenCalledWith(
+        'Persistent conversation revision release failed after current-read validation failed',
+        releaseError,
+    )
+    consoleError.mockRestore()
+})

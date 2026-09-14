@@ -38,7 +38,8 @@ impl ActiveReaderRegistry {
     /// that interval GC/eviction must defer instead of rescanning the full asset
     /// library on every small edit. Register under the repository mutation lock.
     pub(crate) fn defer_asset_inventory(self: &Arc<Self>) -> DeferredAssetInventory {
-        self.deferred_asset_inventories.fetch_add(1, Ordering::SeqCst);
+        self.deferred_asset_inventories
+            .fetch_add(1, Ordering::SeqCst);
         DeferredAssetInventory(Arc::clone(self))
     }
     fn register(&self) {
@@ -91,7 +92,10 @@ impl ActiveReaderRegistry {
 pub(crate) struct DeferredAssetInventory(Arc<ActiveReaderRegistry>);
 impl Drop for DeferredAssetInventory {
     fn drop(&mut self) {
-        let previous = self.0.deferred_asset_inventories.fetch_sub(1, Ordering::SeqCst);
+        let previous = self
+            .0
+            .deferred_asset_inventories
+            .fetch_sub(1, Ordering::SeqCst);
         debug_assert!(previous > 0);
     }
 }

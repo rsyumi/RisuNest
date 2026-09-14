@@ -133,7 +133,10 @@ export async function createPeriodicNativeSnapshotIfDue(
         (newest, snapshot) => Math.max(newest, snapshot.modifiedAt),
         Number.NEGATIVE_INFINITY,
     )
-    if (now - newestModifiedAt < PERIODIC_SNAPSHOT_INTERVAL_MS) return null
+    if (
+        newestModifiedAt <= now
+        && now - newestModifiedAt < PERIODIC_SNAPSHOT_INTERVAL_MS
+    ) return null
     return createNativePersistentSnapshot('periodic')
 }
 
