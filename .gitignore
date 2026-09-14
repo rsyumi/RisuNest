@@ -47,6 +47,7 @@ __pycache__/
 .tauri/
 dist.zip
 /scripts/*
+!/scripts/release/
 !/scripts/exportPersistentFixture.ts
 !/scripts/phase3AndroidSmoke.mjs
 !/scripts/phase3AndroidSmoke.test.ts
