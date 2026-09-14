@@ -51,6 +51,11 @@ export interface ServerCycleOptions {
 }
 export type ServerSyncProgress =
   "saving" | "preparing" | "applying" | "refreshing" | "publishing";
+/** Records the running cycle applies or uploads, and how many are done. */
+export interface ServerCycleItems {
+  done: number;
+  total: number;
+}
 type Prepared =
   | { kind: "report"; result: ServerCycle }
   | {
@@ -69,6 +74,18 @@ export class ServerSyncError extends Error {
     super(code);
     this.name = "ServerSyncError";
   }
+}
+function isCycleItems(value: unknown): value is ServerCycleItems {
+  if (typeof value !== "object" || value === null) return false;
+  const { done, total } = value as Record<string, unknown>;
+  return (
+    typeof done === "number" &&
+    typeof total === "number" &&
+    Number.isSafeInteger(done) &&
+    Number.isSafeInteger(total) &&
+    done >= 0 &&
+    total >= done
+  );
 }
 export function serverSyncError(cause: unknown): ServerSyncError {
   if (cause instanceof ServerSyncError) return cause;
@@ -90,6 +107,7 @@ export function createServerSyncFacade(options: {
   onProgress?: (phase: ServerSyncProgress) => void;
   onVerifiedBytes?: (bytes: string) => void;
   onRetryableFailure?: (code: string | undefined) => void;
+  onCycleItems?: (items: ServerCycleItems) => void;
 }) {
   const native = options.invoke ?? invoke;
   const transfer = async <T>(
@@ -98,20 +116,24 @@ export function createServerSyncFacade(options: {
   ): Promise<T> => {
     let closed = false;
     let sampling = false;
+    const observed = Boolean(
+      options.onVerifiedBytes ||
+        options.onRetryableFailure ||
+        options.onCycleItems,
+    );
     const sample = async () => {
-      if (
-        sampling ||
-        (!options.onVerifiedBytes && !options.onRetryableFailure)
-      )
-        return;
+      if (sampling || !observed) return;
       sampling = true;
       try {
-        const [verified, failure] = await Promise.allSettled([
+        const [verified, failure, items] = await Promise.allSettled([
           options.onVerifiedBytes
             ? native<string>("server_sync_verified_bytes")
             : Promise.resolve(undefined),
           options.onRetryableFailure
             ? native<string | null>("server_sync_retryable_failure")
+            : Promise.resolve(undefined),
+          options.onCycleItems
+            ? native<ServerCycleItems>("server_sync_progress_counts")
             : Promise.resolve(undefined),
         ]);
         if (closed) return;
@@ -129,13 +151,18 @@ export function createServerSyncFacade(options: {
           )
             options.onRetryableFailure?.(code ?? undefined);
         }
+        if (items.status === "fulfilled" && isCycleItems(items.value))
+          options.onCycleItems?.({
+            done: items.value.done,
+            total: items.value.total,
+          });
       } catch {
         /* Progress must never change the synchronization outcome. */
       } finally {
         sampling = false;
       }
     };
-    const timer = options.onVerifiedBytes || options.onRetryableFailure
+    const timer = observed
       ? setInterval(() => void sample(), 1000)
       : undefined;
     try {

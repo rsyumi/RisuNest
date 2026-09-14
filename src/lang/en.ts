@@ -58,7 +58,7 @@ export const languageEnglish = {
         preservedSourceHelp:
             'These files are kept separately because the restored library does not need them. They do not sync automatically and can be deleted from the source preservation area.',
         title: 'RisuNest backup',
-        export: 'Full backup (.risunest)',
+        export: 'RisuNest full backup (.risunest)',
         restore: 'Restore backup file',
         library: 'Library and attachments',
         device: 'Device plugin data',
@@ -72,6 +72,8 @@ export const languageEnglish = {
             'Selected device data is captured after restarting the app into maintenance mode.',
         helpRestore:
             'Selected areas replace the data on this device, including keys that exist only here. Unselected areas stay unchanged. No automatic backup will be kept. Back up your current data first if you want to keep it.',
+        helpRestoreFirstRun:
+            'Selected areas are brought onto this device. Unselected areas can be restored later from settings with the same file.',
         repair: 'This file preserves damaged source data. Its library cannot be activated until repaired.',
         continue: 'Continue',
         cancel: 'Cancel',
@@ -1943,7 +1945,8 @@ export const languageEnglish = {
         serverSync: {
             registrationCode: 'Registration code',
             registrationCodeHelp:
-                'Paste the code issued for this device, or scan its QR code. Review the server below before connecting.',
+                'Paste the code made for this device, or scan its QR code. You check the server details before connecting.',
+            codeNote: 'Each device needs its own registration code.',
             readRegistration: 'Read code',
             scanRegistration: 'Scan QR code',
             scanRegistrationHelp: 'Point the camera at the registration QR code.',
@@ -1954,64 +1957,73 @@ export const languageEnglish = {
             cameraUnavailable:
                 'The camera could not scan this code. Try again or paste the code.',
             registrationBlocked:
-                'Disconnect the current server before importing a new registration.',
-            discardRegistration: 'Clear registration input',
-            directoryEnabled: 'Server address discovery enabled',
+                'Disconnect the current server before entering a new registration code.',
+            discardRegistration: 'Clear input',
+            directoryEnabled: 'Server address lookup',
+            manualEntry: 'Enter manually',
+            reviewTitle: 'Check the server',
+            reviewLead: 'These server details were read from the registration code. Check them, then connect.',
+            otherCode: 'Another code',
+            connectHint:
+                'Connecting brings the library on the sync server to this device. A large library can take a while.',
+            connectRow: 'Server connection',
+            connectRowHelp:
+                'Paste the registration code made for this device in the server admin screen, or scan its QR code. Each device needs its own registration code.',
+            enterCode: 'Enter registration code',
+            viewList: 'View list',
+            register: 'Register',
             residency: {
-                title: 'Assets on this device',
+                title: 'Asset storage',
                 description:
-                    'Choose separately for each device. Keep files on a PC, or load media directly from the server on a mobile device.',
-                full: 'Keep all files locally',
-                remote: 'Use remote files',
-                selected: 'Current policy',
-                local: 'Local files',
-                remoteOnly: 'Stored only on the server',
-                offlineReady: 'All tracked files are available offline.',
-                onlineNeeded:
-                    'An internet connection is needed for files stored only on the server.',
-                unavailable: 'Files with no available copy',
+                    'The asset storage mode is chosen separately for each device. Keeping files locally loads assets faster but increases sync time and the space used. Using remote files saves space, but loading an asset can take longer.',
+                full: 'Keep everything on this device',
+                remote: 'Load from the server when needed',
+                local: 'Files on this device',
+                remoteOnly: 'Files only on the server',
+                offlineReady: 'Every file is on this device, so it works without internet.',
+                onlineNeeded: 'Opening a file that is only on the server needs an internet connection.',
+                unavailable: 'Files on neither this device nor the server',
                 cleanupNote:
-                    'Changing to remote mode keeps existing files. Cleanup uploads and verifies files before removing local copies. Files needed by local snapshots remain on the server until those snapshots are deleted and cleanup runs. Attachments read for export or AI requests are downloaded and can be cleared again.',
-                clean: 'Clear local copies',
-                refresh: 'Refresh',
+                    'Switching to loading from the server keeps the files already on this device. Clearing copies checks that a file is on the server before removing the copy here. Files a local snapshot needs stay on the server until that snapshot is deleted and cleanup runs. Attachments used for export or AI requests are downloaded again and can be cleared later.',
+                clean: 'Clear copies on this device',
                 cancel: 'Cancel',
                 working:
                     'Processing files… Cancellation takes effect after the current request.',
-                freed: 'Local space cleared',
+                freed: 'Space cleared',
             },
             management: {
-                title: 'Server sync storage',
-                disk: 'Local disk usage',
-                complete: 'Completed backup payloads',
-                incomplete: 'Incomplete preservation (protected)',
-                cache: 'Transfer cache',
-                protected: 'Protected',
+                title: 'Storage used by sync',
+                disk: 'Space used on this device',
+                complete: 'Finished backups',
+                incomplete: 'Unfinished backups (never cleaned up automatically)',
+                cache: 'Temporary files',
+                protected: 'Still needed',
                 reclaimable: 'Can be cleared',
-                clean: 'Clear unused transfer objects',
+                clean: 'Clear unneeded temporary files',
                 more: 'Older backups',
                 refresh: 'Refresh list',
                 scope: 'Library only. Device plugin data is not included.',
                 restoreConfirm:
-                    'Restore this library backup? The current library will be backed up first. Synchronization stays paused.',
-                deleteConfirm:
-                    'Delete this completed server conflict backup from this device?',
+                    'Go back to this backup? The current library is backed up first, and sync stays paused.',
+                deleteConfirm: 'Delete this conflict backup from this device?',
                 cleanConfirm:
-                    'Clear unused transfer objects? Active work, required bases and local library files are kept.',
+                    'Clear unneeded temporary files? Files the running operation needs and the library files on this device are kept.',
             },
             backups: 'Conflict backups',
             backupHelp:
-                'Restore the complete library from either side of a conflict. The current library is backed up before replacement. Sync stays paused so you can check the restored contents before continuing.',
-            noBackups: 'No completed conflict backups yet.',
+                'Go back to the data kept from this device or from the server when a conflict happened. The current data is backed up first. Sync stays paused so you can check the restored contents before continuing.',
+            backupCount: '{0} conflict backups',
+            noBackups: 'No conflict backups.',
             restoreLocalBackup: 'Restore this device’s backup',
             restoreRemoteBackup: 'Restore server backup',
             reregister: 'Register a new device',
             reregisterHelp:
-                'Revoke the previous device on your server, then enter newly issued credentials for this library. Local edits are kept and differences will be compared before syncing.',
+                'Register this device again on the server, then enter the new registration code. Edits on this device are kept and matched with the server.',
             reconcile: 'Compare restored server',
             reconcileHelp:
-                'The server was restored to a different history. Back up the local state and compare both versions before continuing.',
+                'The server was restored to a different history. This device’s data is backed up and both sides are compared before continuing.',
             activationHelp:
-                'Confirm the saved revision before editing. Select Refresh screen to retry.',
+                'Check that saving finished before editing. Select Refresh screen to check again.',
             title: 'Personal sync server',
             description:
                 'Keep this library in sync across your devices. Your edits are saved locally first.',
@@ -2020,9 +2032,9 @@ export const languageEnglish = {
             deviceId: 'Device ID',
             token: 'Device token',
             credentialsHelp:
-                'Use the address and device credentials issued by your server. Each device needs its own credentials.',
+                'Enter the address and this device’s credentials made in the server admin screen. Each device needs its own.',
             credentialUnavailable:
-                'The operating system could not open this device credential. Unlock its key storage or revoke the old device on the server and register a new device token. Linux requires an unlocked Secret Service.',
+                'The operating system could not open this device’s credentials. Unlock its key storage, or register this device again on the server and enter the new registration code. Linux requires an unlocked Secret Service.',
             connect: 'Connect and sync',
             disconnect: 'Disconnect',
             syncNow: 'Sync now',
@@ -2030,33 +2042,38 @@ export const languageEnglish = {
             refresh: 'Refresh screen',
             disconnected: 'Not connected',
             ready: 'Connected',
-            lastSuccess: 'Last successful sync',
+            lastSuccess: 'Last sync',
             running: 'Syncing',
-            verifiedBytes:
-                'Object data verified this cycle (before delta compression)',
+            verifiedBytes: 'Data transferred',
+            transferRate: 'Transfer speed',
+            progressItems: 'Items processed',
+            pendingChanges: 'Changes to upload',
+            progressLabel: 'Progress',
+            elapsed: 'Elapsed',
+            count: '{0}',
+            itemsCount: '{0} items',
             progress: {
-                saving: 'Saving local changes',
-                preparing: 'Comparing and downloading changes',
-                applying: 'Applying verified changes',
-                refreshing: 'Refreshing local data',
-                publishing: 'Uploading and confirming changes',
+                saving: 'Saving changes on this device',
+                preparing: 'Receiving changes from the server',
+                applying: 'Applying received changes',
+                refreshing: 'Updating the screen',
+                publishing: 'Uploading this device’s changes',
             },
             paused: 'Paused',
             pending: 'Finishing sync',
-            registrationRequired: 'New device credentials required',
+            registrationRequired: 'New registration code required',
             refreshPending: 'Screen refresh needed',
-            initialScan: 'Preparing the first complete comparison',
-            queued: '{0} items waiting to sync',
+            initialScan: 'Preparing the first full comparison with the server',
             pendingHelp:
-                'Resume to confirm the unfinished operation before disconnecting.',
+                'The sync in progress has to finish before disconnecting. Select Sync now.',
             conflict: 'Conflicts need attention',
             conflictCount: '{0} conflicting items',
             conflictHelp:
-                'These items changed on both sides. Choose which version to keep. A backup is required before applying your choice.',
+                'The same items were edited on this device and on the server. Choose which side to keep. Both sides are saved as conflict backups before applying.',
             keepLocal: 'Keep this device',
             keepRemote: 'Keep server version',
             errorHelp:
-                'Sync stopped. Your local edits are retained. Check the connection and retry.',
+                'Sync could not finish. Your edits on this device are unchanged. Check your internet connection and try again.',
             refreshHelp:
                 'The received changes are saved. Refresh the screen to continue editing.',
         },
@@ -2322,15 +2339,14 @@ export const languageEnglish = {
             },
             import: {
                 title: 'Import a backup file',
-                lead: 'Choose a .risudat file exported from RisuNest, or a .bin file exported from RisuAI or PocketRisu.',
+                lead: 'Choose a file you already backed up from RisuNest, RisuAI, or another app to import it.',
                 dropTitle: 'Choose a backup file',
                 choose: 'Choose file',
                 hintAndroid:
                     'Opening a backup file from a file manager also leads here.',
-                pocketTitle: 'PocketRisu / RisuAI backup (.bin)',
-                pocketDesc:
-                    'Loads a risu-backup .bin file exported from either app.',
-                pocketAction: 'Import',
+                supportTitle: 'Supported files',
+                supportDesc:
+                    'Backup files can be a RisuNest .risunest backup or a RisuAI or PocketRisu .bin backup.',
                 warning:
                     'A large backup can take a while. Do not close the app until it finishes.',
                 next: 'Continue',
@@ -2340,20 +2356,38 @@ export const languageEnglish = {
                 lead: 'Choose a RisuNest sync server or your RisuAI account.',
                 hubTitle: 'From a sync server',
                 hubDesc:
-                    'Receives data from a RisuNest sync server. Connect with a QR code or a link.',
+                    'Receives data from a RisuNest sync server. Connect with a QR code or a registration code.',
                 accountTitle: 'From a RisuAI account backup',
                 accountDesc:
                     'Restores the backup uploaded to the RisuAI account server. Chat attachments and inlay images are not restored.',
             },
             hub: {
                 title: 'Connect to a sync server',
+                lead: 'Create a registration code for this device under Device management on the sync server and paste it below.',
+                leadScan:
+                    'Create a registration code for this device under Device management on the sync server, then scan its QR code or paste it below.',
                 stepLink:
-                    'Create a new device registration link under Device management on the sync server.',
+                    'You can create a new device registration code under Device management on the sync server.',
+                stepPaste:
+                    'Paste the code below. On mobile you can scan the QR code instead.',
+                stepReview: 'Check the server details, then connect.',
+                linkHint: 'Opening a registration link also leads here.',
+                reviewLead: 'These server details were read from the registration code. Check them, then connect.',
+                serverTag: 'Sync server',
+                syncingLead: 'Do not close the app until it finishes.',
+                pauseNote: 'If you stop, you can continue syncing later from the settings.',
+                errorSummary: 'Sync could not finish.',
+                errorReason:
+                    'The data on this device is unchanged. Check your internet connection and try again.',
+                pendingReason:
+                    'The server is still processing. Try again in a moment.',
+                retry: 'Try again',
             },
             account: {
                 title: 'RisuAI account backup',
                 lead: 'Sign in with your RisuAI account to load the backup on the account server. The sign-in window opens inside the app.',
                 login: 'Sign in with a RisuAI account',
+                closeLogin: 'Close sign-in',
                 hint: 'If you do not have an account, use a backup file or sync instead.',
                 signedIn: 'Signed in as {0}',
                 cont: 'Continue',

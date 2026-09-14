@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { IDBFactory } from "fake-indexeddb";
 import { tick } from "svelte";
+import { language } from "../../../lang";
 import {
   selectPortableBackupExport,
   selectPortableBackupRestore,
@@ -87,5 +88,31 @@ describe("portable backup scope selection", () => {
     current.dispatchEvent(new Event("cancel", { cancelable: true }));
     await expect(pending).resolves.toBeNull();
     expect(document.querySelector("dialog")).toBeNull();
+  });
+  it("describes a first-run restore as an import instead of an overwrite", async () => {
+    const preview = {
+      libraryIncluded: true,
+      repairRequired: false,
+      deviceSections: ["local-storage"],
+    };
+    const firstRun = selectPortableBackupRestore(preview, { firstRun: true });
+    let current = await dialog();
+    expect(current.textContent).toContain(
+      language.portableBackup.helpRestoreFirstRun,
+    );
+    expect(current.textContent).not.toContain(
+      language.portableBackup.helpRestore,
+    );
+    submit(current);
+    await expect(firstRun).resolves.toEqual({
+      library: true,
+      deviceSections: ["local-storage"],
+    });
+
+    const settings = selectPortableBackupRestore(preview);
+    current = await dialog();
+    expect(current.textContent).toContain(language.portableBackup.helpRestore);
+    submit(current);
+    await settings;
   });
 });

@@ -39,6 +39,23 @@ pub(crate) enum Resolution {
     KeepLocal,
     KeepRemote,
 }
+/// Record counts of the cycle in flight, read by the UI beside the byte counter.
+/// `total` covers the records this cycle applies or uploads; `done` advances
+/// once per applied record and once per uploaded record.
+#[derive(Default)]
+pub(crate) struct CycleItemCounter {
+    pub total: std::sync::atomic::AtomicU64,
+    pub done: std::sync::atomic::AtomicU64,
+}
+impl CycleItemCounter {
+    fn advance(counter: Option<&Self>) {
+        if let Some(counter) = counter {
+            counter
+                .done
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CycleOptions {
@@ -51,6 +68,8 @@ pub(crate) struct CycleOptions {
     pub verified_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     #[serde(skip)]
     pub retryable_failure: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
+    #[serde(skip)]
+    pub cycle_items: Option<std::sync::Arc<CycleItemCounter>>,
     #[serde(skip)]
     pub groups: BTreeSet<String>,
 }
@@ -90,6 +109,7 @@ pub(crate) struct PreparedCycle {
     cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     verified_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     retryable_failure: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
+    cycle_items: Option<std::sync::Arc<CycleItemCounter>>,
 }
 fn json<T: Serialize>(value: &T) -> Result<String> {
     String::from_utf8(canonical::encode(value)?)
@@ -175,6 +195,7 @@ impl PersistentStore {
         revision: i64,
         reads: &BTreeMap<String, RecordVersion>,
         scopes: &[ScopeFence],
+        cycle_items: Option<&CycleItemCounter>,
     ) -> Result<()> {
         if self.server_pending()?.is_some() {
             return Err(SyncError::new("operation-already-pending", 409));
@@ -234,7 +255,7 @@ impl PersistentStore {
             |r| r.get(0),
         )?;
         if pages == 1 {
-            self.upload_pending_objects(transfer)?;
+            self.upload_pending_objects(transfer, cycle_items)?;
             let body: Vec<u8> = self.connection.query_row(
                 "SELECT body FROM server_sync_operation_pages WHERE page=0",
                 [],
@@ -365,7 +386,7 @@ impl PersistentStore {
         } else if progress.status != 200 {
             return Err(response_error(progress));
         }
-        self.upload_pending_objects(transfer)?;
+        self.upload_pending_objects(transfer, None)?;
         // Pages are idempotent by index and exact bytes. Replaying them is safe
         // after process death between a successful PUT and recording its response.
         let mut page_index = 0i64;
@@ -437,7 +458,11 @@ impl PersistentStore {
             Err(response_error(reply))
         }
     }
-    fn upload_pending_objects(&self, transfer: &Transfer<'_>) -> Result<()> {
+    fn upload_pending_objects(
+        &self,
+        transfer: &Transfer<'_>,
+        cycle_items: Option<&CycleItemCounter>,
+    ) -> Result<()> {
         let mut remote_context = None;
         self.connection.execute_batch("CREATE TEMP TABLE IF NOT EXISTS server_upload_objects(hash TEXT PRIMARY KEY); DELETE FROM server_upload_objects;")?;
         let mut after = String::new();
@@ -521,6 +546,7 @@ impl PersistentStore {
                 transfer.pin(&remote)?;
                 let hints = transfer.record_reference_hints(&version, &base)?;
                 transfer.upload_with_hints(&local, &bases, base_lease, &hints)?;
+                CycleItemCounter::advance(cycle_items);
             }
         }
         Ok(())
@@ -785,6 +811,7 @@ impl PersistentStore {
                 cancellation: options.cancellation.clone(),
                 verified_bytes: options.verified_bytes.clone(),
                 retryable_failure: options.retryable_failure.clone(),
+                cycle_items: options.cycle_items.clone(),
                 groups: required_groups,
             });
         }
@@ -843,6 +870,19 @@ impl PersistentStore {
         let mut bases = Vec::new();
         let mut acknowledged = Vec::new();
         let mut publish_keys = Vec::new();
+        if let Some(counter) = &options.cycle_items {
+            let total: i64 = self.connection.query_row(
+                "SELECT count(*) FROM server_cycle_records WHERE action IN ('apply','publish')",
+                [],
+                |r| r.get(0),
+            )?;
+            counter
+                .total
+                .store(total.max(0) as u64, std::sync::atomic::Ordering::Relaxed);
+            counter
+                .done
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+        }
         after.clear();
         loop {
             let page = cycle_page(&self.connection, &after)?;
@@ -851,6 +891,7 @@ impl PersistentStore {
             }
             for item in page {
                 after = item.key.clone();
+                let applying = item.action == "apply";
                 let remote: RecordVersion = parse(&item.remote)?;
                 let dirty = key_parts(&item.key, revision)?;
                 let (base_version, base_hash) = self.effective_server_base(&item.key, committed)?;
@@ -968,6 +1009,9 @@ impl PersistentStore {
                     _ => return Err(SyncError::new("unresolved-conflict", 409)),
                 };
                 bases.push((item.key, remote, remote_hash));
+                if applying {
+                    CycleItemCounter::advance(options.cycle_items.as_deref());
+                }
             }
         }
         let applied = records.len();
@@ -991,6 +1035,7 @@ impl PersistentStore {
             cancellation: options.cancellation.clone(),
             verified_bytes: options.verified_bytes.clone(),
             retryable_failure: options.retryable_failure.clone(),
+            cycle_items: options.cycle_items.clone(),
         }))
     }
     /// No network work is allowed here. Production holds the JS mutation fence
@@ -1078,6 +1123,7 @@ impl PersistentStore {
             ready.revision,
             &ready.reads,
             &ready.scope_fences,
+            ready.cycle_items.as_deref(),
         )?;
         Ok(CycleResult {
             endpoint: client.config().endpoint.clone(),

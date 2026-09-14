@@ -13,7 +13,13 @@
     type ServerSyncBackupInventory,
     type ServerSyncCacheUsage,
   } from "src/ts/storage/sync/serverSyncProduction";
-  let { onChange }: { onChange?: () => void } = $props();
+  /** `backups` lists the conflict backups, `cache` the space they and the
+   * temporary files take; `all` shows both under one heading. */
+  let {
+    onChange,
+    section = "all",
+  }: { onChange?: () => void; section?: "all" | "backups" | "cache" } =
+    $props();
   let inventory = $state<ServerSyncBackupInventory>();
   let cache = $state<ServerSyncCacheUsage>();
   let busy = $state(false);
@@ -74,15 +80,17 @@
   aria-label={labels.title}
 >
   <div class="flex flex-wrap items-center justify-between gap-2">
-    <h3 class="font-bold">{labels.title}</h3>
-    <button class={button} disabled={busy} onclick={() => action(() => load())}
-      >{labels.refresh}</button
+    {#if section === "all"}<h3 class="font-bold">{labels.title}</h3>{/if}
+    <button
+      class="{button} ml-auto"
+      disabled={busy}
+      onclick={() => action(() => load())}>{labels.refresh}</button
     >
   </div>
   {#if error}<p role="alert" class="text-sm">
       {language.risuNest.storage.actionFailed} ({error})
     </p>{/if}
-  {#if inventory}
+  {#if inventory && section !== "backups"}
     <dl class="grid grid-cols-[1fr_auto] gap-2 text-sm">
       <dt>{labels.disk}</dt>
       <dd>{bytes(inventory.diskBytes)}</dd>
@@ -91,6 +99,8 @@
       <dt>{labels.incomplete} ({inventory.incompleteCount})</dt>
       <dd>{bytes(inventory.incompleteBytes)}</dd>
     </dl>
+  {/if}
+  {#if inventory && section !== "cache"}
     <p class="text-sm text-textcolor2">{labels.scope}</p>
     {#if inventory.items.length === 0}<p class="text-sm">
         {text.noBackups}
@@ -136,8 +146,13 @@
         onclick={() => action(() => load(true))}>{labels.more}</button
       >{/if}
   {/if}
-  {#if cache}
-    <div class="grid gap-2 border-t border-darkborderc pt-3 text-sm">
+  {#if cache && section !== "backups"}
+    <div
+      class="grid gap-2 text-sm"
+      class:border-t={section === "all"}
+      class:border-darkborderc={section === "all"}
+      class:pt-3={section === "all"}
+    >
       <p>{labels.cache}: {bytes(cache.totalBytes)}</p>
       <p>
         {labels.protected}: {bytes(cache.protectedBytes)} · {labels.reclaimable}:

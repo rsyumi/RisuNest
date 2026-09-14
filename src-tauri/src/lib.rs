@@ -635,6 +635,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         server_sync::commands::server_sync_asset_policy,
         server_sync::commands::server_sync_asset_evict,
         server_sync::commands::server_sync_verified_bytes,
+        server_sync::commands::server_sync_progress_counts,
         server_sync::commands::server_sync_retryable_failure,
         server_sync::commands::server_sync_backups,
         server_sync::commands::server_sync_backup_inventory,

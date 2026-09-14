@@ -27,7 +27,6 @@ describe('RisuNest settings accessibility and copy', () => {
         expect(storageSource).not.toContain('Loading...')
         expect(storageSource).toContain('aria-live="polite"')
         expect(backupSource).not.toContain('console.error')
-        expect(serverSyncSource).toContain('aria-labelledby=')
         expect(serverSyncSource).toContain('aria-live=')
     })
 
@@ -42,6 +41,7 @@ describe('RisuNest settings accessibility and copy', () => {
             backupSource,
             androidSource,
             logSource,
+            serverSyncSource,
         ]) {
             expect(source).toContain('<SettingGroup')
             expect(source).not.toMatch(/<h2\b/)

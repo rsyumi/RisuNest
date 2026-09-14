@@ -46,6 +46,12 @@ export type BackupSourceFactory = (
 ) => Promise<NativeFileJobSource | null>
 export interface BackupRestoreOptions extends NativeFileRestoreJobOptions {
     onSource?(source: SourceInfo): void
+    /**
+     * The device holds nothing worth keeping yet, as on the first-run
+     * screen: skip the replacement confirmation and describe the section
+     * choice as a first import rather than an overwrite.
+     */
+    firstRun?: boolean
 }
 
 function combineSignals(...signals: (AbortSignal | undefined)[]) {
@@ -228,6 +234,7 @@ export async function restoreBackupFromNativeSource(
                 >('native_backup_source_format', { source: input })
                 if (
                     format !== 'portable' &&
+                    !options.firstRun &&
                     (!(await alertConfirm(language.backupLoadConfirm)) ||
                         !(await alertConfirm(language.backupLoadConfirm2)))
                 )
@@ -277,6 +284,11 @@ export async function restoreBackupFromNativeSource(
                                         const selection =
                                             await selectPortableBackupRestore(
                                                 preview,
+                                                {
+                                                    firstRun:
+                                                        options.firstRun ??
+                                                        false,
+                                                },
                                             )
                                         replacesLibrary =
                                             selection?.library ?? false

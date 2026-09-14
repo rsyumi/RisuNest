@@ -176,11 +176,16 @@ function normalizeStage(stage: NativeFileJobStage): DialogStageId {
     return stage === 'awaiting-activation' ? 'activating' : stage
 }
 
+/**
+ * The job the native side reports names the file that is actually being
+ * read. The operation's own format only says which admission rules applied
+ * (one common picker admits every backup as a library backup), so it is the
+ * fallback until the first status arrives.
+ */
 function formatOf(
     explicit: NativeFileOperationFormat | undefined,
     status: NativeFileJobStatus | undefined,
 ): NativeFileOperationFormat | undefined {
-    if (explicit) return explicit
     switch (status?.kind) {
         case 'restore-block-risu-save':
             return 'risu-save'
@@ -189,7 +194,7 @@ function formatOf(
         case 'restore-legacy-local-backup':
             return 'local-backup'
         default:
-            return undefined
+            return explicit
     }
 }
 

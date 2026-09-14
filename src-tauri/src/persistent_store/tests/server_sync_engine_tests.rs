@@ -222,12 +222,19 @@ fn two_native_replicas_seed_publish_pull_and_preserve_same_key_conflicts() {
         })
         .unwrap();
     assert_eq!(settle(&mut first).phase, "idle");
+    let items = Arc::new(super::super::server_sync_engine::CycleItemCounter::default());
     let super::super::server_sync_engine::Preparation::Ready(mut ready) = second
-        .server_prepare_cycle(&CycleOptions::default())
+        .server_prepare_cycle(&CycleOptions {
+            cycle_items: Some(items.clone()),
+            ..Default::default()
+        })
         .unwrap()
     else {
         panic!("expected prepared remote update")
     };
+    // The pulled record is counted while it is applied, so the UI can show n/N.
+    assert_eq!(items.total.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(items.done.load(std::sync::atomic::Ordering::Relaxed), 1);
     let previous_revision = second.revision().unwrap();
     second.connection.execute_batch("CREATE TRIGGER synthetic_server_activation_failure BEFORE UPDATE ON server_sync_state BEGIN SELECT RAISE(ABORT,'synthetic'); END;").unwrap();
     assert!(second.server_activate_cycle(&mut ready).is_err());

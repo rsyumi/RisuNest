@@ -342,6 +342,56 @@ describe('nativeFileJobDialogModel', () => {
         expect(complete.subtitle).toBe(copy.formatRisuAi)
     })
 
+    it('names the format after the reported job when the picker admitted it as a library backup', () => {
+        const counts = { entriesRead: 3, pocketMedia: 1, pocketMetadata: 1 }
+        const archive = buildNativeFileJobDialogModel(
+            running({
+                format: 'library-backup',
+                status: status({
+                    kind: 'restore-legacy-local-backup',
+                    detail: detail('reading-archive', {}, counts),
+                }),
+                observedStages: ['reading-archive'],
+            }),
+            null,
+            1_000,
+        )
+        expect(archive.title).toBe(copy.titleLocalBackup)
+        expect(archive.subtitle).toBe(copy.formatPocketRisu)
+        expect(archive.counters.map((counter) => counter.key)).toEqual([
+            'characters',
+            'presets',
+            'assets',
+            'inlays',
+            'coldStorage',
+            'pocketMedia',
+            'skipped',
+        ])
+        expect(stageIds(archive)).toContain('preparing-attachments:pending')
+
+        const portable = buildNativeFileJobDialogModel(
+            running({
+                format: 'library-backup',
+                status: status({ kind: 'restore-portable-backup' }),
+                observedStages: ['reading-database'],
+            }),
+            null,
+            1_000,
+        )
+        expect(portable.title).toBe(copy.titleBackup)
+        expect(portable.counters.map((counter) => counter.key)).toEqual([
+            'characters',
+            'presets',
+        ])
+
+        const unknown = buildNativeFileJobDialogModel(
+            running({ format: 'library-backup' }),
+            null,
+            1_000,
+        )
+        expect(unknown.title).toBe(copy.titleBackup)
+    })
+
     it('uses the RisuSave template and inserts optional stages only when observed', () => {
         const base = running({
             format: 'risu-save',
