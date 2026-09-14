@@ -136,6 +136,13 @@ diagnostic build to persist fixed operation stage names in the owned synthetic
 app's native log. Leave it unset for performance measurements, since logging
 adds native calls and disk writes.
 
+The owned-device runner packs synthetic files with the app's UID/GID because
+older Android tar implementations try to restore archive ownership even under
+`run-as`. Snapshot preparation is polled separately for up to ten minutes; a
+large debug-build snapshot can exceed the ordinary CDP command timeout. This
+setup time is excluded from the samples and does not relax their startup,
+interaction or stabilization checks.
+
 The optional `android-smoke.mjs` uses only `emulator-5580` named
 `risunest_startup_synthetic`, with a private ADB server on port 5038. Create that
 AVD with isolated, disposable synthetic data and launch it with `-no-window`.

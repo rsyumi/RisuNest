@@ -250,10 +250,17 @@ async function main() {
         console.log(JSON.stringify({ phase }))
         const fixture = await addSyntheticAssets(root, identifier, 100000, true)
         const assembled = path.join(directory, 'fixture.tar')
-        const pack = spawnSync('tar', ['-cf', assembled, '-C', root, 'persistent', 'assets-v2'], {
-            timeout: 180_000,
-            windowsHide: true,
-        })
+        const uid = command(['shell', 'run-as', packageName, 'id', '-u'])
+        const gid = command(['shell', 'run-as', packageName, 'id', '-g'])
+        if (!/^\d+$/.test(uid) || !/^\d+$/.test(gid)) throw new Error('Invalid app archive owner')
+        const pack = spawnSync(
+            'tar',
+            ['--uid', uid, '--gid', gid, '-cf', assembled, '-C', root, 'persistent', 'assets-v2'],
+            {
+                timeout: 180_000,
+                windowsHide: true,
+            },
+        )
         if (pack.status !== 0) throw new Error('Synthetic archive creation failed')
         command(['push', assembled, '/data/local/tmp/risunest-m0-fixture.tar'], {
             timeout: 180_000,
@@ -279,9 +286,27 @@ async function main() {
         await launch()
         await delay(15000)
         await client.evaluate("localStorage.setItem('startupInteract', 'true')")
+        phase = 'snapshot'
+        const snapshotStarted = Date.now()
         await client.evaluate(
-            "window.__TAURI_INTERNALS__.invoke('pds_snapshot_create', {reason:'manual'})",
+            `window.__startupSnapshotState = 'pending';
+            void window.__TAURI_INTERNALS__.invoke('pds_snapshot_create', {reason:'manual'}).then(
+                () => { window.__startupSnapshotState = 'ready'; },
+                () => { window.__startupSnapshotState = 'failed'; }
+            );`,
         )
+        let snapshotReady = false
+        while (Date.now() - snapshotStarted < 600_000) {
+            await delay(15000)
+            const status = await client.evaluate('window.__startupSnapshotState')
+            console.log(JSON.stringify({ phase, status, elapsedMs: Date.now() - snapshotStarted }))
+            if (status === 'failed') throw new Error('Synthetic snapshot preparation failed')
+            if (status === 'ready') {
+                snapshotReady = true
+                break
+            }
+        }
+        if (!snapshotReady) throw new Error('Synthetic snapshot preparation timed out')
         if (options.prepareOnly === 'true') return
     }
     const samples = []
