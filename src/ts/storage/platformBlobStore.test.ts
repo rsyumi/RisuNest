@@ -147,6 +147,42 @@ describe('platform BlobStore', () => {
         })
     })
 
+    test('Tauri new Inlay image writes stream input larger than one IPC chunk', async () => {
+        const { backend } = memoryBackend()
+        const metadata = {
+            key: 'large-image', kind: 'inlay' as const, size: 64 * 1024 + 1,
+            mime: 'image/png', name: 'large.png', ext: 'png', inlayType: 'image' as const,
+            width: 1, height: 1,
+        }
+        const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
+            if (command === 'native_media_inlay_input_open') return { capacity: 64 * 1024 }
+            if (command === 'native_media_inlay_input_chunk') {
+                return Number(args?.offset) + (args?.data as number[]).length
+            }
+            if (command === 'native_media_write_inlay_finish') return metadata
+            return undefined
+        })
+        const store = createTauriBlobStore(backend, invoke)
+
+        await expect(store.putNewInlayImage!(
+            'large-image',
+            new Uint8Array(64 * 1024 + 1),
+            { name: 'large.png' },
+        )).resolves.toEqual(metadata)
+
+        expect(invoke.mock.calls.map(([command]) => command)).toEqual([
+            'native_media_inlay_input_open',
+            'native_media_inlay_input_chunk',
+            'native_media_inlay_input_chunk',
+            'native_media_write_inlay_finish',
+            'native_media_inlay_input_cancel',
+        ])
+        expect(invoke).not.toHaveBeenCalledWith(
+            'native_media_write_inlay_image',
+            expect.anything(),
+        )
+    })
+
     test('normalizes maximum dimension before native write invocation', async () => {
         const { backend } = memoryBackend()
         const metadata = {
@@ -469,6 +505,46 @@ describe('platform BlobStore', () => {
         expect(sliceCalls).toEqual([[1, 3]])
     })
 
+    test('OPFS write abort preserves the write failure and does not close an errored stream', async () => {
+        const writeError = new DOMException('quota exhausted', 'QuotaExceededError')
+        const abort = vi.fn(async () => undefined)
+        const close = vi.fn(async () => undefined)
+        const directory = {
+            getFileHandle: async () => ({
+                createWritable: async () => ({
+                    write: async () => { throw writeError },
+                    abort,
+                    close,
+                }),
+            }),
+        } as unknown as FileSystemDirectoryHandle
+        const backend = createOpfsBlobBackend(directory)
+
+        await expect(backend.write('assets/a', Uint8Array.of(1))).rejects.toBe(writeError)
+        expect(abort).toHaveBeenCalledWith(writeError)
+        expect(close).not.toHaveBeenCalled()
+    })
+
+    test('OPFS write reports an abort failure without replacing the write failure', async () => {
+        const writeError = new Error('write failed')
+        const abortError = new Error('abort failed')
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+        const directory = {
+            getFileHandle: async () => ({
+                createWritable: async () => ({
+                    write: async () => { throw writeError },
+                    abort: async () => { throw abortError },
+                    close: vi.fn(),
+                }),
+            }),
+        } as unknown as FileSystemDirectoryHandle
+        const backend = createOpfsBlobBackend(directory)
+
+        await expect(backend.write('assets/a', Uint8Array.of(1))).rejects.toBe(writeError)
+        expect(consoleError).toHaveBeenCalledWith('OPFS blob write abort failed', abortError)
+        consoleError.mockRestore()
+    })
+
     test('production browser selection keeps OPFS reads bounded', async () => {
         const getItem = vi.fn(async () => new Uint8Array([0, 1, 2, 3]))
         const selected = {
@@ -487,6 +563,12 @@ describe('platform BlobStore', () => {
 
         expect(await backend.readRange!('assets/a', { start: 1, endExclusive: 3 })).toEqual(new Uint8Array([1, 2]))
         expect(getItem).not.toHaveBeenCalled()
+    })
+
+    test('rejects an unconfigured browser storage provider', async () => {
+        await expect(createBrowserBlobBackend(null)).rejects.toThrow(
+            'Blob storage provider is not configured',
+        )
     })
 
     test('facade rejects missing native blobs', async () => {

@@ -8,7 +8,7 @@ use crate::persistent_store::{self, PersistentStore, PersistentStoreState, Store
 use crate::trust_boundary::is_lower_hex_256;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
-use std::io::{self, Cursor, ErrorKind};
+use std::io::{self, Cursor, ErrorKind, Seek, SeekFrom, Write};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, State};
@@ -21,13 +21,176 @@ pub(crate) struct ContentDirectObject {
 
 pub(crate) struct DurableCasJobState {
     jobs: Mutex<HashMap<String, DurableCasJob>>,
+    uploads: Mutex<CasUploadPool>,
 }
 
 impl Default for DurableCasJobState {
     fn default() -> Self {
         Self {
             jobs: Mutex::new(HashMap::new()),
+            uploads: Mutex::new(CasUploadPool::default()),
         }
+    }
+}
+
+impl DurableCasJobState {
+    pub(crate) fn reset_renderer_session(&self) -> Result<(), String> {
+        self.uploads
+            .lock()
+            .map_err(|error| format!("CAS upload mutex poisoned: {error}"))?
+            .clear();
+        Ok(())
+    }
+}
+
+const CAS_UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_CAS_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_CONCURRENT_CAS_UPLOADS: usize = 4;
+const MAX_TOTAL_CAS_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+
+struct CasUpload {
+    session_id: String,
+    role: CasObjectRole,
+    total_bytes: u64,
+    received: u64,
+    file: tempfile::NamedTempFile,
+}
+
+#[derive(Default)]
+struct CasUploadPool {
+    uploads: HashMap<String, CasUpload>,
+    reserved_bytes: u64,
+}
+
+impl CasUploadPool {
+    fn open(
+        &mut self,
+        cas: &PayloadCas,
+        upload_id: String,
+        session_id: String,
+        role: CasObjectRole,
+        total_bytes: u64,
+    ) -> io::Result<()> {
+        if uuid::Uuid::parse_str(&upload_id).is_err() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "invalid CAS upload ID",
+            ));
+        }
+        if total_bytes <= CAS_UPLOAD_CHUNK_BYTES as u64 || total_bytes > MAX_CAS_UPLOAD_BYTES {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "CAS upload length is outside the streamed range",
+            ));
+        }
+        if self.uploads.len() >= MAX_CONCURRENT_CAS_UPLOADS || self.uploads.contains_key(&upload_id)
+        {
+            return Err(io::Error::new(
+                ErrorKind::WouldBlock,
+                "CAS upload capacity is unavailable",
+            ));
+        }
+        let reserved_bytes = self
+            .reserved_bytes
+            .checked_add(total_bytes)
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "CAS upload quota overflow"))?;
+        if reserved_bytes > MAX_TOTAL_CAS_UPLOAD_BYTES {
+            return Err(io::Error::new(
+                ErrorKind::WouldBlock,
+                "CAS upload byte quota is unavailable",
+            ));
+        }
+        let file = cas.create_ipc_staging_file()?;
+        self.uploads.insert(
+            upload_id,
+            CasUpload {
+                session_id,
+                role,
+                total_bytes,
+                received: 0,
+                file,
+            },
+        );
+        self.reserved_bytes = reserved_bytes;
+        Ok(())
+    }
+
+    fn append(&mut self, upload_id: &str, offset: u64, chunk: &[u8]) -> io::Result<u64> {
+        let upload = self
+            .uploads
+            .get(upload_id)
+            .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "CAS upload is missing"))?;
+        if offset != upload.received || chunk.is_empty() || chunk.len() > CAS_UPLOAD_CHUNK_BYTES {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "invalid CAS upload chunk",
+            ));
+        }
+        let next = upload
+            .received
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "CAS upload length overflow"))?;
+        if next > upload.total_bytes {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "CAS upload exceeds declared length",
+            ));
+        }
+        let write_result = self
+            .uploads
+            .get_mut(upload_id)
+            .expect("validated CAS upload")
+            .file
+            .write_all(chunk);
+        if let Err(error) = write_result {
+            self.cancel(upload_id);
+            return Err(error);
+        }
+        self.uploads
+            .get_mut(upload_id)
+            .expect("written CAS upload")
+            .received = next;
+        Ok(next)
+    }
+
+    fn take_complete(&mut self, upload_id: &str) -> io::Result<CasUpload> {
+        let upload = self
+            .uploads
+            .get(upload_id)
+            .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "CAS upload is missing"))?;
+        if upload.received != upload.total_bytes {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "CAS upload is incomplete",
+            ));
+        }
+        let upload = self.uploads.remove(upload_id).expect("checked CAS upload");
+        self.reserved_bytes -= upload.total_bytes;
+        Ok(upload)
+    }
+
+    fn cancel(&mut self, upload_id: &str) {
+        if let Some(upload) = self.uploads.remove(upload_id) {
+            self.reserved_bytes -= upload.total_bytes;
+        }
+    }
+
+    fn cancel_session(&mut self, session_id: &str) {
+        let removed = self
+            .uploads
+            .iter()
+            .filter(|(_, upload)| upload.session_id == session_id)
+            .map(|(id, upload)| (id.clone(), upload.total_bytes))
+            .collect::<Vec<_>>();
+        for (id, total_bytes) in removed {
+            self.uploads.remove(&id);
+            self.reserved_bytes -= total_bytes;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.uploads.clear();
+        self.reserved_bytes = 0;
     }
 }
 
@@ -108,6 +271,9 @@ pub(crate) async fn asset_cas_job_prepare(
     data: Vec<u8>,
     role: CasObjectRole,
 ) -> Result<PreparedPayload, String> {
+    if data.len() > CAS_UPLOAD_CHUNK_BYTES {
+        return Err("direct CAS prepare exceeds the IPC chunk limit".to_owned());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let _operation = app
             .state::<PersistentStoreState>()
@@ -119,6 +285,135 @@ pub(crate) async fn asset_cas_job_prepare(
     })
     .await
     .map_err(|error| format!("failed to join CAS job prepare operation: {error}"))?
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct CasUploadOpened {
+    capacity: usize,
+}
+
+#[tauri::command(async)]
+pub(crate) async fn asset_cas_job_upload_open(
+    app: AppHandle,
+    upload_id: String,
+    session_id: String,
+    role: CasObjectRole,
+    total_bytes: u64,
+) -> Result<CasUploadOpened, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation = app
+            .state::<PersistentStoreState>()
+            .admit_renderer_operation()
+            .map_err(|error| error.to_string())?;
+        let root = repository_root(&app)?;
+        let cas = PayloadCas::new(&root).map_err(|error| error.to_string())?;
+        let state = app.state::<DurableCasJobState>();
+        let mut uploads = state
+            .uploads
+            .lock()
+            .map_err(|error| format!("CAS upload mutex poisoned: {error}"))?;
+        let mut jobs = state
+            .jobs
+            .lock()
+            .map_err(|error| format!("CAS job session mutex poisoned: {error}"))?;
+        let job = recover_job(&mut jobs, &root, &session_id)?;
+        if job.is_sealed() || job.is_released() {
+            return Err("sealed or released CAS job cannot accept an upload".to_owned());
+        }
+        uploads
+            .open(&cas, upload_id, session_id, role, total_bytes)
+            .map_err(|error| error.to_string())?;
+        Ok(CasUploadOpened {
+            capacity: CAS_UPLOAD_CHUNK_BYTES,
+        })
+    })
+    .await
+    .map_err(|error| format!("failed to join CAS upload open operation: {error}"))?
+}
+
+#[tauri::command(async)]
+pub(crate) async fn asset_cas_job_upload_chunk(
+    app: AppHandle,
+    upload_id: String,
+    offset: u64,
+    data: Vec<u8>,
+) -> Result<u64, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation = app
+            .state::<PersistentStoreState>()
+            .admit_renderer_operation()
+            .map_err(|error| error.to_string())?;
+        app.state::<DurableCasJobState>()
+            .uploads
+            .lock()
+            .map_err(|error| format!("CAS upload mutex poisoned: {error}"))?
+            .append(&upload_id, offset, &data)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("failed to join CAS upload chunk operation: {error}"))?
+}
+
+#[tauri::command(async)]
+pub(crate) async fn asset_cas_job_upload_finish(
+    app: AppHandle,
+    upload_id: String,
+) -> Result<PreparedPayload, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation = app
+            .state::<PersistentStoreState>()
+            .admit_renderer_operation()
+            .map_err(|error| error.to_string())?;
+        let root = repository_root(&app)?;
+        let cas = PayloadCas::new(&root).map_err(|error| error.to_string())?;
+        let state = app.state::<DurableCasJobState>();
+        let mut upload = state
+            .uploads
+            .lock()
+            .map_err(|error| format!("CAS upload mutex poisoned: {error}"))?
+            .take_complete(&upload_id)
+            .map_err(|error| error.to_string())?;
+        upload.file.flush().map_err(|error| error.to_string())?;
+        upload
+            .file
+            .as_file()
+            .sync_all()
+            .map_err(|error| error.to_string())?;
+        upload
+            .file
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| error.to_string())?;
+        let mut jobs = state
+            .jobs
+            .lock()
+            .map_err(|error| format!("CAS job session mutex poisoned: {error}"))?;
+        recover_job(&mut jobs, &root, &upload.session_id)?
+            .prepare_reader(&cas, &mut upload.file, upload.role)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("failed to join CAS upload finish operation: {error}"))?
+}
+
+#[tauri::command(async)]
+pub(crate) async fn asset_cas_job_upload_cancel(
+    app: AppHandle,
+    upload_id: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation = app
+            .state::<PersistentStoreState>()
+            .admit_renderer_operation()
+            .map_err(|error| error.to_string())?;
+        app.state::<DurableCasJobState>()
+            .uploads
+            .lock()
+            .map_err(|error| format!("CAS upload mutex poisoned: {error}"))?
+            .cancel(&upload_id);
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("failed to join CAS upload cancel operation: {error}"))?
 }
 
 #[tauri::command(async)]
@@ -145,24 +440,33 @@ pub(crate) async fn asset_cas_job_pin_existing(
 #[tauri::command(async)]
 pub(crate) async fn asset_cas_job_seal(app: AppHandle, session_id: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let _operation = app
+        let operation_guard = app
             .state::<PersistentStoreState>()
             .admit_renderer_operation()
             .map_err(|error| error.to_string())?;
         let root = repository_root(&app)?;
         let state = app.state::<DurableCasJobState>();
+        state
+            .uploads
+            .lock()
+            .map_err(|error| format!("CAS upload mutex poisoned: {error}"))?
+            .cancel_session(&session_id);
         let mut jobs = state
             .jobs
             .lock()
             .map_err(|error| format!("CAS job session mutex poisoned: {error}"))?;
         let job = recover_job(&mut jobs, &root, &session_id)?;
-        persistent_store::commands::with_store_mut(app.state::<PersistentStoreState>(), |store| {
-            job.seal(
-                store,
-                now_ms().map_err(|message| StoreError::Store { message })?,
-            )
-            .map_err(StoreError::from)
-        })
+        persistent_store::commands::with_store_mut_admitted(
+            app.state::<PersistentStoreState>(),
+            &operation_guard,
+            |store| {
+                job.seal(
+                    store,
+                    now_ms().map_err(|message| StoreError::Store { message })?,
+                )
+                .map_err(StoreError::from)
+            },
+        )
         .map_err(|error| error.to_string())
     })
     .await
@@ -182,6 +486,11 @@ pub(crate) async fn asset_cas_job_release(
             .map_err(|error| error.to_string())?;
         let root = repository_root(&app)?;
         let state = app.state::<DurableCasJobState>();
+        state
+            .uploads
+            .lock()
+            .map_err(|error| format!("CAS upload mutex poisoned: {error}"))?
+            .cancel_session(&session_id);
         let mut jobs = state
             .jobs
             .lock()
@@ -202,31 +511,15 @@ pub(crate) async fn asset_cas_job_release(
 }
 
 #[tauri::command(async)]
-pub(crate) async fn asset_cas_read_object(
-    app: AppHandle,
-    content_hash: String,
-) -> Result<Option<Vec<u8>>, String> {
-    let root = repository_root(&app)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let _operation = app
-            .state::<PersistentStoreState>()
-            .admit_renderer_operation()
-            .map_err(|error| error.to_string())?;
-        PayloadCas::new(&root)
-            .and_then(|cas| cas.read_object(&content_hash))
-            .map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|error| format!("failed to join CAS read operation: {error}"))?
-}
-
-#[tauri::command(async)]
 pub(crate) async fn asset_cas_read_object_range(
     app: AppHandle,
     content_hash: String,
     start: u64,
     end_exclusive: u64,
 ) -> Result<Option<Vec<u8>>, String> {
+    if end_exclusive < start || end_exclusive - start > CAS_UPLOAD_CHUNK_BYTES as u64 {
+        return Err("CAS range read exceeds the IPC chunk limit".to_owned());
+    }
     let root = repository_root(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
         let _operation = app
@@ -458,7 +751,7 @@ pub(crate) async fn asset_cas_job_finalize_content(
         })
         .collect::<Vec<_>>();
     tauri::async_runtime::spawn_blocking(move || {
-        let _operation = app
+        let operation_guard = app
             .state::<PersistentStoreState>()
             .admit_renderer_operation()
             .map_err(|error| error.to_string())?;
@@ -470,17 +763,21 @@ pub(crate) async fn asset_cas_job_finalize_content(
             .lock()
             .map_err(|error| format!("CAS job session mutex poisoned: {error}"))?;
         let job = recover_job(&mut jobs, &root, &session_id)?;
-        persistent_store::commands::with_store_mut(app.state::<PersistentStoreState>(), |store| {
-            finalize_content_job(
-                job,
-                &cas,
-                store,
-                &owner_manifest,
-                &content_assets,
-                now_ms().map_err(|message| StoreError::Store { message })?,
-            )
-            .map_err(StoreError::from)
-        })
+        persistent_store::commands::with_store_mut_admitted(
+            app.state::<PersistentStoreState>(),
+            &operation_guard,
+            |store| {
+                finalize_content_job(
+                    job,
+                    &cas,
+                    store,
+                    &owner_manifest,
+                    &content_assets,
+                    now_ms().map_err(|message| StoreError::Store { message })?,
+                )
+                .map_err(StoreError::from)
+            },
+        )
         .map_err(|error| error.to_string())
     })
     .await
@@ -560,7 +857,7 @@ pub(crate) async fn asset_cas_job_seal_prepared_content(
 ) -> Result<(), String> {
     let native_jobs = NativeFileJobState::clone(&native_jobs);
     tauri::async_runtime::spawn_blocking(move || {
-        let _operation = app
+        let operation_guard = app
             .state::<PersistentStoreState>()
             .admit_renderer_operation()
             .map_err(|error| error.to_string())?;
@@ -570,17 +867,21 @@ pub(crate) async fn asset_cas_job_seal_prepared_content(
             .jobs
             .lock()
             .map_err(|error| format!("CAS job session mutex poisoned: {error}"))?;
-        persistent_store::commands::with_store_mut(app.state::<PersistentStoreState>(), |store| {
-            seal_prepared_content_job_by_id(
-                &native_jobs,
-                &root,
-                &mut jobs,
-                store,
-                &session_id,
-                now_ms().map_err(|message| StoreError::Store { message })?,
-            )
-            .map_err(|message| StoreError::Store { message })
-        })
+        persistent_store::commands::with_store_mut_admitted(
+            app.state::<PersistentStoreState>(),
+            &operation_guard,
+            |store| {
+                seal_prepared_content_job_by_id(
+                    &native_jobs,
+                    &root,
+                    &mut jobs,
+                    store,
+                    &session_id,
+                    now_ms().map_err(|message| StoreError::Store { message })?,
+                )
+                .map_err(|message| StoreError::Store { message })
+            },
+        )
         .map_err(|error| error.to_string())
     })
     .await
@@ -628,6 +929,105 @@ mod tests {
             payload_hash: Some(payload_hash),
         }])
         .unwrap()
+    }
+
+    #[test]
+    fn cas_upload_pool_enforces_offsets_lengths_and_cleanup() {
+        use std::io::Read;
+
+        let directory = TempDir::new().expect("create upload pool directory");
+        let cas = PayloadCas::new(directory.path()).expect("open payload CAS");
+        let upload_id = uuid::Uuid::new_v4().to_string();
+        let mut pool = CasUploadPool::default();
+        pool.open(
+            &cas,
+            upload_id.clone(),
+            "session-1".to_owned(),
+            CasObjectRole::DirectObject,
+            CAS_UPLOAD_CHUNK_BYTES as u64 + 3,
+        )
+        .expect("open bounded upload");
+
+        assert!(pool.append(&upload_id, 1, b"wrong offset").is_err());
+        assert!(pool
+            .append(&upload_id, 0, &vec![0; CAS_UPLOAD_CHUNK_BYTES + 1])
+            .is_err());
+        assert_eq!(
+            pool.append(&upload_id, 0, &vec![7; CAS_UPLOAD_CHUNK_BYTES])
+                .expect("append full chunk"),
+            CAS_UPLOAD_CHUNK_BYTES as u64
+        );
+        assert!(pool.take_complete(&upload_id).is_err());
+        assert_eq!(
+            pool.append(&upload_id, CAS_UPLOAD_CHUNK_BYTES as u64, &[8, 9, 10])
+                .expect("append final chunk"),
+            CAS_UPLOAD_CHUNK_BYTES as u64 + 3
+        );
+        let mut upload = pool
+            .take_complete(&upload_id)
+            .expect("take completed upload");
+        upload.file.seek(SeekFrom::Start(0)).expect("rewind upload");
+        let mut bytes = Vec::new();
+        upload.file.read_to_end(&mut bytes).expect("read upload");
+        assert_eq!(bytes.len(), CAS_UPLOAD_CHUNK_BYTES + 3);
+        assert_eq!(&bytes[..3], &[7, 7, 7]);
+        assert_eq!(&bytes[CAS_UPLOAD_CHUNK_BYTES..], &[8, 9, 10]);
+        assert_eq!(pool.reserved_bytes, 0);
+    }
+
+    #[test]
+    fn cas_upload_pool_bounds_concurrency_and_releases_reserved_bytes_on_cancel() {
+        let directory = TempDir::new().expect("create upload quota directory");
+        let cas = PayloadCas::new(directory.path()).expect("open payload CAS");
+        let mut pool = CasUploadPool::default();
+        let mut ids = Vec::new();
+        for _ in 0..MAX_CONCURRENT_CAS_UPLOADS {
+            let id = uuid::Uuid::new_v4().to_string();
+            pool.open(
+                &cas,
+                id.clone(),
+                "session-quota".to_owned(),
+                CasObjectRole::DirectObject,
+                MAX_TOTAL_CAS_UPLOAD_BYTES / MAX_CONCURRENT_CAS_UPLOADS as u64,
+            )
+            .expect("reserve upload quota");
+            ids.push(id);
+        }
+        assert!(pool
+            .open(
+                &cas,
+                uuid::Uuid::new_v4().to_string(),
+                "session-quota".to_owned(),
+                CasObjectRole::DirectObject,
+                CAS_UPLOAD_CHUNK_BYTES as u64 + 1,
+            )
+            .is_err());
+        pool.cancel_session("session-quota");
+        assert!(pool.uploads.is_empty());
+        assert_eq!(pool.reserved_bytes, 0);
+        assert_eq!(ids.len(), MAX_CONCURRENT_CAS_UPLOADS);
+    }
+
+    #[test]
+    fn cas_upload_pool_clear_drops_tempfiles_and_releases_reservations() {
+        let directory = TempDir::new().expect("create upload reset directory");
+        let cas = PayloadCas::new(directory.path()).expect("open payload CAS");
+        let mut pool = CasUploadPool::default();
+        let upload_id = uuid::Uuid::new_v4().to_string();
+        pool.open(
+            &cas,
+            upload_id.clone(),
+            "session-reset".to_owned(),
+            CasObjectRole::DirectObject,
+            CAS_UPLOAD_CHUNK_BYTES as u64 + 1,
+        )
+        .expect("open upload for reset");
+        let staging_path = pool.uploads[&upload_id].file.path().to_path_buf();
+        assert!(staging_path.is_file());
+        pool.clear();
+        assert!(pool.uploads.is_empty());
+        assert_eq!(pool.reserved_bytes, 0);
+        assert!(!staging_path.exists());
     }
 
     fn begin_content_job(root: &std::path::Path, id: &str) -> DurableCasJob {

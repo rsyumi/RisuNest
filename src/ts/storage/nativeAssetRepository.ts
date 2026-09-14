@@ -19,8 +19,14 @@ import {
     type PreparedImmutablePayload,
 } from './payloadCas'
 import { createTauriCasObjectUrl, getNativeMediaEndpoint } from './platformBlobStore'
+import {
+    consumeBoundedNativeMediaOutput,
+    invokeWithBoundedNativeMediaInput,
+} from './nativeMediaIpc'
 
 type InvokeCommand = (command: string, args?: Record<string, unknown>) => Promise<unknown>
+
+export const NATIVE_CAS_IPC_CHUNK_BYTES = 64 * 1024
 
 export type NativeCasJobKind =
     | 'direct-asset-or-inlay-write'
@@ -85,11 +91,78 @@ export async function prepareCasObject(
     invokeCommand: InvokeCommand = invoke,
 ): Promise<PreparedImmutablePayload> {
     pinSessionId(sessionId, 'Native CAS job prepare')
-    return preparedPayload(await invokeCommand('asset_cas_job_prepare', {
-        sessionId,
-        data: Array.from(data),
-        role,
-    }), 'Native CAS job prepare')
+    if (data.byteLength <= NATIVE_CAS_IPC_CHUNK_BYTES) {
+        return preparedPayload(await invokeCommand('asset_cas_job_prepare', {
+            sessionId,
+            data: Array.from(data),
+            role,
+        }), 'Native CAS job prepare')
+    }
+    const uploadId = crypto.randomUUID()
+    try {
+        const opened = await invokeCommand('asset_cas_job_upload_open', {
+            uploadId,
+            sessionId,
+            role,
+            totalBytes: data.byteLength,
+        }) as { capacity?: unknown }
+        if (opened.capacity !== NATIVE_CAS_IPC_CHUNK_BYTES) {
+            throw new TypeError('Native CAS upload returned an invalid chunk capacity')
+        }
+        for (let offset = 0; offset < data.byteLength;) {
+            const end = Math.min(offset + NATIVE_CAS_IPC_CHUNK_BYTES, data.byteLength)
+            const acknowledged = safeSize(await invokeCommand('asset_cas_job_upload_chunk', {
+                uploadId,
+                offset,
+                data: Array.from(data.subarray(offset, end)),
+            }), 'Native CAS upload chunk')
+            if (acknowledged !== end) {
+                throw new Error('Native CAS upload returned an invalid chunk acknowledgement')
+            }
+            offset = end
+        }
+        return preparedPayload(
+            await invokeCommand('asset_cas_job_upload_finish', { uploadId }),
+            'Native CAS upload finish',
+        )
+    } finally {
+        await invokeCommand('asset_cas_job_upload_cancel', { uploadId }).catch(() => undefined)
+    }
+}
+
+async function readCasObjectRange(
+    invokeCommand: InvokeCommand,
+    contentHash: string,
+    start: number,
+    endExclusive: number,
+): Promise<Uint8Array | null> {
+    const chunks: Uint8Array[] = []
+    let total = 0
+    for (let offset = start; offset < endExclusive;) {
+        const end = Math.min(offset + NATIVE_CAS_IPC_CHUNK_BYTES, endExclusive)
+        const requestedLength = end - offset
+        const result = await invokeCommand('asset_cas_read_object_range', {
+            contentHash,
+            start: offset,
+            endExclusive: end,
+        })
+        if (result === null) return null
+        const chunk = bytes(result, 'Native CAS range read')
+        if (chunk.byteLength > end - offset) {
+            throw new TypeError('Native CAS range read exceeded its requested length')
+        }
+        chunks.push(chunk)
+        total += chunk.byteLength
+        offset += chunk.byteLength
+        if (chunk.byteLength < requestedLength) break
+    }
+    const combined = new Uint8Array(total)
+    let writeOffset = 0
+    for (const chunk of chunks) {
+        combined.set(chunk, writeOffset)
+        writeOffset += chunk.byteLength
+    }
+    return combined
 }
 
 export async function pinExistingCasObject(
@@ -186,17 +259,39 @@ export function createNativeImmutablePayloadCas(
             throw new Error('Native CAS writes require a durable ownership session')
         },
         async readObject(contentHash) {
-            const result = await invokeCommand('asset_cas_read_object', { contentHash })
-            return result === null ? null : bytes(result, 'Native CAS read')
+            const sizeValue = await invokeCommand('asset_cas_stat_object', { contentHash })
+            if (sizeValue === null) return null
+            const size = safeSize(sizeValue, 'Native CAS stat')
+            if (size === 0) {
+                const result = await invokeCommand('asset_cas_read_object_range', {
+                    contentHash,
+                    start: 0,
+                    endExclusive: 0,
+                })
+                return result === null ? null : bytes(result, 'Native CAS range read')
+            }
+            const result = await readCasObjectRange(invokeCommand, contentHash, 0, size)
+            if (result !== null && result.byteLength !== size) {
+                throw new Error('Native CAS object changed while it was being read')
+            }
+            return result
         },
         async readObjectRange(contentHash, range) {
             validateBlobReadRange(range)
-            const result = await invokeCommand('asset_cas_read_object_range', {
+            if (range.start === range.endExclusive) {
+                const result = await invokeCommand('asset_cas_read_object_range', {
+                    contentHash,
+                    start: range.start,
+                    endExclusive: range.endExclusive,
+                })
+                return result === null ? null : bytes(result, 'Native CAS range read')
+            }
+            return readCasObjectRange(
+                invokeCommand,
                 contentHash,
-                start: range.start,
-                endExclusive: range.endExclusive,
-            })
-            return result === null ? null : bytes(result, 'Native CAS range read')
+                range.start,
+                range.endExclusive,
+            )
         },
         async statObject(contentHash) {
             const result = await invokeCommand('asset_cas_stat_object', { contentHash })
@@ -241,7 +336,9 @@ export function createNativeRemoteAssetReader(
     }
 }
 interface NativeEncodedInlayImage {
-    data: unknown
+    data?: unknown
+    outputId?: unknown
+    outputSize?: unknown
     metadata: InlayBlobMetadata
 }
 
@@ -267,43 +364,55 @@ export function createNativeNewInlayImageEncoder(
     return {
         async encodeNewInlayImage(key, data, input) {
             const options = normalizeInlayEncodeOptions(input.options ?? defaultInlayEncodeOptions)
-            const result = await invokeCommand(
-                'native_media_encode_inlay_image',
-                {
-                    id: key,
-                    data: Array.from(data),
-                    name: input.name,
-                    ...(input.options === undefined ? {} : { options }),
-                },
-            ) as NativeEncodedInlayImage
-            const metadata = result.metadata
             const expected = expectedNativeInlayOutput(options, data)
-            if (
-                metadata.kind !== 'inlay'
-                || metadata.key !== key
-                || !expected
-                || metadata.mime !== expected.mime
-                || metadata.ext !== expected.ext
-                || metadata.inlayType !== 'image'
-                || !Number.isSafeInteger(metadata.width)
-                || !Number.isSafeInteger(metadata.height)
-            ) {
-                throw new TypeError('Native Inlay encoder returned invalid metadata')
-            }
-            const encoded = bytes(result.data, 'Native Inlay encoder')
-            if (metadata.size !== encoded.byteLength) {
+            const result = await invokeWithBoundedNativeMediaInput<NativeEncodedInlayImage>(
+                invokeCommand,
+                {
+                    data,
+                    directCommand: 'native_media_encode_inlay_image',
+                    streamedFinishCommand: 'native_media_encode_inlay_finish',
+                    args: {
+                        id: key,
+                        name: input.name,
+                        ...(input.options === undefined ? {} : { options }),
+                    },
+                },
+            )
+            const encoded = await consumeBoundedNativeMediaOutput(
+                invokeCommand,
+                result,
+                (value) => {
+                    const metadata = value as InlayBlobMetadata
+                    if (
+                        typeof metadata !== 'object'
+                        || metadata === null
+                        || metadata.kind !== 'inlay'
+                        || metadata.key !== key
+                        || !expected
+                        || metadata.mime !== expected.mime
+                        || metadata.ext !== expected.ext
+                        || metadata.inlayType !== 'image'
+                        || !Number.isSafeInteger(metadata.width)
+                        || !Number.isSafeInteger(metadata.height)
+                    ) {
+                        throw new TypeError('Native Inlay encoder returned invalid metadata')
+                    }
+                    return metadata
+                },
+            )
+            if (encoded.metadata.size !== encoded.data.byteLength) {
                 throw new TypeError('Native Inlay encoder size does not match its bytes')
             }
             return {
-                data: encoded,
+                data: encoded.data,
                 metadata: {
                     kind: 'inlay',
-                    mime: metadata.mime,
-                    name: metadata.name,
-                    ext: metadata.ext,
-                    inlayType: metadata.inlayType,
-                    width: metadata.width,
-                    height: metadata.height,
+                    mime: encoded.metadata.mime,
+                    name: encoded.metadata.name,
+                    ext: encoded.metadata.ext,
+                    inlayType: encoded.metadata.inlayType,
+                    width: encoded.metadata.width,
+                    height: encoded.metadata.height,
                 },
             }
         },

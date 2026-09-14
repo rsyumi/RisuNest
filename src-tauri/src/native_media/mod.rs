@@ -21,7 +21,9 @@ use tauri::http::{
     header::{self, HeaderValue},
     Method, Request, Response, StatusCode,
 };
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
+
+pub(crate) mod ipc;
 
 const MAX_BODY_BYTES: u64 = 1024 * 1024;
 const EXPOSED_HEADERS: &str = "Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag";
@@ -497,8 +499,6 @@ fn pair_matches_transaction(
     metadata.key == transaction.id
         && metadata.kind == "inlay"
         && metadata.inlay_type == "image"
-        && metadata.mime == "image/webp"
-        && metadata.ext == "webp"
         && metadata.size == payload_bytes.len() as u64
         && sha256_hex(&payload_bytes) == transaction.payload_sha256
         && sha256_hex(&metadata_bytes) == transaction.metadata_sha256
@@ -1117,28 +1117,60 @@ fn encode_inlay_image(
 
 #[tauri::command(async)]
 pub(crate) async fn native_media_encode_inlay_image(
-    id: String,
-    data: Vec<u8>,
-    name: String,
-    options: Option<InlayEncodeOptions>,
-) -> Result<EncodedInlayImage, String> {
-    tauri::async_runtime::spawn_blocking(move || encode_inlay_image(&id, &data, &name, options))
-        .await
-        .map_err(|error| format!("failed to join native Inlay image encoder: {error}"))?
-}
-
-#[tauri::command(async)]
-pub(crate) async fn native_media_write_inlay_image(
     app: AppHandle,
     id: String,
     data: Vec<u8>,
     name: String,
     options: Option<InlayEncodeOptions>,
+) -> Result<ipc::EncodedInlayIpcResult, String> {
+    if data.len() > ipc::NATIVE_MEDIA_IPC_CHUNK_BYTES {
+        return Err("native Inlay direct encoder input exceeds one IPC chunk".to_owned());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation = app
+            .state::<crate::persistent_store::PersistentStoreState>()
+            .admit_renderer_operation()
+            .map_err(|error| error.to_string())?;
+        ipc::encode_direct(
+            &app.state::<ipc::NativeMediaIpcState>(),
+            &id,
+            &data,
+            &name,
+            options,
+        )
+    })
+    .await
+    .map_err(|error| format!("failed to join native Inlay image encoder: {error}"))?
+}
+
+#[tauri::command(async)]
+pub(crate) async fn native_media_write_inlay_image(
+    app: AppHandle,
+    startup: tauri::State<'_, crate::NativeStartupState>,
+    id: String,
+    data: Vec<u8>,
+    name: String,
+    options: Option<InlayEncodeOptions>,
 ) -> Result<InlayImageMetadata, String> {
+    if data.len() > ipc::NATIVE_MEDIA_IPC_CHUNK_BYTES {
+        return Err("native Inlay direct writer input exceeds one IPC chunk".to_owned());
+    }
+    startup.ensure_ready()?;
     let root = crate::app_data_root::resolve(&app)
         .map_err(|error| format!("failed to resolve application data directory: {error}"))?;
     tauri::async_runtime::spawn_blocking(move || {
-        write_inlay_image_with_options(&root, &id, &data, &name, options)
+        let _operation = app
+            .state::<crate::persistent_store::PersistentStoreState>()
+            .admit_renderer_operation()
+            .map_err(|error| error.to_string())?;
+        ipc::write_direct(
+            &app.state::<ipc::NativeMediaIpcState>(),
+            &root,
+            &id,
+            &data,
+            &name,
+            options,
+        )
     })
     .await
     .map_err(|error| format!("failed to join native Inlay image writer: {error}"))?

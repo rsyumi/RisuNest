@@ -261,7 +261,8 @@ describe('getInlayRenderSource', () => {
     test('detaches an existing original asset URL offscreen without changing its markup layout', () => {
         vi.stubGlobal('IntersectionObserver', TestIntersectionObserver)
         const root = document.createElement('div')
-        root.innerHTML = '<figure class="custom-bot-layout"><img class="portrait" src="http://risuasset.localhost/assets/original.png"><figcaption>caption</figcaption></figure>'
+        const nativeUrl = `http://127.0.0.1:43127/${'a'.repeat(32)}/${Buffer.from('assets/original.png').toString('hex')}`
+        root.innerHTML = `<figure class="custom-bot-layout"><img class="portrait" src="${nativeUrl}"><figcaption>caption</figcaption></figure>`
         document.body.append(root)
         const image = root.querySelector('img')!
 
@@ -272,7 +273,7 @@ describe('getInlayRenderSource', () => {
         expect(root.querySelector('figcaption')?.textContent).toBe('caption')
 
         observer.setVisible(image, true)
-        expect(image.getAttribute('src')).toBe('http://risuasset.localhost/assets/original.png')
+        expect(image.getAttribute('src')).toBe(nativeUrl)
         observer.setVisible(image, false)
         expect(image.getAttribute('src')).toBeNull()
         expect(URL.revokeObjectURL).not.toHaveBeenCalled()

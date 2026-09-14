@@ -83,6 +83,19 @@ impl PayloadCas {
         self.prepare_reader(&mut io::Cursor::new(data))
     }
 
+    pub(crate) fn create_ipc_staging_file(&self) -> io::Result<tempfile::NamedTempFile> {
+        self.ensure_repository_root()?;
+        let mut directory_entries_synced = true;
+        let assets_directory = self.ensure_directory(
+            &self.repository_root,
+            "assets-v2",
+            &mut directory_entries_synced,
+        )?;
+        let staging_directory =
+            self.ensure_directory(&assets_directory, "staging", &mut directory_entries_synced)?;
+        tempfile::NamedTempFile::new_in(staging_directory)
+    }
+
     pub fn prepare_reader(&self, reader: &mut impl Read) -> Result<PreparedPayload, io::Error> {
         self.prepare_reader_inner(reader, None)
     }
@@ -133,7 +146,7 @@ impl PayloadCas {
         let mut buffer = [0_u8; COPY_BUFFER_BYTES];
         loop {
             if cancelled() {
-                return Err(io::Error::new(ErrorKind::Interrupted, "import cancelled"));
+                return Err(io::Error::other("import cancelled"));
             }
             let length = file.read(&mut buffer)?;
             if length == 0 {
@@ -162,7 +175,7 @@ impl PayloadCas {
         let object_path = shard.join(&expected_hash[2..]);
         let physical_key = object_physical_key(expected_hash);
         if cancelled() {
-            return Err(io::Error::new(ErrorKind::Interrupted, "import cancelled"));
+            return Err(io::Error::other("import cancelled"));
         }
         #[cfg(any(target_os = "android", windows))]
         let published = crate::trust_boundary::rename_without_replace(&canonical, &object_path);

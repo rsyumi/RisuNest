@@ -232,7 +232,7 @@ fn unavailable_services_stay_hidden_and_head_size_and_sdk_overhead_are_bounded()
 fn bounded_spool_round_trip_is_idempotent_and_rejects_corruption_and_overrun() {
     use super::transfer::{SpoolSink, SpoolSource};
     tokio::runtime::Runtime::new().unwrap().block_on(async {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let dir = tempfile::tempdir().unwrap();
         let source_path = dir.path().join("source");
         let bytes = vec![42; 100_005];
@@ -274,7 +274,36 @@ fn bounded_spool_round_trip_is_idempotent_and_rejects_corruption_and_overrun() {
         drop(writer);
         assert!(!limited.is_verified());
         assert!(limited.finish(4, &digest).await.is_err());
+        let mut cancelled_reader = source.open(0, 1, &cancel).await.unwrap();
+        let cancelled_output = dir.path().join("cancelled-output");
+        let mut cancelled_sink = SpoolSink::create(&cancelled_output, 1).unwrap();
+        let mut cancelled_writer = cancelled_sink.open(0, 1, &cancel).await.unwrap();
         cancel.cancel();
+        let mut byte = [0];
+        assert_eq!(
+            cancelled_reader
+                .read_exact(&mut byte)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::Other
+        );
+        assert_eq!(
+            cancelled_reader
+                .read_exact(&mut byte)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::Other
+        );
+        assert_eq!(
+            cancelled_writer.write_all(&byte).await.unwrap_err().kind(),
+            std::io::ErrorKind::Other
+        );
+        assert_eq!(
+            cancelled_writer.write_all(&byte).await.unwrap_err().kind(),
+            std::io::ErrorKind::Other
+        );
         assert!(source.open(0, 1, &cancel).await.is_err());
     });
 }

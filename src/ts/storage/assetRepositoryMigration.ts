@@ -25,8 +25,12 @@ function aliasIdentity(kind: AssetAlias['kind'], key: string): string {
     return `${kind}\0${key}`
 }
 
-function aliasFromMetadata(metadata: BlobMetadata, objectHash: string): AssetAlias {
-    const alias = { ...metadata, objectHash } as AssetAlias
+function aliasFromMetadata(
+    metadata: BlobMetadata,
+    objectHash: string,
+    byteSize: number,
+): AssetAlias {
+    const alias = { ...metadata, size: byteSize, objectHash } as AssetAlias
     validateAssetAlias(alias)
     return alias
 }
@@ -163,7 +167,7 @@ export async function migrateLegacyAssetRepository(input: {
             if (prepared.byteSize !== data.byteLength) {
                 throw new Error(`CAS size mismatch during migration: ${metadata.key}`)
             }
-            const alias = aliasFromMetadata(metadata, prepared.contentHash)
+            const alias = aliasFromMetadata(metadata, prepared.contentHash, prepared.byteSize)
             const identity = aliasIdentity(alias.kind, alias.key)
             if (aliases.has(identity)) {
                 throw new Error(`Duplicate legacy asset identity during migration: ${metadata.key}`)

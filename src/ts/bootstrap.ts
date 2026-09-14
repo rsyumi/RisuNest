@@ -14,7 +14,7 @@ import { getDeviceSettings } from "./storage/deviceSettings";
 import { setNativeLogFileEnabled } from "./nativeLog";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { checkRisuUpdate } from "./update";
-import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState, bootFailure, type BootFailure } from "./stores.svelte";
+import { MobileGUI, botMakerMode, selectedCharID, loadedStore, LoadingStatusState, bootFailure, type BootFailure } from "./stores.svelte";
 import { loadPlugins, loadPluginsAfterAuthoritativeRestore, pluginCompatibility } from "./plugins/plugins.svelte";
 import { shouldProjectScalableWorkingSet } from "./plugins/pluginCompatibility";
 import { alertConfirm, alertError, alertInput, alertLogin, alertMd, alertNormal, alertSelect, alertTOS, waitAlert } from "./alert";
@@ -22,7 +22,6 @@ import { checkDriverInit } from "./drive/drive";
 import { characterURLImport, downloadRisuHub, hubURL } from "./characterCards";
 import { initializeNativeLocalUrls } from "./nativeLocalUrls";
 import { loadRisuAccountData } from "./drive/accounter";
-import { decodeRisuSave } from "./storage/risuSave";
 import { updateAnimationSpeed } from "./gui/animation";
 import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
 import { changeLanguage, language } from "src/lang";
@@ -52,10 +51,7 @@ import {
 } from "./globalApi.svelte";
 import { isTauri, isTauriAndroid, isTauriDesktop } from "./platform";
 import { registerModelDynamic } from "./model/modellist";
-import { convertFileSrc } from "@tauri-apps/api/core";
-import { appDataDir, join } from "@tauri-apps/api/path";
 import {
-    checkNewFormat as migrateDatabaseFormat,
     prepareDatabaseForPersistence,
     prepareDatabaseForBootstrap,
     preparePersistentRootForWorkingSet,
@@ -135,7 +131,7 @@ import {
     createNativeOfficialPublicationRecovery,
     type NativeOfficialPublicationRecovery,
 } from "./storage/sync/nativeOfficialPublicationRecovery";
-export { assignIds } from "./storage/databasePreparation";
+import { checkNativeStartupStatus } from './nativeStartup'
 
 const appWindow = isTauri ? getCurrentWebviewWindow() : null
 let disposeLifecycleCommitListeners: (() => void) | undefined
@@ -219,6 +215,10 @@ export async function loadData() {
     }
     LoadingStatusState.text = language.risuNest.startup.storage
     try {
+        if (isTauri) {
+            stage = 'native-setup'
+            await checkNativeStartupStatus()
+        }
         const deviceSettings = getDeviceSettings()
         if (isTauri) {
             stage = 'native-log'
@@ -749,7 +749,7 @@ export async function loadData() {
         // an extra error modal on top of it would only get in the way. Anything
         // else can still fail after the app turned interactive, where no panel
         // is shown, so those keep the modal.
-        if (failure.kind === 'unknown') alertError(error)
+        if (failure.kind === 'unknown' && failure.stage !== 'native-setup') alertError(error)
     } finally {
         LoadingStatusState.startedAt = null
     }
@@ -814,16 +814,6 @@ function updateHeightMode() {
             root.style.setProperty('--risu-height-size', '100%');
             break
     }
-}
-
-/**
- * Checks and updates the database format to the latest version.
- */
-export async function checkNewFormat(
-    db: Database,
-    options: { now?: number } = {},
-): Promise<Database> {
-    return migrateDatabaseFormat(db, options)
 }
 
 /**

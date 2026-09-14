@@ -10,6 +10,7 @@ type ColdStorageCompactionDependencies = {
     createId: () => string
     write: (key: string, value: unknown) => Promise<boolean>
     read: (key: string) => Promise<any>
+    remove: (keys: readonly string[]) => Promise<void>
     replaceDatabase: (database: Database, reason: string) => Promise<void>
     onProgress?: (phase: 'character' | 'chat', remaining: number) => void
     onFailure?: (failure: ColdStorageCompactionFailure) => void
@@ -85,6 +86,7 @@ export async function compactColdStorageDatabase(
     const candidate = safeStructuredClone(database)
     const sourceSnapshot = JSON.stringify(database)
     let changed = false
+    const activatedPayloadKeys = new Set<string>()
 
     const characterTasks = candidate.characters.map((_character, index) => async () => {
         const character = candidate.characters[index]
@@ -109,6 +111,7 @@ export async function compactColdStorageDatabase(
             dependencies.onFailure?.({ kind: 'verify', target: 'character', characterIndex: index })
             return
         }
+        activatedPayloadKeys.add(key)
 
         const coldStoragedChats = character.chats
             .map((chat) => chat.message?.[0]?.data)
@@ -189,6 +192,7 @@ export async function compactColdStorageDatabase(
                     })
                     return
                 }
+                activatedPayloadKeys.add(key)
 
                 chat.message = [{
                     time: dependencies.now,
@@ -211,10 +215,22 @@ export async function compactColdStorageDatabase(
     }
 
     if (changed) {
-        if (JSON.stringify(database) !== sourceSnapshot) {
-            throw new Error('Database changed during cold storage compaction')
+        try {
+            if (JSON.stringify(database) !== sourceSnapshot) {
+                throw new Error('Database changed during cold storage compaction')
+            }
+            await dependencies.replaceDatabase(candidate, 'cold-storage-compaction')
+        } catch (error) {
+            try {
+                await dependencies.remove([...activatedPayloadKeys])
+            } catch (cleanupError) {
+                throw new AggregateError(
+                    [error, cleanupError],
+                    'Cold storage compaction activation and payload cleanup failed',
+                )
+            }
+            throw error
         }
-        await dependencies.replaceDatabase(candidate, 'cold-storage-compaction')
     }
     return changed
 }

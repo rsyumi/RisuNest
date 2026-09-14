@@ -47,6 +47,7 @@ describe('compactColdStorageDatabase', () => {
             createId: () => 'corrupt-payload',
             write: async () => true,
             read: async () => target === 'character' ? { character: {} } : { message: [] },
+            remove: vi.fn(async () => undefined),
             replaceDatabase,
             onFailure: (failure) => failures.push(failure),
         })
@@ -60,6 +61,7 @@ describe('compactColdStorageDatabase', () => {
         const live = fixtureDatabase()
         const payloads = new Map<string, unknown>()
         const replaceDatabase = vi.fn()
+        const remove = vi.fn(async () => undefined)
         await expect(compactColdStorageDatabase(live, {
             now: 20 * 24 * 60 * 60 * 1000,
             createId: () => 'cold-character',
@@ -69,9 +71,11 @@ describe('compactColdStorageDatabase', () => {
                 return true
             },
             read: async (key) => payloads.get(key),
+            remove,
             replaceDatabase,
         })).rejects.toThrow('changed during cold storage compaction')
         expect(replaceDatabase).not.toHaveBeenCalled()
+        expect(remove).toHaveBeenCalledWith(['cold-character'])
         expect(live.characters[0].chats[0].message[0].data).toBe('edited during compaction')
     })
 
@@ -92,6 +96,7 @@ describe('compactColdStorageDatabase', () => {
                 return true
             },
             read: async (key) => payloads.get(key),
+            remove: vi.fn(async () => undefined),
             replaceDatabase,
         })).toBe(true)
         expect(replaceDatabase).toHaveBeenCalledTimes(1)
@@ -120,6 +125,7 @@ describe('compactColdStorageDatabase', () => {
                 events.push('verify')
                 return structuredClone(payloads.get(key))
             },
+            remove: vi.fn(async () => undefined),
             replaceDatabase,
         })
 
@@ -133,6 +139,7 @@ describe('compactColdStorageDatabase', () => {
         const live = fixtureDatabase()
         const original = structuredClone(live)
         const payloads = new Map<string, unknown>()
+        const remove = vi.fn(async () => undefined)
 
         await expect(compactColdStorageDatabase(live, {
             now: 20 * 24 * 60 * 60 * 1000,
@@ -142,12 +149,36 @@ describe('compactColdStorageDatabase', () => {
                 return true
             },
             read: async (key) => structuredClone(payloads.get(key)),
+            remove,
             replaceDatabase: async () => {
                 throw new Error('replacement failed')
             },
         })).rejects.toThrow('replacement failed')
 
         expect(live).toEqual(original)
+        expect(remove).toHaveBeenCalledWith(['cold-character'])
+    })
+
+    it('reports activation and cleanup failures together', async () => {
+        const live = fixtureDatabase()
+        const payloads = new Map<string, unknown>()
+        const activationError = new Error('replacement failed')
+        const cleanupError = new Error('cleanup failed')
+
+        const failure = await compactColdStorageDatabase(live, {
+            now: 20 * 24 * 60 * 60 * 1000,
+            createId: () => 'cold-character',
+            write: async (key, value) => {
+                payloads.set(key, structuredClone(value))
+                return true
+            },
+            read: async (key) => structuredClone(payloads.get(key)),
+            remove: async () => { throw cleanupError },
+            replaceDatabase: async () => { throw activationError },
+        }).catch((error) => error)
+
+        expect(failure).toBeInstanceOf(AggregateError)
+        expect((failure as AggregateError).errors).toEqual([activationError, cleanupError])
     })
 
     it('reports bounded progress and diagnoses a skipped payload without publishing a candidate', async () => {
@@ -161,6 +192,7 @@ describe('compactColdStorageDatabase', () => {
             createId: () => 'cold-character',
             write: async () => false,
             read: vi.fn(),
+            remove: vi.fn(async () => undefined),
             replaceDatabase,
             onProgress: (phase, remaining) => progress.push([phase, remaining]),
             onFailure: (failure) => failures.push(failure),
@@ -201,6 +233,7 @@ describe('compactColdStorageDatabase', () => {
             createId: () => 'unused',
             write,
             read,
+            remove: vi.fn(async () => undefined),
             replaceDatabase,
         })
 
@@ -231,6 +264,7 @@ describe('compactColdStorageDatabase', () => {
             createId: () => 'unused',
             write,
             read,
+            remove: vi.fn(async () => undefined),
             replaceDatabase,
         })
 
@@ -250,6 +284,7 @@ describe('compactColdStorageDatabase', () => {
             createId: () => 'cold-character',
             write: async () => true,
             read: async () => { throw new Error('read failed') },
+            remove: vi.fn(async () => undefined),
             replaceDatabase,
             onFailure: (failure) => failures.push(failure),
         })

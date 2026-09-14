@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
 
+const startupMocks = vi.hoisted(() => ({ checkNativeStartupStatus: vi.fn() }))
+
+vi.mock('svelte/store', async (importOriginal) => ({
+    ...await importOriginal<typeof import('svelte/store')>(),
+    get: vi.fn(() => false),
+}))
 vi.mock('@tauri-apps/plugin-fs', () => ({
     BaseDirectory: { AppData: 'app-data' },
     exists: vi.fn(), mkdir: vi.fn(), readDir: vi.fn(), readFile: vi.fn(),
@@ -31,7 +37,7 @@ vi.mock('./storage/nativeFileJobs', () => ({
     NativeFileJobError: class extends Error {}, runNativeOfficialAccountSnapshotRestore: vi.fn(),
 }))
 vi.mock('./storage/androidRisuSaveRouteProduction.svelte', () => ({ registerAndroidRisuSaveRoute: vi.fn() }))
-vi.mock('src/lang', () => ({ language: {} }))
+vi.mock('src/lang', () => ({ language: { risuNest: { startup: { storage: 'storage' } } } }))
 vi.mock('./platform', () => ({ isTauri: true, isTauriAndroid: false, isTauriDesktop: false }))
 vi.mock('./storage/deviceSettings', () => ({ getDeviceSettings: () => ({ nativeFileLogEnabled: false }) }))
 vi.mock('./nativeLog', () => ({ setNativeLogFileEnabled: vi.fn() }))
@@ -116,8 +122,12 @@ vi.mock('./alert', () => ({
 vi.mock('./characterCards', () => ({ characterURLImport: vi.fn(), hubURL: 'https://hub.invalid' }))
 vi.mock('./storage/androidSafBridge', () => ({ isAndroidSafFileJobsEnabled: vi.fn(() => false) }))
 vi.mock('./storage/lifecycleCommit', () => ({ registerLifecycleCommitListeners: vi.fn() }))
+vi.mock('./nativeStartup', () => startupMocks)
 
-import { classifyBootFailure } from './bootstrap'
+import { alertError } from './alert'
+import { classifyBootFailure, loadData } from './bootstrap'
+import { setNativeLogFileEnabled } from './nativeLog'
+import { bootFailure } from './stores.svelte'
 
 describe('classifyBootFailure', () => {
     it('names an incompatible persistent schema wherever it is thrown', () => {
@@ -172,5 +182,25 @@ describe('classifyBootFailure', () => {
             message: 'null',
             stage: 'plugins',
         })
+    })
+})
+
+describe('native setup failure', () => {
+    it('stops bootstrap before diagnostics and exposes the existing failure panel state', async () => {
+        const failure = new Error('synthetic native setup failure')
+        startupMocks.checkNativeStartupStatus.mockRejectedValueOnce(failure)
+        const log = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+        await loadData()
+
+        expect(startupMocks.checkNativeStartupStatus).toHaveBeenCalledOnce()
+        expect(setNativeLogFileEnabled).not.toHaveBeenCalled()
+        expect(bootFailure.set).toHaveBeenLastCalledWith({
+            kind: 'unknown',
+            message: failure.message,
+            stage: 'native-setup',
+        })
+        expect(alertError).not.toHaveBeenCalled()
+        log.mockRestore()
     })
 })

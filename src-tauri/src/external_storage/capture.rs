@@ -29,6 +29,47 @@ fn checked_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+struct OwnedCaptureFile {
+    path: PathBuf,
+    directory: PathBuf,
+    owned: bool,
+}
+
+impl OwnedCaptureFile {
+    fn new(path: PathBuf, directory: &Path) -> Self {
+        Self {
+            path,
+            directory: directory.to_path_buf(),
+            owned: true,
+        }
+    }
+
+    fn keep(&mut self) {
+        self.owned = false;
+    }
+
+    fn remove_and_sync(&mut self) -> io::Result<bool> {
+        if !self.owned {
+            return Ok(true);
+        }
+        match fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        self.owned = false;
+        sync_directory(&self.directory)
+    }
+}
+
+impl Drop for OwnedCaptureFile {
+    fn drop(&mut self) {
+        if self.owned && fs::remove_file(&self.path).is_ok() {
+            let _ = sync_directory(&self.directory);
+        }
+    }
+}
+
 pub(crate) struct CaptureCatalog {
     pub(crate) db: Connection,
     path: PathBuf,
@@ -60,6 +101,7 @@ impl CaptureCatalog {
             .write(true)
             .create_new(true)
             .open(&path)?;
+        let mut destination_guard = OwnedCaptureFile::new(path.clone(), directory);
         if let Some((source, expected)) = previous {
             if is_link_like(&fs::symlink_metadata(source)?) {
                 return Err(invalid("Capture catalog must not be a link"));
@@ -97,6 +139,7 @@ impl CaptureCatalog {
                 CREATE TABLE dependencies(record TEXT NOT NULL,hash TEXT NOT NULL,bytes INTEGER NOT NULL,PRIMARY KEY(record,hash));
                 CREATE TABLE delta(key TEXT PRIMARY KEY);")?;
         }
+        destination_guard.keep();
         Ok(Self {
             db,
             path,
@@ -112,16 +155,31 @@ impl CaptureCatalog {
             return Err(invalid("Capture object identity differs"));
         }
         let path = self.object_directory.join(expected);
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => {
-                file.write_all(bytes)?;
-                file.sync_all()?;
+        let staging_path = self
+            .object_directory
+            .join(format!(".capture-{}.partial", uuid::Uuid::new_v4()));
+        let mut staging_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging_path)?;
+        let mut staging = OwnedCaptureFile::new(staging_path.clone(), &self.object_directory);
+        staging_file.write_all(bytes)?;
+        staging_file.sync_all()?;
+        drop(staging_file);
+        let _ = sync_directory(&self.object_directory)?;
+        #[cfg(target_os = "android")]
+        let publication = crate::trust_boundary::rename_without_replace(&staging_path, &path);
+        #[cfg(not(target_os = "android"))]
+        let publication = fs::hard_link(&staging_path, &path);
+        match publication {
+            Ok(()) => {
+                let _ = sync_directory(&self.object_directory)?;
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 if is_link_like(&fs::symlink_metadata(&path)?) {
                     return Err(invalid("Capture object must not be a link"));
                 }
-                let mut file = File::open(path)?;
+                let mut file = File::open(&path)?;
                 let actual = hash_reader(&mut file, bytes.len() as u64)
                     .map_err(|_| invalid("Existing capture object differs"))?;
                 if hex::encode(actual) != expected {
@@ -130,6 +188,7 @@ impl CaptureCatalog {
             }
             Err(error) => return Err(error.into()),
         }
+        let _ = staging.remove_and_sync()?;
         Ok(())
     }
 
@@ -319,4 +378,69 @@ pub(crate) fn registered_roots(
         }
     }
     Ok(roots)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_catalog_creation_releases_the_reserved_destination_for_retry() {
+        let root = tempfile::tempdir().expect("create capture root");
+        let source_path = root.path().join("previous.sqlite");
+        let source = Connection::open(&source_path).expect("create previous catalog");
+        source
+            .execute_batch("CREATE TABLE synthetic(value TEXT);")
+            .expect("initialize previous catalog");
+        drop(source);
+        let source_bytes = fs::read(&source_path).expect("read previous catalog");
+        let expected = hash(&source_bytes);
+        let capture_directory = root.path().join("capture");
+        let object_directory = root.path().join("objects");
+
+        assert!(CaptureCatalog::create(
+            &capture_directory,
+            &object_directory,
+            Some((&source_path, &[0; 32])),
+        )
+        .is_err());
+        assert!(!capture_directory.join("capture.sqlite").exists());
+
+        let catalog = CaptureCatalog::create(
+            &capture_directory,
+            &object_directory,
+            Some((&source_path, &expected)),
+        )
+        .expect("retry catalog creation");
+        assert!(catalog.path.is_file());
+    }
+
+    #[test]
+    fn capture_object_publication_never_replaces_an_existing_identity() {
+        let root = tempfile::tempdir().expect("create capture root");
+        let capture_directory = root.path().join("capture");
+        let object_directory = root.path().join("objects");
+        let catalog = CaptureCatalog::create(&capture_directory, &object_directory, None)
+            .expect("create capture catalog");
+        let payload = b"atomic synthetic capture object";
+        let expected = hex::encode(hash(payload));
+
+        catalog
+            .write_object(&expected, payload)
+            .expect("publish capture object");
+        catalog
+            .write_object(&expected, payload)
+            .expect("deduplicate capture object");
+        assert_eq!(
+            fs::read(object_directory.join(&expected)).expect("read published object"),
+            payload
+        );
+        assert!(fs::read_dir(&object_directory)
+            .expect("list object directory")
+            .all(|entry| !entry
+                .expect("read object entry")
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".partial")));
+    }
 }

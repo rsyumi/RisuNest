@@ -12,7 +12,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
-const DURABLE_CAS_JOB_VERSION: u32 = 1;
+const DURABLE_CAS_JOB_VERSION: u32 = 2;
 const MAX_DURABLE_CAS_JOB_JOURNALS: usize = 4_096;
 pub(crate) const MAX_DURABLE_CAS_JOB_PINS: usize = 100_000;
 
@@ -45,6 +45,7 @@ pub(crate) enum CasReleaseOutcome {
 struct PinDescriptor {
     byte_size: u64,
     role: CasObjectRole,
+    published_by_job: bool,
 }
 
 #[derive(Debug)]
@@ -58,6 +59,7 @@ pub(crate) struct DurableCasJob {
 struct JobState {
     job_id: String,
     kind: CasJobKind,
+    created_at_ms: i64,
     pins: BTreeMap<String, PinDescriptor>,
     sealed: bool,
     released: bool,
@@ -80,6 +82,7 @@ enum JobJournalRecord {
         object_hash: String,
         byte_size: u64,
         object_role: CasObjectRole,
+        published_by_job: bool,
     },
     Seal {
         sequence: u64,
@@ -130,6 +133,7 @@ impl DurableCasJob {
             state: JobState {
                 job_id: job_id.to_owned(),
                 kind,
+                created_at_ms,
                 pins: BTreeMap::new(),
                 sealed: false,
                 released: false,
@@ -219,6 +223,7 @@ impl DurableCasJob {
             &prepared.content_hash,
             prepared.byte_size,
             CasObjectRole::DirectObject,
+            !prepared.deduplicated,
         )?;
         Ok(prepared)
     }
@@ -238,7 +243,7 @@ impl DurableCasJob {
             Some(_) => return invalid_data("existing CAS object size does not match its pin"),
             None => return invalid_data("existing CAS object is missing"),
         }
-        self.record_pin(object_hash, byte_size, role)
+        self.record_pin(object_hash, byte_size, role, false)
     }
 
     pub(crate) fn pin_existing_batch(
@@ -254,9 +259,10 @@ impl DurableCasJob {
             let descriptor = PinDescriptor {
                 byte_size: *byte_size,
                 role: *role,
+                published_by_job: false,
             };
             if let Some(existing) = self.state.pins.get(object_hash) {
-                if *existing != descriptor {
+                if existing.byte_size != descriptor.byte_size || existing.role != descriptor.role {
                     return invalid_data("CAS job contains a conflicting object pin");
                 }
                 continue;
@@ -295,6 +301,7 @@ impl DurableCasJob {
                 object_hash: object_hash.clone(),
                 byte_size: pin.byte_size,
                 object_role: pin.role,
+                published_by_job: pin.published_by_job,
             };
             write_record(&mut file, &record, false)?;
             self.state.pins.insert(object_hash, pin);
@@ -364,6 +371,9 @@ impl DurableCasJob {
             return invalid_data("unsealed CAS job cannot be released as committed");
         }
         let _repository_guard = super::coordinator::lock_repository_mutation()?;
+        if outcome == CasReleaseOutcome::Aborted && !self.state.sealed {
+            self.register_abort_candidates()?;
+        }
         let record = JobJournalRecord::Release {
             sequence: self.state.next_sequence,
             job_id: self.state.job_id.clone(),
@@ -389,6 +399,31 @@ impl DurableCasJob {
         Ok(())
     }
 
+    fn register_abort_candidates(&self) -> io::Result<()> {
+        let registrations = self
+            .state
+            .pins
+            .iter()
+            .filter(|(_, pin)| pin.published_by_job)
+            .map(|(object_hash, pin)| AssetObjectRegistration {
+                object_hash: object_hash.clone(),
+                byte_size: pin.byte_size,
+            })
+            .collect::<Vec<_>>();
+        if registrations.is_empty() {
+            return Ok(());
+        }
+        for batch in registrations.chunks(ASSET_OBJECT_CATALOG_MAX_PAGE as usize) {
+            crate::persistent_store::register_asset_objects_at_root(
+                &self.repository_root,
+                batch,
+                self.state.created_at_ms,
+            )
+            .map_err(|error| io::Error::new(ErrorKind::InvalidData, error.to_string()))?;
+        }
+        Ok(())
+    }
+
     // Used by native_file_jobs tests behind the native-official-publication
     // feature; the default lib build cannot see that usage.
     #[allow(dead_code)]
@@ -409,22 +444,22 @@ impl DurableCasJob {
     }
 
     pub(crate) fn has_exact_pins(&self, pins: &[(String, u64, CasObjectRole)]) -> bool {
-        let mut expected = BTreeMap::new();
+        let mut expected = BTreeMap::<String, (u64, CasObjectRole)>::new();
         for (object_hash, byte_size, role) in pins {
             if expected
-                .insert(
-                    object_hash.clone(),
-                    PinDescriptor {
-                        byte_size: *byte_size,
-                        role: *role,
-                    },
-                )
-                .is_some_and(|existing| existing.byte_size != *byte_size || existing.role != *role)
+                .insert(object_hash.clone(), (*byte_size, *role))
+                .is_some_and(|existing| existing != (*byte_size, *role))
             {
                 return false;
             }
         }
-        self.state.pins == expected
+        self.state.pins.len() == expected.len()
+            && expected.iter().all(|(object_hash, (byte_size, role))| {
+                self.state
+                    .pins
+                    .get(object_hash)
+                    .is_some_and(|pin| pin.byte_size == *byte_size && pin.role == *role)
+            })
     }
 
     pub(crate) fn kind(&self) -> CasJobKind {
@@ -478,7 +513,12 @@ impl DurableCasJob {
             Some(actual_size) if actual_size == prepared.byte_size => {}
             _ => return invalid_data("prepared CAS object is not durable at its canonical path"),
         }
-        self.record_pin(&prepared.content_hash, prepared.byte_size, role)
+        self.record_pin(
+            &prepared.content_hash,
+            prepared.byte_size,
+            role,
+            !prepared.deduplicated,
+        )
     }
 
     fn record_pin(
@@ -486,11 +526,16 @@ impl DurableCasJob {
         object_hash: &str,
         byte_size: u64,
         role: CasObjectRole,
+        published_by_job: bool,
     ) -> io::Result<()> {
         validate_hash(object_hash)?;
-        let descriptor = PinDescriptor { byte_size, role };
+        let descriptor = PinDescriptor {
+            byte_size,
+            role,
+            published_by_job,
+        };
         if let Some(existing) = self.state.pins.get(object_hash) {
-            if *existing == descriptor {
+            if existing.byte_size == byte_size && existing.role == role {
                 return Ok(());
             }
             return invalid_data("CAS job contains a conflicting object pin");
@@ -504,6 +549,7 @@ impl DurableCasJob {
             object_hash: object_hash.to_owned(),
             byte_size,
             object_role: role,
+            published_by_job,
         };
         let mut file = OpenOptions::new().append(true).open(&self.journal_path)?;
         write_record(&mut file, &record, false)?;
@@ -871,6 +917,7 @@ fn apply_record(
             *state = Some(JobState {
                 job_id,
                 kind: job_kind,
+                created_at_ms,
                 pins: BTreeMap::new(),
                 sealed: false,
                 released: false,
@@ -883,6 +930,7 @@ fn apply_record(
             object_hash,
             byte_size,
             object_role,
+            published_by_job,
         } => {
             let state = current_state(state, sequence, &job_id, expected_job_id)?;
             if state.sealed || state.released || state.pins.len() >= MAX_DURABLE_CAS_JOB_PINS {
@@ -896,6 +944,7 @@ fn apply_record(
                     PinDescriptor {
                         byte_size,
                         role: object_role,
+                        published_by_job,
                     },
                 )
                 .is_some()
@@ -1125,6 +1174,124 @@ mod tests {
             .items
             .iter()
             .any(|item| item.object_hash == prepared.content_hash));
+    }
+
+    #[test]
+    fn aborted_job_catalogs_only_objects_it_published_for_safe_gc() {
+        let directory = tempfile::tempdir().expect("create aborted job directory");
+        let mut store = PersistentStore::open(directory.path()).expect("open catalog");
+        let cas = PayloadCas::new(directory.path()).expect("open payload CAS");
+        let preexisting = cas
+            .prepare_bytes(b"preexisting unowned payload")
+            .expect("prepare preexisting payload");
+        let mut job = DurableCasJob::begin(
+            directory.path(),
+            "aborted-catalog-job",
+            CasJobKind::LocalBackupRestore,
+            1,
+        )
+        .expect("begin aborted job");
+        let published = job
+            .prepare_bytes(&cas, b"new aborted payload", CasObjectRole::DirectObject)
+            .expect("prepare newly published payload");
+        job.pin_existing(
+            &cas,
+            &preexisting.content_hash,
+            preexisting.byte_size,
+            CasObjectRole::DirectObject,
+        )
+        .expect("pin preexisting payload");
+
+        job.release(CasReleaseOutcome::Aborted)
+            .expect("release aborted job");
+
+        let catalog = store
+            .query_asset_object_catalog(16, None)
+            .expect("read abort candidates");
+        assert!(catalog
+            .items
+            .iter()
+            .any(|candidate| candidate.object_hash == published.content_hash));
+        assert!(!catalog
+            .items
+            .iter()
+            .any(|candidate| candidate.object_hash == preexisting.content_hash));
+
+        let deleted = store
+            .asset_gc_delete_page(16, None, 100, 10)
+            .expect("collect unrooted abort candidate");
+        assert_eq!(deleted.report.deleted_hashes, [published.content_hash]);
+        assert_eq!(
+            cas.stat_object(&preexisting.content_hash)
+                .expect("stat preexisting payload"),
+            Some(preexisting.byte_size)
+        );
+    }
+
+    #[test]
+    fn aborted_job_keeps_its_journal_when_candidate_registration_fails() {
+        let directory = tempfile::tempdir().expect("create failed abort directory");
+        let cas = PayloadCas::new(directory.path()).expect("open payload CAS");
+        let mut job = DurableCasJob::begin(
+            directory.path(),
+            "failed-abort-catalog-job",
+            CasJobKind::LocalBackupRestore,
+            1,
+        )
+        .expect("begin failed abort job");
+        let prepared = job
+            .prepare_bytes(
+                &cas,
+                b"candidate registration failure",
+                CasObjectRole::DirectObject,
+            )
+            .expect("prepare abort candidate");
+        let journal_path = job.journal_path().to_path_buf();
+        let store = PersistentStore::open(directory.path()).expect("open persistent store");
+        drop(store);
+        let connection =
+            rusqlite::Connection::open(directory.path().join("persistent/persistent.db"))
+                .expect("open catalog database");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_abort_candidate BEFORE INSERT ON asset_objects
+                 BEGIN SELECT RAISE(ABORT, 'synthetic'); END;",
+            )
+            .expect("install registration failure");
+        drop(connection);
+
+        assert!(job.release(CasReleaseOutcome::Aborted).is_err());
+        assert!(!job.is_released());
+        assert!(journal_path.is_file());
+        assert_eq!(
+            cas.stat_object(&prepared.content_hash)
+                .expect("stat protected candidate"),
+            Some(prepared.byte_size)
+        );
+        assert!(collect_durable_cas_job_roots(directory.path())
+            .blockers
+            .contains("job-pin-unsealed:failed-abort-catalog-job"));
+    }
+
+    #[test]
+    fn aborted_job_does_not_create_a_missing_persistent_database() {
+        let directory = tempfile::tempdir().expect("create missing store directory");
+        let cas = PayloadCas::new(directory.path()).expect("open payload CAS");
+        let mut job = DurableCasJob::begin(
+            directory.path(),
+            "missing-store-abort-job",
+            CasJobKind::LocalBackupRestore,
+            1,
+        )
+        .expect("begin missing store job");
+        job.prepare_bytes(&cas, b"orphan candidate", CasObjectRole::DirectObject)
+            .expect("prepare orphan candidate");
+        let journal_path = job.journal_path().to_path_buf();
+
+        assert!(job.release(CasReleaseOutcome::Aborted).is_err());
+        assert!(!directory.path().join("persistent/persistent.db").exists());
+        assert!(journal_path.is_file());
+        assert!(!job.is_released());
     }
 
     #[test]
@@ -1638,6 +1805,7 @@ mod tests {
                 object_hash: "aa".repeat(32),
                 byte_size: 1,
                 object_role: CasObjectRole::DirectObject,
+                published_by_job: false,
             },
             true,
         )

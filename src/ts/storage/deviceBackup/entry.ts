@@ -3,6 +3,7 @@ import type {
   DeviceMaintenanceBootstrap,
   DeviceMaintenanceView,
 } from "./maintenance";
+import { checkNativeStartupStatus } from "../../nativeStartup";
 
 function maintenanceView(
   cancel: () => void,
@@ -103,6 +104,13 @@ export async function deviceMaintenanceBeforeBootstrap(): Promise<void> {
     !(window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__
   )
     return;
+  try {
+    await checkNativeStartupStatus();
+  } catch {
+    // normalMain mounts the shared startup panel, whose bootstrap observes the
+    // latched error before it can reach storage, media, or plugin operations.
+    return;
+  }
   let view: ReturnType<typeof maintenanceView> | undefined;
   let sessionId: string | undefined;
   const retry = async () => {

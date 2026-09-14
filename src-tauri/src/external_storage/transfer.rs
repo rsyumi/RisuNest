@@ -82,7 +82,7 @@ impl AsyncRead for CancelledReader {
     ) -> std::task::Poll<std::io::Result<()>> {
         if self.cancel.check().is_err() {
             return std::task::Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
+                std::io::ErrorKind::Other,
                 "cancelled",
             )));
         }
@@ -126,7 +126,7 @@ impl AsyncWrite for LimitedWriter {
     ) -> std::task::Poll<std::io::Result<usize>> {
         if self.cancel.check().is_err() {
             return std::task::Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
+                std::io::ErrorKind::Other,
                 "cancelled",
             )));
         }

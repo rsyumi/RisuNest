@@ -179,4 +179,49 @@ describe('migrateLegacyAssetRepository', () => {
         expect(release).toHaveBeenCalledOnce()
         expect(sessionRelease).toHaveBeenCalledWith('aborted')
     })
+
+    it('uses the verified payload size when legacy metadata is stale', async () => {
+        const payload = Uint8Array.of(1, 2, 3, 4)
+        const hash = 'ab'.repeat(32)
+        const activate = vi.fn(async (_input: AssetRepositoryMigrationInput) => ({ revision: 4 }))
+        const store = {
+            readAssetRepositoryAuthority: vi.fn(async () => ({
+                revision: 3,
+                value: { format: 'legacy' as const },
+            })),
+            acquireRevision: vi.fn(async () => ({ release: vi.fn() })),
+            materializeDatabase: vi.fn(async () => structuredClone(fixtureDatabase)),
+            activateAssetRepositoryMigration: activate,
+        }
+        const cas = {
+            prepare: vi.fn(async () => ({
+                contentHash: hash,
+                byteSize: payload.byteLength,
+                physicalKey: `assets-v2/objects/ab/${hash.slice(2)}`,
+                deduplicated: false,
+            })),
+            statObject: vi.fn(async () => payload.byteLength),
+        }
+
+        await expect(migrateLegacyAssetRepository({
+            store: store as never,
+            legacy: {
+                list: vi.fn(async () => [{
+                    kind: 'asset' as const,
+                    key: 'assets/stale.bin',
+                    size: 99,
+                    mime: 'application/octet-stream',
+                    name: 'stale',
+                    ext: 'bin',
+                }]),
+                read: vi.fn(async () => payload),
+            } as never,
+            cas: cas as never,
+            migrationId: 'stale-size',
+        })).resolves.toMatchObject({ aliases: 1 })
+
+        expect(activate.mock.calls[0]![0].assetAliases).toContainEqual(
+            expect.objectContaining({ key: 'assets/stale.bin', size: payload.byteLength }),
+        )
+    })
 })

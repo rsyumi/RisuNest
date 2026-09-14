@@ -320,6 +320,7 @@ export async function makeColdData():Promise<boolean>{
             createId: () => crypto.randomUUID(),
             write: setLocalColdStorageItem,
             read: (key) => getColdStorageItem(key, { accountFallback: true }),
+            remove: (keys) => requireLocalColdStorageRuntime().remove(keys),
             replaceDatabase: (candidate, reason) => {
                 if (
                     DBState.db !== database

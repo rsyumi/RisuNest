@@ -69,14 +69,22 @@ fn adopts_import_without_copying_and_preserves_conflicts_and_cancelled_sources()
         .is_err());
     assert!(linked.exists());
     assert_eq!(std::fs::read(&alias).unwrap(), bytes);
-    let cancelled = import_payload(directory.path(), "cancelled.payload", bytes);
-    assert_eq!(
-        cas.adopt_import_payload(&cancelled, &hash, bytes.len() as u64, &|| true)
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::Interrupted
-    );
+    let cancelled_bytes = b"synthetic cancelled payload";
+    let cancelled_hash = hex::encode(Sha256::digest(cancelled_bytes));
+    let cancelled = import_payload(directory.path(), "cancelled.payload", cancelled_bytes);
+    let cancellation = cas
+        .adopt_import_payload(
+            &cancelled,
+            &cancelled_hash,
+            cancelled_bytes.len() as u64,
+            &|| true,
+        )
+        .unwrap_err();
+    assert_eq!(cancellation.kind(), io::ErrorKind::Other);
+    assert_eq!(cancellation.to_string(), "import cancelled");
     assert!(cancelled.exists());
+    assert_eq!(std::fs::read(&cancelled).unwrap(), cancelled_bytes);
+    assert!(cas.read_object(&cancelled_hash).unwrap().is_none());
     let external = directory.path().join("user.payload");
     std::fs::write(&external, bytes).unwrap();
     assert!(cas

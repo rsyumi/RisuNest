@@ -7,6 +7,7 @@ import {
     createNativeImmutablePayloadCas,
     createNativeNewInlayImageEncoder,
     finalizeContentCasJob,
+    NATIVE_CAS_IPC_CHUNK_BYTES,
     pinExistingCasObject,
     prepareCasObject,
     releaseCasJob,
@@ -15,9 +16,10 @@ import {
 
 describe('native asset repository adapters', () => {
     it('rejects bare native writes and uses native CAS commands for bounded reads', async () => {
-        const invoke = vi.fn(async (command: string) => {
-            if (command === 'asset_cas_read_object') return [1, 2, 3]
-            if (command === 'asset_cas_read_object_range') return [2]
+        const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
+            if (command === 'asset_cas_read_object_range') {
+                return args?.start === 0 ? [1, 2, 3] : [2]
+            }
             if (command === 'asset_cas_stat_object') return 3
             throw new Error(`Unexpected command ${command}`)
         })
@@ -39,9 +41,76 @@ describe('native asset repository adapters', () => {
         })
     })
 
+    it('streams large CAS writes through bounded chunks and always cancels the spool', async () => {
+        const hash = '22'.repeat(32)
+        const acknowledgements: number[] = []
+        const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
+            if (command === 'asset_cas_job_upload_open') {
+                return { capacity: 64 * 1024 }
+            }
+            if (command === 'asset_cas_job_upload_chunk') {
+                const next = Number(args?.offset) + (args?.data as number[]).length
+                acknowledgements.push(next)
+                return next
+            }
+            if (command === 'asset_cas_job_upload_finish') {
+                return {
+                    contentHash: hash,
+                    byteSize: 64 * 1024 + 3,
+                    physicalKey: `assets-v2/objects/22/${hash.slice(2)}`,
+                    deduplicated: false,
+                }
+            }
+            return undefined
+        })
+
+        await expect(prepareCasObject(
+            'session-large',
+            new Uint8Array(64 * 1024 + 3),
+            'direct-object',
+            invoke,
+        )).resolves.toMatchObject({ byteSize: 64 * 1024 + 3 })
+
+        expect(acknowledgements).toEqual([64 * 1024, 64 * 1024 + 3])
+        expect(invoke.mock.calls.map(([command]) => command)).toEqual([
+            'asset_cas_job_upload_open',
+            'asset_cas_job_upload_chunk',
+            'asset_cas_job_upload_chunk',
+            'asset_cas_job_upload_finish',
+            'asset_cas_job_upload_cancel',
+        ])
+        expect(invoke).not.toHaveBeenCalledWith('asset_cas_job_prepare', expect.anything())
+        const chunks = invoke.mock.calls
+            .filter(([command]) => command === 'asset_cas_job_upload_chunk')
+            .map(([, args]) => (args?.data as number[]).length)
+        expect(chunks).toEqual([64 * 1024, 3])
+    })
+
+    it('assembles large CAS reads from bounded range responses', async () => {
+        const source = new Uint8Array(NATIVE_CAS_IPC_CHUNK_BYTES + 5)
+        source[source.length - 1] = 9
+        const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
+            if (command === 'asset_cas_stat_object') return source.byteLength
+            if (command === 'asset_cas_read_object_range') {
+                return Array.from(source.subarray(Number(args?.start), Number(args?.endExclusive)))
+            }
+            throw new Error(`Unexpected command ${command}`)
+        })
+
+        await expect(createNativeImmutablePayloadCas(invoke).readObject('11'.repeat(32)))
+            .resolves.toEqual(source)
+        const rangeCalls = invoke.mock.calls.filter(
+            ([command]) => command === 'asset_cas_read_object_range',
+        )
+        expect(rangeCalls).toHaveLength(2)
+        expect(rangeCalls.map(([, args]) => Number(args?.endExclusive) - Number(args?.start)))
+            .toEqual([NATIVE_CAS_IPC_CHUNK_BYTES, 5])
+    })
+
     it('forwards configurable inlay options and accepts truthful PNG metadata', async () => {
         const invoke = vi.fn(async () => ({
             data: [4, 5, 6],
+            outputSize: 3,
             metadata: {
                 key: 'inlay-id',
                 kind: 'inlay',
@@ -79,10 +148,65 @@ describe('native asset repository adapters', () => {
         })
     })
 
+    it('streams large Inlay encoder input and output through bounded native media commands', async () => {
+        const transferSize = 64 * 1024 + 1
+        const source = new Uint8Array(transferSize)
+        source.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+        const output = new Uint8Array(transferSize)
+        output[transferSize - 1] = 7
+        const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
+            if (command === 'native_media_inlay_input_open') return { capacity: 64 * 1024 }
+            if (command === 'native_media_inlay_input_chunk') {
+                return Number(args?.offset) + (args?.data as number[]).length
+            }
+            if (command === 'native_media_encode_inlay_finish') {
+                return {
+                    data: null,
+                    outputId: 'encoded-output',
+                    outputSize: transferSize,
+                    metadata: {
+                        key: 'large-inlay', kind: 'inlay', size: transferSize,
+                        mime: 'image/png', name: 'large.png', ext: 'png',
+                        inlayType: 'image', width: 1, height: 1,
+                    },
+                }
+            }
+            if (command === 'native_media_inlay_output_read') {
+                return Array.from(output.subarray(
+                    Number(args?.start),
+                    Number(args?.endExclusive),
+                ))
+            }
+            return undefined
+        })
+
+        await expect(createNativeNewInlayImageEncoder(invoke).encodeNewInlayImage(
+            'large-inlay',
+            source,
+            { name: 'large.png', options: { format: 'png', quality: 85, maxDimension: 0, skipReencode: false } },
+        )).resolves.toMatchObject({ data: output })
+
+        expect(invoke.mock.calls.map(([command]) => command)).toEqual([
+            'native_media_inlay_input_open',
+            'native_media_inlay_input_chunk',
+            'native_media_inlay_input_chunk',
+            'native_media_encode_inlay_finish',
+            'native_media_inlay_input_cancel',
+            'native_media_inlay_output_read',
+            'native_media_inlay_output_read',
+            'native_media_inlay_output_cancel',
+        ])
+        expect(invoke).not.toHaveBeenCalledWith(
+            'native_media_encode_inlay_image',
+            expect.anything(),
+        )
+    })
+
     it('normalizes ignored original conversion options before invoking native code', async () => {
         const source = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)
         const invoke = vi.fn(async () => ({
             data: Array.from(source),
+            outputSize: source.byteLength,
             metadata: {
                 key: 'original-id', kind: 'inlay', size: source.byteLength,
                 mime: 'image/png', name: 'original.png', ext: 'png', inlayType: 'image',
@@ -112,6 +236,7 @@ describe('native asset repository adapters', () => {
     ] as const)('rejects a native %s response with a mismatched MIME and extension pair', async (format, mime, ext) => {
         const encoder = createNativeNewInlayImageEncoder(async () => ({
             data: [4],
+            outputSize: 1,
             metadata: {
                 key: 'inlay-id', kind: 'inlay', size: 1, mime, name: 'Image', ext,
                 inlayType: 'image', width: 1, height: 1,

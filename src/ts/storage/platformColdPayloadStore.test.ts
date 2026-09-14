@@ -68,6 +68,49 @@ describe('platform cold payload storage', () => {
         expect(resolutions).toBe(2)
     })
 
+    test('aborts an errored OPFS write and preserves its primary failure', async () => {
+        const writeError = new Error('write failed')
+        const abortError = new Error('abort failed')
+        const close = vi.fn(async () => undefined)
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+        const directory = {
+            getFileHandle: async () => ({
+                createWritable: async () => ({
+                    write: async () => { throw writeError },
+                    abort: async () => { throw abortError },
+                    close,
+                }),
+            }),
+        } as unknown as FileSystemDirectoryHandle
+        const store = createLegacyBrowserOpfsColdPayloadStore(directory)
+
+        await expect(store.write('same', Uint8Array.of(1))).rejects.toBe(writeError)
+        expect(close).not.toHaveBeenCalled()
+        expect(consoleError).toHaveBeenCalledWith(
+            'OPFS cold payload write abort failed',
+            abortError,
+        )
+        consoleError.mockRestore()
+    })
+
+    test('propagates close failure after an otherwise successful OPFS write', async () => {
+        const closeError = new Error('close failed')
+        const abort = vi.fn(async () => undefined)
+        const directory = {
+            getFileHandle: async () => ({
+                createWritable: async () => ({
+                    write: async () => undefined,
+                    abort,
+                    close: async () => { throw closeError },
+                }),
+            }),
+        } as unknown as FileSystemDirectoryHandle
+        const store = createLegacyBrowserOpfsColdPayloadStore(directory)
+
+        await expect(store.write('same', Uint8Array.of(1))).rejects.toBe(closeError)
+        expect(abort).not.toHaveBeenCalled()
+    })
+
 
     test('gates only cold writes and removals', async () => {
         const backend = memoryBackend()

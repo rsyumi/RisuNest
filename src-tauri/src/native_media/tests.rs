@@ -970,6 +970,73 @@ fn overwrites_payload_and_metadata_as_one_recoverable_pair() {
 }
 
 #[test]
+fn commits_png_and_original_inlay_formats_without_rolling_back_the_new_pair() {
+    for (id, source_format, options, expected_mime, expected_ext) in [
+        (
+            "png-commit",
+            ImageFormat::Png,
+            InlayEncodeOptions {
+                format: InlayEncodeFormat::Png,
+                quality: 85,
+                max_dimension: 0,
+                skip_reencode: false,
+            },
+            "image/png",
+            "png",
+        ),
+        (
+            "original-jpeg-commit",
+            ImageFormat::Jpeg,
+            InlayEncodeOptions {
+                format: InlayEncodeFormat::Original,
+                quality: 85,
+                max_dimension: 0,
+                skip_reencode: false,
+            },
+            "image/jpeg",
+            "jpg",
+        ),
+    ] {
+        let temp = TempDir::new().unwrap();
+
+        let metadata = super::write_inlay_image_with_options(
+            temp.path(),
+            id,
+            &encoded_fixture(source_format, 5, 3),
+            "source",
+            Some(options),
+        )
+        .unwrap();
+        let encoded_id = hex(id);
+        let payload = fs::read(
+            temp.path()
+                .join("blobstore/inlays")
+                .join(format!("{encoded_id}.bin")),
+        )
+        .unwrap();
+        let stored_metadata: InlayImageMetadata = serde_json::from_slice(
+            &fs::read(
+                temp.path()
+                    .join("blobstore/metadata")
+                    .join(format!("{encoded_id}.json")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(!payload.is_empty());
+        assert_eq!(metadata.mime, expected_mime);
+        assert_eq!(metadata.ext, expected_ext);
+        assert_eq!(stored_metadata, metadata);
+        assert!(!temp
+            .path()
+            .join("blobstore/inlay-transactions")
+            .join(format!("{encoded_id}.json"))
+            .exists());
+    }
+}
+
+#[test]
 fn startup_recovery_restores_the_prior_pair_after_interrupted_promotion() {
     let temp = TempDir::new().unwrap();
     write_inlay_image(

@@ -250,6 +250,27 @@ describe('native inlay fresh-install boundary', () => {
         }])
     })
 
+    test('native generated images map asset namespace ids before invoking the optimizer', async () => {
+        const source = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(source, {
+            headers: { 'Content-Type': 'image/png' },
+        })))
+        const image = {
+            src: 'blob:source-asset',
+            currentSrc: '',
+        } as HTMLImageElement
+
+        await expect(writeInlayImage(image, {
+            id: 'assets/persona-image.png',
+            name: 'assets/persona-image.png',
+        })).resolves.toBe('persona-image.png')
+
+        expect(native.optimizedWrites).toEqual([{
+            key: 'persona-image.png', data: source, name: 'assets/persona-image.png',
+        }])
+        expect(native.optimizedWrites.some(({ key }) => key.startsWith('assets/'))).toBe(false)
+    })
+
     test('browser-decodable BMP images fall back to a WebP BlobStore write', async () => {
         const bmp = Uint8Array.of(0x42, 0x4d, 0, 0)
         const fetchSource = vi.fn(async () => new Response(bmp, {

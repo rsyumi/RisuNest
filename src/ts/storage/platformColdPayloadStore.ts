@@ -86,9 +86,15 @@ export function createLegacyBrowserOpfsColdPayloadStore(
             const writable = await (await directory.getFileHandle(fileName(key), { create: true })).createWritable()
             try {
                 await writable.write(data.slice().buffer as ArrayBuffer)
-            } finally {
-                await writable.close()
+            } catch (error) {
+                try {
+                    await writable.abort(error)
+                } catch (abortError) {
+                    console.error('OPFS cold payload write abort failed', abortError)
+                }
+                throw error
             }
+            await writable.close()
         },
         async list() {
             const keys: string[] = []

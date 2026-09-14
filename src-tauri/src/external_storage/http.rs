@@ -133,7 +133,7 @@ impl HttpTransport for NativeHttpTransport {
                 headers,
                 body: Box::pin(ResponseBody {
                     reader: Box::pin(reader),
-                    cancelled: Box::pin(async move { owned_cancel.cancelled().await }),
+                    cancel: owned_cancel,
                 }),
             })
         })
@@ -141,7 +141,7 @@ impl HttpTransport for NativeHttpTransport {
 }
 struct ResponseBody {
     reader: Pin<Box<dyn AsyncRead + Send>>,
-    cancelled: Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    cancel: Cancellation,
 }
 impl AsyncRead for ResponseBody {
     fn poll_read(
@@ -149,9 +149,9 @@ impl AsyncRead for ResponseBody {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        if self.cancelled.as_mut().poll(cx).is_ready() {
+        if self.cancel.check().is_err() {
             return std::task::Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
+                std::io::ErrorKind::Other,
                 "cancelled",
             )));
         }

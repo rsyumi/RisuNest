@@ -1,4 +1,3 @@
-import localforage from 'localforage'
 import {
     BaseDirectory,
     SeekMode,
@@ -24,6 +23,7 @@ import {
 } from './blobStore'
 import type { StorageMutationGate } from './storageMutationGate'
 import { objectPhysicalKey } from './payloadCas'
+import { invokeWithBoundedNativeMediaInput } from './nativeMediaIpc'
 
 function logicalKeyHex(key: string): string {
     return Buffer.from(key, 'utf-8').toString('hex')
@@ -107,12 +107,16 @@ export function createTauriBlobStore(
             const options = input.options === undefined
                 ? undefined
                 : normalizeInlayEncodeOptions(input.options)
-            return await invokeCommand('native_media_write_inlay_image', {
-                id: key,
-                data: Array.from(data),
-                name: input.name,
-                ...(options === undefined ? {} : { options }),
-            }) as InlayBlobMetadata
+            return invokeWithBoundedNativeMediaInput<InlayBlobMetadata>(invokeCommand, {
+                data,
+                directCommand: 'native_media_write_inlay_image',
+                streamedFinishCommand: 'native_media_write_inlay_finish',
+                args: {
+                    id: key,
+                    name: input.name,
+                    ...(options === undefined ? {} : { options }),
+                },
+            })
         },
     }
 }
@@ -177,9 +181,15 @@ export function createOpfsBlobBackend(directory: FileSystemDirectoryHandle): Blo
             const stream = await (await directory.getFileHandle(fileName(key), { create: true })).createWritable()
             try {
                 await stream.write(value.slice().buffer as ArrayBuffer)
-            } finally {
-                await stream.close()
+            } catch (error) {
+                try {
+                    await stream.abort(error)
+                } catch (abortError) {
+                    console.error('OPFS blob write abort failed', abortError)
+                }
+                throw error
             }
+            await stream.close()
         },
         async read(key) {
             const file = await readFileObject(key)
@@ -295,10 +305,9 @@ export function createTauriBlobBackend(dependencies?: TauriBlobBackendDependenci
     }
 }
 
-const browserLocalStorage = localforage.createInstance({ name: 'risuai' }) as unknown as KeyValueStorage
 let productionStore: Promise<BlobStore> | undefined
 let productionBackend: Promise<BlobKeyValueBackend> | undefined
-let storageProvider: () => Promise<KeyValueStorage | null> = async () => browserLocalStorage
+let storageProvider: () => Promise<KeyValueStorage | null> = async () => null
 
 export function configureBlobStoreStorageProvider(provider: () => Promise<KeyValueStorage | null>): void {
     storageProvider = provider
@@ -317,8 +326,9 @@ export async function createBrowserBlobBackend(
     selected: KeyValueStorage | null,
     getOpfsDirectory: () => Promise<FileSystemDirectoryHandle> = () => navigator.storage.getDirectory(),
 ): Promise<BlobKeyValueBackend> {
+    if (!selected) throw new Error('Blob storage provider is not configured')
     if (selected?.blobStorageKind === 'opfs') return createOpfsBlobBackend(await getOpfsDirectory())
-    return createStorageBlobKeyValueBackend(selected ?? browserLocalStorage)
+    return createStorageBlobKeyValueBackend(selected)
 }
 
 export async function readBlobForFacade(

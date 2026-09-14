@@ -30,8 +30,7 @@ pub struct MigrationStatus {
 }
 
 // The staged-migration journal writer is exercised by persistent_store tests
-// as a GC-blocking fixture; the production writer arrives with native asset
-// migration (journal consolidation is queued in docs/remaining-work.md).
+// as a GC-blocking fixture until native asset migration writes these journals.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 pub struct StagedAssetMigration {

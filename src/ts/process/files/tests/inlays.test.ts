@@ -1,4 +1,5 @@
 import fc from 'fast-check'
+import localforage from 'localforage'
 import { beforeEach, describe, expect, test, vi } from 'vitest'
 import type { InlayAsset } from '../inlays'
 import {
@@ -18,7 +19,10 @@ import {
     writeInlayImage,
     UnsupportedAnimatedInlayError,
 } from '../inlays'
-import { createBackedBlobStore } from 'src/ts/storage/platformBlobStore'
+import {
+    configureBlobStoreStorageProvider,
+    createBackedBlobStore,
+} from 'src/ts/storage/platformBlobStore'
 import { getDatabase } from 'src/ts/storage/database.svelte'
 
 //#region module mocks
@@ -169,6 +173,7 @@ beforeEach(() => {
     canvasEncodeArgs = undefined
     loadedImageWidth = 100
     loadedImageHeight = 100
+    configureBlobStoreStorageProvider(async () => localforage.createInstance({ name: 'risunest' }))
     vi.stubGlobal('fetch', vi.fn(async () => new Response(
         Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
         { headers: { 'Content-Type': 'image/png' } },
@@ -838,6 +843,30 @@ describe('writeInlayImage', () => {
         expect(stored!.data.type).toBe('image/webp')
     })
 
+    test('maps an asset namespace id to a stable Inlay id without overwriting the source asset', async () => {
+        const sourceAssetKey = 'assets/character-image.png'
+        store.set(sourceAssetKey, new Uint8Array([9, 8, 7]))
+
+        const first = await writeInlayImage(makeImage(200, 100), {
+            name: sourceAssetKey,
+            ext: 'png',
+            id: sourceAssetKey,
+        })
+        const second = await writeInlayImage(makeImage(200, 100), {
+            name: sourceAssetKey,
+            ext: 'png',
+            id: sourceAssetKey,
+        })
+
+        expect(first).toBe('character-image.png')
+        expect(second).toBe(first)
+        expect(store.get(sourceAssetKey)).toEqual(new Uint8Array([9, 8, 7]))
+        expect(await getInlayAssetBlob(first)).toMatchObject({
+            name: sourceAssetKey,
+            type: 'image',
+        })
+    })
+
     test('generates uuid when no id is provided', async () => {
         const imgObj = makeImage(50, 50)
 
@@ -869,6 +898,18 @@ describe('writeInlayImage', () => {
 })
 
 describe('set -> get round-trip', () => {
+    test('returns the mapped identity when setInlayAsset receives an asset namespace id', async () => {
+        const id = await setInlayAsset('assets/persona.png', {
+            data: new Blob(['data'], { type: 'audio/mpeg' }),
+            ext: 'mp3',
+            name: 'persona.mp3',
+            type: 'audio',
+        })
+
+        expect(id).toBe('persona.png')
+        expect(await getInlayAssetBlob(id)).toMatchObject({ name: 'persona.mp3', type: 'audio' })
+    })
+
     test('preserves metadata through setInlayAsset -> getInlayAsset', async () => {
         await fc.assert(
             fc.asyncProperty(

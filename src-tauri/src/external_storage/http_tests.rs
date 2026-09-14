@@ -108,7 +108,11 @@ fn cancellation_wakes_header_and_body_waits_and_all_listeners() {
                         let mut byte = [0];
                         assert_eq!(
                             response.body.read(&mut byte).await.unwrap_err().kind(),
-                            std::io::ErrorKind::Interrupted
+                            std::io::ErrorKind::Other
+                        );
+                        assert_eq!(
+                            response.body.read(&mut byte).await.unwrap_err().kind(),
+                            std::io::ErrorKind::Other
                         );
                     }
                     Err(error) => assert_eq!(error.kind, ErrorKind::Cancelled),

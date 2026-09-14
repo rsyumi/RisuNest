@@ -25,14 +25,16 @@ afterEach(() => {
 describe("device maintenance bootstrap ordering", () => {
   it("does not evaluate the normal app before the native recovery decision", async () => {
     let decide!: (value: unknown) => void;
-    state.invoke.mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          decide = resolve;
-        }),
-    );
+    state.invoke.mockImplementation((command: string) => {
+      if (command === "native_startup_status") return Promise.resolve();
+      return new Promise((resolve) => {
+        decide = resolve;
+      });
+    });
     const main = await import("../../../main");
-    expect(state.invoke).toHaveBeenCalledExactlyOnceWith(
+    expect(state.invoke).toHaveBeenNthCalledWith(1, "native_startup_status");
+    expect(state.invoke).toHaveBeenNthCalledWith(
+      2,
       "native_device_backup_bootstrap",
       { freshBootstrap: true },
     );
@@ -43,12 +45,20 @@ describe("device maintenance bootstrap ordering", () => {
   });
 
   it("blocks normal imports when the native recovery decision fails", async () => {
-    state.invoke.mockRejectedValue(new Error("synthetic journal failure"));
+    state.invoke.mockImplementation((command: string) => command === "native_startup_status"
+      ? Promise.resolve()
+      : Promise.reject(new Error("synthetic journal failure")));
     await import("../../../main");
     await vi.waitFor(() =>
       expect(document.body.textContent).toContain(
         "Normal app startup is blocked",
       ),
+    );
+    expect(state.invoke).toHaveBeenNthCalledWith(1, "native_startup_status");
+    expect(state.invoke).toHaveBeenNthCalledWith(
+      2,
+      "native_device_backup_bootstrap",
+      { freshBootstrap: true },
     );
     expect(state.normalStarted).not.toHaveBeenCalled();
   });

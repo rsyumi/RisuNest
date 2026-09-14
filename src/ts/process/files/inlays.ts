@@ -44,6 +44,14 @@ const inlayVideoExts = [
     'webm', 'mp4', 'mkv'
 ]
 
+function inlayWriteId(id?: string): string {
+    if (id === undefined) return v4()
+    let inlayId = id
+    while (inlayId.startsWith('assets/')) inlayId = inlayId.slice('assets/'.length)
+    if (inlayId.length === 0) throw new TypeError('Inlay image id is empty after removing the asset namespace')
+    return inlayId
+}
+
 const inlayStorage = localforage.createInstance({
     name: 'inlay',
     storeName: 'inlay'
@@ -148,7 +156,7 @@ function imageReadiness(imgObj: HTMLImageElement, sourceUrl?: string): Promise<v
 }
 
 export async function writeInlayImage(imgObj:HTMLImageElement, arg:{name?:string, ext?:string, id?:string} = {}, sourceUrl?: string) {
-    const imgid = arg.id ?? v4()
+    const imgid = inlayWriteId(arg.id)
     const source = sourceUrl || imgObj.currentSrc || imgObj.src
     if (!source) throw new Error('Inlay image source is unavailable')
     const response = await fetch(source)
@@ -529,25 +537,26 @@ function validateNewInlayImage(data: Uint8Array, mime: string, ext: string): voi
     if (isAnimatedPng(data)) throw new UnsupportedAnimatedInlayError('APNG Inlay images are unsupported')
 }
 
-export async function setInlayAsset(id: string, img: InlayAsset){
+export async function setInlayAsset(id: string, img: InlayAsset): Promise<string> {
+    const inlayId = inlayWriteId(id)
     const { bytes, mime } = await inlayBytes(img)
     const blobStore = await resolveBlobStore()
     if (img.type === 'image') validateNewInlayImage(bytes, mime, img.ext)
     if (isTauri && img.type === 'image' && isNativeInlayFormat(bytes)) {
         if (!blobStore.putNewInlayImage) throw new Error('Native Inlay image writer is unavailable')
-        await blobStore.putNewInlayImage(id, bytes, { name: img.name, options: getInlayEncodeOptions() })
-        return
+        await blobStore.putNewInlayImage(inlayId, bytes, { name: img.name, options: getInlayEncodeOptions() })
+        return inlayId
     }
     if (img.type === 'image') {
         const sourceUrl = URL.createObjectURL(new Blob([asBuffer(bytes)], { type: mime }))
         try {
-            await writeInlayImage(new Image(), { id, name: img.name, ext: img.ext }, sourceUrl)
+            await writeInlayImage(new Image(), { id: inlayId, name: img.name, ext: img.ext }, sourceUrl)
         } finally {
             URL.revokeObjectURL(sourceUrl)
         }
-        return
+        return inlayId
     }
-    await blobStore.put(id, bytes, {
+    await blobStore.put(inlayId, bytes, {
         kind: 'inlay',
         inlayType: img.type,
         mime,
@@ -556,6 +565,7 @@ export async function setInlayAsset(id: string, img: InlayAsset){
         width: img.width,
         height: img.height,
     })
+    return inlayId
 }
 
 export async function removeInlayAsset(id: string){
