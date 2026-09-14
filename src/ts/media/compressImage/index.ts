@@ -1,1 +1,0 @@
-export { compressImage } from './compressImage'
