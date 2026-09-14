@@ -528,7 +528,7 @@ fn source_and_rollback_manifests_detect_corruption_before_device_writes() {
 }
 
 #[test]
-fn archive_roundtrip_preserves_empty_presence_metadata_and_raw_binary() {
+fn native_file_lifecycle_archive_roundtrip_preserves_empty_presence_metadata_and_raw_binary() {
     let root = tempfile::tempdir().unwrap();
     let capture = state(root.path());
     let id = session(&capture, Operation::Capture, false);
@@ -549,6 +549,7 @@ fn archive_roundtrip_preserves_empty_presence_metadata_and_raw_binary() {
     let mut objects = std::collections::HashMap::new();
     capture
         .export_spool(&id, Spool::Source, &archive, |hash, _, reader| {
+            assert!(capture.inner.try_lock().is_ok());
             let mut bytes = Vec::new();
             reader.read_to_end(&mut bytes)?;
             objects.insert(hash.to_owned(), bytes);

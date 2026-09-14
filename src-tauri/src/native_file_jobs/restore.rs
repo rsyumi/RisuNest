@@ -7,7 +7,7 @@ use super::{
 use crate::persistent_store::{RevisionResult, StagingResult, StoreError, StoreResult};
 use flate2::bufread::GzDecoder;
 use rmpv::Value as MessagePackValue;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::io::{self, BufReader, Read};
@@ -485,6 +485,17 @@ fn stage_legacy_database<R: Read>(
             ));
         }
     }
+    for key in ["modules", "loadouts", "plugins"] {
+        if root.get(key).is_some_and(|value| !value.is_array()) {
+            return Err(invalid(format!(
+                "legacy MessagePack {key} must be an array"
+            )));
+        }
+        root.entry(key.to_owned())
+            .or_insert_with(|| Value::Array(Vec::new()));
+    }
+    root.entry("pluginCustomStorage".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
 
     let character_total = characters.len() as u64;
     reader.counts.characters_total = Some(character_total);
@@ -610,7 +621,7 @@ fn messagepack_to_json(value: MessagePackValue) -> Result<JsonSlot, NativeJobErr
         MessagePackValue::Ext(-1, bytes) => {
             Ok(JsonSlot::Value(Value::String(timestamp_to_iso(&bytes)?)))
         }
-        MessagePackValue::Ext(kind, _) => Err(compatibility_fallback(format!(
+        MessagePackValue::Ext(kind, _) => Err(unsupported(format!(
             "unsupported legacy MessagePack extension {kind}"
         ))),
     }
@@ -718,7 +729,7 @@ fn timestamp_to_iso(bytes: &[u8]) -> Result<String, NativeJobError> {
     const JS_DATE_LIMIT_MILLISECONDS: f64 = 8_640_000_000_000_000.0;
     let milliseconds = seconds as f64 * 1000.0 + nanoseconds as f64 / 1_000_000.0;
     if !milliseconds.is_finite() || milliseconds.abs() > JS_DATE_LIMIT_MILLISECONDS {
-        return Err(compatibility_fallback(
+        return Err(unsupported(
             "MessagePack timestamp is outside the JavaScript Date range",
         ));
     }
@@ -727,9 +738,7 @@ fn timestamp_to_iso(bytes: &[u8]) -> Result<String, NativeJobError> {
     let clipped_nanoseconds = milliseconds.rem_euclid(1000) as u32 * 1_000_000;
     let datetime = time::OffsetDateTime::from_unix_timestamp(clipped_seconds)
         .and_then(|value| value.replace_nanosecond(clipped_nanoseconds))
-        .map_err(|_| {
-            compatibility_fallback("MessagePack timestamp cannot be represented natively")
-        })?;
+        .map_err(|_| unsupported("MessagePack timestamp cannot be represented natively"))?;
     let year = datetime.year();
     let year = if (0..=9999).contains(&year) {
         format!("{year:04}")
@@ -1297,7 +1306,7 @@ fn messagepack_error(error: rmpv::decode::Error, job: &JobControl) -> NativeJobE
 }
 
 fn messagepack_io_error(error: io::Error, job: &JobControl) -> NativeJobError {
-    if job.is_cancel_requested() || error.kind() == io::ErrorKind::Interrupted {
+    if job.is_cancel_requested() {
         return cancelled("restore cancelled while decoding legacy MessagePack");
     }
     let message = error.to_string();
@@ -1341,7 +1350,7 @@ fn json_error(
 }
 
 fn gzip_io_error(name: &str, error: io::Error, job: &dyn RestoreControl) -> NativeJobError {
-    if job.is_cancel_requested() || error.kind() == io::ErrorKind::Interrupted {
+    if job.is_cancel_requested() {
         return cancelled(format!("restore cancelled while decoding block {name}"));
     }
     if error.to_string().contains("decoded block limit exceeded") {
@@ -1352,10 +1361,6 @@ fn gzip_io_error(name: &str, error: io::Error, job: &dyn RestoreControl) -> Nati
 
 fn invalid(message: impl AsRef<str>) -> NativeJobError {
     NativeJobError::new("invalid-input", message)
-}
-
-fn compatibility_fallback(message: impl AsRef<str>) -> NativeJobError {
-    NativeJobError::new("compatibility-fallback", message)
 }
 
 fn unsupported(message: impl AsRef<str>) -> NativeJobError {
@@ -1885,6 +1890,78 @@ mod tests {
     }
 
     #[test]
+    fn legacy_restore_supplies_required_optional_root_sections_for_block_round_trip() {
+        let (directory, sink) = fixture();
+        let database = json!({
+            "characters": [],
+            "botPresets": [],
+            "username": "Synthetic"
+        });
+        let job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+        job.start(JobPhase::ReadingSource).unwrap();
+        let staging_id = sink.begin().unwrap().staging_id;
+        let mut reader = TrackedReader::new(io::empty(), 0, &*job);
+        stage_legacy_database(database, &staging_id, &job, &mut reader, &sink).unwrap();
+        sink.commit(&staging_id, 1).unwrap();
+
+        let exported_path = {
+            let mut store = sink.store.lock().unwrap();
+            let restored = store.materialize(Some(2)).unwrap();
+            assert_eq!(restored["modules"], json!([]));
+            assert_eq!(restored["loadouts"], json!([]));
+            assert_eq!(restored["plugins"], json!([]));
+            assert_eq!(restored["pluginCustomStorage"], json!({}));
+            let lease = store.acquire_revision(2).unwrap().lease;
+            let exported = store.export_risu_save(&lease, false).unwrap();
+            store.release_revision(&lease).unwrap();
+            PathBuf::from(exported.path)
+        };
+        let second_job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+        restore_risu_save(&exported_path, 2, &second_job, &sink).unwrap();
+        assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 3);
+        sink.store
+            .lock()
+            .unwrap()
+            .cleanup_risu_save_export(&exported_path)
+            .unwrap();
+        drop(directory);
+    }
+
+    #[test]
+    fn legacy_restore_rejects_present_nonarray_optional_root_sections() {
+        for (key, invalid_value) in [
+            ("modules", Value::Null),
+            ("loadouts", json!({})),
+            ("plugins", json!("invalid")),
+        ] {
+            let (_directory, sink) = fixture();
+            let mut database = json!({
+                "characters": [],
+                "botPresets": [],
+                "pluginCustomStorage": {}
+            });
+            database[key] = invalid_value;
+            let job = JobRegistry::default()
+                .create(JobKind::RestoreBlockRisuSave)
+                .unwrap();
+            job.start(JobPhase::ReadingSource).unwrap();
+            let staging_id = sink.begin().unwrap().staging_id;
+            let mut reader = TrackedReader::new(io::empty(), 0, &*job);
+            let error = match stage_legacy_database(database, &staging_id, &job, &mut reader, &sink)
+            {
+                Ok(_) => panic!("{key} must reject a present non-array value"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, "invalid-input");
+            assert!(error.message.contains(key));
+        }
+    }
+
+    #[test]
     fn strict_raw_msgpackr_restore_rejects_unknown_extensions_without_activation() {
         use base64::Engine;
 
@@ -1895,7 +1972,7 @@ mod tests {
         let bytes = legacy_wire(7, &payload);
 
         let error = assert_failed_general_restore_preserves_active(&bytes, "extension 42");
-        assert_eq!(error.code, "compatibility-fallback");
+        assert_eq!(error.code, "unsupported-format");
     }
 
     #[test]

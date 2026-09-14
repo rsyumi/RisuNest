@@ -222,6 +222,45 @@ describe("native device spool transport", () => {
     ).toHaveLength(2);
   });
 
+  it("reads only the requested ordinal range and skips empty ranges", async () => {
+    const fixture = nativeFixture();
+    await fixture.spool.beginSection("localforage", {
+      profile: "risunest.device-section/v1",
+      sectionId: "localforage",
+      present: true,
+    });
+    for (const key of ["a", "b", "c"]) {
+      await fixture.spool.appendRow("localforage", {
+        kind: "value",
+        key,
+        value: await encodeCloneGraph(key, fixture.spool.putBinary),
+      });
+    }
+    await fixture.spool.finishSection("localforage");
+
+    const values = [];
+    for await (const value of fixture.spool.rows("localforage", {
+      startOrdinal: 1,
+      endOrdinalExclusive: 2,
+    })) values.push(value);
+    expect(values).toHaveLength(1);
+    expect(values[0]).toMatchObject({ key: "b" });
+    const rangeReads = fixture.calls.filter(
+      ({ command }) => command === "native_device_backup_row_read",
+    );
+    expect(rangeReads).toHaveLength(1);
+    expect(rangeReads[0].args).toMatchObject({ afterOrdinal: 0, limit: 1 });
+
+    const readsBeforeEmpty = rangeReads.length;
+    for await (const _value of fixture.spool.rows("localforage", {
+      startOrdinal: 2,
+      endOrdinalExclusive: 2,
+    })) throw new Error("Empty range returned a row");
+    expect(
+      fixture.calls.filter(({ command }) => command === "native_device_backup_row_read"),
+    ).toHaveLength(readsBeforeEmpty);
+  });
+
   it("paginates section metadata and rejects incomplete sections", async () => {
     const fixture = nativeFixture();
     for (const sectionId of ["local-storage", "localforage"] as const) {

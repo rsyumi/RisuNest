@@ -99,7 +99,7 @@ describe('RisuNest Android platform settings', () => {
         expect(Boolean(toggle.compareDocumentPosition(target.querySelector('[data-platform-info]')!) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true)
         target.querySelector('button')?.click()
         expect(mocks.openNotificationSettings).toHaveBeenCalledOnce()
-        mocks.updateDeviceSettings.mockClear()
+        expect(mocks.updateDeviceSettings).not.toHaveBeenCalled()
         ;(target.querySelector('input[type="checkbox"]') as HTMLInputElement).click()
         await tick()
         expect(mocks.updateDeviceSettings).toHaveBeenCalledWith({ androidKeepAliveDuringGeneration: true })

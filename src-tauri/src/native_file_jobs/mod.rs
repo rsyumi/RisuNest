@@ -41,6 +41,7 @@ const MAX_CLEANUP_ERRORS: usize = 4;
 const ANDROID_SPOOL_FORMAT: &str = "risunest-android-saf-spool";
 const ANDROID_SPOOL_VERSION: u8 = 1;
 const ANDROID_SPOOL_STALE_MILLIS: u64 = 24 * 60 * 60 * 1_000;
+const HANDOFF_STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 const ANDROID_SPOOL_STAGING_PREFIX: &str = ".spooling-";
 const ANDROID_SPOOL_CLEANUP_PREFIX: &str = ".cleanup-";
 
@@ -89,8 +90,15 @@ struct SpoolManifest {
     state: SpoolState,
     display_name: String,
     bytes: Option<u64>,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable_u64")]
     total_bytes: Option<u64>,
+}
+
+fn deserialize_required_nullable_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<u64>::deserialize(deserializer)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -813,6 +821,82 @@ fn cleanup_legacy_backup_handoff_path(root: &Path, path: &Path) -> Result<bool, 
     cleanup_handoff_path(root, path, "risu-backup-", ".bin", "legacy backup")
 }
 
+fn is_owned_handoff_name(path: &Path) -> bool {
+    handoff_name(path, "risunest-backup-", ".risunest")
+        || handoff_name(path, "risu-backup-", ".bin")
+        || handoff_name(path, "risu-charx-", ".charx")
+        || handoff_name(path, "risu-charx-", ".jpeg")
+        || handoff_name(path, "risu-character-card-", ".json")
+        || handoff_name(path, "risu-character-card-", ".png")
+        || handoff_name(path, "risu-module-", ".risum")
+}
+
+fn cleanup_stale_handoffs(root: &Path) -> Result<(), String> {
+    cleanup_stale_handoffs_at(root, SystemTime::now(), HANDOFF_STALE_AFTER)
+}
+
+fn cleanup_stale_handoffs_at(
+    handoffs_root: &Path,
+    now: SystemTime,
+    stale_after: Duration,
+) -> Result<(), String> {
+    if !handoffs_root.is_dir() {
+        return Ok(());
+    }
+    let canonical_root = handoffs_root
+        .canonicalize()
+        .map_err(|error| format!("native handoff root cannot be resolved: {error}"))?;
+    let mut errors = Vec::new();
+    for entry in fs::read_dir(&canonical_root)
+        .map_err(|error| format!("native handoff root cannot be read: {error}"))?
+    {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                record_cleanup_error(
+                    &mut errors,
+                    format!("native handoff entry cannot be read: {error}"),
+                );
+                continue;
+            }
+        };
+        let path = entry.path();
+        if !is_owned_handoff_name(&path) {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                record_cleanup_error(
+                    &mut errors,
+                    format!("native handoff metadata is unavailable: {error}"),
+                );
+                continue;
+            }
+        };
+        if !metadata.is_file()
+            || crate::trust_boundary::is_link_like(&metadata)
+            || metadata
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_none_or(|age| age < stale_after)
+        {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => record_cleanup_error(
+                &mut errors,
+                format!("native handoff cannot be removed: {error}"),
+            ),
+        }
+    }
+    cleanup_errors_result(errors)
+}
+
 fn cleanup_character_charx_handoff_path(root: &Path, path: &Path) -> Result<bool, NativeJobError> {
     let suffix = match path.extension().and_then(|extension| extension.to_str()) {
         Some("charx") => ".charx",
@@ -1085,6 +1169,11 @@ impl NativeFileJobState {
         }
         if sources_root.is_dir() {
             if let Err(error) = cleanup_spool_directories(&sources_root) {
+                startup_warnings.push(NativeJobError::new("cleanup-failed", error));
+            }
+        }
+        if handoffs_root.is_dir() {
+            if let Err(error) = cleanup_stale_handoffs(&handoffs_root) {
                 startup_warnings.push(NativeJobError::new("cleanup-failed", error));
             }
         }
@@ -1590,12 +1679,17 @@ impl NativeFileJobState {
         let registry = Arc::clone(&self.registry);
         std::thread::spawn(move || {
             let _admission = admission;
-            let outcome = content::prepare_content(
-                opened_source,
-                &display_name,
-                &owned_directory,
-                &repository_root,
-                &job,
+            let outcome = run_worker(
+                || {
+                    content::prepare_content(
+                        opened_source,
+                        &display_name,
+                        &owned_directory,
+                        &repository_root,
+                        &job,
+                    )
+                },
+                "native content worker panicked",
             );
             let cleanup =
                 cleanup_one_owned_directory(&root.join("jobs"), &owned_directory, &job.id());
@@ -1777,233 +1871,236 @@ impl NativeFileJobState {
         std::thread::spawn(move || {
             let _admission = admission;
             let _worker_permit = worker_permit;
-            let outcome = match task {
-                NativeFileJobTask::ExportPortable {
-                    destination,
-                    expected_revision,
-                    store,
-                    selection,
-                    app,
-                } => portable::export_portable(
-                    destination.as_deref(),
-                    expected_revision,
-                    &owned_directory,
-                    &root.join("handoffs"),
-                    store,
-                    &job,
-                    Some((&app, &selection)),
-                ),
-                NativeFileJobTask::RestorePortable {
-                    opened_source,
-                    source,
-                    expected_revision,
-                    store,
-                    selection,
-                    app,
-                } => match opened_source {
-                    Some(input) => portable::restore_portable(
-                        input,
-                        matches!(source, JobSource::AndroidSpool { .. }),
+            let outcome = run_worker(
+                || match task {
+                    NativeFileJobTask::ExportPortable {
+                        destination,
+                        expected_revision,
+                        store,
+                        selection,
+                        app,
+                    } => portable::export_portable(
+                        destination.as_deref(),
                         expected_revision,
                         &owned_directory,
+                        &root.join("handoffs"),
                         store,
                         &job,
-                        Some((&app, selection.as_ref())),
+                        Some((&app, &selection)),
                     ),
-                    None => Err(NativeJobError::new(
-                        "store-error",
-                        "portable input was not prepared",
-                    )),
-                },
-                NativeFileJobTask::Restore {
-                    opened_source,
-                    expected_revision,
-                    sink,
-                    ..
-                } => match opened_source {
-                    Some(opened_source) => match sink {
-                        RestoreJobSink::Persistent(app) => restore::restore_block_risu_save(
-                            opened_source,
-                            expected_revision,
-                            &job,
-                            &PersistentReplacementSink { app },
-                        ),
-                        #[cfg(test)]
-                        RestoreJobSink::Test(sink) => restore::restore_block_risu_save(
-                            opened_source,
-                            expected_revision,
-                            &job,
-                            sink.as_ref(),
-                        ),
-                    },
-                    None => Err(NativeJobError::new(
-                        "store-error",
-                        "native job source was not prepared",
-                    )),
-                },
-                NativeFileJobTask::Export {
-                    destination,
-                    expected_revision,
-                    omit_account,
-                    app,
-                } => crate::persistent_store::commands::with_store_mut(app.state(), |store| {
-                    store.prepare_risu_save_export(expected_revision)
-                })
-                .map_err(native_store_error)
-                .and_then(|prepared| {
-                    export::export_block_risu_save(prepared, &destination, omit_account, &job)
-                }),
-                NativeFileJobTask::RestoreOfficialSnapshot {
-                    request,
-                    expected_revision,
-                    app,
-                } => official_snapshot::restore_official_snapshot(
-                    request,
-                    expected_revision,
-                    &owned_directory,
-                    &job,
-                    &PersistentReplacementSink { app },
-                ),
-                NativeFileJobTask::RestoreLegacyLocalBackup {
-                    opened_source,
-                    expected_revision,
-                    repository_root,
-                    app,
-                    ..
-                } => match opened_source {
-                    Some(opened_source) => legacy_backup::restore_legacy_local_backup(
+                    NativeFileJobTask::RestorePortable {
                         opened_source,
+                        source,
                         expected_revision,
-                        &owned_directory,
-                        &repository_root,
+                        store,
+                        selection,
                         app,
-                        &job,
-                    ),
-                    None => Err(NativeJobError::new(
-                        "store-error",
-                        "native legacy backup job source was not prepared",
-                    )),
-                },
-                NativeFileJobTask::ExportLegacyLocalBackup {
-                    destination,
-                    expected_revision,
-                    store,
-                } => legacy_backup::export_legacy_local_backup(
-                    destination.as_deref(),
-                    expected_revision,
-                    &owned_directory,
-                    &root.join("handoffs"),
-                    store,
-                    &job,
-                ),
-                NativeFileJobTask::ExportCompatibleLocalBackup {
-                    target,
-                    destination,
-                    expected_revision,
-                    store,
-                } => legacy_backup::export_compatible_local_backup(
-                    target,
-                    destination.as_deref(),
-                    expected_revision,
-                    &owned_directory,
-                    &root.join("handoffs"),
-                    store,
-                    &job,
-                ),
-                NativeFileJobTask::ExportCharacterCharx {
-                    destination,
-                    character_id,
-                    card,
-                    module,
-                    container,
-                    prepared,
-                } => character_charx_export::export_character_charx_container(
-                    prepared,
-                    &character_id,
-                    card,
-                    module,
-                    container,
-                    &owned_directory,
-                    &root.join("handoffs"),
-                    destination.as_deref(),
-                    &job,
-                ),
-                NativeFileJobTask::ExportCharacterCard {
-                    destination,
-                    character_id,
-                    format,
-                    metadata,
-                    prepared,
-                } => match format {
-                    CharacterCardExportFormat::JsonCard => {
-                        character_json_export::export_character_json(
-                            prepared,
-                            &character_id,
-                            metadata,
-                            &owned_directory,
-                            &root.join("handoffs"),
-                            destination.as_deref(),
-                            &job,
-                        )
-                    }
-                    CharacterCardExportFormat::PngCard => {
-                        character_png_export::export_character_png(
-                            prepared,
-                            &character_id,
-                            metadata,
-                            &owned_directory,
-                            &root.join("handoffs"),
-                            destination.as_deref(),
-                            &job,
-                        )
-                    }
-                },
-                NativeFileJobTask::ExportRisuModule {
-                    destination,
-                    module_index,
-                    prepared,
-                } => risum_export::export_risu_module(
-                    prepared,
-                    module_index,
-                    &owned_directory,
-                    &root.join("handoffs"),
-                    destination.as_deref(),
-                    &job,
-                ),
-                NativeFileJobTask::ImportJpegAsset {
-                    opened_source,
-                    display_name,
-                    destination,
-                    expected_revision,
-                    store,
-                    ..
-                } => match opened_source {
-                    Some(opened_source) => {
-                        let repository_root = store.repository_root().to_path_buf();
-                        jpeg_asset::import_jpeg_asset(
-                            opened_source,
-                            &display_name,
-                            destination,
+                    } => match opened_source {
+                        Some(input) => portable::restore_portable(
+                            input,
+                            matches!(source, JobSource::AndroidSpool { .. }),
                             expected_revision,
-                            &repository_root,
+                            &owned_directory,
                             store,
                             &job,
-                        )
+                            Some((&app, selection.as_ref())),
+                        ),
+                        None => Err(NativeJobError::new(
+                            "store-error",
+                            "portable input was not prepared",
+                        )),
+                    },
+                    NativeFileJobTask::Restore {
+                        opened_source,
+                        expected_revision,
+                        sink,
+                        ..
+                    } => match opened_source {
+                        Some(opened_source) => match sink {
+                            RestoreJobSink::Persistent(app) => restore::restore_block_risu_save(
+                                opened_source,
+                                expected_revision,
+                                &job,
+                                &PersistentReplacementSink { app },
+                            ),
+                            #[cfg(test)]
+                            RestoreJobSink::Test(sink) => restore::restore_block_risu_save(
+                                opened_source,
+                                expected_revision,
+                                &job,
+                                sink.as_ref(),
+                            ),
+                        },
+                        None => Err(NativeJobError::new(
+                            "store-error",
+                            "native job source was not prepared",
+                        )),
+                    },
+                    NativeFileJobTask::Export {
+                        destination,
+                        expected_revision,
+                        omit_account,
+                        app,
+                    } => crate::persistent_store::commands::with_store_mut(app.state(), |store| {
+                        store.prepare_risu_save_export(expected_revision)
+                    })
+                    .map_err(native_store_error)
+                    .and_then(|prepared| {
+                        export::export_block_risu_save(prepared, &destination, omit_account, &job)
+                    }),
+                    NativeFileJobTask::RestoreOfficialSnapshot {
+                        request,
+                        expected_revision,
+                        app,
+                    } => official_snapshot::restore_official_snapshot(
+                        request,
+                        expected_revision,
+                        &owned_directory,
+                        &job,
+                        &PersistentReplacementSink { app },
+                    ),
+                    NativeFileJobTask::RestoreLegacyLocalBackup {
+                        opened_source,
+                        expected_revision,
+                        repository_root,
+                        app,
+                        ..
+                    } => match opened_source {
+                        Some(opened_source) => legacy_backup::restore_legacy_local_backup(
+                            opened_source,
+                            expected_revision,
+                            &owned_directory,
+                            &repository_root,
+                            app,
+                            &job,
+                        ),
+                        None => Err(NativeJobError::new(
+                            "store-error",
+                            "native legacy backup job source was not prepared",
+                        )),
+                    },
+                    NativeFileJobTask::ExportLegacyLocalBackup {
+                        destination,
+                        expected_revision,
+                        store,
+                    } => legacy_backup::export_legacy_local_backup(
+                        destination.as_deref(),
+                        expected_revision,
+                        &owned_directory,
+                        &root.join("handoffs"),
+                        store,
+                        &job,
+                    ),
+                    NativeFileJobTask::ExportCompatibleLocalBackup {
+                        target,
+                        destination,
+                        expected_revision,
+                        store,
+                    } => legacy_backup::export_compatible_local_backup(
+                        target,
+                        destination.as_deref(),
+                        expected_revision,
+                        &owned_directory,
+                        &root.join("handoffs"),
+                        store,
+                        &job,
+                    ),
+                    NativeFileJobTask::ExportCharacterCharx {
+                        destination,
+                        character_id,
+                        card,
+                        module,
+                        container,
+                        prepared,
+                    } => character_charx_export::export_character_charx_container(
+                        prepared,
+                        &character_id,
+                        card,
+                        module,
+                        container,
+                        &owned_directory,
+                        &root.join("handoffs"),
+                        destination.as_deref(),
+                        &job,
+                    ),
+                    NativeFileJobTask::ExportCharacterCard {
+                        destination,
+                        character_id,
+                        format,
+                        metadata,
+                        prepared,
+                    } => match format {
+                        CharacterCardExportFormat::JsonCard => {
+                            character_json_export::export_character_json(
+                                prepared,
+                                &character_id,
+                                metadata,
+                                &owned_directory,
+                                &root.join("handoffs"),
+                                destination.as_deref(),
+                                &job,
+                            )
+                        }
+                        CharacterCardExportFormat::PngCard => {
+                            character_png_export::export_character_png(
+                                prepared,
+                                &character_id,
+                                metadata,
+                                &owned_directory,
+                                &root.join("handoffs"),
+                                destination.as_deref(),
+                                &job,
+                            )
+                        }
+                    },
+                    NativeFileJobTask::ExportRisuModule {
+                        destination,
+                        module_index,
+                        prepared,
+                    } => risum_export::export_risu_module(
+                        prepared,
+                        module_index,
+                        &owned_directory,
+                        &root.join("handoffs"),
+                        destination.as_deref(),
+                        &job,
+                    ),
+                    NativeFileJobTask::ImportJpegAsset {
+                        opened_source,
+                        display_name,
+                        destination,
+                        expected_revision,
+                        store,
+                        ..
+                    } => match opened_source {
+                        Some(opened_source) => {
+                            let repository_root = store.repository_root().to_path_buf();
+                            jpeg_asset::import_jpeg_asset(
+                                opened_source,
+                                &display_name,
+                                destination,
+                                expected_revision,
+                                &repository_root,
+                                store,
+                                &job,
+                            )
+                        }
+                        None => Err(NativeJobError::new(
+                            "store-error",
+                            "native JPEG asset source was not prepared",
+                        )),
+                    },
+                    #[cfg(feature = "native-kei-upload-pilot")]
+                    NativeFileJobTask::KeiBackup { prepared } => {
+                        crate::persistent_store::kei::run_job(prepared, Arc::clone(&job))
                     }
-                    None => Err(NativeJobError::new(
-                        "store-error",
-                        "native JPEG asset source was not prepared",
-                    )),
+                    #[cfg(feature = "native-official-publication")]
+                    NativeFileJobTask::OfficialPublication { request, app } => {
+                        publication::run_job(request, app, Arc::clone(&job))
+                    }
                 },
-                #[cfg(feature = "native-kei-upload-pilot")]
-                NativeFileJobTask::KeiBackup { prepared } => {
-                    crate::persistent_store::kei::run_job(prepared, Arc::clone(&job))
-                }
-                #[cfg(feature = "native-official-publication")]
-                NativeFileJobTask::OfficialPublication { request, app } => {
-                    publication::run_job(request, app, Arc::clone(&job))
-                }
-            };
+                "native file job worker panicked",
+            );
             let mut cleanup_errors = Vec::new();
             if let Err(error) =
                 cleanup_one_owned_directory(&root.join("jobs"), &owned_directory, &job.id())
@@ -2480,6 +2577,14 @@ impl Drop for WorkerPermit {
     fn drop(&mut self) {
         self.active_workers.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+fn run_worker<T>(
+    worker: impl FnOnce() -> Result<T, NativeJobError>,
+    panic_message: &str,
+) -> Result<T, NativeJobError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(worker))
+        .unwrap_or_else(|_| Err(NativeJobError::new("store-error", panic_message)))
 }
 
 fn create_owned_directory(jobs_root: &Path, job_id: &str) -> Result<PathBuf, String> {
@@ -3249,7 +3354,7 @@ impl JobRegistry {
             .map_err(|error| format!("native job registry mutex poisoned: {error}"))?;
         let mut terminal = Vec::new();
         for (id, job) in jobs.iter() {
-            if job.retains_terminal_receipt_until_forget()? {
+            if job.retains_terminal_receipt_until_forget() {
                 continue;
             }
             if let Some(time) = job.terminal_time() {
@@ -3378,7 +3483,7 @@ impl JobControl {
             .status
             .lock()
             .map_err(|_| "native job mutex poisoned".to_owned())?;
-        if status.state != JobState::Running {
+        if !matches!(status.state, JobState::Running | JobState::Cancelling) {
             return Err("device maintenance requires running job".into());
         }
         status.device_session_id = Some(id.into());
@@ -3436,20 +3541,22 @@ impl JobControl {
         self.cancel_requested.load(Ordering::Acquire)
     }
 
-    fn retains_terminal_receipt_until_forget(&self) -> Result<bool, String> {
+    fn retains_terminal_receipt_until_forget(&self) -> bool {
         let status = self
             .status
             .lock()
-            .map_err(|error| format!("native job status mutex poisoned: {error}"))?;
-        Ok((status.kind == JobKind::PrepareContentImport
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (status.kind == JobKind::PrepareContentImport
             && status.state == JobState::Succeeded
             && status.prepared_content.is_some())
             || (status.kind == JobKind::ExportCharacterCharx && status.state.is_terminal())
             || (status.kind == JobKind::ExportCharacterCard && status.state.is_terminal())
             || (status.kind == JobKind::ExportRisuModule && status.state.is_terminal())
             || (status.kind == JobKind::ExportPortableBackup && status.state.is_terminal())
+            || (status.kind == JobKind::ExportLegacyLocalBackup && status.state.is_terminal())
+            || (status.kind == JobKind::ExportCompatibleLocalBackup && status.state.is_terminal())
             || (status.device_session_id.is_some() && status.state.is_terminal())
-            || (status.kind == JobKind::OfficialPublicationUpload && status.state.is_terminal()))
+            || (status.kind == JobKind::OfficialPublicationUpload && status.state.is_terminal())
     }
 
     fn request_cancel(&self) -> Result<CancelOutcome, String> {
@@ -6618,7 +6725,7 @@ mod tests {
             "cleanup-failed"
         );
         assert!(state.registry.lookup(&job.id()).unwrap().is_some());
-        assert!(job.retains_terminal_receipt_until_forget().unwrap());
+        assert!(job.retains_terminal_receipt_until_forget());
     }
     #[test]
     fn terminal_status_rejects_unbounded_results_and_sanitizes_errors() {
@@ -7369,6 +7476,108 @@ mod tests {
                 .code,
             "invalid-input"
         );
+    }
+
+    #[test]
+    fn native_file_lifecycle_startup_handoff_cleanup_reclaims_stale_owned_shapes() {
+        let directory = TempDir::new().unwrap();
+        let handoffs = directory.path().join("handoffs");
+        fs::create_dir_all(&handoffs).unwrap();
+        let uuid = Uuid::new_v4();
+        let owned = [
+            format!("risunest-backup-{uuid}.risunest"),
+            format!("risu-backup-{uuid}.bin"),
+            format!("risu-charx-{uuid}.charx"),
+            format!("risu-charx-{uuid}.jpeg"),
+            format!("risu-character-card-{uuid}.json"),
+            format!("risu-character-card-{uuid}.png"),
+            format!("risu-module-{uuid}.risum"),
+        ];
+        for name in &owned {
+            fs::write(handoffs.join(name), b"synthetic handoff").unwrap();
+        }
+        let unrelated = handoffs.join(format!("user-{uuid}.bin"));
+        fs::write(&unrelated, b"keep").unwrap();
+        let created = SystemTime::now();
+
+        cleanup_stale_handoffs_at(&handoffs, created, HANDOFF_STALE_AFTER).unwrap();
+        assert!(owned.iter().all(|name| handoffs.join(name).is_file()));
+
+        cleanup_stale_handoffs_at(
+            &handoffs,
+            created + HANDOFF_STALE_AFTER + Duration::from_secs(1),
+            HANDOFF_STALE_AFTER,
+        )
+        .unwrap();
+        assert!(owned.iter().all(|name| !handoffs.join(name).exists()));
+        assert!(unrelated.is_file());
+    }
+
+    #[test]
+    fn native_file_lifecycle_legacy_handoff_jobs_are_retained_until_forget() {
+        let registry = JobRegistry::with_retention(0, Duration::ZERO);
+        for kind in [
+            JobKind::ExportLegacyLocalBackup,
+            JobKind::ExportCompatibleLocalBackup,
+        ] {
+            let job = registry.create(kind).unwrap();
+            job.start(JobPhase::WritingExport).unwrap();
+            job.finish_success(result(1)).unwrap();
+        }
+
+        assert_eq!(registry.list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn native_file_lifecycle_cancelling_job_retains_new_device_session_for_cleanup() {
+        let job = JobRegistry::default()
+            .create(JobKind::ExportPortableBackup)
+            .unwrap();
+        job.start(JobPhase::WritingExport).unwrap();
+        assert_eq!(job.request_cancel().unwrap(), CancelOutcome::Requested);
+
+        job.set_device_session("synthetic-device-session").unwrap();
+
+        assert_eq!(
+            job.status().device_session_id.as_deref(),
+            Some("synthetic-device-session")
+        );
+    }
+
+    #[test]
+    fn native_file_lifecycle_worker_panics_become_bounded_store_errors() {
+        let error = run_worker::<()>(
+            || panic!("synthetic worker panic with private detail"),
+            "native file job worker panicked",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "store-error");
+        assert_eq!(error.message, "native file job worker panicked");
+    }
+
+    #[test]
+    fn native_file_lifecycle_registry_prune_recovers_from_poisoned_status() {
+        let registry = JobRegistry::default();
+        let job = registry.create(JobKind::ExportBlockRisuSave).unwrap();
+        let poisoned = Arc::clone(&job);
+        assert!(thread::spawn(move || {
+            let _status = poisoned.status.lock().unwrap();
+            panic!("synthetic status poison");
+        })
+        .join()
+        .is_err());
+
+        assert_eq!(registry.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn native_file_lifecycle_android_spool_manifest_requires_total_bytes_key() {
+        let missing = br#"{"token":"token","state":"ready","displayName":"source.bin","bytes":1}"#;
+        let nullable = br#"{"token":"token","state":"ready","displayName":"source.bin","bytes":1,"totalBytes":null}"#;
+
+        assert!(serde_json::from_slice::<SpoolManifest>(missing).is_err());
+        assert!(serde_json::from_slice::<SpoolManifest>(nullable).is_ok());
     }
 
     #[test]

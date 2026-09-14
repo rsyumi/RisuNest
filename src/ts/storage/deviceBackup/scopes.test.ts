@@ -102,8 +102,9 @@ export function fixtureSpool(): DeviceSpool {
     async sections() {
       return [...sections.values()].map((section) => section.info!);
     },
-    async *rows(sectionId) {
-      yield* sections.get(sectionId)!.rows;
+    async *rows(sectionId, range) {
+      const rows = sections.get(sectionId)!.rows;
+      yield* rows.slice(range?.startOrdinal ?? 0, range?.endOrdinalExclusive);
     },
     async putBinary(body) {
       const bytes = new Uint8Array(
@@ -385,6 +386,49 @@ describe("device plugin storage scopes", () => {
         (database) => database.name === name,
       ),
     ).toBe(false);
+  });
+
+  it("replays each plugin store from its bounded ordinal range", async () => {
+    const environment = fixtureEnvironment();
+    const spool = fixtureSpool();
+    const name = "safe_plugin_bounded_ranges";
+    await new Promise<void>((resolve, reject) => {
+      const request = environment.indexedDB.open(name, 1);
+      request.onupgradeneeded = () => {
+        request.result.createObjectStore("a");
+        request.result.createObjectStore("empty");
+        request.result.createObjectStore("z");
+      };
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        const db = request.result;
+        const tx = db.transaction(["a", "z"], "readwrite");
+        tx.objectStore("a").put({ value: 1 }, "a-1");
+        tx.objectStore("z").put({ value: 2 }, "z-1");
+        tx.oncomplete = () => {
+          db.close();
+          resolve();
+        };
+        tx.onerror = () => reject(tx.error);
+      };
+    });
+    const sectionId = databaseSectionId(name);
+    const info = await captureDeviceSection(sectionId, spool, environment);
+    const originalRows = spool.rows.bind(spool);
+    const rows = vi.spyOn(spool, "rows").mockImplementation(
+      (id, range) => originalRows(id, range),
+    );
+
+    const staged = await stageDeviceSection(info, spool, environment);
+    await staged.apply();
+    await staged.cleanup();
+
+    expect(rows.mock.calls[0]).toEqual([sectionId]);
+    expect(rows.mock.calls.slice(1).every(([, range]) => range !== undefined))
+      .toBe(true);
+    expect(rows.mock.calls.some(([, range]) =>
+      range?.startOrdinal === 1 && range.endOrdinalExclusive === 1,
+    )).toBe(true);
   });
 });
 

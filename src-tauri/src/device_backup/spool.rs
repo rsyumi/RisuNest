@@ -625,36 +625,42 @@ impl DeviceBackupState {
         destination: &Connection,
         mut object_sink: impl FnMut(&str, u64, &mut dyn Read) -> Result<()>,
     ) -> Result<()> {
-        let inner = self.lock()?;
-        let connection = inner.connection.as_ref().unwrap();
-        let session = session_for(connection, id)?;
-        for section in &session.selected_sections {
-            let manifest = verify_section(connection, id, spool, section)?;
-            destination.execute("INSERT INTO device_sections(section,schema_version,included,complete,present,record_count,sha256) VALUES(?1,1,1,1,?2,?3,?4)",params![section,manifest.present,sql_integer(manifest.records)?,manifest.sha256])?;
-            destination.execute(
-                "INSERT INTO device_records(section,ordinal,metadata) VALUES(?1,-1,?2)",
-                params![section, manifest.metadata_json],
-            )?;
-            let mut statement=connection.prepare("SELECT ordinal,payload FROM records WHERE session=?1 AND spool=?2 AND section=?3 ORDER BY ordinal")?;
-            let mut rows = statement.query(params![id, spool.key(), section])?;
-            while let Some(row) = rows.next()? {
-                let ordinal: i64 = row.get(0)?;
-                let payload: Vec<u8> = row.get(1)?;
-                let text = std::str::from_utf8(&payload)
-                    .map_err(|_| error("device-metadata-invalid", "Device row UTF-8 is invalid"))?;
+        let objects = {
+            let inner = self.lock()?;
+            let connection = inner.connection.as_ref().unwrap();
+            let session = session_for(connection, id)?;
+            for section in &session.selected_sections {
+                let manifest = verify_section(connection, id, spool, section)?;
+                destination.execute("INSERT INTO device_sections(section,schema_version,included,complete,present,record_count,sha256) VALUES(?1,1,1,1,?2,?3,?4)",params![section,manifest.present,sql_integer(manifest.records)?,manifest.sha256])?;
                 destination.execute(
-                    "INSERT INTO device_records(section,ordinal,metadata) VALUES(?1,?2,?3)",
-                    params![section, ordinal, text],
+                    "INSERT INTO device_records(section,ordinal,metadata) VALUES(?1,-1,?2)",
+                    params![section, manifest.metadata_json],
                 )?;
+                let mut statement=connection.prepare("SELECT ordinal,payload FROM records WHERE session=?1 AND spool=?2 AND section=?3 ORDER BY ordinal")?;
+                let mut rows = statement.query(params![id, spool.key(), section])?;
+                while let Some(row) = rows.next()? {
+                    let ordinal: i64 = row.get(0)?;
+                    let payload: Vec<u8> = row.get(1)?;
+                    let text = std::str::from_utf8(&payload).map_err(|_| {
+                        error("device-metadata-invalid", "Device row UTF-8 is invalid")
+                    })?;
+                    destination.execute(
+                        "INSERT INTO device_records(section,ordinal,metadata) VALUES(?1,?2,?3)",
+                        params![section, ordinal, text],
+                    )?;
+                }
             }
-        }
-        let mut statement=connection.prepare("SELECT sha256,MAX(bytes) FROM blobs WHERE session=?1 AND spool=?2 AND sealed=1 AND metadata_only=0 GROUP BY sha256")?;
-        let mut rows = statement.query(params![id, spool.key()])?;
-        while let Some(row) = rows.next()? {
-            let hash: String = row.get(0)?;
-            let bytes = read_unsigned(row, 1)?;
+            let mut statement=connection.prepare("SELECT sha256,MAX(bytes) FROM blobs WHERE session=?1 AND spool=?2 AND sealed=1 AND metadata_only=0 GROUP BY sha256")?;
+            let mut rows = statement.query(params![id, spool.key()])?;
+            let mut objects = Vec::new();
+            while let Some(row) = rows.next()? {
+                objects.push((row.get::<_, String>(0)?, read_unsigned(row, 1)?));
+            }
+            objects
+        };
+        for (hash, bytes) in objects {
             let mut reader = BlobReader {
-                connection,
+                state: self,
                 id,
                 spool,
                 object: &hash,
@@ -794,7 +800,7 @@ fn append_row(
 }
 
 struct BlobReader<'a> {
-    connection: &'a Connection,
+    state: &'a DeviceBackupState,
     id: &'a str,
     spool: Spool,
     object: &'a str,
@@ -806,15 +812,16 @@ impl Read for BlobReader<'_> {
         if self.position == self.length || buffer.is_empty() {
             return Ok(0);
         }
-        let bytes = read_blob_range(
-            self.connection,
-            self.id,
-            self.spool,
-            self.object,
-            self.position,
-            buffer.len().min(MAX_CHUNK_BYTES),
-        )
-        .map_err(std::io::Error::other)?;
+        let bytes = self
+            .state
+            .blob_read(
+                self.id,
+                self.spool,
+                self.object,
+                self.position,
+                buffer.len().min(MAX_CHUNK_BYTES),
+            )
+            .map_err(std::io::Error::other)?;
         buffer[..bytes.len()].copy_from_slice(&bytes);
         self.position += bytes.len() as u64;
         Ok(bytes.len())

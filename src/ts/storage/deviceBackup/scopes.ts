@@ -34,6 +34,10 @@ export interface DeviceSectionInfo {
   recordCount: number;
   digest: string;
 }
+export interface DeviceRowRange {
+  startOrdinal: number;
+  endOrdinalExclusive: number;
+}
 export interface DeviceSpool {
   beginSection(
     sectionId: DeviceSectionId,
@@ -42,7 +46,7 @@ export interface DeviceSpool {
   appendRow(sectionId: DeviceSectionId, row: DeviceRow): Promise<void>;
   finishSection(sectionId: DeviceSectionId): Promise<DeviceSectionInfo>;
   sections(): Promise<DeviceSectionInfo[]>;
-  rows(sectionId: DeviceSectionId): AsyncIterable<DeviceRow>;
+  rows(sectionId: DeviceSectionId, range?: DeviceRowRange): AsyncIterable<DeviceRow>;
   putBinary(body: Blob | ArrayBuffer): Promise<string>;
   getBinary(reference: string, bytes: number): Promise<Uint8Array>;
 }
@@ -304,15 +308,44 @@ export async function stageDeviceSection(
     const storeNames = new Set(
       database.present ? database.stores.map((store) => store.name) : [],
     );
+    const storeRanges = new Map<string, DeviceRowRange>();
+    let nextOrdinal = 0;
+    if (database.present) {
+      for (const store of database.stores) {
+        const endOrdinalExclusive = nextOrdinal + store.count;
+        if (!Number.isSafeInteger(endOrdinalExclusive))
+          throw new Error("Device database record count exceeds the supported range");
+        storeRanges.set(store.name, {
+          startOrdinal: nextOrdinal,
+          endOrdinalExclusive,
+        });
+        nextOrdinal = endOrdinalExclusive;
+      }
+    }
     let recordCount = 0;
+    let validationStoreIndex = 0;
     let estimatedBytes = 0;
     for await (const row of spool.rows(sectionId)) {
       checkpoint(environment);
-      if (row.kind !== "record" || !storeNames.has(decodeUtf16(row.storeName)))
+      const storeName = row.kind === "record" ? decodeUtf16(row.storeName) : "";
+      while (
+        database.present
+        && validationStoreIndex < database.stores.length
+        && recordCount >= storeRanges.get(
+          database.stores[validationStoreIndex].name,
+        )!.endOrdinalExclusive
+      ) validationStoreIndex++;
+      const expectedStore = database.present
+        ? database.stores[validationStoreIndex]
+        : undefined;
+      if (
+        row.kind !== "record"
+        || !storeNames.has(storeName)
+        || expectedStore?.name !== storeName
+      )
         throw new Error("Device record references an unknown store");
       validateCloneGraph(row.key);
       validateCloneGraph(row.value);
-      const storeName = decodeUtf16(row.storeName);
       storeCounts.set(storeName, (storeCounts.get(storeName) ?? 0) + 1);
       recordCount++;
       estimatedBytes += JSON.stringify(row).length * 2 + 1024;
@@ -350,7 +383,9 @@ export async function stageDeviceSection(
     const source = {
       metadata: database,
       async *records(storeName: string): AsyncIterable<PluginDatabaseRecord> {
-        for await (const row of spool.rows(sectionId)) {
+        const range = storeRanges.get(storeName);
+        if (!range) throw new Error("Database source requested an unknown store");
+        for await (const row of spool.rows(sectionId, range)) {
           if (row.kind !== "record")
             throw new Error("Invalid database record row");
           if (decodeUtf16(row.storeName) !== storeName) continue;

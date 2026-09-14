@@ -412,11 +412,14 @@ describe('native file jobs', () => {
                     wait: async () => undefined,
                     copyToAndroidSaf: async () => ({
                         bytes: 2048,
-                        warningCodes: [],
+                        warningCodes: ['provider-warning'],
                     }),
                 },
             ),
-        ).rejects.toMatchObject({ code: 'length-mismatch' })
+        ).rejects.toMatchObject({
+            code: 'length-mismatch',
+            warningCodes: ['provider-warning', 'partial-destination-may-remain'],
+        })
         expect(commands).toEqual([
             'native_file_job_start',
             'native_file_job_status',
@@ -1417,7 +1420,10 @@ describe('native file jobs', () => {
                     }),
                 },
             ),
-        ).rejects.toMatchObject({ code: 'length-mismatch' })
+        ).rejects.toMatchObject({
+            code: 'length-mismatch',
+            warningCodes: ['partial-destination-may-remain'],
+        })
         expect(commands).toEqual([
             'native_file_job_start',
             'native_file_job_status',

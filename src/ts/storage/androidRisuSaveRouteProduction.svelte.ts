@@ -133,6 +133,20 @@ export async function importAndroidOpenedPreparedContent(
 async function importAndroidCharacterSpool(
     source: AndroidSpoolReady,
 ): Promise<NativeAndroidCharacterSpoolResult<string>> {
+    const replayDestination = source.importDestination
+        ?? (/\.lorebook$/i.test(source.displayName) ? 'module' : null)
+    if (replayDestination) {
+        const { importReplayedAndroidContentSpool } = await import(
+            './androidContentPicker'
+        )
+        const value = await importReplayedAndroidContentSpool(
+            source,
+            replayDestination,
+        )
+        return value === null
+            ? { kind: 'declined' }
+            : { kind: 'imported', value }
+    }
     const [
         { importAndroidNativeCharacterSpool },
         { isNativeCharacterContentImportEnabled },

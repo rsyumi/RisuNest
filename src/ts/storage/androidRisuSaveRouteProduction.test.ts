@@ -162,6 +162,7 @@ describe('Android opened spool production route', () => {
             'card.JPEG',
             `${'p'.repeat(174)}.PnG`,
             `${'m'.repeat(174)}.RiSuM`,
+            'book.LoReBoOk',
         ].map((displayName, index) => ({
             token: `00000000-0000-4000-8000-00000000000${index + 1}`,
             displayName,
@@ -174,7 +175,7 @@ describe('Android opened spool production route', () => {
             failures: [],
         }, dependencies)
 
-        expect(importCharacter).toHaveBeenCalledTimes(6)
+        expect(importCharacter).toHaveBeenCalledTimes(7)
         ready.forEach((source, index) => {
             expect(importCharacter).toHaveBeenNthCalledWith(index + 1, source)
         })

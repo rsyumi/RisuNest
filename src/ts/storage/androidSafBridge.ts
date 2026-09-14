@@ -12,6 +12,7 @@ export interface AndroidSpoolReady {
     displayName: string
     bytes: number
     totalBytes?: number | null
+    importDestination?: 'character' | 'module' | null
 }
 
 export interface AndroidSpoolFailure {
@@ -82,6 +83,7 @@ export function isAndroidNativeContentSpool(source: AndroidSpoolReady): boolean 
         || displayName.endsWith('.jpeg')
         || displayName.endsWith('.png')
         || displayName.endsWith('.risum')
+        || displayName.endsWith('.lorebook')
 }
 
 export async function consumeAndroidSpoolBatch(
@@ -145,7 +147,10 @@ export interface AndroidSafJavascriptBridge {
     cancelExport?(requestId: string): boolean | void
     cancelSource?(requestId: string): void
     pickBackupSource?(requestId: string): void
-    pickContentSource?(requestId: string): void
+    pickContentSource?(
+        requestId: string,
+        destination: 'character' | 'module',
+    ): void
     pickLegacyBackupSource?(requestId: string): void
     discardSource?(token: string): boolean
     getActiveSourceRequestIds?(): string
@@ -160,6 +165,11 @@ export interface AndroidSafSourcePickerOptions {
     onProgress?(progress: AndroidSafProgress): void
     /** Reports the picked file's name and size before the spool token is returned. */
     onSource?(source: { displayName: string; bytes: number }): void
+}
+
+export interface AndroidSafContentSourcePickerOptions
+    extends AndroidSafSourcePickerOptions {
+    destination: 'character' | 'module'
 }
 
 export interface AndroidSafSourcePickerDependencies {
@@ -229,6 +239,7 @@ interface AndroidSafSourcePickerConfig {
     pickerUnavailableMessage: string
     acceptExtension: string | string[]
     cancelMessage: string
+    importDestination?: 'character' | 'module'
 }
 
 function pickAndroidSpoolSource(
@@ -357,7 +368,19 @@ function pickAndroidSpoolSource(
         try {
             const pick = dependencies.bridge[config.pickMethod]
             if (!pick) throw new Error(config.pickerUnavailableMessage)
-            pick.call(dependencies.bridge, requestId)
+            if (config.pickMethod === 'pickContentSource') {
+                dependencies.bridge.pickContentSource?.(
+                    requestId,
+                    config.importDestination!,
+                )
+            }
+            else {
+                const singleArgumentPick = pick as (requestId: string) => void
+                singleArgumentPick.call(
+                    dependencies.bridge,
+                    requestId,
+                )
+            }
         } catch (error) {
             finish(() => reject(error))
         }
@@ -554,7 +577,7 @@ export function copyNativeExportToAndroidSaf(
 }
 
 export function pickAndroidContentSource(
-    options: AndroidSafSourcePickerOptions = {},
+    options: AndroidSafContentSourcePickerOptions,
     dependencies: AndroidSafSourcePickerDependencies = productionDependencies,
 ): Promise<NativeFileJobSource | null> {
     return pickAndroidSpoolSource(
@@ -572,6 +595,7 @@ export function pickAndroidContentSource(
                 '.lorebook',
             ],
             cancelMessage: 'Android content selection was cancelled',
+            importDestination: options.destination,
         },
         options,
         dependencies,

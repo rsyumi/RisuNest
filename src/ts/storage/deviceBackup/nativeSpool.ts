@@ -156,8 +156,18 @@ export function createNativeDeviceSpool(
         }
       }
     },
-    async *rows(sectionId): AsyncIterable<DeviceRow> {
-      let afterOrdinal = -1;
+    async *rows(sectionId, range): AsyncIterable<DeviceRow> {
+      const startOrdinal = range?.startOrdinal ?? 0;
+      const endOrdinalExclusive = range?.endOrdinalExclusive ?? Number.MAX_SAFE_INTEGER;
+      if (
+        !Number.isSafeInteger(startOrdinal)
+        || startOrdinal < 0
+        || !Number.isSafeInteger(endOrdinalExclusive)
+        || endOrdinalExclusive < startOrdinal
+      )
+        throw new Error("Invalid device spool row range");
+      if (startOrdinal === endOrdinalExclusive) return;
+      let afterOrdinal = startOrdinal - 1;
       while (true) {
         const page = await invoke<{
           rows: {
@@ -171,7 +181,7 @@ export function createNativeDeviceSpool(
           ...scope,
           sectionId,
           afterOrdinal: afterOrdinal < 0 ? null : afterOrdinal,
-          limit: 64,
+          limit: Math.min(64, endOrdinalExclusive - afterOrdinal - 1),
         });
         if (page.hasMore && page.rows.length === 0)
           throw new Error("Device spool pagination made no progress");
@@ -194,6 +204,7 @@ export function createNativeDeviceSpool(
           if (row.payloadJson !== undefined) onTransferredBytes?.(row.bytes);
           yield JSON.parse(json) as DeviceRow;
           afterOrdinal = row.ordinal;
+          if (afterOrdinal + 1 === endOrdinalExclusive) return;
         }
         if (!page.hasMore) break;
       }

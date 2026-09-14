@@ -87,11 +87,19 @@ class BarcodeScannerPlugin(private val activity: Activity) : Plugin(activity),
     private val supportedFormats = supportedFormats()
 
     private val scanSession = ScanSession<Invoke>()
+    private val lifecycleObserver = ScanLifecycleObserver {
+        if (::webView.isInitialized && scanSession.pending != null) {
+            failScan("qr-scan-cancelled")
+        }
+    }
+    private var lifecycleOwner: LifecycleOwner? = null
     private var webViewBackground: Drawable? = null
 
     override fun load(webView: WebView) {
         super.load(webView)
         this.webView = webView
+        lifecycleOwner = activity as? LifecycleOwner
+        lifecycleOwner?.lifecycle?.addObserver(lifecycleObserver)
     }
 
     private fun supportedFormats(): Map<String, Int> {
@@ -117,6 +125,8 @@ class BarcodeScannerPlugin(private val activity: Activity) : Plugin(activity),
     }
 
     override fun onDestroy(activity: androidx.appcompat.app.AppCompatActivity) {
+        lifecycleOwner?.lifecycle?.removeObserver(lifecycleObserver)
+        lifecycleOwner = null
         if (::webView.isInitialized) failScan("qr-scan-cancelled")
     }
 
@@ -300,6 +310,7 @@ class BarcodeScannerPlugin(private val activity: Activity) : Plugin(activity),
             scanner
                 ?.process(inputImage)
                 ?.addOnSuccessListener { barcodes ->
+                    scanSession.recordFrameSuccess(generation)
                     if (scanSession.isCurrent(generation) && barcodes.isNotEmpty()) {
                         val barcode = barcodes[0]
                         val bounds = barcode.boundingBox
@@ -324,8 +335,11 @@ class BarcodeScannerPlugin(private val activity: Activity) : Plugin(activity),
                         destroy()
                     }
                 }
-                ?.addOnFailureListener {
-                    if (generation == scanSession.generation) failScan("qr-camera-unavailable")
+                ?.addOnFailureListener { error ->
+                    Logger.error(error.message ?: error.toString())
+                    if (scanSession.shouldFailAfterFrameError(generation)) {
+                        failScan("qr-camera-unavailable")
+                    }
                 }
                 ?.addOnCompleteListener {
                     image.close()

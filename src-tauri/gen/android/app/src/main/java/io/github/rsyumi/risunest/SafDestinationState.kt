@@ -171,7 +171,7 @@ internal class SafDestinationStateStore(
     if (!stateFile.isFile || stateFile.length() > MAX_DESTINATION_STATE_BYTES) return null
     val json = runCatching { stateFile.readText(Charsets.UTF_8) }.getOrNull() ?: return null
     val version = numberField(json, "version") ?: return null
-    if (version !in 1L..DESTINATION_STATE_VERSION.toLong()) return null
+    if (version != DESTINATION_STATE_VERSION.toLong()) return null
     val requestId = stringField(json, "requestId") ?: return null
     val exportId = stringField(json, "exportId") ?: return null
     val phase = stringField(json, "phase")?.let(SafDestinationPhase::fromWireName) ?: return null
@@ -180,16 +180,13 @@ internal class SafDestinationStateStore(
     val code = nullableStringField(json, "code") ?: return null
     val warningCodes = warningCodesField(json) ?: return null
     val updatedAtMillis = numberField(json, "updatedAtMillis") ?: return null
-    val sourceKind = if (version == 1L) {
-      SafDestinationSourceKind.RISU_SAVE
-    } else {
-      stringField(json, "sourceKind")?.let(SafDestinationSourceKind::fromWireName) ?: return null
-    }
-    val publicationPrerequisitesComplete = if (version < 3L) {
-      false
-    } else {
-      booleanField(json, "publicationPrerequisitesComplete") ?: return null
-    }
+    val sourceKind = stringField(json, "sourceKind")
+      ?.let(SafDestinationSourceKind::fromWireName)
+      ?: return null
+    val publicationPrerequisitesComplete = booleanField(
+      json,
+      "publicationPrerequisitesComplete",
+    ) ?: return null
     val record = SafDestinationRecord(
       requestId = requestId,
       exportId = exportId,

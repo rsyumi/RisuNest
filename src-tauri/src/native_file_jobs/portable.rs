@@ -111,8 +111,63 @@ fn begin_device(
             return Err(error(failure));
         }
     };
-    job.set_device_session(&id).map_err(error)?;
+    if let Err(set_failure) = job.set_device_session(&id) {
+        let mut failure = error(set_failure);
+        cleanup_unattached_device_session(&coordinator, &id, &mut failure);
+        return Err(failure);
+    }
     Ok(Some(id))
+}
+
+fn append_cleanup_failure(
+    primary: &mut NativeJobError,
+    operation: &str,
+    cleanup: impl std::fmt::Display,
+) {
+    *primary = NativeJobError::new(
+        &primary.code,
+        format!("{}; {operation} failed: {cleanup}", primary.message),
+    );
+}
+
+fn cleanup_unattached_device_session(
+    coordinator: &DeviceBackupState,
+    id: &str,
+    primary: &mut NativeJobError,
+) {
+    if let Err(cleanup) = coordinator.fail(id, "archive-job-setup-failed") {
+        append_cleanup_failure(primary, "device session failure marking", cleanup);
+        return;
+    }
+    if let Err(cleanup) = coordinator.recovery_complete(id) {
+        append_cleanup_failure(primary, "device session recovery completion", cleanup);
+        return;
+    }
+    if let Err(cleanup) = coordinator.cleanup(id) {
+        append_cleanup_failure(primary, "device session cleanup", cleanup);
+    }
+}
+
+fn mark_restore_device_session_failed(
+    coordinator: &DeviceBackupState,
+    id: &str,
+    primary: &mut NativeJobError,
+) {
+    let phase = match coordinator.session(id) {
+        Ok(session) => session.phase,
+        Err(cleanup) => {
+            append_cleanup_failure(primary, "device session inspection", cleanup);
+            return;
+        }
+    };
+    let cleanup = if phase == "committing-library" {
+        coordinator.library_commit_failed(id)
+    } else {
+        coordinator.fail(id, "archive-restore-failed").map(|_| ())
+    };
+    if let Err(cleanup) = cleanup {
+        append_cleanup_failure(primary, "device session failure marking", cleanup);
+    }
 }
 fn wait_device(
     coordinator: &DeviceBackupState,
@@ -493,9 +548,11 @@ pub(crate) fn restore_portable(
                 Operation::Restore,
             ) {
                 Ok(session) => session,
-                Err(failure) => {
+                Err(mut failure) => {
                     if let Some(stage) = &stage {
-                        store.replace_abort(&stage.staging_id).map_err(error)?;
+                        if let Err(cleanup) = store.replace_abort(&stage.staging_id) {
+                            append_cleanup_failure(&mut failure, "staging abort", cleanup);
+                        }
                     }
                     return Err(failure);
                 }
@@ -603,22 +660,24 @@ pub(crate) fn restore_portable(
                 publication: None,
             })
         })();
-        if activated.is_err() && !committed {
-            if let Some(stage) = stage.as_ref() {
-                store.replace_abort(&stage.staging_id).map_err(error)?;
-            }
-            if let (Some((app, _)), Some(id)) = (device, session.as_deref()) {
-                let coordinator = app.state::<DeviceBackupState>();
-                if coordinator.session(id).map_err(error)?.phase == "committing-library" {
-                    coordinator.library_commit_failed(id).map_err(error)?;
-                } else {
-                    coordinator
-                        .fail(id, "archive-restore-failed")
-                        .map_err(error)?;
+        match activated {
+            Err(mut failure) if !committed => {
+                if let Some(stage) = stage.as_ref() {
+                    if let Err(cleanup) = store.replace_abort(&stage.staging_id) {
+                        append_cleanup_failure(&mut failure, "staging abort", cleanup);
+                    }
                 }
+                if let (Some((app, _)), Some(id)) = (device, session.as_deref()) {
+                    mark_restore_device_session_failed(
+                        &app.state::<DeviceBackupState>(),
+                        id,
+                        &mut failure,
+                    );
+                }
+                Err(failure)
             }
+            outcome => outcome,
         }
-        activated
     })();
     finish_pins(outcome, &mut pins)
 }

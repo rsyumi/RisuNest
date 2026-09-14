@@ -57,9 +57,11 @@
     })
     onDestroy(unsubscribe)
 
-    $effect(() => {
-        updateDeviceSettings({ androidKeepAliveDuringGeneration: keepAlive })
-    })
+    function setKeepAlive(next: boolean): void {
+        if (next === keepAlive) return
+        keepAlive = next
+        updateDeviceSettings({ androidKeepAliveDuringGeneration: next })
+    }
 
 </script>
 
@@ -82,7 +84,7 @@
                 <p class="mt-1 text-sm text-draculared" role="alert">{language.risuNest.platform.keepAliveNeedsNotifications}</p>
             {/if}
         {/snippet}
-        <SettingToggle bind:checked={keepAlive} label={language.risuNest.platform.keepAlive} />
+        <SettingToggle checked={keepAlive} onchange={setKeepAlive} label={language.risuNest.platform.keepAlive} />
     </SettingRow>
     {#if operatingSystem || webView}
         <dl data-platform-info class="grid grid-cols-[auto_1fr] gap-x-5 gap-y-1 px-4 py-3 text-sm">

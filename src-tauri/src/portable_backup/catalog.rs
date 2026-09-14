@@ -45,9 +45,10 @@ impl Catalog {
         }
         spool.as_file().sync_all()?;
         let path = spool.into_temp_path();
-        self.add_pinned_file(kind, key, metadata, &path, size, expected_hash, probe)?;
-        // The catalog owns every stream spool until the archive writer has consumed it.
-        path.keep().map_err(|error| Error::Io(error.error))?;
+        if self.add_pinned_file(kind, key, metadata, &path, size, expected_hash, probe)? {
+            // The catalog owns every stream spool until the archive writer has consumed it.
+            path.keep().map_err(|error| Error::Io(error.error))?;
+        }
         Ok(())
     }
     /// Group a large inventory into one bounded-page-cache SQLite transaction. Raw generation
@@ -69,7 +70,7 @@ impl Catalog {
         size: u64,
         hash: &str,
         probe: &dyn CancellationProbe,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         check(probe)?;
         if !matches!(
             kind,
@@ -95,7 +96,7 @@ impl Catalog {
                 |r| r.get(0),
             )
             .optional()?;
-        match existing {
+        let source_added = match existing {
             Some(existing) if existing != size => {
                 return Err(Error::Invalid("conflicting pinned object lengths"))
             }
@@ -112,14 +113,15 @@ impl Catalog {
                             .ok_or(Error::Invalid("non-Unicode pinned path"))?
                     ],
                 )?;
+                true
             }
-            _ => (),
-        }
+            _ => false,
+        };
         self.db.execute(
             "INSERT INTO files VALUES(?1,?2,?3,?4,?5,'present')",
             params![kind, key, bytes, hash, metadata],
         )?;
-        Ok(())
+        Ok(source_added)
     }
 
     pub(crate) fn create(

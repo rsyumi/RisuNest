@@ -4,7 +4,7 @@
     "uuid": "0f9d2c4a-1b2c-4d3e-8f4a-5b6c7d8e9f0a",
     "spoolSuffixes": {
         "database": [".risunest", ".risudat", ".bin"],
-        "content": [".charx", ".json", ".jpeg", ".jpg", ".png", ".risum"]
+        "content": [".charx", ".json", ".jpeg", ".jpg", ".png", ".risum", ".lorebook"]
     },
     "handoffDirectory": "native-file-jobs/handoffs",
     "managedHandoffs": [

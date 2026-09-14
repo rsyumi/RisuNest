@@ -121,6 +121,28 @@ class SafFileBridgeTest {
   }
 
   @Test
+  fun `content spool persists its import destination for replay`() = runBlocking {
+    val root = temporaryDirectory()
+    val token = "31313131-3131-4131-8131-313131313131"
+    val store = SafSpoolStore(
+      root = root,
+      atomicPublisher = testAtomicPublisher,
+      tokenFactory = { UUID.fromString(token) },
+    )
+
+    val batch = spoolOpenedFilesOnIo(
+      store,
+      listOf(TestSafSource("book.lorebook", 2) { ByteArrayInputStream(byteArrayOf(1, 2)) }),
+      importDestination = SafContentImportDestination.MODULE,
+    )
+
+    assertEquals(SafContentImportDestination.MODULE, batch.ready.single().importDestination)
+    assertEquals(SafContentImportDestination.MODULE, store.listReady().single().importDestination)
+    assertTrue(root.resolve("$token/source.json").readText().contains("\"importDestination\":\"module\""))
+    assertTrue(androidSpoolBatchScript("request", batch).contains("\"importDestination\":\"module\""))
+  }
+
+  @Test
   fun `cancellation between fixed-buffer copies removes the owned partial directory`() = runBlocking {
     val root = temporaryDirectory()
     val token = "33333333-3333-4333-8333-333333333333"
@@ -560,6 +582,26 @@ class SafFileBridgeTest {
     assertNull(store.load())
 
     stateFile.writeText("x".repeat(8_193))
+    assertNull(store.load())
+  }
+
+  @Test
+  fun `destination state rejects pre-release schemas instead of inferring missing fields`() {
+    val root = temporaryDirectory()
+    val stateFile = root.resolve("android-saf-destination.json")
+    val store = SafDestinationStateStore(stateFile, testAtomicPublisher)
+    val current = terminalDestinationRecord(
+      requestId = "51515151-5151-4151-8151-515151515151",
+      exportId = "61616161-6161-4161-8161-616161616161",
+      sourceKind = SafDestinationSourceKind.RISU_SAVE,
+      publicationPrerequisitesComplete = true,
+    )
+    store.save(current)
+    val currentJson = stateFile.readText()
+
+    stateFile.writeText(currentJson.replace("\"version\":3", "\"version\":1"))
+    assertNull(store.load())
+    stateFile.writeText(currentJson.replace("\"version\":3", "\"version\":2"))
     assertNull(store.load())
   }
 

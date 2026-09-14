@@ -176,6 +176,53 @@ describe('native file job bootstrap reconciliation', () => {
         expect(calls).toEqual(['native_file_job_list', 'native_file_job_forget'])
     })
 
+    it('releases a successful prepared-content CAS session before forgetting its job', async () => {
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const result = await reconcileNativeFileJobsBeforeBootstrap({
+            invoke: vi.fn(async (command, args) => {
+                calls.push([command, args])
+                if (command === 'native_file_job_list') return [{
+                    ...restoreStatus('content-success', 'succeeded', 'complete'),
+                    kind: 'prepare-content-import' as const,
+                }]
+                if (command === 'asset_cas_job_release') return undefined
+                if (command === 'native_file_job_forget') return true
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+            wait: vi.fn(async () => undefined),
+        })
+
+        expect(result.pendingRestoreAcknowledgements).toEqual([])
+        expect(calls).toEqual([
+            ['native_file_job_list', undefined],
+            ['asset_cas_job_release', {
+                sessionId: 'content-success',
+                outcome: 'aborted',
+            }],
+            ['native_file_job_forget', { jobId: 'content-success' }],
+        ])
+    })
+
+    it('retains a successful prepared-content job when CAS release fails', async () => {
+        const releaseError = new Error('CAS journal unavailable')
+        const calls: string[] = []
+
+        await expect(reconcileNativeFileJobsBeforeBootstrap({
+            invoke: vi.fn(async (command) => {
+                calls.push(command)
+                if (command === 'native_file_job_list') return [{
+                    ...restoreStatus('content-success', 'succeeded', 'complete'),
+                    kind: 'prepare-content-import' as const,
+                }]
+                if (command === 'asset_cas_job_release') throw releaseError
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+            wait: vi.fn(async () => undefined),
+        })).rejects.toBe(releaseError)
+
+        expect(calls).toEqual(['native_file_job_list', 'asset_cas_job_release'])
+    })
+
     it.each([
         ['export-block-risu-save', 'export-1'],
         ['export-legacy-local-backup', 'legacy-export-1'],

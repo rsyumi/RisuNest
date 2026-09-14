@@ -505,6 +505,7 @@ export class NativeFileJobError extends Error {
     constructor(
         readonly code: string,
         message: string,
+        readonly warningCodes: string[] = [],
     ) {
         super(message)
         this.name = 'NativeFileJobError'
@@ -1660,6 +1661,11 @@ async function runNativeManagedExport(
                 throw new NativeFileJobError(
                     'length-mismatch',
                     `Published ${spec.safLengthMismatchLabel} length differs from its native source`,
+                    mergeWarningCodes(
+                        result.warningCodes,
+                        published.warningCodes,
+                        ['partial-destination-may-remain'],
+                    ),
                 )
             }
             const { handoffPath: _handoffPath, ...publishedResult } = result

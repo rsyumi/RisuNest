@@ -57,9 +57,6 @@ pub(crate) fn capture_library(
             }
             // Unknown raw schema is the explicit physical SQLite salvage profile. This snapshot
             // may contain operational tables and is never eligible for normal activation.
-            if !matches!(error, StoreError::Validation { .. }) {
-                return Err(error.into());
-            }
             let source = catalog.directory.path().join("source.sqlite");
             store.capture_preservation_database(&lease, &source, probe)?;
             catalog.db.execute(

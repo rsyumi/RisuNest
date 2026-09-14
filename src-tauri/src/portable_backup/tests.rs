@@ -234,6 +234,38 @@ fn source_hash_and_length_mismatch_never_become_successful_objects() {
 }
 
 #[test]
+fn native_file_lifecycle_duplicate_stream_object_drops_its_unreferenced_temporary_spool() {
+    let directory = tempfile::tempdir().unwrap();
+    let catalog = fixture(directory.path());
+    let before = fs::read_dir(catalog.directory.path()).unwrap().count();
+    let bytes = b"synthetic file bytes";
+    let hash = hex::encode(Sha256::digest(bytes));
+    let mut input = std::io::Cursor::new(bytes);
+
+    catalog
+        .add_reader(
+            "device",
+            &hash,
+            "{}",
+            &mut input,
+            bytes.len() as u64,
+            &hash,
+            &Never,
+        )
+        .unwrap();
+
+    assert_eq!(
+        fs::read_dir(catalog.directory.path()).unwrap().count(),
+        before
+    );
+    let source_count: i64 = catalog
+        .db
+        .query_row("SELECT count(*) FROM sources", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(source_count, 2);
+}
+
+#[test]
 fn external_sql_objects_are_rejected_without_executing_them() {
     let directory = tempfile::tempdir().unwrap();
     let catalog = Catalog::create(directory.path(), "synthetic", 0).unwrap();

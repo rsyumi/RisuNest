@@ -97,6 +97,7 @@ export async function runNativeKeiBackupJob(
     let started: { jobId: string } | undefined
     let capabilityUnavailable = false
     let startError: unknown
+    let releaseError: unknown
     try {
         started = await invokeJob(dependencies, 'native_file_job_start', {
             request: {
@@ -115,11 +116,26 @@ export async function runNativeKeiBackupJob(
         startError = error
     }
     finally {
-        await releasePersistentRevisionLease(lease)
+        try {
+            await releasePersistentRevisionLease(lease)
+        } catch (error) {
+            releaseError = error
+        }
     }
     if (!started) {
+        if (releaseError !== undefined) {
+            if (startError !== undefined) {
+                console.error('Native KEI backup revision release failed after job start failed', releaseError)
+            } else {
+                throw releaseError
+            }
+        }
         if (capabilityUnavailable) return false
         throw startError
+    }
+    if (releaseError !== undefined) {
+        dependencies.warn?.('revision-release-failed')
+        console.error('Native KEI backup revision release failed after the job was accepted', releaseError)
     }
 
     let cancellationRequested = false

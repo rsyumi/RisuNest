@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 
 import { getAndroidSafExportSourceId } from './androidSafBridge'
+import { releaseCasJob } from './nativeAssetRepository'
 import { isTerminalJob as isTerminal, type NativeFileJobStatus } from './nativeFileJobs'
 
 export interface NativeFileJobRecoveryDependencies {
@@ -168,6 +169,9 @@ async function discardContentJob(
             }) as NativeFileJobStatus
             if (!isTerminal(status)) await dependencies.wait(100)
         } while (!isTerminal(status))
+    }
+    if (status.kind === 'prepare-content-import' && status.state === 'succeeded') {
+        await releaseCasJob(status.jobId, 'aborted', dependencies.invoke)
     }
     await dependencies.invoke('native_file_job_forget', { jobId: status.jobId })
 }

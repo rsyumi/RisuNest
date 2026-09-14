@@ -24,8 +24,8 @@
     },
     "fileAssociations": [
       {
-        "ext": ["risum", "risup", "charx", "risunest", "risudat", "bin"],
-        "mimeType": "application/octet-stream"
+        "ext": ["risum", "risup", "charx", "risunest", "risudat"],
+        "mimeType": "application/x-risunest"
       }
     ]
   },

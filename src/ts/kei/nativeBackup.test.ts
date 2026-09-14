@@ -322,4 +322,70 @@ describe('runNativeKeiBackupJob', () => {
             jobId: 'kei-job-1',
         })
     })
+
+    it('continues an accepted job after revision release fails and reports the resource warning', async () => {
+        const harness = nativeRuntime()
+        const releaseError = new Error('checkpoint failed')
+        harness.release.mockRejectedValue(releaseError)
+        const warn = vi.fn()
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+        const invoke = vi.fn()
+            .mockResolvedValueOnce({ jobId: 'kei-job-1', warningCodes: [] })
+            .mockResolvedValueOnce({
+                jobId: 'kei-job-1',
+                kind: 'kei-backup-upload',
+                state: 'succeeded',
+                phase: 'complete',
+                progress: { completedBytes: 1, completedItems: 1 },
+                result: { warningCodes: [] },
+            })
+            .mockResolvedValueOnce(true)
+
+        await expect(runNativeKeiBackupJob(
+            {
+                runtime: harness.runtime,
+                url: 'https://kei.example/autobackup/save',
+                accountId: 'account-1',
+                token: 'secret-token',
+            },
+            { isTauri: () => true, invoke, wait: vi.fn(), warn },
+        )).resolves.toBe(true)
+
+        expect(harness.release).toHaveBeenCalledTimes(2)
+        expect(warn).toHaveBeenCalledWith('revision-release-failed')
+        expect(consoleError).toHaveBeenCalledWith(
+            'Native KEI backup revision release failed after the job was accepted',
+            releaseError,
+        )
+        expect(invoke).toHaveBeenLastCalledWith('native_file_job_forget', {
+            jobId: 'kei-job-1',
+        })
+        consoleError.mockRestore()
+    })
+
+    it('preserves a job-start failure when revision release also fails', async () => {
+        const harness = nativeRuntime()
+        const releaseError = new Error('checkpoint failed')
+        harness.release.mockRejectedValue(releaseError)
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+        const invoke = vi.fn().mockRejectedValueOnce({
+            code: 'job-capacity',
+            message: 'native file job concurrency limit reached',
+        })
+
+        await expect(runNativeKeiBackupJob(
+            {
+                runtime: harness.runtime,
+                url: 'https://kei.example/autobackup/save',
+                accountId: 'account-1',
+                token: 'secret-token',
+            },
+            { isTauri: () => true, invoke, wait: vi.fn() },
+        )).rejects.toMatchObject({ code: 'job-capacity' })
+        expect(consoleError).toHaveBeenCalledWith(
+            'Native KEI backup revision release failed after job start failed',
+            releaseError,
+        )
+        consoleError.mockRestore()
+    })
 })

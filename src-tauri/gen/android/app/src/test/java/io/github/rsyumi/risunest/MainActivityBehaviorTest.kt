@@ -2,6 +2,7 @@ package io.github.rsyumi.risunest
 
 import android.content.ComponentCallbacks2
 import androidx.core.view.WindowInsetsCompat
+import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -34,6 +35,7 @@ class MainActivityBehaviorTest {
     assertEquals(true, shouldUseNativeFileJobSpool("BACKUP.BIN"))
     assertEquals(true, shouldUseNativeFileJobSpool("card.PnG"))
     assertEquals(true, shouldUseNativeFileJobSpool("module.RiSuM"))
+    assertEquals(true, shouldUseNativeFileJobSpool("book.LoReBoOk"))
     assertEquals(true, shouldUseNativeFileJobSpool("BACKUP.RISUNEST"))
     assertEquals(false, shouldUseNativeFileJobSpool("backup.risulossless"))
     assertEquals(true, shouldUseNativeFileJobSpool("character.charx"))
@@ -593,6 +595,88 @@ class MainActivityBehaviorTest {
     assertEquals(true, destination.contains("\"operation\":\"destination-copy\""))
     assertEquals(true, destination.contains("\"totalBytes\":256"))
     assertEquals(true, destination.contains("\"token\":null"))
+  }
+
+  @Test
+  fun `destination record replay preserves publication readiness proof`() {
+    val script = androidSafDestinationScriptForRecord(
+      SafDestinationRecord(
+        requestId = "11111111-1111-4111-8111-111111111111",
+        exportId = "22222222-2222-4222-8222-222222222222",
+        phase = SafDestinationPhase.SUCCEEDED,
+        destinationUri = "content://provider/document/42",
+        bytes = 42,
+        code = null,
+        warningCodes = emptyList(),
+        updatedAtMillis = 2_000,
+        publicationPrerequisitesComplete = true,
+      ),
+      message = null,
+    )
+
+    assertEquals(true, script.contains("\"publicationPrerequisitesComplete\":true"))
+  }
+
+  @Test
+  fun `SAF progress throttle measures from the last dispatched event`() {
+    val throttle = SafProgressThrottle(intervalMillis = 100)
+
+    assertEquals(true, throttle.shouldDispatch("request:token", 1_000))
+    assertEquals(false, throttle.shouldDispatch("request:token", 1_050))
+    assertEquals(true, throttle.shouldDispatch("request:token", 1_100))
+    assertEquals(false, throttle.shouldDispatch("request:token", 1_150))
+    assertEquals(true, throttle.shouldDispatch("request:token", 1_200))
+  }
+
+  @Test
+  fun `clearing SAF progress throttle releases every token for one request`() {
+    val throttle = SafProgressThrottle(intervalMillis = 100)
+    assertEquals(true, throttle.shouldDispatch("first:a", 1_000))
+    assertEquals(true, throttle.shouldDispatch("first:b", 1_000))
+    assertEquals(true, throttle.shouldDispatch("second:a", 1_000))
+
+    throttle.clear("first")
+
+    assertEquals(true, throttle.shouldDispatch("first:a", 1_001))
+    assertEquals(true, throttle.shouldDispatch("first:b", 1_001))
+    assertEquals(false, throttle.shouldDispatch("second:a", 1_001))
+  }
+
+  @Test
+  fun `SAF picker launch failure runs cleanup instead of escaping`() {
+    val events = mutableListOf<String>()
+
+    launchSafSourcePicker(
+      launch = { throw IllegalStateException("no picker") },
+      onFailure = { events.add("failed") },
+    )
+
+    assertEquals(listOf("failed"), events)
+  }
+
+  @Test
+  fun `legacy opened file cleanup removes only stale regular files`() {
+    val directory = Files.createTempDirectory("risu-opened-files").toFile()
+    val stale = directory.resolve("stale.risup").apply {
+      writeBytes(byteArrayOf(1))
+      setLastModified(1_000)
+    }
+    val recent = directory.resolve("recent.risup").apply {
+      writeBytes(byteArrayOf(2))
+      setLastModified(1_950)
+    }
+    val nested = directory.resolve("nested").apply {
+      mkdirs()
+      setLastModified(1_000)
+    }
+
+    assertEquals(
+      listOf("stale.risup"),
+      cleanupLegacyOpenedFiles(directory, nowMillis = 2_000, staleAfterMillis = 100),
+    )
+    assertEquals(false, stale.exists())
+    assertEquals(true, recent.exists())
+    assertEquals(true, nested.exists())
   }
 
   @Test
