@@ -180,6 +180,12 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
                     }),
                 ).toEqual({ revision: reordered.revision, value: reorderedHeads[0] })
                 expect(
+                    await store.readAssetOwnerHead({
+                        kind: 'persona-embedded-module-assets',
+                        index: 0,
+                    }),
+                ).toEqual({ revision: reordered.revision, value: originalHeads[2] })
+                expect(
                     await lease.readAssetOwnerHead({
                         kind: 'root-module-assets',
                         index: 0,
@@ -245,7 +251,7 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             })
         })
 
-        it('invalidates a character shadow head when its parent changes without a replacement', async () => {
+        it('preserves a character shadow head when unrelated parent fields change', async () => {
             const { store } = await createHarness()
             const database = structuredClone(fixtureDatabase)
             database.characters[0].additionalAssets = [
@@ -278,10 +284,128 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
                 character: { ...detail, name: 'Changed through the legacy path' },
             })
 
-            expect(await store.readAssetOwnerHead(head.owner)).toBeNull()
+            expect(await store.readAssetOwnerHead(head.owner)).toEqual({
+                revision: changed.revision,
+                value: head,
+            })
             expect((await store.readCharacter(database.characters[0].chaId))!.revision).toBe(
                 changed.revision,
             )
+
+            const invalidated = await store.commit({
+                expectedRevision: changed.revision,
+                character: {
+                    ...detail,
+                    additionalAssets: [['replacement', 'assets/replacement.bin', 'BIN']],
+                },
+            })
+            expect(invalidated.revision).toBe(changed.revision + 1)
+            expect(await store.readAssetOwnerHead(head.owner)).toBeNull()
+        })
+
+        it('preserves root owner heads when unrelated root fields change', async () => {
+            const { store } = await createHarness()
+            const database = structuredClone(fixtureDatabase)
+            database.modules = [{
+                id: 'module',
+                name: 'Module',
+                description: '',
+                assets: [['kept', 'assets/kept.bin', 'BIN']],
+            }]
+            const imported = await store.replaceFromDatabase(database)
+            const root = (await store.readRoot()).value
+            const head: AssetOwnerHead = {
+                owner: { kind: 'root-module-assets', index: 0 },
+                present: true,
+                manifestHash: '56'.repeat(32),
+                entryCount: 1,
+            }
+            const shadowed = await store.commit({
+                expectedRevision: imported.revision,
+                root,
+                assetOwnerHeads: [head],
+            })
+
+            const changed = await store.commit({
+                expectedRevision: shadowed.revision,
+                root: { ...root, username: 'Unrelated root change' },
+            })
+
+            expect(await store.readAssetOwnerHead(head.owner)).toEqual({
+                revision: changed.revision,
+                value: head,
+            })
+
+            const changedModules = structuredClone(root.modules!)
+            changedModules[0].assets = [['replacement', 'assets/replacement.bin', 'BIN']]
+            const invalidated = await store.commit({
+                expectedRevision: changed.revision,
+                root: { ...root, modules: changedModules },
+            })
+            expect(invalidated.revision).toBe(changed.revision + 1)
+            expect(await store.readAssetOwnerHead(head.owner)).toBeNull()
+        })
+
+        it('moves omitted root owner heads with uniquely identified modules', async () => {
+            const { store } = await createHarness()
+            const database = structuredClone(fixtureDatabase)
+            database.modules = [
+                {
+                    id: 'module-a',
+                    name: 'Module A',
+                    description: '',
+                    assets: [['a', 'assets/a.bin', 'BIN']],
+                },
+                {
+                    id: 'module-b',
+                    name: 'Module B',
+                    description: '',
+                    assets: [['b', 'assets/b.bin', 'BIN']],
+                },
+            ]
+            const imported = await store.replaceFromDatabase(database)
+            const root = (await store.readRoot()).value
+            const heads: AssetOwnerHead[] = [
+                {
+                    owner: { kind: 'root-module-assets', index: 0 },
+                    present: true,
+                    manifestHash: '57'.repeat(32),
+                    entryCount: 1,
+                },
+                {
+                    owner: { kind: 'root-module-assets', index: 1 },
+                    present: true,
+                    manifestHash: '58'.repeat(32),
+                    entryCount: 1,
+                },
+            ]
+            const shadowed = await store.commit({
+                expectedRevision: imported.revision,
+                root,
+                assetOwnerHeads: heads,
+            })
+            const reorderedRoot = structuredClone(root)
+            reorderedRoot.modules!.reverse()
+
+            const reordered = await store.commit({
+                expectedRevision: shadowed.revision,
+                root: reorderedRoot,
+            })
+
+            expect(await store.readAssetOwnerHead({
+                kind: 'root-module-assets',
+                index: 0,
+            })).toEqual({
+                revision: reordered.revision,
+                value: { ...heads[1], owner: { kind: 'root-module-assets', index: 0 } },
+            })
+            expect(await store.readAssetOwnerHead({
+                kind: 'root-module-assets',
+                index: 1,
+            })).toEqual({
+                revision: reordered.revision,
+                value: { ...heads[0], owner: { kind: 'root-module-assets', index: 1 } },
+            })
         })
 
         it('validates a character owner head against the final same-ID parent atomically', async () => {
