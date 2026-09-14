@@ -41,6 +41,17 @@ $daemon = 'E:/Programming/Github/RisuNest/src-tauri/target/debug/risunest-sync-s
 & $daemon serve --data-dir E:/sync-server-synthetic
 ```
 
+Release builds also provide a read-only update check:
+
+```powershell
+& $daemon update check
+```
+
+The command verifies the signed RisuNest release catalog and reports the current
+version, latest Sync version, and matching raw package URL for this OS and
+architecture. It does not download, install, or reconfigure the daemon or
+cloudflared.
+
 `device add` prints a device ID, library ID, and 256-bit token once. Transfer this
 credential privately to its device. Only the token's SHA-256 verifier is stored
 on the server. Keep credentials out of HTTP URLs, logs, and library content.

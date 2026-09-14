@@ -9,8 +9,10 @@ publish = false
 windows-background = []
 
 [dependencies]
+risunest-release-update = { path = "../../crates/release-update" }
 risunest-sync-wire = { path = "../../crates/sync-wire" }
 risunest-sync-connect = { path = "../../crates/sync-connect" }
+async-trait = "0.1"
 axum = "0.8.9"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "io-util", "fs", "process", "sync"] }
 tokio-util = { version = "0.7", features = ["io"] }
@@ -31,4 +33,6 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32
 libc = "0.2"
 
 [dev-dependencies]
+base64 = "0.22"
+minisign = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }

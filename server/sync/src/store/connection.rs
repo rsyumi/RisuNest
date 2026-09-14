@@ -18,64 +18,6 @@ use std::{
 const MAX_STATE_BYTES: usize = 32768;
 const REPUBLISH_SECONDS: i64 = 7 * 24 * 60 * 60;
 
-#[cfg(test)]
-mod renewal_tests {
-    use super::*;
-
-    #[test]
-    fn renewal_survives_restart_retries_and_resets_only_after_success() {
-        let root = tempfile::tempdir().unwrap();
-        let store = Store::init(root.path()).unwrap();
-        store
-            .configure_connection(ConnectionOptions {
-                endpoint: Some("https://sync.example".into()),
-                cloudflared: None,
-                registry_url: Some("https://registry.example".into()),
-            })
-            .unwrap();
-        let first = store.plan_publication().unwrap().unwrap();
-        store.confirm_publication(&first).unwrap();
-        let mut state = store.read_connection().unwrap();
-        state.last_published_at = now().unwrap() - REPUBLISH_SECONDS + 3600;
-        store.write_connection(&state).unwrap();
-        assert!(store.plan_publication().unwrap().is_none());
-
-        state.last_published_at = now().unwrap() - REPUBLISH_SECONDS;
-        let expired_at = state.last_published_at;
-        store.write_connection(&state).unwrap();
-        drop(store);
-        let store = Store::open(root.path()).unwrap();
-        let renewal = store.plan_publication().unwrap().unwrap();
-        assert_eq!(renewal.directory.uuid, first.directory.uuid);
-        assert_eq!(renewal.directory.key, first.directory.key);
-        assert_ne!(renewal.envelope, first.envelope);
-        assert_eq!(
-            store.read_connection().unwrap().last_published_at,
-            expired_at
-        );
-        drop(store);
-
-        let store = Store::open(root.path()).unwrap();
-        let retry = store.plan_publication().unwrap().unwrap();
-        assert_eq!(retry.envelope, renewal.envelope);
-        store.confirm_publication(&retry).unwrap();
-        assert!(store.read_connection().unwrap().last_published_at > expired_at);
-        assert!(store.plan_publication().unwrap().is_none());
-
-        store
-            .configure_connection(ConnectionOptions {
-                endpoint: Some("https://sync.example".into()),
-                cloudflared: None,
-                registry_url: None,
-            })
-            .unwrap();
-        let mut state = store.read_connection().unwrap();
-        state.last_published_at = expired_at;
-        store.write_connection(&state).unwrap();
-        assert!(store.plan_publication().unwrap().is_none());
-    }
-}
-
 impl Store {
     pub(super) fn read_connection(&self) -> Result<ConnectionState> {
         let path = self.root.join("connection-state");
@@ -378,5 +320,63 @@ pub(crate) fn protect(bytes: &[u8], seal: bool) -> Result<Vec<u8>> {
         let result = std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
         LocalFree(output.pbData.cast());
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod renewal_tests {
+    use super::*;
+
+    #[test]
+    fn renewal_survives_restart_retries_and_resets_only_after_success() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::init(root.path()).unwrap();
+        store
+            .configure_connection(ConnectionOptions {
+                endpoint: Some("https://sync.example".into()),
+                cloudflared: None,
+                registry_url: Some("https://registry.example".into()),
+            })
+            .unwrap();
+        let first = store.plan_publication().unwrap().unwrap();
+        store.confirm_publication(&first).unwrap();
+        let mut state = store.read_connection().unwrap();
+        state.last_published_at = now().unwrap() - REPUBLISH_SECONDS + 3600;
+        store.write_connection(&state).unwrap();
+        assert!(store.plan_publication().unwrap().is_none());
+
+        state.last_published_at = now().unwrap() - REPUBLISH_SECONDS;
+        let expired_at = state.last_published_at;
+        store.write_connection(&state).unwrap();
+        drop(store);
+        let store = Store::open(root.path()).unwrap();
+        let renewal = store.plan_publication().unwrap().unwrap();
+        assert_eq!(renewal.directory.uuid, first.directory.uuid);
+        assert_eq!(renewal.directory.key, first.directory.key);
+        assert_ne!(renewal.envelope, first.envelope);
+        assert_eq!(
+            store.read_connection().unwrap().last_published_at,
+            expired_at
+        );
+        drop(store);
+
+        let store = Store::open(root.path()).unwrap();
+        let retry = store.plan_publication().unwrap().unwrap();
+        assert_eq!(retry.envelope, renewal.envelope);
+        store.confirm_publication(&retry).unwrap();
+        assert!(store.read_connection().unwrap().last_published_at > expired_at);
+        assert!(store.plan_publication().unwrap().is_none());
+
+        store
+            .configure_connection(ConnectionOptions {
+                endpoint: Some("https://sync.example".into()),
+                cloudflared: None,
+                registry_url: None,
+            })
+            .unwrap();
+        let mut state = store.read_connection().unwrap();
+        state.last_published_at = expired_at;
+        store.write_connection(&state).unwrap();
+        assert!(store.plan_publication().unwrap().is_none());
     }
 }
