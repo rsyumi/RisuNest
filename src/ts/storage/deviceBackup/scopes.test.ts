@@ -3,6 +3,10 @@ import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { describe, expect, it, vi } from "vitest";
 import type { RisuNestDeviceSettings } from "../deviceSettings";
 import {
+  getAppUpdateSettings,
+  updateAppUpdateSettings,
+} from "../../update/settings";
+import {
   captureDeviceSection,
   databaseSectionId,
   discoverDeviceSections,
@@ -263,6 +267,41 @@ describe("device plugin storage scopes", () => {
       vi.unstubAllGlobals();
       vi.resetModules();
     }
+  });
+
+  it("backs up and restores the separate app update settings record", async () => {
+    const environment = fixtureEnvironment();
+    const spool = fixtureSpool();
+    const raw = JSON.stringify({
+      schema: "risunest.app-update-settings/v1",
+      autoUpdateCheck: false,
+      skippedVersion: "2.3.4",
+      lastCheckedAt: 123456,
+    });
+    environment.localStorage.setItem("risuNestUpdateSettings", raw);
+    vi.stubGlobal("localStorage", environment.localStorage);
+    expect(getAppUpdateSettings().autoUpdateCheck).toBe(false);
+    const info = await captureDeviceSection(
+      "device-settings",
+      spool,
+      environment,
+    );
+    updateAppUpdateSettings({
+      autoUpdateCheck: true,
+      skippedVersion: "",
+      lastCheckedAt: 999999,
+    });
+    expect(getAppUpdateSettings().autoUpdateCheck).toBe(true);
+    await (await stageDeviceSection(info, spool, environment)).apply();
+    expect(environment.localStorage.getItem("risuNestUpdateSettings")).toBe(
+      raw,
+    );
+    expect(getAppUpdateSettings()).toMatchObject({
+      autoUpdateCheck: false,
+      skippedVersion: "2.3.4",
+      lastCheckedAt: 123456,
+    });
+    vi.unstubAllGlobals();
   });
 
   it.each([

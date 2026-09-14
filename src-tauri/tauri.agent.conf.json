@@ -3,5 +3,13 @@
   "build": {
     "beforeDevCommand": "pnpm dev:agent",
     "beforeBuildCommand": "pnpm tauribuild:agent"
+  },
+  "bundle": {
+    "createUpdaterArtifacts": false
+  },
+  "plugins": {
+    "risunest": {
+      "agent": true
+    }
   }
 }

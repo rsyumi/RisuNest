@@ -9,7 +9,6 @@
     "linux"
   ],
   "permissions": [
-    "updater:default",
     "process:default",
     "shell:default",
     "http:default",

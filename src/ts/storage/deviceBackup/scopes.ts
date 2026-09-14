@@ -1,5 +1,9 @@
 import { pluginDevicePrefix } from "../../plugins/pluginDeviceStorage";
 import {
+  reloadAppUpdateSettings,
+  validateAppUpdateSettings,
+} from "../../update/settings";
+import {
   decodeCloneGraph,
   decodeUtf16,
   encodeCloneGraph,
@@ -123,6 +127,8 @@ function requirePluginKey(encoded: string): string {
 }
 
 const settingsKey = "risuNestDeviceSettings";
+const updateSettingsKey = "risuNestUpdateSettings";
+const settingsKeys = [settingsKey, updateSettingsKey] as const;
 export function validateSettings(raw: unknown): Record<string, unknown> {
   if (typeof raw !== "string")
     throw new Error("Device settings must be a JSON string");
@@ -150,6 +156,12 @@ export function validateSettings(raw: unknown): Record<string, unknown> {
   )
     throw new Error("Unknown device setting");
   return settings;
+}
+
+function validateUpdateSettings(raw: unknown) {
+  if (typeof raw !== "string")
+    throw new Error("App update settings must be a JSON string");
+  return validateAppUpdateSettings(JSON.parse(raw));
 }
 
 export async function captureDeviceSection(
@@ -199,15 +211,18 @@ export async function captureDeviceSection(
       },
     });
   } else {
-    const setting =
-      sectionId === "device-settings"
-        ? environment.localStorage.getItem(settingsKey)
-        : null;
-    if (setting !== null) validateSettings(setting);
+    const settings = sectionId === "device-settings"
+      ? settingsKeys.map((key) => [key, environment.localStorage.getItem(key)] as const)
+      : [];
+    for (const [key, value] of settings) {
+      if (value === null) continue;
+      if (key === settingsKey) validateSettings(value);
+      else validateUpdateSettings(value);
+    }
     await spool.beginSection(sectionId, {
       profile: "risunest.device-section/v1",
       sectionId,
-      present: sectionId !== "device-settings" || setting !== null,
+      present: sectionId !== "device-settings" || settings.some(([, value]) => value !== null),
     });
     if (sectionId === "local-storage") {
       const keys = localKeys(environment.localStorage);
@@ -241,12 +256,11 @@ export async function captureDeviceSection(
         )
       )
         throw new Error("Device plugin storage changed during capture");
-    } else if (setting !== null) {
-      await append({
-        kind: "value",
-        key: encodeUtf16(settingsKey),
-        value: await encode(setting),
-      });
+    } else {
+      for (const [key, value] of settings) {
+        if (value === null) continue;
+        await append({ kind: "value", key: encodeUtf16(key), value: await encode(value) });
+      }
     }
   }
   checkpoint(environment);
@@ -439,15 +453,17 @@ export async function stageDeviceSection(
     if (sectionId === "local-storage" && typeof value !== "string")
       throw new Error("Local storage values must be strings");
     if (sectionId === "device-settings") {
-      if (key !== settingsKey) throw new Error("Invalid device settings key");
-      validateSettings(value);
+      if (!settingsKeys.includes(key as typeof settingsKeys[number]))
+        throw new Error("Invalid device settings key");
+      if (key === settingsKey) validateSettings(value);
+      else validateUpdateSettings(value);
     }
     rowCount++;
   }
   if (
     rowCount !== info.recordCount ||
     (!metadata.present && rowCount !== 0) ||
-    (sectionId === "device-settings" && rowCount !== (metadata.present ? 1 : 0))
+    (sectionId === "device-settings" && (rowCount > settingsKeys.length || (metadata.present ? rowCount === 0 : rowCount !== 0)))
   )
     throw new Error("Device section row count disagrees with metadata");
   const currentKeys =
@@ -457,9 +473,7 @@ export async function stageDeviceSection(
         )
       : sectionId === "local-storage"
         ? localKeys(environment.localStorage)
-        : environment.localStorage.getItem(settingsKey) === null
-          ? []
-          : [settingsKey];
+        : settingsKeys.filter((key) => environment.localStorage.getItem(key) !== null);
   return {
     sectionId,
     deletionCount: currentKeys.filter((key) => !sourceKeys.has(key)).length,
@@ -472,7 +486,7 @@ export async function stageDeviceSection(
             )
           : sectionId === "local-storage"
             ? localKeys(environment.localStorage)
-            : [settingsKey];
+            : [...settingsKeys];
       for (const key of keys) {
         checkpoint(environment);
         if (sectionId === "localforage")
@@ -500,14 +514,17 @@ export async function stageDeviceSection(
             )
           : sectionId === "local-storage"
             ? localKeys(environment.localStorage)
-            : environment.localStorage.getItem(settingsKey) === null
-              ? []
-              : [settingsKey];
+            : settingsKeys.filter((key) => environment.localStorage.getItem(key) !== null);
       if (
         appliedKeys.length !== sourceKeys.size ||
         appliedKeys.some((key) => !sourceKeys.has(key))
       )
         throw new Error("Restored device key set differs from its source");
+      if (
+        sectionId === "device-settings" &&
+        typeof localStorage !== "undefined" &&
+        environment.localStorage === localStorage
+      ) reloadAppUpdateSettings();
     },
     async cleanup() {},
   };

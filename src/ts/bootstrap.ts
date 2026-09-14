@@ -13,7 +13,6 @@ import { setDatabase, getDatabase, type Database } from "./storage/database.svel
 import { getDeviceSettings } from "./storage/deviceSettings";
 import { setNativeLogFileEnabled } from "./nativeLog";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { checkRisuUpdate } from "./update";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, LoadingStatusState, bootFailure, type BootFailure } from "./stores.svelte";
 import { loadPlugins, loadPluginsAfterAuthoritativeRestore, pluginCompatibility } from "./plugins/plugins.svelte";
 import { shouldProjectScalableWorkingSet } from "./plugins/pluginCompatibility";
@@ -633,11 +632,7 @@ export async function loadData() {
             })
         }
 
-        if (isTauriDesktop) {
-            await transition('update-check', language.risuNest.startup.update)
-            await checkRisuUpdate()
-            await changeFullscreen()
-        }
+        if (isTauriDesktop) await changeFullscreen()
 
         if (!isTauri) {
             await transition('drive-sync', language.risuNest.startup.account)

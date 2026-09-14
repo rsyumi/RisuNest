@@ -1,6 +1,7 @@
 #[cfg(any(test, target_os = "android"))]
 mod android_commit_transport;
 mod app_data_root;
+mod app_update;
 mod asset_repository;
 mod cold_payload_codec;
 pub(crate) mod device_backup;
@@ -530,6 +531,15 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
                     .map_err(|error| format!("iOS native initialization failed: {error}"))?;
                 let app_data_dir = app_data_root::resolve(app)
                     .map_err(|error| format!("application data root unavailable: {error}"))?;
+                let agent_build = app
+                    .config()
+                    .plugins
+                    .0
+                    .get("risunest")
+                    .and_then(|value| value.get("agent"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                app.manage(app_update::AppUpdateState::initialize(agent_build));
                 let device_backup = device_backup::DeviceBackupState::initialize(
                     app_data_dir.join("device-backup"),
                 );
@@ -629,6 +639,11 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         #[cfg(target_os = "macos")]
         macos_lifecycle::macos_exit_response,
         native_startup_status,
+        app_update::commands::app_update_environment,
+        app_update::commands::app_update_check,
+        app_update::commands::app_update_cancel,
+        app_update::commands::app_update_install,
+        app_update::commands::app_update_stage_deb,
         native_media::streaming::native_media_base_url,
         server_sync::commands::server_sync_status,
         server_sync::commands::server_sync_asset_status,
