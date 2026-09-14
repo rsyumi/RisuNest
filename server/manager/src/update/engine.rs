@@ -1028,12 +1028,16 @@ async fn run_inner_locked(root: &Path, server: &Path, mode: RunMode) -> Result<R
         Err(error) => Err(error),
     };
     if let Err(error) = helper_started {
+        #[cfg(target_os = "macos")]
+        let helper_cleanup = platform::cleanup_update_helpers(root);
         if cancel_prepared_after_shutdown(root, server, &transaction)
             .await
             .is_err()
         {
             return Err("update-rollback-restart-failed".into());
         }
+        #[cfg(target_os = "macos")]
+        helper_cleanup?;
         return Err(error);
     }
     Ok(RunOutcome::Started(target))

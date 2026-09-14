@@ -20,6 +20,7 @@ use std::{
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::Mutex,
     time::Duration,
 };
 
@@ -189,7 +190,7 @@ struct Scenario {
     manager: PathBuf,
     data_probe: PathBuf,
     launch_label: String,
-    helper_label: String,
+    helper_labels: Mutex<Vec<String>>,
 }
 
 impl Scenario {
@@ -215,7 +216,6 @@ impl Scenario {
         fs::write(&data_probe, b"synthetic-data-must-survive-managed-update")
             .map_err(|error| error.to_string())?;
         let launch_label = format!("io.github.rsyumi.{}", platform::instance_name(&root));
-        let helper_label = format!("{launch_label}-apply-{}", std::process::id());
         Ok(Self {
             _temporary: temporary,
             root,
@@ -226,7 +226,7 @@ impl Scenario {
             manager,
             data_probe,
             launch_label,
-            helper_label,
+            helper_labels: Mutex::new(Vec::new()),
         })
     }
 
@@ -244,7 +244,9 @@ impl Scenario {
 
     fn cleanup_launchd(&self) {
         let domain = launchd_domain();
-        for label in [&self.helper_label, &self.launch_label] {
+        let mut labels = self.helper_labels.lock().unwrap().clone();
+        labels.push(self.launch_label.clone());
+        for label in &labels {
             let _ = Command::new("launchctl")
                 .args(["bootout", &format!("{domain}/{label}")])
                 .stdout(Stdio::null())
@@ -262,7 +264,9 @@ impl Scenario {
     fn cleanup_launchd_checked(&self) -> Result<(), String> {
         self.cleanup_launchd();
         let domain = launchd_domain();
-        for label in [&self.helper_label, &self.launch_label] {
+        let mut labels = self.helper_labels.lock().unwrap().clone();
+        labels.push(self.launch_label.clone());
+        for label in &labels {
             if Command::new("launchctl")
                 .args(["print", &format!("{domain}/{label}")])
                 .stdout(Stdio::null())
@@ -278,6 +282,30 @@ impl Scenario {
             return Err("synthetic startup plist remains installed".into());
         }
         Ok(())
+    }
+
+    fn remember_helper_label(&self) -> Result<String, String> {
+        let directory = self.root.join("manager-update/helper");
+        let prefix = format!(
+            "io.github.rsyumi.{}-update-helper-",
+            platform::instance_name(&self.root)
+        );
+        let labels = fs::read_dir(directory)
+            .map_err(|error| format!("helper plist directory unavailable: {error}"))?
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let path = entry.path();
+                (path.extension().and_then(|value| value.to_str()) == Some("plist"))
+                    .then(|| path.file_stem()?.to_str().map(str::to_owned))
+                    .flatten()
+            })
+            .filter(|label| label.starts_with(&prefix))
+            .collect::<Vec<_>>();
+        if labels.len() != 1 {
+            return Err(format!("expected one helper plist, got {labels:?}"));
+        }
+        self.helper_labels.lock().unwrap().push(labels[0].clone());
+        Ok(labels[0].clone())
     }
 }
 
@@ -445,7 +473,10 @@ fn sleeping_parent() -> Result<Child, String> {
         .map_err(|error| format!("parent spawn failed: {error}"))
 }
 
-async fn spawn_production_helper(scenario: &Scenario, parent: &mut Child) -> Result<(), String> {
+async fn spawn_production_helper(
+    scenario: &Scenario,
+    parent: &mut Child,
+) -> Result<String, String> {
     let helper_directory = scenario.root.join("manager-update/helper");
     fs::create_dir_all(&helper_directory).map_err(|error| error.to_string())?;
     let helper = helper_directory.join("risunest-sync-update-helper");
@@ -463,6 +494,7 @@ async fn spawn_production_helper(scenario: &Scenario, parent: &mut Child) -> Res
         .args(["update", "helper", &parent.id().to_string()])
         .arg(&scenario.install);
     platform::spawn_update_helper(&scenario.root, &mut command)?;
+    let helper_label = scenario.remember_helper_label()?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         if helper_lock_active(&scenario.root)? {
@@ -474,7 +506,33 @@ async fn spawn_production_helper(scenario: &Scenario, parent: &mut Child) -> Res
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     drop(parent_lock);
-    Ok(())
+    Ok(helper_label)
+}
+
+fn launchd_job_loaded(label: &str) -> Result<bool, String> {
+    Command::new("launchctl")
+        .args(["print", &format!("{}/{label}", launchd_domain())])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .map_err(|error| format!("launchctl job check failed: {error}"))
+}
+
+async fn wait_helper_job_gone(root: &Path, label: &str) -> Result<(), String> {
+    let plist = root
+        .join("manager-update/helper")
+        .join(format!("{label}.plist"));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if !launchd_job_loaded(label)? && !helper_lock_active(root)? && !plist.exists() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("one-shot helper job remains loaded: {label}"));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn wait_completed(scenario: &Scenario) -> Result<(), String> {
@@ -569,10 +627,11 @@ async fn successful_update(
     scenario.stop().await?;
     prepare_transaction(&scenario, &fixture.version, &fixture.version, was_running)?;
     let mut parent = sleeping_parent()?;
-    spawn_production_helper(&scenario, &mut parent).await?;
+    let helper_label = spawn_production_helper(&scenario, &mut parent).await?;
     assert_eq!(inode(&scenario.install)?, source_inode);
     parent.wait().map_err(|error| error.to_string())?;
     wait_completed(&scenario).await?;
+    wait_helper_job_gone(&scenario.root, &helper_label).await?;
     if was_running {
         wait_healthy(&scenario.root, &fixture.version).await?;
     } else {
@@ -612,7 +671,7 @@ async fn failing_update_rolls_back(fixture: &VerifiedFixture) -> Result<(), Stri
     let injected_target = format!("{}-synthetic-health-mismatch", fixture.version);
     prepare_transaction(&scenario, &fixture.version, &injected_target, true)?;
     let mut parent = sleeping_parent()?;
-    spawn_production_helper(&scenario, &mut parent).await?;
+    let helper_label = spawn_production_helper(&scenario, &mut parent).await?;
     parent.wait().map_err(|error| error.to_string())?;
     wait_restarting(&scenario, source_inode).await?;
     wait_healthy(&scenario.root, &fixture.version).await?;
@@ -640,6 +699,55 @@ async fn failing_update_rolls_back(fixture: &VerifiedFixture) -> Result<(), Stri
     if file_hash(&scenario.data_probe)? != data_hash {
         return Err("synthetic data changed during rollback".into());
     }
+    wait_helper_job_gone(&scenario.root, &helper_label).await?;
+    tokio::time::sleep(Duration::from_secs(16)).await;
+    if launchd_job_loaded(&helper_label)?
+        || helper_lock_active(&scenario.root)?
+        || InstallTransaction::load(&scenario.root, &scenario.install)?
+            .is_none_or(|value| value.phase != TransactionPhase::RolledBack)
+        || load_status(&scenario.root)?.phase != UpdatePhase::Failed
+    {
+        return Err("failed one-shot helper restarted after launchd throttle".into());
+    }
+    scenario.stop().await?;
+    scenario.cleanup_launchd_checked()?;
+    Ok(())
+}
+
+async fn failed_helper_exec_is_cleaned_up(fixture: &VerifiedFixture) -> Result<(), String> {
+    let scenario = Scenario::new(fixture, "no-helper-claim")?;
+    let data_hash = file_hash(&scenario.data_probe)?;
+    scenario.install_startup()?;
+    wait_healthy(&scenario.root, &fixture.version).await?;
+    scenario.stop().await?;
+    prepare_transaction(&scenario, &fixture.version, &fixture.version, true)?;
+
+    let parent_lock = try_lock(&scenario.root)?;
+    let mut command = Command::new(scenario.root.join("missing-update-helper"));
+    command
+        .args(["--data-dir"])
+        .arg(&scenario.root)
+        .args(["--server"])
+        .arg(&scenario.server)
+        .args(["update", "helper", &std::process::id().to_string()])
+        .arg(&scenario.install);
+    platform::spawn_update_helper(&scenario.root, &mut command)?;
+    let helper_label = scenario.remember_helper_label()?;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    if helper_lock_active(&scenario.root)? {
+        return Err("non-executable helper unexpectedly claimed its lock".into());
+    }
+    platform::cleanup_update_helpers(&scenario.root)?;
+    drop(parent_lock);
+    InstallTransaction::load(&scenario.root, &scenario.install)?
+        .ok_or("prepared transaction disappeared before parent recovery")?
+        .cancel_prepared(&scenario.root)?;
+    platform::start(&scenario.root, &scenario.server)?;
+    wait_healthy(&scenario.root, &fixture.version).await?;
+    wait_helper_job_gone(&scenario.root, &helper_label).await?;
+    if file_hash(&scenario.data_probe)? != data_hash {
+        return Err("synthetic data changed during helper launch recovery".into());
+    }
     scenario.stop().await?;
     scenario.cleanup_launchd_checked()?;
     Ok(())
@@ -649,6 +757,7 @@ async fn failing_update_rolls_back(fixture: &VerifiedFixture) -> Result<(), Stri
 #[ignore = "requires final signed macOS release artifacts and a disposable GUI login session"]
 async fn produced_whole_app_helper_commits_and_rolls_back() {
     let fixture = VerifiedFixture::load().unwrap();
+    failed_helper_exec_is_cleaned_up(&fixture).await.unwrap();
     successful_update(&fixture, "running", true).await.unwrap();
     successful_update(&fixture, "stopped", false).await.unwrap();
     failing_update_rolls_back(&fixture).await.unwrap();
