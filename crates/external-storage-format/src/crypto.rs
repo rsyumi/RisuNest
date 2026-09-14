@@ -173,7 +173,24 @@ pub struct RecoveryEnvelope {
     pub schema: String,
     pub repository_id: String,
     pub salt: [u8; 16],
+    #[serde(with = "recovery_ciphertext")]
     pub wrapped_key: Vec<u8>,
+}
+
+mod recovery_ciphertext {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&URL_SAFE_NO_PAD.encode(bytes))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Vec<u8>, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        if encoded.len() > 24 * 1024 {
+            return Err(serde::de::Error::custom("recovery-ciphertext-limit"));
+        }
+        URL_SAFE_NO_PAD.decode(encoded).map_err(|_| serde::de::Error::custom("invalid-recovery-ciphertext"))
+    }
 }
 const RECOVERY_SCHEMA: &str = "risunest.recovery/v1";
 pub const MAX_RECOVERY_BYTES: usize = 64 * 1024;

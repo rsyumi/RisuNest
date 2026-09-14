@@ -1725,6 +1725,23 @@ export const languageKorean = {
     risuNest: {
         exitSaveFailedWarning:
             '저장에 실패했습니다. 저장하지 않고 종료하려면 예를, 앱을 열어 두고 다시 시도하려면 아니오를 선택하세요.',
+        exitDrain: {
+            title: '동기화를 마치는 중',
+            saveFailedTitle: '변경사항을 저장하지 못했습니다',
+            editBlockedTitle: '변경 작업이 끝나기를 기다리는 중',
+            editBlocked: '다른 저장, 가져오기 또는 교체 작업이 라이브러리를 사용하고 있습니다. 계속 기다리거나 앱으로 돌아가세요.',
+            saving: '앱을 닫기 전에 로컬 변경사항을 저장하고 있습니다.',
+            capturing: '종료할 때 게시할 저장 리비전을 고정하고 있습니다.',
+            syncing: '앱을 닫기 전에 저장된 변경사항을 게시하고 있습니다.',
+            delayed: '동기화가 평소보다 오래 걸리고 있습니다. 사용자가 선택할 때까지 앱을 열어 둡니다.',
+            blocked: '동기화를 마치려면 확인이 필요합니다. 계속 기다리거나, 동기화하지 않고 종료하거나, 앱으로 돌아갈 수 있습니다.',
+            saveFailed: '로컬 변경사항을 저장하지 못했습니다. 다시 저장하거나, 저장하지 않고 종료하거나, 앱으로 돌아갈 수 있습니다.',
+            keepWaiting: '계속 기다리기',
+            retrySaving: '다시 저장',
+            exitWithoutSync: '동기화하지 않고 종료',
+            exitWithoutSaving: '저장하지 않고 종료',
+            cancelExit: '앱으로 돌아가기',
+        },
         streaming: {
             title: '스트리밍',
             thoughtMode: '생성 중 추론 표시',

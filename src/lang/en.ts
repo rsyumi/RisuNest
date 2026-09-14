@@ -1917,6 +1917,23 @@ export const languageEnglish = {
     risuNest: {
         exitSaveFailedWarning:
             'Saving failed. Choose Yes to exit without saving, or No to keep the app open and retry.',
+        exitDrain: {
+            title: 'Finishing synchronization',
+            saveFailedTitle: 'Could not save changes',
+            editBlockedTitle: 'Waiting for changes to finish',
+            editBlocked: 'Another save, import, or replacement is still using the library. Keep waiting, or return to the app.',
+            saving: 'Saving local changes before the app closes.',
+            capturing: 'Locking the saved revision for this exit.',
+            syncing: 'Publishing saved changes before the app closes.',
+            delayed: 'Synchronization is taking longer than usual. The app will stay open until you choose what to do.',
+            blocked: 'Synchronization needs attention before it can finish. You can keep waiting, exit without syncing, or return to the app.',
+            saveFailed: 'Local changes could not be saved. Retry saving, exit without saving, or return to the app.',
+            keepWaiting: 'Keep waiting',
+            retrySaving: 'Retry saving',
+            exitWithoutSync: 'Exit without syncing',
+            exitWithoutSaving: 'Exit without saving',
+            cancelExit: 'Return to app',
+        },
         streaming: {
             title: 'Streaming',
             thoughtMode: 'Thoughts while streaming',

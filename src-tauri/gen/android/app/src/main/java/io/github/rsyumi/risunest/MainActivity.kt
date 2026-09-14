@@ -643,6 +643,8 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       cleanupLegacyOpenedFiles(File(cacheDir, "opened_files"))
     }
     ServerSyncSecrets.initialize()
+    ExternalStorageSecrets.initialize()
+    ExternalStorageAuthorization.onOAuthRedirectIntent(intent)
     if (BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS) {
       recoverSafDestination(savedInstanceState != null)
     }
@@ -771,6 +773,10 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
 
   override fun onNewIntent(intent: Intent) {
     super.onNewIntent(intent)
+    if (ExternalStorageAuthorization.onOAuthRedirectIntent(intent)) {
+      setIntent(intent)
+      return
+    }
     if (BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS) {
       setIntent(intent)
       consumedOpenedFileFingerprint = null

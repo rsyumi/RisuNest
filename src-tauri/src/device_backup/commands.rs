@@ -163,13 +163,22 @@ pub(crate) fn native_device_backup_blob_read(
     state.blob_read(&session_id, spool, &object_id, offset, length)
 }
 
-#[tauri::command(async)]
-pub(crate) fn native_device_backup_prepared(
+pub(super) fn native_device_backup_prepared_state(
     state: State<'_, DeviceBackupState>,
     session_id: String,
 ) -> Result<()> {
     require_renderer_maintenance(&state, &session_id)?;
     state.prepared(&session_id)
+}
+
+#[tauri::command(async)]
+pub(crate) fn native_device_backup_prepared(
+    app: AppHandle,
+    state: State<'_, DeviceBackupState>,
+    session_id: String,
+) -> Result<()> {
+    native_device_backup_prepared_state(state, session_id.clone())?;
+    crate::external_storage::runtime_restore::resume_prepared_device_restore(app, &session_id)
 }
 
 #[tauri::command(async)]
@@ -204,13 +213,38 @@ pub(crate) fn native_device_backup_finish_device(
     state.finish_device(&session_id)
 }
 
+pub(super) fn native_device_backup_recovery_complete_state(
+    state: State<'_, DeviceBackupState>,
+    session_id: String,
+) -> Result<Session> {
+    require_renderer_maintenance(&state, &session_id)?;
+    let session = state.session(&session_id)?;
+    state.recovery_complete(&session_id)?;
+    Ok(session)
+}
+
 #[tauri::command(async)]
 pub(crate) fn native_device_backup_recovery_complete(
+    app: AppHandle,
     state: State<'_, DeviceBackupState>,
     session_id: String,
 ) -> Result<()> {
     require_renderer_maintenance(&state, &session_id)?;
-    state.recovery_complete(&session_id)
+    let session = state.session(&session_id)?;
+    crate::external_storage::runtime_restore::prepare_device_restore_settlement(
+        app.clone(),
+        &session,
+    )?;
+    state.recovery_complete(&session_id)?;
+    if let Err(error) =
+        crate::external_storage::runtime_restore::settle_device_restore(app, &session)
+    {
+        crate::nlog!(
+            "error",
+            "Completed device restore outcome remains queued for settlement: {error}"
+        );
+    }
+    Ok(())
 }
 
 #[tauri::command(async)]

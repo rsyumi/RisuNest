@@ -426,8 +426,11 @@ export const flushPendingData = (reason: string): Promise<void> =>
     getPersistentDataRuntime().flushPendingData(reason)
 export const flushPendingDataLocally = (reason: string): Promise<void> =>
     getPersistentDataRuntime().flushPendingDataLocally(reason)
-export const acknowledgeGenerationCompletion = (): Promise<void> =>
-    getPersistentDataRuntime().acknowledgeGenerationCompletion()
+export const acknowledgeGenerationCompletion = async (): Promise<void> => {
+    const runtime = getPersistentDataRuntime()
+    await runtime.acknowledgeGenerationCompletion()
+    notifyLocalPersistentRevision(runtime.revision, 'generation-complete')
+}
 export const commitCharacterAddition = (
     request: CharacterAdditionRequest,
     reason: string,

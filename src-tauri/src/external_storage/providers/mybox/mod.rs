@@ -1054,13 +1054,24 @@ impl Provider for Mybox {
         &'a self,
         repository: &'a RepositoryHandle,
         intent: &'a ObjectIntent,
-        resume: &'a ResumeState,
+        resume: Option<&'a ResumeState>,
         cancel: &'a Cancellation,
     ) -> ProviderFuture<'a, UploadResolution> {
         Box::pin(async move {
             cancel.check()?;
             let context = self.context(repository)?;
             intent.validate(repository)?;
+            let Some(resume) = resume else {
+                return self
+                    .settle(
+                        context,
+                        config::role_folder(intent.role),
+                        &config::object_name(&intent.object_id)?,
+                        intent,
+                        cancel,
+                    )
+                    .await;
+            };
             let session = self.unseal(context, resume, intent).await?;
             let folder = config::role_folder(intent.role);
             let name = session.name.clone();

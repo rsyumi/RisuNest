@@ -80,8 +80,8 @@ impl AccountType {
     /// Least privileged delegated scopes for the operations this adapter uses.
     pub(super) fn scopes(self) -> &'static [&'static str] {
         match self {
-            Self::AppFolder => &["Files.ReadWrite.AppFolder", "offline_access"],
-            _ => &["Files.ReadWrite", "offline_access"],
+            Self::AppFolder => &["Files.ReadWrite.AppFolder", "User.Read", "offline_access"],
+            _ => &["Files.ReadWrite", "User.Read", "offline_access"],
         }
     }
 }
@@ -226,7 +226,7 @@ fn redirect_uri(raw: &str) -> Result<url::Url> {
     Ok(parsed)
 }
 
-pub(super) fn validate(config: &ConnectionConfig) -> Result<Settings> {
+fn validate_inner(config: &ConnectionConfig, account_required: bool) -> Result<Settings> {
     if config.provider != PROVIDER_ID {
         return Err(unsupported());
     }
@@ -261,7 +261,11 @@ pub(super) fn validate(config: &ConnectionConfig) -> Result<Settings> {
         AccountType::AppFolder => return Err(unsupported()),
         _ => identifier(raw_root)?.to_owned(),
     };
-    let account_id = identifier(&config.account_id)?.to_owned();
+    let account_id = if !account_required && config.account_id.is_empty() {
+        String::new()
+    } else {
+        identifier(&config.account_id)?.to_owned()
+    };
     let client_id = config
         .oauth_profile
         .as_ref()
@@ -299,6 +303,21 @@ pub(super) fn validate(config: &ConnectionConfig) -> Result<Settings> {
     })
 }
 
+pub(super) fn validate(config: &ConnectionConfig) -> Result<Settings> {
+    validate_inner(config, true)
+}
+
+/// Authorization starts before the signed-in Graph user id is known. All
+/// other connection fields remain validated, while the account id alone may be
+/// empty until the token exchange resolves it from the authenticated service.
+pub(super) fn validate_authorization(config: &ConnectionConfig) -> Result<Settings> {
+    validate_inner(config, false)
+}
+
+pub(super) fn account_id(value: &str) -> Result<String> {
+    Ok(identifier(value)?.to_owned())
+}
+
 /// The registered client id for a platform, falling back to the application id
 /// when the registration uses one client for every platform.
 pub(super) fn platform_client_id(config: &ConnectionConfig, platform: &str) -> Result<String> {
@@ -309,6 +328,20 @@ pub(super) fn platform_client_id(config: &ConnectionConfig, platform: &str) -> R
         .map(String::as_str)
         .unwrap_or(profile.project_id.as_str());
     Ok(identifier(chosen)?.to_owned())
+}
+
+pub(super) fn platform_key() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "android") {
+        "android"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "ios") {
+        "ios"
+    } else {
+        "linux"
+    }
 }
 
 /// A remote name relative to the repository root. Rejects anything OneDrive

@@ -459,7 +459,7 @@ fn immutable_create_converges_after_a_lost_response_and_refuses_different_bytes(
             ErrorKind::Transient
         );
         let resolution = provider
-            .reconcile_upload(&handle, &intent, &resume, &cancel)
+            .reconcile_upload(&handle, &intent, Some(&resume), &cancel)
             .await
             .unwrap();
         let receipt = match resolution {
@@ -610,7 +610,7 @@ fn reconcile_resumes_from_the_confirmed_offset_and_restarts_a_spent_session() {
             .await
             .is_err());
         let resumed = match provider
-            .reconcile_upload(&handle, &intent, &started, &cancel)
+            .reconcile_upload(&handle, &intent, Some(&started), &cancel)
             .await
             .unwrap()
         {
@@ -641,7 +641,7 @@ fn reconcile_resumes_from_the_confirmed_offset_and_restarts_a_spent_session() {
         // A session the service no longer knows restarts rather than guessing.
         assert!(matches!(
             provider
-                .reconcile_upload(&handle, &intent, &resumed, &cancel)
+                .reconcile_upload(&handle, &intent, Some(&resumed), &cancel)
                 .await
                 .unwrap(),
             UploadResolution::RestartRequired

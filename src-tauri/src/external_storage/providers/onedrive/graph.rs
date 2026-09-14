@@ -52,6 +52,11 @@ pub(super) struct ChildrenPage {
 }
 
 #[derive(serde::Deserialize)]
+pub(super) struct SignedInUser {
+    pub id: String,
+}
+
+#[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct SessionState {
     #[serde(default)]
@@ -125,6 +130,11 @@ fn parse(raw: String) -> Result<url::Url> {
 fn with_query(mut url: url::Url, query: Option<&str>) -> url::Url {
     url.set_query(query);
     url
+}
+
+pub(super) fn signed_in_user_url(settings: &Settings) -> Result<url::Url> {
+    let url = parse(format!("{}/me", config::base(&settings.endpoint)))?;
+    Ok(with_query(url, Some("$select=id")))
 }
 
 /// Resolution target of the configured root: an item id, or the app folder

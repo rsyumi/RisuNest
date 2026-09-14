@@ -189,6 +189,10 @@ impl DeviceBackupState {
         }
     }
 
+    pub(crate) fn repository_root(&self) -> &Path {
+        &self.repository_root
+    }
+
     pub(crate) fn attach_maintenance_guard(
         &self,
         guard: crate::persistent_store::commands::DeviceMaintenanceGuard,

@@ -130,6 +130,26 @@ pub(crate) fn require_publish(
     capture: &CaptureIdentity,
     connection: &str,
 ) -> StoreResult<()> {
+    require_publish_with_pause(db, capture, connection, false)
+}
+
+/// Exit drain may flush the selected paused target without changing the
+/// user's durable pause intent. Native code validates the live exit session
+/// immediately before every call to this override.
+pub(crate) fn require_publish_exit_drain(
+    db: &Connection,
+    capture: &CaptureIdentity,
+    connection: &str,
+) -> StoreResult<()> {
+    require_publish_with_pause(db, capture, connection, true)
+}
+
+fn require_publish_with_pause(
+    db: &Connection,
+    capture: &CaptureIdentity,
+    connection: &str,
+    allow_paused: bool,
+) -> StoreResult<()> {
     let current = identity(db)?;
     let selection = read(db)?;
     if current.store_id != capture.store_id
@@ -142,7 +162,7 @@ pub(crate) fn require_publish(
         return Err(invalid("Stale external capture"));
     }
     if selection.target != SyncTarget::External(connection.into())
-        || selection.paused
+        || (selection.paused && !allow_paused)
         || selection.decision_required
     {
         return Err(invalid("External sync target is not active"));

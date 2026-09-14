@@ -37,6 +37,7 @@
         cancelActiveNativeFileOperation,
     } from 'src/ts/storage/nativeFileJobManager'
     import { nativeFileJobProgressText } from 'src/ts/gui/nativeFileJobProgress'
+    import ExternalStorageSettings from '../ExternalStorage/ExternalStorageSettings.svelte'
 
     let nativeAccountBusy = $state(false)
     let snapshotRestoreBusy = $state(false)
@@ -294,3 +295,4 @@
         </SettingRow>
     {/if}
 </SettingGroup>
+<ExternalStorageSettings />

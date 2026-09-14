@@ -23,6 +23,8 @@ const state = vi.hoisted(() => ({
     suspend: vi.fn(async () => {}),
     snapshot: vi.fn(() => ({ running: false })),
     pause: vi.fn(async () => {}),
+    drainToRevision: vi.fn(async () => ({ kind: "complete" as const })),
+    cancelExitDrain: vi.fn(async () => {}),
     waitForIdle: vi.fn(async () => {}),
     canRestore: vi.fn(() => true),
   },
@@ -83,6 +85,48 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 describe("native server synchronization scheduling", () => {
+  it("adapts normal exit drains to the server revision controller", async () => {
+    const { createServerSyncExitDrainAdapter } = await import(
+      "./serverSyncProduction"
+    );
+    const adapter = createServerSyncExitDrainAdapter("server:selected:selection");
+    const abort = new AbortController();
+    const target = {
+      revision: 17,
+      libraryEpoch: "epoch",
+      selectionEpoch: "selection",
+      selectionId: "server:selected:selection",
+    };
+
+    await expect(adapter.drain(target, abort.signal)).resolves.toEqual({
+      kind: "complete",
+    });
+    expect(state.controller.drainToRevision).toHaveBeenCalledWith(
+      17,
+      abort.signal,
+    );
+    await adapter.cancel("cancel-exit");
+    expect(state.controller.cancelExitDrain).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a server exit target captured for a different selection", async () => {
+    const { createServerSyncExitDrainAdapter } = await import(
+      "./serverSyncProduction"
+    );
+    const adapter = createServerSyncExitDrainAdapter("server:selected:selection");
+
+    await expect(adapter.drain({
+      revision: 17,
+      libraryEpoch: "epoch",
+      selectionEpoch: "other-selection",
+      selectionId: "server:other:other-selection",
+    }, new AbortController().signal)).resolves.toEqual({
+      kind: "blocked",
+      reason: "server-sync-selection-changed",
+    });
+    expect(state.controller.drainToRevision).not.toHaveBeenCalled();
+  });
+
   it("resolves the selected ID inside the shared file route without automatically cancelling sync", async () => {
     const { restoreServerSyncBackup } = await import("./serverSyncProduction");
     await restoreServerSyncBackup("backup-id", "remote");

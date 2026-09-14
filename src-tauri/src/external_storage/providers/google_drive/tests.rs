@@ -1,7 +1,11 @@
 //! Synthetic wire tests. Every response is scripted by the shared loopback
 //! fixture; no account, no token and no network of any kind is involved.
 use super::{
-    auth::{authorization_policy, exchange_authorization_code},
+    auth::{
+        android_web_authorization_policy, authorization_policy, exchange_authorization_code,
+        verify_google_grant,
+    },
+    config::AuthorizationSettings,
     create,
 };
 use crate::external_storage::{
@@ -20,6 +24,11 @@ const NOW_MS: u64 = 1_700_000_000_000;
 const ACCOUNT: &str = "permission-1";
 const FOLDER: &str = "folder-root";
 const SECRET: &str = "google-drive-secret";
+const PROJECT_NUMBER: &str = "123456789012";
+
+fn client_id(platform: &str) -> String {
+    format!("{PROJECT_NUMBER}-{platform}.apps.googleusercontent.com")
+}
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -31,7 +40,7 @@ fn runtime() -> tokio::runtime::Runtime {
 fn platform_client_ids() -> BTreeMap<String, String> {
     ["windows", "android", "macos", "ios", "linux"]
         .iter()
-        .map(|platform| ((*platform).to_owned(), format!("{platform}-client")))
+        .map(|platform| ((*platform).to_owned(), client_id(platform)))
         .collect()
 }
 
@@ -54,6 +63,13 @@ fn connection(endpoint: &str) -> ConnectionConfig {
 fn stored_secret(expires_at_ms: u64) -> Vec<u8> {
     format!(
         "{{\"refreshToken\":\"synthetic-refresh\",\"accessToken\":\"synthetic-access\",\"accessTokenExpiresAtMs\":{expires_at_ms}}}"
+    )
+    .into_bytes()
+}
+
+fn stored_secret_with_client_secret(expires_at_ms: u64) -> Vec<u8> {
+    format!(
+        "{{\"refreshToken\":\"synthetic-refresh\",\"accessToken\":\"synthetic-access\",\"accessTokenExpiresAtMs\":{expires_at_ms},\"clientSecret\":\"synthetic-client-secret\"}}"
     )
     .into_bytes()
 }
@@ -251,6 +267,17 @@ fn configuration_validation_refuses_foreign_and_incomplete_connections() {
         let mut wrong_profile = connection(endpoint);
         wrong_profile.profile = Some("appdata".to_owned());
         cases.push(wrong_profile);
+        let mut mixed_projects = connection(endpoint);
+        mixed_projects
+            .oauth_profile
+            .as_mut()
+            .unwrap()
+            .platform_client_ids
+            .insert(
+                "android".to_owned(),
+                "999999999999-android.apps.googleusercontent.com".to_owned(),
+            );
+        cases.push(mixed_projects);
         for config in &cases {
             assert_eq!(
                 provider
@@ -531,7 +558,7 @@ fn an_expired_access_token_is_refreshed_once_and_rotation_is_persisted() {
         )];
         replies.extend(open_existing_replies());
         let server = WireServer::start(replies);
-        let test = deps_with(Some(stored_secret(NOW_MS - 1)));
+        let test = deps_with(Some(stored_secret_with_client_secret(NOW_MS - 1)));
         let provider = provider_of(&test.dependencies);
         let cancel = Cancellation::default();
         provider
@@ -551,6 +578,7 @@ fn an_expired_access_token_is_refreshed_once_and_rotation_is_persisted() {
         assert!(body.contains("grant_type=refresh_token"));
         assert!(body.contains("refresh_token=synthetic-refresh"));
         assert!(body.contains("client_id="));
+        assert!(body.contains("client_secret=synthetic-client-secret"));
         assert!(records[1]
             .headers
             .to_lowercase()
@@ -558,6 +586,7 @@ fn an_expired_access_token_is_refreshed_once_and_rotation_is_persisted() {
         let stored = String::from_utf8(test.vault.contents(SECRET).unwrap()).unwrap();
         assert!(stored.contains("rotated-refresh"));
         assert!(stored.contains("refreshed-access"));
+        assert!(stored.contains("synthetic-client-secret"));
         assert!(!stored.contains("synthetic-refresh"));
     });
 }
@@ -1055,13 +1084,13 @@ fn an_expired_session_restarts_and_a_confirmed_one_completes() {
             .unwrap();
         assert!(matches!(
             provider
-                .reconcile_upload(&repository, &intent, &resume, &cancel)
+                .reconcile_upload(&repository, &intent, Some(&resume), &cancel)
                 .await
                 .unwrap(),
             UploadResolution::RestartRequired
         ));
         let UploadResolution::Resumable(updated) = provider
-            .reconcile_upload(&repository, &intent, &resume, &cancel)
+            .reconcile_upload(&repository, &intent, Some(&resume), &cancel)
             .await
             .unwrap()
         else {
@@ -1069,7 +1098,7 @@ fn an_expired_session_restarts_and_a_confirmed_one_completes() {
         };
         assert_eq!(updated.confirmed_offset, 2048);
         let UploadResolution::Complete(receipt) = provider
-            .reconcile_upload(&repository, &intent, &resume, &cancel)
+            .reconcile_upload(&repository, &intent, Some(&resume), &cancel)
             .await
             .unwrap()
         else {
@@ -1079,7 +1108,7 @@ fn an_expired_session_restarts_and_a_confirmed_one_completes() {
         assert!(receipt.checksum.unwrap().provider_verified);
         assert!(matches!(
             provider
-                .reconcile_upload(&repository, &intent, &resume, &cancel)
+                .reconcile_upload(&repository, &intent, Some(&resume), &cancel)
                 .await
                 .unwrap(),
             UploadResolution::Conflict
@@ -1537,8 +1566,8 @@ fn quota_costs_use_the_documented_per_method_weights() {
 fn authorization_uses_the_platform_client_and_the_per_file_scope() {
     let config = connection("https://www.googleapis.com");
     let redirect = url::Url::parse("http://127.0.0.1:52001/oauth").unwrap();
-    let policy = authorization_policy(&config, "android", redirect.clone()).unwrap();
-    assert_eq!(policy.client_id, "android-client");
+    let policy = authorization_policy(&config, "windows", redirect.clone()).unwrap();
+    assert_eq!(policy.client_id, client_id("windows"));
     assert_eq!(
         policy.authorize_url.as_str(),
         "https://accounts.google.com/o/oauth2/v2/auth"
@@ -1560,10 +1589,107 @@ fn authorization_uses_the_platform_client_and_the_per_file_scope() {
     assert!(authorization_policy(&config, "symbian", redirect).is_err());
     assert!(authorization_policy(
         &config,
+        "ios",
+        url::Url::parse("http://127.0.0.1:52001/oauth").unwrap()
+    )
+    .is_err());
+    assert!(authorization_policy(
+        &config,
         "windows",
         url::Url::parse("https://attacker.invalid/callback").unwrap()
     )
     .is_err());
+
+    let android = android_web_authorization_policy(&config).unwrap();
+    assert_eq!(android.client_id, client_id("android"));
+    assert_eq!(
+        android.redirect_url.as_str(),
+        "https://update.rsyumi.workers.dev/oauth/google-drive-callback.html"
+    );
+    let mut custom = config.clone();
+    custom.location.insert(
+        "oauthRedirectUri".into(),
+        "https://oauth.example.test/callback".into(),
+    );
+    assert_eq!(
+        android_web_authorization_policy(&custom)
+            .unwrap()
+            .redirect_url
+            .as_str(),
+        "https://oauth.example.test/callback"
+    );
+    custom.location.insert(
+        "oauthRedirectUri".into(),
+        "https://oauth.example.test/callback?bad=1".into(),
+    );
+    assert!(android_web_authorization_policy(&custom).is_err());
+}
+
+async fn rejected_android_token_info(reply: Reply) -> (ProviderError, String, Vec<u64>) {
+    let server = WireServer::start(vec![reply, about_reply()]);
+    let test = deps_with(None);
+    let config = connection(server.url.as_str());
+    let settings = AuthorizationSettings::parse(&config, "android").unwrap();
+    let cancel = Cancellation::default();
+    let error = verify_google_grant(
+        &test.dependencies,
+        settings.token_info_endpoint().unwrap(),
+        &settings.client_id,
+        &settings.scopes,
+        "synthetic-token",
+        &settings.quota_scope(),
+        &cancel,
+    )
+    .await
+    .err()
+    .unwrap();
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "account lookup must not follow rejection"
+    );
+    let request = requests[0].headers.clone();
+    drop(requests);
+    (error, request, reserved_units(&test, "queries"))
+}
+
+#[test]
+fn android_grant_binding_fails_before_account_lookup() {
+    runtime().block_on(async {
+        let required_scope = "https://www.googleapis.com/auth/drive.file";
+        let (wrong_client, request, charged) = rejected_android_token_info(json_reply(
+            200,
+            json!({
+                "issued_to": "999999999999-foreign.apps.googleusercontent.com",
+                "scope": required_scope
+            }),
+        ))
+        .await;
+        assert_eq!(wrong_client.kind, ErrorKind::ReauthRequired);
+        assert!(request.starts_with("GET /synthetic/tokeninfo?access_token=synthetic-token"));
+        assert_eq!(charged, vec![5]);
+
+        let (missing_scope, _, charged) = rejected_android_token_info(json_reply(
+            200,
+            json!({
+                "issued_to": client_id("android"),
+                "scope": "openid"
+            }),
+        ))
+        .await;
+        assert_eq!(missing_scope.kind, ErrorKind::ReauthRequired);
+        assert_eq!(charged, vec![5]);
+
+        let (throttled, _, charged) = rejected_android_token_info(json_reply_with(
+            429,
+            &[("Retry-After", "3")],
+            json!({ "error": "rate_limit_exceeded" }),
+        ))
+        .await;
+        assert_eq!(throttled.kind, ErrorKind::RateLimited);
+        assert_eq!(charged, vec![5]);
+    });
 }
 
 #[test]
@@ -1578,6 +1704,7 @@ fn a_code_exchange_returns_a_storable_refresh_payload() {
                     "expires_in": 3599
                 }),
             ),
+            about_reply(),
             json_reply(200, json!({ "access_token": "granted-access" })),
         ]);
         let test = deps_with(Some(stored_secret(NOW_MS)));
@@ -1585,16 +1712,24 @@ fn a_code_exchange_returns_a_storable_refresh_payload() {
         let grant = || AuthorizationCode {
             code: SecretBytes(zeroize::Zeroizing::new(b"synthetic-code".to_vec())),
             verifier: SecretBytes(zeroize::Zeroizing::new(b"synthetic-verifier".to_vec())),
-            client_id: "windows-client".to_owned(),
+            client_id: client_id("windows"),
             redirect_url: url::Url::parse("http://127.0.0.1:52001/oauth").unwrap(),
         };
         let config = connection(server.url.as_str());
-        let payload = exchange_authorization_code(&test.dependencies, &config, &grant(), &cancel)
-            .await
-            .unwrap();
-        let text = String::from_utf8(payload.0.to_vec()).unwrap();
+        let payload = exchange_authorization_code(
+            &test.dependencies,
+            &config,
+            &grant(),
+            Some(zeroize::Zeroizing::new("synthetic-client-secret".into())),
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(payload.account_id, ACCOUNT);
+        let text = String::from_utf8(payload.secret.0.to_vec()).unwrap();
         assert!(text.contains("\"refreshToken\":\"granted-refresh\""));
         assert!(text.contains("\"accessToken\":\"granted-access\""));
+        assert!(text.contains("\"clientSecret\":\"synthetic-client-secret\""));
         assert!(text.contains(&format!(
             "\"accessTokenExpiresAtMs\":{}",
             NOW_MS + 3_599_000
@@ -1603,12 +1738,19 @@ fn a_code_exchange_returns_a_storable_refresh_payload() {
         let body = String::from_utf8(records[0].body.clone()).unwrap();
         assert!(body.contains("grant_type=authorization_code"));
         assert!(body.contains("code_verifier=synthetic-verifier"));
-        assert!(body.contains("client_id=windows-client"));
+        assert!(body.contains("client_secret=synthetic-client-secret"));
+        assert!(body.contains(&format!("client_id={}", client_id("windows"))));
+        assert!(records[1]
+            .headers
+            .starts_with("GET /synthetic/drive/v3/about?fields=user"));
+        assert!(records[1]
+            .headers
+            .contains("authorization: Bearer granted-access"));
         drop(records);
 
         // A grant without a refresh token cannot keep the connection alive.
         assert_eq!(
-            exchange_authorization_code(&test.dependencies, &config, &grant(), &cancel)
+            exchange_authorization_code(&test.dependencies, &config, &grant(), None, &cancel,)
                 .await
                 .err()
                 .unwrap()

@@ -2,10 +2,45 @@
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use risunest_external_storage_format::{
+        control::{BackupPointDocument, HeadDocument, MAX_CONTROL_BYTES},
         crypto::{RecoveryCode, RecoveryEnvelope},
         pack,
+        snapshot::{
+            keyed_object_id as format_keyed_object_id, open_envelope, seal_envelope, ObjectRole,
+            PublicObjectHeader, SnapshotDocument, MAX_METADATA_BYTES,
+        },
     };
     use wasm_bindgen::prelude::*;
+
+    fn parse_key(bytes: &[u8]) -> std::result::Result<[u8; 32], JsValue> {
+        bytes
+            .try_into()
+            .map_err(|_| JsValue::from_str("invalid-key"))
+    }
+
+    fn role(value: &str) -> std::result::Result<ObjectRole, JsValue> {
+        match value {
+            "descriptor" => Ok(ObjectRole::Descriptor),
+            "pack" => Ok(ObjectRole::Pack),
+            "catalog" => Ok(ObjectRole::Catalog),
+            "snapshot" => Ok(ObjectRole::Snapshot),
+            "backupPoint" => Ok(ObjectRole::BackupPoint),
+            "head" => Ok(ObjectRole::Head),
+            _ => Err(JsValue::from_str("invalid-object-role")),
+        }
+    }
+
+    fn validate_document(role: ObjectRole, bytes: &[u8]) -> std::result::Result<(), JsValue> {
+        match role {
+            ObjectRole::Snapshot => SnapshotDocument::decode(bytes, MAX_METADATA_BYTES).map(|_| ()),
+            ObjectRole::Head => HeadDocument::decode(bytes, MAX_CONTROL_BYTES).map(|_| ()),
+            ObjectRole::BackupPoint => {
+                BackupPointDocument::decode(bytes, MAX_CONTROL_BYTES).map(|_| ())
+            }
+            _ => Ok(()),
+        }
+        .map_err(|e| JsValue::from_str(e.0))
+    }
     #[wasm_bindgen]
     pub fn compress_chunk(
         bytes: &[u8],
@@ -61,6 +96,122 @@ mod wasm {
             .map(|value| value.root.to_vec())
             .map_err(|e| JsValue::from_str(e.0))
     }
+
+    #[wasm_bindgen]
+    pub fn recover_connection_metadata(
+        bytes: &[u8],
+        repository: &str,
+        code: &str,
+    ) -> std::result::Result<String, JsValue> {
+        let code = RecoveryCode::parse(code).map_err(|e| JsValue::from_str(e.0))?;
+        RecoveryEnvelope::decode(bytes)
+            .and_then(|envelope| envelope.recover(repository, &code))
+            .map(|value| value.connection_metadata.to_string())
+            .map_err(|e| JsValue::from_str(e.0))
+    }
+
+    #[wasm_bindgen]
+    pub fn canonical_recovery_envelope(bytes: &[u8]) -> std::result::Result<Vec<u8>, JsValue> {
+        RecoveryEnvelope::decode(bytes)
+            .and_then(|envelope| envelope.encode())
+            .map_err(|e| JsValue::from_str(e.0))
+    }
+
+    #[wasm_bindgen]
+    pub fn seal_object_envelope(
+        plaintext: &[u8],
+        key_bytes: &[u8],
+        repository_id: &str,
+        object_id: &str,
+        role_name: &str,
+    ) -> std::result::Result<Vec<u8>, JsValue> {
+        if plaintext.len() > MAX_METADATA_BYTES {
+            return Err(JsValue::from_str("object-too-large"));
+        }
+        let key = parse_key(key_bytes)?;
+        let object_role = role(role_name)?;
+        validate_document(object_role, plaintext)?;
+        let header = PublicObjectHeader::new(
+            repository_id.into(),
+            object_id.into(),
+            object_role,
+            plaintext.len() as u64,
+        )
+        .map_err(|e| JsValue::from_str(e.0))?;
+        let mut output = Vec::new();
+        seal_envelope(
+            &mut std::io::Cursor::new(plaintext),
+            &mut output,
+            &key,
+            &header,
+        )
+        .map_err(|e| JsValue::from_str(e.0))?;
+        Ok(output)
+    }
+
+    #[wasm_bindgen]
+    pub fn open_object_envelope(
+        envelope: &[u8],
+        key_bytes: &[u8],
+        repository_id: &str,
+        object_id: &str,
+        role_name: &str,
+        max_plaintext: usize,
+    ) -> std::result::Result<Vec<u8>, JsValue> {
+        let key = parse_key(key_bytes)?;
+        let expected_role = role(role_name)?;
+        let mut plaintext = Vec::new();
+        let header = open_envelope(
+            &mut std::io::Cursor::new(envelope),
+            &mut plaintext,
+            &key,
+            max_plaintext.min(MAX_METADATA_BYTES) as u64,
+        )
+        .map_err(|e| JsValue::from_str(e.0))?;
+        if header.repository_id != repository_id
+            || header.object_id != object_id
+            || header.role != expected_role
+        {
+            return Err(JsValue::from_str("object-header-mismatch"));
+        }
+        validate_document(header.role, &plaintext)?;
+        Ok(plaintext)
+    }
+
+    #[wasm_bindgen]
+    pub fn canonical_snapshot_document(bytes: &[u8]) -> std::result::Result<Vec<u8>, JsValue> {
+        SnapshotDocument::decode(bytes, MAX_METADATA_BYTES)
+            .and_then(|document| document.encode(MAX_METADATA_BYTES))
+            .map_err(|e| JsValue::from_str(e.0))
+    }
+
+    #[wasm_bindgen]
+    pub fn canonical_head_document(bytes: &[u8]) -> std::result::Result<Vec<u8>, JsValue> {
+        HeadDocument::decode(bytes, MAX_CONTROL_BYTES)
+            .and_then(|document| document.encode(MAX_CONTROL_BYTES))
+            .map_err(|e| JsValue::from_str(e.0))
+    }
+
+    #[wasm_bindgen]
+    pub fn canonical_backup_point_document(bytes: &[u8]) -> std::result::Result<Vec<u8>, JsValue> {
+        BackupPointDocument::decode(bytes, MAX_CONTROL_BYTES)
+            .and_then(|document| document.encode(MAX_CONTROL_BYTES))
+            .map_err(|e| JsValue::from_str(e.0))
+    }
+
+    #[wasm_bindgen]
+    pub fn keyed_object_id(
+        key_bytes: &[u8],
+        namespace: &str,
+        role_name: &str,
+        plaintext_sha256: &[u8],
+    ) -> std::result::Result<String, JsValue> {
+        let digest: [u8; 32] = plaintext_sha256
+            .try_into()
+            .map_err(|_| JsValue::from_str("invalid-hash"))?;
+        format_keyed_object_id(&parse_key(key_bytes)?, namespace, role(role_name)?, &digest)
+            .map_err(|e| JsValue::from_str(e.0))
+    }
     #[wasm_bindgen]
     pub fn canonical_record_key(key: &str) -> std::result::Result<String, JsValue> {
         let locator =
@@ -85,9 +236,7 @@ mod wasm {
         if ciphertext.len() > 2 * risunest_external_storage_format::pack::MAX_CHUNK_BYTES {
             return Err(JsValue::from_str("object-too-large"));
         }
-        let key: [u8; 32] = key
-            .try_into()
-            .map_err(|_| JsValue::from_str("invalid-key"))?;
+        let key = parse_key(key)?;
         let mut output = Vec::new();
         risunest_external_storage_format::crypto::decrypt(
             &mut std::io::Cursor::new(ciphertext),

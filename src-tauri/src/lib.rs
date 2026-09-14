@@ -530,6 +530,10 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
                     .map_err(|error| format!("iOS native initialization failed: {error}"))?;
                 let app_data_dir = app_data_root::resolve(app)
                     .map_err(|error| format!("application data root unavailable: {error}"))?;
+                app.state::<external_storage::job_store::JobCommandState>()
+                    .root
+                    .set(app_data_dir.clone())
+                    .map_err(|_| "external storage root is already configured".to_string())?;
                 let device_backup = device_backup::DeviceBackupState::initialize(
                     app_data_dir.join("device-backup"),
                 );
@@ -610,6 +614,9 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         .manage(native_media::ipc::NativeMediaIpcState::default())
         .manage(persistent_store::PersistentStoreState::default())
         .manage(server_sync::commands::ServerSyncCommandState::default())
+        .manage(external_storage::connection_commands::ConnectionCommandState::default())
+        .manage(external_storage::job_store::JobCommandState::default())
+        .manage(external_storage::runtime_restore::RuntimeRestoreState::default())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_process::init())
@@ -622,6 +629,29 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
 /// The product command router, reusable by alternative native entries.
 pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
+        external_storage::connection_commands::external_storage_list_providers,
+        external_storage::connection_commands::external_storage_prepare_connection,
+        external_storage::connection_commands::external_storage_commit_connection,
+        external_storage::connection_commands::external_storage_begin_authorization,
+        external_storage::connection_commands::external_storage_complete_authorization,
+        external_storage::connection_commands::external_storage_cancel_authorization,
+        external_storage::connection_commands::external_storage_remove_connection,
+        external_storage::connection_commands::external_storage_begin_recovery_export,
+        external_storage::connection_commands::external_storage_save_recovery_file,
+        external_storage::connection_commands::external_storage_prepare_recovery_import,
+        external_storage::runtime::external_storage_get_state,
+        external_storage::runtime::external_storage_capture_exit_target,
+        external_storage::runtime::external_storage_set_execution_session,
+        external_storage::runtime::external_storage_set_sync_target,
+        external_storage::runtime::external_storage_start_job,
+        external_storage::runtime::external_storage_get_job,
+        external_storage::runtime::external_storage_cancel_job,
+        external_storage::runtime::external_storage_get_quota,
+        external_storage::history::external_storage_list_history,
+        external_storage::sync_engine::external_storage_list_conflicts,
+        external_storage::sync_engine::external_storage_apply_received,
+        external_storage::device_commands::external_storage_prepare_device_capture,
+        external_storage::snapshot_export_commands::external_storage_export_snapshot,
         #[cfg(target_os = "ios")]
         ios_lifecycle::ios_prepare_restart,
         #[cfg(target_os = "macos")]

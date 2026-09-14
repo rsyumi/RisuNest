@@ -13,8 +13,10 @@
 //! - `account_id` is the signed in account identity. It takes part in the
 //!   connection identity and in the quota account, never in a request path.
 //! - `location["accountType"]` is `personal`, `business` or `appFolder` and
-//!   selects the requested scope. `Files.ReadWrite.AppFolder` for `appFolder`,
-//!   `Files.ReadWrite` otherwise, both with `offline_access`.
+//!   selects the requested file scope. `Files.ReadWrite.AppFolder` for
+//!   `appFolder`, `Files.ReadWrite` otherwise. Every profile also requests
+//!   `User.Read` to bind the connection to the authenticated Graph user and
+//!   `offline_access` for refresh tokens.
 //! - `location["tenant"]` is `consumers`, `common`, `organizations` or a tenant
 //!   identifier, and forms the token endpoint path. A `personal` connection
 //!   accepts only `consumers` or `common`; a `business` connection rejects
@@ -107,6 +109,11 @@ pub(crate) fn create(dependencies: Dependencies) -> Result<Arc<dyn Provider>> {
 
 pub(crate) struct OneDrive {
     deps: Dependencies,
+}
+
+pub(crate) struct AuthorizedSecret {
+    pub secret: SecretRef,
+    pub account_id: String,
 }
 
 struct Context {
@@ -294,8 +301,11 @@ impl OneDrive {
         config: &ConnectionConfig,
         grant: &AuthorizationCode,
         cancel: &Cancellation,
-    ) -> Result<SecretRef> {
-        let settings = config::validate(config)?;
+    ) -> Result<AuthorizedSecret> {
+        let settings = config::validate_authorization(config)?;
+        if grant.client_id != config::platform_client_id(config, config::platform_key())? {
+            return Err(ProviderError::new(ErrorKind::Unsupported));
+        }
         let account = settings.quota_account();
         let form = tokens::authorization_code_form(&settings, grant)?;
         let request = tokens::token_request(
@@ -312,7 +322,29 @@ impl OneDrive {
             ));
         }
         let granted = tokens::parse_grant(&mut response, None, self.now(), cancel).await?;
-        self.deps.vault.store(&tokens::encode(&granted)?).await
+        let access_token = granted
+            .access_token
+            .as_ref()
+            .ok_or_else(|| ProviderError::new(ErrorKind::ReauthRequired))?;
+        let request = self.request(
+            reqwest::Method::GET,
+            graph::signed_in_user_url(&settings)?,
+            ProviderOperation::Metadata,
+            &account,
+            Some(access_token),
+        );
+        let mut response = self.send(request, cancel).await?;
+        if response.status != 200 {
+            return Err(graph::classify_token(
+                response.status,
+                &response.headers,
+                self.now(),
+            ));
+        }
+        let identity: graph::SignedInUser = graph::json(&mut response, cancel).await?;
+        let account_id = config::account_id(&identity.id)?;
+        let secret = self.deps.vault.store(&tokens::encode(&granted)?).await?;
+        Ok(AuthorizedSecret { secret, account_id })
     }
 
     fn locator(&self, context: &Context, folder: &str, path: String) -> RemoteLocator {
@@ -952,7 +984,7 @@ impl Provider for OneDrive {
         &'a self,
         repository: &'a RepositoryHandle,
         intent: &'a ObjectIntent,
-        resume: &'a ResumeState,
+        resume: Option<&'a ResumeState>,
         cancel: &'a Cancellation,
     ) -> ProviderFuture<'a, UploadResolution> {
         Box::pin(async move {
@@ -960,36 +992,39 @@ impl Provider for OneDrive {
             let context = self.context(repository)?;
             intent.validate(repository)?;
             let path = config::object_path(intent.role, &intent.object_id)?;
-            let session = self.open_session(&resume.sealed_state, intent).await?;
-            let url = url::Url::parse(&session.upload_url).map_err(|_| corrupt())?;
-            let request = self.request(
-                reqwest::Method::GET,
-                url,
-                ProviderOperation::ReconcileUpload,
-                &context.quota_account,
-                None,
-            );
-            let mut response = self.send(request, cancel).await?;
-            match response.status {
-                200 => {
-                    let state: graph::SessionState = graph::json(&mut response, cancel).await?;
-                    let expires_at_ms = graph::expires_at_ms(state.expiration_date_time.as_ref());
-                    if let Some(offset) = state
-                        .next_expected_ranges
-                        .as_deref()
-                        .and_then(graph::confirmed_offset)
-                        .filter(|offset| *offset < intent.byte_length)
-                    {
-                        return Ok(UploadResolution::Resumable(ResumeState {
-                            sealed_state: resume.sealed_state.clone(),
-                            confirmed_offset: offset,
-                            expires_at_ms,
-                        }));
+            if let Some(resume) = resume {
+                let session = self.open_session(&resume.sealed_state, intent).await?;
+                let url = url::Url::parse(&session.upload_url).map_err(|_| corrupt())?;
+                let request = self.request(
+                    reqwest::Method::GET,
+                    url,
+                    ProviderOperation::ReconcileUpload,
+                    &context.quota_account,
+                    None,
+                );
+                let mut response = self.send(request, cancel).await?;
+                match response.status {
+                    200 => {
+                        let state: graph::SessionState = graph::json(&mut response, cancel).await?;
+                        let expires_at_ms =
+                            graph::expires_at_ms(state.expiration_date_time.as_ref());
+                        if let Some(offset) = state
+                            .next_expected_ranges
+                            .as_deref()
+                            .and_then(graph::confirmed_offset)
+                            .filter(|offset| *offset < intent.byte_length)
+                        {
+                            return Ok(UploadResolution::Resumable(ResumeState {
+                                sealed_state: resume.sealed_state.clone(),
+                                confirmed_offset: offset,
+                                expires_at_ms,
+                            }));
+                        }
                     }
+                    // The session is gone: it either committed or expired.
+                    404 | 410 => (),
+                    status => return Err(graph::classify(status, &response.headers, self.now())),
                 }
-                // The session is gone: it either committed or expired.
-                404 | 410 => (),
-                status => return Err(graph::classify(status, &response.headers, self.now())),
             }
             match self.fetch_item(context, &path, cancel).await? {
                 None => Ok(UploadResolution::RestartRequired),

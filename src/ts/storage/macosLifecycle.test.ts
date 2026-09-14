@@ -18,6 +18,23 @@ function harness() {
 }
 
 describe('macOS acknowledged quit', () => {
+    it('delegates the held request to the shared coordinator', async () => {
+        const coordinator = {
+            requestExit: vi.fn(async () => 'exit' as const),
+        }
+        const dependencies = {
+            coordinator,
+            respond: vi.fn(async (_token: string, _exit: boolean) => {}),
+            reportError: vi.fn(),
+        }
+        const handle = createMacosExitHandler(dependencies)
+
+        await handle('coordinated')
+
+        expect(coordinator.requestExit).toHaveBeenCalledOnce()
+        expect(dependencies.respond).toHaveBeenCalledWith('coordinated', true)
+    })
+
     it('awaits the save and checkpoint, then sync confirmation before responding', async () => {
         const h = harness()
         let release!: () => void

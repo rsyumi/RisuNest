@@ -82,6 +82,39 @@ pub(crate) struct CaptureCatalog {
 /// Both paths are selected by the native owner. Previous catalogs must have
 /// an authoritative PDS manifest hash; an unregistered receipt is not sufficient.
 impl CaptureCatalog {
+    pub(crate) fn reopen(
+        path: &Path,
+        object_directory: &Path,
+        expected_hash: &[u8; 32],
+        expected_identity: &CaptureIdentity,
+    ) -> Result<Self> {
+        let mut file = crate::trust_boundary::open_regular_source(path)?;
+        let size = file.metadata()?.len();
+        if hash_reader(&mut file, size).map_err(|_| invalid("Capture catalog integrity failed"))?
+            != *expected_hash
+        {
+            return Err(invalid("Capture catalog integrity failed"));
+        }
+        let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let encoded: String = db.query_row(
+            "SELECT identity FROM capture_info WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let identity: CaptureIdentity = serde_json::from_str(&encoded)?;
+        if identity != *expected_identity {
+            return Err(invalid("Capture catalog identity differs"));
+        }
+        Ok(Self {
+            db,
+            path: path.into(),
+            object_directory: object_directory.into(),
+            identity: Some(identity),
+            rebuilt: false,
+            finalized: true,
+        })
+    }
+
     fn require_writing(&self) -> Result<()> {
         if self.identity.is_none() || self.finalized || self.db.is_autocommit() {
             return Err(invalid("Capture catalog is not writable"));

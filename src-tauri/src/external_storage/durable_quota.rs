@@ -3,7 +3,7 @@
 use super::{
     contract::*,
     http::RequestBudget,
-    quota::{Bucket, QuotaLedger},
+    quota::{Bucket, BucketSnapshot, QuotaLedger},
 };
 use rusqlite::{Connection, TransactionBehavior};
 use std::{
@@ -71,6 +71,36 @@ impl DurableBudget {
             Ok(())
         })
     }
+    pub fn configure_many(&self, buckets: &[(String, String, Bucket)]) -> Result<()> {
+        self.update(|ledger| {
+            for (account, name, bucket) in buckets {
+                ledger.configure(account, name, bucket.clone());
+            }
+            Ok(())
+        })
+    }
+    pub fn record_backoff(&self, costs: &[RequestCost], until_ms: u64) -> Result<()> {
+        self.update(|ledger| ledger.block(costs, until_ms))
+    }
+    pub fn snapshot(&self, account: &str, name: &str) -> Result<Option<BucketSnapshot>> {
+        let mut result = None;
+        self.update(|ledger| {
+            result = ledger.snapshot(account, name);
+            Ok(())
+        })?;
+        Ok(result)
+    }
+    #[cfg(test)]
+    pub fn update_for_tests(
+        &self,
+        operation: impl FnOnce(&mut QuotaLedger) -> Result<()>,
+    ) -> Result<()> {
+        self.update(operation)
+    }
+    #[cfg(test)]
+    pub fn reserve_for_tests(&self, costs: &[RequestCost], now_ms: u64) -> Result<()> {
+        self.update(|ledger| ledger.reserve(costs, now_ms))
+    }
 }
 impl RequestBudget for DurableBudget {
     fn reserve<'a>(&'a self, costs: &'a [RequestCost], now_ms: u64) -> ProviderFuture<'a, ()> {
@@ -82,6 +112,19 @@ impl RequestBudget for DurableBudget {
             })
             .await
             .map_err(storage_error)?
+        })
+    }
+    fn record_backoff<'a>(
+        &'a self,
+        costs: &'a [RequestCost],
+        until_ms: u64,
+    ) -> ProviderFuture<'a, ()> {
+        let owner = Self(Arc::clone(&self.0));
+        let costs = costs.to_vec();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || owner.record_backoff(&costs, until_ms))
+                .await
+                .map_err(storage_error)?
         })
     }
 }
@@ -171,5 +214,19 @@ mod tests {
             .execute_batch("PRAGMA query_only=OFF")
             .unwrap();
         assert!(budget.update(|ledger| ledger.reserve(&[cost()], 1)).is_ok());
+    }
+    #[test]
+    fn first_request_tracks_an_unknown_bucket_before_dispatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let budget = DurableBudget::open(&directory.path().join("quota.sqlite")).unwrap();
+        budget
+            .update(|ledger| ledger.reserve(&[cost()], 1))
+            .unwrap();
+        let snapshot = budget
+            .snapshot("synthetic-account", "download")
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.limit, None);
+        assert_eq!(snapshot.used, 1);
     }
 }

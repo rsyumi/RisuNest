@@ -6,6 +6,10 @@ pub(crate) mod content_capture;
 pub(crate) mod content_change_index;
 mod content_locators;
 pub(crate) mod export;
+pub(crate) mod external_apply;
+pub(crate) mod external_capture;
+pub(crate) mod external_conflicts;
+pub(crate) mod external_runtime;
 pub(crate) mod external_storage_state;
 #[cfg(feature = "native-kei-upload-pilot")]
 pub(crate) mod kei;

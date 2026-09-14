@@ -1,6 +1,7 @@
 import { flushPendingData } from './persistentDataRuntime.svelte'
 import { isTauri } from '../platform'
 import { checkpointNativePersistentStore } from './nativePersistentMaintenance'
+import type { SyncExitDisposition } from './syncExitCoordinator'
 
 export type LifecycleCommitReason =
     | 'pagehide'
@@ -23,6 +24,18 @@ export interface LifecycleExitSyncPolicy {
     isSyncActive(): boolean
     hasPendingSync(): boolean
     confirmExit(): Promise<boolean>
+}
+
+export interface LifecycleExitCoordinator {
+    requestExit(): Promise<SyncExitDisposition>
+}
+
+type LifecycleExitHandler = LifecycleExitSyncPolicy | LifecycleExitCoordinator
+
+function isExitCoordinator(
+    handler: LifecycleExitHandler | undefined,
+): handler is LifecycleExitCoordinator {
+    return typeof (handler as LifecycleExitCoordinator | undefined)?.requestExit === 'function'
 }
 
 interface NativeLifecycleDetail {
@@ -131,11 +144,12 @@ async function confirmDefaultExitWithoutSaving(): Promise<boolean> {
 
 export function registerLifecycleCommitListeners(
     flush: LifecycleFlush = flushPendingData,
-    exitSyncPolicy?: LifecycleExitSyncPolicy,
+    exitHandler?: LifecycleExitHandler,
     checkpoint: LifecycleCheckpoint | undefined = productionCheckpoint,
     confirmExitWithoutSaving: ConfirmExitWithoutSaving = confirmDefaultExitWithoutSaving,
     settleTimeout: LifecycleSettleTimeout = productionLifecycleSettleTimeout,
 ): () => void {
+    let pendingExit: Promise<void> | undefined
     const requestFlush = (reason: LifecycleCommitReason, ackToken?: string) => {
         void settleLifecycleCommit(reason, flush, checkpoint).then(() => {
             if (ackToken !== undefined) {
@@ -144,11 +158,16 @@ export function registerLifecycleCommitListeners(
         })
     }
     const requestExitFlush = (ackToken: string) => {
+        if (pendingExit) return
         if (!holdNativeExit(ackToken)) {
             requestFlush('exit', ackToken)
             return
         }
-        void (async () => {
+        pendingExit = (async () => {
+            if (isExitCoordinator(exitHandler)) {
+                if (await exitHandler.requestExit() === 'exit') requestNativeExit()
+                return
+            }
             let settled = false
             do {
                 try {
@@ -167,9 +186,9 @@ export function registerLifecycleCommitListeners(
                 }
             } while (!settled)
             if (
-                exitSyncPolicy?.isSyncActive()
-                && exitSyncPolicy.hasPendingSync()
-                && !await exitSyncPolicy.confirmExit()
+                exitHandler?.isSyncActive()
+                && exitHandler.hasPendingSync()
+                && !await exitHandler.confirmExit()
             ) {
                 return
             }
@@ -177,6 +196,9 @@ export function registerLifecycleCommitListeners(
         })()
             .catch((error) => {
                 console.error('Lifecycle exit confirmation failed', error)
+            })
+            .finally(() => {
+                pendingExit = undefined
             })
     }
     const onPageHide = () => requestFlush('pagehide')

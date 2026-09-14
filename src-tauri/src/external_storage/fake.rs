@@ -299,7 +299,7 @@ impl Provider for FakeProvider {
         &'a self,
         repository: &'a RepositoryHandle,
         intent: &'a ObjectIntent,
-        _: &'a ResumeState,
+        _: Option<&'a ResumeState>,
         cancel: &'a Cancellation,
     ) -> ProviderFuture<'a, UploadResolution> {
         Box::pin(async move {
