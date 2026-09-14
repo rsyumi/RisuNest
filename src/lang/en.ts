@@ -1962,7 +1962,7 @@ export const languageEnglish = {
             residency: {
                 title: 'Asset storage',
                 description:
-                    'Choose separately for each device. Keep files on a PC, or load media directly from the server on a mobile device.',
+                    'The asset storage mode is chosen separately for each device. Keeping files locally loads assets faster but increases sync time and the space used. Using remote files saves space, but loading an asset can take longer.',
                 full: 'Keep all files locally',
                 remote: 'Use remote files',
                 selected: 'Current policy',
