@@ -1,20 +1,43 @@
 <script lang="ts">
     import { language } from 'src/lang'
     import { isTauri } from 'src/ts/platform'
+    import { alertConfirm } from 'src/ts/alert'
     import Button from 'src/lib/UI/GUI/Button.svelte'
     import SettingGroup from '../RisuNest/SettingGroup.svelte'
-    import { listInlayAssetMetadata } from 'src/ts/process/files/inlays'
+    import SettingRow from '../RisuNest/SettingRow.svelte'
+    import { getInlayEncodeOptions, listInlayAssetMetadata } from 'src/ts/process/files/inlays'
     import {
         summarizeInlayAssets,
         type InlayInventory,
         type InlayInventoryEntry,
     } from 'src/ts/process/files/inlayInventory'
+    import {
+        emptyInlayOptimizationProgress,
+        runInlayOptimization,
+        selectInlayOptimizationTargets,
+        type InlayOptimizationProgress,
+    } from 'src/ts/process/files/inlayOptimizationJob'
+    import {
+        inlayOptimizationConfirmMessage,
+        inlayOptimizationProgressMessage,
+        inlayOptimizationResultMessage,
+    } from 'src/ts/process/files/inlayOptimizationMessages'
+    import {
+        createStoredInlayOptimizationDeps,
+        readInlayOptimizationEnvironment,
+    } from 'src/ts/process/files/inlayOptimizationRuntime'
     import { formatRisuNestStorageBytes } from 'src/ts/storage/risuNestStorageDashboard'
+    import type { InlayBlobMetadata } from 'src/ts/storage/blobStore'
 
     const strings = language.risuNest.inlay
-    let inventory: InlayInventory | null = $state(null)
+    let assets: InlayBlobMetadata[] | null = $state(null)
     let loading = $state(false)
     let loadFailed = $state(false)
+    let optimizing = $state(false)
+    let cancelRequested = $state(false)
+    let progress: InlayOptimizationProgress = $state(emptyInlayOptimizationProgress())
+    let resultText = $state('')
+    let inventory: InlayInventory | null = $derived(assets ? summarizeInlayAssets(assets) : null)
     let summary = $derived(
         inventory
             ? strings.inventoryTotal
@@ -22,13 +45,14 @@
                   .replace('{size}', formatRisuNestStorageBytes(inventory.total.bytes))
             : '',
     )
+    let progressText = $derived(inlayOptimizationProgressMessage(progress))
 
     async function load(): Promise<void> {
         if (loading) return
         loading = true
         loadFailed = false
         try {
-            inventory = summarizeInlayAssets(await listInlayAssetMetadata({ migrateLegacy: !isTauri }))
+            assets = await listInlayAssetMetadata({ migrateLegacy: !isTauri })
         } catch (error) {
             void error
             loadFailed = true
@@ -39,6 +63,38 @@
 
     function share(bytes: number): string {
         return `${(bytes / Math.max(1, inventory?.total.bytes ?? 0)) * 100}%`
+    }
+
+    async function optimize(): Promise<void> {
+        if (!assets || optimizing) return
+        const options = getInlayEncodeOptions()
+        const targets = selectInlayOptimizationTargets(assets, options)
+        resultText = ''
+        if (targets.length === 0) {
+            resultText = strings.optimizeNone
+            return
+        }
+        const message = inlayOptimizationConfirmMessage({
+            targets,
+            storedFormat: options.format,
+            ...await readInlayOptimizationEnvironment(),
+        })
+        if (!await alertConfirm(message)) return
+        optimizing = true
+        cancelRequested = false
+        progress = emptyInlayOptimizationProgress(targets.length)
+        try {
+            const done = await runInlayOptimization(targets, createStoredInlayOptimizationDeps(), {
+                options,
+                isCancelled: () => cancelRequested,
+                onProgress: (value) => { progress = value },
+            })
+            resultText = inlayOptimizationResultMessage(done)
+        } finally {
+            optimizing = false
+            cancelRequested = false
+        }
+        await load()
     }
 </script>
 
@@ -73,7 +129,7 @@
 <SettingGroup id="risunest-inlay-inventory" title={strings.inventoryTitle} divide={false}>
     {#snippet actions()}
         {#if inventory}
-            <Button size="sm" styled="outlined" disabled={loading} onclick={load}>{loading ? language.loading : strings.inventoryRefresh}</Button>
+            <Button size="sm" styled="outlined" disabled={loading || optimizing} onclick={load}>{loading ? language.loading : strings.inventoryRefresh}</Button>
         {/if}
     {/snippet}
     {#if loadFailed}
@@ -90,6 +146,24 @@
         {@render table(strings.inventoryImages, inventory.images)}
         {#if inventory.others.length > 0}
             {@render table(strings.inventoryOthers, inventory.others)}
+        {/if}
+        {#if inventory.images.length > 0}
+            <div class="border-t border-darkborderc/55">
+                <SettingRow label={strings.optimize} help={strings.optimizeHelp}>
+                    {#snippet below()}
+                        {#if optimizing}
+                            <p data-inlay-optimize-progress class="mt-1 text-sm tabular-nums text-textcolor2" role="status" aria-live="polite">{progressText}</p>
+                        {:else if resultText}
+                            <p data-inlay-optimize-result class="mt-1 text-sm text-textcolor2" role="status" aria-live="polite">{resultText}</p>
+                        {/if}
+                    {/snippet}
+                    {#if optimizing}
+                        <Button size="sm" styled="outlined" disabled={cancelRequested} onclick={() => { cancelRequested = true }}>{language.cancel}</Button>
+                    {:else}
+                        <Button size="sm" disabled={loading} onclick={optimize}>{strings.optimize}</Button>
+                    {/if}
+                </SettingRow>
+            </div>
         {/if}
     {/if}
 </SettingGroup>

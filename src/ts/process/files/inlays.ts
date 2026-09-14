@@ -13,6 +13,12 @@ import {
     type InlayEncodeOptions,
 } from "../../storage/blobStore";
 import { resolveBlobStore } from "../../storage/platformBlobStore";
+import {
+    encodeInlayImageWithCanvas,
+    isAnimatedPng,
+    isAnimatedWebP,
+    isGifImage,
+} from "./inlayImageEncoding";
 import { isTauri } from "../../platform";
 
 export type InlayAsset = {
@@ -196,33 +202,11 @@ export async function writeInlayImage(imgObj:HTMLImageElement, arg:{name?:string
         })
         return `${imgid}`
     }
-    if (options.maxDimension > 0 && Math.max(drawWidth, drawHeight) > options.maxDimension) {
-        const ratio = options.maxDimension / Math.max(drawWidth, drawHeight)
-        drawWidth = Math.max(1, Math.round(drawWidth * ratio))
-        drawHeight = Math.max(1, Math.round(drawHeight * ratio))
-    }
-    const canvas = document.createElement('canvas')
-    const ctx = canvas.getContext('2d')
-    canvas.width = drawWidth
-    canvas.height = drawHeight
-    if (!ctx) throw new Error('Image canvas is unavailable')
-    ctx.drawImage(imgObj, 0, 0, drawWidth, drawHeight)
-    const imageBlob = await new Promise<Blob>((resolve, reject) => {
-        canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error('Failed to encode Inlay image')), `image/${options.format}`, options.quality / 100)
-    })
-    const output = imageBlob.type.toLowerCase() === 'image/webp'
-        ? { mime: 'image/webp', ext: 'webp' }
-        : imageBlob.type.toLowerCase() === 'image/png'
-            ? { mime: 'image/png', ext: 'png' }
-            : imageBlob.type.toLowerCase() === 'image/jpeg'
-                ? { mime: 'image/jpeg', ext: 'jpg' }
-                : null
-    if (!output) throw new Error(`Unsupported browser Inlay encoder MIME: ${imageBlob.type || '(empty)'}`)
+    const encoded = await encodeInlayImageWithCanvas(imgObj, drawWidth, drawHeight, options)
 
-
-    await (await resolveBlobStore()).put(imgid, new Uint8Array(await imageBlob.arrayBuffer()), {
-        kind: 'inlay', inlayType: 'image', mime: output.mime,
-        name: arg.name ?? imgid, ext: output.ext, height: drawHeight, width: drawWidth,
+    await (await resolveBlobStore()).put(imgid, encoded.data, {
+        kind: 'inlay', inlayType: 'image', mime: encoded.mime,
+        name: arg.name ?? imgid, ext: encoded.ext, height: encoded.height, width: encoded.width,
     })
 
     return `${imgid}`
@@ -449,19 +433,6 @@ export async function getInlayAssetRenderUrl(
     return url
 }
 
-function isAnimatedWebP(data: Uint8Array): boolean {
-    if (data.byteLength < 12
-        || new TextDecoder().decode(data.subarray(0, 4)) !== 'RIFF'
-        || new TextDecoder().decode(data.subarray(8, 12)) !== 'WEBP') return false
-    const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
-    for (let offset = 12; offset + 8 <= data.byteLength;) {
-        const type = new TextDecoder().decode(data.subarray(offset, offset + 4))
-        if (type === 'ANIM' || type === 'ANMF') return true
-        const length = view.getUint32(offset + 4, true)
-        offset += 8 + length + (length % 2)
-    }
-    return false
-}
 
 function isNativeInlayFormat(data: Uint8Array): boolean {
     const isPng = data.byteLength >= 8
@@ -474,21 +445,6 @@ function isNativeInlayFormat(data: Uint8Array): boolean {
     return isPng || isJpeg || isWebP
 }
 
-function isAnimatedPng(data: Uint8Array): boolean {
-    const pngSignature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
-    if (data.byteLength < pngSignature.length
-        || !pngSignature.every((value, index) => data[index] === value)) return false
-    const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
-    for (let offset = 8; offset + 12 <= data.byteLength;) {
-        const length = view.getUint32(offset)
-        const chunkEnd = offset + 12 + length
-        if (chunkEnd > data.byteLength) return false
-        const type = new TextDecoder().decode(data.subarray(offset + 4, offset + 8))
-        if (type === 'acTL') return true
-        offset = chunkEnd
-    }
-    return false
-}
 
 function hasAvifBrand(data: Uint8Array): boolean {
     const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
@@ -525,9 +481,7 @@ function hasAvifBrand(data: Uint8Array): boolean {
 function validateNewInlayImage(data: Uint8Array, mime: string, ext: string): void {
     const normalizedExt = ext.replace(/^\.+/, '').toLowerCase()
     const normalizedMime = mime.split(';', 1)[0].trim().toLowerCase()
-    const gifSignature = data.byteLength >= 6
-        && new TextDecoder().decode(data.subarray(0, 6)).startsWith('GIF8')
-    if (normalizedExt === 'gif' || normalizedMime === 'image/gif' || gifSignature) {
+    if (normalizedExt === 'gif' || normalizedMime === 'image/gif' || isGifImage(data)) {
         throw new UnsupportedAnimatedInlayError('New GIF Inlay images are unsupported because animation cannot be preserved')
     }
     if (normalizedExt === 'avif' || normalizedMime === 'image/avif' || hasAvifBrand(data)) {

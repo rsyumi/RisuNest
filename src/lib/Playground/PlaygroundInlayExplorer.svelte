@@ -3,8 +3,19 @@
   import { SvelteSet } from 'svelte/reactivity'
 
   import { language } from 'src/lang'
-  import { alertConfirm } from 'src/ts/alert'
-  import { listInlayAssetMetadata, removeInlayAsset } from 'src/ts/process/files/inlays'
+  import { alertConfirm, alertNormal } from 'src/ts/alert'
+  import { getInlayEncodeOptions, listInlayAssetMetadata, removeInlayAsset } from 'src/ts/process/files/inlays'
+  import {
+    emptyInlayOptimizationProgress,
+    runInlayOptimization,
+    selectInlayOptimizationTargets,
+    type InlayOptimizationProgress,
+  } from 'src/ts/process/files/inlayOptimizationJob'
+  import {
+    inlayOptimizationConfirmMessage,
+    inlayOptimizationProgressMessage,
+    inlayOptimizationResultMessage,
+  } from 'src/ts/process/files/inlayOptimizationMessages'
   import { summarizeInlayAssets } from 'src/ts/process/files/inlayInventory'
   import { getInlayRenderSource } from 'src/ts/process/files/inlayRenderSource'
   import type { InlayRenderSource } from 'src/ts/process/files/inlayRenderSource'
@@ -31,6 +42,8 @@
   const hasMore = $derived(displayCount < allAssets.length)
   const hasSelection = $derived(selection.size > 0)
   const inventory = $derived(summarizeInlayAssets(allAssets))
+  let optimizing = $state(false)
+  let optimizeProgress = $state<InlayOptimizationProgress>(emptyInlayOptimizationProgress())
   const extensionSummary = $derived(
     [...inventory.images, ...inventory.others]
       .map((entry) => `${entry.ext || language.risuNest.inlay.inventoryNoExtension} ${entry.count.toLocaleString()}`)
@@ -109,6 +122,42 @@
     }
     allAssets = allAssets.filter((asset) => !selection.has(asset.key))
     selection.clear()
+  }
+
+  const optimizeSelected = async () => {
+    if (selection.size === 0 || optimizing) return
+    const options = getInlayEncodeOptions()
+    const targets = selectInlayOptimizationTargets(
+      allAssets.filter((asset) => selection.has(asset.key)),
+      options,
+    )
+    if (targets.length === 0) {
+      alertNormal(language.risuNest.inlay.optimizeNone)
+      return
+    }
+    // Loaded here so the playground does not pull the storage and sync wiring on open.
+    const runtime = await import('src/ts/process/files/inlayOptimizationRuntime')
+    const message = inlayOptimizationConfirmMessage({
+      targets,
+      storedFormat: options.format,
+      ...(await runtime.readInlayOptimizationEnvironment()),
+    })
+    if (!(await alertConfirm(message))) return
+    optimizing = true
+    optimizeProgress = emptyInlayOptimizationProgress(targets.length)
+    try {
+      const done = await runInlayOptimization(targets, runtime.createStoredInlayOptimizationDeps(), {
+        options,
+        onProgress: (value) => {
+          optimizeProgress = value
+        },
+      })
+      selection.clear()
+      await loadAssets()
+      alertNormal(inlayOptimizationResultMessage(done))
+    } finally {
+      optimizing = false
+    }
   }
 
   const formatSize = (bytes: number) => {
@@ -270,7 +319,14 @@
     >
     <div class="flex gap-2 ml-auto">
       {#if hasSelection}
-        <Button onclick={deleteSelected} styled="danger" size="sm">{language.playground.inlayDeleteSelected}</Button>
+        {#if optimizing}
+          <span class="text-textcolor2 self-center text-sm tabular-nums" role="status" aria-live="polite"
+            >{inlayOptimizationProgressMessage(optimizeProgress)}</span
+          >
+        {:else}
+          <Button onclick={optimizeSelected} styled="primary" size="sm">{language.risuNest.inlay.optimizeSelected}</Button>
+        {/if}
+        <Button onclick={deleteSelected} styled="danger" size="sm" disabled={optimizing}>{language.playground.inlayDeleteSelected}</Button>
         <Button onclick={deselectAll} styled="primary" size="sm"
           >{language.playground.inlayDeselectAll} ({selection.size})</Button
         >
