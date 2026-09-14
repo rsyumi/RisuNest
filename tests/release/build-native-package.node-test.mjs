@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,7 @@ import {
   inspectMacAppRoot,
   validateIosArchiveEntries,
 } from "../../scripts/release/package-app.mjs";
+import { validateOwnedInventory } from "../../server/manager/install/package.mjs";
 
 function pe(machine) {
   const bytes = Buffer.alloc(128);
@@ -91,6 +93,57 @@ test("raw packaging accepts native Windows ARM64 targets", () => {
   const report = JSON.parse(result.stdout.trim());
   assert.equal(report.target, "aarch64-pc-windows-msvc");
   assert.ok(readFileSync(join(output, "risunest-sync-server-1.2.3-aarch64-pc-windows-msvc.zip")).length > 0);
+});
+
+test("NSIS inspection excludes only generated installer metadata from the owned inventory", () => {
+  const root = mkdtempSync(join(tmpdir(), "risunest-nsis-inventory-"));
+  const cloudflared = Buffer.from("synthetic cloudflared");
+  const cloudflaredSha256 = createHash("sha256").update(cloudflared).digest("hex");
+  writeFileSync(join(root, "cloudflared.exe"), cloudflared);
+  writeFileSync(join(root, "risunest-sync-gui.exe"), pe(0xaa64));
+  mkdirSync(join(root, "$PLUGINSDIR"));
+  writeFileSync(join(root, "$PLUGINSDIR", "nsDialogs.dll"), "installer scaffold");
+  writeFileSync(join(root, "uninstall.exe"), "generated uninstaller");
+  const marker = join(root, "risunest-sync-bundle.json");
+  writeFileSync(marker, JSON.stringify({
+    schema: "risunest-sync-bundle/v1",
+    product: "sync",
+    variant: "managed",
+    version: "1.2.3",
+    protocolId: "risunest-sync/v1",
+    storeFormatId: "risunest-sync-store/v8",
+    files: ["cloudflared.exe", "risunest-sync-gui.exe"],
+    vendor: [{
+      name: "cloudflared",
+      version: "2026.9.1",
+      os: "windows",
+      arch: "x86_64",
+      sha256: cloudflaredSha256,
+      path: "cloudflared.exe",
+    }],
+  }));
+  const releaseInput = {
+    version: "1.2.3",
+    compatibility: {
+      protocolId: "risunest-sync/v1",
+      storeFormatId: "risunest-sync-store/v8",
+    },
+    vendorInput: { version: "2026.9.1" },
+  };
+  const build = { cloudflaredArch: "x86_64", cloudflaredSha256 };
+  assert.throws(
+    () => validateOwnedInventory(root, marker, releaseInput, build),
+    /does not exactly list/,
+  );
+  assert.equal(
+    validateOwnedInventory(root, marker, releaseInput, build, cloudflaredSha256, ["uninstall.exe"]).version,
+    "1.2.3",
+  );
+  writeFileSync(join(root, "unexpected.exe"), "unexpected owned file");
+  assert.throws(
+    () => validateOwnedInventory(root, marker, releaseInput, build, cloudflaredSha256, ["uninstall.exe"]),
+    /does not exactly list/,
+  );
 });
 
 test("mounted DMG inspection rejects a mismatched app architecture", () => {

@@ -73,7 +73,14 @@ function normalizeOwnedPath(value) {
   return value;
 }
 
-function validateOwnedInventory(root, markerPath, releaseInput, build, vendorSha256 = build.cloudflaredSha256) {
+export function validateOwnedInventory(
+  root,
+  markerPath,
+  releaseInput,
+  build,
+  vendorSha256 = build.cloudflaredSha256,
+  ignoredInstallerFiles = [],
+) {
   const inventory = JSON.parse(readFileSync(markerPath, "utf8"));
   const keys = ["schema", "product", "variant", "version", "protocolId", "storeFormatId", "files", "vendor"];
   if (JSON.stringify(Object.keys(inventory).sort()) !== JSON.stringify(keys.sort()))
@@ -87,9 +94,11 @@ function validateOwnedInventory(root, markerPath, releaseInput, build, vendorSha
     inventory.storeFormatId !== releaseInput.compatibility.storeFormatId
   ) throw new Error("Sync bundle inventory identity mismatch.");
   const marker = resolve(markerPath);
+  const ignored = new Set(ignoredInstallerFiles.map(normalizeOwnedPath));
   const actual = filesUnder(root)
     .filter((path) => resolve(path) !== marker)
     .filter((path) => !relative(root, path).split(/[\\/]/)[0].startsWith("$"))
+    .filter((path) => !ignored.has(relative(root, path).replace(/\\/g, "/")))
     .map((path) => {
       if (!lstatSync(path).isFile()) throw new Error(`Bundle entry is not a regular file: ${path}.`);
       return relative(root, path).replace(/\\/g, "/");
@@ -284,7 +293,7 @@ export function packageNativeSuite({ nativeBuild, rawArchive, output, releaseInp
         run("7z", ["x", "-y", `-o${installerStage}`, installer]);
         const installedMarker = unique(installerStage, (path) => basename(path) === "risunest-sync-bundle.json", "installed Sync bundle marker");
         const installedRoot = dirname(installedMarker);
-        validateOwnedInventory(installedRoot, installedMarker, releaseInput, build);
+        validateOwnedInventory(installedRoot, installedMarker, releaseInput, build, build.cloudflaredSha256, ["uninstall.exe"]);
         const installedGui = join(installedRoot, "risunest-sync-gui.exe");
         const installedDaemon = join(installedRoot, "risunest-sync-server.exe");
         const installedManager = join(installedRoot, "risunest-sync-manager.exe");
