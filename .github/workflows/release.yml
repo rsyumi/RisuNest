@@ -727,7 +727,7 @@ jobs:
           test "$(loginctl show-user "$USER" --property=Linger --value)" = yes
           systemctl --user daemon-reload
           managed=$(node -e "const path=require('node:path'); const matches=require('./release-work/packages/assets.json').filter((asset) => asset.download.variant === 'managed' && asset.download.os === 'linux' && asset.download.arch === process.argv[1] && asset.download.format === 'tar.gz'); if (matches.length !== 1) throw new Error('Expected one managed Linux archive.'); process.stdout.write(path.resolve(matches[0].path));" "${{ matrix.arch }}")
-          bash server/manager/install/managed-install.integration.test.sh "$managed"
+          env -u XDG_CONFIG_HOME -u XDG_DATA_HOME bash server/manager/install/managed-install.integration.test.sh "$managed"
       - name: Run synthetic Windows NSIS install failure and rollback checks
         if: matrix.os == 'windows'
         shell: pwsh

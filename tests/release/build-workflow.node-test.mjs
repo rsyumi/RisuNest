@@ -109,6 +109,7 @@ test("both Linux release packages pass the real managed installer transaction", 
   const integrationStep = syncSuite.indexOf("server/manager/install/managed-install.integration.test.sh");
   const uploadStep = syncSuite.indexOf("node scripts/release/upload-build.mjs");
   assert(packageStep >= 0 && integrationStep > packageStep && uploadStep > integrationStep);
+  assert.match(syncSuite, /env -u XDG_CONFIG_HOME -u XDG_DATA_HOME bash server\/manager\/install\/managed-install\.integration\.test\.sh/);
   assert.match(syncSuite, /if: matrix\.os == 'linux'[\s\S]*loginctl enable-linger[\s\S]*asset\.download\.arch === process\.argv\[1\]/);
 });
 
