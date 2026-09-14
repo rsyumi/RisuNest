@@ -70,6 +70,7 @@ export async function captureChatScreenshot(
     const { surface, encoder, output, signal, onProgress } = dependencies
     const batchCount = Math.ceil(job.messages.length / CHAT_SCREENSHOT_BATCH_SIZE)
     let archive: StreamingScreenshotArchive | null = null
+    let pngCommitted = false
     let pageNumber = 0
 
     try {
@@ -124,8 +125,9 @@ export async function captureChatScreenshot(
                         if (!published) {
                             throw new DOMException('Screenshot export was cancelled', 'AbortError')
                         }
+                        pngCommitted = true
                     }
-                    throwIfAborted(signal)
+                    if (!pngCommitted) throwIfAborted(signal)
                 }
                 onProgress?.({
                     completedTurns: Math.min(batchStart + batch.length, job.messages.length),
@@ -136,8 +138,8 @@ export async function captureChatScreenshot(
             }
         }
 
-        throwIfAborted(signal)
-        const committedAfterCancellation = archive ? await archive.close(signal) : false
+        if (!pngCommitted) throwIfAborted(signal)
+        const committedAfterCancellation = archive ? await archive.close(signal) : pngCommitted
         if (!committedAfterCancellation) throwIfAborted(signal)
         return { kind: archive ? 'zip' : 'png', pages: pageNumber }
     } catch (error) {

@@ -23,7 +23,6 @@ import { getInlayAsset } from "./files/inlays";
 import { getGenerationModelString } from "./models/modelString";
 import { connectionOpen, peerRevertChat, peerSafeCheck, peerSync } from "../sync/multiuser";
 import { runInlayScreen } from "./inlayScreen";
-import { addRerolls } from "./prereroll";
 import { runImageEmbedding } from "./transformers";
 import { hanuraiMemory } from "./memory/hanuraiMemory";
 import { hypaMemoryV2 } from "./memory/hypav2";
@@ -1913,7 +1912,6 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
                     alertError(error)
                 }
             },
-            addRerolls,
             trimIncompleteResponse: trimUntilPunctuation,
             markResponseApplied: () => {
                 lifecycle.responseApplied = true

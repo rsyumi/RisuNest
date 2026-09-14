@@ -2,7 +2,6 @@ import { Buffer } from 'buffer'
 import { describe, expect, it } from 'vitest'
 import {
     createChatScreenshotDialogSnapshot,
-    createChatScreenshotJob,
     createChatScreenshotJobFromDialogSnapshot,
     fullScreenshotRange,
     recentScreenshotRange,
@@ -86,6 +85,24 @@ function renderContext(): ChatScreenshotRenderContext {
     }
 }
 
+async function createProductScreenshotJob(
+    messages: Message[],
+    start: number,
+    end: number,
+    context = renderContext(),
+) {
+    const { reader } = rangeReader(messages)
+    const snapshot = createChatScreenshotDialogSnapshot({
+        characterId: reader.characterId,
+        chatId: reader.chatId,
+        revision: reader.revision,
+        sessionVersion: 1,
+        totalTurns: reader.totalTurns,
+        renderContext: context,
+    })
+    return createChatScreenshotJobFromDialogSnapshot(snapshot, reader, start, end)
+}
+
 describe('chat screenshot ranges', () => {
     it('accepts 1-based inclusive turn bounds and rejects invalid input', () => {
         expect(validateScreenshotRange(5, 1, 5)).toEqual({ ok: true, start: 1, end: 5 })
@@ -101,60 +118,29 @@ describe('chat screenshot ranges', () => {
         expect(fullScreenshotRange(120)).toEqual({ start: 1, end: 120 })
     })
 
-    it('creates a deep immutable snapshot of the selected conversation', () => {
+    it('creates a deep immutable snapshot of the selected conversation', async () => {
         const messages = [
             { role: 'user' as const, data: 'one', generationInfo: { model: 'a' } },
             { role: 'char' as const, data: 'two' },
             { role: 'user' as const, data: 'three' },
         ]
 
-        const job = createChatScreenshotJob({
-            characterId: 'character-1',
-            chatId: 'chat-1',
-            messages,
-            start: 1,
-            end: 2,
-            renderContext: {
-                character: null,
-                characterName: 'Character',
-                characterImageSource: 'character.png',
-                characterLargePortrait: false,
-                userName: 'User',
-                userImageSource: 'user.png',
-                userLargePortrait: false,
-                moduleAssets: [['Module asset', 'module.png', 'png']],
-                presetRegex: [],
-                moduleRegexScripts: [],
-                assetStyle: 'default',
-                parserContext: parserContext(),
-                settings: {
-                    autoTranslate: false,
-                    autoTranslateCachedOnly: false,
-                    translatorType: 'google',
-                    translateBeforeHTMLFormatting: false,
-                    legacyTranslation: false,
-                    showTranslationLoading: false,
-                    newImageHandlingBeta: true,
-                    assetWidth: 12,
-                    hideAllImages: false,
-                    iconSize: 100,
-                    zoomSize: 100,
-                    lineHeight: 1.25,
-                    dynamicAssets: false,
-                    dynamicAssetsEditDisplay: false,
-                    legacyMediaFindings: false,
-                    assetMaxDifference: 0.5,
-                },
-            },
-        })
+        const context = renderContext()
+        context.characterImageSource = 'character.png'
+        context.userImageSource = 'user.png'
+        context.moduleAssets = [['Module asset', 'module.png', 'png']]
+        context.assetStyle = 'default'
+        context.settings.newImageHandlingBeta = true
+        context.settings.assetWidth = 12
+        const job = await createProductScreenshotJob(messages, 1, 2, context)
 
         messages[0].data = 'edited'
         messages[0].generationInfo!.model = 'b'
         messages.push({ role: 'char', data: 'appended' })
 
         expect(job).toMatchObject({
-            characterId: 'character-1',
-            chatId: 'chat-1',
+            characterId: 'open-character',
+            chatId: 'open-chat',
             start: 1,
             end: 2,
             totalTurns: 3,
@@ -166,57 +152,6 @@ describe('chat screenshot ranges', () => {
         expect(Object.isFrozen(job)).toBe(true)
         expect(Object.isFrozen(job.messages[0].generationInfo)).toBe(true)
         expect(Object.isFrozen(job.renderContext.moduleAssets)).toBe(true)
-    })
-
-    it('snapshots live proxy-backed messages', () => {
-        const message = new Proxy(
-            { role: 'user' as const, data: 'proxied', generationInfo: { model: 'model' } },
-            {},
-        )
-
-        const job = createChatScreenshotJob({
-            characterId: 'character',
-            chatId: 'chat',
-            messages: [message],
-            start: 1,
-            end: 1,
-            renderContext: {
-                character: null,
-                characterName: 'Character',
-                characterImageSource: '',
-                characterLargePortrait: false,
-                userName: 'User',
-                userImageSource: '',
-                userLargePortrait: false,
-                moduleAssets: [],
-                presetRegex: [],
-                moduleRegexScripts: [],
-                assetStyle: '',
-                parserContext: parserContext(),
-                settings: {
-                    autoTranslate: false,
-                    autoTranslateCachedOnly: false,
-                    translatorType: 'google',
-                    translateBeforeHTMLFormatting: false,
-                    legacyTranslation: false,
-                    showTranslationLoading: false,
-                    newImageHandlingBeta: false,
-                    assetWidth: -1,
-                    hideAllImages: false,
-                    iconSize: 100,
-                    zoomSize: 100,
-                    lineHeight: 1.25,
-                    dynamicAssets: false,
-                    dynamicAssetsEditDisplay: false,
-                    legacyMediaFindings: false,
-                    assetMaxDifference: 0.5,
-                },
-            },
-        })
-
-        expect(job.messages).toEqual([
-            { role: 'user', data: 'proxied', generationInfo: { model: 'model' } },
-        ])
     })
 
     it('keeps only dialog-open identity, revision, count, and render context', async () => {
@@ -483,53 +418,14 @@ describe('chat screenshot ranges', () => {
         ).toEqual(['character-1', 'member-1'])
     })
 
-    it('keeps the selected messages and the derived frozen history window needed by CBS', () => {
+    it('keeps the selected messages and the derived frozen history window needed by CBS', async () => {
         const messages = [
             { role: 'char' as const, data: 'too old' },
             { role: 'user' as const, data: 'previous' },
             { role: 'char' as const, data: 'selected one' },
             { role: 'user' as const, data: 'selected two' },
         ]
-        const context = parserContext()
-        const job = createChatScreenshotJob({
-            characterId: 'character-1',
-            chatId: 'chat-1',
-            messages,
-            start: 3,
-            end: 4,
-            renderContext: {
-                character: null,
-                characterName: 'Character',
-                characterImageSource: '',
-                characterLargePortrait: false,
-                userName: 'User',
-                userImageSource: '',
-                userLargePortrait: false,
-                moduleAssets: [],
-                presetRegex: [],
-                moduleRegexScripts: [],
-                assetStyle: '',
-                parserContext: context,
-                settings: {
-                    autoTranslate: false,
-                    autoTranslateCachedOnly: false,
-                    translatorType: 'google',
-                    translateBeforeHTMLFormatting: false,
-                    legacyTranslation: false,
-                    showTranslationLoading: false,
-                    newImageHandlingBeta: false,
-                    assetWidth: -1,
-                    hideAllImages: false,
-                    iconSize: 100,
-                    zoomSize: 100,
-                    lineHeight: 1.25,
-                    dynamicAssets: false,
-                    dynamicAssetsEditDisplay: false,
-                    legacyMediaFindings: false,
-                    assetMaxDifference: 0.5,
-                },
-            },
-        })
+        const job = await createProductScreenshotJob(messages, 3, 4)
 
         const parserMessages = job.renderContext.parserContext.character.chats[0].message
         expect(parserMessages.map((message) => message.data)).toEqual([
@@ -543,50 +439,12 @@ describe('chat screenshot ranges', () => {
         expect(job.renderContext.firstParserMessageIndex).toBe(2)
     })
 
-    it('keeps the parser history projection bounded when full history is not requested', () => {
+    it('keeps the parser history projection bounded when full history is not requested', async () => {
         const messages = Array.from({ length: 100 }, (_, index) => ({
             role: index % 2 === 0 ? 'char' as const : 'user' as const,
             data: `turn ${index + 1}`,
         }))
-        const job = createChatScreenshotJob({
-            characterId: 'character-1',
-            chatId: 'chat-1',
-            messages,
-            start: 100,
-            end: 100,
-            renderContext: {
-                character: null,
-                characterName: 'Character',
-                characterImageSource: '',
-                characterLargePortrait: false,
-                userName: 'User',
-                userImageSource: '',
-                userLargePortrait: false,
-                moduleAssets: [],
-                presetRegex: [],
-                moduleRegexScripts: [],
-                assetStyle: '',
-                parserContext: parserContext(),
-                settings: {
-                    autoTranslate: false,
-                    autoTranslateCachedOnly: false,
-                    translatorType: 'google',
-                    translateBeforeHTMLFormatting: false,
-                    legacyTranslation: false,
-                    showTranslationLoading: false,
-                    newImageHandlingBeta: false,
-                    assetWidth: -1,
-                    hideAllImages: false,
-                    iconSize: 100,
-                    zoomSize: 100,
-                    lineHeight: 1.25,
-                    dynamicAssets: false,
-                    dynamicAssetsEditDisplay: false,
-                    legacyMediaFindings: false,
-                    assetMaxDifference: 0.5,
-                },
-            },
-        })
+        const job = await createProductScreenshotJob(messages, 100, 100)
 
         expect(job.renderContext.historyStartIndex).toBe(95)
         expect(job.renderContext.parserContext.character.chats[0].message).toHaveLength(5)

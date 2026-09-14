@@ -28,6 +28,30 @@ const parserCalls = vi.hoisted(() => [] as Array<{
     historyOffset?: number
 }>)
 
+class TestIntersectionObserver {
+    static instance: TestIntersectionObserver | undefined
+
+    constructor(private readonly callback: IntersectionObserverCallback) {
+        TestIntersectionObserver.instance = this
+    }
+
+    observe = vi.fn()
+    unobserve = vi.fn()
+    disconnect = vi.fn()
+    takeRecords = () => []
+    readonly root = null
+    readonly rootMargin = ''
+    readonly thresholds = [0]
+
+    setVisible(element: Element) {
+        this.callback([{
+            target: element,
+            isIntersecting: true,
+            intersectionRatio: 1,
+        } as IntersectionObserverEntry], this as unknown as IntersectionObserver)
+    }
+}
+
 vi.mock('./ChatBody.svelte', async () => ({
     default: (await import('./ChatBodyCaptureProbe.test.svelte')).default,
 }))
@@ -94,10 +118,32 @@ vi.mock('../../lang', () => ({
     language: {
         branchedText: 'Branched from {}',
         noMessage: 'No message',
+        cancel: 'Cancel',
+        confirm: 'Confirm',
+        partialEdit: {
+            cancel: 'Cancel',
+            cancelShortcut: 'Cancel',
+            deleteButtonTooltip: 'Delete block',
+            deleteConfirmMessage: 'Delete this block?',
+            deleteModalTitle: 'Delete block',
+            deleteNo: 'No',
+            deleteYes: 'Yes',
+            editButtonTooltip: 'Edit block',
+            editModalTitle: 'Edit block',
+            lineNumber: (line: number) => `Line ${line}`,
+            matchesFound: 'matches',
+            matchFailedMessage: 'No match',
+            matchFailedTitle: 'No match',
+            matchFound: (method: string) => `Match ${method}`,
+            save: 'Save',
+            saveShortcut: 'Save',
+            selectDeleteMatch: 'Select block',
+            selectMatch: 'Select block',
+        },
     },
 }))
 vi.mock('../../ts/alert', () => ({
-    alertClear: vi.fn(), alertConfirm: vi.fn(), alertInput: vi.fn(), alertNormal: vi.fn(),
+    alertClear: vi.fn(), alertConfirm: vi.fn(), alertError: vi.fn(), alertInput: vi.fn(), alertNormal: vi.fn(),
     alertRequestData: vi.fn(), alertWait: vi.fn(),
 }))
 vi.mock('../../ts/translator/translator', () => ({ getLLMCache: vi.fn(), setLLMCache: vi.fn() }))
@@ -177,7 +223,6 @@ function context(overrides: Record<string, unknown> = {}) {
             requestInfoInsideChat: false,
             aiLawApplies: false,
             translator: '',
-            swipe: true,
             showFirstMessagePages: true,
             memoryLimitThickness: 1,
             customQuotes: false,
@@ -312,6 +357,8 @@ describe('Chat frozen capture presentation', () => {
     afterEach(async () => {
         if (mounted) await unmount(mounted)
         document.body.replaceChildren()
+        TestIntersectionObserver.instance = undefined
+        vi.unstubAllGlobals()
     })
 
     test.each(['off', 'balanced', 'strong'] as const)(
@@ -466,7 +513,6 @@ describe('Chat frozen capture presentation', () => {
                 translator: '',
                 useChatCopy: false,
                 enableBookmark: false,
-                swipe: false,
             }
             mounted = mount(Chat, {
                 target,
@@ -817,7 +863,6 @@ describe('Chat frozen capture presentation', () => {
             translator: '',
             useChatCopy: false,
             enableBookmark: false,
-            swipe: false,
             clickToEdit: false,
         }
         mounted = mount(Chat, {
@@ -874,6 +919,69 @@ describe('Chat frozen capture presentation', () => {
         expect((mounted as { hasActiveEditor(): boolean }).hasActiveEditor()).toBe(false)
     })
 
+    test('releases the windowed editor pin when a partial edit is cancelled', async () => {
+        const harness = makeWindowedEditHarness()
+        live.db = {
+            ...live.db,
+            theme: 'cardboard',
+            characters: [harness.metadataCharacter],
+            translator: '',
+            useChatCopy: false,
+            enableBookmark: false,
+            enableBlockPartialEdit: true,
+            enableDragPartialEdit: false,
+            swipe: false,
+            clickToEdit: false,
+        }
+        vi.stubGlobal('IntersectionObserver', TestIntersectionObserver)
+        vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+            callback(0)
+            return 1
+        })
+        vi.stubGlobal('cancelAnimationFrame', vi.fn())
+        mounted = mount(Chat, {
+            target,
+            props: {
+                message: harness.message.data,
+                name: 'Live Character',
+                role: 'char',
+                idx: 1,
+                totalLength: 2,
+                isLastMemory: false,
+                viewportRow: {
+                    key: 'row-1' as ConversationViewportKey,
+                    absoluteIndex: 1,
+                    message: harness.message,
+                    sourceVersion: 3,
+                },
+                viewportSourceToken: 'source-a',
+                selectedConversationOperations: harness.operations,
+                captureViewportTarget: () => null,
+            },
+        })
+        await tick()
+
+        const bodyRoot = target.querySelector<HTMLElement>('.chattext')!
+        const block = target.querySelector<HTMLElement>('[data-chat-body-probe]')!
+        vi.spyOn(document, 'elementFromPoint').mockReturnValue(block)
+        TestIntersectionObserver.instance?.setVisible(bodyRoot)
+        await tick()
+        document.dispatchEvent(new MouseEvent('mousemove', { clientX: 10, clientY: 10 }))
+        await tick()
+        document.querySelector<HTMLButtonElement>('.partial-edit-btn-edit')!.click()
+        await tick()
+
+        expect((mounted as { hasActiveEditor(): boolean }).hasActiveEditor()).toBe(true)
+        const cancel = await vi.waitFor(() => {
+            const button = document.querySelector<HTMLButtonElement>('.partial-edit-cancel-btn')
+            expect(button).not.toBeNull()
+            return button!
+        })
+        cancel.click()
+        await tick()
+        expect((mounted as { hasActiveEditor(): boolean }).hasActiveEditor()).toBe(false)
+    })
+
     test('promotes and releases a windowed message operation before removing its row', async () => {
         const harness = makeWindowedEditHarness()
         live.db = {
@@ -883,7 +991,6 @@ describe('Chat frozen capture presentation', () => {
             translator: '',
             useChatCopy: false,
             enableBookmark: false,
-            swipe: false,
             askRemoval: false,
             instantRemove: false,
         }
@@ -931,7 +1038,6 @@ describe('Chat frozen capture presentation', () => {
             translator: '',
             useChatCopy: false,
             enableBookmark: false,
-            swipe: false,
         }
         const requireCurrent = vi.fn(() => ({
             character: harness.completeCharacter,

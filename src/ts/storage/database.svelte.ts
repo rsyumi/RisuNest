@@ -102,9 +102,6 @@ export function normalizeDatabaseDefaults(data:Database): Database {
     if(checkNullish(data.language)){
         data.language = 'en'
     }
-    if(checkNullish(data.swipe)){
-        data.swipe = true
-    }
     if(checkNullish(data.translator)){
         data.translator = ''
     }
@@ -888,7 +885,6 @@ export interface Database{
     ttsAutoSpeech?:boolean
     promptPreprocess:boolean
     bias: [string, number][]
-    swipe:boolean
     instantRemove:boolean
     textTheme: string
     customTextTheme: {

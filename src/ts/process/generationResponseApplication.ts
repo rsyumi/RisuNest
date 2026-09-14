@@ -55,7 +55,6 @@ export interface GenerationResponseCallbacks {
     >
     runOutputListeners(chat: Chat, messageIndex: number): Promise<void>
     speak(data: string): Promise<void>
-    addRerolls(generationId: string, values: string[]): void
     trimIncompleteResponse(data: string): string
     markResponseApplied(): void
     onProviderFailure(message: string): void
@@ -170,7 +169,6 @@ export async function applyGenerationResponse(
             targetChat.isStreaming = true
             targetChat.activeStreamingDisplayOptimizationMode = performanceMode
             options.operation.incrementReloadKeys()
-            let lastResponseChunk: Record<string, string> = {}
             const processStreamingSnapshot = async (
                 snapshot: string,
                 cache: 'normal' | 'bypass',
@@ -209,8 +207,7 @@ export async function applyGenerationResponse(
                             ? options.callbacks.trimIncompleteResponse(snapshot)
                             : snapshot
                     },
-                    onValue: (value, snapshot) => {
-                        lastResponseChunk = value
+                    onValue: (_value, snapshot) => {
                         result = snapshot
                     },
                     processSemantic: async ({ value }, context) => {
@@ -243,11 +240,6 @@ export async function applyGenerationResponse(
             }
 
             if (!streamCompleted) return null
-
-            options.callbacks.addRerolls(
-                options.generationId,
-                Object.values(lastResponseChunk),
-            )
 
             if (!outputTarget.isOwned()) return null
             let currentChat = options.callbacks.runCurrentChatParser(targetChat)
@@ -430,6 +422,7 @@ export async function applyGenerationResponse(
                         if (!outputTarget.commitData(inlayData)) return null
                     }
                     outputMessageId = outputTarget.messageId
+                    multilineRerolls.push(result)
                 } else if (index === 0) {
                     if (
                         options.operation.getTargetChat() !== operationChat
@@ -474,7 +467,6 @@ export async function applyGenerationResponse(
                     !outputTarget!.commitMessage(precomputedResponseVariants(message, multilineRerolls))
                 )
                     return null
-                options.callbacks.addRerolls(options.generationId, multilineRerolls)
             }
 
             const outputChat = options.operation.getTargetChat()

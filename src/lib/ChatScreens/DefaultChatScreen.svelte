@@ -93,6 +93,7 @@
     }
     import { readSelectedConversationLatestTail } from '../../ts/selectedConversationTail';
     import { writeConversationSuggestions } from '../../ts/autoSuggestionMetadata';
+    import { moveAlternateGreeting } from './conversationStartMutations';
 
     const loadPlaygroundMenu = () => import('../Playground/PlaygroundMenu.svelte').then(m => m.default);
     
@@ -492,6 +493,41 @@
         return result === true
     }
 
+    async function selectAlternateGreeting(direction: -1 | 1): Promise<void> {
+        try {
+            await runSelectedConversationOperation('select-alternate-greeting', (context) => {
+                const { character, conversation, session } = context.requireCurrent()
+                if (character.type === 'group') return
+                moveAlternateGreeting(
+                    conversation,
+                    session,
+                    character.alternateGreetings.length,
+                    direction,
+                )
+                context.requireCurrent()
+            })
+        } catch (error) {
+            alertError(error)
+        }
+    }
+
+    async function removeCreatorQuote(): Promise<void> {
+        const character = DBState.db.characters[$selectedCharID]
+        if (!character || character.type === 'group') return
+        try {
+            const changed = await persistentRuntime.mutatePersistentCharacterDetail(
+                character.chaId,
+                'remove-creator-quote',
+                ({ character: storedCharacter }) => {
+                    if (storedCharacter.type !== 'group') storedCharacter.removedQuotes = true
+                },
+            )
+            if (!changed) alertError(language.errors.noData)
+        } catch (error) {
+            alertError(error)
+        }
+    }
+
     let abortController:null|AbortController = null
 
     async function sendChatMain(continued:boolean = false) {
@@ -857,7 +893,6 @@
                 requestInfoInsideChat: DBState.db.requestInfoInsideChat ?? false,
                 aiLawApplies: aiLawApplies(),
                 translator: DBState.db.translator,
-                swipe: DBState.db.swipe,
                 showFirstMessagePages: DBState.db.showFirstMessagePages,
                 memoryLimitThickness: DBState.db.memoryLimitThickness ?? 1,
                 customQuotes: DBState.db.customQuotes,
@@ -1376,30 +1411,9 @@
                 onReroll={reroll}
                 onNextReroll={nextReroll}
                 unReroll={unReroll}
-                onFirstMessageReroll={() => {
-                    const character = DBState.db.characters[$selectedCharID]
-                    const chat = character.chats[character.chatPage]
-                    if (character.type !== 'group') {
-                        chat.fmIndex = chat.fmIndex >= character.alternateGreetings.length - 1
-                            ? -1
-                            : chat.fmIndex + 1
-                    }
-                    character.chats[character.chatPage] = chat
-                }}
-                unFirstMessageReroll={() => {
-                    const character = DBState.db.characters[$selectedCharID]
-                    const chat = character.chats[character.chatPage]
-                    if (character.type !== 'group') {
-                        chat.fmIndex = chat.fmIndex === -1
-                            ? character.alternateGreetings.length - 1
-                            : chat.fmIndex - 1
-                    }
-                    character.chats[character.chatPage] = chat
-                }}
-                onRemoveCreatorQuote={() => {
-                    const character = DBState.db.characters[$selectedCharID]
-                    if (character.type !== 'group') character.removedQuotes = true
-                }}
+                onFirstMessageReroll={() => void selectAlternateGreeting(1)}
+                unFirstMessageReroll={() => void selectAlternateGreeting(-1)}
+                onRemoveCreatorQuote={() => void removeCreatorQuote()}
                 showAiWarning={aiLawApplies()}
                 currentCharacter={currentCharacter}
                 currentUsername={currentUsername}

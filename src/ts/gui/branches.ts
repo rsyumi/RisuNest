@@ -13,6 +13,13 @@ import {
 } from '../storage/persistentRecordIterator'
 
 const BRANCH_SCAN_PAGE_SIZE = 128
+const BRANCH_PREVIEW_MAX_LENGTH = 200
+
+function branchPreview(value: string): string {
+    return value.length <= BRANCH_PREVIEW_MAX_LENGTH
+        ? value
+        : `${value.slice(0, BRANCH_PREVIEW_MAX_LENGTH - 3)}...`
+}
 
 type ChatBranch = {
     children: Map<string, ChatBranch>
@@ -203,7 +210,7 @@ async function scanPinnedGraph(
                 root,
                 simpleHasher(firstMessage),
                 chatId,
-                firstMessage,
+                branchPreview(firstMessage),
                 summary.id,
                 null,
             )
@@ -236,7 +243,7 @@ async function scanPinnedGraph(
                         branch,
                         simpleHasher(message.data),
                         chatId,
-                        message.data,
+                        branchPreview(message.data),
                         summary.id,
                         sourceIndex,
                     )

@@ -1,5 +1,19 @@
 import { Zip, ZipPassThrough } from 'fflate'
 
+export const SCREENSHOT_ARCHIVE_ZIP32_SENTINEL = 0xffff_ffff
+export const SCREENSHOT_ARCHIVE_MAX_ENTRIES = 0xffff - 1
+export const SCREENSHOT_ARCHIVE_MAX_BYTES = SCREENSHOT_ARCHIVE_ZIP32_SENTINEL - 1
+
+type ScreenshotArchiveLimits = Readonly<{
+    maxEntries: number
+    maxBytes: number
+}>
+
+const ZIP32_ARCHIVE_LIMITS: ScreenshotArchiveLimits = {
+    maxEntries: SCREENSHOT_ARCHIVE_MAX_ENTRIES,
+    maxBytes: SCREENSHOT_ARCHIVE_MAX_BYTES,
+}
+
 export interface ScreenshotArchiveWriter {
     write(chunk: Uint8Array): Promise<void>
     close(): Promise<void>
@@ -28,9 +42,13 @@ async function waitForClose(promise: Promise<void>, signal?: AbortSignal) {
 
 export function createStreamingScreenshotArchive(
     writer: ScreenshotArchiveWriter,
+    limits: ScreenshotArchiveLimits = ZIP32_ARCHIVE_LIMITS,
 ): StreamingScreenshotArchive {
     let state: 'open' | 'closed' | 'aborted' = 'open'
     let writeChain = Promise.resolve()
+    let entryCount = 0
+    let outputBytes = 0
+    let pageBytes = 0
     let streamError: unknown
     let resolveFinal!: () => void
     let rejectFinal!: (error: unknown) => void
@@ -38,6 +56,7 @@ export function createStreamingScreenshotArchive(
         resolveFinal = resolve
         rejectFinal = reject
     })
+    void finalChunk.catch(() => {})
     const zip = new Zip((error, chunk, final) => {
         if (error) {
             streamError = error
@@ -45,6 +64,12 @@ export function createStreamingScreenshotArchive(
             return
         }
         if (chunk.length > 0) {
+            if (outputBytes + chunk.length > limits.maxBytes) {
+                streamError = new Error('Screenshot archive exceeds the ZIP32 size limit')
+                rejectFinal(streamError)
+                return
+            }
+            outputBytes += chunk.length
             writeChain = writeChain.then(() => writer.write(chunk))
         }
         if (final) resolveFinal()
@@ -71,7 +96,11 @@ export function createStreamingScreenshotArchive(
     }
 
     async function fail(error: unknown): Promise<boolean> {
-        if (!await abortOnce()) return true
+        try {
+            if (!await abortOnce()) return true
+        } catch (abortError) {
+            if (error instanceof DOMException && error.name === 'AbortError') throw abortError
+        }
         throw error
     }
 
@@ -81,9 +110,27 @@ export function createStreamingScreenshotArchive(
             if (!Number.isSafeInteger(pageNumber) || pageNumber < 1) {
                 throw new Error('Screenshot page number must be a positive integer')
             }
+            if (pageNumber > limits.maxEntries) {
+                await fail(new Error('Screenshot archive exceeds the ZIP32 entry limit'))
+                return
+            }
+            if (entryCount >= limits.maxEntries) {
+                await fail(new Error('Screenshot archive exceeds the ZIP32 entry limit'))
+                return
+            }
+            if (page.size > limits.maxBytes) {
+                await fail(new Error('Screenshot page exceeds the ZIP32 size limit'))
+                return
+            }
+            if (pageBytes + page.size > limits.maxBytes) {
+                await fail(new Error('Screenshot archive exceeds the ZIP32 size limit'))
+                return
+            }
             try {
                 const entry = new ZipPassThrough(`page-${pageNumber.toString().padStart(4, '0')}.png`)
                 zip.add(entry)
+                entryCount += 1
+                pageBytes += page.size
                 const reader = page.stream().getReader()
                 try {
                     while (true) {

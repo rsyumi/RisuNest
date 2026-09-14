@@ -172,10 +172,6 @@ export function inlayScreenModule(overrides: ModuleOverrides = {}) {
     }
 }
 
-export function prerollModule(overrides: ModuleOverrides = {}) {
-    return { addRerolls: vi.fn(), ...overrides }
-}
-
 export function transformersModule(overrides: ModuleOverrides = {}) {
     return { runImageEmbedding: vi.fn(), ...overrides }
 }

@@ -21,7 +21,9 @@ export function replaceResponseTail(
     recovery: RerollRecovery | null | undefined = chat.rerollRecovery,
 ): void {
     const expectedMetadata = cloneConversationMetadata(chat)
-    const metadata = { ...expectedMetadata, rerollRecovery: recovery ?? undefined }
+    const metadata = { ...expectedMetadata }
+    if (recovery) metadata.rerollRecovery = recovery
+    else delete metadata.rerollRecovery
     if (session?.isActive) {
         session.applyOperation({
             expectedVersion: session.version,
@@ -35,7 +37,8 @@ export function replaceResponseTail(
         })
     } else {
         chat.message.splice(start, chat.message.length - start, ...safeStructuredClone(messages))
-        chat.rerollRecovery = recovery ?? undefined
+        if (recovery) chat.rerollRecovery = recovery
+        else delete chat.rerollRecovery
     }
 }
 

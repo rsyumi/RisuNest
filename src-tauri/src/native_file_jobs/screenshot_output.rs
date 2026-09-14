@@ -15,6 +15,8 @@ use tauri::State;
 use uuid::Uuid;
 
 pub(crate) const MAX_SCREENSHOT_OUTPUT_APPEND_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_SCREENSHOT_ZIP32_BYTES: u64 = 0xFFFF_FFFF;
+pub(crate) const MAX_SCREENSHOT_ZIP32_ENTRIES: usize = 0xFFFF;
 const OWNERSHIP_FILE: &str = "ownership";
 const SPOOL_FILE: &str = "archive.zip.part";
 const READY_FILE: &str = "ready";
@@ -32,7 +34,6 @@ pub(crate) enum ScreenshotOutputCancelOutcome {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ScreenshotOutputPublished {
     pub(crate) bytes: u64,
-    pub(crate) sha256: String,
     pub(crate) warning_codes: Vec<String>,
     pub(crate) source_path: Option<String>,
 }
@@ -41,16 +42,30 @@ pub(crate) struct ScreenshotOutputPublished {
 pub(crate) struct ScreenshotOutputState {
     root: PathBuf,
     jobs: Arc<Mutex<HashMap<String, Arc<ScreenshotOutputJob>>>>,
-    capability_error: Option<NativeJobError>,
+    initialization: Arc<Mutex<ScreenshotOutputInitialization>>,
+}
+
+struct ScreenshotOutputInitialization {
+    ready: bool,
+    warning_codes: Vec<String>,
 }
 
 impl ScreenshotOutputState {
     pub(crate) fn initialize(root: PathBuf) -> Self {
-        let capability_error = initialize_root(&root).err();
+        let initialization = match initialize_root(&root) {
+            Ok(warning_codes) => ScreenshotOutputInitialization {
+                ready: true,
+                warning_codes,
+            },
+            Err(_) => ScreenshotOutputInitialization {
+                ready: false,
+                warning_codes: Vec::new(),
+            },
+        };
         Self {
             root,
             jobs: Arc::new(Mutex::new(HashMap::new())),
-            capability_error,
+            initialization: Arc::new(Mutex::new(initialization)),
         }
     }
 
@@ -58,9 +73,14 @@ impl ScreenshotOutputState {
         &self,
         destination: Option<PathBuf>,
     ) -> Result<NativeFileJobStarted, NativeJobError> {
-        if let Some(error) = &self.capability_error {
-            return Err(error.clone());
-        }
+        let warning_codes = {
+            let mut initialization = self.initialization.lock().map_err(registry_error)?;
+            if !initialization.ready {
+                initialization.warning_codes = initialize_root(&self.root)?;
+                initialization.ready = true;
+            }
+            initialization.warning_codes.clone()
+        };
         let destination = destination.map(validate_destination).transpose()?;
         let job_id = Uuid::new_v4().to_string();
         let owned_directory = self.root.join(&job_id);
@@ -133,6 +153,7 @@ impl ScreenshotOutputState {
                 inner: Mutex::new(ScreenshotOutputJobInner {
                     phase: ScreenshotOutputPhase::Open,
                     file: Some(file),
+                    bytes_written: 0,
                 }),
             }))
         })();
@@ -149,7 +170,7 @@ impl ScreenshotOutputState {
             .insert(job_id.clone(), job);
         Ok(NativeFileJobStarted {
             job_id,
-            warning_codes: Vec::new(),
+            warning_codes,
         })
     }
 
@@ -169,6 +190,7 @@ impl ScreenshotOutputState {
                     "screenshot output is not open for appends",
                 ));
             }
+            validate_screenshot_append_length(inner.bytes_written, chunk.len())?;
             let result = inner
                 .file
                 .as_mut()
@@ -181,7 +203,9 @@ impl ScreenshotOutputState {
                         error,
                     )
                 });
-            if result.is_err() {
+            if result.is_ok() {
+                inner.bytes_written += chunk.len() as u64;
+            } else {
                 inner.phase = ScreenshotOutputPhase::Cancelled;
                 inner.file.take();
             }
@@ -320,7 +344,6 @@ impl ScreenshotOutputState {
         let cleanup = self.remove_and_cleanup(job);
         Ok(ScreenshotOutputPublished {
             bytes: result.bytes,
-            sha256: result.sha256,
             warning_codes: cleanup
                 .err()
                 .map(|_| vec!["cleanup-failed".to_owned()])
@@ -333,7 +356,9 @@ impl ScreenshotOutputState {
         &self,
         job: &Arc<ScreenshotOutputJob>,
     ) -> Result<ScreenshotOutputPublished, NativeJobError> {
-        let (bytes, sha256) = screenshot_spool_fingerprint(&job)?;
+        let bytes = fs::metadata(&job.spool_path)
+            .map_err(|error| io_error("invalid-source", "inspect screenshot output spool", error))?
+            .len();
         write_owned_marker(&job.owned_directory, READY_FILE, &job.id)?;
         let cancelled = {
             let mut inner = job.inner.lock().map_err(job_error)?;
@@ -354,7 +379,6 @@ impl ScreenshotOutputState {
         }
         Ok(ScreenshotOutputPublished {
             bytes,
-            sha256,
             warning_codes: Vec::new(),
             source_path: Some(job.spool_path.to_string_lossy().into_owned()),
         })
@@ -456,6 +480,7 @@ struct ScreenshotOutputJob {
 struct ScreenshotOutputJobInner {
     phase: ScreenshotOutputPhase,
     file: Option<File>,
+    bytes_written: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -468,11 +493,14 @@ enum ScreenshotOutputPhase {
     Cancelled,
 }
 
-fn initialize_root(root: &Path) -> Result<(), NativeJobError> {
+fn initialize_root(root: &Path) -> Result<Vec<String>, NativeJobError> {
     initialize_root_at(root, SystemTime::now())
 }
 
-pub(crate) fn initialize_root_at(root: &Path, now: SystemTime) -> Result<(), NativeJobError> {
+pub(crate) fn initialize_root_at(
+    root: &Path,
+    now: SystemTime,
+) -> Result<Vec<String>, NativeJobError> {
     fs::create_dir_all(root).map_err(|error| {
         io_error(
             "capability-unavailable",
@@ -487,14 +515,17 @@ pub(crate) fn initialize_root_at(root: &Path, now: SystemTime) -> Result<(), Nat
             error,
         )
     })?;
+    let mut warning_codes = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|error| {
-            io_error(
-                "capability-unavailable",
-                "inspect screenshot output entry",
-                error,
-            )
-        })?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                if !warning_codes.iter().any(|code| code == "cleanup-failed") {
+                    warning_codes.push("cleanup-failed".to_owned());
+                }
+                continue;
+            }
+        };
         let path = entry.path();
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
@@ -508,15 +539,13 @@ pub(crate) fn initialize_root_at(root: &Path, now: SystemTime) -> Result<(), Nat
         if is_owned_handoff(&path, &name) && !is_stale_handoff(&path, now) {
             continue;
         }
-        fs::remove_dir_all(&path).map_err(|error| {
-            io_error(
-                "cleanup-failed",
-                "remove abandoned screenshot output directory",
-                error,
-            )
-        })?;
+        if fs::remove_dir_all(&path).is_err()
+            && !warning_codes.iter().any(|code| code == "cleanup-failed")
+        {
+            warning_codes.push("cleanup-failed".to_owned());
+        }
     }
-    Ok(())
+    Ok(warning_codes)
 }
 
 fn is_stale_handoff(directory: &Path, now: SystemTime) -> bool {
@@ -581,46 +610,6 @@ fn write_owned_marker(directory: &Path, name: &str, job_id: &str) -> Result<(), 
     Ok(())
 }
 
-fn screenshot_spool_fingerprint(
-    job: &ScreenshotOutputJob,
-) -> Result<(u64, String), NativeJobError> {
-    screenshot_spool_fingerprint_controlled(&job.spool_path, || {
-        job.cancel_requested.load(Ordering::Acquire)
-    })
-}
-
-pub(crate) fn screenshot_spool_fingerprint_controlled(
-    path: &Path,
-    is_cancelled: impl Fn() -> bool,
-) -> Result<(u64, String), NativeJobError> {
-    use sha2::{Digest, Sha256};
-
-    let mut file = File::open(path)
-        .map_err(|error| io_error("invalid-source", "open screenshot output spool", error))?;
-    let mut hasher = Sha256::new();
-    let mut bytes = 0u64;
-    let mut buffer = vec![0u8; MAX_SCREENSHOT_OUTPUT_APPEND_BYTES];
-    loop {
-        if is_cancelled() {
-            return Err(NativeJobError::new(
-                "cancelled",
-                "screenshot output fingerprint was cancelled",
-            ));
-        }
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| io_error("invalid-source", "read screenshot output spool", error))?;
-        if read == 0 {
-            break;
-        }
-        bytes = bytes.checked_add(read as u64).ok_or_else(|| {
-            NativeJobError::new("invalid-source", "screenshot output size overflowed")
-        })?;
-        hasher.update(&buffer[..read]);
-    }
-    Ok((bytes, hex::encode(hasher.finalize())))
-}
-
 fn validate_destination(destination: PathBuf) -> Result<PathBuf, NativeJobError> {
     if !destination.is_absolute() {
         return Err(NativeJobError::new(
@@ -666,6 +655,7 @@ fn validate_screenshot_archive(job: &ScreenshotOutputJob) -> Result<(), NativeJo
             "screenshot output ZIP has no pages",
         ));
     }
+    validate_screenshot_entry_count(archive.len())?;
     let mut buffer = vec![0u8; MAX_SCREENSHOT_OUTPUT_APPEND_BYTES];
     for index in 0..archive.len() {
         if job.cancel_requested.load(Ordering::Acquire) {
@@ -704,6 +694,32 @@ fn validate_screenshot_archive(job: &ScreenshotOutputJob) -> Result<(), NativeJo
                 break;
             }
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_screenshot_append_length(
+    current: u64,
+    appended: usize,
+) -> Result<(), NativeJobError> {
+    if current
+        .checked_add(appended as u64)
+        .is_none_or(|total| total >= MAX_SCREENSHOT_ZIP32_BYTES)
+    {
+        return Err(NativeJobError::new(
+            "invalid-input",
+            "screenshot output exceeds the ZIP32 size limit",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_screenshot_entry_count(entries: usize) -> Result<(), NativeJobError> {
+    if entries >= MAX_SCREENSHOT_ZIP32_ENTRIES {
+        return Err(NativeJobError::new(
+            "invalid-input",
+            "screenshot output exceeds the ZIP32 entry limit",
+        ));
     }
     Ok(())
 }

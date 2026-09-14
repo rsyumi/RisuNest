@@ -312,9 +312,15 @@ export async function openChatScreenshotSourceLease(
         let activeJob: Promise<ChatScreenshotJob> | null = null
         const release = () => {
             if (releasePromise) return releasePromise
-            releasePromise = releasePersistentRevisionLease(lease).then(() => {
-                released = true
-            })
+            releasePromise = releasePersistentRevisionLease(lease).then(
+                () => {
+                    released = true
+                },
+                (error) => {
+                    releasePromise = null
+                    throw error
+                },
+            )
             return releasePromise
         }
         const source: ChatScreenshotSourceLease = {
@@ -331,11 +337,19 @@ export async function openChatScreenshotSourceLease(
                     jobSignal,
                 )
                 activeJob = job
+                let jobFailed = false
                 try {
                     return await job
+                } catch (error) {
+                    jobFailed = true
+                    throw error
                 } finally {
                     if (activeJob === job) activeJob = null
-                    await release()
+                    try {
+                        await release()
+                    } catch (error) {
+                        if (!jobFailed) throw error
+                    }
                 }
             },
             async close() {

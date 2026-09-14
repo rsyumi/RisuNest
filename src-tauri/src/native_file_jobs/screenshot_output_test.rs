@@ -1,8 +1,8 @@
 use super::screenshot_output::{
-    initialize_root_at, screenshot_spool_fingerprint_controlled, ScreenshotOutputCancelOutcome,
-    ScreenshotOutputState, MAX_SCREENSHOT_OUTPUT_APPEND_BYTES, READY_HANDOFF_STALE_AFTER,
+    initialize_root_at, validate_screenshot_append_length, validate_screenshot_entry_count,
+    ScreenshotOutputCancelOutcome, ScreenshotOutputState, MAX_SCREENSHOT_OUTPUT_APPEND_BYTES,
+    READY_HANDOFF_STALE_AFTER,
 };
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Cursor, Write};
 use std::time::{Duration, SystemTime};
@@ -57,7 +57,20 @@ fn append_accepts_64_kib_and_rejects_larger_ipc_chunks() {
 }
 
 #[test]
-fn publish_replaces_the_destination_only_after_the_complete_spool_is_synced() {
+fn native_file_lifecycle_zip32_bounds_reject_only_exclusive_sentinel_values() {
+    assert!(validate_screenshot_append_length(0xFFFF_FFFE, 0).is_ok());
+    let bytes = validate_screenshot_append_length(0xFFFF_FFFE, 1).unwrap_err();
+    assert_eq!(bytes.code, "invalid-input");
+    assert!(bytes.message.contains("ZIP32 size limit"));
+
+    assert!(validate_screenshot_entry_count(0xFFFE).is_ok());
+    let entries = validate_screenshot_entry_count(0xFFFF).unwrap_err();
+    assert_eq!(entries.code, "invalid-input");
+    assert!(entries.message.contains("ZIP32 entry limit"));
+}
+
+#[test]
+fn native_file_lifecycle_publish_replaces_destination_after_complete_spool_sync() {
     let (_directory, state, destination) = fixture();
     fs::write(&destination, b"previous screenshot").unwrap();
     let started = state.start(Some(destination.clone())).unwrap();
@@ -70,7 +83,6 @@ fn publish_replaces_the_destination_only_after_the_complete_spool_is_synced() {
 
     assert_eq!(fs::read(destination).unwrap(), expected);
     assert_eq!(published.bytes, expected.len() as u64);
-    assert_eq!(published.sha256, hex::encode(Sha256::digest(&expected)));
     assert_eq!(
         state.cancel(&started.job_id).unwrap(),
         ScreenshotOutputCancelOutcome::Missing
@@ -114,7 +126,7 @@ fn invalid_zip_never_replaces_an_existing_destination() {
 }
 
 #[test]
-fn startup_recovery_removes_only_owned_incomplete_screenshot_jobs() {
+fn native_file_lifecycle_startup_recovery_removes_only_owned_incomplete_screenshot_jobs() {
     let (directory, state, destination) = fixture();
     let started = state.start(Some(destination.clone())).unwrap();
     state.append(&started.job_id, b"partial zip").unwrap();
@@ -135,24 +147,31 @@ fn startup_recovery_removes_only_owned_incomplete_screenshot_jobs() {
 }
 
 #[test]
-fn fingerprint_stops_between_bounded_reads_when_cancellation_is_requested() {
+fn native_file_lifecycle_start_retries_transient_root_initialization_failure() {
     let directory = TempDir::new().unwrap();
-    let source = directory.path().join("large.zip");
-    fs::write(&source, vec![1u8; MAX_SCREENSHOT_OUTPUT_APPEND_BYTES * 3]).unwrap();
-    let checks = std::cell::Cell::new(0usize);
+    let root = directory.path().join("screenshot-output");
+    fs::write(&root, b"temporarily blocks directory creation").unwrap();
+    let destination_root = directory.path().join("chosen");
+    fs::create_dir(&destination_root).unwrap();
+    let state = ScreenshotOutputState::initialize(root.clone());
 
-    let error = screenshot_spool_fingerprint_controlled(&source, || {
-        checks.set(checks.get() + 1);
-        checks.get() > 1
-    })
-    .unwrap_err();
+    let first = state
+        .start(Some(destination_root.join("first.zip")))
+        .unwrap_err();
+    assert_eq!(first.code, "capability-unavailable");
 
-    assert_eq!(error.code, "cancelled");
-    assert_eq!(checks.get(), 2);
+    fs::remove_file(&root).unwrap();
+    let started = state
+        .start(Some(destination_root.join("second.zip")))
+        .unwrap();
+    assert_eq!(
+        state.cancel(&started.job_id).unwrap(),
+        ScreenshotOutputCancelOutcome::Requested
+    );
 }
 
 #[test]
-fn android_handoff_keeps_one_validated_owned_zip_until_release() {
+fn native_file_lifecycle_android_handoff_keeps_validated_zip_until_release() {
     let (directory, state, _destination) = fixture();
     let started = state.start(None).unwrap();
     let expected = screenshot_zip(&[b"first page", b"second page"]);
@@ -175,7 +194,7 @@ fn android_handoff_keeps_one_validated_owned_zip_until_release() {
 }
 
 #[test]
-fn startup_preserves_only_ready_android_handoffs_and_release_reclaims_them() {
+fn native_file_lifecycle_startup_preserves_ready_handoffs_until_release() {
     let (directory, state, _destination) = fixture();
     let ready = state.start(None).unwrap();
     state
@@ -200,7 +219,7 @@ fn startup_preserves_only_ready_android_handoffs_and_release_reclaims_them() {
 }
 
 #[test]
-fn startup_reclaims_only_stale_ready_android_handoffs() {
+fn native_file_lifecycle_startup_reclaims_only_stale_ready_android_handoffs() {
     let (directory, state, _destination) = fixture();
     let ready = state.start(None).unwrap();
     state

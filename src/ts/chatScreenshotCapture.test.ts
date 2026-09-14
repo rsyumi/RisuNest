@@ -240,7 +240,7 @@ describe('bounded chat screenshot capture', () => {
         expect(deps.surface.dispose).toHaveBeenCalledOnce()
     })
 
-    it('checks cancellation after publishing a page and through archive close', async () => {
+    it('reports a PNG as saved when cancellation arrives after publication', async () => {
         const pngDeps = harness()
         const pngController = new AbortController()
         pngDeps.output.publishPng.mockImplementationOnce(async () => {
@@ -248,13 +248,13 @@ describe('bounded chat screenshot capture', () => {
             return true
         })
 
-        await expect(
-            captureChatScreenshot(job(1), {
-                ...pngDeps,
-                signal: pngController.signal,
-            }),
-        ).rejects.toMatchObject({ name: 'AbortError' })
+        await expect(captureChatScreenshot(job(1), {
+            ...pngDeps,
+            signal: pngController.signal,
+        })).resolves.toEqual({ kind: 'png', pages: 1 })
+    })
 
+    it('checks cancellation through archive close before publication commits', async () => {
         const zipDeps = harness()
         const zipController = new AbortController()
         zipDeps.archive.close.mockImplementationOnce(async (signal?: AbortSignal) => {

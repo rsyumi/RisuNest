@@ -139,6 +139,60 @@ describe('chat branch visualization', () => {
         })
     })
 
+    it('bounds retained branch previews without changing the message identity hash', async () => {
+        const data = 'x'.repeat(1_000)
+        const lease = {
+            revision: 8,
+            readCharacter: vi.fn(async () => ({
+                revision: 8,
+                value: {
+                    type: 'character',
+                    chaId: 'char-preview',
+                    name: 'Preview',
+                    firstMessage: '',
+                    alternateGreetings: [],
+                },
+            })),
+            queryConversations: vi.fn(async () => ({
+                revision: 8,
+                items: [{
+                    id: 'chat-preview',
+                    characterId: 'char-preview',
+                    name: 'Preview chat',
+                    configuredIndex: 0,
+                    recentAt: 0,
+                    messageCount: 1,
+                    fmIndex: -1,
+                }],
+            })),
+            readConversationWindow: vi.fn(async () => ({
+                revision: 8,
+                value: {
+                    characterId: 'char-preview',
+                    conversationId: 'chat-preview',
+                    messages: [{ role: 'char', data }],
+                    startIndex: 0,
+                    endIndex: 1,
+                    totalMessages: 1,
+                    hasMoreBefore: false,
+                    hasMoreAfter: false,
+                },
+            })),
+            release: vi.fn(async () => undefined),
+        } as unknown as PersistentRevisionLease
+
+        const graph = await scanPinnedChatBranches(
+            { acquireRevision: vi.fn(async () => lease) } as never,
+            'char-preview',
+            8,
+        )
+        const messageBranch = graph.branches.find((branch) => branch.sourceIndex === 0)!
+
+        expect(messageBranch.preview).toHaveLength(200)
+        expect(messageBranch.preview.endsWith('...')).toBe(true)
+        expect(messageBranch.content).not.toBe('')
+    })
+
     it('preserves the 10,000-turn graph hash without recursive materialization', async () => {
         const messages = Array.from({ length: 10_000 }, (_, index) => ({
             role: index % 2 === 0 ? 'user' as const : 'char' as const,

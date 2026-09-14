@@ -52,7 +52,6 @@ export interface ChatScreenshotRenderSettings {
     requestInfoInsideChat?: boolean
     aiLawApplies?: boolean
     translator?: string
-    swipe?: boolean
     showFirstMessagePages?: boolean
     memoryLimitThickness?: number
     customQuotes?: boolean
@@ -409,101 +408,4 @@ async function deriveParserHistoryBoundsFromReader(
         cursor = batchStart
     }
     return { start, end }
-}
-
-export function createChatScreenshotJob(input: {
-    characterId: string
-    chatId: string
-    messages: Message[]
-    start: number
-    end: number
-    renderContext: ChatScreenshotRenderContext
-}): ChatScreenshotJob {
-    const validation = validateScreenshotRange(input.messages.length, input.start, input.end)
-    if (validation.ok === false) throw new Error(`Invalid screenshot range: ${validation.reason}`)
-
-    const selectedMessages = cloneScreenshotData(
-        input.messages.slice(validation.start - 1, validation.end),
-    )
-    const renderContext = cloneScreenshotData(input.renderContext)
-    const historyBounds = deriveParserHistoryBounds(
-        input.messages,
-        validation.start - 1,
-        validation.end,
-        renderContext,
-    )
-    const historyMessages = cloneScreenshotData(
-        input.messages.slice(historyBounds.start, validation.start - 1),
-    )
-    const trailingMessages = cloneScreenshotData(
-        input.messages.slice(validation.end, historyBounds.end),
-    )
-    const parserMessages = [...historyMessages, ...selectedMessages, ...trailingMessages]
-    const parserCharacter = renderContext.parserContext.character
-    parserCharacter.chats[parserCharacter.chatPage].message = parserMessages
-    renderContext.parserContext.database.characters[renderContext.parserContext.selectedCharID] = parserCharacter
-    renderContext.parserContext.historyOffset = historyBounds.start
-    renderContext.totalTurns = input.messages.length
-    renderContext.selectionStart = validation.start
-    renderContext.historyStartIndex = historyBounds.start
-    renderContext.firstParserMessageIndex = validation.start - 1 - historyBounds.start
-    return deepFreeze({
-        characterId: input.characterId,
-        chatId: input.chatId,
-        totalTurns: input.messages.length,
-        start: validation.start,
-        end: validation.end,
-        messages: selectedMessages,
-        renderContext,
-    })
-}
-
-function deriveParserHistoryBounds(
-    messages: Message[],
-    selectionStartIndex: number,
-    selectionEndExclusive: number,
-    renderContext: ChatScreenshotRenderContext,
-) {
-    let start = selectionStartIndex
-    let end = selectionEndExclusive
-
-    const selectedRoles = new Set(
-        messages.slice(selectionStartIndex, selectionEndExclusive).map((message) => message.role),
-    )
-    selectedRoles.add('char')
-
-    for (const role of selectedRoles) {
-        const previousIndex = findPreviousRoleIndex(messages, selectionStartIndex, role)
-        if (previousIndex !== -1) start = Math.min(start, previousIndex)
-    }
-
-    let previousUserIndex = selectionStartIndex
-    for (let count = 0; count < 2; count += 1) {
-        previousUserIndex = findPreviousRoleIndex(messages, previousUserIndex, 'user')
-        if (previousUserIndex === -1) break
-        start = Math.min(start, previousUserIndex)
-    }
-
-    const classification = classifyChatParserHistory({
-        source: [
-            messages.slice(selectionStartIndex, selectionEndExclusive),
-            renderContext,
-        ],
-    })
-    const classifiedBounds = extendChatParserHistoryBounds(classification, {
-        start,
-        end,
-        totalMessages: messages.length,
-    })
-    start = classifiedBounds.start
-    end = classifiedBounds.end
-
-    return { start, end }
-}
-
-function findPreviousRoleIndex(messages: Message[], beforeIndex: number, role: Message['role']) {
-    for (let index = beforeIndex - 1; index >= 0; index -= 1) {
-        if (messages[index].role === role) return index
-    }
-    return -1
 }

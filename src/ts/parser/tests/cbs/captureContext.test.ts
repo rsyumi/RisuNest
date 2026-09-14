@@ -1,6 +1,7 @@
 import { writable } from 'svelte/store'
 import { beforeEach, expect, test, vi } from 'vitest'
-import type { Database, character, customscript } from '../../../storage/database.svelte'
+import type { Database, Message, character, customscript } from '../../../storage/database.svelte'
+import type { ChatScreenshotRenderContext } from '../../../chatScreenshotRange'
 
 const live = vi.hoisted(() => ({
     database: {} as Database,
@@ -50,7 +51,11 @@ vi.mock('../../../translator/bergamotTranslator', () => ({ bergamotTranslate }))
 
 const { ParseMarkdown, risuChatParser, trimMarkdown } = await import('../../parser.svelte')
 const { processScriptFull } = await import('../../../process/scripts')
-const { createChatScreenshotJob, snapshotChatScreenshotCharacter } = await import('../../../chatScreenshotRange')
+const {
+    createChatScreenshotDialogSnapshot,
+    createChatScreenshotJobFromDialogSnapshot,
+    snapshotChatScreenshotCharacter,
+} = await import('../../../chatScreenshotRange')
 const { clearLLMCache, setLLMCache, translate, translateHTML } = await import('../../../translator/translator')
 const { runLuaEditTrigger } = await import('../../../process/scriptings')
 
@@ -92,6 +97,57 @@ function makeDatabase(character: character, prefix: string): Database {
         mainPrompt: `${prefix} main`,
         globalChatVariables: { world: `${prefix} world` },
     } as unknown as Database
+}
+
+async function createProductScreenshotJob(input: {
+    characterId: string
+    chatId: string
+    messages: Message[]
+    start: number
+    end: number
+    renderContext: ChatScreenshotRenderContext
+}) {
+    const parserContext = input.renderContext.parserContext
+    const sourceCharacter = parserContext.character
+    const sourceChat = sourceCharacter.chats[sourceCharacter.chatPage]
+    const captureCharacter = snapshotChatScreenshotCharacter(sourceCharacter, sourceChat)
+    const renderContext: ChatScreenshotRenderContext = {
+        ...input.renderContext,
+        parserContext: {
+            ...parserContext,
+            character: captureCharacter,
+            database: {
+                ...parserContext.database,
+                characters: parserContext.database.characters.map((candidate, index) =>
+                    index === parserContext.selectedCharID ? captureCharacter : candidate,
+                ),
+            },
+        },
+    }
+    const frozenMessages = structuredClone(input.messages)
+    const reader = {
+        characterId: input.characterId,
+        chatId: input.chatId,
+        revision: 1,
+        totalTurns: frozenMessages.length,
+        async readRange(startIndex: number, limit: number) {
+            return structuredClone(frozenMessages.slice(startIndex, startIndex + limit))
+        },
+    }
+    const snapshot = createChatScreenshotDialogSnapshot({
+        characterId: reader.characterId,
+        chatId: reader.chatId,
+        revision: reader.revision,
+        sessionVersion: 1,
+        totalTurns: reader.totalTurns,
+        renderContext,
+    })
+    return createChatScreenshotJobFromDialogSnapshot(
+        snapshot,
+        reader,
+        input.start,
+        input.end,
+    )
 }
 
 beforeEach(() => {
@@ -158,6 +214,34 @@ test('uses frozen CBS values after the live database, persona, variables, and mo
         '{{user}}|{{char}}|{{persona}}|{{previoususerchat}}|{{getvar::score}}|{{getglobalvar::world}}|{{moduleenabled::frozen-module}}|{{mainprompt}}|{{date::YYYY-MM-DD}}',
         parserContext,
     )).toBe('Frozen user|Frozen|Frozen persona|Frozen previous|Frozen score|Frozen world|1|Frozen main|2020-01-02')
+})
+
+test('uses frozen variable snapshots for #when operators', () => {
+    const frozenCharacter = makeCharacter('Frozen')
+    const frozenDatabase = makeDatabase(frozenCharacter, 'Frozen')
+    const parserContext = {
+        db: frozenDatabase,
+        chara: frozenCharacter,
+        chatID: 1,
+        chatVariables: { enabled: '1', score: 'Frozen score' },
+        globalChatVariables: { toggle_enabled: '1' },
+    }
+
+    live.database.characters[0].chats[0].scriptstate = {
+        $enabled: '0',
+        $score: 'Live score',
+    }
+    live.database.globalChatVariables = { toggle_enabled: '0' }
+
+    expect(risuChatParser(
+        [
+            '{{#when::var::enabled}}var{{/when}}',
+            '{{#when::score::vis::Frozen score}}vis{{/when}}',
+            '{{#when::toggle::enabled}}toggle{{/when}}',
+            '{{#when::enabled::tis::1}}tis{{/when}}',
+        ].join('|'),
+        parserContext,
+    )).toBe('var|vis|toggle|tis')
 })
 
 test('uses the supplied database when resolving the active member of a frozen group', () => {
@@ -236,7 +320,7 @@ test('keeps real ParseMarkdown CBS output frozen when live state changes mid-cap
         { role: 'char', data: '{{user}}|{{persona}}|{{previoususerchat}}|{{moduleenabled::frozen-module}}' },
     ])
     const frozenDatabase = makeDatabase(frozenCharacter, 'Frozen')
-    const job = createChatScreenshotJob({
+    const job = await createProductScreenshotJob({
         characterId: frozenCharacter.chaId,
         chatId: 'chat',
         messages: frozenCharacter.chats[0].message,
@@ -322,7 +406,7 @@ test('keeps absolute chatindex while previouscharchat scans the projected frozen
         { role: 'char', data: '{{chatindex}}|{{previouscharchat}}' },
     ])
     const frozenDatabase = makeDatabase(frozenCharacter, 'Frozen')
-    const job = createChatScreenshotJob({
+    const job = await createProductScreenshotJob({
         characterId: frozenCharacter.chaId,
         chatId: 'chat',
         messages: frozenCharacter.chats[0].message,
@@ -416,7 +500,7 @@ test('keeps the original final message and absolute id for a middle capture rang
         { role: 'char', data: 'original final turn' },
     ])
     const frozenDatabase = makeDatabase(frozenCharacter, 'Frozen')
-    const job = createChatScreenshotJob({
+    const job = await createProductScreenshotJob({
         characterId: frozenCharacter.chaId,
         chatId: 'chat',
         messages: frozenCharacter.chats[0].message,
@@ -518,7 +602,7 @@ test('uses frozen parser and regex inputs through real cached auto-translation',
         out: 'frozen module',
         type: 'edittrans',
     }
-    const job = createChatScreenshotJob({
+    const job = await createProductScreenshotJob({
         characterId: frozenCharacter.chaId,
         chatId: 'chat',
         messages: frozenCharacter.chats[0].message,

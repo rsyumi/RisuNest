@@ -8,7 +8,7 @@ import { setRuntimePerformanceProfile } from '../runtimePerformanceProfile'
 import { requestChatData } from './request/request'
 import { readImage } from '../globalApi.svelte'
 import { getCurrentCharacter, getCurrentChat, getDatabase } from '../storage/database.svelte'
-import { asBuffer } from '../util'
+import { asBuffer, getUserIcon } from '../util'
 import { writeInlayImage } from './files/inlays'
 import { ActiveConversationSession } from '../storage/activeConversationSession'
 import { createConversationOperationContext } from './conversationOperationContext'
@@ -506,6 +506,59 @@ test('revokes the character image URL once after the inlay write succeeds', asyn
     expect(result.res).toBe('{{inlayed::character.jpg}}')
     expect(revokeObjectURL).toHaveBeenCalledTimes(1)
     expect(revokeObjectURL).toHaveBeenCalledWith('blob:lua-character-success')
+  }
+  finally {
+    globalThis.Image = previousImage
+    vi.restoreAllMocks()
+  }
+})
+
+test('character and persona image APIs preserve the mapped Inlay identity returned by the writer', async () => {
+  vi.mocked(getDatabase).mockReturnValue({
+    characters: [{
+      type: 'character',
+      chaId: 'mapped-lua-images',
+      image: 'assets/character-source.png',
+    }],
+  } as never)
+  vi.mocked(getUserIcon).mockReturnValue('assets/persona-source.png')
+  vi.mocked(readImage).mockResolvedValue(new Uint8Array([1, 2, 3]))
+  vi.mocked(asBuffer).mockReturnValue(new ArrayBuffer(3))
+  vi.mocked(writeInlayImage).mockImplementation(async (_image, options) =>
+    options.id?.replace(/^assets\//, '') ?? '')
+  vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:mapped-lua-image')
+  vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+  const previousImage = globalThis.Image
+  globalThis.Image = class {} as never
+
+  try {
+    const character = await runScripted(`
+      mapped_character_image = async(function(id)
+        return getCharacterImage(id)
+      end)
+    `, {
+      char: { chaId: 'mapped-lua-images' } as never,
+      chat: { message: [] } as never,
+      lowLevelAccess: true,
+      mode: 'mapped_character_image',
+    })
+    const persona = await runScripted(`
+      mapped_persona_image = async(function(id)
+        return getPersonaImage(id)
+      end)
+    `, {
+      char: { chaId: 'mapped-lua-images' } as never,
+      chat: { message: [] } as never,
+      lowLevelAccess: true,
+      mode: 'mapped_persona_image',
+    })
+
+    expect(character.res).toBe('{{inlayed::character-source.png}}')
+    expect(persona.res).toBe('{{inlayed::persona-source.png}}')
+    expect(vi.mocked(writeInlayImage).mock.calls.slice(-2).map(([, options]) => options?.id)).toEqual([
+      'assets/character-source.png',
+      'assets/persona-source.png',
+    ])
   }
   finally {
     globalThis.Image = previousImage
@@ -1756,6 +1809,7 @@ test('keeps stored trigger permissions and parser identity stable during Lua dis
   continuationRuntime.session = fixture.session
   const { runLuaEditTrigger } = await import('./scriptings')
   const before = createChatParserDependencyStamp(fixture.char)
+  const readRange = vi.spyOn(fixture.session, 'readRange')
   try {
     for (let index = 0; index < 3; index++) {
       await expect(
@@ -1764,6 +1818,45 @@ test('keeps stored trigger permissions and parser identity stable during Lua dis
       expect(fixture.char.triggerscript[0].lowLevelAccess).toBe(true)
       expect(createChatParserDependencyStamp(fixture.char)).toBe(before)
     }
+    expect(readRange).not.toHaveBeenCalled()
+  } finally {
+    continuationRuntime.session = null
+  }
+})
+
+test('releases a read-only Lua edit operation without publishing an empty commit', async () => {
+  const fixture = operationCharacterFixture('read-only-edit-operation')
+  fixture.char.customscript = []
+  fixture.char.triggerscript = [
+    {
+      type: 'output',
+      comment: 'synthetic read-only listener',
+      conditions: [],
+      effect: [
+        {
+          type: 'triggerlua',
+          code: `
+      listenEdit('editOutput', function(id, value)
+        getChatVar(id, 'missing')
+        return value
+      end)
+    `,
+        },
+      ],
+    },
+  ]
+  installOperationCharacterFixture(fixture)
+  vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+  continuationRuntime.session = fixture.session
+  const applyOperation = vi.spyOn(fixture.session, 'applyOperation')
+  const { runLuaEditTrigger } = await import('./scriptings')
+
+  try {
+    await expect(
+      runLuaEditTrigger(fixture.char, 'editoutput', 'unchanged'),
+    ).resolves.toBe('unchanged')
+    expect(applyOperation).not.toHaveBeenCalled()
+    expect(fixture.session.activePinReasons).toEqual([])
   } finally {
     continuationRuntime.session = null
   }

@@ -1078,6 +1078,18 @@ let activeMatcherContext: matcherArg | null = null
 
 const matcherMap = new Map<string, RegisterCallback>()
 
+function readMatcherChatVar(context: matcherArg | null, key: string): string {
+    if (context?.chatVariables) return context.chatVariables[key] ?? 'null'
+    if (context?.getChatVar) return context.getChatVar(key)
+    return getChatVar(key)
+}
+
+function readMatcherGlobalChatVar(context: matcherArg | null, key: string): string {
+    return context?.globalChatVariables
+        ? context.globalChatVariables[key] ?? 'null'
+        : getGlobalChatVar(key)
+}
+
 function initMatcher(){
     if(matcherInitialized) return
     registerCBS({
@@ -1106,15 +1118,16 @@ function initMatcher(){
         safeStructuredClone: safeStructuredClone,
         parseArray: parseArray,
         parseDict: parseDict,
-        getChatVar: (key) => activeMatcherContext?.chatVariables
-            ? activeMatcherContext.chatVariables[key] ?? 'null'
-            : getChatVar(key),
+        getChatVar: (key) => readMatcherChatVar(activeMatcherContext, key),
         setChatVar: (key, value) => {
-            if (!activeMatcherContext?.chatVariables) setChatVar(key, value)
+            if (activeMatcherContext?.chatVariables) return
+            if (activeMatcherContext?.setChatVar) {
+                activeMatcherContext.setChatVar(key, value)
+                return
+            }
+            setChatVar(key, value)
         },
-        getGlobalChatVar: (key) => activeMatcherContext?.globalChatVariables
-            ? activeMatcherContext.globalChatVariables[key] ?? 'null'
-            : getGlobalChatVar(key),
+        getGlobalChatVar: (key) => readMatcherGlobalChatVar(activeMatcherContext, key),
         calcString: calcString,
         dateTimeFormat: (format, timestamp) => dateTimeFormat(
             format,
@@ -1356,7 +1369,7 @@ function blockStartMatcher(p1:string,matcherArg:matcherArg):{type:blockMatch,typ
                         break
                     }
                     case 'var':{
-                        const variable = getChatVar(condition)
+                        const variable = readMatcherChatVar(matcherArg, condition)
                         if(isTruthy(variable)){
                             statement.push('1')
                         }
@@ -1366,7 +1379,7 @@ function blockStartMatcher(p1:string,matcherArg:matcherArg):{type:blockMatch,typ
                         break
                     }
                     case 'toggle':{
-                        const variable = getGlobalChatVar('toggle_' + condition)
+                        const variable = readMatcherGlobalChatVar(matcherArg, 'toggle_' + condition)
                         if(isTruthy(variable)){
                             statement.push('1')
                         }
@@ -1376,7 +1389,7 @@ function blockStartMatcher(p1:string,matcherArg:matcherArg):{type:blockMatch,typ
                         break
                     }
                     case 'vis':{ //vis = variable is
-                        const variable = getChatVar(statement.pop())
+                        const variable = readMatcherChatVar(matcherArg, statement.pop())
                         if(variable === condition){
                             statement.push('1')
                         }
@@ -1386,7 +1399,7 @@ function blockStartMatcher(p1:string,matcherArg:matcherArg):{type:blockMatch,typ
                         break
                     }
                     case 'visnot':{ //visnot = variable is not
-                        const variable = getChatVar(statement.pop())
+                        const variable = readMatcherChatVar(matcherArg, statement.pop())
                         if(variable !== condition){
                             statement.push('1')
                         }
@@ -1396,7 +1409,7 @@ function blockStartMatcher(p1:string,matcherArg:matcherArg):{type:blockMatch,typ
                         break
                     }
                     case 'tis':{ //tis = toggle is
-                        const variable = getGlobalChatVar('toggle_' + statement.pop())
+                        const variable = readMatcherGlobalChatVar(matcherArg, 'toggle_' + statement.pop())
                         if(variable === condition){
                             statement.push('1')
                         }
@@ -1406,7 +1419,7 @@ function blockStartMatcher(p1:string,matcherArg:matcherArg):{type:blockMatch,typ
                         break
                     }
                     case 'tisnot':{ //tisnot = toggle is not
-                        const variable = getGlobalChatVar('toggle_' + statement.pop())
+                        const variable = readMatcherGlobalChatVar(matcherArg, 'toggle_' + statement.pop())
                         if(variable !== condition){
                             statement.push('1')
                         }

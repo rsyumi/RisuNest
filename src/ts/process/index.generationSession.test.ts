@@ -38,7 +38,6 @@ const mocks = vi.hoisted(() => ({
         return { data, emoChanged: false }
     }),
     sayTTS: vi.fn(async (_char: unknown, _data: string) => undefined),
-    addRerolls: vi.fn((_generationId: string, _values: string[]) => undefined),
     trimUntilPunctuation: vi.fn((value: string) => value),
 }))
 
@@ -100,9 +99,6 @@ vi.mock('./inlayScreen', () => ({
         mocks.events.push('inlay-sync')
         return mocks.inlay ? mocks.inlay(data) : { text: data }
     },
-}))
-vi.mock('./prereroll', async () => (await import('./tests/sendChatTestHarness')).prerollModule({
-    addRerolls: mocks.addRerolls,
 }))
 vi.mock('./transformers', async () => (await import('./tests/sendChatTestHarness')).transformersModule())
 vi.mock('./memory/hanuraiMemory', async () => (await import('./tests/sendChatTestHarness')).hanuraiMemoryModule())
@@ -314,7 +310,6 @@ describe('sendChat generation session integration', () => {
             return { data, emoChanged: false }
         })
         mocks.sayTTS.mockReset().mockResolvedValue(undefined)
-        mocks.addRerolls.mockReset()
         mocks.trimUntilPunctuation.mockReset().mockImplementation((value: string) => value)
         mocks.acquireCompleteConversation.mockReset()
         mocks.acquireCompleteConversation.mockImplementation(async (_reason, target) => {
@@ -907,9 +902,6 @@ describe('sendChat generation session integration', () => {
         mocks.sayTTS.mockImplementation(async (_char, data: string) => {
             mocks.events.push(`tts:${data}`)
         })
-        mocks.addRerolls.mockImplementation((_generationId, values: string[]) => {
-            mocks.events.push(`rerolls:${values.join(',')}`)
-        })
         mocks.listeners.add(async () => {
             mocks.events.push('output-listener')
         })
@@ -924,7 +916,9 @@ describe('sendChat generation session integration', () => {
             saying: currentCharacter.chaId,
             generationInfo: expect.objectContaining({ generationId: expect.any(String) }),
         })
-        expect(mocks.addRerolls).toHaveBeenCalledWith(expect.any(String), [
+        expect(publishedChat.message.at(-1)?.responseVariants?.candidates.map(
+            (candidate) => candidate.messages[0].data,
+        )).toEqual([
             'First choice|script|inlay',
             'Second choice|script|inlay',
         ])
@@ -936,7 +930,6 @@ describe('sendChat generation session integration', () => {
             event.startsWith('output-script:')
             || event === 'inlay-sync'
             || event.startsWith('tts:')
-            || event.startsWith('rerolls:')
             || event === 'output-trigger'
             || event === 'output-listener'
             || event === 'tokenize-result'
@@ -947,7 +940,6 @@ describe('sendChat generation session integration', () => {
             'output-script:Second choice',
             'inlay-sync',
             'tts:Second choice|script|inlay',
-            'rerolls:First choice|script|inlay,Second choice|script|inlay',
             'output-trigger',
             'output-listener',
             'tokenize-result',
@@ -1035,7 +1027,6 @@ describe('sendChat generation session integration', () => {
             ['concurrent-message', 'Concurrent mutation'],
         ])
         expect(chat.message.some((message) => message.data === 'Late inlay result')).toBe(false)
-        expect(mocks.addRerolls).not.toHaveBeenCalled()
         expect(mocks.sayTTS).not.toHaveBeenCalled()
         expect(mocks.events).not.toContain('output-trigger')
         expect(mocks.acknowledge).toHaveBeenCalledOnce()
@@ -1049,7 +1040,6 @@ describe('sendChat generation session integration', () => {
             expectedStored: 'script:trim:Second raw',
             expectedOutputInputs: ['trim:First raw', 'trim:Second raw'],
             expectedTrimInputs: ['First raw', 'Second raw'],
-            expectedRerolls: ['Second raw'],
         },
         {
             name: 'multiline',
@@ -1063,14 +1053,13 @@ describe('sendChat generation session integration', () => {
             expectedStored: 'trim:script:First raw',
             expectedOutputInputs: ['First raw', 'Second raw'],
             expectedTrimInputs: ['script:First raw', 'script:Second raw'],
-            expectedRerolls: ['trim:script:First raw', 'trim:script:Second raw'],
         },
     ])('preserves removeIncompleteResponse trimming for $name response application', async ({
         response,
         expectedStored,
         expectedOutputInputs,
         expectedTrimInputs,
-        expectedRerolls,
+        name,
     }) => {
         const { session } = installDatabase()
         DBState.db.removeIncompleteResponse = true
@@ -1090,7 +1079,11 @@ describe('sendChat generation session integration', () => {
             expectedTrimInputs,
         )
         expect(DBState.db.characters[0].chats[0].message.at(-1)?.data).toBe(expectedStored)
-        expect(mocks.addRerolls).toHaveBeenCalledWith(expect.any(String), expectedRerolls)
+        const candidates = DBState.db.characters[0].chats[0].message.at(-1)
+            ?.responseVariants?.candidates.map((candidate) => candidate.messages[0].data)
+        expect(candidates).toEqual(name === 'multiline'
+            ? ['trim:script:First raw', 'trim:script:Second raw']
+            : undefined)
         expect(mocks.acknowledge).toHaveBeenCalledOnce()
         expect(session.pinCount('transaction')).toBe(0)
     })

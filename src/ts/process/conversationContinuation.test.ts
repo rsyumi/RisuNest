@@ -179,7 +179,6 @@ test.each(['success', 'streaming'] as const)(
                         runTrigger(char, 'output', { chat: c, onConversationCommit }),
                     runOutputListeners: listeners,
                     speak: async () => {},
-                    addRerolls: () => {},
                     trimIncompleteResponse: (v) => v,
                     markResponseApplied: () => {},
                     onProviderFailure: () => {},
@@ -206,3 +205,55 @@ test.each(['success', 'streaming'] as const)(
         }
     },
 )
+
+test('keeps the committed continuation as the selected multiline response candidate', async () => {
+    const { chat, char, session } = fixture()
+    runtime.session = session
+    DBState.db = { characters: [char], templateDefaultVariables: '' } as never
+
+    const result = await applyGenerationResponse({
+        response: {
+            type: 'multiline',
+            result: [
+                ['char', ' first'],
+                ['char', 'second'],
+                ['char', 'third'],
+            ],
+        },
+        abortSignal: new AbortController().signal,
+        continueGeneration: true,
+        sayingCharacterId: char.chaId,
+        generationId: 'generation-continue',
+        generationInfo: {} as never,
+        promptInfo: {} as never,
+        removeIncompleteResponse: () => false,
+        streamingDisplayOptimizationMode: () => 'off',
+        ttsAutoSpeech: () => false,
+        operation: {
+            getCurrentSession: () => session,
+            getTargetChat: () => chat,
+            isOwnerCurrent: () => true,
+            publishTargetChat: () => {},
+            invalidateSession: () => session.invalidate(),
+            incrementReloadKeys: () => {},
+        },
+        callbacks: {
+            reformatContent: (value) => value,
+            processOutput: async (data) => ({ data, emoChanged: false }),
+            runCurrentChatParser: (current) => current,
+            runInlay: (data) => ({ text: data }),
+            runOutputTrigger: async () => null,
+            runOutputListeners: async () => {},
+            speak: async () => {},
+            trimIncompleteResponse: (value) => value,
+            markResponseApplied: () => {},
+            onProviderFailure: () => {},
+        },
+    })
+
+    expect(chat.message.at(-1)?.data).toBe('one first')
+    expect(chat.message.at(-1)?.responseVariants?.candidates.map(
+        (candidate) => candidate.messages[0].data,
+    )).toEqual(['one first', 'second', 'third'])
+    result?.release()
+})

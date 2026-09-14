@@ -64,6 +64,7 @@ interface BasicScriptingEngineState {
     operationCharacter?: character|groupChat|simpleCharacterArgument
     selectedCharacterId?: string
     capturedCharacterOwner?: CapturedCharacterOwner
+    ensureConversationOperation?: () => void
     stopSending?: boolean
 }
 
@@ -87,6 +88,7 @@ function clearScriptingEngineInvocationState(state: ScriptingEngineState) {
     state.operationCharacter = undefined
     state.selectedCharacterId = undefined
     state.capturedCharacterOwner = undefined
+    state.ensureConversationOperation = undefined
     state.stopSending = undefined
 }
 
@@ -110,6 +112,7 @@ export async function runScripted(code:string, arg:{
     mode?: string,
     type?: 'lua'|'py'
     operationContext?: ConversationOperationContext
+    createConversationOperation?: () => ConversationOperationContext | undefined
 }){
     const type: 'lua'|'py' = arg.type ?? 'lua'
     if (type === 'py' && isTauriMobile) {
@@ -178,6 +181,21 @@ export async function runScripted(code:string, arg:{
         ScriptingEngineState.operationDatabase = operationDatabase
         ScriptingEngineState.selectedCharacterId = selectedCharacterId
         ScriptingEngineState.capturedCharacterOwner = capturedCharacterOwner
+        let invocationOperationContext = arg.operationContext
+        ScriptingEngineState.ensureConversationOperation = () => {
+            if (invocationOperationContext || !arg.createConversationOperation) return
+            const context = arg.createConversationOperation()
+            if (!context) return
+            invocationOperationContext = context
+            const database = context.createDatabaseView(getDatabase())
+            ScriptingEngineState.chat = context.chat
+            ScriptingEngineState.operationDatabase = database
+            ScriptingEngineState.selectedCharacterId = context.characterId
+            ScriptingEngineState.setVar = (key: string, value: string) =>
+                setChatVarOnConversation(context.chat, key, value)
+            ScriptingEngineState.getVar = (key: string) =>
+                getChatVarFromConversation(database, context.characterId, context.chat, key)
+        }
         ScriptingEngineState.stopSending = false
         if (code !== ScriptingEngineState.code) {
             try {
@@ -203,8 +221,12 @@ export async function runScripted(code:string, arg:{
                     ScriptingEngineState.pyodide?.declareAPI(name, func as any)
                 }
             }
-            const getScriptingDatabase = () =>
-                ScriptingEngineState.operationDatabase ?? getDatabase()
+            const ensureScriptingConversation = () =>
+                ScriptingEngineState.ensureConversationOperation?.()
+            const getScriptingDatabase = () => {
+                ensureScriptingConversation()
+                return ScriptingEngineState.operationDatabase ?? getDatabase()
+            }
             const getScriptingCharacterIndex = (db: Database) => {
                 if (ScriptingEngineState.selectedCharacterId !== undefined) {
                     return db.characters.findIndex(
@@ -253,18 +275,21 @@ export async function runScripted(code:string, arg:{
                 return true
             }
             declareAPI('getChatVar', (id:string,key:string) => {
+                ensureScriptingConversation()
                 return ScriptingEngineState.getVar(key)
             })
             declareAPI('setChatVar', (id:string,key:string, value:string) => {
                 if(!ScriptingSafeIds.has(id) && !ScriptingEditDisplayIds.has(id)){
                     return
                 }
+                ensureScriptingConversation()
                 ScriptingEngineState.setVar(key, value)
             })
             declareAPI('setChatVarChanged', (id:string,key:string, value:string) => {
                 if(!ScriptingSafeIds.has(id) && !ScriptingEditDisplayIds.has(id)){
                     return
                 }
+                ensureScriptingConversation()
                 if(ScriptingEngineState.setVar(key, value) === true){
                     return true
                 }
@@ -310,6 +335,7 @@ export async function runScripted(code:string, arg:{
             })
 
             declareAPI('getChatMain', (id:string, index:number) => {
+                ensureScriptingConversation()
                 const chat = ScriptingEngineState.chat.message.at(index)
                 if(!chat){
                     return JSON.stringify(null)
@@ -323,16 +349,19 @@ export async function runScripted(code:string, arg:{
             })
 
             declareAPI('getChatData', (id:string, index:number) => {
+                ensureScriptingConversation()
                 const chat = ScriptingEngineState.chat.message.at(index)
                 return chat?.data ?? ''
             })
 
             declareAPI('getChatRole', (id:string, index:number) => {
+                ensureScriptingConversation()
                 const chat = ScriptingEngineState.chat.message.at(index)
                 return chat?.role ?? ''
             })
 
             declareAPI('getRecentChatsMain', (id:string, count:number) => {
+                ensureScriptingConversation()
                 const chats = ScriptingEngineState.chat.message
                 const safeCount = Math.max(0, Math.floor(count || 0))
                 const start = Math.max(0, chats.length - safeCount)
@@ -347,6 +376,7 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
+                ensureScriptingConversation()
                 const message = ScriptingEngineState.chat.message?.at(index)
                 if(message){
                     message.data = value ?? ''
@@ -356,6 +386,7 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
+                ensureScriptingConversation()
                 const message = ScriptingEngineState.chat.message?.at(index)
                 if(message){
                     message.role = value === 'user' ? 'user' : 'char'
@@ -365,18 +396,21 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
+                ensureScriptingConversation()
                 ScriptingEngineState.chat.message = ScriptingEngineState.chat.message.slice(start,end)
             })
             declareAPI('removeChat', (id:string, index:number) => {
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
+                ensureScriptingConversation()
                 ScriptingEngineState.chat.message.splice(index, 1)
             })
             declareAPI('addChat', (id:string, role:string, value:string) => {
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
+                ensureScriptingConversation()
                 let roleData:'user'|'char' = role === 'user' ? 'user' : 'char'
                 ScriptingEngineState.chat.message.push({role: roleData, data: value ?? ''})
             })
@@ -384,6 +418,7 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
+                ensureScriptingConversation()
                 let roleData:'user'|'char' = role === 'user' ? 'user' : 'char'
                 ScriptingEngineState.chat.message.splice(index, 0, {role: roleData, data: value ?? ''})
             })
@@ -396,10 +431,12 @@ export async function runScripted(code:string, arg:{
             })
 
             declareAPI('getChatLength', (id:string) => {
+                ensureScriptingConversation()
                 return ScriptingEngineState.chat.message.length
             })
 
             declareAPI('getFullChatMain', (id:string) => {
+                ensureScriptingConversation()
                 const data = JSON.stringify(ScriptingEngineState.chat.message.map((v) => {
                     return {
                         role: v.role,
@@ -423,6 +460,7 @@ export async function runScripted(code:string, arg:{
             })
 
             declareAPI('cbs', (value) => {
+                ensureScriptingConversation()
                 const operationCharacter = ScriptingEngineState.operationCharacter
                 const parserCharacter = operationCharacter?.type === 'simple'
                     ? getScriptingCharacter()
@@ -440,6 +478,7 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
+                ensureScriptingConversation()
                 const realValue = JSON.parse(value)
                 const originals = new Map<string, Chat['message'][number] | null>()
                 for (const message of ScriptingEngineState.chat.message) {
@@ -907,6 +946,7 @@ export async function runScripted(code:string, arg:{
             })
 
             declareAPI('getAuthorsNote', (id:string) => {
+                ensureScriptingConversation()
                 return ScriptingEngineState.chat?.note ?? ''
             })
 
@@ -972,6 +1012,8 @@ export async function runScripted(code:string, arg:{
                 if (ScriptingEngineState.operationCharacter?.type !== 'character') {
                     return
                 }
+
+                ensureScriptingConversation()
 
                 const {
                     alwaysActive = false,
@@ -1157,6 +1199,7 @@ export async function runScripted(code:string, arg:{
             })
 
             declareAPI('getCharacterLastMessage', (id: string) => {
+                ensureScriptingConversation()
                 const chat = ScriptingEngineState.chat
                 if (!chat) {
                     return ''
@@ -1177,6 +1220,7 @@ export async function runScripted(code:string, arg:{
             })
 
             declareAPI('getUserLastMessage', (id: string) => {
+                ensureScriptingConversation()
                 const chat = ScriptingEngineState.chat
                 if (!chat) {
                     return ''
@@ -1195,6 +1239,7 @@ export async function runScripted(code:string, arg:{
             })
 
             declareAPI('getCharacterLastMessage', (id: string) => {
+                ensureScriptingConversation()
                 const chat = ScriptingEngineState.chat
                 if (!chat) {
                     return ''
@@ -1215,6 +1260,7 @@ export async function runScripted(code:string, arg:{
             })
 
             declareAPI('getUserLastMessage', (id: string) => {
+                ensureScriptingConversation()
                 const chat = ScriptingEngineState.chat
                 if (!chat) {
                     return ''
@@ -1752,9 +1798,9 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
         if (!triggers.some((trigger) => trigger?.effect?.[0]?.type === 'triggerlua')) {
             return content
         }
-        if (!operationContext) {
-            ownedOperation = createCurrentConversationOperation(onConversationCommit)
-            operationContext = ownedOperation?.context
+        const createOperation = () => {
+            ownedOperation ??= createCurrentConversationOperation(onConversationCommit)
+            return ownedOperation?.context
         }
 
         for (let trigger of triggers) {
@@ -1766,6 +1812,7 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
                     data,
                     meta,
                     operationContext,
+                    createConversationOperation: operationContext ? undefined : createOperation,
                 })
                 data = runResult.res ?? data
             }
@@ -1776,9 +1823,13 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
         return content
     } finally {
         if (ownedOperation) {
-            ownedOperation.context.commit(peekActiveConversationSession(), {
-                origin: mode === 'editDisplay' ? 'display' : undefined,
-            })
+            if (ownedOperation.context.hasPendingMutations()) {
+                ownedOperation.context.commit(peekActiveConversationSession(), {
+                    origin: mode === 'editDisplay' ? 'display' : undefined,
+                })
+            } else {
+                ownedOperation.context.release()
+            }
         }
     }
 }

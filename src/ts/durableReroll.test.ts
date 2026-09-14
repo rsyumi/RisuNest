@@ -66,6 +66,7 @@ describe('durable response candidates', () => {
             return generate()
         }
         expect(await generateResponseCandidate(f.options)).toBe(true)
+        expect(Object.hasOwn(f.chat, 'rerollRecovery')).toBe(false)
         const reopened = structuredClone(f.persisted())
         expect(reopened.rerollRecovery).toBeUndefined()
         expect(reopened.message.at(-1)?.responseVariants?.candidates).toHaveLength(2)

@@ -18,7 +18,7 @@
     import { type Unsubscriber } from "svelte/store"
     import { v4 as uuidv4 } from 'uuid'
     import { language } from "../../lang"
-    import { alertClear, alertConfirm, alertInput, alertNormal, alertRequestData, alertWait } from "../../ts/alert"
+    import { alertClear, alertConfirm, alertError, alertInput, alertNormal, alertRequestData, alertWait } from "../../ts/alert"
     import { ParseMarkdown, type CbsConditions, type simpleCharacterArgument } from "../../ts/parser/parser.svelte"
     import { getCurrentCharacter, getCurrentChat, setCurrentChat, type character as CharacterRecord, type Message, type MessageGenerationInfo, type StreamingDisplayOptimizationMode } from "../../ts/storage/database.svelte"
     import { selectedCharID } from "../../ts/stores.svelte"
@@ -26,6 +26,7 @@
     import AutoresizeArea from "../UI/GUI/TextAreaResizable.svelte"
     import ChatBody from './ChatBody.svelte'
     import { getStreamingThoughtPreview } from '../../ts/parser/streamingThoughtPreview'
+    import { reportFailedBookmarkOperation } from '../Others/bookmarkOperation'
     import PopupButton from "../UI/PopupButton.svelte";
     import PartialEditController from './PartialEditController.svelte';
     import { getLLMCache, setLLMCache } from "../../ts/translator/translator"
@@ -392,6 +393,11 @@
     function beginPartialEdit() {
         partialEditIntent = captureViewportEditIntent()
         partialEditTarget = partialEditIntent ? null : captureCurrentMessage()
+    }
+
+    function cancelPartialEdit() {
+        partialEditIntent = null
+        partialEditTarget = null
     }
 
     async function rm(e:MouseEvent, rec?:boolean){
@@ -773,27 +779,30 @@
     })
 
     async function toggleBookmark(target: CapturedChatMessageTarget) {
-        await toggleCapturedBookmark(target, chatMessageContext, {
-            requestName: (currentName) => alertInput(
-                language.bookmarkAskNameOrDefault,
-                [],
-                currentName,
-            ),
-            createMessageId: uuidv4,
-            defaultName: (targetMessage) => {
-                const msgSender = targetMessage.role === 'user' ? getUserName() : name
-                const blacklist = ['!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '-', '=', '[', ']', '{', '}', '|', ';', ':', '"', "'", ',', '.', '<', '>', '/', '?']
-                let lines = targetMessage.data.split('\n')
-                lines = lines.splice(Math.floor(lines.length * 0.5))
-                const defaultLine = lines.find((line) =>
-                    line && !blacklist.some((character) => line.startsWith(character)),
-                )
-                const defaultName = defaultLine
-                    ? defaultLine.trim().slice(0, 50) + '...'
-                    : targetMessage.data.slice(0, 50) + '...'
-                return msgSender + '| ' + defaultName
-            },
-        })
+        await reportFailedBookmarkOperation(
+            () => toggleCapturedBookmark(target, chatMessageContext, {
+                requestName: (currentName) => alertInput(
+                    language.bookmarkAskNameOrDefault,
+                    [],
+                    currentName,
+                ),
+                createMessageId: uuidv4,
+                defaultName: (targetMessage) => {
+                    const msgSender = targetMessage.role === 'user' ? getUserName() : name
+                    const blacklist = ['!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '-', '=', '[', ']', '{', '}', '|', ';', ':', '"', "'", ',', '.', '<', '>', '/', '?']
+                    let lines = targetMessage.data.split('\n')
+                    lines = lines.splice(Math.floor(lines.length * 0.5))
+                    const defaultLine = lines.find((line) =>
+                        line && !blacklist.some((character) => line.startsWith(character)),
+                    )
+                    const defaultName = defaultLine
+                        ? defaultLine.trim().slice(0, 50) + '...'
+                        : targetMessage.data.slice(0, 50) + '...'
+                    return msgSender + '| ' + defaultName
+                },
+            }),
+            () => alertError(language.bookmarkActionFailed),
+        )
     }
 </script>
 
@@ -956,6 +965,7 @@
                 translatedView={translated}
                 getTranslationEditContext={getTranslationPartialEditContext}
                 on:start={beginPartialEdit}
+                on:cancel={cancelPartialEdit}
                 on:save={handlePartialEditSave}
             />
         {/if}

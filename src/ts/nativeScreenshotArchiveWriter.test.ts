@@ -228,6 +228,60 @@ describe('Android screenshot archive writer', () => {
             .toHaveBeenCalledExactlyOnceWith('saf-request-1')
     })
 
+    it('fails publication when the SAF copy length differs from the native handoff', async () => {
+        const { calls, dependencies } = androidHarness()
+        dependencies.copyToAndroidSaf.mockResolvedValueOnce({
+            requestId: 'saf-request-1',
+            bytes: 6,
+            warningCodes: [],
+        })
+        const writer = await createAndroidScreenshotArchiveWriter('chat.zip', dependencies)
+
+        await expect(writer.close()).rejects.toMatchObject({
+            code: 'length-mismatch',
+            warningCodes: ['partial-destination-may-remain'],
+        })
+
+        expect(calls.filter(([command]) =>
+            command === 'native_file_job_screenshot_output_release')).toHaveLength(1)
+        expect(dependencies.acknowledgeAndroidSafExport)
+            .toHaveBeenCalledExactlyOnceWith('saf-request-1')
+        expect(dependencies.warn).not.toHaveBeenCalledWith('length-mismatch')
+    })
+
+    it('does not reconcile cancellation as success when a committed SAF copy mismatches', async () => {
+        const { calls, dependencies } = androidHarness()
+        type CopyResult = { requestId: string; bytes: number; warningCodes: string[] }
+        let finishCopy!: (result: CopyResult) => void
+        dependencies.copyToAndroidSaf.mockImplementationOnce(() =>
+            new Promise<CopyResult>((resolve) => {
+                finishCopy = (result) => resolve(result)
+            }),
+        )
+        const controller = new AbortController()
+        const writer = await createAndroidScreenshotArchiveWriter('chat.zip', dependencies)
+        const archive = createStreamingScreenshotArchive(writer)
+        await archive.addPage(1, new Blob(['page'], { type: 'image/png' }))
+
+        const close = archive.close(controller.signal)
+        await vi.waitFor(() => expect(dependencies.copyToAndroidSaf).toHaveBeenCalledOnce())
+        controller.abort()
+        finishCopy({
+            requestId: 'saf-request-1',
+            bytes: 6,
+            warningCodes: [],
+        })
+
+        await expect(close).rejects.toMatchObject({
+            code: 'length-mismatch',
+            warningCodes: ['partial-destination-may-remain'],
+        })
+        expect(calls.filter(([command]) =>
+            command === 'native_file_job_screenshot_output_release')).toHaveLength(1)
+        expect(dependencies.acknowledgeAndroidSafExport)
+            .toHaveBeenCalledExactlyOnceWith('saf-request-1')
+    })
+
     it('cancels SAF and releases the owned spool without reporting publication', async () => {
         const { calls, dependencies } = androidHarness()
         let sourceAvailable = true

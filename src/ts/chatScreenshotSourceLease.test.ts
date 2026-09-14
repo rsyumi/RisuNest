@@ -437,6 +437,66 @@ describe('chat screenshot source lease', () => {
         expect(source.release).toHaveBeenCalledTimes(2)
     })
 
+    it('allows close to retry after both immediate release attempts fail', async () => {
+        const source = harness([{ role: 'user', data: 'open' }])
+        const firstError = new Error('first release failure')
+        source.release
+            .mockRejectedValueOnce(firstError)
+            .mockRejectedValueOnce(new Error('second release failure'))
+            .mockResolvedValueOnce(undefined)
+        const lease = await openChatScreenshotSourceLease({
+            characterId: source.owner.chaId,
+            chatId: source.conversation.id!,
+            renderContext: renderContext(source.owner),
+        }, source.dependencies)
+
+        await expect(lease.close()).rejects.toBe(firstError)
+        await expect(lease.close()).resolves.toBeUndefined()
+
+        expect(source.release).toHaveBeenCalledTimes(3)
+    })
+
+    it('preserves cancellation when releasing the pinned revision also fails', async () => {
+        const source = harness([{ role: 'user', data: 'open' }])
+        const lease = await openChatScreenshotSourceLease({
+            characterId: source.owner.chaId,
+            chatId: source.conversation.id!,
+            renderContext: renderContext(source.owner),
+        }, source.dependencies)
+        const controller = new AbortController()
+        controller.abort()
+        source.release
+            .mockRejectedValueOnce(new Error('first release failure'))
+            .mockRejectedValueOnce(new Error('second release failure'))
+            .mockResolvedValueOnce(undefined)
+
+        await expect(lease.createJob(1, 1, controller.signal)).rejects.toMatchObject({
+            name: 'AbortError',
+        })
+        await expect(lease.close()).resolves.toBeUndefined()
+
+        expect(source.release).toHaveBeenCalledTimes(3)
+    })
+
+    it('reports release failure after a successful job and permits a close retry', async () => {
+        const source = harness([{ role: 'user', data: 'open' }])
+        const firstError = new Error('first release failure')
+        source.release
+            .mockRejectedValueOnce(firstError)
+            .mockRejectedValueOnce(new Error('second release failure'))
+            .mockResolvedValueOnce(undefined)
+        const lease = await openChatScreenshotSourceLease({
+            characterId: source.owner.chaId,
+            chatId: source.conversation.id!,
+            renderContext: renderContext(source.owner),
+        }, source.dependencies)
+
+        await expect(lease.createJob(1, 1)).rejects.toBe(firstError)
+        await expect(lease.close()).resolves.toBeUndefined()
+
+        expect(source.release).toHaveBeenCalledTimes(3)
+    })
+
     it('releases the pinned revision when materialization is cancelled', async () => {
         const source = harness([{ role: 'user', data: 'open' }])
         const lease = await openChatScreenshotSourceLease({

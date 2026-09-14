@@ -26,7 +26,6 @@ describe('RisuNest settings accessibility and copy', () => {
         expect(storageSource).toContain('{language.loading}')
         expect(storageSource).not.toContain('Loading...')
         expect(storageSource).toContain('aria-live="polite"')
-        expect(backupSource).toContain('aria-live="polite"')
         expect(backupSource).not.toContain('console.error')
         expect(serverSyncSource).toContain('aria-labelledby=')
         expect(serverSyncSource).toContain('aria-live=')

@@ -1,6 +1,10 @@
 import { strFromU8, unzipSync } from 'fflate'
 import { describe, expect, it, vi } from 'vitest'
-import { createStreamingScreenshotArchive } from './chatScreenshotArchive'
+import {
+    SCREENSHOT_ARCHIVE_MAX_BYTES,
+    SCREENSHOT_ARCHIVE_MAX_ENTRIES,
+    createStreamingScreenshotArchive,
+} from './chatScreenshotArchive'
 
 function blob(text: string) {
     return new Blob([text], { type: 'image/png' })
@@ -92,6 +96,85 @@ describe('streaming screenshot archive', () => {
         await expect(archive.addPage(1, blob('page'))).rejects.toThrow('disk full')
         expect(writer.abort).toHaveBeenCalledOnce()
         expect(writer.close).not.toHaveBeenCalled()
+    })
+
+    it('aborts before adding a page beyond the ZIP32 entry limit', async () => {
+        const writer = {
+            write: vi.fn(async () => {}),
+            close: vi.fn(async () => {}),
+            abort: vi.fn(async () => {}),
+        }
+        const archive = createStreamingScreenshotArchive(writer)
+
+        await expect(archive.addPage(
+            SCREENSHOT_ARCHIVE_MAX_ENTRIES + 1,
+            blob('page'),
+        )).rejects.toThrow('ZIP32 entry limit')
+
+        expect(writer.write).not.toHaveBeenCalled()
+        expect(writer.abort).toHaveBeenCalledOnce()
+    })
+
+    it('aborts before streaming a page that cannot fit in ZIP32', async () => {
+        const writer = {
+            write: vi.fn(async () => {}),
+            close: vi.fn(async () => {}),
+            abort: vi.fn(async () => {}),
+        }
+        const page = blob('page')
+        Object.defineProperty(page, 'size', { value: SCREENSHOT_ARCHIVE_MAX_BYTES + 1 })
+        const archive = createStreamingScreenshotArchive(writer)
+
+        await expect(archive.addPage(1, page)).rejects.toThrow('ZIP32 size limit')
+
+        expect(writer.write).not.toHaveBeenCalled()
+        expect(writer.abort).toHaveBeenCalledOnce()
+    })
+
+    it('aborts before cumulative page bytes exceed the ZIP32 size limit', async () => {
+        const writer = {
+            write: vi.fn(async () => {}),
+            close: vi.fn(async () => {}),
+            abort: vi.fn(async () => {}),
+        }
+        const first = blob('first')
+        const second = blob('second')
+        const firstSize = Math.floor(SCREENSHOT_ARCHIVE_MAX_BYTES / 2)
+        Object.defineProperty(first, 'size', { value: firstSize })
+        Object.defineProperty(second, 'size', {
+            value: SCREENSHOT_ARCHIVE_MAX_BYTES - firstSize + 1,
+        })
+        const archive = createStreamingScreenshotArchive(writer)
+
+        await archive.addPage(1, first)
+        await expect(archive.addPage(2, second)).rejects.toThrow('ZIP32 size limit')
+
+        expect(writer.write).toHaveBeenCalled()
+        expect(writer.abort).toHaveBeenCalledOnce()
+    })
+
+    it('handles an emitted ZIP overhead overflow and preserves it across abort failure', async () => {
+        const writer = {
+            write: vi.fn(async (_chunk: Uint8Array) => {}),
+            close: vi.fn(async () => {}),
+            abort: vi.fn(async () => {
+                throw new Error('abort cleanup failed')
+            }),
+        }
+        const page = blob('page')
+        const archive = createStreamingScreenshotArchive(writer, {
+            maxEntries: SCREENSHOT_ARCHIVE_MAX_ENTRIES,
+            maxBytes: page.size + 1,
+        })
+
+        await expect(archive.addPage(1, page)).rejects.toThrow(
+            'Screenshot archive exceeds the ZIP32 size limit',
+        )
+        await new Promise((resolve) => setTimeout(resolve, 0))
+
+        expect(writer.write).toHaveBeenCalledOnce()
+        expect(writer.write.mock.calls[0][0]).toHaveLength(page.size)
+        expect(writer.abort).toHaveBeenCalledOnce()
     })
 
     it('aborts instead of completing when cancellation arrives during close', async () => {

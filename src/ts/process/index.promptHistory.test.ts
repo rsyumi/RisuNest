@@ -102,7 +102,6 @@ vi.mock('./files/inlays', async () => (await import('./tests/sendChatTestHarness
 vi.mock('./models/modelString', async () => (await import('./tests/sendChatTestHarness')).modelStringModule())
 vi.mock('../sync/multiuser', async () => (await import('./tests/sendChatTestHarness')).multiuserModule())
 vi.mock('./inlayScreen', () => ({ runInlayScreen: vi.fn() }))
-vi.mock('./prereroll', async () => (await import('./tests/sendChatTestHarness')).prerollModule())
 vi.mock('./transformers', async () => (await import('./tests/sendChatTestHarness')).transformersModule({
     runImageEmbedding: vi.fn(async () => []),
 }))

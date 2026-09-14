@@ -68,6 +68,10 @@ function readAndroidHandoff(result: unknown): { bytes: number; sourcePath: strin
     return { bytes: value.bytes, sourcePath: value.sourcePath }
 }
 
+function androidPublicationError(code: string, message: string, warningCodes: string[] = []) {
+    return Object.assign(new Error(message), { code, warningCodes })
+}
+
 async function appendNativeChunk(
     jobId: string,
     chunk: Uint8Array,
@@ -231,11 +235,15 @@ class AndroidScreenshotArchiveWriter implements ScreenshotArchiveWriter {
             this.destinationCommitted = true
             for (const warningCode of warningCodes(published)) this.dependencies.warn(warningCode)
             if (published.bytes !== handoff.bytes) {
-                this.dependencies.warn('length-mismatch')
+                throw androidPublicationError(
+                    'length-mismatch',
+                    'Android screenshot output length does not match its native handoff',
+                    ['partial-destination-may-remain'],
+                )
             }
         }
         catch (error) {
-            this.destinationRequestId = readAndroidSafRequestId(error)
+            this.destinationRequestId = readAndroidSafRequestId(error) ?? this.destinationRequestId
             throw error
         }
         finally {
@@ -296,12 +304,15 @@ class AndroidScreenshotArchiveWriter implements ScreenshotArchiveWriter {
                 // The SAF path reports cancellation by rejecting publication.
             }
             await nativeCancellation
+            if (this.publicationError) {
+                this.state = 'aborted'
+                throw this.publicationError
+            }
             if (this.destinationCommitted) {
                 this.state = 'closed'
                 return false
             }
             this.state = 'aborted'
-            if (this.publicationError) throw this.publicationError
             return true
         }
         await nativeCancellation

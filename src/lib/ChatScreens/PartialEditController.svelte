@@ -36,6 +36,7 @@
 
     const dispatch = createEventDispatcher<{
         start: void;
+        cancel: void;
         save: {
             newData: string;
             target: PartialEditTarget;
@@ -401,6 +402,7 @@
             matchingState.targetElement.innerHTML = matchingState.originalHTML;
         }
         closeEdit();
+        dispatch('cancel');
     }
 
     // Close edit mode
@@ -436,6 +438,7 @@
     // Cancel deletion
     function handleCancelDelete() {
         closeDeleteConfirm();
+        dispatch('cancel');
     }
 
     // Close delete confirmation
