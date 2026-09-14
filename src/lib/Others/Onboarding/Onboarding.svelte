@@ -582,7 +582,7 @@
                             {job.currentItem}
                         </p>{/if}
                     {#if job.counters.length > 0}
-                        <dl class="counts">
+                        <dl class="counts" style:--cards={job.counters.length}>
                             {#each job.counters as counter (counter.key)}
                                 <div>
                                     <dt>{counter.label}</dt>
@@ -830,7 +830,10 @@
                                 </p>
                                 {#if hubView}
                                     {@render stageList(hubView.stages)}
-                                    <dl class="counts">
+                                    <dl
+                                        class="counts"
+                                        style:--cards={hubView.counters.length}
+                                    >
                                         {#each hubView.counters as counter (counter.key)}
                                             <div>
                                                 <dt>{counter.label}</dt>
@@ -1728,17 +1731,22 @@
         font-size: 12px;
         color: var(--o-faint);
     }
-    /* The same two-then-four column grid as the shared import dialog. */
+    /* As many columns as fit, so a wide panel lays every card out in one row
+       and a phone keeps three or four per row. The row stops growing at 160px
+       per card, which keeps a two-card set card-sized. */
     .counts {
         display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(84px, 1fr));
         gap: 8px;
+        max-width: calc(var(--cards) * 160px + (var(--cards) - 1) * 8px);
         margin: 0 0 16px;
     }
     .counts div {
-        padding: 8px 10px;
+        min-width: 0;
+        padding: 8px;
         border: 1px solid var(--o-line);
         border-radius: 10px;
+        overflow-wrap: anywhere;
     }
     .counts dt {
         font-size: 12px;
@@ -2002,9 +2010,6 @@
         }
         .panel-foot {
             margin-top: 28px;
-        }
-        .counts {
-            grid-template-columns: repeat(4, minmax(0, 1fr));
         }
     }
 

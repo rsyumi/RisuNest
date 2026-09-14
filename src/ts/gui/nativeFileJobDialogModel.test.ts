@@ -124,6 +124,8 @@ describe('nativeFileJobDialogModel', () => {
             'assets=–',
             'inlays=–',
             'coldStorage=–',
+            'pocketMedia=–',
+            'skipped=–',
         ])
         expect(model.cancelVisible).toBe(true)
         expect(model.cancelEnabled).toBe(true)
@@ -589,6 +591,8 @@ describe('nativeFileJobDialogModel', () => {
             'assets=4',
             'inlays=3',
             'coldStorage=2',
+            'pocketMedia=0',
+            'skipped=0',
         ])
         expect(model.warnings).toEqual([
             copy.warningCleanupFailed,

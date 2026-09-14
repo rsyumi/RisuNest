@@ -386,24 +386,17 @@ function buildCounters(
                 label: copy.countColdStorage,
                 value: known(counts?.coldStorage),
             },
+            {
+                key: 'pocketMedia',
+                label: copy.countPocketMedia,
+                value: known(counts?.pocketMedia),
+            },
+            {
+                key: 'skipped',
+                label: copy.countSkipped,
+                value: known(counts?.skipped),
+            },
         )
-        if (
-            counts &&
-            counts.pocketMedia + counts.pocketMetadata + counts.skipped > 0
-        ) {
-            rows.push(
-                {
-                    key: 'pocketMedia',
-                    label: copy.countPocketMedia,
-                    value: formatCount(counts.pocketMedia),
-                },
-                {
-                    key: 'skipped',
-                    label: copy.countSkipped,
-                    value: formatCount(counts.skipped),
-                },
-            )
-        }
     }
     return rows
 }
