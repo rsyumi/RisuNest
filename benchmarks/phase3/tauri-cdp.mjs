@@ -669,8 +669,9 @@ async function runBenchmark(options) {
             page.call('Performance.enable'),
             page.call('Network.enable'),
         ])
-        // 측정하는 번들은 프로덕션과 동일하게 두고, RisuRealm만 브라우저 레벨에서
-        // 끊는다. 제3자 카드와 이미지가 이 세션의 화면이나 로그에 들어오지 못한다.
+        // Keep the measured bundle identical to production and cut only RisuRealm
+        // at the browser level, so third-party cards and images cannot reach this
+        // session's screen or logs.
         await page.call('Network.setBlockedURLs', { urls: REALM_BLOCKED_URL_PATTERNS })
         await evaluate(page, INSTALL_LONG_TASK_OBSERVER)
         await waitForInteractive(page, options.timeoutMs)

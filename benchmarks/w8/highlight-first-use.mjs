@@ -210,8 +210,9 @@ async function main() {
         await client.call('Page.enable')
         await client.call('Network.enable')
         await client.call('Network.setCacheDisabled', { cacheDisabled: true })
-        // 이 엔트리는 ParseMarkdown만 묶어 Realm에 닿을 수 없지만, 다른 CDP 러너와
-        // 같은 세션 차단을 걸어 두어 "모든 벤치마크 러너가 Realm을 막는다"를 유지한다.
+        // This entry bundles only ParseMarkdown and cannot reach Realm, but it takes
+        // the same session block as the other CDP runners so that "every benchmark
+        // runner blocks Realm" stays true.
         await client.call('Network.setBlockedURLs', { urls: REALM_BLOCKED_URL_PATTERNS })
 
         const samples = []

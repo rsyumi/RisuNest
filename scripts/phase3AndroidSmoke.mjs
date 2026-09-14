@@ -80,17 +80,19 @@ function parseArguments(argv) {
     return { command, options }
 }
 
-// 이 스모크는 adb만 쓰고 앱도 로컬 persistent store만 검증하므로 네트워크가 전혀
-// 필요 없다. 그래서 아예 끊는다. RisuRealm 목록과 카드 이미지가 screencap이나
-// logcat을 타고 나올 수 없게 만드는 가장 확실한 지점이다.
+// This smoke test only drives adb, and the app it exercises only verifies the
+// local persistent store, so it needs no network at all. Cutting networking
+// outright is the surest way to keep RisuRealm listings and card images out of
+// screencap and logcat.
 //
-// 명령의 종료 코드는 믿지 않는다. `svc wifi disable`은 eth0으로 나가는 에뮬레이터
-// 이미지에서 0을 돌려주면서도 아무것도 끊지 않는다. 그래서 ConnectivityService가
-// 보고하는 기본 네트워크가 사라질 때까지 기다렸다가, 남아 있으면 거부한다.
-// `run`과 `sleep`은 테스트에서 adb 없이 돌리기 위한 주입 지점이다.
+// Exit codes are not trusted. `svc wifi disable` returns 0 on emulator images
+// that route through eth0 while disconnecting nothing, so wait until the default
+// network reported by ConnectivityService is gone and refuse if it is still
+// there. `run` and `sleep` are injection points for running this without adb in
+// tests.
 export async function cutDeviceNetwork(serial, { run = adb, sleep = delay, attempts = 20 } = {}) {
-    // 라디오 명령은 기기와 API 레벨에 따라 있고 없고가 달라 실패를 허용한다.
-    // 실제 검증은 아래 dumpsys 확인이 한다.
+    // Radio commands come and go with the device and API level, so failures are
+    // tolerated here. The dumpsys check below is what actually verifies the state.
     run(serial, ['shell', 'cmd', 'connectivity', 'airplane-mode', 'enable'], { allowFailure: true })
     run(serial, ['shell', 'svc', 'wifi', 'disable'], { allowFailure: true })
     run(serial, ['shell', 'svc', 'data', 'disable'], { allowFailure: true })
@@ -114,7 +116,7 @@ export async function cutDeviceNetwork(serial, { run = adb, sleep = delay, attem
     )
 }
 
-// ConnectivityService.dump()가 찍는 "Active default network: <netId|none>" 줄을 읽는다.
+// Reads the "Active default network: <netId|none>" line that ConnectivityService.dump() prints.
 function readActiveDefaultNetwork(serial, run) {
     const dump = String(run(serial, ['shell', 'dumpsys', 'connectivity'], { allowFailure: true }).stdout || '')
     const match = dump.match(/^Active default network:\s*(\S+)/m)
@@ -467,7 +469,7 @@ async function main() {
     }
 }
 
-// 테스트가 cutDeviceNetwork를 import할 수 있도록, 직접 실행됐을 때만 main을 돌린다.
+// Run main only when invoked directly, so tests can import cutDeviceNetwork.
 const invokedDirectly =
     Boolean(process.argv[1]) && import.meta.url === pathToFileURL(resolve(process.argv[1])).href
 if (invokedDirectly) {

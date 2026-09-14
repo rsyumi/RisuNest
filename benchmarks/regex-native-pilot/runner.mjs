@@ -274,7 +274,7 @@ async function runPilot(options) {
         await page.connect(options.timeoutMs)
         await page.call('Runtime.enable')
         await page.call('Network.enable')
-        // RisuRealm만 브라우저 레벨에서 끊는다. 측정 번들은 프로덕션과 동일하다.
+        // Cut RisuRealm at the browser level only. The measured bundle stays identical to production.
         await page.call('Network.setBlockedURLs', { urls: REALM_BLOCKED_URL_PATTERNS })
         await waitForPilot(page, options.timeoutMs)
         const pilot = await evaluate(page, 'globalThis.__RISUNEST_REGEX_NATIVE_PILOT__.run()')
