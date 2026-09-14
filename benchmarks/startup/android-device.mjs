@@ -16,6 +16,7 @@ const packageName = 'io.github.rsyumi.risunest'
 const port = 19367
 const directory = path.resolve(options.directory ?? '.tmp/external-storage-m0/android')
 const runs = Number(options.runs ?? 20)
+const kinds = options.kind ? [options.kind] : ['reload', 'restart']
 const apk = path.resolve(options.apk ?? '.tmp/external-storage-m0/android-agent.apk')
 let phase = 'preflight'
 let client
@@ -120,6 +121,8 @@ function memory() {
 }
 
 async function main() {
+    if (kinds.some((kind) => !['reload', 'restart'].includes(kind)))
+        throw new Error('Invalid measurement kind')
     if (!/^[0-9a-f]{40}$/.test(options.revision ?? ''))
         throw new Error('Explicit build revision required')
     if (!adb || !/^[a-zA-Z0-9]+$/.test(serial ?? '') || !Number.isSafeInteger(runs) || runs < 1)
@@ -370,10 +373,10 @@ async function main() {
         if (!sample.interaction?.success || sample.stabilizationTimeout)
             throw new Error('Android baseline sample failed')
     }
-    await measure('reload', true)
-    for (let i = 0; i < runs; i++) await measure('reload')
-    await measure('restart', true)
-    for (let i = 0; i < runs; i++) await measure('restart')
+    for (const kind of kinds) {
+        await measure(kind, true)
+        for (let i = 0; i < runs; i++) await measure(kind)
+    }
 }
 
 try {
@@ -386,6 +389,9 @@ try {
             timeout: String(error?.message).includes('timed out'),
             pageFailure: String(error?.message).includes('page evaluation'),
             adbFailure: String(error?.message).includes('Android benchmark command'),
+            cdpConnectionFailure: error?.message === 'CDP connection failed',
+            cdpCommandFailure: error?.message === 'CDP command failed',
+            hidden: error?.message === 'Android app is hidden; unlock the device before measuring',
         }),
     )
     process.exitCode = 1

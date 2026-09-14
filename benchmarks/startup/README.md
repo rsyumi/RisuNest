@@ -143,6 +143,12 @@ large debug-build snapshot can exceed the ordinary CDP command timeout. This
 setup time is excluded from the samples and does not relax their startup,
 interaction or stabilization checks.
 
+Use `--kind=reload` or `--kind=restart` to collect a complete group separately,
+including its own warmup. Preserve an interrupted group's raw output and rerun
+that entire group; do not top it up with selected successful rows. When combining
+complete groups, record their source files and require matching product revision,
+APK hash and fixture. Both groups still need twenty valid samples.
+
 The optional `android-smoke.mjs` uses only `emulator-5580` named
 `risunest_startup_synthetic`, with a private ADB server on port 5038. Create that
 AVD with isolated, disposable synthetic data and launch it with `-no-window`.

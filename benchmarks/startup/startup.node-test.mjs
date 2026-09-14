@@ -18,6 +18,69 @@ import { startupInstrumentation } from './android-observation.mjs'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import ts from 'typescript'
+import { connectVerifiedIdentity } from './cdp.mjs'
+
+test('CDP retries a disappearing endpoint and still verifies identity before returning', async (t) => {
+    const originalWebSocket = globalThis.WebSocket
+    t.after(() => {
+        globalThis.WebSocket = originalWebSocket
+    })
+    const sockets = []
+    t.mock.method(globalThis, 'fetch', async () => ({
+        json: async () => [{ type: 'page', webSocketDebuggerUrl: 'ws://synthetic' }],
+    }))
+    globalThis.WebSocket = class {
+        closed = false
+        methods = []
+        constructor() {
+            this.index = sockets.push(this)
+            queueMicrotask(() => (this.index === 1 ? this.onerror() : this.onopen()))
+        }
+        close() {
+            this.closed = true
+        }
+        send(encoded) {
+            const { id, method } = JSON.parse(encoded)
+            this.methods.push(method)
+            queueMicrotask(() =>
+                this.onmessage({
+                    data: JSON.stringify({
+                        id,
+                        result:
+                            method === 'Runtime.evaluate'
+                                ? { result: { value: this.index === 3 } }
+                                : {},
+                    }),
+                }),
+            )
+        }
+    }
+    const client = await connectVerifiedIdentity(12345, 'synthetic', 1000)
+    assert.equal(sockets.length, 3)
+    assert.equal(sockets[0].closed, true)
+    assert.equal(sockets[1].closed, true)
+    assert.equal(sockets[2].closed, false)
+    assert.ok(
+        sockets[2].methods.indexOf('Network.setBlockedURLs') <
+            sockets[2].methods.indexOf('Runtime.evaluate'),
+    )
+    client.close()
+    assert.equal(sockets[2].closed, true)
+    let failedSocketsClosed = 0
+    globalThis.WebSocket = class {
+        constructor() {
+            queueMicrotask(() => this.onerror())
+        }
+        close() {
+            failedSocketsClosed++
+        }
+    }
+    await assert.rejects(
+        connectVerifiedIdentity(12345, 'synthetic', 20),
+        /Verified isolated CDP target unavailable/,
+    )
+    assert.ok(failedSocketsClosed > 0)
+})
 
 test('M0 summary rejects a missing per-sample commit even when aggregate count is sufficient', async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'risunest-m0-summary-'))

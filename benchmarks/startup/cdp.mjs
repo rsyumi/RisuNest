@@ -34,10 +34,15 @@ export async function connectVerifiedIdentity(port, identifier, timeoutMs = 120_
         }
         for (const target of targets.filter((item) => item.type === 'page')) {
             const ws = new WebSocket(target.webSocketDebuggerUrl)
-            await new Promise((resolve, reject) => {
-                ws.onopen = resolve
-                ws.onerror = () => reject(new Error('CDP connection failed'))
-            })
+            try {
+                await new Promise((resolve, reject) => {
+                    ws.onopen = resolve
+                    ws.onerror = () => reject(new Error('CDP connection failed'))
+                })
+            } catch {
+                ws.close()
+                continue
+            }
             let sequence = 0
             const pending = new Map()
             ws.onmessage = ({ data }) => {
