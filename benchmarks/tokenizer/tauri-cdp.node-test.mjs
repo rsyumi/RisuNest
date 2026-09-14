@@ -43,7 +43,7 @@ test('benchmark config isolates the Windows profile and disables bundling', () =
     const config = buildBenchmarkConfig(original, 9333, 'run-123')
     assert.equal(config.identifier, 'RisuNest.tokenizerbenchmark.run123')
     assert.equal(config.bundle.active, false)
-    assert.equal(config.build.beforeBuildCommand, 'pnpm benchmark:tokenizer:build:agent')
+    assert.equal(config.build.beforeBuildCommand, 'pnpm exec vite build --mode agent --config benchmarks/tokenizer/vite.config.ts')
     assert.match(config.build.frontendDist.replaceAll('\\', '/'), /benchmarks\/tokenizer\/dist$/)
     assert.match(config.app.windows[0].additionalBrowserArgs, /--remote-debugging-port=9333/)
     assert.equal(original.app.windows[0].additionalBrowserArgs, undefined)

@@ -12,7 +12,7 @@ It never launches the installed product or reads its data.
 ```sh
 pnpm install --frozen-lockfile
 pnpm build:agent
-pnpm benchmark:macos:build:agent
+pnpm exec vite build --mode agent --config benchmarks/macos/vite.config.ts
 node benchmarks/macos/prepare.mjs
 export CARGO_TARGET_DIR="$PWD/src-tauri/target"
 export APPLE_SIGNING_IDENTITY=-

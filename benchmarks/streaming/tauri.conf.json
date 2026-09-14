@@ -1,6 +1,6 @@
 {
   "build": {
-    "beforeBuildCommand": "pnpm benchmark:streaming:build:agent",
+    "beforeBuildCommand": "pnpm exec vite build --mode agent --config benchmarks/streaming/vite.config.ts",
     "frontendDist": "../benchmarks/streaming/dist"
   }
 }

@@ -1,7 +1,7 @@
 {
   "identifier": "io.github.rsyumi.risunest.linux.bench",
   "build": {
-    "beforeBuildCommand": "pnpm benchmark:linux:build:agent",
+    "beforeBuildCommand": "pnpm exec vite build --mode agent --config benchmarks/linux/vite.config.ts",
     "frontendDist": "../benchmarks/linux/dist"
   },
   "bundle": { "active": false }

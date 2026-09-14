@@ -84,7 +84,7 @@ export function buildBenchmarkConfig(original, port, runId, repositoryRoot = pro
         ...structuredClone(original),
         build: {
             ...original.build,
-            beforeBuildCommand: 'pnpm benchmark:tokenizer:build:agent',
+            beforeBuildCommand: 'pnpm exec vite build --mode agent --config benchmarks/tokenizer/vite.config.ts',
             frontendDist: path.resolve(repositoryRoot, 'benchmarks/tokenizer/dist'),
         },
         identifier: `RisuNest.tokenizerbenchmark.${safeRunId}`,
