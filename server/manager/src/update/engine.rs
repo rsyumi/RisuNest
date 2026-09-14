@@ -1346,13 +1346,15 @@ mod tests {
         drop(lock);
         drop(try_lock(root.path()).unwrap());
 
+        let install = install_path(&server).unwrap();
+        let install_parent = install.parent().unwrap().to_owned();
         InstallTransaction::new(
             "1.0.0".into(),
             "2.0.0".into(),
             TransactionKind::Directory,
-            install_path(&server).unwrap(),
-            root.path().join(".risunest-sync-update-stage"),
-            root.path().join(".risunest-sync-update-backup"),
+            install,
+            install_parent.join(".risunest-sync-update-stage"),
+            install_parent.join(".risunest-sync-update-backup"),
             Vec::new(),
             false,
         )
