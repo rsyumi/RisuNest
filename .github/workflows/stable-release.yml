@@ -17,5 +17,5 @@ jobs:
       tag: ${{ github.ref_name }}
       source_ref: ${{ github.sha }}
       publish: true
-      bootstrap: false
+      bootstrap: ${{ vars.RISUNEST_RELEASE_BOOTSTRAP == 'true' }}
     secrets: inherit
