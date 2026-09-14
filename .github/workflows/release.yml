@@ -174,6 +174,7 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev
       - run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --target ${{ matrix.target }}
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --package tauri-plugin-updater --release --locked --target ${{ matrix.target }} --lib
 
   app-android-tests:
     if: inputs.product == 'app'
@@ -474,6 +475,14 @@ jobs:
           pnpm exec -- tauri build --target "$TARGET" --bundles "$BUNDLES" --config "$RUNNER_TEMP/release-tauri.json" -- --locked
           node scripts/release/package-app.mjs --kind desktop --os "$OS" --arch "$ARCH" --bundle-dir "$CARGO_TARGET_DIR/$TARGET/release/bundle" --binary release-work/app-binary --release-input release-input.json --output release-work/packages
           node scripts/release/build.mjs --release-input release-input.json --leg "desktop_${OS}_${ARCH}" --assets-json release-work/packages/assets.json --output release-out --public-key "$RISUNEST_UPDATE_PUBLIC_KEY"
+      - name: Verify the produced macOS archive with the production updater
+        if: matrix.os == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RISUNEST_MAC_UPDATE_ARCHIVE="$CARGO_TARGET_DIR/${{ matrix.target }}/release/bundle/macos/RisuNest.app.tar.gz"
+          cargo test --manifest-path src-tauri/Cargo.toml --package tauri-plugin-updater --target '${{ matrix.target }}' --release --locked --lib updater::tests::produced_macos_archive_replaces_disposable_app_and_preserves_sibling_data -- --ignored --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/app-update-install.log"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/app-update-install.log"
       - name: Upload final assets to draft
         if: inputs.publish == true
         env:
