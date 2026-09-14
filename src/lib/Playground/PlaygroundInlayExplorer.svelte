@@ -5,10 +5,12 @@
   import { language } from 'src/lang'
   import { alertConfirm } from 'src/ts/alert'
   import { listInlayAssetMetadata, removeInlayAsset } from 'src/ts/process/files/inlays'
+  import { summarizeInlayAssets } from 'src/ts/process/files/inlayInventory'
   import { getInlayRenderSource } from 'src/ts/process/files/inlayRenderSource'
   import type { InlayRenderSource } from 'src/ts/process/files/inlayRenderSource'
   import { isTauri } from 'src/ts/platform'
   import type { InlayBlobMetadata } from 'src/ts/storage/blobStore'
+  import { formatRisuNestStorageBytes } from 'src/ts/storage/risuNestStorageDashboard'
   import Button from '../UI/GUI/Button.svelte'
   import CheckInput from '../UI/GUI/CheckInput.svelte'
   import { loadMediaSource } from '../UI/mediaSource'
@@ -28,6 +30,12 @@
   const displayedAssets = $derived(allAssets.slice(0, displayCount))
   const hasMore = $derived(displayCount < allAssets.length)
   const hasSelection = $derived(selection.size > 0)
+  const inventory = $derived(summarizeInlayAssets(allAssets))
+  const extensionSummary = $derived(
+    [...inventory.images, ...inventory.others]
+      .map((entry) => `${entry.ext || language.risuNest.inlay.inventoryNoExtension} ${entry.count.toLocaleString()}`)
+      .join(' · '),
+  )
 
   const getPreviewURL = async (asset: InlayBlobMetadata) => {
     const id = asset.key
@@ -257,6 +265,9 @@
 <header class="flex flex-wrap gap-4 py-6 items-center sticky top-0 bg-bgcolor">
   <span class="text-textcolor2">{language.playground.inlayTotalAssets.replace('{count}', allAssets.length.toString())}</span>
   {#if allAssets.length > 0}
+    <span data-inlay-extension-summary class="text-textcolor2 min-w-0 text-sm break-words"
+      >{formatRisuNestStorageBytes(inventory.total.bytes)} · {extensionSummary}</span
+    >
     <div class="flex gap-2 ml-auto">
       {#if hasSelection}
         <Button onclick={deleteSelected} styled="danger" size="sm">{language.playground.inlayDeleteSelected}</Button>

@@ -2101,6 +2101,18 @@ export const languageEnglish = {
             skipReencode: "Don't re-convert images that are already WebP",
             skipReencodeHelp:
                 'Converting the same image again loses a little quality each time.',
+            inventoryTitle: 'Stored attachments',
+            inventoryLoad: 'Load',
+            inventoryRefresh: 'Refresh',
+            inventoryTotal: '{count} files, {size}',
+            inventoryEmpty: 'No attachments are stored',
+            inventoryLoadFailed: "Couldn't load the stored attachments.",
+            inventoryImages: 'Images',
+            inventoryOthers: 'Audio, video, and signatures',
+            inventoryExtension: 'Extension',
+            inventoryCount: 'Files',
+            inventorySize: 'Size',
+            inventoryNoExtension: 'No extension',
             unsupportedAnimated:
                 "GIF and animated images can't be attached yet.",
         },

@@ -1908,6 +1908,18 @@ export const languageKorean = {
             skipReencode: '이미 WebP인 이미지는 다시 변환하지 않기',
             skipReencodeHelp:
                 '같은 이미지를 다시 변환할수록 화질이 조금씩 나빠집니다.',
+            inventoryTitle: '저장된 첨부 파일',
+            inventoryLoad: '불러오기',
+            inventoryRefresh: '새로 고침',
+            inventoryTotal: '전체 {count}개, {size}',
+            inventoryEmpty: '저장된 첨부 파일이 없습니다',
+            inventoryLoadFailed: '저장된 첨부 파일을 불러오지 못했습니다.',
+            inventoryImages: '이미지',
+            inventoryOthers: '소리·영상·서명',
+            inventoryExtension: '확장자',
+            inventoryCount: '개수',
+            inventorySize: '용량',
+            inventoryNoExtension: '확장자 없음',
             unsupportedAnimated:
                 'GIF와 애니메이션 이미지는 아직 첨부할 수 없습니다.',
         },

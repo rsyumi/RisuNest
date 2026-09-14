@@ -1,9 +1,10 @@
 <script lang="ts">
     import { language } from 'src/lang'
-    import { risuNestSettingsItems } from 'src/ts/setting/risuNestSettingsData'
+    import { risuNestInlaySettingsItems, risuNestStreamingSettingsItems } from 'src/ts/setting/risuNestSettingsData'
     import { isTauri, isTauriAndroid, isTauriIOS } from 'src/ts/platform'
     import RisuNestSettingRows from '../RisuNest/RisuNestSettingRows.svelte'
     import RisuNestPerformanceSettings from './RisuNestPerformanceSettings.svelte'
+    import RisuNestInlayInventory from './RisuNestInlayInventory.svelte'
     import RisuNestStorageDashboard from './RisuNestStorageDashboard.svelte'
     import RisuNestBackupRestore from './RisuNestBackupRestore.svelte'
     import RisuNestIOSPlatform from './RisuNestIOSPlatform.svelte'
@@ -35,7 +36,9 @@
         {/each}
     </nav>
     <RisuNestPerformanceSettings />
-    <RisuNestSettingRows items={risuNestSettingsItems} />
+    <RisuNestSettingRows items={risuNestStreamingSettingsItems} />
+    <RisuNestSettingRows items={risuNestInlaySettingsItems} />
+    <RisuNestInlayInventory />
     {#if isTauri}
         <section id="risunest-server-sync" class="scroll-mt-4"><ServerSyncSettings /></section>
     {/if}
