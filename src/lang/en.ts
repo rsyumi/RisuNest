@@ -2034,8 +2034,7 @@ export const languageEnglish = {
             ready: 'Connected',
             lastSuccess: 'Last successful sync',
             running: 'Syncing',
-            verifiedBytes:
-                'Object data verified this cycle (before delta compression)',
+            verifiedBytes: 'Verified data',
             progress: {
                 saving: 'Saving local changes',
                 preparing: 'Comparing and downloading changes',

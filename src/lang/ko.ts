@@ -1840,7 +1840,7 @@ export const languageKorean = {
             ready: '연결됨',
             lastSuccess: '최근 동기화 성공',
             running: '동기화 중',
-            verifiedBytes: '이번 작업에서 검증한 객체 데이터 (델타 압축 전)',
+            verifiedBytes: '검증한 데이터',
             progress: {
                 saving: '로컬 변경 저장 중',
                 preparing: '변경 비교 및 다운로드 중',
