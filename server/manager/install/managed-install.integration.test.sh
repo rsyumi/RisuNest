@@ -200,13 +200,16 @@ assert_registration_state() {
   "$wrapper" autostart status | python3 -c 'import json,sys; assert json.load(sys.stdin) == {"registered": True, "enabled": True, "actionMatches": True}'
   "$wrapper" update status | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["settings"]["policy"] == "notify"; assert value["schedule"] == {"registered": True, "enabled": True, "actionMatches": True}'
   test "$(systemctl --user is-enabled "$service")" = enabled
-  test "$(systemctl --user is-active "$service")" = active
   test "$(systemctl --user is-enabled "$update_timer")" = enabled
   test "$(systemctl --user is-active "$update_timer")" = active
   test "$(systemctl --user show "$service" --property=FragmentPath --value)" = "$service_path"
   grep -Fq "ExecStart=\"$install_dir/risunest-sync-server\" serve --data-dir \"$data_dir\"" "$service_path"
   grep -Fq "ExecStart=\"$install_dir/risunest-sync-manager\" --data-dir \"$data_dir\" --server \"$install_dir/risunest-sync-server\" update scheduled" "$update_service_path"
   test "$(loginctl show-user "$task_user" --property=Linger --value)" = yes
+}
+
+assert_service_active() {
+  test "$(systemctl --user is-active "$service")" = active
 }
 
 assert_running_health() {
@@ -237,6 +240,7 @@ assert publication["phase"] in ("published", "disabled", "stopped") or (
 assert_manager_state() {
   assert_running_health "$1"
   assert_registration_state
+  assert_service_active
 }
 
 sh "$extract_dir/install.sh" --non-interactive --policy=notify
