@@ -17,7 +17,10 @@ use crate::{
     logical_records::{decode_logical_record_key, encode_logical_record_key, LogicalRecordLocator},
     server_sync::{
         cache::Cache,
-        client::{is_ambiguous_transient, response_error, Reply, RetryBudget, ServerClient},
+        client::{
+            is_ambiguous_transient, response_error, Reply, RequestAttempt, RetryBudget,
+            ServerClient,
+        },
         planner::{self, Decision},
         remote,
         transfer::Transfer,
@@ -143,6 +146,72 @@ mod commit_retry_tests {
         assert_eq!(reply.status, 202);
         task.join().unwrap();
     }
+
+    #[test]
+    fn slow_ambiguous_commits_and_receipt_misses_stay_within_retry_budget() {
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", server.local_addr().unwrap());
+        let config = ServerConfig {
+            directory: None,
+            endpoint,
+            library_id: "library".into(),
+            device_id: "device".into(),
+            token: "a".repeat(64),
+        };
+        let intent = CommitIntent {
+            device_operation_seq: 1.into(),
+            expected_head: RemoteHead {
+                library_id: config.library_id.clone(),
+                epoch: "epoch".into(),
+                seq: 0.into(),
+                head_id: "b".repeat(64),
+                min_retained_seq: 0.into(),
+            },
+            changes_digest: "c".repeat(64),
+            staged_changes_id: "d".repeat(64),
+        };
+        let operation = risunest_sync_wire::operation_id(
+            &config.library_id,
+            &config.device_id,
+            &intent.device_operation_seq,
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let now = std::sync::Arc::new(std::sync::Mutex::new(started));
+        let server_now = now.clone();
+        let task = std::thread::spawn(move || {
+            for attempt in 0..7 {
+                let (mut commit, _) = server.accept().unwrap();
+                assert!(read_request(&mut commit).starts_with(b"POST /commits HTTP/1.1\r\n"));
+                *server_now.lock().unwrap() += Duration::from_secs(30);
+                drop(commit);
+                if attempt == 6 {
+                    break;
+                }
+                let (mut lookup, _) = server.accept().unwrap();
+                assert!(read_request(&mut lookup)
+                    .starts_with(format!("GET /operations/{operation} HTTP/1.1\r\n").as_bytes()));
+                lookup
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                lookup.flush().unwrap();
+            }
+        });
+        let clock_now = now.clone();
+        let sleep_now = now.clone();
+        let budget = std::sync::Arc::new(RetryBudget::with_driver(
+            None,
+            std::sync::Arc::new(move || *clock_now.lock().unwrap()),
+            std::sync::Arc::new(move |duration| *sleep_now.lock().unwrap() += duration),
+        ));
+        let client = ServerClient::with_retry_budget(config, None, budget).unwrap();
+        let error = submit_commit(&client, &intent).err().unwrap();
+        assert_eq!(error.code, "sync-retry-budget-exhausted");
+        assert!(now.lock().unwrap().duration_since(started) <= Duration::from_secs(5 * 60));
+        task.join().unwrap();
+    }
 }
 /// Record counts of the cycle in flight, read by the UI beside the byte counter.
 /// `total` covers the records this cycle applies or uploads; `done` advances
@@ -235,24 +304,30 @@ fn submit_commit(client: &ServerClient, intent: &CommitIntent) -> Result<Reply> 
         &intent.device_operation_seq,
     )?;
     loop {
-        let ambiguous = match client.request(
+        let ambiguous = match client.request_ambiguous_mutation(
             Method::POST,
             "commits",
-            &[],
             Some(canonical::encode(intent)?),
             &[("if-match", intent.expected_head.etag())],
             MAX_METADATA_BYTES,
-        ) {
-            Ok(reply) if matches!(reply.status, 502 | 503 | 504) => {
-                client.wait_transient_response(reply.retry_after, "server-unreachable")?;
+        )? {
+            RequestAttempt::Response(reply) if matches!(reply.status, 502 | 503 | 504) => {
+                client.wait_transient_response(
+                    reply.retry_after,
+                    "server-unreachable",
+                    reply.attempt_duration,
+                )?;
                 true
             }
-            Ok(reply) => return Ok(reply),
-            Err(error) if is_ambiguous_transient(&error) => {
-                client.wait_after_ambiguous(&error)?;
+            RequestAttempt::Response(reply) => return Ok(reply),
+            RequestAttempt::Failure {
+                error,
+                attempt_duration,
+            } if is_ambiguous_transient(&error) => {
+                client.wait_after_ambiguous(&error, attempt_duration)?;
                 true
             }
-            Err(error) => return Err(error),
+            RequestAttempt::Failure { error, .. } => return Err(error),
         };
         debug_assert!(ambiguous);
         let mut status = client.request(
@@ -263,6 +338,7 @@ fn submit_commit(client: &ServerClient, intent: &CommitIntent) -> Result<Reply> 
             &[],
             MAX_METADATA_BYTES,
         )?;
+        client.charge_retry_resolution(status.attempt_duration)?;
         client.report_retryable_failure(None);
         match status.status {
             200 if canonical::decode::<Receipt>(&status.body, MAX_METADATA_BYTES).is_ok() => {

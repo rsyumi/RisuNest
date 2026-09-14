@@ -31,7 +31,7 @@ impl RetryBudget {
         )
     }
 
-    fn with_driver(
+    pub(crate) fn with_driver(
         cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
         clock: Clock,
         sleep: Sleeper,
@@ -95,6 +95,19 @@ impl RetryBudget {
             (self.sleep)(remaining.min(Duration::from_millis(100)));
         }
     }
+
+    fn charge(&self, elapsed: Duration) -> Result<()> {
+        self.ensure_active()?;
+        let mut spent = self
+            .spent
+            .lock()
+            .map_err(|_| SyncError::new("sync-retry-state-unavailable", 503))?;
+        if elapsed > RETRY_BUDGET.saturating_sub(*spent) {
+            return Err(SyncError::new("sync-retry-budget-exhausted", 503));
+        }
+        *spent += elapsed;
+        Ok(())
+    }
 }
 
 fn jitter(delay: Duration, attempt: u32) -> Duration {
@@ -127,6 +140,14 @@ pub(crate) struct Reply {
     pub body: Vec<u8>,
     pub content_range: Option<String>,
     pub retry_after: Option<Duration>,
+    pub attempt_duration: Duration,
+}
+pub(crate) enum RequestAttempt {
+    Response(Reply),
+    Failure {
+        error: SyncError,
+        attempt_duration: Duration,
+    },
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -324,6 +345,40 @@ impl ServerClient {
         self.request_with_policy(method, path, query, body, headers, limit, true)
     }
 
+    pub(crate) fn request_ambiguous_mutation(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Vec<u8>>,
+        headers: &[(&str, String)],
+        limit: usize,
+    ) -> Result<RequestAttempt> {
+        loop {
+            let attempted = (self.retry_budget.clock)();
+            let result = self.request_once(method.clone(), path, &[], body.clone(), headers, limit);
+            let elapsed = (self.retry_budget.clock)().saturating_duration_since(attempted);
+            match result {
+                Ok(mut reply) => {
+                    reply.attempt_duration = elapsed;
+                    let maintenance = reply.status == 503
+                        && response_code(&reply).as_deref() == Some("server-updating");
+                    if maintenance {
+                        self.report_retryable_failure(Some("server-updating"));
+                        self.retry_budget.wait(reply.retry_after, elapsed)?;
+                        continue;
+                    }
+                    return Ok(RequestAttempt::Response(reply));
+                }
+                Err(error) => {
+                    return Ok(RequestAttempt::Failure {
+                        error,
+                        attempt_duration: elapsed,
+                    })
+                }
+            }
+        }
+    }
+
     fn request_with_policy(
         &self,
         method: Method,
@@ -341,7 +396,9 @@ impl ServerClient {
             let result =
                 self.request_once(method.clone(), path, query, body.clone(), headers, limit);
             match result {
-                Ok(reply) => {
+                Ok(mut reply) => {
+                    let elapsed = (self.retry_budget.clock)().saturating_duration_since(attempted);
+                    reply.attempt_duration = elapsed;
                     let code = response_code(&reply);
                     let maintenance =
                         reply.status == 503 && code.as_deref() == Some("server-updating");
@@ -356,10 +413,7 @@ impl ServerClient {
                             let _ = self.resolve_identity(false);
                         }
                         recovering = true;
-                        self.retry_budget.wait(
-                            reply.retry_after,
-                            (self.retry_budget.clock)().saturating_duration_since(attempted),
-                        )?;
+                        self.retry_budget.wait(reply.retry_after, elapsed)?;
                         continue;
                     }
                     if recovering {
@@ -486,24 +540,34 @@ impl ServerClient {
             body: bytes,
             content_range,
             retry_after,
+            attempt_duration: Duration::ZERO,
         })
     }
 
-    pub(crate) fn wait_after_ambiguous(&self, error: &SyncError) -> Result<()> {
+    pub(crate) fn wait_after_ambiguous(
+        &self,
+        error: &SyncError,
+        attempt_duration: Duration,
+    ) -> Result<()> {
         if !is_ambiguous_transient(error) {
             return Err(SyncError::new("non-transient-retry-requested", 409));
         }
         self.report_retryable_failure(Some(&error.code));
-        self.retry_budget.wait(None, Duration::ZERO)
+        self.retry_budget.wait(None, attempt_duration)
     }
 
     pub(crate) fn wait_transient_response(
         &self,
         retry_after: Option<Duration>,
         code: &str,
+        attempt_duration: Duration,
     ) -> Result<()> {
         self.report_retryable_failure(Some(code));
-        self.retry_budget.wait(retry_after, Duration::ZERO)
+        self.retry_budget.wait(retry_after, attempt_duration)
+    }
+
+    pub(crate) fn charge_retry_resolution(&self, elapsed: Duration) -> Result<()> {
+        self.retry_budget.charge(elapsed)
     }
     pub fn json<T: DeserializeOwned>(
         &self,
@@ -747,6 +811,15 @@ mod tests {
         assert_eq!(
             capped.wait(None, Duration::ZERO).unwrap_err().code,
             "sync-retry-budget-exhausted"
+        );
+        *capped.spent.lock().unwrap() = RETRY_BUDGET - Duration::from_millis(250);
+        assert_eq!(
+            capped.charge(Duration::from_millis(251)).unwrap_err().code,
+            "sync-retry-budget-exhausted"
+        );
+        assert_eq!(
+            *capped.spent.lock().unwrap(),
+            RETRY_BUDGET - Duration::from_millis(250)
         );
     }
 
