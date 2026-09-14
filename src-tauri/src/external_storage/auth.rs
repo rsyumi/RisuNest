@@ -5,6 +5,12 @@ use oauth2::{CsrfToken, PkceCodeChallenge, PkceCodeVerifier};
 pub(crate) trait SecretVault: Send + Sync {
     fn read<'a>(&'a self, reference: &'a SecretRef) -> ProviderFuture<'a, SecretBytes>;
     fn store<'a>(&'a self, bytes: &'a SecretBytes) -> ProviderFuture<'a, SecretRef>;
+    /// Rotated tokens overwrite the same reference so a connection keeps one secret.
+    fn replace<'a>(
+        &'a self,
+        reference: &'a SecretRef,
+        bytes: &'a SecretBytes,
+    ) -> ProviderFuture<'a, ()>;
     fn remove<'a>(&'a self, reference: &'a SecretRef) -> ProviderFuture<'a, ()>;
 }
 // No serializer or debug formatter. The concrete vault owns OS sealing and namespace.

@@ -300,6 +300,19 @@ pub(crate) trait Provider: Send + Sync {
         sink: &'a mut dyn TransferSink,
         cancel: &'a Cancellation,
     ) -> ProviderFuture<'a, ReadReceipt>;
+    /// Opens a resumable session (multipart, upload session, issued upload URL)
+    /// when the service has one, so the owner journals the sealed state before
+    /// any payload byte moves. `None` means the object is sent in one request
+    /// and retried whole after a failure.
+    fn begin_upload<'a>(
+        &'a self,
+        repository: &'a RepositoryHandle,
+        intent: &'a ObjectIntent,
+        cancel: &'a Cancellation,
+    ) -> ProviderFuture<'a, Option<ResumeState>>;
+    /// With `resume`, continues from its remotely confirmed offset. Without it,
+    /// a single-request upload; a retry with the same identity and bytes must
+    /// converge on the same complete receipt, never overwrite different bytes.
     fn create_object<'a>(
         &'a self,
         repository: &'a RepositoryHandle,

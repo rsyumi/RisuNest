@@ -43,6 +43,11 @@ tauri-plugin-shell = "2.3.5"
 # Native callers may supply Cookie, Origin, Referer and other HTTP headers.
 tauri-plugin-http = { version = "2.5.9", features = ["unsafe-headers"] }
 oauth2 = "5.0.0"
+# External storage adapters: request signing, DAV/S3 XML, path escaping, Retry-After dates.
+hmac = "0.12"
+quick-xml = { version = "0.41", features = ["serialize"] }
+percent-encoding = "2"
+httpdate = "1"
 tokio = { version = "1.47.1", features = ["net", "rt", "time", "fs", "io-util", "sync"] }
 tokio-util = { version = "0.7.19", features = ["io"] }
 libc = { version = "0.2", optional = true }

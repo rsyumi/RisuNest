@@ -1,6 +1,19 @@
-//! Shared in-memory provider for synthetic core/adapter tests only.
-use super::{capabilities::*, contract::*};
-use std::{collections::BTreeMap, sync::Mutex};
+//! Shared in-memory provider and injectable test doubles for synthetic
+//! core/adapter tests only. Nothing here is compiled into the product.
+use super::{
+    auth::{SecretBytes, SecretVault},
+    capabilities::*,
+    contract::*,
+    http::{Clock, HttpTransport, NativeHttpTransport, RequestBudget},
+    providers::Dependencies,
+};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+};
 pub(super) fn capabilities(cas: bool) -> Capabilities {
     Capabilities {
         immutable_create: Evidence::Synthetic,
@@ -132,6 +145,18 @@ impl Provider for FakeProvider {
                 checksum: None,
                 complete: true,
             }))
+        })
+    }
+    fn begin_upload<'a>(
+        &'a self,
+        r: &'a RepositoryHandle,
+        intent: &'a ObjectIntent,
+        c: &'a Cancellation,
+    ) -> ProviderFuture<'a, Option<ResumeState>> {
+        Box::pin(async move {
+            c.check()?;
+            intent.validate(r)?;
+            Ok(None)
         })
     }
     fn create_object<'a>(
@@ -319,5 +344,143 @@ pub(crate) fn locator() -> RemoteLocator {
         connection_identity: repository().connection_identity,
         collection: None,
         object: "head".into(),
+    }
+}
+
+/// Test-only secret store. Missing references surface as `ReauthRequired`,
+/// which is what a product vault reports for a revoked or lost credential.
+#[derive(Default)]
+pub(crate) struct MemoryVault {
+    secrets: Mutex<BTreeMap<String, Vec<u8>>>,
+    next: AtomicU64,
+}
+impl MemoryVault {
+    pub(crate) fn with(reference: &str, bytes: &[u8]) -> Self {
+        let vault = Self::default();
+        vault
+            .secrets
+            .lock()
+            .unwrap()
+            .insert(reference.into(), bytes.into());
+        vault
+    }
+    pub(crate) fn contents(&self, reference: &str) -> Option<Vec<u8>> {
+        self.secrets.lock().unwrap().get(reference).cloned()
+    }
+}
+impl SecretVault for MemoryVault {
+    fn read<'a>(&'a self, reference: &'a SecretRef) -> ProviderFuture<'a, SecretBytes> {
+        Box::pin(async move {
+            self.secrets
+                .lock()
+                .unwrap()
+                .get(&reference.0)
+                .map(|bytes| SecretBytes(zeroize::Zeroizing::new(bytes.clone())))
+                .ok_or_else(|| ProviderError::new(ErrorKind::ReauthRequired))
+        })
+    }
+    fn store<'a>(&'a self, bytes: &'a SecretBytes) -> ProviderFuture<'a, SecretRef> {
+        Box::pin(async move {
+            let reference = format!("secret-{}", self.next.fetch_add(1, Ordering::SeqCst));
+            self.secrets
+                .lock()
+                .unwrap()
+                .insert(reference.clone(), bytes.0.to_vec());
+            Ok(SecretRef(reference))
+        })
+    }
+    fn replace<'a>(
+        &'a self,
+        reference: &'a SecretRef,
+        bytes: &'a SecretBytes,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            let mut secrets = self.secrets.lock().unwrap();
+            let slot = secrets
+                .get_mut(&reference.0)
+                .ok_or_else(|| ProviderError::new(ErrorKind::ReauthRequired))?;
+            *slot = bytes.0.to_vec();
+            Ok(())
+        })
+    }
+    fn remove<'a>(&'a self, reference: &'a SecretRef) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            self.secrets.lock().unwrap().remove(&reference.0);
+            Ok(())
+        })
+    }
+}
+
+pub(crate) struct FixedClock(AtomicU64);
+impl FixedClock {
+    pub(crate) fn at(now_ms: u64) -> Self {
+        Self(AtomicU64::new(now_ms))
+    }
+    pub(crate) fn set(&self, now_ms: u64) {
+        self.0.store(now_ms, Ordering::SeqCst);
+    }
+}
+impl Clock for FixedClock {
+    fn now_ms(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Records every reservation so a wire test can assert per-request costs.
+/// `deny` simulates an exhausted account budget before dispatch.
+#[derive(Default)]
+pub(crate) struct RecordingBudget {
+    pub(crate) reservations: Mutex<Vec<(Vec<RequestCost>, u64)>>,
+    pub(crate) deny: AtomicBool,
+}
+impl RequestBudget for RecordingBudget {
+    fn reserve<'a>(&'a self, costs: &'a [RequestCost], now_ms: u64) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            self.reservations
+                .lock()
+                .unwrap()
+                .push((costs.to_vec(), now_ms));
+            if self.deny.load(Ordering::SeqCst) {
+                Err(ProviderError::new(ErrorKind::DailyQuotaExhausted))
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+pub(crate) struct TestDependencies {
+    pub(crate) dependencies: Dependencies,
+    pub(crate) budget: Arc<RecordingBudget>,
+    pub(crate) clock: Arc<FixedClock>,
+    pub(crate) vault: Arc<MemoryVault>,
+}
+/// Loopback HTTP against `wire_fixture::WireServer`, a fixed clock and a
+/// recording budget. Adapter factories receive `dependencies`.
+pub(crate) fn loopback_dependencies(vault: MemoryVault, now_ms: u64) -> TestDependencies {
+    with_transport(
+        Arc::new(NativeHttpTransport::for_loopback_tests()),
+        vault,
+        now_ms,
+    )
+}
+pub(crate) fn with_transport(
+    http: Arc<dyn HttpTransport>,
+    vault: MemoryVault,
+    now_ms: u64,
+) -> TestDependencies {
+    let budget = Arc::new(RecordingBudget::default());
+    let clock = Arc::new(FixedClock::at(now_ms));
+    let vault = Arc::new(vault);
+    TestDependencies {
+        dependencies: Dependencies {
+            http,
+            budget: budget.clone(),
+            clock: clock.clone(),
+            vault: vault.clone(),
+        },
+        budget,
+        clock,
+        vault,
     }
 }

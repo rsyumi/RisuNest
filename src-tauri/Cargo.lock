@@ -4107,6 +4107,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
  "memchr",
+ "serde",
 ]
 
 [[package]]
@@ -4515,11 +4516,15 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "hex",
+ "hmac",
+ "httpdate",
  "image",
  "jni 0.21.1",
  "keyring",
  "libc",
  "oauth2",
+ "percent-encoding",
+ "quick-xml",
  "rcgen",
  "regex",
  "reqwest 0.11.27",
