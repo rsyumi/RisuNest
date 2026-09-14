@@ -393,10 +393,14 @@ export interface NativeBlockRestoreRuntime {
         revision: number
         mutationGeneration: number
     }>
-    acquireDestructiveReplacementFence(token: {
-        revision: number
-        mutationGeneration: number
-    }): Promise<{
+    acquireDestructiveReplacementFence(
+        token: {
+            revision: number
+            mutationGeneration: number
+        },
+        options?: { allowRevisionAdvance?: boolean },
+    ): Promise<{
+        readonly revision: number
         refreshCommittedWorkingSet(revision: number): Promise<void>
         release(): void
     }>
@@ -1198,6 +1202,7 @@ async function runNativeReplacementRestore(
                     replacementFence =
                         await runtime.acquireDestructiveReplacementFence(
                             mutationToken,
+                            { allowRevisionAdvance: true },
                         )
                     options.onBlockingChange?.(true)
                 }
@@ -1211,7 +1216,13 @@ async function runNativeReplacementRestore(
                 await invokeNative(
                     dependencies,
                     'native_portable_select_sections',
-                    { jobId: started.jobId, selection },
+                    {
+                        jobId: started.jobId,
+                        selection,
+                        ...(replacementFence
+                            ? { expectedRevision: replacementFence.revision }
+                            : {}),
+                    },
                 )
             }
             if (
@@ -1249,6 +1260,7 @@ async function runNativeReplacementRestore(
                     replacementFence =
                         await runtime.acquireDestructiveReplacementFence(
                             mutationToken,
+                            { allowRevisionAdvance: true },
                         )
                 } catch (error) {
                     mutationConflict =
@@ -1274,8 +1286,12 @@ async function runNativeReplacementRestore(
                     })
                     continue
                 }
+                // The acquisition flushed whatever the renderer left dirty while
+                // the job was reading, so the replacement applies to the revision
+                // the fence now holds, not the one the start request carried.
                 await invokeNative(dependencies, 'native_file_job_finalize', {
                     jobId: started.jobId,
+                    expectedRevision: replacementFence.revision,
                 })
                 options.onStatus?.({
                     ...status,
@@ -1927,11 +1943,13 @@ export async function runNativeArchiveExport(
                             await runtime.capturePersistentMutationToken(
                                 'native-portable-export',
                             )
-                        expectedRevision = token.revision
                         fence =
                             await runtime.acquireDestructiveReplacementFence(
                                 token,
+                                { allowRevisionAdvance: true },
                             )
+                        // The acquisition's own flush can advance past the token.
+                        expectedRevision = fence.revision
                     } else {
                         await runtime.flushPendingData('native-portable-export')
                         expectedRevision = runtime.revision

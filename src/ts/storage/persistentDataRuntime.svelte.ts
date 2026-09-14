@@ -21,6 +21,7 @@ import type {
 } from './persistentDataStore'
 import type {
     CharacterAdditionRequest,
+    DestructiveReplacementFenceOptions,
     PersistentCharacterDetailMutation,
     PersistentCompleteCharacterMutation,
     PersistentCompleteCharacterUpsert,
@@ -638,8 +639,9 @@ export const capturePersistentMutationToken = (
     getPersistentDataRuntime().capturePersistentMutationToken(reason)
 export const acquireDestructiveReplacementFence = (
     expected: PersistentMutationToken,
+    options?: DestructiveReplacementFenceOptions,
 ): Promise<PersistentDestructiveReplacementFence> =>
-    getPersistentDataRuntime().acquireDestructiveReplacementFence(expected)
+    getPersistentDataRuntime().acquireDestructiveReplacementFence(expected, options)
 export const acquireCommittedWorkingSetRefreshFence =
 (): Promise<PersistentDestructiveReplacementFence> =>
     getPersistentDataRuntime().acquireCommittedWorkingSetRefreshFence()

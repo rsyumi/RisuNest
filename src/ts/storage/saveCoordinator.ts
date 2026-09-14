@@ -448,6 +448,14 @@ export interface PersistentMutationToken {
     mutationGeneration: number
 }
 
+export interface DestructiveReplacementFenceOptions {
+    /**
+     * Accept a revision the acquisition's own flush advanced to. The caller must
+     * then replace against the fence's revision rather than the captured token's.
+     */
+    allowRevisionAdvance?: boolean
+}
+
 export class PersistentMutationFencedError extends Error {
     constructor() {
         super('A destructive persistent replacement is active')
@@ -2085,7 +2093,18 @@ export class SaveCoordinator {
         })
     }
 
-    acquireDestructiveReplacementFence(expected: PersistentMutationToken): Promise<symbol> {
+    /**
+     * Fences a replacement that discards the working set. The acquisition flushes
+     * first, so its own commit advances the revision whenever anything was left
+     * dirty while the replacement was being prepared. `allowRevisionAdvance`
+     * callers re-pin their replacement to `revision` after this resolves instead
+     * of treating that self-inflicted advance as a lost race; callers that staged
+     * against the captured revision keep the strict comparison.
+     */
+    acquireDestructiveReplacementFence(
+        expected: PersistentMutationToken,
+        options: DestructiveReplacementFenceOptions = {},
+    ): Promise<symbol> {
         this.assertInitialized()
         if (this.destructiveReplacementFence) throw new PersistentMutationFencedError()
         const owner = Symbol('destructive-persistent-replacement')
@@ -2100,14 +2119,25 @@ export class SaveCoordinator {
         return this.enqueue(async () => {
             try {
                 await this.flushIterations('destructive-persistent-replacement', true)
-                if (this.revision !== expected.revision) {
-                    throw new RevisionConflictError(expected.revision, this.revision)
-                }
-                if (this.dirtyGeneration !== expected.mutationGeneration) {
-                    throw new Error(
-                        `Expected mutation generation ${expected.mutationGeneration}, ` +
-                            `but current generation is ${this.dirtyGeneration}`,
-                    )
+                if (options.allowRevisionAdvance) {
+                    if (this.revision < expected.revision) {
+                        throw new RevisionConflictError(expected.revision, this.revision)
+                    }
+                    // The flush must have persisted everything it captured;
+                    // anything still pending raced the acquisition.
+                    if (!this.captureMatchesBaseline()) {
+                        throw new PersistentMutationFencedError()
+                    }
+                } else {
+                    if (this.revision !== expected.revision) {
+                        throw new RevisionConflictError(expected.revision, this.revision)
+                    }
+                    if (this.dirtyGeneration !== expected.mutationGeneration) {
+                        throw new Error(
+                            `Expected mutation generation ${expected.mutationGeneration}, ` +
+                                `but current generation is ${this.dirtyGeneration}`,
+                        )
+                    }
                 }
                 if (this.destructiveReplacementFence?.owner !== owner) {
                     throw new Error('Destructive persistent replacement fence ownership changed')

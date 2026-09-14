@@ -2241,9 +2241,13 @@ impl NativeFileJobState {
             .map_err(|error| NativeJobError::new("store-error", error))
     }
 
-    pub(crate) fn finalize(&self, job_id: &str) -> Result<FinalizeOutcome, NativeJobError> {
+    pub(crate) fn finalize(
+        &self,
+        job_id: &str,
+        expected_revision: Option<i64>,
+    ) -> Result<FinalizeOutcome, NativeJobError> {
         self.registry
-            .finalize(job_id)
+            .finalize(job_id, expected_revision)
             .map_err(|error| NativeJobError::new("store-error", error))
     }
 
@@ -2754,6 +2758,7 @@ pub(crate) fn native_portable_select_sections(
     state: State<'_, NativeFileJobState>,
     job_id: String,
     selection: portable::PortableSelection,
+    expected_revision: Option<i64>,
 ) -> Result<(), NativeJobError> {
     let job = state
         .registry
@@ -2762,7 +2767,7 @@ pub(crate) fn native_portable_select_sections(
         .ok_or_else(|| {
             NativeJobError::new("job-not-found", "Portable backup job is unavailable")
         })?;
-    job.select_portable_sections(selection)
+    job.select_portable_sections(selection, expected_revision)
         .map_err(|e| NativeJobError::new("invalid-selection", e))
 }
 
@@ -2770,8 +2775,9 @@ pub(crate) fn native_portable_select_sections(
 pub(crate) fn native_file_job_finalize(
     state: State<'_, NativeFileJobState>,
     job_id: String,
+    expected_revision: Option<i64>,
 ) -> Result<FinalizeOutcome, NativeJobError> {
-    state.finalize(&job_id)
+    state.finalize(&job_id, expected_revision)
 }
 
 #[tauri::command(async)]
@@ -3186,6 +3192,10 @@ pub(crate) struct JobRegistry {
 struct JobWaitState {
     portable_selection: Option<portable::PortableSelection>,
     restore_finalized: bool,
+    /// Revision the renderer holds its replacement fence at. The renderer is
+    /// free to commit while this job reads and stages, so activation, not the
+    /// start request, decides which revision the replacement applies to.
+    activation_expected_revision: Option<i64>,
     official_publication_retry: Option<OfficialPublicationRetryInput>,
 }
 
@@ -3302,12 +3312,16 @@ impl JobRegistry {
         job.request_cancel()
     }
 
-    pub(crate) fn finalize(&self, id: &str) -> Result<FinalizeOutcome, String> {
+    pub(crate) fn finalize(
+        &self,
+        id: &str,
+        expected_revision: Option<i64>,
+    ) -> Result<FinalizeOutcome, String> {
         self.prune()?;
         let Some(job) = self.lookup(id)? else {
             return Ok(FinalizeOutcome::Missing);
         };
-        job.request_finalize()
+        job.request_finalize(expected_revision)
     }
 
     pub(crate) fn retry_official_publication(
@@ -3439,6 +3453,7 @@ impl JobControl {
     fn select_portable_sections(
         &self,
         selection: portable::PortableSelection,
+        expected_revision: Option<i64>,
     ) -> Result<(), String> {
         let mut status = self
             .status
@@ -3469,10 +3484,18 @@ impl JobControl {
         {
             return Err("invalid portable restore selection".into());
         }
-        self.wait_state
-            .lock()
-            .map_err(|_| "native job wait mutex poisoned".to_owned())?
-            .portable_selection = Some(selection);
+        {
+            let mut wait = self
+                .wait_state
+                .lock()
+                .map_err(|_| "native job wait mutex poisoned".to_owned())?;
+            wait.portable_selection = Some(selection);
+            // A renderer that fences the replacement at selection time reports
+            // the revision it flushed to, which supersedes the start request's.
+            if expected_revision.is_some() {
+                wait.activation_expected_revision = expected_revision;
+            }
+        }
         status.state = JobState::Running;
         status.phase = JobPhase::ReadingSource;
         self.wait_changed.notify_all();
@@ -3590,7 +3613,10 @@ impl JobControl {
         Ok(CancelOutcome::Requested)
     }
 
-    fn request_finalize(&self) -> Result<FinalizeOutcome, String> {
+    fn request_finalize(
+        &self,
+        expected_revision: Option<i64>,
+    ) -> Result<FinalizeOutcome, String> {
         let mut status = self
             .status
             .lock()
@@ -3627,6 +3653,9 @@ impl JobControl {
         if wait.restore_finalized {
             return Ok(FinalizeOutcome::AlreadyRequested);
         }
+        if expected_revision.is_some() {
+            wait.activation_expected_revision = expected_revision;
+        }
         wait.restore_finalized = true;
         status.state = JobState::Running;
         status.phase = JobPhase::ActivatingDatabase;
@@ -3640,7 +3669,17 @@ impl JobControl {
         Ok(FinalizeOutcome::Requested)
     }
 
-    pub(crate) fn wait_for_restore_finalization(&self) -> Result<(), String> {
+    /// Revision the renderer last confirmed for this job's replacement, if it
+    /// reported one while holding its fence.
+    pub(crate) fn activation_expected_revision(&self) -> Result<Option<i64>, String> {
+        Ok(self
+            .wait_state
+            .lock()
+            .map_err(|error| format!("native restore finalization mutex poisoned: {error}"))?
+            .activation_expected_revision)
+    }
+
+    pub(crate) fn wait_for_restore_finalization(&self) -> Result<Option<i64>, String> {
         {
             let mut status = self
                 .status
@@ -3666,7 +3705,7 @@ impl JobControl {
                     status.detail.as_ref(),
                     JobStage::Activating,
                 ));
-                return Ok(());
+                return Ok(self.activation_expected_revision()?);
             }
             status.state = JobState::WaitingForInput;
             status.phase = JobPhase::AwaitingActivation;
@@ -3685,7 +3724,7 @@ impl JobControl {
                 return Err("native restore was cancelled before activation".to_owned());
             }
             if wait.restore_finalized {
-                return Ok(());
+                return Ok(wait.activation_expected_revision);
             }
             wait = self
                 .wait_changed
@@ -4429,8 +4468,11 @@ mod tests {
         }
         assert_eq!(job.status().state, JobState::WaitingForInput);
         assert_eq!(job.status().phase, JobPhase::AwaitingActivation);
-        assert_eq!(job.request_finalize().unwrap(), FinalizeOutcome::Requested);
-        assert_eq!(waited.join().unwrap(), Ok(()));
+        assert_eq!(
+            job.request_finalize(None).unwrap(),
+            FinalizeOutcome::Requested
+        );
+        assert_eq!(waited.join().unwrap(), Ok(None));
         assert_eq!(job.status().phase, JobPhase::ActivatingDatabase);
         assert_eq!(job.request_cancel().unwrap(), CancelOutcome::TooLate);
         job.finish_success(result(5)).unwrap();
@@ -5268,10 +5310,10 @@ mod tests {
         }
         assert_eq!(job.status().phase, JobPhase::AwaitingActivation);
         assert_eq!(
-            registry.finalize(&job.id()).unwrap(),
+            registry.finalize(&job.id(), Some(9)).unwrap(),
             FinalizeOutcome::Requested
         );
-        assert_eq!(waited.join().unwrap(), Ok(()));
+        assert_eq!(waited.join().unwrap(), Ok(Some(9)));
         assert_eq!(job.status().state, JobState::Running);
         assert_eq!(job.status().phase, JobPhase::ActivatingDatabase);
 
@@ -6964,7 +7006,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(matches!(
-            registry.finalize(&job.id()).unwrap(),
+            registry.finalize(&job.id(), None).unwrap(),
             FinalizeOutcome::Requested
         ));
         handle.join().unwrap().unwrap();

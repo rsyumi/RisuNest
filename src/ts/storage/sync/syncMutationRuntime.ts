@@ -14,6 +14,7 @@ export interface SyncMutationRuntime {
         revision: number
         mutationGeneration: number
     }): Promise<{
+        readonly revision: number
         refreshCommittedWorkingSet(revision: number): Promise<void>
         release(): void
     }>

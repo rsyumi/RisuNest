@@ -283,15 +283,28 @@ fn restore_risu_save_reader_controlled<R: Read>(
         if job.is_cancel_requested() {
             return Err(cancelled("restore cancelled before activation"));
         }
-        sink.preserve_active_repositories(&staging_id, expected_revision)
-            .map_err(store_error)?;
+        // The renderer keeps serving the app while this job reads and stages,
+        // so it may commit in that window. Copying the active repositories here
+        // is the fast path for the common case; activation repeats it whenever
+        // the renderer reports a different revision to replace.
+        let preserved = match sink.preserve_active_repositories(&staging_id, expected_revision) {
+            Ok(()) => true,
+            Err(StoreError::RevisionConflict { .. }) => false,
+            Err(error) => return Err(store_error(error)),
+        };
         if job.is_cancel_requested() {
             return Err(cancelled("restore cancelled before activation"));
         }
-        job.wait_for_restore_finalization()
-            .map_err(|error| job_error(job, error))?;
+        let activation_revision = job
+            .wait_for_restore_finalization()
+            .map_err(|error| job_error(job, error))?
+            .unwrap_or(expected_revision);
+        if !preserved || activation_revision != expected_revision {
+            sink.preserve_active_repositories(&staging_id, activation_revision)
+                .map_err(store_error)?;
+        }
         let revision = sink
-            .commit(&staging_id, expected_revision)
+            .commit(&staging_id, activation_revision)
             .map_err(store_error)?
             .revision;
         Ok(JobResultSummary {
@@ -2490,6 +2503,68 @@ mod tests {
     }
 
     #[test]
+    fn activation_replaces_against_the_revision_the_renderer_confirms() {
+        let (directory, sink) = fixture();
+        let source = directory.path().join("selected.risudat");
+        valid_save(&source);
+        let opened = open_job_source(
+            directory.path(),
+            &JobSource::DesktopPath {
+                path: source.to_string_lossy().into_owned(),
+            },
+        )
+        .unwrap();
+        let sink = Arc::new(sink);
+        let registry = JobRegistry::default();
+        let job = registry
+            .create_with_context(JobKind::RestoreBlockRisuSave, Some(1), Vec::new())
+            .unwrap();
+
+        let restoring = {
+            let job = Arc::clone(&job);
+            let sink = Arc::clone(&sink);
+            thread::spawn(move || restore_block_risu_save(opened, 1, &job, sink.as_ref()))
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while job.status().phase != JobPhase::AwaitingActivation {
+            assert!(
+                Instant::now() < deadline,
+                "restore did not reach activation wait"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        // The renderer keeps serving the app while the job reads, so it can
+        // commit before it fences the replacement.
+        let confirmed = {
+            let mut store = sink.store.lock().unwrap();
+            let staging = store.replace_begin().unwrap().staging_id;
+            store
+                .replace_put_root(&staging, &json!({ "username": "Edited while importing" }))
+                .unwrap();
+            store.replace_put_presets(&staging, &[]).unwrap();
+            store.replace_add_characters(&staging, &[]).unwrap();
+            store.replace_commit(&staging, Some(1)).unwrap().revision
+        };
+        assert_eq!(confirmed, 2);
+
+        assert_eq!(
+            job.request_finalize(Some(confirmed)).unwrap(),
+            FinalizeOutcome::Requested
+        );
+
+        let result = restoring.join().unwrap().unwrap();
+
+        assert_eq!(result.revision, 3);
+        assert_eq!(result.character_count, 1);
+        assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 3);
+        // The pre-activation copy was made against the stale revision, so
+        // activation had to repeat it.
+        assert_eq!(sink.preserve_calls.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
     fn opened_source_identity_survives_path_replacement_without_reopening() {
         let (directory, sink) = fixture();
         let source = directory.path().join("selected.risudat");
@@ -2864,7 +2939,7 @@ mod tests {
             .any(|status| status.job_id == started.job_id));
 
         assert_eq!(
-            state.finalize(&started.job_id).unwrap(),
+            state.finalize(&started.job_id, None).unwrap(),
             FinalizeOutcome::Requested
         );
         let deadline = Instant::now() + Duration::from_secs(2);

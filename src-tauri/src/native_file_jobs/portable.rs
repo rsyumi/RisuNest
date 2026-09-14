@@ -464,7 +464,7 @@ pub(crate) fn export_portable(
 pub(crate) fn restore_portable(
     mut source: OpenedJobSource,
     already_owned: bool,
-    revision: i64,
+    mut revision: i64,
     owned: &Path,
     mut store: PersistentStore,
     job: &JobControl,
@@ -518,6 +518,11 @@ pub(crate) fn restore_portable(
         .and_then(|(_, selection)| selection)
         .unwrap_or(&fallback);
     let device = device.map(|(app, _)| (app, selection));
+    // A renderer that fenced the replacement while choosing sections reports the
+    // revision it flushed to, which supersedes the one the start request carried.
+    if let Some(selected) = job.activation_expected_revision().map_err(error)? {
+        revision = selected;
+    }
     if !selection.library && selection.device_sections.is_empty() {
         return Err(error("Select at least one backup section"));
     }
@@ -593,7 +598,9 @@ pub(crate) fn restore_portable(
                     committed = true;
                 }
             } else {
-                job.wait_for_restore_finalization().map_err(error)?;
+                if let Some(finalized) = job.wait_for_restore_finalization().map_err(error)? {
+                    revision = finalized;
+                }
             }
             if selection.library {
                 if probe.is_cancelled() {

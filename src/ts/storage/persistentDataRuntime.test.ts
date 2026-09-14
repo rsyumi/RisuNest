@@ -1483,6 +1483,90 @@ describe('native replacement working-set refresh', () => {
         expect(lease.release).toHaveBeenCalledOnce()
     })
 
+    it('activates a revision-advancing fence over an edit made while the job ran', async () => {
+        const harness = createFenceRuntimeHarness(
+            makeConversationDatabase('Before native restore'),
+        )
+        const { runtime } = harness
+        await runtime.initializeActiveWorkingSet(harness.database)
+        const token = await runtime.capturePersistentMutationToken('native-restore-start')
+
+        harness.username = 'Live edit during native parse'
+        runtime.markPersistentDataDirty(1)
+
+        const fence = await runtime.acquireDestructiveReplacementFence(token, {
+            allowRevisionAdvance: true,
+        })
+
+        // The acquisition persists the edit instead of losing the staged import
+        // to the revision its own flush produced.
+        expect(fence.revision).toBe(token.revision + 1)
+        expect(runtime.revision).toBe(fence.revision)
+        expect(harness.store.commit).toHaveBeenCalledWith(
+            expect.objectContaining({
+                rootMutations: [
+                    { type: 'set', key: 'username', value: 'Live edit during native parse' },
+                ],
+            }),
+        )
+        fence.release()
+    })
+
+    it('activates a revision-advancing fence after a dirty notice that changed nothing', async () => {
+        const harness = createFenceRuntimeHarness(
+            makeConversationDatabase('Before native restore'),
+        )
+        const { runtime } = harness
+        await runtime.initializeActiveWorkingSet(harness.database)
+        const token = await runtime.capturePersistentMutationToken('native-restore-start')
+
+        runtime.markPersistentDataDirty(0)
+
+        const fence = await runtime.acquireDestructiveReplacementFence(token, {
+            allowRevisionAdvance: true,
+        })
+
+        expect(fence.revision).toBe(token.revision)
+        expect(harness.store.commit).not.toHaveBeenCalled()
+        fence.release()
+    })
+
+    it('persists an edit that lands while a revision-advancing fence flushes', async () => {
+        const harness = createFenceRuntimeHarness(
+            makeConversationDatabase('Before native restore'),
+        )
+        const { runtime } = harness
+        await runtime.initializeActiveWorkingSet(harness.database)
+        const token = await runtime.capturePersistentMutationToken('native-restore-start')
+
+        harness.username = 'Live edit during native parse'
+        runtime.markPersistentDataDirty(1)
+        vi.mocked(harness.store.commit).mockImplementationOnce(async (commit) => {
+            harness.username = 'Edit landed while the fence was flushing'
+            return { revision: commit.expectedRevision + 1 }
+        })
+
+        const fence = await runtime.acquireDestructiveReplacementFence(token, {
+            allowRevisionAdvance: true,
+        })
+
+        // The fence only holds once nothing is left unpersisted, so the revision
+        // it reports is the one the replacement has to be pinned to.
+        expect(fence.revision).toBe(runtime.revision)
+        expect(harness.store.commit).toHaveBeenLastCalledWith(
+            expect.objectContaining({
+                rootMutations: [
+                    {
+                        type: 'set',
+                        key: 'username',
+                        value: 'Edit landed while the fence was flushing',
+                    },
+                ],
+            }),
+        )
+        fence.release()
+    })
+
     it('rejects a destructive fence when a live edit happened after the captured token', async () => {
         const harness = createFenceRuntimeHarness(
             makeConversationDatabase('Before native restore'),

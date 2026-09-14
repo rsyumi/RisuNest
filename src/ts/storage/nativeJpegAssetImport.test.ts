@@ -24,6 +24,7 @@ function dependencies(statuses: unknown[]): NativeJpegAssetImportDependencies {
         wait: vi.fn(async () => undefined),
         captureMutationToken: vi.fn(async () => ({ revision: 7, mutationGeneration: 3 })),
         acquireFence: vi.fn(async () => ({
+            revision: 7,
             refreshCommittedWorkingSet: vi.fn(async () => undefined),
             release: vi.fn(),
         })),
@@ -147,6 +148,7 @@ describe('native JPEG asset import', () => {
             },
         }])
         vi.mocked(deps.acquireFence).mockResolvedValueOnce({
+            revision: 7,
             refreshCommittedWorkingSet: vi.fn(async () => {
                 throw new Error('refresh unavailable')
             }),

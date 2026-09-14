@@ -46,6 +46,8 @@ function restoreRuntime(
         refresh?: (revision: number) => void | Promise<void>
         acquire?: () => void | Promise<void>
         release?: () => void
+        /** Revision the fence reports after its own flush advanced past the token. */
+        fencedRevision?: number
     } = {},
 ) {
     return {
@@ -56,6 +58,7 @@ function restoreRuntime(
         acquireDestructiveReplacementFence: async () => {
             await options.acquire?.()
             return {
+                revision: options.fencedRevision ?? revision,
                 refreshCommittedWorkingSet: async (
                     committedRevision: number,
                 ) => {
@@ -1167,7 +1170,10 @@ describe('native file jobs', () => {
                 },
             ],
             ['native_file_job_status', { jobId: 'lossless-restore' }],
-            ['native_file_job_finalize', { jobId: 'lossless-restore' }],
+            [
+                'native_file_job_finalize',
+                { jobId: 'lossless-restore', expectedRevision: 17 },
+            ],
             ['native_file_job_status', { jobId: 'lossless-restore' }],
             ['native_file_job_forget', { jobId: 'lossless-restore' }],
         ])
@@ -1581,12 +1587,70 @@ describe('native file jobs', () => {
             ],
             ['native_file_job_status', { jobId: 'job-1' }],
             ['native_file_job_status', { jobId: 'job-1' }],
-            ['native_file_job_finalize', { jobId: 'job-1' }],
+            [
+                'native_file_job_finalize',
+                { jobId: 'job-1', expectedRevision: 3 },
+            ],
             ['native_file_job_status', { jobId: 'job-1' }],
             ['native_file_job_forget', { jobId: 'job-1' }],
         ])
         expect(calls.some(([command]) => command.includes('read'))).toBe(false)
         expect(JSON.stringify(calls)).not.toContain('Uint8Array')
+    })
+
+    it('activates against the revision its fence flushed to, not the started one', async () => {
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const statuses = [
+            {
+                ...status('waitingForInput'),
+                phase: 'awaiting-activation' as const,
+            },
+            status('succeeded', {
+                revision: 6,
+                sourceBytes: 128,
+                sourceSha256: 'a'.repeat(64),
+                characterCount: 2,
+                presetCount: 1,
+                warningCodes: [],
+            }),
+        ]
+
+        const result = await runNativeBlockRisuSaveRestore(
+            // Reading the backup took long enough for the renderer to leave an
+            // edit behind, which the fence acquisition flushes to revision 5.
+            restoreRuntime(4, { fencedRevision: 5 }),
+            { type: 'desktopPath', path: 'C:\chosen\backup.risudat' },
+            undefined,
+            {
+                isTauri: () => true,
+                invoke: async (command, args) => {
+                    calls.push([command, args])
+                    if (command === 'native_file_job_start')
+                        return { jobId: 'job-1' }
+                    if (command === 'native_file_job_status')
+                        return statuses.shift()
+                    if (command === 'native_file_job_finalize')
+                        return 'requested'
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+                copyToAndroidSaf: async () => ({
+                    bytes: 0,
+                    warningCodes: [],
+                }),
+            },
+        )
+
+        expect(result.revision).toBe(6)
+        expect(
+            calls.find(([command]) => command === 'native_file_job_start')?.[1],
+        ).toMatchObject({ request: { expectedRevision: 4 } })
+        expect(
+            calls.find(
+                ([command]) => command === 'native_file_job_finalize',
+            )?.[1],
+        ).toEqual({ jobId: 'job-1', expectedRevision: 5 })
     })
 
     it('explicit abort requests native cancellation and waits for terminal cleanup', async () => {

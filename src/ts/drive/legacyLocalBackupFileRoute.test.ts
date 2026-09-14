@@ -17,6 +17,7 @@ function dependencies(): LegacyLocalBackupFileRouteDependencies {
                 mutationGeneration: 3,
             })),
             acquireDestructiveReplacementFence: vi.fn(async () => ({
+                revision: 7,
                 refreshCommittedWorkingSet: vi.fn(async () => undefined),
                 release: vi.fn(),
             })),

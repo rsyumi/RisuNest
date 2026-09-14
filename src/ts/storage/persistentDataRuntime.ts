@@ -25,6 +25,7 @@ import {
     SaveCoordinator,
     PersistentMutationFencedError,
     type CharacterAdditionRequest,
+    type DestructiveReplacementFenceOptions,
     type OfficialRevisionPublisher,
     type PersistentPresetMutation,
     type PersistentPresetMutationResult,
@@ -434,6 +435,7 @@ export interface PersistentDataRuntime {
     ): Promise<PersistentMutationToken>
     acquireDestructiveReplacementFence(
         expected: PersistentMutationToken,
+        options?: DestructiveReplacementFenceOptions,
     ): Promise<PersistentDestructiveReplacementFence>
     acquireCommittedWorkingSetRefreshFence(): Promise<PersistentDestructiveReplacementFence>
     materializePersistentDatabaseSnapshot(reason: string): Promise<Database>
@@ -450,6 +452,8 @@ export interface PersistentDataRuntime {
 }
 
 export interface PersistentDestructiveReplacementFence {
+    /** Revision the working set is pinned to while the fence is held. */
+    readonly revision: DataRevision
     refreshCommittedWorkingSet(
         revision: DataRevision,
         options?: PersistentCommittedWorkingSetRefreshOptions,
@@ -868,11 +872,15 @@ export function createPersistentDataRuntime(
             coordinator.readPersistentSelectedConversation(characterId, reason),
         capturePersistentMutationToken: (reason) =>
             coordinator.capturePersistentMutationToken(reason),
-        async acquireDestructiveReplacementFence(expected) {
-            const owner =
-                await coordinator.acquireDestructiveReplacementFence(expected)
+        async acquireDestructiveReplacementFence(expected, options) {
+            const owner = await coordinator.acquireDestructiveReplacementFence(
+                expected,
+                options,
+            )
+            const heldRevision = coordinator.revision
             let released = false
             return {
+                revision: heldRevision,
                 refreshCommittedWorkingSet(revision, options) {
                     if (released) {
                         return Promise.reject(
@@ -893,8 +901,10 @@ export function createPersistentDataRuntime(
         async acquireCommittedWorkingSetRefreshFence() {
             const owner =
                 await coordinator.acquireCommittedWorkingSetRefreshFence()
+            const heldRevision = coordinator.revision
             let released = false
             return {
+                revision: heldRevision,
                 async refreshCommittedWorkingSet(minimumRevision, options) {
                     if (released) {
                         throw new Error(
