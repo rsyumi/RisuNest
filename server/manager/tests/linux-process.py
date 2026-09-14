@@ -4,6 +4,7 @@ Run with explicit daemon and manager paths. Never opens installed application da
 """
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import pty
@@ -104,9 +105,33 @@ with tempfile.TemporaryDirectory(prefix="risunest-manager-test-") as temporary:
     (archive / "CLOUDFLARED-LICENSE").write_text("Synthetic installer fixture\n")
     installer = Path(__file__).resolve().parents[1] / "install/install.sh"
     shutil.copy2(installer, archive / "install.sh")
+    cloudflared_hash = hashlib.sha256((archive / "cloudflared").read_bytes()).hexdigest()
+    (archive / "risunest-sync-bundle.json").write_text(json.dumps({
+        "schema": "risunest-sync-bundle/v1",
+        "product": "sync",
+        "variant": "managed",
+        "version": "0.1.0",
+        "protocolId": "risunest-sync/v1",
+        "storeFormatId": "risunest-sync-store/v8",
+        "files": [
+            "CLOUDFLARED-LICENSE",
+            "cloudflared",
+            "install.sh",
+            "risunest-sync-manager",
+            "risunest-sync-server",
+        ],
+        "vendor": [{
+            "name": "cloudflared",
+            "version": "synthetic",
+            "os": "linux",
+            "arch": "x86_64" if os.uname().machine == "x86_64" else "aarch64",
+            "sha256": cloudflared_hash,
+            "path": "cloudflared",
+        }],
+    }, indent=2) + "\n")
     installed = home / ".local/bin/risunest-sync-manager"
     try:
-        run(["sh", str(archive / "install.sh")], env=env, input="")
+        run(["sh", str(archive / "install.sh"), "--non-interactive"], env=env, input="")
         assert installed.is_file()
         assert json.loads(run([str(installed), "status"], env=env))["devices"] == []
         run([str(installed), "uninstall"], env=env)

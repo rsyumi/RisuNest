@@ -1,0 +1,91 @@
+name: Verified release download caches
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - package.json
+      - pnpm-lock.yaml
+      - server/manager/gui/pnpm-lock.yaml
+      - src-tauri/Cargo.lock
+      - crates/sync-wire/Cargo.lock
+      - server/sync/Cargo.lock
+      - server/manager/Cargo.lock
+      - server/manager/gui/src-tauri/Cargo.lock
+      - scripts/release/**
+      - tests/release/**
+      - .github/workflows/release-cache.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with: { persist-credentials: false }
+      - uses: pnpm/action-setup@v5
+        with: { version: "10.34.1" }
+      - uses: actions/setup-node@v6
+        with: { node-version: "24", package-manager-cache: false }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:release
+
+  downloads:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-2022, target: x86_64-pc-windows-msvc }
+          - { runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { runner: macos-15-intel, target: x86_64-apple-darwin }
+          - { runner: macos-15, target: aarch64-apple-darwin }
+    runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target
+    steps:
+      - uses: actions/checkout@v6
+        with: { persist-credentials: false }
+      - uses: pnpm/action-setup@v5
+        with: { version: "10.34.1" }
+      - uses: actions/setup-node@v6
+        with: { node-version: "24", package-manager-cache: false }
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - id: pnpm-store
+        shell: bash
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+      - name: Fetch lockfile-pinned package downloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm fetch --frozen-lockfile
+          pnpm --dir server/manager/gui fetch --frozen-lockfile
+          cargo fetch --manifest-path src-tauri/Cargo.toml --locked --target "${{ matrix.target }}"
+          cargo fetch --manifest-path crates/sync-wire/Cargo.toml --locked --target "${{ matrix.target }}"
+          cargo fetch --manifest-path server/sync/Cargo.toml --locked --target "${{ matrix.target }}"
+          cargo fetch --manifest-path server/manager/Cargo.toml --locked --target "${{ matrix.target }}"
+          cargo fetch --manifest-path server/manager/gui/src-tauri/Cargo.toml --locked --target "${{ matrix.target }}"
+      - name: Enforce the per-runner share of the 8 GB active-cache target
+        shell: bash
+        run: >-
+          node scripts/release/cache-budget.mjs --max-bytes 1300000000
+          --path "${{ steps.pnpm-store.outputs.path }}"
+          --path "$HOME/.cargo/registry/cache"
+          --path "$HOME/.cargo/registry/index" --path "$HOME/.cargo/git/db"
+      - uses: actions/cache/save@v5
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: release-pnpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pnpm-lock.yaml', 'server/manager/gui/pnpm-lock.yaml') }}
+      - uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+          key: release-cargo-1.97.1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src-tauri/Cargo.lock', 'crates/sync-wire/Cargo.lock', 'server/sync/Cargo.lock', 'server/manager/Cargo.lock', 'server/manager/gui/src-tauri/Cargo.lock') }}
