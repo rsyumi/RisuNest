@@ -63,10 +63,6 @@ test("first publication requires explicit bootstrap and no existing stable relea
   await assert.rejects(publishRelease(t.options), /bootstrap/);
   t.options.bootstrap = true;
   t.options.github.hasPublishedStable = async () => true;
-  const list = t.options.github.listPublishedStable;
-  t.options.github.listPublishedStable = async () => [
-    ...await list(), { id: 9, tag_name: "documentation-snapshot", draft: false, prerelease: false },
-  ];
   await assert.rejects(publishRelease(t.options), /bootstrap/);
   t.options.github.hasPublishedStable = async () => false;
   await publishRelease(t.options);
@@ -127,6 +123,10 @@ test("a missing latest pointer is recovered only after comparing every published
   await publishRelease(t.options);
   t.options.github.latest = null;
   t.options.github.hasPublishedStable = async () => true;
+  const list = t.options.github.listPublishedStable;
+  t.options.github.listPublishedStable = async () => [
+    ...await list(), { id: 9, tag_name: "documentation-snapshot", draft: false, prerelease: false },
+  ];
   const events = t.events.length;
   assert.equal((await publishRelease(t.options)).status, "recovered");
   assert.deepEqual(t.events.slice(events), ["make-latest"]);

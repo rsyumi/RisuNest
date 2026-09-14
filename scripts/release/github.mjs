@@ -10,7 +10,7 @@ export class GitHubReleases {
   async request(path, { method = "GET", body, binary = false, allow404 = false, upload = false } = {}) {
     const host = upload ? "https://uploads.github.com" : "https://api.github.com";
     const response = await this.fetcher(`${host}/repos/${REPOSITORY}${path}`, {
-      method, signal: AbortSignal.timeout(60000),
+      method, signal: AbortSignal.timeout(upload ? 10 * 60 * 1000 : 60000),
       headers: { Authorization: `Bearer ${this.token}`, "X-GitHub-Api-Version": "2022-11-28",
         Accept: binary ? "application/octet-stream" : "application/vnd.github+json",
         ...(body === undefined ? {} : { "Content-Type": upload ? "application/octet-stream" : "application/json" }) },

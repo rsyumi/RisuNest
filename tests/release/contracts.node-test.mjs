@@ -29,6 +29,9 @@ test("rejects duplicate, wrong product, architecture and installer mappings", ()
     r => r.downloads[0].size = -1,
     r => r.downloads[0].sha256 = "0",
     r => r.localizedNotes.en = "a".repeat(4097),
+    r => r.platforms["windows-x86_64-nsis"] = r.platforms["windows-aarch64-nsis"],
+    r => r.downloads[0].unrecognized = true,
+    r => delete r.compatibility,
   ]) {
     const release = productFixture();
     mutate(release);
@@ -59,9 +62,10 @@ test("SemVer compares numeric components and prerelease identifiers precisely", 
   assert.equal(compareVersions("1.0.0-rc.2", "1.0.0"), -1);
   assert.equal(compareVersions("1.0.0+build.2", "1.0.0+build.1"), 0);
   assert.equal(compareVersions("99999999999999999.0.0", "99999999999999998.0.0"), 1);
-  for (const invalid of ["1", "1.2", "01.0.0", "1.0.0-01", "1.0.0-", "1.0.0+", "v1.0.0"]) {
+  for (const invalid of ["1", "1.2", "01.0.0", "1.0.0-01", "1.0.0-", "1.0.0+", "v1.0.0", "18446744073709551616.0.0"]) {
     assert.throws(() => compareVersions(invalid, "1.0.0"), /version/);
   }
+  assert.throws(() => validateProductRelease(productFixture("app", "1.0.0+build.1")), /build-metadata/);
 });
 
 test("catalog preserves separate product versions and validates fixed product URLs", () => {
