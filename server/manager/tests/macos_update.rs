@@ -19,8 +19,9 @@ use std::{
     fs::{self, OpenOptions},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     sync::Mutex,
+    thread::JoinHandle,
     time::Duration,
 };
 
@@ -463,20 +464,41 @@ fn helper_lock_active(root: &Path) -> Result<bool, String> {
     }
 }
 
-fn sleeping_parent() -> Result<Child, String> {
-    Command::new("sh")
+struct ReapedParent {
+    pid: u32,
+    reaper: JoinHandle<Result<(), String>>,
+}
+
+impl ReapedParent {
+    fn wait(self) -> Result<(), String> {
+        self.reaper
+            .join()
+            .map_err(|_| "parent reaper panicked".to_owned())?
+    }
+}
+
+fn sleeping_parent() -> Result<ReapedParent, String> {
+    let mut child = Command::new("sh")
         .args(["-c", "sleep 2"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|error| format!("parent spawn failed: {error}"))
+        .map_err(|error| format!("parent spawn failed: {error}"))?;
+    let pid = child.id();
+    let reaper = std::thread::spawn(move || {
+        let status = child
+            .wait()
+            .map_err(|error| format!("parent wait failed: {error}"))?;
+        if !status.success() {
+            return Err(format!("parent exited unsuccessfully: {status}"));
+        }
+        Ok(())
+    });
+    Ok(ReapedParent { pid, reaper })
 }
 
-async fn spawn_production_helper(
-    scenario: &Scenario,
-    parent: &mut Child,
-) -> Result<String, String> {
+async fn spawn_production_helper(scenario: &Scenario, parent_pid: u32) -> Result<String, String> {
     let helper_directory = scenario.root.join("manager-update/helper");
     fs::create_dir_all(&helper_directory).map_err(|error| error.to_string())?;
     let helper = helper_directory.join("risunest-sync-update-helper");
@@ -491,7 +513,7 @@ async fn spawn_production_helper(
         .arg(&scenario.root)
         .args(["--server"])
         .arg(&scenario.server)
-        .args(["update", "helper", &parent.id().to_string()])
+        .args(["update", "helper", &parent_pid.to_string()])
         .arg(&scenario.install);
     platform::spawn_update_helper(&scenario.root, &mut command)?;
     let helper_label = scenario.remember_helper_label()?;
@@ -626,10 +648,10 @@ async fn successful_update(
     wait_healthy(&scenario.root, &fixture.version).await?;
     scenario.stop().await?;
     prepare_transaction(&scenario, &fixture.version, &fixture.version, was_running)?;
-    let mut parent = sleeping_parent()?;
-    let helper_label = spawn_production_helper(&scenario, &mut parent).await?;
+    let parent = sleeping_parent()?;
+    let helper_label = spawn_production_helper(&scenario, parent.pid).await?;
     assert_eq!(inode(&scenario.install)?, source_inode);
-    parent.wait().map_err(|error| error.to_string())?;
+    parent.wait()?;
     wait_completed(&scenario).await?;
     wait_helper_job_gone(&scenario.root, &helper_label).await?;
     if was_running {
@@ -670,9 +692,9 @@ async fn failing_update_rolls_back(fixture: &VerifiedFixture) -> Result<(), Stri
     scenario.stop().await?;
     let injected_target = format!("{}-synthetic-health-mismatch", fixture.version);
     prepare_transaction(&scenario, &fixture.version, &injected_target, true)?;
-    let mut parent = sleeping_parent()?;
-    let helper_label = spawn_production_helper(&scenario, &mut parent).await?;
-    parent.wait().map_err(|error| error.to_string())?;
+    let parent = sleeping_parent()?;
+    let helper_label = spawn_production_helper(&scenario, parent.pid).await?;
+    parent.wait()?;
     wait_restarting(&scenario, source_inode).await?;
     wait_healthy(&scenario.root, &fixture.version).await?;
     let target_pid = listener_pid(&scenario.root)?;
