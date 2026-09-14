@@ -179,10 +179,15 @@ fn stopped_directory_helper_rolls_back_when_the_target_cannot_be_health_checked(
     .save(&root)
     .unwrap();
     let mut parent = sleeping_parent();
+    let parent_id = parent.id();
+    let (parent_send, parent_receive) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = parent_send.send(parent.wait());
+    });
     let result = run_in_thread(
         root.clone(),
         root.join("missing-server-must-not-start"),
-        parent.id(),
+        parent_id,
         install.clone(),
     );
 
@@ -192,7 +197,11 @@ fn stopped_directory_helper_rolls_back_when_the_target_cannot_be_health_checked(
         .recv_timeout(Duration::from_secs(10))
         .unwrap()
         .unwrap_err();
-    let _ = parent.wait();
+    assert!(parent_receive
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap()
+        .success());
 
     assert_eq!(error, "server-executable-or-data-path-invalid");
     assert_eq!(fs::read(install.join("version")).unwrap(), b"old");
