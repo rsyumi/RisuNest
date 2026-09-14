@@ -1,5 +1,6 @@
 use crate::{
     store::{CommitSubmission, Device, Store},
+    workload::{WorkKind, Workload},
     Error, Result,
 };
 use axum::{
@@ -32,6 +33,7 @@ struct App {
     materializers: Arc<Semaphore>,
     media_slots: Arc<Semaphore>,
     devices: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    workload: Workload,
     _lifetime: Arc<()>,
 }
 #[derive(Clone)]
@@ -39,9 +41,14 @@ struct BufferedRequest {
     _permit: Arc<tokio::sync::OwnedSemaphorePermit>,
 }
 pub fn router(store: Arc<Store>) -> Router {
+    router_with_workload(store, Workload::new())
+}
+
+pub fn router_with_workload(store: Arc<Store>, workload: Workload) -> Router {
     let lifetime = Arc::new(());
     let maintenance_alive = Arc::downgrade(&lifetime);
     let maintenance_store = Arc::downgrade(&store);
+    let maintenance_workload = workload.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
@@ -51,27 +58,58 @@ pub fn router(store: Arc<Store>) -> Router {
             let Some(store) = maintenance_store.upgrade() else {
                 break;
             };
-            let _ = blocking(move || store.maintain()).await;
+            let Ok(mut work) = maintenance_workload.begin(WorkKind::Background) else {
+                continue;
+            };
+            let _ = blocking(move || {
+                let result = store.maintain();
+                work.set_performed_work(true);
+                result
+            })
+            .await;
         }
     });
     let uploads_alive = Arc::downgrade(&lifetime);
     let uploads = Arc::downgrade(&store);
+    let upload_workload = workload.clone();
     tokio::spawn(async move {
         while uploads_alive.strong_count() > 0 {
             let Some(store) = uploads.upgrade() else {
                 break;
             };
-            if !matches!(blocking(move || store.run_pending_upload()).await, Ok(true)) {
+            let Ok(mut work) = upload_workload.begin(WorkKind::Background) else {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            };
+            if !matches!(
+                blocking(move || {
+                    let result = store.run_pending_upload();
+                    work.set_performed_work(!matches!(&result, Ok(false)));
+                    result
+                })
+                .await,
+                Ok(true)
+            ) {
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
         }
     });
     let alive = Arc::downgrade(&lifetime);
     let jobs = Arc::downgrade(&store);
+    let commit_workload = workload.clone();
     tokio::spawn(async move {
         while alive.strong_count() > 0 {
             let Some(store) = jobs.upgrade() else { break };
-            let result = blocking(move || store.run_pending_commit()).await;
+            let Ok(mut work) = commit_workload.begin(WorkKind::Background) else {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            };
+            let result = blocking(move || {
+                let result = store.run_pending_commit();
+                work.set_performed_work(!matches!(&result, Ok(false)));
+                result
+            })
+            .await;
             if !matches!(result, Ok(true)) {
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
@@ -79,13 +117,23 @@ pub fn router(store: Arc<Store>) -> Router {
     });
     let delta_alive = Arc::downgrade(&lifetime);
     let delta_store = Arc::downgrade(&store);
+    let delta_workload = workload.clone();
     tokio::spawn(async move {
         while delta_alive.strong_count() > 0 {
             let Some(store) = delta_store.upgrade() else {
                 break;
             };
+            let Ok(mut work) = delta_workload.begin(WorkKind::Background) else {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            };
             if !matches!(
-                blocking(move || store.run_pending_download_delta()).await,
+                blocking(move || {
+                    let result = store.run_pending_download_delta();
+                    work.set_performed_work(!matches!(&result, Ok(false)));
+                    result
+                })
+                .await,
                 Ok(true)
             ) {
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -100,6 +148,7 @@ pub fn router(store: Arc<Store>) -> Router {
         materializers: Arc::new(Semaphore::new(1)),
         media_slots: Arc::new(Semaphore::new(16)),
         devices: Arc::new(Mutex::new(HashMap::new())),
+        workload,
         _lifetime: lifetime,
     };
     Router::new()
@@ -161,7 +210,7 @@ impl IntoResponse for Error {
             Json(serde_json::json!({"error":self.code})),
         )
             .into_response();
-        if self.status == 429 {
+        if self.status == 429 || self.code == "server-updating" {
             response
                 .headers_mut()
                 .insert("retry-after", "1".parse().unwrap());
@@ -213,6 +262,7 @@ async fn authorize(State(app): State<App>, request: Request, next: Next) -> Resp
         if header(request.headers(), "content-encoding").is_some_and(|v| v != "identity") {
             return Err(Error::new("unsupported-content-encoding", 415));
         }
+        let work = app.workload.begin(WorkKind::Request)?;
         let semaphore = {
             let mut devices = app
                 .devices
@@ -267,9 +317,16 @@ async fn authorize(State(app): State<App>, request: Request, next: Next) -> Resp
         } else {
             60
         };
-        let mut response = tokio::time::timeout(Duration::from_secs(deadline), next.run(request))
+        // The task owns every admission permit. If the HTTP deadline expires,
+        // blocking work continues to hold admission until it actually returns.
+        let task = tokio::spawn(async move {
+            let response = next.run(request).await;
+            (response, (_device_permit, _global_permit, buffered, work))
+        });
+        let (mut response, permits) = tokio::time::timeout(Duration::from_secs(deadline), task)
             .await
-            .map_err(|_| Error::new("request-timeout", 408))?;
+            .map_err(|_| Error::new("request-timeout", 408))?
+            .map_err(|_| Error::new("worker-unavailable", 503))?;
         response
             .headers_mut()
             .insert("cache-control", "no-store".parse().unwrap());
@@ -277,7 +334,6 @@ async fn authorize(State(app): State<App>, request: Request, next: Next) -> Resp
         // disconnected, not just until response headers are ready.
         use futures_util::StreamExt;
         let (parts, body) = response.into_parts();
-        let permits = (_device_permit, _global_permit, buffered);
         let stream = body.into_data_stream().map(move |chunk| {
             let _ = &permits;
             chunk

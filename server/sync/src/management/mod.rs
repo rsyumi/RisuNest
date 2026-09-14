@@ -2,7 +2,11 @@ pub mod discovery;
 pub mod storage;
 
 use crate::{
-    connection::ConnectionOptions, runtime::ConnectionRuntime, store::Store, Error, Result,
+    connection::ConnectionOptions,
+    runtime::ConnectionRuntime,
+    store::Store,
+    workload::{WorkKind, Workload},
+    Error, Result,
 };
 use axum::{
     extract::{DefaultBodyLimit, Path, Request, State},
@@ -37,6 +41,7 @@ struct Context {
     usage: RwLock<storage::StorageUsage>,
     started: Instant,
     stop: watch::Sender<bool>,
+    workload: Workload,
 }
 
 pub struct Management {
@@ -47,6 +52,14 @@ pub struct Management {
 
 impl Management {
     pub async fn start(store: Arc<Store>, origin: SocketAddr) -> Result<Self> {
+        Self::start_with_workload(store, origin, Workload::new()).await
+    }
+
+    pub async fn start_with_workload(
+        store: Arc<Store>,
+        origin: SocketAddr,
+        workload: Workload,
+    ) -> Result<Self> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let locator = discovery::Discovery {
             address: listener.local_addr()?,
@@ -66,6 +79,7 @@ impl Management {
             usage: RwLock::new(storage::StorageUsage::default()),
             started: Instant::now(),
             stop,
+            workload,
         });
         if let Err(error) = context.locator.save(context.store.data_path()) {
             if let Some(runtime) = context.runtime.lock().await.connection.take() {
@@ -81,6 +95,11 @@ impl Management {
             .route("/tunnel/{action}", post(tunnel))
             .route("/registry/repost", post(repost))
             .route("/shutdown", post(shutdown))
+            .route("/maintenance", get(maintenance_status))
+            .route("/maintenance/acquire", post(maintenance_acquire))
+            .route("/maintenance/renew", post(maintenance_renew))
+            .route("/maintenance/release", post(maintenance_release))
+            .route("/maintenance/shutdown", post(maintenance_shutdown))
             .layer(DefaultBodyLimit::max(16 * 1024))
             .layer(middleware::from_fn_with_state(context.clone(), authorize))
             .with_state(context.clone());
@@ -199,12 +218,50 @@ async fn status(State(ctx): State<Arc<Context>>) -> Result<Json<Value>> {
             json!({"phase":"stopped","error":null}),
         ),
     };
+    let maintenance = maintenance_value(&ctx, None).await?;
     Ok(Json(json!({
         "revision":format!("{}:{}",ctx.session,rt.revision), "uptimeSeconds":ctx.started.elapsed().as_secs(),
         "connection":connection, "connectionState":persisted, "tunnel":tunnel, "publication":publication,
         "storage":*ctx.usage.read().await, "devices":devices,
+        "maintenance":maintenance,
+        "version":env!("CARGO_PKG_VERSION"),
+        "protocolId":crate::PROTOCOL_ID,
+        "storeFormatId":crate::STORE_FORMAT_ID,
         "defaultRegistryUrl":option_env!("RISUNEST_DEFAULT_REGISTRY_URL"),
     })))
+}
+
+async fn maintenance_value(ctx: &Context, lease_token: Option<String>) -> Result<Value> {
+    let status = ctx.workload.status()?;
+    let store = ctx.store.clone();
+    let durable = blocking(move || store.durable_work()).await?;
+    let mut value =
+        serde_json::to_value(status).map_err(|_| Error::new("management-operation-failed", 503))?;
+    let fields = value
+        .as_object_mut()
+        .ok_or(Error::new("management-operation-failed", 503))?;
+    fields.insert("durablePending".into(), json!(durable));
+    if let Some(token) = lease_token {
+        fields.insert("leaseToken".into(), json!(token));
+    }
+    Ok(value)
+}
+
+async fn maintenance_response(ctx: &Arc<Context>, token: Option<String>) -> Result<Json<Value>> {
+    let revision = {
+        let rt = ctx.runtime.lock().await;
+        format!("{}:{}", ctx.session, rt.revision)
+    };
+    let mut value = maintenance_value(ctx, token).await?;
+    value
+        .as_object_mut()
+        .ok_or(Error::new("management-operation-failed", 503))?
+        .insert("revision".into(), json!(revision));
+    Ok(Json(value))
+}
+
+async fn maintenance_status(State(ctx): State<Arc<Context>>) -> Result<Json<Value>> {
+    maintenance_response(&ctx, None).await
 }
 
 #[derive(Deserialize)]
@@ -215,19 +272,93 @@ struct Mutation {
     name: Option<String>,
     request_id: Option<String>,
 }
-fn check(ctx: &Context, rt: &mut RuntimeState, input: &Mutation) -> Result<()> {
-    if input.revision != format!("{}:{}", ctx.session, rt.revision) {
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LeaseMutation {
+    revision: String,
+    lease_token: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevisionMutation {
+    revision: String,
+}
+
+fn require_revision(ctx: &Context, rt: &RuntimeState, revision: &str) -> Result<()> {
+    if revision != format!("{}:{}", ctx.session, rt.revision) {
         return Err(Error::new("management-stale-state", 409));
     }
+    Ok(())
+}
+fn check(ctx: &Context, rt: &mut RuntimeState, input: &Mutation) -> Result<()> {
+    require_revision(ctx, rt, &input.revision)?;
     // Increment even if a later action fails after an external side effect.
     rt.revision += 1;
     Ok(())
+}
+
+async fn maintenance_acquire(
+    State(ctx): State<Arc<Context>>,
+    Json(input): Json<RevisionMutation>,
+) -> Result<Json<Value>> {
+    let token = {
+        let mut rt = ctx.runtime.lock().await;
+        require_revision(&ctx, &rt, &input.revision)?;
+        let (token, _) = ctx.workload.acquire()?;
+        rt.revision += 1;
+        token
+    };
+    maintenance_response(&ctx, Some(token)).await
+}
+
+async fn maintenance_renew(
+    State(ctx): State<Arc<Context>>,
+    Json(input): Json<LeaseMutation>,
+) -> Result<Json<Value>> {
+    {
+        let mut rt = ctx.runtime.lock().await;
+        require_revision(&ctx, &rt, &input.revision)?;
+        ctx.workload.renew(&input.lease_token)?;
+        rt.revision += 1;
+    }
+    maintenance_response(&ctx, None).await
+}
+
+async fn maintenance_release(
+    State(ctx): State<Arc<Context>>,
+    Json(input): Json<LeaseMutation>,
+) -> Result<Json<Value>> {
+    {
+        let mut rt = ctx.runtime.lock().await;
+        require_revision(&ctx, &rt, &input.revision)?;
+        ctx.workload.release(&input.lease_token)?;
+        rt.revision += 1;
+    }
+    maintenance_response(&ctx, None).await
+}
+
+async fn maintenance_shutdown(
+    State(ctx): State<Arc<Context>>,
+    Json(input): Json<LeaseMutation>,
+) -> Result<Json<Value>> {
+    let revision = {
+        let mut rt = ctx.runtime.lock().await;
+        require_revision(&ctx, &rt, &input.revision)?;
+        ctx.workload.transition_to_stopping(&input.lease_token)?;
+        rt.revision += 1;
+        format!("{}:{}", ctx.session, rt.revision)
+    };
+    ctx.stop.send_replace(true);
+    Ok(Json(json!({"revision":revision,"stopping":true})))
 }
 
 async fn configure(
     State(ctx): State<Arc<Context>>,
     Json(input): Json<Mutation>,
 ) -> Result<Json<Value>> {
+    let _work = ctx.workload.begin(WorkKind::Request)?;
     let options = input
         .options
         .clone()
@@ -249,6 +380,7 @@ async fn issue(
     State(ctx): State<Arc<Context>>,
     Json(input): Json<Mutation>,
 ) -> Result<Json<Value>> {
+    let _work = ctx.workload.begin(WorkKind::Request)?;
     let mut rt = ctx.runtime.lock().await;
     check(&ctx, &mut rt, &input)?;
     let state = ctx.store.connection_status()?;
@@ -273,6 +405,7 @@ async fn revoke(
     Path(id): Path<String>,
     Json(input): Json<Mutation>,
 ) -> Result<Json<Value>> {
+    let _work = ctx.workload.begin(WorkKind::Request)?;
     let mut rt = ctx.runtime.lock().await;
     check(&ctx, &mut rt, &input)?;
     let store = ctx.store.clone();
@@ -285,6 +418,7 @@ async fn tunnel(
     Path(action): Path<String>,
     Json(input): Json<Mutation>,
 ) -> Result<Json<Value>> {
+    let _work = ctx.workload.begin(WorkKind::Request)?;
     if !["start", "stop", "restart"].contains(&action.as_str()) {
         return Err(Error::new("invalid-tunnel-action", 400));
     }
@@ -306,6 +440,7 @@ async fn repost(
     State(ctx): State<Arc<Context>>,
     Json(input): Json<Mutation>,
 ) -> Result<Json<Value>> {
+    let _work = ctx.workload.begin(WorkKind::Request)?;
     let mut rt = ctx.runtime.lock().await;
     check(&ctx, &mut rt, &input)?;
     let runtime = rt
@@ -322,6 +457,7 @@ async fn shutdown(
     State(ctx): State<Arc<Context>>,
     Json(input): Json<Mutation>,
 ) -> Result<Json<Value>> {
+    let _work = ctx.workload.begin(WorkKind::Request)?;
     let mut rt = ctx.runtime.lock().await;
     check(&ctx, &mut rt, &input)?;
     ctx.stop.send_replace(true);

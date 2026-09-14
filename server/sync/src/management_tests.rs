@@ -289,6 +289,154 @@ async fn management_http_auth_revision_and_live_issuance() {
     assert!(!root.path().join("management-session").exists());
 }
 
+#[tokio::test]
+async fn maintenance_lease_blocks_new_work_and_tracks_active_work() {
+    use crate::workload::{WorkKind, Workload};
+    use std::{
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::init(root.path()).unwrap());
+    store
+        .configure_connection(ConnectionOptions {
+            endpoint: Some("https://sync.example.com".into()),
+            cloudflared: None,
+            registry_url: None,
+        })
+        .unwrap();
+    let credential = store.add_device().unwrap();
+
+    let now = Arc::new(Mutex::new(Instant::now()));
+    let clock_now = now.clone();
+    let workload = Workload::with_clock(
+        Duration::from_secs(30),
+        Duration::from_secs(45),
+        Arc::new(move || *clock_now.lock().unwrap()),
+    );
+    let active = workload.begin(WorkKind::Request).unwrap();
+    *now.lock().unwrap() += Duration::from_secs(30);
+
+    let sync_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sync_address = sync_listener.local_addr().unwrap();
+    let sync_app = crate::http::router_with_workload(store.clone(), workload.clone());
+    let sync_server = tokio::spawn(async move {
+        axum::serve(sync_listener, sync_app).await.unwrap();
+    });
+    let manager = crate::management::Management::start_with_workload(store, sync_address, workload)
+        .await
+        .unwrap();
+    let discovery = crate::management::discovery::Discovery::load(root.path()).unwrap();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let management_url = format!("http://{}", manager.address());
+    let sync_url = format!("http://{sync_address}");
+
+    let status: serde_json::Value = client
+        .get(format!("{management_url}/maintenance"))
+        .bearer_auth(&discovery.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["activeRequests"], 1);
+    let acquired: serde_json::Value = client
+        .post(format!("{management_url}/maintenance/acquire"))
+        .bearer_auth(&discovery.token)
+        .json(&serde_json::json!({"revision":status["revision"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(acquired["state"], "draining");
+    assert_eq!(acquired["activeRequests"], 1);
+    assert_eq!(acquired["drained"], false);
+    assert_eq!(acquired["durablePending"]["uploads"], 0);
+    let lease = acquired["leaseToken"].as_str().unwrap();
+
+    let not_drained = client
+        .post(format!("{management_url}/maintenance/shutdown"))
+        .bearer_auth(&discovery.token)
+        .json(&serde_json::json!({
+            "revision":acquired["revision"],
+            "leaseToken":lease
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(not_drained.status(), 409);
+    assert_eq!(
+        not_drained.json::<serde_json::Value>().await.unwrap()["error"],
+        "maintenance-not-drained"
+    );
+    let blocked = client
+        .get(format!("{sync_url}/head"))
+        .bearer_auth(&credential.token)
+        .header("x-risu-library", &credential.library_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), 503);
+    assert_eq!(blocked.headers()["retry-after"], "1");
+    assert_eq!(
+        blocked.json::<serde_json::Value>().await.unwrap()["error"],
+        "server-updating"
+    );
+
+    drop(active);
+    let drained: serde_json::Value = client
+        .get(format!("{management_url}/maintenance"))
+        .bearer_auth(&discovery.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(drained["drained"], true);
+
+    let denied = client
+        .post(format!("{management_url}/maintenance/release"))
+        .bearer_auth(&discovery.token)
+        .json(&serde_json::json!({
+            "revision":acquired["revision"],
+            "leaseToken":"wrong"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 403);
+    let released = client
+        .post(format!("{management_url}/maintenance/release"))
+        .bearer_auth(&discovery.token)
+        .json(&serde_json::json!({
+            "revision":acquired["revision"],
+            "leaseToken":lease
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(released.status(), 200);
+    assert_eq!(
+        client
+            .get(format!("{sync_url}/head"))
+            .bearer_auth(&credential.token)
+            .header("x-risu-library", &credential.library_id)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    manager.close().await;
+    sync_server.abort();
+}
+
 #[test]
 fn storage_counts_files_without_reading_payloads() {
     let root = tempfile::tempdir().unwrap();

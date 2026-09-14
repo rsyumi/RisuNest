@@ -184,9 +184,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "local development"
                 }
             );
-            let management = Management::start(store.clone(), origin).await?;
+            let workload = risunest_sync_server::workload::Workload::new();
+            let management =
+                Management::start_with_workload(store.clone(), origin, workload.clone()).await?;
             let mut stopped = management.shutdown_receiver();
-            let result = axum::serve(listener, http::router(store))
+            let result = axum::serve(listener, http::router_with_workload(store, workload))
                 .with_graceful_shutdown(async move {
                     tokio::select! { _ = shutdown() => (), _ = stopped.changed() => () }
                 })

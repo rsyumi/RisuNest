@@ -74,6 +74,16 @@ pub struct DeviceSession {
     pub operation_pending: bool,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DurableWork {
+    pub commit_jobs: u64,
+    pub upload_jobs: u64,
+    pub download_jobs: u64,
+    pub staged_changes: u64,
+    pub uploads: u64,
+}
+
 pub(super) fn random_id() -> Result<String> {
     let mut bytes = [0u8; 32];
     getrandom::getrandom(&mut bytes).map_err(|_| Error::new("entropy-unavailable", 503))?;
@@ -89,6 +99,23 @@ pub(super) fn parse<T: for<'de> Deserialize<'de>>(value: &str) -> Result<T> {
 }
 
 impl Store {
+    pub fn durable_work(&self) -> Result<DurableWork> {
+        let db = self.reader()?;
+        let count = |table: &str| -> Result<u64> {
+            let value: i64 = db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })?;
+            u64::try_from(value).map_err(|_| Error::new("corrupt-metadata", 503))
+        };
+        Ok(DurableWork {
+            commit_jobs: count("commit_jobs")?,
+            upload_jobs: count("upload_jobs")?,
+            download_jobs: count("download_deltas")?,
+            staged_changes: count("staged_changes")?,
+            uploads: count("uploads")?,
+        })
+    }
+
     pub fn init(root: &Path) -> Result<Self> {
         Self::open_inner(root, true)
     }
@@ -161,7 +188,7 @@ impl Store {
             objects::sync_directory(&root)?;
         } else {
             let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            if version != 8 {
+            if version != schema::VERSION {
                 return Err(Error::new("incompatible-store", 409));
             }
         }
@@ -340,5 +367,26 @@ impl Store {
             params![seq.as_str(), device.id],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    #[test]
+    fn exported_store_format_matches_the_initialized_schema() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::init(&root.path().join("sync")).unwrap();
+        let version: i64 = store
+            .reader()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, schema::VERSION);
+        assert_eq!(
+            crate::STORE_FORMAT_ID,
+            format!("risunest-sync-store/v{version}")
+        );
     }
 }

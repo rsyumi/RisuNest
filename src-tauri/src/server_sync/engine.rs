@@ -17,7 +17,7 @@ use crate::{
     logical_records::{decode_logical_record_key, encode_logical_record_key, LogicalRecordLocator},
     server_sync::{
         cache::Cache,
-        client::{response_error, ServerClient},
+        client::{is_ambiguous_transient, response_error, Reply, RetryBudget, ServerClient},
         planner::{self, Decision},
         remote,
         transfer::Transfer,
@@ -26,8 +26,8 @@ use crate::{
 };
 use reqwest::Method;
 use risunest_sync_wire::{
-    canonical, change_digest::ChangeDigest, ChangeSet, ReadFence, Receipt, RecordChange,
-    RecordVersion, RemoteHead, ScopeFence, MAX_METADATA_BYTES,
+    canonical, change_digest::ChangeDigest, ChangeSet, CommitIntent, ReadFence, Receipt,
+    RecordChange, RecordVersion, RemoteHead, ScopeFence, MAX_METADATA_BYTES,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,111 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) enum Resolution {
     KeepLocal,
     KeepRemote,
+}
+
+#[cfg(test)]
+mod commit_retry_tests {
+    use super::*;
+    use crate::server_sync::client::ServerConfig;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        time::Duration,
+    };
+
+    fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).unwrap();
+            assert!(read > 0, "request ended before its headers were complete");
+            bytes.extend_from_slice(&chunk[..read]);
+            let Some(headers_end) = bytes.windows(4).position(|value| value == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&bytes[..headers_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            let request_length = headers_end + 4 + content_length;
+            if bytes.len() >= request_length {
+                bytes.truncate(request_length);
+                return bytes;
+            }
+        }
+    }
+
+    #[test]
+    fn accepted_commit_with_lost_response_checks_same_operation_without_reposting() {
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", server.local_addr().unwrap());
+        let config = ServerConfig {
+            directory: None,
+            endpoint,
+            library_id: "library".into(),
+            device_id: "device".into(),
+            token: "a".repeat(64),
+        };
+        let intent = CommitIntent {
+            device_operation_seq: 1.into(),
+            expected_head: RemoteHead {
+                library_id: config.library_id.clone(),
+                epoch: "epoch".into(),
+                seq: 0.into(),
+                head_id: "b".repeat(64),
+                min_retained_seq: 0.into(),
+            },
+            changes_digest: "c".repeat(64),
+            staged_changes_id: "d".repeat(64),
+        };
+        let operation = risunest_sync_wire::operation_id(
+            &config.library_id,
+            &config.device_id,
+            &intent.device_operation_seq,
+        )
+        .unwrap();
+        let expected = operation.clone();
+        let task = std::thread::spawn(move || {
+            let (mut commit, _) = server.accept().unwrap();
+            let request = read_request(&mut commit);
+            assert!(request.starts_with(b"POST /commits HTTP/1.1\r\n"));
+            drop(commit);
+
+            let (mut lookup, _) = server.accept().unwrap();
+            let request = read_request(&mut lookup);
+            assert!(
+                request.starts_with(format!("GET /operations/{expected} HTTP/1.1\r\n").as_bytes())
+            );
+            let body = serde_json::json!({"operationId":expected,"status":"pending"}).to_string();
+            write!(
+                lookup,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            lookup.flush().unwrap();
+
+            server.set_nonblocking(true).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(matches!(
+                server.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+        });
+        let client = ServerClient::new(config).unwrap();
+        let reply = submit_commit(&client, &intent).unwrap();
+        assert_eq!(reply.status, 202);
+        task.join().unwrap();
+    }
 }
 /// Record counts of the cycle in flight, read by the UI beside the byte counter.
 /// `total` covers the records this cycle applies or uploads; `done` advances
@@ -70,6 +175,8 @@ pub(crate) struct CycleOptions {
     pub retryable_failure: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
     #[serde(skip)]
     pub cycle_items: Option<std::sync::Arc<CycleItemCounter>>,
+    #[serde(skip)]
+    pub(crate) retry_budget: Option<std::sync::Arc<RetryBudget>>,
     #[serde(skip)]
     pub groups: BTreeSet<String>,
 }
@@ -110,6 +217,7 @@ pub(crate) struct PreparedCycle {
     verified_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     retryable_failure: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
     cycle_items: Option<std::sync::Arc<CycleItemCounter>>,
+    retry_budget: std::sync::Arc<RetryBudget>,
 }
 fn json<T: Serialize>(value: &T) -> Result<String> {
     String::from_utf8(canonical::encode(value)?)
@@ -117,6 +225,65 @@ fn json<T: Serialize>(value: &T) -> Result<String> {
 }
 fn parse<T: for<'de> Deserialize<'de>>(value: &str) -> Result<T> {
     Ok(canonical::decode(value.as_bytes(), MAX_METADATA_BYTES)?)
+}
+
+fn submit_commit(client: &ServerClient, intent: &CommitIntent) -> Result<Reply> {
+    let config = client.config();
+    let operation = risunest_sync_wire::operation_id(
+        &config.library_id,
+        &config.device_id,
+        &intent.device_operation_seq,
+    )?;
+    loop {
+        let ambiguous = match client.request(
+            Method::POST,
+            "commits",
+            &[],
+            Some(canonical::encode(intent)?),
+            &[("if-match", intent.expected_head.etag())],
+            MAX_METADATA_BYTES,
+        ) {
+            Ok(reply) if matches!(reply.status, 502 | 503 | 504) => {
+                client.wait_transient_response(reply.retry_after, "server-unreachable")?;
+                true
+            }
+            Ok(reply) => return Ok(reply),
+            Err(error) if is_ambiguous_transient(&error) => {
+                client.wait_after_ambiguous(&error)?;
+                true
+            }
+            Err(error) => return Err(error),
+        };
+        debug_assert!(ambiguous);
+        let mut status = client.request(
+            Method::GET,
+            &format!("operations/{operation}"),
+            &[],
+            None,
+            &[],
+            MAX_METADATA_BYTES,
+        )?;
+        client.report_retryable_failure(None);
+        match status.status {
+            200 if canonical::decode::<Receipt>(&status.body, MAX_METADATA_BYTES).is_ok() => {
+                return Ok(status)
+            }
+            200 => {
+                let value: serde_json::Value = canonical::decode(&status.body, MAX_METADATA_BYTES)?;
+                if value.get("operationId").and_then(|value| value.as_str())
+                    != Some(operation.as_str())
+                    || value.get("status").and_then(|value| value.as_str()) != Some("pending")
+                {
+                    return Err(SyncError::new("invalid-operation-status", 502));
+                }
+                status.status = 202;
+                return Ok(status);
+            }
+            404 => continue,
+            410 => return Ok(status),
+            _ => return Err(response_error(status)),
+        }
+    }
 }
 fn lookup(db: &Connection, table: &str, key: &str) -> Result<RecordVersion> {
     let value: Option<String> = db
@@ -284,14 +451,7 @@ impl PersistentStore {
             }
             let intent =
                 self.server_reserve(head, changes_digest, sealed.staged_changes_id, revision)?;
-            let reply = client.request(
-                Method::POST,
-                "commits",
-                &[],
-                Some(canonical::encode(&intent)?),
-                &[("if-match", head.etag())],
-                MAX_METADATA_BYTES,
-            )?;
+            let reply = submit_commit(client, &intent)?;
             if reply.status == 202 {
                 return Ok(());
             }
@@ -436,14 +596,7 @@ impl PersistentStore {
         {
             return Err(SyncError::new("staged-intent-mismatch", 409));
         }
-        let reply = client.request(
-            Method::POST,
-            "commits",
-            &[],
-            Some(canonical::encode(&pending.intent)?),
-            &[("if-match", pending.intent.expected_head.etag())],
-            MAX_METADATA_BYTES,
-        )?;
+        let reply = submit_commit(client, &pending.intent)?;
         if reply.status == 202 {
             return Ok(true);
         }
@@ -569,12 +722,19 @@ impl PersistentStore {
         if status.registration_required {
             return Err(SyncError::new("device-registration-required", 409));
         }
-        let mut client =
-            ServerClient::with_cancellation(config.clone(), options.cancellation.clone())?;
+        let mut client = if let Some(retry_budget) = &options.retry_budget {
+            ServerClient::with_retry_budget(
+                config.clone(),
+                options.cancellation.clone(),
+                retry_budget.clone(),
+            )?
+        } else {
+            ServerClient::with_cancellation(config.clone(), options.cancellation.clone())?
+        };
         client.verified_bytes = options.verified_bytes.clone();
         client.retryable_failure = options.retryable_failure.clone();
         let identity_head = client.resolve_identity(false)?;
-        self.server_cache_endpoint(&config, client.config())?;
+        self.server_cache_endpoint(&config, &client.config())?;
         let resume_may_commit = self
             .server_pending()?
             .is_some_and(|p| !p.phase.starts_with('{'));
@@ -584,6 +744,7 @@ impl PersistentStore {
             ),
         ))?;
         let transfer = Transfer::new(&client, &cache)?;
+        let retry_budget = client.retry_budget();
         if self.resume_server_operation(&client, &transfer)? {
             return Ok(Preparation::Report(CycleResult {
                 endpoint: client.config().endpoint.clone(),
@@ -812,6 +973,7 @@ impl PersistentStore {
                 verified_bytes: options.verified_bytes.clone(),
                 retryable_failure: options.retryable_failure.clone(),
                 cycle_items: options.cycle_items.clone(),
+                retry_budget: Some(retry_budget),
                 groups: required_groups,
             });
         }
@@ -879,9 +1041,7 @@ impl PersistentStore {
             counter
                 .total
                 .store(total.max(0) as u64, std::sync::atomic::Ordering::Relaxed);
-            counter
-                .done
-                .store(0, std::sync::atomic::Ordering::Relaxed);
+            counter.done.store(0, std::sync::atomic::Ordering::Relaxed);
         }
         after.clear();
         loop {
@@ -1036,6 +1196,7 @@ impl PersistentStore {
             verified_bytes: options.verified_bytes.clone(),
             retryable_failure: options.retryable_failure.clone(),
             cycle_items: options.cycle_items.clone(),
+            retry_budget,
         }))
     }
     /// No network work is allowed here. Production holds the JS mutation fence
@@ -1079,8 +1240,11 @@ impl PersistentStore {
         let config = self
             .server_config()?
             .ok_or_else(|| SyncError::new("server-not-bound", 409))?;
-        let mut client =
-            ServerClient::with_cancellation(config.clone(), ready.cancellation.clone())?;
+        let mut client = ServerClient::with_retry_budget(
+            config.clone(),
+            ready.cancellation.clone(),
+            ready.retry_budget.clone(),
+        )?;
         client.verified_bytes = ready.verified_bytes.clone();
         client.retryable_failure = ready.retryable_failure.clone();
         let cache = Cache::open(&self.repository_root.join("server-sync").join(

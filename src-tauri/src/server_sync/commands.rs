@@ -389,10 +389,10 @@ pub(crate) async fn server_sync_bind(
         let state = app.state::<ServerSyncCommandState>();
         let _running = state.claim()?;
         state.require_no_preparation()?;
-        let mut client = ServerClient::new(config.clone())?;
+        let client = ServerClient::new(config.clone())?;
         client.resolve_identity(true)?;
         let mut store = job_store(&app)?;
-        store.server_bind(client.config())?;
+        store.server_bind(&client.config())?;
         store.server_status()
     })
     .await
@@ -426,7 +426,7 @@ pub(crate) async fn server_sync_reregister(
         if old.library_id != config.library_id || old.device_id == config.device_id {
             return Err(SyncError::new("new-device-registration-required", 409));
         }
-        let mut client = ServerClient::new(config.clone())?;
+        let client = ServerClient::new(config.clone())?;
         client.resolve_identity(true)?;
         #[derive(serde::Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -447,7 +447,7 @@ pub(crate) async fn server_sync_reregister(
         if status.active {
             return Err(SyncError::new("revoke-previous-device-first", 409));
         }
-        store.server_replace_registration(client.config(), expected_revision)?;
+        store.server_replace_registration(&client.config(), expected_revision)?;
         store.server_status()
     })
     .await
@@ -466,9 +466,9 @@ pub(crate) async fn server_sync_reconcile(
         let config = store
             .server_config()?
             .ok_or_else(|| SyncError::new("server-not-bound", 409))?;
-        let mut client = ServerClient::new(config.clone())?;
+        let client = ServerClient::new(config.clone())?;
         let head = client.resolve_identity(false)?;
-        store.server_cache_endpoint(&config, client.config())?;
+        store.server_cache_endpoint(&config, &client.config())?;
         store.server_reconcile_epoch(&head, expected_revision)?;
         store.server_status()
     })
