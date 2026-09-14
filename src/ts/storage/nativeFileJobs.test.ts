@@ -1635,10 +1635,6 @@ describe('native file jobs', () => {
                     throw new Error(`Unexpected command: ${command}`)
                 },
                 wait: async () => undefined,
-                copyToAndroidSaf: async () => ({
-                    bytes: 0,
-                    warningCodes: [],
-                }),
             },
         )
 
