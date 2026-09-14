@@ -33,6 +33,7 @@ try {
   if($reason.HResult -ne -2147024894 -and $reason.HResult -ne -2147024893){throw}
  }
  $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+ $actionMatches=$true
  if($null -ne $task) {
   $stage='ownership'
   $definition=$task.Definition
@@ -40,7 +41,10 @@ try {
   if($principal -notlike 'S-1-*'){$principal=([System.Security.Principal.NTAccount]$principal).Translate([System.Security.Principal.SecurityIdentifier]).Value}
   if($principal -ne $sid -or $definition.Actions.Count -ne 1 -or $definition.RegistrationInfo.Description -ne 'RisuNest user sync server'){throw 'unexpected-task-owner'}
   $action=$definition.Actions.Item(1)
-  if($action.Type -ne 0 -or ![StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($action.Path),[IO.Path]::GetFullPath($env:RISUNEST_TASK_PROGRAM)) -or $action.Arguments -ne $env:RISUNEST_TASK_ARGUMENTS){throw 'unexpected-task-action'}
+  $actionMatches=$false
+  if($action.Type -eq 0) {
+   try { $actionMatches=[StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($action.Path),[IO.Path]::GetFullPath($env:RISUNEST_TASK_PROGRAM)) -and $action.Arguments -eq $env:RISUNEST_TASK_ARGUMENTS } catch { $actionMatches=$false }
+  }
  }
  switch($env:RISUNEST_TASK_ACTION) {
   'install' {
@@ -49,11 +53,12 @@ try {
    $definition=[IO.File]::ReadAllText($env:RISUNEST_TASK_XML).Replace('__CURRENT_SID__',$sid)
    $stage='register'
    $task=$folder.RegisterTask($env:RISUNEST_TASK_NAME,$definition,6,$sid,$null,3,$null)
+   $actionMatches=$true
   }
-  'remove' { if($null -ne $task){$folder.DeleteTask($env:RISUNEST_TASK_NAME,0)}; $task=$null }
-  'start' { if($null -eq $task){throw 'missing-task'}; $null=$task.Run($null) }
+  'remove' { if($null -ne $task){$folder.DeleteTask($env:RISUNEST_TASK_NAME,0)}; $task=$null; $actionMatches=$true }
+  'start' { if($null -eq $task){throw 'missing-task'}; if(!$actionMatches){throw 'unexpected-task-action'}; $null=$task.Run($null) }
  }
- @{registered=($null -ne $task);enabled=($null -ne $task -and $task.Enabled)} | ConvertTo-Json -Compress
+ @{registered=($null -ne $task);enabled=($null -ne $task -and $task.Enabled);actionMatches=$actionMatches} | ConvertTo-Json -Compress
 } catch {
  $reason=$_.Exception; while($reason.InnerException){$reason=$reason.InnerException}
  [Console]::Error.WriteLine($stage+':'+$reason.HResult.ToString('X8'))
@@ -109,6 +114,9 @@ pub(super) fn startup(root: &Path, executable: &Path, action: &str) -> Result<St
             .as_bool()
             .ok_or("task-scheduler-response-invalid")?,
         enabled: value["enabled"]
+            .as_bool()
+            .ok_or("task-scheduler-response-invalid")?,
+        action_matches: value["actionMatches"]
             .as_bool()
             .ok_or("task-scheduler-response-invalid")?,
     })

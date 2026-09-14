@@ -49,7 +49,7 @@ beforeEach(() => {
       platform: "windows",
       dataDir: "synthetic",
       cloudflared: "C:\\synthetic\\cloudflared.exe",
-      startup: { registered: false, enabled: false },
+      startup: { registered: false, enabled: false, actionMatches: true },
       startupError: null,
       trayStartup: false,
     })),
@@ -116,6 +116,48 @@ it("keeps a dirty form tied to its original revision during status refresh", asy
       }),
     }),
   );
+});
+
+it("rebases a dirty connection draft after an action from the same form", async () => {
+  vi.mocked(backend.mutate).mockImplementation(async (path) => {
+    if (path === "tunnel/restart") {
+      snapshot.revision = "synthetic:1";
+      return structuredClone(snapshot);
+    }
+    return {};
+  });
+  snapshot.connectionState.mode = "managed";
+  snapshot.connection.cloudflared = "C:\\synthetic\\cloudflared.exe";
+  await open();
+  button("연결").click();
+  await settle();
+  const registry = target.querySelector<HTMLInputElement>(
+    'input[aria-label="레지스트리 사용"]',
+  )!;
+  registry.click();
+  button("다시 시작").click();
+  await vi.waitFor(() =>
+    expect(target.textContent).toContain("변경 사항을 적용했습니다."),
+  );
+  await settle();
+  target
+    .querySelector("form")!
+    .dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
+  await settle();
+  expect(backend.mutate).toHaveBeenLastCalledWith(
+    "connection",
+    expect.objectContaining({ revision: "synthetic:1" }),
+  );
+});
+
+it("labels retained overview data as last-known after losing the daemon", async () => {
+  await open();
+  expect(target.textContent).toContain("서버 실행 중");
+  vi.mocked(backend.status).mockRejectedValue("daemon-unavailable");
+  await vi.advanceTimersByTimeAsync(3000);
+  await settle();
+  expect(target.textContent).toContain("마지막으로 확인한 서버 정보");
+  expect(target.textContent).not.toContain("서버 실행 중");
 });
 
 it("shows a registration URI once and clears it on modal close", async () => {

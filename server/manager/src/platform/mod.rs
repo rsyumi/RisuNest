@@ -15,6 +15,7 @@ mod windows;
 pub struct StartupStatus {
     pub registered: bool,
     pub enabled: bool,
+    pub action_matches: bool,
 }
 
 pub fn default_data_dir() -> Result<PathBuf> {
@@ -78,24 +79,38 @@ pub fn initialize(root: &Path, executable: &Path) -> Result<()> {
 
 pub fn start(root: &Path, executable: &Path) -> Result<()> {
     initialize(root, executable)?;
-    if startup(root, executable, "status")?.registered {
+    let state = startup(root, executable, "status")?;
+    if state.registered && state.action_matches {
         startup(root, executable, "start")?;
     } else {
         #[cfg(windows)]
         return Err("startup-registration-required".into());
         #[cfg(not(windows))]
         {
-            process(executable)
+            let mut command = process(executable);
+            command
                 .args(["serve", "--data-dir"])
                 .arg(root)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|_| "server-start-failed")?;
+                .stderr(Stdio::null());
+            spawn_background(&mut command)?;
         }
     }
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn spawn_background(command: &mut Command) -> Result<u32> {
+    let mut child = command.spawn().map_err(|_| "server-start-failed")?;
+    let pid = child.id();
+    std::thread::Builder::new()
+        .name("risunest-server-reaper".into())
+        .spawn(move || {
+            let _ = child.wait();
+        })
+        .map_err(|_| "server-reaper-unavailable")?;
+    Ok(pid)
 }
 
 pub fn startup(root: &Path, executable: &Path, action: &str) -> Result<StartupStatus> {
@@ -135,4 +150,29 @@ pub fn xml(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn background_children_are_reaped_after_exit() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 0"]);
+        let pid = spawn_background(&mut command).unwrap();
+        for _ in 0..50 {
+            let status = Command::new("ps")
+                .args(["-p", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            if !status.success() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("background child was not reaped");
+    }
 }

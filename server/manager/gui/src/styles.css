@@ -262,6 +262,10 @@ main {
   color: #529881;
   flex-shrink: 0;
 }
+.health-icon.offline {
+  background: var(--input);
+  color: var(--subtextcolor);
+}
 .health-heading p {
   margin-top: 4px;
 }

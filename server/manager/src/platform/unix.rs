@@ -59,6 +59,7 @@ pub(super) fn startup(root: &Path, executable: &Path, action: &str) -> Result<St
     Ok(StartupStatus {
         registered: path.exists(),
         enabled,
+        action_matches: true,
     })
 }
 #[cfg(not(target_os = "macos"))]
@@ -126,5 +127,6 @@ pub(super) fn startup(root: &Path, executable: &Path, action: &str) -> Result<St
     Ok(StartupStatus {
         registered: path.exists(),
         enabled,
+        action_matches: true,
     })
 }

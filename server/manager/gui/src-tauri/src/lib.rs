@@ -1,13 +1,16 @@
 use risunest_sync_manager::platform::gui as gui_startup;
 use risunest_sync_manager::{client::Client, platform, Result};
 use serde_json::{json, Value};
-use std::{path::PathBuf, time::Duration};
+use std::{path::{Path, PathBuf}, time::Duration};
 use tauri::{Manager, State};
 
 struct Context {
     root: PathBuf,
     executable: PathBuf,
     client: Client,
+}
+fn path_text(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
 }
 #[tauri::command]
 async fn manager_status(app: tauri::AppHandle, ctx: State<'_, Context>) -> Result<Value> {
@@ -50,7 +53,8 @@ async fn manager_environment(ctx: State<'_, Context>) -> Result<Value> {
     tauri::async_runtime::spawn_blocking(move||{
         let startup=platform::startup(&root,&executable,"status");
         let (startup,error)=match startup{Ok(s)=>(Some(s),None),Err(e)=>(None,Some(e))};
-        Ok(json!({"platform":std::env::consts::OS,"dataDir":root,"cloudflared":executable.with_file_name(if cfg!(windows){"cloudflared.exe"}else{"cloudflared"}),"startup":startup,"startupError":error,"trayStartup":gui_startup::setting(&root,None)?}))
+        let cloudflared=executable.with_file_name(if cfg!(windows){"cloudflared.exe"}else{"cloudflared"});
+        Ok(json!({"platform":std::env::consts::OS,"dataDir":path_text(&root),"cloudflared":path_text(&cloudflared),"startup":startup,"startupError":error,"trayStartup":gui_startup::setting(&root,None)?}))
     }).await.map_err(|_|"environment-unavailable")?
 }
 #[tauri::command]
@@ -169,4 +173,26 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("sync manager runtime failed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn environment_paths_are_json_safe_when_the_os_path_is_not_unicode() {
+        #[cfg(windows)]
+        let value = {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&[0xd800])
+        };
+        #[cfg(unix)]
+        let value = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(vec![0xff])
+        };
+        let path = PathBuf::from(value);
+        assert!(json!({"path":path_text(&path)})["path"].is_string());
+    }
 }

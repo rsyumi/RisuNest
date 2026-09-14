@@ -55,6 +55,20 @@ fn input(label: &str, default: &str) -> Result<String> {
         value.trim().to_owned()
     })
 }
+fn fixed_endpoint_default(status: &Value) -> &str {
+    if status["connectionState"]["mode"] == "managed" {
+        ""
+    } else {
+        status["connection"]["endpoint"].as_str().unwrap_or("")
+    }
+}
+fn fixed_endpoint(value: String) -> Result<String> {
+    if value.trim().is_empty() {
+        Err("fixed-endpoint-required".into())
+    } else {
+        Ok(value)
+    }
+}
 fn pause() -> Result<()> {
     input("Enter를 누르면 돌아갑니다", "").map(|_| ())
 }
@@ -160,6 +174,7 @@ pub fn error_message(code: &str) -> &str {
         "registration-already-issued" => "이미 발급한 요청입니다. 기기 목록을 확인하세요. 등록 링크를 잃었다면 해당 기기를 해제한 뒤 다시 등록하세요.",
         "management-response-incomplete" => "응답을 끝까지 받지 못했습니다. 다시 등록하기 전에 기기 목록을 확인하세요.",
         "public-endpoint-not-ready" => "서버 주소가 준비되지 않았습니다. 연결 설정을 확인하세요.",
+        "fixed-endpoint-required" => "고정 주소를 입력하세요.",
         "invalid-device-name" => "기기 이름을 확인하세요. 1~80자이며 제어 문자는 사용할 수 없습니다.",
         "management-unauthorized" => "관리 인증 정보를 확인할 수 없습니다. 서버에 다시 연결하세요.",
         _ => "작업을 완료하지 못했습니다. 서버 상태와 설정을 확인하세요.",
@@ -314,7 +329,10 @@ async fn connection(client: &Client, status: &Value, executable: &Path) -> Resul
             clear();
             let c = &status["connection"];
             let endpoint = if mode == 0 {
-                Some(input("고정 주소", c["endpoint"].as_str().unwrap_or(""))?)
+                Some(fixed_endpoint(input(
+                    "고정 주소",
+                    fixed_endpoint_default(status),
+                )?)?)
             } else {
                 None
             };
@@ -379,6 +397,30 @@ async fn connection(client: &Client, status: &Value, executable: &Path) -> Resul
         _ => (),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_tunnel_address_is_not_a_fixed_address_default() {
+        let status = json!({
+            "connectionState": {"mode": "managed"},
+            "connection": {"endpoint": "https://synthetic.trycloudflare.com"}
+        });
+        assert_eq!(fixed_endpoint_default(&status), "");
+        assert_eq!(fixed_endpoint(String::new()).unwrap_err(), "fixed-endpoint-required");
+    }
+
+    #[test]
+    fn fixed_address_remains_the_fixed_address_default() {
+        let status = json!({
+            "connectionState": {"mode": "fixed"},
+            "connection": {"endpoint": "https://sync.example.com"}
+        });
+        assert_eq!(fixed_endpoint_default(&status), "https://sync.example.com");
+    }
 }
 
 pub async fn run(root: &Path, executable: &Path) -> Result<()> {

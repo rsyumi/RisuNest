@@ -87,19 +87,29 @@
   async function mutate(
     path: string,
     body: Record<string, unknown> = {},
-  ): Promise<boolean> {
-    if (!connected || busy || !status) return false;
+  ): Promise<string | null> {
+    if (!connected || busy || !status) return null;
     busy = true;
     notice = "";
     try {
-      await backend.mutate(path, { revision: status.revision, ...body });
+      const result = await backend.mutate(path, {
+        revision: status.revision,
+        ...body,
+      });
+      const resultRevision =
+        result &&
+        typeof result === "object" &&
+        "revision" in result &&
+        typeof result.revision === "string"
+          ? result.revision
+          : null;
       await refresh();
       notice = "변경 사항을 적용했습니다.";
-      return true;
+      return resultRevision ?? status?.revision ?? null;
     } catch (error) {
       notice = message(error);
       await refresh();
-      return false;
+      return null;
     } finally {
       busy = false;
     }
@@ -250,6 +260,7 @@
     {#if status}
       {#if page === "overview"}<Overview
           {status}
+          {connected}
           {copy}
           showDevices={() => (page = "devices")}
         />
@@ -298,7 +309,8 @@
               ><input
                 type="checkbox"
                 aria-label="서버 자동 실행"
-                checked={environment?.startup?.enabled ?? false}
+                checked={(environment?.startup?.enabled ?? false) &&
+                  (environment?.startup?.actionMatches ?? false)}
                 disabled={busy || !environment || !!environment.startupError}
                 onchange={(e) => startup(e.currentTarget.checked)}
               /><span></span></label
@@ -307,6 +319,9 @@
           <p>관리 화면을 닫아도 서버는 계속 동작합니다.</p>
           {#if environment?.startupError}<p class="warning">
               자동 실행 상태를 확인하지 못했습니다.
+            </p>{:else if environment?.startup?.registered &&
+              !environment.startup.actionMatches}<p class="warning">
+              이전 설치 위치의 자동 실행 설정입니다. 다시 등록하거나 해제하세요.
             </p>{/if}
         </div>
         <div class="setting">

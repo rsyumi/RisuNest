@@ -12,12 +12,22 @@ function Invoke-Manager([string[]]$ManagerArguments) {
 try {
     Invoke-Manager @('autostart','install') | Out-Null
     $registered=Invoke-Manager @('autostart','status') | ConvertFrom-Json
-    if(!$registered.registered -or !$registered.enabled){throw 'Task was not registered'}
+    if(!$registered.registered -or !$registered.enabled -or !$registered.actionMatches){throw 'Task was not registered'}
     if(!(Get-NetTCPConnection -State Listen -LocalPort 4319 -ErrorAction SilentlyContinue)) {
         Invoke-Manager @('start') | Out-Null
         $started=$true
         Invoke-Manager @('status') | Out-Null
     } else { Write-Output 'SKIP: task start and running-task removal, port 4319 is occupied' }
+    $relocatedServer=Join-Path $dataRoot 'relocated-server.exe'
+    Copy-Item -LiteralPath $Server -Destination $relocatedServer
+    $relocated=& $Manager --data-dir $dataRoot --server $relocatedServer autostart status | ConvertFrom-Json
+    if($LASTEXITCODE -ne 0 -or !$relocated.registered -or $relocated.actionMatches){throw 'Relocated status did not report the stale action'}
+    & $Manager --data-dir $dataRoot --server $relocatedServer autostart install | Out-Null
+    if($LASTEXITCODE -ne 0){throw 'Relocated manager could not replace its owned task'}
+    $updated=& $Manager --data-dir $dataRoot --server $relocatedServer autostart status | ConvertFrom-Json
+    if($LASTEXITCODE -ne 0 -or !$updated.actionMatches){throw 'Replacement task did not use the relocated action'}
+    $original=Invoke-Manager @('autostart','status') | ConvertFrom-Json
+    if($original.actionMatches){throw 'Original location incorrectly matched the replacement task'}
     Invoke-Manager @('autostart','remove') | Out-Null
     $removed=Invoke-Manager @('autostart','status') | ConvertFrom-Json
     if($removed.registered -or $removed.enabled){throw 'Task was not removed'}

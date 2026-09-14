@@ -12,7 +12,10 @@
     status: Status;
     environment: Environment | null;
     busy: boolean;
-    mutate: (path: string, body?: Record<string, unknown>) => Promise<boolean>;
+    mutate: (
+      path: string,
+      body?: Record<string, unknown>,
+    ) => Promise<string | null>;
     copy: (text: string) => void;
   } = $props();
   // Form drafts retain the revision they were based on while status polls continue.
@@ -55,19 +58,23 @@
     dirty = false;
   }
   async function apply() {
-    if (
-      await mutate("connection", {
-        revision,
-        options: {
-          endpoint: mode === "fixed" ? endpoint : null,
-          cloudflared: mode === "managed" ? executable : null,
-          registryUrl: enabled ? registry : null,
-        },
-      })
-    ) {
+    const nextRevision = await mutate("connection", {
+      revision,
+      options: {
+        endpoint: mode === "fixed" ? endpoint : null,
+        cloudflared: mode === "managed" ? executable : null,
+        registryUrl: enabled ? registry : null,
+      },
+    });
+    if (nextRevision) {
+      revision = nextRevision;
       await tick();
       reset();
     }
+  }
+  async function act(path: string) {
+    const nextRevision = await mutate(path);
+    if (nextRevision) revision = nextRevision;
   }
 </script>
 
@@ -134,13 +141,13 @@
       {#if status.connectionState.mode === "managed"}<div class="actions">
           <button
             type="button"
-            onclick={() => mutate("tunnel/start")}
+            onclick={() => void act("tunnel/start")}
             disabled={status.tunnel.phase === "connected" || busy}>시작</button
-          ><button type="button" onclick={() => mutate("tunnel/restart")}
+          ><button type="button" onclick={() => void act("tunnel/restart")}
             >다시 시작</button
           ><button
             type="button"
-            onclick={() => mutate("tunnel/stop")}
+            onclick={() => void act("tunnel/stop")}
             disabled={status.tunnel.phase === "stopped" || busy}>중지</button
           >
         </div>{/if}
@@ -173,7 +180,7 @@
         <button
           type="button"
           disabled={!status.connection.registryEnabled || busy}
-          onclick={() => mutate("registry/repost")}>다시 게시</button
+          onclick={() => void act("registry/repost")}>다시 게시</button
         >
       </div>
       <details class="advanced">

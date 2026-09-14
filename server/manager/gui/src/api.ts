@@ -36,6 +36,7 @@ export interface Status {
 export interface Startup {
   registered: boolean;
   enabled: boolean;
+  actionMatches: boolean;
 }
 export interface Environment {
   platform: string;

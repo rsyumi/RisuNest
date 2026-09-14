@@ -3,10 +3,15 @@
   import { formatBytes, phase, type Status } from "./api";
   let {
     status,
+    connected,
     copy,
     showDevices,
-  }: { status: Status; copy: (text: string) => void; showDevices: () => void } =
-    $props();
+  }: {
+    status: Status;
+    connected: boolean;
+    copy: (text: string) => void;
+    showDevices: () => void;
+  } = $props();
   const active = $derived(status.devices.filter((d) => !d.revoked));
   const unmeasured = $derived(
     status.storage.error ? "측정할 수 없음" : "측정 중",
@@ -20,11 +25,15 @@
 
 <section class="card health">
   <div class="health-heading">
-    <span class="health-icon"><Check size={20} /></span>
+    <span class="health-icon" class:offline={!connected}
+      >{#if connected}<Check size={20} />{:else}<AlertCircle size={20} />{/if}</span
+    >
     <div>
-      <h2>서버 실행 중</h2>
+      <h2>{connected ? "서버 실행 중" : "마지막으로 확인한 서버 정보"}</h2>
       <p>
-        {address
+        {!connected
+          ? "연결이 끊기기 전 상태입니다."
+          : address
           ? "등록된 기기와 동기화할 수 있습니다."
           : "연결 설정에서 서버 주소를 준비하세요."}
       </p>

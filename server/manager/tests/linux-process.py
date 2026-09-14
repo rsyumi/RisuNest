@@ -73,7 +73,7 @@ with tempfile.TemporaryDirectory(prefix="risunest-manager-test-") as temporary:
     try:
         run(args + ["autostart", "install"])
         assert json.loads(run(args + ["autostart", "status"])) == {
-            "registered": True, "enabled": True
+            "registered": True, "enabled": True, "actionMatches": True
         }
         run(args + ["start"])
         assert json.loads(run(args + ["status"]))["devices"] == []

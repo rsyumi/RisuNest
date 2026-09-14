@@ -1,10 +1,14 @@
 use risunest_sync_manager::client::Client;
+use risunest_sync_manager::lifecycle;
 use risunest_sync_server::{management::Management, store::Store};
 use serde_json::json;
-use std::sync::Arc;
+use std::{fs, sync::Arc};
+
+static MANAGEMENT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
 async fn client_reconnects_without_replaying_issuance_and_rejects_stale_edits() {
+    let _guard = MANAGEMENT_TEST_LOCK.lock().await;
     let temp = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::init(temp.path()).unwrap());
     let manager = Management::start(store.clone(), "127.0.0.1:4320".parse().unwrap())
@@ -64,4 +68,42 @@ async fn client_reconnects_without_replaying_issuance_and_rejects_stale_edits() 
         "invalid-management-action"
     );
     restarted.close().await;
+}
+
+#[tokio::test]
+async fn stop_accepts_an_unchanged_locator_after_the_daemon_disappears() {
+    let _guard = MANAGEMENT_TEST_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::init(temp.path()).unwrap());
+    let manager = Management::start(store, "127.0.0.1:4320".parse().unwrap())
+        .await
+        .unwrap();
+    let path = temp.path().join("management-session");
+    let bytes = fs::read(&path).unwrap();
+    let permissions = fs::metadata(&path).unwrap().permissions();
+    manager.close().await;
+    fs::write(&path, bytes).unwrap();
+    fs::set_permissions(&path, permissions).unwrap();
+
+    let client = Client::new(temp.path().to_owned()).unwrap();
+    lifecycle::stop(temp.path(), &client).await.unwrap();
+
+    assert!(path.exists());
+}
+
+#[tokio::test]
+async fn stop_preserves_a_locator_that_cannot_be_authenticated() {
+    let _guard = MANAGEMENT_TEST_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("management-session");
+    fs::write(&path, b"synthetic-invalid-locator").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let client = Client::new(temp.path().to_owned()).unwrap();
+
+    assert!(lifecycle::stop(temp.path(), &client).await.is_err());
+    assert!(path.exists());
 }

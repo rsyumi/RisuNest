@@ -45,7 +45,7 @@ const backend: Backend = {
     platform: "windows",
     cloudflared: "C:\\synthetic\\cloudflared.exe",
     dataDir: "synthetic",
-    startup: { registered: true, enabled: true },
+    startup: { registered: true, enabled: true, actionMatches: true },
     startupError: null,
     trayStartup: false,
   }),

@@ -21,7 +21,19 @@ impl Client {
     pub async fn status(&self) -> Result<Value> {
         self.send("status", None).await
     }
+    pub(crate) async fn status_with_locator(&self, locator: &Discovery) -> Result<Value> {
+        self.send_with_locator("status", None, locator).await
+    }
     pub async fn mutate(&self, path: &str, body: Value) -> Result<Value> {
+        let locator = Discovery::load(&self.root).map_err(|e| e.code.to_owned())?;
+        self.mutate_with_locator(path, body, &locator).await
+    }
+    pub(crate) async fn mutate_with_locator(
+        &self,
+        path: &str,
+        body: Value,
+        locator: &Discovery,
+    ) -> Result<Value> {
         let allowed = [
             "connection",
             "devices",
@@ -45,21 +57,37 @@ impl Client {
         if !allowed {
             return Err("invalid-management-action".into());
         }
-        self.send(path, Some(body)).await
+        self.send_with_locator(path, Some(body), locator).await
     }
     async fn send(&self, path: &str, body: Option<Value>) -> Result<Value> {
         // Reload only for each new user operation; never retry a mutation automatically.
         let locator = Discovery::load(&self.root).map_err(|e| e.code.to_owned())?;
+        self.send_with_locator(path, body, &locator).await
+    }
+    async fn send_with_locator(
+        &self,
+        path: &str,
+        body: Option<Value>,
+        locator: &Discovery,
+    ) -> Result<Value> {
         let url = format!("http://{}/{path}", locator.address);
         let request = match body {
             Some(value) => self.http.post(url).json(&value),
             None => self.http.get(url),
         };
         let mut response = request
-            .bearer_auth(locator.token)
+            .bearer_auth(&locator.token)
             .send()
             .await
-            .map_err(|_| "daemon-unavailable")?;
+            .map_err(|error| {
+                if error.is_connect() {
+                    "daemon-unavailable"
+                } else if error.is_timeout() {
+                    "management-response-timeout"
+                } else {
+                    "management-request-failed"
+                }
+            })?;
         let status = response.status();
         let mut bytes = Vec::new();
         while let Some(chunk) = response
@@ -84,5 +112,61 @@ impl Client {
                 .into());
         }
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+    };
+
+    #[tokio::test]
+    async fn captured_locator_is_used_after_the_discovery_file_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let locator = Discovery {
+            address: listener.local_addr().unwrap(),
+            token: "a".repeat(64),
+        };
+        let server = std::thread::spawn(move || {
+            for (method, response) in [
+                ("GET /status ", r#"{"revision":"synthetic:0"}"#),
+                ("POST /shutdown ", r#"{"stopping":true}"#),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 4096];
+                let count = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..count]);
+                assert!(request.starts_with(method));
+                assert!(request.to_ascii_lowercase().contains(&format!(
+                    "authorization: bearer {}",
+                    "a".repeat(64)
+                )));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                )
+                .unwrap();
+            }
+        });
+        let client = Client::new(temp.path().to_owned()).unwrap();
+        let status = client.status_with_locator(&locator).await.unwrap();
+        std::fs::write(temp.path().join("management-session"), b"replacement").unwrap();
+
+        client
+            .mutate_with_locator(
+                "shutdown",
+                json!({"revision":status["revision"]}),
+                &locator,
+            )
+            .await
+            .unwrap();
+        server.join().unwrap();
     }
 }
