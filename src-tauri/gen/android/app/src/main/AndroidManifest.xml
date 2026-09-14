@@ -66,13 +66,12 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:mimeType="application/octet-stream" />
+                <data android:mimeType="application/x-risunest" />
                 <data android:pathPattern=".*\\.risum" />
                 <data android:pathPattern=".*\\.risup" />
                 <data android:pathPattern=".*\\.charx" />
                 <data android:pathPattern=".*\\.risunest" />
                 <data android:pathPattern=".*\\.risudat" />
-                <data android:pathPattern=".*\\.bin" />
             </intent-filter>
             
             <!-- tauri-file-associations. AUTO-GENERATED. DO NOT REMOVE. -->
