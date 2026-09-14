@@ -68,6 +68,25 @@ test("Windows installer failure checks run after the job has cached NSIS", () =>
   assert(packageStep >= 0 && installerTest > packageStep);
 });
 
+test("both macOS app legs run the produced archive updater before upload", () => {
+  const start = workflow.indexOf("\n  app-desktop:\n");
+  const end = workflow.indexOf("\n  app-android:\n");
+  assert(start >= 0 && end > start);
+  const desktop = workflow.slice(start, end);
+  const macRows = desktop.split("\n").filter((line) => /runner: macos-/.test(line));
+  assert.equal(macRows.length, 2);
+  const gateStart = desktop.indexOf("name: Verify the produced macOS archive with the production updater");
+  const uploadStart = desktop.indexOf("name: Upload final assets to draft");
+  assert(gateStart > desktop.indexOf("node scripts/release/package-app.mjs"));
+  assert(uploadStart > gateStart);
+  const gate = desktop.slice(gateStart, uploadStart);
+  const gatedOs = /if: matrix\.os == '([^']+)'/.exec(gate)?.[1];
+  for (const row of macRows) assert.equal(/\bos: ([a-z]+)/.exec(row)?.[1], gatedOs);
+  assert.match(gate, /--package tauri-plugin-updater/);
+  assert.match(gate, /produced_macos_archive_replaces_disposable_app_and_preserves_sibling_data -- --ignored --exact --nocapture/);
+  assert.match(gate, /test result: ok\. 1 passed; 0 failed; 0 ignored;/);
+});
+
 test("both native installer rollback harnesses are required release gates", () => {
   assert.match(workflow, /if: runner\.os == 'Linux'\n\s+run: bash server\/manager\/install\/install\.test\.sh/);
   assert.match(workflow, /if: matrix\.os == 'windows'\n\s+shell: pwsh\n\s+run: pwsh -NoProfile -File server\/manager\/install\/windows\.test\.ps1/);
