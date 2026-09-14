@@ -187,6 +187,7 @@ fn with_store_mutex<T>(
     operation(store)
 }
 
+#[cfg(any(target_os = "android", test))]
 fn with_snapshot_directory<T>(
     state: &PersistentStoreState,
     operation: impl FnOnce(&Path) -> StoreResult<T>,
@@ -805,7 +806,14 @@ pub(crate) fn pds_snapshot_create(
 pub(crate) fn pds_snapshot_list(
     state: State<'_, PersistentStoreState>,
 ) -> Result<Vec<SnapshotInfo>, StoreError> {
-    with_snapshot_directory(&state, super::snapshot::list)
+    #[cfg(target_os = "android")]
+    {
+        with_snapshot_directory(&state, super::snapshot::list)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        with_store(state, PersistentStore::snapshot_list)
+    }
 }
 
 #[tauri::command(async)]
