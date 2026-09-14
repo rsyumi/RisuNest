@@ -155,7 +155,7 @@ fn stopped_helper_rolls_back_when_the_replacement_cannot_be_started() {
 
 #[cfg(unix)]
 #[test]
-fn helper_waits_for_parent_then_exchanges_a_prepared_directory_while_stopped() {
+fn stopped_directory_helper_rolls_back_when_the_target_cannot_be_health_checked() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_owned();
     let install = root.join("managed-install");
@@ -188,17 +188,25 @@ fn helper_waits_for_parent_then_exchanges_a_prepared_directory_while_stopped() {
 
     assert!(result.recv_timeout(Duration::from_millis(250)).is_err());
     assert_eq!(fs::read(install.join("version")).unwrap(), b"old");
-    let outcome = result
+    let error = result
         .recv_timeout(Duration::from_secs(10))
         .unwrap()
-        .unwrap();
+        .unwrap_err();
     let _ = parent.wait();
 
-    assert_eq!(outcome, RunOutcome::Completed("2.0.0".into()));
-    assert_eq!(fs::read(install.join("version")).unwrap(), b"new");
+    assert_eq!(error, "server-executable-or-data-path-invalid");
+    assert_eq!(fs::read(install.join("version")).unwrap(), b"old");
     assert!(!backup.exists());
-    assert!(InstallTransaction::load(&root, &install).unwrap().is_none());
-    assert_eq!(load_status(&root).unwrap().phase, UpdatePhase::Completed);
+    let transaction = InstallTransaction::load(&root, &install)
+        .unwrap()
+        .unwrap();
+    assert_eq!(transaction.phase, TransactionPhase::RolledBack);
+    let status = load_status(&root).unwrap();
+    assert_eq!(status.phase, UpdatePhase::Failed);
+    assert_eq!(
+        status.reason.as_deref(),
+        Some("server-executable-or-data-path-invalid")
+    );
 }
 
 #[cfg(windows)]

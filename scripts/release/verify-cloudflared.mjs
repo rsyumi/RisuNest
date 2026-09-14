@@ -29,12 +29,24 @@ async function waitForExit(exit, timeout = 10000) {
 
 export const tunnelArgs = (origin) => ["tunnel", "--no-autoupdate", "--output", "json", "--url", origin];
 
+function diagnosticError(message, diagnostic) {
+  return new Error(`${message}: ${JSON.stringify(diagnostic)}`);
+}
+
+function diagnosticCode(error) {
+  const candidate = error?.cause?.code ?? error?.code ?? error?.name;
+  return typeof candidate === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(candidate)
+    ? candidate
+    : "FETCH_ERROR";
+}
+
 async function runTunnel(binary, origin, token, options = {}) {
   const spawnProcess = options.spawnProcess ?? spawn;
   const fetchUrl = options.fetchUrl ?? fetch;
   const readinessTimeout = options.readinessTimeout ?? 60000;
   const pollInterval = options.pollInterval ?? 250;
-  const proxyAttempts = options.proxyAttempts ?? 20;
+  const proxyReadinessTimeout = options.proxyReadinessTimeout ?? 60000;
+  const proxyPollInterval = options.proxyPollInterval ?? 500;
   const proxyTimeout = options.proxyTimeout ?? 5000;
   const child = spawnProcess(binary, tunnelArgs(origin), {
     windowsHide: true,
@@ -44,7 +56,12 @@ async function runTunnel(binary, origin, token, options = {}) {
   let spawnError;
   child.once("error", (error) => { spawnError = error; });
   let text = "";
-  const append = (chunk) => { text = `${text}${chunk}`.slice(-131072); };
+  let outputLength = 0;
+  const append = (chunk) => {
+    const value = String(chunk);
+    outputLength += Buffer.byteLength(value);
+    text = `${text}${value}`.slice(-8192);
+  };
   child.stdout.on("data", append);
   child.stderr.on("data", append);
   let stopped;
@@ -58,24 +75,68 @@ async function runTunnel(binary, origin, token, options = {}) {
       publicUrl = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/.exec(text)?.[0];
       edgeRegistered = /Registered tunnel connection|Connection .* registered/i.test(text);
       if (publicUrl && edgeRegistered) break;
-      if (spawnError) throw spawnError;
-      if (child.exitCode !== null) throw new Error(`cloudflared exited before readiness (${child.exitCode}): ${text}`);
+      if (spawnError)
+        throw diagnosticError("cloudflared failed before readiness", {
+          code: diagnosticCode(spawnError), status: null, length: outputLength,
+        });
+      if (child.exitCode !== null || child.signalCode !== null)
+        throw diagnosticError("cloudflared exited before readiness", {
+          code: /Incorrect Usage/i.test(text) ? "CLOUDFLARED_USAGE_ERROR" : "CLOUDFLARED_EXITED",
+          status: null,
+          length: outputLength,
+        });
       await new Promise((resolveWait) => setTimeout(resolveWait, pollInterval));
     }
-    if (!publicUrl) throw new Error(`cloudflared did not publish a Quick Tunnel URL: ${text}`);
-    if (!edgeRegistered) throw new Error(`cloudflared did not register an edge connection: ${text}`);
+    if (!publicUrl)
+      throw diagnosticError("cloudflared did not publish a Quick Tunnel URL", {
+        code: "QUICK_TUNNEL_URL_NOT_PUBLISHED", status: null, length: outputLength,
+      });
+    if (!edgeRegistered)
+      throw diagnosticError("cloudflared did not register an edge connection", {
+        code: "QUICK_TUNNEL_EDGE_NOT_REGISTERED", status: null, length: outputLength,
+      });
     let proxied = false;
-    for (let attempt = 0; attempt < proxyAttempts; attempt += 1) {
+    let attempts = 0;
+    let lastFailure = { code: "PROXY_NOT_ATTEMPTED", status: null, length: null };
+    const proxyDeadline = Date.now() + proxyReadinessTimeout;
+    while (Date.now() < proxyDeadline) {
+      attempts += 1;
       try {
-        const response = await fetchUrl(publicUrl, { signal: AbortSignal.timeout(proxyTimeout) });
-        if (response.ok && await response.text() === token) {
+        const remaining = Math.max(1, proxyDeadline - Date.now());
+        const response = await fetchUrl(publicUrl, {
+          signal: AbortSignal.timeout(Math.min(proxyTimeout, remaining)),
+        });
+        const body = await response.text();
+        const status = Number.isInteger(response.status) ? response.status : null;
+        const length = Buffer.byteLength(body);
+        if (response.ok && body === token) {
           proxied = true;
           break;
         }
-      } catch {}
-      await new Promise((resolveWait) => setTimeout(resolveWait, pollInterval * 2));
+        lastFailure = {
+          code: response.ok ? "PROXY_BODY_MISMATCH" : "PROXY_HTTP_STATUS",
+          status,
+          length,
+        };
+      } catch (error) {
+        lastFailure = { code: diagnosticCode(error), status: null, length: null };
+      }
+      if (spawnError)
+        throw diagnosticError("cloudflared failed during proxy readiness", {
+          code: diagnosticCode(spawnError), status: null, length: outputLength,
+        });
+      if (child.exitCode !== null || child.signalCode !== null)
+        throw diagnosticError("cloudflared exited during proxy readiness", {
+          code: "CLOUDFLARED_EXITED", status: null, length: outputLength,
+        });
+      const delay = Math.min(proxyPollInterval, proxyDeadline - Date.now());
+      if (delay > 0) await new Promise((resolveWait) => setTimeout(resolveWait, delay));
     }
-    if (!proxied) throw new Error("Quick Tunnel did not proxy the synthetic origin.");
+    if (!proxied)
+      throw diagnosticError("Quick Tunnel did not proxy the synthetic origin", {
+        ...lastFailure,
+        attempts,
+      });
     completed = true;
   } finally {
     const running = child.exitCode === null && child.signalCode === null;
