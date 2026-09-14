@@ -1,150 +1,147 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import ServerSyncStorage from "./ServerSyncStorage.svelte";
-  import ServerAssetResidency from "./ServerAssetResidency.svelte";
-  import ServerSyncRegistrationInput from "./ServerSyncRegistrationInput.svelte";
-  import { serverRegistrationInbox } from "src/ts/storage/sync/serverSyncRegistrationInbox";
-  import type {
-    ServerConfig,
-    ServerDirectory,
-  } from "src/ts/storage/sync/serverSync";
   import { language } from "src/lang";
-  import { getServerSyncController } from "src/ts/storage/sync/serverSyncProduction";
+  import SettingGroup from "../RisuNest/SettingGroup.svelte";
+  import SettingRow from "../RisuNest/SettingRow.svelte";
+  import ServerAssetResidency from "./ServerAssetResidency.svelte";
+  import ServerSyncConnect from "./ServerSyncConnect.svelte";
+  import ServerSyncRegistrationInput from "./ServerSyncRegistrationInput.svelte";
+  import ServerSyncStorage from "./ServerSyncStorage.svelte";
+  import { formatRisuNestStorageBytes as bytes } from "src/ts/storage/risuNestStorageDashboard";
+  import { setAssetResidencyPolicy } from "src/ts/storage/sync/serverAssetResidency";
   import { serverSyncError } from "src/ts/storage/sync/serverSync";
-  import type { ServerSyncNavigation } from "src/ts/storage/sync/serverSyncDeepLink";
-  import { completedServerSyncAttempt } from "src/ts/storage/sync/serverSyncPresenter";
   import {
-    validateServerSyncEndpoint,
-    validateServerSyncId,
-  } from "src/ts/storage/sync/serverSyncConnection";
+    connectServerSync,
+    serverSyncErrorHelp,
+    serverSyncProgressView,
+    serverSyncRefreshRequired,
+    serverSyncStatus,
+    type ServerSyncConnectRequest,
+  } from "src/ts/storage/sync/serverSyncConnectFlow";
+  import type { ServerSyncNavigation } from "src/ts/storage/sync/serverSyncDeepLink";
+  import {
+    getServerSyncBackupInventory,
+    getServerSyncCacheUsage,
+    getServerSyncController,
+    type ServerSyncCacheUsage,
+  } from "src/ts/storage/sync/serverSyncProduction";
+
+  /** The settings section: state, the connection, and the rows that manage it. */
   let {
     origin = "settings",
     initialNavigation,
-    onInitialSyncComplete,
   }: {
-    origin?: "settings" | "onboarding" | "deep-link";
+    origin?: "settings" | "deep-link";
     initialNavigation?: ServerSyncNavigation;
-    onInitialSyncComplete?: (attemptId: number) => void;
   } = $props();
   const controller = getServerSyncController();
   let snapshot = $state(controller.snapshot());
-  let endpoint = $state("");
-  let libraryId = $state("");
-  let deviceId = $state("");
-  let token = $state("");
-  let directory = $state<ServerDirectory | undefined>();
-  let inputRevision = $state(0);
   let connecting = $state(false);
   let pausing = $state(false);
   let actionError = $state("");
-  let replacing = $state(false);
-  let backupsVisible = $state(false);
-  let notifiedAttempt: number | null = null;
+  let connectOpen = $state(false);
+  let connectStage = $state<"code" | "review">("code");
+  let connectKey = $state(0);
+  let replacingOpen = $state(false);
+  let backupsOpen = $state(false);
+  let storageOpen = $state(false);
+  let backupCount = $state<number | undefined>();
+  let cacheUsage = $state<ServerSyncCacheUsage | undefined>();
+  let now = $state(Date.now());
   let appliedNavigation: ServerSyncNavigation | undefined;
-  $effect(() => {
-    if (!initialNavigation || appliedNavigation === initialNavigation) return;
-    appliedNavigation = initialNavigation;
-    if (snapshot.status?.configured || snapshot.running || connecting) return;
-    endpoint = initialNavigation.endpoint ?? "";
-    libraryId = initialNavigation.libraryId ?? "";
-    deviceId = "";
-    token = "";
-    directory = undefined;
-    replacing = false;
-  });
-  $effect(() => {
-    const attempt = completedServerSyncAttempt(snapshot);
-    if (attempt === null || notifiedAttempt === attempt) return;
-    notifiedAttempt = attempt;
-    onInitialSyncComplete?.(attempt);
-  });
   const text = $derived(language.risuNest.serverSync);
   const error = $derived(actionError || snapshot.error);
-  const refreshRequired = $derived(
-    error === "committed-refresh-pending" ||
-      error === "activation-confirmation-pending",
-  );
+  const refreshRequired = $derived(serverSyncRefreshRequired(error));
+  const configured = $derived(Boolean(snapshot.status?.configured));
   const conflict = $derived(
     snapshot.result?.phase === "conflict" ? snapshot.result : undefined,
   );
   const busy = $derived(
     connecting || pausing || snapshot.running || snapshot.replacing,
   );
-  const status = $derived(
-    snapshot.status?.registrationRequired
-      ? text.registrationRequired
-      : refreshRequired
-        ? text.refreshPending
-        : conflict
-          ? text.conflict
-          : snapshot.running
-            ? snapshot.progress
-              ? text.progress[snapshot.progress]
-              : text.running
-            : snapshot.paused
-              ? text.paused
-              : snapshot.status?.operationPending
-                ? text.pending
-                : snapshot.status?.configured
-                  ? text.ready
-                  : text.disconnected,
+  const status = $derived(serverSyncStatus(snapshot, text, actionError));
+  const progress = $derived(
+    snapshot.running ? serverSyncProgressView(snapshot, text, now) : undefined,
   );
+  const pendingChanges = $derived(
+    snapshot.status
+      ? snapshot.status.fullScan
+        ? text.initialScan
+        : text.count.replace(
+            "{0}",
+            snapshot.status.dirtyRecords.toLocaleString(),
+          )
+      : "",
+  );
+  const backupsHelp = $derived(
+    backupCount === undefined
+      ? text.backupHelp
+      : backupCount === 0
+        ? text.noBackups
+        : text.backupCount.replace("{0}", backupCount.toLocaleString()),
+  );
+  const storageHelp = $derived(
+    cacheUsage
+      ? `${text.management.cache} ${bytes(cacheUsage.totalBytes)} · ${text.management.reclaimable} ${bytes(cacheUsage.reclaimableBytes)}`
+      : text.management.scope,
+  );
+  $effect(() => {
+    if (!initialNavigation || appliedNavigation === initialNavigation) return;
+    appliedNavigation = initialNavigation;
+    if (!configured) connectOpen = true;
+  });
+  $effect(() => {
+    // A code delivered while the block is folded still needs its check shown.
+    if (connectStage === "review") connectOpen = true;
+  });
+  $effect(() => {
+    if (!snapshot.running) return;
+    now = Date.now();
+    const timer = setInterval(() => {
+      now = Date.now();
+    }, 1000);
+    return () => clearInterval(timer);
+  });
+  $effect(() => {
+    // Row summaries follow every finished attempt.
+    if (!snapshot.running) void loadSummaries();
+  });
   onMount(() => {
     const unsubscribe = controller.subscribe((value) => {
       snapshot = value;
     });
     // Startup owns initialization; mounting a view must preserve its attempt.
-    return () => {
-      token = "";
-      directory = undefined;
-      unsubscribe();
-    };
+    return unsubscribe;
   });
-  async function connect(): Promise<void> {
+  async function loadSummaries(): Promise<void> {
+    try {
+      const [inventory, usage] = await Promise.all([
+        getServerSyncBackupInventory(),
+        getServerSyncCacheUsage(),
+      ]);
+      backupCount = inventory.completeCount;
+      cacheUsage = usage;
+    } catch {
+      backupCount = undefined;
+      cacheUsage = undefined;
+    }
+  }
+  async function connect(request: ServerSyncConnectRequest): Promise<void> {
     if (busy) return;
     connecting = true;
     actionError = "";
     try {
-      const config = {
-        endpoint: validateServerSyncEndpoint(endpoint.trim()),
-        libraryId: validateServerSyncId(libraryId.trim()),
-        deviceId: validateServerSyncId(deviceId.trim()),
-        token: token.trim(),
-        ...(directory ? { directory: $state.snapshot(directory) } : {}),
-      };
-      if (replacing) await controller.reregister(config);
-      else await controller.bind(config);
-      token = "";
-      directory = undefined;
-      serverRegistrationInbox.clear();
-      inputRevision++;
-      replacing = false;
-      await controller.synchronize();
+      await connectServerSync(controller, setAssetResidencyPolicy, request);
+      // The credentials are bound now; drop the copy the check screen held.
+      connectStage = "code";
+      connectKey++;
+      connectOpen = false;
+      replacingOpen = false;
     } catch (cause) {
       actionError = serverSyncError(cause).code;
     } finally {
       connecting = false;
     }
-  }
-  function acceptRegistration(config: ServerConfig): void {
-    if (busy || (snapshot.status?.configured && !replacing)) return;
-    endpoint = config.endpoint;
-    libraryId = config.libraryId;
-    deviceId = config.deviceId;
-    token = config.token;
-    directory = config.directory;
-    actionError = "";
-  }
-  function discardRegistration(): void {
-    endpoint = "";
-    libraryId = "";
-    deviceId = "";
-    token = "";
-    directory = undefined;
-    replacing = false;
-    actionError = "";
-    serverRegistrationInbox.clear();
-    inputRevision++;
   }
   async function pause(): Promise<void> {
     if (pausing) return;
@@ -187,230 +184,232 @@
       expectedHead: conflict.head,
     });
   }
+  const button =
+    "rounded border border-darkborderc px-3 py-2 text-sm hover:bg-selected disabled:cursor-not-allowed disabled:opacity-45";
+  const danger =
+    "rounded border border-danger-400/50 px-3 py-2 text-sm text-danger-400 hover:bg-danger-400/10 disabled:cursor-not-allowed disabled:opacity-45";
 </script>
 
-<section
-  class="server-sync text-textcolor"
-  data-origin={origin}
-  aria-labelledby="server-sync-title"
+<SettingGroup
+  title={text.title}
+  description={text.description}
+  panelProps={{ "data-origin": origin }}
 >
-  <div class="flex flex-wrap items-center justify-between gap-3">
-    <h2 id="server-sync-title" class="text-2xl font-bold">{text.title}</h2>
-    <span class="status border border-darkborderc" aria-live="polite">
-      <span
-        class:working={snapshot.running}
-        class:connected={snapshot.status?.configured}
-        class="status-dot"
-        aria-hidden="true"
-      ></span>
-      {status}
+  {#snippet actions()}
+    <span class="status border border-darkborderc" data-tone={status.tone} aria-live="polite">
+      <span class="status-dot" aria-hidden="true"></span>
+      {status.label}
     </span>
-  </div>
-  <p class="text-sm opacity-75">{text.description}</p>
-  {#if snapshot.status?.configured}
-    <div class="connection bg-darkbg border border-darkborderc">
-      <div class="min-w-0">
-        <p class="text-xs opacity-65">{text.endpoint}</p>
-        <p class="break-all font-medium">{snapshot.status.endpoint}</p>
-      </div>
-      <p class="text-sm opacity-75">
-        {snapshot.status.fullScan
-          ? text.initialScan
-          : text.queued.replace("{0}", String(snapshot.status.dirtyRecords))}
-      </p>
-      <p class="text-xs opacity-65">
-        {text.deviceId}: {snapshot.status.deviceId}
-      </p>
-      {#if snapshot.lastSuccessAt !== undefined}
-        <p class="text-xs opacity-65">
-          {text.lastSuccess}: {new Date(
-            snapshot.lastSuccessAt,
-          ).toLocaleString()}
-        </p>
-      {/if}
-      {#if snapshot.verifiedBytes !== undefined}
-        <p class="text-xs opacity-65">
-          {text.verifiedBytes}: {BigInt(
-            snapshot.verifiedBytes,
-          ).toLocaleString()} B
-        </p>
-      {/if}
-      {#if snapshot.running && snapshot.retryableFailure}
-        <p class="text-sm" role="status">
-          {text.running}: <span class="opacity-75">({snapshot.retryableFailure})</span>
-        </p>
-      {/if}
-    </div>
-    <div class="flex flex-wrap gap-2">
-      <button
-        class="action bg-darkbutton border border-darkborderc hover:bg-selected"
-        disabled={busy || snapshot.status.registrationRequired}
-        onclick={() => void controller.synchronize()}
-        >{refreshRequired ? text.refresh : text.syncNow}</button
-      >
-      <button
-        class="action border border-darkborderc hover:bg-selected"
-        disabled={connecting || pausing || snapshot.paused || refreshRequired}
-        onclick={() => void pause()}>{text.pause}</button
-      >
-      <button
-        class="action border border-darkborderc hover:bg-selected"
-        disabled={busy || snapshot.status.operationPending || refreshRequired}
-        onclick={() => void disconnect()}>{text.disconnect}</button
-      >
-    </div>
-    {#if snapshot.status.operationPending}<p class="text-sm opacity-75">
-        {text.pendingHelp}
-      </p>{/if}
-    {#if !replacing}
-      <button
-        class="action border border-darkborderc hover:bg-selected justify-self-start"
-        disabled={busy || refreshRequired}
-        onclick={() => {
-          endpoint = snapshot.status?.endpoint ?? "";
-          libraryId = snapshot.status?.libraryId ?? "";
-          deviceId = "";
-          token = "";
-          directory = undefined;
-          replacing = true;
-        }}>{text.reregister}</button
-      >
-    {/if}
-    {#if error === "epoch-reconciliation-required"}
-      <p class="text-sm opacity-75">{text.reconcileHelp}</p>
-      <button
-        class="action bg-darkbutton border border-darkborderc hover:bg-selected justify-self-start"
-        disabled={busy || refreshRequired}
-        onclick={() => void reconcile()}>{text.reconcile}</button
-      >
-    {/if}
-  {/if}
-  {#key inputRevision}
-    <ServerSyncRegistrationInput
-      available={!snapshot.status?.configured || replacing}
-      {busy}
-      onRegistration={acceptRegistration}
-    />
-  {/key}
-  {#if !snapshot.status?.configured || replacing}
-    {#if replacing}<p class="text-sm opacity-75">{text.reregisterHelp}</p>{/if}
-    <form
-      class="connection-form"
-      onsubmit={(event) => {
-        event.preventDefault();
-        void connect();
-      }}
-    >
-      <label class="field"
-        ><span>{text.endpoint}</span><input
-          type="url"
-          bind:value={endpoint}
-          placeholder="https://sync.example.com"
-          required
-          autocomplete="url"
-          disabled={busy}
-        /></label
-      >
-      <div class="identity-fields">
-        <label class="field"
-          ><span>{text.libraryId}</span><input
-            bind:value={libraryId}
-            required
-            autocomplete="off"
-            autocapitalize="none"
-            spellcheck="false"
-            disabled={busy}
-          /></label
-        >
-        <label class="field"
-          ><span>{text.deviceId}</span><input
-            bind:value={deviceId}
-            required
-            autocomplete="off"
-            autocapitalize="none"
-            spellcheck="false"
-            disabled={busy}
-          /></label
-        >
-      </div>
-      <label class="field"
-        ><span>{text.token}</span><input
-          type="password"
-          bind:value={token}
-          required
-          autocomplete="new-password"
-          spellcheck="false"
-          disabled={busy}
-        /></label
-      >
-      <p class="text-sm opacity-75">{text.credentialsHelp}</p>
-      {#if directory}<p class="text-sm opacity-75">
-          {text.directoryEnabled}: {directory.baseUrl}
-        </p>{/if}
-      <button
-        type="button"
-        class="action border border-darkborderc hover:bg-selected justify-self-start"
-        disabled={busy}
-        onclick={discardRegistration}>{text.discardRegistration}</button
-      >
-      <button
-        class="action bg-darkbutton border border-darkborderc hover:bg-selected justify-self-start"
-        type="submit"
-        disabled={busy}>{replacing ? text.reregister : text.connect}</button
-      >
-    </form>
-  {/if}
+  {/snippet}
   {#if conflict}
-    <div class="conflict border border-darkborderc" role="status">
+    <div class="conflict m-4 mb-1" role="status">
       <h3 class="font-bold">
         {text.conflictCount.replace("{0}", String(conflict.conflictCount))}
       </h3>
       <p class="text-sm opacity-80">{text.conflictHelp}</p>
       <div class="flex flex-wrap gap-2">
         <button
-          class="action bg-darkbutton border border-darkborderc hover:bg-selected"
+          type="button"
+          class="{button} bg-darkbutton"
           disabled={busy}
           onclick={() => resolve("keep-local")}>{text.keepLocal}</button
         >
         <button
-          class="action bg-darkbutton border border-darkborderc hover:bg-selected"
+          type="button"
+          class="{button} bg-darkbutton"
           disabled={busy}
           onclick={() => resolve("keep-remote")}>{text.keepRemote}</button
         >
       </div>
     </div>
   {/if}
-  {#if error && error !== "cancelled"}
-    <p class="text-sm" role="alert">
-      {error === "activation-confirmation-pending"
-        ? text.activationHelp
-        : error === "committed-refresh-pending"
-          ? text.refreshHelp
-          : error === "device-credential-unavailable"
-            ? text.credentialUnavailable
-            : text.errorHelp} <span class="opacity-60">({error})</span>
-    </p>
+  {#if snapshot.status?.configured}
+    <div class="summary px-4 py-3">
+      <p class="break-all text-[15px] font-semibold">{snapshot.status.endpoint}</p>
+      <dl class="kv">
+        <dt>{text.libraryId}</dt>
+        <dd>{snapshot.status.libraryId}</dd>
+        <dt>{text.deviceId}</dt>
+        <dd>{snapshot.status.deviceId}</dd>
+        {#if progress}
+          <dt>{text.progressLabel}</dt>
+          <dd>
+            {progress.current}{progress.percent === null
+              ? ""
+              : ` (${progress.percent}%)`}
+          </dd>
+          <dt>{text.verifiedBytes}</dt>
+          <dd>{progress.counters[0].value} · {progress.counters[1].value}</dd>
+          <dt>{text.pendingChanges}</dt>
+          <dd>{pendingChanges}</dd>
+          {#if progress.elapsed}
+            <dt>{text.elapsed}</dt>
+            <dd>{progress.elapsed.slice(text.elapsed.length).trim()}</dd>
+          {/if}
+        {:else}
+          {#if snapshot.lastSuccessAt !== undefined}
+            <dt>{text.lastSuccess}</dt>
+            <dd>{new Date(snapshot.lastSuccessAt).toLocaleString()}</dd>
+          {/if}
+          <dt>{text.pendingChanges}</dt>
+          <dd>{pendingChanges}</dd>
+        {/if}
+      </dl>
+      {#if progress}
+        <div
+          class="thin"
+          role="progressbar"
+          aria-label={text.running}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={progress.percent ?? undefined}
+        >
+          <i
+            class:pulse={progress.percent === null}
+            style:width={progress.percent === null
+              ? "100%"
+              : `${progress.percent}%`}
+          ></i>
+        </div>
+      {/if}
+      {#if snapshot.running && snapshot.retryableFailure}
+        <p class="mt-2 text-sm" role="status">
+          {text.running}: <span class="opacity-75">({snapshot.retryableFailure})</span>
+        </p>
+      {/if}
+      <div class="mt-3 flex flex-wrap gap-2">
+        <button
+          type="button"
+          class="{button} bg-darkbutton"
+          disabled={busy || snapshot.status.registrationRequired}
+          onclick={() => void controller.synchronize()}
+          >{refreshRequired ? text.refresh : text.syncNow}</button
+        >
+        <button
+          type="button"
+          class={button}
+          disabled={connecting || pausing || snapshot.paused || refreshRequired}
+          onclick={() => void pause()}>{text.pause}</button
+        >
+        <button
+          type="button"
+          class={danger}
+          disabled={busy || snapshot.status.operationPending || refreshRequired}
+          onclick={() => void disconnect()}>{text.disconnect}</button
+        >
+      </div>
+      {#if snapshot.status.operationPending}<p class="mt-2 text-sm opacity-75">
+          {text.pendingHelp}
+        </p>{/if}
+      {#if error === "epoch-reconciliation-required"}
+        <p class="mt-2 text-sm opacity-75">{text.reconcileHelp}</p>
+        <button
+          type="button"
+          class="{button} mt-2 bg-darkbutton"
+          disabled={busy || refreshRequired}
+          onclick={() => void reconcile()}>{text.reconcile}</button
+        >
+      {/if}
+      {#if error && error !== "cancelled" && !replacingOpen}
+        <p class="mt-2 text-sm" role="alert">
+          {serverSyncErrorHelp(error, text)} <span class="opacity-60">({error})</span>
+        </p>
+      {/if}
+    </div>
+    <ServerAssetResidency disabled={busy || refreshRequired} />
+    <SettingRow label={text.reregister} help={text.reregisterHelp}>
+      <button
+        type="button"
+        class={button}
+        disabled={busy || refreshRequired}
+        aria-expanded={replacingOpen}
+        onclick={() => {
+          replacingOpen = !replacingOpen;
+          connectKey++;
+        }}>{text.register}</button
+      >
+    </SettingRow>
+    {#if replacingOpen}
+      <div class="px-4 py-3">
+        {#key connectKey}
+          <ServerSyncConnect
+            replacing
+            available
+            {busy}
+            error={actionError}
+            initialNavigation={{
+              endpoint: snapshot.status.endpoint ?? undefined,
+              libraryId: snapshot.status.libraryId ?? undefined,
+            }}
+            onSubmit={(request) => void connect(request)}
+          />
+        {/key}
+      </div>
+    {:else}
+      <div class="contents">
+        <ServerSyncRegistrationInput available={false} onRegistration={() => {}} />
+      </div>
+    {/if}
+  {:else}
+    <SettingRow label={text.connectRow} help={text.connectRowHelp}>
+      <button
+        type="button"
+        class="{button} bg-darkbutton"
+        aria-expanded={connectOpen}
+        onclick={() => {
+          connectOpen = !connectOpen;
+        }}>{text.enterCode}</button
+      >
+    </SettingRow>
+    <div class="px-4 py-3" hidden={!connectOpen}>
+      {#key connectKey}
+        <ServerSyncConnect
+          bind:stage={connectStage}
+          {initialNavigation}
+          {busy}
+          error={actionError}
+          onSubmit={(request) => void connect(request)}
+        />
+      {/key}
+    </div>
   {/if}
-  <button
-    class="action border border-darkborderc hover:bg-selected justify-self-start"
-    disabled={busy || refreshRequired}
-    onclick={() => {
-      backupsVisible = !backupsVisible;
-    }}>{text.backups}</button
-  >
-  {#if snapshot.status?.configured}<ServerAssetResidency />{/if}
-  {#if backupsVisible}<ServerSyncStorage />{/if}
-</section>
+  <SettingRow label={text.backups} help={backupsHelp}>
+    <button
+      type="button"
+      class={button}
+      disabled={busy || refreshRequired}
+      aria-expanded={backupsOpen}
+      onclick={() => {
+        backupsOpen = !backupsOpen;
+      }}>{text.viewList}</button
+    >
+  </SettingRow>
+  {#if backupsOpen}
+    <div class="px-4">
+      <ServerSyncStorage section="backups" onChange={() => void loadSummaries()} />
+    </div>
+  {/if}
+  {#if snapshot.status?.configured}
+    <SettingRow label={text.management.title} help={storageHelp}>
+      <button
+        type="button"
+        class={button}
+        disabled={busy || refreshRequired}
+        aria-expanded={storageOpen}
+        onclick={() => {
+          storageOpen = !storageOpen;
+        }}>{text.viewList}</button
+      >
+    </SettingRow>
+    {#if storageOpen}
+      <div class="px-4">
+        <ServerSyncStorage section="cache" onChange={() => void loadSummaries()} />
+      </div>
+    {/if}
+  {/if}
+</SettingGroup>
 
 <style>
-  .server-sync {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
-    min-width: 0;
-    overflow-wrap: anywhere;
-    gap: 1rem;
-    margin-block: 2rem;
-  }
   .status {
     display: inline-flex;
     align-items: center;
@@ -419,6 +418,10 @@
     padding: 0.35rem 0.75rem;
     font-size: 0.75rem;
   }
+  .status[data-tone="attention"] {
+    color: var(--risu-theme-danger-400);
+    border-color: color-mix(in srgb, var(--risu-theme-danger-400) 50%, transparent);
+  }
   .status-dot {
     width: 0.45rem;
     height: 0.45rem;
@@ -426,68 +429,65 @@
     background: currentColor;
     opacity: 0.35;
   }
-  .status-dot.connected {
+  .status[data-tone="connected"] .status-dot {
+    background: var(--risu-theme-success-500);
     opacity: 1;
   }
-  .status-dot.working {
+  .status[data-tone="attention"] .status-dot {
+    opacity: 1;
+  }
+  .status[data-tone="working"] .status-dot {
+    background: var(--risu-theme-primary-500);
+    opacity: 1;
     animation: pulse 1.5s ease-in-out infinite;
   }
-  .connection {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
-    gap: 0.75rem;
-    border-radius: 0.5rem;
-    padding: 1rem;
-  }
-  .connection-form,
-  .field {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
-    gap: 0.5rem;
-  }
-  .connection-form {
-    gap: 1rem;
-  }
-  .field > span {
-    font-size: 0.875rem;
-    font-weight: 500;
-  }
-  .field input {
-    color: inherit;
-    background: transparent;
-    border: 1px solid var(--risu-theme-darkborderc);
-    border-radius: 0.35rem;
-    padding: 0.65rem 0.75rem;
+  .summary {
     min-width: 0;
-    width: 100%;
+    overflow-wrap: anywhere;
   }
-  .identity-fields {
+  .kv {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 1rem;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 0.25rem 1rem;
+    margin: 0.5rem 0 0;
+    font-size: 0.8125rem;
   }
-  .action {
-    border-radius: 0.35rem;
-    padding: 0.6rem 0.9rem;
-    font-size: 0.875rem;
-    transition: background-color 0.15s;
+  .kv dt {
+    color: color-mix(in srgb, var(--risu-theme-textcolor) 60%, transparent);
   }
-  .action:disabled,
-  input:disabled {
-    opacity: 0.45;
-    cursor: not-allowed;
+  .kv dd {
+    margin: 0;
+    min-width: 0;
+    font-variant-numeric: tabular-nums;
   }
-  .action:focus-visible,
-  input:focus-visible {
-    outline: 2px solid currentColor;
-    outline-offset: 3px;
+  .thin {
+    height: 4px;
+    margin-top: 0.6rem;
+    border-radius: 99px;
+    background: color-mix(in srgb, var(--risu-theme-textcolor) 8%, transparent);
+    overflow: hidden;
+  }
+  .thin i {
+    display: block;
+    height: 100%;
+    background: linear-gradient(90deg, #22c8c6, var(--risu-theme-primary-500));
+    transition: width 0.3s;
+  }
+  .thin i.pulse {
+    animation: pulse 1.4s ease-in-out infinite;
   }
   .conflict {
     display: grid;
     gap: 0.75rem;
-    border-radius: 0.5rem;
-    padding: 1rem;
+    border: 1px solid color-mix(in srgb, var(--risu-theme-danger-400) 45%, transparent);
     border-left-width: 3px;
+    border-radius: 0.5rem;
+    padding: 0.85rem 1rem;
+    background: color-mix(in srgb, var(--risu-theme-danger-400) 6%, transparent);
+  }
+  button:focus-visible {
+    outline: 2px solid currentColor;
+    outline-offset: 3px;
   }
   @keyframes pulse {
     50% {
@@ -495,13 +495,9 @@
     }
   }
   @media (prefers-reduced-motion: reduce) {
-    .status-dot.working {
+    .status-dot,
+    .thin i.pulse {
       animation: none;
-    }
-  }
-  @media (max-width: 480px) {
-    .identity-fields {
-      grid-template-columns: 1fr;
     }
   }
 </style>

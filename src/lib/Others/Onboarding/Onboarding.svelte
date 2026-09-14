@@ -13,6 +13,7 @@
         Info,
         LoaderCircle,
         MonitorSmartphone,
+        Pause,
         Server,
         Smartphone,
         TriangleAlert,
@@ -46,6 +47,16 @@
     import { restoreBackupFromSystemPicker } from 'src/ts/storage/portableBackupFileRouteProduction.svelte'
     import { importRisuSaveFromSystemPicker } from 'src/ts/storage/risuSaveFileRouteProduction.svelte'
     import { getNativeOfficialAccountFlow } from 'src/ts/storage/sync/nativeOfficialAccountFlow'
+    import { setAssetResidencyPolicy } from 'src/ts/storage/sync/serverAssetResidency'
+    import { serverSyncError } from 'src/ts/storage/sync/serverSync'
+    import {
+        connectServerSync,
+        serverSyncHostLabel,
+        serverSyncProgressView,
+        type ServerSyncConnectRequest,
+    } from 'src/ts/storage/sync/serverSyncConnectFlow'
+    import { getServerSyncController } from 'src/ts/storage/sync/serverSyncProduction'
+    import ServerSyncConnect from 'src/lib/Setting/ServerSync/ServerSyncConnect.svelte'
     import { DBState } from 'src/ts/stores.svelte'
 
     import {
@@ -58,6 +69,7 @@
     } from './onboardingFlow'
     import { onboardingHold } from './onboardingGate'
     import { observeOnboardingWeave } from './onboardingWeave'
+    import { serverSyncOnboardingOutcome } from './serverSyncOnboardingFlow'
 
     const UI_LANGUAGES = [
         { value: 'de', label: 'Deutsch' },
@@ -87,7 +99,6 @@
     }
 
     import { serverSyncScreenRequest } from 'src/ts/storage/sync/serverSyncDeepLink'
-    import ServerSyncConnection from 'src/lib/Setting/ServerSync/ServerSyncConnection.svelte'
     let lastServerRequest: unknown
     $effect(() => {
         if (
@@ -132,8 +143,44 @@
         detail: string
     }
 
+    // The sync server screen. The shared connect part collects the code and
+    // the check; this component runs the connection and draws the attempt
+    // with the same progress panel as a backup import.
+    const syncController = isTauri ? getServerSyncController() : undefined
+    let syncSnapshot = $state(syncController?.snapshot())
+    let hubStage = $state<'code' | 'review'>('code')
+    let hubStarted = $state(false)
+    let hubConnecting = $state(false)
+    let hubPausing = $state(false)
+    let hubError = $state('')
+    let hubKey = $state(0)
+    let hubServer = $state<{ endpoint: string; libraryId: string; deviceId: string }>()
+    // Kept only while this screen is up, so a failed registration can be retried.
+    let hubRequest: ServerSyncConnectRequest | undefined
+    const s = $derived(strings.risuNest.serverSync)
+    const hubOutcome = $derived(
+        hubStarted && syncSnapshot ? serverSyncOnboardingOutcome(syncSnapshot) : undefined,
+    )
+    const hubSyncing = $derived(hubStarted && (hubConnecting || hubOutcome === 'syncing'))
+    const hubView = $derived(
+        syncSnapshot?.running ? serverSyncProgressView(syncSnapshot, s, now) : undefined,
+    )
+    const hubConflict = $derived(
+        syncSnapshot?.result?.phase === 'conflict' ? syncSnapshot.result : undefined,
+    )
+    const hubErrorCode = $derived(hubError || syncSnapshot?.error || '')
+    const hubTicking = $derived(hubSyncing && Boolean(syncSnapshot?.running))
+
     $effect(() => {
-        if (!jobTicking) return
+        if (!hubStarted || hubConnecting || !hubOutcome) return
+        if (hubOutcome === 'complete' || hubOutcome === 'paused') {
+            resetHub()
+            goTo('done')
+        }
+    })
+
+    $effect(() => {
+        if (!jobTicking && !hubTicking) return
         now = Date.now()
         const timer = setInterval(() => {
             now = Date.now()
@@ -158,8 +205,15 @@
         const stopWeave = weaveCanvas
             ? observeOnboardingWeave(weaveCanvas)
             : () => {}
+        const stopSync = syncController
+            ? syncController.subscribe((value) => {
+                  syncSnapshot = value
+              })
+            : () => {}
         return () => {
             stopWeave()
+            stopSync()
+            hubRequest = undefined
             nativeFileJobHost.set('dialog')
             onboardingHold.set(false)
         }
@@ -234,6 +288,82 @@
             }, 1500)
         } catch {
             jobDetailsCopied = false
+        }
+    }
+
+    function resetHub(): void {
+        hubRequest = undefined
+        hubServer = undefined
+        hubStarted = false
+        hubError = ''
+        hubStage = 'code'
+        hubKey += 1
+    }
+
+    async function startHub(request: ServerSyncConnectRequest): Promise<void> {
+        if (!syncController || hubConnecting) return
+        hubRequest = request
+        hubServer = {
+            endpoint: request.config.endpoint,
+            libraryId: request.config.libraryId,
+            deviceId: request.config.deviceId,
+        }
+        hubStarted = true
+        hubConnecting = true
+        hubError = ''
+        try {
+            await connectServerSync(syncController, setAssetResidencyPolicy, request)
+        } catch (cause) {
+            hubError = serverSyncError(cause).code
+        } finally {
+            hubConnecting = false
+        }
+    }
+
+    /** Bound already: run the attempt again. Not bound: register again. */
+    async function retryHub(): Promise<void> {
+        if (!syncController || hubConnecting) return
+        if (!syncSnapshot?.status?.configured) {
+            if (hubRequest) await startHub(hubRequest)
+            else resetHub()
+            return
+        }
+        hubConnecting = true
+        hubError = ''
+        try {
+            await syncController.synchronize()
+        } catch (cause) {
+            hubError = serverSyncError(cause).code
+        } finally {
+            hubConnecting = false
+        }
+    }
+
+    async function resolveHub(resolution: 'keep-local' | 'keep-remote'): Promise<void> {
+        if (!syncController || !hubConflict || hubConnecting) return
+        hubConnecting = true
+        hubError = ''
+        try {
+            await syncController.synchronize({
+                resolution,
+                expectedRevision: hubConflict.localRevision,
+                expectedHead: hubConflict.head,
+            })
+        } catch (cause) {
+            hubError = serverSyncError(cause).code
+        } finally {
+            hubConnecting = false
+        }
+    }
+
+    async function pauseHub(): Promise<void> {
+        if (!syncController || hubPausing) return
+        hubPausing = true
+        try {
+            await syncController.pause()
+            await syncController.waitForIdle()
+        } finally {
+            hubPausing = false
         }
     }
 
@@ -322,6 +452,24 @@
     <button class="back" type="button" onclick={() => goTo(target)}>
         <ChevronLeft />{label}
     </button>
+{/snippet}
+
+{#snippet hubServerChip()}
+    {@const server = syncSnapshot?.status?.configured
+        ? {
+              endpoint: syncSnapshot.status.endpoint ?? '',
+              libraryId: syncSnapshot.status.libraryId ?? '',
+              deviceId: syncSnapshot.status.deviceId ?? '',
+          }
+        : hubServer}
+    {#if server}
+        <div class="file">
+            <Server />
+            <span class="name">{serverSyncHostLabel(server.endpoint)}</span>
+            <span class="dim">{server.libraryId} · {server.deviceId}</span>
+            <span class="tag">{t.hub.serverTag}</span>
+        </div>
+    {/if}
 {/snippet}
 
 {#snippet bar(percent: number | null, label: string)}
@@ -660,16 +808,148 @@
                                 </button>
                             </div>
                         {:else if flow.state === 'sync-hub'}
-                            {@render back('sync', t.back)}
-                            <h1>{t.hub.title}</h1>
-                            {#if isTauri}
-                                <ServerSyncConnection
-                                    origin="onboarding"
-                                    initialNavigation={$serverSyncScreenRequest}
-                                    onInitialSyncComplete={() => goTo('done')}
-                                />
-                            {:else}
+                            {#if !isTauri}
+                                {@render back('sync', t.back)}
+                                <h1>{t.hub.title}</h1>
                                 <p class="lead">{t.hub.stepLink}</p>
+                            {:else if hubSyncing}
+                                <h1>{s.running}</h1>
+                                <p class="lead">{t.hub.syncingLead}</p>
+                                {@render hubServerChip()}
+                                {@render bar(hubView?.percent ?? null, s.running)}
+                                <p class="meta">
+                                    <span
+                                        >{hubView?.percent !== null &&
+                                        hubView?.percent !== undefined
+                                            ? `${hubView.percent}%`
+                                            : strings.risuNest.importDialog
+                                                  .preparing}</span
+                                    >
+                                    <span>{hubView?.current ?? s.running}</span>
+                                    <span class="dim">{hubView?.elapsed ?? ''}</span>
+                                </p>
+                                {#if hubView}
+                                    {@render stageList(hubView.stages)}
+                                    <dl class="counts">
+                                        {#each hubView.counters as counter (counter.key)}
+                                            <div>
+                                                <dt>{counter.label}</dt>
+                                                <dd>{counter.value}</dd>
+                                            </div>
+                                        {/each}
+                                    </dl>
+                                {/if}
+                                <div class="actions">
+                                    <button
+                                        class="btn ghost"
+                                        type="button"
+                                        disabled={hubPausing ||
+                                            !syncSnapshot?.running ||
+                                            syncSnapshot.paused}
+                                        onclick={() => void pauseHub()}
+                                    >
+                                        <Pause />{s.pause}
+                                    </button>
+                                    <span class="dim">{t.hub.pauseNote}</span>
+                                </div>
+                            {:else if hubStarted && hubOutcome === 'conflict' && hubConflict}
+                                <h1>{t.hub.title}</h1>
+                                {@render hubServerChip()}
+                                <p class="result failed" role="status">
+                                    {s.conflictCount.replace(
+                                        '{0}',
+                                        String(hubConflict.conflictCount),
+                                    )}
+                                </p>
+                                <p class="reason">{s.conflictHelp}</p>
+                                <div class="actions">
+                                    <button
+                                        class="btn primary"
+                                        type="button"
+                                        onclick={() => void resolveHub('keep-local')}
+                                    >
+                                        {s.keepLocal}
+                                    </button>
+                                    <button
+                                        class="btn"
+                                        type="button"
+                                        onclick={() => void resolveHub('keep-remote')}
+                                    >
+                                        {s.keepRemote}
+                                    </button>
+                                </div>
+                            {:else if hubStarted}
+                                <button class="back" type="button" onclick={resetHub}>
+                                    <ChevronLeft />{s.otherCode}
+                                </button>
+                                <h1>{t.hub.title}</h1>
+                                {@render hubServerChip()}
+                                <p class="result failed" role="status">
+                                    {t.hub.errorSummary}
+                                </p>
+                                <p class="reason">
+                                    {hubOutcome === 'pending'
+                                        ? t.hub.pendingReason
+                                        : t.hub.errorReason}
+                                    {#if hubErrorCode && hubErrorCode !== 'cancelled'}<span
+                                            class="dim">({hubErrorCode})</span
+                                        >{/if}
+                                </p>
+                                <div class="actions">
+                                    <button
+                                        class="btn primary"
+                                        type="button"
+                                        onclick={() => void retryHub()}
+                                    >
+                                        {t.hub.retry}
+                                    </button>
+                                    <button class="btn ghost" type="button" onclick={resetHub}>
+                                        {s.otherCode}
+                                    </button>
+                                    <button
+                                        class="btn ghost"
+                                        type="button"
+                                        onclick={() => {
+                                            resetHub()
+                                            goTo('home')
+                                        }}
+                                    >
+                                        {t.backHome}
+                                    </button>
+                                </div>
+                            {:else}
+                                {#if hubStage === 'review'}
+                                    <button class="back" type="button" onclick={resetHub}>
+                                        <ChevronLeft />{s.otherCode}
+                                    </button>
+                                    <h1>{s.reviewTitle}</h1>
+                                    <p class="lead">{t.hub.reviewLead}</p>
+                                {:else}
+                                    {@render back('sync', t.back)}
+                                    <h1>{t.hub.title}</h1>
+                                    <p class="lead">
+                                        {isTauriAndroid ? t.hub.leadScan : t.hub.lead}
+                                    </p>
+                                    <ol class="howto">
+                                        <li>{t.hub.stepLink}</li>
+                                        <li>{t.hub.stepPaste}</li>
+                                        <li>{t.hub.stepReview}</li>
+                                    </ol>
+                                {/if}
+                                {#key hubKey}
+                                    <ServerSyncConnect
+                                        bind:stage={hubStage}
+                                        initialNavigation={$serverSyncScreenRequest}
+                                        tone="onboarding"
+                                        busy={hubConnecting}
+                                        onSubmit={(request) => void startHub(request)}
+                                    />
+                                {/key}
+                                {#if isTauriAndroid && hubStage === 'code'}
+                                    <p class="hint spaced">
+                                        <Smartphone /><span>{t.hub.linkHint}</span>
+                                    </p>
+                                {/if}
                             {/if}
                         {:else if flow.state === 'sync-account'}
                             {@render back('sync', t.back)}
