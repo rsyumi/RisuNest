@@ -29,10 +29,18 @@ const COLD_STORAGE_HEADER: &str = "\u{ef01}COLDSTORAGE\u{ef01}";
 #[derive(Default)]
 pub(crate) struct ActiveReaderRegistry {
     count: AtomicUsize,
+    deferred_asset_inventories: AtomicUsize,
     detached_asset_roots: Mutex<HashMap<String, AssetRootSet>>,
 }
 
 impl ActiveReaderRegistry {
+    /// Short local captures pin their referenced objects incrementally. During
+    /// that interval GC/eviction must defer instead of rescanning the full asset
+    /// library on every small edit. Register under the repository mutation lock.
+    pub(crate) fn defer_asset_inventory(self: &Arc<Self>) -> DeferredAssetInventory {
+        self.deferred_asset_inventories.fetch_add(1, Ordering::SeqCst);
+        DeferredAssetInventory(Arc::clone(self))
+    }
     fn register(&self) {
         self.count.fetch_add(1, Ordering::SeqCst);
     }
@@ -63,6 +71,11 @@ impl ActiveReaderRegistry {
     }
 
     pub(crate) fn detached_asset_roots(&self) -> StoreResult<Vec<AssetRootSet>> {
+        if self.deferred_asset_inventories.load(Ordering::SeqCst) > 0 {
+            return Err(StoreError::Validation {
+                message: "Asset inventory is being pinned by a local capture".into(),
+            });
+        }
         Ok(self
             .detached_asset_roots
             .lock()
@@ -72,6 +85,14 @@ impl ActiveReaderRegistry {
             .values()
             .cloned()
             .collect())
+    }
+}
+
+pub(crate) struct DeferredAssetInventory(Arc<ActiveReaderRegistry>);
+impl Drop for DeferredAssetInventory {
+    fn drop(&mut self) {
+        let previous = self.0.deferred_asset_inventories.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(previous > 0);
     }
 }
 
@@ -181,7 +202,10 @@ fn prepare_restore_candidate(persistent_dir: &Path, target: &Path) -> StoreResul
     let result = (|| -> StoreResult<()> {
         let mut connection = Connection::open(&candidate)?;
         super::schema::initialize(&mut connection)?;
-        super::server_sync_outbox::restored_copy(&connection)?;
+        let transaction = connection.transaction()?;
+        super::server_sync_outbox::restored_copy(&transaction)?;
+        super::sync_selection::restored_copy(&transaction)?;
+        transaction.commit()?;
         let _ = super::query::materialize(&connection, None)?;
         let integrity: String =
             connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;

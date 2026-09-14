@@ -6,6 +6,7 @@
     "./streaming/**/*.ts",
     "./streaming/**/*.svelte",
     "./linux/**/*.ts",
+    "./macos/**/*.ts",
     "./device-backup/**/*.ts",
     "../src/**/*.d.ts"
   ],

@@ -245,6 +245,48 @@ mod platform {
     }
 }
 
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_credentials_roundtrip_through_keychain_and_are_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let config = ServerConfig {
+            directory: Some(
+                risunest_sync_connect::generate_directory("https://registry.example".into())
+                    .unwrap(),
+            ),
+            endpoint: "http://127.0.0.1:1".into(),
+            library_id: "macos-synthetic-library".into(),
+            device_id: "macos-synthetic-device".into(),
+            token: "ab".repeat(32),
+        };
+        let stored = StoredConfig::persist(root.path(), &config).unwrap();
+        // Only the newly generated credential ID is touched, including on assertion failure.
+        struct Cleanup<'a>(&'a StoredConfig, &'a Path);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.remove(self.1);
+            }
+        }
+        let _cleanup = Cleanup(&stored, root.path());
+        let metadata = serde_json::to_string(&stored).unwrap();
+        let directory = config.directory.as_ref().unwrap();
+        assert!(!metadata.contains(&config.token));
+        assert!(!metadata.contains(&directory.key));
+        assert!(!metadata.contains(&directory.uuid));
+        assert_eq!(stored.resolve(root.path()).unwrap().token, config.token);
+        assert_eq!(
+            stored.resolve(root.path()).unwrap().directory.unwrap().key,
+            directory.key
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        stored.remove(root.path()).unwrap();
+        assert!(stored.resolve(root.path()).is_err());
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;

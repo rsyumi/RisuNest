@@ -45,7 +45,7 @@ export function isNativeRegexTauriRuntime(
 ): boolean {
     return (
         Boolean(tauriInternals) &&
-        ['windows', 'android', 'linux', 'ios'].includes(os ?? platform())
+        ['windows', 'android', 'linux', 'ios', 'macos'].includes(os ?? platform())
     )
 }
 

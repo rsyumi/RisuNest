@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { pathToFileURL } from "node:url";
 
 const forbiddenMarkers = [
+  "macos_bench_",
+  "macos-synthetic-expected",
   "__RISUNEST_LINUX_BENCHMARK__",
   "__RISUNEST_TOKENIZER_BENCHMARK__",
   "__streamingSmoke",

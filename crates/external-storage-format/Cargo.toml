@@ -1,0 +1,26 @@
+[package]
+name = "risunest-external-storage-format"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+base64 = "0.21"
+hex = "0.4"
+dryoc = "1.0"
+hkdf = "0.12"
+zeroize = { version = "1", features = ["derive"] }
+zstd = { version = "0.13", default-features = false }
+getrandom = { version = "0.2", features = ["js"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
+[dev-dependencies]
+flate2 = "1"

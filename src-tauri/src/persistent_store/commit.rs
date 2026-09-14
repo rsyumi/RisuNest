@@ -25,7 +25,9 @@ fn incremental_commit<T>(
     let revision = actual_revision + 1;
     let generation = active;
     super::server_sync_outbox::begin_mutation(&transaction, &generation, revision)?;
+    super::content_change_index::begin_mutation(&transaction, &generation, revision, "local")?;
     body(&transaction, &generation, prepared)?;
+    super::content_change_index::finish_mutation(&transaction)?;
     super::server_sync_outbox::finish_mutation(&transaction)?;
     set_active(&transaction, revision, &generation)?;
     transaction.commit()?;
@@ -1327,6 +1329,25 @@ pub(super) fn replace_commit_with_app_kv(
     expected_revision: Option<i64>,
     app_kv: Option<(&str, &Value)>,
 ) -> StoreResult<RevisionResult> {
+    replace_commit_transaction(connection, staging_id, expected_revision, app_kv, None)
+}
+
+pub(super) fn replace_commit_from_external(
+    connection: &mut Connection,
+    staging_id: &str,
+    expected_revision: i64,
+    job: &str,
+) -> StoreResult<RevisionResult> {
+    replace_commit_transaction(connection, staging_id, Some(expected_revision), None, Some(job))
+}
+
+fn replace_commit_transaction(
+    connection: &mut Connection,
+    staging_id: &str,
+    expected_revision: Option<i64>,
+    app_kv: Option<(&str, &Value)>,
+    external_job: Option<&str>,
+) -> StoreResult<RevisionResult> {
     let serialized_app_kv = app_kv
         .map(|(key, value)| serde_json::to_string(value).map(|value| (key, value)))
         .transpose()?;
@@ -1343,13 +1364,23 @@ pub(super) fn replace_commit_with_app_kv(
         }
     }
 
+    if let Some(job) = external_job {
+        super::external_storage_state::begin_receive_activation(&transaction, job)?;
+    }
     let active = active_generation(&transaction)?;
     let revision = actual_revision + 1;
     let generation = format!("revision-{revision}");
     delete_generation(&transaction, &active)?;
     move_generation(&transaction, staging_id, &generation)?;
     super::server_sync_outbox::full_replacement(&transaction)?;
+    super::content_change_index::full_replacement(&transaction, &generation, revision)?;
+    if external_job.is_none() {
+        super::sync_selection::replaced(&transaction)?;
+    }
     set_active(&transaction, revision, &generation)?;
+    if let Some(job) = external_job {
+        super::external_storage_state::finish_receive_activation(&transaction, job)?;
+    }
     if let Some((key, value)) = serialized_app_kv {
         transaction.execute(
             "INSERT INTO app_kv (key, value) VALUES (?1, ?2)
@@ -1423,7 +1454,7 @@ fn require_activatable_authority(connection: &Connection, staging_id: &str) -> S
     Ok(())
 }
 
-fn read_asset_repository_authority(
+pub(super) fn read_asset_repository_authority(
     connection: &Connection,
     generation: &str,
 ) -> StoreResult<AssetRepositoryAuthorityState> {

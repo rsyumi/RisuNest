@@ -17,6 +17,8 @@ axum = "0.8.9"
 tempfile = "3"
 risunest-sync-wire = { path = "../crates/sync-wire" }
 risunest-sync-connect = { path = "../crates/sync-connect" }
+risunest-external-storage-format = { path = "../crates/external-storage-format" }
+zeroize = "1"
 tauri = { version = "2.11.5", features = ["protocol-asset", "devtools"] }
 rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
 ryu-js = { version = "1.0.3", optional = true }
@@ -42,7 +44,7 @@ tauri-plugin-shell = "2.3.5"
 tauri-plugin-http = { version = "2.5.9", features = ["unsafe-headers"] }
 oauth2 = "5.0.0"
 tokio = { version = "1.47.1", features = ["net", "rt", "time", "fs", "io-util", "sync"] }
-tokio-util = { version = "0.7.19", features = ["io"], optional = true }
+tokio-util = { version = "0.7.19", features = ["io"] }
 libc = { version = "0.2", optional = true }
 hex = "0.4.3"
 image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
@@ -58,7 +60,6 @@ default = ["native-kei-upload-pilot", "native-official-publication"]
 custom-protocol = ["tauri/custom-protocol"]
 native-official-publication = [
     "dep:libc",
-    "dep:tokio-util",
     "reqwest/stream",
     "tokio/fs",
     "tokio/io-util",
@@ -66,7 +67,6 @@ native-official-publication = [
 official-publication-upload-pilot = ["native-official-publication"]
 native-kei-upload-pilot = [
     "dep:ryu-js",
-    "dep:tokio-util",
     "reqwest/stream",
     "tokio/fs",
     "tokio/io-util",
@@ -82,7 +82,7 @@ tauri-plugin-updater = "2.10.1"
 getrandom = "0.2.15"
 reqwest = { version = "0.11.16", features = ["blocking", "json"] }
 
-[target.'cfg(any(windows, target_os = "android", target_os = "linux", target_os = "ios"))'.dependencies]
+[target.'cfg(any(windows, target_os = "android", target_os = "linux", target_os = "ios", target_os = "macos"))'.dependencies]
 regex = "1.13.1"
 
 [target.'cfg(windows)'.dependencies]

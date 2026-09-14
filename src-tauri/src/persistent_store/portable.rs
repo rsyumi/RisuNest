@@ -410,7 +410,15 @@ fn validate_live_columns(source: &Connection) -> StoreResult<()> {
             && !TABLES.iter().any(|t| t.name == name)
             && !matches!(
                 name.as_str(),
-                "asset_alias_replacement_candidates" | "snapshot_leases" | "server_sync_context"
+                "asset_alias_replacement_candidates"
+                    | "snapshot_leases"
+                    | "server_sync_context"
+                    | "content_change_context"
+                    | "content_changes"
+                    | "content_change_consumers"
+                    | "content_change_floor"
+                    | "content_capture_reservations"
+                    | "external_storage_content_cache"
             )
         {
             return Err(invalid(&format!(

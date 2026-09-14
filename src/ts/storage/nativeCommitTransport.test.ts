@@ -28,6 +28,7 @@ function harness(
         android?: boolean
         linux?: boolean
         ios?: boolean
+        macos?: boolean
         unsupported?: boolean
         fail?: string
         ack?: number
@@ -74,6 +75,7 @@ function harness(
         android: () => options.android ?? false,
         linux: () => options.linux ?? false,
         ios: () => options.ios ?? false,
+        macos: () => options.macos ?? false,
         invoke,
         encode,
         shared: () => webview,
@@ -82,7 +84,7 @@ function harness(
 }
 
 describe('native commit transport', () => {
-    it.each(['linux', 'ios'] as const)(
+    it.each(['linux', 'ios', 'macos'] as const)(
         'encodes %s large saves and submits raw bytes without touching shared buffers',
         async (os) => {
             const h = harness({ windows: false, [os]: true })
@@ -98,7 +100,7 @@ describe('native commit transport', () => {
         },
     )
 
-    it.each(['linux', 'ios'] as const)(
+    it.each(['linux', 'ios', 'macos'] as const)(
         'keeps small %s saves on JSON and only falls back before raw submission',
         async (os) => {
             const h = harness({ windows: false, [os]: true })
@@ -120,7 +122,7 @@ describe('native commit transport', () => {
         },
     )
 
-    it.each(['linux', 'ios'] as const)(
+    it.each(['linux', 'ios', 'macos'] as const)(
         'does not replay an ambiguous %s raw commit and allows the next queued save',
         async (os) => {
             const h = harness({
@@ -139,7 +141,7 @@ describe('native commit transport', () => {
         },
     )
 
-    it.each(['linux', 'ios'] as const)(
+    it.each(['linux', 'ios', 'macos'] as const)(
         'does not turn the Windows shared-buffer budget into a %s save limit',
         async (os) => {
             const h = harness({ windows: false, [os]: true })

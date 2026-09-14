@@ -64,6 +64,19 @@ pub(crate) fn deliver_single_instance_arguments(
     launch_directory: &str,
 ) {
     let files = collect_opened_files(args, Some(Path::new(launch_directory)));
+    deliver_files(app, files);
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn deliver_opened_urls(app: &AppHandle, urls: &[url::Url]) {
+    let files = urls
+        .iter()
+        .filter_map(|url| normalize_opened_file(OsStr::new(url.as_str()), None))
+        .collect();
+    deliver_files(app, files);
+}
+
+fn deliver_files(app: &AppHandle, files: Vec<PathBuf>) {
     if files.is_empty() {
         return;
     }
@@ -124,9 +137,9 @@ fn normalize_opened_file(arg: &OsStr, launch_directory: Option<&Path>) -> Option
     if trimmed.is_empty() || trimmed.starts_with('-') {
         return None;
     }
-    // Linux desktop launchers using %U may deliver local files as encoded URLs.
+    // Linux launchers and macOS Finder deliver local files as encoded URLs.
     // Keep all other protocols with the deep-link plugin and only grant local files.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let file_url_path = if has_url_scheme(trimmed) {
         let uri = url::Url::parse(trimmed).ok()?;
         if uri.scheme() != "file" || uri.query().is_some() || uri.fragment().is_some() {
@@ -136,13 +149,13 @@ fn normalize_opened_file(arg: &OsStr, launch_directory: Option<&Path>) -> Option
     } else {
         None
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     if has_url_scheme(trimmed) {
         return None;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let path = file_url_path.as_deref().unwrap_or_else(|| Path::new(arg));
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let path = Path::new(arg);
     let path = if path.is_absolute() {
         path.to_path_buf()
@@ -186,9 +199,9 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn linux_file_urls_decode_and_deduplicate_with_plain_paths() {
+    fn desktop_file_urls_decode_and_deduplicate_with_plain_paths() {
         let directory = tempfile::tempdir().unwrap();
         let card = directory.path().join("synthetic 한글 # %.charx");
         std::fs::write(&card, b"synthetic fixture").unwrap();
@@ -208,9 +221,9 @@ mod tests {
         assert_eq!(collected, vec![std::fs::canonicalize(card).unwrap()]);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn linux_file_urls_reject_remote_hosts_queries_fragments_and_missing_files() {
+    fn desktop_file_urls_reject_remote_hosts_queries_fragments_and_missing_files() {
         let directory = tempfile::tempdir().unwrap();
         let card = directory.path().join("synthetic.charx");
         std::fs::write(&card, b"synthetic fixture").unwrap();

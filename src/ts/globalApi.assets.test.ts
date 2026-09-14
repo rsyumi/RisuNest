@@ -73,7 +73,7 @@ vi.mock('./alert', () => ({
     alertNormal: vi.fn(),
     alertNormalWait: vi.fn(),
     alertSelect: vi.fn(),
-    alertTOS: vi.fn(),
+    alertTOS: vi.fn(), alertRisuServiceTOS: vi.fn(),
     waitAlert: vi.fn(),
 }))
 vi.mock('./storage/persistentDataRuntime.svelte', () => ({

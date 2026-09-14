@@ -1,6 +1,6 @@
 import { runContentImport } from './storage/contentImportOperation'
 import { writable, type Writable } from 'svelte/store'
-import { alertCardExport, alertConfirm, alertError, alertInput, alertMd, alertNormal, alertStore, alertTOS, alertWait } from "./alert"
+import { alertCardExport, alertConfirm, alertError, alertInput, alertMd, alertNormal, alertRisuServiceTOS, alertStore, alertWait } from "./alert"
 import { defaultSdDataFunc, type character, setDatabase, type customscript, type loreSettings, type loreBook, type triggerscript, importPreset, type groupChat, setCurrentCharacter, getCurrentCharacter, getDatabase, setDatabaseLite, appVer } from "./storage/database.svelte"
 import { checkNullish, decryptBuffer, isKnownUri, selectFileByDom, sleep } from "./util"
 import { language } from "src/lang"
@@ -2249,7 +2249,7 @@ export async function downloadRisuHub(id:string, arg:{
 } = {}) {
     try {
         if(!arg.forceRedirect){
-            if(!(await alertTOS())){
+            if(!(await alertRisuServiceTOS())){
                 return
             }
             alertStore.set({

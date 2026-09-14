@@ -8,7 +8,7 @@ import { alertStore as alertStoreImported } from "./stores.svelte"
 export interface alertData{
     type: 'error'|'normal'|'none'|'ask'|'wait'|'selectChar'
             |'input'|'toast'|'wait2'|'markdown'|'select'|'login'
-            |'tos'|'cardexport'|'requestdata'|'addchar'|'hypaV2'|'selectModule'
+            |'tos'|'risu-tos'|'cardexport'|'requestdata'|'addchar'|'hypaV2'|'selectModule'
             |'chatOptions'|'pukmakkurit'|'branches'|'progress'|'pluginconfirm'|'requestlogs',
     msg: string,
     submsg?: string
@@ -233,26 +233,33 @@ export async function alertCardExport(type:string = ''){
     }
 }
 
+// RisuNest's own terms and the RisuAI service terms never stand in for each
+// other, so each keeps its own key. Callers also treat a refusal differently:
+// refusing ours leaves the app unusable (bootstrap), while refusing the upstream
+// service terms cancels only that one action.
 export async function alertTOS(){
+    return askLegalAcceptance('tos', 'risunest_tos_v1')
+}
 
-    if(localStorage.getItem('tos4') === 'true'){
+export async function alertRisuServiceTOS(){
+    return askLegalAcceptance('risu-tos', 'risu_service_tos_v1')
+}
+
+async function askLegalAcceptance(type: 'tos'|'risu-tos', acceptanceKey: string){
+
+    if(localStorage.getItem(acceptanceKey) === 'true'){
         return true
     }
 
     alertStoreImported.set({
-        'type': 'tos',
-        'msg': 'tos'
+        'type': type,
+        'msg': type
     })
 
     await waitAlert()
 
     if(get(alertStoreImported).msg === 'yes'){
-        localStorage.setItem('tos4', 'true')
-        return true
-    }
-
-    if(localStorage.getItem('tos2') && Date.now() - new Date('2026-05-15').getTime() < 0){
-        //apply grace period until 2026-05-15 for users who accepted tos2
+        localStorage.setItem(acceptanceKey, 'true')
         return true
     }
 

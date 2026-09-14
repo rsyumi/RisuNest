@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <title>Mac synthetic desktop verification</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="benchmark">
+      <p id="status">Mac synthetic verification</p>
+      <textarea aria-label="Synthetic input">합성 입력 🐿️</textarea>
+      <div
+        id="motion"
+        style="width: 20px; height: 20px; background: green"
+      ></div>
+    </div>
+    <script type="module" src="/benchmarks/macos/main.ts"></script>
+  </body>
+</html>

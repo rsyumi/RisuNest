@@ -2,6 +2,11 @@ pub(crate) mod asset_object_catalog;
 pub(crate) mod asset_residency;
 pub(crate) mod commands;
 mod commit;
+pub(crate) mod content_change_index;
+pub(crate) mod content_capture;
+mod content_locators;
+pub(crate) mod external_storage_state;
+pub(crate) mod sync_selection;
 pub(crate) mod export;
 #[cfg(feature = "native-kei-upload-pilot")]
 pub(crate) mod kei;
@@ -1700,6 +1705,23 @@ impl PersistentStore {
         )
     }
 
+    /// Normal external sync receive, after complete staged logical/payload
+    /// validation and under the existing replacement fence and file(true).
+    /// The remote base and activation are committed atomically.
+    pub(crate) fn finish_external_receive(
+        &mut self,
+        prepared: PreparedReplaceCommit,
+        job: &str,
+    ) -> StoreResult<RevisionResult> {
+        self.verify_staged_cold_payload_objects(&prepared.staging_id)?;
+        commit::replace_commit_from_external(
+            &mut self.connection,
+            &prepared.staging_id,
+            prepared.revision,
+            job,
+        )
+    }
+
     pub(crate) fn replace_abort(&mut self, staging_id: &str) -> StoreResult<()> {
         commit::replace_abort(&mut self.connection, staging_id)
     }
@@ -2388,6 +2410,9 @@ impl PersistentStore {
             roots.push(snapshot::collect_asset_roots(&reader.connection, cas)?);
         }
         roots.extend(self.active_readers.detached_asset_roots()?);
+        roots.push(crate::external_storage::capture::registered_roots(
+            &self.connection, &self.repository_root,
+        )?);
         roots.extend(snapshot_archive::Archive::open(&self.snapshots_dir)?.roots()?);
         roots.extend(collect_staged_migration_roots(&self.repository_root)?);
         roots.push(if read_only {

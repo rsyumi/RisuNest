@@ -553,47 +553,54 @@ describe('persistent production runtime', () => {
         expect(legacyWriter).not.toHaveBeenCalled()
     })
 
-    it('does not acknowledge completion until the generation survives renderer reload', async () => {
-        const databaseName = `runtime-generation-reload-${crypto.randomUUID()}`
-        const database = makeDatabase()
-        const store = makeStore(databaseName)
-        await store.open()
-        await store.replaceFromDatabase(database)
-        const adapter = makeAdapter(database)
-        const pin = vi.fn(() => new Promise<never>(() => undefined))
-        const runtime = createPersistentDataRuntime({
-            store,
-            state: adapter,
-            clock: rendererOwnedDebounceClock,
-            officialPublisher: { pin },
-            prepareDatabase: async (candidate) => structuredClone(candidate),
-        })
-        await runtime.initializeActiveWorkingSet(database)
+    it.each(['generation', 'exit'])(
+        'makes %s durable across reload before waiting for remote publication',
+        async (reason) => {
+            const databaseName = `runtime-generation-reload-${crypto.randomUUID()}`
+            const database = makeDatabase()
+            const store = makeStore(databaseName)
+            await store.open()
+            await store.replaceFromDatabase(database)
+            const adapter = makeAdapter(database)
+            const pin = vi.fn(() => new Promise<never>(() => undefined))
+            const runtime = createPersistentDataRuntime({
+                store,
+                state: adapter,
+                clock: rendererOwnedDebounceClock,
+                officialPublisher: { pin },
+                prepareDatabase: async (candidate) =>
+                    structuredClone(candidate),
+            })
+            await runtime.initializeActiveWorkingSet(database)
 
-        const completedGeneration = {
-            role: 'char' as const,
-            data: 'completed provider response',
-            chatId: 'generation-complete',
-            generationInfo: {
-                generationId: 'generation-complete',
-                model: 'synthetic-model',
-            },
-        }
-        adapter.current().characters[0].chats[0].message.push(completedGeneration)
-        runtime.markPersistentDataDirty(64)
-        await runtime.acknowledgeGenerationCompletion()
+            const completedGeneration = {
+                role: 'char' as const,
+                data: 'completed provider response',
+                chatId: 'generation-complete',
+                generationInfo: {
+                    generationId: 'generation-complete',
+                    model: 'synthetic-model',
+                },
+            }
+            adapter
+                .current()
+                .characters[0].chats[0].message.push(completedGeneration)
+            runtime.markPersistentDataDirty(64)
+            if (reason === 'exit') await runtime.flushPendingDataLocally('exit')
+            else await runtime.acknowledgeGenerationCompletion()
 
-        expect(pin).not.toHaveBeenCalled()
-        expect(runtime.hasPendingOfficialPublication()).toBe(true)
+            expect(pin).not.toHaveBeenCalled()
+            expect(runtime.hasPendingOfficialPublication()).toBe(true)
 
-        const reopened = makeStore(databaseName)
-        await reopened.open()
-        const recovered = await reopened.materializeDatabase()
+            const reopened = makeStore(databaseName)
+            await reopened.open()
+            const recovered = await reopened.materializeDatabase()
 
-        expect(recovered.characters[0].chats[0].message).toContainEqual(
-            completedGeneration,
-        )
-    })
+            expect(recovered.characters[0].chats[0].message).toContainEqual(
+                completedGeneration,
+            )
+        },
+    )
 
     it('keeps a failed completion dirty so a retry makes it durable', async () => {
         const databaseName = `runtime-generation-retry-${crypto.randomUUID()}`

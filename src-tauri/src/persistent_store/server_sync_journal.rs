@@ -132,6 +132,15 @@ impl PersistentStore {
         )? {
             return Err(SyncError::new("server-already-bound", 409));
         }
+        let selected = super::sync_selection::read(&tx)?;
+        if selected.target != super::sync_selection::SyncTarget::None {
+            return Err(SyncError::new("sync-target-already-selected", 409));
+        }
+        super::sync_selection::select(
+            &tx,
+            &selected.epoch,
+            &super::sync_selection::SyncTarget::Server(uuid::Uuid::new_v4().to_string()),
+        )?;
         let stored = StoredConfig::persist(&root, config)?;
         let outcome = (|| -> Result<()> {
             tx.execute(
@@ -163,6 +172,14 @@ impl PersistentStore {
             |r| r.get(0),
         )? {
             return Err(SyncError::new("resolve-pending-operation-first", 409));
+        }
+        let selected = super::sync_selection::read(&tx)?;
+        if matches!(selected.target, super::sync_selection::SyncTarget::Server(_)) {
+            super::sync_selection::select(
+                &tx,
+                &selected.epoch,
+                &super::sync_selection::SyncTarget::None,
+            )?;
         }
         for table in [
             "server_sync_clear_members",

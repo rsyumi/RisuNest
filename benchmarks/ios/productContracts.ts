@@ -35,7 +35,7 @@ export async function productApp(restart: boolean) {
     },
     assetAliases: [],
   });
-  localStorage.setItem("tos4", "true");
+  localStorage.setItem("risunest_tos_v1", "true");
   document.getElementById("benchmark")!.remove();
   const app = await import("../../src/main");
   await app.default;

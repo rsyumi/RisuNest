@@ -10,15 +10,17 @@ import { RISU_SIDEBAR_DRAG_TYPE } from "./dragTypes"
 import { changeChar } from "./characters"
 import { deactivateActiveWorkingSet } from "./storage/persistentDataRuntime.svelte"
 
+import { shortcutModifier } from './hotkeyModifier'
+
 export function initHotkey(){
     document.addEventListener('keydown', async (ev) => {
-        if(
-            !ev.ctrlKey &&
+        if (
+            !shortcutModifier(ev) &&
             !ev.altKey &&
             !ev.shiftKey &&
             (['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName) ||
-            document.activeElement.getAttribute('contenteditable'))
-        ){
+                document.activeElement.getAttribute('contenteditable'))
+        ) {
             return
         }
 
@@ -190,7 +192,7 @@ export function initHotkey(){
         }
 
 
-        if(ev.ctrlKey){
+        if (shortcutModifier(ev)) {
             if (/^[1-9]$/.test(ev.key)) {
                 ev.preventDefault()
                 ev.stopPropagation()
@@ -291,7 +293,7 @@ export function hotkeyMatches(hotkey: typeof DBState.db.hotkeys[number], ev: Key
     hotkey.alt = hotkey.alt ?? false
     hotkey.shift = hotkey.shift ?? false
 
-    if(hotkey.ctrl !== ev.ctrlKey) return false
+    if (hotkey.ctrl !== shortcutModifier(ev)) return false
     if(hotkey.alt !== ev.altKey) return false
     if(hotkey.shift !== ev.shiftKey) return false
     if(hotkey.key.toLowerCase() !== ev.key.toLowerCase()) return false

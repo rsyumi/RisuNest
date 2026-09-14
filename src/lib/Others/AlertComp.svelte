@@ -28,6 +28,7 @@
     import { getDetailedOSLabel, getFallbackOSLabel, getRisuEnvironmentLabel } from "src/ts/platform";
     import versionData from "../../../version.json";
     import { isExpectedHubMessage } from "src/ts/storage/officialAccountMessage";
+    import { RISUNEST_PRIVACY_URL, RISUNEST_TERMS_URL, RISU_SERVICE_PRIVACY_URL, RISU_SERVICE_TERMS_URL } from "src/ts/legal";
 
     let showDetails = $state(false);
     let translatedStackTrace = $state('');
@@ -223,28 +224,38 @@
                         <DeferredMarkdown data={$alertStore.msg} />
                     </span>
                 </div>
-            {:else if $alertStore.type === 'tos'}
+            {:else if $alertStore.type === 'tos' || $alertStore.type === 'risu-tos'}
                 <!-- svelte-ignore a11y_missing_attribute -->
                 <!-- svelte-ignore a11y_click_events_have_key_events -->
 
-                <div class="text-textcolor">
-                    You should accept
-                    <a role="button" tabindex="0" class="text-green-600 hover:text-green-500 transition-colors duration-200 cursor-pointer" onclick={() => {
-                        openURL('https://account.sionyw.com/terms')
-                    }}>Terms of Service</a>
+                {#if $alertStore.type === 'tos'}
+                    <div class="text-textcolor">
+                        To use RisuNest, you should accept the
+                        <a role="button" tabindex="0" class="text-green-600 hover:text-green-500 transition-colors duration-200 cursor-pointer" onclick={() => {
+                            openURL(RISUNEST_TERMS_URL)
+                        }}>Terms of Use</a>
 
-                    and
+                        and
 
-                    <a role="button" tabindex="0" class="text-green-600 hover:text-green-500 transition-colors duration-200 cursor-pointer" onclick={() => {
-                        openURL('https://account.sionyw.com/privacy')
-                    }}>Privacy Policy</a>
+                        <a role="button" tabindex="0" class="text-green-600 hover:text-green-500 transition-colors duration-200 cursor-pointer" onclick={() => {
+                            openURL(RISUNEST_PRIVACY_URL)
+                        }}>Privacy Notice</a>.
+                    </div>
+                {:else}
+                    <div class="text-textcolor">
+                        This feature connects to a service operated by the RisuAI maintainers. To continue, you should accept their
+                        <a role="button" tabindex="0" class="text-green-600 hover:text-green-500 transition-colors duration-200 cursor-pointer" onclick={() => {
+                            openURL(RISU_SERVICE_TERMS_URL)
+                        }}>Terms of Service</a>
 
-                    to continue
-                </div>
+                        and
 
-                {#if localStorage.getItem('tos2') && Date.now() - new Date('2026-05-15').getTime() < 0}
+                        <a role="button" tabindex="0" class="text-green-600 hover:text-green-500 transition-colors duration-200 cursor-pointer" onclick={() => {
+                            openURL(RISU_SERVICE_PRIVACY_URL)
+                        }}>Privacy Policy</a>.
+                    </div>
                     <div class="text-gray-500 mt-4 text-sm">
-                        You can still continue using Risuai using original terms until {new Date('2026-05-15').toLocaleDateString()}.
+                        These services are not operated by RisuNest.
                     </div>
                 {/if}
             {:else if $alertStore.type === 'pluginconfirm'}
@@ -325,7 +336,7 @@
                         })
                     }}>NO</Button>
                 </div>
-            {:else if $alertStore.type === 'tos' && import.meta.env.VITE_RISU_LEGAL_CONFIGURED}
+            {:else if ($alertStore.type === 'tos' || $alertStore.type === 'risu-tos') && import.meta.env.VITE_RISU_LEGAL_CONFIGURED}
                 <div class="flex gap-2 w-full">
                     <Button className="mt-4 grow" onclick={() => {
                         alertStore.set({
