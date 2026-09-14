@@ -1311,7 +1311,31 @@ mod tests {
 
     #[test]
     fn first_scheduled_jitter_is_decided_under_a_lock_that_can_be_released_before_sleep() {
+        #[cfg(target_os = "macos")]
+        if std::env::var_os("RISUNEST_MAC_JITTER_TEST_CHILD").is_none() {
+            let app = tempfile::tempdir().unwrap();
+            let executable = app.path().join("RisuNest Sync Tests.app/Contents/MacOS");
+            std::fs::create_dir_all(&executable).unwrap();
+            let executable = executable.join("risunest-sync-manager-tests");
+            std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+            let status = std::process::Command::new(executable)
+                .arg("update::engine::tests::first_scheduled_jitter_is_decided_under_a_lock_that_can_be_released_before_sleep")
+                .args(["--exact", "--nocapture"])
+                .env("RISUNEST_MAC_JITTER_TEST_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "managed .app jitter child test failed");
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "macos")]
+        let server = std::env::current_exe()
+            .unwrap()
+            .ancestors()
+            .find(|path| path.extension().is_some_and(|value| value == "app"))
+            .unwrap()
+            .join("Contents/MacOS/risunest-sync-server");
+        #[cfg(not(target_os = "macos"))]
         let server = root.path().join("managed-install/server");
         let lock = try_lock(root.path()).unwrap();
         let delay = scheduled_initial_delay(root.path(), &server, &lock)
@@ -1326,7 +1350,7 @@ mod tests {
             "1.0.0".into(),
             "2.0.0".into(),
             TransactionKind::Directory,
-            server.parent().unwrap().to_owned(),
+            install_path(&server).unwrap(),
             root.path().join(".risunest-sync-update-stage"),
             root.path().join(".risunest-sync-update-backup"),
             Vec::new(),

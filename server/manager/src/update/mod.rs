@@ -1138,13 +1138,49 @@ mod tests {
 
     #[test]
     fn installer_configuration_allows_only_its_applied_directory_transaction() {
+        #[cfg(target_os = "macos")]
+        if std::env::var_os("RISUNEST_MAC_INSTALLER_CONFIG_TEST_CHILD").is_none() {
+            let app = tempfile::tempdir().unwrap();
+            let executable = app.path().join("RisuNest Sync Tests.app/Contents/MacOS");
+            fs::create_dir_all(&executable).unwrap();
+            let executable = executable.join("risunest-sync-manager-tests");
+            fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+            let status = std::process::Command::new(executable)
+                .arg("update::tests::installer_configuration_allows_only_its_applied_directory_transaction")
+                .args(["--exact", "--nocapture"])
+                .env("RISUNEST_MAC_INSTALLER_CONFIG_TEST_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "managed .app installer configuration child test failed"
+            );
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("data");
+        #[cfg(target_os = "macos")]
+        let install = std::env::current_exe()
+            .unwrap()
+            .ancestors()
+            .find(|path| path.extension().is_some_and(|value| value == "app"))
+            .unwrap()
+            .to_owned();
+        #[cfg(not(target_os = "macos"))]
         let install = temp.path().join("install");
-        let staged = temp.path().join(".risunest-sync-update-stage");
-        let backup = temp.path().join(".risunest-sync-update-backup");
+        let staged = install
+            .parent()
+            .unwrap()
+            .join(".risunest-sync-update-stage");
+        let backup = install
+            .parent()
+            .unwrap()
+            .join(".risunest-sync-update-backup");
         fs::create_dir_all(&install).unwrap();
         fs::create_dir_all(&staged).unwrap();
+        #[cfg(target_os = "macos")]
+        let server = install.join("Contents/MacOS/risunest-sync-server");
+        #[cfg(not(target_os = "macos"))]
         let server = install.join(if cfg!(windows) {
             "risunest-sync-server.exe"
         } else {
