@@ -453,7 +453,7 @@ jobs:
           restore-keys: release-cargo-1.97.1-${{ runner.os }}-${{ runner.arch }}-
       - name: Install Linux package dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev patchelf desktop-file-utils shared-mime-info libfuse2t64
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev patchelf desktop-file-utils shared-mime-info xdg-utils libfuse2t64
       - run: pnpm install --frozen-lockfile
       - name: Build once and package from the product binary
         shell: bash
