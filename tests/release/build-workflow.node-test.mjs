@@ -104,6 +104,25 @@ test("both Linux release packages pass the real managed installer transaction", 
   assert.match(syncSuite, /if: matrix\.os == 'linux'[\s\S]*loginctl enable-linger[\s\S]*asset\.download\.arch === process\.argv\[1\]/);
 });
 
+test("both macOS Sync legs verify whole-app apply and rollback before upload", () => {
+  const start = workflow.indexOf("\n  sync-suite:\n");
+  const end = workflow.indexOf("\n  collect-publish:\n");
+  assert(start >= 0 && end > start);
+  const suite = workflow.slice(start, end);
+  const macRows = suite.split("\n").filter((line) => /runner: macos-/.test(line));
+  assert.equal(macRows.length, 2);
+  const gateStart = suite.indexOf("name: Apply and roll back the produced macOS Sync app");
+  const uploadStart = suite.indexOf("name: Upload final assets to draft");
+  assert(gateStart > suite.indexOf("node scripts/release/build.mjs"));
+  assert(uploadStart > gateStart);
+  const gate = suite.slice(gateStart, uploadStart);
+  const gatedOs = /if: matrix\.os == '([^']+)'/.exec(gate)?.[1];
+  for (const row of macRows) assert.equal(/\bos: ([a-z]+)/.exec(row)?.[1], gatedOs);
+  assert.match(gate, /RISUNEST_TEST_RUST_TARGET: \$\{\{ matrix\.target \}\}/);
+  assert.match(gate, /macos-update\.sh "\$managed" "\$managed\.sig" "\$inventory"/);
+  assert.match(gate, /test result: ok\. 1 passed; 0 failed; 0 ignored;/);
+});
+
 test("raw Sync release binaries require the embedded update public key", () => {
   const syncBuild = workflow.slice(
     workflow.indexOf("Build console, background and GUI executables once"),

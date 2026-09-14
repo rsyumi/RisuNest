@@ -197,9 +197,7 @@ fn stopped_directory_helper_rolls_back_when_the_target_cannot_be_health_checked(
     assert_eq!(error, "server-executable-or-data-path-invalid");
     assert_eq!(fs::read(install.join("version")).unwrap(), b"old");
     assert!(!backup.exists());
-    let transaction = InstallTransaction::load(&root, &install)
-        .unwrap()
-        .unwrap();
+    let transaction = InstallTransaction::load(&root, &install).unwrap().unwrap();
     assert_eq!(transaction.phase, TransactionPhase::RolledBack);
     let status = load_status(&root).unwrap();
     assert_eq!(status.phase, UpdatePhase::Failed);

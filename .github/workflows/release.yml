@@ -731,6 +731,17 @@ jobs:
         if: matrix.os == 'windows'
         shell: pwsh
         run: pwsh -NoProfile -File server/manager/install/windows.test.ps1
+      - name: Apply and roll back the produced macOS Sync app
+        if: matrix.os == 'darwin'
+        shell: bash
+        env:
+          RISUNEST_TEST_RUST_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          inventory="$(pwd)/release-out/inventory-sync_darwin_${{ matrix.arch }}.json"
+          managed="$(node -e "const path=require('node:path'); const i=require(process.argv[1]); const d=i.downloads.filter(x=>x.variant==='managed'&&x.format==='app.tar.gz'); if(d.length!==1)throw new Error('Expected one managed app archive'); console.log(path.join(path.dirname(process.argv[1]),d[0].fileName));" "$inventory")"
+          sh server/manager/tests/macos-update.sh "$managed" "$managed.sig" "$inventory" 2>&1 | tee "$RUNNER_TEMP/macos-update.log"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/macos-update.log"
       - name: Upload final assets to draft
         if: inputs.publish == true
         env: { GITHUB_TOKEN: "${{ github.token }}" }
