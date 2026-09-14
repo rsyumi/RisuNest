@@ -132,7 +132,7 @@ async fn standalone_daemon_sigterm_releases_the_owner_and_reopens_exact_head() {
     let start = std::time::Instant::now();
     loop {
         if let Some(status) = daemon.child.try_wait().unwrap() {
-            assert!(status.success());
+            assert!(status.success(), "SIGTERM daemon exit was {status:?}");
             break;
         }
         assert!(start.elapsed() < Duration::from_secs(10));

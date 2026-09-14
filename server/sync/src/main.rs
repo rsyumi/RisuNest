@@ -185,6 +185,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let listener = tokio::net::TcpListener::bind(config.listen).await?;
             let origin = listener.local_addr()?;
             let store = Arc::new(store);
+            // A service manager may send SIGTERM as soon as readiness is observable.
+            let shutdown = shutdown();
             eprintln!(
                 "sync listener ready: {} ({})",
                 listener.local_addr()?,
@@ -200,7 +202,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut stopped = management.shutdown_receiver();
             let result = axum::serve(listener, http::router_with_workload(store, workload))
                 .with_graceful_shutdown(async move {
-                    tokio::select! { _ = shutdown() => (), _ = stopped.changed() => () }
+                    tokio::select! { _ = shutdown => (), _ = stopped.changed() => () }
                 })
                 .await;
             management.close().await;
@@ -210,14 +212,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
-async fn shutdown() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+#[cfg(unix)]
+fn shutdown() -> impl std::future::Future<Output = ()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let terminate = signal(SignalKind::terminate());
+    async move {
+        if let Ok(mut terminate) = terminate {
             tokio::select! { _=tokio::signal::ctrl_c()=>{},_=terminate.recv()=>{} }
-            return;
+        } else {
+            let _ = tokio::signal::ctrl_c().await;
         }
     }
+}
+#[cfg(not(unix))]
+async fn shutdown() {
     let _ = tokio::signal::ctrl_c().await;
 }
