@@ -3,6 +3,7 @@ mod android_commit_transport;
 mod app_data_root;
 mod asset_repository;
 mod cold_payload_codec;
+mod data_health;
 pub(crate) mod device_backup;
 mod external_storage;
 pub mod import_export_jobs;
