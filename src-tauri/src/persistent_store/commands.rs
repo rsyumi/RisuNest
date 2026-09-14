@@ -968,6 +968,10 @@ fn pds_asset_gc_preview_all(
     operation_guard: &RendererOperationGuard,
 ) -> Result<AssetGcMaintenanceResult, StoreError> {
     let now = current_time_ms()?;
+    // Preview roots are scoped to this invocation. Deletion always collects fresh roots.
+    let preview = with_store_mutex_admitted(state, operation_guard, |store| {
+        store.prepare_asset_gc_preview()
+    })?;
     let mut cursor = None;
     let mut result = AssetGcMaintenanceResult {
         candidate_count: 0,
@@ -978,7 +982,13 @@ fn pds_asset_gc_preview_all(
     };
     loop {
         let page = with_store_mutex_admitted(state, operation_guard, |store| {
-            store.asset_gc_dry_run(128, cursor.as_deref(), now, 7 * 24 * 60 * 60 * 1_000)
+            store.asset_gc_preview_page(
+                &preview,
+                128,
+                cursor.as_deref(),
+                now,
+                7 * 24 * 60 * 60 * 1_000,
+            )
         })?;
         let page_result = asset_gc_result(page.report);
         result.candidate_count += page_result.candidate_count;
@@ -1078,6 +1088,8 @@ pub(crate) fn pds_remove_app_kv(
 
 #[cfg(test)]
 mod tests {
+    mod asset_gc_performance;
+
     use super::*;
     use serde_json::json;
     use std::fs;

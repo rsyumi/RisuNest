@@ -262,9 +262,12 @@ impl Archive {
     }
 
     pub fn roots(&self) -> StoreResult<Vec<AssetRootSet>> {
-        self.list()?
-            .iter()
-            .map(|s| self.metadata(&s.id).map(|m| m.roots))
+        let mut statement = self.connection.prepare("SELECT id FROM snapshots")?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.iter()
+            .map(|id| self.metadata(id).map(|metadata| metadata.roots))
             .collect()
     }
 
@@ -440,6 +443,48 @@ fn invalid(message: &str) -> StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roots_read_checked_metadata_without_reading_snapshot_payload_tables() {
+        unsafe extern "C" fn deny_payload_reads(
+            _: *mut std::ffi::c_void,
+            action: std::ffi::c_int,
+            table: *const std::ffi::c_char,
+            _: *const std::ffi::c_char,
+            _: *const std::ffi::c_char,
+            _: *const std::ffi::c_char,
+        ) -> std::ffi::c_int {
+            if action == rusqlite::ffi::SQLITE_READ && !table.is_null() {
+                let table = unsafe { std::ffi::CStr::from_ptr(table) }.to_bytes();
+                if table == b"chunks" || table == b"snapshot_pages" {
+                    return rusqlite::ffi::SQLITE_DENY;
+                }
+            }
+            rusqlite::ffi::SQLITE_OK
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut archive = Archive::open(dir.path()).unwrap();
+        let source = archive.scratch().unwrap();
+        fs::write(&source.path, vec![17; 8192]).unwrap();
+        let mut expected = AssetRootSet::default();
+        expected.object_hashes.insert("a".repeat(64));
+        archive.insert(&source.path, 1, "synthetic", expected.clone()).unwrap();
+        // SQLite owns callback arguments, and the callback captures no Rust state.
+        assert_eq!(unsafe {
+            rusqlite::ffi::sqlite3_set_authorizer(
+                archive.connection.handle(),
+                Some(deny_payload_reads),
+                std::ptr::null_mut(),
+            )
+        }, rusqlite::ffi::SQLITE_OK);
+        let roots = archive.roots().unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].object_hashes, expected.object_hashes);
+        assert!(archive.list().is_err());
+        archive.connection.execute("UPDATE snapshots SET checksum=zeroblob(32)", []).unwrap();
+        assert!(archive.roots().is_err());
+    }
 
     #[test]
     fn identical_snapshots_share_payload_and_survive_independent_deletion() {

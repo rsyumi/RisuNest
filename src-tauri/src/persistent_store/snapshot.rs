@@ -26,6 +26,11 @@ const MAX_COLD_DECODED_BYTES: u64 = 64 * 1024 * 1024;
 const CAS_PHYSICAL_PREFIX: &[u8] = b"assets-v2/objects/";
 const COLD_STORAGE_HEADER: &str = "\u{ef01}COLDSTORAGE\u{ef01}";
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static ASSET_ROOT_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Default)]
 pub(crate) struct ActiveReaderRegistry {
     count: AtomicUsize,
@@ -476,6 +481,8 @@ pub(super) fn collect_asset_roots(
     connection: &Connection,
     cas: &PayloadCas,
 ) -> StoreResult<AssetRootSet> {
+    #[cfg(test)]
+    ASSET_ROOT_SCANS.with(|count| count.set(count.get() + 1));
     collect_asset_roots_scoped(connection, cas, None)
 }
 

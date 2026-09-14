@@ -912,6 +912,12 @@ pub(crate) struct PersistentStore {
     pending_restore_failure: Option<String>,
 }
 
+pub(crate) struct AssetGcPreview {
+    cas: crate::asset_repository::PayloadCas,
+    residency: crate::server_sync::residency::Residency,
+    marks: crate::asset_repository::migration_gc::AssetGcMarks,
+}
+
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct StorageCountBytes {
@@ -2203,31 +2209,47 @@ impl PersistentStore {
         now_ms: i64,
         minimum_grace_ms: i64,
     ) -> StoreResult<crate::asset_repository::migration_gc::AssetGcDryRunPage> {
+        let preview = self.prepare_asset_gc_preview()?;
+        self.asset_gc_preview_page(&preview, limit, cursor, now_ms, minimum_grace_ms)
+    }
+
+    pub(crate) fn prepare_asset_gc_preview(&self) -> StoreResult<AssetGcPreview> {
+        let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
+        let roots = self.collect_asset_gc_roots(&cas, false, true)?;
+        let residency = crate::server_sync::residency::Residency::open(&self.repository_root)
+            .map_err(|error| std::io::Error::other(error.code))?;
+        let marks = crate::asset_repository::migration_gc::mark_asset_roots_with_remote(
+            &cas,
+            roots,
+            |hash| residency.gc_size(hash),
+        )?;
+        Ok(AssetGcPreview {
+            cas,
+            residency,
+            marks,
+        })
+    }
+
+    pub(crate) fn asset_gc_preview_page(
+        &self,
+        preview: &AssetGcPreview,
+        limit: i64,
+        cursor: Option<&str>,
+        now_ms: i64,
+        minimum_grace_ms: i64,
+    ) -> StoreResult<crate::asset_repository::migration_gc::AssetGcDryRunPage> {
         use crate::asset_repository::migration_gc::{
-            dry_run_mark_and_sweep_with_remote, AssetGcDryRunPage,
+            sweep_asset_candidates_with_remote, AssetGcDryRunPage,
         };
 
-        let persistent_dir = self
-            .snapshots_dir
-            .parent()
-            .ok_or_else(|| StoreError::Store {
-                message: "persistent snapshots directory has no parent".to_owned(),
-            })?;
-        let repository_root = persistent_dir.parent().ok_or_else(|| StoreError::Store {
-            message: "persistent directory has no repository root".to_owned(),
-        })?;
-        let cas = crate::asset_repository::PayloadCas::new(repository_root)?;
-        let roots = self.collect_asset_gc_roots(&cas, false, true)?;
         let candidates = self.query_asset_object_catalog(limit, cursor)?;
-        let residency = crate::server_sync::residency::Residency::open(repository_root)
-            .map_err(|error| std::io::Error::other(error.code))?;
-        let report = dry_run_mark_and_sweep_with_remote(
-            &cas,
+        let report = sweep_asset_candidates_with_remote(
+            &preview.cas,
             candidates.items,
-            roots,
+            &preview.marks,
             now_ms,
             minimum_grace_ms,
-            |hash| residency.gc_size(hash),
+            |hash| preview.residency.gc_size(hash),
         )
         .map_err(StoreError::from)?;
         Ok(AssetGcDryRunPage {
