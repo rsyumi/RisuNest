@@ -528,7 +528,28 @@ pub(crate) fn dry_run_mark_and_sweep_with_remote(
     if now_ms < 0 || minimum_grace_ms < 0 {
         return invalid_data("asset GC timestamps must be nonnegative");
     }
-    let cutoff = now_ms.saturating_sub(minimum_grace_ms);
+    let marks = mark_asset_roots_with_remote(cas, roots, &remote)?;
+    sweep_asset_candidates_with_remote(
+        cas,
+        candidates,
+        &marks,
+        now_ms,
+        minimum_grace_ms,
+        remote,
+    )
+}
+
+pub(crate) struct AssetGcMarks {
+    marked_hashes: BTreeSet<String>,
+    blockers: BTreeSet<String>,
+    retain_all_objects: bool,
+}
+
+pub(crate) fn mark_asset_roots_with_remote(
+    cas: &PayloadCas,
+    roots: impl IntoIterator<Item = AssetRootSet>,
+    remote: impl Fn(&str) -> io::Result<Option<u64>>,
+) -> io::Result<AssetGcMarks> {
     let mut manifest_hashes = BTreeSet::new();
     let mut marked_hashes = BTreeSet::new();
     let mut blockers = BTreeSet::new();
@@ -573,6 +594,27 @@ pub(crate) fn dry_run_mark_and_sweep_with_remote(
         }
     }
 
+    Ok(AssetGcMarks {
+        marked_hashes,
+        blockers,
+        retain_all_objects,
+    })
+}
+
+pub(crate) fn sweep_asset_candidates_with_remote(
+    cas: &PayloadCas,
+    candidates: impl IntoIterator<Item = AssetGcCandidate>,
+    marks: &AssetGcMarks,
+    now_ms: i64,
+    minimum_grace_ms: i64,
+    remote: impl Fn(&str) -> io::Result<Option<u64>>,
+) -> io::Result<AssetGcDryRunReport> {
+    if now_ms < 0 || minimum_grace_ms < 0 {
+        return invalid_data("asset GC timestamps must be nonnegative");
+    }
+    let cutoff = now_ms.saturating_sub(minimum_grace_ms);
+    let mut marked_hashes = marks.marked_hashes.clone();
+
     let mut seen_candidates = BTreeSet::new();
     let mut grace_retained_hashes = Vec::new();
     let mut potential_delete_hashes = Vec::new();
@@ -596,7 +638,7 @@ pub(crate) fn dry_run_mark_and_sweep_with_remote(
         if physical.is_none() {
             continue;
         }
-        if retain_all_objects {
+        if marks.retain_all_objects {
             marked_hashes.insert(candidate.object_hash);
             continue;
         }
@@ -621,7 +663,7 @@ pub(crate) fn dry_run_mark_and_sweep_with_remote(
         potential_delete_bytes,
         deleted_hashes: Vec::new(),
         deleted_bytes: 0,
-        blockers: blockers.into_iter().collect(),
+        blockers: marks.blockers.iter().cloned().collect(),
         deletion_enabled: false,
     })
 }
