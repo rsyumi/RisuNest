@@ -27,8 +27,16 @@ async function waitForExit(exit, timeout = 10000) {
   }
 }
 
-async function runTunnel(binary, origin, token) {
-  const child = spawn(binary, ["tunnel", "--no-autoupdate", "--logformat", "json", "--url", origin], {
+export const tunnelArgs = (origin) => ["tunnel", "--no-autoupdate", "--output", "json", "--url", origin];
+
+async function runTunnel(binary, origin, token, options = {}) {
+  const spawnProcess = options.spawnProcess ?? spawn;
+  const fetchUrl = options.fetchUrl ?? fetch;
+  const readinessTimeout = options.readinessTimeout ?? 60000;
+  const pollInterval = options.pollInterval ?? 250;
+  const proxyAttempts = options.proxyAttempts ?? 20;
+  const proxyTimeout = options.proxyTimeout ?? 5000;
+  const child = spawnProcess(binary, tunnelArgs(origin), {
     windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -39,45 +47,66 @@ async function runTunnel(binary, origin, token) {
   const append = (chunk) => { text = `${text}${chunk}`.slice(-131072); };
   child.stdout.on("data", append);
   child.stderr.on("data", append);
+  let stopped;
+  let stopRequested = false;
+  let completed = false;
   try {
-    const deadline = Date.now() + 60000;
+    const deadline = Date.now() + readinessTimeout;
     let publicUrl;
+    let edgeRegistered = false;
     while (Date.now() < deadline) {
       publicUrl = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/.exec(text)?.[0];
-      if (publicUrl && /Registered tunnel connection|Connection .* registered/i.test(text)) break;
+      edgeRegistered = /Registered tunnel connection|Connection .* registered/i.test(text);
+      if (publicUrl && edgeRegistered) break;
       if (spawnError) throw spawnError;
       if (child.exitCode !== null) throw new Error(`cloudflared exited before readiness (${child.exitCode}): ${text}`);
-      await new Promise((resolveWait) => setTimeout(resolveWait, 250));
+      await new Promise((resolveWait) => setTimeout(resolveWait, pollInterval));
     }
     if (!publicUrl) throw new Error(`cloudflared did not publish a Quick Tunnel URL: ${text}`);
+    if (!edgeRegistered) throw new Error(`cloudflared did not register an edge connection: ${text}`);
     let proxied = false;
-    for (let attempt = 0; attempt < 20; attempt += 1) {
+    for (let attempt = 0; attempt < proxyAttempts; attempt += 1) {
       try {
-        const response = await fetch(publicUrl, { signal: AbortSignal.timeout(5000) });
+        const response = await fetchUrl(publicUrl, { signal: AbortSignal.timeout(proxyTimeout) });
         if (response.ok && await response.text() === token) {
           proxied = true;
           break;
         }
       } catch {}
-      await new Promise((resolveWait) => setTimeout(resolveWait, 500));
+      await new Promise((resolveWait) => setTimeout(resolveWait, pollInterval * 2));
     }
     if (!proxied) throw new Error("Quick Tunnel did not proxy the synthetic origin.");
+    completed = true;
   } finally {
-    if (child.exitCode === null && child.signalCode === null) child.kill();
+    const running = child.exitCode === null && child.signalCode === null;
+    stopRequested = running && child.kill();
     const result = await waitForExit(exit);
     if (result.error) throw result.error;
+    if (completed && !stopRequested) throw new Error("cloudflared exited before the requested stop.");
+    stopped = result;
   }
+  return {
+    urlPublished: true,
+    edgeRegistered: true,
+    originProxied: true,
+    stopRequested,
+    stopped: true,
+    exitCode: stopped.code ?? null,
+    signal: stopped.signal ?? null,
+  };
 }
 
-export async function verifyCloudflared(binary) {
-  const version = spawn(binary, ["--version"], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+export async function verifyCloudflared(binary, options = {}) {
+  const spawnProcess = options.spawnProcess ?? spawn;
+  const version = spawnProcess(binary, ["--version"], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
   const exit = observeExit(version);
   let output = "";
   version.stdout.on("data", (chunk) => { output += chunk; });
   version.stderr.on("data", (chunk) => { output += chunk; });
   const result = await waitForExit(exit);
   if (result.error) throw result.error;
-  if (result.code !== 0 || !/cloudflared version \d{4}\.\d+\.\d+/.test(output))
+  const versionMatch = /cloudflared version (\d{4}\.\d+\.\d+)/.exec(output);
+  if (result.code !== 0 || !versionMatch)
     throw new Error(`cloudflared version probe failed: ${output}`);
   const token = `risunest-cloudflared-${process.pid}`;
   const server = createServer((_request, response) => response.end(token));
@@ -87,8 +116,16 @@ export async function verifyCloudflared(binary) {
   });
   const { port } = server.address();
   try {
-    await runTunnel(binary, `http://127.0.0.1:${port}`, token);
-    await runTunnel(binary, `http://127.0.0.1:${port}`, token);
+    const runs = [
+      await runTunnel(binary, `http://127.0.0.1:${port}`, token, options),
+      await runTunnel(binary, `http://127.0.0.1:${port}`, token, options),
+    ];
+    return {
+      schema: "risunest-cloudflared-lifecycle/v1",
+      version: versionMatch[1],
+      output: "json",
+      runs,
+    };
   } finally {
     await new Promise((resolveClose) => server.close(resolveClose));
   }
@@ -96,7 +133,8 @@ export async function verifyCloudflared(binary) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  await verifyCloudflared(requireArg(args, "binary"));
+  const result = await verifyCloudflared(requireArg(args, "binary"));
+  process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url))

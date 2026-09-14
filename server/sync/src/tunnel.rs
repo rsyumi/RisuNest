@@ -51,6 +51,14 @@ impl Readiness {
     }
 }
 
+fn cloudflared_args(origin: SocketAddr) -> Vec<String> {
+    ["tunnel", "--no-autoupdate", "--output", "json", "--url"]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(std::iter::once(format!("http://{origin}")))
+        .collect()
+}
+
 async fn read_lines(reader: impl AsyncRead + Unpin, tx: mpsc::Sender<Vec<u8>>) {
     let mut reader = BufReader::new(reader);
     loop {
@@ -151,14 +159,7 @@ async fn run_child(
 ) -> Result<()> {
     let mut command = Command::new(executable);
     command
-        .args([
-            "tunnel",
-            "--no-autoupdate",
-            "--logformat",
-            "json",
-            "--url",
-            &format!("http://{origin}"),
-        ])
+        .args(cloudflared_args(origin))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -260,6 +261,20 @@ mod tests {
                 )
                 .is_none());
         }
+    }
+    #[test]
+    fn pinned_cloudflared_command_uses_json_output_flag() {
+        assert_eq!(
+            cloudflared_args("127.0.0.1:3210".parse().unwrap()),
+            [
+                "tunnel",
+                "--no-autoupdate",
+                "--output",
+                "json",
+                "--url",
+                "http://127.0.0.1:3210",
+            ]
+        );
     }
     #[tokio::test]
     async fn child_output_is_bounded_without_a_newline() {
