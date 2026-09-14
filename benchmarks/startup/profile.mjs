@@ -59,10 +59,14 @@ async function stop(child, client) {
     client?.close()
     if (child.exitCode === null)
         await run('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], process.env)
+    if (child.exitCode === null && child.signalCode === null)
+        await once(child, 'exit', { signal: AbortSignal.timeout(15_000) })
     stopped.add(child)
 }
 
 async function main() {
+    if (options.kind && !['reload', 'restart'].includes(options.kind))
+        throw new Error('Invalid measurement kind')
     const server = net.createServer()
     server.listen(0, '127.0.0.1')
     await once(server, 'listening')
@@ -480,13 +484,13 @@ async function main() {
                     source: instrumentation,
                 })
             }
-            for (let i = 0; i < runs; i++) {
+            for (let i = 0; i < (options.kind === 'restart' ? 0 : runs); i++) {
                 await prepareNext()
                 await measure('reload')
             }
             await prepareNext()
             await stop(child, client)
-            for (let i = 0; i < runs; i++) {
+            for (let i = 0; i < (options.kind === 'reload' ? 0 : runs); i++) {
                 await measure('restart')
                 await prepareNext()
                 await stop(child, client)

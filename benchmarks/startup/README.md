@@ -149,6 +149,10 @@ that entire group; do not top it up with selected successful rows. When combinin
 complete groups, record their source files and require matching product revision,
 APK hash and fixture. Both groups still need twenty valid samples.
 
+The Windows runner also accepts `--kind` for a complete per-group follow-up.
+It waits for the app's actual exit event after `taskkill` before opening SQLite
+offline; completion of `taskkill` alone does not mean the app released its files.
+
 The optional `android-smoke.mjs` uses only `emulator-5580` named
 `risunest_startup_synthetic`, with a private ADB server on port 5038. Create that
 AVD with isolated, disposable synthetic data and launch it with `-no-window`.
