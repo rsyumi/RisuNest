@@ -4,6 +4,17 @@ import test from "node:test";
 
 const workflow = readFileSync(new URL("../../.github/workflows/release.yml", import.meta.url), "utf8");
 const cacheWorkflow = readFileSync(new URL("../../.github/workflows/release-cache.yml", import.meta.url), "utf8");
+const checkWorkflow = readFileSync(new URL("../../.github/workflows/release-check.yml", import.meta.url), "utf8");
+
+test("both products and pull requests run shared native signature and catalog tests", () => {
+  const commonTests = workflow.slice(workflow.indexOf("\n  release-tooling-tests:\n"), workflow.indexOf("\n  app-web-tests:\n"));
+  assert.doesNotMatch(commonTests, /if: inputs\.product/);
+  for (const contents of [commonTests, checkWorkflow]) {
+    assert.match(contents, /uses: dtolnay\/rust-toolchain@1\.97\.1/);
+    assert.match(contents, /cargo test --manifest-path crates\/release-update\/Cargo\.toml --release --locked/);
+  }
+  assert.match(workflow, /needs: \[source, release-tooling-tests,/);
+});
 
 test("release source input uses one run timestamp instead of the commit timestamp", () => {
   assert.match(workflow, /published_at=\$\(date -u/);

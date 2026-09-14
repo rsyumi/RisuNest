@@ -101,7 +101,8 @@ export function sourceCheck({
         "server/manager/gui/pnpm-lock.yaml",
         "server/manager/gui/src-tauri/Cargo.lock",
       ];
-  for (const lockfile of lockfiles) requireFile(join(repo, lockfile), "Lockfile");
+  for (const lockfile of ["crates/release-update/Cargo.lock", ...lockfiles])
+    requireFile(join(repo, lockfile), "Lockfile");
 
   let compatibility = null;
   let vendorInput = null;

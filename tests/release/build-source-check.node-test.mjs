@@ -20,6 +20,7 @@ function json(path, value) {
 
 function repository(product, version) {
   const root = mkdtempSync(join(tmpdir(), "risunest-source-check-"));
+  write(join(root, "crates/release-update/Cargo.lock"));
   write(join(root, "release-notes", product, `${version}.md`), `# ${product} ${version}\n`);
   if (product === "app") {
     json(join(root, "version.json"), { version });
@@ -120,6 +121,21 @@ test("source check requires the directly tested sync-wire lockfile", () => {
     publishedAt: "2026-09-15T00:00:00Z",
     registryUrl: "https://sync.example.invalid/",
   }), /Lockfile is missing/);
+});
+
+test("both products require the shared native update test lockfile", () => {
+  for (const product of ["app", "sync"]) {
+    const root = repository(product, "1.2.3");
+    rmSync(join(root, "crates/release-update/Cargo.lock"));
+    assert.throws(() => sourceCheck({
+      repository: root,
+      product,
+      tag: `${product}-v1.2.3`,
+      sourceCommit: "e".repeat(40),
+      publishedAt: "2026-09-15T00:00:00Z",
+      registryUrl: "https://sync.example.invalid/",
+    }), /Lockfile is missing/);
+  }
 });
 
 test("release names are unique and Android build numbers are bounded", () => {

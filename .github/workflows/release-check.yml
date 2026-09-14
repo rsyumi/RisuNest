@@ -25,6 +25,8 @@ permissions:
 jobs:
   contracts:
     runs-on: ubuntu-24.04
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target
     steps:
       - uses: actions/checkout@v6
         with: { persist-credentials: false }
@@ -32,5 +34,7 @@ jobs:
         with: { version: "10.34.1" }
       - uses: actions/setup-node@v6
         with: { node-version: "24", package-manager-cache: false }
+      - uses: dtolnay/rust-toolchain@1.97.1
       - run: pnpm install --frozen-lockfile
       - run: pnpm test:release
+      - run: cargo test --manifest-path crates/release-update/Cargo.toml --release --locked

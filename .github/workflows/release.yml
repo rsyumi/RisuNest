@@ -107,6 +107,7 @@ jobs:
         with: { version: "10.34.1" }
       - uses: actions/setup-node@v6
         with: { node-version: "24", package-manager-cache: false }
+      - uses: dtolnay/rust-toolchain@1.97.1
       - id: pnpm-store
         shell: bash
         run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
@@ -117,6 +118,7 @@ jobs:
           restore-keys: release-pnpm-${{ runner.os }}-${{ runner.arch }}-
       - run: pnpm install --frozen-lockfile
       - run: pnpm test:release
+      - run: cargo test --manifest-path crates/release-update/Cargo.toml --release --locked
 
   app-web-tests:
     if: inputs.product == 'app'
