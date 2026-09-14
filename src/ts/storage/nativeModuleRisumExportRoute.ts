@@ -59,9 +59,17 @@ export async function exportNativeModuleRisumFromPicker(
     if (flow.kind === 'cancelled') return null
     const moduleIndex = dependencies.modules().findIndex((candidate) => candidate === module)
     if (moduleIndex < 0) throw new Error('Native RISUM export requires the exact root module object')
+    const runtime = dependencies.runtime()
+    await runtime.flushPendingData('native-risum-export')
+    if (options.signal?.aborted) {
+        throw new DOMException('Native file job was cancelled', 'AbortError')
+    }
+    if (dependencies.modules()[moduleIndex] !== module) {
+        throw new Error('Native RISUM export module identity changed while pinning its revision')
+    }
     return dependencies.runExport({
         moduleIndex,
-        expectedRevision: flow.expectedRevision,
+        expectedRevision: runtime.revision,
         destination: flow.destination,
     }, options)
 }

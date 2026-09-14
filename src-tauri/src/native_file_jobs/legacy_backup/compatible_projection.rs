@@ -173,26 +173,50 @@ fn validate_message_references(
             if let Some(id) = text.strip_prefix("\u{ef01}COLDSTORAGE\u{ef01}") {
                 validate_cold_ids(&Value::String(id.into()), inventory)?;
             }
-            let mut rest = text.as_str();
-            while let Some(start) = rest.find("{{") {
-                rest = &rest[start + 2..];
-                let Some(end) = rest.find("}}") else { break };
-                let token = &rest[..end];
-                if let Some((kind, id)) = token.split_once("::") {
-                    if matches!(kind, "inlay" | "inlayed" | "inlayeddata") {
-                        if target == CompatibilityTarget::RisuAi {
-                            losses.add("unsupported-inlay-references", 1)
-                        } else if !inventory.contains(&format!("inlay_sidecar/{id}")) {
-                            return Err(error("referenced inlay is missing from target inventory"));
-                        }
-                    }
+            for id in inlay_references(text) {
+                if target == CompatibilityTarget::RisuAi {
+                    losses.add("unsupported-inlay-references", 1)
+                } else if !inventory.contains(&format!("inlay_sidecar/{id}")) {
+                    return Err(error("referenced inlay is missing from target inventory"));
                 }
-                rest = &rest[end + 2..];
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+fn inlay_references(value: &str) -> Vec<&str> {
+    let mut references = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative_start) = value[cursor..].find("{{") {
+        let after_open = cursor + relative_start + 2;
+        let prefix = ["inlay::", "inlayed::", "inlayeddata::"]
+            .into_iter()
+            .find(|prefix| value[after_open..].starts_with(prefix));
+        let Some(prefix) = prefix else {
+            cursor = after_open;
+            continue;
+        };
+        let key_start = after_open + prefix.len();
+        let Some(relative_end) = value[key_start..].find("}}") else {
+            cursor = after_open;
+            continue;
+        };
+        let key_end = key_start + relative_end;
+        let key = &value[key_start..key_end];
+        if !key.is_empty()
+            && !key
+                .chars()
+                .any(|character| matches!(character, '\n' | '\r' | '\u{2028}' | '\u{2029}'))
+        {
+            references.push(key);
+            cursor = key_end + 2;
+        } else {
+            cursor = after_open;
+        }
+    }
+    references
 }
 fn validate_asset_fields(value: &Value, inventory: &HashSet<String>) -> Result<(), NativeJobError> {
     fn asset(value: &Value, inventory: &HashSet<String>) -> Result<(), NativeJobError> {
@@ -646,6 +670,25 @@ mod tests {
         let source = json!({"role":"char","data":"user text {{inlay::missing}} untouched"});
         assert_eq!(projector.project("Message", &source).unwrap(), source);
         assert_eq!(projector.losses.0["unsupported-inlay-references"], 1);
+    }
+
+    #[test]
+    fn compatible_inlay_scanner_matches_runtime_token_boundaries() {
+        let mut projector = Projector::new(CompatibilityTarget::PocketRisu).unwrap();
+        projector.set_inventory(HashSet::from([
+            "inlay_sidecar/inner".to_owned(),
+            "inlay_sidecar/second".to_owned(),
+        ]));
+        let source = json!({
+            "role": "char",
+            "data": "{{inlay::}} {{inlay::line\nbreak}} {{random::{{inlay::inner}}::{{inlayeddata::second}}}}"
+        });
+        assert_eq!(projector.project("Message", &source).unwrap(), source);
+
+        let mut projector = Projector::new(CompatibilityTarget::RisuAi).unwrap();
+        projector.set_inventory(HashSet::new());
+        projector.project("Message", &source).unwrap();
+        assert_eq!(projector.losses.0["unsupported-inlay-references"], 2);
     }
 
     #[test]

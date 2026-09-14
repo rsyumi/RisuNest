@@ -11,8 +11,10 @@ import {
     decodeBackupInlayEntry,
     encodeBackupInlayEntry,
     getBackupInlayName,
+    isBackupInlayEntryName,
     isLegacyBackupAssetKey,
     readBackupAsset,
+    readLocalBackupAsset,
     scanPinnedBackupRecords,
     writeBackupAsset,
 } from "./backupAssets";
@@ -330,7 +332,7 @@ async function savePartialLocalBackupSnapshot(blobStore: BlobStore, pinned: Pinn
         }
         alertWait(message)
 
-        let data = await blobStore.read(key)
+        let data = await readLocalBackupAsset(blobStore, key)
         let readRemotely = false
         if (data === null && forageStorage.isAccount) {
             data = await readBackupAsset(blobStore, key, true)
@@ -574,6 +576,15 @@ export async function importLegacyBackupWithWebView(
                     } catch (e) {
                         console.error(`Failed to restore inlay ${inlayEntry.key}:`, e)
                         counts.skipped += 1
+                    }
+                    offset += entryLength
+                    await sleep(10)
+                    continue
+                }
+                if (isBackupInlayEntryName(name)) {
+                    counts.skipped += 1
+                    if (!warningCodes.includes('invalid-inlay-entry')) {
+                        warningCodes.push('invalid-inlay-entry')
                     }
                     offset += entryLength
                     await sleep(10)

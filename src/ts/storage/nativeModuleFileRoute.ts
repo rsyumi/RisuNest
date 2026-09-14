@@ -31,6 +31,9 @@ export async function importDesktopNativeModulePath<T>(
         }, options)
     }
     catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') {
+            return { kind: 'declined' }
+        }
         try {
             onError?.(error)
         }

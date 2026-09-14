@@ -34,4 +34,19 @@ describe('native RISUM desktop route', () => {
         expect(reportError).toHaveBeenCalledWith(error)
         expect(nativeImport).toHaveBeenCalledOnce()
     })
+
+    it('treats an aborted native import as a declined route without reporting corruption', async () => {
+        const error = new DOMException('cancelled', 'AbortError')
+        const nativeImport = vi.fn(async () => { throw error })
+        const reportError = vi.fn()
+
+        await expect(importDesktopNativeModulePath(
+            'C:\\chosen\\module.risum',
+            nativeImport,
+            {},
+            reportError,
+        )).resolves.toEqual({ kind: 'declined' })
+
+        expect(reportError).not.toHaveBeenCalled()
+    })
 })

@@ -262,6 +262,55 @@ describe('bootstrapPersistentDatabase', () => {
         )
     })
 
+    it('fully migrates pre-v3 characters once before projecting a scalable working set', async () => {
+        const indexedDB = new IDBFactory()
+        const store = new IndexedDbPersistentDataStore(
+            `bootstrap-scalable-migration-${crypto.randomUUID()}`,
+            indexedDB,
+            IDBKeyRange,
+        )
+        const persistent = structuredClone(fixtureDatabase)
+        persistent.plugins = [plugin('2.1', false)]
+        delete (persistent as Partial<Database>).formatversion
+        persistent.characters[0].image = 'C:\\synthetic\\assets\\avatar.png'
+        persistent.characters[0].emotionImages = [
+            ['happy', 'C:\\synthetic\\assets\\happy.png'],
+        ]
+        await store.open()
+        await store.replaceFromDatabase(persistent)
+        const materializeDatabase = vi.spyOn(store, 'materializeDatabase')
+
+        const result = await bootstrapPersistentDatabase({
+            store,
+            now: () => 500,
+            prepareDatabase: async (database) => {
+                const migrated = structuredClone(database)
+                migrated.formatversion = 5
+                migrated.characters[0].image = 'assets/avatar.png'
+                migrated.characters[0].emotionImages = [
+                    ['happy', 'assets/happy.png'],
+                ]
+                return preparedResult(database, migrated)
+            },
+            prepareRoot: async (root) => structuredClone(root),
+            projectScalableWorkingSet: (input) => projectCatalogWorkingSet(
+                input.root,
+                input.characters,
+                createCatalogPresetWorkingSet(input.presetCatalog, input.activePreset),
+            ),
+        })
+
+        expect(materializeDatabase).toHaveBeenCalledOnce()
+        expect(result.profile).toBe('scalable-v3')
+        expect(result.database.characters.every(isCatalogCharacterStub)).toBe(true)
+        const stored = await store.materializeDatabase(result.revision)
+        expect(stored.formatversion).toBe(5)
+        expect(stored.characters[0].image).toBe('assets/avatar.png')
+        expect(stored.characters[0].emotionImages).toEqual([
+            ['happy', 'assets/happy.png'],
+        ])
+    })
+
     it('yields between character catalog pages without delaying every summary', async () => {
         const persistent = structuredClone(fixtureDatabase)
         persistent.plugins = [plugin('2.1', false)]

@@ -9,7 +9,9 @@ use crate::persistent_store::{
     PreparedRisuSaveExport, StoreResult,
 };
 use crate::server_sync::residency::RemotePayloadAccess;
-use base64::{engine::general_purpose::STANDARD, write::EncoderWriter, Engine as _};
+#[cfg(test)]
+use base64::Engine as _;
+use base64::{engine::general_purpose::STANDARD, write::EncoderWriter};
 use image::ImageEncoder;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -21,7 +23,7 @@ use uuid::Uuid;
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 const MAX_PNG_CHUNK_BYTES: usize = i32::MAX as usize;
-const MAX_EMBEDDED_ASSET_BYTES: u64 = 50 * 1024 * 1024;
+const MAX_EMBEDDED_ASSET_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EMBEDDED_ASSET_COUNT: u64 = 10_000;
 const MAX_EMBEDDED_ASSET_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -44,13 +46,13 @@ impl Default for PngExportLimits {
     }
 }
 
-#[derive(Clone)]
-struct ParsedPngChunk {
+#[derive(Clone, Copy)]
+struct ParsedPngChunk<'a> {
     kind: [u8; 4],
-    data: Vec<u8>,
+    data: &'a [u8],
 }
 
-fn parse_chunks(bytes: &[u8]) -> Result<Vec<ParsedPngChunk>, NativeJobError> {
+fn parse_chunks(bytes: &[u8]) -> Result<Vec<ParsedPngChunk<'_>>, NativeJobError> {
     if bytes.len() < PNG_SIGNATURE.len() || &bytes[..PNG_SIGNATURE.len()] != PNG_SIGNATURE {
         return Err(invalid_input("character portrait is not a PNG"));
     }
@@ -109,7 +111,7 @@ fn parse_chunks(bytes: &[u8]) -> Result<Vec<ParsedPngChunk>, NativeJobError> {
         }
         chunks.push(ParsedPngChunk {
             kind,
-            data: bytes[header_end..data_end].to_vec(),
+            data: &bytes[header_end..data_end],
         });
         offset = chunk_end;
         if kind == *b"IEND" {
@@ -126,7 +128,7 @@ fn parse_chunks(bytes: &[u8]) -> Result<Vec<ParsedPngChunk>, NativeJobError> {
 }
 
 fn prepare_png_portrait(
-    bytes: &[u8],
+    bytes: Vec<u8>,
     limits: PngExportLimits,
     is_cancelled: impl Fn() -> bool,
 ) -> Result<Vec<u8>, NativeJobError> {
@@ -138,7 +140,7 @@ fn prepare_png_portrait(
             "character portrait exceeds the PNG input limit",
         ));
     }
-    let mut reader = image::ImageReader::new(Cursor::new(bytes))
+    let mut reader = image::ImageReader::new(Cursor::new(bytes.as_slice()))
         .with_guessed_format()
         .map_err(|error| invalid_input(format!("character portrait is invalid: {error}")))?;
     let source_format = reader
@@ -169,8 +171,9 @@ fn prepare_png_portrait(
         return Err(cancelled("PNG export cancelled before portrait encoding"));
     }
     if source_format == image::ImageFormat::Png {
-        parse_chunks(bytes)?;
-        return Ok(bytes.to_vec());
+        drop(decoded);
+        parse_chunks(&bytes)?;
+        return Ok(bytes);
     }
     let rgba = decoded.to_rgba8();
     let mut png = Vec::new();
@@ -201,7 +204,7 @@ fn write_png_card(
         .take((PngExportLimits::default().max_input_bytes + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(io_error)?;
-    let bytes = prepare_png_portrait(&bytes, PngExportLimits::default(), &is_cancelled)?;
+    let bytes = prepare_png_portrait(bytes, PngExportLimits::default(), &is_cancelled)?;
     let chunks = parse_chunks(&bytes)?;
     output.write_all(PNG_SIGNATURE).map_err(io_error)?;
     for chunk in chunks {
@@ -209,7 +212,7 @@ fn write_png_card(
             return Err(cancelled("PNG export cancelled while writing chunks"));
         }
         if chunk.kind == *b"IEND" {
-            write_text_chunk(output, "ccv3", &STANDARD.encode(metadata))?;
+            write_base64_text_chunk(output, "ccv3", metadata, &is_cancelled)?;
             for (reference, payload) in assets {
                 if reference.is_empty() || reference.as_bytes().len() > 60 {
                     return Err(invalid_input("PNG asset reference is invalid"));
@@ -220,13 +223,13 @@ fn write_png_card(
                     &STANDARD.encode(payload),
                 )?;
             }
-            write_chunk(output, &chunk.kind, &chunk.data)?;
+            write_chunk(output, &chunk.kind, chunk.data)?;
             continue;
         }
-        if chunk.kind == *b"tEXt" && owned_text_chunk(&chunk.data) {
+        if chunk.kind == *b"tEXt" && owned_text_chunk(chunk.data) {
             continue;
         }
-        write_chunk(output, &chunk.kind, &chunk.data)?;
+        write_chunk(output, &chunk.kind, chunk.data)?;
     }
     Ok(())
 }
@@ -274,7 +277,7 @@ where
         job.start(JobPhase::WritingExport).map_err(job_error)?;
         let repository =
             PayloadCas::new(prepared.repository_root().map_err(store_error)?).map_err(io_error)?;
-        let (portrait, sources) = {
+        let (portrait, mut sources) = {
             let reader = prepared.reader().map_err(store_error)?;
             let projected = export::projected_character(
                 &reader.connection,
@@ -298,6 +301,11 @@ where
             .pointer_mut("/data/assets")
             .and_then(Value::as_array_mut)
             .ok_or_else(|| invalid_input("CCv3 assets must be an array"))?;
+        for (asset, source) in assets.iter().zip(&mut sources) {
+            if asset.get("uri").and_then(Value::as_str) == Some("ccdefault:") {
+                *source = None;
+            }
+        }
         let mut next_reference = 0_u64;
         let references = sources
             .iter()
@@ -341,14 +349,13 @@ where
         if embedded_asset_bytes > MAX_EMBEDDED_ASSET_TOTAL_BYTES {
             return Err(invalid_input("PNG embedded asset total exceeds its limit"));
         }
-        let metadata = serde_json::to_vec(&metadata)
-            .map_err(|error| invalid_input(format!("CCv3 metadata cannot be encoded: {error}")))?;
-        if metadata.len() > 5 * 1024 * 1024 {
+        let metadata_length = serialized_json_length(&metadata)?;
+        if metadata_length > super::content::JSON_CARD_MAX_METADATA_BYTES {
             return Err(invalid_input(
                 "PNG card metadata exceeds the importer limit",
             ));
         }
-        let portrait = prepare_png_portrait(&portrait, PngExportLimits::default(), || {
+        let portrait = prepare_png_portrait(portrait, PngExportLimits::default(), || {
             job.is_cancel_requested()
         })?;
         let source = owned_directory.join("character.png");
@@ -367,7 +374,13 @@ where
                 return Err(cancelled("PNG export cancelled while writing chunks"));
             }
             if chunk.kind == *b"IEND" {
-                write_text_chunk(&mut output, "ccv3", &STANDARD.encode(&metadata))?;
+                write_base64_json_text_chunk(
+                    &mut output,
+                    "ccv3",
+                    &metadata,
+                    metadata_length,
+                    &|| job.is_cancel_requested(),
+                )?;
                 for (source, reference) in sources.iter().zip(&references) {
                     let (Some(source), Some(reference)) = (source, reference) else {
                         continue;
@@ -382,9 +395,9 @@ where
                     })
                     .map_err(job_error)?;
                 }
-                write_chunk(&mut output, &chunk.kind, &chunk.data)?;
-            } else if chunk.kind != *b"tEXt" || !owned_text_chunk(&chunk.data) {
-                write_chunk(&mut output, &chunk.kind, &chunk.data)?;
+                write_chunk(&mut output, &chunk.kind, chunk.data)?;
+            } else if chunk.kind != *b"tEXt" || !owned_text_chunk(chunk.data) {
+                write_chunk(&mut output, &chunk.kind, chunk.data)?;
             }
         }
         output.flush().map_err(io_error)?;
@@ -637,6 +650,7 @@ fn owned_text_chunk(data: &[u8]) -> bool {
     keyword == b"chara" || keyword == b"ccv3" || keyword.starts_with(b"chara-ext-asset_")
 }
 
+#[cfg(test)]
 fn write_text_chunk(
     output: &mut impl Write,
     keyword: &str,
@@ -650,6 +664,139 @@ fn write_text_chunk(
     data.push(0);
     data.extend_from_slice(value.as_bytes());
     write_chunk(output, b"tEXt", &data)
+}
+
+#[cfg(test)]
+fn write_base64_text_chunk(
+    output: &mut impl Write,
+    keyword: &str,
+    value: &[u8],
+    is_cancelled: &impl Fn() -> bool,
+) -> Result<(), NativeJobError> {
+    if keyword.is_empty() || keyword.as_bytes().len() > 79 || keyword.as_bytes().contains(&0) {
+        return Err(invalid_input("PNG text keyword is invalid"));
+    }
+    let encoded = u64::try_from(value.len())
+        .map_err(|_| invalid_input("PNG text payload length does not fit this platform"))?
+        .checked_add(2)
+        .map(|length| length / 3)
+        .and_then(|length| length.checked_mul(4))
+        .ok_or_else(|| invalid_input("PNG text payload length overflow"))?;
+    let data_length = u64::try_from(keyword.len() + 1)
+        .unwrap()
+        .checked_add(encoded)
+        .and_then(|length| u32::try_from(length).ok())
+        .ok_or_else(|| invalid_input("PNG text chunk is too large"))?;
+    output
+        .write_all(&data_length.to_be_bytes())
+        .map_err(io_error)?;
+    output.write_all(b"tEXt").map_err(io_error)?;
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(b"tEXt");
+    output.write_all(keyword.as_bytes()).map_err(io_error)?;
+    output.write_all(&[0]).map_err(io_error)?;
+    crc.update(keyword.as_bytes());
+    crc.update(&[0]);
+    {
+        let mut hashing = HashingWriter {
+            output,
+            crc: &mut crc,
+        };
+        let mut encoder = EncoderWriter::new(&mut hashing, &STANDARD);
+        for chunk in value.chunks(64 * 1024) {
+            if is_cancelled() {
+                return Err(cancelled("PNG export cancelled while writing metadata"));
+            }
+            encoder.write_all(chunk).map_err(io_error)?;
+        }
+        encoder.finish().map_err(io_error)?;
+    }
+    output
+        .write_all(&crc.finalize().to_be_bytes())
+        .map_err(io_error)
+}
+
+#[derive(Default)]
+struct CountingWriter {
+    bytes: usize,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(buffer.len())
+            .ok_or_else(|| io::Error::other("serialized JSON length overflow"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_length(value: &Value) -> Result<usize, NativeJobError> {
+    let mut counter = CountingWriter::default();
+    serde_json::to_writer(&mut counter, value)
+        .map_err(|error| invalid_input(format!("CCv3 metadata cannot be encoded: {error}")))?;
+    Ok(counter.bytes)
+}
+
+fn write_base64_json_text_chunk(
+    output: &mut impl Write,
+    keyword: &str,
+    value: &Value,
+    value_length: usize,
+    is_cancelled: &impl Fn() -> bool,
+) -> Result<(), NativeJobError> {
+    if keyword.is_empty() || keyword.as_bytes().len() > 79 || keyword.as_bytes().contains(&0) {
+        return Err(invalid_input("PNG text keyword is invalid"));
+    }
+    let encoded = u64::try_from(value_length)
+        .map_err(|_| invalid_input("PNG text payload length does not fit this platform"))?
+        .checked_add(2)
+        .map(|length| length / 3)
+        .and_then(|length| length.checked_mul(4))
+        .ok_or_else(|| invalid_input("PNG text payload length overflow"))?;
+    let data_length = u64::try_from(keyword.len() + 1)
+        .unwrap()
+        .checked_add(encoded)
+        .and_then(|length| u32::try_from(length).ok())
+        .ok_or_else(|| invalid_input("PNG text chunk is too large"))?;
+    output
+        .write_all(&data_length.to_be_bytes())
+        .map_err(io_error)?;
+    output.write_all(b"tEXt").map_err(io_error)?;
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(b"tEXt");
+    output.write_all(keyword.as_bytes()).map_err(io_error)?;
+    output.write_all(&[0]).map_err(io_error)?;
+    crc.update(keyword.as_bytes());
+    crc.update(&[0]);
+    {
+        if is_cancelled() {
+            return Err(cancelled("PNG export cancelled while writing metadata"));
+        }
+        let mut hashing = HashingWriter {
+            output,
+            crc: &mut crc,
+        };
+        let mut encoder = EncoderWriter::new(&mut hashing, &STANDARD);
+        serde_json::to_writer(&mut encoder, value).map_err(|error| {
+            if let Some(kind) = error.io_error_kind() {
+                io_error(io::Error::new(kind, error))
+            } else {
+                invalid_input(format!("CCv3 metadata cannot be encoded: {error}"))
+            }
+        })?;
+        encoder.finish().map_err(io_error)?;
+        if is_cancelled() {
+            return Err(cancelled("PNG export cancelled while writing metadata"));
+        }
+    }
+    output
+        .write_all(&crc.finalize().to_be_bytes())
+        .map_err(io_error)
 }
 
 fn write_chunk(output: &mut impl Write, kind: &[u8; 4], data: &[u8]) -> Result<(), NativeJobError> {
@@ -739,7 +886,7 @@ mod tests {
         let texts = parsed
             .iter()
             .filter(|chunk| chunk.kind == *b"tEXt")
-            .map(|chunk| chunk.data.clone())
+            .map(|chunk| chunk.data.to_vec())
             .collect::<Vec<_>>();
         assert_eq!(texts[0], b"keep\0safe");
         assert_eq!(
@@ -765,9 +912,41 @@ mod tests {
         image::DynamicImage::ImageRgba8(image)
             .write_to(&mut Cursor::new(&mut webp), image::ImageFormat::WebP)
             .unwrap();
-        let png = prepare_png_portrait(&webp, PngExportLimits::default(), || false).unwrap();
+        let png = prepare_png_portrait(webp, PngExportLimits::default(), || false).unwrap();
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
         assert!(parse_chunks(&png).is_ok());
+    }
+
+    #[test]
+    fn valid_png_portrait_reuses_its_owned_buffer() {
+        let png = synthetic_png();
+        let pointer = png.as_ptr();
+        let prepared = prepare_png_portrait(png, PngExportLimits::default(), || false).unwrap();
+        assert_eq!(prepared.as_ptr(), pointer);
+        assert!(parse_chunks(&prepared).is_ok());
+    }
+
+    #[test]
+    fn valid_png_passthrough_still_rejects_corrupt_image_data() {
+        let mut png = synthetic_png();
+        let mut offset = PNG_SIGNATURE.len();
+        loop {
+            let length = u32::from_be_bytes(png[offset..offset + 4].try_into().unwrap()) as usize;
+            let kind: [u8; 4] = png[offset + 4..offset + 8].try_into().unwrap();
+            let data_start = offset + 8;
+            let data_end = data_start + length;
+            if kind == *b"IDAT" {
+                png[data_start] ^= 0xff;
+                let mut crc = crc32fast::Hasher::new();
+                crc.update(&kind);
+                crc.update(&png[data_start..data_end]);
+                png[data_end..data_end + 4].copy_from_slice(&crc.finalize().to_be_bytes());
+                break;
+            }
+            offset = data_end + 4;
+        }
+        assert!(parse_chunks(&png).is_ok());
+        assert!(prepare_png_portrait(png, PngExportLimits::default(), || false).is_err());
     }
 
     fn alias(key: &str, bytes: &[u8], ext: &str, cas: &PayloadCas) -> AssetAlias {
@@ -960,11 +1139,93 @@ mod tests {
             parsed.base_image.sha256,
             hex::encode(Sha256::digest(&portrait_bytes))
         );
-        assert_eq!(parsed.embedded_assets.len(), 2);
+        assert_eq!(parsed.embedded_assets.len(), 1);
         assert_eq!(parsed.embedded_assets[0].sha256, asset.object_hash.unwrap());
         let card = STANDARD.decode(parsed.ccv3.unwrap()).unwrap();
         let card: Value = serde_json::from_slice(&card).unwrap();
         assert_eq!(card["data"]["assets"][0]["uri"], "__asset:1");
-        assert_eq!(card["data"]["assets"][1]["uri"], "__asset:2");
+        assert_eq!(card["data"]["assets"][1]["uri"], "ccdefault:");
+    }
+
+    #[test]
+    fn native_png_writer_accepts_metadata_within_the_native_reader_limit() {
+        let (directory, mut store, revision, mut metadata) = publication_fixture();
+        metadata["data"]["description"] = Value::String("x".repeat(6 * 1024 * 1024));
+        let prepared = store.prepare_risu_save_export(revision).unwrap();
+        let owned = directory.path().join("owned");
+        let chosen = directory.path().join("chosen");
+        fs::create_dir(&owned).unwrap();
+        fs::create_dir(&chosen).unwrap();
+        let destination = chosen.join("large-metadata.png");
+        let parse_root = directory.path().join("parse-large-metadata");
+        fs::create_dir(&parse_root).unwrap();
+        let job = JobRegistry::default()
+            .create(JobKind::ExportCharacterCard)
+            .unwrap();
+
+        export_character_png(
+            prepared,
+            "png-publication",
+            metadata,
+            &owned,
+            &directory.path().join("handoffs"),
+            Some(&destination),
+            &job,
+        )
+        .unwrap();
+        let parsed = parse_png_card(
+            &mut fs::File::open(destination).unwrap(),
+            &parse_root,
+            PngCardLimits::default(),
+            || false,
+        )
+        .unwrap();
+        let card = STANDARD.decode(parsed.ccv3.unwrap()).unwrap();
+        let card: Value = serde_json::from_slice(&card).unwrap();
+        assert_eq!(
+            card["data"]["description"].as_str().unwrap().len(),
+            6 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    #[ignore = "manual synthetic peak-memory boundary probe"]
+    fn native_png_writer_round_trips_one_byte_below_the_128_mib_metadata_limit() {
+        let (directory, mut store, revision, mut metadata) = publication_fixture();
+        metadata["data"]["description"] = Value::String(String::new());
+        let baseline_length = serde_json::to_vec(&metadata).unwrap().len();
+        let target_length = super::super::content::JSON_CARD_MAX_METADATA_BYTES - 1;
+        metadata["data"]["description"] =
+            Value::String("x".repeat(target_length - baseline_length));
+        let prepared = store.prepare_risu_save_export(revision).unwrap();
+        let owned = directory.path().join("owned-boundary");
+        let chosen = directory.path().join("chosen-boundary");
+        fs::create_dir(&owned).unwrap();
+        fs::create_dir(&chosen).unwrap();
+        let destination = chosen.join("boundary-metadata.png");
+        let parse_root = directory.path().join("parse-boundary-metadata");
+        fs::create_dir(&parse_root).unwrap();
+        let job = JobRegistry::default()
+            .create(JobKind::ExportCharacterCard)
+            .unwrap();
+
+        export_character_png(
+            prepared,
+            "png-publication",
+            metadata,
+            &owned,
+            &directory.path().join("handoffs"),
+            Some(&destination),
+            &job,
+        )
+        .unwrap();
+        let parsed = parse_png_card(
+            &mut fs::File::open(destination).unwrap(),
+            &parse_root,
+            PngCardLimits::default(),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(parsed.ccv3.unwrap().len(), target_length.div_ceil(3) * 4);
     }
 }

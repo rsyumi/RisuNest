@@ -25,18 +25,10 @@ import {
 } from '../process/coldstorageData'
 import { replaceExactPluginStorageAssetReferences } from '../drive/backupAssets'
 import {
-    decodeRisuSave,
     encodeRisuSaveBlock,
     magicRisuSaveHeader,
     RisuSaveType,
 } from './risuSave'
-
-export async function importRisuSaveToStore(
-    bytes: Uint8Array,
-    store: PersistentDataStore,
-): Promise<{ revision: DataRevision }> {
-    return store.replaceFromDatabase((await decodeRisuSave(bytes)) as Database)
-}
 
 async function* characterValues(reader: PersistentRevisionReader): AsyncGenerator<Database['characters'][number]> {
     for await (const record of iteratePinnedCharacters(reader)) {

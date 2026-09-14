@@ -440,6 +440,22 @@ mod tests {
         assert_eq!(error.code, "invalid-input");
         assert!(error.message.contains("MIME"));
     }
+
+    #[test]
+    fn native_json_export_rejects_an_asset_above_the_native_reader_limit() {
+        let maximum_bytes =
+            super::super::content::content_classification_limits().max_payload_bytes;
+        assert_eq!(maximum_bytes, 64 * 1024 * 1024);
+        let sources = vec![Some(JsonAssetSource::Cas {
+            key: "assets/oversized.bin".to_owned(),
+            hash: "ab".repeat(32),
+            size: maximum_bytes + 1,
+            mime: "application/octet-stream".to_owned(),
+        })];
+        let error = validate_asset_source_sizes(&sources, maximum_bytes).unwrap_err();
+        assert_eq!(error.code, "invalid-input");
+        assert!(error.message.contains("importer limit"));
+    }
 }
 use super::content::JSON_CARD_MAX_METADATA_BYTES;
 use super::error::{
@@ -570,6 +586,10 @@ where
             &repository,
         )?
     };
+    validate_asset_source_sizes(
+        &sources,
+        super::content::content_classification_limits().max_payload_bytes,
+    )?;
     let total_items = u64::try_from(sources.iter().filter(|source| source.is_some()).count())
         .map_err(|_| invalid_input("character JSON asset count is invalid"))?;
     job.set_progress(JobProgress {
@@ -687,6 +707,24 @@ where
         handoff_path,
         publication: None,
     })
+}
+
+fn validate_asset_source_sizes(
+    sources: &[Option<JsonAssetSource>],
+    maximum_bytes: u64,
+) -> Result<(), NativeJobError> {
+    for source in sources.iter().flatten() {
+        let size = match source {
+            JsonAssetSource::Cas { size, .. } => *size,
+            JsonAssetSource::FallbackPortrait => FALLBACK_PORTRAIT.len() as u64,
+        };
+        if size > maximum_bytes {
+            return Err(invalid_input(
+                "JSON card embedded asset exceeds the importer limit",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn validate_metadata(

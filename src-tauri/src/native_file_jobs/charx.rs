@@ -469,7 +469,7 @@ where
     archive
         .start_file(
             "card.json",
-            FileOptions::default().compression_method(CompressionMethod::Deflated),
+            FileOptions::default().compression_method(CompressionMethod::Stored),
         )
         .map_err(|error| write_zip_error("start CharX card metadata", error))?;
     write_cancellable_bytes(

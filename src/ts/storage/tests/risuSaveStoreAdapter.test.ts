@@ -11,7 +11,6 @@ import {
 } from '../persistentDataStore'
 import { decodeRisuSave, encodeRisuSaveBlock, RisuSaveType } from '../risuSave'
 import {
-    importRisuSaveToStore,
     streamRisuSaveFromLease,
     streamRisuSaveFromStore,
     withFlushedRisuSaveExport,
@@ -104,7 +103,9 @@ describe('RisuSave persistent store adapter', () => {
         )
         await store.open()
 
-        const imported = await importRisuSaveToStore(fixture, store)
+        const imported = await store.replaceFromDatabase(
+            (await decodeRisuSave(fixture)) as typeof risuSaveFixtureDatabase,
+        )
         await localforage.dropInstance({ name: 'risuSaveCache' })
         const exported = await concatenate(streamRisuSaveFromStore(store, imported.revision))
 

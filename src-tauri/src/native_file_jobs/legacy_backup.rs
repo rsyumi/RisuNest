@@ -862,6 +862,12 @@ fn write_inlay_entry(
     }
     let header = serde_json::to_vec(&metadata)
         .map_err(|error| NativeJobError::new("store-error", error.to_string()))?;
+    if header.len() > MAX_METADATA_BYTES as usize {
+        return Err(NativeJobError::new(
+            "invalid-input",
+            "legacy backup Inlay metadata exceeds the importer limit",
+        ));
+    }
     let header_length = u32::try_from(header.len()).map_err(|_| {
         NativeJobError::new("store-error", "legacy backup Inlay metadata is too large")
     })?;
@@ -1371,6 +1377,20 @@ fn prepare_inlay(
                 .ok_or_else(|| invalid(format!("legacy backup Inlay {field} is invalid"))),
         }
     };
+    let mut retained_metadata = object.clone();
+    for key in [
+        "key",
+        "kind",
+        "size",
+        "mime",
+        "name",
+        "ext",
+        "inlayType",
+        "width",
+        "height",
+    ] {
+        retained_metadata.remove(key);
+    }
     Ok(AssetAlias {
         key,
         object_hash: Some(payload.content_hash),
@@ -1382,7 +1402,7 @@ fn prepare_inlay(
         inlay_type: Some(inlay_type),
         width: dimension("width")?,
         height: dimension("height")?,
-        metadata: Value::Object(Map::new()),
+        metadata: Value::Object(retained_metadata),
     })
 }
 
@@ -1586,10 +1606,7 @@ impl<'a, R> CancellationReader<'a, R> {
 impl<R: Read> Read for CancellationReader<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if self.cancellation.is_cancelled() {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "legacy backup operation was cancelled",
-            ));
+            return Err(io::Error::other("legacy backup operation was cancelled"));
         }
         let read = self.inner.read(buffer)?;
         if let Some(observer) = self.observer {
@@ -1708,6 +1725,24 @@ mod tests {
         bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
         bytes.extend_from_slice(data);
         bytes
+    }
+
+    #[test]
+    fn cancellation_reader_uses_a_non_retryable_error_for_exact_reads() {
+        struct AlwaysCancelled;
+        impl CancellationProbe for AlwaysCancelled {
+            fn is_cancelled(&self) -> bool {
+                true
+            }
+        }
+
+        let mut reader = CancellationReader::new(io::empty(), &AlwaysCancelled);
+        let error = reader.read_exact(&mut [0_u8; 1]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            cancellation_io(error, &AlwaysCancelled).code,
+            LocalBackupErrorCode::Cancelled
+        );
     }
 
     #[derive(Default)]
@@ -2193,6 +2228,7 @@ mod tests {
     #[test]
     fn prepares_asset_inlay_and_cold_payloads_without_mutating_live_aliases() {
         let directory = tempfile::tempdir().unwrap();
+        let _store = PersistentStore::open(directory.path()).unwrap();
         let cas = PayloadCas::new(directory.path()).unwrap();
         let inlay_metadata = serde_json::json!({
             "key": "inlay-id",
@@ -2203,7 +2239,18 @@ mod tests {
             "ext": "webp",
             "size": 4,
             "width": 2,
-            "height": 3
+            "height": 3,
+            "pocketRisu": {
+                "createdAt": 11,
+                "updatedAt": 22,
+                "charId": "synthetic-character",
+                "chatId": "synthetic-chat"
+            },
+            "unknownMetadata": {
+                "nested": {
+                    "retained": true
+                }
+            }
         });
         let header = serde_json::to_vec(&inlay_metadata).unwrap();
         let mut inlay = Vec::new();
@@ -2246,6 +2293,22 @@ mod tests {
         assert_eq!(prepared.asset_aliases.len(), 2);
         assert_eq!(prepared.asset_aliases[0].key, "assets/portrait.png");
         assert_eq!(prepared.asset_aliases[1].key, "inlay-id");
+        assert_eq!(
+            prepared.asset_aliases[1].metadata,
+            serde_json::json!({
+                "pocketRisu": {
+                    "createdAt": 11,
+                    "updatedAt": 22,
+                    "charId": "synthetic-character",
+                    "chatId": "synthetic-chat"
+                },
+                "unknownMetadata": {
+                    "nested": {
+                        "retained": true
+                    }
+                }
+            })
+        );
         assert_eq!(prepared.cold_aliases[0].key, cold_key);
         for alias in &prepared.asset_aliases {
             assert!(cas
@@ -2444,6 +2507,7 @@ mod tests {
     #[test]
     fn imports_pocket_risu_110_inlays_with_sidecars_after_payloads() {
         let directory = tempfile::tempdir().unwrap();
+        let _store = PersistentStore::open(directory.path()).unwrap();
         let cas = PayloadCas::new(directory.path()).unwrap();
         let bytes = [
             entry(b"portrait.png", b"original"),

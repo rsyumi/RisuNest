@@ -289,6 +289,74 @@ describe('local backup persistent snapshot', () => {
         expect(JSON.stringify(context.onStatus.mock.calls)).toContain(`coldstorage_${coldKey}.json`)
     })
 
+    it('skips a damaged RisuNest inlay envelope instead of restoring it as an asset', async () => {
+        const database = structuredClone(risuSaveFixtureDatabase) as Database
+        const encodeEntry = (name: string, data: Uint8Array) => {
+            const encodedName = new TextEncoder().encode(name)
+            const record = new Uint8Array(8 + encodedName.byteLength + data.byteLength)
+            const view = new DataView(record.buffer)
+            view.setUint32(0, encodedName.byteLength, true)
+            record.set(encodedName, 4)
+            view.setUint32(4 + encodedName.byteLength, data.byteLength, true)
+            record.set(data, 8 + encodedName.byteLength)
+            return record
+        }
+        const damagedInlayName = getBackupInlayName('damaged-inlay')
+        const entries = [
+            encodeEntry(damagedInlayName, Uint8Array.of(9, 0, 0, 0, 1, 2)),
+            encodeEntry('database.risudat', encodeRisuSaveLegacy(database, 'compression')),
+        ]
+        const archive = new Uint8Array(entries.reduce((sum, entry) => sum + entry.byteLength, 0))
+        let archiveOffset = 0
+        for (const entry of entries) {
+            archive.set(entry, archiveOffset)
+            archiveOffset += entry.byteLength
+        }
+        const file = {
+            name: 'damaged-inlay.bin',
+            size: archive.byteLength,
+            stream: () => new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(archive)
+                    controller.close()
+                },
+            }),
+        } as File
+        const input = {
+            type: '',
+            accept: '',
+            files: [file],
+            onchange: null as null | (() => Promise<void>),
+            click: vi.fn(),
+            remove: vi.fn(),
+        }
+        const createElement = vi.spyOn(document, 'createElement')
+            .mockReturnValueOnce(input as unknown as HTMLInputElement)
+        const { importLegacyBackupWithWebView } = await import('./backuplocal')
+        const context = {
+            signal: new AbortController().signal,
+            onStatus: vi.fn(),
+            setSource: vi.fn(),
+            setPartialWritesPossible: vi.fn(),
+        }
+
+        const pending = importLegacyBackupWithWebView(context)
+        await vi.waitFor(() => expect(input.onchange).not.toBeNull())
+        await input.onchange?.()
+        const result = await pending
+        createElement.mockRestore()
+
+        expect(result).toEqual({ warningCodes: ['invalid-inlay-entry'] })
+        expect(state.blobStore?.put).not.toHaveBeenCalled()
+        const last = context.onStatus.mock.calls.at(-1)?.[0]
+        expect(last?.detail?.counts).toMatchObject({
+            entriesRead: 2,
+            inlays: 0,
+            assets: 0,
+            skipped: 1,
+        })
+    })
+
     it('stops a WebView import at the next chunk after cancellation and flags partial writes', async () => {
         const coldKey = 'partial-cold'
         const cold = { message: [{ role: 'user', data: 'already written' }] }
@@ -562,6 +630,45 @@ describe('local backup persistent snapshot', () => {
                 new TextEncoder().encode(JSON.stringify(payload.value)),
             ]),
         )
+    })
+
+    it('reads a partial backup asset from the normalized key after the raw key misses', async () => {
+        const store = new IndexedDbPersistentDataStore(
+            `partial-local-backslash-${crypto.randomUUID()}`,
+            new IDBFactory(),
+            IDBKeyRange,
+        )
+        await store.open()
+        const persisted = structuredClone(risuSaveFixtureDatabase) as Database
+        persisted.characters[0].image = 'assets\\partial-profile.png'
+        const imported = await store.replaceFromDatabase(persisted)
+        state.currentDatabase = structuredClone(persisted)
+        state.runtime = {
+            store,
+            revision: imported.revision,
+            capturePersistentMutationToken: vi.fn(async () => ({
+                revision: imported.revision,
+                mutationGeneration: 0,
+            })),
+        } as unknown as PersistentDataRuntime
+        const profileBytes = Uint8Array.of(4, 2)
+        const read = vi.fn(async (key: string) => key === 'assets/partial-profile.png'
+            ? profileBytes.slice()
+            : null)
+        state.blobStore = {
+            ...emptyBlobStore(),
+            read,
+        }
+
+        const { SavePartialLocalBackup } = await import('./backuplocal')
+        await SavePartialLocalBackup()
+
+        expect(read).toHaveBeenCalledWith('assets\\partial-profile.png')
+        expect(read).toHaveBeenCalledWith('assets/partial-profile.png')
+        expect(state.written.get('assets\\partial-profile.png')).toEqual(profileBytes)
+        const { alertMd, alertNormal } = await import('../alert')
+        expect(alertMd).not.toHaveBeenCalled()
+        expect(alertNormal).toHaveBeenCalledWith('Success')
     })
 
     it('uses pinned cold asset and inlay references without rereading mutable cold storage', async () => {

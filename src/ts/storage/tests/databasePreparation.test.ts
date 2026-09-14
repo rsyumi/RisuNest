@@ -146,6 +146,32 @@ describe('prepareDatabaseForPersistence', () => {
         expect(prepared.characterOrder).toEqual(original.characterOrder)
     })
 
+    it('does not mark character migrations complete while preparing only the root', async () => {
+        const database = structuredClone(fixtureDatabase)
+        const { characters: _characters, botPresets: _botPresets, ...root } = database
+        delete (root as Partial<PersistentRoot>).formatversion
+        root.loreBookToken = 400
+
+        const prepared = await preparePersistentRootForWorkingSet(root, {
+            now: 1_700_000_000_000,
+        })
+
+        expect(prepared.formatversion).toBeUndefined()
+        expect(prepared.loreBookToken).toBe(8000)
+    })
+
+    it('keeps format version 2 pending until character migration can run', async () => {
+        const database = structuredClone(fixtureDatabase)
+        const { characters: _characters, botPresets: _botPresets, ...root } = database
+        root.formatversion = 2
+
+        const prepared = await preparePersistentRootForWorkingSet(root, {
+            now: 1_700_000_000_000,
+        })
+
+        expect(prepared.formatversion).toBe(2)
+    })
+
     it('normalizes a detached database without changing the input', async () => {
         const input = structuredClone(fixtureDatabase)
         input.formatversion = 4

@@ -361,6 +361,7 @@ fn plan(
     cancellation: &dyn CancellationProbe,
 ) -> Result<PreparedLegacyRestorePayloads, LocalBackupError> {
     let directory = tempfile::tempdir().unwrap();
+    drop(PersistentStore::open(directory.path()).unwrap());
     let cas = PayloadCas::new(directory.path()).unwrap();
     struct Planner<'a>(
         &'a PayloadCas,

@@ -2,7 +2,6 @@ import { readFileSync } from 'node:fs'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
-    compressImage: vi.fn(async (_data: Uint8Array) => new Uint8Array([0xde, 0xad, 0xbe, 0xef])),
     readImage: vi.fn(),
     saveAsset: vi.fn(async (_data: Uint8Array) => ''),
 }))
@@ -48,7 +47,6 @@ vi.mock('../util', () => ({
 }))
 vi.mock('uuid', () => ({ v4: () => 'roundtrip-module-id' }))
 vi.mock('./lorebook.svelte', () => ({ convertExternalLorebook: vi.fn() }))
-vi.mock('../media', () => ({ compressImage: mocks.compressImage }))
 vi.mock('../stores.svelte', () => ({
     DBState: { db: { modules: [] } },
     HideIconStore: { set: vi.fn() },
@@ -78,7 +76,7 @@ describe('legacy module export', () => {
         })))
     })
 
-    it('roundtrips ordinary asset bytes and preserves asset metadata without image compression', async () => {
+    it('roundtrips ordinary asset bytes and preserves asset metadata exactly', async () => {
         const firstBytes = new Uint8Array([0x00, 0xff, 0x13, 0x7a, 0x80, 0x42])
         const secondBytes = new Uint8Array([0x91, 0x04, 0xcc, 0x2d, 0x7f])
         mocks.readImage.mockImplementation(async (source: string) => {
@@ -102,7 +100,6 @@ describe('legacy module export', () => {
         const exported = await exportModuleLegacy(module, { alertEnd: false, saveData: false })
         const imported = await readModule(Buffer.from(exported))
 
-        expect(mocks.compressImage).not.toHaveBeenCalled()
         expect(mocks.readImage.mock.calls.map(([source]) => source)).toEqual([
             'asset://source-a',
             'asset://source-b',

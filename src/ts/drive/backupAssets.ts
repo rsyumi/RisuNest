@@ -16,6 +16,10 @@ import { listCharacterResources, listDatabaseRootResources } from '../process/co
 const INLAY_ENTRY_NAME = /^inlay_((?:[0-9a-f]{2})+)\.risuinlay$/
 const INLAY_TYPES = new Set(['image', 'video', 'audio', 'signature'])
 
+export function isBackupInlayEntryName(name: string): boolean {
+    return INLAY_ENTRY_NAME.test(name)
+}
+
 export function isLegacyBackupAssetKey(key: string): boolean {
     const normalized = key.replace(/\\/g, '/')
     return normalized.startsWith('assets/') && normalized.length > 'assets/'.length
@@ -516,6 +520,16 @@ export function readBackupAsset(
     return readActiveAsset(store, key, { officialAccount, tauri: false })
 }
 
+export async function readLocalBackupAsset(
+    store: BlobStore,
+    key: string,
+): Promise<Uint8Array | null> {
+    const exact = await store.read(key)
+    if (exact !== null) return exact
+    const normalized = key.replace(/\\/g, '/')
+    return normalized === key ? null : store.read(normalized)
+}
+
 export async function writeBackupAsset(
     store: BlobStore,
     key: string,
@@ -551,7 +565,7 @@ export function encodeBackupInlayEntry(metadata: InlayBlobMetadata, data: Uint8A
 }
 
 export function decodeBackupInlayEntry(name: string, entry: Uint8Array): BackupInlayEntry | null {
-    if (!INLAY_ENTRY_NAME.test(name) || entry.byteLength < 4) return null
+    if (!isBackupInlayEntryName(name) || entry.byteLength < 4) return null
     const headerLength = new DataView(entry.buffer, entry.byteOffset, entry.byteLength).getUint32(0, true)
     if (headerLength === 0 || 4 + headerLength > entry.byteLength) return null
     let header: unknown

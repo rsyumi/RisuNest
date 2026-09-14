@@ -1,7 +1,8 @@
 // @vitest-environment happy-dom
+import { Buffer } from 'buffer'
 import { describe, expect, it, vi } from 'vitest'
 import { strToU8, zipSync } from 'fflate'
-import { CharXImporter } from './processzip'
+import { CharXImporter, CharXWriter } from './processzip'
 
 vi.mock('../globalApi.svelte', async () => ({
     ...(await import('../appendableBuffer')),
@@ -28,6 +29,33 @@ vi.mock('../util', () => ({
 }))
 
 describe('large CharX fallback', () => {
+    it('round-trips card metadata and asset bytes through the JavaScript writer and reader', async () => {
+        const chunks: Uint8Array[] = []
+        const writer = new CharXWriter({
+            write: async (data: Uint8Array) => { chunks.push(data.slice()) },
+            close: async () => undefined,
+        } as any)
+        const card = '{"name":"Synthetic card"}'
+        const asset = Uint8Array.of(0, 255, 7, 128)
+
+        await writer.init()
+        await writer.write('card.json', card)
+        await writer.write('assets/avatar.png', asset)
+        await writer.end()
+
+        const stored: Uint8Array[] = []
+        const importer = new CharXImporter(async (data) => {
+            stored.push(data.slice())
+            return 'assets/synthetic'
+        })
+        await importer.parse(Uint8Array.from(Buffer.concat(chunks)))
+        await importer.done()
+
+        expect(importer.cardData).toBe(card)
+        expect(stored).toEqual([asset])
+        expect(importer.assets).toEqual({ 'assets/avatar.png': 'assets/synthetic' })
+    })
+
     it('pauses decoding behind storage and imports 10,000 highly compressed entries without recursive overflow', async () => {
         const entries: Record<string, Uint8Array> = {}
         for (let i = 0; i < 10_000; i++)

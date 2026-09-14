@@ -96,21 +96,52 @@ export async function bootstrapPersistentDatabase(
     }
 
     const profile = selectPluginCompatibilityProfile(active.value.plugins ?? [])
+    const needsCharacterMigration = !active.value.formatversion
+        || active.value.formatversion < 3
+    const prepareScalableMigration = profile === 'scalable-v3'
+        && needsCharacterMigration
+        && dependencies.prepareRoot !== undefined
+        && dependencies.projectScalableWorkingSet !== undefined
     if (
         profile === 'maximum-compatibility' ||
         !dependencies.prepareRoot ||
-        !dependencies.projectScalableWorkingSet
+        !dependencies.projectScalableWorkingSet ||
+        prepareScalableMigration
     ) {
         await dependencies.onPhase?.('compatibility', active.value.language)
         const persistent = await dependencies.store.materializeDatabase(active.revision)
         const { database, changed } = await dependencies.prepareDatabase(persistent)
-        if (!changed) {
-            return { database, revision: active.revision, profile }
+        const revision = changed
+            ? (await dependencies.store.replaceFromDatabase(
+                  database,
+                  active.revision,
+              )).revision
+            : active.revision
+        if (prepareScalableMigration) {
+            const {
+                characters: _characters,
+                botPresets: _botPresets,
+                pluginCustomStorage: _pluginCustomStorage,
+                ...storedRoot
+            } = database
+            const root = await canonicalizePresetSelection(
+                dependencies.store,
+                revision,
+                storedRoot,
+            )
+            const projectedRevision = canonicalJson(root) === canonicalJson(storedRoot)
+                ? revision
+                : (await dependencies.store.commit({
+                    expectedRevision: revision,
+                    root,
+                })).revision
+            const projected = await projectScalableRevision(
+                dependencies,
+                root,
+                projectedRevision,
+            )
+            return { ...projected, profile }
         }
-        const { revision } = await dependencies.store.replaceFromDatabase(
-            database,
-            active.revision,
-        )
         return { database, revision, profile }
     }
 

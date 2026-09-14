@@ -48,6 +48,17 @@ describe('prepared native PNG card metadata adapter', () => {
         expect(JSON.stringify(result)).not.toContain(encoded(v3()))
     })
 
+    it('decodes native PNG metadata above the legacy five MiB ceiling', async () => {
+        const card = v3('Large native card') as any
+        card.data.description = 'x'.repeat(6 * 1024 * 1024)
+
+        const result = await decodePreparedNativePngCardMetadata({
+            ccv3: encoded(card),
+        }, unusedRccDependencies)
+
+        expect((result?.data as any).description).toHaveLength(6 * 1024 * 1024)
+    })
+
     it('decodes v2 and normalizes a numeric character_version', async () => {
         const result = await decodePreparedNativePngCardMetadata({
             chara: encoded(v2()),

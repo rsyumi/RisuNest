@@ -255,6 +255,8 @@ export async function preparePersistentRootForWorkingSet(
     options: Pick<DatabasePreparationOptions, 'now'> = {},
 ): Promise<PersistentRoot> {
     const detachedRoot = JSON.parse(canonicalJson(input)) as PersistentRoot
+    const initialFormatVersion = detachedRoot.formatversion
+    const hasPendingCharacterMigration = !initialFormatVersion || initialFormatVersion < 3
     const characterOrder = detachedRoot.characterOrder ?? []
     const candidate = {
         ...detachedRoot,
@@ -264,6 +266,13 @@ export async function preparePersistentRootForWorkingSet(
 
     normalizeDatabaseDefaults(candidate)
     await checkNewFormat(candidate, { now: options.now })
+    if (hasPendingCharacterMigration) {
+        if (initialFormatVersion === undefined) {
+            delete (candidate as Partial<Database>).formatversion
+        } else {
+            candidate.formatversion = initialFormatVersion
+        }
+    }
     candidate.characterOrder = characterOrder
 
     const {

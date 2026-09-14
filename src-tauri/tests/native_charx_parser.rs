@@ -391,6 +391,37 @@ fn native_export_second_import_preserves_card_graph_and_payload_hashes() {
 }
 
 #[test]
+fn native_export_stores_highly_compressible_card_metadata_for_parser_round_trip() {
+    let bytes = zip_bytes(&valid_entries(), true);
+    let (directory, inspection) =
+        parse_card("Compressible.CHARX", &bytes, CharXLimits::default()).expect("native import");
+    let CharXInspection::Card(mut card) = inspection else {
+        panic!("fixture must produce a card")
+    };
+    let mut metadata: serde_json::Value = serde_json::from_str(&card.card_json).unwrap();
+    metadata["data"]["description"] = serde_json::Value::String("x".repeat(8 * 1024 * 1024));
+    card.card_json = serde_json::to_string(&metadata).unwrap();
+    let export_root = directory.path().join("compressible-export");
+    fs::create_dir(&export_root).unwrap();
+
+    let exported = write_charx_file(&card, &export_root, || false).expect("native export");
+    let second_staging = directory.path().join("compressible-import");
+    fs::create_dir(&second_staging).unwrap();
+    let second = inspect_charx_file(
+        &exported.path,
+        "second.CHARX",
+        &second_staging,
+        CharXLimits::default(),
+        || false,
+    )
+    .expect("stored metadata must satisfy the native parser limits");
+    let CharXInspection::Card(second) = second else {
+        panic!("second import must produce a card")
+    };
+    assert_eq!(second.card_json.len(), card.card_json.len());
+}
+
+#[test]
 fn native_export_rejects_changed_staged_payloads_without_leaving_output() {
     let bytes = zip_bytes(&valid_entries(), false);
     let (directory, inspection) =

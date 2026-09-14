@@ -12,6 +12,7 @@ import {
     getBackupInlayName,
     isLegacyBackupAssetKey,
     readBackupAsset,
+    readLocalBackupAsset,
     replaceExactPluginStorageAssetReferences,
     selectLegacyBackupAssetKeys,
     writeBackupAsset,
@@ -30,6 +31,19 @@ describe('legacy backup asset selection', () => {
             'assets', 'database/database.bin', 'coldstorage/a', 'coldstorage_a',
             'blobstore/metadata/a.json', 'blobstore/inlays/a.bin', 'raw-inlay-id', 'backup/file',
         ]) expect(isLegacyBackupAssetKey(key)).toBe(false)
+    })
+
+    test('reads the exact key before falling back to its slash-normalized form', async () => {
+        const read = vi.fn(async (key: string) => key === 'assets/profile.png'
+            ? Uint8Array.of(1, 2, 3)
+            : null)
+        const store = { read } as unknown as BlobStore
+
+        await expect(readLocalBackupAsset(store, 'assets\\profile.png')).resolves.toEqual(
+            Uint8Array.of(1, 2, 3),
+        )
+        expect(read).toHaveBeenNthCalledWith(1, 'assets\\profile.png')
+        expect(read).toHaveBeenNthCalledWith(2, 'assets/profile.png')
     })
 })
 

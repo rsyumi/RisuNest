@@ -1,6 +1,9 @@
 use crate::trust_boundary::is_link_like;
-use base64::{engine::general_purpose::STANDARD, read::DecoderReader, Engine as _};
-use serde::Serialize;
+use base64::{engine::general_purpose::STANDARD, read::DecoderReader};
+use serde::{
+    de::{MapAccess, SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -29,7 +32,7 @@ impl Default for PngCardLimits {
         Self {
             max_card_metadata_bytes: crate::import_export_jobs::MAX_CONTENT_METADATA_BYTES as u64,
             max_recognized_metadata_bytes: 768 * 1024 * 1024,
-            max_embedded_asset_bytes: 50 * 1024 * 1024,
+            max_embedded_asset_bytes: 64 * 1024 * 1024,
             max_embedded_asset_total_bytes: 512 * 1024 * 1024,
             max_embedded_asset_count: 10_000,
         }
@@ -195,7 +198,7 @@ struct ChunkReader<'a, R, F> {
 impl<R: Read, F: Fn() -> bool> Read for ChunkReader<'_, R, F> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if (self.is_cancelled)() {
-            return Err(io::Error::new(ErrorKind::Interrupted, "cancelled"));
+            return Err(io::Error::other("cancelled"));
         }
         if self.remaining == 0 || buffer.is_empty() {
             return Ok(0);
@@ -370,8 +373,8 @@ pub(crate) fn parse_png_card<R: Read, F: Fn() -> bool>(
         .map_err(|_| PngCardError::Invalid("PNG card metadata is not UTF-8".to_string()))?;
     validate_card_metadata(selected_card, limits.max_card_metadata_bytes)?;
 
-    let chara = chara.map(|value| String::from_utf8_lossy(&value).into_owned());
-    let ccv3 = ccv3.map(|value| String::from_utf8_lossy(&value).into_owned());
+    let chara = chara.map(bytes_to_lossy_string);
+    let ccv3 = ccv3.map(bytes_to_lossy_string);
 
     base_image.finish()?;
     let base_image = base_image.into_descriptor();
@@ -458,7 +461,7 @@ fn parse_text_chunk<R: Read, F: Fn() -> bool>(
     }
 
     if keyword == b"chara" || keyword == b"ccv3" {
-        if value_length > limits.max_card_metadata_bytes {
+        if value_length > maximum_base64_bytes(limits.max_card_metadata_bytes)? {
             return Err(PngCardError::LimitExceeded(
                 "PNG card metadata exceeds the per-chunk limit".to_string(),
             ));
@@ -561,45 +564,125 @@ fn validate_card_metadata(value: &str, decoded_limit: u64) -> Result<(), PngCard
                 "invalid encrypted PNG card envelope".to_string(),
             ));
         }
-        decode_bounded_base64(parts[2], decoded_limit, "encrypted PNG card payload")?;
-        let metadata =
-            decode_bounded_base64(parts[4], decoded_limit, "PNG card envelope metadata")?;
-        let metadata = std::str::from_utf8(&metadata).map_err(|_| {
-            PngCardError::Invalid("PNG card envelope metadata is not UTF-8".to_string())
-        })?;
-        serde_json::from_str::<serde_json::Value>(metadata).map_err(|_| {
-            PngCardError::Invalid("PNG card envelope metadata is not valid JSON".to_string())
-        })?;
+        validate_bounded_base64(parts[2], decoded_limit, "encrypted PNG card payload")?;
+        validate_bounded_base64(parts[4], decoded_limit, "PNG card envelope metadata")?;
+        validate_base64_json(parts[4], "PNG card envelope metadata")?;
         return Ok(());
     }
 
-    let decoded = decode_bounded_base64(value, decoded_limit, "PNG card metadata")?;
-    let decoded = std::str::from_utf8(&decoded)
-        .map_err(|_| PngCardError::Invalid("decoded PNG card metadata is not UTF-8".to_string()))?;
-    serde_json::from_str::<serde_json::Value>(decoded)
-        .map_err(|_| PngCardError::Invalid("PNG card metadata is not valid JSON".to_string()))?;
-    Ok(())
+    validate_bounded_base64(value, decoded_limit, "PNG card metadata")?;
+    validate_base64_json(value, "PNG card metadata")
 }
 
-fn decode_bounded_base64(
+fn validate_bounded_base64(
     encoded: &str,
     decoded_limit: u64,
     label: &str,
-) -> Result<Vec<u8>, PngCardError> {
+) -> Result<(), PngCardError> {
     if encoded.len() as u64 > maximum_base64_bytes(decoded_limit)? {
         return Err(PngCardError::LimitExceeded(format!(
             "{label} exceeds the encoded size limit"
         )));
     }
-    let decoded = STANDARD
-        .decode(encoded)
-        .map_err(|_| PngCardError::Invalid(format!("invalid base64 in {label}")))?;
-    if decoded.len() as u64 > decoded_limit {
+    let padding = if encoded.ends_with("==") {
+        2_u64
+    } else if encoded.ends_with('=') {
+        1
+    } else {
+        0
+    };
+    let decoded_length = (encoded.len() as u64 / 4)
+        .checked_mul(3)
+        .and_then(|length| length.checked_sub(padding))
+        .ok_or_else(|| PngCardError::Invalid(format!("invalid base64 in {label}")))?;
+    if decoded_length > decoded_limit {
         return Err(PngCardError::LimitExceeded(format!(
             "{label} exceeds the decoded size limit"
         )));
     }
-    Ok(decoded)
+    let mut decoder = DecoderReader::new(encoded.as_bytes(), &STANDARD);
+    io::copy(&mut decoder, &mut io::sink())
+        .map_err(|_| PngCardError::Invalid(format!("invalid base64 in {label}")))?;
+    Ok(())
+}
+
+fn validate_base64_json(encoded: &str, label: &str) -> Result<(), PngCardError> {
+    let mut decoder = DecoderReader::new(encoded.as_bytes(), &STANDARD);
+    let mut deserializer = serde_json::Deserializer::from_reader(&mut decoder);
+    StrictJsonValue::deserialize(&mut deserializer)
+        .and_then(|_| deserializer.end())
+        .map_err(|_| PngCardError::Invalid(format!("{label} is not valid UTF-8 JSON")))
+}
+
+struct StrictJsonValue;
+
+impl<'de> Deserialize<'de> for StrictJsonValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(StrictJsonVisitor)
+    }
+}
+
+struct StrictJsonVisitor;
+
+impl<'de> Visitor<'de> for StrictJsonVisitor {
+    type Value = StrictJsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a valid JSON value")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue)
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue)
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue)
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue)
+    }
+
+    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        StrictJsonValue::deserialize(deserializer)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+        while sequence.next_element::<StrictJsonValue>()?.is_some() {}
+        Ok(StrictJsonValue)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        while map.next_entry::<String, StrictJsonValue>()?.is_some() {}
+        Ok(StrictJsonValue)
+    }
+}
+
+fn bytes_to_lossy_string(value: Vec<u8>) -> String {
+    match String::from_utf8(value) {
+        Ok(value) => value,
+        Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+    }
 }
 
 fn maximum_base64_bytes(decoded_limit: u64) -> Result<u64, PngCardError> {
@@ -623,7 +706,7 @@ fn copy_decoded_asset<R: Read, F: Fn() -> bool>(
         check_cancelled(is_cancelled)?;
         let read = match source.read(&mut buffer) {
             Ok(read) => read,
-            Err(error) if error.kind() == ErrorKind::Interrupted && is_cancelled() => {
+            Err(_) if is_cancelled() => {
                 return Err(PngCardError::Cancelled);
             }
             Err(error) if error.kind() == ErrorKind::InvalidData => {
@@ -670,7 +753,7 @@ fn copy_all<R: Read, W: Write, F: Fn() -> bool>(
         check_cancelled(is_cancelled)?;
         let read = match source.read(&mut buffer) {
             Ok(read) => read,
-            Err(error) if error.kind() == ErrorKind::Interrupted && is_cancelled() => {
+            Err(_) if is_cancelled() => {
                 return Err(PngCardError::Cancelled);
             }
             Err(error) => return Err(PngCardError::Io(error)),
@@ -690,7 +773,11 @@ fn read_exact_cancelled<R: Read, F: Fn() -> bool>(
 ) -> Result<(), PngCardError> {
     while !destination.is_empty() {
         check_cancelled(is_cancelled)?;
-        let read = source.read(destination)?;
+        let read = match source.read(destination) {
+            Ok(read) => read,
+            Err(_) if is_cancelled() => return Err(PngCardError::Cancelled),
+            Err(error) => return Err(PngCardError::Io(error)),
+        };
         if read == 0 {
             return Err(PngCardError::Invalid(format!("truncated {label}")));
         }
@@ -719,7 +806,9 @@ fn validate_staging_directory(path: &Path) -> Result<PathBuf, PngCardError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_png_card, PngCardError, PngCardLimits};
+    use super::{
+        parse_png_card, read_exact_cancelled, validate_card_metadata, PngCardError, PngCardLimits,
+    };
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use sha2::{Digest, Sha256};
     use std::{
@@ -1159,6 +1248,21 @@ mod tests {
     }
 
     #[test]
+    fn strict_streaming_metadata_validation_rejects_malformed_json_scalars() {
+        for decoded in [
+            vec![b'"', 0xff, b'"'],
+            br#""\uD800""#.to_vec(),
+            b"1e400".to_vec(),
+        ] {
+            let encoded = STANDARD.encode(decoded);
+            assert!(matches!(
+                validate_card_metadata(&encoded, 1024),
+                Err(PngCardError::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
     fn enforces_metadata_asset_and_descriptor_limits() {
         let limits = PngCardLimits {
             max_card_metadata_bytes: 3,
@@ -1167,13 +1271,39 @@ mod tests {
         let oversized_metadata = png_with([
             ihdr(),
             chunk(b"IDAT", &[1]),
-            text_chunk("chara", "!!!!"),
+            text_chunk("chara", &STANDARD.encode([0, 1, 2, 3])),
             chunk(b"IEND", &[]),
         ]);
         assert!(matches!(
             assert_failure_cleans_staging(oversized_metadata, limits),
             PngCardError::LimitExceeded(_)
         ));
+
+        let directory = tempfile::tempdir().unwrap();
+        let decoded_size_limit = PngCardLimits {
+            max_card_metadata_bytes: 3,
+            ..PngCardLimits::default()
+        };
+        let encoded_json = STANDARD.encode("{}");
+        assert!(encoded_json.len() as u64 > decoded_size_limit.max_card_metadata_bytes);
+        let within_decoded_limit = png_with([
+            ihdr(),
+            chunk(b"IDAT", &[1]),
+            text_chunk("chara", &encoded_json),
+            chunk(b"IEND", &[]),
+        ]);
+        let result = parse_png_card(
+            &mut within_decoded_limit.as_slice(),
+            directory.path(),
+            decoded_size_limit,
+            || false,
+        )
+        .unwrap();
+        assert_eq!(result.chara.as_deref(), Some(encoded_json.as_str()));
+        assert_eq!(
+            PngCardLimits::default().max_embedded_asset_bytes,
+            64 * 1024 * 1024
+        );
 
         let first = encoded_card("One");
         let second = STANDARD.encode(r#"{"spec":"chara_card_v3","data":{"name":"Two"}}"#);
@@ -1281,6 +1411,27 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn cancellation_during_an_exact_read_is_not_retried_or_reported_as_io() {
+        struct CancelDuringRead<'a>(&'a Cell<bool>);
+        impl Read for CancelDuringRead<'_> {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                self.0.set(true);
+                Err(io::Error::other("cancelled during read"))
+            }
+        }
+
+        let cancelled = Cell::new(false);
+        let error = read_exact_cancelled(
+            &mut CancelDuringRead(&cancelled),
+            &mut [0_u8; 1],
+            &|| cancelled.get(),
+            "synthetic field",
+        )
+        .unwrap_err();
+        assert!(matches!(error, PngCardError::Cancelled));
     }
 
     #[test]

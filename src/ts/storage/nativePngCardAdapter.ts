@@ -32,14 +32,35 @@ export class InvalidPreparedNativePngCardError extends TypeError {
 }
 
 function decodeStandardBase64(value: string, label: string): Uint8Array {
-    if (
-        value.length === 0
-        || value.length % 4 !== 0
-        || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)
-    ) {
+    if (!isStandardBase64(value)) {
         throw new InvalidPreparedNativePngCardError(`${label} is not valid standard base64`)
     }
-    return Uint8Array.from(Buffer.from(value, 'base64'))
+    const decoded = Buffer.from(value, 'base64')
+    return new Uint8Array(decoded.buffer, decoded.byteOffset, decoded.byteLength)
+}
+
+function isStandardBase64(value: string): boolean {
+    if (value.length === 0 || value.length % 4 !== 0) return false
+    const padding = value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0
+    const contentLength = value.length - padding
+    for (let index = 0; index < contentLength; index += 1) {
+        const code = value.charCodeAt(index)
+        const valid =
+            (code >= 0x41 && code <= 0x5a)
+            || (code >= 0x61 && code <= 0x7a)
+            || (code >= 0x30 && code <= 0x39)
+            || code === 0x2b
+            || code === 0x2f
+        if (!valid) return false
+    }
+    for (let index = contentLength; index < value.length; index += 1) {
+        if (value.charCodeAt(index) !== 0x3d) return false
+    }
+    return padding === 0
+        ? contentLength % 4 === 0
+        : padding === 1
+          ? contentLength % 4 === 3
+          : contentLength % 4 === 2
 }
 
 function parseJsonObject(bytes: Uint8Array, label: string): DecodedPreparedNativePngCard {

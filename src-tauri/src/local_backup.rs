@@ -1,4 +1,3 @@
-use crate::asset_repository::{PayloadCas, PreparedPayload};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
@@ -115,7 +114,6 @@ pub(crate) struct StagedLocalBackupEntry {
     pub(crate) byte_length: u64,
     pub(crate) sha256: String,
     pub(crate) staged_path: Option<PathBuf>,
-    pub(crate) immutable_object: Option<PreparedPayload>,
 }
 
 pub(crate) trait StrictLocalBackupDatabaseRestore {
@@ -126,9 +124,8 @@ pub(crate) trait StrictLocalBackupDatabaseRestore {
     ) -> Result<(), LocalBackupError>;
 }
 
-pub(crate) enum PayloadTarget<'a> {
+pub(crate) enum PayloadTarget {
     JobStaging,
-    ImmutableCas(&'a PayloadCas),
 }
 
 #[derive(Debug)]
@@ -141,7 +138,7 @@ pub(crate) struct LegacyLocalBackupParseReport {
 pub(crate) fn parse_legacy_local_backup_v1(
     reader: &mut impl Read,
     job_staging_root: &Path,
-    payload_target: PayloadTarget<'_>,
+    payload_target: PayloadTarget,
     database_restore: &mut dyn StrictLocalBackupDatabaseRestore,
     cancellation: &dyn CancellationProbe,
 ) -> Result<LegacyLocalBackupParseReport, LocalBackupError> {
@@ -158,7 +155,7 @@ pub(crate) fn parse_legacy_local_backup_v1(
 pub(crate) fn parse_legacy_local_backup_v1_observed(
     reader: &mut impl Read,
     job_staging_root: &Path,
-    payload_target: PayloadTarget<'_>,
+    _payload_target: PayloadTarget,
     database_restore: &mut dyn StrictLocalBackupDatabaseRestore,
     cancellation: &dyn CancellationProbe,
     observer: &dyn LocalBackupParseObserver,
@@ -221,29 +218,15 @@ pub(crate) fn parse_legacy_local_backup_v1_observed(
         )?;
         let byte_length = u32::from_le_bytes(length_bytes) as u64;
         observer.entry_started(&logical_name, byte_length, entries.len());
-        let staged = if is_database || matches!(payload_target, PayloadTarget::JobStaging) {
-            stage_entry(
-                &mut source,
-                &staging_directory,
-                logical_name,
-                byte_length,
-                cancellation,
-                observer,
-                &mut staging_ownership,
-            )?
-        } else {
-            let PayloadTarget::ImmutableCas(cas) = payload_target else {
-                unreachable!("payload target was matched above")
-            };
-            prepare_entry_in_cas(
-                &mut source,
-                cas,
-                logical_name,
-                byte_length,
-                cancellation,
-                observer,
-            )?
-        };
+        let staged = stage_entry(
+            &mut source,
+            &staging_directory,
+            logical_name,
+            byte_length,
+            cancellation,
+            observer,
+            &mut staging_ownership,
+        )?;
         if is_database {
             database_index = Some(entries.len());
         }
@@ -339,84 +322,7 @@ fn stage_entry(
         byte_length,
         sha256: hex::encode(hasher.finalize()),
         staged_path: Some(staged_path),
-        immutable_object: None,
     })
-}
-
-fn prepare_entry_in_cas(
-    source: &mut TrackedReader<'_, impl Read>,
-    cas: &PayloadCas,
-    logical_name: String,
-    byte_length: u64,
-    cancellation: &dyn CancellationProbe,
-    observer: &dyn LocalBackupParseObserver,
-) -> Result<StagedLocalBackupEntry, LocalBackupError> {
-    check_cancelled(cancellation)?;
-    let mut entry_reader = DeclaredEntryReader {
-        source,
-        remaining: byte_length,
-        cancellation,
-        observer,
-    };
-    let prepared = cas.prepare_reader(&mut entry_reader).map_err(|error| {
-        if cancellation.is_cancelled() {
-            cancelled_error()
-        } else if error.kind() == io::ErrorKind::UnexpectedEof {
-            LocalBackupError::new(
-                LocalBackupErrorCode::TruncatedInput,
-                format!("truncated legacy backup entry body: {logical_name}"),
-            )
-        } else {
-            LocalBackupError::io(error)
-        }
-    })?;
-    check_cancelled(cancellation)?;
-    if prepared.byte_size != byte_length {
-        return Err(LocalBackupError::new(
-            LocalBackupErrorCode::Io,
-            "immutable payload result does not match its declared entry length",
-        ));
-    }
-    Ok(StagedLocalBackupEntry {
-        logical_name,
-        byte_length,
-        sha256: prepared.content_hash.clone(),
-        staged_path: None,
-        immutable_object: Some(prepared),
-    })
-}
-
-struct DeclaredEntryReader<'a, 'b, R> {
-    source: &'a mut TrackedReader<'b, R>,
-    remaining: u64,
-    cancellation: &'a dyn CancellationProbe,
-    observer: &'a dyn LocalBackupParseObserver,
-}
-
-impl<R: Read> Read for DeclaredEntryReader<'_, '_, R> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if self.remaining == 0 {
-            return Ok(0);
-        }
-        if self.cancellation.is_cancelled() {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "local backup operation cancelled",
-            ));
-        }
-        let wanted = usize::try_from(self.remaining.min(buffer.len() as u64))
-            .expect("bounded reader length");
-        let read = self.source.read(&mut buffer[..wanted])?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "truncated legacy backup entry body",
-            ));
-        }
-        self.remaining -= read as u64;
-        self.observer.bytes_read(self.source.bytes_read);
-        Ok(read)
-    }
 }
 
 struct IncompleteFile {
@@ -803,7 +709,6 @@ fn write_all_checked(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::asset_repository::PayloadCas;
     use std::{
         fs,
         io::{self, Cursor, Read},
@@ -1246,90 +1151,6 @@ mod tests {
         .expect("a completed restore must remain successful");
 
         assert_eq!(report.entries.len(), 1);
-    }
-
-    #[test]
-    fn prepares_opaque_payloads_in_cas_without_creating_logical_aliases() {
-        let repository = tempfile::tempdir().expect("temporary repository");
-        let job = tempfile::tempdir().expect("temporary job root");
-        let cas = PayloadCas::new(repository.path()).expect("open CAS");
-        let bytes = archive(&[
-            (b"images/raw.asset", b"unchanged-bytes"),
-            (b"database.risudat", b"db"),
-        ]);
-        let mut restore = RestoreSpy::default();
-
-        let report = parse_legacy_local_backup_v1(
-            &mut Cursor::new(bytes),
-            job.path(),
-            PayloadTarget::ImmutableCas(&cas),
-            &mut restore,
-            &NeverCancelled,
-        )
-        .expect("parse into CAS");
-
-        let payload = &report.entries[0];
-        assert!(payload.staged_path.is_none());
-        assert_eq!(
-            fs::read_dir(job.path().join("local-backup-v1"))
-                .expect("read job staging")
-                .count(),
-            1,
-            "only the database entry remains in job staging",
-        );
-        assert_eq!(
-            cas.read_object(&payload.sha256).expect("read CAS object"),
-            Some(b"unchanged-bytes".to_vec())
-        );
-        assert_eq!(
-            cas.stat_object(&payload.sha256).expect("stat CAS object"),
-            Some(b"unchanged-bytes".len() as u64)
-        );
-        assert!(
-            cas.prepare_bytes(b"unchanged-bytes")
-                .expect("deduplicate exact bytes")
-                .deduplicated
-        );
-        assert_eq!(
-            payload
-                .immutable_object
-                .as_ref()
-                .expect("CAS result")
-                .content_hash,
-            payload.sha256
-        );
-        assert!(!repository.path().join("assets-v2/aliases").exists());
-    }
-
-    #[test]
-    fn truncated_cas_payload_cleans_partial_object_and_skips_database_restore() {
-        let repository = tempfile::tempdir().expect("temporary repository");
-        let job = tempfile::tempdir().expect("temporary job root");
-        let cas = PayloadCas::new(repository.path()).expect("open CAS");
-        let mut bytes = entry(b"database.risudat", b"db");
-        bytes.extend_from_slice(&9_u32.to_le_bytes());
-        bytes.extend_from_slice(b"asset.bin");
-        bytes.extend_from_slice(&32_u32.to_le_bytes());
-        bytes.extend_from_slice(b"short");
-        let mut restore = RestoreSpy::default();
-
-        let error = parse_legacy_local_backup_v1(
-            &mut Cursor::new(bytes),
-            job.path(),
-            PayloadTarget::ImmutableCas(&cas),
-            &mut restore,
-            &NeverCancelled,
-        )
-        .expect_err("truncated CAS payload must fail");
-
-        assert_eq!(error.code, LocalBackupErrorCode::TruncatedInput);
-        assert_eq!(restore.calls, 0);
-        assert_eq!(
-            fs::read_dir(repository.path().join("assets-v2/staging"))
-                .expect("read CAS staging")
-                .count(),
-            0
-        );
     }
 
     fn file_entry(name: &str, path: &Path) -> LegacyBackupWriteEntry {
