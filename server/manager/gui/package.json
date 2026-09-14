@@ -8,7 +8,7 @@
     "build:agent": "vite build --mode agent",
     "check": "svelte-check --tsconfig tsconfig.json",
     "tauri": "tauri",
-    "tauri:dev:agent": "tauri dev",
+    "desktop:dev:agent": "tauri dev",
     "test": "vitest run --config vitest.config.ts"
   },
   "dependencies": {
