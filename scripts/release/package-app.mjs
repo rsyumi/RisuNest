@@ -11,6 +11,7 @@ import {
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { isDeepStrictEqual } from "node:util";
 import { parseArgs, readJson, requireArg, writeJson } from "./common.mjs";
 import { assertBinaryArchitecture } from "./platform/native.mjs";
 
@@ -38,6 +39,70 @@ function unique(directory, predicate, label) {
   const matches = walk(directory).filter(predicate);
   if (matches.length !== 1) throw new Error(`Expected one ${label}, found ${matches.length}.`);
   return matches[0];
+}
+
+export function validateIosArchiveEntries(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) throw new Error("IPA is empty.");
+  const seen = new Set();
+  const normalized = [];
+  for (const entry of entries) {
+    if (typeof entry !== "string" || !entry || entry.includes("\\") || entry.startsWith("/") || /^[A-Za-z]:/.test(entry))
+      throw new Error(`IPA contains an unsafe path: ${entry}`);
+    const parts = entry.split("/").filter(Boolean);
+    if (parts.some((part) => part === "." || part === "..")) throw new Error(`IPA contains an unsafe path: ${entry}`);
+    const key = `${parts.join("/")}${entry.endsWith("/") ? "/" : ""}`;
+    if (seen.has(key)) throw new Error(`IPA contains a duplicate path: ${entry}`);
+    seen.add(key);
+    normalized.push(key);
+  }
+  if (normalized.some((entry) => entry !== "Payload/" && entry !== "Payload/RisuNest.app/" && !entry.startsWith("Payload/RisuNest.app/")))
+    throw new Error("IPA must contain only the Payload/RisuNest.app bundle.");
+  if (!seen.has("Payload/RisuNest.app/Info.plist")) throw new Error("IPA is missing Payload/RisuNest.app/Info.plist.");
+  return normalized.sort();
+}
+
+function expectedIosDocuments(tauriConfig) {
+  return tauriConfig.bundle.fileAssociations.map((association) => ({
+    CFBundleTypeExtensions: association.ext,
+    CFBundleTypeName: association.ext[0],
+    CFBundleTypeRole: "Editor",
+    LSHandlerRank: "Default",
+  }));
+}
+
+function expectedIosUrls(tauriConfig) {
+  return tauriConfig.plugins["deep-link"].mobile
+    .filter((deepLink) => !deepLink.appLink)
+    .map((deepLink) => ({
+      CFBundleURLSchemes: deepLink.scheme.filter((scheme) => scheme !== "http" && scheme !== "https"),
+      CFBundleURLName: deepLink.scheme[0],
+    }));
+}
+
+export function assertIosBundleMetadata(info, releaseInput, tauriConfig, iosConfig) {
+  const expected = {
+    identifier: tauriConfig.identifier,
+    platforms: ["iPhoneOS"],
+    minimumOS: iosConfig.bundle.iOS.minimumSystemVersion,
+    version: releaseInput.version,
+    build: releaseInput.iosBuildNumber,
+    documents: expectedIosDocuments(tauriConfig),
+    urls: expectedIosUrls(tauriConfig),
+  };
+  const actual = {
+    identifier: info.CFBundleIdentifier,
+    platforms: info.CFBundleSupportedPlatforms,
+    minimumOS: info.MinimumOSVersion,
+    version: info.CFBundleShortVersionString,
+    build: info.CFBundleVersion,
+    documents: info.CFBundleDocumentTypes,
+    urls: info.CFBundleURLTypes,
+  };
+  if (!isDeepStrictEqual(actual, expected))
+    throw new Error(`IPA bundle metadata does not match the release configuration: ${JSON.stringify(actual)}`);
+  if (typeof info.CFBundleExecutable !== "string" || !info.CFBundleExecutable)
+    throw new Error("IPA bundle metadata does not name an executable.");
+  return { ...actual, executable: info.CFBundleExecutable };
 }
 
 function binaryFormat(os) {
@@ -175,21 +240,20 @@ function androidAssets({ arch, packagePath, releaseInput, output }) {
   }];
 }
 
-function iosAssets({ arch, packagePath, releaseInput, output }) {
+function iosAssets({ arch, packagePath, releaseInput, output, tauriConfig, iosConfig }) {
   if (arch !== "aarch64") throw new Error("The iOS release is ARM64 only.");
   const stage = mkdtempSync(join(output, ".ipa-proof-"));
   try {
+    const entries = validateIosArchiveEntries(run("unzip", ["-Z1", packagePath], true).trim().split(/\r?\n/).filter(Boolean));
     run("unzip", ["-q", packagePath, "-d", stage]);
     const apps = readdirSync(join(stage, "Payload"), { withFileTypes: true }).filter((entry) => entry.isDirectory() && entry.name.endsWith(".app"));
-    if (apps.length !== 1) throw new Error("IPA must contain exactly one Payload app.");
+    if (apps.length !== 1 || apps[0].name !== "RisuNest.app") throw new Error("IPA must contain exactly one RisuNest.app bundle.");
     const app = join(stage, "Payload", apps[0].name);
     const plist = join(app, "Info.plist");
-    const executable = run("plutil", ["-extract", "CFBundleExecutable", "raw", "-o", "-", plist], true).trim();
-    const version = run("plutil", ["-extract", "CFBundleShortVersionString", "raw", "-o", "-", plist], true).trim();
-    const build = run("plutil", ["-extract", "CFBundleVersion", "raw", "-o", "-", plist], true).trim();
-    if (version !== releaseInput.version) throw new Error("IPA version metadata does not match release input.");
-    if (build !== releaseInput.iosBuildNumber) throw new Error("IPA build number does not match release input.");
-    const binary = join(app, executable);
+    const info = JSON.parse(run("plutil", ["-convert", "json", "-o", "-", plist], true));
+    const metadata = assertIosBundleMetadata(info, releaseInput, tauriConfig, iosConfig);
+    const binary = join(app, metadata.executable);
+    if (!entries.includes(`Payload/RisuNest.app/${metadata.executable}`)) throw new Error("IPA is missing its declared executable.");
     const platform = run("xcrun", ["vtool", "-show-build", binary], true);
     if (!/platform IOS\b/.test(platform) || /IOSSIMULATOR/.test(platform))
       throw new Error("IPA binary is not an iPhoneOS device build.");
@@ -199,11 +263,16 @@ function iosAssets({ arch, packagePath, releaseInput, output }) {
     if (signing.status === 0) throw new Error("IPA executable is code signed.");
     const proofBinary = join(output, "ios-app-proof");
     copyFileSync(binary, proofBinary);
+    writeJson(join(output, "ios-package-inventory.json"), {
+      schema: "risunest-ios-package-inventory/v1",
+      entries,
+      metadata,
+    });
     return [{
       download: { product: "app", variant: "mobile", os: "ios", arch, format: "ipa" },
       path: resolve(packagePath),
       binaries: [{ path: proofBinary, arch, format: "macho", role: "app" }],
-      checks: ["iphoneos", "payload-single-app", "version-match"],
+      checks: ["iphoneos", "payload-single-app", "version-match", "archive-inventory", "bundle-metadata"],
     }];
   } finally {
     rmSync(stage, { recursive: true, force: true });
@@ -216,7 +285,12 @@ export function packageApp(options) {
   let assets;
   if (options.kind === "desktop") assets = desktopAssets({ ...options, output });
   else if (options.kind === "android") assets = androidAssets(options);
-  else if (options.kind === "ios") assets = iosAssets({ ...options, output });
+  else if (options.kind === "ios") assets = iosAssets({
+    ...options,
+    output,
+    tauriConfig: options.tauriConfig ?? readJson(resolve("src-tauri/tauri.conf.json")),
+    iosConfig: options.iosConfig ?? readJson(resolve("src-tauri/tauri.ios.conf.json")),
+  });
   else throw new Error(`Unsupported app package kind: ${options.kind}.`);
   const manifest = join(output, "assets.json");
   writeJson(manifest, assets);
@@ -233,6 +307,8 @@ function main() {
     bundleDirectory: args["bundle-dir"] ? resolve(args["bundle-dir"]) : undefined,
     binary: args.binary ? resolve(args.binary) : undefined,
     packagePath: args.package ? resolve(args.package) : undefined,
+    tauriConfig: args["tauri-config"] ? readJson(resolve(args["tauri-config"])) : undefined,
+    iosConfig: args["ios-config"] ? readJson(resolve(args["ios-config"])) : undefined,
     output: requireArg(args, "output"),
     releaseInput,
   });

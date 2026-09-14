@@ -43,7 +43,7 @@ function packageBytes(format) {
 
 function checks(download) {
   if (download.format === "apk") return ["abi-arm64", "apk-signed", "version-match", "zipaligned-16k"];
-  if (download.format === "ipa") return ["iphoneos", "payload-single-app", "version-match"];
+  if (download.format === "ipa") return ["iphoneos", "payload-single-app", "version-match", "archive-inventory", "bundle-metadata"];
   if (download.product === "sync" && download.variant === "managed") {
     if (download.os === "windows" && download.format === "zip") return ["archive-layout", "bundle-inventory"];
     if (download.os === "linux") return ["archive-layout", "bundle-inventory"];

@@ -2,11 +2,16 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { assertBinaryArchitecture } from "../../scripts/release/platform/native.mjs";
 import { assertPackageFormat } from "../../scripts/release/platform/package.mjs";
-import { inspectMacAppRoot } from "../../scripts/release/package-app.mjs";
+import {
+  assertIosBundleMetadata,
+  inspectMacAppRoot,
+  validateIosArchiveEntries,
+} from "../../scripts/release/package-app.mjs";
 
 function pe(machine) {
   const bytes = Buffer.alloc(128);
@@ -94,4 +99,102 @@ test("mounted DMG inspection rejects a mismatched app architecture", () => {
   mkdirSync(join(executable, ".."), { recursive: true });
   writeFileSync(executable, Buffer.concat([macho(0x01000007), Buffer.from("__TAURI_BUNDLE_TYPE_VAR_APP")]));
   assert.throws(() => inspectMacAppRoot(root, "aarch64", join(root, "proof")), /expected aarch64/);
+});
+
+const tauriConfig = {
+  identifier: "io.github.rsyumi.risunest",
+  bundle: { fileAssociations: [{ ext: ["risum", "risudat"] }] },
+  plugins: {
+    "deep-link": {
+      mobile: [
+        { scheme: ["risunestlocal"], appLink: false },
+        { scheme: ["https"], appLink: true },
+      ],
+    },
+  },
+};
+const iosConfig = { bundle: { iOS: { minimumSystemVersion: "16.4" } } };
+const releaseInput = { version: "2026.8.250", iosBuildNumber: "2026.8.250" };
+
+function iosInfo() {
+  return {
+    CFBundleIdentifier: "io.github.rsyumi.risunest",
+    CFBundleSupportedPlatforms: ["iPhoneOS"],
+    MinimumOSVersion: "16.4",
+    CFBundleShortVersionString: "2026.8.250",
+    CFBundleVersion: "2026.8.250",
+    CFBundleDocumentTypes: [{
+      LSHandlerRank: "Default",
+      CFBundleTypeRole: "Editor",
+      CFBundleTypeName: "risum",
+      CFBundleTypeExtensions: ["risum", "risudat"],
+    }],
+    CFBundleURLTypes: [{
+      CFBundleURLName: "risunestlocal",
+      CFBundleURLSchemes: ["risunestlocal"],
+    }],
+    CFBundleExecutable: "RisuNest",
+  };
+}
+
+test("iOS package inventory accepts only one complete RisuNest app", () => {
+  assert.deepEqual(validateIosArchiveEntries([
+    "Payload/",
+    "Payload/RisuNest.app/",
+    "Payload/RisuNest.app/RisuNest",
+    "Payload/RisuNest.app/Info.plist",
+    "Payload/RisuNest.app/assets/index.html",
+  ]), [
+    "Payload/",
+    "Payload/RisuNest.app/",
+    "Payload/RisuNest.app/Info.plist",
+    "Payload/RisuNest.app/RisuNest",
+    "Payload/RisuNest.app/assets/index.html",
+  ]);
+  assert.throws(() => validateIosArchiveEntries([
+    "Payload/RisuNest.app/Info.plist",
+    "SwiftSupport/libswiftCore.dylib",
+  ]), /only the Payload\/RisuNest.app bundle/);
+  assert.throws(() => validateIosArchiveEntries([
+    "Payload/RisuNest.app/Info.plist",
+    "Payload/RisuNest.app/../escaped",
+  ]), /unsafe path/);
+  assert.throws(() => validateIosArchiveEntries([
+    "Payload/RisuNest.app/Info.plist",
+    "Payload/RisuNest.app/Info.plist",
+  ]), /duplicate path/);
+});
+
+test("iOS bundle proof requires the configured custom URL scheme", () => {
+  assert.equal(
+    assertIosBundleMetadata(iosInfo(), releaseInput, tauriConfig, iosConfig).executable,
+    "RisuNest",
+  );
+  const missingUrls = iosInfo();
+  delete missingUrls.CFBundleURLTypes;
+  assert.throws(
+    () => assertIosBundleMetadata(missingUrls, releaseInput, tauriConfig, iosConfig),
+    /bundle metadata does not match/,
+  );
+});
+
+test("committed iOS shell carries the configured custom URL scheme", () => {
+  const repository = fileURLToPath(new URL("../..", import.meta.url));
+  const plistPath = join(repository, "src-tauri/gen/apple/risunest_iOS/Info.plist");
+  const parsed = spawnSync("python", [
+    "-c",
+    "import json, plistlib, sys; print(json.dumps(plistlib.load(open(sys.argv[1], 'rb'))['CFBundleURLTypes']))",
+    plistPath,
+  ], { encoding: "utf8" });
+  assert.equal(parsed.status, 0, parsed.stderr);
+  const config = JSON.parse(readFileSync(join(repository, "src-tauri/tauri.conf.json"), "utf8"));
+  const expected = config.plugins["deep-link"].mobile
+    .filter((deepLink) => !deepLink.appLink)
+    .map((deepLink) => ({
+      CFBundleURLSchemes: deepLink.scheme.filter((scheme) => scheme !== "http" && scheme !== "https"),
+      CFBundleURLName: deepLink.scheme[0],
+    }));
+  assert.deepEqual(JSON.parse(parsed.stdout), expected);
+  const project = readFileSync(join(repository, "src-tauri/gen/apple/project.yml"), "utf8");
+  assert.match(project, /CFBundleURLSchemes: \[risunestlocal\]\s+CFBundleURLName: risunestlocal/);
 });
