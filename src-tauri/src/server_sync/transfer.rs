@@ -39,6 +39,7 @@ struct UploadProgress {
     complete: bool,
     finishing: bool,
     failure: Option<String>,
+    retryable_failure: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -619,13 +620,23 @@ impl<'a> Transfer<'a> {
         struct Started {
             job_id: String,
         }
-        let (_, started): (_, Started) = self.client.json(
+        let reply = self.client.request(
             Method::POST,
             "objects/delta",
             &[],
-            Some(&serde_json::json!({"target":target,"bases":bases})),
+            Some(canonical::encode(
+                &serde_json::json!({"target":target,"bases":bases}),
+            )?),
             &[],
+            MAX_METADATA_BYTES,
         )?;
+        if delta_job_falls_back(reply.status) {
+            return Ok(false);
+        }
+        if !(200..300).contains(&reply.status) {
+            return Err(response_error(reply));
+        }
+        let started: Started = canonical::decode(&reply.body, MAX_METADATA_BYTES)?;
         risunest_sync_wire::validate_id(&started.job_id)?;
         let path = format!("object-deltas/{}", started.job_id);
         loop {
@@ -691,6 +702,20 @@ impl<'a> Transfer<'a> {
                         return Err(response_error(released));
                     }
                     return Ok(true);
+                }
+                status if delta_job_falls_back(status) => {
+                    let released = self.client.request(
+                        Method::DELETE,
+                        &path,
+                        &[],
+                        None,
+                        &[],
+                        MAX_METADATA_BYTES,
+                    )?;
+                    if !matches!(released.status, 204 | 404 | 410) {
+                        return Err(response_error(released));
+                    }
+                    return Ok(false);
                 }
                 _ => return Err(response_error(reply)),
             }
@@ -885,6 +910,8 @@ impl<'a> Transfer<'a> {
             {
                 return Err(SyncError::new("upload-manifest-mismatch", 409));
             }
+            self.client
+                .report_retryable_failure(progress.retryable_failure.as_deref());
             if progress.failure.is_some() {
                 let reply = self.client.request(
                     Method::DELETE,
@@ -1022,6 +1049,10 @@ impl<'a> Transfer<'a> {
     }
 }
 
+fn delta_job_falls_back(status: u16) -> bool {
+    matches!(status, 409 | 429)
+}
+
 /// Preserve the job's cancellation error across the CAS streaming I/O boundary.
 pub(crate) fn prepare_checked(
     cas: &crate::asset_repository::PayloadCas,
@@ -1079,6 +1110,20 @@ impl Read for ChunkReader<'_, '_> {
                     .map_err(|_| std::io::Error::other("Invalid verified chunk"))?,
             );
             self.index += 1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod transfer_policy_tests {
+    use super::delta_job_falls_back;
+
+    #[test]
+    fn delta_job_capacity_and_generation_failures_use_the_full_transfer_path() {
+        assert!(delta_job_falls_back(409));
+        assert!(delta_job_falls_back(429));
+        for status in [400, 401, 403, 404, 500, 503] {
+            assert!(!delta_job_falls_back(status), "status {status}");
         }
     }
 }

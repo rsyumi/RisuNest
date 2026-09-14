@@ -274,6 +274,25 @@ describe('SyncConflictBackupStore', () => {
         expect(await store.list()).toEqual([])
     })
 
+    it('keeps valid metadata when a neighboring index entry is corrupted', async () => {
+        const kv = memoryKv()
+        const payloads = memoryPayloadStore()
+        const store = new SyncConflictBackupStore(kv, sequenceClock(), payloads)
+        const kept = await store.save({
+            side: 'remote', bytes: Uint8Array.of(1), characterCount: 1,
+        })
+        kv.values.set('index', [
+            ...(kv.values.get('index') as unknown[]),
+            { id: 'corrupt' },
+        ])
+
+        await store.save({
+            side: 'local', bytes: Uint8Array.of(2), characterCount: 2,
+        })
+
+        expect((await store.list()).map((entry) => entry.id)).toContain(kept.id)
+    })
+
     it('keeps payload bytes outside the metadata key-value store', async () => {
         const kv = memoryKv()
         const payloads = memoryPayloadStore()

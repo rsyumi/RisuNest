@@ -104,6 +104,26 @@ describe("server sync controller", () => {
     expect(controller.snapshot().progress).toBeUndefined();
     expect(controller.snapshot().error).toBe("server-timeout");
   });
+  it("shows the latest retryable failure only during the active synchronization", async () => {
+    const { controller, facade } = fixture();
+    controller.reportRetryableFailure("storage-io");
+    expect(controller.snapshot().retryableFailure).toBeUndefined();
+    facade.cycle.mockImplementationOnce(async () => {
+      controller.reportRetryableFailure("storage-io");
+      expect(controller.snapshot().retryableFailure).toBe("storage-io");
+      controller.reportRetryableFailure(undefined);
+      expect(controller.snapshot().retryableFailure).toBeUndefined();
+      controller.reportRetryableFailure("storage-io");
+      return {
+        phase: "idle",
+        conflictCount: 0,
+        localRevision: 3,
+        head: controller.snapshot().status!.head!,
+      };
+    });
+    await controller.synchronize();
+    expect(controller.snapshot().retryableFailure).toBeUndefined();
+  });
   it("reports the last completed synchronization without replacing it on failure or conflict", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(1000);

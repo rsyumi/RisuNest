@@ -19,6 +19,7 @@ export interface ServerSyncSnapshot {
   lastSuccessAt?: number;
   progress?: ServerSyncProgress;
   verifiedBytes?: string;
+  retryableFailure?: string;
   attemptId?: number;
   attemptIdentity?: { endpoint: string; libraryId: string; deviceId: string };
   initialSyncComplete?: boolean;
@@ -72,6 +73,7 @@ export function createServerSyncController(
     state.result = undefined;
     state.progress = undefined;
     state.verifiedBytes = undefined;
+    state.retryableFailure = undefined;
     state.error = "";
     publish();
     try {
@@ -142,6 +144,7 @@ export function createServerSyncController(
     } finally {
       state.running = false;
       state.progress = undefined;
+      state.retryableFailure = undefined;
       publish();
     }
   };
@@ -213,6 +216,11 @@ export function createServerSyncController(
     reportVerifiedBytes(verifiedBytes: string): void {
       if (!state.running) return;
       state.verifiedBytes = verifiedBytes;
+      publish();
+    },
+    reportRetryableFailure(code: string | undefined): void {
+      if (!state.running) return;
+      state.retryableFailure = code;
       publish();
     },
     reportProgress(progress: ServerSyncProgress): void {

@@ -2,7 +2,7 @@ export const MAX_LOGICAL_RECORD_KEY_BYTES = 64 * 1024
 
 const KEY_PREFIX = 'r1'
 const textEncoder = new TextEncoder()
-const textDecoder = new TextDecoder('utf-8', { fatal: true })
+const textDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
 const base64urlAlphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
 
 export type LogicalRecordLocator =

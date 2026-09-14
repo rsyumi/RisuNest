@@ -81,9 +81,9 @@ export class SyncConflictBackupStore {
     async list(): Promise<SyncConflictBackupEntry[]> {
         const raw = await this.kv.getItem(indexKey)
         if (!Array.isArray(raw)) return []
-        const entries = raw.map(normalizeEntry)
-        if (entries.some((entry) => entry === null)) return []
-        return (entries as SyncConflictBackupEntry[])
+        return raw
+            .map(normalizeEntry)
+            .filter((entry): entry is SyncConflictBackupEntry => entry !== null)
             .sort((left, right) => right.createdAt - left.createdAt)
     }
 

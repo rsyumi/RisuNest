@@ -176,6 +176,28 @@ describe("shared server connection view", () => {
     component = undefined;
     expect(state.controller.pause).not.toHaveBeenCalled();
   });
+  it("shows a retryable transfer failure while synchronization continues", async () => {
+    component = mount(ServerSyncConnection, { target });
+    await tick();
+    state.emit({
+      ...idle(),
+      running: true,
+      retryableFailure: "corrupt-chunk",
+      status: {
+        configured: true,
+        endpoint: "https://bound.test/",
+        libraryId: "lib",
+        deviceId: "device",
+        dirtyRecords: 1,
+        fullScan: false,
+        registrationRequired: false,
+        operationPending: true,
+      },
+    });
+    await tick();
+    expect(target.textContent).toContain("Syncing: (corrupt-chunk)");
+    expect(target.textContent).not.toContain("Sync stopped");
+  });
 });
 
 it("receives a cold registration after mounting, submits directory only explicitly, and discards secrets", async () => {

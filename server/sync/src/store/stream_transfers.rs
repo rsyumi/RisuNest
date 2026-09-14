@@ -192,7 +192,7 @@ impl Store {
             return Err(Error::new("delta-job-expired", 410));
         }
         if error.is_some() {
-            return Err(Error::new("delta-generation-failed", 409));
+            return Ok(DeltaProgress::FullRequired);
         }
         Ok(match state.as_str() {
             "complete" => body

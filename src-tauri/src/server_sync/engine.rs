@@ -50,6 +50,8 @@ pub(crate) struct CycleOptions {
     #[serde(skip)]
     pub verified_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     #[serde(skip)]
+    pub retryable_failure: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
+    #[serde(skip)]
     pub groups: BTreeSet<String>,
 }
 #[derive(Serialize)]
@@ -87,6 +89,7 @@ pub(crate) struct PreparedCycle {
     activated: Option<i64>,
     cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     verified_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    retryable_failure: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
 }
 fn json<T: Serialize>(value: &T) -> Result<String> {
     String::from_utf8(canonical::encode(value)?)
@@ -271,6 +274,10 @@ impl PersistentStore {
             if reply.status == 202 {
                 return Ok(());
             }
+            if reply.status == 410 {
+                self.server_abandon_expired_operation()?;
+                return Ok(());
+            }
             if let Ok(receipt) = canonical::decode::<Receipt>(&reply.body, MAX_METADATA_BYTES) {
                 self.server_observe_receipt(&receipt)?;
                 return Ok(());
@@ -332,9 +339,8 @@ impl PersistentStore {
             return Ok(true);
         }
         if reply.status == 410 {
-            self.connection
-                .execute("UPDATE server_sync_state SET registration_required=1", [])?;
-            return Err(SyncError::new("operation-history-lost", 409));
+            self.server_abandon_expired_operation()?;
+            return Ok(false);
         }
         if reply.status != 404 {
             return Err(response_error(reply));
@@ -419,6 +425,10 @@ impl PersistentStore {
         )?;
         if reply.status == 202 {
             return Ok(true);
+        }
+        if reply.status == 410 {
+            self.server_abandon_expired_operation()?;
+            return Ok(false);
         }
         if let Ok(receipt) = canonical::decode::<Receipt>(&reply.body, MAX_METADATA_BYTES) {
             self.server_observe_receipt(&receipt)?;
@@ -536,6 +546,7 @@ impl PersistentStore {
         let mut client =
             ServerClient::with_cancellation(config.clone(), options.cancellation.clone())?;
         client.verified_bytes = options.verified_bytes.clone();
+        client.retryable_failure = options.retryable_failure.clone();
         let identity_head = client.resolve_identity(false)?;
         self.server_cache_endpoint(&config, client.config())?;
         let resume_may_commit = self
@@ -773,6 +784,7 @@ impl PersistentStore {
                 expected_head: options.expected_head.clone(),
                 cancellation: options.cancellation.clone(),
                 verified_bytes: options.verified_bytes.clone(),
+                retryable_failure: options.retryable_failure.clone(),
                 groups: required_groups,
             });
         }
@@ -978,6 +990,7 @@ impl PersistentStore {
             activated: None,
             cancellation: options.cancellation.clone(),
             verified_bytes: options.verified_bytes.clone(),
+            retryable_failure: options.retryable_failure.clone(),
         }))
     }
     /// No network work is allowed here. Production holds the JS mutation fence
@@ -1024,6 +1037,7 @@ impl PersistentStore {
         let mut client =
             ServerClient::with_cancellation(config.clone(), ready.cancellation.clone())?;
         client.verified_bytes = ready.verified_bytes.clone();
+        client.retryable_failure = ready.retryable_failure.clone();
         let cache = Cache::open(&self.repository_root.join("server-sync").join(
             risunest_sync_wire::hash(
                 format!("{}:{}", config.library_id, config.device_id).as_bytes(),

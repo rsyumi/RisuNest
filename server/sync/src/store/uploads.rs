@@ -39,6 +39,7 @@ pub struct UploadProgress {
     pub complete: bool,
     pub finishing: bool,
     pub failure: Option<String>,
+    pub retryable_failure: Option<String>,
 }
 
 impl Store {
@@ -117,6 +118,13 @@ impl Store {
         } else {
             None
         };
+        let job_failure = db
+            .query_row(
+                "SELECT terminal,error FROM upload_jobs WHERE upload=?1",
+                [id],
+                |r| Ok((r.get::<_, bool>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
         Ok(UploadProgress {
             upload_id: id.into(),
             manifest: UploadManifest {
@@ -128,14 +136,13 @@ impl Store {
             next_after,
             complete: state == "complete",
             finishing: matches!(state.as_str(), "queued" | "finalizing"),
-            failure: db
-                .query_row(
-                    "SELECT error FROM upload_jobs WHERE upload=?1 AND terminal=1",
-                    [id],
-                    |r| r.get::<_, Option<String>>(0),
-                )
-                .optional()?
-                .flatten(),
+            failure: job_failure
+                .as_ref()
+                .filter(|(terminal, _)| *terminal)
+                .and_then(|(_, error)| error.clone()),
+            retryable_failure: job_failure
+                .filter(|(terminal, _)| !*terminal)
+                .and_then(|(_, error)| error),
         })
     }
     pub fn put_upload_chunk(

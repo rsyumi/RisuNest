@@ -89,6 +89,7 @@ export function createServerSyncFacade(options: {
   restorePlugins?: () => Promise<void>;
   onProgress?: (phase: ServerSyncProgress) => void;
   onVerifiedBytes?: (bytes: string) => void;
+  onRetryableFailure?: (code: string | undefined) => void;
 }) {
   const native = options.invoke ?? invoke;
   const transfer = async <T>(
@@ -98,23 +99,43 @@ export function createServerSyncFacade(options: {
     let closed = false;
     let sampling = false;
     const sample = async () => {
-      if (sampling || !options.onVerifiedBytes) return;
+      if (
+        sampling ||
+        (!options.onVerifiedBytes && !options.onRetryableFailure)
+      )
+        return;
       sampling = true;
       try {
-        const bytes = await native<string>("server_sync_verified_bytes");
+        const [verified, failure] = await Promise.allSettled([
+          options.onVerifiedBytes
+            ? native<string>("server_sync_verified_bytes")
+            : Promise.resolve(undefined),
+          options.onRetryableFailure
+            ? native<string | null>("server_sync_retryable_failure")
+            : Promise.resolve(undefined),
+        ]);
+        if (closed) return;
         if (
-          !closed &&
-          typeof bytes === "string" &&
-          /^(0|[1-9][0-9]{0,19})$/.test(bytes)
+          verified.status === "fulfilled" &&
+          typeof verified.value === "string" &&
+          /^(0|[1-9][0-9]{0,19})$/.test(verified.value)
         )
-          options.onVerifiedBytes(bytes);
+          options.onVerifiedBytes?.(verified.value);
+        if (failure.status === "fulfilled") {
+          const code = failure.value;
+          if (
+            code === null ||
+            (typeof code === "string" && /^[a-z-]{1,64}$/.test(code))
+          )
+            options.onRetryableFailure?.(code ?? undefined);
+        }
       } catch {
         /* Progress must never change the synchronization outcome. */
       } finally {
         sampling = false;
       }
     };
-    const timer = options.onVerifiedBytes
+    const timer = options.onVerifiedBytes || options.onRetryableFailure
       ? setInterval(() => void sample(), 1000)
       : undefined;
     try {

@@ -104,6 +104,9 @@ impl Transfer<'_> {
         let mut seen = BTreeSet::new();
         let mut dependencies = BTreeSet::new();
         while !pending.is_empty() {
+            if !reference_queue_has_capacity(seen.len(), pending.len(), 0) {
+                return Err(SyncError::new("invalid-descriptor-tree", 409));
+            }
             let current = std::mem::take(&mut pending);
             let hints: BTreeMap<_, _> = current
                 .iter()
@@ -117,7 +120,8 @@ impl Transfer<'_> {
                 &[],
                 &hints,
             )?;
-            for (digest, bases, depth) in current {
+            let current_len = current.len();
+            for (position, (digest, bases, depth)) in current.into_iter().enumerate() {
                 if !seen.insert(digest.clone())
                     || depth >= MAX_TREE_DEPTH
                     || seen.len() > MAX_DESCRIPTOR_REFERENCES
@@ -131,6 +135,13 @@ impl Transfer<'_> {
                 page.validate()?;
                 match page {
                     ReferencePage::Branches { children } => {
+                        let waiting = pending
+                            .len()
+                            .checked_add(current_len - position - 1)
+                            .ok_or_else(|| SyncError::new("invalid-descriptor-tree", 409))?;
+                        if !reference_queue_has_capacity(seen.len(), waiting, children.len()) {
+                            return Err(SyncError::new("invalid-descriptor-tree", 409));
+                        }
                         let old_children = self.previous_reference_children(&bases);
                         for (index, child) in children.iter().enumerate() {
                             pending.push((
@@ -150,6 +161,12 @@ impl Transfer<'_> {
         }
         Ok(dependencies.into_iter().collect())
     }
+}
+
+fn reference_queue_has_capacity(seen: usize, pending: usize, additional: usize) -> bool {
+    seen.checked_add(pending)
+        .and_then(|count| count.checked_add(additional))
+        .is_some_and(|count| count <= MAX_DESCRIPTOR_REFERENCES)
 }
 
 fn adjacent_bases(current: &[String], index: usize, previous: &[String]) -> Vec<String> {
@@ -212,5 +229,20 @@ mod tests {
         let current = values(&["old-118", "changed"]);
         assert_eq!(adjacent_bases(&current, 1, &previous), previous[119..123]);
         assert!(adjacent_bases(&values(&["new", "old-0"]), 0, &previous).is_empty());
+    }
+
+    #[test]
+    fn reference_queue_rejects_a_level_before_materializing_past_the_tree_limit() {
+        assert!(!reference_queue_has_capacity(
+            MAX_DESCRIPTOR_REFERENCES - 1,
+            1,
+            1
+        ));
+        assert!(reference_queue_has_capacity(
+            MAX_DESCRIPTOR_REFERENCES - 2,
+            1,
+            1
+        ));
+        assert!(!reference_queue_has_capacity(usize::MAX, 1, 1));
     }
 }

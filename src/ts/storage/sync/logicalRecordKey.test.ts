@@ -8,6 +8,14 @@ import {
 } from './logicalRecordKey'
 
 describe('logical record key codec', () => {
+    it('preserves a leading U+FEFF as part of a logical identifier', () => {
+        const locator = { kind: 'plugin', storageKey: '\uFEFFplugin-key' } as const
+        const encoded = encodeLogicalRecordKey(locator)
+
+        expect(encoded).not.toBe(encodeLogicalRecordKey({ ...locator, storageKey: 'plugin-key' }))
+        expect(decodeLogicalRecordKey(encoded)).toEqual(locator)
+    })
+
     it.each(golden.roundTrip)(
         'round-trips $encoded using one canonical encoded form',
         ({ locator, encoded }) => {

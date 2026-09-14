@@ -18,7 +18,10 @@ const result: ServerCycle = {
   appliedRecords: 1,
   proposedRecords: 0,
 };
-function fixture(onVerifiedBytes?: (bytes: string) => void) {
+function fixture(
+  onVerifiedBytes?: (bytes: string) => void,
+  onRetryableFailure?: (code: string | undefined) => void,
+) {
   const trace: string[] = [];
   let fenced = false;
   const fence = {
@@ -70,6 +73,7 @@ function fixture(onVerifiedBytes?: (bytes: string) => void) {
     invoke: native as never,
     onProgress: (phase) => progress.push(phase),
     onVerifiedBytes,
+    onRetryableFailure,
   });
   const progress: string[] = [];
   return { facade, native, runtime, fence, trace, progress };
@@ -106,6 +110,30 @@ describe("server sync activation boundary", () => {
       await Promise.resolve();
       expect(receive).not.toHaveBeenCalled();
       expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("reports a sanitized retryable server failure while the transfer keeps running", async () => {
+    vi.useFakeTimers();
+    try {
+      const receive = vi.fn();
+      const { facade, native } = fixture(undefined, receive);
+      let finish!: (value: unknown) => void;
+      native.mockImplementation((command) => {
+        if (command === "server_sync_prepare")
+          return new Promise((resolve) => {
+            finish = resolve;
+          }) as never;
+        if (command === "server_sync_retryable_failure")
+          return Promise.resolve("storage-io") as never;
+        throw new Error("Unexpected command");
+      });
+      const active = facade.cycle();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(receive).toHaveBeenCalledWith("storage-io");
+      finish({ kind: "report", result });
+      await expect(active).resolves.toEqual(result);
     } finally {
       vi.useRealTimers();
     }

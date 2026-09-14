@@ -208,3 +208,55 @@ fn corrupt_final_hash_expiry_empty_and_cancel_never_publish_partial_content() {
         .put_upload_chunk(&a, &id, 0, &hash(b"x"), b"x")
         .is_err());
 }
+#[test]
+fn retryable_finalization_failure_is_visible_and_clears_after_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::init(dir.path()).unwrap();
+    let a = device(&store);
+    let id = store
+        .begin_upload(
+            &a,
+            &UploadManifest {
+                hash: hash(b"x"),
+                size: 1.into(),
+            },
+        )
+        .unwrap();
+    store
+        .put_upload_chunk(&a, &id, 0, &hash(b"x"), b"x")
+        .unwrap();
+    let db = rusqlite::Connection::open(dir.path().join("metadata.sqlite")).unwrap();
+    db.execute("INSERT INTO upload_jobs(upload) VALUES(?1)", [&id])
+        .unwrap();
+    db.execute("UPDATE uploads SET state='queued' WHERE id=?1", [&id])
+        .unwrap();
+    std::fs::write(
+        dir.path().join("staging").join(format!("{id}-0.chunk")),
+        b"broken",
+    )
+    .unwrap();
+
+    assert_eq!(
+        store.run_pending_upload().unwrap_err().code,
+        "corrupt-chunk"
+    );
+    let progress = store.upload_progress(&a, &id, None).unwrap();
+    assert!(progress.finishing);
+    assert_eq!(progress.failure, None);
+    assert_eq!(progress.retryable_failure.as_deref(), Some("corrupt-chunk"));
+
+    std::fs::write(
+        dir.path().join("staging").join(format!("{id}-0.chunk")),
+        b"x",
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE upload_jobs SET retry_after=0 WHERE upload=?1",
+        [&id],
+    )
+    .unwrap();
+    assert!(store.run_pending_upload().unwrap());
+    let progress = store.upload_progress(&a, &id, None).unwrap();
+    assert!(progress.complete);
+    assert_eq!(progress.retryable_failure, None);
+}

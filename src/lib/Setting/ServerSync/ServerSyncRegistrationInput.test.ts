@@ -30,7 +30,7 @@ describe("registration form input", () => {
     expect(input.value).toBe("");
     expect(target.textContent).not.toContain(vector.registration.token);
   });
-  it("consumes OS delivery once and refuses replacement of an existing connection", async () => {
+  it("rejects OS delivery while connected and allows the same link to be delivered again", async () => {
     serverRegistrationInbox.stage(vector.uri);
     const target = document.createElement("div");
     document.body.append(target);
@@ -45,5 +45,6 @@ describe("registration form input", () => {
       expect(target.querySelector("[role=status]")).not.toBeNull(),
     );
     expect(serverRegistrationInbox.take()).toBeUndefined();
+    expect(serverRegistrationInbox.stage(vector.uri)).toBe(true);
   });
 });

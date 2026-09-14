@@ -2,6 +2,7 @@ use super::super::server_sync_engine::{CycleOptions, CycleResult};
 use super::*;
 use crate::server_sync::client::ServerConfig;
 use risunest_sync_server::{http, store::Store};
+use risunest_sync_wire::{ChangeSet, ScopeFence};
 use std::fs::OpenOptions;
 #[path = "server_sync_initial_tests.rs"]
 mod initial;
@@ -75,6 +76,94 @@ fn settle(store: &mut PersistentStore) -> CycleResult {
     }
     panic!("Server operation did not settle")
 }
+
+#[test]
+fn expired_server_operation_history_reproposes_without_losing_dirty_records() {
+    let server_dir = tempfile::tempdir().unwrap();
+    let server = Arc::new(Store::init(server_dir.path()).unwrap());
+    let credential = server.add_device().unwrap();
+    let server_device = server
+        .authenticate(&credential.library_id, &credential.token)
+        .unwrap();
+    let staged = server
+        .stage_changes(
+            &server_device,
+            &ChangeSet {
+                changes: vec![],
+                read_fences: vec![],
+                scope_fences: vec![ScopeFence {
+                    scope: "synthetic-expired-history".into(),
+                    expected_version: server.scope_version("synthetic-expired-history").unwrap(),
+                    clear: true,
+                }],
+            },
+        )
+        .unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server_clone = server.clone();
+    let task = runtime.spawn(async move {
+        axum::serve(listener, http::router(server_clone))
+            .await
+            .unwrap();
+    });
+    let (_local_dir, mut local) = prepared();
+    local
+        .server_bind(&ServerConfig {
+            directory: None,
+            endpoint,
+            library_id: credential.library_id.clone(),
+            device_id: credential.device_id.clone(),
+            token: credential.token,
+        })
+        .unwrap();
+    local
+        .server_reserve(
+            &server.head().unwrap(),
+            staged.changes_digest,
+            staged.staged_changes_id,
+            local.revision().unwrap(),
+        )
+        .unwrap();
+    let dirty = local.server_status().unwrap().dirty_records;
+    let db = rusqlite::Connection::open(server_dir.path().join("metadata.sqlite")).unwrap();
+    db.execute(
+        "UPDATE devices SET watermark='1' WHERE id=?1",
+        [&credential.device_id],
+    )
+    .unwrap();
+
+    local
+        .server_prepare_cycle(&CycleOptions::default())
+        .unwrap();
+
+    assert!(local.server_pending().unwrap().is_none());
+    assert_eq!(local.server_status().unwrap().dirty_records, dirty);
+    assert!(!local.server_status().unwrap().registration_required);
+    let replacement = local
+        .server_reserve(
+            &server.head().unwrap(),
+            "b".repeat(64),
+            "replacement-stage".into(),
+            local.revision().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        replacement.device_operation_seq,
+        risunest_sync_wire::Sequence::from(2)
+    );
+    local.server_abandon_expired_operation().unwrap();
+    task.abort();
+    runtime.shutdown_timeout(Duration::from_secs(2));
+}
+
 #[test]
 fn two_native_replicas_seed_publish_pull_and_preserve_same_key_conflicts() {
     let directory = tempfile::tempdir().unwrap();

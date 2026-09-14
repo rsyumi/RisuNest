@@ -11,6 +11,7 @@ pub(crate) struct ServerClient {
     config: ServerConfig,
     cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub(crate) verified_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    pub(crate) retryable_failure: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
 }
 pub(crate) struct Reply {
     pub status: u16,
@@ -93,6 +94,7 @@ impl ServerClient {
         let mut candidate = Self::with_cancellation(config, self.cancelled.clone())?;
         candidate.http = self.http.clone();
         candidate.verified_bytes = self.verified_bytes.clone();
+        candidate.retryable_failure = self.retryable_failure.clone();
         let head = verify(&candidate)?;
         *self = candidate;
         Ok(head)
@@ -131,11 +133,21 @@ impl ServerClient {
             config,
             cancelled,
             verified_bytes: None,
+            retryable_failure: None,
         })
     }
     pub fn verified(&self, bytes: u64) {
         if let Some(counter) = &self.verified_bytes {
             counter.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    pub fn report_retryable_failure(&self, code: Option<&str>) {
+        let Some(progress) = &self.retryable_failure else {
+            return;
+        };
+        let sanitized = sanitize_retryable_failure(code);
+        if let Ok(mut current) = progress.lock() {
+            *current = sanitized;
         }
     }
     pub fn ensure_active(&self) -> Result<()> {
@@ -266,6 +278,45 @@ impl ServerClient {
             return Err(SyncError::new("library-mismatch", 409));
         }
         Ok(head)
+    }
+}
+
+fn sanitize_retryable_failure(code: Option<&str>) -> Option<String> {
+    code.map(|value| {
+        if value.len() <= 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+        {
+            value.to_owned()
+        } else {
+            "server-response-error".into()
+        }
+    })
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::sanitize_retryable_failure;
+
+    #[test]
+    fn retryable_failure_progress_exposes_only_a_bounded_error_code() {
+        assert_eq!(
+            sanitize_retryable_failure(Some("storage-io")).as_deref(),
+            Some("storage-io")
+        );
+        let oversized = "x".repeat(65);
+        for private in [
+            "token=synthetic-secret",
+            "Response Body",
+            oversized.as_str(),
+        ] {
+            assert_eq!(
+                sanitize_retryable_failure(Some(private)).as_deref(),
+                Some("server-response-error")
+            );
+        }
+        assert_eq!(sanitize_retryable_failure(None), None);
     }
 }
 pub(crate) fn response_error(reply: Reply) -> SyncError {

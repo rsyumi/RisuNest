@@ -134,3 +134,34 @@ fn durable_file_delta_jobs_pin_bases_survive_restart_and_isolate_devices() {
         DeltaProgress::FullRequired
     ));
 }
+
+#[test]
+fn failed_delta_generation_is_an_explicit_full_download_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::init(dir.path()).unwrap();
+    let a = device(&store);
+    let target = b"synthetic target";
+    let target_hash = hash(target);
+    store.put_object(&a, &target_hash, target).unwrap();
+    let job = store
+        .begin_download_delta(
+            &a,
+            &TransferRequest {
+                target: target_hash,
+                bases: Vec::new(),
+            },
+        )
+        .unwrap();
+    let db = rusqlite::Connection::open(dir.path().join("metadata.sqlite")).unwrap();
+    db.execute(
+        "UPDATE download_deltas SET state='complete',error='delta-cache-quota' WHERE id=?1",
+        [&job],
+    )
+    .unwrap();
+
+    assert!(matches!(
+        store.download_delta_progress(&a, &job).unwrap(),
+        DeltaProgress::FullRequired
+    ));
+    store.release_download_delta(&a, &job).unwrap();
+}

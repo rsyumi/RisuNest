@@ -29,6 +29,7 @@ pub(crate) struct ServerSyncCommandState {
     cancelled: Mutex<Arc<AtomicBool>>,
     prepared: Mutex<Option<PreparedJob>>,
     verified_bytes: Mutex<Arc<std::sync::atomic::AtomicU64>>,
+    retryable_failure: Arc<Mutex<Option<String>>>,
     backup_sources: Mutex<BTreeMap<String, String>>,
 }
 struct Running<'a>(&'a ServerSyncCommandState);
@@ -351,6 +352,15 @@ pub(crate) fn server_sync_verified_bytes(app: AppHandle) -> Result<String> {
     Ok(counter.load(Ordering::Relaxed).to_string())
 }
 #[tauri::command]
+pub(crate) fn server_sync_retryable_failure(app: AppHandle) -> Result<Option<String>> {
+    Ok(app
+        .state::<ServerSyncCommandState>()
+        .retryable_failure
+        .lock()
+        .map_err(|_| SyncError::new("server-sync-state-unavailable", 503))?
+        .clone())
+}
+#[tauri::command]
 pub(crate) async fn server_sync_bind(
     app: AppHandle,
     config: ServerConfig,
@@ -462,6 +472,11 @@ pub(crate) async fn server_sync_prepare(
             .lock()
             .map_err(|_| SyncError::new("server-sync-state-unavailable", 503))? = counter.clone();
         options.verified_bytes = Some(counter);
+        *state
+            .retryable_failure
+            .lock()
+            .map_err(|_| SyncError::new("server-sync-state-unavailable", 503))? = None;
+        options.retryable_failure = Some(state.retryable_failure.clone());
         let mut store = job_store(&app)?;
         match store.server_prepare_cycle(&options)? {
             Preparation::Report(result) => Ok(PreparedReply::Report { result }),

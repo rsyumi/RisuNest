@@ -174,7 +174,10 @@ impl PersistentStore {
             return Err(SyncError::new("resolve-pending-operation-first", 409));
         }
         let selected = super::sync_selection::read(&tx)?;
-        if matches!(selected.target, super::sync_selection::SyncTarget::Server(_)) {
+        if matches!(
+            selected.target,
+            super::sync_selection::SyncTarget::Server(_)
+        ) {
             super::sync_selection::select(
                 &tx,
                 &selected.epoch,
@@ -411,6 +414,26 @@ impl PersistentStore {
         )?;
         Ok(pending.intent)
     }
+
+    pub(crate) fn server_abandon_expired_operation(&mut self) -> Result<()> {
+        if self.server_pending()?.is_none() {
+            return Err(SyncError::new("missing-operation", 409));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for table in [
+            "server_sync_operation",
+            "server_sync_operation_records",
+            "server_sync_operation_pages",
+            "server_sync_operation_scopes",
+        ] {
+            tx.execute(&format!("DELETE FROM {table}"), [])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Receipt evidence is checked before updating any local durable identity.
     /// A committed receipt is retained until the corresponding remote revision
     /// has been semantically applied, including changes from concurrent devices.

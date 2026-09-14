@@ -16,6 +16,7 @@ export function getServerSyncController() {
     createServerSyncFacade({
       onProgress: (phase) => controller?.reportProgress(phase),
       onVerifiedBytes: (bytes) => controller?.reportVerifiedBytes(bytes),
+      onRetryableFailure: (code) => controller?.reportRetryableFailure(code),
       runtime: {
         flushPendingData,
         capturePersistentMutationToken,

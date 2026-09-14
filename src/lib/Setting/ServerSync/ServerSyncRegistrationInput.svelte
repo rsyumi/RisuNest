@@ -84,7 +84,14 @@
       void tick().then(() => {
         if (!mounted) return;
         const config = serverRegistrationInbox.take();
-        if (config) accept(config);
+        if (config) {
+          if (!available || busy) {
+            serverRegistrationInbox.releaseConsumed();
+            message = text.registrationBlocked;
+            return;
+          }
+          accept(config);
+        }
       });
     });
     const hidden = () => {

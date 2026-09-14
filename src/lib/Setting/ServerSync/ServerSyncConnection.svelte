@@ -235,6 +235,11 @@
           ).toLocaleString()} B
         </p>
       {/if}
+      {#if snapshot.running && snapshot.retryableFailure}
+        <p class="text-sm" role="status">
+          {text.running}: <span class="opacity-75">({snapshot.retryableFailure})</span>
+        </p>
+      {/if}
     </div>
     <div class="flex flex-wrap gap-2">
       <button
