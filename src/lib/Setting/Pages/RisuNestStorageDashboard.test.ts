@@ -10,6 +10,8 @@ const maintenance = vi.hoisted(() => ({
     executeNativePersistentAssetGc: vi.fn(),
     deleteNativePersistentSnapshot: vi.fn(),
     createNativePersistentSnapshot: vi.fn(),
+    restoreNativePersistentSnapshot: vi.fn(),
+    restartNativeApp: vi.fn(),
 }))
 const server = vi.hoisted(() => ({
     getServerSyncBackupInventory: vi.fn(),
@@ -29,7 +31,24 @@ vi.mock('src/ts/platform', () => ({ isTauri: true }))
 vi.mock('src/lang', async () => ({ language: (await import('src/lang/en')).languageEnglish }))
 
 import RisuNestStorageDashboard from './RisuNestStorageDashboard.svelte'
+import { languageEnglish } from 'src/lang/en'
 import { languageKorean } from 'src/lang/ko'
+import type { ManagedServerSyncBackup } from 'src/ts/storage/sync/serverSyncProduction'
+
+const syncText = languageEnglish.risuNest.serverSync
+const serverBackup: ManagedServerSyncBackup = {
+    id: 'synthetic-id',
+    createdAt: 5,
+    localRevision: 2,
+    head: { libraryId: 'library', epoch: 'epoch', seq: '1', headId: 'head', minRetainedSeq: '0' },
+    localBytes: 1024,
+    remoteBytes: 2048,
+    preservationScope: 'library',
+    recoveryReady: true,
+    diskBytes: 3200,
+    deletable: true,
+    blockedReason: null,
+}
 
 const stats = {
     snapshotBytes: 2 * 1024 * 1024,
@@ -48,8 +67,18 @@ describe('RisuNestStorageDashboard', () => {
         vi.clearAllMocks()
     })
 
+    const button = (target: HTMLElement, text: string) =>
+        [...target.querySelectorAll<HTMLButtonElement>('button')].find(
+            (candidate) => candidate.textContent?.trim().startsWith(text),
+        )
+    const exact = (target: HTMLElement, text: string) =>
+        [...target.querySelectorAll<HTMLButtonElement>('button')].find(
+            (candidate) => candidate.textContent?.trim() === text,
+        )
+
     function setup(
         statsPromise: Promise<typeof stats> = Promise.resolve(stats),
+        serverBackups: ManagedServerSyncBackup[] = [],
     ): HTMLElement {
         maintenance.getNativePersistentStorageStats.mockImplementation(
             () => statsPromise,
@@ -64,7 +93,7 @@ describe('RisuNestStorageDashboard', () => {
             },
         ])
         server.getServerSyncBackupInventory.mockResolvedValue({
-            items: [],
+            items: serverBackups,
             next: null,
             completeCount: 105,
             completeBytes: 2048,
@@ -139,10 +168,13 @@ describe('RisuNestStorageDashboard', () => {
         expect(summaries.map((summary) => summary.textContent?.replace(/\s+/g, ' ').trim())).toEqual([
             'Snapshots 1 items · 2.0 MiB',
             'Conflict backups 1 items · 4.0 KiB',
+            'Sync backups 106 items · 4.0 KiB',
+            'Temporary files 1.0 KiB',
         ])
         const row = target.querySelector<HTMLElement>('[data-storage-backup-list] [data-storage-backup-row]')
         expect(row?.className).not.toContain('justify-between')
         expect(row?.textContent).toContain('1.0 KiB')
+        expect(row?.textContent).toContain('Created manually')
         expect(target.textContent).toContain('The total counts shared storage once.')
         expect(target.textContent).toContain('2 characters · 3 chats · 4 messages')
     })
@@ -217,7 +249,7 @@ describe('RisuNestStorageDashboard', () => {
         const actionRow = target.querySelector<HTMLElement>('[data-storage-action-row]')
         const lists = [...target.querySelectorAll<HTMLElement>('[data-storage-backup-list]')]
         expect(actionRow).not.toBeNull()
-        expect(lists).toHaveLength(2)
+        expect(lists).toHaveLength(4)
         expect(lists.every((list) => Boolean(list.compareDocumentPosition(actionRow!) & Node.DOCUMENT_POSITION_FOLLOWING))).toBe(true)
     })
 
@@ -232,5 +264,69 @@ describe('RisuNestStorageDashboard', () => {
         await vi.waitFor(() => expect(target.textContent).toContain('Storage totals may be out of date.'))
         expect(target.textContent).toContain('Total data')
         expect(target.textContent).toContain('Retry')
+    })
+
+    it('restores a snapshot from its row after confirmation and restarts through the guarded flow', async () => {
+        const target = setup()
+        alerts.alertConfirm.mockResolvedValue(true)
+        maintenance.restoreNativePersistentSnapshot.mockImplementation(async (actions) => {
+            const chosen = await actions.choose([{ id: 'snapshot.db', reason: 'manual', reclaimableBytes: 0, bytes: 1024, modifiedAt: 1 }])
+            if (chosen === null || !(await actions.confirm())) return false
+            await actions.restart()
+            return true
+        })
+        await vi.waitFor(() => expect(exact(target, 'Restore')).toBeDefined())
+
+        exact(target, 'Restore')!.click()
+
+        await vi.waitFor(() => expect(maintenance.restartNativeApp).toHaveBeenCalledOnce())
+        expect(maintenance.restoreNativePersistentSnapshot).toHaveBeenCalledOnce()
+        expect(alerts.alertConfirm).toHaveBeenCalledWith(languageEnglish.restoreLocalSnapshotConfirm)
+        expect(languageKorean.restoreLocalSnapshotConfirm).toBe('현재 데이터를 이 로컬 스냅샷으로 교체하고 앱을 다시 시작할까요?')
+    })
+
+    it('lists sync backups with restore and delete, and clears temporary files, through the dashboard actions', async () => {
+        const target = setup(Promise.resolve(stats), [serverBackup])
+        alerts.alertConfirm.mockResolvedValue(true)
+        server.restoreServerSyncBackup.mockResolvedValue(undefined)
+        server.deleteServerSyncBackup.mockResolvedValue(undefined)
+        server.cleanupServerSyncCache.mockResolvedValue({ totalBytes: 512, protectedBytes: 512, reclaimableBytes: 0, blockedReason: null })
+        await vi.waitFor(() => expect(button(target, syncText.restoreRemoteBackup)).toBeDefined())
+
+        button(target, syncText.restoreRemoteBackup)!.click()
+        await vi.waitFor(() => expect(server.restoreServerSyncBackup).toHaveBeenCalledExactlyOnceWith('synthetic-id', 'remote'))
+        expect(alerts.alertConfirm).toHaveBeenCalledWith(syncText.management.restoreConfirm)
+
+        const syncList = target.querySelector<HTMLElement>('[data-storage-backup-list="sync-backups"]')!
+        expect(syncList.textContent).toContain(new Date(5).toLocaleString())
+        const remove = [...syncList.querySelectorAll<HTMLButtonElement>('button')].find((candidate) => candidate.textContent?.trim() === 'Remove')!
+        await vi.waitFor(() => expect(remove.disabled).toBe(false))
+        remove.click()
+        await vi.waitFor(() => expect(server.deleteServerSyncBackup).toHaveBeenCalledExactlyOnceWith('synthetic-id'))
+        expect(alerts.alertConfirm).toHaveBeenCalledWith(syncText.management.deleteConfirm)
+
+        const clean = button(target, syncText.management.clean)!
+        await vi.waitFor(() => expect(clean.disabled).toBe(false))
+        clean.click()
+        await vi.waitFor(() => expect(server.cleanupServerSyncCache).toHaveBeenCalledOnce())
+        expect(alerts.alertConfirm).toHaveBeenCalledWith(syncText.management.cleanConfirm)
+        expect(target.querySelector('[data-storage-backup-list="temp-files"]')?.textContent).toContain(syncText.management.reclaimable)
+    })
+
+    it('marks a running action busy on its button instead of swapping the label', async () => {
+        const target = setup()
+        let finish: ((value: { id: string; revision: number; bytes: number; durationMs: number }) => void) | undefined
+        maintenance.createNativePersistentSnapshot.mockImplementation(() => new Promise((resolve) => { finish = resolve }))
+        await vi.waitFor(() => expect(button(target, 'Create now')).toBeDefined())
+        const create = button(target, 'Create now')!
+
+        create.click()
+
+        await vi.waitFor(() => expect(create.getAttribute('aria-busy')).toBe('true'))
+        expect(create.disabled).toBe(true)
+        expect(create.textContent).toContain('Create now')
+        expect(create.textContent).not.toContain('Loading...')
+        finish?.({ id: 'new.db', revision: 1, bytes: 1, durationMs: 1 })
+        await vi.waitFor(() => expect(create.getAttribute('aria-busy')).toBeNull())
     })
 })

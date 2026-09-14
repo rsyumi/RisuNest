@@ -1275,9 +1275,6 @@ export const languageEnglish = {
     webdeeplwarn: "This option is not recommended for use with web version, as it can cause CORS errors.",
     saveBackupLocal: "Save Backup Locally",
     loadBackupLocal: "Load Backup Locally",
-    restoreLocalSnapshot: "Restore Local Snapshot",
-    chooseLocalSnapshot: "Choose a local snapshot",
-    noLocalSnapshots: "No local snapshots are available.",
     restoreLocalSnapshotConfirm: "Replace the current data with this local snapshot and restart the app?",
     topP: "Top P",
     genTimes: "Generation Choices",
@@ -2116,6 +2113,12 @@ export const languageEnglish = {
             plugins: 'Plugin data',
             snapshots: 'Snapshots',
             conflictBackups: 'Conflict backups',
+            restoreSnapshot: 'Restore',
+            snapshotReasons: {
+                manual: 'Created manually',
+                periodic: 'Automatic',
+                preRestore: 'Kept before a restore',
+            },
             counts: '{0} characters · {1} chats · {2} messages',
             subMetrics:
                 'Chat attachments {0} (included in images & media) · Plugin data {1}',
@@ -2173,7 +2176,7 @@ export const languageEnglish = {
             exportFile: 'Export',
             groupRestore: 'Restore',
             restoreHelp:
-                "Restores from a snapshot kept on this device or from another app's backup.",
+                "Restores from another app's backup. Snapshots kept on this device are restored from the snapshot list under Storage.",
             groupAccount: 'Official account',
             accountHelp:
                 'Uploads a backup to your RisuAI account or downloads it. Chat attachments are not included.',

@@ -6,6 +6,7 @@ import type {
 } from './nativePersistentMaintenance'
 import type { SyncConflictBackupEntry } from './sync/syncConflictBackup'
 import type {
+    ServerSyncBackupCursor,
     ServerSyncBackupInventory,
     ServerSyncCacheUsage,
 } from './sync/serverSyncProduction'
@@ -35,7 +36,8 @@ export interface RisuNestStorageDashboardDependencies {
     getStats(): Promise<NativePersistentStorageStats>
     listSnapshots(): Promise<NativeSnapshotInfo[]>
     listConflictBackups(): Promise<SyncConflictBackupEntry[]>
-    getServerBackups(): Promise<ServerSyncBackupInventory>
+    /** The newest page, or the page before `before` when a cursor is given. */
+    getServerBackups(before?: ServerSyncBackupCursor): Promise<ServerSyncBackupInventory>
     getTemp(): Promise<ServerSyncCacheUsage>
     cleanupTemp(): Promise<ServerSyncCacheUsage>
     previewGc(): Promise<NativeAssetGcResult>
@@ -43,6 +45,7 @@ export interface RisuNestStorageDashboardDependencies {
     deleteSnapshot(id: string): Promise<void>
     deleteConflictBackup(id: string): Promise<void>
     deleteServerBackup(id: string): Promise<void>
+    restoreServerBackup(id: string, side: 'local' | 'remote'): Promise<void>
     createSnapshot(reason: string): Promise<NativeSnapshotCreated>
 }
 
@@ -277,6 +280,28 @@ export function createRisuNestStorageDashboard(
                 await deps.deleteServerBackup(id)
                 invalidatePendingReloads()
                 await reload()
+            })
+        },
+        async restoreServerBackup(id: string, side: 'local' | 'remote') {
+            return run(`restore-server-backup:${id}:${side}`, async () => {
+                await deps.restoreServerBackup(id, side)
+                invalidatePendingReloads()
+                await reload()
+            })
+        },
+        /** Appends the page before the last loaded one to the server backup list. */
+        async loadMoreServerBackups() {
+            return run('more-server-backups', async () => {
+                const current = state.serverBackups
+                if (!current?.next) return
+                const older = await deps.getServerBackups(current.next)
+                if (state.serverBackups !== current) return
+                update({
+                    serverBackups: {
+                        ...older,
+                        items: [...current.items, ...older.items],
+                    },
+                })
             })
         },
         async createSnapshot() {

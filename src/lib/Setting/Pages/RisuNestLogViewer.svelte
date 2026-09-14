@@ -5,6 +5,7 @@
     import SettingGroup from '../RisuNest/SettingGroup.svelte'
     import SettingRow from '../RisuNest/SettingRow.svelte'
     import SettingToggle from '../RisuNest/SettingToggle.svelte'
+    import SettingButton from '../RisuNest/SettingButton.svelte'
     import {
         getNativeLogFilePath,
         getNativeLogTail,
@@ -23,11 +24,10 @@
     let fileLogEnabled = $state(getDeviceSettings().nativeFileLogEnabled)
     let fileLogPath = $state('')
     let fileLogUpdatePending = $state(false)
+    let pending = $state<'view' | 'copy' | null>(null)
     let viewRequest = 0
     let copyRequest = 0
     let clipboardWriteQueue = Promise.resolve()
-
-    const buttonClass = 'bg-darkbutton border border-darkborderc rounded-md px-4 py-2 text-textcolor shadow-xs transition-colors duration-200 hover:bg-selected focus-visible:outline focus-visible:outline-2 focus-visible:outline-darkborderc focus-visible:outline-offset-2'
 
     function formatLog(logEntries: NativeLogEntry[]) {
         return logEntries
@@ -75,6 +75,7 @@
 
     async function viewLog() {
         const request = ++viewRequest
+        pending = 'view'
         try {
             const freshEntries = await getNativeLogTail()
             if (request !== viewRequest) return
@@ -85,11 +86,14 @@
             alertMd(text ? fenceLog(text) : language.risuNest.diag.logEmpty)
         } catch {
             if (request === viewRequest) errorMessage = language.risuNest.diag.actionFailed
+        } finally {
+            if (request === viewRequest) pending = null
         }
     }
 
     async function copyLog() {
         const request = ++copyRequest
+        pending = 'copy'
         try {
             const freshEntries = await getNativeLogTail()
             if (request !== copyRequest) return
@@ -97,6 +101,9 @@
             logLoaded = true
             errorMessage = ''
             const text = formatLog(freshEntries) || language.risuNest.diag.logEmpty
+            // The button is free again once the log is read; a slow clipboard
+            // write is serialized below, so a repeat request cannot reorder it.
+            pending = null
             const pendingWrite = clipboardWriteQueue.then(async () => {
                 if (request !== copyRequest) return
                 try {
@@ -118,6 +125,8 @@
             await pendingWrite
         } catch {
             if (request === copyRequest) errorMessage = language.risuNest.diag.actionFailed
+        } finally {
+            if (request === copyRequest) pending = null
         }
     }
 
@@ -148,12 +157,12 @@
                 <p class="mt-1 text-sm text-textcolor2" role="status" aria-live="polite">{language.risuNest.diag.logEmpty}</p>
             {/if}
         {/snippet}
-        <button class={buttonClass} data-view-log onclick={viewLog}>
+        <SettingButton data-view-log busy={pending === 'view'} onclick={viewLog}>
             {language.risuNest.diag.viewLog}
-        </button>
-        <button class={buttonClass} data-copy-log onclick={() => void copyLog()}>
+        </SettingButton>
+        <SettingButton data-copy-log busy={pending === 'copy'} onclick={() => void copyLog()}>
             {language.risuNest.diag.copyLog}
-        </button>
+        </SettingButton>
     </SettingRow>
     <SettingRow inline label={language.risuNest.diag.fileLog} help={language.risuNest.diag.fileLogHelp}>
         {#snippet below()}

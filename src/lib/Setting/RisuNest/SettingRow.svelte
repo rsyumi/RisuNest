@@ -15,14 +15,18 @@
         inline?: boolean
         /** Extra content under the help text, such as a status line. */
         below?: Snippet
-        /** The control, aligned to the right on wide panels. */
+        /**
+         * The control, aligned to the right on wide panels. It never takes
+         * more than half the row, so a wide group of buttons wraps instead of
+         * squeezing the label and help text.
+         */
         children?: Snippet
     }
 
     let { label, help, labelFor, inline = false, below, children, class: className = '', ...rest }: Props = $props()
 </script>
 
-<div {...rest} class="grid items-center gap-x-6 px-4 py-3 {inline ? 'grid-cols-[minmax(0,1fr)_auto] gap-y-0' : 'grid-cols-1 gap-y-2 @xl:grid-cols-[minmax(0,1fr)_auto]'} {className}">
+<div {...rest} class="grid items-center gap-x-6 px-4 py-3 {inline ? 'grid-cols-[minmax(0,1fr)_auto] gap-y-0' : 'grid-cols-1 gap-y-2 @xl:grid-cols-[minmax(50%,1fr)_auto]'} {className}">
     <div class="min-w-0">
         {#if label}
             {#if labelFor}

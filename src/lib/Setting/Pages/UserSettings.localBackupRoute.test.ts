@@ -23,7 +23,7 @@ describe('UserSettings local backup route', () => {
                     : parents
             if (
                 node.type === 'InlineComponent' &&
-                node.name === 'Button' &&
+                node.name === 'SettingButton' &&
                 /runRisuSaveOperation\(['"]import['"]\)/.test(
                     backup.slice(node.start, node.end),
                 )
@@ -83,10 +83,12 @@ describe('UserSettings local backup route', () => {
 
     it('moves RisuNest backup and sync controls to the dedicated page', async () => {
         const backupSource = await import('./RisuNestBackupRestore.svelte?raw')
+        const storageSource = await import('./RisuNestStorageDashboard.svelte?raw')
 
+        expect(storageSource.default).toContain('restoreNativePersistentSnapshot')
+        expect(source).not.toContain('restoreNativePersistentSnapshot')
         for (const control of [
             'runRisuSaveOperation',
-            'restoreNativePersistentSnapshot',
             'openSyncConflictBackups()',
             'getNativeOfficialAccountFlow().publish',
             'getNativeOfficialAccountFlow().restore',
@@ -99,8 +101,8 @@ describe('UserSettings local backup route', () => {
 
     it('keeps official account actions behind the existing account gate', async () => {
         const backupSource = await import('./RisuNestBackupRestore.svelte?raw')
-        const snapshot = backupSource.default.indexOf(
-            '{language.restoreLocalSnapshot}',
+        const restoreGroup = backupSource.default.indexOf(
+            '{language.risuNest.backup.groupRestore}',
         )
         const accountGate = backupSource.default.indexOf(
             '{#if isTauri && DBState.db.account}',
@@ -108,8 +110,8 @@ describe('UserSettings local backup route', () => {
         const officialRestore = backupSource.default.indexOf(
             '{language.risuNest.backup.officialRestore}',
         )
-        expect(snapshot).toBeGreaterThan(-1)
-        expect(accountGate).toBeGreaterThan(snapshot)
+        expect(restoreGroup).toBeGreaterThan(-1)
+        expect(accountGate).toBeGreaterThan(restoreGroup)
         expect(officialRestore).toBeGreaterThan(accountGate)
     })
 

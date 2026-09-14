@@ -3,6 +3,7 @@
   import { language } from "src/lang";
   import SettingGroup from "../RisuNest/SettingGroup.svelte";
   import SettingRow from "../RisuNest/SettingRow.svelte";
+  import SettingButton from "../RisuNest/SettingButton.svelte";
   import ServerAssetResidency from "./ServerAssetResidency.svelte";
   import ServerSyncConnect from "./ServerSyncConnect.svelte";
   import ServerSyncRegistrationInput from "./ServerSyncRegistrationInput.svelte";
@@ -38,6 +39,7 @@
   let snapshot = $state(controller.snapshot());
   let connecting = $state(false);
   let pausing = $state(false);
+  let disconnecting = $state(false);
   let actionError = $state("");
   let connectOpen = $state(false);
   let connectStage = $state<"code" | "review">("code");
@@ -57,7 +59,11 @@
     snapshot.result?.phase === "conflict" ? snapshot.result : undefined,
   );
   const busy = $derived(
-    connecting || pausing || snapshot.running || snapshot.replacing,
+    connecting ||
+      pausing ||
+      disconnecting ||
+      snapshot.running ||
+      snapshot.replacing,
   );
   const status = $derived(serverSyncStatus(snapshot, text, actionError));
   const progress = $derived(
@@ -157,11 +163,15 @@
     }
   }
   async function disconnect(): Promise<void> {
+    if (disconnecting) return;
+    disconnecting = true;
     actionError = "";
     try {
       await controller.unbind();
     } catch (cause) {
       actionError = serverSyncError(cause).code;
+    } finally {
+      disconnecting = false;
     }
   }
   async function reconcile(): Promise<void> {
@@ -184,10 +194,6 @@
       expectedHead: conflict.head,
     });
   }
-  const button =
-    "rounded border border-darkborderc px-3 py-2 text-sm hover:bg-selected disabled:cursor-not-allowed disabled:opacity-45";
-  const danger =
-    "rounded border border-danger-400/50 px-3 py-2 text-sm text-danger-400 hover:bg-danger-400/10 disabled:cursor-not-allowed disabled:opacity-45";
 </script>
 
 <SettingGroup
@@ -208,17 +214,11 @@
       </h3>
       <p class="text-sm opacity-80">{text.conflictHelp}</p>
       <div class="flex flex-wrap gap-2">
-        <button
-          type="button"
-          class="{button} bg-darkbutton"
-          disabled={busy}
-          onclick={() => resolve("keep-local")}>{text.keepLocal}</button
+        <SettingButton disabled={busy} onclick={() => resolve("keep-local")}
+          >{text.keepLocal}</SettingButton
         >
-        <button
-          type="button"
-          class="{button} bg-darkbutton"
-          disabled={busy}
-          onclick={() => resolve("keep-remote")}>{text.keepRemote}</button
+        <SettingButton disabled={busy} onclick={() => resolve("keep-remote")}
+          >{text.keepRemote}</SettingButton
         >
       </div>
     </div>
@@ -278,24 +278,23 @@
         </p>
       {/if}
       <div class="mt-3 flex flex-wrap gap-2">
-        <button
-          type="button"
-          class="{button} bg-darkbutton"
+        <SettingButton
+          busy={snapshot.running}
           disabled={busy || snapshot.status.registrationRequired}
           onclick={() => void controller.synchronize()}
-          >{refreshRequired ? text.refresh : text.syncNow}</button
+          >{refreshRequired ? text.refresh : text.syncNow}</SettingButton
         >
-        <button
-          type="button"
-          class={button}
-          disabled={connecting || pausing || snapshot.paused || refreshRequired}
-          onclick={() => void pause()}>{text.pause}</button
+        <SettingButton
+          variant="secondary"
+          busy={pausing}
+          disabled={connecting || snapshot.paused || refreshRequired}
+          onclick={() => void pause()}>{text.pause}</SettingButton
         >
-        <button
-          type="button"
-          class={danger}
+        <SettingButton
+          variant="danger"
+          busy={disconnecting}
           disabled={busy || snapshot.status.operationPending || refreshRequired}
-          onclick={() => void disconnect()}>{text.disconnect}</button
+          onclick={() => void disconnect()}>{text.disconnect}</SettingButton
         >
       </div>
       {#if snapshot.status.operationPending}<p class="mt-2 text-sm opacity-75">
@@ -303,11 +302,11 @@
         </p>{/if}
       {#if error === "epoch-reconciliation-required"}
         <p class="mt-2 text-sm opacity-75">{text.reconcileHelp}</p>
-        <button
-          type="button"
-          class="{button} mt-2 bg-darkbutton"
+        <SettingButton
+          class="mt-2"
+          busy={connecting}
           disabled={busy || refreshRequired}
-          onclick={() => void reconcile()}>{text.reconcile}</button
+          onclick={() => void reconcile()}>{text.reconcile}</SettingButton
         >
       {/if}
       {#if error && error !== "cancelled" && !replacingOpen}
@@ -318,15 +317,14 @@
     </div>
     <ServerAssetResidency disabled={busy || refreshRequired} />
     <SettingRow label={text.reregister} help={text.reregisterHelp}>
-      <button
-        type="button"
-        class={button}
+      <SettingButton
+        variant="secondary"
         disabled={busy || refreshRequired}
         aria-expanded={replacingOpen}
         onclick={() => {
           replacingOpen = !replacingOpen;
           connectKey++;
-        }}>{text.register}</button
+        }}>{text.register}</SettingButton
       >
     </SettingRow>
     {#if replacingOpen}
@@ -352,13 +350,11 @@
     {/if}
   {:else}
     <SettingRow label={text.connectRow} help={text.connectRowHelp}>
-      <button
-        type="button"
-        class="{button} bg-darkbutton"
+      <SettingButton
         aria-expanded={connectOpen}
         onclick={() => {
           connectOpen = !connectOpen;
-        }}>{text.enterCode}</button
+        }}>{text.enterCode}</SettingButton
       >
     </SettingRow>
     <div class="px-4 py-3" hidden={!connectOpen}>
@@ -374,14 +370,13 @@
     </div>
   {/if}
   <SettingRow label={text.backups} help={backupsHelp}>
-    <button
-      type="button"
-      class={button}
+    <SettingButton
+      variant="secondary"
       disabled={busy || refreshRequired}
       aria-expanded={backupsOpen}
       onclick={() => {
         backupsOpen = !backupsOpen;
-      }}>{text.viewList}</button
+      }}>{text.viewList}</SettingButton
     >
   </SettingRow>
   {#if backupsOpen}
@@ -391,14 +386,13 @@
   {/if}
   {#if snapshot.status?.configured}
     <SettingRow label={text.management.title} help={storageHelp}>
-      <button
-        type="button"
-        class={button}
+      <SettingButton
+        variant="secondary"
         disabled={busy || refreshRequired}
         aria-expanded={storageOpen}
         onclick={() => {
           storageOpen = !storageOpen;
-        }}>{text.viewList}</button
+        }}>{text.viewList}</SettingButton
       >
     </SettingRow>
     {#if storageOpen}
@@ -435,6 +429,11 @@
   }
   .status[data-tone="attention"] .status-dot {
     opacity: 1;
+  }
+  .status[data-tone="paused"] .status-dot {
+    background: transparent;
+    box-shadow: inset 0 0 0 1.5px currentColor;
+    opacity: 0.7;
   }
   .status[data-tone="working"] .status-dot {
     background: var(--risu-theme-primary-500);
@@ -484,10 +483,6 @@
     border-radius: 0.5rem;
     padding: 0.85rem 1rem;
     background: color-mix(in srgb, var(--risu-theme-danger-400) 6%, transparent);
-  }
-  button:focus-visible {
-    outline: 2px solid currentColor;
-    outline-offset: 3px;
   }
   @keyframes pulse {
     50% {

@@ -1,10 +1,10 @@
 <script lang="ts">
     import { onDestroy, onMount } from 'svelte'
     import { language } from 'src/lang'
-    import Button from 'src/lib/UI/GUI/Button.svelte'
     import SettingGroup from '../RisuNest/SettingGroup.svelte'
     import SettingRow from '../RisuNest/SettingRow.svelte'
     import SettingToggle from '../RisuNest/SettingToggle.svelte'
+    import SettingButton from '../RisuNest/SettingButton.svelte'
     import { getDetailedOSLabel } from 'src/ts/platform'
     import { getDeviceSettings, subscribeDeviceSettings, updateDeviceSettings } from 'src/ts/storage/deviceSettings'
     import { androidGenerationNotificationsEnabled } from 'src/ts/androidGenerationKeepAlive'
@@ -76,7 +76,7 @@
                     : 'border-draculared bg-draculared/10'}`}
             ><span class="h-2 w-2 rounded-full {notificationStatus ? 'bg-success-500' : 'bg-draculared'}" aria-hidden="true"></span>{notificationStatus ? language.risuNest.platform.notificationsOn : language.risuNest.platform.notificationsOff}</span>
         {/if}
-        <Button size="sm" styled="outlined" onclick={openNotificationSettings}>{language.risuNest.platform.openSettings}</Button>
+        <SettingButton variant="secondary" onclick={openNotificationSettings}>{language.risuNest.platform.openSettings}</SettingButton>
     </SettingRow>
     <SettingRow inline label={language.risuNest.platform.keepAlive} help={language.risuNest.platform.keepAliveHelp}>
         {#snippet below()}

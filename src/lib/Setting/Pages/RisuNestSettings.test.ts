@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import settingsRawSource from '../Settings.svelte?raw'
 import pageRawSource from './RisuNestSettings.svelte?raw'
 import backupRestoreRawSource from './RisuNestBackupRestore.svelte?raw'
+import storageRawSource from './RisuNestStorageDashboard.svelte?raw'
 import tauriLibRawSource from '../../../../src-tauri/src/lib.rs?raw'
 import { languageEnglish } from 'src/lang/en'
 import { languageKorean } from 'src/lang/ko'
@@ -11,6 +12,7 @@ const normalizeNewlines = (source: string) => source.replace(/\r\n?/g, '\n')
 const settingsSource = normalizeNewlines(settingsRawSource)
 const pageSource = normalizeNewlines(pageRawSource)
 const backupRestoreSource = normalizeNewlines(backupRestoreRawSource)
+const storageSource = normalizeNewlines(storageRawSource)
 const tauriLibSource = normalizeNewlines(tauriLibRawSource)
 
 describe('RisuNest settings navigation', () => {
@@ -118,17 +120,15 @@ describe('RisuNest backup and restore layout', () => {
         )
     })
 
-    it('keeps local snapshot restore above PocketRisu restore', () => {
-        const localSnapshotRestore = backupRestoreSource.search(
-            /\{language\.restoreLocalSnapshot\}<\/Button\s*>/,
-        )
-        const pocketRisuRestore = backupRestoreSource.search(
-            /\{language\.loadPocketRisuBackup\}<\/Button\s*>/,
-        )
-
-        expect(localSnapshotRestore).toBeGreaterThanOrEqual(0)
-        expect(pocketRisuRestore).toBeGreaterThanOrEqual(0)
-        expect(localSnapshotRestore).toBeLessThan(pocketRisuRestore)
+    it('restores local snapshots from the storage snapshot list instead of a popup', () => {
+        expect(backupRestoreSource).not.toContain('restoreLocalSnapshot')
+        expect(backupRestoreSource).not.toContain('alertSelect')
+        expect(storageSource).toContain('restoreNativePersistentSnapshot')
+        expect(storageSource).toContain('alertConfirm(language.restoreLocalSnapshotConfirm)')
+        const restore = storageSource.indexOf('{strings.restoreSnapshot}')
+        const remove = storageSource.indexOf('{language.remove}')
+        expect(restore).toBeGreaterThanOrEqual(0)
+        expect(restore).toBeLessThan(remove)
     })
 })
 

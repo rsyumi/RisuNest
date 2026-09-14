@@ -3,6 +3,7 @@
   import { language } from "src/lang";
   import SegmentedButtons from "../RisuNest/SegmentedButtons.svelte";
   import SettingRow from "../RisuNest/SettingRow.svelte";
+  import SettingButton from "../RisuNest/SettingButton.svelte";
   import { formatRisuNestStorageBytes as bytes } from "src/ts/storage/risuNestStorageDashboard";
   import { serverSyncError } from "src/ts/storage/sync/serverSync";
   import {
@@ -15,7 +16,8 @@
   } from "src/ts/storage/sync/serverAssetResidency";
   let { disabled = false }: { disabled?: boolean } = $props();
   let status = $state<AssetResidencyStatus>();
-  let busy = $state(false);
+  let running = $state<"policy" | "evict" | null>(null);
+  const busy = $derived(running !== null);
   let error = $state("");
   let freed = $state(0);
   const text = $derived(language.risuNest.serverSync.residency);
@@ -24,11 +26,12 @@
     { value: "full" as const, label: text.full },
     { value: "remote" as const, label: text.remote },
   ]);
-  const button =
-    "rounded border border-darkborderc px-3 py-2 text-sm hover:bg-selected disabled:opacity-40 disabled:cursor-not-allowed";
-  async function run(action: () => Promise<AssetResidencyStatus>) {
+  async function run(
+    action: () => Promise<AssetResidencyStatus>,
+    kind: "policy" | "evict" = "policy",
+  ) {
     if (busy) return;
-    busy = true;
+    running = kind;
     error = "";
     freed = 0;
     try {
@@ -42,7 +45,7 @@
         /* Keep the last known counts. */
       }
     } finally {
-      busy = false;
+      running = null;
     }
   }
   onMount(() => {
@@ -84,18 +87,17 @@
     role="radiogroup"
     onchange={(next) => run(() => setAssetResidencyPolicy(next))}
   />
-  <button
-    type="button"
-    class={button}
+  <SettingButton
+    variant="secondary"
+    busy={running === "evict"}
     disabled={busy || disabled || policy !== "remote"}
-    onclick={() => run(evictLocalAssets)}>{text.clean}</button
+    onclick={() => run(evictLocalAssets, "evict")}>{text.clean}</SettingButton
   >
-  {#if busy}<button
-      type="button"
-      class={button}
+  {#if busy}<SettingButton
+      variant="secondary"
       onclick={() =>
         cancelAssetResidencyOperation().catch((cause) => {
           error = serverSyncError(cause).code;
-        })}>{text.cancel}</button
+        })}>{text.cancel}</SettingButton
     >{/if}
 </SettingRow>

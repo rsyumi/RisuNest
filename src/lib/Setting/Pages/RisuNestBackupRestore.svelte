@@ -1,22 +1,13 @@
 <script lang="ts">
     import { onDestroy } from 'svelte'
     import { language } from 'src/lang'
-    import {
-        alertConfirm,
-        alertError,
-        alertNormal,
-        alertSelect,
-    } from 'src/ts/alert'
+    import { alertConfirm, alertError, alertNormal } from 'src/ts/alert'
     import { isTauri, isTauriAndroid, isTauriDesktop } from 'src/ts/platform'
     import { LoadLocalBackup } from 'src/ts/drive/backuplocal'
     import { openSyncConflictBackups } from 'src/ts/storage/sync/syncConflictRestore'
-    import Button from 'src/lib/UI/GUI/Button.svelte'
     import SettingGroup from '../RisuNest/SettingGroup.svelte'
     import SettingRow from '../RisuNest/SettingRow.svelte'
-    import {
-        restoreNativePersistentSnapshot,
-        restartNativeApp,
-    } from 'src/ts/storage/nativePersistentMaintenance'
+    import SettingButton from '../RisuNest/SettingButton.svelte'
     import { getNativeOfficialAccountFlow } from 'src/ts/storage/sync/nativeOfficialAccountFlow'
     import { DBState } from 'src/ts/stores.svelte'
     import {
@@ -39,7 +30,6 @@
     import { nativeFileJobProgressText } from 'src/ts/gui/nativeFileJobProgress'
 
     let nativeAccountBusy = $state(false)
-    let snapshotRestoreBusy = $state(false)
     let nativePublishController = $state<AbortController | null>(null)
     let risuSaveOperation = $derived($nativeFileOperation?.kind ?? null)
     let risuSaveStatus = $derived($nativeFileOperation?.status)
@@ -122,36 +112,6 @@
         }
     }
 
-    async function restoreLocalSnapshot(): Promise<void> {
-        if (snapshotRestoreBusy) return
-        snapshotRestoreBusy = true
-        try {
-            await restoreNativePersistentSnapshot({
-                choose: async (snapshots) => {
-                    const labels = snapshots.map(
-                        (snapshot) =>
-                            `${new Date(snapshot.modifiedAt).toLocaleString()} (${snapshot.bytes / (1024 * 1024) >= 1 ? `${(snapshot.bytes / (1024 * 1024)).toFixed(1)} MiB` : `${Math.max(1, Math.round(snapshot.bytes / 1024))} KiB`})`,
-                    )
-                    const selected = Number(
-                        await alertSelect(
-                            [...labels, language.cancel],
-                            language.chooseLocalSnapshot,
-                        ),
-                    )
-                    return snapshots[selected]?.id ?? null
-                },
-                confirm: () =>
-                    alertConfirm(language.restoreLocalSnapshotConfirm),
-                restart: restartNativeApp,
-                onEmpty: () => alertNormal(language.noLocalSnapshots),
-            })
-        } catch {
-            alertError(language.risuNest.backup.actionFailed)
-        } finally {
-            snapshotRestoreBusy = false
-        }
-    }
-
     async function loadPocketRisuBackup(): Promise<void> {
         if (isTauri) return runRisuSaveOperation('import')
         if (
@@ -227,27 +187,28 @@
                     aria-live="polite"
                 >
                     <span>{nativeFileJobProgressText(risuSaveStatus)}</span>
-                    <Button
-                        styled="outlined"
-                        size="sm"
+                    <SettingButton
+                        variant="secondary"
                         onclick={cancelActiveNativeFileOperation}
-                        >{language.cancelRisuSaveOperation}</Button
+                        >{language.cancelRisuSaveOperation}</SettingButton
                     >
                 </div>
             {/if}
         {/snippet}
         {#if !isTauri || isTauriDesktop || isTauriAndroid}
-            <Button
+            <SettingButton
+                busy={risuSaveOperation === 'import'}
                 disabled={risuSaveOperation !== null}
                 onclick={() => runRisuSaveOperation('import')}
-                >{language.risuNest.backup.importFile}</Button
+                >{language.risuNest.backup.importFile}</SettingButton
             >
         {/if}
         {#if !isTauri || isTauriDesktop || isTauriAndroid}
-            <Button
+            <SettingButton
+                busy={risuSaveOperation === 'export'}
                 disabled={risuSaveOperation !== null}
                 onclick={() => runRisuSaveOperation('export')}
-                >{language.risuNest.backup.exportFile}</Button
+                >{language.risuNest.backup.exportFile}</SettingButton
             >
         {/if}
     </SettingRow>
@@ -256,20 +217,13 @@
         label={language.risuNest.backup.groupRestore}
         help={language.risuNest.backup.restoreHelp}
     >
-        {#if isTauri}
-            <Button
-                disabled={snapshotRestoreBusy}
-                onclick={restoreLocalSnapshot}
-                >{language.restoreLocalSnapshot}</Button
-            >
-        {/if}
-        <Button
+        <SettingButton
             disabled={risuSaveOperation !== null}
             onclick={loadPocketRisuBackup}
-            >{language.loadPocketRisuBackup}</Button
+            >{language.loadPocketRisuBackup}</SettingButton
         >
-        <Button styled="outlined" onclick={() => openSyncConflictBackups()}
-            >{language.syncConflictBackups}</Button
+        <SettingButton variant="secondary" onclick={() => openSyncConflictBackups()}
+            >{language.syncConflictBackups}</SettingButton
         >
     </SettingRow>
     {#if isTauri && DBState.db.account}
@@ -278,17 +232,23 @@
             label={language.risuNest.backup.groupAccount}
             help={language.risuNest.backup.accountHelp}
         >
-            <Button disabled={nativeAccountBusy} onclick={publishOfficialBackup}
-                >{language.risuNest.backup.officialPublish}</Button
+            <SettingButton
+                busy={nativePublishController !== null}
+                disabled={nativeAccountBusy}
+                onclick={publishOfficialBackup}
+                >{language.risuNest.backup.officialPublish}</SettingButton
             >
-            <Button disabled={nativeAccountBusy} onclick={restoreOfficialBackup}
-                >{language.risuNest.backup.officialRestore}</Button
+            <SettingButton
+                busy={nativeAccountBusy && nativePublishController === null}
+                disabled={nativeAccountBusy}
+                onclick={restoreOfficialBackup}
+                >{language.risuNest.backup.officialRestore}</SettingButton
             >
             {#if nativePublishController}
-                <Button
-                    styled="outlined"
+                <SettingButton
+                    variant="secondary"
                     onclick={() => nativePublishController?.abort()}
-                    >{language.risuNest.backup.officialCancel}</Button
+                    >{language.risuNest.backup.officialCancel}</SettingButton
                 >
             {/if}
         </SettingRow>

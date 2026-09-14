@@ -1113,9 +1113,6 @@ export const languageKorean = {
     "webdeeplwarn": "이 옵션은 웹에서는 제대로 작동하지 않을 수 있습니다.",
     "saveBackupLocal": "로컬 백업 저장",
     "loadBackupLocal": "로컬 백업 불러오기",
-    "restoreLocalSnapshot": "로컬 스냅샷 복원",
-    "chooseLocalSnapshot": "로컬 스냅샷 선택",
-    "noLocalSnapshots": "사용 가능한 로컬 스냅샷이 없습니다.",
     "restoreLocalSnapshotConfirm": "현재 데이터를 이 로컬 스냅샷으로 교체하고 앱을 다시 시작할까요?",
     "topP": "Top P",
     "genTimes": "생성 횟수",
@@ -1923,6 +1920,12 @@ export const languageKorean = {
             plugins: '플러그인 데이터',
             snapshots: '스냅샷',
             conflictBackups: '충돌 백업',
+            restoreSnapshot: '복원',
+            snapshotReasons: {
+                manual: '직접 만듦',
+                periodic: '자동',
+                preRestore: '복원 전 보관',
+            },
             counts: '캐릭터 {0}개 · 대화 {1}개 · 메시지 {2}개',
             subMetrics:
                 '채팅 첨부 {0} (이미지·미디어에 포함) · 플러그인 데이터 {1}',
@@ -1981,7 +1984,7 @@ export const languageKorean = {
             exportFile: '내보내기',
             groupRestore: '복원',
             restoreHelp:
-                '이 기기에 보관된 스냅샷이나 다른 앱의 백업으로 되돌립니다.',
+                '다른 앱의 백업으로 되돌립니다. 이 기기에 보관된 스냅샷은 저장 공간의 스냅샷 목록에서 되돌릴 수 있습니다.',
             groupAccount: '공식 계정',
             accountHelp:
                 'RisuAI 계정 서버에 백업을 올리거나 내려받습니다. 채팅 첨부 파일은 포함되지 않습니다.',

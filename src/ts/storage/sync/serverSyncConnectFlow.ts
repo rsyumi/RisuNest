@@ -59,7 +59,12 @@ export function serverSyncErrorHelp(code: string, text: ServerSyncText): string 
   }
 }
 
-export type ServerSyncStatusTone = "idle" | "connected" | "working" | "attention";
+export type ServerSyncStatusTone =
+  | "idle"
+  | "connected"
+  | "paused"
+  | "working"
+  | "attention";
 export interface ServerSyncStatusView {
   label: string;
   tone: ServerSyncStatusTone;
@@ -83,7 +88,7 @@ export function serverSyncStatus(
       label: snapshot.progress ? text.progress[snapshot.progress] : text.running,
       tone: "working",
     };
-  if (snapshot.paused) return { label: text.paused, tone: "connected" };
+  if (snapshot.paused) return { label: text.paused, tone: "paused" };
   if (snapshot.status?.operationPending)
     return { label: text.pending, tone: "connected" };
   if (snapshot.status?.configured)

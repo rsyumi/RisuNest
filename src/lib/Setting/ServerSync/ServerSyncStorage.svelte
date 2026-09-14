@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { language } from "src/lang";
   import { alertConfirm } from "src/ts/alert";
+  import SettingButton from "../RisuNest/SettingButton.svelte";
   import { formatRisuNestStorageBytes as bytes } from "src/ts/storage/risuNestStorageDashboard";
   import { serverSyncError } from "src/ts/storage/sync/serverSync";
   import {
@@ -22,7 +23,8 @@
     $props();
   let inventory = $state<ServerSyncBackupInventory>();
   let cache = $state<ServerSyncCacheUsage>();
-  let busy = $state(false);
+  let pending = $state("");
+  const busy = $derived(pending !== "");
   let error = $state("");
   const text = $derived(language.risuNest.serverSync);
   const labels = $derived(text.management);
@@ -38,9 +40,10 @@
   async function action(
     run: () => Promise<unknown>,
     changed = false,
+    key = "refresh",
   ): Promise<void> {
     if (busy) return;
-    busy = true;
+    pending = key;
     error = "";
     try {
       await run();
@@ -52,27 +55,29 @@
         cache = undefined;
       }
     } finally {
-      busy = false;
+      pending = "";
       if (changed) onChange?.();
     }
   }
   async function remove(id: string): Promise<void> {
     if (await alertConfirm(labels.deleteConfirm))
-      await action(() => deleteServerSyncBackup(id), true);
+      await action(() => deleteServerSyncBackup(id), true, `remove:${id}`);
   }
   async function restore(id: string, side: "local" | "remote"): Promise<void> {
     if (await alertConfirm(labels.restoreConfirm))
-      await action(() => restoreServerSyncBackup(id, side), true);
+      await action(
+        () => restoreServerSyncBackup(id, side),
+        true,
+        `restore:${id}:${side}`,
+      );
   }
   async function clean(): Promise<void> {
     if (await alertConfirm(labels.cleanConfirm))
-      await action(cleanupServerSyncCache, true);
+      await action(cleanupServerSyncCache, true, "clean");
   }
   onMount(() => {
     void action(() => load());
   });
-  const button =
-    "rounded border border-darkborderc px-3 py-2 text-sm hover:bg-selected disabled:opacity-40 disabled:cursor-not-allowed";
 </script>
 
 <section
@@ -81,10 +86,12 @@
 >
   <div class="flex flex-wrap items-center justify-between gap-2">
     {#if section === "all"}<h3 class="font-bold">{labels.title}</h3>{/if}
-    <button
-      class="{button} ml-auto"
+    <SettingButton
+      variant="secondary"
+      class="ml-auto"
+      busy={pending === "refresh"}
       disabled={busy}
-      onclick={() => action(() => load())}>{labels.refresh}</button
+      onclick={() => action(() => load())}>{labels.refresh}</SettingButton
     >
   </div>
   {#if error}<p role="alert" class="text-sm">
@@ -113,26 +120,29 @@
           )}
         </p>
         <div class="flex flex-wrap gap-2">
-          <button
-            class={button}
+          <SettingButton
+            variant="secondary"
+            busy={pending === `restore:${item.id}:local`}
             disabled={busy ||
               !item.recoveryReady ||
               Boolean(item.blockedReason)}
             onclick={() => restore(item.id, "local")}
-            >{text.restoreLocalBackup} ({bytes(item.localBytes)})</button
+            >{text.restoreLocalBackup} ({bytes(item.localBytes)})</SettingButton
           >
-          <button
-            class={button}
+          <SettingButton
+            variant="secondary"
+            busy={pending === `restore:${item.id}:remote`}
             disabled={busy ||
               !item.recoveryReady ||
               Boolean(item.blockedReason)}
             onclick={() => restore(item.id, "remote")}
-            >{text.restoreRemoteBackup} ({bytes(item.remoteBytes)})</button
+            >{text.restoreRemoteBackup} ({bytes(item.remoteBytes)})</SettingButton
           >
-          <button
-            class={button}
+          <SettingButton
+            variant="secondary"
+            busy={pending === `remove:${item.id}`}
             disabled={busy || !item.deletable}
-            onclick={() => remove(item.id)}>{language.remove}</button
+            onclick={() => remove(item.id)}>{language.remove}</SettingButton
           >
         </div>
         {#if item.blockedReason}<p class="text-xs text-textcolor2">
@@ -140,10 +150,11 @@
           </p>{/if}
       </div>
     {/each}
-    {#if inventory.next}<button
-        class={button}
+    {#if inventory.next}<SettingButton
+        variant="secondary"
+        busy={pending === "more"}
         disabled={busy}
-        onclick={() => action(() => load(true))}>{labels.more}</button
+        onclick={() => action(() => load(true), false, "more")}>{labels.more}</SettingButton
       >{/if}
   {/if}
   {#if cache && section !== "backups"}
@@ -158,12 +169,13 @@
         {labels.protected}: {bytes(cache.protectedBytes)} · {labels.reclaimable}:
         {bytes(cache.reclaimableBytes)}
       </p>
-      <button
-        class={button}
+      <SettingButton
+        variant="secondary"
+        busy={pending === "clean"}
         disabled={busy ||
           cache.reclaimableBytes === 0 ||
           Boolean(cache.blockedReason)}
-        onclick={clean}>{labels.clean}</button
+        onclick={clean}>{labels.clean}</SettingButton
       >
       {#if cache.blockedReason}<p class="text-textcolor2">
           {cache.blockedReason}

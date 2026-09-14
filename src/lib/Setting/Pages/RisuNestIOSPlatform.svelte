@@ -4,9 +4,9 @@
   import { alertError } from "src/ts/alert";
   import { getDetailedOSLabel } from "src/ts/platform";
   import { getIOSNativeState, openIOSSettings } from "src/ts/iosNative";
-  import Button from "src/lib/UI/GUI/Button.svelte";
   import SettingGroup from "../RisuNest/SettingGroup.svelte";
   import SettingRow from "../RisuNest/SettingRow.svelte";
+  import SettingButton from "../RisuNest/SettingButton.svelte";
 
   let notifications = $state<boolean | null>(null);
   let os = $state("");
@@ -49,8 +49,8 @@
           : language.risuNest.platform.notificationsOff}</span
       >
     {/if}
-    <Button size="sm" styled="outlined" onclick={settings}
-      >{language.risuNest.platform.openSettings}</Button
+    <SettingButton variant="secondary" onclick={settings}
+      >{language.risuNest.platform.openSettings}</SettingButton
     >
   </SettingRow>
   <SettingRow

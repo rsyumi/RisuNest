@@ -128,9 +128,10 @@ describe("status and error copy", () => {
     expect(
       serverSyncStatus(bound(), text, "committed-refresh-pending"),
     ).toEqual({ label: text.refreshPending, tone: "attention" });
-    expect(serverSyncStatus({ ...bound(), paused: true }, text).label).toBe(
-      text.paused,
-    );
+    expect(serverSyncStatus({ ...bound(), paused: true }, text)).toEqual({
+      label: text.paused,
+      tone: "paused",
+    });
   });
   it("explains refresh and credential failures specifically and everything else generally", () => {
     expect(serverSyncErrorHelp("committed-refresh-pending", text)).toBe(
