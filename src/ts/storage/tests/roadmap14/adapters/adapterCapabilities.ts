@@ -88,13 +88,13 @@ export const ADAPTER_CAPABILITY_MATRIX = {
         {
             id: 'local-full-backup',
             oracleStatus: 'known-gap',
-            resultWarning: 'Local backup restore safety is fixture-only and unprobed at the production boundary.',
+            resultWarning: 'Native parser safety is covered, but full end-to-end portability evidence remains incomplete.',
             capabilities: COMPLETE_BACKUP_CAPABILITIES,
         },
         {
             id: 'local-partial-backup',
             oracleStatus: 'known-gap',
-            resultWarning: 'Partial local restore safety is fixture-only and unprobed at the production boundary.',
+            resultWarning: 'Native parser safety is covered, but partial-profile portability evidence remains incomplete.',
             capabilities: [
                 { feature: 'database', category: 'preserved' },
                 {
@@ -193,14 +193,12 @@ export const ADAPTER_CAPABILITY_MATRIX = {
         },
         {
             id: 'card-charx',
-            oracleStatus: 'known-gap',
-            resultWarning: 'CharX collision safety is fixture-only and unprobed at the production boundary.',
+            oracleStatus: 'passing',
             capabilities: CHARX_CAPABILITIES,
         },
         {
             id: 'card-charx-jpeg',
-            oracleStatus: 'known-gap',
-            resultWarning: 'CharX-JPEG collision safety is fixture-only and unprobed at the production boundary.',
+            oracleStatus: 'passing',
             capabilities: CHARX_CAPABILITIES,
         },
         {

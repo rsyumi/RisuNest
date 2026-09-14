@@ -28,6 +28,7 @@ test("accepts product code and RegExp.test polyfill", () => {
 test("rejects a test module in a dynamic chunk and a test framework", () => {
   for (const id of [
     "/src/foo.test.ts",
+    "/src/lib/ComponentHarness.test.svelte",
     "/benchmarks/streaming/fixture.ts",
     "/benchmarks/linux/main.ts",
     "/tests/support/helper.ts",

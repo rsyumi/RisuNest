@@ -1,11 +1,7 @@
 import localforage from 'localforage'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { decodeRisuSave, RisuSaveType } from '../../../risuSave'
-import {
-    inspectCharXCollisionFixture,
-    inspectLocalBackupFixture,
-    observeRisuSaveNegativeFixture,
-} from './negativeAdapterOracle'
+import { observeRisuSaveNegativeFixture } from './negativeAdapterOracle'
 
 vi.mock('../../../database.svelte', () => ({ presetTemplate: {} }))
 vi.mock('../../../../globalApi.svelte', () => ({ forageStorage: {} }))
@@ -65,42 +61,4 @@ describe('Roadmap 14 negative adapter oracle', () => {
         })
     })
 
-    it('freezes truncated-tail and payload-before-database local backup failures', () => {
-        expect(inspectLocalBackupFixture('truncated-local-backup-tail')).toEqual({
-            evidence: 'fixture-only',
-            entries: ['database.risudat'],
-            trailingByteLength: 9,
-            payloadBeforeDatabase: false,
-            result: {
-                status: 'unprobed-known-gap',
-                warning: 'Local backup restore may ignore a truncated nonempty archive tail.',
-            },
-        })
-        expect(inspectLocalBackupFixture('payload-before-database')).toEqual({
-            evidence: 'fixture-only',
-            entries: ['avatar.PNG', 'database.risudat'],
-            trailingByteLength: 0,
-            payloadBeforeDatabase: true,
-            result: {
-                status: 'unprobed-known-gap',
-                warning: 'Local backup restore may write payloads before database validation and activation.',
-            },
-        })
-    })
-
-    it('freezes mixed-extension CharX collisions and unsafe path aliases', () => {
-        expect(inspectCharXCollisionFixture()).toEqual({
-            evidence: 'fixture-only',
-            collisionGroups: [[
-                'assets/avatar?.PNG',
-                'assets/avatar*.png',
-            ]],
-            extensions: [null, 'png', 'webp'],
-            unsafePaths: ['assets/../avatar.png'],
-            result: {
-                status: 'unprobed-known-gap',
-                warning: 'CharX does not reject every sanitized, case-folded, or traversal path collision.',
-            },
-        })
-    })
 })

@@ -61,7 +61,7 @@ fn encode_canonical(value: &Value) -> Vec<u8> {
 }
 
 #[test]
-fn rust_reproduces_the_typescript_canonical_fixture_hash() {
+fn rust_test_oracle_matches_the_roadmap14_canonical_fixture_hash() {
     let manifest: Value = serde_json::from_str(COMPATIBILITY_MANIFEST).unwrap();
     let fixture: Value = serde_json::from_str(CANONICAL_PARITY_FIXTURE).unwrap();
     let expected = manifest["paritySha256"].as_str().unwrap();

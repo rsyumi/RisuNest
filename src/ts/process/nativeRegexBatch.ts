@@ -4,6 +4,7 @@ import { platform } from '@tauri-apps/plugin-os'
 import type { RegexExecutionPlan, RegexExecutionResult } from './regexExecutionPlan'
 import { classifyRegexSafePlan, type RegexSafePlan } from './regexSafePlan'
 
+// Measured pilot eligibility: exactly 500 rules and at least 256 KiB of input.
 const NATIVE_REGEX_BATCH_RULES = 500
 const NATIVE_REGEX_BATCH_MIN_INPUT_BYTES = 256 * 1024
 

@@ -43,7 +43,7 @@ export function isVerificationModule(id) {
       normalized,
     );
   }
-  return /(?:^|\/)(?:benchmarks|tests|__tests__|__fixtures__)(?:\/|$)|\.(?:test|spec|bench|testSupport)\.[cm]?[jt]sx?$/.test(
+  return /(?:^|\/)(?:benchmarks|tests|__tests__|__fixtures__)(?:\/|$)|\.(?:test|spec|bench|testSupport)\.(?:[cm]?[jt]sx?|svelte)$/.test(
     normalized,
   );
 }
