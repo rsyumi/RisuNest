@@ -78,6 +78,8 @@ async function launch() {
     if (!/^\d+$/.test(pid)) throw new Error('Android process unavailable')
     command(['forward', `tcp:${port}`, `localabstract:webview_devtools_remote_${pid}`])
     client = await connectVerifiedIdentity(port, packageName)
+    if (!(await client.evaluate("document.visibilityState === 'visible'")))
+        throw new Error('Android app is hidden; unlock the device before measuring')
     await waitForInteractive(client)
 }
 

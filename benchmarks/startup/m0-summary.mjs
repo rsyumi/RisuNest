@@ -30,6 +30,7 @@ for (const kind of ['reload', 'restart']) {
                 row.interaction.failure !== null ||
                 !row.interaction.inputAccepted ||
                 !row.interaction.scrollImmediateChanged ||
+                row.documentVisible !== true ||
                 row.stabilizationTimeout ||
                 !row.host ||
                 !row.calls.some((call) => call.command === 'pds_commit' && call.success) ||

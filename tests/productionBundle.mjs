@@ -9,6 +9,8 @@ const forbiddenMarkers = [
   "__streamingSmoke",
   "__startupMetrics",
   "__startupRecord",
+  "__startupObserveCall",
+  "M0-stage:",
   "risunest-m0-owner",
   "__testResponsesAPI",
   "resetOpenedFileListenersForTest",

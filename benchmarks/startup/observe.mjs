@@ -20,8 +20,38 @@ const observed = {
     '/src/ts/globalApi.svelte.ts': { saveDb: 'save-observer' },
 }
 
-export function instrumentSource(source, id) {
+export function instrumentSource(source, id, platform) {
     const normalizedId = id.replaceAll('\\', '/').split('?')[0]
+    if (
+        platform === 'android' &&
+        normalizedId.endsWith('/src/ts/storage/sqlitePersistentDataStore.ts')
+    ) {
+        const file = ts.createSourceFile(id, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+        const edits = []
+        const found = new Set()
+        const visit = (node) => {
+            const isInvoke = ts.isFunctionDeclaration(node) && node.name?.text === 'invokeStore'
+            const isCommit =
+                ts.isMethodDeclaration(node) &&
+                node.name?.getText(file) === 'commit' &&
+                node.parent.name?.text === 'SqlitePersistentDataStore'
+            if ((isInvoke || isCommit) && node.body) {
+                found.add(isInvoke ? 'invokeStore' : 'commit')
+                edits.push({
+                    at: node.body.getStart(file) + 1,
+                    text: `return window.__startupObserveCall(${isInvoke ? 'command' : "'pds_commit'"}, ${isInvoke ? 'async ' : ''}() => {`,
+                })
+                edits.push({ at: node.body.end - 1, text: '});' })
+            }
+            ts.forEachChild(node, visit)
+        }
+        visit(file)
+        if (found.size !== 2) throw new Error('Missing Android native store observation boundary')
+        for (const edit of edits.sort((a, b) => b.at - a.at)) {
+            source = source.slice(0, edit.at) + edit.text + source.slice(edit.at)
+        }
+        return source
+    }
     const suffix = Object.keys(observed).find((key) => normalizedId.endsWith(key))
     if (!suffix) return null
     const names =
@@ -117,8 +147,12 @@ export function instrumentSource(source, id) {
     return source
 }
 
-export function startupObservationPlugin() {
-    return { name: 'synthetic-startup-observation', enforce: 'pre', transform: instrumentSource }
+export function startupObservationPlugin(platform) {
+    return {
+        name: 'synthetic-startup-observation',
+        enforce: 'pre',
+        transform: (source, id) => instrumentSource(source, id, platform),
+    }
 }
 
 export function baselineFrontendPlugin() {

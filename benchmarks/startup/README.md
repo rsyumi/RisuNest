@@ -89,6 +89,8 @@ from Windows release results.
 The physical-device runner remains experimental until a complete run passes.
 A device that cannot finish startup has no latency or memory baseline, even when
 synthetic DB creation succeeded. Do not count failed preparation as measured samples.
+Unlock the physical device before launch. The runner rejects a hidden WebView,
+and the M0 summary rejects samples collected while the document was hidden.
 
 Use separate result files for every run. Output contains allowlisted numbers,
 fixed stage names and success flags, plus build provenance. It never stores
@@ -127,6 +129,12 @@ unmeasured. The summary reports the number of measured values for each metric.
 `observe.mjs` instruments existing function bodies only in the benchmark build.
 It preserves real return values, promises, native opens and revisions. Ordinary
 agent and production builds contain none of these observation hooks.
+
+Android observations wrap the store's build-only call sites. They do not replace
+the immutable Tauri bridge. Set `STARTUP_DIAGNOSTIC_STAGES=true` only for a
+diagnostic build to persist fixed operation stage names in the owned synthetic
+app's native log. Leave it unset for performance measurements, since logging
+adds native calls and disk writes.
 
 The optional `android-smoke.mjs` uses only `emulator-5580` named
 `risunest_startup_synthetic`, with a private ADB server on port 5038. Create that

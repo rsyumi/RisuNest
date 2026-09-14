@@ -17,6 +17,7 @@ import path from 'node:path'
 import { startupInstrumentation } from './android-observation.mjs'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import ts from 'typescript'
 
 test('M0 summary rejects a missing per-sample commit even when aggregate count is sufficient', async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'risunest-m0-summary-'))
@@ -34,6 +35,7 @@ test('M0 summary rejects a missing per-sample commit even when aggregate count i
                 scrollMs: 2,
             },
             stabilizationTimeout: false,
+            documentVisible: true,
             calls: [{ command: 'pds_commit', success: true, ms: 3 }],
             longTasks: [],
             usedHeapBytes: 1024,
@@ -58,6 +60,10 @@ test('M0 summary rejects a missing per-sample commit even when aggregate count i
         const valid = summarize()
         assert.equal(valid.status, 0, valid.stderr)
         assert.equal(JSON.parse(valid.stdout).groups.reload.samples, 20)
+        input.samples[0].documentVisible = false
+        await writeFile(file, JSON.stringify(input))
+        assert.notEqual(summarize().status, 0)
+        input.samples[0].documentVisible = true
         input.samples[1].calls.push(...input.samples[0].calls)
         input.samples[0].calls = []
         await writeFile(file, JSON.stringify(input))
@@ -70,9 +76,10 @@ test('M0 summary rejects a missing per-sample commit even when aggregate count i
     }
 })
 
-test('Android combined observer preserves IPC results and records completion', async () => {
+test('Android observer works with an immutable bridge and preserves promises and errors', async () => {
     const response = { revision: 17 }
-    const window = { fetch() {}, __TAURI_INTERNALS__: { invoke: async () => response } }
+    const bridge = Object.freeze({ invoke: async () => response })
+    const window = { fetch() {}, __TAURI_INTERNALS__: bridge }
     const run = new Function(
         'window',
         'localStorage',
@@ -88,10 +95,76 @@ test('Android combined observer preserves IPC results and records completion', a
             observe() {}
         },
     )
-    assert.equal(await window.__TAURI_INTERNALS__.invoke('pds_open'), response)
+    const pending = bridge.invoke('pds_open')
+    assert.equal(
+        window.__startupObserveCall('pds_open', () => pending),
+        pending,
+    )
+    assert.equal(await pending, response)
+    assert.equal(window.__TAURI_INTERNALS__, bridge)
     assert.equal(window.__startupMetrics.firstRevision, 17)
     assert.equal(window.__startupMetrics.calls[0].success, true)
     assert.ok(Number.isFinite(window.__startupMetrics.calls[0].ms))
+    const failure = new Error('synthetic failure')
+    const rejected = Promise.reject(failure)
+    assert.equal(
+        window.__startupObserveCall('pds_commit', () => rejected),
+        rejected,
+    )
+    await assert.rejects(rejected, (error) => error === failure)
+    assert.equal(window.__startupMetrics.calls[1].success, false)
+    assert.throws(
+        () =>
+            window.__startupObserveCall('pds_commit', () => {
+                throw failure
+            }),
+        (error) => error === failure,
+    )
+})
+
+test('Android build call sites preserve native error restoration and commit lifetime', async () => {
+    const source = `
+        async function invokeStore(command, args) {
+            try { return await invoke(command, args); } catch (error) { throw restoreStoreError(error); }
+        }
+        class SqlitePersistentDataStore {
+            commit(input) { return transport(input).catch(restoreStoreError); }
+        }
+    `
+    const id = '/src/ts/storage/sqlitePersistentDataStore.ts'
+    assert.equal(instrumentSource(source, id, 'windows'), null)
+    const output = ts.transpileModule(instrumentSource(source, id, 'android'), {
+        compilerOptions: { target: ts.ScriptTarget.ES2022 },
+    }).outputText
+    const calls = []
+    const restored = new Error('restored')
+    const pending = Promise.resolve(17)
+    const run = new Function(
+        'window',
+        'invoke',
+        'restoreStoreError',
+        'transport',
+        output + ';return {invokeStore, store: new SqlitePersistentDataStore()};',
+    )
+    const result = run(
+        {
+            __startupObserveCall(command, callback) {
+                calls.push(command)
+                return callback()
+            },
+        },
+        () => Promise.reject('native error'),
+        () => restored,
+        () => pending,
+    )
+    await assert.rejects(result.invokeStore('pds_open'), (error) => error === restored)
+    assert.equal(await result.store.commit({}), 17)
+    assert.deepEqual(calls, ['pds_open', 'pds_commit'])
+    const actual = await readFile(
+        new URL('../../src/ts/storage/sqlitePersistentDataStore.ts', import.meta.url),
+        'utf8',
+    )
+    assert.ok(instrumentSource(actual, id, 'android').includes('__startupObserveCall'))
 })
 
 test('asset counts reject a replacement generation with no aliases', async () => {
