@@ -2,10 +2,10 @@
 //! only server is the in-process loopback fixture and no account, token or
 //! network outside `127.0.0.1` is involved.
 use super::{
-    config, create, head_locator,
+    config, create,
     profiles::{self, Addressing, Profile},
     provider::capabilities as reported_capabilities,
-    request_cost_for, sigv4,
+    sigv4,
 };
 use crate::external_storage::{
     auth::{SecretBytes, SecretVault},
@@ -832,7 +832,7 @@ fn head_writes_send_exactly_one_request_and_map_a_failed_precondition() {
             Reply::Lost,
         ]);
         let (provider, handle) = opened(&test, "r2", &server).await;
-        let locator = head_locator(&handle).unwrap();
+        let locator = provider.head_locator(&handle).unwrap();
         let first = provider
             .compare_exchange_head(&handle, &locator, &ExpectedHead::Absent, &head, &cancel)
             .await
@@ -901,7 +901,7 @@ fn a_head_survives_a_plain_replacement_and_is_readable_again() {
             reply(200, &[("ETag", "\"head-9\"")], b"published-head".to_vec()),
         ]);
         let (provider, handle) = opened(&test, "r2", &server).await;
-        let locator = head_locator(&handle).unwrap();
+        let locator = provider.head_locator(&handle).unwrap();
         let receipt = provider
             .replace_head(&handle, &locator, &head, &cancel)
             .await
@@ -934,7 +934,7 @@ fn backblaze_reports_no_conditional_head_and_refuses_a_compare_exchange() {
         let test = dependencies();
         let server = WireServer::start(vec![one_descriptor()]);
         let (provider, handle) = opened(&test, "b2", &server).await;
-        let locator = head_locator(&handle).unwrap();
+        let locator = provider.head_locator(&handle).unwrap();
         assert_eq!(
             provider
                 .compare_exchange_head(
@@ -1095,7 +1095,7 @@ fn a_conditional_read_reports_not_modified_where_the_service_documents_it() {
         let test = dependencies();
         let server = WireServer::start(vec![one_descriptor(), reply(304, &[], Vec::new())]);
         let (provider, handle) = opened(&test, "r2", &server).await;
-        let locator = head_locator(&handle).unwrap();
+        let locator = provider.head_locator(&handle).unwrap();
         let directory = tempfile::tempdir().unwrap();
         let mut sink = SpoolSink::create(&directory.path().join("unchanged"), 64).unwrap();
         let token = VersionToken("\"head-7\"".into());
@@ -1374,7 +1374,7 @@ fn documented_failure_statuses_map_to_provider_kinds_without_a_server_message() 
             provider
                 .read_object(
                     &handle,
-                    &head_locator(&handle).unwrap(),
+                    &provider.head_locator(&handle).unwrap(),
                     None,
                     &mut sink,
                     &Cancellation::default(),
@@ -1514,7 +1514,7 @@ fn a_foreign_handle_or_locator_never_reaches_the_service() {
             ErrorKind::Corrupt
         );
         let alien = fake::repository();
-        assert!(head_locator(&alien).is_err());
+        assert!(provider.head_locator(&alien).is_err());
         assert_eq!(
             provider
                 .list_objects(&alien, Collection::Snapshots, None, 10, &cancel)
@@ -1533,7 +1533,7 @@ fn cancellation_during_a_body_stops_the_transfer() {
         let test = dependencies();
         let server = WireServer::start(vec![one_descriptor(), Reply::DelayedBody]);
         let (provider, handle) = opened(&test, "r2", &server).await;
-        let locator = head_locator(&handle).unwrap();
+        let locator = provider.head_locator(&handle).unwrap();
         let cancel = Cancellation::default();
         let directory = tempfile::tempdir().unwrap();
         let mut sink = SpoolSink::create(&directory.path().join("partial"), 100).unwrap();
@@ -1597,7 +1597,7 @@ fn a_body_shorter_than_its_declared_length_is_corrupt() {
             provider
                 .read_object(
                     &handle,
-                    &head_locator(&handle).unwrap(),
+                    &provider.head_locator(&handle).unwrap(),
                     None,
                     &mut sink,
                     &Cancellation::default()
@@ -1616,9 +1616,10 @@ fn request_costs_follow_the_preset_buckets_and_are_reserved_per_request() {
     runtime().block_on(async {
         let test = dependencies();
         let server = WireServer::start(vec![one_descriptor()]);
-        let (_, r2) = opened(&test, "r2", &server).await;
-        let cost =
-            |handle: &RepositoryHandle, operation| request_cost_for(handle, operation).unwrap();
+        let (provider, r2) = opened(&test, "r2", &server).await;
+        let cost = |handle: &RepositoryHandle, operation| {
+            provider.request_cost(handle, operation).unwrap()
+        };
         let names = |costs: &[RequestCost]| {
             costs
                 .iter()

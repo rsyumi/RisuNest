@@ -723,7 +723,9 @@ fn the_daily_download_budget_rolls_over_at_the_next_kst_midnight() {
         let (handle, _) = open(&provider, &api, OpenMode::Existing, &cancel)
             .await
             .unwrap();
-        let today = provider.request_cost(ProviderOperation::Get);
+        let today = provider
+            .request_cost(&handle, ProviderOperation::Get)
+            .unwrap();
         assert_eq!(today.len(), 1);
         assert_eq!(today[0].bucket, api::DAILY_DOWNLOAD);
         assert_eq!(today[0].units, 1);
@@ -733,12 +735,17 @@ fn the_daily_download_budget_rolls_over_at_the_next_kst_midnight() {
                 unix_ms: NEXT_RESET_MS
             }
         );
-        let issuance = provider.request_cost(ProviderOperation::DownloadUrl);
+        let issuance = provider
+            .request_cost(&handle, ProviderOperation::DownloadUrl)
+            .unwrap();
         assert_eq!(issuance.len(), 2);
         assert_eq!(issuance[0].reset, QuotaReset::Rolling { window_ms: 60_000 });
         deps.clock.set(NEXT_RESET_MS + 1);
         assert_eq!(
-            provider.request_cost(ProviderOperation::Get)[0].reset,
+            provider
+                .request_cost(&handle, ProviderOperation::Get)
+                .unwrap()[0]
+                .reset,
             QuotaReset::At {
                 unix_ms: NEXT_RESET_MS + DAY_MS
             }

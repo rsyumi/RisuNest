@@ -1,6 +1,9 @@
 //! Synthetic wire tests. Every response is scripted by the shared loopback
 //! fixture; no account, no token and no network of any kind is involved.
-use super::{authorization_policy, create, exchange_authorization_code, head_locator};
+use super::{
+    auth::{authorization_policy, exchange_authorization_code},
+    create,
+};
 use crate::external_storage::{
     auth::{AuthorizationCode, SecretBytes},
     capabilities::Evidence,
@@ -404,7 +407,10 @@ fn create_mode_reserves_a_head_identifier_in_an_empty_location() {
             )
             .await
             .unwrap();
-        assert_eq!(head_locator(&repository).unwrap().object, "control-head");
+        assert_eq!(
+            provider.head_locator(&repository).unwrap().object,
+            "control-head"
+        );
         let lines = request_lines(&server);
         assert_eq!(lines.len(), 4);
         assert!(lines[3].contains("/drive/v3/files/generateIds?count=1&space=drive"));
@@ -1194,7 +1200,7 @@ fn a_head_replacement_writes_once_and_is_readable_afterwards() {
         let test = deps_with(Some(stored_secret(NOW_MS + 3_600_000)));
         let cancel = Cancellation::default();
         let (provider, repository) = opened(&server, &test, &cancel).await;
-        let locator = head_locator(&repository).unwrap();
+        let locator = provider.head_locator(&repository).unwrap();
         let head = HeadBytes::new(head_bytes.clone()).unwrap();
         let receipt = provider
             .replace_head(&repository, &locator, &head, &cancel)
@@ -1261,7 +1267,7 @@ fn a_missing_head_is_created_once_with_the_reserved_identifier() {
         let test = deps_with(Some(stored_secret(NOW_MS + 3_600_000)));
         let cancel = Cancellation::default();
         let (provider, repository) = opened(&server, &test, &cancel).await;
-        let locator = head_locator(&repository).unwrap();
+        let locator = provider.head_locator(&repository).unwrap();
         let receipt = provider
             .replace_head(
                 &repository,
@@ -1291,7 +1297,7 @@ fn compare_and_exchange_is_unsupported_rather_than_emulated() {
         let test = deps_with(Some(stored_secret(NOW_MS + 3_600_000)));
         let cancel = Cancellation::default();
         let (provider, repository) = opened(&server, &test, &cancel).await;
-        let locator = head_locator(&repository).unwrap();
+        let locator = provider.head_locator(&repository).unwrap();
         let head = HeadBytes::new(b"head".to_vec()).unwrap();
         for expected in [
             ExpectedHead::Absent,
@@ -1465,9 +1471,21 @@ fn quota_costs_use_the_documented_per_method_weights() {
     runtime().block_on(async {
         let test = deps_with(Some(stored_secret(NOW_MS + 3_600_000)));
         let provider = provider_of(&test.dependencies);
+        let server = WireServer::start(open_existing_replies());
+        let cancel = Cancellation::default();
+        let (repository, _) = provider
+            .open_repository(
+                &connection(server.url.as_str()),
+                &secret_ref(),
+                OpenMode::Existing,
+                &cancel,
+            )
+            .await
+            .unwrap();
         let units = |operation: ProviderOperation, bucket: &str| {
             provider
-                .request_cost(operation)
+                .request_cost(&repository, operation)
+                .unwrap()
                 .into_iter()
                 .find(|cost| cost.bucket == bucket)
                 .map(|cost| cost.units)
@@ -1489,36 +1507,29 @@ fn quota_costs_use_the_documented_per_method_weights() {
             units(ProviderOperation::ReconcileUpload, "queries"),
             Some(5)
         );
-        assert!(provider
-            .request_cost(ProviderOperation::CompareExchangeHead)
-            .is_empty());
-        assert!(provider
-            .request_cost(ProviderOperation::Authenticate)
-            .is_empty());
-        assert_eq!(
-            provider.request_cost(ProviderOperation::List)[0].shared_account,
-            "google_drive/project+user"
-        );
-        assert_eq!(
-            provider.request_cost(ProviderOperation::List)[0].reset,
-            QuotaReset::Rolling { window_ms: 60_000 }
-        );
-
-        let server = WireServer::start(open_existing_replies());
-        let cancel = Cancellation::default();
-        provider
-            .open_repository(
-                &connection(server.url.as_str()),
-                &secret_ref(),
-                OpenMode::Existing,
-                &cancel,
-            )
-            .await
+        let list = provider
+            .request_cost(&repository, ProviderOperation::List)
             .unwrap();
         assert_eq!(
-            provider.request_cost(ProviderOperation::List)[0].shared_account,
+            list[0].shared_account,
             "google_drive/project+user:project-1:permission-1"
         );
+        assert_eq!(list[0].reset, QuotaReset::Rolling { window_ms: 60_000 });
+        for operation in [
+            ProviderOperation::CompareExchangeHead,
+            ProviderOperation::Authenticate,
+        ] {
+            assert!(provider
+                .request_cost(&repository, operation)
+                .unwrap()
+                .is_empty());
+        }
+        assert!(provider
+            .request_cost(
+                &crate::external_storage::fake::repository(),
+                ProviderOperation::List
+            )
+            .is_err());
     });
 }
 

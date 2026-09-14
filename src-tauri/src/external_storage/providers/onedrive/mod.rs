@@ -41,11 +41,6 @@
 //! provider verified checksum and a lost response is reconciled against the
 //! remote length.
 
-// The registry does not list this provider yet, so nothing outside the adapter
-// calls `create` and every item below reads as unreachable. Drop this attribute
-// when the provider is registered.
-#![allow(dead_code)]
-
 mod config;
 mod graph;
 #[cfg(test)]
@@ -75,6 +70,36 @@ pub(crate) fn authorization_policy(
 const DOCUMENTED_AT: &str = "2026-09-14";
 /// Guard against a server that acknowledges fragments without making progress.
 const MAX_FRAGMENT_REQUESTS: u32 = 4096;
+/// The one mutable head, a root member beside the role folders.
+const HEAD_OBJECT: &str = "head";
+
+/// Graph throttling is dynamic and publishes no fixed daily allowance, so
+/// every bucket resets at an unknown time and a 429 carries the real hint.
+fn cost_model(operation: ProviderOperation, account: &str) -> Vec<RequestCost> {
+    let bucket = |name: &str| RequestCost {
+        bucket: name.to_owned(),
+        shared_account: account.to_owned(),
+        units: 1,
+        reset: QuotaReset::Unknown,
+    };
+    match operation {
+        // The identity platform is a separate service from Graph.
+        ProviderOperation::Authenticate => vec![bucket("auth")],
+        ProviderOperation::Metadata
+        | ProviderOperation::List
+        | ProviderOperation::DownloadUrl
+        | ProviderOperation::Get
+        | ProviderOperation::Range
+        | ProviderOperation::ReconcileUpload => vec![bucket("requests")],
+        // Writes are throttled on their own threshold.
+        ProviderOperation::Create
+        | ProviderOperation::UploadSession
+        | ProviderOperation::UploadChunk
+        | ProviderOperation::CompleteUpload
+        | ProviderOperation::CompareExchangeHead
+        | ProviderOperation::ReplaceHead => vec![bucket("requests"), bucket("writes")],
+    }
+}
 
 pub(crate) fn create(dependencies: Dependencies) -> Result<Arc<dyn Provider>> {
     Ok(Arc::new(OneDrive::new(dependencies)))
@@ -164,14 +189,8 @@ impl OneDrive {
         self.deps.clock.now_ms()
     }
 
-    /// Per request costs carry the connection account. `request_cost` has no
-    /// connection parameter, so it reports the provider wide fallback scope.
     fn costs(&self, operation: ProviderOperation, account: &str) -> Vec<RequestCost> {
-        let mut costs = self.request_cost(operation);
-        for cost in costs.iter_mut() {
-            cost.shared_account = account.to_owned();
-        }
-        costs
+        cost_model(operation, account)
     }
 
     async fn send(&self, request: HttpRequest, cancel: &Cancellation) -> Result<HttpResponse> {
@@ -507,7 +526,9 @@ impl OneDrive {
     ) -> Result<HeadReceipt> {
         let context = self.context(repository)?;
         locator.validate_for(repository)?;
-        config::validate_relative_path(&locator.object)?;
+        if locator.object != HEAD_OBJECT || locator.collection.is_some() {
+            return Err(corrupt());
+        }
         let token = self.access_token(context, cancel).await?;
         let condition = match expected {
             Some(ExpectedHead::Exact(version)) => Some(version.0.clone()),
@@ -983,31 +1004,23 @@ impl Provider for OneDrive {
         })
     }
 
-    /// Graph throttling is dynamic and publishes no fixed daily allowance, so
-    /// every bucket resets at an unknown time and a 429 carries the real hint.
-    fn request_cost(&self, operation: ProviderOperation) -> Vec<RequestCost> {
-        let bucket = |name: &str| RequestCost {
-            bucket: name.to_owned(),
-            shared_account: config::PROVIDER_ID.to_owned(),
-            units: 1,
-            reset: QuotaReset::Unknown,
-        };
-        match operation {
-            // The identity platform is a separate service from Graph.
-            ProviderOperation::Authenticate => vec![bucket("auth")],
-            ProviderOperation::Metadata
-            | ProviderOperation::List
-            | ProviderOperation::DownloadUrl
-            | ProviderOperation::Get
-            | ProviderOperation::Range
-            | ProviderOperation::ReconcileUpload => vec![bucket("requests")],
-            // Writes are throttled on their own threshold.
-            ProviderOperation::Create
-            | ProviderOperation::UploadSession
-            | ProviderOperation::UploadChunk
-            | ProviderOperation::CompleteUpload
-            | ProviderOperation::CompareExchangeHead
-            | ProviderOperation::ReplaceHead => vec![bucket("requests"), bucket("writes")],
-        }
+    fn head_locator(&self, repository: &RepositoryHandle) -> Result<RemoteLocator> {
+        self.context(repository)?;
+        Ok(RemoteLocator {
+            connection_identity: repository.connection_identity.clone(),
+            collection: None,
+            object: HEAD_OBJECT.to_owned(),
+        })
+    }
+
+    fn request_cost(
+        &self,
+        repository: &RepositoryHandle,
+        operation: ProviderOperation,
+    ) -> Result<Vec<RequestCost>> {
+        Ok(cost_model(
+            operation,
+            &self.context(repository)?.quota_account,
+        ))
     }
 }

@@ -328,8 +328,15 @@ impl Provider for FakeProvider {
             }))
         })
     }
-    fn request_cost(&self, _: ProviderOperation) -> Vec<RequestCost> {
-        Vec::new()
+    fn head_locator(&self, repository: &RepositoryHandle) -> Result<RemoteLocator> {
+        Ok(RemoteLocator {
+            connection_identity: repository.connection_identity.clone(),
+            collection: None,
+            object: "head".into(),
+        })
+    }
+    fn request_cost(&self, _: &RepositoryHandle, _: ProviderOperation) -> Result<Vec<RequestCost>> {
+        Ok(Vec::new())
     }
 }
 pub(crate) fn repository() -> RepositoryHandle {

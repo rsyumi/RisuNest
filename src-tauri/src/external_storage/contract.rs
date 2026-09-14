@@ -80,6 +80,9 @@ pub(crate) enum OpenMode {
 }
 
 pub(crate) struct RepositoryHandle {
+    /// Provider-defined identity of the remote root, computed identically on
+    /// every device from the same connection. It is not the descriptor's own
+    /// repository id; `ObjectIntent.repository_id` carries this value back.
     pub repository_id: String,
     /// Provider/account/endpoint/root identity, checked before reusing a locator.
     pub connection_identity: String,
@@ -352,7 +355,16 @@ pub(crate) trait Provider: Send + Sync {
         resume: &'a ResumeState,
         cancel: &'a Cancellation,
     ) -> ProviderFuture<'a, UploadResolution>;
-    fn request_cost(&self, operation: ProviderOperation) -> Vec<RequestCost>;
+    /// The one mutable head of a repository. Head writes accept only this
+    /// locator, so an ordinary object can never be replaced by a head write;
+    /// a backup-only service answers `Unsupported`.
+    fn head_locator(&self, repository: &RepositoryHandle) -> Result<RemoteLocator>;
+    /// Budget one operation reserves on the account buckets of this connection.
+    fn request_cost(
+        &self,
+        repository: &RepositoryHandle,
+        operation: ProviderOperation,
+    ) -> Result<Vec<RequestCost>>;
 }
 
 #[derive(Clone)]

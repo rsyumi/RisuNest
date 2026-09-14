@@ -214,6 +214,26 @@ fn quota_is_shared_persistent_atomic_and_does_not_reset_on_restore_or_retry() {
 }
 
 #[test]
+fn every_listed_provider_has_a_factory_and_only_registration_exposes_it() {
+    use super::{fake::MemoryVault, providers, registry::PROVIDER_IDS};
+    let test = super::fake::loopback_dependencies(MemoryVault::default(), 0);
+    let mut registry = Registry::default();
+    assert!(providers::create("proton", test.dependencies.clone()).is_err());
+    for id in PROVIDER_IDS {
+        let provider = providers::create(id, test.dependencies.clone()).unwrap();
+        // A handle from another provider never yields a head or a budget.
+        assert!(provider.head_locator(&repository()).is_err());
+        assert!(provider
+            .request_cost(&repository(), ProviderOperation::Get)
+            .is_err());
+        assert!(registry.get(id).is_err());
+        registry.register(id, provider).unwrap();
+        assert!(registry.get(id).is_ok());
+    }
+    assert_eq!(registry.available().len(), PROVIDER_IDS.len());
+}
+
+#[test]
 fn unavailable_services_stay_hidden_and_head_size_and_sdk_overhead_are_bounded() {
     let registry = Registry::default();
     assert!(registry.available().is_empty());

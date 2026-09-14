@@ -1211,10 +1211,21 @@ fn reconciliation_uses_the_stored_object_rather_than_local_progress() {
 fn request_costs_name_the_documented_buckets_and_gate_dispatch() {
     runtime().block_on(async {
         let harness = fixture(open_existing_replies(), "personalAccessToken");
-        let upload = harness.provider.request_cost(ProviderOperation::Create);
+        assert!(harness
+            .provider
+            .request_cost(
+                &crate::external_storage::fake::repository(),
+                ProviderOperation::Create
+            )
+            .is_err());
+        let (handle, _) = harness.open(OpenMode::Existing).await.unwrap();
+        let upload = harness
+            .provider
+            .request_cost(&handle, ProviderOperation::Create)
+            .unwrap();
         assert_eq!(upload.len(), 2);
         assert_eq!(upload[0].bucket, "apiRequests");
-        assert_eq!(upload[0].shared_account, "gitlab:user");
+        assert_eq!(upload[0].shared_account, "gitlab:user:synthetic-user");
         assert_eq!(upload[0].units, 1);
         assert_eq!(
             upload[0].reset,
@@ -1223,13 +1234,15 @@ fn request_costs_name_the_documented_buckets_and_gate_dispatch() {
             }
         );
         assert_eq!(upload[1].bucket, "packageRegistryRequests");
-        assert_eq!(upload[1].shared_account, "gitlab:address");
+        assert_eq!(upload[1].shared_account, "gitlab:address:127.0.0.1");
         assert_eq!(
-            harness.provider.request_cost(ProviderOperation::List).len(),
+            harness
+                .provider
+                .request_cost(&handle, ProviderOperation::List)
+                .unwrap()
+                .len(),
             1
         );
-
-        harness.open(OpenMode::Existing).await.unwrap();
         let reservations = harness.reservations();
         assert_eq!(reservations.len(), 2);
         assert_eq!(reservations[0].len(), 2);

@@ -697,7 +697,7 @@ fn an_unchanged_token_produces_a_conditional_not_modified_read() {
         let directory = tempfile::tempdir().unwrap();
         let mut sink = SpoolSink::create(&directory.path().join("unused"), 64).unwrap();
         let token = VersionToken("etag-head".to_owned());
-        let locator = locator_for(&repository, "descriptors/head");
+        let locator = provider.head_locator(&repository).unwrap();
         let receipt = provider
             .read_object(&repository, &locator, Some(&token), &mut sink, &cancel)
             .await
@@ -1134,7 +1134,7 @@ fn head_writes_send_exactly_one_request_and_never_retry_a_lost_response() {
         )
         .await
         .unwrap();
-        let locator = locator_for(&repository, "descriptors/head");
+        let locator = provider.head_locator(&repository).unwrap();
         let head_bytes = HeadBytes::new(b"head".to_vec()).unwrap();
         assert!(provider
             .replace_head(&repository, &locator, &head_bytes, &cancel)
@@ -1152,9 +1152,7 @@ fn head_writes_send_exactly_one_request_and_never_retry_a_lost_response() {
         for record in &records[2..] {
             assert_eq!(
                 line(record),
-                format!(
-                    "PUT /synthetic/drives/drive-1/items/{ROOT_ITEM}:/descriptors/head:/content HTTP/1.1"
-                )
+                format!("PUT /synthetic/drives/drive-1/items/{ROOT_ITEM}:/head:/content HTTP/1.1")
             );
             assert_eq!(record.body, b"head");
             assert!(!head(record).contains("if-match"));
@@ -1182,7 +1180,7 @@ fn head_preconditions_use_create_if_absent_and_an_exact_version() {
         )
         .await
         .unwrap();
-        let locator = locator_for(&repository, "descriptors/head");
+        let locator = provider.head_locator(&repository).unwrap();
         let head_bytes = HeadBytes::new(b"head".to_vec()).unwrap();
 
         let receipt = provider
@@ -1619,16 +1617,22 @@ fn request_costs_separate_reads_writes_and_the_identity_platform() {
     let harness = harness(NOW_MS);
     let provider = OneDrive::new(harness.dependencies.clone());
     let names = |operation| {
-        provider
-            .request_cost(operation)
+        cost_model(operation, "onedrive:test")
             .into_iter()
             .map(|cost| {
                 assert_eq!(cost.units, 1);
                 assert_eq!(cost.reset, QuotaReset::Unknown);
+                assert_eq!(cost.shared_account, "onedrive:test");
                 cost.bucket
             })
             .collect::<Vec<_>>()
     };
+    assert!(provider
+        .request_cost(
+            &crate::external_storage::fake::repository(),
+            ProviderOperation::List
+        )
+        .is_err());
     assert_eq!(names(ProviderOperation::Authenticate), vec!["auth"]);
     for read in [
         ProviderOperation::Metadata,

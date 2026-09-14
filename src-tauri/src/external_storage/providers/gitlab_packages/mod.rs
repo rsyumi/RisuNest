@@ -505,7 +505,7 @@ fn capabilities(settings: &Settings, can_list: bool) -> Capabilities {
         resumable_upload: false,
         max_stored_bytes: settings.max_stored_bytes,
         sdk_overhead_bytes: 0,
-        upload_alignment: 0,
+        upload_alignment: 1,
         documented_at: Some(DOCUMENTED_AT.into()),
         evidence_urls: evidence_urls(),
     }
@@ -901,7 +901,17 @@ impl Provider for GitlabPackages {
         })
     }
 
-    fn request_cost(&self, operation: ProviderOperation) -> Vec<RequestCost> {
-        api::cost_model(operation)
+    /// Generic packages offer no stable head, so no locator can name one.
+    fn head_locator(&self, repository: &RepositoryHandle) -> Result<RemoteLocator> {
+        self.context(repository)?;
+        Err(unsupported())
+    }
+
+    fn request_cost(
+        &self,
+        repository: &RepositoryHandle,
+        operation: ProviderOperation,
+    ) -> Result<Vec<RequestCost>> {
+        Ok(api::costs(&self.context(repository)?.settings, operation))
     }
 }

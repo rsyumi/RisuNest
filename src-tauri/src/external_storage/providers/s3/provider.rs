@@ -178,29 +178,11 @@ pub(crate) fn capabilities(profile: &Profile) -> Capabilities {
     }
 }
 
-/// Per-connection request costs. The trait method cannot see a connection, so
-/// this is the entry point that yields the real account and preset buckets.
-pub(crate) fn request_cost_for(
-    repository: &RepositoryHandle,
-    operation: ProviderOperation,
-) -> Result<Vec<RequestCost>> {
-    let context = context_of(repository)?;
-    Ok(context.profile.costs(&context.account_id, operation))
-}
-
-pub(crate) fn head_locator(repository: &RepositoryHandle) -> Result<RemoteLocator> {
-    context_of(repository)?;
-    Ok(RemoteLocator {
-        connection_identity: repository.connection_identity.clone(),
-        collection: None,
-        object: "head".into(),
-    })
-}
-
 fn context_of(repository: &RepositoryHandle) -> Result<&RepositoryContext> {
     repository
         .context
         .downcast_ref::<RepositoryContext>()
+        .filter(|context| context.connection_identity == repository.connection_identity)
         .ok_or_else(corrupt)
 }
 
@@ -1019,10 +1001,22 @@ impl Provider for S3Provider {
         })
     }
 
-    /// The trait gives no connection here, so only the request shape is known;
-    /// `request_cost_for` resolves the preset buckets and the shared account.
-    fn request_cost(&self, operation: ProviderOperation) -> Vec<RequestCost> {
-        profiles::generic::PROFILE.costs("", operation)
+    fn head_locator(&self, repository: &RepositoryHandle) -> Result<RemoteLocator> {
+        context_of(repository)?;
+        Ok(RemoteLocator {
+            connection_identity: repository.connection_identity.clone(),
+            collection: None,
+            object: "head".into(),
+        })
+    }
+
+    fn request_cost(
+        &self,
+        repository: &RepositoryHandle,
+        operation: ProviderOperation,
+    ) -> Result<Vec<RequestCost>> {
+        let context = context_of(repository)?;
+        Ok(context.profile.costs(&context.account_id, operation))
     }
 }
 

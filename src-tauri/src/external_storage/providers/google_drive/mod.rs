@@ -36,33 +36,18 @@
 //! `control-head` and is resolved to its stable file ID when the repository is
 //! opened.
 use super::Dependencies;
-use crate::external_storage::contract::{
-    ErrorKind, Provider, ProviderError, RemoteLocator, RepositoryHandle, Result,
-};
+use crate::external_storage::contract::{Provider, Result};
 use std::sync::Arc;
 
-mod auth;
+/// `auth::authorization_policy` and `auth::exchange_authorization_code` are the
+/// OAuth entry points the connection flow drives.
+pub(crate) mod auth;
 mod config;
 mod provider;
 #[cfg(test)]
 mod tests;
 mod wire;
 
-pub(crate) use auth::{authorization_policy, exchange_authorization_code};
-
 pub(crate) fn create(dependencies: Dependencies) -> Result<Arc<dyn Provider>> {
     Ok(provider::provider(dependencies))
-}
-
-/// Canonical locator of the mutable head of an opened repository. The owner
-/// uses it for `replace_head` and for reading the head back.
-pub(crate) fn head_locator(repository: &RepositoryHandle) -> Result<RemoteLocator> {
-    if repository.connection_identity.is_empty() {
-        return Err(ProviderError::new(ErrorKind::Corrupt));
-    }
-    Ok(RemoteLocator {
-        connection_identity: repository.connection_identity.clone(),
-        collection: None,
-        object: provider::HEAD_OBJECT.to_owned(),
-    })
 }

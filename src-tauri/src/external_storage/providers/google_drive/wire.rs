@@ -190,15 +190,6 @@ impl AccountScope {
             download: format!("google_drive/project:{}", settings.project_id),
         }
     }
-    /// Used before any connection is opened and when more than one account has
-    /// been opened, where naming a single account would attribute wrongly.
-    pub(super) fn unbound() -> Self {
-        Self {
-            queries: "google_drive/project+user".into(),
-            upload: "google_drive/user".into(),
-            download: "google_drive/project".into(),
-        }
-    }
 }
 
 fn unit(bucket: &str, shared_account: &str, units: u64, window_ms: u64) -> RequestCost {

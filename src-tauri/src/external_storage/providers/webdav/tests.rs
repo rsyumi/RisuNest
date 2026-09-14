@@ -1308,10 +1308,12 @@ fn every_issued_request_costs_one_unit_of_the_account_bucket() {
     }
     let test = loopback_dependencies(MemoryVault::default(), NOW_MS);
     let provider = create(test.dependencies).unwrap();
-    assert_eq!(
-        provider.request_cost(ProviderOperation::Get)[0].shared_account,
-        UNBOUND_ACCOUNT
-    );
+    assert!(provider
+        .request_cost(
+            &crate::external_storage::fake::repository(),
+            ProviderOperation::Get
+        )
+        .is_err());
 }
 
 #[test]

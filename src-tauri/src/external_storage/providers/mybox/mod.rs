@@ -27,9 +27,6 @@
 //! `RemoteLocator.object` is that `<role folder>/<file name>` pair. Names are
 //! percent encoded into `[A-Za-z0-9._%-]` so they need no escaping anywhere.
 //! Heads live in `heads/` and are the only mutable files.
-// Nothing reaches the factory while the product registry lists no provider.
-// Remove this once the registry constructs the adapter.
-#![allow(dead_code)]
 mod api;
 mod config;
 #[cfg(test)]
@@ -64,6 +61,8 @@ const EVIDENCE_URLS: [&str; 8] = [
 ];
 /// The listing API pages at most 1,000 entries per request.
 const PAGE_SIZE: u16 = 1000;
+/// The one mutable head, kept inside the heads folder like any other head write.
+const HEAD_NAME: &str = "head.bin";
 const MAX_LIST_PAGES: usize = 256;
 
 pub(crate) fn create(dependencies: Dependencies) -> Result<Arc<dyn Provider>> {
@@ -1108,10 +1107,22 @@ impl Provider for Mybox {
         })
     }
 
-    fn request_cost(&self, operation: ProviderOperation) -> Vec<RequestCost> {
-        // Without a connection here the account scope is the provider itself;
-        // every dispatched request carries the per-account scope instead.
-        api::costs(config::PROVIDER_ID, operation, self.deps.clock.now_ms())
+    fn head_locator(&self, repository: &RepositoryHandle) -> Result<RemoteLocator> {
+        let context = self.context(repository)?;
+        Ok(config::locator(&context.identity, config::HEADS, HEAD_NAME))
+    }
+
+    fn request_cost(
+        &self,
+        repository: &RepositoryHandle,
+        operation: ProviderOperation,
+    ) -> Result<Vec<RequestCost>> {
+        let context = self.context(repository)?;
+        Ok(api::costs(
+            &context.account,
+            operation,
+            self.deps.clock.now_ms(),
+        ))
     }
 }
 

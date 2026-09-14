@@ -24,9 +24,6 @@
 //! `catalogs`, `snapshots`, `points`) and the head is the root member `head`.
 //! A `RemoteLocator.object` is the slash-joined raw path of an object relative
 //! to the root, which any device can resolve on its own.
-// Nothing in the product registers this provider yet, so every item below is
-// unreachable outside the test build.
-#![allow(dead_code)]
 mod multistatus;
 mod paths;
 #[cfg(test)]
@@ -51,9 +48,6 @@ pub(crate) const PROVIDER_ID: &str = "webdav";
 pub(crate) const HEAD_OBJECT: &str = "head";
 /// Koofr's documented WebDAV address for the user's own space.
 pub(crate) const KOOFR_ENDPOINT: &str = "https://app.koofr.net/dav/Koofr";
-/// `request_cost` has no connection parameter, so the template it returns names
-/// no account. Requests this adapter issues carry the connection's own account.
-pub(crate) const UNBOUND_ACCOUNT: &str = "webdav:unbound";
 
 const KOOFR_PROFILE: &str = "koofr";
 const KOOFR_HOST: &str = "app.koofr.net";
@@ -213,7 +207,15 @@ fn context_of(repository: &RepositoryHandle) -> Result<&RepositoryContext> {
     repository
         .context
         .downcast_ref::<RepositoryContext>()
+        .filter(|context| context.identity == repository.connection_identity)
         .ok_or_else(paths::corrupt)
+}
+/// Head writes only ever touch the root member `head`, never a role member.
+fn head_path(locator: &RemoteLocator) -> Result<Vec<String>> {
+    if locator.object != HEAD_OBJECT || locator.collection.is_some() {
+        return Err(paths::corrupt());
+    }
+    object_path(locator)
 }
 fn repository_id(identity: &str) -> String {
     use sha2::Digest;
@@ -355,7 +357,7 @@ fn capabilities(profile: Profile) -> Capabilities {
 /// No DAV method carries a documented weight, so one request costs one unit of
 /// the account's single bucket and no reset instant is known. Operations this
 /// adapter never issues cost nothing.
-pub(crate) fn request_cost_for(account: &str, operation: ProviderOperation) -> Vec<RequestCost> {
+fn request_cost_for(account: &str, operation: ProviderOperation) -> Vec<RequestCost> {
     match operation {
         ProviderOperation::DownloadUrl
         | ProviderOperation::Range
@@ -897,7 +899,7 @@ impl Provider for WebdavProvider {
             cancel.check()?;
             let context = context_of(repository)?;
             locator.validate_for(repository)?;
-            let object = object_path(locator)?;
+            let object = head_path(locator)?;
             let mut request = self.request(
                 context,
                 reqwest::Method::PUT,
@@ -931,7 +933,7 @@ impl Provider for WebdavProvider {
             cancel.check()?;
             let context = context_of(repository)?;
             locator.validate_for(repository)?;
-            let object = object_path(locator)?;
+            let object = head_path(locator)?;
             let request = self.request(
                 context,
                 reqwest::Method::PUT,
@@ -1025,7 +1027,23 @@ impl Provider for WebdavProvider {
         })
     }
 
-    fn request_cost(&self, operation: ProviderOperation) -> Vec<RequestCost> {
-        request_cost_for(UNBOUND_ACCOUNT, operation)
+    fn head_locator(&self, repository: &RepositoryHandle) -> Result<RemoteLocator> {
+        context_of(repository)?;
+        Ok(RemoteLocator {
+            connection_identity: repository.connection_identity.clone(),
+            collection: None,
+            object: HEAD_OBJECT.to_owned(),
+        })
+    }
+
+    fn request_cost(
+        &self,
+        repository: &RepositoryHandle,
+        operation: ProviderOperation,
+    ) -> Result<Vec<RequestCost>> {
+        Ok(request_cost_for(
+            &context_of(repository)?.account,
+            operation,
+        ))
     }
 }

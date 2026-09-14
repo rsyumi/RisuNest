@@ -50,8 +50,6 @@ mod provider;
 mod sigv4;
 mod xml;
 
-pub(crate) use provider::{head_locator, request_cost_for};
-
 pub(crate) fn create(dependencies: Dependencies) -> Result<Arc<dyn Provider>> {
     provider::create(dependencies)
 }

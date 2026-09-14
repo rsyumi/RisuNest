@@ -1116,45 +1116,69 @@ fn a_create_receipt_locator_reads_the_same_bytes_back() {
 
 #[test]
 fn request_cost_reports_documented_weights_and_nothing_for_unused_operations() {
-    let provider = adapter(dependencies().dependencies);
-    for operation in [
-        ProviderOperation::Metadata,
-        ProviderOperation::List,
-        ProviderOperation::DownloadUrl,
-        ProviderOperation::ReconcileUpload,
-    ] {
-        let costs = provider.request_cost(operation);
-        assert_eq!(costs.len(), 2, "{operation:?}");
-        assert_eq!(costs[0].bucket, api::PRIMARY_BUCKET);
-        assert_eq!(
-            costs[0].reset,
-            QuotaReset::Rolling {
-                window_ms: 60 * 60 * 1000
-            }
-        );
-        assert_eq!(costs[1].units, 1);
-    }
-    let create = provider.request_cost(ProviderOperation::Create);
-    assert_eq!(create.len(), 4);
-    assert_eq!(create[1].units, 5);
-    assert_eq!(create[2].reset, QuotaReset::Rolling { window_ms: 60_000 });
-    let body = provider.request_cost(ProviderOperation::Get);
-    assert_eq!(body[0].bucket, api::ASSET_BODY_BUCKET);
-    assert_eq!(body[0].reset, QuotaReset::Unknown);
-    for operation in [
-        ProviderOperation::Range,
-        ProviderOperation::UploadSession,
-        ProviderOperation::UploadChunk,
-        ProviderOperation::CompleteUpload,
-        ProviderOperation::CompareExchangeHead,
-        ProviderOperation::ReplaceHead,
-        ProviderOperation::Authenticate,
-    ] {
-        assert!(
-            provider.request_cost(operation).is_empty(),
-            "{operation:?} is never dispatched"
-        );
-    }
+    runtime().block_on(async {
+        let server = WireServer::start(vec![
+            repository_reply(true),
+            reply(200, json!([release(9, &format!("{PREFIX}-d-0"))])),
+            reply(200, json!([asset(3, "descriptor-root", 4, None)])),
+        ]);
+        let provider = adapter(dependencies().dependencies);
+        let handle = open(provider.as_ref(), &server, OpenMode::Existing)
+            .await
+            .unwrap();
+        assert!(provider
+            .request_cost(
+                &crate::external_storage::fake::repository(),
+                ProviderOperation::Get
+            )
+            .is_err());
+        for operation in [
+            ProviderOperation::Metadata,
+            ProviderOperation::List,
+            ProviderOperation::DownloadUrl,
+            ProviderOperation::ReconcileUpload,
+        ] {
+            let costs = provider.request_cost(&handle, operation).unwrap();
+            assert_eq!(costs.len(), 2, "{operation:?}");
+            assert_eq!(costs[0].shared_account, "synthetic-owner");
+            assert_eq!(costs[0].bucket, api::PRIMARY_BUCKET);
+            assert_eq!(
+                costs[0].reset,
+                QuotaReset::Rolling {
+                    window_ms: 60 * 60 * 1000
+                }
+            );
+            assert_eq!(costs[1].units, 1);
+        }
+        let create = provider
+            .request_cost(&handle, ProviderOperation::Create)
+            .unwrap();
+        assert_eq!(create.len(), 4);
+        assert_eq!(create[1].units, 5);
+        assert_eq!(create[2].reset, QuotaReset::Rolling { window_ms: 60_000 });
+        let body = provider
+            .request_cost(&handle, ProviderOperation::Get)
+            .unwrap();
+        assert_eq!(body[0].bucket, api::ASSET_BODY_BUCKET);
+        assert_eq!(body[0].reset, QuotaReset::Unknown);
+        for operation in [
+            ProviderOperation::Range,
+            ProviderOperation::UploadSession,
+            ProviderOperation::UploadChunk,
+            ProviderOperation::CompleteUpload,
+            ProviderOperation::CompareExchangeHead,
+            ProviderOperation::ReplaceHead,
+            ProviderOperation::Authenticate,
+        ] {
+            assert!(
+                provider
+                    .request_cost(&handle, operation)
+                    .unwrap()
+                    .is_empty(),
+                "{operation:?} is never dispatched"
+            );
+        }
+    });
 }
 
 #[test]

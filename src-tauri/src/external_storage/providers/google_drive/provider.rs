@@ -101,15 +101,8 @@ struct Session<'a> {
     token: &'a Mutex<Option<CachedToken>>,
 }
 
-enum ScopeCache {
-    Empty,
-    One(AccountScope),
-    Many,
-}
-
 pub(super) struct GoogleDrive {
     dependencies: Dependencies,
-    scope: Mutex<ScopeCache>,
 }
 
 /// Opaque upload state sealed in the vault. The session URI is a bearer
@@ -161,10 +154,7 @@ fn parse_confirmed_offset(headers: &BTreeMap<String, String>) -> Result<u64> {
 
 impl GoogleDrive {
     pub(super) fn new(dependencies: Dependencies) -> Self {
-        Self {
-            dependencies,
-            scope: Mutex::new(ScopeCache::Empty),
-        }
+        Self { dependencies }
     }
     fn now_ms(&self) -> u64 {
         self.dependencies.clock.now_ms()
@@ -579,16 +569,6 @@ impl GoogleDrive {
         let file: DriveFile = wire::json(&mut response, cancel).await?;
         self.completed_receipt(session.settings, intent, &file, Some(file_id))
     }
-
-    fn remember_scope(&self, scope: &AccountScope) {
-        let mut slot = self.scope.lock().unwrap();
-        let next = match &*slot {
-            ScopeCache::Empty => ScopeCache::One(scope.clone()),
-            ScopeCache::One(existing) if existing == scope => ScopeCache::One(scope.clone()),
-            _ => ScopeCache::Many,
-        };
-        *slot = next;
-    }
 }
 
 fn multipart_body(
@@ -778,7 +758,6 @@ impl Provider for GoogleDrive {
                     present: false,
                 },
             };
-            self.remember_scope(&scope);
             let handle = RepositoryHandle {
                 repository_id: format!(
                     "{}:{}:{}",
@@ -1179,14 +1158,25 @@ impl Provider for GoogleDrive {
         })
     }
 
+    /// The reserved control name resolves to the stable head file id held by
+    /// the handle, so the same locator works before and after the first write.
+    fn head_locator(&self, repository: &RepositoryHandle) -> Result<RemoteLocator> {
+        context(repository)?;
+        Ok(RemoteLocator {
+            connection_identity: repository.connection_identity.clone(),
+            collection: None,
+            object: HEAD_OBJECT.to_owned(),
+        })
+    }
+
     /// Documented per-method quota units. The transfer buckets count one unit
     /// per byte, so an actual request scales them by the bytes it moves.
-    fn request_cost(&self, operation: ProviderOperation) -> Vec<RequestCost> {
-        let scope = match &*self.scope.lock().unwrap() {
-            ScopeCache::One(scope) => scope.clone(),
-            ScopeCache::Empty | ScopeCache::Many => AccountScope::unbound(),
-        };
-        wire::costs(operation, &scope, 1)
+    fn request_cost(
+        &self,
+        repository: &RepositoryHandle,
+        operation: ProviderOperation,
+    ) -> Result<Vec<RequestCost>> {
+        Ok(wire::costs(operation, &context(repository)?.scope, 1))
     }
 }
 

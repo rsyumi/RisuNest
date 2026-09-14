@@ -775,11 +775,18 @@ impl Provider for GithubReleases {
         })
     }
 
-    /// Bucket shape and documented weights only. The account a bucket is shared
-    /// by is bound per request from the open connection, because this method
-    /// receives no repository handle.
-    fn request_cost(&self, operation: ProviderOperation) -> Vec<RequestCost> {
-        api::costs(operation, "")
+    /// No head exists on this service, so no locator can name one.
+    fn head_locator(&self, repository: &RepositoryHandle) -> Result<RemoteLocator> {
+        self.context(repository)?;
+        Err(ProviderError::new(ErrorKind::Unsupported))
+    }
+
+    fn request_cost(
+        &self,
+        repository: &RepositoryHandle,
+        operation: ProviderOperation,
+    ) -> Result<Vec<RequestCost>> {
+        Ok(api::costs(operation, &self.context(repository)?.account))
     }
 }
 
