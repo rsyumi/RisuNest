@@ -152,6 +152,33 @@ describe('common backup file production route', () => {
         expect(m.discard).toHaveBeenCalledWith('synthetic-token')
         expect(m.legacy).not.toHaveBeenCalled()
     })
+    it('a first run skips the replacement confirmation and asks for sections as an import', async () => {
+        m.invoke.mockResolvedValue('local-backup')
+        expect(
+            await restoreBackupFromNativeSource(
+                { type: 'desktopPath', path: 'C:\\synthetic\\pocket.bin' },
+                { firstRun: true },
+            ),
+        ).toEqual(result)
+        expect(m.confirm).not.toHaveBeenCalled()
+        expect(m.legacy).toHaveBeenCalledOnce()
+
+        m.invoke.mockResolvedValue('portable')
+        await restoreBackupFromNativeSource(
+            { type: 'desktopPath', path: 'C:\\synthetic\\fresh.risunest' },
+            { firstRun: true },
+        )
+        const preview = {
+            libraryIncluded: true,
+            repairRequired: false,
+            deviceSections: [],
+        }
+        m.chooseRestore.mockResolvedValue({ library: true, deviceSections: [] })
+        await m.portable.mock.calls[0][2].choosePortableSections(preview)
+        expect(m.chooseRestore).toHaveBeenCalledExactlyOnceWith(preview, {
+            firstRun: true,
+        })
+    })
     it('device-only restoration leaves automatic sync intent unchanged', async () => {
         await restoreBackupFromNativeSource({
             type: 'desktopPath',

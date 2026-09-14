@@ -9,6 +9,7 @@
     choices,
     libraryIncluded,
     repairRequired = false,
+    firstRun = false,
     onDone,
     onError,
   }: {
@@ -16,6 +17,8 @@
     choices: DeviceSectionChoice[];
     libraryIncluded: boolean;
     repairRequired?: boolean;
+    /** Nothing on the device is at stake, so the help describes an import, not an overwrite. */
+    firstRun?: boolean;
     onDone: (selection: NativePortableSelection | null) => void;
     onError: (error: unknown) => void;
   } = $props();
@@ -84,7 +87,11 @@
         id={`${titleId}-help`}
         class="mt-2 text-sm leading-relaxed text-textcolor2"
       >
-        {mode === "export" ? text.helpExport : text.helpRestore}
+        {mode === "export"
+          ? text.helpExport
+          : firstRun
+            ? text.helpRestoreFirstRun
+            : text.helpRestore}
       </p>
     </header>
     <div class="overflow-y-auto px-5 py-4">

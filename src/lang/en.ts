@@ -58,7 +58,7 @@ export const languageEnglish = {
         preservedSourceHelp:
             'These files are kept separately because the restored library does not need them. They do not sync automatically and can be deleted from the source preservation area.',
         title: 'RisuNest backup',
-        export: 'Full backup (.risunest)',
+        export: 'RisuNest full backup (.risunest)',
         restore: 'Restore backup file',
         library: 'Library and attachments',
         device: 'Device plugin data',
@@ -72,6 +72,8 @@ export const languageEnglish = {
             'Selected device data is captured after restarting the app into maintenance mode.',
         helpRestore:
             'Selected areas replace the data on this device, including keys that exist only here. Unselected areas stay unchanged. No automatic backup will be kept. Back up your current data first if you want to keep it.',
+        helpRestoreFirstRun:
+            'Selected areas are brought onto this device. Unselected areas can be restored later from settings with the same file.',
         repair: 'This file preserves damaged source data. Its library cannot be activated until repaired.',
         continue: 'Continue',
         cancel: 'Cancel',
@@ -2322,15 +2324,14 @@ export const languageEnglish = {
             },
             import: {
                 title: 'Import a backup file',
-                lead: 'Choose a .risudat file exported from RisuNest, or a .bin file exported from RisuAI or PocketRisu.',
+                lead: 'Choose a file you already backed up from RisuNest, RisuAI, or another app to import it.',
                 dropTitle: 'Choose a backup file',
                 choose: 'Choose file',
                 hintAndroid:
                     'Opening a backup file from a file manager also leads here.',
-                pocketTitle: 'PocketRisu / RisuAI backup (.bin)',
-                pocketDesc:
-                    'Loads a risu-backup .bin file exported from either app.',
-                pocketAction: 'Import',
+                supportTitle: 'Supported files',
+                supportDesc:
+                    'Backup files can be a RisuNest .risunest backup or a RisuAI or PocketRisu .bin backup.',
                 warning:
                     'A large backup can take a while. Do not close the app until it finishes.',
                 next: 'Continue',
@@ -2354,6 +2355,7 @@ export const languageEnglish = {
                 title: 'RisuAI account backup',
                 lead: 'Sign in with your RisuAI account to load the backup on the account server. The sign-in window opens inside the app.',
                 login: 'Sign in with a RisuAI account',
+                closeLogin: 'Close sign-in',
                 hint: 'If you do not have an account, use a backup file or sync instead.',
                 signedIn: 'Signed in as {0}',
                 cont: 'Continue',

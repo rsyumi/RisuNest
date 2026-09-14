@@ -23,7 +23,6 @@
     import { changeLanguage, language } from 'src/lang'
     import { alertConfirm, alertError, alertNormal } from 'src/ts/alert'
     import { hubURL } from 'src/ts/characterCards'
-    import { LoadLocalBackup } from 'src/ts/drive/backuplocal'
     import { getVersionString } from 'src/ts/globalApi.svelte'
     import { updateTextThemeAndCSS } from 'src/ts/gui/colorscheme'
     import {
@@ -202,12 +201,15 @@
     /**
      * Both import routes report through the shared operation stores. The job
      * panel draws the progress and outcome, and the reader moves on from it.
+     * A first run has nothing to lose, so the native route skips the
+     * replacement confirmation it shows in the settings.
      */
-    async function runImport(operation: () => Promise<unknown>): Promise<void> {
+    async function runImport(): Promise<void> {
         if (importBusy) return
         importBusy = true
         try {
-            await operation()
+            if (isTauri) await restoreBackupFromSystemPicker({ firstRun: true })
+            else await importRisuSaveFromSystemPicker()
         } catch {
             // Preflight failures happen before the shared operation panel exists.
             alertError(strings.risuNest.backup.actionFailed)
@@ -240,6 +242,10 @@
         loginOpen = true
     }
 
+    function closeAccountLogin(): void {
+        loginOpen = false
+    }
+
     async function restoreAccountBackup(): Promise<void> {
         if (accountBusy) return
         accountBusy = true
@@ -269,6 +275,9 @@
 </script>
 
 <svelte:window
+    onkeydown={(event) => {
+        if (loginOpen && event.key === 'Escape') closeAccountLogin()
+    }}
     onmessage={async (event) => {
         if (!loginOpen) return
         const message = event.data?.msg
@@ -378,7 +387,7 @@
                     {#if job.terminal === null}
                         <p class="lead">{t.import.warning}</p>
                     {/if}
-                    {#if job.sourceName}
+                    {#if job.sourceName || job.subtitle}
                         <div class="file">
                             <FileDown />
                             <span class="name">{job.sourceName}</span>
@@ -595,12 +604,7 @@
                                     class="btn primary"
                                     type="button"
                                     disabled={importBusy}
-                                    onclick={() =>
-                                        runImport(
-                                            isTauri
-                                                ? restoreBackupFromSystemPicker
-                                                : importRisuSaveFromSystemPicker,
-                                        )}
+                                    onclick={runImport}
                                 >
                                     <FolderOpen />{t.import.choose}
                                 </button>
@@ -613,25 +617,12 @@
                                 </p>
                             {/if}
                             <div class="detect">
-                                <span class="ic"><FolderOpen /></span>
+                                <span class="ic"><Info /></span>
                                 <div>
-                                    <b>{t.import.pocketTitle}</b><small
-                                        >{t.import.pocketDesc}</small
+                                    <b>{t.import.supportTitle}</b><small
+                                        >{t.import.supportDesc}</small
                                     >
                                 </div>
-                                <button
-                                    class="btn ghost"
-                                    type="button"
-                                    disabled={importBusy}
-                                    onclick={() =>
-                                        runImport(
-                                            isTauri
-                                                ? restoreBackupFromSystemPicker
-                                                : LoadLocalBackup,
-                                        )}
-                                >
-                                    {t.import.pocketAction}
-                                </button>
                             </div>
                             <p class="note warn">
                                 <TriangleAlert /><span>{t.import.warning}</span>
@@ -772,16 +763,21 @@
 </div>
 
 {#if loginOpen}
-    <div class="login-scrim">
+    <div class="login-scrim" role="dialog" aria-modal="true" aria-label={t.account.login}>
+        <div class="login-bar">
+            <span class="login-title">{t.account.login}</span>
+            <button
+                class="login-close"
+                type="button"
+                title={t.account.closeLogin}
+                aria-label={t.account.closeLogin}
+                onclick={closeAccountLogin}
+            >
+                <XIcon />
+            </button>
+        </div>
         <iframe bind:this={loginFrame} src={loginUrl} title={t.account.login}
         ></iframe>
-        <button
-            class="btn"
-            type="button"
-            onclick={() => {
-                loginOpen = false
-            }}>{strings.cancel}</button
-        >
     </div>
 {/if}
 
@@ -889,10 +885,11 @@
         letter-spacing: -0.01em;
         text-wrap: balance;
     }
+    /* No width cap: `ch` is narrow next to CJK glyphs, so a cap broke every
+       description in two well before the panel edge. */
     .brand .desc {
         display: none;
         margin: 10px 0 0;
-        max-width: 34ch;
         font-size: 13.5px;
         color: var(--o-soft);
     }
@@ -972,7 +969,6 @@
     }
     .lead {
         margin: 0 0 20px;
-        max-width: 46ch;
         font-size: 13.5px;
         color: var(--o-soft);
     }
@@ -1203,7 +1199,7 @@
     }
     .detect {
         display: grid;
-        grid-template-columns: 36px 1fr auto;
+        grid-template-columns: 36px 1fr;
         align-items: center;
         gap: 12px;
         margin-top: 16px;
@@ -1452,9 +1448,10 @@
         font-size: 12px;
         color: var(--o-faint);
     }
+    /* The same two-then-four column grid as the shared import dialog. */
     .counts {
         display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+        grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 8px;
         margin: 0 0 16px;
     }
@@ -1632,22 +1629,54 @@
         z-index: 50;
         display: flex;
         flex-direction: column;
-        gap: 8px;
-        padding: 12px;
+        padding: calc(12px + var(--o-safe-top)) 12px
+            calc(12px + env(safe-area-inset-bottom, 0px));
         background: rgba(0, 0, 0, 0.55);
+        color: var(--color-textcolor);
+    }
+    .login-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 8px 8px 8px 14px;
+        border: 1px solid var(--color-darkborderc);
+        border-bottom: 0;
+        border-radius: 12px 12px 0 0;
+        background: var(--color-darkbg);
+    }
+    .login-title {
+        font-size: 13.5px;
+        font-weight: 600;
+    }
+    .login-close {
+        display: grid;
+        place-items: center;
+        width: 32px;
+        height: 32px;
+        border: 1px solid var(--color-darkborderc);
+        border-radius: 8px;
+        background: var(--color-darkbutton);
+        color: inherit;
+        cursor: pointer;
+    }
+    .login-close:hover {
+        background: var(--color-selected);
+    }
+    .login-close:focus-visible {
+        outline: 2px solid var(--color-primary-500);
+        outline-offset: 2px;
+    }
+    .login-close :global(svg) {
+        width: 16px;
+        height: 16px;
     }
     .login-scrim iframe {
         flex: 1;
         width: 100%;
         border: 0;
-        border-radius: 12px;
+        border-radius: 0 0 12px 12px;
         background: #fff;
-    }
-    .login-scrim .btn {
-        align-self: center;
-        border: 1px solid var(--color-darkborderc);
-        background: var(--color-darkbutton);
-        color: var(--color-textcolor);
     }
 
     @container (min-width: 720px) {
@@ -1693,6 +1722,9 @@
         }
         .panel-foot {
             margin-top: 28px;
+        }
+        .counts {
+            grid-template-columns: repeat(4, minmax(0, 1fr));
         }
     }
 

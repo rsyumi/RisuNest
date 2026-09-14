@@ -32,6 +32,7 @@ function showSelection(
   choices: DeviceSectionChoice[],
   libraryIncluded: boolean,
   repairRequired = false,
+  firstRun = false,
 ): Promise<NativePortableSelection | null> {
   if (selectionOpen)
     return Promise.reject(new Error("A backup selection is already open"));
@@ -66,6 +67,7 @@ function showSelection(
           choices: choices.map(localize),
           libraryIncluded,
           repairRequired,
+          firstRun,
           onDone: (selection) => finish(selection),
           onError: (error) => finish(null, error),
         },
@@ -89,6 +91,7 @@ export async function selectPortableBackupExport(): Promise<NativePortableSelect
 
 export function selectPortableBackupRestore(
   preview: NativePortableRestorePreview,
+  options: { firstRun?: boolean } = {},
 ): Promise<NativePortableSelection | null> {
   const unique = new Set<string>();
   const choices = preview.deviceSections.map(
@@ -105,5 +108,6 @@ export function selectPortableBackupRestore(
     choices,
     preview.libraryIncluded,
     preview.repairRequired,
+    options.firstRun ?? false,
   );
 }

@@ -54,7 +54,7 @@ export const languageKorean = {
         preservedSourceHelp:
             '복원한 라이브러리에 필요하지 않은 파일을 원본 보존 영역에 별도 보관했습니다. 자동 동기화되지 않으며 해당 보존 영역에서 삭제할 수 있습니다.',
         title: 'RisuNest 백업',
-        export: '전체 백업 (.risunest)',
+        export: 'RisuNest 전체 백업 (.risunest)',
         restore: '백업 파일 복원',
         library: '라이브러리와 첨부 파일',
         device: '기기 플러그인 데이터',
@@ -68,6 +68,8 @@ export const languageKorean = {
             '선택한 기기 데이터는 앱을 유지보수 모드로 재시작한 뒤 캡처합니다.',
         helpRestore:
             '선택한 영역은 이 기기에만 있는 키를 포함해 교체됩니다. 선택하지 않은 영역은 유지됩니다. 자동 백업은 남기지 않습니다. 기존 데이터를 보관하려면 먼저 직접 백업하세요.',
+        helpRestoreFirstRun:
+            '선택한 영역을 이 기기로 가져옵니다. 선택하지 않은 영역은 나중에 설정에서 같은 파일로 복원할 수 있습니다.',
         repair: '손상된 원본을 보존한 파일입니다. 라이브러리는 수리 후 활성화할 수 있습니다.',
         continue: '계속',
         cancel: '취소',
@@ -2129,15 +2131,14 @@ export const languageKorean = {
             },
             import: {
                 title: '백업 파일 가져오기',
-                lead: 'RisuNest에서 내보낸 .risudat 파일이나 RisuAI·PocketRisu에서 내보낸 .bin 파일을 선택해주세요.',
+                lead: 'RisuNest나 RisuAI 등에서 이미 백업한 파일을 선택하여 가져올 수 있습니다.',
                 dropTitle: '백업 파일을 선택해주세요',
                 choose: '파일 선택',
                 hintAndroid:
                     '파일 관리자에서 백업 파일을 열어도 여기로 이어집니다.',
-                pocketTitle: 'PocketRisu·RisuAI 백업(.bin)',
-                pocketDesc:
-                    '두 앱에서 내보낸 risu-backup .bin 파일을 불러옵니다.',
-                pocketAction: '가져오기',
+                supportTitle: '지원하는 파일 안내',
+                supportDesc:
+                    '백업 파일은 RisuNest의 .risunest 백업 파일, RisuAI와 PocketRisu의 .bin 백업 파일을 지원합니다.',
                 warning:
                     '백업 용량이 큰 경우 시간이 소요될 수 있습니다. 끝날 때까지 앱을 닫지 말아주세요.',
                 next: '계속',
@@ -2161,6 +2162,7 @@ export const languageKorean = {
                 title: 'RisuAI 계정 백업',
                 lead: 'RisuAI 계정으로 로그인하여 계정 서버의 백업본을 불러옵니다. 로그인 창은 앱 안에서 열립니다.',
                 login: 'RisuAI 계정으로 로그인',
+                closeLogin: '로그인 창 닫기',
                 hint: '계정이 없다면 백업 파일이나 동기화를 사용해 주세요.',
                 signedIn: '{0}로 로그인됨',
                 cont: '계속',
