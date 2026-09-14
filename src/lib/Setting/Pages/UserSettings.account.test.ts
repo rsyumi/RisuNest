@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { parse } from 'svelte/compiler'
 import source from './UserSettings.svelte?raw'
 
-function handler(name: string) {
+function handler(name: string, marker = 'unMigrationAccount') {
     let expression: any
     function visit(node: any) {
         if (!node || typeof node !== 'object') return
@@ -10,7 +10,7 @@ function handler(name: string) {
             const candidate = node.value?.[0]?.expression
             if (
                 candidate &&
-                source.slice(candidate.start, candidate.end).includes('unMigrationAccount')
+                source.slice(candidate.start, candidate.end).includes(marker)
             ) {
                 expression = candidate
             }
@@ -82,5 +82,70 @@ describe('web account settings actions', () => {
         await handler('onclick')(dependencies)()
         expect(dependencies.unMigrationAccount).not.toHaveBeenCalled()
         expect(dependencies.DBState.db.account).toBeDefined()
+    })
+})
+
+describe('native account settings actions', () => {
+    const failureText = "Couldn't complete the backup operation."
+
+    function nativeDependencies() {
+        const account = { id: 'account-a', token: 'synthetic', data: {} }
+        const flow = {
+            login: vi.fn(),
+            logout: vi.fn(),
+        }
+        return {
+            account,
+            flow,
+            dependencies: {
+                hubURL: 'https://example.invalid',
+                openIframeURL: 'https://example.invalid/hub/login',
+                drivePopup: { source: null, close: vi.fn() },
+                accountIframe: undefined,
+                resolveExpectedOfficialAccountMessageUrl: vi.fn(() => 'https://example.invalid'),
+                isExpectedHubMessage: vi.fn(() => true),
+                isTauri: true,
+                nativeAccountBusy: false,
+                $accountUnmigrationBusy: false,
+                runNativeAccountOperation: (operation: () => Promise<unknown>) => operation(),
+                getNativeOfficialAccountFlow: () => flow,
+                alertError: vi.fn(),
+                language: { risuNest: { backup: { actionFailed: failureText } } },
+                DBState: { db: { account: account as typeof account | undefined } },
+                forageStorage: { isAccount: false },
+                unMigrationAccount: vi.fn(),
+                loadRisuAccountData: vi.fn(),
+                saveRisuAccountData: vi.fn(),
+            },
+        }
+    }
+
+    it('keeps the login session unchanged and reports a native login failure', async () => {
+        const { dependencies, flow } = nativeDependencies()
+        dependencies.DBState.db.account = undefined
+        flow.login.mockRejectedValue(new Error('app kv failed'))
+
+        await handler('onmessage', 'getNativeOfficialAccountFlow().login')(dependencies)({
+            data: {
+                msg: {
+                    id: 'account-a',
+                    token: 'synthetic',
+                    data: { vaild: true },
+                },
+            },
+        })
+
+        expect(dependencies.DBState.db.account).toBeUndefined()
+        expect(dependencies.alertError).toHaveBeenCalledWith(failureText)
+    })
+
+    it('keeps the visible account and reports a native logout failure', async () => {
+        const { account, dependencies, flow } = nativeDependencies()
+        flow.logout.mockRejectedValue(new Error('metadata flush failed'))
+
+        await handler('onclick', 'getNativeOfficialAccountFlow().logout')(dependencies)()
+
+        expect(dependencies.DBState.db.account).toBe(account)
+        expect(dependencies.alertError).toHaveBeenCalledWith(failureText)
     })
 })

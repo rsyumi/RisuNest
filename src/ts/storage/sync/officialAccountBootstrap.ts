@@ -88,8 +88,8 @@ export async function publishOfficialRevisionIfChanged(
 }
 
 function accountSyncRequested(dependencies: OfficialAccountBootstrapDependencies): boolean {
-    if (dependencies.markers.getItem('accountst') === 'able') return true
     if (dependencies.markers.getItem('dosync') === 'avoid') return false
+    if (dependencies.markers.getItem('accountst') === 'able') return true
     return dependencies.markers.getItem('dosync') === 'sync'
         || Boolean(dependencies.local.database.account?.useSync)
 }

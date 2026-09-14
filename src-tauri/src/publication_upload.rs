@@ -135,6 +135,15 @@ fn authenticated_headers(
     Ok(headers)
 }
 
+fn build_client() -> Result<reqwest::Client, OfficialPublicationUploadError> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| OfficialPublicationUploadError::Transport {
+            message: error.to_string(),
+        })
+}
+
 async fn response_bytes(
     mut response: reqwest::Response,
 ) -> Result<Vec<u8>, OfficialPublicationUploadError> {
@@ -221,7 +230,7 @@ pub(crate) async fn upload_open_file_attempt(
     file: std::fs::File,
     bytes_uploaded: u64,
 ) -> Result<OfficialPublicationUploadResult, OfficialPublicationUploadError> {
-    let client = reqwest::Client::new();
+    let client = build_client()?;
     let session = match &request.session {
         Some(session) if !session.is_empty() => session.clone(),
         _ => acquire_session(&client, &request).await?,
@@ -354,8 +363,8 @@ pub(crate) async fn upload_open_file_attempt(
 mod tests {
     use super::{
         upload_file_attempt, upload_open_file_attempt, OfficialPublicationCredential,
-        OfficialPublicationUploadRequest, OfficialPublicationUploadResult, DATABASE_KEY,
-        MAX_RESPONSE_BYTES,
+        OfficialPublicationUploadError, OfficialPublicationUploadRequest,
+        OfficialPublicationUploadResult, DATABASE_KEY, MAX_RESPONSE_BYTES,
     };
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
@@ -630,6 +639,31 @@ mod tests {
             OfficialPublicationUploadResult::Written { .. }
         ));
         assert_eq!(requests.lock().unwrap()[0].body, body);
+    }
+
+    #[test]
+    fn authenticated_upload_does_not_follow_redirects() {
+        let directory = TempDir::new().unwrap();
+        let source = directory.path().join("snapshot.risudat");
+        std::fs::write(&source, b"database").unwrap();
+        let (base_url, requests, server) = mock_server(vec![MockResponse {
+            status: 302,
+            headers: &[("location", "/redirected")],
+            body: b"",
+        }]);
+
+        let mut input = request(base_url, &source);
+        input.session = Some("existing".to_owned());
+        let error = tauri::async_runtime::block_on(upload_file_attempt(input)).unwrap_err();
+        server.join().unwrap();
+
+        assert!(matches!(
+            error,
+            OfficialPublicationUploadError::HttpStatus { status: 302, .. }
+        ));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, "/api/account/write");
     }
 
     #[test]

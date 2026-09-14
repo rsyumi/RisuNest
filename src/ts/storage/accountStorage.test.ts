@@ -525,6 +525,28 @@ describe('AccountStorage structured wire contract', () => {
         ])
     })
 
+    it('stops native publication after three rejected reauthentication attempts', async () => {
+        const credentialRouting = {
+            getToken: vi.fn(() => 'native-token'),
+            reauthenticate: vi.fn(async () => undefined),
+        }
+        const attempt = vi.fn(async () => ({
+            kind: 'reauthentication-needed' as const,
+            session: 'session-42',
+        }))
+        const { AccountStorage, resetAccountStorageSession } = await loadStorage()
+        resetAccountStorageSession()
+        const storage = new AccountStorage({ credentialRouting })
+
+        await expect(storage.writeOfficialDatabaseFromNative(attempt)).rejects.toThrow(
+            'Official account reauthentication was rejected too many times',
+        )
+
+        expect(attempt).toHaveBeenCalledTimes(3)
+        expect(mocks.alertLogin).toHaveBeenCalledTimes(2)
+        expect(credentialRouting.reauthenticate).toHaveBeenCalledTimes(2)
+    })
+
     it('aborts while waiting for native reauthentication without retrying after login resolves', async () => {
         let resolveLogin!: (value: string) => void
         mocks.alertLogin.mockReturnValueOnce(new Promise<string>((resolve) => {
@@ -921,6 +943,33 @@ describe('AccountStorage structured wire contract', () => {
         await expect(write).rejects.toBe(aborted)
         expect(credentialRouting.reauthenticate).not.toHaveBeenCalled()
         expect(mocks.fetchProtectedResource).toHaveBeenCalledTimes(2)
+    })
+
+    it('aborts an account read while its 403 reauthentication is waiting', async () => {
+        let resolveLogin!: (value: string) => void
+        mocks.alertLogin.mockReturnValueOnce(new Promise<string>((resolve) => {
+            resolveLogin = resolve
+        }))
+        mocks.fetchProtectedResource.mockResolvedValueOnce(response('retry', 403))
+        const credentialRouting = {
+            getToken: vi.fn(() => 'old-token'),
+            reauthenticate: vi.fn(async () => undefined),
+        }
+        const { AccountStorage } = await loadStorage()
+        const storage = new AccountStorage({ credentialRouting })
+        const controller = new AbortController()
+
+        const read = storage.readItem('database/database.bin', { signal: controller.signal })
+        await vi.waitFor(() => expect(mocks.alertLogin).toHaveBeenCalledOnce())
+        controller.abort(new DOMException('Read cancelled', 'AbortError'))
+
+        await expect(read).rejects.toMatchObject({ name: 'AbortError' })
+        resolveLogin('new-token')
+        await Promise.resolve()
+        await Promise.resolve()
+
+        expect(credentialRouting.reauthenticate).not.toHaveBeenCalled()
+        expect(mocks.fetchProtectedResource).toHaveBeenCalledOnce()
     })
 
     it('routes native reauthentication without reading or writing the legacy fallback token', async () => {

@@ -22,6 +22,7 @@ export function resetAccountStorageSession(): void {
 
 let seenWarnings:string[] = []
 const accountDatabaseKey = 'database/database.bin'
+const maxNativeOfficialWriteAttempts = 3
 
 export type AccountReadResult =
     | { kind: 'value'; bytes: Uint8Array }
@@ -276,7 +277,7 @@ export class AccountStorage{
         attempt: AccountNativeOfficialWriteAttempt<T>,
         options: AccountWriteOptions = {},
     ): Promise<AccountNativeOfficialWriteResult<T> | null> {
-        while (true) {
+        for (let attemptNumber = 1; attemptNumber <= maxNativeOfficialWriteAttempts; attemptNumber += 1) {
             this.checkAuth()
             if (localStorage.getItem('ignoreRisuAuth') === 'true' || !this.auth) return null
 
@@ -290,6 +291,9 @@ export class AccountStorage{
             if (result.session !== null) risuSession = result.session
             publishAccountWarning(result.warning)
             if (result.kind === 'reauthentication-needed') {
+                if (attemptNumber === maxNativeOfficialWriteAttempts) {
+                    throw new Error('Official account reauthentication was rejected too many times')
+                }
                 await this.reauthenticate(options.signal)
                 continue
             }
@@ -349,7 +353,7 @@ export class AccountStorage{
             }, options.signal))
             if(da.status === 403){
                 await discardResponseBody(da)
-                await this.reauthenticate()
+                await this.reauthenticate(options.signal)
             }
         }
         if(da.status === 303){

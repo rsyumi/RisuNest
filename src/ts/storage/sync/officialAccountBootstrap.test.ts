@@ -250,6 +250,25 @@ describe('official account production bootstrap', () => {
         expect(harness.dependencies.confirmInitialPush).toHaveBeenCalledOnce()
     })
 
+    it('remembers a rejected recovery upload and does not prompt again on restart', async () => {
+        const harness = makeHarness({ accountEnabled: true })
+        harness.dependencies.confirmInitialPush = vi.fn(async () => false)
+
+        await expect(initializeOfficialAccountBootstrap(harness.dependencies)).resolves.toMatchObject({
+            revision: 1,
+            officialEnabled: false,
+        })
+        expect(harness.markers.get('accountst')).toBe('able')
+        expect(harness.markers.get('dosync')).toBe('avoid')
+
+        await expect(initializeOfficialAccountBootstrap(harness.dependencies)).resolves.toMatchObject({
+            revision: 1,
+            officialEnabled: false,
+        })
+        expect(harness.adapter.pull).toHaveBeenCalledOnce()
+        expect(harness.dependencies.confirmInitialPush).toHaveBeenCalledOnce()
+    })
+
     it('propagates one pull CAS conflict without markers or bootstrap continuation', async () => {
         const harness = makeHarness({
             syncRequested: true,

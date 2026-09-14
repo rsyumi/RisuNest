@@ -619,7 +619,7 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
         }
     })
 
-    it('projects every character resource in a cloned pinned cold payload', async () => {
+    it('rejects a cold payload that changes after its fingerprint is pinned', async () => {
         const database = makeDatabase()
         const coldCharacter = structuredClone(database.characters[0])
         const coldPayload = { character: coldCharacter }
@@ -631,6 +631,26 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
         const publication = await harness.adapter.pin(harness.imported.revision)
         coldCharacter.image = 'assets/mutated-after-pin.png'
 
+        await expect(publication.publish()).rejects.toThrow(
+            'Pinned cold payload changed before publication: cold-chat',
+        )
+
+        expect(harness.cold.writeRemote).not.toHaveBeenCalled()
+        expect((localCold.get('cold-chat') as any).character.image).toBe('assets/mutated-after-pin.png')
+    })
+
+    it('projects every character resource after rereading a stable pinned cold payload', async () => {
+        const database = makeDatabase()
+        const coldPayload = { character: structuredClone(database.characters[0]) }
+        const harness = await makeHarness({
+            database,
+            localCold: new Map<string, unknown>([
+                ['cold-chat', coldPayload],
+                ['cold-message', { message: [{ data: 'unchanged' }] }],
+            ]),
+        })
+        const publication = await harness.adapter.pin(harness.imported.revision)
+
         await publication.publish()
 
         const written = harness.writes.find((write) => write.key === 'cold-chat')!.value as {
@@ -640,7 +660,6 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
             expect(key).toMatch(/^remote\/assets\//)
         }
         expect(written.character.image).toBe('remote/assets/character.png')
-        expect((localCold.get('cold-chat') as any).character.image).toBe('assets/mutated-after-pin.png')
     })
 
     it('pins and uploads an asset referenced only by a full cold character', async () => {

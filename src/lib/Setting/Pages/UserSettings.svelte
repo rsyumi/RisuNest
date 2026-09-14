@@ -215,15 +215,26 @@
             if (!isTauri) await saveRisuAccountData();
             drivePopup.close();
         } else if (message?.data.vaild) {
-            openIframe = false;
             const credential = {
                 id: message.id,
                 token: message.token,
                 data: message.data,
             };
-            DBState.db.account = isTauri
-                ? await getNativeOfficialAccountFlow().login(credential)
-                : credential;
+            if (isTauri) {
+                try {
+                    const account = await runNativeAccountOperation(() =>
+                        getNativeOfficialAccountFlow().login(credential),
+                    );
+                    if (!account) return;
+                    DBState.db.account = account;
+                } catch {
+                    alertError(language.risuNest.backup.actionFailed);
+                    return;
+                }
+            } else {
+                DBState.db.account = credential;
+            }
+            openIframe = false;
         }
     }}
 />
@@ -379,9 +390,14 @@
                         if ($accountUnmigrationBusy) return;
                         if (isTauri) {
                             if (nativeAccountBusy) return;
-                            await runNativeAccountOperation(() =>
-                                getNativeOfficialAccountFlow().logout(),
-                            );
+                            try {
+                                await runNativeAccountOperation(() =>
+                                    getNativeOfficialAccountFlow().logout(),
+                                );
+                            } catch {
+                                alertError(language.risuNest.backup.actionFailed);
+                                return;
+                            }
                         } else if (
                             DBState.db.account.useSync ||
                             forageStorage.isAccount
