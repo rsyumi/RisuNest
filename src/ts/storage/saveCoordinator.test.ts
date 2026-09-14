@@ -15,6 +15,46 @@ import {
 } from './saveCoordinator.testSupport'
 
 describe('SaveCoordinator', () => {
+    it('initializes large plugin baselines once and retains exact later mutation detection', async () => {
+        const database = makeDatabase()
+        const payload = 'synthetic-large-plugin:'.repeat(50000)
+        database.pluginCustomStorage = { payload, nested: { count: 1 } }
+        const store = makeStore(vi.fn(async () => ({ revision: 2 })))
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            capturePluginStorage: () => database.pluginCustomStorage,
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+        })
+        const parse = vi.spyOn(JSON, 'parse')
+        const stringify = vi.spyOn(JSON, 'stringify')
+        let parses: number, encodes: number
+        try {
+            coordinator.initialize(1, database)
+            parses = parse.mock.calls.filter(([value]) =>
+                value.includes('synthetic-large-plugin:'),
+            ).length
+            encodes = stringify.mock.calls.filter(([value]) => value === payload).length
+        } finally {
+            parse.mockRestore()
+            stringify.mockRestore()
+        }
+        expect(parses).toBe(0)
+        expect(encodes).toBe(1)
+        await coordinator.flushPendingData('clean')
+        expect(store.commit).not.toHaveBeenCalled()
+        database.pluginCustomStorage.nested.count = 2
+        coordinator.markPersistentDataDirty(1)
+        await coordinator.flushPendingData('changed')
+        expect(store.commit).toHaveBeenCalledWith(
+            expect.objectContaining({
+                pluginStorage: [{ type: 'set', key: 'nested', value: { count: 2 } }],
+            }),
+        )
+        expect(database.pluginCustomStorage.payload).toBe(payload)
+    })
+
     function makeAdditionDatabase() {
         const database = makeDatabase()
         const added = structuredClone(database.characters[0])

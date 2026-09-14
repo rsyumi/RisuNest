@@ -662,10 +662,17 @@ export class SaveCoordinator {
         this.cancelOfficialPublishRetry()
         this.pluginStorageCaptureCache.clear()
         const captured = database ? this.captureDatabase(database) : this.capture()
+        if (captured.pluginStorageCapture) {
+            this.dependencies.canonicalCapture?.seedPluginStorage?.(captured.pluginStorageCapture)
+        }
         this.authorityEpoch++
         this.currentRevision = revision
         this.rootBaseline = captured.rootCanonical
-        this.pluginStorageBaseline = captured.pluginStorageCanonical
+        this.pluginStorageBaselineEntries = captured.pluginStorageCapture
+            ? new PluginStorageBaseline(captured.pluginStorageCapture)
+            : captured.pluginStorageCanonical === null
+              ? null
+              : new PluginStorageBaseline(captured.pluginStorageCanonical)
         this.presetsBaseline = captured.presetsCanonical
         this.setCharacterBaseline(captured)
         this.dirtyGeneration = 0
@@ -3904,9 +3911,10 @@ export class SaveCoordinator {
         const pluginStorageUnavailable =
             !Object.prototype.hasOwnProperty.call(database, 'pluginCustomStorage') &&
             this.dependencies.isIncompleteWorkingSet?.(database) === true
-        const pluginStorageCanonical = pluginStorageUnavailable
+        const pluginStorageCapture = pluginStorageUnavailable
             ? null
-            : pluginStorageJson(pluginCustomStorage ?? {})
+            : this.pluginStorageCaptureCache.capture(pluginCustomStorage ?? {})
+        let detachedPluginStorage: Database['pluginCustomStorage'] | null | undefined
         const selectedId = this.dependencies.captureSelectedCharacter()?.chaId
         const character = selectedId
             ? (characters.find((candidate) => candidate.chaId === selectedId) ?? null)
@@ -3915,11 +3923,16 @@ export class SaveCoordinator {
         return {
             root: JSON.parse(rootCanonical) as RootDatabase,
             rootCanonical,
-            pluginStorage:
-                pluginStorageCanonical === null
-                    ? null
-                    : (JSON.parse(pluginStorageCanonical) as Database['pluginCustomStorage']),
-            pluginStorageCanonical,
+            get pluginStorage() {
+                if (detachedPluginStorage === undefined) {
+                    detachedPluginStorage = pluginStorageCapture?.value ?? null
+                }
+                return detachedPluginStorage
+            },
+            get pluginStorageCanonical() {
+                return pluginStorageCapture?.json ?? null
+            },
+            pluginStorageCapture,
             presets: JSON.parse(presetsCanonical) as botPreset[],
             presetsCanonical,
             character: characterCanonical

@@ -71,7 +71,9 @@ function deterministicIds(...ids: string[]): () => string {
 
 describe('prepareDatabaseForPersistence', () => {
     it('reports real normalization changes and becomes unchanged after preparation', async () => {
-        const input = await prepareDatabaseForPersistence(fixtureDatabase, { now: 1_700_000_000_000 })
+        const input = await prepareDatabaseForPersistence(fixtureDatabase, {
+            now: 1_700_000_000_000,
+        })
         input.formatversion = 4
         input.loreBookToken = 400
         input.characters[0].chaId = ''
@@ -84,16 +86,13 @@ describe('prepareDatabaseForPersistence', () => {
         const expected = await prepareDatabaseForPersistence(input, options)
         vi.mocked(canonicalJson).mockClear()
         const prepared = await prepareDatabaseForBootstrap(input, options)
-        expect(canonicalJson).toHaveBeenCalledTimes(2)
+        expect(canonicalJson).not.toHaveBeenCalled()
         expect(prepared.database).toEqual(expected)
         expect(prepared.changed).toBe(true)
         expect(input).toEqual(original)
         expect(prepared.database).not.toBe(input)
 
-        const stable = await prepareDatabaseForBootstrap(
-            prepared.database,
-            options,
-        )
+        const stable = await prepareDatabaseForBootstrap(prepared.database, options)
         expect(stable.changed).toBe(false)
         expect(stable.database).toEqual(prepared.database)
         expect(stable.database).not.toBe(prepared.database)
@@ -172,7 +171,12 @@ describe('prepareDatabaseForPersistence', () => {
         input.characters[1].chats[1].id = ''
 
         const prepared = await prepareDatabaseForPersistence(input, {
-            createId: deterministicIds('new-character', 'new-character-2', 'new-chat', 'new-chat-2'),
+            createId: deterministicIds(
+                'new-character',
+                'new-character-2',
+                'new-chat',
+                'new-chat-2',
+            ),
             now: 0,
         })
 

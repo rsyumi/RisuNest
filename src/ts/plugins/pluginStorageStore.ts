@@ -115,10 +115,39 @@ interface CacheEntry {
 }
 
 function serializedByteSize(value: unknown): number {
+    if (typeof value === 'string') {
+        // Count UTF-8 JSON bytes without allocating a second large string and buffer.
+        let bytes = 2
+        for (let index = 0; index < value.length; index++) {
+            const code = value.charCodeAt(index)
+            if (
+                code === 0x22 ||
+                code === 0x5c ||
+                code === 8 ||
+                code === 9 ||
+                code === 10 ||
+                code === 12 ||
+                code === 13
+            ) {
+                bytes += 2
+            } else if (code < 0x20) bytes += 6
+            else if (code < 0x80) bytes++
+            else if (code < 0x800) bytes += 2
+            else if (code >= 0xd800 && code <= 0xdfff) {
+                const next = value.charCodeAt(index + 1)
+                if (code <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
+                    bytes += 4
+                    index++
+                } else bytes += 6
+            } else bytes += 3
+        }
+        return bytes
+    }
     return new TextEncoder().encode(JSON.stringify(value) ?? 'null').byteLength
 }
 
 function clonePluginStorageValue<T>(value: T): T {
+    if (typeof value === 'string') return value
     try {
         return structuredClone(value)
     } catch (error) {

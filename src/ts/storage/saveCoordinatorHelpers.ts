@@ -39,6 +39,7 @@ export function pluginStorageJson(storage: Database['pluginCustomStorage']): str
 export interface PluginStorageCapture {
     /** Owned encoded entries, or null when callable hooks require whole-object JSON. */
     readonly entries: readonly (readonly [key: string, json: string])[] | null
+    readonly encodedStrings?: readonly (readonly [key: string, value: string, json: string])[]
     readonly json: string
     /** A fresh detached value on every read, so callers cannot mutate the cache. */
     readonly value: Database['pluginCustomStorage']
@@ -140,6 +141,13 @@ export class PluginStorageCaptureCache {
         this.latest = this.snapshot(
             () => `{${bytes.map(([keyJson, json]) => `${keyJson}:${json}`).join(',')}}`,
             entries,
+            Object.freeze(
+                encoded.flatMap(({ key, primitive, reusable, json }) =>
+                    reusable && typeof primitive === 'string' && json !== undefined
+                        ? [Object.freeze([key, primitive, json] as const)]
+                        : [],
+                ),
+            ),
         )
         return this.latest
     }
@@ -147,11 +155,13 @@ export class PluginStorageCaptureCache {
     private snapshot(
         encode: () => string,
         entries: PluginStorageCapture['entries'],
+        encodedStrings?: PluginStorageCapture['encodedStrings'],
     ): PluginStorageCapture {
         let json: string | undefined
         const read = () => (json ??= encode())
         return Object.freeze({
             entries,
+            encodedStrings,
             get json() {
                 return read()
             },
@@ -559,7 +569,12 @@ export class PluginStorageBaseline {
     private readonly entries = new Map<string, string>()
     private serialized: string | undefined
 
-    constructor(serialized: string) {
+    constructor(source: string | PluginStorageCapture) {
+        if (typeof source !== 'string' && source.entries !== null) {
+            for (const [key, json] of source.entries) this.entries.set(key, json)
+            return
+        }
+        const serialized = typeof source === 'string' ? source : source.json
         const storage = JSON.parse(serialized) as Record<string, unknown>
         for (const key of Object.keys(storage)) {
             this.entries.set(key, JSON.stringify(storage[key]))
@@ -570,8 +585,7 @@ export class PluginStorageBaseline {
     apply(mutations: readonly PluginStorageMutation[]): void {
         for (const mutation of mutations) {
             if (mutation.type === 'clear') this.entries.clear()
-            else if (mutation.type === 'delete')
-                this.entries.delete(mutation.key)
+            else if (mutation.type === 'delete') this.entries.delete(mutation.key)
             else this.entries.set(mutation.key, canonicalJson(mutation.value))
         }
         this.serialized = undefined
@@ -593,9 +607,7 @@ export class PluginStorageBaseline {
 
     get json(): string {
         // Object.keys supplies JavaScript's integer-key ordering after insertions.
-        return (this.serialized ??= `{${Object.keys(
-            Object.fromEntries(this.entries),
-        )
+        return (this.serialized ??= `{${Object.keys(Object.fromEntries(this.entries))
             .map((key) => `${JSON.stringify(key)}:${this.entries.get(key)}`)
             .join(',')}}`)
     }

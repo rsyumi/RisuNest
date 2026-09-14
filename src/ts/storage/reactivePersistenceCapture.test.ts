@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createPersistenceCanonicalCapture } from './reactivePersistenceCapture.svelte'
 import { createPersistentSaveObserverHarness } from './tests/persistentSaveObserverHarness.svelte'
-import { canonicalJson, pluginStorageJson } from './saveCoordinatorHelpers'
+import {
+    canonicalJson,
+    pluginStorageJson,
+    PluginStorageCaptureCache,
+} from './saveCoordinatorHelpers'
 import type { Database } from './database.svelte'
 
 function fixture() {
@@ -28,6 +32,49 @@ function root(state: ReturnType<typeof fixture>) {
 }
 
 describe('production reactive persistence captures', () => {
+    it('reuses initialized strings on first reactive capture and defers whole-object encoding', () => {
+        const value = 'x'.repeat(16 * 1024 * 1024)
+        const state = fixture()
+        state.database.pluginCustomStorage = { payload: value }
+        const seeded = new PluginStorageCaptureCache().capture({ payload: value })
+        const cached = capture(state)
+        cached.seedPluginStorage!(seeded)
+        const stringify = vi.spyOn(JSON, 'stringify')
+        const join = vi.spyOn(Array.prototype, 'join')
+        let result: ReturnType<typeof cached.pluginStorage>
+        try {
+            result = cached.pluginStorage()
+            expect(stringify.mock.calls.some(([input]) => input === value)).toBe(false)
+            expect(join).not.toHaveBeenCalled()
+            expect(result!.entries).toEqual(seeded.entries)
+        } finally {
+            stringify.mockRestore()
+            join.mockRestore()
+        }
+        expect(result!.json).toBe(pluginStorageJson({ payload: value }))
+        state.database.pluginCustomStorage.payload = 'changed'
+        expect(cached.pluginStorage()!.json).toBe(pluginStorageJson({ payload: 'changed' }))
+    })
+
+    it('does not reuse a seed when the value changed before its first reactive capture', () => {
+        const state = fixture()
+        state.database.pluginCustomStorage = { payload: 'after', nested: { count: 2 } }
+        const cached = capture(state)
+        cached.seedPluginStorage!(
+            new PluginStorageCaptureCache().capture({
+                payload: 'before',
+                nested: { count: 1 },
+            }),
+        )
+        expect(cached.pluginStorage()!.json).toBe(
+            pluginStorageJson(state.database.pluginCustomStorage),
+        )
+        state.database.pluginCustomStorage.nested.count++
+        expect(cached.pluginStorage()!.json).toBe(
+            pluginStorageJson(state.database.pluginCustomStorage),
+        )
+    })
+
     it('does not cache plain or raw objects whose edits cannot invalidate a derived', () => {
         const raw = {
             root: { nested: { value: 1 } },

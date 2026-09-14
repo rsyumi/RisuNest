@@ -15,6 +15,7 @@ export interface PersistenceCanonicalCapture {
     presets(): string | null
     character(): string | null
     pluginStorage(): PluginStorageCapture | null
+    seedPluginStorage?(capture: PluginStorageCapture): void
 }
 
 // Applying $state to an existing deep state proxy preserves its identity.
@@ -48,13 +49,23 @@ function normalize(value: unknown, markVolatile: () => never): unknown {
     return output
 }
 
-function fieldCapture(read: () => unknown) {
+function fieldCapture(
+    read: () => unknown,
+    takeStringSeed?: () => readonly [string, string] | undefined,
+) {
     const capture = () => {
         try {
             const value = normalize(read(), () => {
                 throw volatileValue
             })
-            return { json: JSON.stringify(value) as string | undefined, volatile: false }
+            const seed = takeStringSeed?.()
+            return {
+                json:
+                    typeof value === 'string' && seed?.[0] === value
+                        ? seed[1]
+                        : (JSON.stringify(value) as string | undefined),
+                volatile: false,
+            }
         } catch (error) {
             if (error !== volatileValue) throw error
             return { json: undefined, volatile: true }
@@ -68,6 +79,7 @@ function objectCapture(
     read: () => Record<string, unknown> | null,
     omit: ReadonlySet<string>,
     ordered: boolean,
+    stringSeeds?: Map<string, readonly [string, string]>,
 ) {
     const fields = new Map<string, ReturnType<typeof fieldCapture>>()
     let previous:
@@ -76,11 +88,13 @@ function objectCapture(
     const snapshot = () => {
         const source = read()
         if (source === null) {
+            stringSeeds?.clear()
             fields.clear()
             previous = undefined
             return null
         }
         if (!isDeepState(source)) {
+            stringSeeds?.clear()
             fields.clear()
             previous = undefined
             return { volatile: true as const }
@@ -99,13 +113,20 @@ function objectCapture(
             let field = fields.get(key)
             if (!field) {
                 field = untrack(() =>
-                    fieldCapture(() => {
-                        const value = read()
-                        // Do not evaluate an external getter inside a cached derived.
-                        if (value && Object.getOwnPropertyDescriptor(value, key)?.get)
-                            throw volatileValue
-                        return value?.[key]
-                    }),
+                    fieldCapture(
+                        () => {
+                            const value = read()
+                            // Do not evaluate an external getter inside a cached derived.
+                            if (value && Object.getOwnPropertyDescriptor(value, key)?.get)
+                                throw volatileValue
+                            return value?.[key]
+                        },
+                        () => {
+                            const seed = stringSeeds?.get(key)
+                            stringSeeds?.delete(key)
+                            return seed
+                        },
+                    ),
                 )
                 fields.set(key, field)
             }
@@ -113,6 +134,7 @@ function objectCapture(
             volatile ||= captured.volatile
             if (captured.json !== undefined) entries.push(Object.freeze([key, captured.json]))
         }
+        stringSeeds?.clear()
         if (volatile) return { volatile: true as const }
         if (
             previous &&
@@ -123,12 +145,15 @@ function objectCapture(
             )
         )
             return previous
+        let json: string | undefined
         previous = {
             volatile: false as const,
-            json:
-                '{' +
-                entries.map(([key, json]) => JSON.stringify(key) + ':' + json).join(',') +
-                '}',
+            get json() {
+                return (json ??=
+                    '{' +
+                    entries.map(([key, json]) => JSON.stringify(key) + ':' + json).join(',') +
+                    '}')
+            },
             entries: Object.freeze(entries),
         }
         return previous
@@ -159,11 +184,18 @@ export function createPersistenceCanonicalCapture(read: {
         new Set(['characters', 'botPresets', 'pluginCustomStorage']),
         false,
     )
-    const captureStorage = objectCapture(read.pluginStorage, new Set(), true)
+    const storageStringSeeds = new Map<string, readonly [string, string]>()
+    const captureStorage = objectCapture(read.pluginStorage, new Set(), true, storageStringSeeds)
     const presets = fieldCapture(read.presets)
     const character = fieldCapture(read.character)
     const roots = new Map<string, ReadonlyMap<string, string>>()
     return {
+        seedPluginStorage(capture) {
+            storageStringSeeds.clear()
+            for (const [key, value, json] of capture.encodedStrings ?? []) {
+                storageStringSeeds.set(key, [value, json])
+            }
+        },
         root() {
             const captured = captureRoot()!
             if (captured.entries && !roots.has(captured.json)) {
@@ -203,7 +235,9 @@ export function createPersistenceCanonicalCapture(read: {
             const captured = captureStorage()
             if (!captured) return null
             return {
-                json: captured.json,
+                get json() {
+                    return captured.json
+                },
                 entries: captured.entries,
                 get value() {
                     return JSON.parse(captured.json)

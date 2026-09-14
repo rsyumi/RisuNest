@@ -77,6 +77,49 @@ function harness(entries: Record<string, { byteSize: number; value: unknown }>, 
 }
 
 describe('plugin storage V3 residency', () => {
+    it('preserves exact JSON byte budgets for strings including escaped and unpaired UTF-16', async () => {
+        const values = [
+            '',
+            'ASCII "quoted" \\ text',
+            '한글🙂é\u2028\u2029',
+            '\ud800a\udc00\ud800\ud800\udc00',
+            Array.from({ length: 0x10000 }, (_, code) => String.fromCharCode(code)).join(''),
+        ]
+        for (const value of values) {
+            const byteSize = new TextEncoder().encode(JSON.stringify(value)).byteLength
+            for (const budget of [byteSize, byteSize - 1]) {
+                const { storage, readPluginStorage } = harness(
+                    { alpha: { value, byteSize } },
+                    budget,
+                )
+                storage.preloadCompatibilityValues({ alpha: value })
+                storage.setEvictionAllowed(true)
+                await expect(storage.getItem('alpha')).resolves.toBe(value)
+                expect(readPluginStorage).toHaveBeenCalledTimes(budget < byteSize ? 1 : 0)
+            }
+        }
+    })
+
+    it('preloads large immutable strings without serialization, encoding or cloning copies', async () => {
+        const value = 'x'.repeat(16 * 1024 * 1024)
+        const { storage, readPluginStorage } = harness({})
+        const stringify = vi.spyOn(JSON, 'stringify')
+        const encode = vi.spyOn(TextEncoder.prototype, 'encode')
+        const clone = vi.spyOn(globalThis, 'structuredClone')
+        try {
+            storage.preloadCompatibilityValues({ alpha: value })
+            expect(stringify).not.toHaveBeenCalled()
+            expect(encode).not.toHaveBeenCalled()
+            expect(clone).not.toHaveBeenCalled()
+        } finally {
+            stringify.mockRestore()
+            encode.mockRestore()
+            clone.mockRestore()
+        }
+        await expect(storage.getItem('alpha')).resolves.toBe(value)
+        expect(readPluginStorage).not.toHaveBeenCalled()
+    })
+
     it('boots from the key and size index and reads values only on demand', async () => {
         const { storage, store, readPluginStorage } = harness({
             alpha: { byteSize: 6, value: 'alpha' },
