@@ -337,16 +337,35 @@ pub(super) fn acquire_revision(
     ))
 }
 
-fn open_revision_reader(database_path: &Path) -> StoreResult<Connection> {
+pub(super) fn open_revision_reader(database_path: &Path) -> StoreResult<Connection> {
+    open_reader(database_path, &|_| Ok(()))
+}
+
+/// A reader that presents one generation under the raw table names. The views are temp objects,
+/// so they have to exist before the connection becomes read-only.
+pub(super) fn open_generation_reader(
+    database_path: &Path,
+    generation: &str,
+) -> StoreResult<Connection> {
+    open_reader(database_path, &|connection| {
+        super::portable::install_generation_views(connection, generation)
+    })
+}
+
+fn open_reader(
+    database_path: &Path,
+    prepare: &dyn Fn(&Connection) -> StoreResult<()>,
+) -> StoreResult<Connection> {
     let preferred = revision_reader_open_flags_for_target(cfg!(target_os = "android"));
     if cfg!(target_os = "android") {
-        return configure_revision_reader(database_path, preferred);
+        return configure_revision_reader(database_path, preferred, prepare);
     }
-    match configure_revision_reader(database_path, preferred) {
+    match configure_revision_reader(database_path, preferred, prepare) {
         Ok(connection) => Ok(connection),
         Err(_) => configure_revision_reader(
             database_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            prepare,
         ),
     }
 }
@@ -360,13 +379,18 @@ pub(super) fn revision_reader_open_flags_for_target(is_android: bool) -> OpenFla
     access | OpenFlags::SQLITE_OPEN_NO_MUTEX
 }
 
-fn configure_revision_reader(database_path: &Path, flags: OpenFlags) -> StoreResult<Connection> {
+fn configure_revision_reader(
+    database_path: &Path,
+    flags: OpenFlags,
+    prepare: &dyn Fn(&Connection) -> StoreResult<()>,
+) -> StoreResult<Connection> {
     let connection = Connection::open_with_flags(database_path, flags)?;
     connection.busy_timeout(Duration::ZERO)?;
+    connection.execute_batch("PRAGMA cache_size = -2048;")?;
+    prepare(&connection)?;
     connection.execute_batch(
         "
         PRAGMA query_only = ON;
-        PRAGMA cache_size = -2048;
         BEGIN DEFERRED;
         ",
     )?;

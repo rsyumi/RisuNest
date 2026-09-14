@@ -2564,6 +2564,28 @@ impl PersistentStore {
         Ok(())
     }
 
+    /// Scans the leased generation in place, reporting every violation instead of the first.
+    /// The lease pins the generation against collection, and the caller compares its revision
+    /// again before applying any repair.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn scan_data_health(
+        &self,
+        lease: &str,
+        limit: usize,
+        probe: &dyn crate::local_backup::CancellationProbe,
+    ) -> StoreResult<crate::data_health::Findings> {
+        let (_, target) = self.read_view(Some(lease))?;
+        let view = snapshot::open_generation_reader(&self.database_path, &target.generation)?;
+        let cas = crate::asset_repository::PayloadCas::new(self.repository_root())?;
+        let mut findings = crate::data_health::Findings::new(limit);
+        crate::portable_backup::scan_live_library(&view, &cas, &mut findings, probe).map_err(
+            |error| StoreError::Store {
+                message: error.to_string(),
+            },
+        )?;
+        Ok(findings)
+    }
+
     fn read_view(&self, lease: Option<&str>) -> StoreResult<(&Connection, ReadTarget)> {
         match lease {
             None => Ok((

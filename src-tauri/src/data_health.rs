@@ -30,7 +30,7 @@ pub(crate) enum Severity {
 fn severity_of(code: &str) -> Severity {
     match code {
         codes::REFERENCE_MISSING | codes::REFERENCE_INVALID => Severity::Degraded,
-        codes::RECORD_ORPHAN | codes::OBJECT_UNREFERENCED => Severity::Informational,
+        codes::OBJECT_UNREFERENCED => Severity::Informational,
         _ => Severity::Blocking,
     }
 }
@@ -46,7 +46,7 @@ pub(crate) struct Owner {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Locator {
     pub(crate) source_path: String,
-    pub(crate) occurrence: i64,
+    pub(crate) occurrence: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -88,7 +88,7 @@ impl Finding {
         }
     }
 
-    pub(crate) fn at(mut self, source_path: impl Into<String>, occurrence: i64) -> Self {
+    pub(crate) fn at(mut self, source_path: impl Into<String>, occurrence: u64) -> Self {
         self.locator = Some(Locator {
             source_path: source_path.into(),
             occurrence,
@@ -106,11 +106,14 @@ impl Finding {
 }
 
 pub(crate) trait FindingSink {
-    /// Returns false when the validator must stop at this finding instead of continuing.
+    /// A rule violation. Returns false when the validator must stop instead of continuing.
     fn record(&mut self, finding: Finding) -> bool;
+    /// An observation the activation contract accepts, such as a reference that has always been
+    /// allowed to dangle. It belongs in a diagnosis but never fails a gate.
+    fn note(&mut self, finding: Finding);
 }
 
-/// Keeps the first finding and stops the scan, reproducing the fail-fast contract.
+/// Keeps the first blocking finding and stops the scan, reproducing the fail-fast contract.
 #[derive(Default)]
 pub(crate) struct FirstFinding(Option<Finding>);
 
@@ -122,9 +125,13 @@ impl FirstFinding {
 
 impl FindingSink for FirstFinding {
     fn record(&mut self, finding: Finding) -> bool {
+        if finding.severity != Severity::Blocking {
+            return true;
+        }
         self.0 = Some(finding);
         false
     }
+    fn note(&mut self, _finding: Finding) {}
 }
 
 /// Keeps every finding up to a bound and counts the rest, so a thoroughly damaged library
@@ -147,11 +154,49 @@ impl Findings {
 
 impl FindingSink for Findings {
     fn record(&mut self, finding: Finding) -> bool {
+        self.note(finding);
+        true
+    }
+    fn note(&mut self, finding: Finding) {
         if self.items.len() < self.limit {
             self.items.push(finding);
         } else {
             self.omitted += 1;
         }
-        true
+    }
+}
+
+/// Carries the stop decision across nested validators, so a fail-fast caller stops the whole
+/// scan at its first blocking violation rather than only the loop that produced it.
+pub(crate) struct Report<'a> {
+    sink: &'a mut dyn FindingSink,
+    stopped: bool,
+}
+
+impl<'a> Report<'a> {
+    pub(crate) fn new(sink: &'a mut dyn FindingSink) -> Self {
+        Self {
+            sink,
+            stopped: false,
+        }
+    }
+
+    pub(crate) fn running(&self) -> bool {
+        !self.stopped
+    }
+}
+
+impl FindingSink for Report<'_> {
+    fn record(&mut self, finding: Finding) -> bool {
+        if self.stopped {
+            return false;
+        }
+        self.stopped = !self.sink.record(finding);
+        !self.stopped
+    }
+    fn note(&mut self, finding: Finding) {
+        if !self.stopped {
+            self.sink.note(finding);
+        }
     }
 }

@@ -172,6 +172,23 @@ pub(crate) fn create_raw_tables(destination: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+/// Presents one generation under the raw table names, without copying a row. SQLite resolves an
+/// unqualified name in the temp schema first, so this needs a connection of its own.
+pub(crate) fn install_generation_views(
+    destination: &Connection,
+    generation: &str,
+) -> StoreResult<()> {
+    let quoted = generation.replace('\'', "''");
+    for table in TABLES {
+        destination.execute_batch(&format!(
+            "CREATE TEMP VIEW {name} AS SELECT {columns} FROM main.{name} WHERE generation='{quoted}'",
+            name = table.name,
+            columns = table.column_list(),
+        ))?;
+    }
+    Ok(())
+}
+
 fn cancelled(probe: &dyn CancellationProbe) -> StoreResult<()> {
     if probe.is_cancelled() {
         return Err(StoreError::Validation {

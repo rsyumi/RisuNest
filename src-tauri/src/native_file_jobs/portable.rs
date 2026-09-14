@@ -1088,6 +1088,15 @@ mod tests {
             .unwrap();
             assert!(archive.manifest.repair_required);
             assert!(archive.validate_library(&NeverCancelled).is_err());
+            if archive.manifest.library_included {
+                // The gate refuses this archive, so only the collecting scan can say what is wrong.
+                let mut findings = crate::data_health::Findings::new(64);
+                archive.scan_library(&mut findings, &NeverCancelled).unwrap();
+                assert!(findings
+                    .items
+                    .iter()
+                    .any(|finding| finding.code == crate::data_health::codes::RECORD_INVALID));
+            }
             if unknown {
                 assert_eq!(
                     archive.manifest.profile,

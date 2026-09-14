@@ -611,7 +611,8 @@ mod tests {
             .iter()
             .find(|finding| finding.code == codes::RECORD_ORPHAN)
             .expect("conversations without a character are orphans");
-        assert_eq!(orphan.severity, Severity::Informational);
+        // An orphan still refuses activation, so the diagnosis must not call it harmless.
+        assert_eq!(orphan.severity, Severity::Blocking);
         assert_eq!(orphan.owner.kind, "conversations");
         assert!(validate_records(&db, &Never).is_err());
     }
