@@ -290,7 +290,6 @@ export const languageEnglish = {
             "Balanced shows the first update immediately, then processes only the latest update at most about every 0.125 seconds. Stateful scripts can run fewer times.\n\n" +
             "Strong shows batched raw previews and performs semantic post-processing once after normal completion. It changes intermediate behavior the most.\n\n" +
             "The selected mode is pinned until the current generation ends. Balanced and Strong can change how many times stateful regex, Lua, or plugin actions run.",
-        imageCompression: "If enabled, it will compress images when exporting character. if animated images doesn't works, try disabling this option.",
         useExperimental: "If enabled, it will show some experimental features.",
         forceProxyAsOpenAI: "If enabled, it will force to use OpenAI format when using reverse proxy.",
         forcePlainFetch: "If enabled, it will use browser fetch api instead of native http request. this can cause CORS errors.",
@@ -314,8 +313,6 @@ export const languageEnglish = {
         genTimes:
             "This option is used to set the number of responses to generate on support models. Other then first response will be act as cached reroll. This can reduce the cost of the model, but it can also increase the cost if you use it without reroll.",
         requestretrys: "This option is used to set the number of request retries when request fails.",
-        chatLoadInitialPages: "Number of recent chat messages to render when a chat screen opens. Higher values show more history immediately but can make long chats heavier to open.",
-        chatLoadAdditionalPages: "Number of older chat messages to render each time you scroll to the top. Higher values reduce repeated loading but can make each load heavier.",
         emotionPrompt: "This option is used to set the prompt that is used to detect emotion. If it is blank, it will use the default prompt.",
         removePunctuationHypa: "If enabled, it will remove punctuation before executing HypaMemory.",
         additionalParams:
@@ -917,8 +914,6 @@ export const languageEnglish = {
     prompt: "Prompt",
     loreBookDepth: "Lorebook Search Depth",
     loreBookToken: "Lorebook Max Tokens",
-    chatLoadInitialPages: "Initial Chat Load Count",
-    chatLoadAdditionalPages: "Additional Chat Load Count",
     removeCharacter: "Remove Character",
     removeGroup: "Remove Group",
     exportCharacter: "Export Character",
@@ -1126,7 +1121,6 @@ export const languageEnglish = {
     recent: "Recent",
     downloads: "Downloads",
     trending: "Trending",
-    imageCompression: "Image Compression",
     notLoggedIn: "Not Logged in to Risu Account",
     googleDriveInfo: "Connect to Google Drive to sync your data.",
     googleDriveConnection: "Google Drive Connection",
@@ -1743,6 +1737,8 @@ export const languageEnglish = {
     noBookmarks: "No Bookmarks",
     bookmarkAskNameOrDefault: "Enter bookmark name. If not entered, it will be automatically assigned.",
     bookmarkAskNameOrCancel: "Enter bookmark name. If not entered, rename will be canceled.",
+    bookmarkActionFailed: "The bookmark changed before the action finished. Refresh the list and try again.",
+    presetActionFailed: "Couldn't update the preset. Refresh the preset list and try again.",
     collapseAll: "Collapse All",
     expandAll: "Expand All",
     noRequestLogs: "No request logs available.",
@@ -2370,6 +2366,7 @@ export const languageEnglish = {
                 note: 'Chat attachments and inlay images are not included. The app restarts once the restore finishes.',
                 restore: 'Restore and start',
                 other: 'Another way',
+                notRestored: 'The account backup was not applied. Local data was kept, so you can retry or choose another way.',
             },
             done: {
                 title: 'Ready',
