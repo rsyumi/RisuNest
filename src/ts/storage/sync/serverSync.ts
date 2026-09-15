@@ -2,12 +2,20 @@ import type { SyncMutationRuntime } from "./syncMutationRuntime";
 import { invoke } from "@tauri-apps/api/core";
 import type { PersistentDestructiveReplacementFence } from "../persistentDataRuntime";
 
+/** Ledger sections. Device-fixed data is never addressable on the server. */
+export type ServerSection = "library" | "hypa" | "local-plugins";
+export interface ServerSectionHead {
+  stateId: string;
+  changedSeq: string;
+  gcFloor: string;
+}
 export interface ServerHead {
   libraryId: string;
   epoch: string;
   seq: string;
   headId: string;
   minRetainedSeq: string;
+  sections: Record<ServerSection, ServerSectionHead>;
 }
 export interface ServerDirectory {
   baseUrl: string;

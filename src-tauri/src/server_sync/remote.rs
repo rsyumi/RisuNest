@@ -5,8 +5,12 @@ use super::{
 };
 use reqwest::Method;
 use risunest_sync_wire::{
-    canonical, RecordChange, RecordVersion, RemoteHead, Sequence, MAX_METADATA_BYTES,
+    canonical, Domain, RecordChange, RecordVersion, RemoteHead, Sequence, MAX_METADATA_BYTES,
 };
+
+/// The library is the only section this replica applies today. Hypa and local
+/// plugin sections are requested by the section-aware paths added later.
+const SECTIONS: [Domain; 1] = [Domain::Library];
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -22,23 +26,32 @@ struct Pin {
     pin_id: String,
     after_seq: Sequence,
     through: RemoteHead,
+    domains: Vec<Domain>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Checkpoint {
     checkpoint_id: String,
     head: RemoteHead,
+    domains: Vec<Domain>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CheckpointPage {
     checkpoint: Checkpoint,
     records: Vec<Entry>,
-    next_key: Option<String>,
+    next: Option<CheckpointCursor>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointCursor {
+    domain: Domain,
+    key: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Entry {
+    domain: Domain,
     key: String,
     version: RecordVersion,
 }
@@ -46,6 +59,7 @@ struct Entry {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ChangePage {
     through: RemoteHead,
+    domains: Vec<Domain>,
     entries: Vec<JournalChange>,
     next: Cursor,
     has_more: bool,
@@ -59,8 +73,14 @@ struct JournalChange {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 enum Fetch {
-    Checkpoint { id: String, after: Option<String> },
-    Journal { id: String, after: Cursor },
+    Checkpoint {
+        id: String,
+        after: Option<CheckpointCursor>,
+    },
+    Journal {
+        id: String,
+        after: Cursor,
+    },
 }
 fn decode<T: for<'de> Deserialize<'de>>(text: &str) -> Result<T> {
     Ok(canonical::decode(text.as_bytes(), MAX_METADATA_BYTES)?)
@@ -69,7 +89,10 @@ fn json<T: Serialize>(value: &T) -> Result<String> {
     String::from_utf8(canonical::encode(value)?)
         .map_err(|_| SyncError::new("invalid-remote-metadata", 502))
 }
-fn version(db: &Connection, key: &str) -> Result<RecordVersion> {
+fn version(db: &Connection, domain: Domain, key: &str) -> Result<RecordVersion> {
+    if domain != Domain::Library {
+        return Err(SyncError::new("unsupported-remote-section", 502));
+    }
     let value: Option<String> = db
         .query_row(
             "SELECT version FROM server_sync_remote WHERE key=?1",
@@ -149,10 +172,15 @@ fn refresh_once(
                 Method::POST,
                 "read-pins",
                 &[],
-                Some(&serde_json::json!({"epoch":previous.epoch,"afterSeq":previous.seq})),
+                Some(
+                    &serde_json::json!({"epoch":previous.epoch,"afterSeq":previous.seq,"domains":SECTIONS}),
+                ),
                 &[],
             )?;
-            if pin.after_seq != previous.seq || pin.through.epoch != previous.epoch {
+            if pin.after_seq != previous.seq
+                || pin.through.epoch != previous.epoch
+                || pin.domains != SECTIONS
+            {
                 return Err(SyncError::new("invalid-read-pin", 502));
             }
             risunest_sync_wire::validate_id(&pin.pin_id)?;
@@ -165,9 +193,17 @@ fn refresh_once(
                 },
             };
         } else {
-            let (_, checkpoint): (_, Checkpoint) =
-                client.json(Method::POST, "checkpoints", &[], None::<&()>, &[])?;
+            let (_, checkpoint): (_, Checkpoint) = client.json(
+                Method::POST,
+                "checkpoints",
+                &[],
+                Some(&serde_json::json!({"domains":SECTIONS})),
+                &[],
+            )?;
             risunest_sync_wire::validate_id(&checkpoint.checkpoint_id)?;
+            if checkpoint.domains != SECTIONS {
+                return Err(SyncError::new("checkpoint-identity-mismatch", 502));
+            }
             through = checkpoint.head;
             fetch = Fetch::Checkpoint {
                 id: checkpoint.checkpoint_id,
@@ -187,7 +223,7 @@ fn refresh_once(
             )?;
             tx.execute("DELETE FROM server_sync_remote", [])?;
         }
-        tx.execute("INSERT INTO server_sync_remote_cursor VALUES(1,?1,?2,0) ON CONFLICT(singleton) DO UPDATE SET head=excluded.head,cursor=excluded.cursor,complete=0",params![json(&through)?,json(&fetch)?])?;
+        tx.execute("INSERT INTO server_sync_remote_cursor VALUES(1,?1,?2,?3,0) ON CONFLICT(singleton) DO UPDATE SET head=excluded.head,domains=excluded.domains,cursor=excluded.cursor,complete=0",params![json(&through)?,json(&SECTIONS)?,json(&fetch)?])?;
         tx.commit()?;
     }
     loop {
@@ -195,7 +231,8 @@ fn refresh_once(
             Fetch::Checkpoint { id, after } => {
                 let mut query = vec![("limit", "1024".into())];
                 if let Some(after) = after {
-                    query.push(("afterKey", after.clone()));
+                    query.push(("afterDomain", after.domain.as_str().into()));
+                    query.push(("afterKey", after.key.clone()));
                 }
                 let (_, page): (_, CheckpointPage) = client.json(
                     Method::GET,
@@ -206,26 +243,28 @@ fn refresh_once(
                 )?;
                 if page.checkpoint.checkpoint_id != *id
                     || !page.checkpoint.head.same_revision(&through)
+                    || page.checkpoint.domains != SECTIONS
                     || page.records.len() > 1024
                 {
                     return Err(SyncError::new("checkpoint-identity-mismatch", 502));
                 }
-                let mut previous = after.as_deref();
+                let mut previous = after.as_ref().map(|c| (c.domain, c.key.as_str()));
                 for entry in &page.records {
-                    if previous.is_some_and(|p| p >= entry.key.as_str()) {
+                    if previous.is_some_and(|p| p >= (entry.domain, entry.key.as_str())) {
                         return Err(SyncError::new("unordered-checkpoint", 502));
                     }
-                    previous = Some(&entry.key);
+                    previous = Some((entry.domain, &entry.key));
                 }
-                if page.next_key.is_some()
-                    && page.next_key.as_deref() != page.records.last().map(|r| r.key.as_str())
-                {
+                if page.next.as_ref().is_some_and(|next| {
+                    page.records.last().map(|r| (r.domain, r.key.as_str()))
+                        != Some((next.domain, next.key.as_str()))
+                }) {
                     return Err(SyncError::new("invalid-checkpoint-cursor", 502));
                 }
-                let done = page.next_key.is_none();
+                let done = page.next.is_none();
                 let next = Fetch::Checkpoint {
                     id: id.clone(),
-                    after: page.next_key,
+                    after: page.next,
                 };
                 (page.records, next, done, format!("checkpoints/{id}"))
             }
@@ -241,7 +280,10 @@ fn refresh_once(
                     None::<&()>,
                     &[],
                 )?;
-                if !page.through.same_revision(&through) || page.entries.len() > 1024 {
+                if !page.through.same_revision(&through)
+                    || page.domains != SECTIONS
+                    || page.entries.len() > 1024
+                {
                     return Err(SyncError::new("journal-identity-mismatch", 502));
                 }
                 let mut prior = after.clone();
@@ -253,15 +295,17 @@ fn refresh_once(
                     {
                         return Err(SyncError::new("invalid-journal-cursor", 502));
                     }
+                    let address = (entry.change.domain, entry.change.key.clone());
                     let before = within
-                        .get(&entry.change.key)
+                        .get(&address)
                         .cloned()
-                        .unwrap_or(version(db, &entry.change.key)?);
+                        .unwrap_or(version(db, address.0, &address.1)?);
                     if before != entry.change.before {
                         return Err(SyncError::new("journal-base-mismatch", 409));
                     }
-                    within.insert(entry.change.key.clone(), entry.change.after.clone());
+                    within.insert(address, entry.change.after.clone());
                     entries.push(Entry {
+                        domain: entry.change.domain,
                         key: entry.change.key,
                         version: entry.change.after,
                     });
@@ -285,6 +329,7 @@ fn refresh_once(
         for entry in entries {
             if entry.key.is_empty()
                 || entry.key.len() > risunest_sync_wire::MAX_KEY_BYTES
+                || !SECTIONS.contains(&entry.domain)
                 || matches!(entry.version, RecordVersion::Absent)
             {
                 return Err(SyncError::new("invalid-remote-record", 502));

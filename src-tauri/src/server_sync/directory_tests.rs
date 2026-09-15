@@ -65,7 +65,11 @@ fn tls_identity_requests(
             let input = request(&mut stream);
             assert!(input.starts_with("GET /session ") || input.starts_with("GET /head "));
             assert!(input.to_lowercase().contains("authorization: bearer "));
-            let head = serde_json::json!({"libraryId":"library","epoch":"epoch","seq":"0","headId":"a".repeat(64),"minRetainedSeq":"0"});
+            let head = serde_json::to_value(risunest_sync_wire::RemoteHead {
+                head_id: "a".repeat(64),
+                ..risunest_sync_wire::RemoteHead::genesis("library".into(), "epoch".into()).unwrap()
+            })
+            .unwrap();
             let body = if input.starts_with("GET /session ") {
                 serde_json::json!({"head":head,"deviceId":device,"operationWatermark":"0","operationPending":false}).to_string()
             } else {

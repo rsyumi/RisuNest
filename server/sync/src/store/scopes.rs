@@ -68,7 +68,7 @@ impl Store {
                 return Err(Error::new("scope-fence-mismatch", 409));
             }
             if fence.clear {
-                let incomplete: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM record_scopes WHERE scope=?1 AND NOT EXISTS(SELECT 1 FROM staged_records WHERE stage=?2 AND staged_records.key=record_scopes.key) AND NOT EXISTS(SELECT 1 FROM staged_fences WHERE stage=?2 AND staged_fences.key=record_scopes.key))",params![fence.scope,stage],|r|r.get(0))?;
+                let incomplete: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM record_scopes WHERE scope=?1 AND NOT EXISTS(SELECT 1 FROM staged_records WHERE stage=?2 AND staged_records.domain=record_scopes.domain AND staged_records.key=record_scopes.key) AND NOT EXISTS(SELECT 1 FROM staged_fences WHERE stage=?2 AND staged_fences.domain=record_scopes.domain AND staged_fences.key=record_scopes.key))",params![fence.scope,stage],|r|r.get(0))?;
                 if incomplete {
                     return Err(Error::new("incomplete-scope-clear", 409));
                 }
@@ -86,11 +86,17 @@ impl Store {
             Ok(())
         })?;
         Self::each_change(db, stage, |change| {
-            let mut statement = db.prepare("SELECT scope FROM record_scopes WHERE key=?1")?;
-            for scope in statement.query_map([&change.key], |r| r.get::<_, String>(0))? {
+            let mut statement =
+                db.prepare("SELECT scope FROM record_scopes WHERE domain=?1 AND key=?2")?;
+            for scope in statement.query_map(params![change.domain.as_str(), change.key], |r| {
+                r.get::<_, String>(0)
+            })? {
                 touched.insert(scope?);
             }
-            db.execute("DELETE FROM record_scopes WHERE key=?1", [&change.key])?;
+            db.execute(
+                "DELETE FROM record_scopes WHERE domain=?1 AND key=?2",
+                params![change.domain.as_str(), change.key],
+            )?;
             if let RecordVersion::Live {
                 descriptor_hash: Some(digest),
                 ..
@@ -104,8 +110,8 @@ impl Store {
                 let descriptor: RecordDescriptor = parse(&body)?;
                 for scope in descriptor.scopes {
                     db.execute(
-                        "INSERT INTO record_scopes VALUES(?1,?2)",
-                        params![change.key, scope],
+                        "INSERT INTO record_scopes VALUES(?1,?2,?3)",
+                        params![change.domain.as_str(), change.key, scope],
                     )?;
                     touched.insert(scope);
                 }

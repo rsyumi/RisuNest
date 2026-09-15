@@ -1,4 +1,4 @@
-use risunest_sync_wire::{RecordChange, RecordVersion};
+use risunest_sync_wire::{Domain, RecordChange, RecordVersion};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Decision {
@@ -42,6 +42,7 @@ pub(crate) fn proposal(
     remote: &RecordVersion,
 ) -> Option<RecordChange> {
     (decide(&base, &local, remote) == Decision::PublishLocal).then_some(RecordChange {
+        domain: Domain::Library,
         key,
         before: remote.clone(),
         after: local,

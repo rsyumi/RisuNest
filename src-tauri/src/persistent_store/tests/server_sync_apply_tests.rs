@@ -12,11 +12,9 @@ use risunest_sync_wire::{Receipt, RecordVersion, RemoteHead, Sequence, TerminalS
 
 fn head(seq: u64) -> RemoteHead {
     RemoteHead {
-        library_id: "library".into(),
-        epoch: "epoch".into(),
         seq: Sequence::from(seq),
         head_id: risunest_sync_wire::hash(seq.to_string().as_bytes()),
-        min_retained_seq: Sequence::from(0),
+        ..RemoteHead::genesis("library".into(), "epoch".into()).unwrap()
     }
 }
 fn bind(store: &mut PersistentStore) {

@@ -88,7 +88,7 @@ fn bad_registration_input_allocates_no_device() {
 
 #[tokio::test]
 async fn live_revoke_cancels_reserved_work_without_removing_committed_data() {
-    use risunest_sync_wire::{hash, ChangeSet, CommitIntent, RecordChange, RecordVersion};
+    use risunest_sync_wire::{hash, ChangeSet, CommitIntent, Domain, RecordChange, RecordVersion};
     let root = tempfile::tempdir().unwrap();
     let store = std::sync::Arc::new(Store::init(root.path()).unwrap());
     let credential = store.add_device().unwrap();
@@ -104,6 +104,7 @@ async fn live_revoke_cancels_reserved_work_without_removing_committed_data() {
                 &device,
                 &ChangeSet {
                     changes: vec![RecordChange {
+                        domain: Domain::Library,
                         key: key.into(),
                         before: RecordVersion::Absent,
                         after: RecordVersion::Live {

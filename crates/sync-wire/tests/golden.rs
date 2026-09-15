@@ -1,6 +1,6 @@
 use risunest_sync_wire::{
-    batch, canonical, hash, operation_id, ChangeSet, CommitIntent, ReadFence, RecordChange,
-    RecordVersion, RemoteHead, Sequence,
+    batch, canonical, change_digest::ChangeDigest, hash, operation_id, ChangeSet, CommitIntent,
+    Domain, ReadFence, RecordChange, RecordVersion, RemoteHead, Sequence,
 };
 use serde_json::{json, Value};
 
@@ -52,6 +52,7 @@ fn sequence_is_decimal_not_a_local_revision_or_js_number() {
 fn changes() -> ChangeSet {
     ChangeSet {
         changes: vec![RecordChange {
+            domain: Domain::Library,
             key: "conversation/한글".into(),
             before: RecordVersion::Absent,
             after: RecordVersion::Live {
@@ -67,11 +68,9 @@ fn intent() -> CommitIntent {
     CommitIntent {
         device_operation_seq: 1.into(),
         expected_head: RemoteHead {
-            library_id: "library".into(),
-            epoch: "epoch".into(),
             seq: 7.into(),
             head_id: hash(b"head"),
-            min_retained_seq: 0.into(),
+            ..RemoteHead::genesis("library".into(), "epoch".into()).unwrap()
         },
         changes_digest: changes().digest().unwrap(),
         staged_changes_id: "first".into(),
@@ -87,6 +86,7 @@ fn intent_identity_excludes_transport_and_staging_but_includes_fences() {
     assert_ne!(a.digest().unwrap(), b.digest().unwrap());
     let mut changed = changes();
     changed.read_fences.push(ReadFence {
+        domain: Domain::Library,
         key: "owner".into(),
         version: RecordVersion::Absent,
     });
@@ -159,4 +159,109 @@ fn batch_rejects_every_truncated_prefix_trailing_bytes_corruption_and_unknown_co
     assert!(batch::decode(&bad).is_err());
     assert!(batch::encode(&[&vec![0; batch::MAX_BATCH_BYTES]]).is_err());
     assert!(batch::encode(&vec![b"".as_slice(); 1025]).is_err());
+}
+
+#[test]
+fn domain_ordering_matches_its_wire_strings() {
+    let mut sorted = Domain::ALL;
+    sorted.sort_by_key(Domain::as_str);
+    assert_eq!(sorted, Domain::ALL);
+    assert_eq!(
+        Domain::ALL.map(|d| d.as_str()),
+        ["hypa", "library", "local-plugins"]
+    );
+    for domain in Domain::ALL {
+        assert_eq!(Domain::try_from(domain.as_str()).unwrap(), domain);
+        assert_eq!(
+            canonical::encode(&domain).unwrap(),
+            format!("\"{domain}\"").as_bytes()
+        );
+    }
+    assert!(Domain::try_from("device-settings").is_err());
+    assert!(canonical::decode::<Domain>(b"\"device-settings\"", 1024).is_err());
+}
+#[test]
+fn change_sets_address_records_by_domain_and_key() {
+    let mut c = changes();
+    let mut other = c.changes[0].clone();
+    other.domain = Domain::Hypa;
+    c.changes.insert(0, other);
+    assert!(c.validate().is_ok());
+    c.changes.swap(0, 1);
+    assert!(c.validate().is_err());
+    let mut c = changes();
+    c.changes.push(RecordChange {
+        domain: Domain::Hypa,
+        ..c.changes[0].clone()
+    });
+    // hypa sorts before library, so the same key in two domains still needs order.
+    assert!(c.validate().is_err());
+    let mut c = changes();
+    let library = c.changes[0].clone();
+    c.changes[0].domain = Domain::Hypa;
+    assert_ne!(c.digest().unwrap(), changes().digest().unwrap());
+    c.changes.push(library);
+    assert!(c.validate().is_ok());
+}
+#[test]
+fn streaming_digest_equals_the_flat_change_set() {
+    let mut set = changes();
+    set.changes.insert(
+        0,
+        RecordChange {
+            domain: Domain::Hypa,
+            ..set.changes[0].clone()
+        },
+    );
+    set.read_fences.push(ReadFence {
+        domain: Domain::LocalPlugins,
+        key: "owner".into(),
+        version: RecordVersion::Absent,
+    });
+    set.read_fences.insert(
+        0,
+        ReadFence {
+            domain: Domain::Hypa,
+            key: "owner".into(),
+            version: RecordVersion::Absent,
+        },
+    );
+    let mut digest = ChangeDigest::new();
+    for change in &set.changes {
+        digest.change(change).unwrap();
+    }
+    for fence in &set.read_fences {
+        digest.read_fence(fence).unwrap();
+    }
+    assert_eq!(digest.finish().unwrap(), set.digest().unwrap());
+}
+#[test]
+fn heads_carry_one_sequence_and_a_state_per_section() {
+    let head = RemoteHead::genesis("library".into(), "epoch".into()).unwrap();
+    head.validate().unwrap();
+    assert_eq!(head.sections.len(), 3);
+    let ids: std::collections::BTreeSet<_> = head
+        .sections
+        .values()
+        .map(|section| section.state_id.clone())
+        .collect();
+    assert_eq!(ids.len(), 3);
+    let encoded = canonical::encode(&head).unwrap();
+    assert_eq!(
+        canonical::decode::<RemoteHead>(&encoded, 4096).unwrap(),
+        head
+    );
+    assert!(std::str::from_utf8(&encoded)
+        .unwrap()
+        .contains("\"local-plugins\":"));
+    let mut missing = head.clone();
+    missing.sections.remove(&Domain::Hypa);
+    assert!(missing.validate().is_err());
+    let mut ahead = head.clone();
+    ahead.sections.get_mut(&Domain::Hypa).unwrap().changed_seq = 1.into();
+    assert!(ahead.validate().is_err());
+    let mut reclaimed = head.clone();
+    reclaimed.min_retained_seq = 0.into();
+    reclaimed.sections.get_mut(&Domain::Hypa).unwrap().gc_floor = 1.into();
+    assert!(reclaimed.validate().is_err());
 }

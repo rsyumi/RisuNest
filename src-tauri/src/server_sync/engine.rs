@@ -29,7 +29,7 @@ use crate::{
 };
 use reqwest::Method;
 use risunest_sync_wire::{
-    canonical, change_digest::ChangeDigest, ChangeSet, CommitIntent, ReadFence, Receipt,
+    canonical, change_digest::ChangeDigest, ChangeSet, CommitIntent, Domain, ReadFence, Receipt,
     RecordChange, RecordVersion, RemoteHead, ScopeFence, MAX_METADATA_BYTES,
 };
 use rusqlite::{params, Connection, OptionalExtension};
@@ -97,11 +97,8 @@ mod commit_retry_tests {
         let intent = CommitIntent {
             device_operation_seq: 1.into(),
             expected_head: RemoteHead {
-                library_id: config.library_id.clone(),
-                epoch: "epoch".into(),
-                seq: 0.into(),
                 head_id: "b".repeat(64),
-                min_retained_seq: 0.into(),
+                ..RemoteHead::genesis(config.library_id.clone(), "epoch".into()).unwrap()
             },
             changes_digest: "c".repeat(64),
             staged_changes_id: "d".repeat(64),
@@ -161,11 +158,8 @@ mod commit_retry_tests {
         let intent = CommitIntent {
             device_operation_seq: 1.into(),
             expected_head: RemoteHead {
-                library_id: config.library_id.clone(),
-                epoch: "epoch".into(),
-                seq: 0.into(),
                 head_id: "b".repeat(64),
-                min_retained_seq: 0.into(),
+                ..RemoteHead::genesis(config.library_id.clone(), "epoch".into()).unwrap()
             },
             changes_digest: "c".repeat(64),
             staged_changes_id: "d".repeat(64),
@@ -460,6 +454,7 @@ impl PersistentStore {
                 let before: RecordVersion = parse(&item.remote)?;
                 let after: RecordVersion = parse(&item.version)?;
                 let change = RecordChange {
+                    domain: Domain::Library,
                     key: item.key.clone(),
                     before,
                     after: after.clone(),
@@ -476,6 +471,7 @@ impl PersistentStore {
         }
         for (key, version) in reads {
             let fence = ReadFence {
+                domain: Domain::Library,
                 key: key.clone(),
                 version: version.clone(),
             };
@@ -1294,6 +1290,7 @@ impl PersistentStore {
                 bases: ready.bases.clone(),
                 finish_operation: ready.committed,
                 clear_revision: ready.clear_acknowledged.then_some(ready.revision),
+                applied_sections: vec![Domain::Library],
                 scanned_revision: if ready.proposals == 0 {
                     Some(ready.revision)
                 } else {
@@ -1330,18 +1327,23 @@ impl PersistentStore {
         ))?;
         let transfer = Transfer::new(&client, &cache)?;
         let through = &ready.through;
-        let ack = client.request(
-            Method::POST,
-            "acks",
-            &[],
-            Some(canonical::encode(
-                &serde_json::json!({"epoch":through.epoch,"seq":through.seq}),
-            )?),
-            &[],
-            MAX_METADATA_BYTES,
-        )?;
-        if ack.status != 204 {
-            return Err(response_error(ack));
+        // Only the sections this device actually applied are acknowledged. With
+        // none applied there is nothing to report, so no request is made.
+        let sections = self.server_applied_sections(&through.epoch)?;
+        if !sections.is_empty() {
+            let ack = client.request(
+                Method::POST,
+                "acks",
+                &[],
+                Some(canonical::encode(
+                    &serde_json::json!({"epoch":through.epoch,"sections":sections}),
+                )?),
+                &[],
+                MAX_METADATA_BYTES,
+            )?;
+            if ack.status != 204 {
+                return Err(response_error(ack));
+            }
         }
         if ready.proposals == 0 && ready.scope_fences.is_empty() {
             return Ok(CycleResult {

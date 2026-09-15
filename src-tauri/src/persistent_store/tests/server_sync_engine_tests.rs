@@ -2,7 +2,7 @@ use super::super::server_sync_engine::{CycleOptions, CycleResult};
 use super::*;
 use crate::server_sync::client::ServerConfig;
 use risunest_sync_server::{http, store::Store};
-use risunest_sync_wire::{ChangeSet, ScopeFence};
+use risunest_sync_wire::{ChangeSet, Domain, ScopeFence};
 use std::fs::OpenOptions;
 #[path = "server_sync_initial_tests.rs"]
 mod initial;
@@ -209,6 +209,20 @@ fn two_native_replicas_seed_publish_pull_and_preserve_same_key_conflicts() {
         "second replica: {:?}",
         second_result.conflicts
     );
+    // Only the library section is published and acknowledged by this replica.
+    let published = server.head().unwrap();
+    assert_eq!(
+        published.section(Domain::Library).unwrap().changed_seq,
+        published.seq
+    );
+    for domain in [Domain::Hypa, Domain::LocalPlugins] {
+        assert_eq!(published.section(domain).unwrap().changed_seq.as_str(), "0");
+        assert_eq!(server.section_ack_floor(domain).unwrap().as_str(), "0");
+    }
+    assert_ne!(
+        server.section_ack_floor(Domain::Library).unwrap().as_str(),
+        "0"
+    );
     assert_eq!(first.server_status().unwrap().dirty_records, 0);
     assert!(!first.server_status().unwrap().full_scan);
     let revision = first.revision().unwrap();
@@ -283,7 +297,9 @@ fn two_native_replicas_seed_publish_pull_and_preserve_same_key_conflicts() {
     let client = crate::server_sync::client::ServerClient::new(config).unwrap();
     let observed = server.head().unwrap();
     for collected in [false, true] {
-        let checkpoint = server.create_checkpoint(&device).unwrap();
+        let checkpoint = server
+            .create_checkpoint(&device, &[risunest_sync_wire::Domain::Library])
+            .unwrap();
         let db = Connection::open(directory.path().join("metadata.sqlite")).unwrap();
         if collected {
             db.execute(

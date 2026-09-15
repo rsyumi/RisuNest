@@ -1,24 +1,31 @@
 use super::{json, parse, Device, Store};
 use crate::{Error, Result};
 use risunest_sync_wire::{
-    canonical, hash, operation_id, CommitIntent, Receipt, RecordVersion, RemoteHead, Sequence,
-    TerminalStatus,
+    canonical, hash, next_section_state_id, operation_id, CommitIntent, Domain, Receipt,
+    RecordVersion, RemoteHead, Sequence, TerminalStatus,
 };
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::BTreeSet;
 
 impl Store {
-    pub(super) fn read_version(db: &Connection, key: &str) -> Result<RecordVersion> {
+    pub(super) fn read_version(
+        db: &Connection,
+        domain: Domain,
+        key: &str,
+    ) -> Result<RecordVersion> {
         let value: Option<String> = db
-            .query_row("SELECT version FROM records WHERE key=?1", [key], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT version FROM records WHERE domain=?1 AND key=?2",
+                params![domain.as_str(), key],
+                |r| r.get(0),
+            )
             .optional()?;
         value
             .map(|v| parse(&v))
             .unwrap_or(Ok(RecordVersion::Absent))
     }
-    pub fn record(&self, key: &str) -> Result<RecordVersion> {
-        Self::read_version(&*self.reader()?, key)
+    pub fn record(&self, domain: Domain, key: &str) -> Result<RecordVersion> {
+        Self::read_version(&*self.reader()?, domain, key)
     }
 
     /// The mutex is the single library writer queue. There is no network/file IO in
@@ -110,7 +117,7 @@ impl Store {
                 return Err(Error::new("changes-digest-mismatch", 409));
             }
             Self::each_change(&tx, stage, |change| {
-                if Self::read_version(&tx, &change.key)? != change.before {
+                if Self::read_version(&tx, change.domain, &change.key)? != change.before {
                     return Err(Error::new("before-version-mismatch", 409));
                 }
                 for digest in change.after.object_hashes() {
@@ -126,7 +133,7 @@ impl Store {
                 Ok(())
             })?;
             Self::each_fence(&tx, stage, |fence| {
-                if Self::read_version(&tx, &fence.key)? != fence.version {
+                if Self::read_version(&tx, fence.domain, &fence.key)? != fence.version {
                     return Err(Error::new("read-fence-mismatch", 409));
                 }
                 Ok(())
@@ -137,11 +144,25 @@ impl Store {
         match validation {
             Ok(()) => {
                 let seq = head.seq.next()?;
+                let mut touched = BTreeSet::new();
+                Self::each_change(&tx, stage, |change| {
+                    touched.insert(change.domain);
+                    Ok(())
+                })?;
+                let mut sections = head.sections.clone();
+                for domain in &touched {
+                    let section = sections
+                        .get_mut(domain)
+                        .ok_or(Error::new("corrupt-metadata", 503))?;
+                    section.state_id = next_section_state_id(&section.state_id, &operation, &seq)?;
+                    section.changed_seq = seq.clone();
+                }
                 let next = RemoteHead {
                     seq: seq.clone(),
                     head_id: hash(&canonical::encode(
                         &serde_json::json!({"domain":"risunest-sync-head-v1","previous":head.head_id,"operation":operation,"intent":digest,"seq":seq}),
                     )?),
+                    sections,
                     ..head
                 };
                 tx.execute_batch("SAVEPOINT apply_records")?;
@@ -151,16 +172,16 @@ impl Store {
                 )?;
                 let mut index = 0i64;
                 Self::each_change(&tx, stage, |change| {
-                    tx.execute("INSERT INTO records VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET version=excluded.version",params![change.key,json(&change.after)?])?;
+                    tx.execute("INSERT INTO records VALUES(?1,?2,?3) ON CONFLICT(domain,key) DO UPDATE SET version=excluded.version",params![change.domain.as_str(),change.key,json(&change.after)?])?;
                     tx.execute(
-                        "INSERT INTO changes VALUES(?1,?2,?3)",
-                        params![seq.as_str(), index, json(&change)?],
+                        "INSERT INTO changes VALUES(?1,?2,?3,?4)",
+                        params![seq.as_str(), index, change.domain.as_str(), json(&change)?],
                     )?;
                     index += 1;
                     Ok(())
                 })?;
                 Self::each_change(&tx, stage, |change| {
-                    Self::update_relations(&tx, &change.key, &change.after)
+                    Self::update_relations(&tx, change.domain, &change.key, &change.after)
                 })?;
                 if let Err(error) = Self::validate_relations(&tx, stage) {
                     if error.status >= 500 {

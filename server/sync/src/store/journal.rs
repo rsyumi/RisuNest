@@ -1,7 +1,7 @@
-use super::{parse, Store};
+use super::{domain_filter, parse, requested_domains, Store};
 use crate::{Error, Result};
 use risunest_sync_wire::{
-    RecordChange, RemoteHead, Sequence, MAX_METADATA_BYTES, MAX_PAGE_RECORDS,
+    Domain, RecordChange, RemoteHead, Sequence, MAX_METADATA_BYTES, MAX_PAGE_RECORDS,
 };
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,7 @@ pub struct JournalChange {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChangePage {
     pub through: RemoteHead,
+    pub domains: Vec<Domain>,
     pub entries: Vec<JournalChange>,
     pub next: ChangeCursor,
     pub has_more: bool,
@@ -45,11 +46,13 @@ impl Store {
         epoch: &str,
         after: &ChangeCursor,
         through: &Sequence,
+        domains: &[Domain],
         limit: usize,
     ) -> Result<ChangePage> {
         if limit == 0 || limit > MAX_PAGE_RECORDS {
             return Err(Error::new("invalid-page-limit", 400));
         }
+        let domains = requested_domains(domains)?;
         let ordinal = after
             .ordinal
             .as_str()
@@ -63,8 +66,10 @@ impl Store {
         if epoch != head.epoch {
             return Err(Error::new("epoch-changed", 409));
         }
-        if after.seq < head.min_retained_seq {
-            return Err(Error::new("checkpoint-required", 410));
+        for domain in &domains {
+            if after.seq < head.section(*domain)?.gc_floor {
+                return Err(Error::new("checkpoint-required", 410));
+            }
         }
         if after.seq > *through || through > &head.seq {
             return Err(Error::new("invalid-cursor", 400));
@@ -72,16 +77,7 @@ impl Store {
         let through_head = if through == &head.seq {
             head
         } else if through == &Sequence::from(0) {
-            let head_id = risunest_sync_wire::hash(&risunest_sync_wire::canonical::encode(&[
-                "risunest-sync-genesis-v1",
-                &head.library_id,
-                &head.epoch,
-            ])?);
-            RemoteHead {
-                seq: 0.into(),
-                head_id,
-                ..head
-            }
+            RemoteHead::genesis(head.library_id.clone(), head.epoch.clone())?
         } else {
             let body: Option<String> = db
                 .query_row(
@@ -92,7 +88,7 @@ impl Store {
                 .optional()?;
             parse(&body.ok_or(Error::new("through-head-not-found", 404))?)?
         };
-        let mut statement=db.prepare("SELECT seq,ordinal,body FROM changes WHERE (length(seq),seq,ordinal)>(?1,?2,?3) AND (length(seq),seq)<=(?4,?5) ORDER BY length(seq),seq,ordinal LIMIT ?6")?;
+        let mut statement = db.prepare(&format!("SELECT seq,ordinal,body FROM changes WHERE domain IN ({}) AND (length(seq),seq,ordinal)>(?1,?2,?3) AND (length(seq),seq)<=(?4,?5) ORDER BY length(seq),seq,ordinal LIMIT ?6",domain_filter(&domains)))?;
         let mut rows = statement.query(params![
             after.seq.as_str().len() as i64,
             after.seq.as_str(),
@@ -127,6 +123,7 @@ impl Store {
         }
         Ok(ChangePage {
             through: through_head,
+            domains,
             entries,
             next,
             has_more,

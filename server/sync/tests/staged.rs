@@ -1,7 +1,7 @@
 mod common;
 use common::*;
 use risunest_sync_server::store::{ChangeCursor, Store};
-use risunest_sync_wire::{hash, ChangeSet, CommitIntent, RecordVersion, TerminalStatus};
+use risunest_sync_wire::{hash, ChangeSet, CommitIntent, Domain, RecordVersion, TerminalStatus};
 
 fn page(start: usize, count: usize) -> ChangeSet {
     ChangeSet {
@@ -106,7 +106,10 @@ fn multi_page_restart_replay_and_atomic_journal_beyond_1024() {
     store
         .put_changes_page(&a, &id, 2, &page(1024, 512))
         .unwrap();
-    assert_eq!(store.record("key-000000").unwrap(), RecordVersion::Absent);
+    assert_eq!(
+        store.record(Domain::Library, "key-000000").unwrap(),
+        RecordVersion::Absent
+    );
     let sealed = store.seal_changes(&a, &id).unwrap();
     let intent = CommitIntent {
         expected_head: head.clone(),
@@ -121,7 +124,7 @@ fn multi_page_restart_replay_and_atomic_journal_beyond_1024() {
     let mut count = 0;
     loop {
         let page = store
-            .changes(&head.epoch, &cursor, &receipt.head.seq, 127)
+            .changes(&head.epoch, &cursor, &receipt.head.seq, &LIBRARY, 127)
             .unwrap();
         count += page.entries.len();
         cursor = page.next;
@@ -135,6 +138,7 @@ fn multi_page_restart_replay_and_atomic_journal_beyond_1024() {
             &head.epoch,
             &ChangeCursor::after_commit(1.into()),
             &receipt.head.seq,
+            &LIBRARY,
             128
         )
         .unwrap()

@@ -1,5 +1,41 @@
-use crate::{validate_hash, Result, WireError};
+use crate::{canonical, hash, validate_hash, Result, WireError};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// Ledger sections. Device-fixed data is never addressable here.
+/// Variants are declared in wire-string order so the derived ordering matches
+/// the `ORDER BY domain` a store uses for the same rows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Domain {
+    Hypa,
+    Library,
+    LocalPlugins,
+}
+impl Domain {
+    pub const ALL: [Self; 3] = [Self::Hypa, Self::Library, Self::LocalPlugins];
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Hypa => "hypa",
+            Self::Library => "library",
+            Self::LocalPlugins => "local-plugins",
+        }
+    }
+}
+impl std::fmt::Display for Domain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+impl TryFrom<&str> for Domain {
+    type Error = WireError;
+    fn try_from(value: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|domain| domain.as_str() == value)
+            .ok_or(WireError("invalid-domain"))
+    }
+}
 
 /// Decimal strings keep remote sequences independent of JS numbers/local PDS revisions.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -59,6 +95,17 @@ impl PartialOrd for Sequence {
     }
 }
 
+/// Per-section state carried by the one commit sequence. `changed_seq` is the
+/// commit that last touched the section; `gc_floor` is the oldest change still
+/// readable incrementally for it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SectionHead {
+    pub state_id: String,
+    pub changed_seq: Sequence,
+    pub gc_floor: Sequence,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoteHead {
@@ -67,26 +114,84 @@ pub struct RemoteHead {
     pub seq: Sequence,
     pub head_id: String,
     pub min_retained_seq: Sequence,
+    pub sections: BTreeMap<Domain, SectionHead>,
 }
 impl RemoteHead {
+    /// The empty ledger both a fresh store and a rotated epoch start from.
+    pub fn genesis(library_id: String, epoch: String) -> Result<Self> {
+        let head_id = hash(&canonical::encode(&[
+            "risunest-sync-genesis-v1",
+            &library_id,
+            &epoch,
+        ])?);
+        let mut sections = BTreeMap::new();
+        for domain in Domain::ALL {
+            sections.insert(
+                domain,
+                SectionHead {
+                    state_id: section_genesis_state_id(&library_id, &epoch, domain)?,
+                    changed_seq: 0.into(),
+                    gc_floor: 0.into(),
+                },
+            );
+        }
+        Ok(Self {
+            library_id,
+            epoch,
+            seq: 0.into(),
+            head_id,
+            min_retained_seq: 0.into(),
+            sections,
+        })
+    }
     pub fn same_revision(&self, other: &Self) -> bool {
         self.library_id == other.library_id
             && self.epoch == other.epoch
             && self.seq == other.seq
             && self.head_id == other.head_id
     }
+    pub fn section(&self, domain: Domain) -> Result<&SectionHead> {
+        self.sections.get(&domain).ok_or(WireError("invalid-head"))
+    }
     pub fn validate(&self) -> Result<()> {
         validate_id(&self.library_id)?;
         validate_id(&self.epoch)?;
         validate_hash(&self.head_id)?;
-        if self.min_retained_seq > self.seq {
+        if self.min_retained_seq > self.seq || self.sections.len() != Domain::ALL.len() {
             return Err(WireError("invalid-head"));
+        }
+        for domain in Domain::ALL {
+            let section = self.section(domain)?;
+            validate_hash(&section.state_id)?;
+            if section.changed_seq > self.seq
+                || section.gc_floor > self.seq
+                || section.gc_floor < self.min_retained_seq
+            {
+                return Err(WireError("invalid-head"));
+            }
         }
         Ok(())
     }
     pub fn etag(&self) -> String {
         format!("\"{}\"", self.head_id)
     }
+}
+pub fn section_genesis_state_id(library_id: &str, epoch: &str, domain: Domain) -> Result<String> {
+    Ok(hash(&canonical::encode(&[
+        "risunest-sync-section-genesis-v1",
+        library_id,
+        epoch,
+        domain.as_str(),
+    ])?))
+}
+/// A section advances only on a commit that carries changes for it.
+pub fn next_section_state_id(previous: &str, operation: &str, seq: &Sequence) -> Result<String> {
+    Ok(hash(&canonical::encode(&[
+        "risunest-sync-section-v1",
+        previous,
+        operation,
+        seq.as_str(),
+    ])?))
 }
 pub fn validate_id(value: &str) -> Result<()> {
     if value.is_empty()

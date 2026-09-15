@@ -129,38 +129,50 @@ impl Store {
         {
             return Err(Error::new("staging-too-large", 413));
         }
-        for (table, key, body) in page
+        for (table, domain, key, body) in page
             .changes
             .iter()
-            .map(|v| Ok(("staged_records", v.key.as_str(), json(v)?)))
+            .map(|v| Ok(("staged_records", v.domain, v.key.as_str(), json(v)?)))
             .chain(
                 page.read_fences
                     .iter()
-                    .map(|v| Ok(("staged_fences", v.key.as_str(), json(v)?))),
-            )
-            .chain(
-                page.scope_fences
-                    .iter()
-                    .map(|v| Ok(("staged_scope_fences", v.scope.as_str(), json(v)?))),
+                    .map(|v| Ok(("staged_fences", v.domain, v.key.as_str(), json(v)?))),
             )
             .collect::<Result<Vec<_>>>()?
         {
-            let key_column = if table == "staged_scope_fences" {
-                "scope"
-            } else {
-                "key"
-            };
-            let prior: Option<String> = tx.query_row(
-                &format!("SELECT MAX({key_column}) FROM {table} WHERE stage=?1"),
-                [id],
-                |r| r.get(0),
-            )?;
-            if prior.as_ref().is_some_and(|prior| prior.as_str() >= key) {
+            let prior: Option<(String, String)> = tx
+                .query_row(
+                    &format!("SELECT domain,key FROM {table} WHERE stage=?1 ORDER BY domain DESC,key DESC LIMIT 1"),
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if prior
+                .as_ref()
+                .is_some_and(|(d, k)| (d.as_str(), k.as_str()) >= (domain.as_str(), key))
+            {
                 return Err(Error::new("unordered-keys", 400));
             }
             tx.execute(
-                &format!("INSERT INTO {table} VALUES(?1,?2,?3)"),
-                params![id, key, body],
+                &format!("INSERT INTO {table} VALUES(?1,?2,?3,?4)"),
+                params![id, domain.as_str(), key, body],
+            )?;
+        }
+        for fence in &page.scope_fences {
+            let prior: Option<String> = tx.query_row(
+                "SELECT MAX(scope) FROM staged_scope_fences WHERE stage=?1",
+                [id],
+                |r| r.get(0),
+            )?;
+            if prior
+                .as_ref()
+                .is_some_and(|prior| prior.as_str() >= fence.scope.as_str())
+            {
+                return Err(Error::new("unordered-keys", 400));
+            }
+            tx.execute(
+                "INSERT INTO staged_scope_fences VALUES(?1,?2,?3)",
+                params![id, fence.scope, json(fence)?],
             )?;
         }
         tx.execute(
@@ -248,7 +260,7 @@ impl Store {
         mut visit: impl FnMut(RecordChange) -> Result<()>,
     ) -> Result<()> {
         let mut statement =
-            db.prepare("SELECT body FROM staged_records WHERE stage=?1 ORDER BY key")?;
+            db.prepare("SELECT body FROM staged_records WHERE stage=?1 ORDER BY domain,key")?;
         let mut rows = statement.query([id])?;
         while let Some(row) = rows.next()? {
             visit(parse(&row.get::<_, String>(0)?)?)?;
@@ -261,7 +273,7 @@ impl Store {
         mut visit: impl FnMut(ReadFence) -> Result<()>,
     ) -> Result<()> {
         let mut statement =
-            db.prepare("SELECT body FROM staged_fences WHERE stage=?1 ORDER BY key")?;
+            db.prepare("SELECT body FROM staged_fences WHERE stage=?1 ORDER BY domain,key")?;
         let mut rows = statement.query([id])?;
         while let Some(row) = rows.next()? {
             visit(parse(&row.get::<_, String>(0)?)?)?;

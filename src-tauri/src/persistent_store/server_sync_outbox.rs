@@ -18,9 +18,11 @@ CREATE TABLE server_sync_objects(hash TEXT PRIMARY KEY,size INTEGER NOT NULL,pat
 CREATE TABLE server_sync_operation_records(key TEXT PRIMARY KEY,version TEXT NOT NULL,local_hash TEXT,kind TEXT NOT NULL,key1 TEXT NOT NULL,key2 TEXT NOT NULL,revision INTEGER NOT NULL);
 CREATE TABLE server_sync_operation_pages(page INTEGER PRIMARY KEY,body BLOB NOT NULL);
 CREATE TABLE server_sync_operation_scopes(scope TEXT PRIMARY KEY,version TEXT NOT NULL);
+CREATE TABLE server_sync_operation_sections(domain TEXT PRIMARY KEY,base_seq TEXT NOT NULL,base_state_id TEXT NOT NULL);
 CREATE TABLE server_sync_remote(key TEXT PRIMARY KEY,version TEXT NOT NULL);
 CREATE TABLE server_sync_remote_dirty(key TEXT PRIMARY KEY);
-CREATE TABLE server_sync_remote_cursor(singleton INTEGER PRIMARY KEY CHECK(singleton=1),head TEXT NOT NULL,cursor TEXT,complete INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE server_sync_remote_cursor(singleton INTEGER PRIMARY KEY CHECK(singleton=1),head TEXT NOT NULL,domains TEXT NOT NULL,cursor TEXT,complete INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE server_sync_remote_sections(domain TEXT PRIMARY KEY,applied_seq TEXT NOT NULL,state_id TEXT NOT NULL);
 "#;
 
 use super::content_locators::tracked_tables;
@@ -49,7 +51,8 @@ pub(super) fn create_schema(db: &Connection) -> StoreResult<()> {
 }
 pub(super) fn validate_schema(db: &Connection) -> StoreResult<()> {
     let reconciliation: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('server_sync_state') WHERE name='reconciling' AND type='INTEGER' AND \"notnull\"=1)", [], |r|r.get(0))?;
-    if !reconciliation {
+    let sections: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('server_sync_remote_cursor') WHERE name='domains' AND type='TEXT' AND \"notnull\"=1)", [], |r|r.get(0))?;
+    if !reconciliation || !sections {
         return Err(StoreError::Validation {
             message: "Server sync replica schema is incompatible".into(),
         });
@@ -68,9 +71,11 @@ pub(super) fn validate_schema(db: &Connection) -> StoreResult<()> {
         "server_sync_operation_records",
         "server_sync_operation_pages",
         "server_sync_operation_scopes",
+        "server_sync_operation_sections",
         "server_sync_remote",
         "server_sync_remote_dirty",
         "server_sync_remote_cursor",
+        "server_sync_remote_sections",
     ] {
         let present: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",

@@ -3,7 +3,7 @@ use crate::{Error, Result};
 use risunest_sync_wire::{
     canonical,
     descriptor::{RecordDescriptor, ReferencePage, MAX_DESCRIPTOR_REFERENCES, MAX_TREE_DEPTH},
-    ChangeSet, RecordVersion, MAX_METADATA_BYTES,
+    ChangeSet, Domain, RecordVersion, MAX_METADATA_BYTES,
 };
 use rusqlite::{params, OptionalExtension};
 use std::collections::BTreeSet;
@@ -153,10 +153,14 @@ impl Store {
     }
     pub(super) fn update_relations(
         db: &rusqlite::Connection,
+        domain: Domain,
         key: &str,
         version: &RecordVersion,
     ) -> Result<()> {
-        db.execute("DELETE FROM record_relations WHERE source=?1", [key])?;
+        db.execute(
+            "DELETE FROM record_relations WHERE domain=?1 AND source=?2",
+            params![domain.as_str(), key],
+        )?;
         if let RecordVersion::Live {
             descriptor_hash: Some(digest),
             ..
@@ -169,7 +173,7 @@ impl Store {
             )?;
             let descriptor: RecordDescriptor = parse(&body)?;
             if let Some(root) = descriptor.relation_root {
-                db.execute("WITH RECURSIVE nodes(hash) AS (SELECT ?1 UNION SELECT child FROM reference_children JOIN nodes ON root=nodes.hash) INSERT INTO record_relations(source,target) SELECT ?2,target FROM reference_relations WHERE root IN nodes ON CONFLICT DO NOTHING",params![root,key])?;
+                db.execute("WITH RECURSIVE nodes(hash) AS (SELECT ?1 UNION SELECT child FROM reference_children JOIN nodes ON root=nodes.hash) INSERT INTO record_relations(domain,source,target) SELECT ?2,?3,target FROM reference_relations WHERE root IN nodes ON CONFLICT DO NOTHING",params![root,domain.as_str(),key])?;
             }
         }
         Ok(())
@@ -178,8 +182,8 @@ impl Store {
         Self::each_change(db, stage, |change| {
             if !matches!(change.after, RecordVersion::Live { .. }) {
                 let used: bool = db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM record_relations WHERE target=?1)",
-                    [&change.key],
+                    "SELECT EXISTS(SELECT 1 FROM record_relations WHERE domain=?1 AND target=?2)",
+                    params![change.domain.as_str(), change.key],
                     |r| r.get(0),
                 )?;
                 if used {
@@ -187,11 +191,14 @@ impl Store {
                 }
             }
             let mut statement =
-                db.prepare("SELECT target FROM record_relations WHERE source=?1")?;
-            let mut targets = statement.query([&change.key])?;
+                db.prepare("SELECT target FROM record_relations WHERE domain=?1 AND source=?2")?;
+            let mut targets = statement.query(params![change.domain.as_str(), change.key])?;
             while let Some(row) = targets.next()? {
                 let key: String = row.get(0)?;
-                if !matches!(Self::read_version(db, &key)?, RecordVersion::Live { .. }) {
+                if !matches!(
+                    Self::read_version(db, change.domain, &key)?,
+                    RecordVersion::Live { .. }
+                ) {
                     return Err(Error::new("missing-related-record", 409));
                 }
             }

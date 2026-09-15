@@ -1,4 +1,4 @@
-use crate::{canonical, ReadFence, RecordChange, Result, ScopeFence, WireError};
+use crate::{canonical, Domain, ReadFence, RecordChange, Result, ScopeFence, WireError};
 use sha2::{Digest, Sha256};
 
 /// Same restricted-JCS digest as a flat ChangeSet, independent of page boundaries.
@@ -6,7 +6,7 @@ pub struct ChangeDigest {
     hash: Sha256,
     phase: u8,
     first: bool,
-    prior: Option<String>,
+    prior: Option<(Option<Domain>, String)>,
 }
 impl Default for ChangeDigest {
     fn default() -> Self {
@@ -40,29 +40,33 @@ impl ChangeDigest {
         }
         Ok(())
     }
-    fn add(&mut self, key: &str, value: &impl serde::Serialize) -> Result<()> {
-        if self.prior.as_ref().is_some_and(|p| p.as_str() >= key) {
+    fn add(&mut self, order: (Option<Domain>, &str), value: &impl serde::Serialize) -> Result<()> {
+        if self
+            .prior
+            .as_ref()
+            .is_some_and(|p| (p.0, p.1.as_str()) >= order)
+        {
             return Err(WireError("unordered-keys"));
         }
         if !self.first {
             self.hash.update(b",");
         }
         self.first = false;
-        self.prior = Some(key.into());
+        self.prior = Some((order.0, order.1.into()));
         self.hash.update(canonical::encode(value)?);
         Ok(())
     }
     pub fn change(&mut self, value: &RecordChange) -> Result<()> {
         self.advance(0)?;
-        self.add(&value.key, value)
+        self.add((Some(value.domain), &value.key), value)
     }
     pub fn read_fence(&mut self, value: &ReadFence) -> Result<()> {
         self.advance(1)?;
-        self.add(&value.key, value)
+        self.add((Some(value.domain), &value.key), value)
     }
     pub fn scope_fence(&mut self, value: &ScopeFence) -> Result<()> {
         self.advance(2)?;
-        self.add(&value.scope, value)
+        self.add((None, &value.scope), value)
     }
     pub fn finish(mut self) -> Result<String> {
         self.advance(2)?;

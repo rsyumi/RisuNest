@@ -2,7 +2,8 @@ mod common;
 use common::*;
 use risunest_sync_server::store::{Device, Store};
 use risunest_sync_wire::{
-    descriptor::RecordDescriptor, hash, ChangeSet, RecordVersion, ScopeFence, TerminalStatus,
+    descriptor::RecordDescriptor, hash, ChangeSet, Domain, RecordVersion, ScopeFence,
+    TerminalStatus,
 };
 
 fn scoped(store: &Store, device: &Device, key: &str) -> ChangeSet {
@@ -54,7 +55,7 @@ fn clear_keeps_original_scope_fence_after_remote_new_key_and_preserves_every_key
     assert_eq!(store.head().unwrap(), head);
     for key in ["plugin/a", "plugin/b"] {
         assert!(matches!(
-            store.record(key).unwrap(),
+            store.record(Domain::Library, key).unwrap(),
             RecordVersion::Live { .. }
         ));
     }
@@ -108,6 +109,7 @@ fn empty_clear_and_clear_then_identical_set_are_durable_scope_operations() {
     let head = store.commit(&a, &intent, &head.etag()).unwrap().head;
     clear.scope_fences[0].expected_version = store.scope_version("plugin-storage").unwrap();
     clear.read_fences.push(risunest_sync_wire::ReadFence {
+        domain: Domain::Library,
         key: "plugin/a".into(),
         version: c.changes[0].after.clone(),
     });
@@ -116,5 +118,8 @@ fn empty_clear_and_clear_then_identical_set_are_durable_scope_operations() {
         store.commit(&a, &intent, &head.etag()).unwrap().status,
         TerminalStatus::Committed
     );
-    assert_eq!(store.record("plugin/a").unwrap(), c.changes[0].after);
+    assert_eq!(
+        store.record(Domain::Library, "plugin/a").unwrap(),
+        c.changes[0].after
+    );
 }

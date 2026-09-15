@@ -1,7 +1,7 @@
 mod common;
 use common::*;
 use risunest_sync_server::store::{ChangeCursor, Store};
-use risunest_sync_wire::{hash, RecordChange, RecordVersion};
+use risunest_sync_wire::{hash, Domain, RecordChange, RecordVersion};
 
 #[test]
 fn fixed_through_pagination_excludes_concurrent_commits_and_followup_gets_them() {
@@ -22,28 +22,45 @@ fn fixed_through_pagination_excludes_concurrent_commits_and_followup_gets_them()
             &first.epoch,
             &ChangeCursor::after_commit(0.into()),
             &0.into(),
+            &LIBRARY,
             1,
         )
         .unwrap();
     assert_eq!(genesis.through, first);
     assert!(genesis.entries.is_empty());
     let page1 = store
-        .changes(&h1.epoch, &ChangeCursor::after_commit(0.into()), &h1.seq, 1)
+        .changes(
+            &h1.epoch,
+            &ChangeCursor::after_commit(0.into()),
+            &h1.seq,
+            &LIBRARY,
+            1,
+        )
         .unwrap();
     assert!(page1.has_more);
     assert_eq!(page1.entries[0].change.key, "a");
     let intent = stage(&store, &a, &h1, 2, &changes("c", b"x"));
     let h2 = store.commit(&a, &intent, &h1.etag()).unwrap().head;
-    let page2 = store.changes(&h1.epoch, &page1.next, &h1.seq, 1).unwrap();
+    let page2 = store
+        .changes(&h1.epoch, &page1.next, &h1.seq, &LIBRARY, 1)
+        .unwrap();
     assert!(!page2.has_more);
     assert_eq!(page2.through, h1);
     assert_eq!(page2.entries[0].change.key, "b");
     let page3 = store
-        .changes(&h2.epoch, &ChangeCursor::after_commit(h1.seq), &h2.seq, 10)
+        .changes(
+            &h2.epoch,
+            &ChangeCursor::after_commit(h1.seq),
+            &h2.seq,
+            &LIBRARY,
+            10,
+        )
         .unwrap();
     assert_eq!(page3.entries.len(), 1);
     assert_eq!(page3.entries[0].change.key, "c");
-    assert!(store.changes("wrong", &page3.next, &h2.seq, 10).is_err());
+    assert!(store
+        .changes("wrong", &page3.next, &h2.seq, &LIBRARY, 10)
+        .is_err());
 }
 #[test]
 fn tombstones_keep_identity_and_do_not_release_other_device_history() {
@@ -63,17 +80,21 @@ fn tombstones_keep_identity_and_do_not_release_other_device_history() {
     };
     let intent = stage(&store, &a, &h1, 2, &delete);
     let h2 = store.commit(&a, &intent, &h1.etag()).unwrap().head;
-    store.acknowledge(&a, &h2.epoch, &h2.seq).unwrap();
-    store.acknowledge(&b, &h2.epoch, &0.into()).unwrap();
+    store.acknowledge(&a, &h2.epoch, &acks(&h2.seq)).unwrap();
+    store.acknowledge(&b, &h2.epoch, &acks(&0.into())).unwrap();
     let page = store
         .changes(
             &h2.epoch,
             &ChangeCursor::after_commit(0.into()),
             &h2.seq,
+            &LIBRARY,
             10,
         )
         .unwrap();
     assert_eq!(page.entries.len(), 2);
-    assert_eq!(store.record("a").unwrap(), delete.changes[0].after);
+    assert_eq!(
+        store.record(Domain::Library, "a").unwrap(),
+        delete.changes[0].after
+    );
     assert_eq!(store.get_object(&hash(b"x")).unwrap(), b"x");
 }
