@@ -1445,6 +1445,14 @@ impl PersistentStore {
             })
     }
 
+    pub(crate) fn device_store_mut(&mut self) -> StoreResult<&mut device_store::DeviceStore> {
+        self.device_store
+            .as_mut()
+            .map_err(|message| StoreError::Store {
+                message: message.clone(),
+            })
+    }
+
     pub(crate) fn revision(&self) -> StoreResult<i64> {
         current_revision(&self.connection)
     }

@@ -425,3 +425,196 @@ fn only_mutations_inside_a_context_reach_the_change_index() {
         ]
     );
 }
+
+fn vector_bytes(values: &[f32]) -> Vec<u8> {
+    values.iter().flat_map(|value| value.to_le_bytes()).collect()
+}
+
+fn embedding(key: &str, values: &[f32]) -> hypa::HypaEmbeddingWrite {
+    hypa::HypaEmbeddingWrite {
+        cache_key: key.to_owned(),
+        producer: "hypa-v2".to_owned(),
+        model: "MiniLM".to_owned(),
+        endpoint: None,
+        preprocess_version: 1,
+        dimensions: values.len() as i64,
+        vector: vector_bytes(values),
+        metadata: None,
+    }
+}
+
+fn clock(db: &Connection, section: &str) -> String {
+    db.query_row(
+        "SELECT max_write_clock FROM device_sections WHERE section=?1",
+        [section],
+        |row| row.get(0),
+    )
+    .expect("read section clock")
+}
+
+#[test]
+fn an_embedding_batch_commits_one_write_clock_and_one_change_row_per_key() {
+    let (_directory, mut store) = open();
+    store
+        .write_hypa_embeddings(&[
+            embedding("key-a", &[1.0, 2.0]),
+            embedding("key-b", &[3.0, 4.0]),
+            embedding("key-c", &[5.0, 6.0]),
+        ])
+        .expect("write embedding batch");
+
+    assert_eq!(clock(store.connection(), "hypa"), "3");
+    assert_eq!(clock(store.connection(), "local-plugins"), "0");
+    let writer_id = store.writer_id().expect("read writer identity");
+    let mut statement = store
+        .connection()
+        .prepare("SELECT cache_key,write_clock,writer_id,published_clock FROM hypa_embeddings ORDER BY cache_key")
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("key-a".to_owned(), "1".to_owned(), writer_id.clone(), None),
+            ("key-b".to_owned(), "2".to_owned(), writer_id.clone(), None),
+            ("key-c".to_owned(), "3".to_owned(), writer_id, None),
+        ]
+    );
+    assert_eq!(
+        changes(store.connection()),
+        vec![
+            ("hypa".to_owned(), "key-a".to_owned(), String::new(), String::new(), 1),
+            ("hypa".to_owned(), "key-b".to_owned(), String::new(), String::new(), 1),
+            ("hypa".to_owned(), "key-c".to_owned(), String::new(), String::new(), 1),
+        ]
+    );
+    assert_eq!(
+        store
+            .connection()
+            .query_row("SELECT count(*) FROM device_change_context", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn an_embedding_read_answers_in_request_order_with_gaps_for_misses() {
+    let (_directory, mut store) = open();
+    store
+        .write_hypa_embeddings(&[embedding("key-a", &[1.0, 2.0]), embedding("key-b", &[3.0])])
+        .expect("write embedding batch");
+
+    let keys = vec![
+        "key-b".to_owned(),
+        "missing".to_owned(),
+        "key-a".to_owned(),
+        "key-b".to_owned(),
+    ];
+    let rows = store.read_hypa_embeddings(&keys).expect("read embeddings");
+    let observed = rows
+        .iter()
+        .map(|row| (row.cache_key.as_str(), row.dimensions, row.vector.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        observed,
+        vec![
+            ("key-b", 1, Some(vector_bytes(&[3.0]))),
+            ("missing", 0, None),
+            ("key-a", 2, Some(vector_bytes(&[1.0, 2.0]))),
+            ("key-b", 1, Some(vector_bytes(&[3.0]))),
+        ]
+    );
+}
+
+#[test]
+fn a_tombstoned_embedding_reads_as_a_miss() {
+    let (_directory, mut store) = open();
+    store
+        .write_hypa_embeddings(&[embedding("key-a", &[1.0])])
+        .expect("write embedding");
+    store
+        .connection()
+        .execute("UPDATE hypa_embeddings SET tombstone=1", [])
+        .unwrap();
+
+    let rows = store
+        .read_hypa_embeddings(&["key-a".to_owned()])
+        .expect("read embeddings");
+    assert_eq!(rows[0].dimensions, 0);
+    assert!(rows[0].vector.is_none());
+}
+
+#[test]
+fn rewriting_a_key_replaces_the_vector_and_takes_a_new_clock() {
+    let (_directory, mut store) = open();
+    store
+        .write_hypa_embeddings(&[embedding("key-a", &[1.0, 2.0])])
+        .expect("write embedding");
+    store
+        .connection()
+        .execute("UPDATE hypa_embeddings SET published_clock='1', tombstone=1", [])
+        .unwrap();
+    store
+        .write_hypa_embeddings(&[embedding("key-a", &[7.0, 8.0, 9.0])])
+        .expect("rewrite embedding");
+
+    let rows = store
+        .read_hypa_embeddings(&["key-a".to_owned()])
+        .expect("read embeddings");
+    assert_eq!(rows[0].dimensions, 3);
+    assert_eq!(rows[0].vector, Some(vector_bytes(&[7.0, 8.0, 9.0])));
+    assert_eq!(clock(store.connection(), "hypa"), "2");
+    assert_eq!(
+        store
+            .connection()
+            .query_row("SELECT published_clock FROM hypa_embeddings", [], |row| row
+                .get::<_, Option<String>>(0))
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn an_embedding_batch_is_rejected_whole_when_one_entry_is_malformed() {
+    let (_directory, mut store) = open();
+    let mut broken = embedding("key-b", &[1.0, 2.0]);
+    broken.dimensions = 3;
+    let error = store
+        .write_hypa_embeddings(&[embedding("key-a", &[1.0]), broken])
+        .expect_err("reject mismatched vector length");
+    assert!(matches!(error, StoreError::Validation { .. }));
+
+    assert_eq!(
+        store
+            .connection()
+            .query_row("SELECT count(*) FROM hypa_embeddings", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(clock(store.connection(), "hypa"), "0");
+}
+
+#[test]
+fn an_embedding_batch_rejects_dimensions_outside_the_supported_range() {
+    let (_directory, mut store) = open();
+    let mut zero = embedding("key-a", &[]);
+    zero.dimensions = 0;
+    assert!(store.write_hypa_embeddings(&[zero]).is_err());
+
+    let mut huge = embedding("key-a", &[1.0]);
+    huge.dimensions = hypa::MAX_DIMENSIONS + 1;
+    huge.vector = vec![0; (hypa::MAX_DIMENSIONS as usize + 1) * hypa::VECTOR_ELEMENT_BYTES];
+    assert!(store.write_hypa_embeddings(&[huge]).is_err());
+}

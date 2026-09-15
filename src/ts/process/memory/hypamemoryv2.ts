@@ -1,5 +1,17 @@
-import localforage from "localforage";
 import { type HypaModel, localModels } from "./hypamemory";
+import {
+    HYPA_PREPROCESS_VERSION,
+    hypaCacheKeys,
+    hypaEmbeddingIdentity,
+    type HypaEmbeddingIdentity,
+} from "./hypaCacheKey";
+import {
+    consistentEmbeddings,
+    getHypaEmbeddingCache,
+    staleEmbeddingKeys,
+    toVectorBuffer,
+    type HypaEmbeddingEntry,
+} from "src/ts/storage/hypaEmbeddingCache";
 import { isContextModel, getContextProvider } from "./contextualEmbedding";
 import { TaskRateLimiter, TaskCanceledError } from "./taskRateLimiter";
 import { runEmbedding } from "../transformers";
@@ -32,9 +44,6 @@ export class HypaProcessorV2<TMetadata> {
   public readonly options: HypaProcessorV2Options;
   public progressCallback: (queuedCount: number) => void = null;
   public vectors: Map<string, EmbeddingResult<TMetadata>> = new Map();
-  private forage: LocalForage = localforage.createInstance({
-    name: "hypaVector",
-  });
 
   public constructor(options?: HypaProcessorV2Options) {
     const db = getDatabase();
@@ -104,12 +113,15 @@ export class HypaProcessorV2<TMetadata> {
 
   private async getEmbeds(
     ebdTexts: EmbeddingText<TMetadata>[],
-    saveToMemory: boolean = true
+    saveToMemory: boolean = true,
+    skipCache: boolean = false
   ): Promise<EmbeddingResult<TMetadata>[]> {
     if (ebdTexts.length === 0) {
       return [];
     }
 
+    const cache = getHypaEmbeddingCache();
+    const pendingWrites: HypaEmbeddingEntry[] = [];
     const resultMap: Map<string, EmbeddingResult<TMetadata>> = new Map();
     const toEmbed: EmbeddingText<TMetadata>[] = [];
 
@@ -130,46 +142,43 @@ export class HypaProcessorV2<TMetadata> {
       }
     }
 
-    // Load cache
-    const loadPromises = ebdTexts.map(async (item, index) => {
+    // Load cache: one batch call for the whole round, never one per chunk
+    const keys = await this.getCacheKeys(ebdTexts, ctxGroups);
+    let cached = new Map<string, { vector: Float32Array; dimensions: number }>();
+
+    if (!skipCache) {
+      cached = consistentEmbeddings(await cache.read([...new Set(keys.values())]));
+    }
+
+    for (const item of ebdTexts) {
       const { id, content, metadata } = item;
 
       // Use if already in memory
       if (this.vectors.has(id)) {
         resultMap.set(id, this.vectors.get(id));
-        return;
+        continue;
       }
 
-      try {
-        const cached = await this.forage.getItem<EmbeddingResult<TMetadata>>(
-          this.getCacheKey(content, ctxGroups.get(id))
-        );
+      const hit = cached.get(keys.get(id));
 
-        if (cached) {
-          // Debug log for cache hit
-          console.debug(
-            HypaProcessorV2.LOG_PREFIX,
-            `Cache hit for getting embedding ${index} with model ${this.options.model}`
-          );
+      if (hit) {
+        const ebdResult: EmbeddingResult<TMetadata> = {
+          id,
+          content,
+          embedding: hit.vector,
+          metadata,
+        };
 
-          // Add metadata
-          cached.metadata = metadata;
-
-          // Save to memory
-          if (saveToMemory) {
-            this.vectors.set(id, cached);
-          }
-
-          resultMap.set(id, cached);
-        } else {
-          toEmbed.push(item);
+        // Save to memory
+        if (saveToMemory) {
+          this.vectors.set(id, ebdResult);
         }
-      } catch (error) {
+
+        resultMap.set(id, ebdResult);
+      } else {
         toEmbed.push(item);
       }
-    });
-
-    await Promise.all(loadPromises);
+    }
 
     if (ctxProvider && toEmbed.length > 0 && saveToMemory) {
       const missMetadatas = new Set(
@@ -236,9 +245,7 @@ export class HypaProcessorV2<TMetadata> {
             id, content, embedding, metadata
           };
 
-          await this.forage.setItem(this.getCacheKey(content, ctxGroups.get(id)), {
-            content, embedding
-          });
+          pendingWrites.push(this.cacheEntry(keys.get(id), embedding));
 
           if (saveToMemory) {
             this.vectors.set(id, ebdResult);
@@ -258,7 +265,8 @@ export class HypaProcessorV2<TMetadata> {
           chunk.map((item) => item.content)
         );
 
-        const savePromises = embeddings.map(async (embedding, j) => {
+        for (let j = 0; j < embeddings.length; j++) {
+          const embedding = embeddings[j];
           const { id, content, metadata } = chunk[j];
 
           const ebdResult: EmbeddingResult<TMetadata> = {
@@ -269,10 +277,7 @@ export class HypaProcessorV2<TMetadata> {
           };
 
           // Save to DB
-          await this.forage.setItem(this.getCacheKey(content), {
-            content,
-            embedding,
-          });
+          pendingWrites.push(this.cacheEntry(keys.get(id), embedding));
 
           // Save to memory
           if (saveToMemory) {
@@ -280,9 +285,7 @@ export class HypaProcessorV2<TMetadata> {
           }
 
           resultMap.set(id, ebdResult);
-        });
-
-        await Promise.all(savePromises);
+        }
       }
     } else {
       // API model: Parallel processing
@@ -312,7 +315,8 @@ export class HypaProcessorV2<TMetadata> {
         }
 
         const chunk = chunks[i];
-        const savePromises = result.data.map(async (embedding, j) => {
+        for (let j = 0; j < result.data.length; j++) {
+          const embedding = result.data[j];
           const { id, content, metadata } = chunk[j];
 
           const ebdResult: EmbeddingResult<TMetadata> = {
@@ -323,10 +327,7 @@ export class HypaProcessorV2<TMetadata> {
           };
 
           // Save to DB
-          await this.forage.setItem(this.getCacheKey(content), {
-            content,
-            embedding,
-          });
+          pendingWrites.push(this.cacheEntry(keys.get(id), embedding));
 
           // Save to memory
           if (saveToMemory) {
@@ -334,9 +335,7 @@ export class HypaProcessorV2<TMetadata> {
           }
 
           resultMap.set(id, ebdResult);
-        });
-
-        await Promise.all(savePromises);
+        }
       });
 
       await Promise.all(chunksSavePromises);
@@ -351,7 +350,56 @@ export class HypaProcessorV2<TMetadata> {
       }
     }
 
+    if (pendingWrites.length > 0) {
+      await cache.write(pendingWrites);
+    }
+
+    // A cached vector that disagrees with the freshly computed width belongs to
+    // a model that answers under the same identity. Recompute those.
+    const stale = new Set(
+      staleEmbeddingKeys(cached, pendingWrites[0]?.dimensions ?? 0)
+    );
+
+    if (stale.size > 0) {
+      const outdated = ebdTexts.filter((item) => stale.has(keys.get(item.id)));
+
+      for (const item of outdated) {
+        resultMap.delete(item.id);
+        this.vectors.delete(item.id);
+      }
+
+      const recomputed = await this.getEmbeds(outdated, saveToMemory, true);
+
+      for (let i = 0; i < outdated.length; i++) {
+        resultMap.set(outdated[i].id, recomputed[i]);
+      }
+    }
+
     return ebdTexts.map((item) => resultMap.get(item.id));
+  }
+
+  private cacheIdentity(): HypaEmbeddingIdentity {
+    const db = getDatabase();
+
+    return hypaEmbeddingIdentity(
+      this.options.model,
+      this.options.customEmbeddingUrl,
+      db.hypaCustomSettings?.model
+    );
+  }
+
+  private cacheEntry(key: string, embedding: EmbeddingVector): HypaEmbeddingEntry {
+    const identity = this.cacheIdentity();
+
+    return {
+      key,
+      producer: "hypa-v2",
+      model: identity.model,
+      endpoint: identity.endpoint || null,
+      preprocessVersion: HYPA_PREPROCESS_VERSION,
+      dimensions: embedding.length,
+      vector: toVectorBuffer(embedding),
+    };
   }
 
   private similarity(a: EmbeddingVector, b: EmbeddingVector): number {
@@ -368,19 +416,27 @@ export class HypaProcessorV2<TMetadata> {
     return dot / (Math.sqrt(magA) * Math.sqrt(magB));
   }
 
-  private getCacheKey(content: string, contextTexts?: string[]): string {
-    const db = getDatabase();
-    const suffix =
-      this.options.model === "custom" && db.hypaCustomSettings?.model?.trim()
-        ? `-${db.hypaCustomSettings.model.trim()}`
-        : "";
+  private async getCacheKeys(
+    ebdTexts: EmbeddingText<TMetadata>[],
+    ctxGroups: Map<string, string[]>
+  ): Promise<Map<string, string>> {
+    const identity = this.cacheIdentity();
+    const ctxProvider = isContextModel(this.options.model)
+      ? getContextProvider(this.options.model)
+      : null;
 
-    const ctxProvider = isContextModel(this.options.model) ? getContextProvider(this.options.model) : null;
-    const ctxSuffix = ctxProvider
-      ? ctxProvider.getCacheKeySuffix(contextTexts)
-      : "";
+    const keys = await hypaCacheKeys(
+      ebdTexts.map((item) => ({
+        producer: "hypa-v2" as const,
+        content: item.content,
+        identity,
+        contextSuffix: ctxProvider
+          ? ctxProvider.getCacheKeySuffix(ctxGroups.get(item.id))
+          : "",
+      }))
+    );
 
-    return `${content}|${this.options.model}${suffix}${ctxSuffix}`;
+    return new Map(ebdTexts.map((item, index) => [item.id, keys[index]]));
   }
 
   private getOptimalChunkSize(): number {

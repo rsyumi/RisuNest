@@ -1,4 +1,5 @@
 pub(crate) mod data_health;
+pub(crate) mod hypa;
 
 use super::export::ExportedRisuSave;
 #[cfg(feature = "native-kei-upload-pilot")]

@@ -1,9 +1,22 @@
-import localforage from "localforage";
 import { globalFetch } from "src/ts/globalApi.svelte";
 import { runEmbedding } from "../transformers";
 import { appendLastPath } from "src/ts/util";
 import { getDatabase } from "src/ts/storage/database.svelte";
+import {
+    consistentEmbeddings,
+    getHypaEmbeddingCache,
+    staleEmbeddingKeys,
+    toVectorBuffer,
+    type HypaEmbeddingEntry,
+} from "src/ts/storage/hypaEmbeddingCache";
 import { isContextModel, getContextProvider } from "./contextualEmbedding";
+import {
+    HYPA_PREPROCESS_VERSION,
+    hypaCacheKeys,
+    hypaEmbeddingIdentity,
+    type HypaCacheProducer,
+    type HypaEmbeddingIdentity,
+} from "./hypaCacheKey";
 
 export type HypaModel = 'custom'|'ada'|'openai3small'|'openai3large'|'MiniLM'|'MiniLMGPU'|'nomic'|'nomicGPU'|'bgeSmallEn'|'bgeSmallEnGPU'|'bgem3'|'bgem3GPU'|'multiMiniLM'|'multiMiniLMGPU'|'bgeM3Ko'|'bgeM3KoGPU'|'voyageContext3'
 
@@ -38,14 +51,10 @@ export const localModels = {
 export class HypaProcesser{
     oaikey:string
     vectors:memoryVector[]
-    forage:LocalForage
     model:HypaModel
     customEmbeddingUrl:string
 
     constructor(model:HypaModel|'auto' = 'auto',customEmbeddingUrl?:string){
-        this.forage = localforage.createInstance({
-            name: "hypaVector"
-        })
         this.vectors = []
         const db = getDatabase()
         if(model === 'auto'){
@@ -144,29 +153,45 @@ export class HypaProcesser{
         return result
     }
 
-    async testText(text:string){
-        const forageResult:number[] = await this.forage.getItem(text)
-        if(forageResult){
-            return forageResult
-        }
-        const vec = (await this.embedDocuments([text]))[0]
-        await this.forage.setItem(text, vec)
-        return vec
-    }
-    
-    async addText(texts:string[]) {
+    protected cacheIdentity():HypaEmbeddingIdentity{
         const db = getDatabase()
-        const suffix = (this.model === 'custom' && db.hypaCustomSettings?.model?.trim()) ? `-${db.hypaCustomSettings.model.trim()}` : ""
+        return hypaEmbeddingIdentity(this.model, this.customEmbeddingUrl, db.hypaCustomSettings?.model)
+    }
+
+    protected cacheEntry(producer:HypaCacheProducer, key:string, embedding:VectorArray):HypaEmbeddingEntry{
+        const identity = this.cacheIdentity()
+        return {
+            key,
+            producer,
+            model: identity.model,
+            endpoint: identity.endpoint || null,
+            preprocessVersion: HYPA_PREPROCESS_VERSION,
+            dimensions: embedding.length,
+            vector: toVectorBuffer(embedding),
+        }
+    }
+
+    async addText(texts:string[]) {
+        const identity = this.cacheIdentity()
+        const cache = getHypaEmbeddingCache()
+        const keys = await hypaCacheKeys(
+            texts.map((content) => ({ producer: 'hypa-v1-text' as const, content, identity }))
+        )
+        const keyOf = new Map(texts.map((text, index) => [text, keys[index]]))
+        const cached = consistentEmbeddings(await cache.read(keys))
 
         for(let i=0;i<texts.length;i++){
-            const itm:memoryVector = await this.forage.getItem(texts[i] + '|' + this.model + suffix)
-            if(itm){
-                itm.alreadySaved = true
-                this.vectors.push(itm)
+            const hit = cached.get(keys[i])
+            if(hit){
+                this.vectors.push({
+                    content: texts[i],
+                    embedding: hit.vector,
+                    alreadySaved: true
+                })
             }
         }
 
-        texts = texts.filter((v) => {
+        let pending = texts.filter((v) => {
             for(let i=0;i<this.vectors.length;i++){
                 if(this.vectors[i].content === v){
                     return false
@@ -175,22 +200,28 @@ export class HypaProcesser{
             return true
         })
 
-        if(texts.length === 0){
+        if(pending.length === 0){
             return
         }
-        const vectors = await this.embedDocuments(texts)
+        let vectors = await this.embedDocuments(pending)
+
+        const stale = new Set(staleEmbeddingKeys(cached, vectors[0]?.length ?? 0))
+        if(stale.size > 0){
+            const recompute = texts.filter((text) => stale.has(keyOf.get(text)))
+            const recomputed = new Set(recompute)
+            this.vectors = this.vectors.filter((vector) => !recomputed.has(vector.content))
+            pending = pending.concat(recompute)
+            vectors = vectors.concat(await this.embedDocuments(recompute))
+        }
 
         const memoryVectors:memoryVector[] = vectors.map((embedding, idx) => ({
-            content: texts[idx],
+            content: pending[idx],
             embedding
         }));
 
-        for(let i=0;i<memoryVectors.length;i++){
-            const vec = memoryVectors[i]
-            if(!vec.alreadySaved){
-                await this.forage.setItem(texts[i] + '|' + this.model + suffix, vec)
-            }
-        }
+        await cache.write(memoryVectors.map((vec) =>
+            this.cacheEntry('hypa-v1-text', keyOf.get(vec.content), vec.embedding)
+        ))
 
         this.vectors = memoryVectors.concat(this.vectors)
     }
