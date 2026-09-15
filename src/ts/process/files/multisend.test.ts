@@ -13,7 +13,7 @@ const mocks = vi.hoisted(() => ({
     selectedTarget: null as any,
     acquireCompleteConversation: vi.fn(),
     postInlayAsset: vi.fn(),
-    UnsupportedAnimatedInlayError: class UnsupportedAnimatedInlayError extends Error {},
+    InlayInputTooLargeError: class InlayInputTooLargeError extends Error {},
     alertError: vi.fn(),
 }))
 
@@ -35,7 +35,7 @@ vi.mock('../index.svelte', async () => {
 })
 vi.mock('src/ts/globalApi.svelte', () => ({ downloadFile: mocks.downloadFile }))
 vi.mock('src/lang', () => ({
-    language: { risuNest: { inlay: { unsupportedAnimated: 'unsupported' } } },
+    language: { risuNest: { inlay: { tooLarge: 'too large' } } },
 }))
 vi.mock('src/ts/platform', () => ({ isTauri: false }))
 vi.mock('../memory/hypamemory', () => ({
@@ -50,7 +50,7 @@ vi.mock('src/ts/util', () => ({
 }))
 vi.mock('./inlays', () => ({
     postInlayAsset: mocks.postInlayAsset,
-    UnsupportedAnimatedInlayError: mocks.UnsupportedAnimatedInlayError,
+    InlayInputTooLargeError: mocks.InlayInputTooLargeError,
 }))
 vi.mock('src/ts/alert', () => ({ alertError: mocks.alertError }))
 vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
@@ -62,7 +62,7 @@ vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
 }))
 
 import { postChatFile } from './multisend'
-import { UnsupportedAnimatedInlayError } from './inlays'
+import { InlayInputTooLargeError } from './inlays'
 import { doingChat, reserveGeneration } from '../generationState'
 
 function createDatabase(): Database {
@@ -250,13 +250,13 @@ describe('postChatFile attachment errors', () => {
         mocks.alertError.mockReset()
     })
 
-    it.each(['gif', 'avif'])('skips typed unsupported %s attachments without appending an asset or message', async (extension) => {
-        mocks.postInlayAsset.mockRejectedValueOnce(new UnsupportedAnimatedInlayError('unsupported animation'))
+    it.each(['gif', 'png'])('skips an oversized %s attachment without appending an asset or message', async (extension) => {
+        mocks.postInlayAsset.mockRejectedValueOnce(new InlayInputTooLargeError('over the input limit'))
         const conversation = mocks.dbState.db!.characters[0].chats[0]
 
-        await expect(postChatFile({ name: `animated.${extension}`, data: new Uint8Array([1]) })).resolves.toEqual([])
+        await expect(postChatFile({ name: `huge.${extension}`, data: new Uint8Array([1]) })).resolves.toEqual([])
 
-        expect(mocks.alertError).toHaveBeenCalledWith('unsupported')
+        expect(mocks.alertError).toHaveBeenCalledWith('too large')
         expect(conversation.message).toEqual([{ role: 'char', data: 'before' }])
         expect(mocks.sendChat).not.toHaveBeenCalled()
     })

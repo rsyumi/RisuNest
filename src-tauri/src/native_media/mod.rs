@@ -1,9 +1,13 @@
 use crate::asset_repository::PayloadCas;
 use crate::trust_boundary::{is_lower_hex_byte, sync_directory};
+use image::codecs::gif::GifDecoder;
 use image::codecs::png::PngDecoder;
+use image::codecs::webp::WebPDecoder;
 use image::imageops::FilterType;
-use image::metadata::Orientation;
-use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
+use image::metadata::{LoopCount, Orientation};
+use image::{
+    AnimationDecoder, Delay, DynamicImage, ImageDecoder, ImageFormat, ImageReader, RgbaImage,
+};
 use serde::{
     de::{self, Visitor},
     Deserialize, Deserializer, Serialize,
@@ -29,6 +33,15 @@ const MAX_BODY_BYTES: u64 = 1024 * 1024;
 const EXPOSED_HEADERS: &str = "Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag";
 static INLAY_WRITE_LOCK: Mutex<()> = Mutex::new(());
 const MAX_INLAY_DIMENSION: u32 = u32::MAX;
+const MAX_INLAY_ANIMATION_FPS: u32 = 240;
+const MAX_ANIMATION_FRAMES: usize = 600;
+const MAX_ANIMATION_RGBA_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_ANIMATION_CANVAS_SIDE: u32 = 4096;
+/// Browsers play a GIF frame at or under this delay as `SLOW_FRAME_DELAY_MS`.
+const GIF_FAST_FRAME_DELAY_MS: u32 = 10;
+const SLOW_FRAME_DELAY_MS: u32 = 100;
+/// A leading frame without a delay of its own still has to advance the timeline.
+const FIRST_FRAME_MIN_DELAY_MS: u32 = 10;
 
 #[derive(Deserialize)]
 struct BlobMetadata {
@@ -48,8 +61,10 @@ pub(crate) struct InlayImageMetadata {
     name: String,
     ext: String,
     inlay_type: String,
-    width: u32,
-    height: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -68,6 +83,16 @@ pub(crate) struct InlayEncodeOptions {
     #[serde(deserialize_with = "deserialize_inlay_max_dimension")]
     max_dimension: u32,
     skip_reencode: bool,
+    /// Frames per second an animation is thinned down to, or 0 to keep the original rate.
+    #[serde(deserialize_with = "deserialize_inlay_animation_fps")]
+    animation_max_fps: u32,
+}
+
+fn deserialize_inlay_animation_fps<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(u32::deserialize(deserializer)?.min(MAX_INLAY_ANIMATION_FPS))
 }
 
 fn deserialize_inlay_quality<'de, D>(deserializer: D) -> Result<u8, D::Error>
@@ -133,6 +158,7 @@ impl Default for InlayEncodeOptions {
             quality: 85,
             max_dimension: 0,
             skip_reencode: false,
+            animation_max_fps: 0,
         }
     }
 }
@@ -1000,6 +1026,340 @@ fn write_inlay_image_with_suffix(
     Ok(metadata)
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum InlayAnimation {
+    Gif,
+    Apng,
+    WebP,
+}
+
+fn inlay_animation(format: ImageFormat, data: &[u8]) -> Option<InlayAnimation> {
+    match format {
+        ImageFormat::Gif => Some(InlayAnimation::Gif),
+        ImageFormat::WebP => webp::BitstreamFeatures::new(data)
+            .is_some_and(|features| features.has_animation())
+            .then_some(InlayAnimation::WebP),
+        ImageFormat::Png => PngDecoder::new(Cursor::new(data))
+            .ok()
+            .and_then(|decoder| decoder.is_apng().ok())
+            .unwrap_or(false)
+            .then_some(InlayAnimation::Apng),
+        _ => None,
+    }
+}
+
+fn inlay_media_type(format: Option<ImageFormat>, name: &str) -> (String, String) {
+    let known = format.and_then(|format| match format {
+        ImageFormat::Png => Some(("image/png", "png")),
+        ImageFormat::Jpeg => Some(("image/jpeg", "jpg")),
+        ImageFormat::WebP => Some(("image/webp", "webp")),
+        ImageFormat::Gif => Some(("image/gif", "gif")),
+        ImageFormat::Avif => Some(("image/avif", "avif")),
+        ImageFormat::Bmp => Some(("image/bmp", "bmp")),
+        ImageFormat::Tiff => Some(("image/tiff", "tiff")),
+        _ => None,
+    });
+    if let Some((mime, ext)) = known {
+        return (mime.to_owned(), ext.to_owned());
+    }
+    let ext = name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        _ => "application/octet-stream",
+    };
+    (mime.to_owned(), ext)
+}
+
+/// Stores the input untouched. Every image this encoder cannot improve ends up
+/// here, so an attachment never fails because of its format.
+fn preserved_inlay_image(
+    id: &str,
+    data: &[u8],
+    name: &str,
+    size: Option<(u32, u32)>,
+) -> EncodedInlayImage {
+    let (mime, ext) = inlay_media_type(image::guess_format(data).ok(), name);
+    EncodedInlayImage {
+        data: data.to_vec(),
+        metadata: InlayImageMetadata {
+            key: id.to_owned(),
+            kind: "inlay".to_owned(),
+            size: data.len() as u64,
+            mime,
+            name: name.to_owned(),
+            ext,
+            inlay_type: "image".to_owned(),
+            width: size.map(|(width, _)| width),
+            height: size.map(|(_, height)| height),
+        },
+    }
+}
+
+fn frame_delay_ms(delay: Delay, source: InlayAnimation) -> u32 {
+    let (numerator, denominator) = delay.numer_denom_ms();
+    let milliseconds = if denominator == 0 {
+        0
+    } else {
+        numerator / denominator
+    };
+    match source {
+        // Browsers play a GIF frame this short as a tenth of a second, so keeping
+        // the stored delay would speed the animation up against what was on screen.
+        InlayAnimation::Gif if milliseconds <= GIF_FAST_FRAME_DELAY_MS => SLOW_FRAME_DELAY_MS,
+        InlayAnimation::Apng if milliseconds == 0 => SLOW_FRAME_DELAY_MS,
+        // Animated WebP counts in milliseconds, where a short delay is meant literally.
+        _ => milliseconds,
+    }
+}
+
+struct DecodedInlayAnimation {
+    frames: Vec<(RgbaImage, u32)>,
+    loop_count: i32,
+}
+
+fn decode_inlay_animation(
+    data: &[u8],
+    source: InlayAnimation,
+) -> Result<DecodedInlayAnimation, String> {
+    let (loop_count, frames) = match source {
+        InlayAnimation::Gif => {
+            let decoder = GifDecoder::new(Cursor::new(data))
+                .map_err(|error| format!("failed to read GIF Inlay image: {error}"))?;
+            (decoder.loop_count(), decoder.into_frames())
+        }
+        InlayAnimation::Apng => {
+            let decoder = PngDecoder::new(Cursor::new(data))
+                .map_err(|error| format!("failed to read APNG Inlay image: {error}"))?
+                .apng()
+                .map_err(|error| format!("failed to read APNG Inlay image: {error}"))?;
+            (decoder.loop_count(), decoder.into_frames())
+        }
+        InlayAnimation::WebP => {
+            let decoder = WebPDecoder::new(Cursor::new(data))
+                .map_err(|error| format!("failed to read animated WebP Inlay image: {error}"))?;
+            (decoder.loop_count(), decoder.into_frames())
+        }
+    };
+    let mut collected: Vec<(RgbaImage, u32)> = Vec::new();
+    let mut rgba_bytes: u64 = 0;
+    for frame in frames {
+        let frame =
+            frame.map_err(|error| format!("failed to decode Inlay animation frame: {error}"))?;
+        if collected.len() >= MAX_ANIMATION_FRAMES {
+            return Err("Inlay animation has too many frames".to_owned());
+        }
+        let delay = frame_delay_ms(frame.delay(), source);
+        let buffer = frame.into_buffer();
+        rgba_bytes += buffer.as_raw().len() as u64;
+        if rgba_bytes > MAX_ANIMATION_RGBA_BYTES {
+            return Err("Inlay animation needs too much memory".to_owned());
+        }
+        collected.push((buffer, delay));
+    }
+    if collected.is_empty() {
+        return Err("Inlay animation has no frames".to_owned());
+    }
+    Ok(DecodedInlayAnimation {
+        frames: collected,
+        loop_count: match loop_count {
+            LoopCount::Infinite => 0,
+            LoopCount::Finite(count) => count.get().min(i32::MAX as u32) as i32,
+        },
+    })
+}
+
+/// Drops frames the timeline cannot carry and hands their time to the frame
+/// before them, so the animation still runs for exactly as long as it did.
+fn merge_animation_frames(
+    frames: Vec<(RgbaImage, u32)>,
+    min_delay_ms: u32,
+) -> Vec<(RgbaImage, u32)> {
+    let mut kept: Vec<(RgbaImage, u32)> = Vec::with_capacity(frames.len());
+    for (buffer, delay) in frames {
+        match kept.last_mut() {
+            Some(previous) if delay == 0 || previous.1 < min_delay_ms => previous.1 += delay,
+            _ => {
+                let delay = if kept.is_empty() && delay == 0 {
+                    FIRST_FRAME_MIN_DELAY_MS
+                } else {
+                    delay
+                };
+                kept.push((buffer, delay));
+            }
+        }
+    }
+    kept
+}
+
+fn animation_canvas(
+    width: u32,
+    height: u32,
+    options: &InlayEncodeOptions,
+) -> Result<(u32, u32), String> {
+    let (width, height) = if options.max_dimension > 0 && width.max(height) > options.max_dimension
+    {
+        let scale = options.max_dimension as f64 / width.max(height) as f64;
+        (
+            (width as f64 * scale).round().max(1.0) as u32,
+            (height as f64 * scale).round().max(1.0) as u32,
+        )
+    } else {
+        (width, height)
+    };
+    if width.max(height) > MAX_ANIMATION_CANVAS_SIDE {
+        return Err("Inlay animation canvas is too large".to_owned());
+    }
+    Ok((width, height))
+}
+
+/// libwebp reads a frame's duration from the timestamp of the frame after it,
+/// and the encoder this crate exposes cannot pass an end timestamp, so it guesses
+/// the last one. Writing the time that is left into the last frame keeps the
+/// animation as long as it was, even where libwebp folded repeated frames together.
+fn set_last_animation_frame_duration(
+    data: &mut [u8],
+    total_duration_ms: u32,
+) -> Result<(), String> {
+    let mut frames: Vec<(usize, u32)> = Vec::new();
+    let mut offset = 12usize;
+    while offset + 8 <= data.len() {
+        let size = u32::from_le_bytes(
+            data[offset + 4..offset + 8]
+                .try_into()
+                .map_err(|_| "unreadable WebP chunk size".to_owned())?,
+        ) as usize;
+        let payload = offset + 8;
+        if payload + size > data.len() {
+            return Err("truncated WebP chunk in the Inlay animation".to_owned());
+        }
+        if &data[offset..offset + 4] == b"ANMF" {
+            if size < 16 {
+                return Err("truncated animation frame in the Inlay animation".to_owned());
+            }
+            let duration = u32::from_le_bytes([
+                data[payload + 12],
+                data[payload + 13],
+                data[payload + 14],
+                0,
+            ]);
+            frames.push((payload, duration));
+        }
+        offset = payload + size + (size & 1);
+    }
+    let Some((payload, _)) = frames.last().copied() else {
+        return Err("the encoded Inlay animation has no frames".to_owned());
+    };
+    let earlier: u32 = frames[..frames.len() - 1]
+        .iter()
+        .map(|(_, duration)| *duration)
+        .sum();
+    let last = total_duration_ms
+        .saturating_sub(earlier)
+        .clamp(1, 0x00ff_ffff);
+    data[payload + 12..payload + 15].copy_from_slice(&last.to_le_bytes()[..3]);
+    Ok(())
+}
+
+fn encode_animated_webp(
+    frames: &[(RgbaImage, u32)],
+    width: u32,
+    height: u32,
+    quality: u8,
+    loop_count: i32,
+) -> Result<Vec<u8>, String> {
+    let mut config = webp::WebPConfig::new()
+        .map_err(|()| "failed to prepare the WebP animation encoder".to_owned())?;
+    config.quality = f32::from(quality);
+    let mut encoder = webp::AnimEncoder::new(width, height, &config);
+    encoder.set_loop_count(loop_count);
+    let mut timestamp: i32 = 0;
+    for (buffer, delay) in frames {
+        encoder.add_frame(webp::AnimFrame::from_rgba(
+            buffer.as_raw(),
+            width,
+            height,
+            timestamp,
+        ));
+        timestamp = timestamp.saturating_add(*delay as i32);
+    }
+    let mut encoded = encoder
+        .try_encode()
+        .map(|memory| memory.to_vec())
+        .map_err(|error| format!("failed to encode the Inlay animation: {error:?}"))?;
+    let total: u32 = frames
+        .iter()
+        .map(|(_, delay)| *delay)
+        .fold(0u32, u32::saturating_add);
+    set_last_animation_frame_duration(&mut encoded, total)?;
+    Ok(encoded)
+}
+
+fn encode_animated_inlay_image(
+    id: &str,
+    data: &[u8],
+    name: &str,
+    options: &InlayEncodeOptions,
+    source: InlayAnimation,
+) -> Result<EncodedInlayImage, String> {
+    let decoded = decode_inlay_animation(data, source)?;
+    let (source_width, source_height) = {
+        let first = &decoded.frames[0].0;
+        (first.width(), first.height())
+    };
+    let (width, height) = animation_canvas(source_width, source_height, options)?;
+    let min_delay_ms = if options.animation_max_fps > 0 {
+        (1000f64 / f64::from(options.animation_max_fps)).ceil() as u32
+    } else {
+        0
+    };
+    let frames = merge_animation_frames(decoded.frames, min_delay_ms);
+    let frames: Vec<(RgbaImage, u32)> = frames
+        .into_iter()
+        .map(|(buffer, delay)| {
+            let buffer = if buffer.width() == width && buffer.height() == height {
+                buffer
+            } else {
+                image::imageops::resize(&buffer, width, height, FilterType::Lanczos3)
+            };
+            (buffer, delay)
+        })
+        .collect();
+    let encoded = if frames.len() == 1 {
+        let (buffer, _) = &frames[0];
+        webp::Encoder::from_rgba(buffer.as_raw(), width, height)
+            .encode(f32::from(options.quality))
+            .to_vec()
+    } else {
+        encode_animated_webp(&frames, width, height, options.quality, decoded.loop_count)?
+    };
+    // An animation that grows is not worth the quality it loses on the way.
+    if encoded.len() >= data.len() {
+        return Err("re-encoding the Inlay animation saved nothing".to_owned());
+    }
+    Ok(EncodedInlayImage {
+        metadata: InlayImageMetadata {
+            key: id.to_owned(),
+            kind: "inlay".to_owned(),
+            size: encoded.len() as u64,
+            mime: "image/webp".to_owned(),
+            name: name.to_owned(),
+            ext: "webp".to_owned(),
+            inlay_type: "image".to_owned(),
+            width: Some(width),
+            height: Some(height),
+        },
+        data: encoded,
+    })
+}
+
 fn encode_inlay_image(
     id: &str,
     data: &[u8],
@@ -1009,62 +1369,40 @@ fn encode_inlay_image(
     if id.is_empty() || id.starts_with("assets/") {
         return Err("invalid Inlay image id".to_owned());
     }
-    let format = image::guess_format(data)
-        .map_err(|error| format!("unsupported Inlay image format: {error}"))?;
+    let options = options.unwrap_or_default();
+    let Ok(format) = image::guess_format(data) else {
+        return Ok(preserved_inlay_image(id, data, name, None));
+    };
+    if let Some(source) = inlay_animation(format, data) {
+        if options.format != InlayEncodeFormat::Original {
+            if let Ok(encoded) = encode_animated_inlay_image(id, data, name, &options, source) {
+                return Ok(encoded);
+            }
+        }
+        return Ok(preserved_inlay_image(id, data, name, None));
+    }
     if !matches!(
         format,
         ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP
     ) {
-        return Err(format!("unsupported new Inlay image format: {format:?}"));
-    }
-    if format == ImageFormat::WebP
-        && webp::BitstreamFeatures::new(data).is_some_and(|features| features.has_animation())
-    {
-        return Err("animated WebP Inlay images are unsupported".to_owned());
-    }
-    if format == ImageFormat::Png
-        && PngDecoder::new(Cursor::new(data))
-            .map_err(|error| format!("failed to inspect PNG Inlay image: {error}"))?
-            .is_apng()
-            .map_err(|error| format!("failed to inspect PNG animation: {error}"))?
-    {
-        return Err("APNG Inlay images are unsupported".to_owned());
+        return Ok(preserved_inlay_image(id, data, name, None));
     }
 
-    let reader = ImageReader::new(Cursor::new(data))
-        .with_guessed_format()
-        .map_err(|error| format!("failed to inspect Inlay image: {error}"))?;
-    let mut decoder = reader
-        .into_decoder()
-        .map_err(|error| format!("failed to decode Inlay image: {error}"))?;
+    let Ok(reader) = ImageReader::new(Cursor::new(data)).with_guessed_format() else {
+        return Ok(preserved_inlay_image(id, data, name, None));
+    };
+    let Ok(mut decoder) = reader.into_decoder() else {
+        return Ok(preserved_inlay_image(id, data, name, None));
+    };
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
-    let mut decoded = DynamicImage::from_decoder(decoder)
-        .map_err(|error| format!("failed to decode Inlay image: {error}"))?;
+    let Ok(mut decoded) = DynamicImage::from_decoder(decoder) else {
+        return Ok(preserved_inlay_image(id, data, name, None));
+    };
     decoded.apply_orientation(orientation);
-    let options = options.unwrap_or_default();
     let width = decoded.width();
     let height = decoded.height();
     if options.format == InlayEncodeFormat::Original {
-        let (mime, ext) = match format {
-            ImageFormat::Png => ("image/png", "png"),
-            ImageFormat::Jpeg => ("image/jpeg", "jpg"),
-            ImageFormat::WebP => ("image/webp", "webp"),
-            _ => unreachable!(),
-        };
-        return Ok(EncodedInlayImage {
-            data: data.to_vec(),
-            metadata: InlayImageMetadata {
-                key: id.to_owned(),
-                kind: "inlay".to_owned(),
-                size: data.len() as u64,
-                mime: mime.to_owned(),
-                name: name.to_owned(),
-                ext: ext.to_owned(),
-                inlay_type: "image".to_owned(),
-                width,
-                height,
-            },
-        });
+        return Ok(preserved_inlay_image(id, data, name, Some((width, height))));
     }
     let needs_resize = options.max_dimension > 0 && width.max(height) > options.max_dimension;
     if needs_resize {
@@ -1106,8 +1444,8 @@ fn encode_inlay_image(
         name: name.to_owned(),
         ext: ext.to_owned(),
         inlay_type: "image".to_owned(),
-        width: rgba.width(),
-        height: rgba.height(),
+        width: Some(rgba.width()),
+        height: Some(rgba.height()),
     };
     Ok(EncodedInlayImage {
         data: encoded,

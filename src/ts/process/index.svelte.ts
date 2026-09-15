@@ -20,6 +20,7 @@ import { runTrigger } from "./triggers";
 import { HypaProcesser } from "./memory/hypamemory";
 import { additionalInformations } from "./embedding/addinfo";
 import { getInlayAsset } from "./files/inlays";
+import { inlayImageForProvider } from "./files/inlayProviderImage";
 import { getGenerationModelString } from "./models/modelString";
 import { connectionOpen, peerRevertChat, peerSafeCheck, peerSync } from "../sync/multiuser";
 import { runInlayScreen } from "./inlayScreen";
@@ -1156,11 +1157,16 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
                 const inlayData = await getInlayAsset(inlayName)
                 if(inlayData?.type === 'image'){
                     if(modelinfo.flags.includes(LLMFlags.hasImageInput)){
+                        const sendable = await inlayImageForProvider(inlayName, {
+                            data: inlayData.data as string,
+                            width: inlayData.width,
+                            height: inlayData.height,
+                        })
                         multimodal.push({
                             type: 'image',
-                            base64: inlayData.data,
-                            width: inlayData.width,
-                            height: inlayData.height
+                            base64: sendable.data,
+                            width: sendable.width,
+                            height: sendable.height
                         })
                     }
                     else{

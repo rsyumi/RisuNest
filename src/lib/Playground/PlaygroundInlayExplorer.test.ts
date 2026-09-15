@@ -33,6 +33,14 @@ vi.mock('src/lang', () => ({
             inlayDeleteSelected: 'Delete selected',
             inlaySelectAll: 'Select all',
         },
+        risuNest: {
+            inlay: {
+                inventoryNoExtension: 'No extension',
+                optimizeSelected: 'Convert selected',
+                optimizeNone: 'Nothing to convert',
+                optimizeProgress: '{done} / {total}',
+            },
+        },
     },
 }))
 
@@ -546,5 +554,20 @@ describe('PlaygroundInlayExplorer browser preview ownership', () => {
         media.dispatchEvent(new Event(stopEvent))
         await vi.waitFor(() => expect(target.querySelector('source')?.getAttribute('src')).toBeNull())
         expect(URL.revokeObjectURL).toHaveBeenCalledWith(`blob:${type}`)
+    })
+
+    test('offers converting the selected entries', async () => {
+        inlayMocks.listInlayAssetMetadata.mockResolvedValue([{ ...metadata, key: 'photo-png', name: 'photo.png', ext: 'png' }])
+        const target = document.createElement('div')
+        document.body.appendChild(target)
+        mounted = mount(PlaygroundInlayExplorer, { target })
+        await vi.waitFor(() => expect(target.querySelector('input[type="checkbox"]')).not.toBeNull())
+        const labels = () => [...target.querySelectorAll('button')].map((button) => button.textContent?.trim())
+
+        expect(labels()).not.toContain('Convert selected')
+        target.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click()
+
+        await vi.waitFor(() => expect(labels()).toContain('Convert selected'))
+        expect(target.textContent).toContain('4.0 KiB · png 1')
     })
 })

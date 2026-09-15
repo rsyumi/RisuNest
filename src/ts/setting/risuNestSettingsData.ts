@@ -6,7 +6,7 @@ export const risuNestSettingUnits: Record<string, string> = {
     'risunest.inlay.maxDimension': 'px',
 }
 
-export const risuNestSettingsItems: SettingItem[] = [
+export const risuNestStreamingSettingsItems: SettingItem[] = [
     {
         id: 'risunest.streaming.header',
         type: 'header',
@@ -37,6 +37,9 @@ export const risuNestSettingsItems: SettingItem[] = [
         helpKey: 'risuNest.streaming.deferEffectsHelp',
         bindKey: 'streamingDeferDisplayProcessing',
     },
+]
+
+export const risuNestInlaySettingsItems: SettingItem[] = [
     { id: 'risunest.inlay.header', type: 'header', labelKey: 'risuNest.inlay.title', options: { level: 'h2' } },
     {
         id: 'risunest.inlay.format',
@@ -79,5 +82,40 @@ export const risuNestSettingsItems: SettingItem[] = [
         helpKey: 'risuNest.inlay.skipReencodeHelp',
         bindKey: 'risunestInlaySkipReencode',
         condition: (ctx) => ctx.db.risunestInlayFormat === 'webp',
+    },
+]
+
+/** Every RisuNest item in display order, used by the settings search. */
+export const risuNestSettingsItems: SettingItem[] = [
+    ...risuNestStreamingSettingsItems,
+    ...risuNestInlaySettingsItems,
+    {
+        id: 'risunest.inlay.animationFps',
+        type: 'select',
+        labelKey: 'risuNest.inlay.animationMaxFps',
+        helpKey: 'risuNest.inlay.animationMaxFpsHelp',
+        bindKey: 'risunestInlayAnimationMaxFps',
+        getValue: (db) => String(db.risunestInlayAnimationMaxFps ?? 0),
+        setValue: (db, value: string) => {
+            db.risunestInlayAnimationMaxFps = normalizeInlayEncodeOptions({
+                animationMaxFps: Number(value),
+            }).animationMaxFps
+        },
+        condition: (ctx) => ctx.db.risunestInlayFormat !== 'original',
+        options: {
+            selectOptions: [
+                { value: '0', labelKey: 'risuNest.inlay.animationMaxFpsKeep' },
+                { value: '24', label: '24' },
+                { value: '15', label: '15' },
+                { value: '12', label: '12' },
+            ],
+        },
+    },
+    {
+        id: 'risunest.inlay.animationStillFrame',
+        type: 'check',
+        labelKey: 'risuNest.inlay.animationStillFrame',
+        helpKey: 'risuNest.inlay.animationStillFrameHelp',
+        bindKey: 'risunestInlayAnimationStillFrame',
     },
 ]

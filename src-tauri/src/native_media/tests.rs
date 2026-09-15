@@ -3,7 +3,12 @@ use super::{
     write_inlay_image, write_inlay_image_with_suffix, InlayEncodeFormat, InlayEncodeOptions,
     InlayImageMetadata,
 };
-use image::{imageops::FilterType, DynamicImage, ImageFormat, Rgba, RgbaImage};
+use image::{
+    codecs::gif::{GifEncoder, Repeat},
+    codecs::webp::WebPDecoder,
+    imageops::FilterType,
+    AnimationDecoder, Delay, DynamicImage, Frame, ImageFormat, Rgba, RgbaImage,
+};
 use serde_json::json;
 use std::{fs, io::Cursor, path::Path};
 use tauri::http::{header, Method, Request, StatusCode};
@@ -466,26 +471,382 @@ fn crc32(bytes: &[u8]) -> u32 {
     !value
 }
 
-fn apng_fixture() -> Vec<u8> {
-    let png = encoded_fixture(ImageFormat::Png, 2, 1);
-    let insert_at = 8 + 12 + u32::from_be_bytes(png[8..12].try_into().unwrap()) as usize;
-    let mut chunk = Vec::new();
-    chunk.extend_from_slice(&8u32.to_be_bytes());
-    chunk.extend_from_slice(b"acTL");
-    chunk.extend_from_slice(&1u32.to_be_bytes());
-    chunk.extend_from_slice(&0u32.to_be_bytes());
-    chunk.extend_from_slice(&crc32(&chunk[4..]).to_be_bytes());
-    let mut apng = Vec::with_capacity(png.len() + chunk.len());
-    apng.extend_from_slice(&png[..insert_at]);
-    apng.extend_from_slice(&chunk);
-    apng.extend_from_slice(&png[insert_at..]);
-    apng
+/// Noise, so that neither the source nor the re-encoded animation compresses
+/// away to nothing and hides what the encoder actually did.
+fn animation_frame(width: u32, height: u32, seed: u32) -> RgbaImage {
+    RgbaImage::from_fn(width, height, |x, y| {
+        let mixed = x
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add(y.wrapping_mul(40_503))
+            .wrapping_add(seed.wrapping_mul(2_246_822_519));
+        let mixed = mixed ^ (mixed >> 15);
+        Rgba([
+            (mixed >> 3) as u8,
+            (mixed >> 11) as u8,
+            (mixed >> 19) as u8,
+            255,
+        ])
+    })
 }
 
-fn animated_webp_header() -> Vec<u8> {
-    let mut bytes = b"RIFF\x16\0\0\0WEBPVP8X\x0a\0\0\0".to_vec();
-    bytes.extend_from_slice(&[0x02, 0, 0, 0, 1, 0, 0, 1, 0, 0]);
-    bytes
+fn animated_gif_fixture(delays_ms: &[u32], width: u32, height: u32) -> Vec<u8> {
+    let mut output = Vec::new();
+    {
+        let mut encoder = GifEncoder::new(Cursor::new(&mut output));
+        encoder.set_repeat(Repeat::Infinite).unwrap();
+        for (index, delay) in delays_ms.iter().enumerate() {
+            encoder
+                .encode_frame(Frame::from_parts(
+                    animation_frame(width, height, index as u32),
+                    0,
+                    0,
+                    Delay::from_numer_denom_ms(*delay, 1),
+                ))
+                .unwrap();
+        }
+    }
+    output
+}
+
+fn animated_webp_fixture(delays_ms: &[u32], width: u32, height: u32) -> Vec<u8> {
+    let frames: Vec<RgbaImage> = (0..delays_ms.len())
+        .map(|index| animation_frame(width, height, index as u32))
+        .collect();
+    let mut config = webp::WebPConfig::new().unwrap();
+    config.lossless = 1;
+    let mut encoder = webp::AnimEncoder::new(width, height, &config);
+    encoder.set_loop_count(0);
+    let mut timestamp = 0i32;
+    for (frame, delay) in frames.iter().zip(delays_ms) {
+        encoder.add_frame(webp::AnimFrame::from_rgba(
+            frame.as_raw(),
+            width,
+            height,
+            timestamp,
+        ));
+        timestamp += *delay as i32;
+    }
+    let mut encoded = encoder.try_encode().unwrap().to_vec();
+    set_webp_frame_delays(&mut encoded, delays_ms);
+    encoded
+}
+
+fn png_chunk(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    let mut chunk = Vec::with_capacity(payload.len() + 12);
+    chunk.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    chunk.extend_from_slice(kind);
+    chunk.extend_from_slice(payload);
+    let crc = crc32(&chunk[4..]);
+    chunk.extend_from_slice(&crc.to_be_bytes());
+    chunk
+}
+
+fn png_chunks(png: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let mut chunks = Vec::new();
+    let mut offset = 8usize;
+    while offset + 12 <= png.len() {
+        let length = u32::from_be_bytes(png[offset..offset + 4].try_into().unwrap()) as usize;
+        let kind = String::from_utf8_lossy(&png[offset + 4..offset + 8]).into_owned();
+        chunks.push((kind, png[offset + 8..offset + 8 + length].to_vec()));
+        offset += 12 + length;
+    }
+    chunks
+}
+
+fn apng_frame_control(sequence: u32, width: u32, height: u32, delay_ms: u16) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(26);
+    payload.extend_from_slice(&sequence.to_be_bytes());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    payload.extend_from_slice(&delay_ms.to_be_bytes());
+    payload.extend_from_slice(&1000u16.to_be_bytes());
+    payload.push(0);
+    payload.push(0);
+    payload
+}
+
+/// Every frame repeats the default image, which is enough to check frame timing.
+fn animated_apng_fixture(delays_ms: &[u16], width: u32, height: u32) -> Vec<u8> {
+    let frame_png = |seed: u32| {
+        let mut buffer = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(animation_frame(width, height, seed))
+            .write_to(&mut buffer, ImageFormat::Png)
+            .unwrap();
+        buffer.into_inner()
+    };
+    let frame_data = |seed: u32| -> Vec<u8> {
+        png_chunks(&frame_png(seed))
+            .iter()
+            .filter(|(kind, _)| kind == "IDAT")
+            .flat_map(|(_, payload)| payload.clone())
+            .collect()
+    };
+    let png = frame_png(0);
+    let chunks = png_chunks(&png);
+    let image_data = frame_data(0);
+    let mut output = png[..8].to_vec();
+    for (kind, payload) in &chunks {
+        if kind == "IDAT" || kind == "IEND" {
+            continue;
+        }
+        output.extend_from_slice(&png_chunk(kind.as_bytes().try_into().unwrap(), payload));
+        if kind == "IHDR" {
+            let mut control = Vec::new();
+            control.extend_from_slice(&(delays_ms.len() as u32).to_be_bytes());
+            control.extend_from_slice(&0u32.to_be_bytes());
+            output.extend_from_slice(&png_chunk(b"acTL", &control));
+        }
+    }
+    let mut sequence = 0u32;
+    output.extend_from_slice(&png_chunk(
+        b"fcTL",
+        &apng_frame_control(sequence, width, height, delays_ms[0]),
+    ));
+    sequence += 1;
+    output.extend_from_slice(&png_chunk(b"IDAT", &image_data));
+    for (index, delay) in delays_ms[1..].iter().enumerate() {
+        output.extend_from_slice(&png_chunk(
+            b"fcTL",
+            &apng_frame_control(sequence, width, height, *delay),
+        ));
+        sequence += 1;
+        let mut payload = sequence.to_be_bytes().to_vec();
+        sequence += 1;
+        payload.extend_from_slice(&frame_data(index as u32 + 1));
+        output.extend_from_slice(&png_chunk(b"fdAT", &payload));
+    }
+    output.extend_from_slice(&png_chunk(b"IEND", &[]));
+    output
+}
+
+fn set_webp_frame_delays(data: &mut [u8], delays: &[u32]) {
+    let mut written = 0usize;
+    let mut offset = 12usize;
+    while offset + 8 <= data.len() {
+        let size = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        let payload = offset + 8;
+        if &data[offset..offset + 4] == b"ANMF" {
+            let duration = delays[written].to_le_bytes();
+            data[payload + 12..payload + 15].copy_from_slice(&duration[..3]);
+            written += 1;
+        }
+        offset = payload + size + (size & 1);
+    }
+    assert_eq!(written, delays.len(), "unexpected animation frame count");
+}
+
+fn webp_frame_delays(data: &[u8]) -> Vec<u32> {
+    WebPDecoder::new(Cursor::new(data))
+        .unwrap()
+        .into_frames()
+        .collect_frames()
+        .unwrap()
+        .iter()
+        .map(|frame| {
+            let (numerator, denominator) = frame.delay().numer_denom_ms();
+            numerator / denominator
+        })
+        .collect()
+}
+
+fn animation_options(max_dimension: u32, animation_max_fps: u32) -> InlayEncodeOptions {
+    InlayEncodeOptions {
+        format: InlayEncodeFormat::Webp,
+        quality: 85,
+        max_dimension,
+        skip_reencode: true,
+        animation_max_fps,
+    }
+}
+
+#[test]
+fn stores_an_animated_gif_as_an_animated_webp_with_the_delays_browsers_play() {
+    let source = animated_gif_fixture(&[10, 30, 50], 64, 64);
+
+    let result =
+        encode_inlay_image("gif", &source, "loop.gif", Some(animation_options(0, 0))).unwrap();
+
+    assert_eq!(result.metadata.mime, "image/webp");
+    assert_eq!(result.metadata.ext, "webp");
+    assert_eq!(
+        (result.metadata.width, result.metadata.height),
+        (Some(64), Some(64))
+    );
+    // A GIF frame at or under 10 ms plays as 100 ms in browsers; longer delays stay.
+    assert_eq!(webp_frame_delays(&result.data), vec![100, 30, 50]);
+}
+
+#[test]
+fn keeps_animated_webp_delays_and_folds_a_zero_delay_frame_into_the_one_before_it() {
+    let mut source = animated_webp_fixture(&[30, 30, 40], 64, 64);
+    set_webp_frame_delays(&mut source, &[30, 0, 40]);
+    assert_eq!(webp_frame_delays(&source), vec![30, 0, 40]);
+
+    let result =
+        encode_inlay_image("webp", &source, "loop.webp", Some(animation_options(0, 0))).unwrap();
+
+    // Milliseconds are meant literally in WebP, so only the unplayable frame goes.
+    assert_eq!(webp_frame_delays(&result.data), vec![30, 40]);
+}
+
+#[test]
+fn replaces_a_zero_delay_apng_frame_with_a_tenth_of_a_second() {
+    let source = animated_apng_fixture(&[0, 40], 64, 64);
+
+    let result =
+        encode_inlay_image("apng", &source, "loop.png", Some(animation_options(0, 0))).unwrap();
+
+    assert_eq!(result.metadata.ext, "webp");
+    assert_eq!(webp_frame_delays(&result.data), vec![100, 40]);
+}
+
+#[test]
+fn caps_the_frame_rate_without_changing_how_long_the_animation_runs() {
+    let source = animated_gif_fixture(&[30, 30, 30, 30], 64, 64);
+
+    let capped =
+        encode_inlay_image("fps", &source, "loop.gif", Some(animation_options(0, 15))).unwrap();
+
+    let delays = webp_frame_delays(&capped.data);
+    assert_eq!(delays, vec![90, 30]);
+    assert_eq!(delays.iter().sum::<u32>(), 120);
+}
+
+#[test]
+fn scales_every_animation_frame_to_the_maximum_resolution() {
+    let source = animated_gif_fixture(&[30, 30, 30], 64, 32);
+
+    let result = encode_inlay_image(
+        "scaled",
+        &source,
+        "loop.gif",
+        Some(animation_options(16, 0)),
+    )
+    .unwrap();
+
+    assert_eq!(
+        (result.metadata.width, result.metadata.height),
+        (Some(16), Some(8))
+    );
+    let frames = WebPDecoder::new(Cursor::new(&result.data))
+        .unwrap()
+        .into_frames()
+        .collect_frames()
+        .unwrap();
+    assert_eq!(frames.len(), 3);
+    for frame in &frames {
+        assert_eq!(
+            (frame.buffer().width(), frame.buffer().height()),
+            (16u32, 8u32)
+        );
+    }
+}
+
+#[test]
+fn preserves_an_animation_with_more_frames_than_the_limit_allows() {
+    let delays = vec![20u32; 601];
+    let source = animated_gif_fixture(&delays, 8, 8);
+
+    let result =
+        encode_inlay_image("many", &source, "long.gif", Some(animation_options(0, 0))).unwrap();
+
+    assert_eq!(result.data, source);
+    assert_eq!(result.metadata.mime, "image/gif");
+    assert_eq!(result.metadata.ext, "gif");
+    assert_eq!(
+        (result.metadata.width, result.metadata.height),
+        (None, None)
+    );
+}
+
+#[test]
+fn preserves_an_animation_the_settings_ask_to_keep_as_it_is() {
+    let source = animated_gif_fixture(&[30, 30, 30], 64, 64);
+
+    let result = encode_inlay_image(
+        "original",
+        &source,
+        "loop.gif",
+        Some(InlayEncodeOptions {
+            format: InlayEncodeFormat::Original,
+            quality: 85,
+            max_dimension: 0,
+            skip_reencode: true,
+            animation_max_fps: 0,
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(result.data, source);
+    assert_eq!(result.metadata.ext, "gif");
+}
+
+#[test]
+fn preserves_an_animation_that_re_encoding_would_not_shrink() {
+    let source = animated_gif_fixture(&[30, 30], 2, 1);
+
+    let result =
+        encode_inlay_image("tiny", &source, "tiny.gif", Some(animation_options(0, 0))).unwrap();
+
+    assert_eq!(result.data, source);
+    assert_eq!(result.metadata.mime, "image/gif");
+}
+
+#[test]
+fn preserves_formats_and_broken_bytes_this_device_cannot_re_encode() {
+    let avif = b"\0\0\0\x18ftypavif\0\0\0\0avifmif1";
+    let broken = b"not an image";
+
+    let stored_avif =
+        encode_inlay_image("avif", avif, "source.avif", Some(animation_options(0, 0))).unwrap();
+    let stored_broken = encode_inlay_image(
+        "broken",
+        broken,
+        "broken.png",
+        Some(animation_options(0, 0)),
+    )
+    .unwrap();
+
+    assert_eq!(stored_avif.data, avif);
+    assert_eq!(stored_avif.metadata.mime, "image/avif");
+    assert_eq!(stored_avif.metadata.ext, "avif");
+    assert_eq!(stored_broken.data, broken);
+    // Nothing in the bytes says what this is, so the file name decides.
+    assert_eq!(stored_broken.metadata.mime, "image/png");
+    assert_eq!(stored_broken.metadata.ext, "png");
+    assert_eq!(
+        (stored_broken.metadata.width, stored_broken.metadata.height),
+        (None, None)
+    );
+}
+
+#[test]
+fn stores_an_animation_and_leaves_no_trace_of_the_image_it_replaced() {
+    let temp = TempDir::new().unwrap();
+    let original = encoded_fixture(ImageFormat::Png, 3, 2);
+    write_inlay_image(temp.path(), "stable", &original, "stable.png").unwrap();
+    let payload_path = temp
+        .path()
+        .join("blobstore/inlays")
+        .join(format!("{}.bin", hex("stable")));
+    let metadata_path = temp
+        .path()
+        .join("blobstore/metadata")
+        .join(format!("{}.json", hex("stable")));
+    let source = animated_gif_fixture(&[30, 30, 30], 64, 64);
+
+    let metadata = write_inlay_image(temp.path(), "stable", &source, "loop.gif").unwrap();
+
+    assert_eq!(metadata.mime, "image/webp");
+    let payload = fs::read(&payload_path).unwrap();
+    assert_eq!(payload.len() as u64, metadata.size);
+    assert_eq!(webp_frame_delays(&payload).len(), 3);
+    assert_eq!(
+        serde_json::from_slice::<InlayImageMetadata>(&fs::read(&metadata_path).unwrap()).unwrap(),
+        metadata
+    );
 }
 
 #[test]
@@ -501,7 +862,7 @@ fn writes_png_inlay_as_full_dimension_webp_with_truthful_metadata() {
     assert_eq!(metadata.mime, "image/webp");
     assert_eq!(metadata.ext, "webp");
     assert_eq!(metadata.name, "photo.png");
-    assert_eq!((metadata.width, metadata.height), (7, 3));
+    assert_eq!((metadata.width, metadata.height), (Some(7), Some(3)));
 
     let payload_path = temp
         .path()
@@ -570,6 +931,7 @@ fn configurable_inlay_encoding_preserves_original_and_skipped_webp_bytes() {
                 quality: 12,
                 max_dimension: 0,
                 skip_reencode: skip,
+                animation_max_fps: 0,
             }),
         )
         .unwrap();
@@ -586,6 +948,7 @@ fn configurable_inlay_encoding_preserves_original_and_skipped_webp_bytes() {
             quality: 12,
             max_dimension: 0,
             skip_reencode: false,
+            animation_max_fps: 0,
         }),
     )
     .unwrap();
@@ -605,10 +968,14 @@ fn configurable_inlay_encoding_resizes_before_webp_encoding() {
             quality: 70,
             max_dimension: 5,
             skip_reencode: false,
+            animation_max_fps: 0,
         }),
     )
     .unwrap();
-    assert_eq!((result.metadata.width, result.metadata.height), (5, 3));
+    assert_eq!(
+        (result.metadata.width, result.metadata.height),
+        (Some(5), Some(3))
+    );
     assert_eq!(result.metadata.mime, "image/webp");
 }
 
@@ -627,6 +994,7 @@ fn configured_webp_quality_is_forwarded_instead_of_using_the_default() {
             quality: 70,
             max_dimension: 0,
             skip_reencode: false,
+            animation_max_fps: 0,
         }),
     )
     .unwrap();
@@ -654,12 +1022,16 @@ fn configured_png_resizes_losslessly_with_truthful_dimensions() {
             quality: 1,
             max_dimension: 5,
             skip_reencode: true,
+            animation_max_fps: 0,
         }),
     )
     .unwrap();
 
     assert_eq!(&result.data[..8], b"\x89PNG\r\n\x1a\n");
-    assert_eq!((result.metadata.width, result.metadata.height), (5, 3));
+    assert_eq!(
+        (result.metadata.width, result.metadata.height),
+        (Some(5), Some(3))
+    );
     let decoded = image::load_from_memory_with_format(&result.data, ImageFormat::Png)
         .unwrap()
         .to_rgba8();
@@ -669,34 +1041,6 @@ fn configured_png_resizes_losslessly_with_truthful_dimensions() {
         .resize(5, 3, FilterType::Lanczos3)
         .to_rgba8();
     assert_eq!(decoded, expected);
-}
-
-#[test]
-fn rejects_animated_webp_before_any_reencode_or_preservation() {
-    for format in [
-        InlayEncodeFormat::Original,
-        InlayEncodeFormat::Webp,
-        InlayEncodeFormat::Png,
-    ] {
-        for skip_reencode in [false, true] {
-            let error = match encode_inlay_image(
-                "animated",
-                &animated_webp_header(),
-                "animated.webp",
-                Some(InlayEncodeOptions {
-                    format: format.clone(),
-                    quality: 85,
-                    max_dimension: 0,
-                    skip_reencode,
-                }),
-            ) {
-                Ok(_) => panic!("animated WebP unexpectedly accepted"),
-                Err(error) => error,
-            };
-
-            assert!(error.contains("animated WebP"), "unexpected error: {error}");
-        }
-    }
 }
 
 #[test]
@@ -712,6 +1056,7 @@ fn native_options_clamp_max_dimension_before_original_mode_ignores_it() {
             "quality": 85,
             "maxDimension": input,
             "skipReencode": false,
+            "animationMaxFps": 0,
         }))
         .unwrap();
         assert_eq!(options.max_dimension, expected);
@@ -730,10 +1075,27 @@ fn native_options_clamp_webp_quality_to_the_encoder_range() {
             "quality": input,
             "maxDimension": 0,
             "skipReencode": false,
+            "animationMaxFps": 0,
         }))
         .unwrap();
 
         assert_eq!(options.quality, expected);
+    }
+}
+
+#[test]
+fn native_options_clamp_the_animation_frame_rate() {
+    for (input, expected) in [(0u32, 0u32), (12, 12), (240, 240), (1000, 240)] {
+        let options: InlayEncodeOptions = serde_json::from_value(json!({
+            "format": "webp",
+            "quality": 85,
+            "maxDimension": 0,
+            "skipReencode": false,
+            "animationMaxFps": input,
+        }))
+        .unwrap();
+
+        assert_eq!(options.animation_max_fps, expected);
     }
 }
 
@@ -752,6 +1114,7 @@ fn configured_png_converts_jpeg_and_webp_sources() {
                 quality: 1,
                 max_dimension: 0,
                 skip_reencode: false,
+                animation_max_fps: 0,
             }),
         )
         .unwrap();
@@ -773,11 +1136,15 @@ fn skipped_webp_reencodes_when_max_dimension_requires_resize() {
             quality: 70,
             max_dimension: 5,
             skip_reencode: true,
+            animation_max_fps: 0,
         }),
     )
     .unwrap();
     assert_ne!(result.data, source);
-    assert_eq!((result.metadata.width, result.metadata.height), (5, 3));
+    assert_eq!(
+        (result.metadata.width, result.metadata.height),
+        (Some(5), Some(3))
+    );
     assert_eq!(result.metadata.mime, "image/webp");
 }
 
@@ -793,11 +1160,15 @@ fn original_inlay_ignores_max_dimension_and_preserves_oriented_jpeg_bytes() {
             quality: 1,
             max_dimension: 1,
             skip_reencode: false,
+            animation_max_fps: 0,
         }),
     )
     .unwrap();
     assert_eq!(result.data, source);
-    assert_eq!((result.metadata.width, result.metadata.height), (3, 8));
+    assert_eq!(
+        (result.metadata.width, result.metadata.height),
+        (Some(3), Some(8))
+    );
     assert_eq!(result.metadata.mime, "image/jpeg");
     assert_eq!(result.metadata.ext, "jpg");
 }
@@ -815,7 +1186,7 @@ fn first_write_creates_a_missing_app_data_directory() {
     )
     .unwrap();
 
-    assert_eq!((metadata.width, metadata.height), (2, 4));
+    assert_eq!((metadata.width, metadata.height), (Some(2), Some(4)));
     assert!(root.join("blobstore/inlay-transactions").is_dir());
 }
 
@@ -840,7 +1211,7 @@ fn records_display_dimensions_after_applying_jpeg_orientation() {
 
     let metadata = write_inlay_image(temp.path(), "oriented", &source, "oriented.jpg").unwrap();
 
-    assert_eq!((metadata.width, metadata.height), (3, 8));
+    assert_eq!((metadata.width, metadata.height), (Some(3), Some(8)));
 }
 
 #[test]
@@ -860,77 +1231,12 @@ fn writes_jpeg_and_webp_sources_once_at_quality_85_without_resizing() {
         .unwrap();
         let decoded = image::load_from_memory_with_format(&payload, ImageFormat::WebP).unwrap();
 
-        assert_eq!((metadata.width, metadata.height), (width, height));
+        assert_eq!(
+            (metadata.width, metadata.height),
+            (Some(width), Some(height))
+        );
         assert_eq!((decoded.width(), decoded.height()), (width, height));
     }
-}
-
-#[test]
-fn rejects_unsupported_gif_avif_and_corrupt_new_images_without_mutating_prior_data() {
-    let temp = TempDir::new().unwrap();
-    let original = encoded_fixture(ImageFormat::Png, 3, 2);
-    let original_metadata =
-        write_inlay_image(temp.path(), "stable", &original, "stable.png").unwrap();
-    let payload_path = temp
-        .path()
-        .join("blobstore/inlays")
-        .join(format!("{}.bin", hex("stable")));
-    let metadata_path = temp
-        .path()
-        .join("blobstore/metadata")
-        .join(format!("{}.json", hex("stable")));
-    let prior_payload = fs::read(&payload_path).unwrap();
-    let prior_metadata = fs::read(&metadata_path).unwrap();
-    let gif = encoded_fixture(ImageFormat::Gif, 2, 1);
-    let avif = b"\0\0\0\x18ftypavif\0\0\0\0avifmif1";
-
-    assert!(
-        write_inlay_image(temp.path(), "stable", &gif, "animated.gif")
-            .unwrap_err()
-            .contains("unsupported new Inlay image format")
-    );
-    assert!(
-        write_inlay_image(temp.path(), "stable", avif, "source.avif")
-            .unwrap_err()
-            .contains("unsupported new Inlay image format")
-    );
-    assert!(
-        write_inlay_image(temp.path(), "stable", b"not an image", "broken.png")
-            .unwrap_err()
-            .contains("unsupported Inlay image format")
-    );
-
-    assert_eq!(fs::read(payload_path).unwrap(), prior_payload);
-    assert_eq!(fs::read(metadata_path).unwrap(), prior_metadata);
-    assert_eq!(
-        serde_json::from_slice::<InlayImageMetadata>(&prior_metadata).unwrap(),
-        original_metadata
-    );
-}
-
-#[test]
-fn rejects_apng_without_mutating_prior_data() {
-    let temp = TempDir::new().unwrap();
-    let original = encoded_fixture(ImageFormat::Png, 3, 2);
-    write_inlay_image(temp.path(), "stable-apng", &original, "stable.png").unwrap();
-    let payload_path = temp
-        .path()
-        .join("blobstore/inlays")
-        .join(format!("{}.bin", hex("stable-apng")));
-    let metadata_path = temp
-        .path()
-        .join("blobstore/metadata")
-        .join(format!("{}.json", hex("stable-apng")));
-    let prior_payload = fs::read(&payload_path).unwrap();
-    let prior_metadata = fs::read(&metadata_path).unwrap();
-
-    assert!(
-        write_inlay_image(temp.path(), "stable-apng", &apng_fixture(), "animated.png")
-            .unwrap_err()
-            .contains("APNG")
-    );
-    assert_eq!(fs::read(payload_path).unwrap(), prior_payload);
-    assert_eq!(fs::read(metadata_path).unwrap(), prior_metadata);
 }
 
 #[test]
@@ -960,7 +1266,7 @@ fn overwrites_payload_and_metadata_as_one_recoverable_pair() {
     let decoded = image::load_from_memory_with_format(&payload, ImageFormat::WebP).unwrap();
 
     assert_eq!(second.name, "second.jpg");
-    assert_eq!((second.width, second.height), (11, 3));
+    assert_eq!((second.width, second.height), (Some(11), Some(3)));
     assert_eq!((decoded.width(), decoded.height()), (11, 3));
     assert!(!temp
         .path()
@@ -980,6 +1286,7 @@ fn commits_png_and_original_inlay_formats_without_rolling_back_the_new_pair() {
                 quality: 85,
                 max_dimension: 0,
                 skip_reencode: false,
+                animation_max_fps: 0,
             },
             "image/png",
             "png",
@@ -992,6 +1299,7 @@ fn commits_png_and_original_inlay_formats_without_rolling_back_the_new_pair() {
                 quality: 85,
                 max_dimension: 0,
                 skip_reencode: false,
+                animation_max_fps: 0,
             },
             "image/jpeg",
             "jpg",

@@ -699,10 +699,13 @@ export function normalizeDatabaseDefaults(data:Database): Database {
         quality: data.risunestInlayWebpQuality,
         maxDimension: data.risunestInlayMaxDimension,
         skipReencode: data.risunestInlaySkipReencode,
+        animationMaxFps: data.risunestInlayAnimationMaxFps,
     })
     data.risunestInlayWebpQuality = normalizedInlayOptions.quality
     data.risunestInlayMaxDimension = normalizedInlayOptions.maxDimension
     data.risunestInlaySkipReencode = normalizedInlayOptions.skipReencode
+    data.risunestInlayAnimationMaxFps = normalizedInlayOptions.animationMaxFps
+    data.risunestInlayAnimationStillFrame ??= true
     data.streamingDisplayOptimizationMode ??= 'off'
     data.streamingThoughtMode ??= 'recent'
     data.streamingDeferDisplayProcessing ??= false
@@ -1168,6 +1171,8 @@ export interface Database{
     risunestInlayWebpQuality?: number
     risunestInlayMaxDimension?: number
     risunestInlaySkipReencode?: boolean
+    risunestInlayAnimationMaxFps?: number
+    risunestInlayAnimationStillFrame?: boolean
     reasoningEffort:number
     bulkEnabling:boolean
     showTranslationLoading: boolean

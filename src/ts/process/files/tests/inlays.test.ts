@@ -17,7 +17,8 @@ import {
     saveInlayedSignature,
     setInlayAsset,
     writeInlayImage,
-    UnsupportedAnimatedInlayError,
+    InlayInputTooLargeError,
+    maxNewInlayInputBytes,
 } from '../inlays'
 import {
     configureBlobStoreStorageProvider,
@@ -193,14 +194,14 @@ beforeEach(() => {
 describe('setInlayAsset', () => {
     test('normalizes absent and malformed configured options at the encoding boundary', () => {
         expect(getInlayEncodeOptions()).toEqual({
-            format: 'webp', quality: 85, maxDimension: 0, skipReencode: true,
+            format: 'webp', quality: 85, maxDimension: 0, skipReencode: true, animationMaxFps: 0,
         })
         vi.mocked(getDatabase).mockReturnValue({
             risunestInlayFormat: 'invalid', risunestInlayWebpQuality: 140.6,
             risunestInlayMaxDimension: -4.4, risunestInlaySkipReencode: 'yes',
         } as any)
         expect(getInlayEncodeOptions()).toEqual({
-            format: 'webp', quality: 100, maxDimension: 0, skipReencode: true,
+            format: 'webp', quality: 100, maxDimension: 0, skipReencode: true, animationMaxFps: 0,
         })
     })
 
@@ -333,18 +334,30 @@ describe('setInlayAsset', () => {
 
     test.each([
         ['GIF', Uint8Array.from([0x47, 0x49, 0x46, 0x38, 0x39, 0x61]), 'gif', 'image/gif'],
-        ['AVIF', new TextEncoder().encode('\0\0\0\x18ftypavif'), 'avif', 'image/avif'],
+        ['AVIF', ftypBytes('avif'), 'avif', 'image/avif'],
         ['animated WebP', new TextEncoder().encode('RIFF\x0c\0\0\0WEBPANIM\0\0\0\0'), 'webp', 'image/webp'],
         ['APNG', apngBytes(), 'png', 'image/png'],
-    ])('rejects new %s input rather than flattening it', async (_label, bytes, ext, mime) => {
-        const rejection = setInlayAsset('unsupported-image', {
+    ])('stores new %s input as it arrived instead of flattening it', async (_label, bytes, ext, mime) => {
+        await setInlayAsset('unsupported-image', {
             data: new Blob([bytes.slice().buffer as ArrayBuffer], { type: mime }),
             ext, name: `unsupported.${ext}`, type: 'image',
         })
 
-        await expect(rejection).rejects.toBeInstanceOf(UnsupportedAnimatedInlayError)
+        const stored = await getInlayAssetBlob('unsupported-image')
+        expect(stored).toMatchObject({ ext, type: 'image' })
+        expect(new Uint8Array(await stored!.data.arrayBuffer())).toEqual(bytes)
+        expect(fakeCtx.drawImage).not.toHaveBeenCalled()
+    })
 
-        expect(await getInlayAssetBlob('unsupported-image')).toBeNull()
+    test('refuses only an attachment past the input size limit', async () => {
+        const oversized = new Uint8Array(maxNewInlayInputBytes + 1)
+
+        await expect(setInlayAsset('too-large', {
+            data: new Blob([oversized.buffer as ArrayBuffer], { type: 'image/png' }),
+            ext: 'png', name: 'huge.png', type: 'image',
+        })).rejects.toBeInstanceOf(InlayInputTooLargeError)
+
+        expect(await getInlayAssetBlob('too-large')).toBeNull()
     })
 
     test('stores an asset in the storage', async () => {
@@ -599,7 +612,7 @@ describe('removeInlayAsset', () => {
 })
 
 describe('postInlayAsset', () => {
-    test('revokes an image URL when the source setter throws', async () => {
+    test('keeps the original bytes and the URL contract when the source setter throws', async () => {
         vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:source-throw')
         const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL')
         vi.stubGlobal('Image', class {
@@ -608,16 +621,17 @@ describe('postInlayAsset', () => {
             set src(_value: string) { throw new Error('source assignment failed') }
         })
 
-        await expect(postInlayAsset({
-            name: 'broken.png',
-            data: new Uint8Array([1]),
-        })).rejects.toThrow('source assignment failed')
+        await postInlayAsset({ name: 'broken.png', data: new Uint8Array([1]) })
 
+        // The bytes survive a decoder that never got started.
+        const stored = await getInlayAssetBlob('test-uuid-1234')
+        expect(new Uint8Array(await stored!.data.arrayBuffer())).toEqual(new Uint8Array([1]))
+        expect(stored).toMatchObject({ ext: 'png' })
         expect(revokeObjectURL).toHaveBeenCalledTimes(1)
         expect(revokeObjectURL).toHaveBeenCalledWith('blob:source-throw')
     })
 
-    test('revokes an image URL when image loading fails', async () => {
+    test('keeps the original bytes and the URL contract when image loading fails', async () => {
         vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:load-error')
         const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL')
         vi.stubGlobal('Image', class {
@@ -626,11 +640,10 @@ describe('postInlayAsset', () => {
             set src(_value: string) { queueMicrotask(() => this.onerror?.()) }
         })
 
-        await expect(postInlayAsset({
-            name: 'broken.png',
-            data: new Uint8Array([1]),
-        })).rejects.toThrow('Failed to load image')
+        await postInlayAsset({ name: 'broken.png', data: new Uint8Array([1]) })
 
+        const stored = await getInlayAssetBlob('test-uuid-1234')
+        expect(new Uint8Array(await stored!.data.arrayBuffer())).toEqual(new Uint8Array([1]))
         expect(revokeObjectURL).toHaveBeenCalledTimes(1)
         expect(revokeObjectURL).toHaveBeenCalledWith('blob:load-error')
     })
@@ -755,10 +768,10 @@ describe('reencodeImage temporary object URLs', () => {
 describe('writeInlayImage', () => {
     test.each([
         ['GIF', Uint8Array.from([0x47, 0x49, 0x46, 0x38, 0x39, 0x61]), 'image/gif'],
-        ['AVIF', new TextEncoder().encode('\0\0\0\x18ftypavif'), 'image/avif'],
+        ['AVIF', ftypBytes('avif'), 'image/avif'],
         ['animated WebP', new TextEncoder().encode('RIFF\x0c\0\0\0WEBPANIM\0\0\0\0'), 'image/webp'],
         ['APNG', apngBytes(), 'image/png'],
-    ])('validates direct %s sources before drawing them to canvas', async (_label, bytes, mime) => {
+    ])('stores a direct %s source without drawing it to canvas', async (_label, bytes, mime) => {
         const source = `data:${mime};base64,fixture`
         vi.stubGlobal('fetch', vi.fn(async () => new Response(bytes.slice().buffer as ArrayBuffer, {
             headers: { 'Content-Type': mime },
@@ -766,28 +779,29 @@ describe('writeInlayImage', () => {
         const image = makeImage(20, 10)
         Object.defineProperty(image, 'currentSrc', { get: () => source })
 
-        await expect(writeInlayImage(image, { id: 'direct-unsupported' }))
-            .rejects.toThrow(/unsupported/i)
+        await writeInlayImage(image, { id: 'direct-unsupported' })
 
+        const stored = await getInlayAssetBlob('direct-unsupported')
+        expect(new Uint8Array(await stored!.data.arrayBuffer())).toEqual(bytes)
+        expect(stored!.data.type).toBe(mime)
         expect(fakeCtx.drawImage).not.toHaveBeenCalled()
-        expect(await getInlayAssetBlob('direct-unsupported')).toBeNull()
     })
 
     test.each([
-        ['AVIS major brand', ftypBytes('avis'), 'application/octet-stream'],
-        ['AVIF compatible brand', ftypBytes('mif1', ['miaf', 'avif']), 'application/octet-stream'],
-        ['AVIS compatible brand', ftypBytes('mif1', ['avis']), 'application/octet-stream'],
-        ['parameterized mixed-case MIME', Uint8Array.of(1, 2, 3), ' Image/AVIF; codecs="av01" '],
-    ])('rejects direct %s before canvas without relying on extension', async (_label, bytes, mime) => {
+        ['AVIS major brand', ftypBytes('avis')],
+        ['AVIF compatible brand', ftypBytes('mif1', ['miaf', 'avif'])],
+        ['AVIS compatible brand', ftypBytes('mif1', ['avis'])],
+    ])('stores a direct %s source from its bytes, not its extension', async (_label, bytes) => {
         vi.stubGlobal('fetch', vi.fn(async () => new Response(bytes.slice().buffer as ArrayBuffer, {
-            headers: { 'Content-Type': mime },
+            headers: { 'Content-Type': 'application/octet-stream' },
         })))
 
-        await expect(writeInlayImage(makeImage(20, 10), { id: 'direct-avif-brand' }))
-            .rejects.toThrow(/AVIF|unsupported/i)
+        await writeInlayImage(makeImage(20, 10), { id: 'direct-avif-brand' })
 
+        const stored = await getInlayAssetBlob('direct-avif-brand')
+        expect(stored).toMatchObject({ ext: 'avif' })
+        expect(new Uint8Array(await stored!.data.arrayBuffer())).toEqual(bytes)
         expect(fakeCtx.drawImage).not.toHaveBeenCalled()
-        expect(await getInlayAssetBlob('direct-avif-brand')).toBeNull()
     })
 
     test('captures a production-style load event that fires during source validation', async () => {

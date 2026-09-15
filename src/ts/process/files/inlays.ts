@@ -13,6 +13,12 @@ import {
     type InlayEncodeOptions,
 } from "../../storage/blobStore";
 import { resolveBlobStore } from "../../storage/platformBlobStore";
+import {
+    encodeInlayImageWithCanvas,
+    inlayImageSignature,
+    keepsBrowserOriginal,
+    preservedInlayOutput,
+} from "./inlayImageEncoding";
 import { isTauri } from "../../platform";
 
 export type InlayAsset = {
@@ -25,10 +31,13 @@ export type InlayAsset = {
     width?: number
 }
 
-export class UnsupportedAnimatedInlayError extends Error {
+/** Well below the native transfer ceiling, and the only reason an attachment is refused. */
+export const maxNewInlayInputBytes = 64 * 1024 * 1024
+
+export class InlayInputTooLargeError extends Error {
     constructor(message: string) {
         super(message)
-        this.name = 'UnsupportedAnimatedInlayError'
+        this.name = 'InlayInputTooLargeError'
     }
 }
 
@@ -59,22 +68,15 @@ const inlayStorage = localforage.createInstance({
 
 export function getInlayEncodeOptions(): InlayEncodeOptions {
     const db = (getDatabase() ?? {}) as Partial<Pick<Database,
-        'risunestInlayFormat' | 'risunestInlayWebpQuality' | 'risunestInlayMaxDimension' | 'risunestInlaySkipReencode'>>
+        'risunestInlayFormat' | 'risunestInlayWebpQuality' | 'risunestInlayMaxDimension'
+        | 'risunestInlaySkipReencode' | 'risunestInlayAnimationMaxFps'>>
     return normalizeInlayEncodeOptions({
         format: db.risunestInlayFormat,
         quality: db.risunestInlayWebpQuality,
         maxDimension: db.risunestInlayMaxDimension,
         skipReencode: db.risunestInlaySkipReencode,
+        animationMaxFps: db.risunestInlayAnimationMaxFps,
     })
-}
-
-function sourceImageOutput(data: Uint8Array): { mime: string, ext: string } | null {
-    if (data.byteLength >= 8 && data.slice(0, 8).every((value, index) => value === [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a][index])) {
-        return { mime: 'image/png', ext: 'png' }
-    }
-    if (data.byteLength >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) return { mime: 'image/jpeg', ext: 'jpg' }
-    if (isNativeInlayFormat(data)) return { mime: 'image/webp', ext: 'webp' }
-    return null
 }
 
 export async function postInlayAsset(img:{
@@ -155,40 +157,50 @@ function imageReadiness(imgObj: HTMLImageElement, sourceUrl?: string): Promise<v
     return ready
 }
 
-export async function writeInlayImage(imgObj:HTMLImageElement, arg:{name?:string, ext?:string, id?:string} = {}, sourceUrl?: string) {
+export async function writeInlayImage(
+    imgObj: HTMLImageElement,
+    arg: { name?: string, ext?: string, id?: string, data?: Uint8Array } = {},
+    sourceUrl?: string,
+) {
     const imgid = inlayWriteId(arg.id)
     const source = sourceUrl || imgObj.currentSrc || imgObj.src
     if (!source) throw new Error('Inlay image source is unavailable')
-    const response = await fetch(source)
-    if (!response.ok) throw new Error(`Failed to read Inlay image source: ${response.status}`)
-    const data = new Uint8Array(await response.arrayBuffer())
-    validateNewInlayImage(data, response.headers.get('Content-Type') ?? '', arg.ext ?? '')
+    const data = arg.data ?? await (async () => {
+        const response = await fetch(source)
+        if (!response.ok) throw new Error(`Failed to read Inlay image source: ${response.status}`)
+        return new Uint8Array(await response.arrayBuffer())
+    })()
+    validateNewInlayInput(data)
     const options = getInlayEncodeOptions()
-    const nativeFastPath = isTauri && isNativeInlayFormat(data)
-    if (nativeFastPath) {
+    if (isTauri) {
+        // The native encoder decides what it can improve and keeps the rest as it is.
         const blobStore = await resolveBlobStore()
         if (!blobStore.putNewInlayImage) throw new Error('Native Inlay image writer is unavailable')
         await blobStore.putNewInlayImage(imgid, data, { name: arg.name ?? imgid, options })
         return imgid
     }
-    const ready = imageReadiness(imgObj, sourceUrl)
-
     let drawHeight = 0
     let drawWidth = 0
-    await ready
-    drawHeight = imgObj.naturalHeight || imgObj.height
-    drawWidth = imgObj.naturalWidth || imgObj.width
-    if (options.format === 'original') {
-        const output = sourceImageOutput(data)
-        if (!output) throw new Error('Original Inlay image must be PNG, JPEG, or WebP')
+    let decoded = true
+    try {
+        await imageReadiness(imgObj, sourceUrl)
+        drawHeight = imgObj.naturalHeight || imgObj.height
+        drawWidth = imgObj.naturalWidth || imgObj.width
+    } catch (error) {
+        void error
+        decoded = false
+    }
+    // A canvas keeps the first frame only, so the browser stores animations untouched.
+    if (!decoded || options.format === 'original' || keepsBrowserOriginal(data)) {
+        const output = preservedInlayOutput(data, arg.ext ?? arg.name ?? '')
         await (await resolveBlobStore()).put(imgid, data, {
             kind: 'inlay', inlayType: 'image', mime: output.mime,
-            name: arg.name ?? imgid, ext: output.ext, height: drawHeight, width: drawWidth,
+            name: arg.name ?? imgid, ext: output.ext,
+            ...(decoded ? { height: drawHeight, width: drawWidth } : {}),
         })
         return `${imgid}`
     }
-    const sourceOutput = sourceImageOutput(data)
-    if (options.format === 'webp' && options.skipReencode && sourceOutput?.mime === 'image/webp'
+    if (options.format === 'webp' && options.skipReencode && inlayImageSignature(data)?.mime === 'image/webp'
         && (options.maxDimension === 0 || Math.max(drawWidth, drawHeight) <= options.maxDimension)) {
         await (await resolveBlobStore()).put(imgid, data, {
             kind: 'inlay', inlayType: 'image', mime: 'image/webp',
@@ -196,33 +208,11 @@ export async function writeInlayImage(imgObj:HTMLImageElement, arg:{name?:string
         })
         return `${imgid}`
     }
-    if (options.maxDimension > 0 && Math.max(drawWidth, drawHeight) > options.maxDimension) {
-        const ratio = options.maxDimension / Math.max(drawWidth, drawHeight)
-        drawWidth = Math.max(1, Math.round(drawWidth * ratio))
-        drawHeight = Math.max(1, Math.round(drawHeight * ratio))
-    }
-    const canvas = document.createElement('canvas')
-    const ctx = canvas.getContext('2d')
-    canvas.width = drawWidth
-    canvas.height = drawHeight
-    if (!ctx) throw new Error('Image canvas is unavailable')
-    ctx.drawImage(imgObj, 0, 0, drawWidth, drawHeight)
-    const imageBlob = await new Promise<Blob>((resolve, reject) => {
-        canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error('Failed to encode Inlay image')), `image/${options.format}`, options.quality / 100)
-    })
-    const output = imageBlob.type.toLowerCase() === 'image/webp'
-        ? { mime: 'image/webp', ext: 'webp' }
-        : imageBlob.type.toLowerCase() === 'image/png'
-            ? { mime: 'image/png', ext: 'png' }
-            : imageBlob.type.toLowerCase() === 'image/jpeg'
-                ? { mime: 'image/jpeg', ext: 'jpg' }
-                : null
-    if (!output) throw new Error(`Unsupported browser Inlay encoder MIME: ${imageBlob.type || '(empty)'}`)
+    const encoded = await encodeInlayImageWithCanvas(imgObj, drawWidth, drawHeight, options)
 
-
-    await (await resolveBlobStore()).put(imgid, new Uint8Array(await imageBlob.arrayBuffer()), {
-        kind: 'inlay', inlayType: 'image', mime: output.mime,
-        name: arg.name ?? imgid, ext: output.ext, height: drawHeight, width: drawWidth,
+    await (await resolveBlobStore()).put(imgid, encoded.data, {
+        kind: 'inlay', inlayType: 'image', mime: encoded.mime,
+        name: arg.name ?? imgid, ext: encoded.ext, height: encoded.height, width: encoded.width,
     })
 
     return `${imgid}`
@@ -246,7 +236,6 @@ export async function saveInlayedSignature(sigid:string,signature:InlaySignature
     } satisfies InlayAsset)
     return sigid
 }
-
 
 function base64ToBlob(b64: string): Blob {
     const splitDataURI = b64.split(',');
@@ -449,100 +438,23 @@ export async function getInlayAssetRenderUrl(
     return url
 }
 
-function isAnimatedWebP(data: Uint8Array): boolean {
-    if (data.byteLength < 12
-        || new TextDecoder().decode(data.subarray(0, 4)) !== 'RIFF'
-        || new TextDecoder().decode(data.subarray(8, 12)) !== 'WEBP') return false
-    const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
-    for (let offset = 12; offset + 8 <= data.byteLength;) {
-        const type = new TextDecoder().decode(data.subarray(offset, offset + 4))
-        if (type === 'ANIM' || type === 'ANMF') return true
-        const length = view.getUint32(offset + 4, true)
-        offset += 8 + length + (length % 2)
+/**
+ * Nothing about the format refuses an attachment any more: whatever the encoder
+ * cannot improve is stored as it arrived. Only a file too large to move through
+ * the native transfer is turned away.
+ */
+function validateNewInlayInput(data: Uint8Array): void {
+    if (data.byteLength > maxNewInlayInputBytes) {
+        throw new InlayInputTooLargeError('The Inlay attachment is larger than the input limit')
     }
-    return false
-}
-
-function isNativeInlayFormat(data: Uint8Array): boolean {
-    const isPng = data.byteLength >= 8
-        && data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47
-        && data[4] === 0x0d && data[5] === 0x0a && data[6] === 0x1a && data[7] === 0x0a
-    const isJpeg = data.byteLength >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff
-    const isWebP = data.byteLength >= 12
-        && new TextDecoder().decode(data.subarray(0, 4)) === 'RIFF'
-        && new TextDecoder().decode(data.subarray(8, 12)) === 'WEBP'
-    return isPng || isJpeg || isWebP
-}
-
-function isAnimatedPng(data: Uint8Array): boolean {
-    const pngSignature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
-    if (data.byteLength < pngSignature.length
-        || !pngSignature.every((value, index) => data[index] === value)) return false
-    const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
-    for (let offset = 8; offset + 12 <= data.byteLength;) {
-        const length = view.getUint32(offset)
-        const chunkEnd = offset + 12 + length
-        if (chunkEnd > data.byteLength) return false
-        const type = new TextDecoder().decode(data.subarray(offset + 4, offset + 8))
-        if (type === 'acTL') return true
-        offset = chunkEnd
-    }
-    return false
-}
-
-function hasAvifBrand(data: Uint8Array): boolean {
-    const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
-    const text = new TextDecoder()
-    for (let offset = 0; offset + 8 <= data.byteLength;) {
-        const size32 = view.getUint32(offset)
-        const type = text.decode(data.subarray(offset + 4, offset + 8))
-        let headerSize = 8
-        let boxSize = size32
-        if (size32 === 1) {
-            if (offset + 16 > data.byteLength) return false
-            const high = view.getUint32(offset + 8)
-            const low = view.getUint32(offset + 12)
-            boxSize = high * 0x1_0000_0000 + low
-            headerSize = 16
-        } else if (size32 === 0) {
-            boxSize = data.byteLength - offset
-        }
-        if (!Number.isSafeInteger(boxSize) || boxSize < headerSize || offset + boxSize > data.byteLength) return false
-        if (type === 'ftyp') {
-            const brandsStart = offset + headerSize
-            if (brandsStart + 8 > offset + boxSize) return false
-            for (let brandOffset = brandsStart; brandOffset + 4 <= offset + boxSize; brandOffset += brandOffset === brandsStart ? 8 : 4) {
-                const brand = text.decode(data.subarray(brandOffset, brandOffset + 4)).toLowerCase()
-                if (brand === 'avif' || brand === 'avis') return true
-            }
-            return false
-        }
-        offset += boxSize
-    }
-    return false
-}
-
-function validateNewInlayImage(data: Uint8Array, mime: string, ext: string): void {
-    const normalizedExt = ext.replace(/^\.+/, '').toLowerCase()
-    const normalizedMime = mime.split(';', 1)[0].trim().toLowerCase()
-    const gifSignature = data.byteLength >= 6
-        && new TextDecoder().decode(data.subarray(0, 6)).startsWith('GIF8')
-    if (normalizedExt === 'gif' || normalizedMime === 'image/gif' || gifSignature) {
-        throw new UnsupportedAnimatedInlayError('New GIF Inlay images are unsupported because animation cannot be preserved')
-    }
-    if (normalizedExt === 'avif' || normalizedMime === 'image/avif' || hasAvifBrand(data)) {
-        throw new UnsupportedAnimatedInlayError('New AVIF Inlay images are unsupported')
-    }
-    if (isAnimatedWebP(data)) throw new UnsupportedAnimatedInlayError('Animated WebP Inlay images are unsupported')
-    if (isAnimatedPng(data)) throw new UnsupportedAnimatedInlayError('APNG Inlay images are unsupported')
 }
 
 export async function setInlayAsset(id: string, img: InlayAsset): Promise<string> {
     const inlayId = inlayWriteId(id)
     const { bytes, mime } = await inlayBytes(img)
     const blobStore = await resolveBlobStore()
-    if (img.type === 'image') validateNewInlayImage(bytes, mime, img.ext)
-    if (isTauri && img.type === 'image' && isNativeInlayFormat(bytes)) {
+    validateNewInlayInput(bytes)
+    if (isTauri && img.type === 'image') {
         if (!blobStore.putNewInlayImage) throw new Error('Native Inlay image writer is unavailable')
         await blobStore.putNewInlayImage(inlayId, bytes, { name: img.name, options: getInlayEncodeOptions() })
         return inlayId
@@ -550,7 +462,7 @@ export async function setInlayAsset(id: string, img: InlayAsset): Promise<string
     if (img.type === 'image') {
         const sourceUrl = URL.createObjectURL(new Blob([asBuffer(bytes)], { type: mime }))
         try {
-            await writeInlayImage(new Image(), { id: inlayId, name: img.name, ext: img.ext }, sourceUrl)
+            await writeInlayImage(new Image(), { id: inlayId, name: img.name, ext: img.ext, data: bytes }, sourceUrl)
         } finally {
             URL.revokeObjectURL(sourceUrl)
         }
