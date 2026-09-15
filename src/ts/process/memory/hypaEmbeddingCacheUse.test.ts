@@ -4,6 +4,7 @@ const state = vi.hoisted(() => ({
     database: { hypaModel: 'MiniLM', hypaCustomSettings: { url: '', key: '', model: '' } },
     embedded: [] as string[][],
     width: 4,
+    cache: null as unknown,
 }))
 
 vi.mock('src/ts/storage/database.svelte', () => ({
@@ -33,39 +34,39 @@ vi.mock('../transformers', () => ({
     }),
 }))
 
+vi.mock('src/ts/storage/hypaEmbeddingCache', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('src/ts/storage/hypaEmbeddingCache')>()),
+    getHypaEmbeddingCache: () => state.cache,
+}))
+
 import { HypaProcesser } from './hypamemory'
 import { HypaProcessorV2 } from './hypamemoryv2'
-import {
-    setHypaEmbeddingCacheForTest,
-    toVectorBuffer,
-    type HypaCachedEmbedding,
-    type HypaEmbeddingEntry,
+import type {
+    HypaCachedEmbedding,
+    HypaEmbeddingCache,
+    HypaEmbeddingEntry,
 } from 'src/ts/storage/hypaEmbeddingCache'
 
 function recordingCache(seed: Map<string, HypaCachedEmbedding> = new Map()) {
     const stored = new Map(seed)
     const reads: string[][] = []
     const writes: HypaEmbeddingEntry[][] = []
-    return {
-        reads,
-        writes,
-        stored,
-        cache: {
-            async read(keys: string[]) {
-                reads.push([...keys])
-                return new Map([...stored].filter(([key]) => keys.includes(key)))
-            },
-            async write(entries: HypaEmbeddingEntry[]) {
-                writes.push([...entries])
-                for (const entry of entries) {
-                    stored.set(entry.key, {
-                        vector: new Float32Array(entry.vector),
-                        dimensions: entry.dimensions,
-                    })
-                }
-            },
+    const cache: HypaEmbeddingCache = {
+        async read(keys: string[]) {
+            reads.push([...keys])
+            return new Map([...stored].filter(([key]) => keys.includes(key)))
+        },
+        async write(entries: HypaEmbeddingEntry[]) {
+            writes.push([...entries])
+            for (const entry of entries) {
+                stored.set(entry.key, {
+                    vector: new Float32Array(entry.vector),
+                    dimensions: entry.dimensions,
+                })
+            }
         },
     }
+    return { reads, writes, stored, cache }
 }
 
 const texts = Array.from({ length: 40 }, (_, index) => `chunk ${index}`)
@@ -77,14 +78,14 @@ beforeEach(() => {
 })
 
 afterEach(() => {
-    setHypaEmbeddingCacheForTest(null)
+    state.cache = null
     vi.clearAllMocks()
 })
 
 describe('HypaProcesser.addText', () => {
     it('reads and writes the whole batch once instead of once per text', async () => {
         const recorder = recordingCache()
-        setHypaEmbeddingCacheForTest(recorder.cache)
+        state.cache = recorder.cache
 
         const processer = new HypaProcesser('MiniLM')
         await processer.addText(texts)
@@ -101,7 +102,7 @@ describe('HypaProcesser.addText', () => {
 
     it('embeds nothing on a second pass that the cache already answers', async () => {
         const recorder = recordingCache()
-        setHypaEmbeddingCacheForTest(recorder.cache)
+        state.cache = recorder.cache
 
         await new HypaProcesser('MiniLM').addText(texts)
         state.embedded = []
@@ -115,7 +116,7 @@ describe('HypaProcesser.addText', () => {
 
     it('recomputes cached vectors that disagree with the freshly computed width', async () => {
         const recorder = recordingCache()
-        setHypaEmbeddingCacheForTest(recorder.cache)
+        state.cache = recorder.cache
 
         await new HypaProcesser('MiniLM').addText(texts.slice(0, 20))
         state.width = 6
@@ -137,7 +138,7 @@ describe('HypaProcessorV2.addTexts', () => {
 
     it('reads and writes the whole batch once instead of once per chunk', async () => {
         const recorder = recordingCache()
-        setHypaEmbeddingCacheForTest(recorder.cache)
+        state.cache = recorder.cache
 
         const processor = new HypaProcessorV2<string>()
         await processor.addTexts(items)
@@ -152,7 +153,7 @@ describe('HypaProcessorV2.addTexts', () => {
 
     it('answers a repeat round from the cache and keeps the caller identity', async () => {
         const recorder = recordingCache()
-        setHypaEmbeddingCacheForTest(recorder.cache)
+        state.cache = recorder.cache
 
         await new HypaProcessorV2<string>().addTexts(items)
         state.embedded = []
@@ -166,7 +167,7 @@ describe('HypaProcessorV2.addTexts', () => {
 
     it('recomputes cached vectors that disagree with the freshly computed width', async () => {
         const recorder = recordingCache()
-        setHypaEmbeddingCacheForTest(recorder.cache)
+        state.cache = recorder.cache
 
         await new HypaProcessorV2<string>().addTexts(items.slice(0, 20))
         state.width = 6
@@ -183,11 +184,11 @@ describe('HypaProcessorV2.addTexts', () => {
 
     it('separates the key from the v1 producer for the same text and model', async () => {
         const first = recordingCache()
-        setHypaEmbeddingCacheForTest(first.cache)
+        state.cache = first.cache
         await new HypaProcesser('MiniLM').addText([texts[0]])
 
         const second = recordingCache(first.stored)
-        setHypaEmbeddingCacheForTest(second.cache)
+        state.cache = second.cache
         state.embedded = []
         await new HypaProcessorV2<string>().addTexts([items[0]])
 
@@ -207,7 +208,7 @@ describe('embedding identity', () => {
                 hypaCustomSettings: { url, key: '', model: 'bge-m3' },
             }
             const recorder = recordingCache()
-            setHypaEmbeddingCacheForTest(recorder.cache)
+            state.cache = recorder.cache
             await new HypaProcessorV2<string>({ model: 'custom', customEmbeddingUrl: url })
                 .addTexts([item])
                 .catch(() => undefined)

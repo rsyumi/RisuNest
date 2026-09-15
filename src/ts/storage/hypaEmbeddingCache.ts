@@ -220,10 +220,6 @@ export function getHypaEmbeddingCache(): HypaEmbeddingCache {
     return cache
 }
 
-export function setHypaEmbeddingCacheForTest(replacement: HypaEmbeddingCache | null): void {
-    cache = replacement
-}
-
 export function toVectorBuffer(vector: number[] | Float32Array): ArrayBuffer {
     const floats = vector instanceof Float32Array ? vector : Float32Array.from(vector)
     if (floats.byteOffset === 0 && floats.buffer.byteLength === floats.byteLength) {
