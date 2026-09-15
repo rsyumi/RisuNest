@@ -1,5 +1,7 @@
 use super::*;
 use crate::asset_repository::PayloadCas;
+use crate::logical_records::{LogicalRecordEnvelope, LogicalRecordLocator};
+use crate::persistent_store::record_apply::apply_materialized_record;
 
 fn archive_store() -> (tempfile::TempDir, PersistentStore, PayloadCas) {
     let directory = tempfile::tempdir().expect("create archive directory");
@@ -526,4 +528,107 @@ fn a_full_database_read_leaves_archived_characters_out() {
         .map(|character| character["chaId"].as_str().expect("character id"))
         .collect::<Vec<_>>();
     assert_eq!(ids, ["first-active", "last-active"]);
+}
+
+/// The exchange format has no archive, so a remote delta that names an archived
+/// character or any of its conversations is reported instead of applied. The
+/// outcome does not depend on which side published first.
+#[test]
+fn a_remote_delta_that_touches_an_archived_character_is_reported_not_applied() {
+    for remote_first in [false, true] {
+        let (_directory, mut store, _cas) = archive_store();
+        let revision = store.revision().expect("read revision");
+        store
+            .archive_character("middle-archived", revision, 10)
+            .expect("archive the character");
+        let archived_before = archived_object(&store, "middle-archived");
+        let generation = active_generation(&store.connection).expect("read active generation");
+
+        let deltas = if remote_first {
+            vec![
+                (
+                    LogicalRecordLocator::Conversation {
+                        character_id: "middle-archived".into(),
+                        conversation_id: "remote-new-chat".into(),
+                    },
+                    LogicalRecordEnvelope::Conversation {
+                        configured_index: 0,
+                        recent_at: 0,
+                        detail: json!({ "id": "remote-new-chat", "name": "Remote", "message": [] }),
+                        message_page_hashes: vec![],
+                    },
+                ),
+                (
+                    LogicalRecordLocator::Character {
+                        character_id: "middle-archived".into(),
+                    },
+                    LogicalRecordEnvelope::Character {
+                        configured_index: 1,
+                        detail: json!({
+                            "type": "character",
+                            "chaId": "middle-archived",
+                            "name": "Middle Archived",
+                            "chats": []
+                        }),
+                        owner_heads: vec![],
+                    },
+                ),
+            ]
+        } else {
+            vec![
+                (
+                    LogicalRecordLocator::Character {
+                        character_id: "middle-archived".into(),
+                    },
+                    LogicalRecordEnvelope::Character {
+                        configured_index: 1,
+                        detail: json!({
+                            "type": "character",
+                            "chaId": "middle-archived",
+                            "name": "Middle Archived",
+                            "chats": []
+                        }),
+                        owner_heads: vec![],
+                    },
+                ),
+                (
+                    LogicalRecordLocator::Conversation {
+                        character_id: "middle-archived".into(),
+                        conversation_id: "remote-new-chat".into(),
+                    },
+                    LogicalRecordEnvelope::Conversation {
+                        configured_index: 0,
+                        recent_at: 0,
+                        detail: json!({ "id": "remote-new-chat", "name": "Remote", "message": [] }),
+                        message_page_hashes: vec![],
+                    },
+                ),
+            ]
+        };
+
+        for (locator, envelope) in deltas {
+            let transaction = store.connection.transaction().expect("open transaction");
+            let error = apply_materialized_record(
+                &transaction,
+                &generation,
+                locator,
+                envelope,
+                Some(&[]),
+            )
+            .expect_err("a delta on an archived character is refused");
+            assert!(matches!(error, StoreError::Validation { .. }));
+            transaction.rollback().expect("roll back the refused delta");
+        }
+
+        assert_eq!(archived_object(&store, "middle-archived"), archived_before);
+        let conversations: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM conversations WHERE generation = ?1 AND character_id = ?2",
+                params![generation, "middle-archived"],
+                |row| row.get(0),
+            )
+            .expect("count conversations");
+        assert_eq!(conversations, 0, "no mixed active and archived state is left");
+    }
 }

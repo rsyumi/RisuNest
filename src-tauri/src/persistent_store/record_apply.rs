@@ -275,6 +275,28 @@ pub(super) fn validate_configured_index_uniqueness(
     Ok(())
 }
 
+/// The exchange format cannot describe an archived character, so a remote delta
+/// that names one or names any of its conversations is reported instead of
+/// applied. The scope is the character and its whole conversation set, and the
+/// result is the same whichever side publishes first.
+fn refuse_archived_character_delta(
+    transaction: &Transaction<'_>,
+    generation: &str,
+    locator: &LogicalRecordLocator,
+) -> Result<(), StoreError> {
+    let character_id = match locator {
+        LogicalRecordLocator::Character { character_id } => character_id,
+        LogicalRecordLocator::Conversation { character_id, .. } => character_id,
+        _ => return Ok(()),
+    };
+    if super::archive::is_archived(transaction, generation, character_id)? {
+        return validation(format!(
+            "logical delta touches archived character {character_id}"
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn apply_delete(
     transaction: &Transaction<'_>,
     generation: &str,
@@ -432,6 +454,7 @@ pub(super) fn apply_record_rows(
     envelope: &LogicalRecordEnvelope,
     message_count: u64,
 ) -> Result<(), StoreError> {
+    refuse_archived_character_delta(transaction, generation, locator)?;
     match (locator, envelope) {
         (LogicalRecordLocator::Root, LogicalRecordEnvelope::Root { value, owner_heads }) => {
             transaction
