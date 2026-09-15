@@ -2546,7 +2546,7 @@ export const languageEnglish = {
             eyebrow: 'Onboarding',
             brandTitle: 'Walk through the first-run setup.',
             brandDesc:
-                'Bring an existing backup over, or connect to your sync server.',
+                'Bring an existing backup over, or connect to your sync server or storage.',
             stepStart: 'How to start',
             stepData: 'Data',
             stepDone: 'Finished',
@@ -2564,7 +2564,7 @@ export const languageEnglish = {
                     'Loads a RisuAI, RisuNest, or PocketRisu backup file.',
                 syncTitle: 'Connect to a sync server',
                 syncDesc:
-                    'Uses a RisuNest sync server or a RisuAI account backup.',
+                    'Uses a RisuNest sync server, external storage, or a RisuAI account backup.',
             },
             import: {
                 title: 'Import a backup file',
@@ -2582,13 +2582,16 @@ export const languageEnglish = {
             },
             sync: {
                 title: 'Choose how to sync.',
-                lead: 'Choose a RisuNest sync server or your RisuAI account.',
+                lead: 'Choose a RisuNest sync server, external storage, or your RisuAI account.',
                 hubTitle: 'From a sync server',
                 hubDesc:
                     'Receives data from a RisuNest sync server. Connect with a QR code or a registration code.',
                 accountTitle: 'From a RisuAI account backup',
                 accountDesc:
                     'Restores the backup uploaded to the RisuAI account server. Chat attachments and inlay images are not restored.',
+                externalTitle: 'From external storage',
+                externalDesc:
+                    'Opens a repository you already keep on Google Drive, OneDrive, NAVER MYBOX, WebDAV, S3-compatible storage, GitHub or GitLab.',
             },
             hub: {
                 title: 'Connect to a sync server',
@@ -2611,6 +2614,39 @@ export const languageEnglish = {
                 pendingReason:
                     'The server is still processing. Try again in a moment.',
                 retry: 'Try again',
+            },
+            external: {
+                title: 'Connect external storage',
+                lead: 'Open the recovery file saved when the repository was created, or paste its contents, and enter the recovery code. The service and folder are read from the recovery file.',
+                stepKey: 'Open the recovery file, or paste its contents.',
+                stepCode: 'Enter the recovery code saved with it.',
+                stepPick: 'Check the service and folder, then sign in.',
+                unsupported: 'External storage is available in the Android and desktop apps.',
+                syncTitle: 'Bring the repository contents over',
+                syncDesc:
+                    'This device joins the repository and receives the characters, chats and attachments in it.',
+                syncStart: 'Bring the contents over',
+                syncingLead: 'Do not close the app until it finishes.',
+                restoreTitle: 'Choose a backup',
+                restoreLead:
+                    'These are the backups in the repository, newest first. Choose the one to restore.',
+                restoreEmpty:
+                    'There is no backup in this repository yet. You can start right away and back up from the settings.',
+                restoreMore: 'Show older backups',
+                restore: 'Restore and start',
+                restoreNote: 'Everything on this device is replaced by the backup.',
+                restoreRestartNote:
+                    'Everything on this device is replaced by the backup. The app restarts once the restore finishes.',
+                restoring: 'Restoring',
+                conflictTitle: 'The repository already holds other contents',
+                conflictLead:
+                    'This device has its own starting data, so the repository was not opened by itself. Bringing the repository over replaces what is on this device.',
+                conflictReceive: 'Read the repository contents',
+                conflictTake: 'Use the repository contents',
+                errorSummary: 'This could not finish.',
+                errorReason: 'The data on this device is unchanged. Check your internet connection and try again.',
+                retry: 'Try again',
+                other: 'Another way',
             },
             account: {
                 title: 'RisuAI account backup',

@@ -2352,7 +2352,7 @@ export const languageKorean = {
             eyebrow: '온보딩',
             brandTitle: '온보딩 절차를 진행해주세요.',
             brandDesc:
-                '기존 백업을 가져오거나 동기화 서버에 연결할 수 있습니다.',
+                '기존 백업을 가져오거나 동기화 서버·저장소에 연결할 수 있습니다.',
             stepStart: '시작 방식',
             stepData: '데이터',
             stepDone: '완료',
@@ -2370,7 +2370,7 @@ export const languageKorean = {
                     'RisuAI, RisuNest, PocketRisu 백업 파일을 불러옵니다.',
                 syncTitle: '동기화 서버에 연결',
                 syncDesc:
-                    'RisuNest 동기화 서버나 RisuAI 계정 백업을 사용합니다.',
+                    'RisuNest 동기화 서버, 외부 저장소, RisuAI 계정 백업을 사용합니다.',
             },
             import: {
                 title: '백업 파일 가져오기',
@@ -2388,13 +2388,16 @@ export const languageKorean = {
             },
             sync: {
                 title: '동기화 방식을 선택해주세요.',
-                lead: 'RisuNest 동기화 서버 또는 RisuAI 계정을 선택합니다.',
+                lead: 'RisuNest 동기화 서버, 외부 저장소, RisuAI 계정 중에서 선택합니다.',
                 hubTitle: '동기화 서버에서',
                 hubDesc:
                     'RisuNest 동기화 서버에서 데이터를 받아옵니다. QR 코드나 등록 코드로 연결할 수 있습니다.',
                 accountTitle: 'RisuAI 계정 백업에서',
                 accountDesc:
                     'RisuAI 계정 서버에 업로드된 백업을 복원합니다. 채팅 첨부 파일이나 인레이 이미지는 복원되지 않습니다.',
+                externalTitle: '외부 저장소에서',
+                externalDesc:
+                    'Google Drive, OneDrive, 네이버 MYBOX, WebDAV, S3 호환 저장소, GitHub, GitLab에 이미 만들어 둔 저장소를 엽니다.',
             },
             hub: {
                 title: '동기화 서버와 연결',
@@ -2417,6 +2420,38 @@ export const languageKorean = {
                 pendingReason:
                     '서버가 아직 처리 중입니다. 잠시 뒤 다시 시도해주세요.',
                 retry: '다시 시도',
+            },
+            external: {
+                title: '외부 저장소 연결',
+                lead: '저장소를 만들 때 저장한 복구 파일을 불러오거나 내용을 붙여넣고, 복구 코드를 입력해주세요. 서비스와 폴더는 복구 파일에서 읽어옵니다.',
+                stepKey: '복구 파일을 불러오거나 내용을 붙여넣습니다.',
+                stepCode: '함께 저장한 복구 코드를 입력합니다.',
+                stepPick: '서비스와 폴더를 확인한 뒤 로그인합니다.',
+                unsupported: '외부 저장소는 Android 및 데스크톱 앱에서 사용할 수 있습니다.',
+                syncTitle: '저장소 내용 가져오기',
+                syncDesc:
+                    '이 기기를 저장소에 참여시키고, 저장소에 있는 캐릭터·대화와 첨부 파일을 받아옵니다.',
+                syncStart: '내용 가져오기',
+                syncingLead: '끝날 때까지 앱을 닫지 말아주세요.',
+                restoreTitle: '백업 선택',
+                restoreLead: '저장소에 있는 백업입니다. 최근 것부터 보여드리니 복원할 백업을 골라주세요.',
+                restoreEmpty:
+                    '이 저장소에는 아직 백업이 없습니다. 바로 시작한 뒤 설정에서 백업할 수 있습니다.',
+                restoreMore: '이전 백업 더 보기',
+                restore: '복원하고 시작',
+                restoreNote: '이 기기의 내용은 백업 내용으로 모두 바뀝니다.',
+                restoreRestartNote:
+                    '이 기기의 내용은 백업 내용으로 모두 바뀝니다. 복원이 끝나면 앱이 다시 시작됩니다.',
+                restoring: '복원 중',
+                conflictTitle: '저장소에 다른 내용이 이미 있습니다',
+                conflictLead:
+                    '이 기기에도 시작 데이터가 있어서 저장소를 바로 열지 못했습니다. 저장소 내용을 가져오면 이 기기의 내용은 저장소 내용으로 바뀝니다.',
+                conflictReceive: '저장소 내용 읽어오기',
+                conflictTake: '저장소 내용 사용',
+                errorSummary: '작업을 마치지 못했습니다.',
+                errorReason: '이 기기의 데이터는 그대로입니다. 인터넷 연결을 확인하고 다시 시도해주세요.',
+                retry: '다시 시도',
+                other: '다른 방법',
             },
             account: {
                 title: 'RisuAI 계정 백업',

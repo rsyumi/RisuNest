@@ -32,6 +32,7 @@ describe('onboarding flow', () => {
         expect(onboardingBack('sync-hub')).toBe('sync')
         expect(onboardingBack('sync-account')).toBe('sync')
         expect(onboardingBack('sync-account-found')).toBe('sync')
+        expect(onboardingBack('sync-external')).toBe('sync')
     })
 
     it('offers no back link on the first and last screens', () => {
@@ -45,6 +46,7 @@ describe('onboarding flow', () => {
         expect(goToOnboardingState(flow, 'sync-hub').path).toBe('hub')
         expect(goToOnboardingState(flow, 'sync-hub').path).toBe('hub')
         expect(goToOnboardingState(flow, 'sync-account').path).toBe('account')
+        expect(goToOnboardingState(flow, 'sync-external').path).toBe('external')
     })
 
     it('keeps the current path on screens that choose none', () => {
@@ -66,7 +68,7 @@ describe('onboarding flow', () => {
     it('names the closing sentence after the path that brought the data', () => {
         expect(onboardingSummary('fresh')).toBe('fresh')
         expect(onboardingSummary('import')).toBe('import')
-        for (const path of ['hub', 'account'] as const) {
+        for (const path of ['hub', 'account', 'external'] as const) {
             expect(onboardingSummary(path)).toBe('data')
         }
     })

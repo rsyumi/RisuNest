@@ -3,9 +3,10 @@
  * effect; the rules that decide which screen follows which live here so they
  * can be checked without a DOM.
  *
- * `sync-account` is the RisuAI account backup and `sync-hub` is the RisuNest
- * sync server. The design document calls them `sync-server` and `sync-hub`;
- * the names here say which server each one means.
+ * `sync-account` is the RisuAI account backup, `sync-hub` is the RisuNest sync
+ * server and `sync-external` is a repository the reader keeps on a cloud
+ * service or their own server. The design document calls the first two
+ * `sync-server` and `sync-hub`; the names here say which server each one means.
  */
 
 
@@ -16,13 +17,14 @@ export const ONBOARDING_STATES = [
     'sync-hub',
     'sync-account',
     'sync-account-found',
+    'sync-external',
     'done',
 ] as const
 
 export type OnboardingState = (typeof ONBOARDING_STATES)[number]
 
 /** How the reader got their data. It decides the wording on the last screen. */
-export type OnboardingPath = 'fresh' | 'import' | 'hub' | 'account'
+export type OnboardingPath = 'fresh' | 'import' | 'hub' | 'account' | 'external'
 
 export interface OnboardingFlow {
     readonly state: OnboardingState
@@ -41,6 +43,7 @@ const STEP_OF: Readonly<Record<OnboardingState, OnboardingStep>> = {
     'sync-hub': 2,
     'sync-account': 2,
     'sync-account-found': 2,
+    'sync-external': 2,
     'done': 3,
 }
 
@@ -52,6 +55,7 @@ const BACK_OF: Readonly<Record<OnboardingState, OnboardingState | null>> = {
     'sync-hub': 'sync',
     'sync-account': 'sync',
     'sync-account-found': 'sync',
+    'sync-external': 'sync',
     'done': null,
 }
 
@@ -62,6 +66,7 @@ const PATH_OF: Readonly<Partial<Record<OnboardingState, OnboardingPath>>> = {
     'sync-hub': 'hub',
     'sync-account': 'account',
     'sync-account-found': 'account',
+    'sync-external': 'external',
 }
 
 export function onboardingStep(state: OnboardingState): OnboardingStep {
