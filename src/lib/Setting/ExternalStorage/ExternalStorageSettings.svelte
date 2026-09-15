@@ -16,6 +16,7 @@
     import type {
         ExternalConflictSummary,
         ExternalConnectionResult,
+        ExternalCapturePolicy,
         ExternalConnectionSummary,
         ExternalHistoryItem,
         ExternalJobSummary,
@@ -192,6 +193,21 @@
             error = externalErrorMessage(strings, reason)
         } finally {
             historyLoading[connection.id] = false
+        }
+    }
+
+    async function changeCapturePolicy(
+        connection: ExternalConnectionSummary,
+        policy: ExternalCapturePolicy,
+    ): Promise<void> {
+        busy = true
+        try {
+            await bridge.setCapturePolicy(connection.id, policy)
+            await refresh(true)
+        } catch (failure) {
+            error = externalErrorMessage(strings, failure)
+        } finally {
+            busy = false
         }
     }
 
@@ -401,6 +417,16 @@
                     <div class="thin" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={progress === null ? undefined : Math.round(progress * 100)}>
                         <i class={progress === null ? 'pulse' : ''} style={`width:${progress === null ? 100 : progress * 100}%`}></i>
                     </div>
+                {/if}
+
+                {#if connection.capturePolicy}
+                    {@const policy = connection.capturePolicy}
+                    <h4 class="sub-title">{strings.scope}</h4>
+                    <p class="note"><span>{strings.scopeHelp}</span></p>
+                    <label class="check"><input type="checkbox" checked disabled /><span>{strings.library}</span></label>
+                    <label class="check"><input type="checkbox" disabled={busy} checked={policy.hypa} onchange={event => changeCapturePolicy(connection, { ...policy, hypa: event.currentTarget.checked })} /><span>{strings.hypa}</span></label>
+                    <label class="check"><input type="checkbox" disabled={busy} checked={policy.localPlugins} onchange={event => changeCapturePolicy(connection, { ...policy, localPlugins: event.currentTarget.checked })} /><span>{strings.devicePlugins}</span></label>
+                    <label class="check"><input type="checkbox" disabled={busy} checked={policy.localSettings} onchange={event => changeCapturePolicy(connection, { ...policy, localSettings: event.currentTarget.checked })} /><span>{strings.deviceSettings}</span></label>
                 {/if}
 
                 <div class="actions">

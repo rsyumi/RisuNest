@@ -1038,6 +1038,20 @@ pub(crate) async fn open_connected(
     })
 }
 
+/// Changes what a backup connection captures. The new policy applies to work
+/// started afterwards; a job already running keeps the one it fixed.
+#[tauri::command]
+pub(crate) fn external_storage_set_capture_policy(
+    app: AppHandle,
+    connection_id: String,
+    policy: super::connection::CapturePolicy,
+) -> Result<()> {
+    let root = connection_root(&app)?;
+    let mut store = ConnectionStore::open(&root)?;
+    store.set_capture_policy(&connection_id, policy)?;
+    Ok(())
+}
+
 #[tauri::command]
 pub(crate) async fn external_storage_remove_connection(
     app: AppHandle,

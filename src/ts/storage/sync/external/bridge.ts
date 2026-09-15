@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { isTauri } from '../../../platform'
 import { requestDeviceMaintenanceRestart as restartForDeviceMaintenance } from '../../deviceBackup/maintenance'
 import type {
+    ExternalCapturePolicy,
     DecimalString,
     ExternalConnectionResult,
     ExternalAuthorizationPending,
@@ -122,6 +123,10 @@ export class ExternalStorageBridge {
 
     cancelAuthorization(authorizationId: string): Promise<void> {
         return this.native('external_storage_cancel_authorization', { authorizationId })
+    }
+
+    setCapturePolicy(connectionId: string, policy: ExternalCapturePolicy): Promise<void> {
+        return this.native('external_storage_set_capture_policy', { connectionId, policy })
     }
 
     removeConnection(connectionId: string): Promise<void> {

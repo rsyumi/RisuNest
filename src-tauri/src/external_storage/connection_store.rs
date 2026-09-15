@@ -103,6 +103,28 @@ impl ConnectionStore {
             .map_err(storage)?;
         Ok(())
     }
+    /// Replaces a backup connection's capture policy. Work already started
+    /// keeps the policy it fixed, and no existing point is rewritten.
+    pub fn set_capture_policy(
+        &mut self,
+        id: &str,
+        policy: super::connection::CapturePolicy,
+    ) -> Result<StoredConnection> {
+        let mut connection = self.read(id)?;
+        if connection.capture_policy.is_none() {
+            return Err(ProviderError::new(ErrorKind::Unsupported));
+        }
+        connection.capture_policy = Some(policy);
+        let encoded = serde_json::to_string(&connection).map_err(storage)?;
+        decode(&encoded)?;
+        self.0
+            .execute(
+                "UPDATE connections SET value=?2 WHERE id=?1",
+                params![id, encoded],
+            )
+            .map_err(storage)?;
+        Ok(connection)
+    }
     pub fn put_pending(&self, connection: &PendingStoredConnection) -> Result<()> {
         validate_pending(connection)?;
         let encoded = serde_json::to_string(connection).map_err(storage)?;
@@ -310,6 +332,51 @@ mod tests {
             store.pending(&pending.id),
             Err(ProviderError {
                 kind: ErrorKind::NotFound,
+                ..
+            })
+        ));
+    }
+    /// Changing a backup connection's policy applies to work started later. A
+    /// synchronization connection has none to change.
+    #[test]
+    fn a_backup_policy_changes_in_place_and_a_sync_connection_has_none() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = ConnectionStore::open(root.path()).unwrap();
+        let mut backup = pending();
+        backup.capture_policy = Some(super::super::connection::CapturePolicy::default());
+        store.put_pending(&backup).unwrap();
+        let locator = RemoteLocator {
+            connection_identity: "synthetic-identity".into(),
+            collection: Some("descriptors".into()),
+            object: "descriptor".into(),
+        };
+        store
+            .promote_pending(&backup.id, locator.clone(), Capabilities::default())
+            .unwrap();
+
+        let narrowed = super::super::connection::CapturePolicy {
+            hypa: false,
+            local_plugins: true,
+            local_settings: false,
+        };
+        let updated = store.set_capture_policy(&backup.id, narrowed).unwrap();
+        assert_eq!(updated.capture_policy, Some(narrowed));
+        assert_eq!(
+            store.read(&backup.id).unwrap().capture_policy,
+            Some(narrowed)
+        );
+
+        let mut sync = pending();
+        sync.id = "synthetic-sync".into();
+        sync.capture_policy = None;
+        store.put_pending(&sync).unwrap();
+        store
+            .promote_pending(&sync.id, locator, Capabilities::default())
+            .unwrap();
+        assert!(matches!(
+            store.set_capture_policy(&sync.id, narrowed),
+            Err(ProviderError {
+                kind: ErrorKind::Unsupported,
                 ..
             })
         ));
