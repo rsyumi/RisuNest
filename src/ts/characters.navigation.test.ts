@@ -26,7 +26,6 @@ const mocks = vi.hoisted(() => ({
     readPersistentConversation: vi.fn(),
     replacePersistentCompleteCharacter: vi.fn(),
     reconcilePersistentActiveCharacterIds: vi.fn(),
-    getColdStorageItem: vi.fn(),
     alertConfirm: vi.fn(async () => true),
     alertSelect: vi.fn(async () => '0'),
     alertAddCharacter: vi.fn(async () => 'createfromScratch'),
@@ -99,7 +98,6 @@ vi.mock('./process/index.svelte', async () => {
 vi.mock('./characterCards', () => ({ importCharacter: vi.fn() }))
 vi.mock('./pngChunk', () => ({ PngChunk: {} }))
 vi.mock('./ui/yieldToUi', () => ({ yieldToUi: mocks.yieldToUi }))
-vi.mock('./process/coldstorage.svelte', () => ({ getColdStorageItem: mocks.getColdStorageItem }))
 vi.mock('./storage/persistentDataRuntime.svelte', () => ({
     activateCharacter: mocks.activateCharacter,
     acquireDestructiveReplacementFence: mocks.unexpectedNativeRuntimeAccess,
@@ -593,64 +591,6 @@ describe('runtime chat identity', () => {
         expect(mocks.deactivateActiveWorkingSet).toHaveBeenCalledTimes(2)
     })
 
-    it('persists a restored cold character before activating it', async () => {
-        const stub = createBlankChar()
-        stub.coldstorage = 'cold-key'
-        const restored = structuredClone(stub)
-        restored.name = 'Restored'
-        delete restored.coldstorage
-        mocks.database.characters.push(stub)
-        mocks.getColdStorageItem.mockResolvedValue({ character: restored })
-        const events: string[] = []
-        mocks.replacePersistentCompleteCharacter.mockImplementation(async (id, _reason, mutate) => {
-            events.push('replace')
-            const index = mocks.database.characters.findIndex((character) => character.chaId === id)
-            mocks.database.characters[index] = await mutate(mocks.database.characters[index])
-            return true
-        })
-        mocks.activateCharacter.mockImplementation(async () => {
-            events.push('activate')
-            return true
-        })
-
-        const changed = await changeChar(0)
-
-        expect(changed).toBe(true)
-        expect(events).toEqual(['replace', 'activate'])
-        expect(mocks.database.characters[0].name).toBe('Restored')
-    })
-
-    it('restores cold group members before activating the group', async () => {
-        const group = {
-            type: 'group',
-            chaId: 'group-a',
-            name: 'Group',
-            characters: ['member-a'],
-            chats: [],
-        }
-        const member = createBlankChar()
-        member.chaId = 'member-a'
-        member.name = 'Cold member'
-        member.coldstorage = 'member-cold-key'
-        const restored = structuredClone(member)
-        restored.name = 'Restored member'
-        delete restored.coldstorage
-        mocks.database.characters.push(group, member)
-        mocks.getColdStorageItem.mockResolvedValue({ character: restored })
-
-        expect(await changeChar(0)).toBe(true)
-
-        expect(mocks.replacePersistentCompleteCharacter).toHaveBeenCalledWith(
-            'member-a',
-            'cold-character-restore',
-            expect.any(Function),
-        )
-        expect(mocks.database.characters[1].name).toBe('Restored member')
-        expect(mocks.activateCharacter).toHaveBeenCalledWith('group-a', {
-            normalize: expect.any(Function),
-        })
-    })
-
     it('assigns an ID before a new character first chat is inserted', () => {
         const character = createBlankChar()
 
@@ -778,53 +718,6 @@ describe('character activation retry', () => {
         await addCharacter()
 
         expect(get(OpenRealmStore)).toBe(false)
-    })
-
-    it('does not let a slow cold character restore override a newer character navigation', async () => {
-        const first = createBlankChar()
-        first.coldstorage = 'first-cold-key'
-        const second = createBlankChar()
-        mocks.database.characters.push(first, second)
-        const firstDetail = deferred<any>()
-        mocks.readPersistentCharacterDetail.mockImplementation(async (id) => {
-            if (id === first.chaId) return firstDetail.promise
-            const character = mocks.database.characters.find((candidate) => candidate.chaId === id)
-            if (!character) return null
-            const { chats: _chats, ...detail } = structuredClone(character)
-            return detail
-        })
-
-        const older = changeChar(0)
-        await vi.waitFor(() => expect(mocks.readPersistentCharacterDetail).toHaveBeenCalledWith(
-            first.chaId,
-            'cold-character-inspection',
-        ))
-
-        await expect(changeChar(1)).resolves.toBe(true)
-        const { chats: _chats, ...detail } = structuredClone(first)
-        firstDetail.resolve(detail)
-
-        await expect(older).resolves.toBe(false)
-        expect(mocks.activateCharacter.mock.calls.map(([id]) => id)).toEqual([second.chaId])
-        expect(mocks.getColdStorageItem).not.toHaveBeenCalled()
-    })
-
-    it('does not let a slow cold character restore override Home navigation', async () => {
-        const character = createBlankChar()
-        character.coldstorage = 'cold-key'
-        mocks.database.characters.push(character)
-        const detailRead = deferred<any>()
-        mocks.readPersistentCharacterDetail.mockReturnValue(detailRead.promise)
-
-        const pending = changeChar(0)
-        await vi.waitFor(() => expect(mocks.readPersistentCharacterDetail).toHaveBeenCalledOnce())
-        mocks.invalidatePersistentNavigation()
-        const { chats: _chats, ...detail } = structuredClone(character)
-        detailRead.resolve(detail)
-
-        await expect(pending).resolves.toBe(false)
-        expect(mocks.activateCharacter).not.toHaveBeenCalled()
-        expect(mocks.getColdStorageItem).not.toHaveBeenCalled()
     })
 
     it('does not retry an activation superseded by newer character navigation', async () => {

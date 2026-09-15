@@ -120,8 +120,6 @@ async function createPreviousSchemaDatabase(
             'assetAliases',
             'assetOwnerHeads',
             'assetRepositoryAuthority',
-            'coldAliases',
-            'coldPayloadAuthority',
         ]
         for (const storeName of version === 1 ? ['meta', 'root'] : currentStoreNames) {
             request.result.createObjectStore(storeName, { keyPath: 'key' })
@@ -518,42 +516,6 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         }))
     }, 15_000)
 
-    it('fails closed when cold authority is preparing or malformed', async () => {
-        const indexedDB = new IDBFactory()
-        const databaseName = `invalid-cold-authority-${databaseSequence++}`
-        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
-        await store.open()
-        const alias = {
-            key: 'conversation/blocked',
-            objectHash: '81'.repeat(32),
-            size: 1,
-            metadata: {},
-        }
-        await writeRawRecords(indexedDB, databaseName, 'coldPayloadAuthority', [{
-            key: 'revision-0',
-            generation: 'revision-0',
-            value: { format: 'preparing', migrationId: 'blocked', sourceRevision: 0 },
-        }])
-
-        await expect(store.commitColdAlias(alias, 0)).rejects.toThrow('v2')
-        await expect(store.activateColdPayloadMigration({
-            sourceRevision: 0,
-            migrationId: 'cannot-reenter',
-            compatibilityHash: '82'.repeat(32),
-            coldAliases: [alias],
-        })).rejects.toThrow('legacy')
-        expect((await store.readRoot()).revision).toBe(0)
-
-        await writeRawRecords(indexedDB, databaseName, 'coldPayloadAuthority', [{
-            key: 'revision-0',
-            generation: 'revision-0',
-            value: { format: 'v2', migrationId: 'malformed', compatibilityHash: 'no' },
-        }])
-        await expect(store.readColdPayloadAuthority()).rejects.toThrow('compatibilityHash')
-        await expect(store.deleteColdAlias(alias.key, 0)).rejects.toThrow('compatibilityHash')
-        expect((await store.readRoot()).revision).toBe(0)
-    })
-
     it('boots the plugin catalog without scanning large plugin payload rows', async () => {
         const indexedDB = new IDBFactory()
         const store = new IndexedDbPersistentDataStore(
@@ -655,7 +617,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
                     ? ['meta', 'root']
                     : [
                         'assetAliases', 'assetOwnerHeads', 'assetRepositoryAuthority', 'catalog',
-                        'characters', 'coldAliases', 'coldPayloadAuthority', 'conversations',
+                        'characters', 'conversations',
                         'messageOccurrences', 'messagePages', 'meta', 'pluginStorage',
                         'pluginStorageMetadata', 'presets', 'root',
                     ],
@@ -1583,8 +1545,6 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
             'assetAliases',
             'assetOwnerHeads',
             'assetRepositoryAuthority',
-            'coldAliases',
-            'coldPayloadAuthority',
         ]
         const residueTransaction = rawDatabase.transaction(generationStores, 'readonly')
         const targetResidue = await Promise.all(generationStores.map(async (storeName) => {

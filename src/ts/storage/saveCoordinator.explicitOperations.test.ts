@@ -1976,7 +1976,7 @@ describe('SaveCoordinator', () => {
 
         await expect(coordinator.replacePersistentCompleteCharacter(
             'char-a',
-            'cold-character-restore',
+            'character-detail-replace',
             (current) => ({ ...current, name: 'Restored' }),
         )).resolves.toBe(true)
 

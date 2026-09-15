@@ -33,12 +33,7 @@ import {
     resetAccountStorageSession,
     type AccountStorageCache,
 } from "./storage/accountStorage";
-import {
-    getAccountColdStorageItem,
-    getColdStorageItem,
-    makeColdData,
-    setAccountColdStorageItem,
-} from "./process/coldstorage.svelte";
+import { getAccountColdStorageItem } from "./process/coldstorage.svelte";
 import { getRemoteSaveCleanupAction, getRemoteSavePayloadName } from "./storage/remoteSaveCleanup";
 import {
     forageStorage,
@@ -108,7 +103,6 @@ import {
 } from './storage/recoveryMode.svelte'
 import {
     initializeOfficialAccountBootstrap,
-    publishOfficialRevisionIfChanged,
 } from "./storage/sync/officialAccountBootstrap";
 import { createAccountScopedOfficialAssetLedger } from "./storage/sync/officialAssetLedger";
 import {
@@ -433,15 +427,7 @@ export async function loadData() {
             store: runtime.store,
             resolveBlobs: resolveBlobStore,
             account: accountStorage,
-            cold: {
-                readRemote: getAccountColdStorageItem,
-                async writeRemote(key, value, signal) {
-                    if (!await setAccountColdStorageItem(key, value, signal)) {
-                        throw new Error(`Failed to write official cold payload: ${key}`)
-                    }
-                },
-                readLocal: (key) => getColdStorageItem(key, { accountFallback: true }),
-            },
+            cold: { readRemote: getAccountColdStorageItem },
             prepareCandidate: prepareDatabaseForPersistence,
             markPublished: () => undefined,
             ledger: officialAssetLedger,
@@ -776,14 +762,6 @@ export async function loadData() {
 
         await transition('format-update', language.risuNest.startup.data)
         const fullDatabaseResident = pluginCompatibility.profile === 'maximum-compatibility'
-        const coldStorageChanged = fullDatabaseResident ? await makeColdData() : false
-        await publishOfficialRevisionIfChanged(
-            coldStorageChanged && accountBootstrap.officialEnabled,
-            officialAdapter,
-            runtime.revision,
-        )
-
-        performance.mark('boot:cold-storage-ready')
         await transition('plugins', language.risuNest.startup.plugins)
         let pluginsLoaded = excluded('plugins')
         try {
@@ -938,16 +916,10 @@ function updateHeightMode() {
 /**
  * Purges chunks of data that are not needed.
  */
-async function cleanChunks(options:{
-    cleanColdStorage?: boolean
-} = {}) {
-    const cleanColdStorage = options.cleanColdStorage ?? false
+async function cleanChunks() {
     const db = getDatabase()
     if (hasIncompletePersistentWorkingSet(db, workingSetResidency)) return
     if (db.account?.useSync) {
-        return
-    }
-    if(db.coldstorage && !cleanColdStorage){
         return
     }
 

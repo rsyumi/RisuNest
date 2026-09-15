@@ -4,9 +4,6 @@ export interface OfficialAssetLedger {
     /** The key the account already holds this asset under, or null when it was never published. */
     publishedAs(key: string): string | null
     record(key: string, replacementKey: string): void
-    /** Digest of the last published cold payload, or null when it was never published. */
-    coldDigest(key: string): string | null
-    recordCold(key: string, digest: string): void
     clear(): void
     reset(): void
 }
@@ -14,7 +11,6 @@ export interface OfficialAssetLedger {
 interface LedgerRecord {
     version: number
     assets: Record<string, string>
-    cold: Record<string, string>
 }
 
 export interface LedgerStorage {
@@ -24,7 +20,7 @@ export interface LedgerStorage {
 }
 
 function emptyRecord(): LedgerRecord {
-    return { version: LEDGER_VERSION, assets: {}, cold: {} }
+    return { version: LEDGER_VERSION, assets: {} }
 }
 
 function parseRecord(raw: string | null): LedgerRecord {
@@ -35,7 +31,6 @@ function parseRecord(raw: string | null): LedgerRecord {
         return {
             version: LEDGER_VERSION,
             assets: { ...parsed.assets },
-            cold: { ...parsed.cold },
         }
     } catch {
         return emptyRecord()
@@ -44,8 +39,7 @@ function parseRecord(raw: string | null): LedgerRecord {
 
 /**
  * Remembers what an account already holds so an ordinary publish uploads only what changed.
- * Asset keys are content addressed, so a recorded key stays valid; cold payloads keep a digest
- * because their bytes change under a stable key.
+ * Asset keys are content addressed, so a recorded key stays valid.
  */
 export function createOfficialAssetLedger(
     storage: LedgerStorage,
@@ -68,12 +62,6 @@ export function createOfficialAssetLedger(
             record.assets[key] = replacementKey
             persist()
         },
-        coldDigest: (key) => record.cold[key] ?? null,
-        recordCold(key, digest) {
-            if (record.cold[key] === digest) return
-            record.cold[key] = digest
-            persist()
-        },
         clear() {
             record = emptyRecord()
             storage.removeItem(storageKey)
@@ -88,8 +76,6 @@ export function createUnrecordedOfficialAssetLedger(): OfficialAssetLedger {
     return {
         publishedAs: () => null,
         record: () => undefined,
-        coldDigest: () => null,
-        recordCold: () => undefined,
         clear: () => undefined,
         reset: () => undefined,
     }
@@ -120,8 +106,6 @@ export function createAccountScopedOfficialAssetLedger(
     return {
         publishedAs: (key) => resolve().publishedAs(key),
         record: (key, replacementKey) => resolve().record(key, replacementKey),
-        coldDigest: (key) => resolve().coldDigest(key),
-        recordCold: (key, digest) => resolve().recordCold(key, digest),
         clear: () => resolve().clear(),
         reset() {
             boundId = null

@@ -7,7 +7,6 @@ import type { BlobStore } from "../storage/blobStore";
 import {
     collectBackupAssetKeys,
     collectReferencedBackupInlays,
-    createColdStorageReferenceDatabase,
     decodeBackupInlayEntry,
     encodeBackupInlayEntry,
     getBackupInlayName,
@@ -25,7 +24,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { decryptBuffer, encryptBuffer, sleep } from "../util";
 import { hubURL } from "../characterCards";
 import { language } from "src/lang";
-import { collectColdStorageBackupPayloads, confirmIncompleteColdStorageOperation, getColdStorageBackupKey, isColdStorageBackupData, listColdDataKeys } from "../process/coldstorage.svelte";
+import { confirmIncompleteColdStorageRestore, getColdStorageBackupKey, isColdStorageBackupData, listColdDataKeys } from "../process/coldstorage.svelte";
 import { expandColdPayloads } from "../process/coldPayloadExpansion";
 import { getPersistentDataRuntime, publishCurrentOfficialRevision, replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte";
 import { installLocalBackup } from "../storage/databaseRestore";
@@ -135,19 +134,6 @@ async function saveLocalBackupWithWebView(){
 
 async function saveLocalBackupSnapshot(blobStore: BlobStore, pinned: PinnedRisuSaveExport) {
     const { root, accumulator } = await scanPinnedBackupRecords(pinned.reader, 'full')
-    const coldReferenceDatabase = createColdStorageReferenceDatabase(
-        accumulator.finish().coldCharacterReferences,
-    )
-    const coldStoragePayloads = await collectColdStorageBackupPayloads(coldReferenceDatabase)
-    const unavailableColdStorageKeys = [...coldStoragePayloads.missingKeys, ...coldStoragePayloads.invalidKeys]
-    if(!await confirmIncompleteColdStorageOperation(
-        coldReferenceDatabase,
-        unavailableColdStorageKeys,
-        'backup',
-    )){
-        return
-    }
-    for (const payload of coldStoragePayloads.payloads) accumulator.visitColdPayload(payload.value)
     const references = accumulator.finish()
 
     const writer = new LocalWriter()
@@ -220,14 +206,6 @@ async function saveLocalBackupSnapshot(blobStore: BlobStore, pinned: PinnedRisuS
         )
     }
 
-    for(let i=0;i<coldStoragePayloads.payloads.length;i++){
-        const payload = coldStoragePayloads.payloads[i]
-        let message = `Saving local Backup Cold data... (${i + 1} / ${coldStoragePayloads.payloads.length})`
-        alertWait(message)
-        const encoded = new TextEncoder().encode(JSON.stringify(payload.value))
-        await writer.writeBackup(payload.backupName, encoded)
-    }
-
     alertWait(`Saving local Backup... (Saving database)`)
 
     if(forageStorage.isAccount && location.origin.endsWith('risuai.xyz')){
@@ -297,18 +275,6 @@ export async function SavePartialLocalBackup(){
 async function savePartialLocalBackupSnapshot(blobStore: BlobStore, pinned: PinnedRisuSaveExport) {
     const { accumulator } = await scanPinnedBackupRecords(pinned.reader, 'partial')
     const references = accumulator.finish()
-    const coldReferenceDatabase = createColdStorageReferenceDatabase(
-        references.coldCharacterReferences,
-    )
-    const coldStoragePayloads = await collectColdStorageBackupPayloads(coldReferenceDatabase)
-    const unavailableColdStorageKeys = [...coldStoragePayloads.missingKeys, ...coldStoragePayloads.invalidKeys]
-    if(!await confirmIncompleteColdStorageOperation(
-        coldReferenceDatabase,
-        unavailableColdStorageKeys,
-        'backup',
-    )){
-        return
-    }
 
     const writer = new LocalWriter()
     const r = await writer.init('RisuNest Backup', ['bin'], 'risu-partial-backup.bin')
@@ -347,14 +313,6 @@ async function savePartialLocalBackupSnapshot(blobStore: BlobStore, pinned: Pinn
         if (readRemotely) {
             await sleep(100)
         }
-    }
-
-    for(let i=0;i<coldStoragePayloads.payloads.length;i++){
-        const payload = coldStoragePayloads.payloads[i]
-        let message = `Saving partial local Backup Cold data... (${i + 1} / ${coldStoragePayloads.payloads.length})`
-        alertWait(message)
-        const encoded = new TextEncoder().encode(JSON.stringify(payload.value))
-        await writer.writeBackup(payload.backupName, encoded)
     }
 
     alertWait(`Saving partial local backup... (Saving database)`) 
@@ -682,7 +640,7 @@ export async function importLegacyBackupWithWebView(
 
     const missingColdStorageKeys = (await listColdDataKeys(dbData))
         .filter((key) => !restoredColdStoragePayloads.has(key))
-    if (!await confirmIncompleteColdStorageOperation(dbData, missingColdStorageKeys, 'restore')) {
+    if (!await confirmIncompleteColdStorageRestore(dbData, missingColdStorageKeys)) {
         throw cancelledError()
     }
     await expandColdPayloads(dbData, async (key) => restoredColdStoragePayloads.get(key) ?? null)

@@ -3,8 +3,6 @@ import { describe, expect, it, vi } from 'vitest'
 import type { Database } from '../database.svelte'
 import { IndexedDbPersistentDataStore } from '../indexedDbPersistentDataStore'
 import { RevisionConflictError } from '../persistentDataStore'
-import { createCompleteColdPayloadStore } from '../coldPayloadRepository'
-import { createImmutablePayloadCas } from '../payloadCas'
 import {
     capturePersistentRoot,
     capturePersistentPresets,
@@ -339,90 +337,6 @@ describe('persistent production runtime', () => {
         expect(persisted.characters[1].chats[0].note).toBe('inactive chat replaced')
         expect(persisted.characters[0].chats[1]).toEqual(untouchedSelectedSibling)
         expect(persisted.characters[1].chats[1]).toEqual(untouchedInactiveSibling)
-    })
-
-    it('keeps coordinator and active session revisions current across cold writes before replacement', async () => {
-        const databaseName = `runtime-cold-revision-${crypto.randomUUID()}`
-        const database = makeDatabase()
-        const store = makeStore(databaseName)
-        await store.open()
-        const initial = await store.replaceFromDatabase(database)
-        const activated = await store.activateColdPayloadMigration({
-            sourceRevision: initial.revision,
-            migrationId: 'runtime-cold-revision',
-            compatibilityHash: '17'.repeat(32),
-            coldAliases: [],
-        })
-        const adapter = makeAdapter(database)
-        const runtime = createPersistentDataRuntime({
-            store,
-            state: adapter,
-            prepareDatabase: async (candidate) => structuredClone(candidate),
-        })
-        await runtime.initializeActiveWorkingSet(database)
-        const objects = new Map<string, Uint8Array>()
-        const cold = createCompleteColdPayloadStore({
-            catalog: store,
-            cas: createImmutablePayloadCas({
-                async putIfAbsent(key, bytes) {
-                    if (objects.has(key)) return false
-                    objects.set(key, bytes.slice())
-                    return true
-                },
-                async read(key) {
-                    return objects.get(key)?.slice() ?? null
-                },
-                async stat(key) {
-                    return objects.get(key)?.byteLength ?? null
-                },
-            }),
-            legacy: {
-                read: async () => null,
-                write: async () => undefined,
-                list: async () => [],
-                remove: async () => undefined,
-            },
-        })
-
-        const mutationGeneration = (
-            await runtime.capturePersistentMutationToken('before-cold-storage-only')
-        ).mutationGeneration
-        const mutateCold = (operation: () => Promise<void>) =>
-            runtime.runStorageOnlyMutation(async (expectedRevision) => {
-                expect((await store.readRoot()).revision).toBe(expectedRevision)
-                await operation()
-                return (await store.readRoot()).revision
-            })
-        await mutateCold(() => cold.write(
-            'cold/restored',
-            new TextEncoder().encode('restored payload'),
-        ))
-        await mutateCold(() => cold.write(
-            'cold/removed',
-            new TextEncoder().encode('removed payload'),
-        ))
-        await mutateCold(() => cold.remove('cold/removed'))
-        const rootAfterColdMutations = await store.readRoot()
-        const replacement = structuredClone(database)
-        replacement.username = 'Restored database'
-
-        expect(rootAfterColdMutations.revision).toBe(activated.revision + 3)
-        expect(runtime.revision).toBe(rootAfterColdMutations.revision)
-        expect(runtime.getActiveConversationSession()?.storeRevision).toBe(
-            rootAfterColdMutations.revision,
-        )
-        expect((
-            await runtime.capturePersistentMutationToken('after-cold-storage-only')
-        ).mutationGeneration).toBe(mutationGeneration)
-        await expect(runtime.replacePersistentDatabase(
-            replacement,
-            'cold-then-database',
-        )).resolves.toBeUndefined()
-
-        const reopened = makeStore(databaseName)
-        await reopened.open()
-        expect((await reopened.readColdAlias('cold/restored'))?.value.key).toBe('cold/restored')
-        expect(await reopened.readColdAlias('cold/removed')).toBeNull()
     })
 
     it('preserves V2 plugin insertion order through nested edits, restart, and export', async () => {
@@ -951,7 +865,7 @@ describe('persistent production runtime', () => {
         expect(await runtime.activateCharacter('char-a', {
             prepare: async () => ({
                 database: structuredClone(database),
-                reason: 'cold-character-restore',
+                reason: 'character-detail-replace',
             }),
         })).toBe(true)
 

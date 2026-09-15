@@ -36,64 +36,6 @@ export type AssetRepositoryAuthorityState =
     | { format: 'preparing'; migrationId: string; sourceRevision: DataRevision }
     | { format: 'v2'; migrationId: string; compatibilityHash: string }
 
-export type ColdPayloadAuthorityState =
-    | { format: 'legacy' }
-    | { format: 'preparing'; migrationId: string; sourceRevision: DataRevision }
-    | { format: 'v2'; migrationId: string; compatibilityHash: string }
-
-export interface ColdAlias {
-    key: string
-    objectHash: string | null
-    size: number
-    metadata: Record<string, unknown>
-}
-
-export interface ColdPayloadMigrationInput {
-    sourceRevision: DataRevision
-    migrationId: string
-    compatibilityHash: string
-    coldAliases: ColdAlias[]
-}
-
-function validateJsonValue(value: unknown, ancestors: Set<object>): void {
-    if (value === null || typeof value === 'string' || typeof value === 'boolean') return
-    if (typeof value === 'number') {
-        if (Number.isFinite(value)) return
-        throw new TypeError('Cold alias metadata numbers must be finite')
-    }
-    if (typeof value !== 'object') {
-        throw new TypeError('Cold alias metadata must contain only JSON values')
-    }
-    const prototype = Object.getPrototypeOf(value)
-    if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) {
-        throw new TypeError('Cold alias metadata objects must be plain JSON objects')
-    }
-    if (ancestors.has(value)) {
-        throw new TypeError('Cold alias metadata must not contain cycles')
-    }
-    ancestors.add(value)
-    for (const child of Array.isArray(value) ? value : Object.values(value)) {
-        validateJsonValue(child, ancestors)
-    }
-    ancestors.delete(value)
-}
-
-export function validateColdAlias(alias: ColdAlias): void {
-    if (typeof alias.key !== 'string' || alias.key.length === 0 || alias.key.includes('\0')) {
-        throw new TypeError('Cold alias key must be nonempty and contain no NUL characters')
-    }
-    if (alias.objectHash !== null && !/^[0-9a-f]{64}$/.test(alias.objectHash)) {
-        throw new TypeError('Cold alias objectHash must be null or lowercase SHA-256')
-    }
-    if (!Number.isSafeInteger(alias.size) || alias.size < 0) {
-        throw new TypeError('Cold alias size must be a nonnegative safe integer')
-    }
-    if (alias.metadata === null || typeof alias.metadata !== 'object' || Array.isArray(alias.metadata)) {
-        throw new TypeError('Cold alias metadata must be an object')
-    }
-    validateJsonValue(alias.metadata, new Set())
-}
-
 export interface AssetAliasIdentity {
     kind: AssetAliasKind
     key: string
@@ -489,9 +431,6 @@ export interface PersistentRevisionReader {
     listAssetAliases(query: AssetAliasListQuery): Promise<AssetAliasPage>
     readAssetRepositoryAuthority(): Promise<Versioned<AssetRepositoryAuthorityState>>
     readAssetOwnerHead(owner: AssetOwnerLocator): Promise<Versioned<AssetOwnerHead> | null>
-    readColdPayloadAuthority(): Promise<Versioned<ColdPayloadAuthorityState>>
-    readColdAlias(key: string): Promise<Versioned<ColdAlias> | null>
-    listColdAliases(): Promise<Versioned<ColdAlias[]>>
 }
 
 export interface PersistentRevisionLease extends PersistentRevisionReader {
@@ -521,9 +460,6 @@ export interface PersistentDataStore {
     listAssetAliases(query: AssetAliasListQuery): Promise<AssetAliasPage>
     readAssetRepositoryAuthority(): Promise<Versioned<AssetRepositoryAuthorityState>>
     readAssetOwnerHead(owner: AssetOwnerLocator): Promise<Versioned<AssetOwnerHead> | null>
-    readColdPayloadAuthority(): Promise<Versioned<ColdPayloadAuthorityState>>
-    readColdAlias(key: string): Promise<Versioned<ColdAlias> | null>
-    listColdAliases(): Promise<Versioned<ColdAlias[]>>
     commitAssetAlias(alias: AssetAlias, expectedRevision: DataRevision): Promise<{ revision: DataRevision }>
     deleteAssetAlias(
         identity: AssetAliasIdentity,
@@ -531,11 +467,6 @@ export interface PersistentDataStore {
     ): Promise<{ revision: DataRevision }>
     activateAssetRepositoryMigration(
         input: AssetRepositoryMigrationInput,
-    ): Promise<{ revision: DataRevision }>
-    commitColdAlias(alias: ColdAlias, expectedRevision: DataRevision): Promise<{ revision: DataRevision }>
-    deleteColdAlias(key: string, expectedRevision: DataRevision): Promise<{ revision: DataRevision }>
-    activateColdPayloadMigration(
-        input: ColdPayloadMigrationInput,
     ): Promise<{ revision: DataRevision }>
     commit(input: WorkingSetCommit): Promise<{ revision: DataRevision }>
     replaceFromDatabase(

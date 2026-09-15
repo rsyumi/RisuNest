@@ -3,7 +3,6 @@ import type { Database, groupChat } from '../database.svelte'
 import type {
     AssetAlias,
     AssetOwnerHead,
-    ColdAlias,
     PersistentDataStore,
 } from '../persistentDataStore'
 import { RevisionConflictError, SnapshotReleasedError } from '../persistentDataStore'
@@ -994,113 +993,6 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             })
         })
 
-        it('activates cold aliases and v2 authority in one revision', async () => {
-            const { store, reopen } = await createHarness()
-            const initial = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
-            const lease = await store.acquireRevision(initial.revision)
-            const aliases: ColdAlias[] = [
-                {
-                    key: 'conversation/alpha',
-                    objectHash: '31'.repeat(32),
-                    size: 17,
-                    metadata: { codec: 'gzip', nested: { version: 1 } },
-                },
-                {
-                    key: 'conversation/empty',
-                    objectHash: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
-                    size: 0,
-                    metadata: {},
-                },
-            ]
-
-            expect(await store.readColdPayloadAuthority()).toEqual({
-                revision: initial.revision,
-                value: { format: 'legacy' },
-            })
-            const activated = await store.activateColdPayloadMigration({
-                sourceRevision: initial.revision,
-                migrationId: 'cold-atomic',
-                compatibilityHash: '42'.repeat(32),
-                coldAliases: aliases,
-            })
-
-            expect(await store.readColdPayloadAuthority()).toEqual({
-                revision: activated.revision,
-                value: {
-                    format: 'v2',
-                    migrationId: 'cold-atomic',
-                    compatibilityHash: '42'.repeat(32),
-                },
-            })
-            expect(await store.listColdAliases()).toEqual({
-                revision: activated.revision,
-                value: aliases,
-            })
-            expect(await store.readColdAlias('conversation/alpha')).toEqual({
-                revision: activated.revision,
-                value: aliases[0],
-            })
-            expect(await lease.readColdPayloadAuthority()).toEqual({
-                revision: initial.revision,
-                value: { format: 'legacy' },
-            })
-            expect(await lease.readColdAlias('conversation/alpha')).toBeNull()
-            await lease.release()
-
-            const reopened = await reopen()
-            expect(await reopened.readColdPayloadAuthority()).toEqual({
-                revision: activated.revision,
-                value: {
-                    format: 'v2',
-                    migrationId: 'cold-atomic',
-                    compatibilityHash: '42'.repeat(32),
-                },
-            })
-            expect(await reopened.listColdAliases()).toEqual({
-                revision: activated.revision,
-                value: aliases,
-            })
-        })
-
-        it('preserves v2 cold authority and aliases across a database-only replacement', async () => {
-            const { store, reopen } = await createHarness()
-            const initial = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
-            const alias: ColdAlias = {
-                key: 'conversation/restored',
-                objectHash: '49'.repeat(32),
-                size: 23,
-                metadata: { source: 'restored-before-database' },
-            }
-            const activated = await store.activateColdPayloadMigration({
-                sourceRevision: initial.revision,
-                migrationId: 'cold-restore-preserve',
-                compatibilityHash: '4a'.repeat(32),
-                coldAliases: [alias],
-            })
-            const replacement = structuredClone(fixtureDatabase)
-            replacement.username = 'Restored after cold payloads'
-
-            const replaced = await store.replaceFromDatabase(replacement, activated.revision)
-
-            expect(await store.readColdPayloadAuthority()).toEqual({
-                revision: replaced.revision,
-                value: {
-                    format: 'v2',
-                    migrationId: 'cold-restore-preserve',
-                    compatibilityHash: '4a'.repeat(32),
-                },
-            })
-            expect(await store.listColdAliases()).toEqual({
-                revision: replaced.revision,
-                value: [alias],
-            })
-            const reopened = await reopen()
-            expect(await reopened.readColdAlias(alias.key)).toEqual({
-                revision: replaced.revision,
-                value: alias,
-            })
-        })
-
         it('preserves repository aliases and only unchanged owner heads across a database-only replacement', async () => {
             const { store, reopen } = await createHarness()
             const database = structuredClone(fixtureDatabase)
@@ -1194,29 +1086,12 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
                 assetAliases: aliases,
                 assetOwnerHeads: heads,
             })
-            const coldAlias: ColdAlias = {
-                key: 'cold/database-replacement',
-                objectHash: '66'.repeat(32),
-                size: 6,
-                metadata: { source: 'before-database-replacement' },
-            }
-            const coldAuthority = {
-                format: 'v2' as const,
-                migrationId: 'cold-database-replacement',
-                compatibilityHash: '67'.repeat(32),
-            }
-            const coldActivated = await store.activateColdPayloadMigration({
-                sourceRevision: assetsActivated.revision,
-                migrationId: coldAuthority.migrationId,
-                compatibilityHash: coldAuthority.compatibilityHash,
-                coldAliases: [coldAlias],
-            })
             const replacement = structuredClone(database)
             replacement.username = 'Database-only replacement'
             replacement.modules[1].assets = [['new', 'assets/new.bin', 'BIN']]
             replacement.personas[0].embeddedModule!.assets = []
 
-            const replaced = await store.replaceFromDatabase(replacement, coldActivated.revision)
+            const replaced = await store.replaceFromDatabase(replacement, assetsActivated.revision)
 
             expect(await store.readAssetRepositoryAuthority()).toEqual({
                 revision: replaced.revision,
@@ -1237,14 +1112,6 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
                     ? { revision: replaced.revision, value: head }
                     : null)
             }
-            expect(await store.readColdPayloadAuthority()).toEqual({
-                revision: replaced.revision,
-                value: coldAuthority,
-            })
-            expect(await store.listColdAliases()).toEqual({
-                revision: replaced.revision,
-                value: [coldAlias],
-            })
 
             const reopened = await reopen()
             expect(await reopened.readAssetAlias({ kind: 'asset', key: aliases[0].key })).toEqual({
@@ -1256,10 +1123,6 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
                     ? { revision: replaced.revision, value: head }
                     : null)
             }
-            expect(await reopened.readColdAlias(coldAlias.key)).toEqual({
-                revision: replaced.revision,
-                value: coldAlias,
-            })
         })
 
         it('preserves an owner head when nested object key insertion order changes', async () => {
@@ -1389,115 +1252,6 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
                 revision: replaced.revision,
                 value: authority,
             })
-        })
-
-        it('copy-on-write isolates cold alias commits and deletes from a pinned revision', async () => {
-            const { store } = await createHarness()
-            const initial = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
-            const original: ColdAlias[] = [
-                {
-                    key: 'conversation/alpha',
-                    objectHash: '51'.repeat(32),
-                    size: 10,
-                    metadata: { codec: 'gzip' },
-                },
-                {
-                    key: 'conversation/beta',
-                    objectHash: '52'.repeat(32),
-                    size: 20,
-                    metadata: { codec: 'gzip' },
-                },
-            ]
-            const activated = await store.activateColdPayloadMigration({
-                sourceRevision: initial.revision,
-                migrationId: 'cold-cow',
-                compatibilityHash: '53'.repeat(32),
-                coldAliases: original,
-            })
-            const lease = await store.acquireRevision(activated.revision)
-            const replacement: ColdAlias = {
-                key: original[0].key,
-                objectHash: '54'.repeat(32),
-                size: 30,
-                metadata: { codec: 'gzip', arbitrary: ['kept', 2, true] },
-            }
-
-            const committed = await store.commitColdAlias(replacement, activated.revision)
-            const deleted = await store.deleteColdAlias(original[1].key, committed.revision)
-
-            expect(await store.listColdAliases()).toEqual({
-                revision: deleted.revision,
-                value: [replacement],
-            })
-            expect(await lease.listColdAliases()).toEqual({
-                revision: activated.revision,
-                value: original,
-            })
-            expect(await lease.readColdAlias(original[0].key)).toEqual({
-                revision: activated.revision,
-                value: original[0],
-            })
-            expect(await lease.readColdAlias(original[1].key)).toEqual({
-                revision: activated.revision,
-                value: original[1],
-            })
-            await lease.release()
-        })
-
-        it('rejects legacy cold mutations and invalid migration batches atomically', async () => {
-            const { store } = await createHarness()
-            const initial = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
-            const valid: ColdAlias = {
-                key: 'conversation/valid',
-                objectHash: '61'.repeat(32),
-                size: 1,
-                metadata: {},
-            }
-
-            await expect(store.commitColdAlias(valid, initial.revision)).rejects.toThrow('v2')
-            await expect(store.deleteColdAlias(valid.key, initial.revision)).rejects.toThrow('v2')
-            await expect(store.activateColdPayloadMigration({
-                sourceRevision: initial.revision,
-                migrationId: 'cold-null-payload',
-                compatibilityHash: '62'.repeat(32),
-                coldAliases: [{ ...valid, objectHash: null }],
-            })).rejects.toThrow('objectHash')
-            await expect(store.activateColdPayloadMigration({
-                sourceRevision: initial.revision,
-                migrationId: 'cold-duplicate',
-                compatibilityHash: '63'.repeat(32),
-                coldAliases: [valid, { ...valid, objectHash: '64'.repeat(32) }],
-            })).rejects.toThrow('Duplicate cold alias')
-
-            expect((await store.readRoot()).revision).toBe(initial.revision)
-            expect(await store.readColdPayloadAuthority()).toEqual({
-                revision: initial.revision,
-                value: { format: 'legacy' },
-            })
-            expect(await store.listColdAliases()).toEqual({
-                revision: initial.revision,
-                value: [],
-            })
-        })
-
-        it('rejects a null object hash in a normal v2 cold mutation', async () => {
-            const { store } = await createHarness()
-            const initial = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
-            const activated = await store.activateColdPayloadMigration({
-                sourceRevision: initial.revision,
-                migrationId: 'cold-no-legacy-fallback',
-                compatibilityHash: '69'.repeat(32),
-                coldAliases: [],
-            })
-
-            await expect(store.commitColdAlias({
-                key: 'conversation/null-hash',
-                objectHash: null,
-                size: 0,
-                metadata: {},
-            }, activated.revision)).rejects.toThrow('objectHash')
-            expect((await store.readRoot()).revision).toBe(activated.revision)
-            expect((await store.listColdAliases()).value).toEqual([])
         })
 
         it('activates staged zero-byte and missing-payload aliases across reopen', async () => {

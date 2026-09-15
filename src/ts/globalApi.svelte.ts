@@ -39,7 +39,6 @@ import { initMobileGesture } from "./hotkey";
 import { fetch as TauriHTTPFetch } from '@tauri-apps/plugin-http';
 import { fetchTauriHttpStream } from './network/tauriHttpStream';
 import { moduleUpdate } from "./process/modules";
-import { getColdStorageItem, makeColdData } from "./process/coldstorage.svelte";
 import {
     listCharacterResources,
     listDatabaseRootResources,
@@ -833,20 +832,7 @@ export function getBasename(data: string) {
 }
 
 export async function getUncleanables(db: Database, uptype: 'basename' | 'pure' = 'basename') {
-    let chars: (character|groupChat)[] = []
-    if (db.characters) {
-        for(let cha of db.characters){
-            if(cha?.coldstorage){
-                const coldData = await getColdStorageItem(cha.coldstorage!)
-                if(coldData?.character && coldData.character.chaId === cha.chaId){
-                    cha = coldData.character
-                }
-            }
-            chars.push(cha)
-        }
-    }
-
-    return getUncleanablesSync(db, uptype, { chars });
+    return getUncleanablesSync(db, uptype);
 }
 
 /**

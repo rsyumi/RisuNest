@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { BlobStore } from './blobStore'
-import type { LocalColdStorageRuntime } from './localColdStorageRuntime'
 
 const mocks = vi.hoisted(() => {
     let rootRevision = 4
@@ -87,16 +86,6 @@ const mocks = vi.hoisted(() => {
         }),
         resolveUrl: vi.fn(async () => null),
     }
-    const dispatcher = {
-        read: vi.fn(async () => null),
-        write: vi.fn(async () => {
-            rootRevision++
-        }),
-        list: vi.fn(async () => ['cold/existing']),
-        remove: vi.fn(async () => {
-            rootRevision++
-        }),
-    }
     const runStorageOnlyMutation = vi.fn(async (
         operation: (expectedRevision: number) => Promise<number>,
     ) => {
@@ -124,14 +113,6 @@ const mocks = vi.hoisted(() => {
             revision: rootRevision,
             value: { format: 'v2' },
         })),
-        readColdPayloadAuthority: vi.fn(async () => ({
-            revision: rootRevision,
-            value: {
-                format: 'v2',
-                migrationId: 'production-routing',
-                compatibilityHash: '11'.repeat(32),
-            },
-        })),
     }
     const gate = {
         runKeyedWrite: vi.fn(async <T>(key: string, operation: () => Promise<T>) => {
@@ -143,10 +124,6 @@ const mocks = vi.hoisted(() => {
     return {
         adoptedRevisions,
         assetDispatcher,
-        configureLocalColdStorageRuntime: vi.fn((runtime: LocalColdStorageRuntime) => {
-            configuredRuntime = runtime
-        }),
-        dispatcher,
         flushPendingData,
         gate,
         lockOrder,
@@ -166,13 +143,9 @@ const mocks = vi.hoisted(() => {
     }
 })
 
-let configuredRuntime: LocalColdStorageRuntime | null = null
 let configuredAssetStore: BlobStore | null = null
 
 vi.mock('../platform', () => ({ isNodeServer: false, isTauri: true }))
-vi.mock('../process/coldstorage.svelte', () => ({
-    configureLocalColdStorageRuntime: mocks.configureLocalColdStorageRuntime,
-}))
 vi.mock('./persistentDataRuntime.svelte', () => ({
     getPersistentDataRuntime: () => ({
         flushPendingData: mocks.flushPendingData,
@@ -203,14 +176,6 @@ vi.mock('./platformBlobStore', () => ({
     getPlatformBlobKeyValueBackend: vi.fn(async () => ({})),
 }))
 vi.mock('./assetRepositoryMigration', () => ({ migrateLegacyAssetRepository: vi.fn() }))
-vi.mock('./coldPayloadMigration', () => ({ migrateLegacyColdPayloads: vi.fn() }))
-vi.mock('./coldPayloadRepository', () => ({
-    createCompleteColdPayloadStore: vi.fn(() => ({})),
-}))
-vi.mock('./coldPayloadRuntime', () => ({
-    createRuntimeColdPayloadDispatcher: vi.fn(() => mocks.dispatcher),
-    selectRuntimeColdPayloadStore: vi.fn(async () => mocks.dispatcher),
-}))
 vi.mock('./assetRepositoryRuntime', async (importOriginal) => ({
     ...await importOriginal<typeof import('./assetRepositoryRuntime')>(),
     createNativeV2BlobStore: vi.fn(() => mocks.assetDispatcher),
@@ -225,34 +190,10 @@ vi.mock('./nativeAssetRepository', () => ({
     createNativeImmutablePayloadCas: vi.fn(() => ({})),
     createNativeNewInlayImageEncoder: vi.fn(() => ({})),
 }))
-vi.mock('./platformColdPayloadStore', () => ({
-    createGatedColdPayloadStore: vi.fn((store) => store),
-    createLegacyBrowserOpfsColdPayloadStore: vi.fn(() => ({})),
-    createLegacyNodeColdPayloadStore: vi.fn(() => ({})),
-    createLegacyTauriColdPayloadStore: vi.fn(() => ({})),
-}))
 
 import { initializePersistentStorage } from './persistentStorageRuntime'
 
 describe('persistent storage runtime routing', () => {
-    it('routes configured Tauri writes and removals through the coordinator-owned queue', async () => {
-        await initializePersistentStorage()
-        const runtime = configuredRuntime
-        if (!runtime) throw new Error('Local cold storage runtime was not configured')
-
-        await expect(runtime.list()).resolves.toEqual(['cold/existing'])
-        expect(mocks.runStorageOnlyMutation).not.toHaveBeenCalled()
-
-        await expect(runtime.write('cold/new', { message: 'payload' })).resolves.toBe(true)
-        await expect(runtime.remove(['cold/new'])).resolves.toBeUndefined()
-
-        expect(mocks.dispatcher.write).toHaveBeenCalledOnce()
-        expect(mocks.dispatcher.remove).toHaveBeenCalledWith('cold/new')
-        expect(mocks.runStorageOnlyMutation).toHaveBeenCalledTimes(2)
-        expect(mocks.gate.runTransition).toHaveBeenCalledTimes(2)
-        expect(mocks.adoptedRevisions).toEqual([5, 6])
-    })
-
     it('adopts configured native asset revisions before a following ordinary flush', async () => {
         await initializePersistentStorage()
         const store = configuredAssetStore
@@ -276,7 +217,7 @@ describe('persistent storage runtime routing', () => {
 
         expect(mocks.runStorageOnlyMutation.mock.calls.length - mutationCallOffset).toBe(3)
         expect(mocks.gate.runKeyedWrite.mock.calls.length - gateCallOffset).toBe(3)
-        expect(mocks.adoptedRevisions.slice(revisionOffset)).toEqual([7, 8, 9])
+        expect(mocks.adoptedRevisions.slice(revisionOffset)).toEqual([5, 6, 7])
         expect(mocks.lockOrder).toEqual([
             'prepare:start:assets/avatar.png:1',
             'prepare:end:assets/avatar.png:1',

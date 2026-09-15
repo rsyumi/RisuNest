@@ -103,12 +103,6 @@ function makeLease(input: {
             value: { format: 'legacy' as const },
         })),
         readAssetOwnerHead: vi.fn(async () => null),
-        readColdPayloadAuthority: vi.fn(async () => ({
-            revision,
-            value: { format: 'legacy' as const },
-        })),
-        readColdAlias: vi.fn(async () => null),
-        listColdAliases: vi.fn(async () => ({ revision, value: [] })),
         release: vi.fn(async () => undefined),
     }
 }
@@ -1414,7 +1408,7 @@ describe('ActiveWorkingSet', () => {
         await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce())
         const second = harness.workingSet.activateCharacter('char-b')
         expect(await second).toBe(true)
-        preparation.resolve({ database: harness.database, reason: 'cold-character-restore' })
+        preparation.resolve({ database: harness.database, reason: 'character-detail-replace' })
 
         expect(await first).toBe(false)
         expect(harness.coordinator.replacePersistentDatabase).not.toHaveBeenCalled()
@@ -1466,7 +1460,7 @@ describe('ActiveWorkingSet', () => {
         const first = harness.workingSet.activateCharacter('char-a', {
             prepare: async () => ({
                 database: harness.database,
-                reason: 'cold-character-restore',
+                reason: 'character-detail-replace',
             }),
         })
         await vi.waitFor(() =>
@@ -2478,12 +2472,6 @@ describe('maximum compatibility working set installation', () => {
                 value: { format: 'legacy' as const },
             })),
             readAssetOwnerHead: vi.fn(async () => null),
-            readColdPayloadAuthority: vi.fn(async () => ({
-                revision,
-                value: { format: 'legacy' as const },
-            })),
-            readColdAlias: vi.fn(async () => null),
-            listColdAliases: vi.fn(async () => ({ revision, value: [] })),
             release: vi.fn(async () => undefined),
         }
     }

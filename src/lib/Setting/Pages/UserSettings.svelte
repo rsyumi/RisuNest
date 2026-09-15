@@ -26,7 +26,6 @@
     import Button from "src/lib/UI/GUI/Button.svelte";
     import { exportAsDataset } from "src/ts/storage/exportAsDataset";
     import { loginToSionyw, testSionywLogin } from "src/ts/sionyw";
-    import { cleanColdStorage } from "src/ts/process/coldstorage.svelte";
     import { getNativeOfficialAccountFlow } from "src/ts/storage/sync/nativeOfficialAccountFlow";
     import {
         createHubPopupController,
@@ -345,17 +344,6 @@
         {language.loadAutoServerBackup}
     </Button>
 {/if}
-
-<Button
-    onclick={async () => {
-        if (await alertConfirm(language.cleanColdStorageConfirm)) {
-            cleanColdStorage();
-        }
-    }}
-    className="mt-2"
->
-    {language.cleanColdStorage}
-</Button>
 
 <Button
     onclick={async () => {
