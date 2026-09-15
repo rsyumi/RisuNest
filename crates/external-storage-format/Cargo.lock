@@ -478,11 +478,21 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "hkdf",
+ "risunest-sync-wire",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "zeroize",
  "zstd",
+]
+
+[[package]]
+name = "risunest-sync-wire"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

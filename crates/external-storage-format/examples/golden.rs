@@ -1,13 +1,23 @@
 //! Synthetic interoperability vector generator, excluded from normal builds.
 use risunest_external_storage_format::{
     content_identity::hash,
-    control::{BackupPointDocument, BackupPointKind, HeadDocument},
+    control::{
+        BackupBundleDocument, BackupPointDocument, BackupPointKind, BundleSource, HeadDocument,
+    },
     crypto, pack,
+    section::{
+        hypa_entry_key, local_plugin_entry_key, HypaValue, InlineOrObject, LocalPluginValue,
+        LocalSettingValue, PluginSpace, SectionEntry, SectionEntryVersion, SectionKind,
+        SectionValue, SECTION_CODEC,
+    },
     snapshot::{
-        combine_content_fingerprint, envelope_length, keyed_object_id, open_envelope,
-        seal_envelope, ObjectRole, PublicObjectHeader, SnapshotDocument, StoredObject, WireLocator,
+        envelope_length, keyed_object_id, open_envelope, seal_envelope, LibrarySnapshotRef,
+        ObjectRole, PublicObjectHeader, SectionSnapshotRef, StoredObject, SyncStateDocument,
+        WireLocator,
     },
 };
+use risunest_sync_wire::head::Sequence;
+use std::collections::BTreeMap;
 
 const REPOSITORY: &str = "synthetic-repository";
 const LIBRARY: &str = "synthetic-library";
@@ -41,58 +51,173 @@ fn stored(role: ObjectRole, object_id: &str, plaintext: &[u8]) -> StoredObject {
     }
 }
 
-fn documents() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    let record_catalog = stored(ObjectRole::Catalog, "catalog-records", b"records");
-    let asset_catalog = stored(ObjectRole::Catalog, "catalog-assets", b"assets");
-    let scope_id = [4; 32];
-    let library_fingerprint = [5; 32];
-    let fingerprint = combine_content_fingerprint(&scope_id, &library_fingerprint, None);
-    let snapshot = SnapshotDocument::new(
-        "snapshot-synthetic".into(),
+const HYPA_KEY: &str = "3f2a1b0c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8";
+
+fn section_reference(kind: SectionKind, generation: u64, max_write_clock: u64) -> SectionSnapshotRef {
+    SectionSnapshotRef {
+        kind,
+        codec: SECTION_CODEC.into(),
+        generation: Sequence::from(generation),
+        gc_floor: Sequence::from(generation / 2),
+        max_write_clock: Sequence::from(max_write_clock),
+        entries_root: stored(
+            ObjectRole::Catalog,
+            &format!("catalog-section-{}", kind.id()),
+            kind.id().as_bytes(),
+        ),
+        content_fingerprint: hash(kind.id().as_bytes()),
+    }
+}
+
+/// Section identifiers, key shapes, counters and the empty section. An empty
+/// published section carries a reference; a section that was never published
+/// carries no map key at all.
+fn section_entries() -> Vec<Vec<u8>> {
+    let version = |clock: u64, writer: &str| {
+        Some(SectionEntryVersion {
+            write_clock: Sequence::from(clock),
+            writer_id: writer.into(),
+        })
+    };
+    [
+        SectionEntry::new(
+            SectionKind::Hypa,
+            hypa_entry_key(HYPA_KEY).unwrap(),
+            SectionValue::Hypa(HypaValue {
+                producer: "hypa-v2".into(),
+                model: "text-embedding-3-small".into(),
+                endpoint: None,
+                preprocess_version: 1,
+                dimensions: 8,
+                vector: InlineOrObject::inline(&(0..32).map(|n| n as u8).collect::<Vec<_>>())
+                    .unwrap(),
+                metadata: None,
+            }),
+            version(1, "writer-a"),
+        )
+        .unwrap(),
+        SectionEntry::new(
+            SectionKind::Hypa,
+            hypa_entry_key(&"0".repeat(64)).unwrap(),
+            SectionValue::Tombstone,
+            version(18_446_744_073_709_551_615, "writer-b"),
+        )
+        .unwrap(),
+        SectionEntry::new(
+            SectionKind::LocalPlugins,
+            local_plugin_entry_key("provider-manager", "json", "settings").unwrap(),
+            SectionValue::LocalPlugin(LocalPluginValue {
+                space: PluginSpace::Json,
+                value: serde_json::json!({ "zeta": [1, 2], "alpha": null }),
+            }),
+            version(4, "writer-a"),
+        )
+        .unwrap(),
+        SectionEntry::new(
+            SectionKind::LocalPlugins,
+            local_plugin_entry_key("yumi-translator", "string", "cache:index").unwrap(),
+            SectionValue::LocalPlugin(LocalPluginValue {
+                space: PluginSpace::String,
+                value: serde_json::Value::String("kept verbatim".into()),
+            }),
+            None,
+        )
+        .unwrap(),
+        SectionEntry::new(
+            SectionKind::LocalSettings,
+            "risuNestDeviceSettings".into(),
+            SectionValue::LocalSetting(LocalSettingValue {
+                value: serde_json::json!({ "startup": "restore" }),
+            }),
+            None,
+        )
+        .unwrap(),
+    ]
+    .iter()
+    .map(|entry| entry.encode().unwrap())
+    .collect()
+}
+
+fn documents() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let library = LibrarySnapshotRef {
+        record_catalog: stored(ObjectRole::Catalog, "catalog-records", b"records"),
+        asset_catalog: stored(ObjectRole::Catalog, "catalog-assets", b"assets"),
+        content_fingerprint: [5; 32],
+    };
+    let state = SyncStateDocument::new(
+        "state-synthetic".into(),
         REPOSITORY.into(),
         LIBRARY.into(),
-        "synthetic-device".into(),
+        "epoch-synthetic".into(),
+        Sequence::from(17u64),
+        Some("state-parent".into()),
+        "writer-synthetic".into(),
         1_726_272_000_000,
-        17,
-        scope_id,
-        scope_id,
-        Some("snapshot-parent".into()),
-        fingerprint,
-        library_fingerprint,
-        record_catalog,
-        asset_catalog,
-        None,
-        None,
-        Vec::new(),
+        library.clone(),
+        BTreeMap::from([
+            (
+                SectionKind::Hypa.id().into(),
+                section_reference(SectionKind::Hypa, 17, 240),
+            ),
+            (
+                SectionKind::LocalPlugins.id().into(),
+                section_reference(SectionKind::LocalPlugins, 12, 31),
+            ),
+        ]),
     )
     .unwrap();
-    let snapshot_bytes = snapshot.encode(MAX_DOCUMENT_BYTES).unwrap();
-    let snapshot_object = stored(ObjectRole::Snapshot, "snapshot-synthetic", &snapshot_bytes);
+    let state_fingerprint = state.state_fingerprint;
+    let state_bytes = state.encode(MAX_DOCUMENT_BYTES).unwrap();
+    let state_object = stored(ObjectRole::SyncState, "state-synthetic", &state_bytes);
     let head = HeadDocument::new(
         REPOSITORY.into(),
         LIBRARY.into(),
         "commit-synthetic".into(),
         Some("commit-parent".into()),
-        scope_id,
-        fingerprint,
-        snapshot_object.clone(),
+        state_fingerprint,
+        state_object,
     )
     .unwrap()
     .encode(MAX_DOCUMENT_BYTES)
     .unwrap();
-    let point = BackupPointDocument::new(
+    // A selected section with no entries is still included, which is what
+    // separates an emptied section from one this capture left out.
+    let bundle_document = BackupBundleDocument::new(
+        REPOSITORY.into(),
+        "bundle-synthetic".into(),
+        BundleSource::Device {
+            writer_id: "writer-synthetic".into(),
+        },
+        1_726_272_000_001,
+        Some(Sequence::from(17u64)),
+        Some(Sequence::from(4u64)),
+        None,
+        library,
+        BTreeMap::from([
+            (
+                SectionKind::Hypa.id().into(),
+                section_reference(SectionKind::Hypa, 0, 0),
+            ),
+            (
+                SectionKind::LocalSettings.id().into(),
+                section_reference(SectionKind::LocalSettings, 3, 3),
+            ),
+        ]),
+    )
+    .unwrap();
+    let bundle = bundle_document.encode(MAX_DOCUMENT_BYTES).unwrap();
+    let bundle_object = stored(ObjectRole::BackupBundle, "bundle-synthetic", &bundle);
+    let point = BackupPointDocument::single(
         REPOSITORY.into(),
         "point-synthetic".into(),
         BackupPointKind::Manual,
-        1_726_272_000_001,
-        17,
-        scope_id,
-        vec![snapshot_object],
+        1_726_272_000_002,
+        bundle_object,
     )
     .unwrap()
     .encode(MAX_DOCUMENT_BYTES)
     .unwrap();
-    (snapshot_bytes, head, point)
+    (state_bytes, head, bundle, point)
 }
 
 fn seal(bytes: &[u8], key: &[u8; 32], object_id: &str, role: ObjectRole) -> Vec<u8> {
@@ -149,16 +274,16 @@ fn verify_wasm_vector(value: serde_json::Value) {
     assert_eq!(*recovered.root, [7; 32]);
     assert_eq!(&*recovered.connection_metadata, METADATA);
 
-    let (snapshot, head, point) = documents();
+    let (state, head, bundle, point) = documents();
     let key = [7; 32];
-    let opened_snapshot = open(
-        &bytes(&value, "snapshotEnvelope"),
+    let opened_state = open(
+        &bytes(&value, "stateEnvelope"),
         &key,
-        "snapshot-synthetic",
-        ObjectRole::Snapshot,
+        "state-synthetic",
+        ObjectRole::SyncState,
     );
-    assert_eq!(opened_snapshot, snapshot);
-    SnapshotDocument::decode(&opened_snapshot, MAX_DOCUMENT_BYTES).unwrap();
+    assert_eq!(opened_state, state);
+    SyncStateDocument::decode(&opened_state, MAX_DOCUMENT_BYTES).unwrap();
     let opened_head = open(
         &bytes(&value, "headEnvelope"),
         &key,
@@ -167,6 +292,14 @@ fn verify_wasm_vector(value: serde_json::Value) {
     );
     assert_eq!(opened_head, head);
     HeadDocument::decode(&opened_head, MAX_DOCUMENT_BYTES).unwrap();
+    let opened_bundle = open(
+        &bytes(&value, "bundleEnvelope"),
+        &key,
+        "bundle-synthetic",
+        ObjectRole::BackupBundle,
+    );
+    assert_eq!(opened_bundle, bundle);
+    BackupBundleDocument::decode(&opened_bundle, MAX_DOCUMENT_BYTES).unwrap();
     let opened_point = open(
         &bytes(&value, "pointEnvelope"),
         &key,
@@ -176,7 +309,14 @@ fn verify_wasm_vector(value: serde_json::Value) {
     assert_eq!(opened_point, point);
     BackupPointDocument::decode(&opened_point, MAX_DOCUMENT_BYTES).unwrap();
 
-    let document_hash = hash(&snapshot);
+    let expected_entries = section_entries();
+    let published: Vec<Vec<u8>> = serde_json::from_value(value["sectionEntries"].clone()).unwrap();
+    assert_eq!(published, expected_entries);
+    for entry in &published {
+        SectionEntry::decode(entry).unwrap();
+    }
+
+    let document_hash = hash(&state);
     assert_eq!(
         value["keyedPackId"].as_str().unwrap(),
         keyed_object_id(&key, OBJECT_NAMESPACE, ObjectRole::Pack, &document_hash).unwrap()
@@ -217,8 +357,8 @@ fn main() {
         plaintext.len() as u64,
     )
     .unwrap();
-    let (snapshot, head, point) = documents();
-    let document_hash = hash(&snapshot);
+    let (state, head, bundle, point) = documents();
+    let document_hash = hash(&state);
     println!(
         "{}",
         serde_json::json!({
@@ -230,11 +370,14 @@ fn main() {
             "compressed": compressed,
             "code": &*code.expose(),
             "recovery": recovery,
-            "snapshot": snapshot,
+            "state": state,
             "head": head,
+            "bundle": bundle,
             "point": point,
-            "snapshotEnvelope": seal(&snapshot, &key, "snapshot-synthetic", ObjectRole::Snapshot),
+            "sectionEntries": section_entries(),
+            "stateEnvelope": seal(&state, &key, "state-synthetic", ObjectRole::SyncState),
             "headEnvelope": seal(&head, &key, "head", ObjectRole::Head),
+            "bundleEnvelope": seal(&bundle, &key, "bundle-synthetic", ObjectRole::BackupBundle),
             "pointEnvelope": seal(&point, &key, "point-synthetic", ObjectRole::BackupPoint),
             "objectNamespace": OBJECT_NAMESPACE,
             "keyedPackId": keyed_object_id(&key, OBJECT_NAMESPACE, ObjectRole::Pack, &document_hash).unwrap(),

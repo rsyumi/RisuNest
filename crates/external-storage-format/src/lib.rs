@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod format;
 pub mod logical_records;
 pub mod pack;
+pub mod section;
 pub mod snapshot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

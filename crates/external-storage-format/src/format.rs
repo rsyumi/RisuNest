@@ -2,7 +2,13 @@ use super::{content_identity::hash, FormatError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const SCHEMA: &str = "risunest.external-storage/v1";
+pub const SCHEMA: &str = "risunest.external-storage/v2";
+
+/// Retained only for the persistent store capture and apply boundary, which
+/// still addresses its staged captures by a scope identifier. No exchange
+/// document carries it: repository identity, encryption and publication
+/// strategy live in `Descriptor`, and what a device publishes is decided per
+/// device. Callers inside this workspace pass `Scope::LIBRARY`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Scope {
@@ -12,6 +18,12 @@ pub struct Scope {
     pub device_plugins: bool,
 }
 impl Scope {
+    pub const LIBRARY: Self = Self {
+        library: true,
+        referenced_assets: true,
+        device_settings: false,
+        device_plugins: false,
+    };
     pub fn id(&self) -> [u8; 32] {
         hash(&[
             1,
@@ -33,8 +45,6 @@ pub enum Strategy {
 pub struct Descriptor {
     pub schema: String,
     pub repository_id: String,
-    pub scope: Scope,
-    pub scope_id: [u8; 32],
     pub encrypted: bool,
     pub publication_strategy: Option<Strategy>,
 }
@@ -48,12 +58,10 @@ impl Descriptor {
         descriptor.validate()?;
         Ok(descriptor)
     }
-    pub fn new(repository_id: String, scope: Scope, strategy: Option<Strategy>) -> Result<Self> {
+    pub fn new(repository_id: String, strategy: Option<Strategy>) -> Result<Self> {
         let descriptor = Self {
             schema: SCHEMA.into(),
             repository_id,
-            scope_id: scope.id(),
-            scope,
             encrypted: true,
             publication_strategy: strategy,
         };
@@ -65,31 +73,15 @@ impl Descriptor {
             || !self.encrypted
             || self.repository_id.is_empty()
             || self.repository_id.len() > 128
-            || self.scope_id != self.scope.id()
-            || !self.scope.library
-            || !self.scope.referenced_assets
         {
             return Err(FormatError("invalid-descriptor"));
         }
-        if self.publication_strategy.is_some()
-            && (self.scope.device_settings || self.scope.device_plugins)
-        {
-            return Err(FormatError("sync-scope-includes-device"));
-        }
         Ok(())
-    }
-    pub fn require_scope(&self, id: &[u8; 32]) -> Result<()> {
-        self.validate()?;
-        if id != &self.scope_id {
-            Err(FormatError("repository-scope-mismatch"))
-        } else {
-            Ok(())
-        }
     }
 }
 /// Fingerprints intentionally exclude packing, locators, nonces and timestamps.
-pub fn fingerprint(scope: &[u8; 32], entries: &BTreeMap<String, [u8; 32]>) -> [u8; 32] {
-    let mut digest = FingerprintBuilder::new(scope);
+pub fn fingerprint(domain: &[u8; 32], entries: &BTreeMap<String, [u8; 32]>) -> [u8; 32] {
+    let mut digest = FingerprintBuilder::new(domain);
     for (key, content) in entries {
         digest
             .push(key, content)
@@ -103,20 +95,45 @@ mod tests {
     use super::*;
     #[test]
     fn encryption_is_required_for_every_repository() {
-        let scope = Scope {
-            library: true,
-            referenced_assets: true,
-            device_settings: false,
-            device_plugins: false,
-        };
         for strategy in [None, Some(Strategy::Cas), Some(Strategy::Sequential)] {
-            let mut descriptor =
-                Descriptor::new("synthetic".into(), scope.clone(), strategy).unwrap();
+            let mut descriptor = Descriptor::new("synthetic".into(), strategy).unwrap();
             descriptor.encrypted = false;
             assert!(Descriptor::decode(&serde_json::to_vec(&descriptor).unwrap()).is_err());
             assert!(descriptor.validate().is_err());
-            assert!(descriptor.require_scope(&scope.id()).is_err());
         }
+    }
+    #[test]
+    fn descriptor_identity_no_longer_depends_on_a_published_selection() {
+        let sync = Descriptor::new("repository".into(), Some(Strategy::Cas)).unwrap();
+        let backup = Descriptor::new("repository".into(), None).unwrap();
+        assert_ne!(sync, backup);
+        assert_eq!(
+            Descriptor::decode(&serde_json::to_vec(&sync).unwrap()).unwrap(),
+            sync
+        );
+        // A device section selection is no longer part of repository identity,
+        // so a strategy-carrying repository accepts every device's choice.
+        assert!(Descriptor::new("repository".into(), Some(Strategy::Sequential)).is_ok());
+    }
+    #[test]
+    fn a_descriptor_from_the_previous_schema_is_reported_rather_than_narrowed() {
+        let previous = serde_json::json!({
+            "schema": "risunest.external-storage/v1",
+            "repositoryId": "repository",
+            "scope": {
+                "library": true,
+                "referencedAssets": true,
+                "deviceSettings": false,
+                "devicePlugins": false,
+            },
+            "scopeId": vec![4u8; 32],
+            "encrypted": true,
+            "publicationStrategy": "cas",
+        });
+        assert_eq!(
+            Descriptor::decode(&serde_json::to_vec(&previous).unwrap()),
+            Err(FormatError("invalid-descriptor"))
+        );
     }
 }
 
@@ -125,11 +142,11 @@ pub struct FingerprintBuilder {
     previous: Option<String>,
 }
 impl FingerprintBuilder {
-    pub fn new(scope: &[u8; 32]) -> Self {
+    pub fn new(domain: &[u8; 32]) -> Self {
         use sha2::Digest;
         let mut digest = sha2::Sha256::new();
         digest.update(b"risunest.external-fingerprint/v1\0");
-        digest.update(scope);
+        digest.update(domain);
         Self {
             digest,
             previous: None,
