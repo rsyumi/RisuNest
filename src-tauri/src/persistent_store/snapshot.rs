@@ -558,6 +558,19 @@ fn collect_asset_roots_scoped(
         scope_params,
         &mut roots,
     )?;
+    // An archived character keeps no scannable detail, so its payload object and
+    // the asset hashes it recorded are the only roots that hold those bytes.
+    scan_archived_object_roots(
+        connection,
+        if scoped {
+            "SELECT archived_object FROM characters
+         WHERE generation = ?1 AND archived_object IS NOT NULL"
+        } else {
+            "SELECT archived_object FROM characters WHERE archived_object IS NOT NULL"
+        },
+        scope_params,
+        &mut roots,
+    )?;
     let cold_aliases = scan_cold_alias_roots(
         connection,
         if scoped {
@@ -634,6 +647,122 @@ fn collect_asset_roots_scoped(
         roots.retain_all_objects = true;
     }
     Ok(roots)
+}
+
+/// Every CAS object one character's records reach, so archiving can record them
+/// and keep them out of the sweep while the character has no scannable detail.
+pub(super) fn collect_character_asset_hashes(
+    connection: &Connection,
+    cas: &PayloadCas,
+    generation: &str,
+    character_id: &str,
+) -> StoreResult<Vec<String>> {
+    let mut roots = AssetRootSet::default();
+    let scope: [&dyn rusqlite::ToSql; 2] = [&generation, &character_id];
+    for query in [
+        "SELECT detail FROM characters WHERE generation = ?1 AND character_id = ?2",
+        "SELECT detail FROM conversations WHERE generation = ?1 AND character_id = ?2",
+        "SELECT value FROM messages WHERE generation = ?1 AND character_id = ?2",
+    ] {
+        scan_json_column(connection, query, scope.as_slice(), &mut roots)?;
+    }
+    scan_text_column(
+        connection,
+        "SELECT image FROM characters
+         WHERE generation = ?1 AND character_id = ?2 AND image IS NOT NULL",
+        scope.as_slice(),
+        &mut roots,
+    )?;
+
+    let mut hashes: BTreeSet<String> = std::mem::take(&mut roots.object_hashes);
+    let manifest_hash: Option<String> = connection
+        .query_row(
+            "SELECT manifest_hash FROM asset_owner_heads
+             WHERE generation = ?1 AND owner_kind = 'character-additional-assets'
+               AND owner_locator = ?2 AND present = 1",
+            rusqlite::params![generation, character_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    if let Some(manifest_hash) = manifest_hash {
+        if let Some(canonical) = cas.read_object(&manifest_hash)? {
+            if let Ok(entries) =
+                crate::asset_repository::owner_manifest_codec::decode_owner_manifest(&canonical)
+            {
+                for entry in entries {
+                    if let Some(payload) = entry.payload_hash {
+                        hashes.insert(hex::encode(payload));
+                    }
+                }
+            }
+        }
+        hashes.insert(manifest_hash);
+    }
+
+    let mut candidates: BTreeSet<String> = roots
+        .legacy_asset_keys
+        .iter()
+        .chain(&roots.inlay_ids)
+        .cloned()
+        .collect();
+    collect_alias_key_candidates(connection, generation, character_id, &mut candidates)?;
+    for candidate in candidates {
+        let mut statement = connection.prepare_cached(
+            "SELECT object_hash FROM asset_aliases
+             WHERE generation = ?1 AND logical_key = ?2 AND object_hash IS NOT NULL",
+        )?;
+        let found = statement
+            .query_map(rusqlite::params![generation, candidate], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        hashes.extend(found);
+    }
+    Ok(hashes.into_iter().collect())
+}
+
+/// String leaves of the character detail are the only place an alias logical key
+/// can appear without a recognizable prefix, so they are looked up directly.
+fn collect_alias_key_candidates(
+    connection: &Connection,
+    generation: &str,
+    character_id: &str,
+    candidates: &mut BTreeSet<String>,
+) -> StoreResult<()> {
+    const MAX_CANDIDATE_BYTES: usize = 512;
+    let detail: Option<String> = connection
+        .query_row(
+            "SELECT detail FROM characters WHERE generation = ?1 AND character_id = ?2",
+            rusqlite::params![generation, character_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(detail) = detail else {
+        return Ok(());
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&detail) else {
+        return Ok(());
+    };
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            serde_json::Value::String(value) => {
+                if !value.is_empty()
+                    && value.len() <= MAX_CANDIDATE_BYTES
+                    && !value.contains(char::is_whitespace)
+                {
+                    candidates.insert(value);
+                }
+            }
+            serde_json::Value::Array(values) => pending.extend(values),
+            serde_json::Value::Object(values) => {
+                pending.extend(values.into_iter().map(|(_, value)| value))
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn repository_root_from_snapshots_dir(snapshots_dir: &Path) -> StoreResult<&Path> {
@@ -847,6 +976,30 @@ fn scan_asset_alias_roots<P: rusqlite::Params>(
                 _ => retain_unscannable_record(roots),
             },
             ScannedText::Damaged => retain_unscannable_record(roots),
+        }
+    }
+    Ok(())
+}
+
+fn scan_archived_object_roots<P: rusqlite::Params>(
+    connection: &Connection,
+    query: &str,
+    params: P,
+    roots: &mut AssetRootSet,
+) -> StoreResult<()> {
+    let mut statement = connection.prepare(query)?;
+    let mut rows = statement.query(params)?;
+    while let Some(row) = rows.next()? {
+        let ScannedText::Text(encoded) = scanned_text(row, 0)? else {
+            retain_unscannable_record(roots);
+            continue;
+        };
+        match serde_json::from_str::<super::archive::ArchivedObject>(&encoded) {
+            Ok(archived) => {
+                roots.object_hashes.insert(archived.object_hash);
+                roots.object_hashes.extend(archived.asset_hashes);
+            }
+            Err(_) => retain_unscannable_record(roots),
         }
     }
     Ok(())

@@ -58,6 +58,7 @@ vi.mock('./storage/databasePreparation', () => ({
 vi.mock('./storage/workingSetCatalog', () => ({
     createCatalogPresetWorkingSet: vi.fn(), hasIncompletePersistentWorkingSet: vi.fn(() => false),
     isCatalogCharacterStub: vi.fn(() => false), isCatalogPresetWorkingSet: vi.fn(() => false),
+    isWorkingSetCharacterStub: vi.fn(() => false),
     projectCatalogWorkingSet: vi.fn(), projectCompleteScalableWorkingSet: vi.fn(),
 }))
 vi.mock('./storage/workingSetResidency', () => ({

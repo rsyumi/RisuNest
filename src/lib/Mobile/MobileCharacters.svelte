@@ -2,6 +2,8 @@
     import { DBState } from 'src/ts/stores.svelte';
     import BarIcon from "../SideBars/BarIcon.svelte";
     import { addCharacter, changeChar, getCharImage } from "src/ts/characters";
+    import { characterIsArchived } from "src/ts/storage/characterArchiveView";
+    import { restoreArchivedCharacterWithConfirmation } from "src/ts/storage/characterArchive";
     import { MobileSearch } from "src/ts/stores.svelte";
     import { MessageSquareIcon, PlusIcon } from "@lucide/svelte";
     import { getCatalogConversationCount } from "src/ts/storage/workingSetCatalog";
@@ -66,6 +68,7 @@
             index: number
             interaction: number
             agoText: string
+            archived: boolean
         }> = []
         for (let index = 0; index < DBState.db.characters.length; index += 1) {
             const character = DBState.db.characters[index]
@@ -78,6 +81,7 @@
                 name,
                 image: character.image,
                 chats: getCatalogConversationCount(character),
+                archived: characterIsArchived(character),
                 index,
                 interaction,
                 agoText: makeAgoText(interaction),
@@ -148,7 +152,12 @@
             data-character-id={char.chaId}
             class="flex p-2 border-t-darkborderc gap-2 w-full"
             class:border-t={index !== 0}
+            class:archived-card={char.archived}
             onclick={async () => {
+                if(char.archived){
+                    await restoreArchivedCharacterWithConfirmation(char.chaId)
+                    return
+                }
                 if(await changeChar(char.index)) endGrid()
             }}
         >
@@ -156,10 +165,14 @@
             <div class="flex flex-1 w-full flex-col justify-start items-start text-start">
                 <span>{char.name}</span>
                 <div class="text-sm text-textcolor2 flex items-center w-full flex-wrap">
-                    <span class="mr-1">{char.chats}</span>
-                    <MessageSquareIcon size={14} />
-                    <span class="mr-1 ml-1">|</span>
-                    <span>{char.agoText}</span>
+                    {#if char.archived}
+                        <span>{language.risuNest.archive.listedAs}</span>
+                    {:else}
+                        <span class="mr-1">{char.chats}</span>
+                        <MessageSquareIcon size={14} />
+                        <span class="mr-1 ml-1">|</span>
+                        <span>{char.agoText}</span>
+                    {/if}
                 </div>
             </div>
         </button>
@@ -189,3 +202,10 @@
 }}>
     <PlusIcon size={24} />
 </button>
+
+<style>
+    .archived-card {
+        filter: grayscale(1);
+        opacity: 0.7;
+    }
+</style>

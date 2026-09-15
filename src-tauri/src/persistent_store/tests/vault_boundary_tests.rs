@@ -96,17 +96,11 @@ fn the_account_token_never_reaches_a_snapshot_an_export_or_a_sync_capture() {
         .expect("export a RisuSave");
     assert!(exported.bytes > 0);
 
-    let scope = risunest_external_storage_format::format::Scope {
-        library: true,
-        referenced_assets: true,
-        device_settings: false,
-        device_plugins: false,
-    };
     let hydration = store
-        .hydrate_external_capture_dependencies("vault-boundary", &scope, &Never)
+        .hydrate_external_capture_dependencies("vault-boundary", &Never)
         .expect("hydrate the capture dependencies");
     let captured = store
-        .capture_external_library("vault-boundary", &scope, &hydration, &Never)
+        .capture_external_library("vault-boundary", &hydration, &Never)
         .expect("capture the library");
     assert!(captured.projected_records > 0);
 

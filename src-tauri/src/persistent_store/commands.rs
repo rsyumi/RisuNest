@@ -1,6 +1,7 @@
 pub(crate) mod data_health;
 pub(crate) mod hypa;
 
+use super::archive::ArchivePreview;
 use super::export::ExportedRisuSave;
 #[cfg(feature = "native-kei-upload-pilot")]
 use super::kei::KeiUploadResult;
@@ -642,6 +643,40 @@ pub(crate) fn pds_commit(
 ) -> Result<RevisionResult, StoreError> {
     with_store_mut(state, |store| {
         store.commit_with_asset_aliases(&commit, &asset_aliases)
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_archive_preview(
+    state: State<'_, PersistentStoreState>,
+    character_id: String,
+    lease: Option<String>,
+) -> Result<ArchivePreview, StoreError> {
+    with_store(state, |store| {
+        store.archive_preview(&character_id, lease.as_deref())
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_archive_character(
+    state: State<'_, PersistentStoreState>,
+    character_id: String,
+    expected_revision: i64,
+) -> Result<RevisionResult, StoreError> {
+    let now_ms = current_time_ms()?;
+    with_store_mut(state, |store| {
+        store.archive_character(&character_id, expected_revision, now_ms)
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_restore_character(
+    state: State<'_, PersistentStoreState>,
+    character_id: String,
+    expected_revision: i64,
+) -> Result<RevisionResult, StoreError> {
+    with_store_mut(state, |store| {
+        store.restore_character(&character_id, expected_revision)
     })
 }
 

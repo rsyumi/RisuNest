@@ -2,6 +2,7 @@ import isEqual from 'lodash/isEqual'
 import { applyRootMutations } from './rootMutation'
 import type { Chat, Database, Message, botPreset } from './database.svelte'
 import type {
+    ArchivePreview,
     AssetAlias,
     AssetAliasIdentity,
     AssetAliasKind,
@@ -1025,6 +1026,26 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             } catch {}
             throw error
         }
+    }
+
+    // Archiving is a native library feature. The web store stays error free by
+    // refusing it instead of pretending to hold an archive.
+    archivePreview(_characterId: string): Promise<ArchivePreview> {
+        return Promise.reject(new Error('Archiving characters requires the native store'))
+    }
+
+    archiveCharacter(
+        _characterId: string,
+        _expectedRevision: DataRevision,
+    ): Promise<{ revision: DataRevision }> {
+        return Promise.reject(new Error('Archiving characters requires the native store'))
+    }
+
+    restoreCharacter(
+        _characterId: string,
+        _expectedRevision: DataRevision,
+    ): Promise<{ revision: DataRevision }> {
+        return Promise.reject(new Error('Archiving characters requires the native store'))
     }
 
     async commit(input: WorkingSetCommit): Promise<{ revision: DataRevision }> {

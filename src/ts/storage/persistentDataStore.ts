@@ -289,6 +289,14 @@ export type PluginStorageMutation =
     | { type: 'delete'; key: string }
     | { type: 'clear' }
 
+/// What the list needs about an archived character. The stored object and the
+/// asset hashes it holds stay inside the store.
+export interface ArchivedCharacterSummary {
+    archivedAt: number
+    conversationCount: number
+    messageCount: number
+}
+
 export interface CharacterSummary {
     id: string
     name: string
@@ -300,6 +308,22 @@ export interface CharacterSummary {
     type: CharacterDetail['type']
     creatorNotes?: string
     trashTime?: number
+    archived?: ArchivedCharacterSummary
+}
+
+export interface ArchivePreview {
+    characterId: string
+    name: string
+    conversationCount: number
+    messageCount: number
+    archived: boolean
+}
+
+export class ArchivedCharacterError extends Error {
+    constructor(readonly characterId: string) {
+        super(`Character ${characterId} is archived`)
+        this.name = 'ArchivedCharacterError'
+    }
 }
 
 export interface PresetSummary {
@@ -538,6 +562,15 @@ export interface PersistentDataStore {
         input: ColdPayloadMigrationInput,
     ): Promise<{ revision: DataRevision }>
     commit(input: WorkingSetCommit): Promise<{ revision: DataRevision }>
+    archivePreview(characterId: string): Promise<ArchivePreview>
+    archiveCharacter(
+        characterId: string,
+        expectedRevision: DataRevision,
+    ): Promise<{ revision: DataRevision }>
+    restoreCharacter(
+        characterId: string,
+        expectedRevision: DataRevision,
+    ): Promise<{ revision: DataRevision }>
     replaceFromDatabase(
         database: Database,
         expectedRevision?: DataRevision,

@@ -15,6 +15,11 @@
         importRisuSaveFromSystemPicker,
         exportRisuSaveFromSystemPicker,
     } from 'src/ts/storage/risuSaveFileRouteProduction.svelte'
+    import {
+        collectExportExcludedReport,
+        formatExportExcludedReport,
+        isEmptyExportExcludedReport,
+    } from 'src/ts/storage/exportExcludedReport'
     import { restoreBackupFromSystemPicker } from 'src/ts/storage/portableBackupFileRouteProduction.svelte'
     import {
         alertPartialDestinationWarning,
@@ -89,12 +94,15 @@
             return
         }
         try {
+            const excluded = collectExportExcludedReport(DBState.db.characters)
             const result = await exportRisuSaveFromSystemPicker()
             if (!result) return
             alertNormal(
                 result.warningCodes.includes('cleanup-failed')
                     ? language.risuSaveCleanupWarning
-                    : language.risuSaveExportComplete,
+                    : isEmptyExportExcludedReport(excluded)
+                        ? language.risuSaveExportComplete
+                        : formatExportExcludedReport(excluded),
             )
         } catch (error) {
             showRisuSaveError(error)

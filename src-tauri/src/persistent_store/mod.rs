@@ -1,3 +1,4 @@
+pub(crate) mod archive;
 pub(crate) mod asset_object_catalog;
 pub(crate) mod asset_residency;
 pub(crate) mod commands;
@@ -209,6 +210,18 @@ pub(crate) struct CharacterSummary {
     pub(crate) creator_notes: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) trash_time: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) archived: Option<ArchivedCharacterSummary>,
+}
+
+/// What the list needs about an archived character. The stored object hash and
+/// the asset hash list stay inside the store.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ArchivedCharacterSummary {
+    pub(crate) archived_at: i64,
+    pub(crate) conversation_count: i64,
+    pub(crate) message_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1759,6 +1772,40 @@ impl PersistentStore {
             verify_cold_alias_object(&cas, alias)?;
         }
         commit::activate_cold_payload_migration(&mut self.connection, input)
+    }
+
+    pub(crate) fn archive_preview(
+        &self,
+        character_id: &str,
+        lease: Option<&str>,
+    ) -> StoreResult<archive::ArchivePreview> {
+        let (connection, target) = self.read_view(lease)?;
+        archive::preview(connection, &target.generation, character_id)
+    }
+
+    pub(crate) fn archive_character(
+        &mut self,
+        character_id: &str,
+        expected_revision: i64,
+        now_ms: i64,
+    ) -> StoreResult<RevisionResult> {
+        let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
+        archive::archive_character(
+            &mut self.connection,
+            &cas,
+            character_id,
+            expected_revision,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn restore_character(
+        &mut self,
+        character_id: &str,
+        expected_revision: i64,
+    ) -> StoreResult<RevisionResult> {
+        let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
+        archive::restore_character(&mut self.connection, &cas, character_id, expected_revision)
     }
 
     pub(crate) fn replace_begin(&mut self) -> StoreResult<StagingResult> {

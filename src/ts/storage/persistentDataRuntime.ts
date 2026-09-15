@@ -51,6 +51,7 @@ import {
     getCatalogCharacterMetadata,
     hasIncompletePersistentWorkingSet,
     isCatalogCharacterStub,
+    isWorkingSetCharacterStub,
     isCatalogPresetWorkingSet,
     patchWorkingSetCharacterDetail,
     projectScalableWorkingSetAtRevision,
@@ -96,7 +97,7 @@ export function publishPersistentConversationReplacementToWorkingSet(
     const character = database.characters.find(
         (candidate) => candidate.chaId === result.characterId,
     )
-    if (!character || isCatalogCharacterStub(character)) return
+    if (!character || isWorkingSetCharacterStub(character)) return
     const index = character.chats.findIndex(
         (candidate) => candidate.id === result.conversationId,
     )
@@ -156,7 +157,7 @@ export function captureResidentPersistentCharacter(
 ): CompleteCharacter | null {
     if (residency.isCharacterReleased(id)) return null
     const character = database.characters.find((candidate) => candidate.chaId === id) ?? null
-    if (character && isCatalogCharacterStub(character)) return null
+    if (character && isWorkingSetCharacterStub(character)) return null
     return character
 }
 

@@ -110,6 +110,7 @@ fn validate_row(table: &PortableTable, row: &Row<'_>) -> StoreResult<()> {
             "image"
                 | "creator_notes"
                 | "trash_time"
+                | "archived_object"
                 | "message_id"
                 | "object_hash"
                 | "manifest_hash"

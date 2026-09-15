@@ -6,7 +6,7 @@ use super::{
 };
 use std::collections::{BTreeSet, HashSet};
 
-fn incremental_commit<T>(
+pub(super) fn incremental_commit<T>(
     connection: &mut Connection,
     expected_revision: i64,
     prepare: impl FnOnce(&Transaction<'_>, &str) -> StoreResult<T>,
@@ -225,6 +225,7 @@ pub(super) fn commit(
                     input.delete_character_id.as_deref(),
                 )?;
             }
+            reject_archived_targets(transaction, active, input)?;
             validate_owner_heads_for_commit(input)?;
             retained_commit_owner_heads(transaction, active, input)
         },
@@ -269,6 +270,42 @@ pub(super) fn commit(
             Ok(())
         },
     )
+}
+
+/// An archived character has no conversations and only a marker detail, so any
+/// mutation other than deleting it would leave the row describing nothing.
+fn reject_archived_targets(
+    transaction: &Transaction<'_>,
+    generation: &str,
+    input: &WorkingSetCommit,
+) -> StoreResult<()> {
+    let mut targets: Vec<&str> = Vec::new();
+    for character in input
+        .character
+        .iter()
+        .chain(input.character_details.iter().flatten())
+        .chain(input.replace_character.iter())
+        .chain(input.add_character.iter())
+    {
+        if let Some(character_id) = character.get("chaId").and_then(Value::as_str) {
+            targets.push(character_id);
+        }
+    }
+    for mutation in input.conversations.as_deref().unwrap_or_default() {
+        targets.push(match mutation {
+            ConversationMutation::ReplaceRange { character_id, .. } => character_id,
+            ConversationMutation::Delete { character_id, .. } => character_id,
+        });
+    }
+    for character_id in targets {
+        if Some(character_id) == input.delete_character_id.as_deref() {
+            continue;
+        }
+        if super::archive::is_archived(transaction, generation, character_id)? {
+            return Err(super::archive::archived_error(character_id));
+        }
+    }
+    Ok(())
 }
 
 fn owner_entries<'a>(
@@ -731,6 +768,7 @@ pub(super) fn replace_preserve_repositories(
         .flatten()
         .collect::<Vec<_>>();
 
+    preserve_archived_characters(&transaction, &active, staging_id)?;
     transaction.execute(
         "DELETE FROM asset_aliases WHERE generation = ?1",
         [staging_id],
@@ -780,8 +818,70 @@ pub(super) fn replace_preserve_repositories(
     for head in retained_owner_heads {
         put_asset_owner_head(&transaction, staging_id, head)?;
     }
+    preserve_archived_owner_heads(&transaction, &active, staging_id)?;
     transaction.commit()?;
     Ok(actual_revision)
+}
+
+/// The archived rows carry their own asset ownership, which the retained-head
+/// comparison cannot see because the marker detail lists nothing.
+fn preserve_archived_owner_heads(
+    transaction: &Transaction<'_>,
+    active: &str,
+    staging_id: &str,
+) -> StoreResult<()> {
+    transaction.execute(
+        "INSERT OR REPLACE INTO asset_owner_heads (
+            generation, owner_kind, owner_locator, present, manifest_hash, entry_count
+         )
+         SELECT ?1, heads.owner_kind, heads.owner_locator, heads.present,
+                heads.manifest_hash, heads.entry_count
+         FROM asset_owner_heads AS heads
+         JOIN characters AS archived
+           ON archived.generation = ?2 AND archived.character_id = heads.owner_locator
+         WHERE heads.generation = ?2
+           AND heads.owner_kind = 'character-additional-assets'
+           AND archived.archived_object IS NOT NULL",
+        params![staging_id, active],
+    )?;
+    Ok(())
+}
+
+/// An upstream database has no archive, so a full replacement carries the
+/// archived rows across instead of dropping them.
+fn preserve_archived_characters(
+    transaction: &Transaction<'_>,
+    active: &str,
+    staging_id: &str,
+) -> StoreResult<()> {
+    let archived = super::archive::archived_character_ids(transaction, active)?;
+    if archived.is_empty() {
+        return Ok(());
+    }
+    let mut configured_index: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(configured_index) + 1, 0) FROM characters WHERE generation = ?1",
+        [staging_id],
+        |row| row.get(0),
+    )?;
+    for character_id in archived {
+        if character_exists(transaction, staging_id, &character_id)? {
+            return Err(validation(format!(
+                "Character {character_id} is archived and the replacement carries the same character"
+            )));
+        }
+        transaction.execute(
+            "INSERT INTO characters (
+                generation, character_id, configured_index, recent_at, trashed, name, image,
+                conversation_count, type, creator_notes, trash_time, detail, archived_object
+             )
+             SELECT ?1, character_id, ?3, recent_at, trashed, name, image,
+                    conversation_count, type, creator_notes, trash_time, detail, archived_object
+             FROM characters WHERE generation = ?2 AND character_id = ?4",
+            params![staging_id, active, configured_index, character_id],
+        )?;
+        configured_index += 1;
+    }
+    Ok(())
 }
 
 fn prune_proven_unreachable_forwarded_aliases(

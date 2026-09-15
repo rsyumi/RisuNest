@@ -19,6 +19,7 @@ import { restoreColdPersistentCharacter } from './coldCharacterRestore'
 import { doingChat } from './generationState'
 import { appendCurrentConversationMessage } from '../conversationMutations'
 import type { groupChat } from '../storage/database.svelte'
+import { isArchivedCharacter } from '../storage/workingSetCatalog'
 import type { CompleteConversationLease } from '../storage/activeWorkingSet.svelte'
 import { v4 } from 'uuid'
 
@@ -73,6 +74,11 @@ export async function addGroupChar(): Promise<boolean> {
         if(res){
             if(group.characters.includes(res)){
                 alertError(language.errors.alreadyCharInGroup)
+                return false
+            }
+            const candidate = DBState.db.characters.find((value) => value.chaId === res)
+            if(candidate && isArchivedCharacter(candidate)){
+                alertError(language.risuNest.archive.groupMemberBlocked.replace('{0}', '1'))
                 return false
             }
             else{

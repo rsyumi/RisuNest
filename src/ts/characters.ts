@@ -3,6 +3,8 @@ import { get, writable } from "svelte/store";
 import { saveImage, type character, type Chat, defaultSdDataFunc, type loreBook, getDatabase, getCharacterByIndex, setCharacterByIndex } from "./storage/database.svelte";
 import { alertAddCharacter, alertConfirm, alertError, alertNormal, alertSelect, alertStore, alertToast, alertWait } from "./alert";
 import { language } from "../lang";
+import { isArchivedCharacter } from "./storage/workingSetCatalog";
+import { restoreArchivedCharacterWithConfirmation } from "./storage/characterArchive";
 import { checkNullish, findCharacterbyId, getUserName, selectMultipleFile, selectSingleFile } from "./util";
 import { v4 as uuidv4, v4 } from 'uuid';
 import { getImageType } from "./media";
@@ -1041,8 +1043,13 @@ export async function changeChar(index: number, arg:{
       alertToast(language.navigationBlockedWhileGenerating)
       return false
     }
-    const chaId = DBState.db.characters?.[index]?.chaId
+    const target = DBState.db.characters?.[index]
+    const chaId = target?.chaId
     if(!chaId) return false
+    if(isArchivedCharacter(target)){
+        await restoreArchivedCharacterWithConfirmation(chaId)
+        return false
+    }
     const restoreNavigationGeneration = fencePersistentNavigation()
     const activity = beginNavigationActivity('character')
     const isRestoreCurrent = () =>
