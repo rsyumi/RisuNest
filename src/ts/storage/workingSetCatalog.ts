@@ -33,7 +33,9 @@ const catalogPresetMetadata = Symbol('catalogPresetMetadata')
 export interface CatalogCharacterMetadata {
     configuredIndex: number
     conversationCount: number
-    residency: 'catalog' | 'detail'
+    residency: 'catalog' | 'detail' | 'archived'
+    archivedAt?: number
+    archivedMessageCount?: number
 }
 
 type CatalogCharacter = CompleteCharacter & {
@@ -72,8 +74,14 @@ export function createCatalogCharacterStub(summary: CharacterSummary): CompleteC
         enumerable: false,
         value: {
             configuredIndex: summary.configuredIndex,
-            conversationCount: summary.conversationCount,
-            residency: 'catalog',
+            conversationCount: summary.archived?.conversationCount ?? summary.conversationCount,
+            residency: summary.archived ? 'archived' : 'catalog',
+            ...(summary.archived === undefined
+                ? {}
+                : {
+                      archivedAt: summary.archived.archivedAt,
+                      archivedMessageCount: summary.archived.messageCount,
+                  }),
         } satisfies CatalogCharacterMetadata,
         writable: false,
     })
@@ -88,6 +96,17 @@ export function getCatalogCharacterMetadata(
 
 export function isCatalogCharacterStub(value: CompleteCharacter): boolean {
     return getCatalogCharacterMetadata(value)?.residency === 'catalog'
+}
+
+/// An archived character carries a stub that must never be hydrated.
+export function isArchivedCharacter(value: CompleteCharacter): boolean {
+    return getCatalogCharacterMetadata(value)?.residency === 'archived'
+}
+
+/// Both stub kinds, for callers that must not treat a stub as a complete value.
+export function isWorkingSetCharacterStub(value: CompleteCharacter): boolean {
+    const residency = getCatalogCharacterMetadata(value)?.residency
+    return residency === 'catalog' || residency === 'archived'
 }
 
 export function getCatalogConversationCount(value: CompleteCharacter): number {

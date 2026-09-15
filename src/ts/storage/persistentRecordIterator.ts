@@ -140,11 +140,24 @@ export async function* iteratePinnedCharacterSummaries(
     }
 }
 
+/// The one ordered sequence every whole-library read walks. An archived
+/// character has no detail to read, so it is never part of it.
+export async function* iterateUnarchivedPinnedCharacterSummaries(
+    reader: PersistentRevisionReader,
+): AsyncGenerator<CharacterSummary> {
+    for await (const summary of iteratePinnedCharacterSummaries(reader)) {
+        if (summary.archived) continue
+        yield summary
+    }
+}
+
 export async function collectPinnedCharacterIds(
     reader: PersistentRevisionReader,
 ): Promise<string[]> {
     const ids: string[] = []
-    for await (const summary of iteratePinnedCharacterSummaries(reader)) ids.push(summary.id)
+    for await (const summary of iterateUnarchivedPinnedCharacterSummaries(reader)) {
+        ids.push(summary.id)
+    }
     return ids
 }
 
@@ -152,14 +165,14 @@ export async function countPinnedCharacters(
     reader: PersistentRevisionReader,
 ): Promise<number> {
     let count = 0
-    for await (const _summary of iteratePinnedCharacterSummaries(reader)) count += 1
+    for await (const _summary of iterateUnarchivedPinnedCharacterSummaries(reader)) count += 1
     return count
 }
 
 export async function* iteratePinnedCharacters(
     reader: PersistentRevisionReader,
 ): AsyncGenerator<PinnedCharacterRecord> {
-    for await (const summary of iteratePinnedCharacterSummaries(reader)) {
+    for await (const summary of iterateUnarchivedPinnedCharacterSummaries(reader)) {
         const detail = await reader.readCharacter(summary.id)
         if (!detail) throw new Error(`Missing character detail for ${summary.id}`)
         assertPinnedRevision(reader.revision, detail.revision, `Character ${summary.id}`)

@@ -1,6 +1,7 @@
 import { allowedDbKeys, applyPreparedPluginDatabaseUpdate, customProviderStore, getV2PluginAPIs, handlePluginInstallViaPlugin, pluginStorageStore, pluginV2, type PluginV2ProviderArgument, type PluginV2ProviderOptions, type RisuPlugin } from "../plugins.svelte";
 import { SandboxHost } from "./factory";
 import { getDatabase } from "src/ts/storage/database.svelte";
+import { isArchivedCharacter } from "src/ts/storage/workingSetCatalog";
 import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
 import DOMPurify from 'dompurify';
 import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburgerMenu, additionalSettingsMenu, bodyIntercepterStore, chatPanelStore, DBState, selectedCharID, type MenuDef } from "src/ts/stores.svelte";
@@ -1013,7 +1014,16 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             )
         },
         getCurrentCharacterIndex: () => {
-            return get(selectedCharID)
+            const selected = get(selectedCharID)
+            if (selected < 0) return selected
+            // Plugins see one ordered list without archived characters, so the
+            // selected position is counted in that list.
+            let position = 0
+            for (let index = 0; index < selected; index += 1) {
+                const character = DBState.db.characters[index]
+                if (character && !isArchivedCharacter(character)) position += 1
+            }
+            return position
         },
         getCurrentChatIndex: () => {
             const db = DBState.db

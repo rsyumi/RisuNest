@@ -7,8 +7,10 @@ import {
     getCatalogConversationCount,
     getCatalogPresetMetadata,
     hydrateWorkingSetCharacterDetail,
+    isArchivedCharacter,
     isCatalogCharacterStub,
     isCatalogPresetWorkingSet,
+    isWorkingSetCharacterStub,
     patchWorkingSetCharacterDetail,
     projectCatalogWorkingSet,
     projectCompleteScalableWorkingSet,
@@ -29,6 +31,34 @@ const summary: CharacterSummary = {
 }
 
 describe('working-set catalog', () => {
+    it('marks an archived summary as archived residency and never as a catalog stub', () => {
+        const stub = createCatalogCharacterStub({
+            ...summary,
+            conversationCount: 0,
+            archived: { archivedAt: 1_758_000_000_000, conversationCount: 12, messageCount: 412 },
+        })
+
+        expect(getCatalogCharacterMetadata(stub)).toEqual({
+            configuredIndex: 4,
+            conversationCount: 12,
+            residency: 'archived',
+            archivedAt: 1_758_000_000_000,
+            archivedMessageCount: 412,
+        })
+        expect(isArchivedCharacter(stub)).toBe(true)
+        expect(isCatalogCharacterStub(stub)).toBe(false)
+        expect(isWorkingSetCharacterStub(stub)).toBe(true)
+        expect(getCatalogConversationCount(stub)).toBe(12)
+    })
+
+    it('keeps an unarchived summary on catalog residency', () => {
+        const stub = createCatalogCharacterStub(summary)
+
+        expect(isArchivedCharacter(stub)).toBe(false)
+        expect(isCatalogCharacterStub(stub)).toBe(true)
+        expect(isWorkingSetCharacterStub(stub)).toBe(true)
+    })
+
     it('creates a payload-free compatibility stub with non-enumerable catalog metadata', () => {
         const stub = createCatalogCharacterStub(summary)
 

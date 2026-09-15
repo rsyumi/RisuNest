@@ -10,7 +10,7 @@ import type {
 } from '../storage/activeWorkingSet.svelte'
 import type { ActiveConversationSession } from '../storage/activeConversationSession'
 import { getPersistentDataStore } from '../storage/persistentDataStoreFactory'
-import { isCatalogCharacterStub } from '../storage/workingSetCatalog'
+import { isWorkingSetCharacterStub } from '../storage/workingSetCatalog'
 import type {
     CharacterPage,
     ConversationPage,
@@ -23,7 +23,7 @@ import type {
 import {
     acquireCurrentRevisionWithRetry,
     assertPinnedRevision,
-    iteratePinnedCharacterSummaries,
+    iterateUnarchivedPinnedCharacterSummaries,
     iteratePinnedCharacters,
     iteratePinnedConversations,
     withPersistentRevisionLease,
@@ -303,7 +303,9 @@ async function resolvePinnedCharacterTarget(
 ): Promise<PluginResolvedCharacterTarget | null> {
     if (!Number.isSafeInteger(index) || index < 0) return null
     let position = 0
-    for await (const summary of iteratePinnedCharacterSummaries(reader)) {
+    // The position API walks the same filtered sequence the full database read
+    // walks, so an index means the same character in both.
+    for await (const summary of iterateUnarchivedPinnedCharacterSummaries(reader)) {
         if (position++ === index) {
             return { revision: reader.revision, characterId: summary.id }
         }
@@ -449,7 +451,7 @@ function validatePluginCompleteCharacter(
     if (typeof record.chaId !== 'string' || record.chaId.length === 0) {
         throw new TypeError('Plugin character replacement must have a nonempty character ID')
     }
-    if (isCatalogCharacterStub(value as PluginCompleteCharacter)) {
+    if (isWorkingSetCharacterStub(value as PluginCompleteCharacter)) {
         throw new TypeError('Plugin database characters cannot contain catalog working-set stubs')
     }
     if (!Array.isArray(record.chats)) {

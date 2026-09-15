@@ -91,6 +91,7 @@ function createHarness() {
     const materializedDatabases: Database[] = []
     const pinnedDatabases: Database[] = []
     const pinnedCharacterQueries: unknown[] = []
+    const archivedCharacterIds = new Set<string>()
     const releasedLeases: Array<ReturnType<typeof vi.fn>> = []
     const authoritativeSnapshots: Array<{
         database: Database
@@ -143,11 +144,23 @@ function createHarness() {
                         trashed: trash,
                         conversationCount: character.chats.length,
                         type: character.type,
+                        ...(archivedCharacterIds.has(character.chaId)
+                            ? {
+                                  archived: {
+                                      archivedAt: 10,
+                                      conversationCount: character.chats.length,
+                                      messageCount: 0,
+                                  },
+                              }
+                            : {}),
                     })),
                     nextCursor: end < values.length ? String(end) : undefined,
                 }
             },
             readCharacter: async (id: string) => {
+                if (archivedCharacterIds.has(id)) {
+                    throw new Error(`Character ${id} is archived`)
+                }
                 const character = characters.find((value) => value.chaId === id)
                 if (!character) return null
                 const { chats, ...detail } = character
@@ -276,6 +289,7 @@ function createHarness() {
     return {
         access,
         applyCompatibilityDatabaseLite,
+        archivedCharacterIds,
         authoritativeSnapshots,
         compatibilityDatabase,
         flushPendingData,
@@ -433,6 +447,64 @@ describe('plugin database access', () => {
         await expect(harness.access.getCharacterFromIndex(1, callContext()))
             .resolves.toMatchObject({ chaId: 'trash-b' })
         expect(harness.releasedLeases[0]).toHaveBeenCalledOnce()
+    })
+
+    // Invariant 9.
+    it('reads the whole database without the archived characters and without failing', async () => {
+        const harness = createHarness()
+        harness.archivedCharacterIds.add('archived-b')
+        harness.pinnedDatabases.push(makeFullObjectDatabase([
+            makeCharacter('active-a'),
+            makeCharacter('archived-b'),
+            makeCharacter('active-c'),
+        ]))
+
+        const result = await harness.access.getDatabaseSnapshot(['characters'], ['characters'])
+
+        const characters = result.characters as PluginCompleteCharacter[]
+        expect(characters.map((character) => character.chaId)).toEqual([
+            'active-a',
+            'active-c',
+        ])
+        expect(JSON.stringify(result)).not.toContain('archived-b')
+    })
+
+    // Invariants 20 and 27.
+    it('resolves every index to the character the whole database read holds there', async () => {
+        const harness = createHarness()
+        harness.archivedCharacterIds.add('archived-a')
+        harness.archivedCharacterIds.add('archived-c')
+        const database = () => makeFullObjectDatabase([
+            makeCharacter('archived-a'),
+            makeCharacter('active-b'),
+            makeCharacter('archived-c'),
+            makeCharacter('active-d'),
+            makeCharacter('trash-e', true),
+        ])
+        harness.pinnedDatabases.push(database(), database(), database(), database())
+
+        const snapshot = await harness.access.getDatabaseSnapshot(['characters'], ['characters'])
+        const characters = snapshot.characters as PluginCompleteCharacter[]
+        expect(characters.map((character) => character.chaId)).toEqual([
+            'active-b',
+            'active-d',
+            'trash-e',
+        ])
+        for (let index = 0; index < characters.length; index += 1) {
+            const indexed = await harness.access.getCharacterFromIndex(index, callContext())
+            expect(indexed?.chaId).toBe(characters[index].chaId)
+        }
+    })
+
+    it('resolves no index past the end of the filtered list', async () => {
+        const harness = createHarness()
+        harness.archivedCharacterIds.add('archived-b')
+        harness.pinnedDatabases.push(makeFullObjectDatabase([
+            makeCharacter('active-a'),
+            makeCharacter('archived-b'),
+        ]))
+
+        await expect(harness.access.getCharacterFromIndex(1, callContext())).resolves.toBeNull()
     })
 
     it('returns exact detached current, indexed character, and indexed chat objects', async () => {

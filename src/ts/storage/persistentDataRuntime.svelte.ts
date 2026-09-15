@@ -54,6 +54,7 @@ import { workingSetResidency } from './workingSetResidency'
 import {
     createPresetCatalogWorkingSetFromValues,
     hydrateWorkingSetCharacterDetail,
+    isArchivedCharacter,
     isCatalogCharacterStub,
     isCatalogPresetWorkingSet,
 } from './workingSetCatalog'
@@ -447,6 +448,9 @@ export function hydrateCurrentGroupMemberDetail(
     )
     if (memberIndex < 0 || detail.chaId === groupId) return false
     const member = database.characters[memberIndex]
+    // An archived member has no detail to hydrate, so it is unusable rather
+    // than loadable. This must come before the stub check.
+    if (isArchivedCharacter(member)) return false
     if (!isCatalogCharacterStub(member)) return true
     const hydrated = hydrateWorkingSetCharacterDetail(database, memberIndex, detail)
     workingSetResidency.markCharacterHydrated(hydrated.chaId)

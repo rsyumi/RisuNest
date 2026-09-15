@@ -69,6 +69,11 @@ export function createMutationGatedPersistentDataStore(
         activateColdPayloadMigration: (input: ColdPayloadMigrationInput) =>
             gate.runTransition(() => store.activateColdPayloadMigration(input)),
         commit: (input: WorkingSetCommit) => gate.runWrite(() => store.commit(input)),
+        archivePreview: (characterId: string) => store.archivePreview(characterId),
+        archiveCharacter: (characterId: string, expectedRevision: DataRevision) =>
+            gate.runWrite(() => store.archiveCharacter(characterId, expectedRevision)),
+        restoreCharacter: (characterId: string, expectedRevision: DataRevision) =>
+            gate.runWrite(() => store.restoreCharacter(characterId, expectedRevision)),
         replaceFromDatabase: (
             database: Database,
             expectedRevision?: DataRevision,

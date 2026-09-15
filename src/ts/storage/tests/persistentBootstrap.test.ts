@@ -84,6 +84,9 @@ function createStore(input?: {
         deleteColdAlias: vi.fn(),
         activateColdPayloadMigration: vi.fn(),
         commit: vi.fn(),
+        archivePreview: vi.fn(),
+        archiveCharacter: vi.fn(),
+        restoreCharacter: vi.fn(),
         acquireRevision: vi.fn(),
     }
 }

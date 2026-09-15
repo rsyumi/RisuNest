@@ -57,7 +57,7 @@ import { bootstrapPersistentDatabase } from "./storage/persistentBootstrap";
 import {
     createCatalogPresetWorkingSet,
     hasIncompletePersistentWorkingSet,
-    isCatalogCharacterStub,
+    isWorkingSetCharacterStub,
     isCatalogPresetWorkingSet,
     projectCatalogWorkingSet,
     projectCompleteScalableWorkingSet,
@@ -310,7 +310,7 @@ export async function loadData() {
         const installPersistentWorkingSet = (database: Database) => {
             workingSetResidency.clear()
             for (const character of database.characters) {
-                if (isCatalogCharacterStub(character)) {
+                if (isWorkingSetCharacterStub(character)) {
                     workingSetResidency.markCharacterReleased(character.chaId)
                 }
             }
@@ -335,7 +335,7 @@ export async function loadData() {
                         selectedConversationId,
                     )
                 for (const character of projected.characters) {
-                    if (isCatalogCharacterStub(character)) {
+                    if (isWorkingSetCharacterStub(character)) {
                         workingSetResidency.markCharacterReleased(character.chaId)
                     } else {
                         workingSetResidency.reconcileConversationResidency(character)

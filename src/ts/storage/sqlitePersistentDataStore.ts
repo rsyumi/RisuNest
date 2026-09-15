@@ -10,6 +10,7 @@ import {
     RevisionConflictError,
     SnapshotReleasedError,
     validateConversationWindowQuery,
+    type ArchivePreview,
     type AssetAlias,
     type AssetAliasIdentity,
     type AssetAliasKind,
@@ -331,6 +332,24 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
         return nativeCommitTransport.commit({ commit, assetAliases }).catch((error) => {
             throw restoreStoreError(error)
         })
+    }
+
+    archivePreview(characterId: string): Promise<ArchivePreview> {
+        return invokeStore('pds_archive_preview', { characterId })
+    }
+
+    archiveCharacter(
+        characterId: string,
+        expectedRevision: DataRevision,
+    ): Promise<{ revision: DataRevision }> {
+        return invokeStore('pds_archive_character', { characterId, expectedRevision })
+    }
+
+    restoreCharacter(
+        characterId: string,
+        expectedRevision: DataRevision,
+    ): Promise<{ revision: DataRevision }> {
+        return invokeStore('pds_restore_character', { characterId, expectedRevision })
     }
 
     async replaceFromDatabase(
