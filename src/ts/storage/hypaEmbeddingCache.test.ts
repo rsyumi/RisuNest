@@ -81,7 +81,7 @@ describe('hypa embedding frames', () => {
 
 describe('native hypa embedding cache', () => {
     it('reads a whole batch in one call', async () => {
-        const invoke = vi.fn(async () => readFrame([
+        const invoke = vi.fn(async (_command: string, _args: unknown) => readFrame([
             { key: 'a', values: [1, 2] },
             { key: 'b', values: null },
             { key: 'c', values: [3, 4] },
@@ -95,13 +95,15 @@ describe('native hypa embedding cache', () => {
     })
 
     it('accepts a number array response where raw IPC responses are unavailable', async () => {
-        const invoke = vi.fn(async () => Array.from(readFrame([{ key: 'a', values: [5] }])))
+        const invoke = vi.fn(async (_command: string, _args: unknown) =>
+            Array.from(readFrame([{ key: 'a', values: [5] }])),
+        )
         const cache = createNativeHypaEmbeddingCache(invoke as never, false)
         expect(Array.from((await cache.read(['a'])).get('a').vector)).toEqual([5])
     })
 
     it('writes a whole batch in one call as a raw body', async () => {
-        const invoke = vi.fn(async () => undefined)
+        const invoke = vi.fn(async (_command: string, _args: unknown) => undefined)
         const cache = createNativeHypaEmbeddingCache(invoke as never, false)
 
         await cache.write([entry('a', [1, 2]), entry('b', [3, 4])])
@@ -111,7 +113,7 @@ describe('native hypa embedding cache', () => {
     })
 
     it('sends the same frame as base64 on Android', async () => {
-        const invoke = vi.fn(async () => undefined)
+        const invoke = vi.fn(async (_command: string, _args: unknown) => undefined)
         const cache = createNativeHypaEmbeddingCache(invoke as never, true)
 
         await cache.write([entry('a', [1, 2])])
