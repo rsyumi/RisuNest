@@ -1,5 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
+  "identifier": "RisuNest",
   "bundle": {
     "targets": ["deb", "appimage"],
     "category": "Utility",
