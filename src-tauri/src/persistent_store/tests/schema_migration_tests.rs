@@ -1,7 +1,7 @@
 use super::*;
 
 fn database_path(directory: &Path) -> PathBuf {
-    directory.join("persistent").join("persistent.db")
+    directory.join("persistent").join("persistent.sqlite")
 }
 
 fn assert_payload_alias_schema(connection: &rusqlite::Connection) {

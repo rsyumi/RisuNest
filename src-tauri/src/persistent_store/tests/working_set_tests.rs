@@ -380,7 +380,7 @@ fn opens_new_store_at_revision_zero() {
     let store = PersistentStore::open(directory.path()).expect("open persistent store");
 
     assert_eq!(store.revision().expect("read revision"), 0);
-    assert!(directory.path().join("persistent/persistent.db").is_file());
+    assert!(directory.path().join("persistent/persistent.sqlite").is_file());
 }
 
 #[test]
@@ -2739,7 +2739,7 @@ fn pilot_mutated_database_supports_generation_cow_compatible_reopen_read_and_com
             ..empty_working_set_commit(1)
         })
         .expect("mutate fixture through WAL pilot");
-    let database_path = directory.path().join("persistent/persistent.db");
+    let database_path = directory.path().join("persistent/persistent.sqlite");
     drop(store);
 
     let mut compatibility = Connection::open(&database_path).expect("open database for COW path");

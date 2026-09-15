@@ -1163,7 +1163,7 @@ mod tests {
             )
             .unwrap();
         let database =
-            rusqlite::Connection::open(root.path().join("persistent/persistent.db")).unwrap();
+            rusqlite::Connection::open(root.path().join("persistent/persistent.sqlite")).unwrap();
         database
             .execute("UPDATE meta SET value='1' WHERE key='currentRevision'", [])
             .unwrap();

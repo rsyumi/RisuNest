@@ -855,7 +855,7 @@ mod tests {
     }
 
     fn add_test_aliases(root: &Path, hash: &str, size: usize, count: usize) {
-        let mut db = rusqlite::Connection::open(root.join("persistent/persistent.db")).unwrap();
+        let mut db = rusqlite::Connection::open(root.join("persistent/persistent.sqlite")).unwrap();
         let generation: String = serde_json::from_str(
             &db.query_row::<String, _, _>(
                 "SELECT value FROM meta WHERE key='activeGeneration'",
@@ -955,7 +955,7 @@ mod tests {
         assert!(!target.join("persistent/recovery").exists());
         let store = PersistentStore::open(&target).unwrap();
         assert!(store.snapshot_list().unwrap().is_empty());
-        let db = rusqlite::Connection::open(target.join("persistent/persistent.db")).unwrap();
+        let db = rusqlite::Connection::open(target.join("persistent/persistent.sqlite")).unwrap();
         assert_eq!(
             db.query_row::<i64, _, _>("SELECT count(*) FROM asset_aliases", [], |r| r.get(0))
                 .unwrap(),
@@ -986,7 +986,7 @@ mod tests {
             add_test_aliases(&target, &hash, payload.len(), 1);
             if !corrupt_existing {
                 let db =
-                    rusqlite::Connection::open(target.join("persistent/persistent.db")).unwrap();
+                    rusqlite::Connection::open(target.join("persistent/persistent.sqlite")).unwrap();
                 db.execute_batch("CREATE TRIGGER reject_replacement BEFORE DELETE ON root WHEN OLD.generation='revision-1' BEGIN SELECT RAISE(ABORT,'synthetic commit failure'); END;").unwrap();
             }
             let jobs = directory.path().join("restore-job");
@@ -1053,7 +1053,7 @@ mod tests {
         let target_store = library(&target);
         let revision = target_store.revision().unwrap();
         let before = target_store.read_root(None).unwrap().value;
-        let before_roots = rusqlite::Connection::open(target.join("persistent/persistent.db"))
+        let before_roots = rusqlite::Connection::open(target.join("persistent/persistent.sqlite"))
             .unwrap()
             .query_row::<i64, _, _>("SELECT count(*) FROM root", [], |r| r.get(0))
             .unwrap();
@@ -1079,7 +1079,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(failure.code, "revision-conflict");
-        let db = rusqlite::Connection::open(target.join("persistent/persistent.db")).unwrap();
+        let db = rusqlite::Connection::open(target.join("persistent/persistent.sqlite")).unwrap();
         assert_eq!(
             db.query_row::<i64, _, _>("SELECT count(*) FROM root", [], |r| r.get(0))
                 .unwrap(),
@@ -1102,7 +1102,7 @@ mod tests {
             let store = library(&source);
             let revision = store.revision().unwrap();
             drop(store);
-            let db = rusqlite::Connection::open(source.join("persistent/persistent.db")).unwrap();
+            let db = rusqlite::Connection::open(source.join("persistent/persistent.sqlite")).unwrap();
             if unknown {
                 db.execute_batch("CREATE TABLE future_records(generation TEXT,value TEXT); INSERT INTO future_records VALUES('synthetic','unclassified raw value')").unwrap();
             } else {

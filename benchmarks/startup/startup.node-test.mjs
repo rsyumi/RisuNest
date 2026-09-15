@@ -235,7 +235,7 @@ test('asset counts reject a replacement generation with no aliases', async () =>
     const identifier = 'RisuNest.phase3benchmark.r0123456789ab.catalogtest'
     const root = path.join(parent, identifier)
     await mkdir(path.join(root, 'persistent'), { recursive: true })
-    const file = path.join(root, 'persistent/persistent.db')
+    const file = path.join(root, 'persistent/persistent.sqlite')
     try {
         const db = new DatabaseSync(file)
         db.exec(`CREATE TABLE meta(key TEXT,value TEXT);
@@ -264,7 +264,7 @@ test('WAL observer rejects ordinary profiles and measures only synthetic file si
         await mkdir(path.join(root, 'persistent'), { recursive: true })
         const finish = await observeWal(root, identifier)
         try {
-            await writeFile(path.join(root, 'persistent/persistent.db-wal'), new Uint8Array(8192))
+            await writeFile(path.join(root, 'persistent/persistent.sqlite-wal'), new Uint8Array(8192))
             const measured = await finish()
             assert.equal(measured.startBytes, 0)
             assert.equal(measured.endBytes, 8192)

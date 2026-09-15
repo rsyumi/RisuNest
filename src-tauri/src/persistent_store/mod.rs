@@ -53,6 +53,8 @@ use std::time::Instant;
 
 pub(super) type StoreResult<T> = Result<T, StoreError>;
 
+pub(crate) const DATABASE_FILE: &str = "persistent.sqlite";
+
 pub(super) const CONVERSATION_RANGE_MAX_LIMIT: i64 = 4_096;
 pub(super) const JAVASCRIPT_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 pub(crate) const ASSET_GC_PRODUCT_PAGE_LIMIT: i64 = 128;
@@ -1322,7 +1324,7 @@ pub(crate) fn register_asset_objects_at_root(
     objects: &[asset_object_catalog::AssetObjectRegistration],
     created_at_ms: i64,
 ) -> StoreResult<()> {
-    let database_path = repository_root.join("persistent").join("persistent.db");
+    let database_path = repository_root.join("persistent").join(DATABASE_FILE);
     let mut connection =
         Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     connection.busy_timeout(Duration::from_secs(5))?;
@@ -1353,7 +1355,7 @@ impl PersistentStore {
         let pending_restore_failure =
             snapshot::apply_pending_restore(&persistent_dir, &snapshots_dir)?;
 
-        let database_path = persistent_dir.join("persistent.db");
+        let database_path = persistent_dir.join(DATABASE_FILE);
         let mut connection = Connection::open(&database_path)?;
         schema::initialize(&mut connection)?;
         recover_asset_object_deletions(&mut connection, app_data_dir)?;

@@ -29,7 +29,7 @@ fn dependency_promotion_bounds_wal_writes_and_preserves_durable_objects() {
         .connection
         .pragma_query_value(None, "page_size", |r| r.get(0))
         .unwrap();
-    let bytes = fs::metadata(target.path().join("persistent/persistent.db-wal"))
+    let bytes = fs::metadata(target.path().join("persistent/persistent.sqlite-wal"))
         .unwrap()
         .len();
     let frames = bytes.saturating_sub(32) / (page_size as u64 + 24);

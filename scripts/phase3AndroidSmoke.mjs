@@ -58,7 +58,7 @@ Commands:
       Turn airplane mode off and the wifi and data radios back on after a smoke run.
 
   collect --serial <adb-serial> --label <label>
-      Collect logcat, dumpsys, screenshot, private persistent.db, snapshots, and SQLite
+      Collect logcat, dumpsys, screenshot, private persistent.sqlite, snapshots, and SQLite
       inspection JSON. Force-stop first when a transactionally stable copy is required.
 
   inspect --db <path>
@@ -419,11 +419,11 @@ async function collectEvidence(options) {
     const screenshot = adb(serial, ['exec-out', 'screencap', '-p'], { binary: true, allowFailure: true })
     if (screenshot.status === 0) await writeFile(resolve(outputDirectory, 'screen.png'), screenshot.stdout)
 
-    const databasePath = resolve(outputDirectory, 'persistent.db')
-    await copyPrivateFile(serial, 'files/persistent/persistent.db', databasePath)
+    const databasePath = resolve(outputDirectory, 'persistent.sqlite')
+    await copyPrivateFile(serial, 'files/persistent/persistent.sqlite', databasePath)
     // The store runs in WAL mode, so commits since the last truncate checkpoint
     // live only in the -wal sidecar; without it the inspection under-reports.
-    await copyPrivateFileIfPresent(serial, 'files/persistent/persistent.db-wal', `${databasePath}-wal`)
+    await copyPrivateFileIfPresent(serial, 'files/persistent/persistent.sqlite-wal', `${databasePath}-wal`)
     const inspections = { active: await inspectDatabase(databasePath), snapshots: [] }
 
     const snapshotFiles = String(

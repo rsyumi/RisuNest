@@ -217,7 +217,7 @@ fn checkpoint_truncate_reports_busy_and_truncates_when_unblocked() {
         .connection
         .execute_batch("PRAGMA wal_autocheckpoint = 0; INSERT INTO app_kv VALUES ('first', '1');")
         .expect("create initial WAL frames");
-    let database_path = directory.path().join("persistent/persistent.db");
+    let database_path = directory.path().join("persistent/persistent.sqlite");
     let wal_path = PathBuf::from(format!("{}-wal", database_path.display()));
     store
         .checkpoint(CheckpointMode::Passive)
