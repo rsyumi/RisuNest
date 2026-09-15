@@ -22,6 +22,7 @@
         previewNativePersistentAssetGc,
     } from 'src/ts/storage/nativePersistentMaintenance'
     import { getSyncConflictBackupStore } from 'src/ts/storage/sync/syncConflictBackup'
+    import { openDataHealthScreen } from 'src/ts/storage/dataHealthNavigation'
     import {
         createRisuNestStorageDashboard,
         formatRisuNestStorageBytes,
@@ -115,12 +116,19 @@
         alertError(fallback)
     }
 
+    // Creating a snapshot or reading an image fails on the same damage the data check names.
+    async function showStorageFailure(error: unknown): Promise<void> {
+        void error
+        if (await alertConfirm(`${strings.actionFailed} ${language.risuNest.dataHealth.openResult}`))
+            openDataHealthScreen()
+    }
+
     function isBusy(action: string): boolean {
         return state.busy.includes(action)
     }
 
     async function previewGc(): Promise<void> {
-        try { await dashboard.previewGc() } catch (error) { showActionError(error) }
+        try { await dashboard.previewGc() } catch (error) { await showStorageFailure(error) }
     }
 
     async function executeGc(): Promise<void> {
@@ -144,7 +152,7 @@
     }
 
     async function createSnapshot(): Promise<void> {
-        try { await dashboard.createSnapshot() } catch (error) { showActionError(error) }
+        try { await dashboard.createSnapshot() } catch (error) { await showStorageFailure(error) }
     }
 
     const unsubscribe = dashboard.subscribe((next) => { state = next })

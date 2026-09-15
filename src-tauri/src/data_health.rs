@@ -16,7 +16,7 @@ pub(crate) mod codes {
     pub(crate) const UNCLASSIFIED: &str = "unclassified";
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Severity {
     /// Blocks a backup, a snapshot or an activation.
@@ -35,21 +35,21 @@ fn severity_of(code: &str) -> Severity {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Owner {
     pub(crate) kind: String,
     pub(crate) id: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Locator {
     pub(crate) source_path: String,
     pub(crate) occurrence: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Target {
     pub(crate) kind: String,
@@ -57,10 +57,10 @@ pub(crate) struct Target {
 }
 
 /// `detail` carries the validator's own message. It never carries record content.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Finding {
-    pub(crate) code: &'static str,
+    pub(crate) code: String,
     pub(crate) severity: Severity,
     pub(crate) owner: Owner,
     pub(crate) locator: Option<Locator>,
@@ -76,8 +76,8 @@ impl Finding {
         detail: impl Into<String>,
     ) -> Self {
         Self {
-            code,
             severity: severity_of(code),
+            code: code.to_owned(),
             owner: Owner {
                 kind: owner_kind.into(),
                 id: owner_id.into(),
@@ -198,5 +198,128 @@ impl FindingSink for Report<'_> {
         if !self.stopped {
             self.sink.note(finding);
         }
+    }
+}
+
+/// The renderer asked for the stop, so its own loop ends quietly instead of reporting a failure.
+pub(crate) const CANCELLED: &str = "data-health-scan-cancelled";
+
+/// How much of the library a scan reads. The quick depth stays proportional to the database and
+/// never opens a stored object; the deep depth rereads every registered object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ScanDepth {
+    Quick,
+    Deep,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SeverityCounts {
+    pub(crate) blocking: u64,
+    pub(crate) degraded: u64,
+    pub(crate) informational: u64,
+}
+
+impl SeverityCounts {
+    pub(crate) fn of(items: &[Finding]) -> Self {
+        let mut counts = Self::default();
+        for finding in items {
+            match finding.severity {
+                Severity::Blocking => counts.blocking += 1,
+                Severity::Degraded => counts.degraded += 1,
+                Severity::Informational => counts.informational += 1,
+            }
+        }
+        counts
+    }
+}
+
+/// Where a deep scan stopped. `cursor` is the last object hash it finished, so a resumed run
+/// continues after it instead of rereading what it already hashed.
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DeepProgress {
+    pub(crate) cursor: Option<String>,
+    pub(crate) completed_objects: u64,
+    pub(crate) total_objects: u64,
+    pub(crate) completed_bytes: u64,
+    pub(crate) total_bytes: u64,
+    pub(crate) complete: bool,
+}
+
+/// One diagnosis. It is persisted so a deep scan survives a restart and so the screen can show
+/// the last result without scanning again.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ScanResult {
+    pub(crate) revision: i64,
+    pub(crate) scanned_at: i64,
+    pub(crate) depth: ScanDepth,
+    pub(crate) counts: SeverityCounts,
+    pub(crate) items: Vec<Finding>,
+    pub(crate) omitted: u64,
+    /// Present once a deep scan has started, complete or not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) deep: Option<DeepProgress>,
+}
+
+impl ScanResult {
+    pub(crate) fn new(revision: i64, scanned_at: i64, depth: ScanDepth, findings: Findings) -> Self {
+        Self {
+            revision,
+            scanned_at,
+            depth,
+            counts: SeverityCounts::of(&findings.items),
+            items: findings.items,
+            omitted: findings.omitted,
+            deep: None,
+        }
+    }
+
+    /// Merges a later phase into the result. The phase was bounded by the room this result had
+    /// left, so the total still respects the scan limit.
+    pub(crate) fn absorb(&mut self, findings: Findings) {
+        self.items.extend(findings.items);
+        self.omitted += findings.omitted;
+        self.counts = SeverityCounts::of(&self.items);
+    }
+
+    pub(crate) fn remaining(&self, limit: usize) -> usize {
+        limit.saturating_sub(self.items.len())
+    }
+}
+
+/// The diagnosis result lives in the working folder beside the snapshots. It never enters the
+/// live database, a backup or a sync projection, so a damaged library cannot travel as one.
+pub(crate) fn result_path(app_data_root: &std::path::Path) -> std::path::PathBuf {
+    app_data_root
+        .join("persistent")
+        .join("data-health")
+        .join("result.json")
+}
+
+pub(crate) fn write_result(
+    app_data_root: &std::path::Path,
+    result: &ScanResult,
+) -> std::io::Result<()> {
+    let path = result_path(app_data_root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let staging = path.with_extension("json.writing");
+    std::fs::write(
+        &staging,
+        serde_json::to_vec(result).map_err(std::io::Error::other)?,
+    )?;
+    std::fs::rename(&staging, &path)
+}
+
+/// A result file the current build cannot read is a stale artefact, not a failure to report.
+pub(crate) fn read_result(app_data_root: &std::path::Path) -> std::io::Result<Option<ScanResult>> {
+    match std::fs::read(result_path(app_data_root)) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
 }

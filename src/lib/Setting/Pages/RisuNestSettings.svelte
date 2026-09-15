@@ -5,6 +5,7 @@
     import RisuNestSettingRows from '../RisuNest/RisuNestSettingRows.svelte'
     import RisuNestPerformanceSettings from './RisuNestPerformanceSettings.svelte'
     import RisuNestStorageDashboard from './RisuNestStorageDashboard.svelte'
+    import RisuNestDataHealth from './RisuNestDataHealth.svelte'
     import RisuNestBackupRestore from './RisuNestBackupRestore.svelte'
     import RisuNestIOSPlatform from './RisuNestIOSPlatform.svelte'
     import RisuNestAndroidPlatform from './RisuNestAndroidPlatform.svelte'
@@ -17,6 +18,7 @@
         { id: 'risunest-inlay', label: language.risuNest.inlay.title },
         ...(isTauri ? [{ id: 'risunest-server-sync', label: language.risuNest.serverSync.title }] : []),
         ...(isTauri ? [{ id: 'risunest-storage', label: language.risuNest.storage.title }] : []),
+        ...(isTauri ? [{ id: 'risunest-data-health', label: language.risuNest.dataHealth.title }] : []),
         { id: 'risunest-backup', label: language.risuNest.backup.title },
         ...(isTauriAndroid || isTauriIOS ? [{ id: 'risunest-platform', label: language.risuNest.platform.title }] : []),
         ...(isTauri ? [{ id: 'risunest-diag', label: language.risuNest.diag.title }] : []),
@@ -41,6 +43,7 @@
     {/if}
     {#if isTauri}
         <RisuNestStorageDashboard />
+        <RisuNestDataHealth onOpenUnusedImages={() => jumpTo('risunest-storage')} />
     {/if}
     <RisuNestBackupRestore />
     {#if isTauriIOS}

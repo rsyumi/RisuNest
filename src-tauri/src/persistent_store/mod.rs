@@ -912,6 +912,73 @@ pub(crate) struct PersistentStore {
     pending_restore_failure: Option<String>,
 }
 
+/// One generation, held open for a diagnosis. It outlives the store mutex on purpose: a deep
+/// scan reads every stored object, and the library stays writable while it does.
+pub(crate) struct DataHealthReader {
+    connection: Connection,
+    cas: crate::asset_repository::PayloadCas,
+    revision: i64,
+}
+
+impl DataHealthReader {
+    pub(crate) fn revision(&self) -> i64 {
+        self.revision
+    }
+
+    pub(crate) fn scan(
+        &self,
+        depth: crate::data_health::ScanDepth,
+        limit: usize,
+        probe: &dyn crate::local_backup::CancellationProbe,
+    ) -> StoreResult<crate::data_health::Findings> {
+        let mut findings = crate::data_health::Findings::new(limit);
+        crate::portable_backup::scan_live_library(
+            &self.connection,
+            &self.cas,
+            depth,
+            &mut findings,
+            probe,
+        )
+        .map_err(scan_failure)?;
+        Ok(findings)
+    }
+
+    pub(crate) fn object_totals(&self) -> StoreResult<crate::portable_backup::ObjectTotals> {
+        crate::portable_backup::registered_object_totals(&self.connection).map_err(scan_failure)
+    }
+
+    pub(crate) fn scan_objects(
+        &self,
+        after: Option<&str>,
+        budget: u64,
+        limit: usize,
+        probe: &dyn crate::local_backup::CancellationProbe,
+    ) -> StoreResult<(crate::portable_backup::ObjectPage, crate::data_health::Findings)> {
+        let mut findings = crate::data_health::Findings::new(limit);
+        let page = crate::portable_backup::scan_registered_objects(
+            &self.connection,
+            &self.cas,
+            after,
+            budget,
+            &mut findings,
+            probe,
+        )
+        .map_err(scan_failure)?;
+        Ok((page, findings))
+    }
+}
+
+fn scan_failure(error: crate::portable_backup::Error) -> StoreError {
+    match error {
+        crate::portable_backup::Error::Cancelled => StoreError::Validation {
+            message: crate::data_health::CANCELLED.to_owned(),
+        },
+        error => StoreError::Store {
+            message: error.to_string(),
+        },
+    }
+}
+
 pub(crate) struct AssetGcPreview {
     cas: crate::asset_repository::PayloadCas,
     residency: crate::server_sync::residency::Residency,
@@ -2564,26 +2631,17 @@ impl PersistentStore {
         Ok(())
     }
 
-    /// Scans the leased generation in place, reporting every violation instead of the first.
-    /// The lease pins the generation against collection, and the caller compares its revision
-    /// again before applying any repair.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn scan_data_health(
-        &self,
-        lease: &str,
-        limit: usize,
-        probe: &dyn crate::local_backup::CancellationProbe,
-    ) -> StoreResult<crate::data_health::Findings> {
+    /// Opens the leased generation for diagnosis. The reader owns its connection, so the scan it
+    /// serves runs without the store mutex and never blocks a writer. The lease pins the
+    /// generation against collection, and the caller compares its revision again before applying
+    /// any repair.
+    pub(crate) fn data_health_reader(&self, lease: &str) -> StoreResult<DataHealthReader> {
         let (_, target) = self.read_view(Some(lease))?;
-        let view = snapshot::open_generation_reader(&self.database_path, &target.generation)?;
-        let cas = crate::asset_repository::PayloadCas::new(self.repository_root())?;
-        let mut findings = crate::data_health::Findings::new(limit);
-        crate::portable_backup::scan_live_library(&view, &cas, &mut findings, probe).map_err(
-            |error| StoreError::Store {
-                message: error.to_string(),
-            },
-        )?;
-        Ok(findings)
+        Ok(DataHealthReader {
+            connection: snapshot::open_generation_reader(&self.database_path, &target.generation)?,
+            cas: crate::asset_repository::PayloadCas::new(self.repository_root())?,
+            revision: target.revision,
+        })
     }
 
     fn read_view(&self, lease: Option<&str>) -> StoreResult<(&Connection, ReadTarget)> {

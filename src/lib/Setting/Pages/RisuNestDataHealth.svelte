@@ -1,0 +1,240 @@
+<script lang="ts">
+    import { onDestroy, onMount } from 'svelte'
+    import { ChevronRight } from '@lucide/svelte'
+    import { language } from 'src/lang'
+    import { alertError, alertNormal } from 'src/ts/alert'
+    import Button from 'src/lib/UI/GUI/Button.svelte'
+    import Check from 'src/lib/UI/GUI/CheckInput.svelte'
+    import SettingGroup from '../RisuNest/SettingGroup.svelte'
+    import SettingRow from '../RisuNest/SettingRow.svelte'
+    import {
+        cancelNativeDataHealthScan,
+        deepScanNativeDataHealth,
+        getNativeDataHealthResult,
+        scanNativeDataHealth,
+    } from 'src/ts/storage/nativePersistentMaintenance'
+    import {
+        dataHealthReportFileName,
+        formatDataHealthReport,
+        type DataHealthFinding,
+        type DataHealthSeverity,
+    } from 'src/ts/storage/dataHealth'
+    import { createDataHealthModel } from 'src/ts/storage/dataHealthModel'
+    import { formatRisuNestStorageBytes } from 'src/ts/storage/risuNestStorageDashboard'
+    import { downloadFile } from 'src/ts/globalApi.svelte'
+
+    interface Props {
+        /** Scrolls to the unused image cleanup, which is the only place files are deleted. */
+        onOpenUnusedImages?: () => void
+    }
+
+    let { onOpenUnusedImages }: Props = $props()
+
+    const strings = language.risuNest.dataHealth
+    const model = createDataHealthModel({
+        getResult: getNativeDataHealthResult,
+        scan: scanNativeDataHealth,
+        deepScan: deepScanNativeDataHealth,
+        cancel: cancelNativeDataHealthScan,
+    })
+    let view = $state(model.snapshot())
+    let includeNames = $state(false)
+
+    const severityLabels: Record<DataHealthSeverity, string> = {
+        blocking: strings.severityBlocking,
+        degraded: strings.severityDegraded,
+        informational: strings.severityInformational,
+    }
+    const codeLabels: Record<string, string> = {
+        'reference-missing': strings.codeReferenceMissing,
+        'reference-invalid': strings.codeReferenceInvalid,
+        'alias-object-absent': strings.codeAliasObjectAbsent,
+        'alias-object-mismatch': strings.codeAliasObjectMismatch,
+        'record-invalid': strings.codeRecordInvalid,
+        'record-orphan': strings.codeRecordOrphan,
+        'cold-undecodable': strings.codeColdUndecodable,
+        'authority-incomplete': strings.codeAuthorityIncomplete,
+        'object-unreferenced': strings.codeObjectUnreferenced,
+        unclassified: strings.codeUnclassified,
+    }
+    const severityColors: Record<DataHealthSeverity, string> = {
+        blocking: 'bg-danger-400',
+        degraded: 'bg-primary-300',
+        informational: 'bg-borderc',
+    }
+
+    const count = (value: number): string => value.toLocaleString()
+    const codeLabel = (code: string): string => codeLabels[code] ?? code
+    const itemLocation = (item: DataHealthFinding): string =>
+        [item.owner.id || item.owner.kind, item.locator?.sourcePath]
+            .filter(Boolean)
+            .join(' · ')
+    const itemTarget = (item: DataHealthFinding): string =>
+        item.target ? `${item.target.kind}: ${item.target.key}` : ''
+
+    let deepProgress = $derived.by(() => {
+        const deep = view.result?.deep
+        if (!deep) return ''
+        const percent = `${Math.round((view.deepFraction ?? 0) * 100)}%`
+        const objects = strings.deepProgress
+            .replace('{0}', count(deep.completedObjects))
+            .replace('{1}', count(deep.totalObjects))
+            .replace('{2}', percent)
+        const bytes = strings.deepBytes
+            .replace('{0}', formatRisuNestStorageBytes(deep.completedBytes))
+            .replace('{1}', formatRisuNestStorageBytes(deep.totalBytes))
+        return `${objects} · ${bytes}`
+    })
+    let summaryLines = $derived.by(() => {
+        const result = view.result
+        if (!result) return [strings.never]
+        const lines = [
+            strings.lastScan.replace(
+                '{0}',
+                new Date(result.scannedAt).toLocaleString(),
+            ),
+            strings.dataVersion.replace('{0}', count(result.revision)),
+            result.depth === 'quick'
+                ? strings.quickOnly
+                : result.deep?.complete
+                  ? strings.deepDone
+                  : strings.deepStopped,
+        ]
+        return lines
+    })
+
+    function reportText(): string {
+        const result = view.result
+        return result ? formatDataHealthReport(result, { includeNames }) : ''
+    }
+
+    async function copyReport(): Promise<void> {
+        try {
+            await navigator.clipboard.writeText(reportText())
+            alertNormal(strings.copied)
+        } catch {
+            alertError(strings.scanFailed)
+        }
+    }
+
+    function saveReport(): void {
+        const result = view.result
+        if (!result) return
+        void downloadFile(dataHealthReportFileName(result), reportText())
+        alertNormal(strings.saved)
+    }
+
+    async function run(action: () => Promise<void>): Promise<void> {
+        try {
+            await action()
+        } catch {
+            alertError(strings.scanFailed)
+        }
+    }
+
+    const unsubscribe = model.subscribe((next) => {
+        view = next
+    })
+    onMount(() => {
+        void model.load()
+    })
+    onDestroy(unsubscribe)
+</script>
+
+<SettingGroup
+    id="risunest-data-health"
+    title={strings.title}
+    description={strings.description}
+    panelProps={{ 'data-data-health': '' }}
+>
+    <div data-data-health-summary class="px-4 py-3">
+        <div role="status" aria-live="polite">
+            <p class="text-sm text-textcolor2">{summaryLines.join(' · ')}</p>
+            {#if view.result}
+                {#if view.result.items.length === 0}
+                    <p class="mt-1 text-[15px]">{strings.healthy}</p>
+                {:else}
+                    <ul class="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-sm">
+                        {#each ['blocking', 'degraded', 'informational'] as const as severity (severity)}
+                            <li class="flex items-center gap-2">
+                                <span class="h-2.5 w-2.5 shrink-0 rounded-xs {severityColors[severity]}" aria-hidden="true"></span>
+                                <span class="text-textcolor2">{severityLabels[severity]}</span>
+                                <span class="tabular-nums">{count(view.result.counts[severity])}</span>
+                            </li>
+                        {/each}
+                    </ul>
+                {/if}
+                {#if view.result.omitted > 0}
+                    <p class="mt-1 text-sm text-textcolor2">{strings.omitted.replace('{0}', count(view.result.omitted))}</p>
+                {/if}
+                {#if deepProgress}
+                    <p class="mt-1 text-sm text-textcolor2 tabular-nums">{deepProgress}</p>
+                {/if}
+            {/if}
+            {#if view.failed}
+                <p class="mt-1 text-sm text-textcolor2" role="alert">{strings.scanFailed}</p>
+            {/if}
+        </div>
+    </div>
+
+    <SettingRow data-data-health-actions label={strings.quickScan} help={strings.quickScanHelp}>
+        <Button
+            styled="outlined"
+            disabled={Boolean(view.running) || view.loading}
+            onclick={() => run(() => model.quickScan())}
+        >{view.running === 'quick' ? language.loading : strings.quickScan}</Button>
+    </SettingRow>
+    <SettingRow data-data-health-deep label={strings.deepScan} help={strings.deepScanHelp}>
+        {#if view.running === 'deep'}
+            <Button styled="outlined" onclick={() => run(() => model.cancel())}>{strings.cancel}</Button>
+        {:else}
+            {#if view.resumable}
+                <Button styled="outlined" disabled={Boolean(view.running) || view.loading} onclick={() => run(() => model.deepScan(true))}>{strings.resume}</Button>
+            {/if}
+            <Button
+                disabled={Boolean(view.running) || view.loading}
+                onclick={() => run(() => model.deepScan(false))}
+            >{view.resumable ? strings.restart : strings.deepScan}</Button>
+        {/if}
+    </SettingRow>
+
+    {#if view.groups.length > 0}
+        {#each view.groups as group (group.severity + group.code)}
+            <details data-data-health-group class="group">
+                <summary class="flex cursor-pointer list-none items-center gap-2 px-4 py-2.5 text-[15px] select-none [&::-webkit-details-marker]:hidden">
+                    <ChevronRight size={16} class="shrink-0 text-textcolor2 transition-transform duration-200 group-open:rotate-90" aria-hidden="true" />
+                    <span class="h-2.5 w-2.5 shrink-0 rounded-xs {severityColors[group.severity]}" aria-hidden="true"></span>
+                    <span class="min-w-0 break-words">{codeLabel(group.code)}</span>
+                    <span class="ml-auto shrink-0 text-sm text-textcolor2 tabular-nums">{count(group.total)}</span>
+                </summary>
+                <p class="border-t border-darkborderc/55 px-4 py-2 pl-10 text-sm text-textcolor2">{severityLabels[group.severity]} · {strings.manual}</p>
+                {#each group.shown as item, index (index)}
+                    <div data-data-health-item class="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 border-t border-darkborderc/55 py-1.5 pr-4 pl-10 text-sm">
+                        <span class="min-w-0 flex-1 break-all">{itemLocation(item)}</span>
+                        {#if itemTarget(item)}
+                            <span class="min-w-0 break-all text-textcolor2">{itemTarget(item)}</span>
+                        {/if}
+                    </div>
+                {/each}
+                {#if group.hidden > 0}
+                    <p class="border-t border-darkborderc/55 py-2 pr-4 pl-10 text-sm text-textcolor2">{strings.groupMore.replace('{0}', count(group.hidden))}</p>
+                {/if}
+                {#if group.code === 'object-unreferenced' && onOpenUnusedImages}
+                    <div class="border-t border-darkborderc/55 py-2 pr-4 pl-10">
+                        <Button size="sm" styled="outlined" onclick={onOpenUnusedImages}>{strings.gcLink}</Button>
+                    </div>
+                {/if}
+            </details>
+        {/each}
+
+        <SettingRow data-data-health-report label={strings.copyReport} help={includeNames ? strings.includeNamesWarning : ''}>
+            {#snippet below()}
+                <div class="mt-1.5 text-sm">
+                    <Check bind:check={includeNames} name={strings.includeNames} margin={false} />
+                </div>
+            {/snippet}
+            <Button size="sm" styled="outlined" onclick={copyReport}>{strings.copyReport}</Button>
+            <Button size="sm" styled="outlined" onclick={saveReport}>{strings.saveReport}</Button>
+        </SettingRow>
+    {/if}
+</SettingGroup>

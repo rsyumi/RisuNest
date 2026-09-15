@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { relaunch } from '@tauri-apps/plugin-process'
 import { isTauriIOS, isTauriMobile } from '../platform'
+import type { DataHealthResult } from './dataHealth'
 
 const PERIODIC_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000
 const PERIODIC_SNAPSHOT_CHECK_INTERVAL_MS = 60 * 60 * 1000
@@ -101,6 +102,22 @@ export function previewNativePersistentAssetGc(): Promise<NativeAssetGcResult> {
 
 export function executeNativePersistentAssetGc(): Promise<NativeAssetGcResult> {
     return invoke('pds_asset_gc_execute')
+}
+
+export function scanNativeDataHealth(): Promise<DataHealthResult> {
+    return invoke('pds_data_health_scan')
+}
+
+export function deepScanNativeDataHealth(resume: boolean): Promise<DataHealthResult> {
+    return invoke('pds_data_health_deep_scan', { resume })
+}
+
+export function getNativeDataHealthResult(): Promise<DataHealthResult | null> {
+    return invoke('pds_data_health_result')
+}
+
+export async function cancelNativeDataHealthScan(): Promise<void> {
+    await invoke('pds_data_health_cancel')
 }
 
 export async function requestNativePersistentSnapshotRestore(id: string): Promise<void> {

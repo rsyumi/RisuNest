@@ -44,6 +44,10 @@
         serverSyncScreenRequest,
     } from './ts/storage/sync/serverSyncDeepLink'
     import { SettingsMenuIndex } from './ts/stores.svelte'
+    import {
+        dataHealthNavigation,
+        DATA_HEALTH_SECTION_ID,
+    } from './ts/storage/dataHealthNavigation'
 
     $effect(() => {
         if (!isTauri || !$loadedStore) return
@@ -53,6 +57,19 @@
                 SettingsMenuIndex.set(17)
                 settingsOpen.set(true)
             }
+        })
+    })
+
+    $effect(() => {
+        if (!isTauri) return
+        return dataHealthNavigation.subscribe(() => {
+            SettingsMenuIndex.set(17)
+            settingsOpen.set(true)
+            requestAnimationFrame(() => {
+                document
+                    .getElementById(DATA_HEALTH_SECTION_ID)
+                    ?.scrollIntoView({ block: 'start' })
+            })
         })
     })
 

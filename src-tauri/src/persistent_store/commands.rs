@@ -1,3 +1,5 @@
+pub(crate) mod data_health;
+
 use super::export::ExportedRisuSave;
 #[cfg(feature = "native-kei-upload-pilot")]
 use super::kei::KeiUploadResult;

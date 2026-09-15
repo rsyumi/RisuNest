@@ -1,5 +1,5 @@
 use super::*;
-use crate::data_health::{codes, Findings, Severity};
+use crate::data_health::{codes, Findings, ScanDepth, Severity};
 use crate::local_backup::NeverCancelled;
 
 /// The shared fixture leaves both storage authorities at their legacy state, which is itself a
@@ -55,7 +55,9 @@ fn scan(store: &mut PersistentStore) -> Findings {
         .expect("acquire revision lease")
         .lease;
     let findings = store
-        .scan_data_health(&lease, 256, &NeverCancelled)
+        .data_health_reader(&lease)
+        .expect("open the diagnosis reader")
+        .scan(ScanDepth::Deep, 256, &NeverCancelled)
         .expect("scan the live library");
     store.release_revision(&lease).expect("release lease");
     findings

@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     asset_repository::PayloadCas,
-    data_health::{codes, Finding, FindingSink, FirstFinding, Report},
+    data_health::{codes, Finding, FindingSink, FirstFinding, Report, ScanDepth},
     lossless_f0::{scan_portable_fragment, F0Reference, F0ReferenceStatus, PortableFragment},
     persistent_store::{
         portable_validation, AssetRepositoryAuthorityState, ColdPayloadAuthorityState,
@@ -40,6 +40,8 @@ fn collect(
     match view.validate(&mut report, probe) {
         Ok(counts) => Ok(counts),
         Err(error) => {
+            // A stop the caller asked for is the stop, not something wrong with the library.
+            check(probe)?;
             report.record(unclassified(error)?);
             Ok(ReferenceCounts::default())
         }
@@ -79,6 +81,7 @@ impl VerifiedArchive {
             LibraryView {
                 db: &self.db,
                 objects: self,
+                depth: ScanDepth::Deep,
             },
             probe,
         )
@@ -88,6 +91,7 @@ impl VerifiedArchive {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn scan_library(
         &self,
+        depth: ScanDepth,
         sink: &mut dyn FindingSink,
         probe: &dyn CancellationProbe,
     ) -> Result<ReferenceCounts> {
@@ -98,6 +102,7 @@ impl VerifiedArchive {
             LibraryView {
                 db: &self.db,
                 objects: self,
+                depth,
             },
             sink,
             probe,
@@ -113,6 +118,7 @@ impl Catalog {
             LibraryView {
                 db: &self.db,
                 objects: self,
+                depth: ScanDepth::Deep,
             },
             probe,
         )
@@ -125,10 +131,125 @@ impl Catalog {
 pub(crate) fn scan_live_library(
     db: &rusqlite::Connection,
     cas: &PayloadCas,
+    depth: ScanDepth,
     sink: &mut dyn FindingSink,
     probe: &dyn CancellationProbe,
 ) -> Result<ReferenceCounts> {
-    collect(LibraryView { db, objects: cas }, sink, probe)
+    collect(
+        LibraryView {
+            db,
+            objects: cas,
+            depth,
+        },
+        sink,
+        probe,
+    )
+}
+
+/// What the deep object pass still has to read, so the screen can show a proportion before the
+/// pass starts and the caller can size its pages.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ObjectTotals {
+    pub(crate) objects: u64,
+    pub(crate) bytes: u64,
+}
+
+/// One bounded step of the deep object pass. `cursor` is the last hash this page finished, and
+/// `done` says the enumeration reached the end rather than the page budget.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ObjectPage {
+    pub(crate) cursor: Option<String>,
+    pub(crate) objects: u64,
+    pub(crate) bytes: u64,
+    pub(crate) done: bool,
+}
+
+/// Totals over the objects the leased generation registers. An object several aliases share is
+/// read once, so the proportion matches the work the pass actually does.
+pub(crate) fn registered_object_totals(db: &rusqlite::Connection) -> Result<ObjectTotals> {
+    let (objects, bytes): (i64, i64) = db.query_row(
+        REGISTERED_OBJECT_TOTALS,
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(ObjectTotals {
+        objects: sql_u64(objects)?,
+        bytes: sql_u64(bytes)?,
+    })
+}
+
+const REGISTERED_OBJECTS: &str = "SELECT object_hash,MAX(size),MAX(kind) FROM (
+            SELECT object_hash,size,kind FROM asset_aliases WHERE object_hash IS NOT NULL
+            UNION ALL SELECT object_hash,size,'cold' FROM cold_aliases WHERE object_hash IS NOT NULL
+        ) WHERE object_hash>?1 GROUP BY object_hash ORDER BY object_hash";
+
+const REGISTERED_OBJECT_TOTALS: &str = "SELECT COUNT(*),COALESCE(SUM(size),0) FROM (
+            SELECT object_hash,MAX(size) AS size FROM (
+                SELECT object_hash,size FROM asset_aliases WHERE object_hash IS NOT NULL
+                UNION ALL SELECT object_hash,size FROM cold_aliases WHERE object_hash IS NOT NULL
+            ) GROUP BY object_hash
+        )";
+
+/// Rereads the stored bytes of every registered object and compares the digest with the hash the
+/// alias registered. `budget` bounds one page by the bytes it reads, so a large library makes
+/// progress the screen can show and the caller can stop between pages.
+pub(crate) fn scan_registered_objects(
+    db: &rusqlite::Connection,
+    cas: &PayloadCas,
+    after: Option<&str>,
+    budget: u64,
+    sink: &mut dyn FindingSink,
+    probe: &dyn CancellationProbe,
+) -> Result<ObjectPage> {
+    let mut report = Report::new(sink);
+    let mut page = ObjectPage::default();
+    let mut statement = db.prepare(REGISTERED_OBJECTS)?;
+    let mut rows = statement.query([after.unwrap_or("")])?;
+    while let Some(row) = rows.next()? {
+        check(probe)?;
+        let hash: String = row.get(0)?;
+        let size = sql_u64(row.get(1)?)?;
+        let kind: String = row.get(2)?;
+        match reread_object(cas, &hash, size) {
+            Ok(read) => page.bytes += read,
+            Err(detail) => {
+                page.bytes += size;
+                if !report.record(Finding::new(
+                    codes::ALIAS_OBJECT_MISMATCH,
+                    kind,
+                    hash.clone(),
+                    detail,
+                )) {
+                    return Ok(page);
+                }
+            }
+        }
+        page.objects += 1;
+        page.cursor = Some(hash);
+        if page.bytes >= budget {
+            return Ok(page);
+        }
+    }
+    page.done = true;
+    Ok(page)
+}
+
+/// Returns the bytes read, or the reason the stored object no longer matches its registration.
+/// An absent object is the quick scan's own finding, so this pass stays quiet about it.
+fn reread_object(cas: &PayloadCas, hash: &str, size: u64) -> std::result::Result<u64, String> {
+    use sha2::Digest;
+    let Some(mut file) = cas.open_object(hash).map_err(|error| error.to_string())? else {
+        return Ok(0);
+    };
+    let mut digest = sha2::Sha256::new();
+    let read = std::io::copy(&mut file, &mut digest).map_err(|error| error.to_string())?;
+    if read != size {
+        return Err("stored payload length differs from the registered size".to_owned());
+    }
+    if hex::encode(digest.finalize()) != hash {
+        return Err("stored payload digest differs from the registered hash".to_owned());
+    }
+    Ok(read)
 }
 
 trait LibraryObjects {
@@ -294,6 +415,9 @@ fn alias_finding(stored: bool, kind: &str, key: &str) -> Finding {
 struct LibraryView<'a> {
     db: &'a rusqlite::Connection,
     objects: &'a dyn LibraryObjects,
+    /// A quick scan stays proportional to the database, so it leaves the stored cold payloads
+    /// closed. Every gate keeps the deep depth the activation contract has always required.
+    depth: ScanDepth,
 }
 impl LibraryView<'_> {
     fn open_object(&self, hash: &str) -> Result<(std::io::Take<std::fs::File>, u64)> {
@@ -463,6 +587,11 @@ impl LibraryView<'_> {
                 report,
                 probe,
             )?;
+        }
+        // Decoding a cold payload reads its stored bytes, so only the deep depth walks them. The
+        // references a cold payload holds are scanned there too.
+        if self.depth == ScanDepth::Quick {
+            return Ok(counts);
         }
         let mut statement = self
             .db

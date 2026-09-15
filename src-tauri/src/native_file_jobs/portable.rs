@@ -1091,7 +1091,13 @@ mod tests {
             if archive.manifest.library_included {
                 // The gate refuses this archive, so only the collecting scan can say what is wrong.
                 let mut findings = crate::data_health::Findings::new(64);
-                archive.scan_library(&mut findings, &NeverCancelled).unwrap();
+                archive
+                    .scan_library(
+                        crate::data_health::ScanDepth::Deep,
+                        &mut findings,
+                        &NeverCancelled,
+                    )
+                    .unwrap();
                 assert!(findings
                     .items
                     .iter()

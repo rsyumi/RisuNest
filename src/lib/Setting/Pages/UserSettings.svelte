@@ -12,6 +12,7 @@
     import { alertConfirm, alertError, alertNormal } from "src/ts/alert";
     import { forageStorage } from "src/ts/globalApi.svelte";
     import { isTauri, isNodeServer } from "src/ts/platform";
+    import { openDataHealthScreen } from "src/ts/storage/dataHealthNavigation";
     import {
         unMigrationAccount,
         accountUnmigrationBusy,
@@ -119,7 +120,9 @@
             error instanceof NativeFileJobError &&
             error.code === "source-preserved-repair-required"
         ) {
-            alertError(language.risuNest.backup.sourceRepairRequired);
+            void offerDataHealth(
+                language.risuNest.backup.sourceRepairRequired,
+            );
             return;
         }
         alertError(
@@ -128,6 +131,20 @@
                 : language.risuNest.backup.actionFailed,
         );
     }
+    // A failure the data check can explain offers it, instead of ending at the message.
+    async function offerDataHealth(message: string): Promise<void> {
+        if (!isTauri) {
+            alertError(message);
+            return;
+        }
+        if (
+            await alertConfirm(
+                `${message} ${language.risuNest.dataHealth.openResult}`,
+            )
+        )
+            openDataHealthScreen();
+    }
+
     async function runLocalBackupOperation(
         kind: "import" | "export",
     ): Promise<void> {

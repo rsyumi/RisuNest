@@ -12,8 +12,9 @@ pub(crate) use capture::{capture_library, CapturedLibrary};
 pub(crate) use catalog::Catalog;
 pub(crate) use internal::create_verified_library_backup;
 pub(crate) use reader::VerifiedArchive;
-#[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use validation::scan_live_library;
+pub(crate) use validation::{
+    registered_object_totals, scan_live_library, scan_registered_objects, ObjectPage, ObjectTotals,
+};
 pub(crate) use restore_inventory::{PreservationReport, RestoreInventory};
 
 use crate::local_backup::CancellationProbe;

@@ -610,6 +610,7 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         .manage(asset_repository::commands::DurableCasJobState::default())
         .manage(native_media::ipc::NativeMediaIpcState::default())
         .manage(persistent_store::PersistentStoreState::default())
+        .manage(persistent_store::commands::data_health::DataHealthState::default())
         .manage(server_sync::commands::ServerSyncCommandState::default())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_deep_link::init())
@@ -663,6 +664,10 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         persistent_store::commands::pds_snapshot_delete,
         persistent_store::commands::pds_asset_gc_preview,
         persistent_store::commands::pds_asset_gc_execute,
+        persistent_store::commands::data_health::pds_data_health_scan,
+        persistent_store::commands::data_health::pds_data_health_deep_scan,
+        persistent_store::commands::data_health::pds_data_health_result,
+        persistent_store::commands::data_health::pds_data_health_cancel,
         native_log::native_log_tail,
         native_log::native_log_error,
         native_log::native_log_file_path,
