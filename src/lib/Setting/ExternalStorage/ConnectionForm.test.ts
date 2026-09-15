@@ -185,7 +185,7 @@ describe('Android Google authorization lifecycle', () => {
         state.cancelAuthorization.mockImplementationOnce(() => new Promise<void>(resolve => {
             finishCancel = resolve
         }))
-        button(strings.cancel).click()
+        button(strings.back).click()
         await tick()
 
         expect(state.cancelAuthorization).toHaveBeenCalledWith('authorization-1')

@@ -1,8 +1,8 @@
 <script lang="ts">
     import { onDestroy, onMount } from 'svelte'
     import QRCode from 'qrcode'
-    import Button from 'src/lib/UI/GUI/Button.svelte'
     import SettingGroup from '../RisuNest/SettingGroup.svelte'
+    import SettingButton from '../RisuNest/SettingButton.svelte'
     import { alertConfirm } from 'src/ts/alert'
     import { DBState } from 'src/ts/stores.svelte'
     import { getExternalStorageBridge } from 'src/ts/storage/sync/external/bridge'
@@ -23,7 +23,7 @@
         ExternalStorageState,
     } from 'src/ts/storage/sync/external/types'
     import ConnectionForm from './ConnectionForm.svelte'
-    import { externalStorageStrings } from './strings'
+    import { externalConnectionTitle, externalStorageStrings } from './strings'
 
     const bridge = getExternalStorageBridge()
     const strings = $derived(externalStorageStrings(DBState.db.language))
@@ -177,7 +177,7 @@
     }
 
     async function removeConnection(connection: ExternalConnectionSummary): Promise<void> {
-        if (!(await alertConfirm(`${strings.remove}: ${connection.displayName}`))) return
+        if (!(await alertConfirm(`${strings.remove}: ${externalConnectionTitle(strings, connection)}`))) return
         busy = true
         try {
             await bridge.removeConnection(connection.id)
@@ -289,6 +289,52 @@
         return strings.statusError
     }
 
+    function activeJob(connection: ExternalConnectionSummary): ExternalJobSummary | undefined {
+        return storageState?.jobs.find(job => job.connectionId === connection.id)
+    }
+
+    function connectionTone(connection: ExternalConnectionSummary): 'connected' | 'working' | 'paused' | 'attention' {
+        const job = activeJob(connection)
+        if (job && externalJobIsActive(job)) return 'working'
+        if (connection.status === 'ready') return 'connected'
+        if (connection.status === 'paused') return 'paused'
+        return 'attention'
+    }
+
+    function connectionStatus(connection: ExternalConnectionSummary): string {
+        const job = activeJob(connection)
+        if (job && externalJobIsActive(job)) return strings.jobActive[job.kind]
+        return connectionStatusLabel(connection.status)
+    }
+
+    function jobSummary(job: ExternalJobSummary): string {
+        const progress = externalJobProgress(job)
+        const size = `${bytes(job.completedBytes)}${job.totalBytes ? ` / ${bytes(job.totalBytes)}` : ''}`
+        const state = externalJobIsActive(job) ? strings.jobActive[job.kind] : `${strings.jobKinds[job.kind]} · ${jobLabel(job)}`
+        return progress === null ? `${state} · ${size}` : `${state} · ${size} (${Math.round(progress * 100)}%)`
+    }
+
+    function isSyncTarget(connection: ExternalConnectionSummary): boolean {
+        return storageState?.selection.kind === 'external' && storageState.selection.connectionId === connection.id
+    }
+
+    function when(value?: string): string {
+        return value ? new Date(Number(value)).toLocaleString() : '—'
+    }
+
+    function historyLine(item: ExternalHistoryItem): string {
+        return [
+            when(item.createdAtMs),
+            strings.historyKinds[item.kind],
+            item.deviceName,
+            item.storedBytes ? bytes(item.storedBytes) : undefined,
+        ].filter(Boolean).join(' · ')
+    }
+
+    function atLeast(value: string): string {
+        return strings.atLeast.replace('{0}', bytes(value))
+    }
+
     onMount(async () => {
         await refresh()
         schedulePoll()
@@ -296,98 +342,348 @@
     onDestroy(() => clearTimeout(pollTimer))
 </script>
 
+
 <svelte:window onkeydown={event => { if (event.key === 'Escape' && recovery) closeRecovery() }} />
 
-<SettingGroup id="risunest-external-storage" title={strings.title} divide={false}>
-    <div class="p-4">
-        <div class="flex flex-wrap items-start justify-between gap-3">
-            <p class="max-w-2xl text-sm text-textcolor2">{strings.help}</p>
-            <div class="flex gap-2">
-                {#if storageState?.supported && !adding}<Button size="sm" disabled={busy} onclick={() => adding = true}>{strings.add}</Button>{/if}
-                <Button size="sm" styled="outlined" disabled={busy} onclick={() => refresh()}>{strings.refresh}</Button>
-            </div>
-        </div>
+<SettingGroup id="risunest-external-storage" title={strings.title} description={strings.help}>
+    {#snippet actions()}
+        {#if storageState?.supported && !adding}<SettingButton disabled={busy} onclick={() => adding = true}>{strings.add}</SettingButton>{/if}
+        <SettingButton variant="secondary" disabled={busy} onclick={() => refresh()}>{strings.refresh}</SettingButton>
+    {/snippet}
 
-        {#if !storageState && busy}<p class="mt-3 text-sm text-textcolor2">{strings.loading}</p>
-        {:else if storageState && !storageState.supported}<p class="mt-3 rounded-md border border-darkborderc bg-bgcolor p-3 text-sm">{strings.unsupported}</p>
-        {:else if adding}<div class="mt-4 rounded-lg border border-darkborderc bg-darkbg"><ConnectionForm {strings} onconnected={onConnected} oncancel={() => adding = false} onbusychange={value => busy = value} /></div>
-        {:else if storageState}
-            {#if !storageState.connections.length}<p class="mt-3 text-sm text-textcolor2">{strings.noConnections}</p>{/if}
-            <div class="mt-4 space-y-3">
-                {#each storageState.connections as connection (connection.id)}
-                    <article class="rounded-lg border border-darkborderc bg-darkbg p-4">
-                        <div class="flex flex-wrap items-start justify-between gap-2">
-                            <div><h3 class="font-semibold">{connection.displayName}</h3><p class="text-xs text-textcolor2">{connection.endpoint.authority} · {connection.strategy} · {connectionStatusLabel(connection.status)}</p></div>
-                            {#if storageState.selection.kind === 'external' && storageState.selection.connectionId === connection.id}<span class="rounded-full bg-selected px-2 py-1 text-xs">{strings.activeSync}</span>{/if}
-                        </div>
-                        {#if connection.strategy === 'sequential'}<p class="mt-2 text-xs text-textcolor2">{strings.sequentialWarning}</p>{/if}
-                        {#if connection.lastError}<p class="mt-2 text-sm text-draculared">{errorLabel(connection.lastError)}</p>{/if}
+    {#if !storageState && busy}<p class="p-4 text-sm text-textcolor2">{strings.loading}</p>
+    {:else if storageState && !storageState.supported}<p class="p-4 text-sm text-textcolor2">{strings.unsupported}</p>
+    {:else if adding}
+        <ConnectionForm {strings} onconnected={onConnected} oncancel={() => adding = false} onbusychange={value => busy = value} />
+    {:else if storageState}
+        {#if !storageState.connections.length}<p class="p-4 text-sm text-textcolor2">{strings.noConnections}</p>{/if}
+        {#each storageState.connections as connection (connection.id)}
+            {@const job = activeJob(connection)}
+            {@const syncTarget = isSyncTarget(connection)}
+            <article class="card">
+                <div class="card-head">
+                    <div class="min-w-0">
+                        <h3 class="card-title">{externalConnectionTitle(strings, connection)}</h3>
+                        <p class="card-sub">{[connection.endpoint.authority, connection.endpoint.repositoryHint, strings.strategyLabels[connection.strategy]].join(' · ')}</p>
+                    </div>
+                    <div class="pills">
+                        {#if syncTarget}<span class="status border border-darkborderc">{strings.activeSync}</span>{/if}
+                        <span class="status border border-darkborderc" data-tone={connectionTone(connection)} aria-live="polite"><span class="status-dot" aria-hidden="true"></span>{connectionStatus(connection)}</span>
+                    </div>
+                </div>
 
-                        {#each storageState.jobs.filter(job => job.connectionId === connection.id).slice(0, 1) as job (job.id)}
-                            <div class="mt-3 rounded-md bg-bgcolor p-2 text-sm" role="status" aria-live="polite">
-                                <div class="flex justify-between gap-2"><span>{job.kind}: {jobLabel(job)}</span><span>{bytes(job.completedBytes)}{job.totalBytes ? ` / ${bytes(job.totalBytes)}` : ''}</span></div>
-                                {#if externalJobProgress(job) !== null}<div class="mt-1 h-1.5 overflow-hidden rounded bg-darkborderc"><div class="h-full bg-selected" style={`width:${(externalJobProgress(job) ?? 0) * 100}%`}></div></div>{/if}
-                                {#if job.state === 'waiting' && job.error?.action === 'retry' && (job.kind === 'backup' || job.kind === 'sync')}<Button className="mt-2 mr-2" size="sm" onclick={() => runJob(connection, job.kind)}>{strings.retry}</Button>{/if}
-                                {#if externalJobIsActive(job)}<Button className="mt-2" size="sm" styled="outlined" onclick={async () => { await bridge.cancelJob(job.id); await refresh(true) }}>{strings.cancel}</Button>{/if}
+                {#if connection.lastError}<p class="text-sm text-danger-400">{errorLabel(connection.lastError)}</p>{/if}
+                {#if job && !externalJobIsActive(job) && job.state !== 'succeeded' && !connection.lastError}<p class="text-sm text-danger-400" role="status">{jobLabel(job)}</p>{/if}
+
+                <dl class="kv">
+                    {#if connection.purpose === 'sync'}<dt>{strings.lastSync}</dt><dd>{when(connection.lastSyncAtMs)}</dd>{/if}
+                    <dt>{strings.lastBackup}</dt><dd>{when(connection.lastBackupAtMs)}</dd>
+                    {#if job && (externalJobIsActive(job) || job.state === 'succeeded')}<dt>{strings.progress}</dt><dd role="status" aria-live="polite">{jobSummary(job)}</dd>{/if}
+                </dl>
+                {#if job && externalJobIsActive(job)}
+                    {@const progress = externalJobProgress(job)}
+                    <div class="thin" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={progress === null ? undefined : Math.round(progress * 100)}>
+                        <i class={progress === null ? 'pulse' : ''} style={`width:${progress === null ? 100 : progress * 100}%`}></i>
+                    </div>
+                {/if}
+
+                <div class="actions">
+                    {#if job && job.state === 'waiting' && job.error?.action === 'retry' && (job.kind === 'backup' || job.kind === 'sync')}
+                        <SettingButton disabled={busy} onclick={() => runJob(connection, job.kind)}>{strings.retryAction}</SettingButton>
+                    {/if}
+                    <SettingButton disabled={busy || (job && externalJobIsActive(job))} onclick={() => runJob(connection, 'backup')}>{strings.runBackup}</SettingButton>
+                    {#if connection.purpose === 'sync'}<SettingButton disabled={busy || (job && externalJobIsActive(job))} onclick={() => runJob(connection, 'sync')}>{strings.runSync}</SettingButton>{/if}
+                    {#if connection.purpose === 'sync' && !syncTarget}<SettingButton variant="secondary" disabled={busy} onclick={() => selectSyncTarget(connection)}>{strings.makeSyncTarget}</SettingButton>{/if}
+                    {#if job && externalJobIsActive(job)}<SettingButton variant="secondary" onclick={async () => { await bridge.cancelJob(job.id); await refresh(true) }}>{strings.cancel}</SettingButton>{/if}
+                </div>
+
+                <div class="tabs" role="tablist">
+                    {#each (['history', 'conflicts', 'quota'] as const) as tab (tab)}
+                        <button type="button" role="tab" aria-selected={expanded[connection.id] === tab} class="tab" onclick={() => openDetails(connection, tab)}>{tab === 'history' ? strings.history : tab === 'conflicts' ? strings.conflicts : strings.quota}</button>
+                    {/each}
+                </div>
+
+                {#if expanded[connection.id] === 'history'}
+                    <div class="list" role="tabpanel">
+                        {#each history[connection.id] ?? [] as item (item.id)}
+                            <div class="item">
+                                <div class="line">
+                                    <span>{historyLine(item)}</span>
+                                    <span class="item-actions">
+                                        <SettingButton variant="secondary" disabled={!item.complete || !item.verified} onclick={() => runJob(connection, 'restore', { snapshotId: item.id })}>{strings.restore}</SettingButton>
+                                        <SettingButton variant="secondary" disabled={!item.complete || !item.verified} onclick={() => exportSnapshot(connection.id, item.id)}>{strings.download}</SettingButton>
+                                        {#if item.pinned}<SettingButton variant="secondary" disabled>{strings.pinned}</SettingButton>
+                                        {:else}<SettingButton variant="secondary" onclick={() => runJob(connection, 'pin-history', { snapshotId: item.id })}>{strings.pin}</SettingButton>{/if}
+                                    </span>
+                                </div>
+                                {#if item.warning}<p class="text-xs text-danger-400">{item.warning}</p>{/if}
                             </div>
                         {/each}
-
-                        <div class="mt-3 flex flex-wrap gap-2">
-                            <Button size="sm" disabled={busy} onclick={() => runJob(connection, 'backup')}>{strings.runBackup}</Button>
-                            {#if connection.purpose === 'sync'}<Button size="sm" disabled={busy} onclick={() => runJob(connection, 'sync')}>{strings.runSync}</Button>{/if}
-                            {#if connection.purpose === 'sync' && !(storageState.selection.kind === 'external' && storageState.selection.connectionId === connection.id)}<Button size="sm" styled="outlined" disabled={busy} onclick={() => selectSyncTarget(connection)}>{strings.makeSyncTarget}</Button>{/if}
-                            <Button size="sm" styled="outlined" onclick={() => openDetails(connection, 'history')}>{strings.history}</Button>
-                            <Button size="sm" styled="outlined" onclick={() => openDetails(connection, 'conflicts')}>{strings.conflicts}</Button>
-                            <Button size="sm" styled="outlined" onclick={() => openDetails(connection, 'quota')}>{strings.quota}</Button>
-                            <Button size="sm" styled="outlined" onclick={() => createRecovery(connection)}>{strings.recovery}</Button>
-                            <Button size="sm" styled="danger" disabled={busy} onclick={() => removeConnection(connection)}>{strings.remove}</Button>
-                        </div>
-
-                        {#if expanded[connection.id] === 'history'}
-                            <div class="mt-3 space-y-2 border-t border-darkborderc pt-3">
-                                {#each history[connection.id] ?? [] as item (item.id)}<div class="rounded bg-bgcolor p-2 text-sm"><div class="flex flex-wrap items-center justify-between gap-2"><span>{new Date(Number(item.createdAtMs)).toLocaleString()} · {item.kind} · r{item.logicalRevision}</span><span class="flex flex-wrap gap-1"><Button size="sm" styled="outlined" disabled={!item.complete || !item.verified} onclick={() => runJob(connection, 'restore', { snapshotId: item.id })}>{strings.restore}</Button><Button size="sm" styled="outlined" disabled={!item.complete || !item.verified} onclick={() => exportSnapshot(connection.id, item.id)}>{strings.download}</Button>{#if !item.pinned}<Button size="sm" styled="outlined" onclick={() => runJob(connection, 'pin-history', { snapshotId: item.id })}>{strings.pin}</Button>{/if}</span></div>{#if item.warning}<p class="mt-1 text-xs text-draculared">{item.warning}</p>{/if}</div>{/each}
-                                {#if historyCursor[connection.id]}<Button size="sm" styled="outlined" disabled={historyLoading[connection.id]} onclick={() => loadHistory(connection, true)}>{historyLoading[connection.id] ? strings.loading : strings.loadMore}</Button>{/if}
+                        {#if historyCursor[connection.id]}<div><SettingButton variant="secondary" busy={historyLoading[connection.id]} onclick={() => loadHistory(connection, true)}>{strings.loadMore}</SettingButton></div>{/if}
+                    </div>
+                {:else if expanded[connection.id] === 'conflicts'}
+                    <div class="list" role="tabpanel">
+                        {#each conflicts[connection.id] ?? [] as conflict (conflict.id)}
+                            {@const pending = conflict.preservation === 'local-only'}
+                            <div class="conflict" class:info={pending}>
+                                <strong>{pending ? strings.remotePendingTitle : strings.conflictTitle}</strong>
+                                <p>{pending ? strings.preservationPending : strings.preservationComplete}</p>
+                                <dl class="kv">
+                                    <dt>{strings.thisDevice}</dt><dd>{conflict.localLabel}</dd>
+                                    <dt>{strings.repositorySide}</dt><dd>{conflict.remoteRevision === null ? strings.remotePending : conflict.remoteLabel}</dd>
+                                </dl>
+                                <div class="actions">
+                                    {#if externalConflictActions(conflict).includes('retry-sync')}
+                                        <SettingButton disabled={busy} onclick={() => retryConflictPreservation(connection)}>{strings.retryPreservation}</SettingButton>
+                                    {:else if externalConflictActions(conflict).includes('keep-local')}
+                                        <SettingButton onclick={() => runJob(connection, 'resolve-conflict', { conflictId: conflict.id, choice: 'local' })}>{strings.local}</SettingButton>
+                                        <SettingButton onclick={() => runJob(connection, 'resolve-conflict', { conflictId: conflict.id, choice: 'remote' })}>{strings.remote}</SettingButton>
+                                    {/if}
+                                </div>
                             </div>
-                        {:else if expanded[connection.id] === 'conflicts'}
-                            <div class="mt-3 space-y-2 border-t border-darkborderc pt-3">
-                                {#each conflicts[connection.id] ?? [] as conflict (conflict.id)}
-                                    <div class="rounded bg-bgcolor p-2 text-sm">
-                                        <p>{conflict.localLabel} r{conflict.localRevision} ↔ {conflict.remoteRevision === null ? strings.remotePending : `${conflict.remoteLabel} r${conflict.remoteRevision}`}</p>
-                                        <p class="mt-1 text-xs text-textcolor2">{conflict.preservation === 'local-only' ? strings.preservationPending : strings.preservationComplete}</p>
-                                        <div class="mt-2 flex gap-2">
-                                            {#if externalConflictActions(conflict).includes('retry-sync')}
-                                                <Button size="sm" disabled={busy} onclick={() => retryConflictPreservation(connection)}>{strings.retryPreservation}</Button>
-                                            {:else if externalConflictActions(conflict).includes('keep-local')}
-                                                <Button size="sm" onclick={() => runJob(connection, 'resolve-conflict', { conflictId: conflict.id, choice: 'local' })}>{strings.local}</Button>
-                                                <Button size="sm" onclick={() => runJob(connection, 'resolve-conflict', { conflictId: conflict.id, choice: 'remote' })}>{strings.remote}</Button>
-                                            {/if}
-                                        </div>
-                                    </div>
-                                {/each}
-                            </div>
-                        {:else if expanded[connection.id] === 'quota' && quota[connection.id]}
-                            <div class="mt-3 border-t border-darkborderc pt-3 text-sm">
-                                <p>{strings.quota}: {quota[connection.id].storage.providerPhysicalKnown && quota[connection.id].storage.providerPhysicalBytes !== null ? bytes(quota[connection.id].storage.providerPhysicalBytes ?? undefined) : strings.unknownUsage}</p>
-                                <p class="text-textcolor2">{strings.uploadedLowerBound}: ≥ {bytes(quota[connection.id].storage.locallyUploadedBytesLowerBound)} · ≥ {quota[connection.id].storage.locallyUploadedObjectCountLowerBound} {strings.objects}</p>
-                                {#if quota[connection.id].storage.latestReachable}<p class="text-textcolor2">{strings.latestReachable}: ≥ {bytes(quota[connection.id].storage.latestReachable.knownDirectBytes)} · ≥ {quota[connection.id].storage.latestReachable.knownDirectObjectCount} {strings.objects}</p>{/if}
-                                {#each quota[connection.id].buckets as bucket}<p class="text-textcolor2">{bucket.id}: {bucket.used}{bucket.limit ? ` / ${bucket.limit}` : ''} {bucket.unit}</p>{/each}
-                            </div>
+                        {/each}
+                    </div>
+                {:else if expanded[connection.id] === 'quota' && quota[connection.id]}
+                    {@const usage = quota[connection.id]}
+                    <div role="tabpanel"><dl class="kv">
+                        <dt>{strings.usedByService}</dt>
+                        <dd>{#if usage.storage.providerPhysicalKnown && usage.storage.providerPhysicalBytes !== null}{bytes(usage.storage.providerPhysicalBytes ?? undefined)}{:else}{strings.unknownUsage} <span class="text-textcolor2">({strings.unknownUsageHelp})</span>{/if}</dd>
+                        <dt>{strings.uploadedLowerBound}</dt>
+                        <dd>{atLeast(usage.storage.locallyUploadedBytesLowerBound)} · {strings.files.replace('{0}', usage.storage.locallyUploadedObjectCountLowerBound)}</dd>
+                        {#if usage.storage.latestReachable}
+                            <dt>{strings.latestReachable}</dt>
+                            <dd>{atLeast(usage.storage.latestReachable.knownDirectBytes)}</dd>
                         {/if}
-                    </article>
-                {/each}
-            </div>
-        {/if}
-        {#if error}<p class="mt-3 text-sm text-draculared" role="alert">{error}</p>{/if}
-    </div>
+                        {#each usage.buckets as bucket (bucket.id)}<dt>{bucket.id}</dt><dd>{bucket.used}{bucket.limit ? ` / ${bucket.limit}` : ''} {bucket.unit}</dd>{/each}
+                    </dl></div>
+                {/if}
+
+                <div class="foot">
+                    <SettingButton variant="secondary" onclick={() => createRecovery(connection)}>{strings.recovery}</SettingButton>
+                    <SettingButton variant="danger" disabled={busy} onclick={() => removeConnection(connection)}>{strings.remove}</SettingButton>
+                </div>
+            </article>
+        {/each}
+    {/if}
+    {#if error}<p class="px-4 pb-4 text-sm text-danger-400" role="alert">{error}</p>{/if}
 </SettingGroup>
 
 {#if recovery}
     <div class="fixed inset-0 z-60 flex items-center justify-center bg-black/65 p-4" role="dialog" aria-modal="true" aria-label={strings.recovery}>
-        <div class="max-h-[90vh] max-w-md overflow-y-auto rounded-lg border border-darkborderc bg-bgcolor p-5 text-textcolor">
-            <h3 class="text-lg font-bold">{strings.recovery}</h3><p class="mt-2 text-sm text-textcolor2">{strings.recoveryNotice}</p>
-            {#if recoveryQr}<img class="mx-auto mt-4 rounded bg-white p-2" src={recoveryQr} alt={strings.showRecovery} />{:else}<p class="mt-3 rounded-md border border-darkborderc bg-darkbg p-3 text-sm">{strings.recoveryFileOnly}</p>{/if}
-            <label class="mt-4 block text-sm"><span>{strings.recoveryCode}</span><input readonly class="mt-1 w-full select-all rounded border border-darkborderc bg-darkbg p-2 font-mono" value={recovery.code} /></label>
-            <div class="mt-4 flex flex-wrap gap-2"><Button onclick={saveRecoveryFile}>{strings.saveRecovery}</Button><Button styled="outlined" onclick={closeRecovery}>{strings.closeRecovery}</Button></div>
+        <div class="dialog">
+            <h3 class="text-lg font-bold">{strings.recovery}</h3>
+            <p class="text-sm text-textcolor2">{strings.recoveryNotice}</p>
+            {#if recoveryQr}<img class="mx-auto rounded bg-white p-2" src={recoveryQr} alt={strings.showRecovery} />
+            {:else}<p class="rounded-md border border-darkborderc bg-darkbg p-3 text-sm">{strings.recoveryFileOnly}</p>{/if}
+            <label class="block text-sm">
+                <span class="font-medium">{strings.recoveryCode}</span>
+                <input readonly class="mt-1 w-full select-all rounded border border-darkborderc bg-darkbg p-2 font-mono" value={recovery.code} />
+                <span class="mt-1 block text-[13px] text-textcolor2">{strings.recoveryCodeHelp}</span>
+            </label>
+            <div class="actions"><SettingButton onclick={saveRecoveryFile}>{strings.saveRecovery}</SettingButton><SettingButton variant="secondary" onclick={closeRecovery}>{strings.closeRecovery}</SettingButton></div>
         </div>
     </div>
 {/if}
+
+<style>
+    .card {
+        display: grid;
+        gap: 0.75rem;
+        padding: 1rem;
+        min-width: 0;
+    }
+    .card-head {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 0.5rem 1rem;
+    }
+    .card-title {
+        margin: 0;
+        font-size: 0.9375rem;
+        font-weight: 600;
+        overflow-wrap: anywhere;
+    }
+    .card-sub {
+        margin: 0.15rem 0 0;
+        font-size: 0.8125rem;
+        color: var(--risu-theme-textcolor2);
+        overflow-wrap: anywhere;
+    }
+    .pills {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.4rem;
+    }
+    .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        border-radius: 99px;
+        padding: 0.35rem 0.75rem;
+        font-size: 0.75rem;
+        white-space: nowrap;
+    }
+    .status[data-tone="attention"] {
+        color: var(--risu-theme-danger-400);
+        border-color: color-mix(in srgb, var(--risu-theme-danger-400) 50%, transparent);
+    }
+    .status-dot {
+        width: 0.45rem;
+        height: 0.45rem;
+        border-radius: 50%;
+        background: currentColor;
+        opacity: 0.35;
+    }
+    .status[data-tone="connected"] .status-dot {
+        background: var(--risu-theme-success-500);
+        opacity: 1;
+    }
+    .status[data-tone="attention"] .status-dot {
+        opacity: 1;
+    }
+    .status[data-tone="paused"] .status-dot {
+        background: transparent;
+        box-shadow: inset 0 0 0 1.5px currentColor;
+        opacity: 0.7;
+    }
+    .status[data-tone="working"] .status-dot {
+        background: var(--risu-theme-primary-500);
+        opacity: 1;
+        animation: pulse 1.5s ease-in-out infinite;
+    }
+    .kv {
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr);
+        gap: 0.25rem 1rem;
+        margin: 0;
+        font-size: 0.8125rem;
+    }
+    .kv dt {
+        color: color-mix(in srgb, var(--risu-theme-textcolor) 60%, transparent);
+    }
+    .kv dd {
+        margin: 0;
+        min-width: 0;
+        overflow-wrap: anywhere;
+        font-variant-numeric: tabular-nums;
+    }
+    .thin {
+        height: 4px;
+        border-radius: 99px;
+        background: color-mix(in srgb, var(--risu-theme-textcolor) 8%, transparent);
+        overflow: hidden;
+    }
+    .thin i {
+        display: block;
+        height: 100%;
+        background: linear-gradient(90deg, #22c8c6, var(--risu-theme-primary-500));
+        transition: width 0.3s;
+    }
+    .thin i.pulse {
+        animation: pulse 1.4s ease-in-out infinite;
+    }
+    .actions,
+    .foot,
+    .item-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+    }
+    .foot {
+        padding-top: 0.75rem;
+        border-top: 1px solid color-mix(in srgb, var(--risu-theme-darkborderc) 55%, transparent);
+    }
+    .tabs {
+        display: flex;
+        gap: 0.25rem;
+        border-bottom: 1px solid color-mix(in srgb, var(--risu-theme-darkborderc) 55%, transparent);
+    }
+    .tab {
+        padding: 0.4rem 0.75rem;
+        margin-bottom: -1px;
+        border: 0;
+        border-bottom: 2px solid transparent;
+        background: transparent;
+        font-size: 0.8125rem;
+        color: var(--risu-theme-textcolor2);
+        cursor: pointer;
+    }
+    .tab:hover {
+        color: var(--risu-theme-textcolor);
+    }
+    .tab[aria-selected="true"] {
+        color: var(--risu-theme-textcolor);
+        border-bottom-color: var(--risu-theme-textcolor);
+    }
+    .tab:focus-visible {
+        outline: 2px solid var(--risu-theme-selected);
+        outline-offset: -2px;
+    }
+    .list {
+        display: grid;
+        gap: 0.5rem;
+    }
+    .item {
+        display: grid;
+        gap: 0.35rem;
+        padding: 0.6rem 0.75rem;
+        border-radius: 0.5rem;
+        background: var(--risu-theme-bgcolor);
+        font-size: 0.8125rem;
+    }
+    .line {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.5rem;
+    }
+    .conflict {
+        display: grid;
+        gap: 0.5rem;
+        padding: 0.85rem 1rem;
+        border: 1px solid color-mix(in srgb, var(--risu-theme-danger-400) 45%, transparent);
+        border-left-width: 3px;
+        border-radius: 0.5rem;
+        background: color-mix(in srgb, var(--risu-theme-danger-400) 6%, transparent);
+        font-size: 0.875rem;
+    }
+    .conflict.info {
+        border-color: var(--risu-theme-darkborderc);
+        background: var(--risu-theme-bgcolor);
+    }
+    .conflict strong {
+        font-weight: 600;
+    }
+    .conflict p {
+        margin: 0;
+        font-size: 0.8125rem;
+        line-height: 1.45;
+        opacity: 0.85;
+    }
+    .dialog {
+        display: grid;
+        gap: 1rem;
+        max-height: 90vh;
+        max-width: 28rem;
+        overflow-y: auto;
+        padding: 1.25rem;
+        border: 1px solid var(--risu-theme-darkborderc);
+        border-radius: 0.5rem;
+        background: var(--risu-theme-bgcolor);
+        color: var(--risu-theme-textcolor);
+    }
+    @keyframes pulse {
+        50% {
+            opacity: 0.3;
+        }
+    }
+    @media (prefers-reduced-motion: reduce) {
+        .status-dot,
+        .thin i.pulse {
+            animation: none;
+        }
+    }
+</style>

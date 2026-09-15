@@ -246,6 +246,13 @@ body {
   height: var(--risu-height-size);
 }
 
+/* Native dropdown lists ignore the transparent select background and follow the theme tokens instead. */
+select option,
+select optgroup {
+  background-color: var(--risu-theme-darkbg);
+  color: var(--risu-theme-textcolor);
+}
+
 .chattext p {
   color: var(--FontColorStandard);
 }

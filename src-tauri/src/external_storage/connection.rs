@@ -605,15 +605,11 @@ pub(crate) fn endpoint_confirmation(
         _ => None,
     }
     .unwrap_or_else(|| "configured repository".into());
+    // Warning codes; the UI owns the localized wording.
     let warnings = match config.provider.as_str() {
-        "webdav" => vec!["CAS requires an isolated conditional-write probe on this server.".into()],
-        "github_releases" => {
-            vec!["Use a dedicated private repository. This connection is backup only.".into()]
-        }
-        "gitlab_packages" => vec![
-            "Package cleanup policies can remove backup data. This connection is backup only."
-                .into(),
-        ],
+        "webdav" => vec!["webdav-cas-unverified".into()],
+        "github_releases" => vec!["github-dedicated-repository".into()],
+        "gitlab_packages" => vec!["gitlab-cleanup-policy".into()],
         _ => Vec::new(),
     };
     Ok(EndpointConfirmation {

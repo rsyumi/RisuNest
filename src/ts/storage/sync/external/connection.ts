@@ -48,7 +48,7 @@ export function buildPrepareConnectionRequest(options: {
 }): PrepareExternalConnectionRequest {
     const definition = getExternalProviderDefinition(options.providerId)
     if (!definition.strategies.includes(options.strategy))
-        throw new Error(`${definition.name} does not support ${options.strategy}.`)
+        throw new Error(`${options.providerId} does not support ${options.strategy}.`)
     if (options.purpose === 'sync' && options.strategy === 'backup-only')
         throw new Error('A synchronization connection needs a synchronization strategy.')
     if (options.purpose === 'backup' && options.strategy !== 'backup-only')

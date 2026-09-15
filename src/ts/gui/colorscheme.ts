@@ -282,6 +282,8 @@ export function updateColorScheme(){
         document.documentElement.style.setProperty("--risu-theme-textcolor2", colorScheme.textcolor2);
         document.documentElement.style.setProperty("--risu-theme-darkborderc", colorScheme.darkBorderc);
         document.documentElement.style.setProperty("--risu-theme-darkbutton", colorScheme.darkbutton);
+        // Lets native form controls such as dropdown lists render in the theme's light or dark style.
+        document.documentElement.style.colorScheme = colorScheme.type === 'light' ? 'light' : 'dark'
         ColorSchemeTypeStore.set(colorScheme.type)
         scheduleWindowsAppearance(colorScheme);
     } catch (error) {}
