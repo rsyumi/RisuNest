@@ -2,7 +2,7 @@
     import { language } from 'src/lang'
     import { isTauri } from 'src/ts/platform'
     import { alertConfirm } from 'src/ts/alert'
-    import Button from 'src/lib/UI/GUI/Button.svelte'
+    import SettingButton from '../RisuNest/SettingButton.svelte'
     import SettingGroup from '../RisuNest/SettingGroup.svelte'
     import SettingRow from '../RisuNest/SettingRow.svelte'
     import { getInlayEncodeOptions, listInlayAssetMetadata } from 'src/ts/process/files/inlays'
@@ -134,7 +134,7 @@
 >
     {#snippet actions()}
         {#if inventory}
-            <Button size="sm" styled="outlined" disabled={loading || optimizing} onclick={load}>{loading ? language.loading : strings.inventoryRefresh}</Button>
+            <SettingButton variant="secondary" busy={loading} disabled={optimizing} onclick={load}>{strings.inventoryRefresh}</SettingButton>
         {/if}
     {/snippet}
     {#if loadFailed}
@@ -142,7 +142,7 @@
     {/if}
     {#if !inventory}
         <div class="flex justify-center px-4 py-4">
-            <Button size="sm" disabled={loading} onclick={load}>{loading ? language.loading : strings.inventoryLoad}</Button>
+            <SettingButton busy={loading} onclick={load}>{strings.inventoryLoad}</SettingButton>
         </div>
     {:else if inventory.total.count === 0}
         <div class="px-4 py-3 text-sm text-textcolor2">{strings.inventoryEmpty}</div>
@@ -163,9 +163,9 @@
                         {/if}
                     {/snippet}
                     {#if optimizing}
-                        <Button size="sm" styled="outlined" disabled={cancelRequested} onclick={() => { cancelRequested = true }}>{language.cancel}</Button>
+                        <SettingButton variant="secondary" disabled={cancelRequested} onclick={() => { cancelRequested = true }}>{language.cancel}</SettingButton>
                     {:else}
-                        <Button size="sm" disabled={loading} onclick={optimize}>{strings.optimize}</Button>
+                        <SettingButton disabled={loading} onclick={optimize}>{strings.optimize}</SettingButton>
                     {/if}
                 </SettingRow>
             </div>
