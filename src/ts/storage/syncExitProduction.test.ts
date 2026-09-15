@@ -9,7 +9,7 @@ function harness(result: 'exit' | 'cancelled' = 'exit') {
             handler = next
             return unlisten
         }),
-        close: vi.fn(async () => {}),
+        destroy: vi.fn(async () => {}),
     }
     const coordinator = {
         requestExit: vi.fn(async () => result),
@@ -32,10 +32,10 @@ describe('window close exit drain', () => {
         finish('exit')
         await Promise.all([first, second])
 
-        expect(h.window.close).toHaveBeenCalledOnce()
+        expect(h.window.destroy).toHaveBeenCalledOnce()
     })
 
-    it('holds a close request until the coordinator permits one recursive close', async () => {
+    it('holds a close request until the coordinator permits one direct destroy', async () => {
         const h = harness()
         await registerWindowCloseDrain(h.window, h.coordinator as never)
         const preventDefault = vi.fn()
@@ -44,12 +44,12 @@ describe('window close exit drain', () => {
 
         expect(preventDefault).toHaveBeenCalledOnce()
         expect(h.coordinator.requestExit).toHaveBeenCalledOnce()
-        expect(h.window.close).toHaveBeenCalledOnce()
+        expect(h.window.destroy).toHaveBeenCalledOnce()
 
-        const recursivePrevent = vi.fn()
-        await h.getHandler()({ preventDefault: recursivePrevent })
-        expect(recursivePrevent).not.toHaveBeenCalled()
-        expect(h.window.close).toHaveBeenCalledOnce()
+        const subsequentPrevent = vi.fn()
+        await h.getHandler()({ preventDefault: subsequentPrevent })
+        expect(subsequentPrevent).not.toHaveBeenCalled()
+        expect(h.window.destroy).toHaveBeenCalledOnce()
     })
 
     it('keeps the window open when exit is cancelled', async () => {
@@ -60,6 +60,20 @@ describe('window close exit drain', () => {
         await h.getHandler()({ preventDefault })
 
         expect(preventDefault).toHaveBeenCalledOnce()
-        expect(h.window.close).not.toHaveBeenCalled()
+        expect(h.window.destroy).not.toHaveBeenCalled()
+    })
+
+    it('allows another close request when the native destroy command fails', async () => {
+        const h = harness()
+        h.window.destroy.mockRejectedValueOnce(new Error('destroy denied'))
+        const reportError = vi.fn()
+        await registerWindowCloseDrain(h.window, h.coordinator as never, reportError)
+
+        await h.getHandler()({ preventDefault: vi.fn() })
+        expect(reportError).toHaveBeenCalledOnce()
+        await h.getHandler()({ preventDefault: vi.fn() })
+
+        expect(h.coordinator.requestExit).toHaveBeenCalledTimes(2)
+        expect(h.window.destroy).toHaveBeenCalledTimes(2)
     })
 })

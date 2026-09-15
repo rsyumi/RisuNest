@@ -432,6 +432,7 @@ export interface PersistentDataRuntime {
     ): Promise<PersistentSelectedConversation | null>
     capturePersistentMutationToken(
         reason: string,
+        options?: { publishOfficial?: boolean },
     ): Promise<PersistentMutationToken>
     acquireDestructiveReplacementFence(
         expected: PersistentMutationToken,
@@ -870,8 +871,8 @@ export function createPersistentDataRuntime(
             ),
         readPersistentSelectedConversation: (characterId, reason) =>
             coordinator.readPersistentSelectedConversation(characterId, reason),
-        capturePersistentMutationToken: (reason) =>
-            coordinator.capturePersistentMutationToken(reason),
+        capturePersistentMutationToken: (reason, options) =>
+            coordinator.capturePersistentMutationToken(reason, options),
         async acquireDestructiveReplacementFence(expected, options) {
             const owner = await coordinator.acquireDestructiveReplacementFence(
                 expected,

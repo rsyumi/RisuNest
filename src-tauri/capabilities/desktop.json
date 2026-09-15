@@ -9,6 +9,7 @@
     "linux"
   ],
   "permissions": [
+    "core:window:allow-destroy",
     "process:default",
     "shell:default",
     "http:default",

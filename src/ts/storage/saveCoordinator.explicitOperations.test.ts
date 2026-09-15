@@ -3029,6 +3029,43 @@ describe('SaveCoordinator', () => {
         })
     })
 
+    it('pins a normal exit revision locally without publishing a pending account revision', async () => {
+        const database = makeDatabase()
+        const store = {
+            commit: vi.fn(async ({ expectedRevision }) => ({
+                revision: expectedRevision + 1,
+            })),
+        } as unknown as PersistentDataStore
+        const pin = vi.fn(async () => {
+            throw new Error('offline')
+        })
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: vi.fn(),
+            officialPublisher: { pin },
+        })
+        coordinator.initialize(12)
+        database.username = 'Local edit'
+        coordinator.markPersistentDataDirty(1)
+
+        const token = await coordinator.capturePersistentMutationToken(
+            'normal-exit-fence',
+            { publishOfficial: false },
+        )
+        const fence = await coordinator.acquireDestructiveReplacementFence(token, {
+            allowRevisionAdvance: true,
+            publishOfficial: false,
+        })
+
+        expect(token.revision).toBe(13)
+        expect(coordinator.revision).toBe(13)
+        expect(coordinator.hasPendingOfficialPublication).toBe(true)
+        expect(pin).not.toHaveBeenCalled()
+        coordinator.releaseDestructiveReplacementFence(fence)
+    })
+
     it('rejects a stale destructive replacement token after flushing the newer live edit', async () => {
         const database = makeDatabase()
         const store = {

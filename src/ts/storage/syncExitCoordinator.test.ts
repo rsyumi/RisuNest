@@ -36,6 +36,7 @@ function harness(adapter: SyncExitDrainAdapter | null = null) {
         }),
         selectedDrain: vi.fn(() => adapter),
         softWaitMillis: 5_000,
+        reportError: vi.fn(),
     }
     const coordinator = createSyncExitCoordinator(dependencies)
     return { coordinator, dependencies, fence, order }
@@ -47,7 +48,7 @@ describe('sync exit coordinator', () => {
 
         await expect(h.coordinator.requestExit()).resolves.toBe('exit')
 
-        expect(h.order).toEqual(['fence', 'flush', 'checkpoint', 'capture', 'release'])
+        expect(h.order).toEqual(['flush', 'checkpoint', 'fence', 'capture', 'release'])
         expect(h.coordinator.snapshot()).toEqual({ phase: 'complete', target })
     })
 
@@ -84,10 +85,46 @@ describe('sync exit coordinator', () => {
             phase: 'local-failed',
         }))
         expect(h.dependencies.captureTarget).not.toHaveBeenCalled()
+        expect(h.dependencies.reportError).toHaveBeenCalledOnce()
         expect(h.coordinator.decide('wait')).toBe(true)
 
         await expect(exit).resolves.toBe('exit')
         expect(h.dependencies.flushLocal).toHaveBeenCalledTimes(2)
+    })
+
+    it('can exit without saving after local failure without acquiring an edit fence', async () => {
+        const h = harness()
+        h.dependencies.flushLocal.mockRejectedValue(new Error('disk full'))
+        const exit = h.coordinator.requestExit()
+        await vi.waitFor(() => expect(h.coordinator.snapshot()).toMatchObject({
+            phase: 'local-failed',
+        }))
+
+        expect(h.coordinator.decide('exit-unsynced')).toBe(true)
+        await expect(exit).resolves.toBe('exit')
+        expect(h.dependencies.acquireEditFence).not.toHaveBeenCalled()
+        expect(h.dependencies.captureTarget).not.toHaveBeenCalled()
+    })
+
+    it.each([
+        'PersistentMutationFencedError',
+        'SelectedConversationTransitionInProgressError',
+    ])('does not bypass active %s when local flush is blocked', async (name) => {
+        const h = harness()
+        const fenced = new Error('An edit is active')
+        fenced.name = name
+        h.dependencies.flushLocal
+            .mockRejectedValueOnce(fenced)
+            .mockResolvedValueOnce(undefined)
+
+        const exit = h.coordinator.requestExit()
+        await vi.waitFor(() => expect(h.coordinator.snapshot()).toMatchObject({
+            phase: 'edit-blocked',
+        }))
+        expect(h.coordinator.decide('exit-unsynced')).toBe(true)
+        await vi.waitFor(() => expect(h.dependencies.flushLocal).toHaveBeenCalledTimes(2))
+        await expect(exit).resolves.toBe('exit')
+        expect(h.dependencies.acquireEditFence).toHaveBeenCalledOnce()
     })
 
     it('keeps the exit pending when an edit or replacement fence is busy', async () => {
@@ -100,7 +137,7 @@ describe('sync exit coordinator', () => {
         await vi.waitFor(() => expect(h.coordinator.snapshot()).toMatchObject({
             phase: 'edit-blocked',
         }))
-        expect(h.dependencies.flushLocal).not.toHaveBeenCalled()
+        expect(h.dependencies.flushLocal).toHaveBeenCalledOnce()
 
         h.coordinator.decide('wait')
         await expect(exit).resolves.toBe('exit')

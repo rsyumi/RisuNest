@@ -454,6 +454,7 @@ export interface DestructiveReplacementFenceOptions {
      * then replace against the fence's revision rather than the captured token's.
      */
     allowRevisionAdvance?: boolean
+    publishOfficial?: boolean
 }
 
 export class PersistentMutationFencedError extends Error {
@@ -2080,12 +2081,15 @@ export class SaveCoordinator {
         )
     }
 
-    capturePersistentMutationToken(reason: string): Promise<PersistentMutationToken> {
+    capturePersistentMutationToken(
+        reason: string,
+        options: { publishOfficial?: boolean } = {},
+    ): Promise<PersistentMutationToken> {
         this.assertInitialized()
         this.assertPersistentMutationAllowed()
         this.cancelDebounce()
         return this.enqueue(async () => {
-            await this.flushIterations(reason, true)
+            await this.flushIterations(reason, options.publishOfficial ?? true)
             return {
                 revision: this.revision,
                 mutationGeneration: this.dirtyGeneration,
@@ -2118,7 +2122,10 @@ export class SaveCoordinator {
         this.cancelDebounce()
         return this.enqueue(async () => {
             try {
-                await this.flushIterations('destructive-persistent-replacement', true)
+                await this.flushIterations(
+                    'destructive-persistent-replacement',
+                    options.publishOfficial ?? true,
+                )
                 if (options.allowRevisionAdvance) {
                     if (this.revision < expected.revision) {
                         throw new RevisionConflictError(expected.revision, this.revision)

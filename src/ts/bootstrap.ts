@@ -634,10 +634,11 @@ export async function loadData() {
             async acquireEditFence() {
                 const token = await runtime.capturePersistentMutationToken(
                     'normal-exit-fence',
+                    { publishOfficial: false },
                 )
                 const fence = await runtime.acquireDestructiveReplacementFence(
                     token,
-                    { allowRevisionAdvance: true },
+                    { allowRevisionAdvance: true, publishOfficial: false },
                 )
                 heldExitRevision = fence.revision
                 return fence
@@ -721,7 +722,7 @@ export async function loadData() {
             },
             selectedDrain: () => selectedExitDrain,
             reportError: (error) =>
-                console.error('Normal exit synchronization cancellation failed', error),
+                console.error('Normal exit drain failed', error),
         })
         configureSyncExitCoordinator(syncExitCoordinator)
         disposeLifecycleCommitListeners ??= registerLifecycleCommitListeners(

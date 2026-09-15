@@ -80,6 +80,13 @@ function blockedReason(error: unknown): string {
     return 'sync-exit-drain-failed'
 }
 
+function isEditFenceError(error: unknown): boolean {
+    return error instanceof Error && (
+        error.name === 'PersistentMutationFencedError'
+        || error.name === 'SelectedConversationTransitionInProgressError'
+    )
+}
+
 function validateTarget(target: SyncExitTarget): SyncExitTarget {
     if (!Number.isSafeInteger(target.revision) || target.revision < 0) {
         throw new RangeError('Exit target revision must be a nonnegative safe integer')
@@ -145,6 +152,14 @@ export function createSyncExitCoordinator(
                 await dependencies.checkpointLocal()
                 return { kind: 'settled' }
             } catch (error) {
+                if (isEditFenceError(error)) {
+                    publish({ phase: 'edit-blocked', error })
+                    if (await waitForDecision() === 'cancel-exit') {
+                        return { kind: 'cancelled' }
+                    }
+                    continue
+                }
+                dependencies.reportError?.(error)
                 publish({ phase: 'local-failed', error })
                 const choice = await waitForDecision()
                 if (choice === 'exit-unsynced') return { kind: 'exit' }
@@ -281,6 +296,12 @@ export function createSyncExitCoordinator(
         let fence: SyncExitFence | undefined
         let target: SyncExitTarget | null = null
         try {
+            const local = await settleLocal()
+            if (local.kind === 'exit') {
+                publish({ phase: 'complete', target: null })
+                return 'exit'
+            }
+            if (local.kind === 'cancelled') return settleCancelled(null)
             while (!fence) {
                 try {
                     fence = await dependencies.acquireEditFence()
@@ -290,12 +311,6 @@ export function createSyncExitCoordinator(
                     if (choice === 'cancel-exit') return settleCancelled(null)
                 }
             }
-            const local = await settleLocal()
-            if (local.kind === 'exit') {
-                publish({ phase: 'complete', target: null })
-                return 'exit'
-            }
-            if (local.kind === 'cancelled') return settleCancelled(null)
             const capture = await captureDrainTarget()
             if (capture.kind === 'exit') {
                 publish({ phase: 'complete', target: null })

@@ -28,7 +28,7 @@ export interface CloseDrainWindow {
     onCloseRequested(
         handler: (event: CloseRequestedEventLike) => void | Promise<void>,
     ): Promise<() => void>
-    close(): Promise<void>
+    destroy(): Promise<void>
 }
 
 export async function registerWindowCloseDrain(
@@ -47,8 +47,9 @@ export async function registerWindowCloseDrain(
         try {
             if (await exitCoordinator.requestExit() !== 'exit') return
             closing = true
-            await window.close()
+            await window.destroy()
         } catch (error) {
+            closing = false
             reportError(error)
         } finally {
             if (!closing) pending = false
