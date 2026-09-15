@@ -201,11 +201,18 @@ describe('local backup persistent snapshot', () => {
         })
     })
 
-    it('restores cold payloads before replacing the local backup database', async () => {
+    it('expands cold payloads into the replaced local backup database', async () => {
         const coldKey = 'local-restore-cold'
         const database = structuredClone(risuSaveFixtureDatabase) as Database
         database.characters[0].coldstorage = coldKey
-        const cold = { message: [{ role: 'user', data: 'restored cold payload' }] }
+        const restoredName = 'Restored cold character'
+        const cold = {
+            character: {
+                ...structuredClone(database.characters[0]),
+                name: restoredName,
+                coldstorage: undefined,
+            },
+        }
         const encodeEntry = (name: string, data: Uint8Array) => {
             const encodedName = new TextEncoder().encode(name)
             const record = new Uint8Array(8 + encodedName.byteLength + data.byteLength)
@@ -255,14 +262,17 @@ describe('local backup persistent snapshot', () => {
         await pending
         createElement.mockRestore()
 
-        expect(state.restoreEvents).toEqual([`cold:${coldKey}`, 'database'])
-        expect(state.restoredCold.get(coldKey)).toEqual(cold)
+        expect(state.restoreEvents).toEqual(['database'])
         expect(state.replacePersistentDatabase).toHaveBeenCalledOnce()
+        const replaced = state.replacePersistentDatabase.mock.calls[0][0]
+        expect(replaced.characters[0].name).toBe(restoredName)
+        expect(replaced.characters[0].coldstorage).toBeUndefined()
         expect(alertWait).not.toHaveBeenCalled()
 
         const context = state.fallbackContext
         expect(context.setSource).toHaveBeenCalledExactlyOnceWith({ name: 'backup.bin', bytes: archive.byteLength })
-        expect(context.setPartialWritesPossible).toHaveBeenCalledExactlyOnceWith(true)
+        // Cold payloads become record bodies, so this archive writes nothing before activation.
+        expect(context.setPartialWritesPossible).not.toHaveBeenCalled()
         const stages = context.onStatus.mock.calls.map(([status]) => status.detail?.stage)
         expect(stages[0]).toBe('reading-archive')
         expect(stages.filter((stage, index) => stage !== stages[index - 1])).toEqual([
@@ -358,10 +368,9 @@ describe('local backup persistent snapshot', () => {
     })
 
     it('stops a WebView import at the next chunk after cancellation and flags partial writes', async () => {
-        const coldKey = 'partial-cold'
-        const cold = { message: [{ role: 'user', data: 'already written' }] }
-        const encodedName = new TextEncoder().encode(`coldstorage_${coldKey}.json`)
-        const data = new TextEncoder().encode(JSON.stringify(cold))
+        const assetName = 'partial-asset.png'
+        const encodedName = new TextEncoder().encode(assetName)
+        const data = new Uint8Array([1, 2, 3])
         const entry = new Uint8Array(8 + encodedName.byteLength + data.byteLength)
         const view = new DataView(entry.buffer)
         view.setUint32(0, encodedName.byteLength, true)
@@ -369,7 +378,7 @@ describe('local backup persistent snapshot', () => {
         view.setUint32(4 + encodedName.byteLength, data.byteLength, true)
         entry.set(data, 8 + encodedName.byteLength)
         const controller = new AbortController()
-        // The importer yields between entries; cancelling there leaves the cold payload written.
+        // The importer yields between entries; cancelling there leaves the asset written.
         vi.mocked(sleep).mockImplementationOnce(async () => controller.abort())
         const file = {
             name: 'partial.bin',
@@ -405,7 +414,11 @@ describe('local backup persistent snapshot', () => {
         await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
         createElement.mockRestore()
 
-        expect(state.restoredCold.get(coldKey)).toEqual(cold)
+        expect(state.blobStore?.put).toHaveBeenCalledWith(
+            `assets/${assetName}`,
+            data,
+            expect.objectContaining({ kind: 'asset', name: assetName }),
+        )
         expect(context.setPartialWritesPossible).toHaveBeenCalledWith(true)
         expect(state.replacePersistentDatabase).not.toHaveBeenCalled()
     })

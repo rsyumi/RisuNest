@@ -9,6 +9,7 @@ import {
     listDatabaseRootResources,
     replaceColdStoragePayloadResources,
 } from '../../process/coldstorageData'
+import { expandColdPayloads } from '../../process/coldPayloadExpansion'
 import type {
     AccountStorage,
     AccountWriteResult,
@@ -730,7 +731,12 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
         const candidate = await this.dependencies.prepareCandidate(decoded)
         validateCandidate(candidate)
 
-        // Referenced assets and cold payloads load lazily on use, matching the upstream client;
+        // Upstream account data can reference cold payloads. They become record bodies here,
+        // because nothing downstream resolves a reference; a missing one degrades that item.
+        throwIfAborted(signal)
+        await expandColdPayloads(candidate, (key) => this.dependencies.cold.readRemote(key, signal))
+
+        // Referenced assets load lazily on use, matching the upstream client;
         // a missing one degrades that item instead of failing the whole pull.
         throwIfAborted(signal)
         const activated = await this.dependencies.store.replaceFromDatabase(

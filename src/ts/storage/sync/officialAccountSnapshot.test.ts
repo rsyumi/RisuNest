@@ -1075,7 +1075,11 @@ describe('OfficialAccountSnapshotAdapter pull', () => {
         expect(result.kind).toBe('activated')
         expect(harness.prepareCandidate).toHaveBeenCalledTimes(1)
         expect(replace).toHaveBeenCalledTimes(1)
-        expect(replace).toHaveBeenCalledWith(prepared, harness.imported.revision)
+        const activated = replace.mock.calls[0][0] as any
+        expect(replace.mock.calls[0][1]).toBe(harness.imported.revision)
+        expect(activated.username).toBe('Prepared remote')
+        expect(activated.characters[0].coldStoragedChats).toBeUndefined()
+        expect(activated.characters[0].chats.at(-1).message).toEqual([{ data: 'remote message' }])
         expect((await harness.store.readRoot()).value.username).toBe('Prepared remote')
     })
 
@@ -1172,7 +1176,7 @@ describe('OfficialAccountSnapshotAdapter pull', () => {
         }
     })
 
-    it('activates without probing account assets or cold payloads', async () => {
+    it('activates without probing account assets and keeps a degraded cold record', async () => {
         const remote = makeDatabase() as any
         remote.characters[0].additionalAssets = [['legacy', 'assets\\windows.gif', 'gif']]
         const bytes = encodeRisuSaveLegacy(remote, 'compression')
@@ -1188,7 +1192,11 @@ describe('OfficialAccountSnapshotAdapter pull', () => {
         expect(result.kind).toBe('activated')
         expect(replace).toHaveBeenCalledTimes(1)
         expect(harness.readItem.mock.calls.map(([key]) => key)).toEqual([databaseKey])
-        expect(harness.cold.readRemote).not.toHaveBeenCalled()
+        expect(harness.cold.readRemote.mock.calls.map(([key]) => key)).toEqual(['cold-message'])
+        const activated = replace.mock.calls[0][0] as any
+        expect(activated.characters[0].coldStoragedChats).toBeUndefined()
+        expect(activated.characters[0].chats.at(-1).message[0].data)
+            .toBe(`${coldStorageHeader}cold-message`)
     })
 
     it('checks abort immediately before the single replacement', async () => {

@@ -472,18 +472,17 @@ async function performAccountUnmigration(): Promise<void> {
     const { storeActiveAsset } = await import("./accountAssetAccess")
     const {
         getAccountColdStorageItem,
-        getColdStorageItem,
         isColdStorageBackupData,
         listColdDataKeys,
-        setLocalColdStorageItem,
     } = await import("../process/coldstorage.svelte")
+    const { expandColdPayloads } = await import("../process/coldPayloadExpansion")
     const blobStore = await resolveBlobStore()
     const accountStorage = new AccountStorage()
     const coldKeys = await listColdDataKeys(db)
 
     await completeAccountUnmigration(db, {
-        prepareResources: () =>
-            materializeAccountUnmigrationResources({
+        prepareResources: async (candidate) => {
+            const selectedCold = await materializeAccountUnmigrationResources({
                 coldKeys,
                 onProgress: (stage, completed, total) => {
                     alertStore.set({
@@ -520,7 +519,6 @@ async function performAccountUnmigration(): Promise<void> {
                         ext: name.split('.').pop() ?? '',
                     })
                 },
-                readLocalCold: (key) => getColdStorageItem(key, { accountFallback: true }),
                 readRemoteCold: async (key) => {
                     const value = await getAccountColdStorageItem(key)
                     if (value !== null && !isColdStorageBackupData(value)) {
@@ -528,12 +526,9 @@ async function performAccountUnmigration(): Promise<void> {
                     }
                     return value
                 },
-                writeLocalCold: async (key, value) => {
-                    if (!(await setLocalColdStorageItem(key, value))) {
-                        throw new Error(`Failed to write local cold payload: ${key}`)
-                    }
-                },
-            }),
+            })
+            await expandColdPayloads(candidate, async (key) => selectedCold.get(key) ?? null)
+        },
         replaceDatabase: (database, reason) => {
             alertStore.set({ type: 'wait', msg: language.accountUnmigration.finishing })
             // Keep the snapshot guards: concurrent edits must survive a failed transition.

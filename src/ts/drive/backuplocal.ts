@@ -25,7 +25,8 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { decryptBuffer, encryptBuffer, sleep } from "../util";
 import { hubURL } from "../characterCards";
 import { language } from "src/lang";
-import { collectColdStorageBackupPayloads, confirmIncompleteColdStorageOperation, getColdStorageBackupKey, getColdStorageItem, isColdStorageBackupData, listColdDataKeys, setLocalColdStorageItem } from "../process/coldstorage.svelte";
+import { collectColdStorageBackupPayloads, confirmIncompleteColdStorageOperation, getColdStorageBackupKey, isColdStorageBackupData, listColdDataKeys } from "../process/coldstorage.svelte";
+import { expandColdPayloads } from "../process/coldPayloadExpansion";
 import { getPersistentDataRuntime, publishCurrentOfficialRevision, replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte";
 import { installLocalBackup } from "../storage/databaseRestore";
 import { type PinnedRisuSaveExport, withFlushedRisuSaveExport } from "../storage/risuSaveStoreAdapter";
@@ -515,7 +516,7 @@ export async function importLegacyBackupWithWebView(
     const reader = file.stream().getReader()
     let remainingBuffer = new Uint8Array()
     let pendingDatabase: Uint8Array | null = null
-    const restoredColdStorageKeys = new Set<string>()
+    const restoredColdStoragePayloads = new Map<string, unknown>()
 
     while (true) {
         checkCancelled()
@@ -617,13 +618,7 @@ export async function importLegacyBackupWithWebView(
                         const jsonData = JSON.parse(text)
 
                         if (isColdStorageBackupData(jsonData)) {
-                            if (await setLocalColdStorageItem(coldStorageKey, jsonData)) {
-                                restoredColdStorageKeys.add(coldStorageKey)
-                                markPartialWrite()
-                            } else {
-                                console.error(`Failed to restore cold storage item ${coldStorageKey}`)
-                                counts.skipped += 1
-                            }
+                            restoredColdStoragePayloads.set(coldStorageKey, jsonData)
                         } else {
                             console.warn(`Skipping invalid cold storage backup item ${name}`)
                             counts.skipped += 1
@@ -685,17 +680,12 @@ export async function importLegacyBackupWithWebView(
     counts.presets = dbData.botPresets?.length ?? 0
     report('decoding-database')
 
-    const missingColdStorageKeys: string[] = []
-    for (const key of await listColdDataKeys(dbData)) {
-        if (restoredColdStorageKeys.has(key)) continue
-        const existingColdStorage = await getColdStorageItem(key, { accountFallback: true })
-        if (!isColdStorageBackupData(existingColdStorage)) {
-            missingColdStorageKeys.push(key)
-        }
-    }
+    const missingColdStorageKeys = (await listColdDataKeys(dbData))
+        .filter((key) => !restoredColdStoragePayloads.has(key))
     if (!await confirmIncompleteColdStorageOperation(dbData, missingColdStorageKeys, 'restore')) {
         throw cancelledError()
     }
+    await expandColdPayloads(dbData, async (key) => restoredColdStoragePayloads.get(key) ?? null)
     checkCancelled()
 
     report('activating')

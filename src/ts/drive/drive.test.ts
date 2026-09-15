@@ -63,9 +63,9 @@ vi.mock('../globalApi.svelte', () => ({
         Init: state.forageInit,
         isAccount: true,
     },
-    getUncleanablesSync: vi.fn((_database: Database, _mode: string, options: {
+    getUncleanablesSync: vi.fn((database: Database, _mode: string, options?: {
         chars: Array<{ image?: string }>
-    }) => options.chars.flatMap((character) => (
+    }) => (options?.chars ?? database.characters).flatMap((character) => (
         character.image?.split('/').at(-1) ? [character.image.split('/').at(-1)!] : []
     ))),
     getUncleanables: state.getUncleanables,
@@ -415,7 +415,6 @@ describe('Drive restore cold snapshot assets', () => {
         expect(accountWrites).not.toContain('assets/account-only.png')
         expect(accountWrites.at(-1)).toBe('database/database.bin')
         expect(state.restoreEvents).toEqual([
-            `cold:${coldKey}`,
             'asset:assets/drive-only.png',
             `asset:${pluginAssetKey}`,
             'database',

@@ -18,7 +18,8 @@ import { relaunch } from '@tauri-apps/plugin-process';
 import { sleep } from "../util";
 import { hubURL } from "../characterCards";
 import { decodeRisuSave } from "../storage/risuSave";
-import { collectColdStorageBackupPayloads, confirmIncompleteColdStorageOperation, getColdStorageBackupName, getColdStorageItem, isColdStorageBackupData, listColdDataKeys, setLocalColdStorageItem } from "../process/coldstorage.svelte";
+import { collectColdStorageBackupPayloads, confirmIncompleteColdStorageOperation, getColdStorageBackupName, isColdStorageBackupData, listColdDataKeys } from "../process/coldstorage.svelte";
+import { expandColdPayloads } from "../process/coldPayloadExpansion";
 import { getPersistentDataRuntime, publishCurrentOfficialRevision, replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte";
 import { installDriveRestore } from "../storage/databaseRestore";
 import { type PinnedRisuSaveExport, withFlushedRisuSaveExport } from "../storage/risuSaveStoreAdapter";
@@ -394,16 +395,17 @@ export async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Prom
         }
     
         const db:Database = mode === 'backup' ? await getDbFromList() : JSON.parse(Buffer.from(await getFileData(ACCESS_TOKEN, dbs[0][0].id)).toString('utf-8'))
-        const coldStorageRestoreFailures = await restoreColdStorageFromDrive(ACCESS_TOKEN, files, db, mode)
-        if(coldStorageRestoreFailures.length > 0){
+        const coldStorage = await readColdStorageFromDrive(ACCESS_TOKEN, files, db, mode)
+        if(coldStorage.failures.length > 0){
             if(mode === 'sync'){
-                alertError(`Sync failed. ${coldStorageRestoreFailures.length} cold storage item(s) could not be restored.`)
+                alertError(`Sync failed. ${coldStorage.failures.length} cold storage item(s) could not be restored.`)
                 return
             }
-            if(!await confirmIncompleteColdStorageOperation(db, coldStorageRestoreFailures, 'restore')){
+            if(!await confirmIncompleteColdStorageOperation(db, coldStorage.failures, 'restore')){
                 return
             }
         }
+        await expandColdPayloads(db, async (key) => coldStorage.payloads.get(key) ?? null)
         const requiredImages = await getDriveRestoreRequiredImages(db)
         let ind = 0;
         let errorLogs:string[] = []
@@ -478,27 +480,14 @@ export async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Prom
 }
 
 async function getDriveRestoreRequiredImages(db:Database):Promise<string[]> {
-    const chars = []
-    for (const character of db.characters) {
-        if (!character.coldstorage) {
-            chars.push(character)
-            continue
-        }
-        const selected = await getColdStorageItem(character.coldstorage, {
-            accountFallback: true,
-        }) as { character?: typeof character } | null
-        chars.push(selected?.character?.chaId === character.chaId
-            ? selected.character
-            : character)
-    }
-    const required = new Set(getUncleanablesSync(db, 'basename', { chars }))
+    const required = new Set(getUncleanablesSync(db, 'basename'))
     for (const key of collectExactPluginStorageAssetReferences(db.pluginCustomStorage ?? {})) {
         required.add(getBasename(key))
     }
     return [...required]
 }
 
-async function restoreColdStorageFromDrive(
+async function readColdStorageFromDrive(
     ACCESS_TOKEN:string,
     files:DriveFile[],
     db:Database,
@@ -506,6 +495,7 @@ async function restoreColdStorageFromDrive(
 ) {
     const coldKeys = await listColdDataKeys(db)
     const failures:string[] = []
+    const payloads = new Map<string, unknown>()
     for(let i=0;i<coldKeys.length;i++){
         const key = coldKeys[i]
         const names = new Set([
@@ -526,9 +516,7 @@ async function restoreColdStorageFromDrive(
         try {
             const jsonData = JSON.parse(new TextDecoder().decode(await getFileData(ACCESS_TOKEN, file.id)))
             if(isColdStorageBackupData(jsonData)){
-                if(!await setLocalColdStorageItem(key, jsonData)){
-                    failures.push(key)
-                }
+                payloads.set(key, jsonData)
             }
             else{
                 console.warn(`Skipping invalid cold storage Drive item ${file.name}`)
@@ -539,7 +527,7 @@ async function restoreColdStorageFromDrive(
             failures.push(key)
         }
     }
-    return failures
+    return { payloads, failures }
 }
 
 function checkImageExist(image:string){

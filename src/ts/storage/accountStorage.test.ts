@@ -213,7 +213,7 @@ describe('AccountStorage structured wire contract', () => {
         mocks.replacePersistentDatabase.mockImplementation((candidate, reason, options) =>
             coordinator.replacePersistentDatabase(candidate, reason, options),
         )
-        mocks.getColdStorageItem.mockResolvedValue({ character: database.characters[0] })
+        mocks.getAccountColdStorageItem.mockResolvedValue({ character: database.characters[0] })
         mocks.getUncleanablesSync.mockReturnValue(['assets/remote.png'])
         let finishDownload!: (value: Response) => void
         mocks.fetchProtectedResource.mockImplementation(
@@ -245,7 +245,7 @@ describe('AccountStorage structured wire contract', () => {
         const actual =
             await vi.importActual<typeof import('./databaseRestore')>('./databaseRestore')
         mocks.completeAccountUnmigration.mockImplementation(actual.completeAccountUnmigration)
-        mocks.getColdStorageItem.mockResolvedValue({ character: {} })
+        mocks.getAccountColdStorageItem.mockResolvedValue({ character: {} })
         mocks.getUncleanablesSync.mockReturnValue(['assets/retry.png'])
         mocks.fetchProtectedResource
             .mockRejectedValueOnce(new Error('offline'))
@@ -1536,19 +1536,12 @@ describe('AccountStorage structured wire contract', () => {
         expect(forbidden.cancel).toHaveBeenCalledOnce()
     })
 
-    it('unmigrates assets referenced by the retained local cold character before disabling account', async () => {
-        const localCold = {
-            character: {
-                type: 'character',
-                chaId: 'cold-character',
-                additionalAssets: [['local', 'assets/local-cold-only.png']],
-            },
-        }
+    it('unmigrates assets referenced by the account cold character before disabling account', async () => {
         const officialCold = {
             character: {
                 type: 'character',
                 chaId: 'cold-character',
-                additionalAssets: [['official', 'assets/official-only.png']],
+                additionalAssets: [['official', 'assets/account-cold-only.png']],
             },
         }
         mocks.database.characters = [{
@@ -1570,7 +1563,6 @@ describe('AccountStorage structured wire contract', () => {
             revision: 11,
             mutationGeneration: 17,
         })
-        mocks.getColdStorageItem.mockResolvedValue(localCold)
         mocks.getAccountColdStorageItem.mockResolvedValue(officialCold)
         mocks.getUncleanablesSync.mockImplementation((_database, _mode, options) => (
             options.chars.flatMap((character: any) => (
@@ -1580,11 +1572,9 @@ describe('AccountStorage structured wire contract', () => {
         mocks.fetchProtectedResource.mockResolvedValue(response(new Uint8Array([7, 6, 5])))
         const events: string[] = []
         mocks.completeAccountUnmigration.mockImplementation(async (_database, dependencies) => {
-            await dependencies.prepareResources()
-            await dependencies.replaceDatabase(
-                { ..._database, account: null },
-                'account-unmigration',
-            )
+            const candidate = structuredClone({ ..._database, account: null })
+            await dependencies.prepareResources(candidate)
+            await dependencies.replaceDatabase(candidate, 'account-unmigration')
             events.push('disable-account')
         })
         const { unMigrationAccount } = await loadStorage()
@@ -1607,11 +1597,15 @@ describe('AccountStorage structured wire contract', () => {
                 expectedMutationGeneration: 17,
             },
         )
-        expect(mocks.getAccountColdStorageItem).not.toHaveBeenCalled()
-        expect(mocks.blobAssets.get('assets/local-cold-only.png')).toEqual(
+        expect(mocks.getAccountColdStorageItem).toHaveBeenCalledWith('cold-character-key')
+        expect(mocks.blobAssets.get('assets/account-cold-only.png')).toEqual(
             new Uint8Array([7, 6, 5]),
         )
-        expect(mocks.blobAssets.has('assets/official-only.png')).toBe(false)
+        const replaced = mocks.replacePersistentDatabase.mock.calls[0][0]
+        expect(replaced.characters[0].coldstorage).toBeUndefined()
+        expect(replaced.characters[0].additionalAssets).toEqual(
+            officialCold.character.additionalAssets,
+        )
         expect(events).toEqual(['disable-account'])
     })
 
