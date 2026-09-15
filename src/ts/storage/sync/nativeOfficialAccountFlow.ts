@@ -1,11 +1,14 @@
 import type { Database } from '../database.svelte'
-import type { NativeAppKv } from '../nativeAppKv'
+import type { NativeAccountCredentialVault } from '../nativeAccountCredential'
 import type { DataRevision } from '../persistentDataStore'
 import type { PinnedPublication } from '../saveCoordinator'
 import type { OfficialPullResult } from './officialAccountSnapshot'
 
+/**
+ * The credential is not here: it belongs to the OS vault, not to a stored
+ * value a backup or a restore would carry.
+ */
 export const nativeOfficialAccountKeys = {
-    credential: 'official-account.credential.v1',
     association: 'official-account.association.v1',
     assetLedger: 'official-account.asset-ledger.v1',
 } as const
@@ -19,7 +22,7 @@ interface NativeOfficialAdapter {
 }
 
 export interface NativeOfficialAccountFlowDependencies {
-    appKv: NativeAppKv
+    credentialVault: NativeAccountCredentialVault
     adapter: NativeOfficialAdapter
     initialCredential: NativeOfficialAccountCredential | null
     flushPendingData(reason: string): Promise<void>
@@ -28,7 +31,8 @@ export interface NativeOfficialAccountFlowDependencies {
     setRouting(credential: NativeOfficialAccountCredential | null): void | Promise<void>
     clearLegacyFallback(): void
     flushMetadata(): Promise<void>
-    resetMetadata(): void
+    /** Removes the stored account metadata and drops the in-memory copies. */
+    clearMetadata(): Promise<void>
     resetAccountSession(): void
     nativeRestore?(credential: NativeOfficialAccountCredential): Promise<
         OfficialPullResult | { kind: 'compatibility-fallback' }
@@ -88,7 +92,7 @@ export function createNativeOfficialAccountFlowService(
         const accountChanged = previousCredential?.id !== nextCredential.id
         try {
             if (accountChanged) dependencies.resetAccountSession()
-            await dependencies.appKv.set(nativeOfficialAccountKeys.credential, nextCredential)
+            await dependencies.credentialVault.write(nextCredential)
             await dependencies.setRouting(nextCredential)
             if (accountChanged) {
                 dependencies.adapter.resetAccountAssociation(nextCredential.id)
@@ -96,12 +100,9 @@ export function createNativeOfficialAccountFlowService(
         } catch (error) {
             try {
                 if (previousCredential) {
-                    await dependencies.appKv.set(
-                        nativeOfficialAccountKeys.credential,
-                        previousCredential,
-                    )
+                    await dependencies.credentialVault.write(previousCredential)
                 } else {
-                    await dependencies.appKv.remove(nativeOfficialAccountKeys.credential)
+                    await dependencies.credentialVault.clear()
                 }
             } catch {}
             try {
@@ -222,10 +223,8 @@ export function createNativeOfficialAccountFlowService(
                 dependencies.clearLegacyFallback()
                 dependencies.resetAccountSession()
                 await dependencies.flushMetadata()
-                await Promise.all(Object.values(nativeOfficialAccountKeys).map(
-                    (key) => dependencies.appKv.remove(key),
-                ))
-                dependencies.resetMetadata()
+                await dependencies.credentialVault.clear()
+                await dependencies.clearMetadata()
                 credential = null
                 credentialGeneration += 1
                 dependencies.adapter.resetAccountAssociation(null)

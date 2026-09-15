@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { NativeAccountCredentialVault } from '../nativeAccountCredential'
 import {
-    createNativeAppKvStringStorage,
-    type NativeAppKv,
-} from '../nativeAppKv'
+    createNativeDeviceSettingsBag,
+    type NativeDeviceSettings,
+} from '../nativeDeviceSettings'
 import { createAccountScopedOfficialAssetLedger } from './officialAssetLedger'
 import type { OfficialPullResult } from './officialAccountSnapshot'
 import {
@@ -11,19 +12,19 @@ import {
 } from './nativeOfficialAccountFlow'
 
 function createHarness(loggedIn = false, useNativeRestore = false) {
-    const values = new Map<string, unknown>()
     const events: string[] = []
-    const appKv: NativeAppKv = {
-        get: vi.fn(async (key: string) => values.get(key) ?? null),
-        set: vi.fn(async (key, value) => {
-            events.push(`set:${key}`)
-            values.set(key, value)
+    const vault = {
+        stored: null as unknown,
+        read: vi.fn(async () => vault.stored ?? null),
+        write: vi.fn(async (credential: unknown) => {
+            events.push('credential:write')
+            vault.stored = credential
         }),
-        remove: vi.fn(async (key) => {
-            events.push(`remove:${key}`)
-            values.delete(key)
+        clear: vi.fn(async () => {
+            events.push('credential:clear')
+            vault.stored = null
         }),
-    }
+    } satisfies NativeAccountCredentialVault & { stored: unknown }
     const publication = {
         publish: vi.fn(async () => { events.push('publish') }),
         dispose: vi.fn(async () => { events.push('dispose') }),
@@ -40,7 +41,7 @@ function createHarness(loggedIn = false, useNativeRestore = false) {
     })
     const clearLegacyFallback = vi.fn(() => events.push('fallback:clear'))
     const flushMetadata = vi.fn(async () => { events.push('metadata:flush') })
-    const resetMetadata = vi.fn(() => events.push('metadata:reset'))
+    const clearMetadata = vi.fn(async () => { events.push('metadata:clear') })
     const resetAccountSession = vi.fn(() => events.push('session:reset'))
     const nativeRestore = vi.fn(async (): Promise<
         OfficialPullResult | { kind: 'compatibility-fallback' }
@@ -49,7 +50,7 @@ function createHarness(loggedIn = false, useNativeRestore = false) {
         revision: 8,
     }))
     const flow = createNativeOfficialAccountFlow({
-        appKv,
+        credentialVault: vault,
         adapter,
         initialCredential: loggedIn ? {
             id: 'account-1',
@@ -62,14 +63,14 @@ function createHarness(loggedIn = false, useNativeRestore = false) {
         setRouting,
         clearLegacyFallback,
         flushMetadata,
-        resetMetadata,
+        clearMetadata,
         resetAccountSession,
         ...(useNativeRestore ? { nativeRestore } : {}),
     })
     return {
         adapter,
-        appKv,
         clearLegacyFallback,
+        clearMetadata,
         events,
         flow,
         flushMetadata,
@@ -78,7 +79,7 @@ function createHarness(loggedIn = false, useNativeRestore = false) {
         nativeRestore,
         restart,
         setRouting,
-        values,
+        vault,
     }
 }
 
@@ -108,7 +109,7 @@ describe('explicit native official account flow', () => {
             },
         })
 
-        expect(harness.values.get(nativeOfficialAccountKeys.credential)).toEqual({
+        expect(harness.vault.stored).toEqual({
             id: 'account-1',
             token: 'legacy-token',
             data: {
@@ -145,7 +146,7 @@ describe('explicit native official account flow', () => {
             },
         })
 
-        expect(harness.values.get(nativeOfficialAccountKeys.credential)).toEqual({
+        expect(harness.vault.stored).toEqual({
             id: 'account-1',
             token: 'refreshed-token',
             data: {
@@ -184,7 +185,7 @@ describe('explicit native official account flow', () => {
             token: 'legacy-token',
             data: {},
         }
-        harness.values.set(nativeOfficialAccountKeys.credential, previous)
+        harness.vault.stored = previous
         harness.setRouting.mockRejectedValueOnce(new Error('route failed'))
 
         await expect(harness.flow.login({
@@ -194,7 +195,7 @@ describe('explicit native official account flow', () => {
         })).rejects.toThrow('route failed')
 
         expect(harness.flow.getToken()).toBe('legacy-token')
-        expect(harness.values.get(nativeOfficialAccountKeys.credential)).toEqual(previous)
+        expect(harness.vault.stored).toEqual(previous)
         expect(harness.setRouting).toHaveBeenLastCalledWith(previous)
         expect(harness.adapter.resetAccountAssociation).toHaveBeenCalledWith('account-1')
     })
@@ -310,7 +311,7 @@ describe('explicit native official account flow', () => {
         await new Promise((resolve) => setTimeout(resolve, 0))
 
         expect(harness.adapter.pin).not.toHaveBeenCalled()
-        expect(harness.appKv.remove).not.toHaveBeenCalled()
+        expect(harness.vault.clear).not.toHaveBeenCalled()
 
         resolvePull({ kind: 'missing' })
         await expect(Promise.all([restore, publish, logout])).resolves.toEqual([
@@ -319,7 +320,7 @@ describe('explicit native official account flow', () => {
             undefined,
         ])
         expect(harness.adapter.pin).toHaveBeenCalledOnce()
-        expect(harness.appKv.remove).toHaveBeenCalledTimes(3)
+        expect(harness.vault.clear).toHaveBeenCalledOnce()
         expect(harness.events.indexOf('publish')).toBeLessThan(
             harness.events.indexOf('fallback:clear'),
         )
@@ -367,15 +368,19 @@ describe('explicit native official account flow', () => {
         expect(harness.publication.dispose).not.toHaveBeenCalled()
     })
 
-    it('logs out by clearing native account keys and routing without remote work', async () => {
+    it('logs out by clearing the vault and the stored metadata without remote work', async () => {
         const harness = createHarness(true)
-        for (const key of Object.values(nativeOfficialAccountKeys)) harness.values.set(key, {})
+        harness.vault.stored = { id: 'account-1', token: 'legacy-token', data: {} }
 
         await harness.flow.logout()
 
         expect(harness.flushMetadata).toHaveBeenCalledOnce()
-        expect(harness.appKv.remove).toHaveBeenCalledTimes(3)
-        expect(harness.values.size).toBe(0)
+        expect(harness.vault.clear).toHaveBeenCalledOnce()
+        expect(harness.vault.stored).toBeNull()
+        expect(harness.clearMetadata).toHaveBeenCalledOnce()
+        expect(harness.events.indexOf('metadata:flush')).toBeLessThan(
+            harness.events.indexOf('metadata:clear'),
+        )
         expect(harness.clearLegacyFallback).toHaveBeenCalledOnce()
         expect(harness.adapter.resetAccountAssociation).toHaveBeenCalledWith(null)
         expect(harness.setRouting).toHaveBeenCalledWith(null)
@@ -399,17 +404,27 @@ describe('explicit native official account flow', () => {
                 }),
             }],
         ])
-        const appKv: NativeAppKv = {
+        const settings: NativeDeviceSettings = {
             get: vi.fn(async (key) => backend.get(key) ?? null),
-            set: vi.fn(async (key, value) => void backend.set(key, value)),
-            remove: vi.fn(async (key) => void backend.delete(key)),
+            set: vi.fn(async (key, value) => {
+                if (value === null) backend.delete(key)
+                else backend.set(key, value)
+            }),
+            patch: vi.fn(async (key: string, entries: Record<string, string | null>) => {
+                const stored = { ...(backend.get(key) as Record<string, string> ?? {}) }
+                for (const [entry, value] of Object.entries(entries)) {
+                    if (value === null) delete stored[entry]
+                    else stored[entry] = value
+                }
+                backend.set(key, stored)
+            }),
         }
-        const association = await createNativeAppKvStringStorage(
-            appKv,
+        const association = await createNativeDeviceSettingsBag(
+            settings,
             nativeOfficialAccountKeys.association,
         )
-        const assetLedger = await createNativeAppKvStringStorage(
-            appKv,
+        const assetLedger = await createNativeDeviceSettingsBag(
+            settings,
             nativeOfficialAccountKeys.assetLedger,
         )
         let accountId: string | undefined = 'account-1'
@@ -419,7 +434,11 @@ describe('explicit native official account flow', () => {
         )
         expect(ledger.publishedAs('assets/old.png')).toBe('remote/old.png')
         const flow = createNativeOfficialAccountFlow({
-            appKv,
+            credentialVault: {
+                read: vi.fn(async () => null),
+                write: vi.fn(async () => undefined),
+                clear: vi.fn(async () => undefined),
+            },
             adapter: {
                 pull: vi.fn(),
                 pin: vi.fn(),
@@ -437,9 +456,9 @@ describe('explicit native official account flow', () => {
                 await association.flush()
                 await assetLedger.flush()
             },
-            resetMetadata: () => {
-                association.reset()
-                assetLedger.reset()
+            clearMetadata: async () => {
+                await association.clear()
+                await assetLedger.clear()
                 ledger.reset()
             },
             resetAccountSession: vi.fn(),
