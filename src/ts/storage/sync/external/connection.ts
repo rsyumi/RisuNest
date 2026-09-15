@@ -82,6 +82,10 @@ export function externalJobProgress(job: ExternalJobSummary): number | null {
     return Math.max(0, Math.min(1, completed / total))
 }
 
+/**
+ * Pages arrive grouped by repository object identifier, which carries no time
+ * order, so the merged list is the only place that can put the newest first.
+ */
 export function mergeExternalHistoryItems(
     current: readonly ExternalHistoryItem[],
     next: readonly ExternalHistoryItem[],
@@ -108,7 +112,17 @@ export function mergeExternalHistoryItems(
                 : item.kind,
         })
     }
-    return [...merged.values()]
+    return [...merged.values()].sort((left, right) => {
+        const difference = Number(right.createdAtMs) - Number(left.createdAtMs)
+        return Number.isFinite(difference) ? difference : 0
+    })
+}
+
+/** History entries a restore can actually read back. */
+export function restorableExternalHistoryItems(
+    items: readonly ExternalHistoryItem[],
+): ExternalHistoryItem[] {
+    return items.filter(item => item.complete && item.verified)
 }
 
 export type ExternalConflictAction = 'retry-sync' | 'keep-local' | 'use-remote'

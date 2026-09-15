@@ -5,6 +5,7 @@ import {
     buildPrepareConnectionRequest,
     defaultExternalStorageScope,
     mergeExternalHistoryItems,
+    restorableExternalHistoryItems,
     externalConflictActions,
 } from './connection'
 import { buildProviderSecret } from './providerRegistry'
@@ -91,6 +92,34 @@ describe('external storage connection request', () => {
         const second = { ...first, id: 'snapshot-2', logicalRevision: '2' as const }
 
         expect(mergeExternalHistoryItems([first], [updated, second])).toEqual([updated, second])
+    })
+
+    it('puts the newest entry first because pages arrive in object order', () => {
+        const base = {
+            kind: 'recovery-candidate' as const, logicalRevision: '1' as const,
+            pinned: false, complete: true, verified: true,
+        }
+
+        expect(mergeExternalHistoryItems(
+            [{ ...base, id: 'aaa', createdAtMs: '1000' as const }],
+            [
+                { ...base, id: 'zzz', createdAtMs: '3000' as const },
+                { ...base, id: 'mmm', createdAtMs: '2000' as const },
+            ],
+        ).map(item => item.id)).toEqual(['zzz', 'mmm', 'aaa'])
+    })
+
+    it('keeps only the entries a restore can read back', () => {
+        const base = {
+            kind: 'recovery-candidate' as const, createdAtMs: '1' as const,
+            logicalRevision: '1' as const, pinned: false,
+        }
+
+        expect(restorableExternalHistoryItems([
+            { ...base, id: 'partial', complete: false, verified: true },
+            { ...base, id: 'unverified', complete: true, verified: false },
+            { ...base, id: 'usable', complete: true, verified: true },
+        ]).map(item => item.id)).toEqual(['usable'])
     })
 
     it('preserves pinned conflict metadata when a later root page repeats a snapshot', () => {

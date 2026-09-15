@@ -10,6 +10,7 @@
     import {
         refreshExternalStorageProductionState,
         requestExternalStorageNow,
+        requestExternalStorageResolveConflict,
         requestExternalStorageRestore,
     } from 'src/ts/storage/sync/external/production'
     import type {
@@ -26,6 +27,8 @@
     import { externalConnectionTitle, externalErrorMessage, externalStorageStrings } from './strings'
 
     const bridge = getExternalStorageBridge()
+    /** How many empty history pages one request reads past before stopping. */
+    const EMPTY_HISTORY_STEPS = 4
     const strings = $derived(externalStorageStrings(DBState.db.language))
     let storageState = $state<ExternalStorageState | null>(null)
     let adding = $state(false)
@@ -82,6 +85,12 @@
         await refreshExternalStorageProductionState()
         await refresh()
         schedulePoll()
+        // An already existing repository is opened to read what is in it, so
+        // its contents are shown without asking for the history tab first.
+        if (result.connection.mode === 'existing') {
+            expanded[result.connection.id] = 'history'
+            await loadHistory(result.connection, false)
+        }
     }
 
     async function runJob(
@@ -106,6 +115,16 @@
                         ...(connection.scope.deviceSettings ? ['deviceSettings' as const] : []),
                         ...(connection.scope.devicePlugins ? ['devicePlugins' as const] : []),
                     ],
+                )
+                schedulePoll(true)
+                await operation
+            } else if (job === 'resolve-conflict') {
+                if (!details.conflictId || !details.choice)
+                    throw new Error('Missing conflict decision')
+                const operation = requestExternalStorageResolveConflict(
+                    connection.id,
+                    details.conflictId,
+                    details.choice,
                 )
                 schedulePoll(true)
                 await operation
@@ -159,15 +178,19 @@
         if (historyLoading[connection.id]) return
         historyLoading[connection.id] = true
         try {
-            const page = await bridge.listHistory(
-                connection.id,
-                append ? historyCursor[connection.id] : undefined,
-            )
-            history[connection.id] = mergeExternalHistoryItems(
-                append ? history[connection.id] ?? [] : [],
-                page.items,
-            )
-            historyCursor[connection.id] = page.nextCursor
+            let items = append ? history[connection.id] ?? [] : []
+            let cursor = append ? historyCursor[connection.id] : undefined
+            // The first page covers kept and conflict copies only, so a
+            // repository that just holds backups answers it with nothing. Keep
+            // reading until this step has something to show.
+            for (let step = 0; step < EMPTY_HISTORY_STEPS; step += 1) {
+                const page = await bridge.listHistory(connection.id, cursor)
+                items = mergeExternalHistoryItems(items, page.items)
+                cursor = page.nextCursor
+                if (page.items.length > 0 || !cursor) break
+            }
+            history[connection.id] = items
+            historyCursor[connection.id] = cursor
             error = ''
         } catch (reason) {
             error = externalErrorMessage(strings, reason)

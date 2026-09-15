@@ -47,9 +47,19 @@
         onconnected: (result: ExternalConnectionResult) => void | Promise<void>
         oncancel: () => void
         onbusychange?: (busy: boolean) => void
+        /** Opens an already existing repository only, without the create form. */
+        restoreOnly?: boolean
+        tone?: 'settings' | 'onboarding'
     }
 
-    let { strings, onconnected, oncancel, onbusychange = () => {} }: Props = $props()
+    let {
+        strings,
+        onconnected,
+        oncancel,
+        onbusychange = () => {},
+        restoreOnly = false,
+        tone = 'settings',
+    }: Props = $props()
     const bridge = getExternalStorageBridge()
     const platform = isTauriAndroid
         ? 'android'
@@ -57,7 +67,11 @@
           ? 'ios'
           : ({ windows: 'windows', macos: 'macos', linux: 'linux' } as Record<string, string>)[osType()] ?? 'windows'
     let providerId = $state<ExternalProviderId>('google_drive')
-    let mode = $state<ExternalOpenMode>('create')
+    let chosenMode = $state<ExternalOpenMode>('create')
+    const mode = $derived<ExternalOpenMode>(restoreOnly ? 'existing' : chosenMode)
+    // The recovery file carries the repository settings, so the review must not
+    // show the purpose this form never asked for.
+    let fromRecovery = $state(false)
     let purpose = $state<ExternalConnectionPurpose>('backup')
     let strategy = $state<ExternalPublicationStrategy>('backup-only')
     let values = $state<Record<string, string>>({
@@ -176,6 +190,7 @@
             return
         }
         prepared = null
+        fromRecovery = false
         endpointConfirmed = false
         currentPlatformClientId = ''
         oauthClientSecret = ''
@@ -206,6 +221,39 @@
         }
         accepted = []
         resetPrepared()
+    }
+
+    function selectMode(value: ExternalOpenMode): void {
+        chosenMode = value
+        recoveryPayload = ''
+        recoveryCode = ''
+        resetPrepared()
+    }
+
+    function readRecoveryFile(): Promise<string | null> {
+        return new Promise(resolve => {
+            const input = document.createElement('input')
+            input.type = 'file'
+            // The Android picker hides extensions it does not know, so it stays
+            // open there and the contents are checked when the key is read.
+            if (!isTauriAndroid) input.accept = '.rnrecovery,text/plain'
+            input.style.display = 'none'
+            const finish = async (file?: File) => {
+                input.remove()
+                resolve(file ? await file.text() : null)
+            }
+            input.addEventListener('cancel', () => void finish())
+            input.addEventListener('change', () => void finish(input.files?.[0] ?? undefined))
+            document.body.appendChild(input)
+            input.click()
+        })
+    }
+
+    async function loadRecoveryFile(): Promise<void> {
+        const contents = await readRecoveryFile()
+        if (contents === null) return
+        recoveryPayload = contents.replace(/^﻿/, '').trim()
+        error = ''
     }
 
     function selectPurpose(value: ExternalConnectionPurpose): void {
@@ -274,6 +322,7 @@
         error = ''
         try {
             prepared = await bridge.prepareRecoveryImport(recoveryPayload.trim(), recoveryCode.trim())
+            fromRecovery = true
             providerId = prepared.endpoint.providerId
         } catch (reason) {
             error = externalErrorMessage(strings, reason)
@@ -340,29 +389,36 @@
     }
 </script>
 
-<fieldset disabled={busy} class="form" data-external-storage-connection-form>
+<fieldset disabled={busy} class="form" data-external-storage-connection-form data-tone={tone}>
     <fieldset disabled={prepared !== null} class="contents">
+    {#if !restoreOnly}
     <section class="sub">
-        <h4 class="sub-title">{strings.provider}</h4>
+        <h4 class="sub-title">{mode === 'create' ? strings.provider : strings.mode}</h4>
         <div class="fields two">
-            <label class="field">
-                <span>{strings.provider}</span>
-                <SelectInput value={providerId} className="w-full" onchange={event => selectProvider(event.currentTarget.value)}>
-                    {#each providerOptions as option (option.value)}<OptionInput value={option.value} disabled={option.disabled}>{option.label}</OptionInput>{/each}
-                </SelectInput>
-                <small>{providerStrings.description}</small>
-            </label>
+            {#if mode === 'create'}
+                <label class="field">
+                    <span>{strings.provider}</span>
+                    <SelectInput value={providerId} className="w-full" onchange={event => selectProvider(event.currentTarget.value)}>
+                        {#each providerOptions as option (option.value)}<OptionInput value={option.value} disabled={option.disabled}>{option.label}</OptionInput>{/each}
+                    </SelectInput>
+                    <small>{providerStrings.description}</small>
+                </label>
+            {/if}
             <div class="field">
                 <span>{strings.mode}</span>
-                <SegmentedButtons bind:value={mode} label={strings.mode} role="radiogroup" onchange={resetPrepared} options={[{ value: 'create', label: strings.create }, { value: 'existing', label: strings.existing }]} />
+                <SegmentedButtons value={mode} label={strings.mode} role="radiogroup" onchange={selectMode} options={[{ value: 'create', label: strings.create }, { value: 'existing', label: strings.existing }]} />
                 {#if mode === 'existing'}<small>{strings.existingHelp}</small>{/if}
             </div>
         </div>
-        {#if !authorizationAvailable}<p class="note danger"><span>{strings.authorizationUnavailable}</span></p>{/if}
-        {#if googleAndroid}<p class="note"><span>{strings.googleAndroidSetup}</span></p>{/if}
-        {#if isTauriAndroid && providerId === 'onedrive'}<p class="note"><span>{strings.oneDriveAndroidSetup}</span></p>{/if}
+        {#if mode === 'create'}
+            {#if !authorizationAvailable}<p class="note danger"><span>{strings.authorizationUnavailable}</span></p>{/if}
+            {#if googleAndroid}<p class="note"><span>{strings.googleAndroidSetup}</span></p>{/if}
+            {#if isTauriAndroid && providerId === 'onedrive'}<p class="note"><span>{strings.oneDriveAndroidSetup}</span></p>{/if}
+        {/if}
     </section>
+    {/if}
 
+    {#if mode === 'create'}
     <section class="sub">
         <h4 class="sub-title">{strings.purpose}</h4>
         <div class="field">
@@ -435,24 +491,17 @@
         <label class="check"><input type="checkbox" bind:checked={deviceSettings} onchange={resetPrepared} /><span>{strings.deviceSettings}</span></label>
         <label class="check"><input type="checkbox" bind:checked={devicePlugins} onchange={resetPrepared} /><span>{strings.devicePlugins}</span></label>
     </fieldset>
+    {/if}
     </fieldset>
 
-    {#if !prepared}
-        <section class="sub">
-            <div class="actions">
-                <SettingButton disabled={busy || !authorizationAvailable || requiredAcks.some(item => !accepted.includes(item))} onclick={prepare}>{strings.prepare}</SettingButton>
-                <SettingButton variant="secondary" onclick={oncancel}>{strings.cancel}</SettingButton>
-            </div>
-            <p class="sub-help">{strings.pendingVerification}</p>
-        </section>
-    {:else}
+    {#if prepared}
         <section class="sub">
             <h4 class="sub-title">{strings.endpointReview}</h4>
             <dl class="review">
                 <dt>{strings.authority}</dt><dd>{prepared.endpoint.authority}</dd>
                 {#if prepared.endpoint.accountHint}<dt>{strings.account}</dt><dd>{prepared.endpoint.accountHint}</dd>{/if}
                 <dt>{strings.repository}</dt><dd>{prepared.endpoint.repositoryHint}</dd>
-                {#if !prepared.requiresRecoveryKey}
+                {#if !fromRecovery}
                     <dt>{strings.purposeReview}</dt>
                     <dd>{purpose === 'backup' ? `${strings.backup} · ${strings.includes.replace('{0}', scopeSummary)}` : `${strings.sync} · ${strings.strategyLabels[strategy]}`}</dd>
                 {/if}
@@ -460,55 +509,64 @@
             </dl>
             {#each prepared.endpoint.warnings as warning (warning)}<p class="note"><span>{externalEndpointWarning(strings, warning)}</span></p>{/each}
 
-            {#if prepared.requiresRecoveryKey}
-                <div class="warning">
-                    <strong>{strings.recoveryRequiredTitle}</strong>
-                    <p>{strings.recoveryRequired}</p>
-                </div>
-                <label class="field"><span>{strings.recoveryPayload}</span><textarea class="textarea" placeholder={strings.recoveryPayloadPlaceholder} bind:value={recoveryPayload}></textarea></label>
-                <label class="field"><span>{strings.recoveryCode}</span><TextInput fullwidth hideText bind:value={recoveryCode} /></label>
-                <div class="actions">
-                    <SettingButton disabled={busy || !recoveryPayload.trim() || !recoveryCode.trim()} onclick={authenticateRecovery}>{strings.unlock}</SettingButton>
-                    <SettingButton variant="secondary" onclick={resetPrepared}>{strings.back}</SettingButton>
-                </div>
-            {:else}
-                <label class="check"><input type="checkbox" bind:checked={endpointConfirmed} /><span>{strings.confirmEndpoint}</span></label>
-                {#if prepared.requiresPlatformOAuthClient}
-                    <label class="field"><span>{googleAndroid ? strings.webOAuthClientId : strings.platformClientId}</span><TextInput fullwidth bind:value={currentPlatformClientId} /></label>
-                {/if}
-                {#if endpointConfirmed && prepared.requiresOAuth && googleAndroid}
-                    <div class="fields two">
-                        <label class="field"><span>{strings.oauthClientSecret}</span><TextInput fullwidth hideText bind:value={oauthClientSecret} /></label>
-                        {#if pendingAuthorizationId}<label class="field"><span>{strings.manualOAuthCallback}</span><TextInput fullwidth hideText bind:value={manualOAuthCallback} /><small>{strings.manualOAuthHelp}</small></label>{/if}
-                    </div>
-                {/if}
-                {#if endpointConfirmed && !prepared.requiresOAuth}
-                    <div class="fields two">
-                        {#each definition.secretFields as field (field.key)}
-                            {@const help = externalFieldHelp(strings, providerId, field.key)}
-                            <label class="field">
-                                <span>{fieldLabel(field.key)}</span>
-                                {#if field.type === 'select'}
-                                    <SelectInput value={values[field.key] ?? field.options?.[0] ?? ''} className="w-full" onchange={event => values[field.key] = event.currentTarget.value}>
-                                        {#each field.options ?? [] as option (option)}<OptionInput value={option}>{externalOptionLabel(strings, providerId, field.key, option)}</OptionInput>{/each}
-                                    </SelectInput>
-                                {:else if field.type === 'datetime-local'}
-                                    <input type="datetime-local" class="datetime" bind:value={values[field.key]} />
-                                {:else}
-                                    <TextInput fullwidth hideText={field.secret} bind:value={values[field.key]} />
-                                {/if}
-                                {#if help}<small>{help}</small>{/if}
-                            </label>
-                        {/each}
-                    </div>
-                {/if}
-                {#if authorizationStatus}<p class="sub-help" role="status">{authorizationStatus}</p>{/if}
-                <div class="actions">
-                    <SettingButton disabled={busy || !endpointConfirmed || !authorizationAvailable || (prepared.requiresPlatformOAuthClient && !currentPlatformClientId.trim())} onclick={connect}>{connectLabel}</SettingButton>
-                    <SettingButton variant="secondary" onclick={resetPrepared}>{strings.back}</SettingButton>
-                </div>
-                {#if !prepared.requiresOAuth && mode === 'create'}<p class="sub-help">{strings.connectHint}</p>{/if}
+            <label class="check"><input type="checkbox" bind:checked={endpointConfirmed} /><span>{strings.confirmEndpoint}</span></label>
+            {#if prepared.requiresPlatformOAuthClient}
+                <label class="field"><span>{googleAndroid ? strings.webOAuthClientId : strings.platformClientId}</span><TextInput fullwidth bind:value={currentPlatformClientId} /></label>
             {/if}
+            {#if endpointConfirmed && prepared.requiresOAuth && googleAndroid}
+                <div class="fields two">
+                    <label class="field"><span>{strings.oauthClientSecret}</span><TextInput fullwidth hideText bind:value={oauthClientSecret} /></label>
+                    {#if pendingAuthorizationId}<label class="field"><span>{strings.manualOAuthCallback}</span><TextInput fullwidth hideText bind:value={manualOAuthCallback} /><small>{strings.manualOAuthHelp}</small></label>{/if}
+                </div>
+            {/if}
+            {#if endpointConfirmed && !prepared.requiresOAuth}
+                <div class="fields two">
+                    {#each definition.secretFields as field (field.key)}
+                        {@const help = externalFieldHelp(strings, providerId, field.key)}
+                        <label class="field">
+                            <span>{fieldLabel(field.key)}</span>
+                            {#if field.type === 'select'}
+                                <SelectInput value={values[field.key] ?? field.options?.[0] ?? ''} className="w-full" onchange={event => values[field.key] = event.currentTarget.value}>
+                                    {#each field.options ?? [] as option (option)}<OptionInput value={option}>{externalOptionLabel(strings, providerId, field.key, option)}</OptionInput>{/each}
+                                </SelectInput>
+                            {:else if field.type === 'datetime-local'}
+                                <input type="datetime-local" class="datetime" bind:value={values[field.key]} />
+                            {:else}
+                                <TextInput fullwidth hideText={field.secret} bind:value={values[field.key]} />
+                            {/if}
+                            {#if help}<small>{help}</small>{/if}
+                        </label>
+                    {/each}
+                </div>
+            {/if}
+            {#if authorizationStatus}<p class="sub-help" role="status">{authorizationStatus}</p>{/if}
+            <div class="actions">
+                <SettingButton disabled={busy || !endpointConfirmed || !authorizationAvailable || (prepared.requiresPlatformOAuthClient && !currentPlatformClientId.trim())} onclick={connect}>{connectLabel}</SettingButton>
+                <SettingButton variant="secondary" onclick={resetPrepared}>{strings.back}</SettingButton>
+            </div>
+            {#if !prepared.requiresOAuth && mode === 'create'}<p class="sub-help">{strings.connectHint}</p>{/if}
+        </section>
+    {:else if mode === 'existing'}
+        <section class="sub">
+            <h4 class="sub-title">{strings.recoveryRequiredTitle}</h4>
+            <p class="sub-help">{strings.recoveryRequired}</p>
+            <div class="actions">
+                <SettingButton variant="secondary" disabled={busy} onclick={loadRecoveryFile}>{strings.openRecoveryFile}</SettingButton>
+            </div>
+            <label class="field"><span>{strings.recoveryPayload}</span><textarea class="textarea" placeholder={strings.recoveryPayloadPlaceholder} bind:value={recoveryPayload}></textarea></label>
+            <label class="field"><span>{strings.recoveryCode}</span><TextInput fullwidth hideText bind:value={recoveryCode} /></label>
+            <div class="actions">
+                <SettingButton disabled={busy || !recoveryPayload.trim() || !recoveryCode.trim()} onclick={authenticateRecovery}>{strings.unlock}</SettingButton>
+                <SettingButton variant="secondary" onclick={oncancel}>{strings.cancel}</SettingButton>
+            </div>
+        </section>
+    {:else}
+        <section class="sub">
+            <div class="actions">
+                <SettingButton disabled={busy || !authorizationAvailable || requiredAcks.some(item => !accepted.includes(item))} onclick={prepare}>{strings.prepare}</SettingButton>
+                <SettingButton variant="secondary" onclick={oncancel}>{strings.cancel}</SettingButton>
+            </div>
+            <p class="sub-help">{strings.pendingVerification}</p>
         </section>
     {/if}
     {#if error}<p class="px-4 pb-4 text-sm text-danger-400" role="alert">{error}</p>{/if}
@@ -522,6 +580,14 @@
     .form > .sub,
     .form > .contents > .sub + .sub {
         border-top: 1px solid color-mix(in srgb, var(--risu-theme-darkborderc) 55%, transparent);
+    }
+    /* The onboarding panel draws its own frame and gutter. */
+    .form[data-tone='onboarding'] > .sub,
+    .form[data-tone='onboarding'] > .contents > .sub + .sub {
+        border-top: 0;
+    }
+    .form[data-tone='onboarding'] .sub {
+        padding: 0 0 0.75rem;
     }
     .sub {
         display: grid;
