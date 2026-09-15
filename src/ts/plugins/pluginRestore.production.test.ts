@@ -36,26 +36,17 @@ import { workingSetResidency } from '../storage/workingSetResidency'
 import { selectedCharID } from '../stores.svelte'
 import {
     loadPluginsAfterAuthoritativeRestore,
-    pluginCompatibility,
     pluginStorageStore,
 } from './plugins.svelte'
-import {
-    shouldProjectScalableWorkingSet,
-    type PluginCompatibilityProfile,
-} from './pluginCompatibility'
 
 afterEach(() => {
     configurePersistentDataRuntime({ projectWorkingSet: undefined })
-    pluginCompatibility.initialize('scalable-v3')
     pluginStorageStore.invalidate()
     workingSetResidency.clear()
     vi.restoreAllMocks()
 })
 
-async function restoreFixture(
-    previous: PluginCompatibilityProfile,
-    maximum: boolean,
-) {
+async function restoreFixture() {
     const initial = {
         characters: [],
         botPresets: [],
@@ -68,16 +59,6 @@ async function restoreFixture(
     const restored = {
         ...initial,
         plugins: [
-            ...(maximum
-                ? [
-                      {
-                          name: 'synthetic-v2',
-                          version: '2.1',
-                          enabled: true,
-                          script: '',
-                      },
-                  ]
-                : []),
             { name: 'synthetic-v3', version: '3.0', enabled: true, script: '' },
         ],
         pluginCustomStorage: {
@@ -103,8 +84,6 @@ async function restoreFixture(
     await store.replaceFromDatabase(initial, 0)
     setDatabaseLite(initial)
     selectedCharID.set(-1)
-    pluginCompatibility.initialize(previous)
-    pluginStorageStore.preloadCompatibilityValues(initial.pluginCustomStorage)
     configurePersistentDataRuntime({
         projectWorkingSet(
             database,
@@ -113,15 +92,15 @@ async function restoreFixture(
             activeIds,
             force,
         ) {
-            return shouldProjectScalableWorkingSet(pluginCompatibility, force)
-                ? projectCompleteScalableWorkingSet(
+            return force === false
+                ? database
+                : projectCompleteScalableWorkingSet(
                       database,
                       selectedId,
                       2,
                       activeIds,
                       conversationId,
                   )
-                : database
         },
     })
     const runtime = createPersistentDataRuntime({
@@ -137,49 +116,22 @@ async function restoreFixture(
 }
 
 describe('authoritative restore plugin initialization', () => {
-    it.each<PluginCompatibilityProfile>([
-        'scalable-v3',
-        'maximum-compatibility',
-    ])(
-        'installs restored compatibility data before loading plugins from %s',
-        async (previous) => {
-            const { store, restored } = await restoreFixture(previous, true)
-            expect(isCatalogCharacterStub(getDatabase().characters[0])).toBe(
-                false,
-            )
-            expect(getDatabase().characters[0]).toMatchObject({
-                desc: 'restored detail',
-            })
-            let observed: unknown
-            vi.mocked(loadV3Plugins).mockImplementationOnce(async () => {
-                observed = await pluginStorageStore.getItem('pm_store')
-            })
-            await loadPluginsAfterAuthoritativeRestore()
-            expect(pluginCompatibility.profile).toBe('maximum-compatibility')
-            expect(observed).toEqual({
-                version: 5,
-                models: [{ id: 'restored' }],
-                keys: [],
-            })
-            expect((await store.readPluginStorage('pm_store'))?.value).toEqual(
-                restored.pluginCustomStorage.pm_store,
-            )
-        },
-    )
-
     it('invalidates old cached values and reads restored v3 storage without materializing the database', async () => {
-        const { materialize } = await restoreFixture(
-            'maximum-compatibility',
-            false,
-        )
+        const { store, restored, materialize } = await restoreFixture()
         expect(isCatalogCharacterStub(getDatabase().characters[0])).toBe(true)
+        let observed: unknown
+        vi.mocked(loadV3Plugins).mockImplementationOnce(async () => {
+            observed = await pluginStorageStore.getItem('pm_store')
+        })
         await loadPluginsAfterAuthoritativeRestore()
-        expect(pluginCompatibility.profile).toBe('scalable-v3')
-        await expect(pluginStorageStore.getItem('pm_store')).resolves.toEqual({
+        expect(observed).toEqual({
             version: 5,
             models: [{ id: 'restored' }],
             keys: [],
         })
+        expect((await store.readPluginStorage('pm_store'))?.value).toEqual(
+            restored.pluginCustomStorage.pm_store,
+        )
         expect(materialize).not.toHaveBeenCalled()
     })
 })

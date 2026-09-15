@@ -7,7 +7,6 @@ import {
 import type { OfficialRevisionPublisher, PinnedPublication } from '../saveCoordinator'
 import type { OfficialPullResult } from './officialAccountSnapshot'
 import type { OfficialAccountAssetReader } from '../accountAssetAccess'
-import type { PluginCompatibilityProfile } from '../../plugins/pluginCompatibility'
 
 interface OfficialBootstrapAdapter extends OfficialRevisionPublisher {
     pull(signal?: AbortSignal): Promise<OfficialPullResult>
@@ -23,12 +22,10 @@ export interface OfficialAccountBootstrapDependencies {
     local: {
         database: Database
         revision: DataRevision
-        profile: PluginCompatibilityProfile
     }
     resolveWorkingSet(revision: DataRevision): Promise<{
         database: Database
         revision: DataRevision
-        profile: PluginCompatibilityProfile
     }>
     adapter: OfficialBootstrapAdapter
     readRemoteDatabase(): Promise<AccountReadResult>
@@ -39,7 +36,6 @@ export interface OfficialAccountBootstrapDependencies {
     configureAssetReader(reader: OfficialAccountAssetReader | null): void
     chooseExistingRemote(): Promise<'pull' | 'push'>
     confirmInitialPush(): Promise<boolean>
-    initializeProfile(profile: PluginCompatibilityProfile): void
     installDatabase(database: Database): void
     initializeWorkingSet(database: Database): Promise<void>
     onRemoteError(error: unknown): void
@@ -163,7 +159,6 @@ export async function initializeOfficialAccountBootstrap(
     if (resolved.revision !== revision) {
         throw new RevisionConflictError(revision, resolved.revision)
     }
-    dependencies.initializeProfile(resolved.profile)
     dependencies.installDatabase(resolved.database)
     await dependencies.initializeWorkingSet(resolved.database)
     return { database: resolved.database, revision, officialEnabled }

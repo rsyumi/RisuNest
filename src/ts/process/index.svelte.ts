@@ -32,11 +32,7 @@ import { getModelInfo, LLMFlags } from "../model/modellist";
 import { hypaMemoryV3 } from "./memory/hypav3";
 import { getModuleAssets, getModuleToggles } from "./modules";
 import { readImage } from "../globalApi.svelte";
-import {
-    chatOutputListenerProvenance,
-    pluginCompatibility,
-    pluginV2,
-} from "../plugins/plugins.svelte";
+import { pluginV2 } from "../plugins/plugins.svelte";
 import { dispatchChatOutputListeners } from '../plugins/pluginChatOutputListeners'
 import { createProductionPluginChatOutputProjector } from '../plugins/pluginDatabaseAccess'
 import { activatePresetChainForRequest } from "./presetChain";
@@ -102,15 +98,12 @@ export async function runChatOutputListeners(char: any, chat: any, characterInde
     }
     await dispatchChatOutputListeners({
         listeners: pluginV2.chatOutput,
-        provenance: chatOutputListenerProvenance,
-        profile: pluginCompatibility.profile,
         char,
         chat,
         characterIndex,
         chatIndex,
         messageIndex,
         signal,
-        snapshot: <T>(value: T) => $state.snapshot(value) as T,
         projectScalable: projectPluginChatOutput,
         onError: (error) => console.error(error),
     })

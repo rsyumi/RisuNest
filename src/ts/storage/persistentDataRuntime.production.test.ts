@@ -252,7 +252,7 @@ describe('production persistent working-set publication', () => {
         expect(getDatabase().characters[1].personality).toBe('Complete personality')
     })
 
-    it('reports selected lifecycle policy, compatibility, operation and viewport budget', () => {
+    it('reports selected lifecycle policy, operation and viewport budget', () => {
         setDatabaseLite({
             botPresets: [],
             characters: [],
@@ -267,7 +267,6 @@ describe('production persistent working-set publication', () => {
         )
 
         expect(adapter.canUseWindowedSelectedConversation?.()).toBe(true)
-        expect(adapter.isMaximumCompatibilityMode?.()).toBe(false)
         expect(adapter.isConversationOperationActive?.()).toBe(false)
         expect(adapter.conversationViewportRowBudget).toBe(
             getRuntimePerformanceBudgets().chatMountedMessageBudget,
@@ -275,14 +274,8 @@ describe('production persistent working-set publication', () => {
 
         workingSetResidency.setEvictionAllowed(false)
         doingChat.set(true)
-        setDatabaseLite({
-            botPresets: [],
-            characters: [],
-            plugins: [{ enabled: true, version: '2.1' }],
-        } as unknown as Database)
 
         expect(adapter.canUseWindowedSelectedConversation?.()).toBe(false)
-        expect(adapter.isMaximumCompatibilityMode?.()).toBe(true)
         expect(adapter.isConversationOperationActive?.()).toBe(true)
         doingChat.set(false)
         expect(operationTransitions).toEqual([false, true, false])
@@ -380,48 +373,4 @@ describe('production persistent working-set publication', () => {
             unregister()
         }
     })
-
-    it.each(['proxy', 'pluginStorage'] as const)(
-        'creates a safe own proto key through the V2 %s writer',
-        (writer) => {
-            setDatabaseLite({
-                botPresets: [],
-                characters: [],
-                plugins: [],
-                pluginCustomStorage: JSON.parse('{"2":0,"zeta":false}'),
-            } as unknown as Database)
-            const expectedPrototype = Object.getPrototypeOf(
-                getDatabase().pluginCustomStorage,
-            )
-            const value = ''
-            const api = getV2PluginAPIs()
-            const initialStorage = getDatabase().pluginCustomStorage
-
-            if (writer === 'proxy') {
-                ;(api.getDatabase() as Record<string, unknown>).ordinary = 0
-            } else api.pluginStorage.setItem('ordinary', '')
-            expect(getDatabase().pluginCustomStorage).toBe(initialStorage)
-
-            if (writer === 'proxy') {
-                ;(api.getDatabase() as Record<string, unknown>).__proto__ = value
-            }
-            else api.pluginStorage.setItem('__proto__', value)
-
-            const storage = getDatabase().pluginCustomStorage
-            expect(Object.keys(storage)).toEqual(['2', 'zeta', 'ordinary', '__proto__'])
-            expect(Object.hasOwn(storage, '__proto__')).toBe(true)
-            expect(storage.__proto__).toEqual(value)
-            expect(Object.getPrototypeOf(storage)).toBe(expectedPrototype)
-            expect(storage['2']).toBe(0)
-            expect(storage.zeta).toBe(false)
-            expect(storage.ordinary).toBe(writer === 'proxy' ? 0 : '')
-
-            if (writer === 'proxy') {
-                ;(api.getDatabase() as Record<string, unknown>).__proto__ = 'updated'
-            } else api.pluginStorage.setItem('__proto__', 'updated')
-            expect(getDatabase().pluginCustomStorage).toBe(storage)
-            expect(Object.keys(storage)).toEqual(['2', 'zeta', 'ordinary', '__proto__'])
-            expect(storage.__proto__).toBe('updated')
-        },
-    )
 })

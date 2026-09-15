@@ -30,7 +30,6 @@ import {
 } from '../storage/persistentRecordIterator'
 import { defineOwnEnumerableProperty } from '../storage/ownEnumerableProperty'
 import { isConversationSummaryStub } from '../storage/conversationResidency'
-import type { PluginCompatibilityProfile } from './pluginCompatibility'
 
 export const PLUGIN_SUMMARY_QUERY_DEFAULT_LIMIT = 50
 export const PLUGIN_SUMMARY_QUERY_MAX_LIMIT = 100
@@ -137,7 +136,6 @@ export interface PluginDatabaseAccessDependencies {
     store: PersistentDataStore
     flushPendingData(reason: string): Promise<void>
     getCompatibilityDatabase(): Database
-    getCompatibilityProfile(): PluginCompatibilityProfile
     getSelectedCharacterId(): string | null
     captureSelectedConversationTarget(): SelectedConversationTarget | null
     acquireCompleteConversation(
@@ -167,7 +165,6 @@ export interface PluginDatabaseAccessDependencies {
     ): void
     getNavigationGeneration(): number
     applyCompatibilityDatabaseLite(database: Record<string, unknown>): void
-    applyCompatibilityDatabase(database: Record<string, unknown>): Promise<void>
     readPluginStorageSnapshot(): Promise<Record<string, unknown>>
     mutatePluginStorage(mutations: readonly PluginStorageMutation[]): Promise<void>
     invalidatePluginStorage(): void
@@ -234,10 +231,10 @@ export interface PluginDatabaseAccess {
     ): Promise<void>
 }
 
-const SCALABLE_CHARACTER_SET_ERROR =
-    'Synchronous plugin character updates are unavailable in scalable-v3. Use async setDatabase() or maximum-compatibility.'
+const SYNCHRONOUS_CHARACTER_SET_ERROR =
+    'Synchronous plugin character updates are unavailable. Use async setDatabase().'
 const STALE_DATABASE_SET_ERROR =
-    'Plugin database update became stale because compatibility or navigation state changed.'
+    'Plugin database update became stale because navigation state changed.'
 const DANGEROUS_DATABASE_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
 
 function positiveLimit(value: number | undefined, defaultValue: number, maximum: number): number {
@@ -609,15 +606,11 @@ export function createPluginDatabaseAccess(
 
     return {
         async getCurrentCharacter(context) {
-            const initialProfile = dependencies.getCompatibilityProfile()
             throwIfFullObjectCallAborted(context.signal)
             await dependencies.flushPendingData('plugin-full-object-read')
             throwIfFullObjectCallAborted(context.signal)
             const characterId = dependencies.getSelectedCharacterId()
             if (characterId === null) {
-                if (dependencies.getCompatibilityProfile() !== initialProfile) {
-                    throw new Error(STALE_DATABASE_SET_ERROR)
-                }
                 return undefined
             }
             await openStore()
@@ -626,15 +619,11 @@ export function createPluginDatabaseAccess(
                 throwIfFullObjectCallAborted(context.signal)
                 const value = await readPinnedCompleteCharacter(reader, characterId)
                 throwIfFullObjectCallAborted(context.signal)
-                if (dependencies.getCompatibilityProfile() !== initialProfile) {
-                    throw new Error(STALE_DATABASE_SET_ERROR)
-                }
                 return value === null ? undefined : dependencies.snapshot(value)
             })
         },
 
         async getCharacterFromIndex(index, context) {
-            const initialProfile = dependencies.getCompatibilityProfile()
             throwIfFullObjectCallAborted(context.signal)
             await dependencies.flushPendingData('plugin-full-object-read')
             throwIfFullObjectCallAborted(context.signal)
@@ -647,15 +636,11 @@ export function createPluginDatabaseAccess(
                     ? await readPinnedCompleteCharacter(reader, target.characterId)
                     : null
                 throwIfFullObjectCallAborted(context.signal)
-                if (dependencies.getCompatibilityProfile() !== initialProfile) {
-                    throw new Error(STALE_DATABASE_SET_ERROR)
-                }
                 return value === null ? null : dependencies.snapshot(value)
             })
         },
 
         async getChatFromIndex(characterIndex, chatIndex, context) {
-            const initialProfile = dependencies.getCompatibilityProfile()
             throwIfFullObjectCallAborted(context.signal)
             await dependencies.flushPendingData('plugin-full-object-read')
             throwIfFullObjectCallAborted(context.signal)
@@ -679,9 +664,6 @@ export function createPluginDatabaseAccess(
                     )
                 }
                 throwIfFullObjectCallAborted(context.signal)
-                if (dependencies.getCompatibilityProfile() !== initialProfile) {
-                    throw new Error(STALE_DATABASE_SET_ERROR)
-                }
                 return found === null ? null : dependencies.snapshot(found.value)
             })
         },
@@ -689,7 +671,6 @@ export function createPluginDatabaseAccess(
         async setCurrentCharacter(character, context) {
             validatePluginCompleteCharacter(character)
             const candidate = dependencies.snapshot(character)
-            const initialProfile = dependencies.getCompatibilityProfile()
             const selectedBoundary = captureSelectedCallBoundary()
             throwIfFullObjectCallAborted(context.signal)
             await dependencies.flushPendingData('plugin-full-object-write')
@@ -706,9 +687,6 @@ export function createPluginDatabaseAccess(
             })
             if (!target) throw new PluginFullObjectTargetStaleError(characterId)
             throwIfFullObjectCallAborted(context.signal)
-            if (dependencies.getCompatibilityProfile() !== initialProfile) {
-                throw new Error(STALE_DATABASE_SET_ERROR)
-            }
             if (candidate.chaId !== target.characterId) {
                 rejectIdentityReplacement(
                     context,
@@ -724,9 +702,6 @@ export function createPluginDatabaseAccess(
                     target.characterId,
                 )
                 throwIfFullObjectCallAborted(context.signal)
-                if (dependencies.getCompatibilityProfile() !== initialProfile) {
-                    throw new Error(STALE_DATABASE_SET_ERROR)
-                }
                 const replaced = await dependencies.replacePersistentCompleteCharacter(
                     target.characterId,
                     'plugin-setCharacter',
@@ -749,7 +724,6 @@ export function createPluginDatabaseAccess(
         async setCharacterToIndex(index, character, context) {
             validatePluginCompleteCharacter(character)
             const candidate = dependencies.snapshot(character)
-            const initialProfile = dependencies.getCompatibilityProfile()
             const selectedBoundary = captureSelectedCallBoundary()
             throwIfFullObjectCallAborted(context.signal)
             await dependencies.flushPendingData('plugin-full-object-write')
@@ -760,9 +734,6 @@ export function createPluginDatabaseAccess(
                 resolvePinnedCharacterTarget(reader, index))
             if (!target) return
             throwIfFullObjectCallAborted(context.signal)
-            if (dependencies.getCompatibilityProfile() !== initialProfile) {
-                throw new Error(STALE_DATABASE_SET_ERROR)
-            }
             if (candidate.chaId !== target.characterId) {
                 rejectIdentityReplacement(
                     context,
@@ -778,9 +749,6 @@ export function createPluginDatabaseAccess(
                     target.characterId,
                 )
                 throwIfFullObjectCallAborted(context.signal)
-                if (dependencies.getCompatibilityProfile() !== initialProfile) {
-                    throw new Error(STALE_DATABASE_SET_ERROR)
-                }
                 const replaced = await dependencies.replacePersistentCompleteCharacter(
                     target.characterId,
                     'plugin-setCharacterToIndex',
@@ -803,7 +771,6 @@ export function createPluginDatabaseAccess(
         async setChatToIndex(characterIndex, chatIndex, chat, context) {
             validatePluginCompleteChat(chat)
             const candidate = dependencies.snapshot(chat)
-            const initialProfile = dependencies.getCompatibilityProfile()
             const selectedBoundary = captureSelectedCallBoundary()
             throwIfFullObjectCallAborted(context.signal)
             await dependencies.flushPendingData('plugin-full-object-write')
@@ -814,9 +781,6 @@ export function createPluginDatabaseAccess(
                 resolvePinnedConversationTarget(reader, characterIndex, chatIndex))
             if (!target) return
             throwIfFullObjectCallAborted(context.signal)
-            if (dependencies.getCompatibilityProfile() !== initialProfile) {
-                throw new Error(STALE_DATABASE_SET_ERROR)
-            }
             if (candidate.id !== target.conversationId) {
                 rejectIdentityReplacement(
                     context,
@@ -833,9 +797,6 @@ export function createPluginDatabaseAccess(
                     target.conversationId,
                 )
                 throwIfFullObjectCallAborted(context.signal)
-                if (dependencies.getCompatibilityProfile() !== initialProfile) {
-                    throw new Error(STALE_DATABASE_SET_ERROR)
-                }
                 const replaced = await dependencies.replacePersistentConversation(
                     target.characterId,
                     target.conversationId,
@@ -975,15 +936,13 @@ export function createPluginDatabaseAccess(
                 includeOnly === 'all'
                     ? [...allowedKeys]
                     : allowedKeys.filter((key) => includeOnly.includes(key))
-            const compatibilityProfile = dependencies.getCompatibilityProfile()
             const needsCharacters = requestedKeys.includes('characters')
-            const needsPersistentPresets =
-                compatibilityProfile === 'scalable-v3' && requestedKeys.includes('botPresets')
+            const needsPersistentPresets = requestedKeys.includes('botPresets')
             if (!needsCharacters && !needsPersistentPresets) {
                 const compatibilityDatabase = dependencies.getCompatibilityDatabase()
                 const result: Record<string, unknown> = {}
                 for (const key of requestedKeys) {
-                    if (key === 'pluginCustomStorage' && compatibilityProfile === 'scalable-v3') {
+                    if (key === 'pluginCustomStorage') {
                         await dependencies.flushPendingData('plugin-storage-snapshot')
                         result[key] = await dependencies.readPluginStorageSnapshot()
                     } else {
@@ -994,113 +953,96 @@ export function createPluginDatabaseAccess(
                 }
                 return result
             }
-            if (compatibilityProfile === 'scalable-v3') {
-                await dependencies.flushPendingData('plugin-full-database-snapshot')
-                await openStore()
-                const reader = await acquireCurrentRevisionReader()
-                return withPersistentRevisionLease(reader, async (reader) => {
-                    const pinnedRoot = await reader.readRoot()
-                    assertPinnedRevision(reader.revision, pinnedRoot.revision, 'Root')
-                    const result: Record<string, unknown> = {}
-                    for (const key of requestedKeys) {
-                        if (key === 'characters') {
-                            const characters: Database['characters'] = []
-                            for await (const character of iteratePinnedCharacters(reader)) {
-                                const chats: Database['characters'][number]['chats'] = []
-                                for await (const conversation of iteratePinnedConversations(
-                                    reader,
-                                    character.summary.id,
-                                )) {
-                                    chats.push(conversation.value)
-                                }
-                                characters.push(dependencies.snapshot({
-                                    ...character.detail,
-                                    chats,
-                                } as Database['characters'][number]))
+            await dependencies.flushPendingData('plugin-full-database-snapshot')
+            await openStore()
+            const reader = await acquireCurrentRevisionReader()
+            return withPersistentRevisionLease(reader, async (reader) => {
+                const pinnedRoot = await reader.readRoot()
+                assertPinnedRevision(reader.revision, pinnedRoot.revision, 'Root')
+                const result: Record<string, unknown> = {}
+                for (const key of requestedKeys) {
+                    if (key === 'characters') {
+                        const characters: Database['characters'] = []
+                        for await (const character of iteratePinnedCharacters(reader)) {
+                            const chats: Database['characters'][number]['chats'] = []
+                            for await (const conversation of iteratePinnedConversations(
+                                reader,
+                                character.summary.id,
+                            )) {
+                                chats.push(conversation.value)
                             }
-                            result[key] = characters
-                            continue
+                            characters.push(dependencies.snapshot({
+                                ...character.detail,
+                                chats,
+                            } as Database['characters'][number]))
                         }
-                        if (key === 'botPresets') {
-                            const catalog = await reader.queryPresets()
-                            assertPinnedRevision(
-                                reader.revision,
-                                catalog.revision,
-                                'Preset catalog',
-                            )
-                            const presets: Database['botPresets'] = []
-                            for (const summary of catalog.items) {
-                                const preset = await reader.readPreset(summary.id)
-                                if (!preset) throw new Error(`Missing preset ${summary.id}`)
-                                assertPinnedRevision(
-                                    reader.revision,
-                                    preset.revision,
-                                    `Preset ${summary.id}`,
-                                )
-                                presets.push(dependencies.snapshot(preset.value))
-                            }
-                            result[key] = presets
-                            continue
-                        }
-                        if (key === 'pluginCustomStorage') {
-                            const catalog = await reader.queryPluginStorage()
-                            assertPinnedRevision(
-                                reader.revision,
-                                catalog.revision,
-                                'Plugin storage catalog',
-                            )
-                            const storage: Record<string, unknown> = {}
-                            for (const summary of catalog.items) {
-                                const value = await reader.readPluginStorage(summary.key)
-                                if (!value) {
-                                    throw new Error(
-                                        `Missing plugin storage value for ${summary.key}`,
-                                    )
-                                }
-                                assertPinnedRevision(
-                                    reader.revision,
-                                    value.revision,
-                                    `Plugin storage value ${summary.key}`,
-                                )
-                                defineOwnEnumerableProperty(
-                                    storage,
-                                    summary.key,
-                                    dependencies.snapshot(value.value),
-                                )
-                            }
-                            result[key] = storage
-                            continue
-                        }
-                        result[key] = dependencies.snapshot(
-                            (pinnedRoot.value as unknown as Record<string, unknown>)[key],
-                        )
+                        result[key] = characters
+                        continue
                     }
-                    return result
-                })
-            }
-
-            const sourceDatabase = dependencies.snapshot(dependencies.getCompatibilityDatabase())
-            const result: Record<string, unknown> = {}
-            for (const key of requestedKeys) {
-                const value = (sourceDatabase as unknown as Record<string, unknown>)[key]
-                result[key] = dependencies.snapshot(value)
-            }
-            return result
+                    if (key === 'botPresets') {
+                        const catalog = await reader.queryPresets()
+                        assertPinnedRevision(
+                            reader.revision,
+                            catalog.revision,
+                            'Preset catalog',
+                        )
+                        const presets: Database['botPresets'] = []
+                        for (const summary of catalog.items) {
+                            const preset = await reader.readPreset(summary.id)
+                            if (!preset) throw new Error(`Missing preset ${summary.id}`)
+                            assertPinnedRevision(
+                                reader.revision,
+                                preset.revision,
+                                `Preset ${summary.id}`,
+                            )
+                            presets.push(dependencies.snapshot(preset.value))
+                        }
+                        result[key] = presets
+                        continue
+                    }
+                    if (key === 'pluginCustomStorage') {
+                        const catalog = await reader.queryPluginStorage()
+                        assertPinnedRevision(
+                            reader.revision,
+                            catalog.revision,
+                            'Plugin storage catalog',
+                        )
+                        const storage: Record<string, unknown> = {}
+                        for (const summary of catalog.items) {
+                            const value = await reader.readPluginStorage(summary.key)
+                            if (!value) {
+                                throw new Error(
+                                    `Missing plugin storage value for ${summary.key}`,
+                                )
+                            }
+                            assertPinnedRevision(
+                                reader.revision,
+                                value.revision,
+                                `Plugin storage value ${summary.key}`,
+                            )
+                            defineOwnEnumerableProperty(
+                                storage,
+                                summary.key,
+                                dependencies.snapshot(value.value),
+                            )
+                        }
+                        result[key] = storage
+                        continue
+                    }
+                    result[key] = dependencies.snapshot(
+                        (pinnedRoot.value as unknown as Record<string, unknown>)[key],
+                    )
+                }
+                return result
+            })
         },
 
         setDatabaseLite(database, allowedKeys) {
             validatePluginDatabaseUpdate(database)
-            if (
-                dependencies.getCompatibilityProfile() === 'scalable-v3' &&
-                hasCharacterUpdate(database)
-            ) {
-                throw new Error(SCALABLE_CHARACTER_SET_ERROR)
+            if (hasCharacterUpdate(database)) {
+                throw new Error(SYNCHRONOUS_CHARACTER_SET_ERROR)
             }
             const prepared = dependencies.snapshot(database)
-            if (dependencies.getCompatibilityProfile() !== 'scalable-v3') {
-                dependencies.applyCompatibilityDatabaseLite(prepared)
-                return
-            }
             const compatibilityUpdate = compatibilityOnlyUpdate(prepared, allowedKeys)
             if (Object.keys(compatibilityUpdate).length > 0) {
                 dependencies.applyCompatibilityDatabaseLite(compatibilityUpdate)
@@ -1111,9 +1053,8 @@ export function createPluginDatabaseAccess(
 
         async setDatabase(database, allowedKeys) {
             validatePluginDatabaseUpdate(database)
-            const initialProfile = dependencies.getCompatibilityProfile()
             const initialNavigationGeneration = dependencies.getNavigationGeneration()
-            if (initialProfile === 'scalable-v3' && hasCharacterUpdate(database)) {
+            if (hasCharacterUpdate(database)) {
                 validateCompleteCharacters(database.characters)
             }
             const detachedUpdate = dependencies.snapshot(database)
@@ -1121,24 +1062,8 @@ export function createPluginDatabaseAccess(
                 ? await dependencies.prepareAuthoritativeDatabaseUpdate(detachedUpdate)
                 : detachedUpdate
             validatePluginDatabaseUpdate(preparedUpdate)
-            if (
-                dependencies.getCompatibilityProfile() !== initialProfile ||
-                dependencies.getNavigationGeneration() !== initialNavigationGeneration
-            ) {
+            if (dependencies.getNavigationGeneration() !== initialNavigationGeneration) {
                 throw new Error(STALE_DATABASE_SET_ERROR)
-            }
-            if (initialProfile === 'maximum-compatibility') {
-                if (hasCharacterUpdate(preparedUpdate)) {
-                    await dependencies.applyCompatibilityDatabase(
-                        dependencies.snapshot(preparedUpdate),
-                    )
-                } else {
-                    dependencies.applyCompatibilityDatabaseLite(
-                        dependencies.snapshot(preparedUpdate),
-                    )
-                    await dependencies.flushPendingData('plugin-root-update')
-                }
-                return
             }
             if (hasCharacterUpdate(preparedUpdate)) {
                 validateCompleteCharacters(preparedUpdate.characters)
@@ -1159,10 +1084,7 @@ export function createPluginDatabaseAccess(
             const materialized = await dependencies.materializeDatabaseSnapshot(
                 'plugin-database-set',
             )
-            if (
-                dependencies.getCompatibilityProfile() !== initialProfile ||
-                dependencies.getNavigationGeneration() !== initialNavigationGeneration
-            ) {
+            if (dependencies.getNavigationGeneration() !== initialNavigationGeneration) {
                 throw new Error(STALE_DATABASE_SET_ERROR)
             }
             const candidate = dependencies.snapshot(materialized.database)

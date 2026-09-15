@@ -109,6 +109,7 @@ vi.mock('../model/modellist', async () => (await import('./tests/sendChatTestHar
 vi.mock('./modules', async () => (await import('./tests/sendChatTestHarness')).modulesModule())
 vi.mock('../globalApi.svelte', async () => (await import('./tests/sendChatTestHarness')).globalApiModule())
 vi.mock('../plugins/plugins.svelte', async () => (await import('./tests/sendChatTestHarness')).pluginsModule(mocks.listeners))
+vi.mock('../plugins/pluginDatabaseAccess', async (importOriginal) => (await import('./tests/sendChatTestHarness')).pluginDatabaseAccessModule(importOriginal as () => Promise<Record<string, unknown>>))
 vi.mock('./presetChain', () => ({
     activatePresetChainForRequest: vi.fn(async () => {
         mocks.presetActivationCount += 1

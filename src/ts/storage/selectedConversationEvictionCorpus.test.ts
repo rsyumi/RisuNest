@@ -204,7 +204,6 @@ describe('selected conversation eviction correctness corpus', () => {
                 publishPersistentConversationReplacementToWorkingSet(workingCopy, result)
             },
             canUseWindowedSelectedConversation: () => true,
-            isMaximumCompatibilityMode: () => false,
             isConversationOperationActive: () => false,
             conversationViewportRowBudget: VIEWPORT_ROW_BUDGET,
         }
@@ -268,14 +267,12 @@ describe('selected conversation eviction correctness corpus', () => {
         const assertWindowed = (stage = 'unnamed stage') =>
             assertSelectedWindowed(stage, 'chat-a', oracle)
 
-        const profile = { profile: 'scalable-v3' as const, allowsEviction: true }
         const materializeDatabaseSnapshot = vi.fn()
         const replacePersistentDatabase = vi.fn()
         const pluginAccess = createPluginDatabaseAccess({
             store,
             flushPendingData: (reason) => runtime.flushPendingData(reason),
             getCompatibilityDatabase: () => workingCopy,
-            getCompatibilityProfile: () => profile.profile,
             getSelectedCharacterId: () => workingCopy.characters[0]?.chaId ?? null,
             captureSelectedConversationTarget: () => runtime.captureSelectedConversationTarget(),
             acquireCompleteConversation: (reason, target) =>
@@ -300,7 +297,6 @@ describe('selected conversation eviction correctness corpus', () => {
             reportIdentityReplacementRejected: vi.fn(),
             getNavigationGeneration: () => runtime.getNavigationGeneration(),
             applyCompatibilityDatabaseLite: vi.fn(),
-            applyCompatibilityDatabase: vi.fn(),
             readPluginStorageSnapshot: vi.fn(async () => ({})),
             mutatePluginStorage: vi.fn(),
             invalidatePluginStorage: vi.fn(),
@@ -337,7 +333,6 @@ describe('selected conversation eviction correctness corpus', () => {
         Object.assign(oracle, persistedPluginReplacement!.value)
         expectedRevision += 1
         await assertWindowed('scalable plugin getter and setter')
-        expect(profile).toEqual({ profile: 'scalable-v3', allowsEviction: true })
         expect(materializeDatabaseSnapshot).not.toHaveBeenCalled()
         expect(replacePersistentDatabase).not.toHaveBeenCalled()
         expect(storeMaterializeDatabase).not.toHaveBeenCalled()
@@ -985,61 +980,6 @@ describe('selected conversation eviction correctness corpus', () => {
         const exportedOwner = exported.database.characters[0].chats.find((chat) => chat.id === 'chat-a')!
         expect(exportedOwner).toEqual(oracle)
         await assertWindowed('authoritative export')
-
-        for (const moduleId of [
-            '../plugins/plugins.svelte',
-            '../globalApi.svelte',
-            '../alert',
-            '../util',
-            '../../lang',
-            '../stores.svelte',
-        ]) vi.doUnmock(moduleId)
-        vi.resetModules()
-        vi.doMock('./persistentDataRuntime.svelte', () => ({
-            acquireDestructiveReplacementFence: vi.fn(),
-            capturePersistentMutationToken: vi.fn(),
-            getPersistentDataRuntime: () => runtime,
-            getPersistentNavigationGeneration: () => runtime.getNavigationGeneration(),
-            materializeMaximumCompatibilityWorkingSet: () =>
-                runtime.materializeMaximumCompatibilityWorkingSet(),
-            mutatePersistentPluginStorage: (
-                reason: string,
-                mutations: never,
-            ) => runtime.mutatePersistentPluginStorage(reason, mutations),
-            releaseInactiveWorkingSet: (
-                canRelease?: () => boolean | Promise<boolean>,
-                isCurrent?: () => boolean,
-            ) => runtime.releaseInactiveWorkingSet(canRelease, isCurrent),
-            replacePersistentDatabase: (
-                database: Database,
-                reason: string,
-                options: never,
-            ) => runtime.replacePersistentDatabase(database, reason, options),
-        }))
-        const pluginStores = await import('../stores.svelte')
-        pluginStores.DBState.db = workingCopy
-        pluginStores.selectedCharID.set(0)
-        const { getV2PluginAPIs, pluginCompatibility } = await import('../plugins/plugins.svelte')
-        await pluginCompatibility.transition('maximum-compatibility')
-        pluginStores.DBState.db = workingCopy
-        const livePluginDatabase = getV2PluginAPIs().getDatabase() as Database
-        expect(livePluginDatabase).not.toBe(workingCopy)
-        const livePluginConversation = livePluginDatabase.characters[0].chats
-            .find((chat: Chat) => chat.id === 'chat-a')!
-        expect(livePluginConversation.message).toEqual(oracle.message)
-        const pluginMessage = {
-            role: 'user',
-            data: 'plugin compatibility append',
-            chatId: 'op-plugin-v2.1',
-            saying: 'live proxy compatibility',
-        } as Message
-        livePluginConversation.message.push(pluginMessage)
-        oracle.message.push(pluginMessage)
-        await pluginCompatibility.transition('scalable-v3')
-        expectedRevision += 1
-        await runtime.initializeActiveWorkingSet(workingCopy)
-        await assertWindowed('Plugin API v2.1 live Proxy')
-        vi.doUnmock('./persistentDataRuntime.svelte')
 
         const finalPersisted = await store.readConversation('char-a', 'chat-a')
         expect(finalPersisted).not.toBeNull()

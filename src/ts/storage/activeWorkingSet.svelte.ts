@@ -106,7 +106,6 @@ export interface ActiveWorkingSetDependencies {
         nextConversationId: string,
     ): boolean
     canUseWindowedSelectedConversation?(): boolean
-    isMaximumCompatibilityMode?(): boolean
     isConversationOperationActive?(): boolean
     subscribeConversationOperationActive?(listener: (active: boolean) => void): () => void
     conversationViewportRowBudget?: number
@@ -379,7 +378,6 @@ export class ActiveWorkingSet {
             !this.matchesTarget(state, target) ||
             this.promotionFlight !== null ||
             this.dependencies.canUseWindowedSelectedConversation?.() !== true ||
-            this.dependencies.isMaximumCompatibilityMode?.() === true ||
             this.dependencies.isConversationOperationActive?.() === true ||
             this.dependencies.coordinator.hasPendingPersistenceWork !== false ||
             !transition ||
@@ -1378,7 +1376,6 @@ export class ActiveWorkingSet {
             options.prepare === undefined &&
             this.dependencies.canActivateWorkingSet?.() !== false &&
             this.dependencies.canUseWindowedSelectedConversation?.() === true &&
-            this.dependencies.isMaximumCompatibilityMode?.() !== true &&
             this.dependencies.isConversationOperationActive?.() !== true &&
             this.dependencies.coordinator.runSelectedConversationTransition !==
                 undefined &&

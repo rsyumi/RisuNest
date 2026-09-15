@@ -5,7 +5,6 @@ import type { alertData } from "./alert";
 import { moduleUpdate } from "./process/modules";
 import { resetScriptCache } from "./process/scripts";
 import type { hubType } from "./characterCards";
-import type { PluginSafetyErrors } from "./plugins/pluginSafety";
 import type { CapturedChatMessageTarget } from "./chatMessageUi";
 
 function updateSize(){
@@ -132,11 +131,6 @@ export const LoadingStatusState = $state({
 export const QuickSettings = $state({
     open: false,
     index: 0
-})
-
-export const pluginAlertModalStore = $state({
-    open: false,
-    errors: [] as PluginSafetyErrors[]
 })
 
 export const disableHighlight = writable(true)

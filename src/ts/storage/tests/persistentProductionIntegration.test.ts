@@ -171,7 +171,6 @@ describe('persistent production runtime', () => {
             store,
             flushPendingData: (reason) => runtime.flushPendingData(reason),
             getCompatibilityDatabase: () => adapter.current(),
-            getCompatibilityProfile: () => 'scalable-v3',
             getSelectedCharacterId: () => adapter.current().characters[0]?.chaId ?? null,
             captureSelectedConversationTarget: () => runtime.captureSelectedConversationTarget(),
             acquireCompleteConversation: (reason, target) =>
@@ -196,7 +195,6 @@ describe('persistent production runtime', () => {
             reportIdentityReplacementRejected: vi.fn(),
             getNavigationGeneration: () => runtime.getNavigationGeneration(),
             applyCompatibilityDatabaseLite: vi.fn(),
-            applyCompatibilityDatabase: vi.fn(),
             readPluginStorageSnapshot: vi.fn(async () => ({})),
             mutatePluginStorage: vi.fn(),
             invalidatePluginStorage: vi.fn(),
@@ -275,7 +273,6 @@ describe('persistent production runtime', () => {
             store,
             flushPendingData: (reason) => runtime.flushPendingData(reason),
             getCompatibilityDatabase: () => adapter.current(),
-            getCompatibilityProfile: () => 'scalable-v3',
             getSelectedCharacterId: () => adapter.current().characters[0]?.chaId ?? null,
             captureSelectedConversationTarget: () => runtime.captureSelectedConversationTarget(),
             acquireCompleteConversation: (reason, target) =>
@@ -300,7 +297,6 @@ describe('persistent production runtime', () => {
             reportIdentityReplacementRejected: vi.fn(),
             getNavigationGeneration: () => runtime.getNavigationGeneration(),
             applyCompatibilityDatabaseLite: vi.fn(),
-            applyCompatibilityDatabase: vi.fn(),
             readPluginStorageSnapshot: vi.fn(async () => ({})),
             mutatePluginStorage: vi.fn(),
             invalidatePluginStorage: vi.fn(),

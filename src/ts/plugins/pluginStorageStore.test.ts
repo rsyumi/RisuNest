@@ -6,7 +6,6 @@ import {
 } from '../storage/persistentDataStore'
 import {
     createPluginStorageStore,
-    readCompatibilityPluginStorageValue,
     observePluginStorageValue,
     notifyPluginStorageAuthorityReplacement,
     registerPluginStorageLifecycle,
@@ -92,22 +91,21 @@ describe('plugin storage V3 residency', () => {
                     { alpha: { value, byteSize } },
                     budget,
                 )
-                storage.preloadCompatibilityValues({ alpha: value })
-                storage.setEvictionAllowed(true)
+                storage.synchronizeCompatibilityStorage({ alpha: value })
                 await expect(storage.getItem('alpha')).resolves.toBe(value)
                 expect(readPluginStorage).toHaveBeenCalledTimes(budget < byteSize ? 1 : 0)
             }
         }
     })
 
-    it('preloads large immutable strings without serialization, encoding or cloning copies', async () => {
+    it('adopts large immutable strings without serialization, encoding or cloning copies', async () => {
         const value = 'x'.repeat(16 * 1024 * 1024)
-        const { storage, readPluginStorage } = harness({})
+        const { storage, readPluginStorage } = harness({}, 32 * 1024 * 1024)
         const stringify = vi.spyOn(JSON, 'stringify')
         const encode = vi.spyOn(TextEncoder.prototype, 'encode')
         const clone = vi.spyOn(globalThis, 'structuredClone')
         try {
-            storage.preloadCompatibilityValues({ alpha: value })
+            storage.synchronizeCompatibilityStorage({ alpha: value })
             expect(stringify).not.toHaveBeenCalled()
             expect(encode).not.toHaveBeenCalled()
             expect(clone).not.toHaveBeenCalled()
@@ -174,11 +172,11 @@ describe('plugin storage V3 residency', () => {
         expect(readPluginStorage).not.toHaveBeenCalled()
     })
 
-    it('keeps the preloaded V3 cache coherent with synchronous compatibility mutations', async () => {
+    it('keeps the V3 cache coherent with published storage mutations', async () => {
         const { storage, readPluginStorage } = harness({
             alpha: { byteSize: 6, value: 'alpha' },
-        })
-        storage.preloadCompatibilityValues({ alpha: 'alpha' })
+        }, 1024)
+        storage.synchronizeCompatibilityStorage({ alpha: 'alpha' })
         readPluginStorage.mockClear()
 
         storage.synchronizeCompatibilityMutation({
@@ -201,10 +199,10 @@ describe('plugin storage V3 residency', () => {
         await expect(storage.getItem('gamma')).resolves.toBe('replacement')
     })
 
-    it('adopts values materialized for maximum compatibility without rereading records', async () => {
-        const { storage, store, readPluginStorage } = harness({})
+    it('adopts published storage values without rereading records', async () => {
+        const { storage, store, readPluginStorage } = harness({}, 1024)
 
-        storage.preloadCompatibilityValues({
+        storage.synchronizeCompatibilityStorage({
             alpha: 'materialized',
             beta: { nested: true },
         })
@@ -453,14 +451,5 @@ describe('plugin storage V3 residency', () => {
 
         await expect(storage.snapshot()).rejects.toBeInstanceOf(RevisionConflictError)
         expect(store.acquireRevision).toHaveBeenCalledTimes(3)
-    })
-
-    it('distinguishes a stored zero from a missing compatibility key', () => {
-        const storage = { zero: 0, disabled: false, empty: '' }
-
-        expect(readCompatibilityPluginStorageValue(storage, 'zero')).toBe(0)
-        expect(readCompatibilityPluginStorageValue(storage, 'disabled')).toBe(false)
-        expect(readCompatibilityPluginStorageValue(storage, 'empty')).toBe('')
-        expect(readCompatibilityPluginStorageValue(storage, 'missing')).toBeNull()
     })
 })

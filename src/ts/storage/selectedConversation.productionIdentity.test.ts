@@ -138,7 +138,6 @@ describe('selected conversation production publication identity', () => {
             captureActivationRollback: adapter.captureActivationRollback,
             canActivateWorkingSet: () => true,
             canUseWindowedSelectedConversation: () => true,
-            isMaximumCompatibilityMode: () => false,
             isConversationOperationActive: () => false,
         })
 

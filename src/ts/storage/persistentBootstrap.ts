@@ -1,7 +1,3 @@
-import {
-    selectPluginCompatibilityProfile,
-    type PluginCompatibilityProfile,
-} from '../plugins/pluginCompatibility'
 import type { Database, botPreset } from './database.svelte'
 import type { PreparedBootstrapDatabase } from './databasePreparation'
 import {
@@ -48,7 +44,6 @@ export interface ScalableBootstrapProjection {
 export interface PersistentBootstrapResult {
     database: Database
     revision: DataRevision
-    profile: PluginCompatibilityProfile
 }
 
 /**
@@ -66,8 +61,7 @@ export async function bootstrapPersistentDatabase(
     if (active.revision === 0) {
         const { database } = await dependencies.prepareDatabase({ ...NEW_DATABASE_SEED } as Database)
         const { revision } = await dependencies.store.replaceFromDatabase(database, 0)
-        const profile = selectPluginCompatibilityProfile(database.plugins ?? [])
-        if (profile === 'scalable-v3' && dependencies.projectScalableWorkingSet) {
+        if (dependencies.projectScalableWorkingSet) {
             const {
                 characters: _characters,
                 botPresets: _botPresets,
@@ -90,20 +84,17 @@ export async function bootstrapPersistentDatabase(
                 root,
                 projectedRevision,
             )
-            return { ...projected, profile }
+            return projected
         }
-        return { database, revision, profile }
+        return { database, revision }
     }
 
-    const profile = selectPluginCompatibilityProfile(active.value.plugins ?? [])
     const needsCharacterMigration = !active.value.formatversion
         || active.value.formatversion < 3
-    const prepareScalableMigration = profile === 'scalable-v3'
-        && needsCharacterMigration
+    const prepareScalableMigration = needsCharacterMigration
         && dependencies.prepareRoot !== undefined
         && dependencies.projectScalableWorkingSet !== undefined
     if (
-        profile === 'maximum-compatibility' ||
         !dependencies.prepareRoot ||
         !dependencies.projectScalableWorkingSet ||
         prepareScalableMigration
@@ -140,9 +131,9 @@ export async function bootstrapPersistentDatabase(
                 root,
                 projectedRevision,
             )
-            return { ...projected, profile }
+            return projected
         }
-        return { database, revision, profile }
+        return { database, revision }
     }
 
     const preparedRoot = await dependencies.prepareRoot(active.value)
@@ -159,8 +150,7 @@ export async function bootstrapPersistentDatabase(
         })).revision
     }
 
-    const projected = await projectScalableRevision(dependencies, root, revision)
-    return { ...projected, profile }
+    return await projectScalableRevision(dependencies, root, revision)
 }
 
 async function canonicalizePresetSelection(

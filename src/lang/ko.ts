@@ -1732,6 +1732,12 @@ export const languageKorean = {
     risuNest: {
         exitSaveFailedWarning:
             '저장에 실패했습니다. 저장하지 않고 종료하려면 예를, 앱을 열어 두고 다시 시도하려면 아니오를 선택하세요.',
+        plugins: {
+            unsupportedApiVersionInstall:
+                '플러그인 API {version} 버전은 지원하지 않습니다. API 3.0으로 업데이트된 버전을 설치하세요.',
+            unsupportedApiVersionLoad:
+                '다음 플러그인은 지원하지 않는 플러그인 API 버전을 사용하므로 실행되지 않았습니다. API 3.0으로 업데이트된 버전을 설치하세요.\n\n{plugins}',
+        },
         exitDrain: {
             title: '동기화를 마치는 중',
             saveFailedTitle: '변경사항을 저장하지 못했습니다',
