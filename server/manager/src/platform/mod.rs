@@ -1,6 +1,12 @@
+use crate::update::UpdatePolicy;
 use crate::Result;
 pub mod gui;
 use serde::Serialize;
+#[cfg(target_os = "macos")]
+use std::{
+    fs::{self, File},
+    io::Write,
+};
 use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -10,9 +16,17 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartupStatus {
+    pub registered: bool,
+    pub enabled: bool,
+    pub action_matches: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateScheduleStatus {
     pub registered: bool,
     pub enabled: bool,
     pub action_matches: bool,
@@ -42,6 +56,16 @@ pub fn server_executable() -> Result<PathBuf> {
         "risunest-sync-server.exe"
     } else {
         "risunest-sync-server"
+    };
+    Ok(current.parent().ok_or("executable-unavailable")?.join(name))
+}
+
+pub fn manager_executable() -> Result<PathBuf> {
+    let current = std::env::current_exe().map_err(|_| "executable-unavailable")?;
+    let name = if cfg!(windows) {
+        "risunest-sync-manager.exe"
+    } else {
+        "risunest-sync-manager"
     };
     Ok(current.parent().ok_or("executable-unavailable")?.join(name))
 }
@@ -80,6 +104,12 @@ pub fn initialize(root: &Path, executable: &Path) -> Result<()> {
 pub fn start(root: &Path, executable: &Path) -> Result<()> {
     initialize(root, executable)?;
     let state = startup(root, executable, "status")?;
+    #[cfg(target_os = "macos")]
+    let state = if state.registered && !state.action_matches {
+        startup(root, executable, "install")?
+    } else {
+        state
+    };
     if state.registered && state.action_matches {
         startup(root, executable, "start")?;
     } else {
@@ -130,6 +160,310 @@ pub fn startup(root: &Path, executable: &Path, action: &str) -> Result<StartupSt
     #[cfg(unix)]
     {
         unix::startup(root, executable, action)
+    }
+}
+
+pub fn spawn_update_helper(root: &Path, command: &mut Command) -> Result<u32> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        #[cfg(target_os = "macos")]
+        return spawn_macos_update_helper(root, command);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let program = command.get_program().to_owned();
+            let arguments = command
+                .get_args()
+                .map(|value| value.to_owned())
+                .collect::<Vec<_>>();
+            let mut launcher = {
+                let mut value = process("systemd-run");
+                value
+                    .args(["--user", "--collect", "--quiet", "--unit"])
+                    .arg(format!("{}-update-apply", instance_name(root)))
+                    .arg(program)
+                    .args(arguments);
+                value
+            };
+            let output = launcher
+                .stdin(Stdio::null())
+                .output()
+                .map_err(|_| "update-helper-start-failed".to_owned())?;
+            if !output.status.success() {
+                return Err("update-helper-start-failed".into());
+            }
+            return Ok(0);
+        }
+    }
+    #[cfg(windows)]
+    windows::spawn_update_helper(root, command)
+}
+
+pub fn finish_update_helper(root: &Path, task_name: &str) -> Result<()> {
+    #[cfg(windows)]
+    return windows::finish_update_helper(root, task_name);
+    #[cfg(target_os = "macos")]
+    return finish_macos_update_helper(root, task_name);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = (root, task_name);
+        Err("update-helper-task-invalid".into())
+    }
+}
+
+pub fn cleanup_update_helpers(root: &Path) -> Result<()> {
+    #[cfg(windows)]
+    return windows::cleanup_update_helpers(root);
+    #[cfg(target_os = "macos")]
+    return cleanup_macos_update_helpers(root);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = root;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_user_domain() -> Result<String> {
+    let output = process("id")
+        .arg("-u")
+        .output()
+        .map_err(|_| "user-id-unavailable".to_owned())?;
+    if !output.status.success() {
+        return Err("user-id-unavailable".into());
+    }
+    let uid = String::from_utf8(output.stdout).map_err(|_| "user-id-unavailable".to_owned())?;
+    Ok(format!("gui/{}", uid.trim()))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_helper_prefix(root: &Path) -> String {
+    format!("io.github.rsyumi.{}-update-helper-", instance_name(root))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_helper_plist(root: &Path, task_name: &str) -> PathBuf {
+    root.join("manager-update/helper")
+        .join(format!("{task_name}.plist"))
+}
+
+#[cfg(target_os = "macos")]
+fn valid_macos_helper_task(root: &Path, task_name: &str) -> bool {
+    let prefix = macos_helper_prefix(root);
+    task_name.starts_with(&prefix)
+        && task_name.len() == prefix.len() + 64
+        && task_name[prefix.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_macos_update_helper(root: &Path, command: &mut Command) -> Result<u32> {
+    let task_name = format!(
+        "{}{}",
+        macos_helper_prefix(root),
+        risunest_sync_server::management::discovery::request_id()
+            .map_err(|_| "update-helper-start-failed".to_owned())?
+    );
+    command.args(["--scheduled-task", &task_name]);
+    let program = command
+        .get_program()
+        .to_str()
+        .ok_or("update-helper-start-failed")?;
+    let arguments = command
+        .get_args()
+        .map(|value| {
+            value
+                .to_str()
+                .ok_or_else(|| "update-helper-start-failed".to_owned())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Label</key><string>{}</string><key>ProgramArguments</key><array><string>{}</string>",
+        xml(&task_name),
+        xml(program)
+    );
+    for argument in arguments {
+        body.push_str("<string>");
+        body.push_str(&xml(argument));
+        body.push_str("</string>");
+    }
+    body.push_str("</array><key>RunAtLoad</key><true/><key>KeepAlive</key><false/><key>LaunchOnlyOnce</key><true/><key>ProcessType</key><string>Background</string><key>AbandonProcessGroup</key><true/></dict></plist>");
+    let path = macos_helper_plist(root, &task_name);
+    let directory = path.parent().ok_or("update-helper-start-failed")?;
+    fs::create_dir_all(directory).map_err(|_| "update-helper-start-failed".to_owned())?;
+    let domain = launchd_user_domain()?;
+    let mut file = tempfile::NamedTempFile::new_in(directory)
+        .map_err(|_| "update-helper-start-failed".to_owned())?;
+    file.write_all(body.as_bytes())
+        .and_then(|()| file.as_file().sync_all())
+        .map_err(|_| "update-helper-start-failed".to_owned())?;
+    file.persist(&path)
+        .map_err(|_| "update-helper-start-failed".to_owned())?;
+    if File::open(directory)
+        .and_then(|value| value.sync_all())
+        .is_err()
+    {
+        let _ = fs::remove_file(&path);
+        let _ = File::open(directory).and_then(|value| value.sync_all());
+        return Err("update-helper-start-failed".into());
+    }
+    let output = process("launchctl")
+        .args(["bootstrap", &domain])
+        .arg(&path)
+        .stdin(Stdio::null())
+        .output();
+    if output.is_err() || !output.is_ok_and(|value| value.status.success()) {
+        let _ = fs::remove_file(&path);
+        let _ = File::open(directory).and_then(|value| value.sync_all());
+        return Err("update-helper-start-failed".into());
+    }
+    Ok(0)
+}
+
+#[cfg(target_os = "macos")]
+fn finish_macos_update_helper(root: &Path, task_name: &str) -> Result<()> {
+    if !valid_macos_helper_task(root, task_name) {
+        return Err("update-helper-task-invalid".into());
+    }
+    let path = macos_helper_plist(root, task_name);
+    let directory = path.parent().ok_or("update-helper-task-invalid")?;
+    if path.exists() {
+        fs::remove_file(&path).map_err(|_| "update-helper-task-cleanup-failed".to_owned())?;
+        File::open(directory)
+            .and_then(|value| value.sync_all())
+            .map_err(|_| "update-helper-task-cleanup-failed".to_owned())?;
+    }
+    let service = format!("{}/{}", launchd_user_domain()?, task_name);
+    process("launchctl")
+        .args(["bootout", &service])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "update-helper-task-cleanup-failed".to_owned())?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn cleanup_macos_update_helpers(root: &Path) -> Result<()> {
+    let directory = root.join("manager-update/helper");
+    if !directory.exists() {
+        return Ok(());
+    }
+    let mut tasks = Vec::new();
+    for entry in
+        fs::read_dir(&directory).map_err(|_| "update-helper-task-cleanup-failed".to_owned())?
+    {
+        let entry = entry.map_err(|_| "update-helper-task-cleanup-failed".to_owned())?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("plist") {
+            continue;
+        }
+        let task = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or("update-helper-task-cleanup-failed")?;
+        if !valid_macos_helper_task(root, task) {
+            return Err("update-helper-task-cleanup-failed".into());
+        }
+        tasks.push(task.to_owned());
+    }
+    let domain = launchd_user_domain()?;
+    for task in tasks {
+        let path = macos_helper_plist(root, &task);
+        let service = format!("{domain}/{task}");
+        let present = process("launchctl")
+            .args(["print", &service])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|_| "update-helper-task-cleanup-failed".to_owned())?
+            .success();
+        if present {
+            let status = process("launchctl")
+                .args(["bootout", &service])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map_err(|_| "update-helper-task-cleanup-failed".to_owned())?;
+            if !status.success() {
+                return Err("update-helper-task-cleanup-failed".into());
+            }
+        }
+        fs::remove_file(&path).map_err(|_| "update-helper-task-cleanup-failed".to_owned())?;
+        File::open(&directory)
+            .and_then(|value| value.sync_all())
+            .map_err(|_| "update-helper-task-cleanup-failed".to_owned())?;
+    }
+    Ok(())
+}
+
+pub fn wait_for_parent_exit(process_id: u32, timeout: std::time::Duration) -> Result<()> {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::Threading::{OpenProcess, WaitForSingleObject},
+        };
+        let handle = OpenProcess(0x00100000, 0, process_id);
+        if handle.is_null() {
+            return Ok(());
+        }
+        let milliseconds = timeout.as_millis().min(u32::MAX as u128) as u32;
+        let result = WaitForSingleObject(handle, milliseconds);
+        CloseHandle(handle);
+        match result {
+            0 => Ok(()),
+            0x00000102 => Err("update-parent-exit-timeout".into()),
+            _ => Err("update-parent-wait-failed".into()),
+        }
+    }
+    #[cfg(unix)]
+    {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if unsafe { libc::kill(process_id as i32, 0) } != 0 {
+                let error = std::io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(libc::ESRCH) => return Ok(()),
+                    Some(libc::EPERM) => {}
+                    _ => return Err("update-parent-wait-failed".into()),
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("update-parent-exit-timeout".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+}
+
+pub fn update_schedule(
+    root: &Path,
+    manager: &Path,
+    server: &Path,
+    policy: UpdatePolicy,
+    action: &str,
+) -> Result<UpdateScheduleStatus> {
+    if !["status", "install", "remove"].contains(&action) {
+        return Err("invalid-update-schedule-action".into());
+    }
+    if !root.is_absolute() || !manager.is_absolute() || !server.is_absolute() {
+        return Err("absolute-path-required".into());
+    }
+    #[cfg(windows)]
+    {
+        windows::update_schedule(root, manager, server, policy, action)
+    }
+    #[cfg(unix)]
+    {
+        unix::update_schedule(root, manager, server, policy, action)
     }
 }
 

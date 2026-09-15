@@ -11,9 +11,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--target", required=True, choices=[
-        "x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc",
+        "x86_64-unknown-linux-gnu",
         "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "aarch64-apple-darwin",
     ])
+    parser.add_argument("--version", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
@@ -22,7 +24,10 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     files = [(binary, binary.name), (source / "LICENSE", "LICENSE"),
              (source / "server/sync/README.md", "README.md")]
-    stem = "risunest-sync-server-" + args.target
+    if not all(part.isdigit() and (part == "0" or not part.startswith("0"))
+               for part in args.version.split(".")) or len(args.version.split(".")) != 3:
+        parser.error("--version must be an unprefixed stable SemVer")
+    stem = "risunest-sync-server-" + args.version + "-" + args.target
     if "windows" in args.target:
         archive = output / (stem + ".zip")
         with zipfile.ZipFile(archive, "x", compression=zipfile.ZIP_DEFLATED) as bundle:
@@ -41,7 +46,8 @@ def main():
     with archive.open("rb") as stream:
         checksum = hashlib.file_digest(stream, "sha256").hexdigest()
     (output / (archive.name + ".sha256")).write_text(checksum + "  " + archive.name + "\n", encoding="utf-8")
-    print(json.dumps({"target": args.target, "binaryBytes": binary.stat().st_size,
+    print(json.dumps({"target": args.target, "version": args.version,
+                      "binaryBytes": binary.stat().st_size,
                       "archiveBytes": archive.stat().st_size, "sha256": checksum}))
 
 

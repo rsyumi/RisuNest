@@ -1,3 +1,5 @@
+pub const VERSION: i64 = 8;
+
 pub const SCHEMA: &str = r#"
 CREATE TABLE library (singleton INTEGER PRIMARY KEY CHECK(singleton=1), head TEXT NOT NULL);
 CREATE TABLE media_secret(singleton INTEGER PRIMARY KEY CHECK(singleton=1),key BLOB NOT NULL CHECK(length(key)=32));

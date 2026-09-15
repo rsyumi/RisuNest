@@ -1,0 +1,888 @@
+name: Release build
+
+on:
+  workflow_call:
+    inputs:
+      product: { type: string, required: true }
+      tag: { type: string, required: true }
+      source_ref: { type: string, required: true }
+      publish: { type: boolean, required: true }
+      bootstrap: { type: boolean, default: false }
+  workflow_dispatch:
+    inputs:
+      product:
+        type: choice
+        options: [app, sync]
+        required: true
+      tag:
+        description: Existing product tag matching the checked-out version
+        type: string
+        required: true
+      source_ref:
+        description: Exact 40-character commit SHA to build
+        type: string
+        required: true
+      publish:
+        description: Publish a stable production release
+        type: boolean
+        default: false
+      bootstrap:
+        description: Explicit first-product catalog bootstrap
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: risunest-release-${{ inputs.tag }}
+  queue: max
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "24"
+  PNPM_VERSION: "10.34.1"
+  RUST_VERSION: "1.97.1"
+  CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target
+  VITE_RISU_LEGAL_CONFIGURED: "TRUE"
+  RISUNEST_UPDATE_PUBLIC_KEY: ${{ secrets.RISUNEST_UPDATE_PUBLIC_KEY }}
+
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    outputs:
+      product: ${{ inputs.product }}
+      tag: ${{ inputs.tag }}
+      source_commit: ${{ steps.identity.outputs.source_commit }}
+      publish: ${{ inputs.publish }}
+      bootstrap: ${{ inputs.bootstrap }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+      - id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${#SOURCE_REF}" -eq 40
+          test "$(git rev-parse HEAD)" = "$SOURCE_REF"
+          printf 'source_commit=%s\n' "$SOURCE_REF" >> "$GITHUB_OUTPUT"
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+      - uses: pnpm/action-setup@v5
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: Validate source release inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          published_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          args=(--product "$PRODUCT" --tag "$TAG" --source-commit "$SOURCE_COMMIT" --published-at "$published_at" --output release-input.json)
+          if test "$PRODUCT" = sync; then args+=(--registry-url "$RISUNEST_DEFAULT_REGISTRY_URL"); fi
+          node scripts/release/source-check.mjs "${args[@]}"
+        env:
+          PRODUCT: ${{ inputs.product }}
+          TAG: ${{ inputs.tag }}
+          SOURCE_COMMIT: ${{ steps.identity.outputs.source_commit }}
+          RISUNEST_DEFAULT_REGISTRY_URL: ${{ secrets.RISUNEST_DEFAULT_REGISTRY_URL }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-input
+          path: release-input.json
+          if-no-files-found: error
+          retention-days: 2
+
+  release-tooling-tests:
+    needs: source
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
+      - uses: pnpm/action-setup@v5
+        with: { version: "10.34.1" }
+      - uses: actions/setup-node@v6
+        with: { node-version: "24", package-manager-cache: false }
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - id: pnpm-store
+        shell: bash
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v5
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: release-pnpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pnpm-lock.yaml', 'server/manager/gui/pnpm-lock.yaml') }}
+          restore-keys: release-pnpm-${{ runner.os }}-${{ runner.arch }}-
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:release
+      - run: cargo test --manifest-path crates/release-update/Cargo.toml --release --locked
+
+  app-web-tests:
+    if: inputs.product == 'app'
+    needs: source
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
+      - uses: pnpm/action-setup@v5
+        with: { version: "10.34.1" }
+      - uses: actions/setup-node@v6
+        with: { node-version: "24", package-manager-cache: false }
+      - id: pnpm-store
+        shell: bash
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v5
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: release-pnpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pnpm-lock.yaml', 'server/manager/gui/pnpm-lock.yaml') }}
+          restore-keys: release-pnpm-${{ runner.os }}-${{ runner.arch }}-
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: pnpm test
+      - run: pnpm check:plugin-dts
+      - run: pnpm check:production-bundle
+
+  app-native-tests:
+    if: inputs.product == 'app'
+    needs: source
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-2022, target: x86_64-pc-windows-msvc }
+          - { runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { runner: macos-15-intel, target: x86_64-apple-darwin }
+          - { runner: macos-15, target: aarch64-apple-darwin }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+        with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with: { targets: "${{ matrix.target }}" }
+      - uses: actions/cache/restore@v5
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+          key: release-cargo-1.97.1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src-tauri/Cargo.lock', 'crates/sync-wire/Cargo.lock', 'server/sync/Cargo.lock', 'server/manager/Cargo.lock', 'server/manager/gui/src-tauri/Cargo.lock') }}
+          restore-keys: release-cargo-1.97.1-${{ runner.os }}-${{ runner.arch }}-
+      - name: Install Linux test dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --release --locked --target ${{ matrix.target }}
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --package tauri-plugin-updater --release --locked --target ${{ matrix.target }} --lib
+
+  app-android-tests:
+    if: inputs.product == 'app'
+    needs: source
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
+      - uses: pnpm/action-setup@v5
+        with: { version: "10.34.1" }
+      - uses: actions/setup-node@v6
+        with: { node-version: "24", package-manager-cache: false }
+      - uses: actions/setup-java@v5
+        with: { distribution: temurin, java-version: "21" }
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358'
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with: { targets: aarch64-linux-android,x86_64-linux-android }
+      - run: pnpm install --frozen-lockfile
+      - name: Verify the committed Android shell
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(
+            src-tauri/gen/android/settings.gradle
+            src-tauri/gen/android/app/build.gradle.kts
+            src-tauri/gen/android/buildSrc/src/main/java/io/github/rsyumi/risunest/kotlin/BuildTask.kt
+            src-tauri/gen/android/gradle/wrapper/gradle-wrapper.jar
+            src-tauri/gen/android/app/src/main/java/io/github/rsyumi/risunest/MainActivity.kt
+          )
+          for path in "${required[@]}"; do test -f "$path"; done
+          git diff --exit-code -- src-tauri/gen/android
+      - name: Generate Android build files through a real agent build
+        shell: bash
+        run: |
+          set -euo pipefail
+          export NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
+          pnpm exec -- tauri android build --debug --apk --target aarch64 --ci --config src-tauri/tauri.agent.conf.json -- --locked
+          git diff --exit-code -- src-tauri/gen/android
+      - run: chmod +x src-tauri/gen/android/gradlew
+      - working-directory: src-tauri/gen/android
+        run: ./gradlew :app:testArmDebugUnitTest :app:testLowMemorySafCopy --no-daemon
+
+  app-ios-tests:
+    if: inputs.product == 'app'
+    needs: source
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+        with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
+      - uses: pnpm/action-setup@v5
+        with: { version: "10.34.1" }
+      - uses: actions/setup-node@v6
+        with: { node-version: "24", package-manager-cache: false }
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with: { targets: aarch64-apple-ios-sim }
+      - name: Select the verified iOS toolchain
+        shell: bash
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+        run: |
+          set -euo pipefail
+          test -d "$DEVELOPER_DIR"
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          printf '%s\n' "$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin" >> "$GITHUB_PATH"
+          xcodebuild -version
+      - run: pnpm install --frozen-lockfile
+      - name: Run Rust test inventory in an iOS simulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          device_id=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(device["udid"] for runtime,devices in data["devices"].items() if "iOS" in runtime for device in devices if device.get("isAvailable") and device.get("state") in ("Shutdown", "Booted")))')
+          xcrun simctl boot "$device_id" 2>/dev/null || true
+          xcrun simctl bootstatus "$device_id" -b
+          cat > "$RUNNER_TEMP/ios-sim-runner.sh" <<'EOF'
+          #!/bin/sh
+          exec xcrun simctl spawn "$IOS_SIMULATOR_UDID" "$@"
+          EOF
+          chmod +x "$RUNNER_TEMP/ios-sim-runner.sh"
+          IOS_SIMULATOR_UDID="$device_id" CARGO_TARGET_AARCH64_APPLE_IOS_SIM_RUNNER="$RUNNER_TEMP/ios-sim-runner.sh" cargo test --manifest-path src-tauri/Cargo.toml --release --locked --target aarch64-apple-ios-sim --lib
+          xcrun simctl shutdown "$device_id"
+      - run: pnpm ios:build:simulator:agent
+
+  sync-tests:
+    if: inputs.product == 'sync'
+    needs: source
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-2022, target: x86_64-pc-windows-msvc }
+          - { runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+          - { runner: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { runner: macos-15-intel, target: x86_64-apple-darwin }
+          - { runner: macos-15, target: aarch64-apple-darwin }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+        with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with: { targets: "${{ matrix.target }}", components: clippy,rustfmt }
+      - uses: actions/setup-node@v6
+        with: { node-version: "24", package-manager-cache: false }
+      - uses: actions/cache/restore@v5
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+          key: release-cargo-1.97.1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src-tauri/Cargo.lock', 'crates/sync-wire/Cargo.lock', 'server/sync/Cargo.lock', 'server/manager/Cargo.lock', 'server/manager/gui/src-tauri/Cargo.lock') }}
+          restore-keys: release-cargo-1.97.1-${{ runner.os }}-${{ runner.arch }}-
+      - run: cargo fmt --manifest-path server/sync/Cargo.toml --check
+      - run: cargo fmt --manifest-path server/manager/Cargo.toml --check
+      - run: cargo clippy --manifest-path server/sync/Cargo.toml --all-targets --locked --target ${{ matrix.target }} -- -D warnings
+      - run: cargo test --manifest-path crates/sync-wire/Cargo.toml --release --locked --target ${{ matrix.target }}
+      - run: cargo test --manifest-path server/sync/Cargo.toml --release --locked --target ${{ matrix.target }}
+      - run: cargo test --manifest-path server/manager/Cargo.toml --release --locked --target ${{ matrix.target }}
+      - name: Run synthetic Linux installer success and rollback checks
+        if: runner.os == 'Linux'
+        run: bash server/manager/install/install.test.sh
+      - name: Build native process harness executables
+        run: |
+          cargo build --manifest-path server/sync/Cargo.toml --release --locked --target ${{ matrix.target }}
+          cargo build --manifest-path server/manager/Cargo.toml --release --locked --target ${{ matrix.target }}
+      - name: Run isolated daemon and manager process lifecycle
+        shell: bash
+        run: >-
+          node server/manager/tests/daemon-process.mjs
+          "$CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-server${{ runner.os == 'Windows' && '.exe' || '' }}"
+          "$CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-manager${{ runner.os == 'Windows' && '.exe' || '' }}"
+      - name: Run Windows Task Scheduler lifecycle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          ./server/manager/tests/windows-startup.ps1
+          -Manager "$env:CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-manager.exe"
+          -Server "$env:CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-server.exe"
+      - name: Run Windows scheduled update success and recovery lifecycle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RISUNEST_TEST_SERVER: ${{ format('{0}/{1}/release/risunest-sync-server.exe', env.CARGO_TARGET_DIR, matrix.target) }}
+          RISUNEST_TEST_MANAGER: ${{ format('{0}/{1}/release/risunest-sync-manager.exe', env.CARGO_TARGET_DIR, matrix.target) }}
+        run: |
+          $tests = @(
+            'no_claim_helper_task_is_removed_without_consuming_recovery_state',
+            'helper_replaces_and_restarts_an_isolated_live_server',
+            'helper_verifies_a_stopped_replacement_then_restores_stopped_intent',
+            'interrupted_files_recovery_outlives_the_active_installed_manager',
+            'helper_recovers_the_live_server_when_its_parent_does_not_exit',
+            'helper_rolls_back_a_corrupt_live_replacement_and_restarts_the_old_server',
+            'installer_guard_records_restart_failure_after_accepted_corrupt_server_start'
+          )
+          foreach ($test in $tests) {
+            $output = & cargo test --manifest-path server/manager/Cargo.toml --release --locked --target '${{ matrix.target }}' --test update_helper $test -- --ignored --exact --nocapture 2>&1 |
+              Tee-Object -FilePath "$env:RUNNER_TEMP/$test.log"
+            if ($LASTEXITCODE -ne 0) { throw "$test failed." }
+            if (($output | Out-String) -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') {
+              throw "$test did not execute exactly one passing test."
+            }
+          }
+      - name: Run Linux systemd, TUI and installer lifecycle
+        if: runner.os == 'Linux'
+        run: |
+          sudo loginctl enable-linger "$USER"
+          test "$(loginctl show-user "$USER" -p Linger --value)" = yes
+          systemctl --user daemon-reload
+          python3 server/manager/tests/linux-process.py \
+            "$CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-server" \
+            "$CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-manager"
+      - name: Run macOS LaunchAgent and updater schedule lifecycle
+        if: runner.os == 'macOS'
+        run: >-
+          sh server/manager/tests/macos-startup.sh
+          "$CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-server"
+          "$CARGO_TARGET_DIR/${{ matrix.target }}/release/risunest-sync-manager"
+
+  sync-gui-tests:
+    if: inputs.product == 'sync'
+    needs: source
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
+      - uses: pnpm/action-setup@v5
+        with: { version: "10.34.1" }
+      - uses: actions/setup-node@v6
+        with: { node-version: "24", package-manager-cache: false }
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - name: Install native GUI test dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev
+      - run: pnpm --dir server/manager/gui --ignore-workspace install --frozen-lockfile
+      - run: pnpm --dir server/manager/gui --ignore-workspace check
+      - run: pnpm --dir server/manager/gui --ignore-workspace test
+      - run: cargo test --manifest-path server/manager/gui/src-tauri/Cargo.toml --release --locked
+
+  prepare-draft:
+    if: >-
+      always() && needs.source.result == 'success' && needs.release-tooling-tests.result == 'success' &&
+      ((inputs.product == 'app' && needs.app-web-tests.result == 'success' && needs.app-native-tests.result == 'success' && needs.app-android-tests.result == 'success' && needs.app-ios-tests.result == 'success') ||
+       (inputs.product == 'sync' && needs.sync-tests.result == 'success' && needs.sync-gui-tests.result == 'success'))
+    needs: [source, release-tooling-tests, app-web-tests, app-native-tests, app-android-tests, app-ios-tests, sync-tests, sync-gui-tests]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.draft.outputs.release_id }}
+      already_published: ${{ steps.mode.outputs.already_published || steps.draft.outputs.already_published }}
+    steps:
+      - uses: actions/checkout@v6
+        with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
+      - uses: actions/download-artifact@v4
+        with: { name: release-input }
+      - id: mode
+        if: inputs.publish != true
+        run: echo "already_published=false" >> "$GITHUB_OUTPUT"
+      - uses: pnpm/action-setup@v5
+        if: inputs.publish == true
+        with: { version: "10.34.1" }
+      - uses: actions/setup-node@v6
+        if: inputs.publish == true
+        with: { node-version: "24", package-manager-cache: false }
+      - run: pnpm install --frozen-lockfile
+        if: inputs.publish == true
+      - id: draft
+        if: inputs.publish == true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          node scripts/release/publish.mjs --prepare-draft
+          --tag "${{ needs.source.outputs.tag }}"
+          --source-commit "${{ needs.source.outputs.source_commit }}"
+          --release-input release-input.json
+
+  app-desktop:
+    if: inputs.product == 'app' && needs.prepare-draft.outputs.already_published != 'true'
+    needs: [source, prepare-draft]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-2022, target: x86_64-pc-windows-msvc, os: windows, arch: x86_64, bundles: nsis, executable: RisuNest.exe }
+          - { runner: windows-11-arm, target: aarch64-pc-windows-msvc, os: windows, arch: aarch64, bundles: nsis, executable: RisuNest.exe }
+          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu, os: linux, arch: x86_64, bundles: "deb,appimage", executable: RisuNest }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, os: linux, arch: aarch64, bundles: "deb,appimage", executable: RisuNest }
+          - { runner: macos-15-intel, target: x86_64-apple-darwin, os: darwin, arch: x86_64, bundles: "app,dmg", executable: RisuNest }
+          - { runner: macos-15, target: aarch64-apple-darwin, os: darwin, arch: aarch64, bundles: "app,dmg", executable: RisuNest }
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
+      - uses: actions/download-artifact@v4
+        with: { name: release-input }
+      - uses: pnpm/action-setup@v5
+        with: { version: "10.34.1" }
+      - uses: actions/setup-node@v6
+        with: { node-version: "24", package-manager-cache: false }
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with: { targets: "${{ matrix.target }}" }
+      - id: pnpm-store
+        shell: bash
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v5
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: release-pnpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pnpm-lock.yaml', 'server/manager/gui/pnpm-lock.yaml') }}
+          restore-keys: release-pnpm-${{ runner.os }}-${{ runner.arch }}-
+      - uses: actions/cache/restore@v5
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+          key: release-cargo-1.97.1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src-tauri/Cargo.lock', 'crates/sync-wire/Cargo.lock', 'server/sync/Cargo.lock', 'server/manager/Cargo.lock', 'server/manager/gui/src-tauri/Cargo.lock') }}
+          restore-keys: release-cargo-1.97.1-${{ runner.os }}-${{ runner.arch }}-
+      - name: Install Linux package dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev patchelf desktop-file-utils shared-mime-info xdg-utils libfuse2t64
+      - run: pnpm install --frozen-lockfile
+      - name: Build once and package from the product binary
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+          TARGET: ${{ matrix.target }}
+          EXECUTABLE: ${{ matrix.executable }}
+          BUNDLES: ${{ matrix.bundles }}
+          OS: ${{ matrix.os }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-work release-out
+          node scripts/release/tauri-config.mjs --release-input release-input.json --output "$RUNNER_TEMP/release-tauri.json"
+          pnpm exec -- tauri build --target "$TARGET" --no-bundle --config "$RUNNER_TEMP/release-tauri.json" -- --locked
+          cp "$CARGO_TARGET_DIR/$TARGET/release/$EXECUTABLE" release-work/app-binary
+          pnpm exec -- tauri build --target "$TARGET" --bundles "$BUNDLES" --config "$RUNNER_TEMP/release-tauri.json" -- --locked
+          node scripts/release/package-app.mjs --kind desktop --os "$OS" --arch "$ARCH" --bundle-dir "$CARGO_TARGET_DIR/$TARGET/release/bundle" --binary release-work/app-binary --release-input release-input.json --output release-work/packages
+          node scripts/release/build.mjs --release-input release-input.json --leg "desktop_${OS}_${ARCH}" --assets-json release-work/packages/assets.json --output release-out --public-key "$RISUNEST_UPDATE_PUBLIC_KEY"
+      - name: Verify the produced macOS archive with the production updater
+        if: matrix.os == 'darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RISUNEST_MAC_UPDATE_ARCHIVE="$CARGO_TARGET_DIR/${{ matrix.target }}/release/bundle/macos/RisuNest.app.tar.gz"
+          cargo test --manifest-path src-tauri/Cargo.toml --package tauri-plugin-updater --target '${{ matrix.target }}' --release --locked --lib updater::tests::produced_macos_archive_replaces_disposable_app_and_preserves_sibling_data -- --ignored --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/app-update-install.log"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/app-update-install.log"
+      - name: Upload final assets to draft
+        if: inputs.publish == true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          node scripts/release/upload-build.mjs
+          --draft-id "${{ needs.prepare-draft.outputs.release_id }}"
+          --directory release-out
+          --inventory "release-out/inventory-desktop_${{ matrix.os }}_${{ matrix.arch }}.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.publish && format('inventory-app-desktop-{0}-{1}', matrix.os, matrix.arch) || format('rehearsal-app-desktop-{0}-{1}', matrix.os, matrix.arch) }}
+          path: ${{ inputs.publish && format('release-out/inventory-desktop_{0}_{1}.json', matrix.os, matrix.arch) || 'release-out/*' }}
+          if-no-files-found: error
+          retention-days: 2
+
+  app-android:
+    if: inputs.product == 'app' && needs.prepare-draft.outputs.already_published != 'true'
+    needs: [source, prepare-draft]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
+      - uses: actions/download-artifact@v4
+        with: { name: release-input }
+      - uses: pnpm/action-setup@v5
+        with: { version: "10.34.1" }
+      - uses: actions/setup-node@v6
+        with: { node-version: "24", package-manager-cache: false }
+      - uses: actions/setup-java@v5
+        with: { distribution: temurin, java-version: "21" }
+      - uses: android-actions/setup-android@v3
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with: { targets: aarch64-linux-android }
+      - run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358'
+      - run: pnpm install --frozen-lockfile
+      - name: Verify the committed Android shell
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(
+            src-tauri/gen/android/settings.gradle
+            src-tauri/gen/android/app/build.gradle.kts
+            src-tauri/gen/android/buildSrc/src/main/java/io/github/rsyumi/risunest/kotlin/BuildTask.kt
+            src-tauri/gen/android/gradle/wrapper/gradle-wrapper.jar
+            src-tauri/gen/android/app/src/main/java/io/github/rsyumi/risunest/MainActivity.kt
+          )
+          for path in "${required[@]}"; do test -f "$path"; done
+          git diff --exit-code -- src-tauri/gen/android
+      - name: Configure release keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: >-
+          node scripts/release/android-signing.mjs
+          --keystore "$RUNNER_TEMP/risunest-release.jks"
+          --properties src-tauri/gen/android/keystore.properties
+      - name: Build and verify signed ARM64 APK
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-work release-out
+          export NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
+          export PATH="$ANDROID_HOME/build-tools/36.0.0:$PATH"
+          node scripts/release/tauri-config.mjs --release-input release-input.json --output "$RUNNER_TEMP/release-tauri.json"
+          pnpm exec -- tauri android build --apk --target aarch64 --ci --config "$RUNNER_TEMP/release-tauri.json" -- --locked
+          git diff --exit-code -- src-tauri/gen/android
+          apk_count=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' | wc -l | tr -d ' ')
+          test "$apk_count" -eq 1
+          apk=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' -print -quit)
+          node scripts/release/package-app.mjs --kind android --arch aarch64 --package "$apk" --binary "$CARGO_TARGET_DIR/aarch64-linux-android/release/librisunest_lib.so" --release-input release-input.json --output release-work/packages
+          node scripts/release/build.mjs --release-input release-input.json --leg mobile_android_aarch64 --assets-json release-work/packages/assets.json --output release-out --public-key "$RISUNEST_UPDATE_PUBLIC_KEY"
+      - name: Remove runner signing material
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/risunest-release.jks" src-tauri/gen/android/keystore.properties
+      - name: Upload final assets to draft
+        if: inputs.publish == true
+        env: { GITHUB_TOKEN: "${{ github.token }}" }
+        run: node scripts/release/upload-build.mjs --draft-id "${{ needs.prepare-draft.outputs.release_id }}" --directory release-out --inventory release-out/inventory-mobile_android_aarch64.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.publish && 'inventory-app-android-aarch64' || 'rehearsal-app-android-aarch64' }}
+          path: ${{ inputs.publish && 'release-out/inventory-mobile_android_aarch64.json' || 'release-out/*' }}
+          if-no-files-found: error
+          retention-days: 2
+
+  app-ios:
+    if: inputs.product == 'app' && needs.prepare-draft.outputs.already_published != 'true'
+    needs: [source, prepare-draft]
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
+      - uses: actions/download-artifact@v4
+        with: { name: release-input }
+      - uses: pnpm/action-setup@v5
+        with: { version: "10.34.1" }
+      - uses: actions/setup-node@v6
+        with: { node-version: "24", package-manager-cache: false }
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with: { targets: aarch64-apple-ios }
+      - name: Select the verified iPhoneOS toolchain
+        shell: bash
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+        run: |
+          set -euo pipefail
+          test -d "$DEVELOPER_DIR"
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          printf '%s\n' "$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin" >> "$GITHUB_PATH"
+          xcodebuild -version
+      - run: pnpm install --frozen-lockfile
+      - name: Build unsigned iPhoneOS ARM64 IPA
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-work release-out
+          node scripts/release/tauri-config.mjs --release-input release-input.json --output "$RUNNER_TEMP/release-tauri.json"
+          pnpm exec -- tauri ios build --ci --target aarch64 --no-sign --config "$RUNNER_TEMP/release-tauri.json" -- --locked
+          ipa_count=$(find src-tauri/gen/apple -type f -name '*.ipa' | wc -l | tr -d ' ')
+          test "$ipa_count" -eq 1
+          ipa=$(find src-tauri/gen/apple -type f -name '*.ipa' -print -quit)
+          node scripts/release/package-app.mjs --kind ios --arch aarch64 --package "$ipa" --release-input release-input.json --output release-work/packages
+          node scripts/release/build.mjs --release-input release-input.json --leg mobile_ios_aarch64 --assets-json release-work/packages/assets.json --output release-out --public-key "$RISUNEST_UPDATE_PUBLIC_KEY"
+      - name: Upload final assets to draft
+        if: inputs.publish == true
+        env: { GITHUB_TOKEN: "${{ github.token }}" }
+        run: node scripts/release/upload-build.mjs --draft-id "${{ needs.prepare-draft.outputs.release_id }}" --directory release-out --inventory release-out/inventory-mobile_ios_aarch64.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.publish && 'inventory-app-ios-aarch64' || 'rehearsal-app-ios-aarch64' }}
+          path: ${{ inputs.publish && 'release-out/inventory-mobile_ios_aarch64.json' || 'release-out/*' }}
+          if-no-files-found: error
+          retention-days: 2
+
+  sync-suite:
+    if: inputs.product == 'sync' && needs.prepare-draft.outputs.already_published != 'true'
+    needs: [source, prepare-draft]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-2022, target: x86_64-pc-windows-msvc, os: windows, arch: x86_64, suffix: .exe }
+          - { runner: windows-11-arm, target: aarch64-pc-windows-msvc, os: windows, arch: aarch64, suffix: .exe }
+          - { runner: ubuntu-22.04, target: x86_64-unknown-linux-gnu, os: linux, arch: x86_64, suffix: "" }
+          - { runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, os: linux, arch: aarch64, suffix: "" }
+          - { runner: macos-15-intel, target: x86_64-apple-darwin, os: darwin, arch: x86_64, suffix: "" }
+          - { runner: macos-15, target: aarch64-apple-darwin, os: darwin, arch: aarch64, suffix: "" }
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    env:
+      RISUNEST_DEFAULT_REGISTRY_URL: ${{ secrets.RISUNEST_DEFAULT_REGISTRY_URL }}
+    steps:
+      - uses: actions/checkout@v6
+        with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
+      - uses: actions/download-artifact@v4
+        with: { name: release-input }
+      - uses: pnpm/action-setup@v5
+        with: { version: "10.34.1" }
+      - uses: actions/setup-node@v6
+        with: { node-version: "24", package-manager-cache: false }
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12" }
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with: { targets: "${{ matrix.target }}" }
+      - id: pnpm-store
+        shell: bash
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v5
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: release-pnpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pnpm-lock.yaml', 'server/manager/gui/pnpm-lock.yaml') }}
+          restore-keys: release-pnpm-${{ runner.os }}-${{ runner.arch }}-
+      - uses: actions/cache/restore@v5
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+          key: release-cargo-1.97.1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src-tauri/Cargo.lock', 'crates/sync-wire/Cargo.lock', 'server/sync/Cargo.lock', 'server/manager/Cargo.lock', 'server/manager/gui/src-tauri/Cargo.lock') }}
+          restore-keys: release-cargo-1.97.1-${{ runner.os }}-${{ runner.arch }}-
+      - run: pnpm install --frozen-lockfile
+      - name: Install Sync GUI dependencies
+        if: matrix.os != 'linux'
+        run: pnpm --dir server/manager/gui --ignore-workspace install --frozen-lockfile
+      - name: Fetch and verify pinned cloudflared
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/release/vendor.mjs --target "$OS-$ARCH" --output vendor
+          node -e "const fs=require('node:fs'),v=require('./vendor/vendor.json'); fs.appendFileSync(process.env.GITHUB_ENV, 'RISUNEST_CLOUDFLARED_INPUT='+require('node:path').resolve('vendor/vendor.json')+'\nRISUNEST_CLOUDFLARED='+v.executable+'\nRISUNEST_CLOUDFLARED_LICENSE='+v.license+'\n')"
+        env:
+          OS: ${{ matrix.os }}
+          ARCH: ${{ matrix.arch }}
+      - name: Prove Windows cloudflared start, tunnel, stop and restart
+        if: matrix.os == 'windows'
+        run: node scripts/release/verify-cloudflared.mjs --binary "$env:RISUNEST_CLOUDFLARED"
+      - name: Build console, background and GUI executables once
+        shell: bash
+        env:
+          RISUNEST_UPDATE_PUBLIC_KEY: ${{ secrets.RISUNEST_UPDATE_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+          TARGET: ${{ matrix.target }}
+          OS: ${{ matrix.os }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          test -n "$RISUNEST_UPDATE_PUBLIC_KEY"
+          mkdir -p release-work/native release-work/raw release-work/packages release-out
+          version=$(node -p "require('./release-input.json').version")
+          node server/manager/install/build.mjs --target "$TARGET" --output release-work/native --registry-url "$RISUNEST_DEFAULT_REGISTRY_URL" --version "$version"
+          daemon=$(node -p "require('./release-work/native/native-build.json').daemon")
+          python server/sync/distribution/package.py --binary "$daemon" --target "$TARGET" --version "$version" --output release-work/raw
+          raw_count=$(find release-work/raw -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' \) | wc -l | tr -d ' ')
+          test "$raw_count" -eq 1
+          raw=$(find release-work/raw -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print -quit)
+          vendor_sha=$(node -p "require('./vendor/vendor.json').executableSha256")
+          node server/manager/install/package.mjs --native-build release-work/native/native-build.json --raw-archive "$raw" --release-input release-input.json --output release-work/packages --cloudflared-sha256 "$vendor_sha"
+          node scripts/release/build.mjs --release-input release-input.json --leg "sync_${OS}_${ARCH}" --assets-json release-work/packages/assets.json --output release-out --public-key "$RISUNEST_UPDATE_PUBLIC_KEY"
+      - name: Install, reinstall and roll back the produced Linux managed package
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo loginctl enable-linger "$USER"
+          test "$(loginctl show-user "$USER" --property=Linger --value)" = yes
+          systemctl --user daemon-reload
+          managed=$(node -e "const path=require('node:path'); const matches=require('./release-work/packages/assets.json').filter((asset) => asset.download.variant === 'managed' && asset.download.os === 'linux' && asset.download.arch === process.argv[1] && asset.download.format === 'tar.gz'); if (matches.length !== 1) throw new Error('Expected one managed Linux archive.'); process.stdout.write(path.resolve(matches[0].path));" "${{ matrix.arch }}")
+          env -u XDG_CONFIG_HOME -u XDG_DATA_HOME bash server/manager/install/managed-install.integration.test.sh "$managed"
+      - name: Run synthetic Windows NSIS install failure and rollback checks
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh -NoProfile -File server/manager/install/windows.test.ps1
+      - name: Apply and roll back the produced macOS Sync app
+        if: matrix.os == 'darwin'
+        shell: bash
+        env:
+          RISUNEST_TEST_RUST_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          inventory="$(pwd)/release-out/inventory-sync_darwin_${{ matrix.arch }}.json"
+          managed="$(node -e "const path=require('node:path'); const i=require(process.argv[1]); const d=i.downloads.filter(x=>x.variant==='managed'&&x.format==='app.tar.gz'); if(d.length!==1)throw new Error('Expected one managed app archive'); console.log(path.join(path.dirname(process.argv[1]),d[0].fileName));" "$inventory")"
+          sh server/manager/tests/macos-update.sh "$managed" "$managed.sig" "$inventory" 2>&1 | tee "$RUNNER_TEMP/macos-update.log"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/macos-update.log"
+      - name: Upload final assets to draft
+        if: inputs.publish == true
+        env: { GITHUB_TOKEN: "${{ github.token }}" }
+        run: >-
+          node scripts/release/upload-build.mjs
+          --draft-id "${{ needs.prepare-draft.outputs.release_id }}"
+          --directory release-out
+          --inventory "release-out/inventory-sync_${{ matrix.os }}_${{ matrix.arch }}.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.publish && format('inventory-sync-{0}-{1}', matrix.os, matrix.arch) || format('rehearsal-sync-{0}-{1}', matrix.os, matrix.arch) }}
+          path: ${{ inputs.publish && format('release-out/inventory-sync_{0}_{1}.json', matrix.os, matrix.arch) || 'release-out/*' }}
+          if-no-files-found: error
+          retention-days: 2
+
+  collect-publish:
+    if: >-
+      always() && needs.prepare-draft.result == 'success' && needs.prepare-draft.outputs.already_published != 'true' &&
+      ((inputs.product == 'app' && needs.app-desktop.result == 'success' && needs.app-android.result == 'success' && needs.app-ios.result == 'success') ||
+       (inputs.product == 'sync' && needs.sync-suite.result == 'success'))
+    needs: [source, prepare-draft, app-desktop, app-android, app-ios, sync-suite]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: risunest-stable-publish
+      queue: max
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+        with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
+      - uses: actions/download-artifact@v4
+        with: { name: release-input }
+      - uses: pnpm/action-setup@v5
+        with: { version: "10.34.1" }
+      - uses: actions/setup-node@v6
+        with: { node-version: "24", package-manager-cache: false }
+      - uses: dtolnay/rust-toolchain@1.97.1
+        if: inputs.product == 'sync'
+      - uses: actions/cache/restore@v5
+        if: inputs.product == 'sync'
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+          key: release-cargo-1.97.1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src-tauri/Cargo.lock', 'crates/sync-wire/Cargo.lock', 'server/sync/Cargo.lock', 'server/manager/Cargo.lock', 'server/manager/gui/src-tauri/Cargo.lock') }}
+          restore-keys: release-cargo-1.97.1-${{ runner.os }}-${{ runner.arch }}-
+      - run: pnpm install --frozen-lockfile
+      - name: Download build inventories
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.publish && format('inventory-{0}-*', inputs.product) || format('rehearsal-{0}-*', inputs.product) }}
+          path: collected
+          merge-multiple: false
+      - name: Download draft release assets
+        if: inputs.publish == true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "${{ needs.source.outputs.tag }}" --dir collected/assets
+      - name: Collect and validate every required artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/release/collect.mjs --product "$PRODUCT" --tag "$TAG" --source-commit "$SOURCE_COMMIT" --release-input release-input.json --input-dir collected --output-dir release-manifest --public-key "$RISUNEST_UPDATE_PUBLIC_KEY"
+        env:
+          PRODUCT: ${{ needs.source.outputs.product }}
+          TAG: ${{ needs.source.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.source.outputs.source_commit }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+      - name: Prove all managed Sync packages with the production Rust extractor
+        if: inputs.product == 'sync'
+        run: >-
+          node scripts/release/runtime-parity.mjs
+          --product-manifest release-manifest/product-manifest.json
+          --assets-dir collected
+      - name: Publish verified stable release
+        if: inputs.publish == true
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PRODUCT: ${{ needs.source.outputs.product }}
+          TAG: ${{ needs.source.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.source.outputs.source_commit }}
+          DRAFT_ID: ${{ needs.prepare-draft.outputs.release_id }}
+          BOOTSTRAP: ${{ inputs.bootstrap }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          args=(--publish --product "$PRODUCT" --tag "$TAG" --source-commit "$SOURCE_COMMIT" --release-input release-input.json --product-manifest release-manifest/product-manifest.json --assets collected/assets --draft-id "$DRAFT_ID")
+          if test "$BOOTSTRAP" = true; then args+=(--bootstrap); fi
+          node scripts/release/publish.mjs "${args[@]}"
+      - uses: actions/upload-artifact@v4
+        if: inputs.publish != true
+        with:
+          name: release-validation-${{ inputs.product }}
+          path: |
+            release-manifest/product-manifest.json
+            release-manifest/product-manifest.json.sig
+          if-no-files-found: error
+          retention-days: 2
+
+  recover-published:
+    if: always() && inputs.publish == true && needs.prepare-draft.outputs.already_published == 'true'
+    needs: [source, prepare-draft]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: risunest-stable-publish
+      queue: max
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+        with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
+      - uses: pnpm/action-setup@v5
+        with: { version: "10.34.1" }
+      - uses: actions/setup-node@v6
+        with: { node-version: "24", package-manager-cache: false }
+      - run: pnpm install --frozen-lockfile
+      - name: Download immutable published assets
+        shell: bash
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: >-
+          gh release download "${{ needs.source.outputs.tag }}" --dir published
+          --pattern product-manifest.json --pattern product-manifest.json.sig
+      - name: Recover latest only when this release still owns the newest catalog
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          node scripts/release/publish.mjs --publish
+          --product "${{ needs.source.outputs.product }}"
+          --tag "${{ needs.source.outputs.tag }}"
+          --source-commit "${{ needs.source.outputs.source_commit }}"
+          --product-manifest published/product-manifest.json
+          --assets published
+          --draft-id "${{ needs.prepare-draft.outputs.release_id }}"

@@ -25,6 +25,7 @@
     "check:plugin-dts": "tsc --noEmit --skipLibCheck --target es2023 --module es2022 --moduleResolution bundler --lib es2023,dom src/ts/plugins/apiV3/risuai.d.ts",
     "check:production-bundle": "node tests/productionBundle.mjs",
     "check:benchmark-harnesses": "svelte-check --tsconfig benchmarks/tsconfig.json",
+    "test:release": "node --test tests/release/*.node-test.mjs",
     "test:tokenizer-corpus": "node --test benchmarks/tokenizer/corpus.node-test.mjs benchmarks/tokenizer/oracle-benchmark.node-test.mjs",
     "desktop:dev:agent": "tauri dev --config src-tauri/tauri.agent.conf.json",
     "desktop:build:agent": "tauri build --config src-tauri/tauri.agent.conf.json -- --locked",

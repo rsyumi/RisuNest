@@ -4506,6 +4506,7 @@ dependencies = [
 name = "risunest"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64 0.21.7",
  "cap-primitives",
@@ -4529,6 +4530,7 @@ dependencies = [
  "regex",
  "reqwest 0.11.27",
  "risunest-external-storage-format",
+ "risunest-release-update",
  "risunest-sync-connect",
  "risunest-sync-server",
  "risunest-sync-wire",
@@ -4591,6 +4593,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "risunest-release-update"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.21.7",
+ "hex",
+ "minisign-verify",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "time",
+ "url",
+]
+
+[[package]]
 name = "risunest-sync-connect"
 version = "0.1.0"
 dependencies = [
@@ -4607,12 +4626,14 @@ dependencies = [
 name = "risunest-sync-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "futures-util",
  "getrandom 0.2.17",
  "libc",
  "qrcode",
  "reqwest 0.12.28",
+ "risunest-release-update",
  "risunest-sync-connect",
  "risunest-sync-wire",
  "rusqlite",
@@ -6029,8 +6050,6 @@ dependencies = [
 [[package]]
 name = "tauri-plugin-updater"
 version = "2.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "806d9dac662c2e4594ff03c647a552f2c9bd544e7d0f683ec58f872f952ce4af"
 dependencies = [
  "base64 0.22.1",
  "dirs",

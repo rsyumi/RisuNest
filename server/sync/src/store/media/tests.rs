@@ -30,7 +30,7 @@ fn signed_access_survives_server_restart_and_is_revoked_with_device() {
     let (root, store, device, request) = fixture();
     let epoch = store.head().unwrap().epoch;
     let access = store
-        .media_access(&device, &epoch, &[request.clone()])
+        .media_access(&device, &epoch, std::slice::from_ref(&request))
         .unwrap()
         .remove(0);
     assert!(matches!(
@@ -76,7 +76,7 @@ fn size_epoch_and_callback_scope_are_validated_before_grant() {
     let (_root, store, device, request) = fixture();
     let epoch = store.head().unwrap().epoch;
     assert!(store
-        .media_access(&device, "wrong-epoch", &[request.clone()])
+        .media_access(&device, "wrong-epoch", std::slice::from_ref(&request))
         .is_err());
     let mut altered = request.clone();
     altered.object.size = 1.into();

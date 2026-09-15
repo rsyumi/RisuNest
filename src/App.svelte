@@ -37,6 +37,7 @@
     import { keepFocusedInputVisible } from './ts/gui/imeVisibility';
     import { isTauri, isTauriMobile } from './ts/platform';
     import NativeFileJobDialog from './lib/Others/NativeFileJobDialog.svelte';
+    import UpdatePopup from './lib/Others/UpdatePopup.svelte';
     import LoadingIndicator from './lib/UI/GUI/LoadingIndicator.svelte';
     import SyncExitDialog from './lib/Others/SyncExitDialog.svelte';
 
@@ -73,6 +74,7 @@
         if (isTauri && $loadedStore) {
             // Start only after storage, asset authority and the working set are ready.
             void import('./ts/storage/sync/serverSyncProduction').then(({ startServerSync }) => startServerSync())
+            void import('./ts/update/controller').then(({ startAppUpdateChecks }) => startAppUpdateChecks())
         }
     })
 
@@ -536,4 +538,5 @@
     {/if}
     <NativeFileJobDialog />
     <SyncExitDialog />
+    <UpdatePopup />
 </main>

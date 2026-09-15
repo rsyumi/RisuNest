@@ -58,6 +58,9 @@ targets:
           - UIInterfaceOrientationLandscapeRight
         CFBundleShortVersionString: 2026.8.250
         CFBundleVersion: "2026.8.250"
+        CFBundleURLTypes:
+          - CFBundleURLSchemes: [risunestlocal]
+            CFBundleURLName: risunestlocal
     entitlements:
       path: risunest_iOS/risunest_iOS.entitlements
     scheme:

@@ -15,6 +15,7 @@ tauri-build = { version = "2.6.3", features = [] }
 [dependencies]
 axum = "0.8.9"
 tempfile = "3"
+risunest-release-update = { path = "../crates/release-update" }
 risunest-sync-wire = { path = "../crates/sync-wire" }
 risunest-sync-connect = { path = "../crates/sync-connect" }
 risunest-external-storage-format = { path = "../crates/external-storage-format" }
@@ -32,6 +33,7 @@ darling = "0.20.3"
 zip = "0.6.6"
 eventsource-client = "0.12.2"
 futures = "0.3.30"
+async-trait = "0.1"
 url = "2.2"
 uuid = { version = "1.9.1", features = [ "v4" ] }
 tauri-plugin-deep-link = "2.4.9"
@@ -138,3 +140,7 @@ risunest-sync-server = { path = "../server/sync" }
 tokio = { version = "1", features = ["rt-multi-thread", "net"] }
 tauri = { version = "2.11.5", features = ["test"] }
 regex = "1.13.1"
+
+[patch.crates-io]
+# Keep failed desktop updates from closing or discarding the installed app.
+tauri-plugin-updater = { path = "../crates/tauri-plugin-updater" }

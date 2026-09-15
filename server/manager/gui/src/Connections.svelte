@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { untrack, tick } from "svelte";
+  import { onDestroy, untrack, tick } from "svelte";
   import { Copy } from "@lucide/svelte";
   import { phase, type Status, type Environment } from "./api";
   let {
@@ -8,6 +8,7 @@
     busy,
     mutate,
     copy,
+    activity,
   }: {
     status: Status;
     environment: Environment | null;
@@ -17,6 +18,7 @@
       body?: Record<string, unknown>,
     ) => Promise<string | null>;
     copy: (text: string) => void;
+    activity: (active: boolean) => void;
   } = $props();
   // Form drafts retain the revision they were based on while status polls continue.
   let mode = $state(
@@ -46,6 +48,7 @@
   let dirty = $state(false);
   function changed() {
     dirty = true;
+    activity(true);
   }
   function reset() {
     mode = status.connectionState.mode === "managed" ? "managed" : "fixed";
@@ -56,6 +59,7 @@
     enabled = status.connection.registryEnabled;
     revision = status.revision;
     dirty = false;
+    activity(false);
   }
   async function apply() {
     const nextRevision = await mutate("connection", {
@@ -76,6 +80,7 @@
     const nextRevision = await mutate(path);
     if (nextRevision) revision = nextRevision;
   }
+  onDestroy(() => activity(false));
 </script>
 
 <p class="page-description">

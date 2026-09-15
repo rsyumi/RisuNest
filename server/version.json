@@ -1,0 +1,8 @@
+{
+  "version": "0.1.0",
+  "compatibility": {
+    "protocolId": "risunest-sync/v1",
+    "storeFormatId": "risunest-sync-store/v8",
+    "automaticApply": true
+  }
+}

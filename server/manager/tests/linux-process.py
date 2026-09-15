@@ -1,4 +1,4 @@
-"""Synthetic Linux process, user systemd, and local installer integration.
+"""Synthetic Linux process and user systemd integration.
 
 Run with explicit daemon and manager paths. Never opens installed application data.
 """
@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 import pty
 import select
-import shutil
 import socket
 import subprocess
 import sys
@@ -75,6 +74,15 @@ with tempfile.TemporaryDirectory(prefix="risunest-manager-test-") as temporary:
         assert json.loads(run(args + ["autostart", "status"])) == {
             "registered": True, "enabled": True, "actionMatches": True
         }
+        update_status = json.loads(run(args + ["update", "status"]))
+        assert update_status["settings"]["policy"] == "automatic"
+        assert not update_status["schedule"]["registered"]
+        assert not update_status["schedule"]["enabled"]
+        run(args + ["update", "schedule", "reconcile"])
+        update_status = json.loads(run(args + ["update", "status"]))
+        assert update_status["schedule"] == {
+            "registered": True, "enabled": True, "actionMatches": True
+        }
         run(args + ["start"])
         assert json.loads(run(args + ["status"]))["devices"] == []
         screen = run(args, input="1\n\n0\n")
@@ -82,37 +90,23 @@ with tempfile.TemporaryDirectory(prefix="risunest-manager-test-") as temporary:
         keyboard_menu(args)
         run(args + ["autostart", "remove"])
         assert not json.loads(run(args + ["autostart", "status"]))["registered"]
+        update_status = json.loads(run(args + ["update", "status"]))
+        assert update_status["schedule"] == {
+            "registered": True, "enabled": True, "actionMatches": True
+        }
+        assert json.loads(run(args + ["status"]))["devices"] == []
+
+        run(args + ["update", "policy", "off"])
+        update_status = json.loads(run(args + ["update", "status"]))
+        assert update_status["settings"]["policy"] == "off"
+        assert not update_status["schedule"]["registered"]
+        assert not update_status["schedule"]["enabled"]
+        assert not json.loads(run(args + ["autostart", "status"]))["registered"]
         assert json.loads(run(args + ["status"]))["devices"] == []
         run(args + ["stop"])
         assert not (data / "management-session").exists()
-        print("PASS: Linux user systemd, numeric TUI, removal preserves daemon, graceful stop")
+        print("PASS: Linux independent user systemd scheduling, numeric TUI, removal preserves daemon, graceful stop")
     finally:
+        run(args + ["update", "policy", "off"])
         run(args + ["prepare-update"])
         run(args + ["autostart", "remove"])
-
-    home = root / "isolated-home"
-    home.mkdir()
-    env = dict(os.environ, HOME=str(home), XDG_DATA_HOME=str(home / "data"),
-               XDG_CONFIG_HOME=str(home / "config"))
-    archive = root / "archive"
-    archive.mkdir()
-    shutil.copy2(server, archive / "risunest-sync-server")
-    shutil.copy2(manager, archive / "risunest-sync-manager")
-    # This test does not start a Tunnel. Only verify the installer's local file contract.
-    (archive / "cloudflared").write_text("#!/bin/sh\nexit 99\n")
-    (archive / "cloudflared").chmod(0o700)
-    (archive / "CLOUDFLARED-LICENSE").write_text("Synthetic installer fixture\n")
-    installer = Path(__file__).resolve().parents[1] / "install/install.sh"
-    shutil.copy2(installer, archive / "install.sh")
-    installed = home / ".local/bin/risunest-sync-manager"
-    try:
-        run(["sh", str(archive / "install.sh")], env=env, input="")
-        assert installed.is_file()
-        assert json.loads(run([str(installed), "status"], env=env))["devices"] == []
-        run([str(installed), "uninstall"], env=env)
-        assert (home / "data/risunest-sync/metadata.sqlite").is_file()
-        assert not (home / "data/risunest-sync/management-session").exists()
-        print("PASS: local sh installation, user bin wrapper, uninstall preserves synthetic data")
-    finally:
-        if installed.exists():
-            run([str(installed), "prepare-update"], env=env)

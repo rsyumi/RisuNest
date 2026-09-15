@@ -35,7 +35,7 @@
   "identifier": "io.github.rsyumi.risunest",
   "plugins": {
     "updater": {
-      "comment": "RisuNest has no update server yet. The endpoint list is intentionally empty and the pubkey is intentionally blank so that check() fails fast with EmptyEndpoints instead of resolving upstream RisuAI releases. Do not delete this block: tauri_plugin_updater is still registered in lib.rs and its Config requires `pubkey`, so a missing `plugins.updater` aborts app startup. To re-enable updates, publish a latest.json, put its URL in `endpoints`, put the matching minisign public key in `pubkey`, set `bundle.createUpdaterArtifacts` back to true, sign the build with TAURI_SIGNING_PRIVATE_KEY, and flip UPDATER_ENDPOINT_CONFIGURED in src/ts/update.ts.",
+      "comment": "The signed product manifest endpoint and public key are supplied by the native verified-update boundary. The public release build injects RISUNEST_UPDATE_PUBLIC_KEY and signs artifacts with TAURI_SIGNING_PRIVATE_KEY. Empty endpoints prevent direct frontend checks against an unverified multi-product catalog.",
       "pubkey": "",
       "endpoints": [],
       "windows": {

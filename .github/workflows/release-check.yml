@@ -1,0 +1,40 @@
+name: Release pipeline check
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/release*.yml
+      - .github/workflows/stable-release.yml
+      - scripts/release/**
+      - tests/release/**
+      - package.json
+      - pnpm-lock.yaml
+      - version.json
+      - server/version.json
+      - release-notes/**
+      - crates/release-update/**
+      - crates/tauri-plugin-updater/**
+      - crates/sync-wire/**
+      - server/sync/**
+      - server/manager/**
+      - src-tauri/**
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target
+    steps:
+      - uses: actions/checkout@v6
+        with: { persist-credentials: false }
+      - uses: pnpm/action-setup@v5
+        with: { version: "10.34.1" }
+      - uses: actions/setup-node@v6
+        with: { node-version: "24", package-manager-cache: false }
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:release
+      - run: cargo test --manifest-path crates/release-update/Cargo.toml --release --locked

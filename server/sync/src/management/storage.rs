@@ -109,5 +109,10 @@ fn available(path: &Path) -> Option<u64> {
         return None;
     }
     let stat = unsafe { stat.assume_init() };
-    (stat.f_bavail as u64).checked_mul(stat.f_frsize as u64)
+    // Apple's block count remains 32-bit even on 64-bit targets.
+    #[cfg(target_vendor = "apple")]
+    let blocks = u64::from(stat.f_bavail);
+    #[cfg(not(target_vendor = "apple"))]
+    let blocks = stat.f_bavail;
+    blocks.checked_mul(stat.f_frsize)
 }
