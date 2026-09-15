@@ -609,6 +609,69 @@ mod tests {
         );
     }
 
+    /// Two devices backing up the same repository produce separate points whose
+    /// contents are never merged, and a conflict point names both complete
+    /// bundles rather than a combination of them.
+    #[test]
+    fn a_backup_point_belongs_to_one_device_and_a_conflict_keeps_both_whole() {
+        let bundle = |id: &str, writer: &str, kind: SectionKind| {
+            BackupBundleDocument::new(
+                "repository".into(),
+                id.into(),
+                BundleSource::Device {
+                    writer_id: writer.into(),
+                },
+                1,
+                Some(Sequence::from(12u64)),
+                Some(Sequence::from(4u64)),
+                None,
+                library(),
+                BTreeMap::from([(kind.id().into(), section(kind, 1))]),
+            )
+            .unwrap()
+        };
+        let first = bundle("bundle-a", "writer-a", SectionKind::Hypa);
+        let second = bundle("bundle-b", "writer-b", SectionKind::LocalPlugins);
+        assert_ne!(first.bundle_id, second.bundle_id);
+        assert_ne!(first.source, second.source);
+        assert_ne!(first.included_sections, second.included_sections);
+        assert_ne!(first.bundle_fingerprint, second.bundle_fingerprint);
+
+        let point = |id: &str, bundle: &str| {
+            BackupPointDocument::single(
+                "repository".into(),
+                id.into(),
+                BackupPointKind::Backup,
+                1,
+                stored(bundle, ObjectRole::BackupBundle),
+            )
+            .unwrap()
+        };
+        let own = point("point-a", "bundle-a");
+        let other = point("point-b", "bundle-b");
+        assert_eq!(own.bundles().len(), 1);
+        assert_eq!(other.bundles().len(), 1);
+        assert_ne!(own.bundles()[0].header.object_id, other.bundles()[0].header.object_id);
+
+        let conflict = BackupPointDocument::conflict(
+            "repository".into(),
+            "point-conflict".into(),
+            1,
+            stored("bundle-a", ObjectRole::BackupBundle),
+            stored("bundle-b", ObjectRole::BackupBundle),
+        )
+        .unwrap();
+        assert!(conflict.bundle.is_none());
+        assert_eq!(
+            conflict
+                .bundles()
+                .iter()
+                .map(|object| object.header.object_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bundle-a", "bundle-b"]
+        );
+    }
+
     /// A repository created while every device section was switched off still
     /// accepts those sections later. Neither the repository identity nor the
     /// recovery information has to be rebuilt for that.

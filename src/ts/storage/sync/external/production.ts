@@ -273,7 +273,7 @@ function restoreFailure(job: ExternalJobSummary): Error {
 export async function requestExternalStorageRestore(
     connectionId: string,
     snapshotId: string,
-    restoreAreas: Array<'library' | 'referencedAssets' | 'deviceSettings' | 'devicePlugins'>,
+    restoreAreas: Array<'library' | 'referencedAssets'>,
 ): Promise<ExternalJobSummary> {
     const current = runtime
     if (!current) throw new Error('External storage production is not installed')

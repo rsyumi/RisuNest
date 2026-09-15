@@ -55,6 +55,9 @@ fn role_token(role: ObjectRole) -> &'static str {
         ObjectRole::BackupPoint => "backupPoint",
     }
 }
+/// Only names the container a collection lives in. States and bundles share
+/// one, so the role returned here never classifies a listed object; the
+/// authenticated envelope header does that.
 fn collection_role(collection: Collection) -> ObjectRole {
     match collection {
         Collection::Snapshots => ObjectRole::SyncState,

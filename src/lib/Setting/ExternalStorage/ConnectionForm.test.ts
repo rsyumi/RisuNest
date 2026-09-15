@@ -324,10 +324,16 @@ describe('what a connection stores', () => {
         await settle()
         await selectProvider('s3')
 
-        for (const item of [strings.library, strings.hypa, strings.devicePlugins, strings.deviceSettings]) {
+        for (const item of [strings.hypa, strings.devicePlugins, strings.deviceSettings]) {
             expect(labelControl<HTMLInputElement>(item).type).toBe('checkbox')
         }
-        expect(labelControl<HTMLInputElement>(strings.library).disabled).toBe(true)
+        // The library is always stored, so its row states the outcome instead
+        // of offering a control that does nothing.
+        expect(() => labelControl<HTMLInputElement>(strings.library)).toThrow()
+        const library = [...target.querySelectorAll('p')]
+            .find(item => item.textContent?.includes(strings.library))
+        expect(library?.textContent).toContain(strings.included)
+        expect(library?.querySelector('input')).toBeNull()
 
         button(strings.sync).click()
         await settle()
@@ -338,6 +344,7 @@ describe('what a connection stores', () => {
             expect(() => labelControl<HTMLInputElement>(item)).toThrow()
         }
         expect(target.textContent).not.toContain(strings.scopeHelp)
+        expect(target.textContent).not.toContain(strings.included)
     })
 
     it('sends the chosen policy for a backup and none for a synchronization', async () => {

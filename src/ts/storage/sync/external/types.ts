@@ -148,7 +148,7 @@ export interface StartExternalJobRequest {
     snapshotId?: string
     conflictId?: string
     choice?: 'local' | 'remote'
-    restoreAreas?: Array<'library' | 'referencedAssets' | 'deviceSettings' | 'devicePlugins'>
+    restoreAreas?: Array<'library' | 'referencedAssets'>
     targetRevision?: DecimalString
     session?: 'foreground' | 'exitDrain'
     sessionId?: string

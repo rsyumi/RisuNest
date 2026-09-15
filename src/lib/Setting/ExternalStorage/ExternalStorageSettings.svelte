@@ -421,12 +421,12 @@
 
                 {#if connection.capturePolicy}
                     {@const policy = connection.capturePolicy}
-                    <h4 class="sub-title">{strings.scope}</h4>
-                    <p class="note"><span>{strings.scopeHelp}</span></p>
-                    <label class="check"><input type="checkbox" checked disabled /><span>{strings.library}</span></label>
-                    <label class="check"><input type="checkbox" disabled={busy} checked={policy.hypa} onchange={event => changeCapturePolicy(connection, { ...policy, hypa: event.currentTarget.checked })} /><span>{strings.hypa}</span></label>
-                    <label class="check"><input type="checkbox" disabled={busy} checked={policy.localPlugins} onchange={event => changeCapturePolicy(connection, { ...policy, localPlugins: event.currentTarget.checked })} /><span>{strings.devicePlugins}</span></label>
-                    <label class="check"><input type="checkbox" disabled={busy} checked={policy.localSettings} onchange={event => changeCapturePolicy(connection, { ...policy, localSettings: event.currentTarget.checked })} /><span>{strings.deviceSettings}</span></label>
+                    <h4 class="policy-title">{strings.scope}</h4>
+                    <p class="policy-note">{strings.scopeHelp}</p>
+                    <p class="policy-row fixed"><span>{strings.library}</span><span class="value">{strings.included}</span></p>
+                    <label class="policy-row"><input type="checkbox" disabled={busy} checked={policy.hypa} onchange={event => changeCapturePolicy(connection, { ...policy, hypa: event.currentTarget.checked })} /><span>{strings.hypa}</span></label>
+                    <label class="policy-row"><input type="checkbox" disabled={busy} checked={policy.localPlugins} onchange={event => changeCapturePolicy(connection, { ...policy, localPlugins: event.currentTarget.checked })} /><span>{strings.devicePlugins}</span></label>
+                    <label class="policy-row"><input type="checkbox" disabled={busy} checked={policy.localSettings} onchange={event => changeCapturePolicy(connection, { ...policy, localSettings: event.currentTarget.checked })} /><span>{strings.deviceSettings}</span></label>
                 {/if}
 
                 <div class="actions">
@@ -557,6 +557,30 @@
         display: flex;
         flex-wrap: wrap;
         gap: 0.4rem;
+    }
+    .policy-title {
+        margin: 0.25rem 0 0;
+        font-size: 0.875rem;
+        font-weight: 600;
+    }
+    .policy-note {
+        margin: 0;
+        font-size: 0.8125rem;
+        line-height: 1.45;
+        color: var(--risu-theme-textcolor2);
+    }
+    .policy-row {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin: 0;
+        font-size: 0.875rem;
+    }
+    .policy-row.fixed {
+        justify-content: space-between;
+    }
+    .policy-row .value {
+        color: var(--risu-theme-textcolor2);
     }
     .status {
         display: inline-flex;

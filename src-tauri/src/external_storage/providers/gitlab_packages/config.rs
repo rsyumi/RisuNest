@@ -93,6 +93,9 @@ fn role_from_name(name: &str) -> Option<ObjectRole> {
         _ => return None,
     })
 }
+/// Only names the container a collection lives in. States and bundles share
+/// one, so the role returned here never classifies a listed object; the
+/// authenticated envelope header does that.
 pub(super) fn collection_role(collection: Collection) -> ObjectRole {
     match collection {
         Collection::Snapshots => ObjectRole::SyncState,

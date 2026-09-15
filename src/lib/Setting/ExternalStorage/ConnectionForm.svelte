@@ -486,7 +486,7 @@
     <fieldset class="sub">
         <legend class="sub-title">{strings.scope}</legend>
         <p class="note"><span>{strings.scopeHelp}</span></p>
-        <label class="check"><input type="checkbox" checked disabled /><span>{strings.library}</span></label>
+        <p class="check fixed"><span>{strings.library}</span><span class="value">{strings.included}</span></p>
         <p class="note"><span>{strings.libraryHelp}</span></p>
         <label class="check"><input type="checkbox" bind:checked={hypa} onchange={resetPrepared} /><span>{strings.hypa}</span></label>
         <p class="note"><span>{strings.hypaHelp}</span></p>
@@ -649,6 +649,13 @@
     }
     .check input {
         margin-top: 0.2rem;
+    }
+    .check.fixed {
+        margin: 0;
+        justify-content: space-between;
+    }
+    .check.fixed .value {
+        color: var(--risu-theme-textcolor2);
     }
     .actions {
         display: flex;
