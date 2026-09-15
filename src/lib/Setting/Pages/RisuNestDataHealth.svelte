@@ -33,9 +33,14 @@
     interface Props {
         /** Scrolls to the unused image cleanup, which is the only place files are deleted. */
         onOpenUnusedImages?: () => void
+        /**
+         * Opens the store before the first command. The ordinary settings screen runs behind a
+         * library that is already open; the recovery shell is the one place that is not true.
+         */
+        prepare?: () => Promise<void>
     }
 
-    let { onOpenUnusedImages }: Props = $props()
+    let { onOpenUnusedImages, prepare }: Props = $props()
 
     const strings = language.risuNest.dataHealth
     const model = createDataHealthModel({
@@ -197,7 +202,10 @@
         view = next
     })
     onMount(() => {
-        void model.load().then(() => model.loadRepairs())
+        void (prepare ? prepare() : Promise.resolve())
+            .then(() => model.load())
+            .then(() => model.loadRepairs())
+            .catch(() => alertError(strings.scanFailed))
     })
     onDestroy(unsubscribe)
 </script>

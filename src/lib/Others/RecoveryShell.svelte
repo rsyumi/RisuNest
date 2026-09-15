@@ -1,6 +1,7 @@
 <script lang="ts">
     // The shell that stands in for the app when the last start did not finish. It calls native
     // commands only: no library, plugin, module or sync state has been initialised behind it.
+    import { invoke } from '@tauri-apps/api/core'
     import { language } from 'src/lang'
     import Button from 'src/lib/UI/GUI/Button.svelte'
     import Check from 'src/lib/UI/GUI/CheckInput.svelte'
@@ -21,6 +22,14 @@
     }
 
     let { onStart, onExportSource }: Props = $props()
+
+    // Nothing has opened the store, because opening it is part of the start this shell replaced.
+    // The data check needs it and nothing else here does, so it opens it and stops there.
+    let opened: Promise<void> | null = null
+    const openStore = (): Promise<void> => {
+        opened ??= invoke<unknown>('pds_open').then(() => undefined)
+        return opened
+    }
 
     const strings = language.risuNest.recovery
     const state = recoveryState()
@@ -90,7 +99,7 @@
             </div>
         </section>
 
-        <RisuNestDataHealth />
+        <RisuNestDataHealth prepare={openStore} />
 
         <section data-recovery-export class="rounded-lg border border-darkborderc bg-bgcolor p-4">
             <h2 class="text-lg font-bold">{strings.exportTitle}</h2>

@@ -19,7 +19,8 @@ vi.mock('src/ts/storage/nativePersistentMaintenance', () => maintenance)
 vi.mock('src/ts/alert', () => ({ alertError: vi.fn(), alertNormal: vi.fn() }))
 vi.mock('src/ts/globalApi.svelte', () => ({ downloadFile: vi.fn() }))
 vi.mock('src/ts/platform', () => ({ isTauri: true }))
-vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }))
+const core = vi.hoisted(() => ({ invoke: vi.fn().mockResolvedValue({ revision: 0 }) }))
+vi.mock('@tauri-apps/api/core', () => core)
 vi.mock('src/lang', async () => ({
     language: (await import('src/lang/en')).languageEnglish,
 }))
@@ -37,7 +38,7 @@ import { decideBoot } from 'src/ts/storage/recoveryMode.svelte'
 const strings = languageEnglish.risuNest.recovery
 
 async function settle(): Promise<void> {
-    for (let index = 0; index < 4; index += 1) await tick()
+    for (let index = 0; index < 12; index += 1) await tick()
 }
 
 describe('RecoveryShell', () => {
@@ -119,14 +120,21 @@ describe('RecoveryShell', () => {
         expect(localStorage.getItem('risuNestDeviceSettings')).toBeNull()
     })
 
-    it('mounts the same data check the settings screen uses', async () => {
+    it('opens the store itself before the data check asks it anything', async () => {
         await decideBoot({
             begin: vi.fn().mockResolvedValue({ consecutiveFailures: 2 }),
             complete: vi.fn(),
         })
         const body = await setup()
         expect(body.querySelector('[data-data-health]')).toBeTruthy()
+        // The start that would have opened it is exactly what this shell replaced.
+        expect(core.invoke).toHaveBeenCalledWith('pds_open')
         expect(maintenance.getNativeDataHealthResult).toHaveBeenCalled()
+        expect(
+            core.invoke.mock.invocationCallOrder[0],
+        ).toBeLessThan(
+            maintenance.getNativeDataHealthResult.mock.invocationCallOrder[0],
+        )
     })
 
     it('keeps every string it shows in both shipped languages', () => {
