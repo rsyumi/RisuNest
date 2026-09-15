@@ -26,6 +26,8 @@ import {
 import { normalizeInlayEncodeOptions } from './blobStore';
 
 //APP_VERSION_POINT is to locate the app version in the database file for version bumping
+//appVer is the last RisuAI version this build stays compatible with, and it is what CBS
+//and remote RisuAI services are told. The RisuNest release version lives in version.json.
 export let appVer = "2026.8.250" //<APP_VERSION_POINT>
 export let appSubVer = ''
 

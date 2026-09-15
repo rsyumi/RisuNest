@@ -14,7 +14,8 @@ import { get } from "svelte/store";
 import { open } from '@tauri-apps/plugin-shell'
 import { openUrl } from '@tauri-apps/plugin-opener'
 import streamSaver from 'streamsaver';
-import { type Database, defaultSdDataFunc, getDatabase, appVer, getCurrentCharacter, type character, type groupChat, appSubVer } from "./storage/database.svelte";
+import { type Database, defaultSdDataFunc, getDatabase, getCurrentCharacter, type character, type groupChat, appSubVer } from "./storage/database.svelte";
+import versionData from "../../version.json";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState, selIdState, ReloadGUIPointer, bodyIntercepterStore } from "./stores.svelte";
 import { loadPlugins } from "./plugins/plugins.svelte";
@@ -1734,7 +1735,7 @@ export function getLanguageCodes() {
 }
 
 export function getVersionString(): string {
-    let versionString = appVer
+    let versionString = versionData.version
     if(appSubVer) {
         versionString += '-' + appSubVer
     }

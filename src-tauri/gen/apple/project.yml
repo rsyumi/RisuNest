@@ -56,8 +56,8 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-        CFBundleShortVersionString: 2026.8.250
-        CFBundleVersion: "2026.8.250"
+        CFBundleShortVersionString: 1.0.0
+        CFBundleVersion: "1.0.0"
         CFBundleURLTypes:
           - CFBundleURLSchemes: [risunestlocal]
             CFBundleURLName: risunestlocal

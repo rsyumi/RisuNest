@@ -30,9 +30,9 @@ The Linux override adds a desktop launcher, icons and MIME definitions for
 these desktop resources but does not install them into the host desktop.
 
 ```sh
-sudo apt-get install ./RisuNest_2026.8.250_amd64.deb
-chmod +x ./RisuNest_2026.8.250_amd64.AppImage
-./RisuNest_2026.8.250_amd64.AppImage
+sudo apt-get install ./RisuNest_1.0.0_amd64.deb
+chmod +x ./RisuNest_1.0.0_amd64.AppImage
+./RisuNest_1.0.0_amd64.AppImage
 ```
 
 AppImage needs FUSE 2 for normal execution. On hosts without FUSE, its
