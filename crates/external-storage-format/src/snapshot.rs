@@ -2,35 +2,25 @@
 //! The public envelope header supports provider listings whose opaque locator
 //! does not preserve the immutable object ID. Its fields become trusted only
 //! after the enclosed secretstream authenticates the exact header bytes.
-use super::{crypto, FormatError, Result};
+use super::{
+    crypto,
+    section::{SectionKind, SECTION_CODEC},
+    FormatError, Result,
+};
+use risunest_sync_wire::head::Sequence;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::io::{Read, Write};
+use std::{
+    collections::BTreeMap,
+    io::{Read, Write},
+};
 
 const ENVELOPE_MAGIC: &[u8; 4] = b"RNX1";
 const HEADER_SCHEMA: &str = "risunest.external-object/v1";
-const SNAPSHOT_SCHEMA: &str = "risunest.external-snapshot/v1";
+const STATE_SCHEMA: &str = "risunest.external-state/v1";
 const CATALOG_SCHEMA: &str = "risunest.external-catalog/v1";
 pub const MAX_PUBLIC_HEADER_BYTES: usize = 32 * 1024;
 pub const MAX_METADATA_BYTES: usize = 16 * 1024 * 1024;
-
-/// Extend the library's descriptor-scope fingerprint with the independently
-/// captured device state. Library-only snapshots preserve the PDS fingerprint.
-pub fn combine_content_fingerprint(
-    scope_id: &[u8; 32],
-    library_fingerprint: &[u8; 32],
-    device_identity: Option<&[u8; 32]>,
-) -> [u8; 32] {
-    let Some(device_identity) = device_identity else {
-        return *library_fingerprint;
-    };
-    let mut digest = Sha256::new();
-    digest.update(b"risunest.external-snapshot-fingerprint/v1\0");
-    digest.update(scope_id);
-    digest.update(library_fingerprint);
-    digest.update(device_identity);
-    digest.finalize().into()
-}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -38,7 +28,8 @@ pub enum ObjectRole {
     Descriptor,
     Pack,
     Catalog,
-    Snapshot,
+    SyncState,
+    BackupBundle,
     BackupPoint,
     Head,
 }
@@ -255,7 +246,7 @@ pub fn open_envelope(
 pub enum CatalogKind {
     Records,
     Assets,
-    Device,
+    Section,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -263,8 +254,8 @@ pub enum CatalogKind {
 pub enum CatalogEntryKind {
     Record,
     Object,
-    DeviceCatalog,
-    DeviceObject,
+    SectionEntry,
+    SectionObject,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -477,149 +468,235 @@ impl CatalogDocument {
     }
 }
 
+/// The library is always present. A repository without one is not a
+/// repository, so this is a required field rather than a selected section.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SnapshotDocument {
-    pub schema: String,
-    pub snapshot_id: String,
-    pub repository_id: String,
-    pub library_id: String,
-    pub author_device_id: String,
-    pub created_at_ms: u64,
-    pub logical_revision: u64,
-    pub scope_id: [u8; 32],
-    pub library_scope_id: [u8; 32],
-    pub parent_snapshot_id: Option<String>,
-    pub fingerprint: [u8; 32],
-    pub library_fingerprint: [u8; 32],
+pub struct LibrarySnapshotRef {
     pub record_catalog: StoredObject,
     pub asset_catalog: StoredObject,
-    pub device_catalog: Option<StoredObject>,
-    pub device_identity: Option<[u8; 32]>,
-    pub device_sections: Vec<String>,
+    pub content_fingerprint: [u8; 32],
 }
 
-impl SnapshotDocument {
+impl LibrarySnapshotRef {
+    pub fn validate(&self, repository_id: &str) -> Result<()> {
+        for object in [&self.record_catalog, &self.asset_catalog] {
+            object.validate()?;
+            if object.header.repository_id != repository_id
+                || object.header.role != ObjectRole::Catalog
+            {
+                return Err(FormatError("invalid-library-catalog"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A published section. Absence of the map key means the section was never
+/// published; emptying a published section means publishing a valid reference
+/// whose entries are tombstones. Turning a toggle off removes neither.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SectionSnapshotRef {
+    pub kind: SectionKind,
+    pub codec: String,
+    pub generation: Sequence,
+    pub gc_floor: Sequence,
+    pub max_write_clock: Sequence,
+    pub entries_root: StoredObject,
+    pub content_fingerprint: [u8; 32],
+}
+
+impl SectionSnapshotRef {
+    pub fn validate(&self, repository_id: &str, id: &str) -> Result<()> {
+        if SectionKind::parse(id)? != self.kind {
+            return Err(FormatError("section-kind-mismatch"));
+        }
+        if self.codec != SECTION_CODEC {
+            return Err(FormatError("unsupported-section-codec"));
+        }
+        if self.gc_floor > self.generation {
+            return Err(FormatError("invalid-section-floor"));
+        }
+        self.entries_root.validate()?;
+        if self.entries_root.header.repository_id != repository_id
+            || self.entries_root.header.role != ObjectRole::Catalog
+        {
+            return Err(FormatError("invalid-section-catalog"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FingerprintedSection<'a> {
+    content: String,
+    generation: &'a Sequence,
+    gc_floor: &'a Sequence,
+    max_write_clock: &'a Sequence,
+}
+
+#[derive(Serialize)]
+struct FingerprintedState<'a> {
+    domain: &'a str,
+    library: String,
+    sections: BTreeMap<&'a str, FingerprintedSection<'a>>,
+}
+
+fn synthesized_fingerprint(
+    domain: &str,
+    library_fingerprint: &[u8; 32],
+    sections: &BTreeMap<String, SectionSnapshotRef>,
+) -> [u8; 32] {
+    let value = FingerprintedState {
+        domain,
+        library: hex::encode(library_fingerprint),
+        sections: sections
+            .iter()
+            .map(|(id, section)| {
+                (
+                    id.as_str(),
+                    FingerprintedSection {
+                        content: hex::encode(section.content_fingerprint),
+                        generation: &section.generation,
+                        gc_floor: &section.gc_floor,
+                        max_write_clock: &section.max_write_clock,
+                    },
+                )
+            })
+            .collect(),
+    };
+    super::content_identity::hash(
+        &serde_json::to_vec(&value).expect("fingerprint inputs are plain strings and maps"),
+    )
+}
+
+pub const STATE_FINGERPRINT_DOMAIN: &str = "risunest.external-state-fingerprint/v1";
+
+/// Identifies the whole synthesized state, control changes included. A floor
+/// that moved without any value changing is still a real remote change, so it
+/// has to reach this value while leaving the library content fingerprint alone.
+pub fn state_fingerprint(
+    library_fingerprint: &[u8; 32],
+    sections: &BTreeMap<String, SectionSnapshotRef>,
+) -> [u8; 32] {
+    synthesized_fingerprint(STATE_FINGERPRINT_DOMAIN, library_fingerprint, sections)
+}
+
+pub const BUNDLE_FINGERPRINT_DOMAIN: &str = "risunest.external-backup-bundle-fingerprint/v1";
+
+pub fn bundle_fingerprint(
+    library_fingerprint: &[u8; 32],
+    sections: &BTreeMap<String, SectionSnapshotRef>,
+) -> [u8; 32] {
+    synthesized_fingerprint(BUNDLE_FINGERPRINT_DOMAIN, library_fingerprint, sections)
+}
+
+/// One head points at one of these, and it binds the library to whichever
+/// sections have been published. Device-fixed sections are never admitted.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SyncStateDocument {
+    pub schema: String,
+    pub state_id: String,
+    pub repository_id: String,
+    pub library_id: String,
+    pub epoch: String,
+    pub generation: Sequence,
+    pub parent_state_id: Option<String>,
+    pub author_writer_id: String,
+    pub created_at_ms: u64,
+    pub library: LibrarySnapshotRef,
+    pub sections: BTreeMap<String, SectionSnapshotRef>,
+    pub library_fingerprint: [u8; 32],
+    pub state_fingerprint: [u8; 32],
+}
+
+impl SyncStateDocument {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        state_id: String,
+        repository_id: String,
+        library_id: String,
+        epoch: String,
+        generation: Sequence,
+        parent_state_id: Option<String>,
+        author_writer_id: String,
+        created_at_ms: u64,
+        library: LibrarySnapshotRef,
+        sections: BTreeMap<String, SectionSnapshotRef>,
+    ) -> Result<Self> {
+        let library_fingerprint = library.content_fingerprint;
+        let value = Self {
+            schema: STATE_SCHEMA.into(),
+            state_id,
+            repository_id,
+            library_id,
+            epoch,
+            generation,
+            parent_state_id,
+            author_writer_id,
+            created_at_ms,
+            library,
+            state_fingerprint: state_fingerprint(&library_fingerprint, &sections),
+            sections,
+            library_fingerprint,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != STATE_SCHEMA
+            || self.state_id.is_empty()
+            || self.state_id.len() > 1024
+            || self.repository_id.is_empty()
+            || self.repository_id.len() > 128
+            || self.library_id.is_empty()
+            || self.library_id.len() > 1024
+            || self.epoch.is_empty()
+            || self.epoch.len() > 1024
+            || self.author_writer_id.is_empty()
+            || self.author_writer_id.len() > 1024
+            || self
+                .parent_state_id
+                .as_ref()
+                .is_some_and(|id| id.is_empty() || id.len() > 1024)
+        {
+            return Err(FormatError("invalid-state"));
+        }
+        self.library.validate(&self.repository_id)?;
+        if self.library_fingerprint != self.library.content_fingerprint {
+            return Err(FormatError("invalid-state-library"));
+        }
+        for (id, section) in &self.sections {
+            section.validate(&self.repository_id, id)?;
+            if !section.kind.is_synchronizable() {
+                return Err(FormatError("section-not-synchronizable"));
+            }
+        }
+        if self.state_fingerprint != state_fingerprint(&self.library_fingerprint, &self.sections) {
+            return Err(FormatError("invalid-state-fingerprint"));
+        }
+        Ok(())
+    }
     pub fn encode(&self, max_bytes: usize) -> Result<Vec<u8>> {
         self.validate()?;
-        let bytes = serde_json::to_vec(self).map_err(|_| FormatError("invalid-snapshot"))?;
+        let bytes = serde_json::to_vec(self).map_err(|_| FormatError("invalid-state"))?;
         if bytes.len() > max_bytes.min(MAX_METADATA_BYTES) {
-            return Err(FormatError("snapshot-limit-exceeded"));
+            return Err(FormatError("state-limit-exceeded"));
         }
         Ok(bytes)
     }
     pub fn decode(bytes: &[u8], max_bytes: usize) -> Result<Self> {
         if bytes.len() > max_bytes.min(MAX_METADATA_BYTES) {
-            return Err(FormatError("snapshot-limit-exceeded"));
+            return Err(FormatError("state-limit-exceeded"));
         }
-        let value: Self =
-            serde_json::from_slice(bytes).map_err(|_| FormatError("invalid-snapshot"))?;
+        let value: Self = serde_json::from_slice(bytes).map_err(|_| FormatError("invalid-state"))?;
         value.validate()?;
         if value.encode(max_bytes)? != bytes {
-            return Err(FormatError("non-canonical-snapshot"));
+            return Err(FormatError("non-canonical-state"));
         }
-        Ok(value)
-    }
-    pub fn validate(&self) -> Result<()> {
-        if self.schema != SNAPSHOT_SCHEMA
-            || self.snapshot_id.is_empty()
-            || self.snapshot_id.len() > 1024
-            || self.repository_id.is_empty()
-            || self.repository_id.len() > 128
-            || self.library_id.is_empty()
-            || self.library_id.len() > 1024
-            || self.author_device_id.is_empty()
-            || self.author_device_id.len() > 1024
-            || self.logical_revision > i64::MAX as u64
-            || self
-                .parent_snapshot_id
-                .as_ref()
-                .is_some_and(|id| id.is_empty() || id.len() > 1024)
-        {
-            return Err(FormatError("invalid-snapshot"));
-        }
-        for object in [
-            (CatalogKind::Records, &self.record_catalog),
-            (CatalogKind::Assets, &self.asset_catalog),
-        ]
-        .map(|(_, object)| object)
-        {
-            object.validate()?;
-            if object.header.repository_id != self.repository_id
-                || object.header.role != ObjectRole::Catalog
-            {
-                return Err(FormatError("invalid-snapshot-catalog"));
-            }
-        }
-        if self.device_catalog.is_some() != self.device_identity.is_some()
-            || self.device_catalog.is_some() != !self.device_sections.is_empty()
-            || self.fingerprint
-                != combine_content_fingerprint(
-                    &self.scope_id,
-                    &self.library_fingerprint,
-                    self.device_identity.as_ref(),
-                )
-        {
-            return Err(FormatError("invalid-snapshot-device"));
-        }
-        if let Some(object) = &self.device_catalog {
-            object.validate()?;
-            if object.header.repository_id != self.repository_id
-                || object.header.role != ObjectRole::Catalog
-            {
-                return Err(FormatError("invalid-snapshot-device"));
-            }
-            let mut previous: Option<&str> = None;
-            for section in &self.device_sections {
-                if section.is_empty()
-                    || section.len() > 64 * 1024
-                    || previous.is_some_and(|value| value >= section.as_str())
-                {
-                    return Err(FormatError("invalid-device-sections"));
-                }
-                previous = Some(section);
-            }
-        }
-        Ok(())
-    }
-    pub fn new(
-        snapshot_id: String,
-        repository_id: String,
-        library_id: String,
-        author_device_id: String,
-        created_at_ms: u64,
-        logical_revision: u64,
-        scope_id: [u8; 32],
-        library_scope_id: [u8; 32],
-        parent_snapshot_id: Option<String>,
-        fingerprint: [u8; 32],
-        library_fingerprint: [u8; 32],
-        record_catalog: StoredObject,
-        asset_catalog: StoredObject,
-        device_catalog: Option<StoredObject>,
-        device_identity: Option<[u8; 32]>,
-        device_sections: Vec<String>,
-    ) -> Result<Self> {
-        let value = Self {
-            schema: SNAPSHOT_SCHEMA.into(),
-            snapshot_id,
-            repository_id,
-            library_id,
-            author_device_id,
-            created_at_ms,
-            logical_revision,
-            scope_id,
-            library_scope_id,
-            parent_snapshot_id,
-            fingerprint,
-            library_fingerprint,
-            record_catalog,
-            asset_catalog,
-            device_catalog,
-            device_identity,
-            device_sections,
-        };
-        value.validate()?;
         Ok(value)
     }
 }

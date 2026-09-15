@@ -1070,7 +1070,7 @@ fn a_create_receipt_locator_reads_the_same_bytes_back() {
                 201,
                 asset(
                     77,
-                    "snapshot-object-1",
+                    "state-object-1",
                     bytes.len() as u64,
                     Some(digest_of(&bytes)),
                 ),
@@ -1088,7 +1088,7 @@ fn a_create_receipt_locator_reads_the_same_bytes_back() {
             .unwrap();
         let directory = tempfile::tempdir().unwrap();
         let source = source(directory.path(), "snapshot", &bytes);
-        let intent = object_intent(&handle, ObjectRole::Snapshot, "object-1", &bytes);
+        let intent = object_intent(&handle, ObjectRole::SyncState, "object-1", &bytes);
         let cancel = Cancellation::default();
         let created = provider
             .create_object(&handle, &intent, &source, None, &cancel)

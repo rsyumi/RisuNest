@@ -10,7 +10,6 @@ use super::{
     providers::{self, Dependencies},
     secrets,
 };
-use risunest_external_storage_format::format::Scope;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, path::Path, sync::Arc};
 use zeroize::{Zeroize, Zeroizing};
@@ -60,6 +59,27 @@ impl From<ConnectionOpenMode> for OpenMode {
     }
 }
 
+/// What a backup connection captures by default. A synchronization connection
+/// has none: what it exchanges is chosen per device under local data.
+/// Changing it applies to work started afterwards and never rewrites a point.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CapturePolicy {
+    pub hypa: bool,
+    pub local_plugins: bool,
+    pub local_settings: bool,
+}
+
+impl Default for CapturePolicy {
+    fn default() -> Self {
+        Self {
+            hypa: true,
+            local_plugins: true,
+            local_settings: true,
+        }
+    }
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PrepareConnectionRequest {
@@ -67,7 +87,9 @@ pub(crate) struct PrepareConnectionRequest {
     pub mode: ConnectionOpenMode,
     pub purpose: ConnectionPurpose,
     pub publication_strategy: ConnectionStrategy,
-    pub scope: Scope,
+    /// Backup connections only.
+    #[serde(default)]
+    pub capture_policy: Option<CapturePolicy>,
     pub acknowledgements: Vec<String>,
 }
 
@@ -229,7 +251,8 @@ pub(crate) struct ConnectionSummary {
     pub mode: ConnectionOpenMode,
     pub display_name: String,
     pub endpoint: EndpointConfirmation,
-    pub scope: Scope,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_policy: Option<CapturePolicy>,
     pub capabilities: ConnectionCapabilities,
     pub status: ConnectionStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -336,13 +359,11 @@ pub(crate) fn validate_preparation(
     if request.config.oauth_profile.is_some() {
         return Err(ProviderError::new(ErrorKind::Unsupported));
     }
-    if !request.scope.library || !request.scope.referenced_assets {
-        return Err(ProviderError::new(ErrorKind::Unsupported));
-    }
+    // A synchronization connection carries no capture policy: what it
+    // exchanges is chosen per device.
     if request.purpose == ConnectionPurpose::Sync
         && (request.publication_strategy == ConnectionStrategy::BackupOnly
-            || request.scope.device_settings
-            || request.scope.device_plugins)
+            || request.capture_policy.is_some())
     {
         return Err(ProviderError::new(ErrorKind::Unsupported));
     }
@@ -693,7 +714,7 @@ pub(crate) fn summary(connection: &StoredConnection) -> ConnectionSummary {
             warnings: Vec::new(),
             remote_verified: false,
         }),
-        scope: connection.descriptor.scope.clone(),
+        capture_policy: connection.capture_policy,
         capabilities: capabilities(&connection.capabilities),
         status: ConnectionStatus::Ready,
         last_verified_at_ms: Some(connection.created_at_ms.to_string()),
@@ -835,12 +856,8 @@ mod tests {
             mode: ConnectionOpenMode::Create,
             purpose,
             publication_strategy: strategy,
-            scope: Scope {
-                library: true,
-                referenced_assets: true,
-                device_settings: purpose == ConnectionPurpose::Backup,
-                device_plugins: false,
-            },
+            capture_policy: (purpose == ConnectionPurpose::Backup)
+                .then(CapturePolicy::default),
             acknowledgements: match strategy {
                 ConnectionStrategy::Sequential => vec![SEQUENTIAL_ACKNOWLEDGEMENT.into()],
                 ConnectionStrategy::BackupOnly => Vec::new(),
@@ -861,7 +878,8 @@ mod tests {
         sequential
             .acknowledgements
             .push(SEQUENTIAL_ACKNOWLEDGEMENT.into());
-        sequential.scope.device_settings = true;
+        // A synchronization connection never carries a capture policy.
+        sequential.capture_policy = Some(CapturePolicy::default());
         assert!(validate_preparation(&sequential).is_err());
     }
 

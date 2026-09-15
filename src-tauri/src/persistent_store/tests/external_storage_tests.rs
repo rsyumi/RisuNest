@@ -825,11 +825,10 @@ fn capture_fixture() -> (tempfile::TempDir, PersistentStore, Value) {
 fn capture_library(
     store: &mut PersistentStore,
     consumer: &str,
-    scope: &risunest_external_storage_format::format::Scope,
     probe: &dyn crate::local_backup::CancellationProbe,
 ) -> super::super::StoreResult<super::super::external_capture::CapturedSnapshot> {
-    let hydration = store.hydrate_external_capture_dependencies(consumer, scope, probe)?;
-    store.capture_external_library(consumer, scope, &hydration, probe)
+    let hydration = store.hydrate_external_capture_dependencies(consumer, probe)?;
+    store.capture_external_library(consumer, &hydration, probe)
 }
 
 #[test]
@@ -841,19 +840,13 @@ fn external_capture_manager_shares_consumers_and_reuses_their_durable_cursor() {
         }
     }
     let (_directory, mut store, _) = capture_fixture();
-    let scope = risunest_external_storage_format::format::Scope {
-        library: true,
-        referenced_assets: true,
-        device_settings: false,
-        device_plugins: false,
-    };
-    let first = capture_library(&mut store, "destination-a", &scope, &Never).unwrap();
+    let first = capture_library(&mut store, "destination-a", &Never).unwrap();
     assert!(first.projected_records > 1);
     assert!(!first.shared);
     store
         .retain_external_capture(&first.id, "destination-a")
         .unwrap();
-    let second = capture_library(&mut store, "destination-b", &scope, &Never).unwrap();
+    let second = capture_library(&mut store, "destination-b", &Never).unwrap();
     assert!(second.shared);
     assert_eq!(second.projected_records, 0);
     assert_eq!(first.id, second.id);
@@ -865,7 +858,7 @@ fn external_capture_manager_shares_consumers_and_reuses_their_durable_cursor() {
         .unwrap());
     assert!(external::capture_has_consumers(&store.connection, &first.id).unwrap());
     edit(&mut store, 2);
-    let next = capture_library(&mut store, "destination-b", &scope, &Never).unwrap();
+    let next = capture_library(&mut store, "destination-b", &Never).unwrap();
     assert_eq!(next.projected_records, 1);
     assert!(!next.catalog.rebuilt);
     assert_ne!(next.id, first.id);
@@ -884,20 +877,14 @@ fn external_capture_rebuilds_an_unreferenced_missing_cache_and_collects_old_meta
         }
     }
     let (_directory, mut store, _) = capture_fixture();
-    let scope = risunest_external_storage_format::format::Scope {
-        library: true,
-        referenced_assets: true,
-        device_settings: false,
-        device_plugins: false,
-    };
-    let first = capture_library(&mut store, "destination", &scope, &Never).unwrap();
+    let first = capture_library(&mut store, "destination", &Never).unwrap();
     let first_id = first.id.clone();
     let (_, first_path, _) = first.catalog.manifest().unwrap();
     let first_path = first_path.to_owned();
     drop(first);
     fs::remove_file(first_path).unwrap();
 
-    let rebuilt = capture_library(&mut store, "destination", &scope, &Never).unwrap();
+    let rebuilt = capture_library(&mut store, "destination", &Never).unwrap();
     assert!(!rebuilt.shared);
     assert_ne!(rebuilt.id, first_id);
     assert_eq!(count(&store, "external_storage_captures"), 1);
@@ -913,20 +900,14 @@ fn external_capture_rebuilds_an_unreferenced_corrupt_cache() {
         }
     }
     let (_directory, mut store, _) = capture_fixture();
-    let scope = risunest_external_storage_format::format::Scope {
-        library: true,
-        referenced_assets: true,
-        device_settings: false,
-        device_plugins: false,
-    };
-    let first = capture_library(&mut store, "destination", &scope, &Never).unwrap();
+    let first = capture_library(&mut store, "destination", &Never).unwrap();
     let first_id = first.id.clone();
     let (_, path, _) = first.catalog.manifest().unwrap();
     let path = path.to_owned();
     drop(first);
     fs::write(path, b"synthetic-corrupt-capture-cache").unwrap();
 
-    let rebuilt = capture_library(&mut store, "destination", &scope, &Never).unwrap();
+    let rebuilt = capture_library(&mut store, "destination", &Never).unwrap();
     assert!(!rebuilt.shared);
     assert_ne!(rebuilt.id, first_id);
     assert_eq!(count(&store, "external_storage_captures"), 1);
@@ -941,13 +922,7 @@ fn external_capture_never_discards_a_missing_cache_owned_by_a_pending_job() {
         }
     }
     let (_directory, mut store, _) = capture_fixture();
-    let scope = risunest_external_storage_format::format::Scope {
-        library: true,
-        referenced_assets: true,
-        device_settings: false,
-        device_plugins: false,
-    };
-    let first = capture_library(&mut store, "destination", &scope, &Never).unwrap();
+    let first = capture_library(&mut store, "destination", &Never).unwrap();
     let first_id = first.id.clone();
     let (_, path, _) = first.catalog.manifest().unwrap();
     let path = path.to_owned();
@@ -965,7 +940,7 @@ fn external_capture_never_discards_a_missing_cache_owned_by_a_pending_job() {
     drop(first);
     fs::remove_file(path).unwrap();
 
-    let error = match capture_library(&mut store, "other-destination", &scope, &Never) {
+    let error = match capture_library(&mut store, "other-destination", &Never) {
         Ok(_) => panic!("referenced damaged cache was reused"),
         Err(error) => error.to_string(),
     };
@@ -992,13 +967,7 @@ fn external_capture_reopens_a_pinned_old_revision_and_gc_keeps_only_needed_cache
         }
     }
     let (_directory, mut store, _) = capture_fixture();
-    let scope = risunest_external_storage_format::format::Scope {
-        library: true,
-        referenced_assets: true,
-        device_settings: false,
-        device_plugins: false,
-    };
-    let first = capture_library(&mut store, "destination", &scope, &Never).unwrap();
+    let first = capture_library(&mut store, "destination", &Never).unwrap();
     let first_id = first.id.clone();
     let first_revision = first.identity.revision;
     drop(first);
@@ -1006,7 +975,7 @@ fn external_capture_reopens_a_pinned_old_revision_and_gc_keeps_only_needed_cache
         .retain_external_capture(&first_id, "pending-owner")
         .unwrap();
     edit(&mut store, 2);
-    let second = capture_library(&mut store, "destination", &scope, &Never).unwrap();
+    let second = capture_library(&mut store, "destination", &Never).unwrap();
     assert_ne!(second.id, first_id);
     assert_eq!(count(&store, "external_storage_captures"), 2);
     let reopened = store.reopen_external_capture(&first_id).unwrap();
@@ -1018,7 +987,7 @@ fn external_capture_reopens_a_pinned_old_revision_and_gc_keeps_only_needed_cache
         .release_external_capture(&first_id, "pending-owner")
         .unwrap();
     edit(&mut store, 3);
-    let third = capture_library(&mut store, "destination", &scope, &Never).unwrap();
+    let third = capture_library(&mut store, "destination", &Never).unwrap();
     assert_eq!(count(&store, "external_storage_captures"), 1);
     assert_eq!(count(&store, "external_storage_capture_files"), 1);
     assert!(store.reopen_external_capture(&third.id).is_err());
@@ -1053,13 +1022,7 @@ fn external_capture_text_delta_does_not_hydrate_unchanged_remote_only_payloads()
             1,
         )
         .unwrap();
-    let scope = risunest_external_storage_format::format::Scope {
-        library: true,
-        referenced_assets: true,
-        device_settings: false,
-        device_plugins: false,
-    };
-    let first = capture_library(&mut store, "destination", &scope, &Never).unwrap();
+    let first = capture_library(&mut store, "destination", &Never).unwrap();
     drop(first);
     crate::server_sync::residency::Residency::open(directory.path()).unwrap();
     fs::remove_file(
@@ -1079,29 +1042,10 @@ fn external_capture_text_delta_does_not_hydrate_unchanged_remote_only_payloads()
         })
         .unwrap();
 
-    let delta = capture_library(&mut store, "destination", &scope, &Never).unwrap();
+    let delta = capture_library(&mut store, "destination", &Never).unwrap();
     assert_eq!(delta.projected_records, 1);
     assert!(!delta.catalog.rebuilt);
     assert!(cas.stat_object(&payload.content_hash).unwrap().is_none());
-}
-
-#[test]
-fn external_capture_manager_never_reuses_library_revision_for_device_scope() {
-    struct Never;
-    impl crate::local_backup::CancellationProbe for Never {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-    let (_directory, mut store, _) = capture_fixture();
-    let scope = risunest_external_storage_format::format::Scope {
-        library: true,
-        referenced_assets: true,
-        device_settings: true,
-        device_plugins: false,
-    };
-    assert!(capture_library(&mut store, "destination", &scope, &Never).is_err());
-    assert_eq!(count(&store, "external_storage_captures"), 0);
 }
 
 #[test]

@@ -3,7 +3,6 @@
 use super::{
     connection_commands::ConnectedRepository,
     contract::{Cancellation, ErrorKind, ProviderError, Result},
-    device_capture,
     job_store::{DurableJob, JobCommandState, JobKind, JobStore},
     runtime,
     snapshot_restore::{self, PreparedRemoteSnapshot},
@@ -18,7 +17,7 @@ use crate::{
         PersistentStore, StoreError,
     },
 };
-use risunest_external_storage_format::format::Scope;
+use risunest_external_storage_format::format::library_fingerprint_domain;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeSet, path::Path, sync::Mutex, time::Duration};
@@ -27,7 +26,6 @@ use tauri::{AppHandle, Manager};
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RestoreSelection {
     library: bool,
-    device_sections: Vec<String>,
 }
 
 const RESTORE_COMMIT_SCHEMA: &str = "risunest.external-restore-commit/v1";
@@ -190,27 +188,15 @@ fn decode_hash(value: &str) -> Result<[u8; 32]> {
         .ok_or_else(corrupt)
 }
 
-fn restore_selection(
-    scope: &Scope,
-    restore_areas: Option<&[String]>,
-    available_device_sections: &[String],
-) -> Result<RestoreSelection> {
-    device_capture::validate_snapshot_scope(scope, available_device_sections)
-        .map_err(device_error)?;
+/// A bundle declares what it covers. Until section publication lands the only
+/// coverage is the library, so a request for anything else is rejected rather
+/// than quietly narrowed.
+fn restore_selection(restore_areas: Option<&[String]>) -> Result<RestoreSelection> {
     let defaults;
     let areas = match restore_areas {
         Some(areas) => areas,
         None => {
-            defaults = [
-                scope.library.then_some("library"),
-                scope.referenced_assets.then_some("referencedAssets"),
-                scope.device_settings.then_some("deviceSettings"),
-                scope.device_plugins.then_some("devicePlugins"),
-            ]
-            .into_iter()
-            .flatten()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
+            defaults = vec!["library".to_owned(), "referencedAssets".to_owned()];
             &defaults
         }
     };
@@ -218,41 +204,15 @@ fn restore_selection(
     if unique.len() != areas.len() {
         return Err(corrupt());
     }
-    let wants = |area: &str| areas.iter().any(|value| value == area);
-    let library = wants("library") || wants("referencedAssets");
-    if library && (!scope.library || !scope.referenced_assets) {
+    let known = ["library", "referencedAssets"];
+    if areas.iter().any(|area| !known.contains(&area.as_str())) {
         return Err(corrupt());
     }
-
-    let mut seen = BTreeSet::new();
-    let mut selected = Vec::new();
-    for section in available_device_sections {
-        if !seen.insert(section.as_str()) {
-            return Err(corrupt());
-        }
-        if (section == "device-settings" && wants("deviceSettings"))
-            || (section != "device-settings" && wants("devicePlugins"))
-        {
-            selected.push(section.clone());
-        }
-    }
-    if wants("deviceSettings") && (!scope.device_settings || !seen.contains("device-settings")) {
+    let library = areas.iter().any(|area| known.contains(&area.as_str()));
+    if !library {
         return Err(corrupt());
     }
-    if wants("devicePlugins")
-        && (!scope.device_plugins
-            || !seen.contains("local-storage")
-            || !seen.contains("localforage"))
-    {
-        return Err(corrupt());
-    }
-    if !library && selected.is_empty() {
-        return Err(corrupt());
-    }
-    Ok(RestoreSelection {
-        library,
-        device_sections: selected,
-    })
+    Ok(RestoreSelection { library })
 }
 
 fn checked_required_bytes(
@@ -270,13 +230,6 @@ fn checked_required_bytes(
         }
         for object in &snapshot.objects {
             add(object.byte_length)?;
-        }
-    }
-    if !selection.device_sections.is_empty() {
-        let device = snapshot.device.as_ref().ok_or_else(corrupt)?;
-        add(device.sqlite.byte_length)?;
-        for blob in &device.blobs {
-            add(blob.byte_length)?;
         }
     }
     Ok(total)
@@ -324,30 +277,11 @@ fn validate_download(
 ) -> Result<()> {
     if snapshot.snapshot_id != requested_snapshot
         || snapshot.repository_id != connected.stored.descriptor.repository_id
-        || snapshot.scope_id != hex::encode(connected.stored.descriptor.scope_id)
     {
         return Err(corrupt());
     }
     decode_hash(&snapshot.fingerprint)?;
     decode_hash(&snapshot.library_fingerprint)?;
-    let mut library_scope = connected.stored.descriptor.scope.clone();
-    library_scope.device_settings = false;
-    library_scope.device_plugins = false;
-    if snapshot.library_scope_id != hex::encode(library_scope.id()) {
-        return Err(corrupt());
-    }
-    if snapshot
-        .device
-        .as_ref()
-        .map(|device| device.sections.as_slice())
-        != if snapshot.device_sections.is_empty() {
-            None
-        } else {
-            Some(snapshot.device_sections.as_slice())
-        }
-    {
-        return Err(corrupt());
-    }
     Ok(())
 }
 
@@ -399,14 +333,7 @@ pub(crate) async fn run_restore(
     .await?;
     cancel.check()?;
     validate_download(connected, snapshot_id, &snapshot)?;
-    let selection = restore_selection(
-        &connected.stored.descriptor.scope,
-        job.request.restore_areas.as_deref(),
-        &snapshot.device_sections,
-    )?;
-    if !selection.device_sections.is_empty() && snapshot.device.is_none() {
-        return Err(corrupt());
-    }
+    let selection = restore_selection(job.request.restore_areas.as_deref())?;
     let required = checked_required_bytes(&snapshot, &selection)?;
     if available_space(&staging_root).map_err(runtime::local_error)? < required {
         return Err(ProviderError::new(ErrorKind::StorageFull));
@@ -415,16 +342,12 @@ pub(crate) async fn run_restore(
 
     let worker_app = app.clone();
     let worker_job = job.clone();
-    let mut scope = connected.stored.descriptor.scope.clone();
-    scope.device_settings = false;
-    scope.device_plugins = false;
     let worker_cancel = cancel.clone();
     let result = tokio::task::spawn_blocking(move || {
         prepare_local_restore(
             &worker_app,
             &worker_job,
             expected_revision,
-            &scope,
             snapshot,
             selection,
             worker_cancel,
@@ -439,7 +362,6 @@ fn prepare_local_restore(
     app: &AppHandle,
     job: &DurableJob,
     expected_revision: i64,
-    scope: &Scope,
     snapshot: PreparedRemoteSnapshot,
     selection: RestoreSelection,
     cancel: Cancellation,
@@ -461,12 +383,10 @@ fn prepare_local_restore(
     if store.revision().map_err(pds_error)? != expected_revision {
         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
     }
-    let old_generation = store.external_active_generation().map_err(pds_error)?;
     let snapshot_id = snapshot.snapshot_id.clone();
     let staging_root = snapshot.staging_root.clone();
-    let device = snapshot.device.clone();
     let prepared = if selection.library {
-        let scope_id = decode_hash(&snapshot.library_scope_id)?;
+        let scope_id = risunest_external_storage_format::format::library_fingerprint_domain();
         let fingerprint = decode_hash(&snapshot.library_fingerprint)?;
         let records = snapshot.records.into_iter().map(|record| {
             Ok(ExternalSnapshotRecord {
@@ -489,7 +409,6 @@ fn prepare_local_restore(
                     &ExternalSnapshotApplication {
                         expected_revision,
                         staging_root: &staging_root,
-                        scope,
                         scope_id: &scope_id,
                         fingerprint: &fingerprint,
                     },
@@ -502,79 +421,25 @@ fn prepare_local_restore(
         None
     };
 
-    if selection.device_sections.is_empty() {
-        let prepared = prepared.ok_or_else(corrupt)?;
-        let marker = restore_marker(job, expected_revision)?;
-        let revision = store
-            .finish_prepared_replace_with_app_kv(
-                prepared,
-                &restore_marker_key(&job.id),
-                &serde_json::to_value(&marker).map_err(runtime::local_error)?,
-            )
-            .map_err(pds_error)?;
-        if revision.revision.to_string() != marker.received_revision {
-            return Err(corrupt());
-        }
-        drop(maintenance);
-        drop(permit);
-        cleanup_staging(&staging_root);
-        return Ok(json!({
-            "snapshotId": snapshot_id,
-            "receivedRevision": revision.revision.to_string()
-        }));
+    let prepared = prepared.ok_or_else(corrupt)?;
+    let marker = restore_marker(job, expected_revision)?;
+    let revision = store
+        .finish_prepared_replace_with_app_kv(
+            prepared,
+            &restore_marker_key(&job.id),
+            &serde_json::to_value(&marker).map_err(runtime::local_error)?,
+        )
+        .map_err(pds_error)?;
+    if revision.revision.to_string() != marker.received_revision {
+        return Err(corrupt());
     }
-
-    let new_generation = prepared
-        .as_ref()
-        .map(|prepared| prepared.external_staging_id().to_owned());
-    let device = device.ok_or_else(corrupt)?;
-    let state = app.state::<DeviceBackupState>();
-    state
-        .attach_startup_admission(permit)
-        .map_err(device_error)?;
-    if let Err(error) = state.attach_maintenance_guard(maintenance) {
-        let _ = state.release_unused_maintenance();
-        if let Some(prepared) = prepared {
-            let _ = store.replace_abort(prepared.external_staging_id());
-        }
-        return Err(device_error(error));
-    }
-    let session_id = match state.create_session(
-        &job.id,
-        Operation::Restore,
-        selection.library,
-        &selection.device_sections,
-        Some(old_generation),
-        new_generation,
-    ) {
-        Ok(session) => session,
-        Err(error) => {
-            let _ = state.release_unused_maintenance();
-            if let Some(prepared) = prepared {
-                let _ = store.replace_abort(prepared.external_staging_id());
-            }
-            return Err(device_error(error));
-        }
-    };
-    if let Err(error) = device_capture::import_device_snapshot(
-        &state,
-        &session_id,
-        &device,
-        &runtime::CancelProbe(cancel),
-    ) {
-        let _ = state.fail(&session_id, "external-restore-import-failed");
-        let _ = state.recovery_complete(&session_id);
-        if let Some(prepared) = prepared {
-            let _ = store.replace_abort(prepared.external_staging_id());
-        }
-        return Err(device_error(error));
-    }
-    if let Err(error) = app.state::<RuntimeRestoreState>().retain(&job.id, store) {
-        let _ = state.fail(&session_id, "external-restore-native-failed");
-        let _ = state.recovery_complete(&session_id);
-        return Err(error);
-    }
-    Ok(json!({"maintenanceSessionId":session_id}))
+    drop(maintenance);
+    drop(permit);
+    cleanup_staging(&staging_root);
+    Ok(json!({
+        "snapshotId": snapshot_id,
+        "receivedRevision": revision.revision.to_string()
+    }))
 }
 
 fn cleanup_staging(path: &Path) {
@@ -1034,57 +899,26 @@ mod tests {
         }
     }
 
-    fn scope() -> Scope {
-        Scope {
-            library: true,
-            referenced_assets: true,
-            device_settings: true,
-            device_plugins: true,
-        }
-    }
-
     #[test]
     fn restore_area_selection_matches_the_renderer_contract() {
-        let available = vec![
-            "device-settings".into(),
-            "indexed-db:0073006100660065005f0070006c007500670069006e005f00730079006e007400680065007400690063".into(),
-            "local-storage".into(),
-            "localforage".into(),
-        ];
         assert_eq!(
-            restore_selection(&scope(), None, &available).unwrap(),
-            RestoreSelection {
-                library: true,
-                device_sections: available.clone(),
-            }
+            restore_selection(None).unwrap(),
+            RestoreSelection { library: true }
         );
         assert_eq!(
-            restore_selection(
-                &scope(),
-                Some(&["referencedAssets".into(), "devicePlugins".into()]),
-                &available,
-            )
-            .unwrap(),
-            RestoreSelection {
-                library: true,
-                device_sections: available[1..].to_vec(),
-            }
+            restore_selection(Some(&["referencedAssets".into()])).unwrap(),
+            RestoreSelection { library: true }
         );
     }
 
+    /// A bundle declares what it covers. Asking for coverage it does not
+    /// declare fails rather than restoring a narrowed selection.
     #[test]
-    fn restore_area_selection_rejects_duplicates_and_incomplete_device_scope() {
-        let available = vec!["device-settings".into(), "local-storage".into()];
-        assert!(restore_selection(
-            &scope(),
-            Some(&["library".into(), "library".into()]),
-            &available,
-        )
-        .is_err());
-        assert!(restore_selection(&scope(), Some(&["devicePlugins".into()]), &available,).is_err());
-        assert!(restore_selection(&scope(), Some(&["deviceSettings".into()]), &[],).is_err());
-        assert!(restore_selection(&scope(), Some(&[]), &available).is_err());
-        assert!(restore_selection(&scope(), Some(&["library".into()]), &available).is_err());
+    fn restore_area_selection_rejects_duplicates_and_undeclared_areas() {
+        assert!(restore_selection(Some(&["library".into(), "library".into()])).is_err());
+        assert!(restore_selection(Some(&["devicePlugins".into()])).is_err());
+        assert!(restore_selection(Some(&["deviceSettings".into()])).is_err());
+        assert!(restore_selection(Some(&[])).is_err());
     }
 
     #[test]

@@ -271,10 +271,13 @@ fn metadata(capture: &CapturedSnapshot) -> SnapshotMetadata {
         author_device_id: capture.identity.store_id.clone(),
         created_at_ms: 10,
         logical_revision: 10,
-        scope_id: [9; 32],
-        library_scope_id: [9; 32],
+        purpose: crate::external_storage::packaging::SnapshotPurpose::SyncState {
+            epoch: "epoch".into(),
+            generation: risunest_sync_wire::head::Sequence::from(1u64),
+            parent_sections: std::collections::BTreeMap::new(),
+        },
         parent_snapshot_id: None,
-        content_fingerprint: capture.catalog.content_fingerprint(&[9; 32]).unwrap(),
+        content_fingerprint: capture.catalog.content_fingerprint(&risunest_external_storage_format::format::library_fingerprint_domain()).unwrap(),
     }
 }
 

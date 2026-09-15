@@ -122,7 +122,8 @@ pub(crate) enum ObjectRole {
     Descriptor,
     Pack,
     Catalog,
-    Snapshot,
+    SyncState,
+    BackupBundle,
     BackupPoint,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

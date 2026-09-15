@@ -16,6 +16,7 @@
     import type {
         ExternalConflictSummary,
         ExternalConnectionResult,
+        ExternalCapturePolicy,
         ExternalConnectionSummary,
         ExternalHistoryItem,
         ExternalJobSummary,
@@ -110,11 +111,7 @@
                 const operation = requestExternalStorageRestore(
                     connection.id,
                     details.snapshotId,
-                    [
-                        'library', 'referencedAssets',
-                        ...(connection.scope.deviceSettings ? ['deviceSettings' as const] : []),
-                        ...(connection.scope.devicePlugins ? ['devicePlugins' as const] : []),
-                    ],
+                    ['library', 'referencedAssets'],
                 )
                 schedulePoll(true)
                 await operation
@@ -196,6 +193,21 @@
             error = externalErrorMessage(strings, reason)
         } finally {
             historyLoading[connection.id] = false
+        }
+    }
+
+    async function changeCapturePolicy(
+        connection: ExternalConnectionSummary,
+        policy: ExternalCapturePolicy,
+    ): Promise<void> {
+        busy = true
+        try {
+            await bridge.setCapturePolicy(connection.id, policy)
+            await refresh(true)
+        } catch (failure) {
+            error = externalErrorMessage(strings, failure)
+        } finally {
+            busy = false
         }
     }
 
@@ -407,6 +419,16 @@
                     </div>
                 {/if}
 
+                {#if connection.capturePolicy}
+                    {@const policy = connection.capturePolicy}
+                    <h4 class="policy-title">{strings.scope}</h4>
+                    <p class="policy-note">{strings.scopeHelp}</p>
+                    <p class="policy-row fixed"><span>{strings.library}</span><span class="value">{strings.included}</span></p>
+                    <label class="policy-row"><input type="checkbox" disabled={busy} checked={policy.hypa} onchange={event => changeCapturePolicy(connection, { ...policy, hypa: event.currentTarget.checked })} /><span>{strings.hypa}</span></label>
+                    <label class="policy-row"><input type="checkbox" disabled={busy} checked={policy.localPlugins} onchange={event => changeCapturePolicy(connection, { ...policy, localPlugins: event.currentTarget.checked })} /><span>{strings.devicePlugins}</span></label>
+                    <label class="policy-row"><input type="checkbox" disabled={busy} checked={policy.localSettings} onchange={event => changeCapturePolicy(connection, { ...policy, localSettings: event.currentTarget.checked })} /><span>{strings.deviceSettings}</span></label>
+                {/if}
+
                 <div class="actions">
                     {#if job && job.state === 'waiting' && job.error?.action === 'retry' && (job.kind === 'backup' || job.kind === 'sync')}
                         <SettingButton disabled={busy} onclick={() => runJob(connection, job.kind)}>{strings.retryAction}</SettingButton>
@@ -535,6 +557,30 @@
         display: flex;
         flex-wrap: wrap;
         gap: 0.4rem;
+    }
+    .policy-title {
+        margin: 0.25rem 0 0;
+        font-size: 0.875rem;
+        font-weight: 600;
+    }
+    .policy-note {
+        margin: 0;
+        font-size: 0.8125rem;
+        line-height: 1.45;
+        color: var(--risu-theme-textcolor2);
+    }
+    .policy-row {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin: 0;
+        font-size: 0.875rem;
+    }
+    .policy-row.fixed {
+        justify-content: space-between;
+    }
+    .policy-row .value {
+        color: var(--risu-theme-textcolor2);
     }
     .status {
         display: inline-flex;

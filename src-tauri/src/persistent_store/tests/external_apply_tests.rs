@@ -8,18 +8,11 @@ use crate::{
     },
     persistent_store::{external_storage_state, sync_selection},
 };
-use risunest_external_storage_format::format::{fingerprint, Scope};
+use risunest_external_storage_format::format::{fingerprint, library_fingerprint_domain};
 use serde_json::json;
 use std::{collections::BTreeMap, fs, path::Path};
 
-fn scope() -> Scope {
-    Scope {
-        library: true,
-        referenced_assets: true,
-        device_settings: false,
-        device_plugins: false,
-    }
-}
+
 
 fn open_store() -> (tempfile::TempDir, PersistentStore) {
     let directory = tempfile::tempdir().unwrap();
@@ -84,7 +77,6 @@ fn write_object(root: &Path, bytes: &[u8]) -> ExternalSnapshotObject {
 
 fn application<'a>(
     root: &'a Path,
-    scope: &'a Scope,
     scope_id: &'a [u8; 32],
     fingerprint: &'a [u8; 32],
     revision: i64,
@@ -92,7 +84,6 @@ fn application<'a>(
     ExternalSnapshotApplication {
         expected_revision: revision,
         staging_root: root,
-        scope,
         scope_id,
         fingerprint,
     }
@@ -201,12 +192,11 @@ fn external_snapshot_stages_streamed_records_and_preserves_local_view_fields() {
     {
         hashes.insert(record.key.clone(), hash);
     }
-    let scope = scope();
-    let scope_id = scope.id();
+    let scope_id = library_fingerprint_domain();
     let fingerprint = fingerprint(&scope_id, &hashes);
     let prepared = store
         .prepare_external_snapshot_application(
-            &application(&staging, &scope, &scope_id, &fingerprint, 1),
+            &application(&staging, &scope_id, &fingerprint, 1),
             records.into_iter().map(Ok),
             [Ok(page_object), Ok(owner_manifest), Ok(owner_payload)],
         )
@@ -262,12 +252,11 @@ fn external_snapshot_stage_feeds_atomic_normal_receive_activation() {
 
     let (root, root_hash) = root_record(&staging, "remote-sync");
     let hashes = BTreeMap::from([(root.key.clone(), root_hash)]);
-    let scope = scope();
-    let scope_id = scope.id();
+    let scope_id = library_fingerprint_domain();
     let fingerprint = fingerprint(&scope_id, &hashes);
     let prepared = store
         .prepare_external_snapshot_application(
-            &application(&staging, &scope, &scope_id, &fingerprint, identity.revision),
+            &application(&staging, &scope_id, &fingerprint, identity.revision),
             [Ok(root)],
             std::iter::empty(),
         )
@@ -303,11 +292,10 @@ fn rejected_record_stream_rolls_back_the_whole_stage_and_preserves_live_library(
     fs::create_dir(&staging).unwrap();
     let (root, root_hash) = root_record(&staging, "rejected");
     let hashes = BTreeMap::from([(root.key.clone(), root_hash)]);
-    let scope = scope();
-    let scope_id = scope.id();
+    let scope_id = library_fingerprint_domain();
     let fingerprint = fingerprint(&scope_id, &hashes);
     let error = match store.prepare_external_snapshot_application(
-        &application(&staging, &scope, &scope_id, &fingerprint, 1),
+        &application(&staging, &scope_id, &fingerprint, 1),
         vec![
             Ok(root),
             Err(StoreError::Validation {
@@ -369,14 +357,12 @@ fn duplicate_key_key_mismatch_missing_payload_and_stale_revision_are_rejected() 
             hashes.insert(asset.key.clone(), hash);
             records.push(asset);
         }
-        let scope = scope();
-        let scope_id = scope.id();
+            let scope_id = library_fingerprint_domain();
         let fingerprint = fingerprint(&scope_id, &hashes);
         assert!(store
             .prepare_external_snapshot_application(
                 &application(
                     &staging,
-                    &scope,
                     &scope_id,
                     &fingerprint,
                     if case == "stale" { 0 } else { 1 },
@@ -397,15 +383,14 @@ fn object_hash_and_scope_mismatches_are_rejected_before_activation() {
     fs::create_dir(&staging).unwrap();
     let (root, root_hash) = root_record(&staging, "rejected");
     let hashes = BTreeMap::from([(root.key.clone(), root_hash)]);
-    let scope = scope();
-    let scope_id = scope.id();
+    let scope_id = library_fingerprint_domain();
     let fingerprint = fingerprint(&scope_id, &hashes);
     let bytes = b"synthetic object";
     let mut object = write_object(&staging, bytes);
     object.content_hash = "b".repeat(64);
     assert!(store
         .prepare_external_snapshot_application(
-            &application(&staging, &scope, &scope_id, &fingerprint, 1),
+            &application(&staging, &scope_id, &fingerprint, 1),
             [Ok(root.clone())],
             [Ok(object)],
         )
@@ -415,7 +400,7 @@ fn object_hash_and_scope_mismatches_are_rejected_before_activation() {
     let wrong_scope = [9; 32];
     assert!(store
         .prepare_external_snapshot_application(
-            &application(&staging, &scope, &wrong_scope, &fingerprint, 1),
+            &application(&staging, &wrong_scope, &fingerprint, 1),
             [Ok(root)],
             std::iter::empty(),
         )

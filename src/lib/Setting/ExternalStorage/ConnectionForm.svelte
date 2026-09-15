@@ -12,7 +12,7 @@
     import {
         SEQUENTIAL_ACKNOWLEDGEMENT,
         buildPrepareConnectionRequest,
-        defaultExternalStorageScope,
+        defaultExternalCapturePolicy,
         requiredConnectionAcknowledgements,
     } from 'src/ts/storage/sync/external/connection'
     import {
@@ -79,8 +79,9 @@
             oauthRedirectUri: 'https://update.rsyumi.workers.dev/oauth/google-drive-callback.html',
         } : {}),
     })
-    let deviceSettings = $state(true)
-    let devicePlugins = $state(false)
+    let hypa = $state(true)
+    let localPlugins = $state(true)
+    let localSettings = $state(true)
     let accepted = $state<string[]>([])
     let prepared = $state<PreparedExternalConnection | null>(null)
     let endpointConfirmed = $state(false)
@@ -123,8 +124,9 @@
     const strategyOptions = $derived(syncStrategies.map(item => ({ value: item, label: strings.strategyLabels[item] })))
     const scopeSummary = $derived([
         strings.library,
-        ...(purpose === 'backup' && deviceSettings ? [strings.deviceSettings] : []),
-        ...(purpose === 'backup' && devicePlugins ? [strings.devicePlugins] : []),
+        ...(hypa ? [strings.hypa] : []),
+        ...(localPlugins ? [strings.devicePlugins] : []),
+        ...(localSettings ? [strings.deviceSettings] : []),
     ].join(', '))
     const providerStrategyNote = $derived('strategyNote' in providerStrings ? providerStrings.strategyNote : undefined)
     const providerWarning = $derived('warningTitle' in providerStrings
@@ -294,11 +296,9 @@
         try {
             request = buildPrepareConnectionRequest({
                 providerId, values, platform, mode, purpose, strategy,
-                scope: {
-                    ...defaultExternalStorageScope(purpose),
-                    deviceSettings: purpose === 'backup' && deviceSettings,
-                    devicePlugins: purpose === 'backup' && devicePlugins,
-                },
+                capturePolicy: purpose === 'backup'
+                    ? { hypa, localPlugins, localSettings }
+                    : defaultExternalCapturePolicy(purpose),
                 acknowledgements: accepted,
             })
         } catch {
@@ -482,12 +482,20 @@
         </div>
     </section>
 
-    <fieldset class="sub" disabled={purpose === 'sync'}>
+    {#if purpose === 'backup'}
+    <fieldset class="sub">
         <legend class="sub-title">{strings.scope}</legend>
-        <label class="check"><input type="checkbox" checked disabled /><span>{strings.library}</span></label>
-        <label class="check"><input type="checkbox" bind:checked={deviceSettings} onchange={resetPrepared} /><span>{strings.deviceSettings}</span></label>
-        <label class="check"><input type="checkbox" bind:checked={devicePlugins} onchange={resetPrepared} /><span>{strings.devicePlugins}</span></label>
+        <p class="note"><span>{strings.scopeHelp}</span></p>
+        <p class="check fixed"><span>{strings.library}</span><span class="value">{strings.included}</span></p>
+        <p class="note"><span>{strings.libraryHelp}</span></p>
+        <label class="check"><input type="checkbox" bind:checked={hypa} onchange={resetPrepared} /><span>{strings.hypa}</span></label>
+        <p class="note"><span>{strings.hypaHelp}</span></p>
+        <label class="check"><input type="checkbox" bind:checked={localPlugins} onchange={resetPrepared} /><span>{strings.devicePlugins}</span></label>
+        <p class="note"><span>{strings.devicePluginsHelp}</span></p>
+        <label class="check"><input type="checkbox" bind:checked={localSettings} onchange={resetPrepared} /><span>{strings.deviceSettings}</span></label>
+        <p class="note"><span>{strings.deviceSettingsHelp}</span></p>
     </fieldset>
+    {/if}
     {/if}
     </fieldset>
 
@@ -504,6 +512,9 @@
                 {/if}
                 {#if prepared.requiresPlatformOAuthClient && prepared.oauthProjectHint}<dt>{strings.oauthProjectHint}</dt><dd>{prepared.oauthProjectHint}</dd>{/if}
             </dl>
+            {#if purpose === 'sync' && !fromRecovery}
+                <p class="note"><span>{strings.syncPurposeLocalDataNotice}</span></p>
+            {/if}
             {#each prepared.endpoint.warnings as warning (warning)}<p class="note"><span>{externalEndpointWarning(strings, warning)}</span></p>{/each}
 
             <label class="check"><input type="checkbox" bind:checked={endpointConfirmed} /><span>{strings.confirmEndpoint}</span></label>
@@ -638,6 +649,13 @@
     }
     .check input {
         margin-top: 0.2rem;
+    }
+    .check.fixed {
+        margin: 0;
+        justify-content: space-between;
+    }
+    .check.fixed .value {
+        color: var(--risu-theme-textcolor2);
     }
     .actions {
         display: flex;

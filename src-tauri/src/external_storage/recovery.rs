@@ -75,19 +75,10 @@ pub(crate) fn import(bytes: &[u8], code: &str) -> Result<ImportedRecovery> {
 mod tests {
     use super::*;
     use crate::external_storage::{capabilities::Capabilities, fake};
-    use risunest_external_storage_format::format::Scope;
-
+    
     #[test]
     fn new_device_recovers_without_source_vault_and_operational_credentials() {
-        let descriptor = Descriptor::new(
-            "synthetic-repository".into(),
-            Scope {
-                library: true,
-                referenced_assets: true,
-                device_settings: false,
-                device_plugins: false,
-            },
-            None,
+        let descriptor = Descriptor::new("synthetic-repository".into(), None,
         )
         .unwrap();
         let connection = StoredConnection {
@@ -105,6 +96,7 @@ mod tests {
             provider_repository_id: fake::repository().repository_id,
             credential_ref: "not-exported-credential".into(),
             root_key_ref: "not-exported-os-key".into(),
+            capture_policy: None,
             capabilities: Capabilities::default(),
             created_at_ms: 1,
         };

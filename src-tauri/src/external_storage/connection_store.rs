@@ -18,6 +18,10 @@ pub(crate) struct StoredConnection {
     pub root_key_ref: String,
     pub capabilities: Capabilities,
     pub created_at_ms: u64,
+    /// Backup connections only. Changing it applies to work started
+    /// afterwards and never rewrites an existing point.
+    #[serde(default)]
+    pub capture_policy: Option<super::connection::CapturePolicy>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -25,6 +29,8 @@ pub(crate) struct PendingStoredConnection {
     pub id: String,
     pub config: ConnectionConfig,
     pub descriptor: Descriptor,
+    #[serde(default)]
+    pub capture_policy: Option<super::connection::CapturePolicy>,
     pub provider_repository_id: Option<String>,
     pub credential_ref: String,
     pub root_key_ref: String,
@@ -97,6 +103,28 @@ impl ConnectionStore {
             .map_err(storage)?;
         Ok(())
     }
+    /// Replaces a backup connection's capture policy. Work already started
+    /// keeps the policy it fixed, and no existing point is rewritten.
+    pub fn set_capture_policy(
+        &mut self,
+        id: &str,
+        policy: super::connection::CapturePolicy,
+    ) -> Result<StoredConnection> {
+        let mut connection = self.read(id)?;
+        if connection.capture_policy.is_none() {
+            return Err(ProviderError::new(ErrorKind::Unsupported));
+        }
+        connection.capture_policy = Some(policy);
+        let encoded = serde_json::to_string(&connection).map_err(storage)?;
+        decode(&encoded)?;
+        self.0
+            .execute(
+                "UPDATE connections SET value=?2 WHERE id=?1",
+                params![id, encoded],
+            )
+            .map_err(storage)?;
+        Ok(connection)
+    }
     pub fn put_pending(&self, connection: &PendingStoredConnection) -> Result<()> {
         validate_pending(connection)?;
         let encoded = serde_json::to_string(connection).map_err(storage)?;
@@ -138,6 +166,7 @@ impl ConnectionStore {
             descriptor_locator,
             provider_repository_id,
             credential_ref: pending.credential_ref,
+            capture_policy: pending.capture_policy,
             root_key_ref: pending.root_key_ref,
             capabilities,
             created_at_ms: pending.created_at_ms,
@@ -256,8 +285,7 @@ fn decode_pending(encoded: &str) -> Result<PendingStoredConnection> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use risunest_external_storage_format::format::Scope;
-
+    
     fn pending() -> PendingStoredConnection {
         PendingStoredConnection {
             id: "synthetic-connection".into(),
@@ -269,20 +297,13 @@ mod tests {
                 location: [("root".into(), "RisuNest".into())].into(),
                 oauth_profile: None,
             },
-            descriptor: Descriptor::new(
-                "synthetic-format-repository".into(),
-                Scope {
-                    library: true,
-                    referenced_assets: true,
-                    device_settings: false,
-                    device_plugins: false,
-                },
-                None,
+            descriptor: Descriptor::new("synthetic-format-repository".into(), None,
             )
             .unwrap(),
             provider_repository_id: Some("synthetic-provider-repository".into()),
             credential_ref: "provider-v1:00000000-0000-4000-8000-000000000001".into(),
             root_key_ref: "repository-key-v1:00000000-0000-4000-8000-000000000002".into(),
+            capture_policy: None,
             created_at_ms: 1,
         }
     }
@@ -311,6 +332,51 @@ mod tests {
             store.pending(&pending.id),
             Err(ProviderError {
                 kind: ErrorKind::NotFound,
+                ..
+            })
+        ));
+    }
+    /// Changing a backup connection's policy applies to work started later. A
+    /// synchronization connection has none to change.
+    #[test]
+    fn a_backup_policy_changes_in_place_and_a_sync_connection_has_none() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = ConnectionStore::open(root.path()).unwrap();
+        let mut backup = pending();
+        backup.capture_policy = Some(super::super::connection::CapturePolicy::default());
+        store.put_pending(&backup).unwrap();
+        let locator = RemoteLocator {
+            connection_identity: "synthetic-identity".into(),
+            collection: Some("descriptors".into()),
+            object: "descriptor".into(),
+        };
+        store
+            .promote_pending(&backup.id, locator.clone(), Capabilities::default())
+            .unwrap();
+
+        let narrowed = super::super::connection::CapturePolicy {
+            hypa: false,
+            local_plugins: true,
+            local_settings: false,
+        };
+        let updated = store.set_capture_policy(&backup.id, narrowed).unwrap();
+        assert_eq!(updated.capture_policy, Some(narrowed));
+        assert_eq!(
+            store.read(&backup.id).unwrap().capture_policy,
+            Some(narrowed)
+        );
+
+        let mut sync = pending();
+        sync.id = "synthetic-sync".into();
+        sync.capture_policy = None;
+        store.put_pending(&sync).unwrap();
+        store
+            .promote_pending(&sync.id, locator, Capabilities::default())
+            .unwrap();
+        assert!(matches!(
+            store.set_capture_policy(&sync.id, narrowed),
+            Err(ProviderError {
+                kind: ErrorKind::Unsupported,
                 ..
             })
         ));

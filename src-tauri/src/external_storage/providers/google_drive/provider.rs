@@ -50,20 +50,24 @@ fn role_token(role: ObjectRole) -> &'static str {
         ObjectRole::Descriptor => DESCRIPTOR_ROLE,
         ObjectRole::Pack => "pack",
         ObjectRole::Catalog => "catalog",
-        ObjectRole::Snapshot => "snapshot",
+        ObjectRole::SyncState => "state",
+        ObjectRole::BackupBundle => "bundle",
         ObjectRole::BackupPoint => "backupPoint",
     }
 }
+/// Only names the container a collection lives in. States and bundles share
+/// one, so the role returned here never classifies a listed object; the
+/// authenticated envelope header does that.
 fn collection_role(collection: Collection) -> ObjectRole {
     match collection {
-        Collection::Snapshots => ObjectRole::Snapshot,
+        Collection::Snapshots => ObjectRole::SyncState,
         Collection::BackupPoints => ObjectRole::BackupPoint,
         Collection::Descriptors => ObjectRole::Descriptor,
     }
 }
 fn collection_token(role: ObjectRole) -> Option<&'static str> {
     match role {
-        ObjectRole::Snapshot => Some("snapshots"),
+        ObjectRole::SyncState | ObjectRole::BackupBundle => Some("snapshots"),
         ObjectRole::BackupPoint => Some("backupPoints"),
         ObjectRole::Descriptor => Some("descriptors"),
         ObjectRole::Pack | ObjectRole::Catalog => None,

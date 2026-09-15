@@ -1,12 +1,8 @@
 import { invoke } from '@tauri-apps/api/core'
 import { isTauri } from '../../../platform'
-import {
-    prepareExternalDeviceCapture,
-    type ExternalDeviceCaptureConsumer,
-    type ExternalDeviceCapturePreparation,
-} from './deviceSections'
 import { requestDeviceMaintenanceRestart as restartForDeviceMaintenance } from '../../deviceBackup/maintenance'
 import type {
+    ExternalCapturePolicy,
     DecimalString,
     ExternalConnectionResult,
     ExternalAuthorizationPending,
@@ -129,6 +125,10 @@ export class ExternalStorageBridge {
         return this.native('external_storage_cancel_authorization', { authorizationId })
     }
 
+    setCapturePolicy(connectionId: string, policy: ExternalCapturePolicy): Promise<void> {
+        return this.native('external_storage_set_capture_policy', { connectionId, policy })
+    }
+
     removeConnection(connectionId: string): Promise<void> {
         return this.native('external_storage_remove_connection', { connectionId })
     }
@@ -142,59 +142,8 @@ export class ExternalStorageBridge {
         })
     }
 
-    async startJob(request: StartExternalJobRequest): Promise<ExternalJobSummary> {
-        const job = await this.native<ExternalJobSummary>('external_storage_start_job', { request })
-        if (request.kind !== 'backup' || job.phase !== 'device-capture') return job
-
-        const storageState = await this.getState()
-        const connection = storageState.connections.find(item => item.id === request.connectionId)
-        if (!connection || (!connection.scope.deviceSettings && !connection.scope.devicePlugins))
-            return job
-
-        const scopeKey = `${Number(connection.scope.deviceSettings)}:${Number(connection.scope.devicePlugins)}`
-        const consumers = storageState.jobs
-            .filter(candidate => (
-                candidate.kind === 'backup'
-                && candidate.state === 'waiting'
-                && candidate.phase === 'device-capture'
-            ))
-            .map(candidate => ({
-                job: candidate,
-                connection: storageState.connections.find(item => item.id === candidate.connectionId),
-            }))
-            .filter(({ connection: candidate }) =>
-                candidate?.purpose === 'backup' &&
-                `${Number(candidate.scope.deviceSettings)}:${Number(candidate.scope.devicePlugins)}` === scopeKey,
-            )
-            .map(({ job: candidate, connection: owner }) => ({
-                jobId: candidate.id,
-                purpose: owner!.purpose,
-                scope: owner!.scope,
-            }))
-
-        if (!consumers.some(consumer => consumer.jobId === job.id)) {
-            consumers.push({
-                jobId: job.id,
-                purpose: connection.purpose,
-                scope: connection.scope,
-            })
-        }
-        try {
-            await this.prepareDeviceCapture(consumers)
-            return job
-        } catch (error) {
-            await this.cancelJob(job.id).catch(() => undefined)
-            throw error
-        }
-    }
-
-    prepareDeviceCapture(
-        consumers: readonly ExternalDeviceCaptureConsumer[],
-    ): Promise<ExternalDeviceCapturePreparation | null> {
-        return prepareExternalDeviceCapture(
-            consumers,
-            (command, args) => this.native(command, args),
-        )
+    startJob(request: StartExternalJobRequest): Promise<ExternalJobSummary> {
+        return this.native<ExternalJobSummary>('external_storage_start_job', { request })
     }
 
     requestDeviceMaintenanceRestart(): Promise<never> {

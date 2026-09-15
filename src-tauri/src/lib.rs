@@ -680,6 +680,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         external_storage::connection_commands::external_storage_begin_authorization,
         external_storage::connection_commands::external_storage_complete_authorization,
         external_storage::connection_commands::external_storage_cancel_authorization,
+        external_storage::connection_commands::external_storage_set_capture_policy,
         external_storage::connection_commands::external_storage_remove_connection,
         external_storage::connection_commands::external_storage_begin_recovery_export,
         external_storage::connection_commands::external_storage_save_recovery_file,
@@ -695,7 +696,6 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         external_storage::history::external_storage_list_history,
         external_storage::sync_engine::external_storage_list_conflicts,
         external_storage::sync_engine::external_storage_apply_received,
-        external_storage::device_commands::external_storage_prepare_device_capture,
         external_storage::snapshot_export_commands::external_storage_export_snapshot,
         #[cfg(target_os = "ios")]
         ios_lifecycle::ios_prepare_restart,

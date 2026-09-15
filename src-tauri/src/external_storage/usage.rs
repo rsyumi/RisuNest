@@ -7,7 +7,6 @@ use super::{
     control,
     packaging::RemoteObject,
 };
-use risunest_external_storage_format::snapshot as wire;
 use rusqlite::{Connection, OpenFlags};
 use std::{collections::BTreeSet, path::Path};
 
@@ -89,7 +88,7 @@ fn local_upload_lower_bound(
 
 fn direct_reachable(
     snapshot: &RemoteObject,
-    document: &wire::SnapshotDocument,
+    document: &control::SnapshotView,
 ) -> Result<ReachableUsage> {
     let mut identities = BTreeSet::new();
     let mut bytes = 0u64;
@@ -102,13 +101,11 @@ fn direct_reachable(
             .checked_add(snapshot.receipt.byte_length)
             .ok_or_else(corrupt)?;
     }
-    for object in [
-        Some(&document.record_catalog),
-        Some(&document.asset_catalog),
-        document.device_catalog.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
+    // Published sections are reachable too, so a library-only publish does not
+    // make an inherited section look unreferenced.
+    for object in [&document.library.record_catalog, &document.library.asset_catalog]
+        .into_iter()
+        .chain(document.sections.values().map(|section| &section.entries_root))
     {
         let identity = (
             object.locator.collection.clone(),
@@ -151,9 +148,9 @@ pub(crate) async fn summarize(
         {
             Some(head) => {
                 let document =
-                    control::read_snapshot_document(connected, &head.document.snapshot, cancel)
+                    control::read_snapshot_document(connected, &head.document.state, cancel)
                         .await?;
-                Some(direct_reachable(&head.document.snapshot, &document)?)
+                Some(direct_reachable(&head.document.state, &document)?)
             }
             None => None,
         }
@@ -186,18 +183,18 @@ mod tests {
         let mut locator = fake::locator();
         locator.object = id.into();
         let wire_role = match role {
-            ObjectRole::Snapshot => wire::ObjectRole::Snapshot,
-            ObjectRole::Catalog => wire::ObjectRole::Catalog,
+            ObjectRole::SyncState => risunest_external_storage_format::snapshot::ObjectRole::SyncState,
+            ObjectRole::Catalog => risunest_external_storage_format::snapshot::ObjectRole::Catalog,
             _ => unreachable!(),
         };
-        let header = wire::PublicObjectHeader::new(
+        let header = risunest_external_storage_format::snapshot::PublicObjectHeader::new(
             repository.repository_id.clone(),
             id.into(),
             wire_role,
             1,
         )
         .unwrap();
-        let bytes = wire::envelope_length(&header).unwrap();
+        let bytes = risunest_external_storage_format::snapshot::envelope_length(&header).unwrap();
         RemoteObject {
             repository_id: repository.repository_id.clone(),
             object_id: id.into(),
@@ -218,30 +215,24 @@ mod tests {
     #[test]
     fn direct_reachable_is_an_explicit_incomplete_lower_bound() {
         let repository = fake::repository();
-        let snapshot = object(&repository, "snapshot-root", ObjectRole::Snapshot);
+        let snapshot = object(&repository, "snapshot-root", ObjectRole::SyncState);
         let records_object = object(&repository, "records", ObjectRole::Catalog);
         let assets_object = object(&repository, "assets", ObjectRole::Catalog);
         let records = records_object.stored(&repository).unwrap();
         let assets = assets_object.stored(&repository).unwrap();
-        let document = wire::SnapshotDocument::new(
-            "snapshot".into(),
-            snapshot.repository_id.clone(),
-            "library".into(),
-            "device".into(),
-            1,
-            1,
-            [1; 32],
-            [1; 32],
-            None,
-            [2; 32],
-            [2; 32],
-            records,
-            assets,
-            None,
-            None,
-            Vec::new(),
-        )
-        .unwrap();
+        let document = control::SnapshotView {
+            snapshot_id: "snapshot".into(),
+            library_id: "library".into(),
+            created_at_ms: 1,
+            revision: "1".into(),
+            library: risunest_external_storage_format::snapshot::LibrarySnapshotRef {
+                record_catalog: records,
+                asset_catalog: assets,
+                content_fingerprint: [2; 32],
+            },
+            sections: std::collections::BTreeMap::new(),
+            is_state: true,
+        };
         let usage = direct_reachable(&snapshot, &document).unwrap();
         assert!(!usage.complete);
         assert_eq!(usage.known_direct_objects, 3);

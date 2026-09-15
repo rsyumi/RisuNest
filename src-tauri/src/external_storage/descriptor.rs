@@ -193,15 +193,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let provider = fake::FakeProvider::new(true);
             let repository = fake::repository();
-            let descriptor = Descriptor::new(
-                "synthetic-descriptor-id".into(),
-                risunest_external_storage_format::format::Scope {
-                    library: true,
-                    referenced_assets: true,
-                    device_settings: false,
-                    device_plugins: false,
-                },
-                Some(risunest_external_storage_format::format::Strategy::Cas),
+            let descriptor = Descriptor::new("synthetic-descriptor-id".into(), Some(risunest_external_storage_format::format::Strategy::Cas),
             )
             .unwrap();
             let locator = upload(

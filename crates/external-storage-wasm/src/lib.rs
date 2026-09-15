@@ -2,12 +2,14 @@
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use risunest_external_storage_format::{
-        control::{BackupPointDocument, HeadDocument, MAX_CONTROL_BYTES},
+        control::{
+            BackupBundleDocument, BackupPointDocument, HeadDocument, MAX_CONTROL_BYTES,
+        },
         crypto::{RecoveryCode, RecoveryEnvelope},
         pack,
         snapshot::{
             keyed_object_id as format_keyed_object_id, open_envelope, seal_envelope, ObjectRole,
-            PublicObjectHeader, SnapshotDocument, MAX_METADATA_BYTES,
+            PublicObjectHeader, SyncStateDocument, MAX_METADATA_BYTES,
         },
     };
     use wasm_bindgen::prelude::*;
@@ -23,7 +25,8 @@ mod wasm {
             "descriptor" => Ok(ObjectRole::Descriptor),
             "pack" => Ok(ObjectRole::Pack),
             "catalog" => Ok(ObjectRole::Catalog),
-            "snapshot" => Ok(ObjectRole::Snapshot),
+            "state" => Ok(ObjectRole::SyncState),
+            "bundle" => Ok(ObjectRole::BackupBundle),
             "backupPoint" => Ok(ObjectRole::BackupPoint),
             "head" => Ok(ObjectRole::Head),
             _ => Err(JsValue::from_str("invalid-object-role")),
@@ -32,7 +35,12 @@ mod wasm {
 
     fn validate_document(role: ObjectRole, bytes: &[u8]) -> std::result::Result<(), JsValue> {
         match role {
-            ObjectRole::Snapshot => SnapshotDocument::decode(bytes, MAX_METADATA_BYTES).map(|_| ()),
+            ObjectRole::SyncState => {
+                SyncStateDocument::decode(bytes, MAX_METADATA_BYTES).map(|_| ())
+            }
+            ObjectRole::BackupBundle => {
+                BackupBundleDocument::decode(bytes, MAX_CONTROL_BYTES).map(|_| ())
+            }
             ObjectRole::Head => HeadDocument::decode(bytes, MAX_CONTROL_BYTES).map(|_| ()),
             ObjectRole::BackupPoint => {
                 BackupPointDocument::decode(bytes, MAX_CONTROL_BYTES).map(|_| ())
@@ -179,9 +187,16 @@ mod wasm {
     }
 
     #[wasm_bindgen]
-    pub fn canonical_snapshot_document(bytes: &[u8]) -> std::result::Result<Vec<u8>, JsValue> {
-        SnapshotDocument::decode(bytes, MAX_METADATA_BYTES)
+    pub fn canonical_sync_state_document(bytes: &[u8]) -> std::result::Result<Vec<u8>, JsValue> {
+        SyncStateDocument::decode(bytes, MAX_METADATA_BYTES)
             .and_then(|document| document.encode(MAX_METADATA_BYTES))
+            .map_err(|e| JsValue::from_str(e.0))
+    }
+
+    #[wasm_bindgen]
+    pub fn canonical_backup_bundle_document(bytes: &[u8]) -> std::result::Result<Vec<u8>, JsValue> {
+        BackupBundleDocument::decode(bytes, MAX_CONTROL_BYTES)
+            .and_then(|document| document.encode(MAX_CONTROL_BYTES))
             .map_err(|e| JsValue::from_str(e.0))
     }
 

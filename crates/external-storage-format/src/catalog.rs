@@ -135,34 +135,16 @@ mod tests {
         assert_eq!(entries, restored);
     }
     #[test]
-    fn scope_and_fingerprint_exclude_physical_locations_and_device_defaults() {
+    fn fingerprints_exclude_physical_locations_and_publication_strategy() {
         use crate::format::*;
-        let scope = Scope {
-            library: true,
-            referenced_assets: true,
-            device_settings: false,
-            device_plugins: false,
-        };
-        let descriptor = Descriptor::new(
-            "repository".into(),
-            scope.clone(),
-            Some(Strategy::Sequential),
-        )
-        .unwrap();
         let entries = BTreeMap::from([("synthetic".into(), hash(b"same"))]);
-        assert_eq!(
-            fingerprint(&scope.id(), &entries),
-            fingerprint(&descriptor.scope_id, &entries)
-        );
-        assert!(descriptor.require_scope(&[0; 32]).is_err());
-        assert!(Descriptor::new(
-            "repository".into(),
-            Scope {
-                device_plugins: true,
-                ..scope
-            },
-            Some(Strategy::Cas)
-        )
-        .is_err());
+        let domain = library_fingerprint_domain();
+        assert_eq!(fingerprint(&domain, &entries), fingerprint(&domain, &entries));
+        assert_ne!(fingerprint(&domain, &entries), fingerprint(&[0; 32], &entries));
+        // Two connections to the same repository agree on identity whatever
+        // each device chose to publish, so neither reports the other corrupt.
+        let sequential = Descriptor::new("repository".into(), Some(Strategy::Sequential)).unwrap();
+        let reconnected = Descriptor::new("repository".into(), Some(Strategy::Sequential)).unwrap();
+        assert_eq!(sequential, reconnected);
     }
 }

@@ -16,18 +16,8 @@ import {
 
 function connection(
     purpose: 'backup' | 'sync',
-    scope: Partial<ExternalConnectionSummary['scope']> = {},
-): Pick<ExternalConnectionSummary, 'purpose' | 'scope'> {
-    return {
-        purpose,
-        scope: {
-            library: true,
-            referencedAssets: true,
-            deviceSettings: false,
-            devicePlugins: false,
-            ...scope,
-        },
-    }
+): Pick<ExternalConnectionSummary, 'purpose'> {
+    return { purpose }
 }
 
 function item(
@@ -69,14 +59,9 @@ describe('external storage onboarding action', () => {
         expect(externalOnboardingAction(connection('backup'))).toBe('restore')
     })
 
-    it('replaces the device sections the repository actually holds', () => {
-        expect(externalOnboardingRestoreAreas(connection('backup')))
-            .toEqual(['library', 'referencedAssets'])
-        expect(externalOnboardingRestoreAreas(connection('backup', { devicePlugins: true })))
-            .toEqual(['library', 'referencedAssets', 'devicePlugins'])
-        expect(externalOnboardingRestoreRestarts(connection('backup'))).toBe(false)
-        expect(externalOnboardingRestoreRestarts(connection('backup', { deviceSettings: true })))
-            .toBe(true)
+    it('replaces only what a bundle covers, so no restore restarts the app', () => {
+        expect(externalOnboardingRestoreAreas()).toEqual(['library', 'referencedAssets'])
+        expect(externalOnboardingRestoreRestarts()).toBe(false)
     })
 })
 

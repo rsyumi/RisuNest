@@ -38,23 +38,14 @@ export function externalOnboardingRestorable(
     return restorableExternalHistoryItems(items)
 }
 
-/** The sections a restore replaces, following what the repository holds. */
-export function externalOnboardingRestoreAreas(
-    connection: Pick<ExternalConnectionSummary, 'scope'>,
-): Array<'library' | 'referencedAssets' | 'deviceSettings' | 'devicePlugins'> {
-    return [
-        'library',
-        'referencedAssets',
-        ...(connection.scope.deviceSettings ? ['deviceSettings' as const] : []),
-        ...(connection.scope.devicePlugins ? ['devicePlugins' as const] : []),
-    ]
+/** The areas a restore replaces, following what the selected bundle covers. */
+export function externalOnboardingRestoreAreas(): Array<'library' | 'referencedAssets'> {
+    return ['library', 'referencedAssets']
 }
 
 /** True when a restore replaces device sections, which restarts the app. */
-export function externalOnboardingRestoreRestarts(
-    connection: Pick<ExternalConnectionSummary, 'scope'>,
-): boolean {
-    return connection.scope.deviceSettings || connection.scope.devicePlugins
+export function externalOnboardingRestoreRestarts(): boolean {
+    return false
 }
 
 /**

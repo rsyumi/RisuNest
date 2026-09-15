@@ -1,7 +1,7 @@
 //! User-requested discovery of authenticated history roots, including orphan snapshots.
 use super::{
     connection_commands::ConnectedRepository, connection_store::ConnectionStore, contract::*,
-    control, packaging::RemoteObject, runtime, transfer::SpoolSink,
+    control, packaging::{self, RemoteObject}, runtime, transfer::SpoolSink,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use risunest_external_storage_format::{
@@ -62,7 +62,7 @@ async fn open_snapshot(
     connected: &ConnectedRepository,
     receipt: ObjectReceipt,
     cancel: &Cancellation,
-) -> Result<(RemoteObject, wire::SnapshotDocument)> {
+) -> Result<(RemoteObject, control::SnapshotView)> {
     receipt.locator.validate_for(&connected.handle)?;
     if !receipt.complete || receipt.byte_length == 0 || receipt.byte_length > MAX_CIPHERTEXT {
         return Err(corrupt());
@@ -98,21 +98,24 @@ async fn open_snapshot(
         wire::MAX_METADATA_BYTES as u64,
     )
     .map_err(|_| corrupt())?;
-    let document = wire::SnapshotDocument::decode(&plaintext, wire::MAX_METADATA_BYTES)
-        .map_err(|_| corrupt())?;
-    if header.role != wire::ObjectRole::Snapshot
-        || header.repository_id != connected.stored.descriptor.repository_id
-        || document.repository_id != header.repository_id
-        || document.scope_id != connected.stored.descriptor.scope_id
-        || header.object_id != format!("snapshot-{}", document.snapshot_id)
-    {
+    if header.repository_id != connected.stored.descriptor.repository_id {
+        return Err(corrupt());
+    }
+    let role = packaging::native_role(header.role).map_err(|_| corrupt())?;
+    let document = control::SnapshotView::read(
+        &plaintext,
+        header.role,
+        &connected.stored.descriptor.repository_id,
+    )
+    .map_err(|_| corrupt())?;
+    if header.object_id != format!("snapshot-{}", document.snapshot_id) {
         return Err(corrupt());
     }
     Ok((
         RemoteObject {
             repository_id: header.repository_id,
             object_id: header.object_id,
-            role: ObjectRole::Snapshot,
+            role,
             receipt,
             ciphertext_sha256: hex::encode(hash(&bytes)),
             plaintext_length: header.plaintext_length,
@@ -122,12 +125,12 @@ async fn open_snapshot(
     ))
 }
 fn item(
-    document: &wire::SnapshotDocument,
+    document: &control::SnapshotView,
     reference: &RemoteObject,
     kind: &str,
     pinned: bool,
 ) -> Value {
-    json!({"id":document.snapshot_id,"kind":kind,"createdAtMs":document.created_at_ms.to_string(),"logicalRevision":document.logical_revision.to_string(),"storedBytes":reference.receipt.byte_length.to_string(),"pinned":pinned,"complete":true,"verified":true,
+    json!({"id":document.snapshot_id,"kind":kind,"createdAtMs":document.created_at_ms.to_string(),"logicalRevision":document.revision,"storedBytes":reference.receipt.byte_length.to_string(),"pinned":pinned,"complete":true,"verified":true,
         "warning":"Snapshot metadata is authenticated. All referenced data is verified before restore."})
 }
 fn remember_item(items: &mut BTreeMap<String, Value>, id: String, mut next: Value) {
@@ -170,7 +173,7 @@ pub(crate) async fn external_storage_list_history(
                 _ => "backup-point",
             };
             let pinned = point.document.kind == control::BackupPointKind::Manual;
-            for reference in point.document.snapshots {
+            for reference in point.document.bundles().into_iter().cloned() {
                 let document =
                     control::read_snapshot_document(&connected, &reference, &cancel).await?;
                 cache.remember_discovery(

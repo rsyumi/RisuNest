@@ -10,16 +10,16 @@ use super::{
     transfer::SpoolSink,
     transfer_job,
 };
-use crate::{
-    asset_repository::PayloadCas, external_storage::device_capture::DeviceSnapshot,
-    persistent_store::external_capture::CapturedSnapshot,
-};
+use crate::{asset_repository::PayloadCas, persistent_store::external_capture::CapturedSnapshot};
 use risunest_external_storage_format::{
     content_identity::{hash, hash_reader},
+    control as wire_control,
     crypto::derive_key,
+    format::library_fingerprint_domain,
     pack::{self, Chunk, ChunkEncoder, CompressionPolicy, ENTRY_OVERHEAD, MAX_CHUNK_BYTES},
     snapshot as wire,
 };
+use risunest_sync_wire::head::Sequence;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -75,6 +75,22 @@ impl PackageLimits {
     }
 }
 
+/// What the packaged object is for. A published state inherits the sections
+/// the observed state carried, so a library-only publish preserves them. A
+/// backup bundle instead declares its own coverage and never merges.
+#[derive(Clone, Debug)]
+pub(crate) enum SnapshotPurpose {
+    SyncState {
+        epoch: String,
+        generation: Sequence,
+        parent_sections: BTreeMap<String, wire::SectionSnapshotRef>,
+    },
+    BackupBundle {
+        source: wire_control::BundleSource,
+        remote_generation: Option<Sequence>,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SnapshotMetadata {
     pub snapshot_id: String,
@@ -83,10 +99,9 @@ pub(crate) struct SnapshotMetadata {
     pub author_device_id: String,
     pub created_at_ms: u64,
     pub logical_revision: u64,
-    pub scope_id: [u8; 32],
-    pub library_scope_id: [u8; 32],
     pub parent_snapshot_id: Option<String>,
     pub content_fingerprint: [u8; 32],
+    pub purpose: SnapshotPurpose,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -169,33 +184,34 @@ pub(crate) struct CompletedSnapshot {
     pub reference: RemoteObject,
     pub snapshot_id: String,
     pub repository_id: String,
-    pub scope_id: String,
-    pub library_scope_id: String,
+    /// The whole-state identifier for a published state, or the bundle
+    /// identifier for a backup. Control changes reach it; library content
+    /// changes reach `library_fingerprint`.
     pub fingerprint: String,
     pub library_fingerprint: String,
     pub logical_revision: u64,
     pub record_catalog: RemoteObject,
     pub asset_catalog: RemoteObject,
-    pub device_catalog: Option<RemoteObject>,
-    pub device_identity: Option<String>,
-    pub device_sections: Vec<String>,
+    pub sections: BTreeMap<String, wire::SectionSnapshotRef>,
     pub referenced_objects: Vec<RemoteObject>,
 }
 
-fn wire_role(role: ObjectRole) -> Result<wire::ObjectRole> {
+pub(crate) fn wire_role(role: ObjectRole) -> Result<wire::ObjectRole> {
     match role {
         ObjectRole::Pack => Ok(wire::ObjectRole::Pack),
         ObjectRole::Catalog => Ok(wire::ObjectRole::Catalog),
-        ObjectRole::Snapshot => Ok(wire::ObjectRole::Snapshot),
+        ObjectRole::SyncState => Ok(wire::ObjectRole::SyncState),
+        ObjectRole::BackupBundle => Ok(wire::ObjectRole::BackupBundle),
         ObjectRole::BackupPoint => Ok(wire::ObjectRole::BackupPoint),
         ObjectRole::Descriptor => Ok(wire::ObjectRole::Descriptor),
     }
 }
-fn native_role(role: wire::ObjectRole) -> Result<ObjectRole> {
+pub(crate) fn native_role(role: wire::ObjectRole) -> Result<ObjectRole> {
     match role {
         wire::ObjectRole::Pack => Ok(ObjectRole::Pack),
         wire::ObjectRole::Catalog => Ok(ObjectRole::Catalog),
-        wire::ObjectRole::Snapshot => Ok(ObjectRole::Snapshot),
+        wire::ObjectRole::SyncState => Ok(ObjectRole::SyncState),
+        wire::ObjectRole::BackupBundle => Ok(ObjectRole::BackupBundle),
         wire::ObjectRole::BackupPoint => Ok(ObjectRole::BackupPoint),
         wire::ObjectRole::Descriptor => Ok(ObjectRole::Descriptor),
         wire::ObjectRole::Head => Err(corrupt("head is not an immutable snapshot object")),
@@ -365,7 +381,7 @@ fn kind_name(kind: wire::CatalogKind) -> &'static str {
     match kind {
         wire::CatalogKind::Records => "records",
         wire::CatalogKind::Assets => "assets",
-        wire::CatalogKind::Device => "device",
+        wire::CatalogKind::Section => "section",
     }
 }
 
@@ -554,39 +570,22 @@ fn capture_sources(
     Ok((records, assets))
 }
 
-fn device_sources(device: DeviceSnapshot) -> Result<(Vec<SourceEntry>, [u8; 32], Vec<String>)> {
-    let device = super::device_capture::verify_snapshot(device).map_err(corrupt)?;
-    let mut sections = device.sections;
-    sections.sort();
-    if sections.is_empty()
-        || sections.iter().any(|section| section.is_empty())
-        || sections.windows(2).any(|pair| pair[0] == pair[1])
-    {
-        return Err(corrupt("invalid device section inventory"));
-    }
-    let mut sources = vec![SourceEntry {
-        kind: wire::CatalogEntryKind::DeviceCatalog,
-        key: "device/catalog".into(),
-        content_sha256: hex::encode(device.sqlite.content_hash),
-        byte_length: device.sqlite.byte_length,
-        path: device.sqlite.path,
-        compression: CompressionPolicy::Text,
-    }];
-    for file in device.blobs {
-        sources.push(SourceEntry {
-            kind: wire::CatalogEntryKind::DeviceObject,
-            key: file.section_id,
-            content_sha256: hex::encode(file.content_hash),
-            byte_length: file.byte_length,
-            path: file.path,
-            compression: CompressionPolicy::AlreadyCompressed,
-        });
-    }
-    sources.sort_by(|a, b| a.key.cmp(&b.key));
-    if sources.windows(2).any(|pair| pair[0].key == pair[1].key) {
-        return Err(corrupt("duplicate device file key"));
-    }
-    Ok((sources, device.device_identity, sections))
+fn max_document_bytes(
+    limits: PackageLimits,
+    repository_id: &str,
+    snapshot_id: &str,
+    role: wire::ObjectRole,
+) -> Result<usize> {
+    usize::try_from(
+        max_plaintext(
+            limits,
+            repository_id,
+            &format!("snapshot-{snapshot_id}"),
+            role,
+        )?
+        .min(wire::MAX_METADATA_BYTES as u64),
+    )
+    .map_err(corrupt)
 }
 
 fn catalog_fingerprint(kind: wire::CatalogKind, sources: &[SourceEntry]) -> String {
@@ -1377,35 +1376,6 @@ pub(crate) async fn package_and_upload(
     repository: &RepositoryHandle,
     cancel: &Cancellation,
 ) -> Result<CompletedSnapshot> {
-    package_and_upload_with_device(
-        capture,
-        None,
-        repository_root,
-        cache_root,
-        metadata,
-        root_key,
-        limits,
-        journal,
-        provider,
-        repository,
-        cancel,
-    )
-    .await
-}
-
-pub(crate) async fn package_and_upload_with_device(
-    capture: CapturedSnapshot,
-    device: Option<DeviceSnapshot>,
-    repository_root: &Path,
-    cache_root: &Path,
-    metadata: SnapshotMetadata,
-    root_key: &[u8; 32],
-    limits: PackageLimits,
-    journal: &mut TransferJournal,
-    provider: &dyn Provider,
-    repository: &RepositoryHandle,
-    cancel: &Cancellation,
-) -> Result<CompletedSnapshot> {
     cancel.check()?;
     if metadata.repository_id.is_empty()
         || metadata.snapshot_id.is_empty()
@@ -1420,21 +1390,16 @@ pub(crate) async fn package_and_upload_with_device(
     let build_root = cache_root.join("build");
     let mut cache = PackageCache::open(cache_root)?;
     let repository_root_owned = repository_root.to_path_buf();
-    let library_scope_id = metadata.library_scope_id;
+    let library_domain = library_fingerprint_domain();
     let cpu = cpu_permit().await?;
-    let (record_sources, asset_sources, device_parts, observed_fingerprint) =
+    let (record_sources, asset_sources, observed_fingerprint) =
         tokio::task::spawn_blocking(move || {
             let (records, assets) = capture_sources(&capture, &repository_root_owned)?;
             let fingerprint = capture
                 .catalog
-                .content_fingerprint(&library_scope_id)
+                .content_fingerprint(&library_domain)
                 .map_err(corrupt)?;
-            Ok((
-                records,
-                assets,
-                device.map(device_sources).transpose()?,
-                fingerprint,
-            ))
+            Ok((records, assets, fingerprint))
         })
         .await
         .map_err(transient)??;
@@ -1515,86 +1480,65 @@ pub(crate) async fn package_and_upload_with_device(
         )
         .await?
     };
-    let (device_catalog, device_identity, device_sections) =
-        if let Some((device_sources, identity, sections)) = device_parts {
-            let mut device_fingerprint =
-                catalog_fingerprint(wire::CatalogKind::Device, &device_sources);
-            device_fingerprint.push_str(&hex::encode(identity));
-            for section in &sections {
-                device_fingerprint.push_str(section);
-            }
-            let (device_entries, uploaded) = build_entries(
-                wire::CatalogKind::Device,
-                device_sources,
-                &metadata.repository_id,
-                &build_root,
-                root_key,
-                limits,
-                &mut cache,
-                journal,
-                provider,
-                repository,
-                cancel,
+    let library = wire::LibrarySnapshotRef {
+        record_catalog: record_catalog.stored(repository)?,
+        asset_catalog: asset_catalog.stored(repository)?,
+        content_fingerprint: metadata.content_fingerprint,
+    };
+    // Sections are carried, never merged here. A published state inherits the
+    // sections the observed state already had; a bundle declares its own.
+    let (bytes, fingerprint, sections, role) = match metadata.purpose {
+        SnapshotPurpose::SyncState {
+            epoch,
+            generation,
+            parent_sections,
+        } => {
+            let document = wire::SyncStateDocument::new(
+                metadata.snapshot_id.clone(),
+                metadata.repository_id.clone(),
+                metadata.library_id,
+                epoch,
+                generation,
+                metadata.parent_snapshot_id,
+                metadata.author_device_id,
+                metadata.created_at_ms,
+                library,
+                parent_sections,
             )
-            .await?;
-            referenced.extend(uploaded);
-            let catalog = build_catalog(
-                wire::CatalogKind::Device,
-                device_entries,
-                &device_fingerprint,
-                &metadata.repository_id,
-                &build_root,
-                root_key,
-                limits,
-                &mut cache,
-                journal,
-                provider,
-                repository,
-                cancel,
-                &mut referenced,
+            .map_err(corrupt)?;
+            let max_state = max_document_bytes(limits, &metadata.repository_id, &metadata.snapshot_id, wire::ObjectRole::SyncState)?;
+            (
+                document.encode(max_state).map_err(corrupt)?,
+                document.state_fingerprint,
+                document.sections,
+                ObjectRole::SyncState,
             )
-            .await?;
-            (Some(catalog), Some(identity), sections)
-        } else {
-            (None, None, Vec::new())
-        };
-    let document = wire::SnapshotDocument::new(
-        metadata.snapshot_id.clone(),
-        metadata.repository_id.clone(),
-        metadata.library_id,
-        metadata.author_device_id,
-        metadata.created_at_ms,
-        metadata.logical_revision,
-        metadata.scope_id,
-        metadata.library_scope_id,
-        metadata.parent_snapshot_id,
-        wire::combine_content_fingerprint(
-            &metadata.scope_id,
-            &metadata.content_fingerprint,
-            device_identity.as_ref(),
-        ),
-        metadata.content_fingerprint,
-        record_catalog.stored(repository)?,
-        asset_catalog.stored(repository)?,
-        device_catalog
-            .as_ref()
-            .map(|catalog| catalog.stored(repository))
-            .transpose()?,
-        device_identity,
-        device_sections.clone(),
-    )
-    .map_err(corrupt)?;
-    let max_snapshot = usize::try_from(
-        max_plaintext(
-            limits,
-            &metadata.repository_id,
-            &format!("snapshot-{}", metadata.snapshot_id),
-            wire::ObjectRole::Snapshot,
-        )?
-        .min(wire::MAX_METADATA_BYTES as u64),
-    )
-    .map_err(corrupt)?;
-    let bytes = document.encode(max_snapshot).map_err(corrupt)?;
+        }
+        SnapshotPurpose::BackupBundle {
+            source,
+            remote_generation,
+        } => {
+            let document = wire_control::BackupBundleDocument::new(
+                metadata.repository_id.clone(),
+                metadata.snapshot_id.clone(),
+                source,
+                metadata.created_at_ms,
+                Some(Sequence::from(metadata.logical_revision)),
+                None,
+                remote_generation,
+                library,
+                std::collections::BTreeMap::new(),
+            )
+            .map_err(corrupt)?;
+            let max_bundle = max_document_bytes(limits, &metadata.repository_id, &metadata.snapshot_id, wire::ObjectRole::BackupBundle)?;
+            (
+                document.encode(max_bundle).map_err(corrupt)?,
+                document.bundle_fingerprint,
+                document.sections,
+                ObjectRole::BackupBundle,
+            )
+        }
+    };
     let metadata_key =
         derive_key(root_key, &metadata.repository_id, "metadata").map_err(corrupt)?;
     let mut file = tempfile::NamedTempFile::new_in(&build_root).map_err(transient)?;
@@ -1607,7 +1551,7 @@ pub(crate) async fn package_and_upload_with_device(
         bytes.len() as u64,
         hash(&bytes),
         format!("snapshot-{}", metadata.snapshot_id),
-        ObjectRole::Snapshot,
+        role,
         &metadata.repository_id,
         &metadata_key,
         limits,
@@ -1624,20 +1568,12 @@ pub(crate) async fn package_and_upload_with_device(
         reference,
         snapshot_id: metadata.snapshot_id,
         repository_id: metadata.repository_id,
-        scope_id: hex::encode(metadata.scope_id),
-        library_scope_id: hex::encode(metadata.library_scope_id),
-        fingerprint: hex::encode(wire::combine_content_fingerprint(
-            &metadata.scope_id,
-            &metadata.content_fingerprint,
-            device_identity.as_ref(),
-        )),
+        fingerprint: hex::encode(fingerprint),
         library_fingerprint: hex::encode(metadata.content_fingerprint),
         logical_revision: metadata.logical_revision,
         record_catalog,
         asset_catalog,
-        device_catalog,
-        device_identity: device_identity.map(hex::encode),
-        device_sections,
+        sections,
         referenced_objects: referenced,
     })
 }
@@ -1647,7 +1583,6 @@ mod tests {
     use super::*;
     use crate::{
         external_storage::{
-            device_capture::{self, DeviceFile},
             fake::{self, FakeProvider},
             journal::JobIdentity,
             snapshot_restore,
@@ -1790,10 +1725,13 @@ mod tests {
             author_device_id: capture.identity.store_id.clone(),
             created_at_ms: 1,
             logical_revision: capture.identity.revision as u64,
-            scope_id: [9; 32],
-            library_scope_id: [9; 32],
+            purpose: SnapshotPurpose::SyncState {
+                epoch: "epoch".into(),
+                generation: risunest_sync_wire::head::Sequence::from(1u64),
+                parent_sections: std::collections::BTreeMap::new(),
+            },
             parent_snapshot_id: None,
-            content_fingerprint: capture.catalog.content_fingerprint(&[9; 32]).unwrap(),
+            content_fingerprint: capture.catalog.content_fingerprint(&library_fingerprint_domain()).unwrap(),
         }
     }
 
@@ -1817,95 +1755,6 @@ mod tests {
             sdk_overhead_bytes: 0,
             target_plaintext_bytes: max,
         }
-    }
-
-    fn synthetic_device_snapshot(root: &Path) -> DeviceSnapshot {
-        let directory = root.join("synthetic-device");
-        fs::create_dir(&directory).unwrap();
-        let blob_bytes = b"synthetic safe plugin binary";
-        let blob_hash = hash(blob_bytes);
-        let blob_path = directory.join(hex::encode(blob_hash));
-        fs::write(&blob_path, blob_bytes).unwrap();
-        // This neighboring value models an excluded credential source. It is
-        // deliberately absent from the immutable device catalog and inventory.
-        fs::write(
-            directory.join("excluded-secret"),
-            b"never-package-this-token",
-        )
-        .unwrap();
-        let catalog_path = directory.join("device.sqlite");
-        let db = Connection::open(&catalog_path).unwrap();
-        db.execute_batch(
-            "CREATE TABLE device_sections(section TEXT PRIMARY KEY,schema_version INTEGER NOT NULL,included INTEGER NOT NULL,complete INTEGER NOT NULL,present INTEGER NOT NULL,record_count INTEGER NOT NULL,sha256 TEXT NOT NULL);
-             CREATE TABLE device_records(section TEXT NOT NULL,ordinal INTEGER NOT NULL,metadata TEXT NOT NULL,PRIMARY KEY(section,ordinal));
-             CREATE TABLE device_objects(sha256 TEXT PRIMARY KEY,byte_length INTEGER NOT NULL);",
-        )
-        .unwrap();
-        let section = "local-storage";
-        let metadata = r#"{"present":true,"profile":"risunest.device-section/v1","sectionId":"local-storage"}"#;
-        let row = format!(
-            r#"{{"kind":"value","key":"0073006100660065005f0070006c007500670069006e005f006b00650079","value":{{"version":1,"root":0,"nodes":[{{"type":"blob","reference":"{}","byteLength":{}}}]}}}}"#,
-            hex::encode(blob_hash),
-            blob_bytes.len()
-        );
-        let mut section_digest = Sha256::new();
-        section_digest.update(b"RisuNest-device-section-v1\0");
-        section_digest.update((metadata.len() as u64).to_le_bytes());
-        section_digest.update(metadata.as_bytes());
-        section_digest.update(0u64.to_le_bytes());
-        section_digest.update((row.len() as u64).to_le_bytes());
-        section_digest.update(row.as_bytes());
-        let section_hash: [u8; 32] = section_digest.finalize().into();
-        db.execute(
-            "INSERT INTO device_sections VALUES(?1,1,1,1,1,1,?2)",
-            params![section, hex::encode(section_hash)],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO device_records VALUES(?1,-1,?2)",
-            params![section, metadata],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO device_records VALUES(?1,0,?2)",
-            params![section, row],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO device_objects VALUES(?1,?2)",
-            params![hex::encode(blob_hash), blob_bytes.len() as i64],
-        )
-        .unwrap();
-        drop(db);
-        let mut catalog = crate::trust_boundary::open_regular_source(&catalog_path).unwrap();
-        let catalog_length = catalog.metadata().unwrap().len();
-        let catalog_hash = hash_reader(&mut catalog, catalog_length).unwrap();
-        let mut identity = Sha256::new();
-        identity.update(b"RisuNest-external-device-capture-v1\0");
-        identity.update((section.len() as u64).to_le_bytes());
-        identity.update(section.as_bytes());
-        identity.update(section_hash);
-        identity.update(blob_hash);
-        identity.update((blob_bytes.len() as u64).to_le_bytes());
-        let device_identity: [u8; 32] = identity.finalize().into();
-        device_capture::verify_snapshot(DeviceSnapshot {
-            capture_id: hex::encode(device_identity),
-            device_identity,
-            sqlite: DeviceFile {
-                section_id: "device/catalog".into(),
-                content_hash: catalog_hash,
-                byte_length: catalog_length,
-                path: catalog_path,
-            },
-            blobs: vec![DeviceFile {
-                section_id: format!("device/object/{}", hex::encode(blob_hash)),
-                content_hash: blob_hash,
-                byte_length: blob_bytes.len() as u64,
-                path: blob_path,
-            }],
-            sections: vec![section.into()],
-        })
-        .unwrap()
     }
 
     #[test]
@@ -2066,74 +1915,6 @@ mod tests {
     }
 
     #[test]
-    fn device_catalog_and_objects_round_trip_without_excluded_sources() {
-        runtime().block_on(async {
-            let root = tempfile::tempdir().unwrap();
-            let provider = FakeProvider::new(false);
-            let repository = fake::repository();
-            let key = [19; 32];
-            let device = synthetic_device_snapshot(root.path());
-            let expected_device_identity = device.device_identity;
-            let (capture, _) = captured(
-                root.path(),
-                "capture-device",
-                11,
-                b"record with device backup",
-                b"library asset",
-            );
-            let snapshot_metadata = metadata("snapshot-device", &capture);
-            let expected_library_fingerprint = snapshot_metadata.content_fingerprint;
-            let mut journal = journal(&root.path().join("job-device"), "job-device", &capture);
-            let completed = package_and_upload_with_device(
-                capture,
-                Some(device),
-                root.path(),
-                &root.path().join("package-cache"),
-                snapshot_metadata,
-                &key,
-                limits(128 * 1024),
-                &mut journal,
-                &provider,
-                &repository,
-                &Cancellation::default(),
-            )
-            .await
-            .unwrap();
-            assert_eq!(
-                completed.device_identity.as_deref(),
-                Some(hex::encode(expected_device_identity).as_str())
-            );
-            assert_eq!(completed.device_sections, vec!["local-storage"]);
-            assert_eq!(
-                completed.fingerprint,
-                hex::encode(wire::combine_content_fingerprint(
-                    &[9; 32],
-                    &expected_library_fingerprint,
-                    Some(&expected_device_identity),
-                ))
-            );
-            let restored = snapshot_restore::download_snapshot(
-                &completed.reference,
-                &root.path().join("restore-device"),
-                &key,
-                &provider,
-                &repository,
-                &Cancellation::default(),
-            )
-            .await
-            .unwrap();
-            let restored_device = restored.device.unwrap();
-            assert_eq!(restored_device.device_identity, expected_device_identity);
-            assert_eq!(restored_device.sections, vec!["local-storage"]);
-            assert_eq!(restored.device_sections, restored_device.sections);
-            assert!(!fs::read(restored_device.sqlite.path)
-                .unwrap()
-                .windows(b"never-package-this-token".len())
-                .any(|window| window == b"never-package-this-token"));
-        });
-    }
-
-    #[test]
     fn stable_job_object_id_rejects_changed_plaintext_after_completed_spool_cleanup() {
         runtime().block_on(async {
             let root = tempfile::tempdir().unwrap();
@@ -2154,7 +1935,7 @@ mod tests {
                 24,
                 hash(b"first immutable snapshot"),
                 "snapshot-stable".into(),
-                ObjectRole::Snapshot,
+                ObjectRole::SyncState,
                 "format-repository",
                 &key,
                 limits(128 * 1024),
@@ -2173,7 +1954,7 @@ mod tests {
                 24,
                 hash(b"other immutable snapshot"),
                 "snapshot-stable".into(),
-                ObjectRole::Snapshot,
+                ObjectRole::SyncState,
                 "format-repository",
                 &key,
                 limits(128 * 1024),

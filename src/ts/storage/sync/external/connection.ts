@@ -4,9 +4,9 @@ import type {
     ExternalHistoryItem,
     ExternalConflictSummary,
     ExternalOpenMode,
+    ExternalCapturePolicy,
     ExternalProviderId,
     ExternalPublicationStrategy,
-    ExternalStorageScope,
     PrepareExternalConnectionRequest,
 } from './types'
 import { buildConnectionConfig, getExternalProviderDefinition } from './providerRegistry'
@@ -14,13 +14,12 @@ import { buildConnectionConfig, getExternalProviderDefinition } from './provider
 export const SEQUENTIAL_ACKNOWLEDGEMENT = 'sequential-single-device'
 export const GITHUB_DEDICATED_REPOSITORY_ACKNOWLEDGEMENT = 'github-dedicated-private-repository'
 
-export function defaultExternalStorageScope(purpose: ExternalConnectionPurpose): ExternalStorageScope {
-    return {
-        library: true,
-        referencedAssets: true,
-        deviceSettings: purpose === 'backup',
-        devicePlugins: false,
-    }
+/** Backup connections start with everything the device can contribute. */
+export function defaultExternalCapturePolicy(
+    purpose: ExternalConnectionPurpose,
+): ExternalCapturePolicy | undefined {
+    if (purpose !== 'backup') return undefined
+    return { hypa: true, localPlugins: true, localSettings: true }
 }
 
 export function requiredConnectionAcknowledgements(
@@ -41,7 +40,7 @@ export function buildPrepareConnectionRequest(options: {
     mode: ExternalOpenMode
     purpose: ExternalConnectionPurpose
     strategy: ExternalPublicationStrategy
-    scope: ExternalStorageScope
+    capturePolicy?: ExternalCapturePolicy
     acknowledgements: string[]
 }): PrepareExternalConnectionRequest {
     const definition = getExternalProviderDefinition(options.providerId)
@@ -51,8 +50,10 @@ export function buildPrepareConnectionRequest(options: {
         throw new Error('A synchronization connection needs a synchronization strategy.')
     if (options.purpose === 'backup' && options.strategy !== 'backup-only')
         throw new Error('A backup destination must use the backup-only strategy.')
-    if (options.purpose === 'sync' && (options.scope.deviceSettings || options.scope.devicePlugins))
-        throw new Error('A synchronization repository cannot include device-only sections.')
+    if (options.purpose === 'sync' && options.capturePolicy)
+        throw new Error('A synchronization connection does not carry a capture policy.')
+    if (options.purpose === 'backup' && !options.capturePolicy)
+        throw new Error('A backup connection needs a capture policy.')
     const missingAcknowledgement = requiredConnectionAcknowledgements(
         options.providerId,
         options.strategy,
@@ -64,7 +65,7 @@ export function buildPrepareConnectionRequest(options: {
         mode: options.mode,
         purpose: options.purpose,
         publicationStrategy: options.strategy,
-        scope: options.scope,
+        ...(options.capturePolicy ? { capturePolicy: { ...options.capturePolicy } } : {}),
         acknowledgements: [...options.acknowledgements],
     }
 }

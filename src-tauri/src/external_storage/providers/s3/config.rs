@@ -86,14 +86,16 @@ pub(crate) fn role_folder(role: ObjectRole) -> &'static str {
         ObjectRole::Descriptor => "descriptors",
         ObjectRole::Pack => "packs",
         ObjectRole::Catalog => "catalogs",
-        ObjectRole::Snapshot => "snapshots",
+        // A published state and a backup bundle share one collection. The
+        // authenticated envelope header, not the path, tells them apart.
+        ObjectRole::SyncState | ObjectRole::BackupBundle => "snapshots",
         ObjectRole::BackupPoint => "backup-points",
     }
 }
 
 pub(crate) fn collection_folder(collection: Collection) -> &'static str {
     match collection {
-        Collection::Snapshots => role_folder(ObjectRole::Snapshot),
+        Collection::Snapshots => role_folder(ObjectRole::SyncState),
         Collection::BackupPoints => role_folder(ObjectRole::BackupPoint),
         Collection::Descriptors => role_folder(ObjectRole::Descriptor),
     }

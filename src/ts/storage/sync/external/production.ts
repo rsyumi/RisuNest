@@ -6,7 +6,6 @@ import {
 import { subscribeLocalPersistentRevision } from '../../persistentRevisionEvents'
 import type { SyncExitDrainAdapter } from '../../syncExitCoordinator'
 import { getExternalStorageBridge } from './bridge'
-import { pendingExternalDeviceCaptureGroups } from './deviceSections'
 import {
     createExternalStorageController,
     type ExternalControllerResult,
@@ -50,43 +49,11 @@ function destinations(state: ExternalStorageState): ExternalScheduledDestination
     return result
 }
 
-async function resumeDeviceCaptureJobs(
-    state: ExternalStorageState,
-    session: ExternalExecutionSession,
-): Promise<void> {
-    const bridge = getExternalStorageBridge()
-    const groups = pendingExternalDeviceCaptureGroups(state)
-    const group = groups[0]
-    if (group) await bridge.prepareDeviceCapture(group)
-    const blocked = new Set(groups.slice(1).flatMap(item => item.map(consumer => consumer.jobId)))
-    const resumable = new Set([
-        ...(group?.map(consumer => consumer.jobId) ?? []),
-        ...state.jobs
-            .filter(job => job.kind === 'backup' && job.state === 'queued')
-            .map(job => job.id),
-    ])
-    const connections = new Set(
-        state.jobs
-            .filter(job => resumable.has(job.id) && !blocked.has(job.id))
-            .map(job => job.connectionId),
-    )
-    for (const connectionId of connections) {
-        await bridge.startJob({
-            connectionId,
-            kind: 'backup',
-            reason: 'manual',
-            session: session.kind,
-            sessionId: session.id,
-        })
-    }
-}
-
 async function refreshForeground(current: ProductionRuntime): Promise<void> {
     const bridge = getExternalStorageBridge()
     current.session = newSession('foreground')
     await bridge.setExecutionSession(current.session)
     const state = await bridge.getState()
-    await resumeDeviceCaptureJobs(state, current.session)
     current.state = state
     current.controller.replaceState(state)
     const token = await capturePersistentMutationToken('external-storage-foreground')
@@ -150,7 +117,6 @@ export function installExternalStorageProduction(): Promise<() => void> {
         const session = newSession('foreground')
         await bridge.setExecutionSession(session)
         const state = await bridge.getState()
-        await resumeDeviceCaptureJobs(state, session)
         const holder: { current?: ProductionRuntime } = {}
         const controller = createExternalStorageController(bridge, state, {
             applyReceived: async job => {
@@ -307,7 +273,7 @@ function restoreFailure(job: ExternalJobSummary): Error {
 export async function requestExternalStorageRestore(
     connectionId: string,
     snapshotId: string,
-    restoreAreas: Array<'library' | 'referencedAssets' | 'deviceSettings' | 'devicePlugins'>,
+    restoreAreas: Array<'library' | 'referencedAssets'>,
 ): Promise<ExternalJobSummary> {
     const current = runtime
     if (!current) throw new Error('External storage production is not installed')
