@@ -1,6 +1,7 @@
 use super::{
-    active_generation, compare_plugin_storage_keys, current_revision, AnchorOccurrence, AssetAlias,
-    AssetAliasListQuery, AssetAliasPage, AssetOwnerHead, AssetOwnerLocator,
+    active_generation, compare_plugin_storage_keys, current_revision, AnchorOccurrence,
+    ArchivedCharacterSummary, AssetAlias, AssetAliasListQuery, AssetAliasPage, AssetOwnerHead,
+    AssetOwnerLocator,
     AssetRepositoryAuthorityState, CharacterPage, CharacterQuery, CharacterSummary, ColdAlias,
     ColdPayloadAuthorityState, ConversationPage, ConversationQuery, ConversationSummary,
     ConversationWindow, ConversationWindowQuery, PluginStorageCatalog, PluginStorageSummary,
@@ -576,7 +577,7 @@ pub(super) fn query_characters(
         .map(str::to_lowercase);
     let mut statement = connection.prepare(&format!(
         "SELECT character_id, name, image, configured_index, recent_at, trashed, conversation_count,
-                type, creator_notes, trash_time
+                type, creator_notes, trash_time, archived_object
          FROM characters
          WHERE generation = ?1 AND trashed = ?2
          ORDER BY {order}"
@@ -586,6 +587,18 @@ pub(super) fn query_characters(
     let mut matched = 0;
     let mut has_more = false;
     while let Some(row) = rows.next()? {
+        let archived = row
+            .get::<_, Option<String>>(10)?
+            .map(|stored| {
+                serde_json::from_str::<super::archive::ArchivedObject>(&stored).map(|archived| {
+                    ArchivedCharacterSummary {
+                        archived_at: archived.archived_at,
+                        conversation_count: archived.conversation_count,
+                        message_count: archived.message_count,
+                    }
+                })
+            })
+            .transpose()?;
         let summary = CharacterSummary {
             id: row.get(0)?,
             name: row.get(1)?,
@@ -597,6 +610,7 @@ pub(super) fn query_characters(
             r#type: row.get(7)?,
             creator_notes: row.get(8)?,
             trash_time: row.get(9)?,
+            archived,
         };
         if search
             .as_ref()
@@ -627,21 +641,26 @@ pub(super) fn read_character(
     id: &str,
     target: &ReadTarget,
 ) -> StoreResult<Option<Versioned<Value>>> {
-    let detail: Option<String> = connection
+    let row: Option<(String, Option<String>)> = connection
         .query_row(
-            "SELECT detail FROM characters WHERE generation = ?1 AND character_id = ?2",
+            "SELECT detail, archived_object FROM characters
+             WHERE generation = ?1 AND character_id = ?2",
             params![target.generation, id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    detail
-        .map(|detail| {
-            Ok(Versioned {
-                revision: target.revision,
-                value: serde_json::from_str(&detail)?,
-            })
-        })
-        .transpose()
+    let Some((detail, archived_object)) = row else {
+        return Ok(None);
+    };
+    // Failing is safer than handing back the marker that stands in for the
+    // archived detail.
+    if archived_object.is_some() {
+        return Err(super::archive::archived_error(id));
+    }
+    Ok(Some(Versioned {
+        revision: target.revision,
+        value: serde_json::from_str(&detail)?,
+    }))
 }
 
 pub(super) fn query_conversations(
@@ -961,7 +980,8 @@ fn materialize_generation(connection: &Connection, generation: &str) -> StoreRes
     let character_records = {
         let mut statement = connection.prepare(
             "SELECT character_id, detail FROM characters
-             WHERE generation = ?1 ORDER BY configured_index ASC",
+             WHERE generation = ?1 AND archived_object IS NULL
+             ORDER BY configured_index ASC",
         )?;
         let rows = statement.query_map([&generation], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))

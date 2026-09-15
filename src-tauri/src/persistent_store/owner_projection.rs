@@ -51,9 +51,20 @@ impl OwnerManifestProjector {
                 let repository_root = persistent_dir.parent().ok_or_else(|| {
                     validation("owner manifest projection cannot locate the repository root")
                 })?;
+                // Archived characters leave the projection entirely, so their
+                // retained owner head must not reach it either.
+                let archived = super::archive::archived_character_ids(connection, &target.generation)?
+                    .into_iter()
+                    .collect::<HashSet<_>>();
                 let heads = query::list_asset_owner_heads(connection, target)?
                     .value
                     .into_iter()
+                    .filter(|head| match &head.owner {
+                        AssetOwnerLocator::CharacterAdditionalAssets { character_id } => {
+                            !archived.contains(character_id)
+                        }
+                        _ => true,
+                    })
                     .map(|head| (head.owner.clone(), head))
                     .collect();
                 Ok(Self {

@@ -1,5 +1,6 @@
 use super::{
-    active_generation, asset_object_catalog, current_revision, hash_exact_file, schema, snapshot,
+    active_generation, archive, asset_object_catalog, current_revision, hash_exact_file, schema,
+    snapshot,
     AnchorOccurrence, AssetAlias, AssetAliasListQuery, AssetOwnerHead, AssetOwnerLocator,
     AssetRepositoryAuthorityState, CharacterQuery, CheckpointMode, ColdAlias,
     ColdPayloadAuthorityState, ColdPayloadMigrationInput, ConversationMutation, ConversationPage,
@@ -120,6 +121,8 @@ fn stage_root(store: &mut PersistentStore, username: &str) -> String {
     staging.staging_id
 }
 
+#[path = "tests/archive_tests.rs"]
+mod archive_tests;
 #[path = "tests/asset_alias_tests.rs"]
 mod asset_alias_tests;
 #[path = "tests/asset_catalog_gc_tests.rs"]

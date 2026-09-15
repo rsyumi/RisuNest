@@ -43,6 +43,7 @@ pub(crate) const TABLES: &[PortableTable] = &[
             ("creator_notes", "TEXT"),
             ("trash_time", "INTEGER"),
             ("detail", "TEXT"),
+            ("archived_object", "TEXT"),
         ],
         order: "character_id",
     },

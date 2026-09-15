@@ -143,6 +143,7 @@ pub(crate) struct ExportedRisuSave {
     pub(crate) bytes: u64,
     pub(crate) character_count: u64,
     pub(crate) preset_count: u64,
+    pub(crate) excluded_archived_character_count: u64,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -349,6 +350,8 @@ fn create_controlled_inner(
     }
 
     let character_ids = character_ids(connection, &target.generation)?;
+    let excluded_archived_character_count =
+        super::archive::archived_character_ids(connection, &target.generation)?.len() as u64;
     owner_projector.validate_character_owners(&character_ids.iter().cloned().collect())?;
     let preset_count = preset_count(connection, &target.generation)?;
     let total_items = character_ids.len() as u64 + 7;
@@ -493,6 +496,7 @@ fn create_controlled_inner(
         bytes,
         character_count: character_ids.len() as u64,
         preset_count,
+        excluded_archived_character_count,
     })
 }
 
@@ -879,10 +883,13 @@ impl<F: Fn() -> bool> Write for CancellationAwareWriter<'_, F> {
     }
 }
 
+// One enumerator serves the RisuSave export and the official account projection,
+// so an archived character cannot reach either as a marker-only shell.
 fn character_ids(connection: &Connection, generation: &str) -> StoreResult<Vec<String>> {
     let mut statement = connection.prepare(
         "SELECT character_id FROM characters
-         WHERE generation = ?1 ORDER BY configured_index ASC",
+         WHERE generation = ?1 AND archived_object IS NULL
+         ORDER BY configured_index ASC",
     )?;
     let ids = statement
         .query_map([generation], |row| row.get(0))?
@@ -1987,6 +1994,121 @@ mod tests {
             source_blocks[5].value["prose"],
             json!("prefix assets/plugin.bin")
         );
+    }
+
+    fn archived_fixture() -> (TempDir, PersistentStore, i64, String) {
+        let directory = TempDir::new().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let staging = store.replace_begin().unwrap().staging_id;
+        store
+            .replace_put_root(
+                &staging,
+                &json!({
+                    "username": "Archive Export",
+                    "account": { "id": "account-1", "token": "secret" },
+                    "modules": [],
+                    "loadouts": [],
+                    "plugins": []
+                }),
+            )
+            .unwrap();
+        store.replace_put_presets(&staging, &[]).unwrap();
+        store
+            .replace_add_characters(
+                &staging,
+                &[
+                    json!({
+                        "type": "character",
+                        "chaId": "kept",
+                        "name": "Kept",
+                        "chats": [{ "id": "kept-chat", "name": "Kept Chat", "message": [] }]
+                    }),
+                    json!({
+                        "type": "character",
+                        "chaId": "archived",
+                        "name": "Archived",
+                        "chats": [{
+                            "id": "archived-chat",
+                            "name": "Archived Chat",
+                            "message": [{ "role": "user", "data": "hidden", "chatId": "a1" }]
+                        }]
+                    }),
+                ],
+            )
+            .unwrap();
+        let revision = store.replace_commit(&staging, None).unwrap().revision;
+        store.archive_character("archived", revision, 10).unwrap();
+        let revision = store.revision().unwrap();
+        let lease = store.acquire_revision(revision).unwrap().lease;
+        (directory, store, revision, lease)
+    }
+
+    /// Invariant 10. The export reads `detail` straight from SQL, so the marker
+    /// can only be kept out by leaving the character out of the enumeration.
+    #[test]
+    fn a_risu_save_export_omits_archived_characters_and_their_marker() {
+        let (_directory, store, _revision, lease) = archived_fixture();
+        let exported = store.export_risu_save(&lease, false).unwrap();
+        assert_eq!(exported.character_count, 1);
+        assert_eq!(exported.excluded_archived_character_count, 1);
+
+        let blocks = read_blocks(Path::new(&exported.path));
+        let characters = blocks
+            .iter()
+            .filter(|block| block.block_type == CHARACTER_WITH_CHAT)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            characters
+                .iter()
+                .map(|block| block.name.as_str())
+                .collect::<Vec<_>>(),
+            ["kept"]
+        );
+        for block in &blocks {
+            assert!(
+                !block.value.to_string().contains("risuNestArchived"),
+                "block {} leaks the archive marker",
+                block.name
+            );
+        }
+    }
+
+    /// Invariant 4. The account projection has its own entry point, and the
+    /// shared enumeration is what keeps the archive out of both.
+    #[cfg(feature = "native-official-publication")]
+    #[test]
+    fn the_official_account_projection_omits_archived_characters() {
+        let (_directory, store, _revision, lease) = archived_fixture();
+        let (connection, target) = store.read_view(Some(&lease)).unwrap();
+        let exported = create_projected_controlled_for_account(
+            connection,
+            &store.snapshots_dir,
+            &target,
+            &lease,
+            "account-1",
+            &HashMap::new(),
+            || false,
+            |_, _, _| {},
+        )
+        .unwrap();
+        assert_eq!(exported.character_count, 1);
+        assert_eq!(exported.excluded_archived_character_count, 1);
+
+        let blocks = read_blocks(Path::new(&exported.path));
+        let characters = blocks
+            .iter()
+            .filter(|block| block.block_type == CHARACTER_WITH_CHAT)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            characters
+                .iter()
+                .map(|block| block.name.as_str())
+                .collect::<Vec<_>>(),
+            ["kept"]
+        );
+        assert!(characters
+            .iter()
+            .all(|block| !block.value.to_string().contains("risuNestArchived")));
     }
 
     #[test]
