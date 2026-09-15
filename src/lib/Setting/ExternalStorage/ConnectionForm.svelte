@@ -33,6 +33,7 @@
     } from 'src/ts/storage/sync/external/types'
     import {
         externalEndpointWarning,
+        externalErrorMessage,
         externalFieldHelp,
         externalFieldLabel,
         externalOptionLabel,
@@ -125,8 +126,8 @@
     onMount(async () => {
         try {
             providerDescriptors = await bridge.listProviders()
-        } catch {
-            error = strings.failed
+        } catch (reason) {
+            error = externalErrorMessage(strings, reason)
         }
     })
     onDestroy(() => {
@@ -163,7 +164,7 @@
             authorizationStatus = ''
             return true
         }
-        error = strings.failed
+        error = strings.errorGeneric
         return false
     }
 
@@ -261,8 +262,8 @@
         }
         try {
             prepared = await bridge.prepareConnection(request)
-        } catch {
-            error = strings.failed
+        } catch (reason) {
+            error = externalErrorMessage(strings, reason, strategy)
         } finally {
             busy = false
         }
@@ -274,8 +275,8 @@
         try {
             prepared = await bridge.prepareRecoveryImport(recoveryPayload.trim(), recoveryCode.trim())
             providerId = prepared.endpoint.providerId
-        } catch {
-            error = strings.failed
+        } catch (reason) {
+            error = externalErrorMessage(strings, reason)
         } finally {
             busy = false
         }
@@ -330,9 +331,9 @@
             if (!secret) throw new Error('This provider requires OAuth authorization.')
             await onconnected(await bridge.commitConnection(prepared.preparationId, secret))
             for (const field of definition.secretFields) values[field.key] = ''
-        } catch {
+        } catch (reason) {
             await cancelPendingAuthorization()
-            error = strings.failed
+            error = externalErrorMessage(strings, reason, strategy)
         } finally {
             busy = false
         }

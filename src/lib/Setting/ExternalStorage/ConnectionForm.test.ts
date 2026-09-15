@@ -5,6 +5,7 @@ import { mount, tick, unmount } from 'svelte'
 const state = vi.hoisted(() => ({
     listProviders: vi.fn(),
     prepareConnection: vi.fn(),
+    commitConnection: vi.fn(),
     beginAuthorization: vi.fn(),
     completeAuthorization: vi.fn(),
     cancelAuthorization: vi.fn(),
@@ -21,6 +22,7 @@ vi.mock('src/ts/storage/sync/external/bridge', () => ({
     getExternalStorageBridge: () => ({
         listProviders: state.listProviders,
         prepareConnection: state.prepareConnection,
+        commitConnection: state.commitConnection,
         beginAuthorization: state.beginAuthorization,
         completeAuthorization: state.completeAuthorization,
         cancelAuthorization: state.cancelAuthorization,
@@ -273,5 +275,50 @@ describe('synchronization mode defaults', () => {
 
         expect(() => button(strings.strategyLabels.cas)).toThrow()
         expect(button(strings.strategyLabels.sequential).getAttribute('aria-checked')).toBe('true')
+    })
+})
+
+describe('native failure messages', () => {
+    it('names the refused strategy when a repository cannot do concurrent-use protection', async () => {
+        component = mount(ConnectionForm, {
+            target,
+            props: { strings, onconnected: vi.fn(), oncancel: vi.fn() },
+        })
+        await settle()
+        await selectProvider('s3')
+        button(strings.sync).click()
+        await settle()
+
+        state.prepareConnection.mockResolvedValueOnce({
+            ...prepared,
+            requiresOAuth: false,
+            endpoint: { ...prepared.endpoint, providerId: 's3', authority: 's3.test' },
+        })
+        button(strings.prepare).click()
+        await settle()
+        labelControl<HTMLInputElement>(strings.confirmEndpoint).click()
+        await settle()
+
+        state.commitConnection.mockRejectedValueOnce({ kind: 'unsupported', httpStatus: null, retryAtMs: null })
+        button(strings.connect).click()
+        await settle()
+
+        expect(target.textContent).toContain(strings.casUnsupported)
+    })
+
+    it('reports a rejected sign-in instead of a bare failure', async () => {
+        component = mount(ConnectionForm, {
+            target,
+            props: { strings, onconnected: vi.fn(), oncancel: vi.fn() },
+        })
+        await settle()
+        await beginGoogleAuthorization()
+
+        state.completeAuthorization.mockRejectedValueOnce({ kind: 'unauthorized', httpStatus: 401, retryAtMs: null })
+        button(strings.finishSignIn).click()
+        await settle()
+
+        await vi.waitFor(() => expect(target.textContent).toContain(strings.credentialsRejected))
+        expect(target.textContent).not.toContain(strings.casUnsupported)
     })
 })

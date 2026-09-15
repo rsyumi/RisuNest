@@ -71,6 +71,7 @@ export const externalProviderDefinitions: ExternalProviderDefinition[] = [
         ], secretFields: [], strategies: ['sequential', 'backup-only'],
     },
     {
+        // No CAS: Graph has no conditional update on the content PUT used for a head.
         id: 'onedrive', oauth: true, customEndpoint: false,
         defaultEndpoint: 'https://graph.microsoft.com/v1.0', profiles: [],
         fields: [
@@ -82,7 +83,7 @@ export const externalProviderDefinitions: ExternalProviderDefinition[] = [
             { key: 'redirectUri', required: true, location: true },
             { key: 'projectId', required: true },
             { key: 'clientId', required: true },
-        ], secretFields: [], strategies: ['cas', 'sequential', 'backup-only'],
+        ], secretFields: [], strategies: ['sequential', 'backup-only'],
     },
     {
         id: 'mybox', oauth: false, customEndpoint: false,

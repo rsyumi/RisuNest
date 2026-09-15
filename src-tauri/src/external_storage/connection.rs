@@ -266,11 +266,12 @@ pub(crate) fn provider_descriptors() -> Vec<ProviderDescriptor> {
             &["sequential", "backup-only"],
             &["drive"],
         ),
+        // No CAS: Graph has no conditional update on the content PUT used for a head.
         provider(
             "onedrive",
             "OneDrive",
             true,
-            &["cas", "sequential", "backup-only"],
+            &["sequential", "backup-only"],
             &[],
         ),
         provider(

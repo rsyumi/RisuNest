@@ -1,4 +1,8 @@
-import type { ExternalConnectionSummary, ExternalProviderId } from 'src/ts/storage/sync/external/types'
+import type {
+    ExternalConnectionSummary,
+    ExternalProviderId,
+    ExternalPublicationStrategy,
+} from 'src/ts/storage/sync/external/types'
 
 const english = {
     title: 'External storage',
@@ -60,6 +64,16 @@ const english = {
     unlockKey: 'Enter the recovery key to use this repository.',
     resolveRequired: 'Resolve the conflict first. The Conflicts tab lets you choose which side to keep.',
     freeSpace: 'The repository is out of space. Free space on the service and try again.',
+    credentialsRejected: 'The service did not accept this sign-in or key. Check what you entered and try again.',
+    repositoryNotFound: 'Could not find the repository. Check the folder, bucket and address.',
+    stateChanged: 'The repository changed while this was running. Refresh and try again.',
+    requestBudget: 'The service request limit was reached. Try again later.',
+    objectTooLarge: 'A file is larger than this service allows.',
+    corrupted: 'The stored data did not pass verification. Choose another backup or connect the repository again.',
+    unsupportedOperation: 'This repository cannot do that.',
+    casUnsupported: 'This repository does not support concurrent-use protection. Change the synchronization mode to one device at a time and try again.',
+    interrupted: 'This stopped before it finished. Try again.',
+    errorGeneric: 'Could not complete this. Try again.',
     oldDriveNote: 'Google Drive backup here uses the official RisuAI account method. To back up to your own Drive folder or another cloud, use External storage in the RisuNest tab.',
     jobKinds: { backup: 'Backup', sync: 'Sync', restore: 'Restore', 'pin-history': 'Keep', 'resolve-conflict': 'Resolve conflict' },
     jobActive: { backup: 'Backing up', sync: 'Syncing', restore: 'Restoring', 'pin-history': 'Keeping', 'resolve-conflict': 'Resolving conflict' },
@@ -74,7 +88,7 @@ const english = {
         webdav: { name: 'WebDAV / Koofr', description: 'Connects to an HTTPS WebDAV folder with an application password.', strategyNote: 'Concurrent-use protection can be chosen only after this server has been confirmed to support it.' },
         s3: { name: 'S3-compatible storage', description: 'Uses an S3-compatible bucket such as Cloudflare R2, Backblaze B2 or Hugging Face.' },
         google_drive: { name: 'Google Drive', description: 'Signs in with a Google account and uses a Drive folder or the hidden app data space.', warningTitle: 'Google Drive synchronization works one device at a time', warning: 'If you choose the hidden app data space, deleting the app data in Drive also deletes the backups.' },
-        onedrive: { name: 'OneDrive', description: 'Signs in with a Microsoft account and uses a personal, work or app-only folder.', strategyNote: 'Concurrent-use protection can be chosen only after this connection has been confirmed to support it.' },
+        onedrive: { name: 'OneDrive', description: 'Signs in with a Microsoft account and uses a personal, work or app-only folder.' },
         mybox: { name: 'NAVER MYBOX', description: 'Uses a MYBOX personal access token and a dedicated folder.' },
         github_releases: { name: 'GitHub Releases', description: 'Uploads encrypted backups to draft releases in a private repository. Backup only.' },
         gitlab_packages: { name: 'GitLab packages', description: 'Uploads encrypted backups to a dedicated package registry. Backup only.', warningTitle: 'GitLab cleanup policies can delete backups', warning: 'Keep package cleanup policies off for this project.' },
@@ -165,6 +179,16 @@ const korean: typeof english = {
     unlockKey: '복구 키를 입력해야 이 저장소를 쓸 수 있습니다.',
     resolveRequired: '충돌을 먼저 해결하세요. 충돌 탭에서 어느 쪽을 남길지 고를 수 있습니다.',
     freeSpace: '저장소 공간이 부족합니다. 서비스에서 공간을 확보한 뒤 다시 시도하세요.',
+    credentialsRejected: '서비스가 이 로그인이나 키를 받아들이지 않았습니다. 입력한 내용을 확인하고 다시 시도하세요.',
+    repositoryNotFound: '저장소를 찾지 못했습니다. 폴더·버킷과 주소를 확인하세요.',
+    stateChanged: '작업하는 사이에 저장소가 바뀌었습니다. 새로 고침한 뒤 다시 시도하세요.',
+    requestBudget: '서비스의 요청 한도에 걸렸습니다. 잠시 뒤 다시 시도하세요.',
+    objectTooLarge: '이 서비스가 허용하는 크기보다 큰 파일이 있습니다.',
+    corrupted: '저장된 데이터가 검증을 통과하지 못했습니다. 다른 백업을 고르거나 저장소를 다시 연결하세요.',
+    unsupportedOperation: '이 저장소에서는 할 수 없는 작업입니다.',
+    casUnsupported: '이 저장소는 동시 사용 보호를 지원하지 않습니다. 동기화 방식을 한 기기씩 사용으로 바꾼 뒤 다시 시도하세요.',
+    interrupted: '끝나기 전에 멈췄습니다. 다시 시도하세요.',
+    errorGeneric: '작업을 마치지 못했습니다. 다시 시도하세요.',
     oldDriveNote: '여기의 Google Drive 백업은 RisuAI 공식 계정 방식입니다. 내 Drive 폴더나 다른 클라우드에 백업하려면 RisuNest 탭의 외부 저장소를 쓰세요.',
     jobKinds: { backup: '백업', sync: '동기화', restore: '복원', 'pin-history': '보관', 'resolve-conflict': '충돌 해결' },
     jobActive: { backup: '백업 중', sync: '동기화 중', restore: '복원 중', 'pin-history': '보관 중', 'resolve-conflict': '충돌 해결 중' },
@@ -179,7 +203,7 @@ const korean: typeof english = {
         webdav: { name: 'WebDAV / Koofr', description: 'HTTPS WebDAV 폴더에 앱 비밀번호로 연결합니다.', strategyNote: '동시 사용 보호는 이 서버가 지원하는지 확인한 뒤에만 고를 수 있습니다.' },
         s3: { name: 'S3 호환 저장소', description: 'Cloudflare R2, Backblaze B2, Hugging Face 같은 S3 호환 버킷을 씁니다.' },
         google_drive: { name: 'Google Drive', description: 'Google 계정으로 로그인해 Drive 폴더나 숨겨진 앱 데이터 공간을 씁니다.', warningTitle: 'Google Drive 동기화는 한 기기씩만 가능합니다', warning: '숨겨진 앱 데이터 공간을 고른 경우, Drive에서 앱 데이터를 삭제하면 백업도 함께 지워집니다.' },
-        onedrive: { name: 'OneDrive', description: 'Microsoft 계정으로 로그인해 개인·회사·앱 전용 폴더를 씁니다.', strategyNote: '동시 사용 보호는 이 연결이 지원하는지 확인한 뒤에만 고를 수 있습니다.' },
+        onedrive: { name: 'OneDrive', description: 'Microsoft 계정으로 로그인해 개인·회사·앱 전용 폴더를 씁니다.' },
         mybox: { name: '네이버 MYBOX', description: 'MYBOX 개인 액세스 토큰과 전용 폴더를 씁니다.' },
         github_releases: { name: 'GitHub Releases', description: '비공개 저장소의 초안 릴리스에 암호화된 백업을 올립니다. 백업만 가능합니다.' },
         gitlab_packages: { name: 'GitLab 패키지', description: '전용 패키지 저장소에 암호화된 백업을 올립니다. 백업만 가능합니다.', warningTitle: 'GitLab의 정리 정책이 백업을 지울 수 있습니다', warning: '이 프로젝트에서는 패키지 정리 정책을 꺼 두세요.' },
@@ -242,6 +266,42 @@ export function externalProfileLabel(strings: ExternalStorageStrings, providerId
 
 export function externalEndpointWarning(strings: ExternalStorageStrings, code: string): string {
     return (strings.endpointWarnings as Record<string, string>)[code] ?? code
+}
+
+/** Native failure kind of a rejected command (`kind`) or of a job error DTO (`code`). */
+function externalErrorKind(value: unknown): string | undefined {
+    if (typeof value !== 'object' || value === null) return undefined
+    const carrier = value as { kind?: unknown; code?: unknown }
+    const kind = typeof carrier.kind === 'string' ? carrier.kind : carrier.code
+    return typeof kind === 'string' ? kind : undefined
+}
+
+/**
+ * Sentence for a failure the native side reported. `strategy` names the publication
+ * strategy a connection attempt asked for, so a refused capability says which one.
+ */
+export function externalErrorMessage(
+    strings: ExternalStorageStrings,
+    value: unknown,
+    strategy?: ExternalPublicationStrategy,
+): string {
+    const kind = externalErrorKind(value)
+    if (kind === 'unsupported' && strategy === 'cas') return strings.casUnsupported
+    switch (kind) {
+        case 'unauthorized': return strings.credentialsRejected
+        case 'reauthRequired': return strings.reauthenticate
+        case 'notFound': return strings.repositoryNotFound
+        case 'preconditionFailed': return strings.stateChanged
+        case 'rateLimited':
+        case 'dailyQuotaExhausted': return strings.requestBudget
+        case 'storageFull': return strings.freeSpace
+        case 'fileTooLarge': return strings.objectTooLarge
+        case 'corrupt': return strings.corrupted
+        case 'unsupported': return strings.unsupportedOperation
+        case 'cancelled': return strings.interrupted
+        case 'transient': return strings.retry
+        default: return strings.errorGeneric
+    }
 }
 
 /** Service name plus the account the native side reports, replacing the provider id in `displayName`. */

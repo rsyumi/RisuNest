@@ -23,7 +23,7 @@
         ExternalStorageState,
     } from 'src/ts/storage/sync/external/types'
     import ConnectionForm from './ConnectionForm.svelte'
-    import { externalConnectionTitle, externalStorageStrings } from './strings'
+    import { externalConnectionTitle, externalErrorMessage, externalStorageStrings } from './strings'
 
     const bridge = getExternalStorageBridge()
     const strings = $derived(externalStorageStrings(DBState.db.language))
@@ -59,8 +59,8 @@
         try {
             storageState = await bridge.getState()
             error = ''
-        } catch {
-            error = strings.failed
+        } catch (reason) {
+            error = externalErrorMessage(strings, reason)
         } finally {
             if (!silent) busy = false
         }
@@ -119,8 +119,8 @@
             }
             await refresh(true)
             schedulePoll()
-        } catch {
-            error = strings.failed
+        } catch (reason) {
+            error = externalErrorMessage(strings, reason)
         } finally {
             busy = false
         }
@@ -133,8 +133,8 @@
             const selection = await bridge.setSyncTarget(connection.id, storageState.selection.selectionEpoch)
             storageState = { ...storageState, selection }
             await refreshExternalStorageProductionState()
-        } catch {
-            error = strings.failed
+        } catch (reason) {
+            error = externalErrorMessage(strings, reason)
         } finally {
             busy = false
         }
@@ -150,8 +150,8 @@
             if (kind === 'history') await loadHistory(connection, false)
             if (kind === 'conflicts') conflicts[connection.id] = await bridge.listConflicts(connection.id)
             if (kind === 'quota') quota[connection.id] = await bridge.getQuota(connection.id)
-        } catch {
-            error = strings.failed
+        } catch (reason) {
+            error = externalErrorMessage(strings, reason)
         }
     }
 
@@ -169,8 +169,8 @@
             )
             historyCursor[connection.id] = page.nextCursor
             error = ''
-        } catch {
-            error = strings.failed
+        } catch (reason) {
+            error = externalErrorMessage(strings, reason)
         } finally {
             historyLoading[connection.id] = false
         }
@@ -183,8 +183,8 @@
             await bridge.removeConnection(connection.id)
             await refreshExternalStorageProductionState()
             await refresh(true)
-        } catch {
-            error = strings.failed
+        } catch (reason) {
+            error = externalErrorMessage(strings, reason)
         } finally {
             busy = false
         }
@@ -194,8 +194,8 @@
         await runJob(connection, 'sync')
         try {
             conflicts[connection.id] = await bridge.listConflicts(connection.id)
-        } catch {
-            error = strings.failed
+        } catch (reason) {
+            error = externalErrorMessage(strings, reason)
         }
     }
 
@@ -216,8 +216,8 @@
         busy = true
         try {
             await displayRecovery(await bridge.beginRecoveryExport(connection.id))
-        } catch {
-            error = strings.failed
+        } catch (reason) {
+            error = externalErrorMessage(strings, reason)
         } finally {
             busy = false
         }
@@ -227,8 +227,8 @@
         if (!recovery) return
         try {
             await bridge.saveRecoveryFile(recovery.recoveryId)
-        } catch {
-            error = strings.failed
+        } catch (reason) {
+            error = externalErrorMessage(strings, reason)
         }
     }
 
@@ -240,8 +240,8 @@
     async function exportSnapshot(connectionId: string, snapshotId: string): Promise<void> {
         try {
             await bridge.exportSnapshot(connectionId, snapshotId)
-        } catch {
-            error = strings.failed
+        } catch (reason) {
+            error = externalErrorMessage(strings, reason)
         }
     }
 
@@ -272,13 +272,9 @@
 
     function errorLabel(value?: ExternalJobSummary['error']): string {
         if (!value) return strings.failed
-        if (value.action === 'reauthenticate') return strings.reauthenticate
         if (value.action === 'unlock-key') return strings.unlockKey
         if (value.action === 'resolve-conflict') return strings.resolveRequired
-        if (value.action === 'free-space') return strings.freeSpace
-        if (value.action === 'wait') return strings.waiting
-        if (value.action === 'retry') return strings.retry
-        return strings.failed
+        return externalErrorMessage(strings, value)
     }
 
     function connectionStatusLabel(status: ExternalConnectionSummary['status']): string {
