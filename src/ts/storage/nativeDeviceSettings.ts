@@ -65,9 +65,16 @@ export async function createNativeDeviceSettingsBag(
     settings: NativeDeviceSettings,
     key: string,
 ): Promise<NativeDeviceSettingsBag> {
-    const values = readEntries(key, await settings.get(key))
     let tail = Promise.resolve()
     let failure: unknown = null
+    // A device file that cannot be read must not take the library with it. The
+    // bag starts empty and reports the failure at the first flush instead.
+    let values: Record<string, string> = {}
+    try {
+        values = readEntries(key, await settings.get(key))
+    } catch (error) {
+        failure = error
+    }
     const enqueue = (operation: () => Promise<void>): void => {
         const next = tail.then(operation, operation)
         tail = next.then(

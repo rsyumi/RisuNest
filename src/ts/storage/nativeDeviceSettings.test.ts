@@ -179,15 +179,37 @@ describe('native device settings', () => {
         expect(bag.storage.getItem('marker:two')).toBeNull()
     })
 
-    it('reports a stored value that does not hold entries', async () => {
+    it('reports a stored value that does not hold entries at the first flush', async () => {
         const settings: NativeDeviceSettings = {
             get: vi.fn(async () => ['not', 'entries']),
             set: vi.fn(async () => undefined),
             patch: vi.fn(async () => undefined),
         }
 
-        await expect(
-            createNativeDeviceSettingsBag(settings, 'official-account.association.v1'),
-        ).rejects.toThrow('does not hold entries')
+        const bag = await createNativeDeviceSettingsBag(
+            settings,
+            'official-account.association.v1',
+        )
+
+        expect(bag.storage.getItem('marker:one')).toBeNull()
+        await expect(bag.flush()).rejects.toThrow('does not hold entries')
+    })
+
+    it('starts empty and reports an unreadable device file without failing to open', async () => {
+        const settings: NativeDeviceSettings = {
+            get: vi.fn(async () => {
+                throw new Error('device store is unavailable')
+            }),
+            set: vi.fn(async () => undefined),
+            patch: vi.fn(async () => undefined),
+        }
+
+        const bag = await createNativeDeviceSettingsBag(
+            settings,
+            'official-account.asset-ledger.v1',
+        )
+
+        expect(bag.storage.getItem('officialPublishedAssets:account-1')).toBeNull()
+        await expect(bag.flush()).rejects.toThrow('device store is unavailable')
     })
 })
