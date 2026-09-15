@@ -1170,3 +1170,177 @@ mod tests {
         assert_eq!(statistics.max, 100);
     }
 }
+
+const HYPA_ENTRIES: usize = 1_000;
+const HYPA_DIMENSIONS: usize = 1_536;
+const HYPA_RUNS: usize = 6;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HypaSample {
+    batch_write_us: u64,
+    per_entry_write_us: u64,
+    batch_read_us: u64,
+    per_key_read_us: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HypaAggregate {
+    batch_write_us: Statistics,
+    per_entry_write_us: Statistics,
+    batch_read_us: Statistics,
+    per_key_read_us: Statistics,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HypaPayload {
+    binary_bytes: usize,
+    json_number_array_bytes: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HypaBenchmarkResult {
+    schema_version: u32,
+    benchmark: &'static str,
+    source_revision: Option<String>,
+    entries: usize,
+    dimensions: usize,
+    vector_transport: &'static str,
+    one_vector: HypaPayload,
+    discarded_warmup_runs: usize,
+    measured_runs: usize,
+    aggregate: HypaAggregate,
+    samples: Vec<HypaSample>,
+}
+
+fn deterministic_vector(seed: u64, dimensions: usize) -> Vec<u8> {
+    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1);
+    let mut bytes = Vec::with_capacity(dimensions * 4);
+    for _ in 0..dimensions {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let value = (state >> 40) as f32 / 16_777_216.0 - 0.5;
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+fn hypa_entries(salt: usize) -> Vec<super::device_store::hypa::HypaEmbeddingWrite> {
+    (0..HYPA_ENTRIES)
+        .map(|index| super::device_store::hypa::HypaEmbeddingWrite {
+            cache_key: format!("{:064x}", (salt * HYPA_ENTRIES + index) as u128),
+            producer: "hypa-v2".to_owned(),
+            model: "bench-model".to_owned(),
+            endpoint: None,
+            preprocess_version: 1,
+            dimensions: HYPA_DIMENSIONS as i64,
+            vector: deterministic_vector((salt * HYPA_ENTRIES + index) as u64, HYPA_DIMENSIONS),
+            metadata: None,
+        })
+        .collect()
+}
+
+fn hypa_sample(run: usize) -> HypaSample {
+    let directory = tempfile::tempdir().expect("create benchmark device store directory");
+    let mut store =
+        super::device_store::DeviceStore::open(directory.path()).expect("open device store");
+
+    let batched = hypa_entries(run * 2);
+    let started = Instant::now();
+    store
+        .write_hypa_embeddings(&batched)
+        .expect("write the batch in one call");
+    let batch_write_us = started.elapsed().as_micros() as u64;
+
+    let single = hypa_entries(run * 2 + 1);
+    let started = Instant::now();
+    for entry in &single {
+        store
+            .write_hypa_embeddings(std::slice::from_ref(entry))
+            .expect("write one entry per call");
+    }
+    let per_entry_write_us = started.elapsed().as_micros() as u64;
+
+    let keys = batched
+        .iter()
+        .map(|entry| entry.cache_key.clone())
+        .collect::<Vec<_>>();
+    let started = Instant::now();
+    let read = store
+        .read_hypa_embeddings(&keys)
+        .expect("read the batch in one call");
+    let batch_read_us = started.elapsed().as_micros() as u64;
+    assert_eq!(read.len(), HYPA_ENTRIES);
+
+    let started = Instant::now();
+    for key in &keys {
+        store
+            .read_hypa_embeddings(std::slice::from_ref(key))
+            .expect("read one key per call");
+    }
+    let per_key_read_us = started.elapsed().as_micros() as u64;
+
+    HypaSample {
+        batch_write_us,
+        per_entry_write_us,
+        batch_read_us,
+        per_key_read_us,
+    }
+}
+
+#[test]
+#[ignore = "release-only embedding cache benchmark"]
+fn hypa_embedding_cache_measurements() {
+    let mut samples = (0..HYPA_RUNS).map(hypa_sample).collect::<Vec<_>>();
+    samples.remove(0);
+
+    let vector = deterministic_vector(0, HYPA_DIMENSIONS);
+    let floats = vector
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .collect::<Vec<_>>();
+
+    macro_rules! statistics {
+        ($field:ident) => {
+            nearest_rank(
+                &samples
+                    .iter()
+                    .map(|sample| sample.$field)
+                    .collect::<Vec<_>>(),
+            )
+        };
+    }
+
+    let result = HypaBenchmarkResult {
+        schema_version: 1,
+        benchmark: "hypa-embedding-cache-roundtrip",
+        source_revision: std::env::var("RISUNEST_HYPA_BENCH_REVISION").ok(),
+        entries: HYPA_ENTRIES,
+        dimensions: HYPA_DIMENSIONS,
+        vector_transport: "float32-little-endian",
+        one_vector: HypaPayload {
+            binary_bytes: vector.len(),
+            json_number_array_bytes: serde_json::to_vec(&floats)
+                .expect("serialize one vector as a JSON number array")
+                .len(),
+        },
+        discarded_warmup_runs: 1,
+        measured_runs: samples.len(),
+        aggregate: HypaAggregate {
+            batch_write_us: statistics!(batch_write_us),
+            per_entry_write_us: statistics!(per_entry_write_us),
+            batch_read_us: statistics!(batch_read_us),
+            per_key_read_us: statistics!(per_key_read_us),
+        },
+        samples,
+    };
+    let encoded = serde_json::to_string(&result).expect("serialize benchmark result");
+    if let Ok(path) = std::env::var("RISUNEST_HYPA_BENCH_OUTPUT") {
+        std::fs::write(path, encoded.as_bytes()).expect("write benchmark result");
+    }
+    println!("{encoded}");
+}
