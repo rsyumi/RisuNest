@@ -277,7 +277,7 @@ fn metadata(capture: &CapturedSnapshot) -> SnapshotMetadata {
             parent_sections: std::collections::BTreeMap::new(),
         },
         parent_snapshot_id: None,
-        content_fingerprint: capture.catalog.content_fingerprint(&crate::external_storage::packaging::library_fingerprint_domain()).unwrap(),
+        content_fingerprint: capture.catalog.content_fingerprint(&risunest_external_storage_format::format::library_fingerprint_domain()).unwrap(),
     }
 }
 

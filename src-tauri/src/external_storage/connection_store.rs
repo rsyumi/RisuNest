@@ -263,8 +263,7 @@ fn decode_pending(encoded: &str) -> Result<PendingStoredConnection> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use risunest_external_storage_format::format::Scope;
-
+    
     fn pending() -> PendingStoredConnection {
         PendingStoredConnection {
             id: "synthetic-connection".into(),

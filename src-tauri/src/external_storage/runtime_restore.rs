@@ -17,7 +17,7 @@ use crate::{
         PersistentStore, StoreError,
     },
 };
-use risunest_external_storage_format::format::Scope;
+use risunest_external_storage_format::format::library_fingerprint_domain;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeSet, path::Path, sync::Mutex, time::Duration};
@@ -342,14 +342,12 @@ pub(crate) async fn run_restore(
 
     let worker_app = app.clone();
     let worker_job = job.clone();
-    let scope = risunest_external_storage_format::format::Scope::LIBRARY;
     let worker_cancel = cancel.clone();
     let result = tokio::task::spawn_blocking(move || {
         prepare_local_restore(
             &worker_app,
             &worker_job,
             expected_revision,
-            &scope,
             snapshot,
             selection,
             worker_cancel,
@@ -364,7 +362,6 @@ fn prepare_local_restore(
     app: &AppHandle,
     job: &DurableJob,
     expected_revision: i64,
-    scope: &Scope,
     snapshot: PreparedRemoteSnapshot,
     selection: RestoreSelection,
     cancel: Cancellation,
@@ -389,7 +386,7 @@ fn prepare_local_restore(
     let snapshot_id = snapshot.snapshot_id.clone();
     let staging_root = snapshot.staging_root.clone();
     let prepared = if selection.library {
-        let scope_id = risunest_external_storage_format::format::Scope::LIBRARY.id();
+        let scope_id = risunest_external_storage_format::format::library_fingerprint_domain();
         let fingerprint = decode_hash(&snapshot.library_fingerprint)?;
         let records = snapshot.records.into_iter().map(|record| {
             Ok(ExternalSnapshotRecord {
@@ -412,7 +409,6 @@ fn prepare_local_restore(
                     &ExternalSnapshotApplication {
                         expected_revision,
                         staging_root: &staging_root,
-                        scope,
                         scope_id: &scope_id,
                         fingerprint: &fingerprint,
                     },
@@ -901,10 +897,6 @@ mod tests {
             selection_epoch: "selection".into(),
             revision: 0,
         }
-    }
-
-    fn scope() -> Scope {
-        Scope::LIBRARY
     }
 
     #[test]

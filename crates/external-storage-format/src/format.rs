@@ -4,36 +4,14 @@ use std::collections::BTreeMap;
 
 pub const SCHEMA: &str = "risunest.external-storage/v2";
 
-/// Retained only for the persistent store capture and apply boundary, which
-/// still addresses its staged captures by a scope identifier. No exchange
-/// document carries it: repository identity, encryption and publication
-/// strategy live in `Descriptor`, and what a device publishes is decided per
-/// device. Callers inside this workspace pass `Scope::LIBRARY`.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Scope {
-    pub library: bool,
-    pub referenced_assets: bool,
-    pub device_settings: bool,
-    pub device_plugins: bool,
+/// The library and its referenced assets are the whole content of every
+/// repository, so their fingerprints are separated by one fixed domain rather
+/// than by a per-repository selection. What a device publishes beyond them is
+/// decided per device and carried in the published state.
+pub fn library_fingerprint_domain() -> [u8; 32] {
+    hash(b"risunest.external-library-fingerprint/v1")
 }
-impl Scope {
-    pub const LIBRARY: Self = Self {
-        library: true,
-        referenced_assets: true,
-        device_settings: false,
-        device_plugins: false,
-    };
-    pub fn id(&self) -> [u8; 32] {
-        hash(&[
-            1,
-            u8::from(self.library),
-            u8::from(self.referenced_assets),
-            u8::from(self.device_settings),
-            u8::from(self.device_plugins),
-        ])
-    }
-}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Strategy {
@@ -101,6 +79,11 @@ mod tests {
             assert!(Descriptor::decode(&serde_json::to_vec(&descriptor).unwrap()).is_err());
             assert!(descriptor.validate().is_err());
         }
+    }
+    #[test]
+    fn the_library_fingerprint_domain_is_stable_and_separates_other_domains() {
+        assert_eq!(library_fingerprint_domain(), library_fingerprint_domain());
+        assert_ne!(library_fingerprint_domain(), [0; 32]);
     }
     #[test]
     fn descriptor_identity_no_longer_depends_on_a_published_selection() {

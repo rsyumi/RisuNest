@@ -15,7 +15,7 @@ use crate::{
         PersistentStore,
     },
 };
-use risunest_external_storage_format::format::Scope;
+use risunest_external_storage_format::format::library_fingerprint_domain;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -103,7 +103,6 @@ fn create_verified_snapshot_backup(
 /// cloud provider nor its credentials or repository key.
 pub(crate) fn export_verified_snapshot(
     snapshot: PreparedRemoteSnapshot,
-    scope: &Scope,
     destination: &Path,
     scratch_parent: &Path,
     cancel: &Cancellation,
@@ -115,9 +114,6 @@ pub(crate) fn export_verified_snapshot(
         return Err(ProviderError::new(ErrorKind::Unsupported));
     }
     let fingerprint = decode_hash(&snapshot.library_fingerprint)?;
-    if scope != &Scope::LIBRARY {
-        return Err(corrupt("snapshot scope differs"));
-    }
     std::fs::create_dir_all(scratch_parent).map_err(transient)?;
     let scratch = tempfile::Builder::new()
         .prefix("external-snapshot-export-")
@@ -127,8 +123,7 @@ pub(crate) fn export_verified_snapshot(
     let application = ExternalSnapshotApplication {
         expected_revision: 0,
         staging_root: &snapshot.staging_root,
-        scope: &Scope::LIBRARY,
-        scope_id: &Scope::LIBRARY.id(),
+        scope_id: &library_fingerprint_domain(),
         fingerprint: &fingerprint,
     };
     let records = snapshot.records.into_iter().map(|value| {
@@ -213,7 +208,6 @@ mod tests {
         let destination = root.path().join("snapshot.bin");
         assert!(export_verified_snapshot(
             snapshot,
-            &Scope::LIBRARY,
             &destination,
             &root.path().join("scratch"),
             &Cancellation::default(),
@@ -227,7 +221,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let staging = root.path().join("staging");
         fs::create_dir(&staging).unwrap();
-        let scope = Scope::LIBRARY;
+        let scope = library_fingerprint_domain();
         let key = encode_logical_record_key(&LogicalRecordLocator::Root).unwrap();
         let encoded = encode_logical_record(&LogicalRecordEnvelope::Root {
             value: serde_json::json!({"marker":"synthetic-remote"}),
@@ -241,7 +235,7 @@ mod tests {
             key.clone(),
             hex::decode(&encoded.hash).unwrap().try_into().unwrap(),
         );
-        let scope_id = scope.id();
+        let scope_id = library_fingerprint_domain();
         let snapshot = PreparedRemoteSnapshot {
             snapshot_id: "synthetic-snapshot".into(),
             repository_id: "synthetic-repository".into(),
@@ -260,7 +254,6 @@ mod tests {
         let destination = root.path().join("snapshot.risunest");
         let receipt = export_verified_snapshot(
             snapshot,
-            &scope,
             &destination,
             &root.path().join("scratch"),
             &Cancellation::default(),

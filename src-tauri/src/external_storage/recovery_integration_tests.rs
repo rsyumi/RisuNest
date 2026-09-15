@@ -27,7 +27,7 @@ use crate::{
 };
 use risunest_external_storage_format::{
     crypto::RecoveryCode,
-    format::{Descriptor, Scope},
+    format::{library_fingerprint_domain, Descriptor},
 };
 use serde_json::json;
 use std::{collections::BTreeMap, io::Read};
@@ -44,7 +44,7 @@ fn recovery_package_opens_and_applies_a_real_snapshot_without_the_source_vault()
             let destination = tempfile::tempdir().unwrap();
             let provider = FakeProvider::new(false);
             let repository = fake::repository();
-            let scope = Scope::LIBRARY;
+            let scope = library_fingerprint_domain();
             let descriptor =
                 Descriptor::new("synthetic-recovery-repository".into(), None)
                     .unwrap();
@@ -93,7 +93,7 @@ fn recovery_package_opens_and_applies_a_real_snapshot_without_the_source_vault()
                 .reference(&root_key_name, &asset.content_hash, asset.byte_size)
                 .unwrap();
             catalog.finish().unwrap();
-            let fingerprint = catalog.content_fingerprint(&scope.id()).unwrap();
+            let fingerprint = catalog.content_fingerprint(&library_fingerprint_domain()).unwrap();
             let capture = crate::persistent_store::external_capture::CapturedSnapshot {
                 id: "recovery-capture".into(),
                 identity: identity.clone(),
@@ -254,8 +254,7 @@ fn recovery_package_opens_and_applies_a_real_snapshot_without_the_source_vault()
             let application = ExternalSnapshotApplication {
                 expected_revision: revision_before_import,
                 staging_root: &prepared.staging_root,
-                scope: &scope,
-                scope_id: &scope.id(),
+                scope_id: &library_fingerprint_domain(),
                 fingerprint: &library_fingerprint,
             };
             let replacement = destination_store

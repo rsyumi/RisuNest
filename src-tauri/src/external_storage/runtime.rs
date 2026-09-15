@@ -796,12 +796,10 @@ async fn run_backup(
             .as_ref()
             .map(|item| item.capture_id.clone())
             .or(worker_job.capture_id.clone());
-        let library_scope = risunest_external_storage_format::format::Scope::LIBRARY;
         let hydration = if retained.is_none() {
             Some(
                 pds.hydrate_external_capture_dependencies(
                     &worker_job.request.connection_id,
-                    &library_scope,
                     &probe,
                 )
                 .map_err(local_error)?,
@@ -817,7 +815,6 @@ async fn run_backup(
                 let capture = pds
                     .capture_external_library(
                         &worker_job.request.connection_id,
-                        &library_scope,
                         hydration
                             .as_ref()
                             .ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))?,
@@ -851,7 +848,7 @@ async fn run_backup(
         }
         let fingerprint = capture
             .catalog
-            .content_fingerprint(&library_scope.id())
+            .content_fingerprint(&risunest_external_storage_format::format::library_fingerprint_domain())
             .map_err(local_error)?;
         Ok((capture, fingerprint))
     })

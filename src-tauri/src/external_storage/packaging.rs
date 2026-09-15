@@ -15,7 +15,7 @@ use risunest_external_storage_format::{
     content_identity::{hash, hash_reader},
     control as wire_control,
     crypto::derive_key,
-    format::Scope,
+    format::library_fingerprint_domain,
     pack::{self, Chunk, ChunkEncoder, CompressionPolicy, ENTRY_OVERHEAD, MAX_CHUNK_BYTES},
     snapshot as wire,
 };
@@ -102,12 +102,6 @@ pub(crate) struct SnapshotMetadata {
     pub parent_snapshot_id: Option<String>,
     pub content_fingerprint: [u8; 32],
     pub purpose: SnapshotPurpose,
-}
-
-/// The seed that separates library content fingerprints from anything else.
-/// Repository identity no longer depends on a published selection.
-pub(crate) fn library_fingerprint_domain() -> [u8; 32] {
-    Scope::LIBRARY.id()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

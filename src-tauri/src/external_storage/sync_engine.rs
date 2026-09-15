@@ -11,10 +11,7 @@ use super::{
     },
     job_store::{DurableJob, JobKind, JobStore},
     journal::{JobIdentity, TransferJournal},
-    packaging::{
-        library_fingerprint_domain, CompletedSnapshot, PackageLimits, SnapshotMetadata,
-        SnapshotPurpose,
-    },
+    packaging::{CompletedSnapshot, PackageLimits, SnapshotMetadata, SnapshotPurpose},
     publication::HeadObservation,
 };
 use crate::persistent_store::{
@@ -23,13 +20,8 @@ use crate::persistent_store::{
     external_runtime::ExternalBase,
     sync_selection::CaptureIdentity,
 };
-use risunest_external_storage_format::format::Descriptor;
+use risunest_external_storage_format::format::{library_fingerprint_domain, Descriptor};
 use risunest_sync_wire::head::Sequence;
-
-/// Library and referenced assets are always captured. The persistent store
-/// still addresses its staged captures by this fixed scope.
-const LIBRARY_SCOPE: risunest_external_storage_format::format::Scope =
-    risunest_external_storage_format::format::Scope::LIBRARY;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
@@ -303,7 +295,6 @@ async fn capture_for_publication(
         let hydration = store
             .hydrate_external_capture_dependencies(
                 &worker_job.request.connection_id,
-                &LIBRARY_SCOPE,
                 &probe,
             )
             .map_err(local_error)?;
@@ -320,7 +311,6 @@ async fn capture_for_publication(
         let capture = store
             .capture_external_library(
                 &worker_job.request.connection_id,
-                &LIBRARY_SCOPE,
                 &hydration,
                 &probe,
             )
@@ -632,7 +622,6 @@ async fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Resu
     let application = ExternalSnapshotApplication {
         expected_revision: authoritative.identity.revision,
         staging_root: &prepared.staging_root,
-        scope: &LIBRARY_SCOPE,
         scope_id: &scope_id,
         fingerprint: &fingerprint,
     };
@@ -1634,7 +1623,7 @@ mod tests {
         packaging::RemoteObject,
     };
     use risunest_external_storage_format::{
-        format::{Scope, Strategy},
+        format::Strategy,
         snapshot as wire,
     };
 

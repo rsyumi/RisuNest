@@ -18,7 +18,7 @@ use crate::{
         encode_logical_record_key, LogicalRecordEnvelope, LogicalRecordLocator,
     },
 };
-use risunest_external_storage_format::format::{fingerprint, Scope};
+use risunest_external_storage_format::format::{fingerprint, library_fingerprint_domain};
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use std::{
@@ -46,7 +46,6 @@ pub(crate) struct ExternalSnapshotObject {
 pub(crate) struct ExternalSnapshotApplication<'a> {
     pub expected_revision: i64,
     pub staging_root: &'a Path,
-    pub scope: &'a Scope,
     pub scope_id: &'a [u8; 32],
     pub fingerprint: &'a [u8; 32],
 }
@@ -153,11 +152,8 @@ impl PersistentStore {
 }
 
 fn validate_application(application: &ExternalSnapshotApplication<'_>) -> StoreResult<()> {
-    if !application.scope.library || !application.scope.referenced_assets {
-        return invalid("External snapshot scope does not contain a complete library");
-    }
-    if application.scope.id() != *application.scope_id {
-        return invalid("External snapshot scope identifier differs from its descriptor");
+    if *application.scope_id != library_fingerprint_domain() {
+        return invalid("External snapshot fingerprint domain differs");
     }
     Ok(())
 }

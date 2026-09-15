@@ -138,7 +138,7 @@ mod tests {
     fn fingerprints_exclude_physical_locations_and_publication_strategy() {
         use crate::format::*;
         let entries = BTreeMap::from([("synthetic".into(), hash(b"same"))]);
-        let domain = Scope::LIBRARY.id();
+        let domain = library_fingerprint_domain();
         assert_eq!(fingerprint(&domain, &entries), fingerprint(&domain, &entries));
         assert_ne!(fingerprint(&domain, &entries), fingerprint(&[0; 32], &entries));
         // Two connections to the same repository agree on identity whatever

@@ -9,7 +9,7 @@ use crate::{
     external_storage::capture::CaptureCatalog,
     local_backup::CancellationProbe,
 };
-use risunest_external_storage_format::format::Scope;
+use risunest_external_storage_format::format::library_fingerprint_domain;
 use rusqlite::{params, OptionalExtension};
 use std::{
     collections::BTreeSet,
@@ -524,14 +524,9 @@ impl PersistentStore {
     pub(crate) fn hydrate_external_capture_dependencies(
         &self,
         consumer: &str,
-        scope: &Scope,
         probe: &dyn CancellationProbe,
     ) -> StoreResult<CaptureHydration> {
         if consumer.is_empty()
-            || !scope.library
-            || !scope.referenced_assets
-            || scope.device_settings
-            || scope.device_plugins
         {
             return Err(invalid(
                 "Library capture requires the library and referenced asset scope",
@@ -539,7 +534,7 @@ impl PersistentStore {
         }
         check(probe)?;
         let identity = sync_selection::identity(&self.connection)?;
-        let scope_id = scope.id();
+        let scope_id = library_fingerprint_domain();
         let scope_hex = hex::encode(scope_id);
         let mut mode = if self
             .capture_candidate(&identity, &scope_hex)?
@@ -637,12 +632,11 @@ impl PersistentStore {
     pub(crate) fn capture_external_library(
         &mut self,
         consumer: &str,
-        scope: &Scope,
         hydration: &CaptureHydration,
         probe: &dyn CancellationProbe,
     ) -> StoreResult<CapturedSnapshot> {
         let identity = sync_selection::identity(&self.connection)?;
-        let scope_id = scope.id();
+        let scope_id = library_fingerprint_domain();
         if hydration.consumer != consumer
             || hydration.identity != identity
             || hydration.scope_id != scope_id

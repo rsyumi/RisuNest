@@ -75,8 +75,7 @@ pub(crate) fn import(bytes: &[u8], code: &str) -> Result<ImportedRecovery> {
 mod tests {
     use super::*;
     use crate::external_storage::{capabilities::Capabilities, fake};
-    use risunest_external_storage_format::format::Scope;
-
+    
     #[test]
     fn new_device_recovers_without_source_vault_and_operational_credentials() {
         let descriptor = Descriptor::new("synthetic-repository".into(), None,

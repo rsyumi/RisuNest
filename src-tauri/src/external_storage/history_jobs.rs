@@ -218,7 +218,7 @@ mod tests {
         persistent_store::{RootMutation, WorkingSetCommit},
     };
     use risunest_external_storage_format::{
-        format::{Descriptor, Scope, Strategy},
+        format::{Descriptor, Strategy},
         snapshot as wire,
     };
     use std::{collections::BTreeMap, sync::Arc};
