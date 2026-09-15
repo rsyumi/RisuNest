@@ -5,6 +5,7 @@ import {
     createNativeHypaEmbeddingCache,
     decodeHypaReadFrame,
     encodeHypaWriteFrame,
+    resilientHypaEmbeddingCache,
     staleEmbeddingKeys,
     toVectorBuffer,
     type HypaCachedEmbedding,
@@ -186,5 +187,36 @@ describe('dimension agreement', () => {
         expect(staleEmbeddingKeys(hits([3, 3]), 3)).toEqual([])
         expect(staleEmbeddingKeys(hits([3, 3]), 4)).toEqual(['key-0', 'key-1'])
         expect(staleEmbeddingKeys(hits([3]), 0)).toEqual([])
+    })
+})
+
+describe('cache availability', () => {
+    const unavailable = {
+        async read(): Promise<never> {
+            throw new Error('device store is unavailable')
+        },
+        async write(): Promise<never> {
+            throw new Error('device store is unavailable')
+        },
+    }
+
+    it('answers an unavailable store as a full miss instead of failing the round', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+        const cache = resilientHypaEmbeddingCache(unavailable)
+
+        expect((await cache.read(['a', 'b'])).size).toBe(0)
+        await expect(cache.write([entry('a', [1, 2])])).resolves.toBeUndefined()
+        expect(warn).toHaveBeenCalledTimes(2)
+        warn.mockRestore()
+    })
+
+    it('passes a working store straight through', async () => {
+        const cache = resilientHypaEmbeddingCache(
+            createNativeHypaEmbeddingCache(
+                (async () => readFrame([{ key: 'a', values: [1] }]).buffer) as never,
+                false,
+            ),
+        )
+        expect((await cache.read(['a'])).size).toBe(1)
     })
 })

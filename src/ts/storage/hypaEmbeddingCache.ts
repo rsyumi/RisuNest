@@ -213,10 +213,34 @@ export function createLocalHypaEmbeddingCache(
     }
 }
 
+/** Every miss is recoverable by recomputing, so an unavailable store must slow
+ *  an embedding round down rather than fail it. */
+export function resilientHypaEmbeddingCache(inner: HypaEmbeddingCache): HypaEmbeddingCache {
+    return {
+        async read(keys: string[]): Promise<Map<string, HypaCachedEmbedding>> {
+            try {
+                return await inner.read(keys)
+            } catch (error) {
+                console.warn('Embedding cache read failed', error)
+                return new Map()
+            }
+        },
+        async write(entries: HypaEmbeddingEntry[]): Promise<void> {
+            try {
+                await inner.write(entries)
+            } catch (error) {
+                console.warn('Embedding cache write failed', error)
+            }
+        },
+    }
+}
+
 let cache: HypaEmbeddingCache | null = null
 
 export function getHypaEmbeddingCache(): HypaEmbeddingCache {
-    cache ??= isTauri ? createNativeHypaEmbeddingCache() : createLocalHypaEmbeddingCache()
+    cache ??= resilientHypaEmbeddingCache(
+        isTauri ? createNativeHypaEmbeddingCache() : createLocalHypaEmbeddingCache(),
+    )
     return cache
 }
 

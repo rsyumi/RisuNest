@@ -1927,7 +1927,7 @@ interface SummaryChunkVector {
     vector: memoryVector;
 }
 
-class HypaProcesserEx extends HypaProcesser {
+export class HypaProcesserEx extends HypaProcesser {
     // Maintain references to SummaryChunks and their associated memoryVectors
     summaryChunkVectors: SummaryChunkVector[] = [];
 

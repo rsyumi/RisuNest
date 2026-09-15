@@ -147,11 +147,7 @@ export class HypaProcessorV2<TMetadata> {
     let cached = new Map<string, { vector: Float32Array; dimensions: number }>();
 
     if (!skipCache) {
-      try {
-        cached = consistentEmbeddings(await cache.read([...new Set(keys.values())]));
-      } catch (error) {
-        console.debug(HypaProcessorV2.LOG_PREFIX, "Cache read failed", error);
-      }
+      cached = consistentEmbeddings(await cache.read([...new Set(keys.values())]));
     }
 
     for (const item of ebdTexts) {
