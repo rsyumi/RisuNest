@@ -149,46 +149,4 @@ describe('ExternalStorageBridge', () => {
         expect(invoke).not.toHaveBeenCalledWith('external_storage_prepare_device_capture', expect.anything())
     })
 
-    it('shares capture only with waiting jobs in the same device-capture phase', async () => {
-        vi.stubGlobal('indexedDB', new IDBFactory())
-        const connection = {
-            id: 'connection',
-            purpose: 'backup',
-            scope: {
-                library: true,
-                referencedAssets: true,
-                deviceSettings: true,
-                devicePlugins: false,
-            },
-        }
-        const invoke = vi.fn(async (command: string) => {
-            if (command === 'external_storage_start_job') return {
-                id: 'new-job', connectionId: 'connection', kind: 'backup',
-                state: 'waiting', phase: 'device-capture',
-            }
-            if (command === 'external_storage_get_state') return {
-                supported: true,
-                selection: { kind: 'none', selectionEpoch: 'epoch', paused: false, decisionRequired: false },
-                connections: [connection],
-                jobs: [
-                    { id: 'waiting-peer', connectionId: 'connection', kind: 'backup', state: 'waiting', phase: 'device-capture' },
-                    { id: 'running-peer', connectionId: 'connection', kind: 'backup', state: 'running', phase: 'upload' },
-                ],
-            }
-            if (command === 'external_storage_prepare_device_capture') return {
-                state: 'ready', captureId: 'a'.repeat(64),
-            }
-            throw new Error(`Unexpected command: ${command}`)
-        })
-        const bridge = new ExternalStorageBridge({ supported: () => true, invoke })
-
-        await bridge.startJob({ connectionId: 'connection', kind: 'backup' })
-
-        expect(invoke).toHaveBeenCalledWith('external_storage_prepare_device_capture', {
-            request: {
-                consumerIds: ['new-job', 'waiting-peer'],
-                deviceSections: ['device-settings'],
-            },
-        })
-    })
 })

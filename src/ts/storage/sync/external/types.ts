@@ -27,11 +27,15 @@ export interface ExternalConnectionConfig {
     oauthProfile?: ExternalOAuthProfile
 }
 
-export interface ExternalStorageScope {
-    library: true
-    referencedAssets: true
-    deviceSettings: boolean
-    devicePlugins: boolean
+/**
+ * What a backup connection captures by default. A synchronization connection
+ * has none: what it exchanges is chosen per device under local data. Changing
+ * it applies to work started afterwards and never rewrites an existing point.
+ */
+export interface ExternalCapturePolicy {
+    hypa: boolean
+    localPlugins: boolean
+    localSettings: boolean
 }
 
 export interface ExternalCapabilities {
@@ -59,7 +63,7 @@ export interface PrepareExternalConnectionRequest {
     mode: ExternalOpenMode
     purpose: ExternalConnectionPurpose
     publicationStrategy: ExternalPublicationStrategy
-    scope: ExternalStorageScope
+    capturePolicy?: ExternalCapturePolicy
     acknowledgements: string[]
 }
 
@@ -108,7 +112,7 @@ export interface ExternalConnectionSummary {
     mode: ExternalOpenMode
     displayName: string
     endpoint: ExternalEndpointConfirmation
-    scope: ExternalStorageScope
+    capturePolicy?: ExternalCapturePolicy
     capabilities: ExternalCapabilities
     status: 'ready' | 'paused' | 'reauth-required' | 'key-locked' | 'error'
     lastVerifiedAtMs?: DecimalString

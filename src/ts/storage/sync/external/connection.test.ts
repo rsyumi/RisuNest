@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
     SEQUENTIAL_ACKNOWLEDGEMENT,
     buildPrepareConnectionRequest,
-    defaultExternalStorageScope,
+    defaultExternalCapturePolicy,
     mergeExternalHistoryItems,
     restorableExternalHistoryItems,
     externalConflictActions,
@@ -10,20 +10,26 @@ import {
 import { buildProviderSecret } from './providerRegistry'
 
 describe('external storage connection request', () => {
-    it('keeps device sections out of synchronization repositories', () => {
+    it('keeps a capture policy off synchronization connections and requires one for a backup', () => {
         expect(() => buildPrepareConnectionRequest({
             providerId: 'google_drive',
             values: { folderId: 'folder', projectId: 'project', clientId: 'client' },
             platform: 'windows', mode: 'create', purpose: 'sync', strategy: 'sequential',
-            scope: { ...defaultExternalStorageScope('sync'), deviceSettings: true },
+            capturePolicy: { hypa: true, localPlugins: false, localSettings: false },
             acknowledgements: [SEQUENTIAL_ACKNOWLEDGEMENT],
-        })).toThrow('device-only')
+        })).toThrow('capture policy')
+        expect(() => buildPrepareConnectionRequest({
+            providerId: 'gitlab_packages',
+            values: { endpoint: 'https://gitlab.example', accountId: 'user', profile: 'selfManaged', projectId: '1', packageName: 'risunest' },
+            platform: 'windows', mode: 'create', purpose: 'backup', strategy: 'backup-only',
+            acknowledgements: [],
+        })).toThrow('capture policy')
     })
 
     it('requires the sequential-use limitation acknowledgement', () => {
         expect(() => buildPrepareConnectionRequest({
             providerId: 'google_drive', values: {}, platform: 'android', mode: 'existing',
-            purpose: 'sync', strategy: 'sequential', scope: defaultExternalStorageScope('sync'),
+            purpose: 'sync', strategy: 'sequential', capturePolicy: defaultExternalCapturePolicy('sync'),
             acknowledgements: [],
         })).toThrow(SEQUENTIAL_ACKNOWLEDGEMENT)
     })
@@ -33,7 +39,7 @@ describe('external storage connection request', () => {
             providerId: 'gitlab_packages',
             values: { endpoint: 'https://gitlab.example', accountId: 'user', profile: 'selfManaged', projectId: '1', packageName: 'risunest' },
             platform: 'windows', mode: 'create', purpose: 'backup', strategy: 'backup-only',
-            scope: defaultExternalStorageScope('backup'), acknowledgements: [],
+            capturePolicy: defaultExternalCapturePolicy('backup'), acknowledgements: [],
         })
         expect(request.config).toEqual({
             provider: 'gitlab_packages', profile: 'selfManaged', endpoint: 'https://gitlab.example', accountId: 'user',
@@ -51,7 +57,7 @@ describe('external storage connection request', () => {
                 clientSecret: 'must-stay-transient',
             },
             platform: 'android', mode: 'create', purpose: 'backup', strategy: 'backup-only',
-            scope: defaultExternalStorageScope('backup'),
+            capturePolicy: defaultExternalCapturePolicy('backup'),
             acknowledgements: [],
         })
 
@@ -72,7 +78,7 @@ describe('external storage connection request', () => {
                 password: 'must-not-be-in-preparation',
             },
             platform: 'windows', mode: 'create', purpose: 'backup', strategy: 'backup-only',
-            scope: defaultExternalStorageScope('backup'), acknowledgements: [],
+            capturePolicy: defaultExternalCapturePolicy('backup'), acknowledgements: [],
         })
         expect(JSON.stringify(request)).not.toContain('must-not-be-in-preparation')
     })

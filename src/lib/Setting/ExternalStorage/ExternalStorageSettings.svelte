@@ -110,11 +110,7 @@
                 const operation = requestExternalStorageRestore(
                     connection.id,
                     details.snapshotId,
-                    [
-                        'library', 'referencedAssets',
-                        ...(connection.scope.deviceSettings ? ['deviceSettings' as const] : []),
-                        ...(connection.scope.devicePlugins ? ['devicePlugins' as const] : []),
-                    ],
+                    ['library', 'referencedAssets'],
                 )
                 schedulePoll(true)
                 await operation

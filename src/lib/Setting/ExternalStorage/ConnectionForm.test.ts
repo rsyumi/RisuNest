@@ -315,6 +315,77 @@ describe('synchronization mode defaults', () => {
     })
 })
 
+describe('what a connection stores', () => {
+    it('offers the four backup items and no selection at all for synchronization', async () => {
+        component = mount(ConnectionForm, {
+            target,
+            props: { strings, onconnected: vi.fn(), oncancel: vi.fn() },
+        })
+        await settle()
+        await selectProvider('s3')
+
+        for (const item of [strings.library, strings.hypa, strings.devicePlugins, strings.deviceSettings]) {
+            expect(labelControl<HTMLInputElement>(item).type).toBe('checkbox')
+        }
+        expect(labelControl<HTMLInputElement>(strings.library).disabled).toBe(true)
+
+        button(strings.sync).click()
+        await settle()
+
+        // A synchronization connection has no selection screen; local data is
+        // chosen per device instead.
+        for (const item of [strings.hypa, strings.devicePlugins, strings.deviceSettings]) {
+            expect(() => labelControl<HTMLInputElement>(item)).toThrow()
+        }
+        expect(target.textContent).not.toContain(strings.scopeHelp)
+    })
+
+    it('sends the chosen policy for a backup and none for a synchronization', async () => {
+        state.prepareConnection.mockResolvedValue(prepared)
+        component = mount(ConnectionForm, {
+            target,
+            props: { strings, onconnected: vi.fn(), oncancel: vi.fn() },
+        })
+        await settle()
+        await selectProvider('s3')
+        labelControl<HTMLInputElement>(strings.hypa).click()
+        await settle()
+        button(strings.prepare).click()
+        await settle()
+
+        expect(state.prepareConnection).toHaveBeenCalledWith(expect.objectContaining({
+            purpose: 'backup',
+            capturePolicy: { hypa: false, localPlugins: true, localSettings: true },
+        }))
+
+        state.prepareConnection.mockClear()
+        button(strings.sync).click()
+        await settle()
+        button(strings.prepare).click()
+        await settle()
+
+        const request = state.prepareConnection.mock.calls.at(-1)?.[0]
+        expect(request.purpose).toBe('sync')
+        expect(request.capturePolicy).toBeUndefined()
+    })
+
+    it('says where local data is chosen when reviewing a synchronization connection', async () => {
+        state.prepareConnection.mockResolvedValue(prepared)
+        component = mount(ConnectionForm, {
+            target,
+            props: { strings, onconnected: vi.fn(), oncancel: vi.fn() },
+        })
+        await settle()
+        await selectProvider('s3')
+        button(strings.sync).click()
+        await settle()
+        button(strings.prepare).click()
+        await settle()
+
+        expect(target.textContent).toContain(strings.syncPurposeLocalDataNotice)
+    })
+})
+
 describe('native failure messages', () => {
     it('names the refused strategy when a repository cannot do concurrent-use protection', async () => {
         component = mount(ConnectionForm, {

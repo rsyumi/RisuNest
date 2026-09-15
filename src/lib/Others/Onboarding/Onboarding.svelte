@@ -619,7 +619,7 @@
             await requestExternalStorageRestore(
                 connection.id,
                 externalSelected,
-                externalOnboardingRestoreAreas(connection),
+                externalOnboardingRestoreAreas(),
             )
             flow = goToOnboardingState(flow, 'done', 'external')
         } catch (cause) {
@@ -1406,7 +1406,7 @@
                                     {/if}
                                     <p class="note warn">
                                         <TriangleAlert /><span
-                                            >{externalOnboardingRestoreRestarts(connection)
+                                            >{externalOnboardingRestoreRestarts()
                                                 ? ex.restoreRestartNote
                                                 : ex.restoreNote}</span
                                         >

@@ -89,12 +89,7 @@ export async function runNativeExternalDriveAction(
     await requestExternalStorageRestore(
         connection.id,
         selectedSnapshot.id,
-        [
-            'library',
-            'referencedAssets',
-            ...(connection.scope.deviceSettings ? ['deviceSettings' as const] : []),
-            ...(connection.scope.devicePlugins ? ['devicePlugins' as const] : []),
-        ],
+        ['library', 'referencedAssets'],
     )
 }
 

@@ -235,7 +235,7 @@ describe('native Drive settings routing', () => {
         expect(state.alertInput).not.toHaveBeenCalled()
     })
 
-    it('restores a verified external snapshot with the configured device scope', async () => {
+    it('restores a verified external snapshot with what the bundle covers', async () => {
         state.externalListHistory.mockResolvedValue({
             items: [{
                 id: 'snapshot-7',
@@ -253,7 +253,7 @@ describe('native Drive settings routing', () => {
         expect(state.requestExternalStorageRestore).toHaveBeenCalledWith(
             'google-primary',
             'snapshot-7',
-            ['library', 'referencedAssets', 'deviceSettings'],
+            ['library', 'referencedAssets'],
         )
     })
 

@@ -14,7 +14,6 @@ const mocks = vi.hoisted(() => ({
         startJob: vi.fn(),
         getJob: vi.fn(),
         cancelJob: vi.fn(),
-        prepareDeviceCapture: vi.fn(),
         requestDeviceMaintenanceRestart: vi.fn(),
         applyReceived: vi.fn(),
     },
@@ -61,7 +60,6 @@ const initialState: ExternalStorageState = {
             providerId: 'webdav', authority: 'synthetic.invalid', repositoryHint: 'old',
             warnings: [], remoteVerified: true,
         },
-        scope: { library: true, referencedAssets: true, deviceSettings: false, devicePlugins: false },
         capabilities: {
             cas: false, sequential: true, backupOnly: true, resumableUpload: false,
             rangeDownload: false, snapshotDiscovery: true, evidence: 'synthetic',
@@ -341,46 +339,4 @@ describe('external storage production integration', () => {
         expect(mocks.refreshWorkingSet).not.toHaveBeenCalled()
     })
 
-    it('reattaches a pending device capture before rebinding its backup job', async () => {
-        const deviceConnection = {
-            ...initialState.connections[0],
-            id: 'device-backup',
-            purpose: 'backup' as const,
-            strategy: 'backup-only' as const,
-            scope: {
-                ...initialState.connections[0].scope,
-                deviceSettings: true,
-            },
-        }
-        const waitingJob: ExternalJobSummary = {
-            ...succeeded('device-backup', '9'),
-            id: 'device-job',
-            kind: 'backup',
-            state: 'waiting',
-            phase: 'device-capture',
-            result: undefined,
-        }
-        mocks.bridge.getState.mockResolvedValue({
-            ...initialState,
-            selection: { ...initialState.selection, kind: 'none', connectionId: undefined },
-            connections: [deviceConnection],
-            jobs: [waitingJob],
-        })
-        mocks.bridge.prepareDeviceCapture.mockResolvedValue({
-            state: 'ready', captureId: 'a'.repeat(64),
-        })
-        const { installExternalStorageProduction } = await import('./production')
-        await installExternalStorageProduction()
-        expect(mocks.bridge.prepareDeviceCapture).toHaveBeenCalledWith([{
-            jobId: 'device-job',
-            purpose: 'backup',
-            scope: deviceConnection.scope,
-        }])
-        expect(mocks.bridge.startJob).toHaveBeenCalledWith(expect.objectContaining({
-            connectionId: 'device-backup',
-            kind: 'backup',
-            reason: 'manual',
-            session: 'foreground',
-        }))
-    })
 })
