@@ -16,6 +16,11 @@ function fixture() {
       seq: "1",
       headId: "head",
       minRetainedSeq: "0",
+      sections: {
+        hypa: { stateId: "hypa-state", changedSeq: "0", gcFloor: "0" },
+        library: { stateId: "library-state", changedSeq: "0", gcFloor: "0" },
+        "local-plugins": { stateId: "plugins-state", changedSeq: "0", gcFloor: "0" },
+      },
     },
     dirtyRecords: 0,
     fullScan: false,

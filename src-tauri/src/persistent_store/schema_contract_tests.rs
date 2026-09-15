@@ -54,9 +54,11 @@ fn all_live_tables_have_an_explicit_preservation_owner() {
         "server_sync_operation_records",
         "server_sync_operation_pages",
         "server_sync_operation_scopes",
+        "server_sync_operation_sections",
         "server_sync_remote",
         "server_sync_remote_dirty",
         "server_sync_remote_cursor",
+        "server_sync_remote_sections",
     ];
     let groups = [&portable[..], &local_operations[..], &server_operations[..]];
     let mut classified = BTreeSet::new();

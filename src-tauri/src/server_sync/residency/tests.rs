@@ -30,11 +30,8 @@ fn config(device: &str) -> StoredConfig {
 }
 fn head() -> RemoteHead {
     RemoteHead {
-        library_id: "library".into(),
-        epoch: "epoch".into(),
-        seq: 0.into(),
         head_id: hash(b"head"),
-        min_retained_seq: 0.into(),
+        ..RemoteHead::genesis("library".into(), "epoch".into()).unwrap()
     }
 }
 fn object(seed: &[u8]) -> RetainedObject {

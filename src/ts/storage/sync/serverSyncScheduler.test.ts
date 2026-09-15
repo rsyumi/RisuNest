@@ -9,6 +9,11 @@ const head = {
   seq: "0",
   headId: "head",
   minRetainedSeq: "0",
+  sections: {
+    hypa: { stateId: "hypa-state", changedSeq: "0", gcFloor: "0" },
+    library: { stateId: "library-state", changedSeq: "0", gcFloor: "0" },
+    "local-plugins": { stateId: "plugins-state", changedSeq: "0", gcFloor: "0" },
+  },
 };
 function fixture() {
   const status: ServerStatus = {

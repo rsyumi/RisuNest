@@ -1,11 +1,12 @@
 use super::{server_sync_outbox::ServerDirtyKey, PersistentStore};
 use crate::server_sync::{client::ServerConfig, credentials::StoredConfig, Result, SyncError};
 use risunest_sync_wire::{
-    canonical, operation_id, CommitIntent, Receipt, RecordVersion, RemoteHead, Sequence,
+    canonical, operation_id, CommitIntent, Domain, Receipt, RecordVersion, RemoteHead, Sequence,
     TerminalStatus,
 };
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -194,9 +195,11 @@ impl PersistentStore {
             "server_sync_remote",
             "server_sync_remote_dirty",
             "server_sync_remote_cursor",
+            "server_sync_remote_sections",
             "server_sync_operation_records",
             "server_sync_operation_pages",
             "server_sync_operation_scopes",
+            "server_sync_operation_sections",
             "server_sync_state",
         ] {
             tx.execute(&format!("DELETE FROM {table}"), [])?;
@@ -302,10 +305,12 @@ impl PersistentStore {
             "server_sync_remote",
             "server_sync_remote_dirty",
             "server_sync_remote_cursor",
+            "server_sync_remote_sections",
             "server_sync_operation",
             "server_sync_operation_records",
             "server_sync_operation_pages",
             "server_sync_operation_scopes",
+            "server_sync_operation_sections",
         ] {
             tx.execute(&format!("DELETE FROM {table}"), [])?;
         }
@@ -337,6 +342,60 @@ impl PersistentStore {
             let _ = replacement.remove(&root);
         }
         outcome
+    }
+    /// Sections whose received changes this device has applied locally. A section
+    /// missing here is unreceived, which is neither a deletion nor an application.
+    pub(crate) fn server_applied_sections(&self, epoch: &str) -> Result<BTreeMap<String, String>> {
+        let stored: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT head FROM server_sync_state WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let stored: Option<RemoteHead> = stored
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(|_| SyncError::new("invalid-local-server-head", 409))?;
+        if stored.is_none_or(|head| head.epoch != epoch) {
+            return Ok(BTreeMap::new());
+        }
+        let mut sections = BTreeMap::new();
+        let mut statement = self
+            .connection
+            .prepare("SELECT domain,applied_seq FROM server_sync_remote_sections")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let domain = Domain::try_from(row.get::<_, String>(0)?.as_str())
+                .map_err(|_| SyncError::new("invalid-local-section", 409))?;
+            let applied = Sequence::try_from(row.get::<_, String>(1)?)
+                .map_err(|_| SyncError::new("invalid-local-section-cursor", 409))?;
+            sections.insert(domain.as_str().to_owned(), applied.as_str().to_owned());
+        }
+        Ok(sections)
+    }
+    /// The per-section remote baseline this operation was planned against. It is
+    /// durable so a restart resumes against the same points, not the latest head.
+    pub(crate) fn server_record_operation_sections(
+        tx: &rusqlite::Transaction<'_>,
+        head: &RemoteHead,
+    ) -> Result<()> {
+        tx.execute("DELETE FROM server_sync_operation_sections", [])?;
+        for domain in Domain::ALL {
+            let section = head
+                .section(domain)
+                .map_err(|_| SyncError::new("invalid-remote-head", 502))?;
+            tx.execute(
+                "INSERT INTO server_sync_operation_sections VALUES(?1,?2,?3)",
+                params![
+                    domain.as_str(),
+                    section.changed_seq.as_str(),
+                    section.state_id
+                ],
+            )?;
+        }
+        Ok(())
     }
     pub(crate) fn server_pending(&self) -> Result<Option<PendingOperation>> {
         let row = self
@@ -393,6 +452,7 @@ impl PersistentStore {
             staged_changes_id: stage_id,
         };
         intent.validate()?;
+        Self::server_record_operation_sections(&tx, head)?;
         tx.execute("INSERT INTO server_sync_operation(singleton,sequence,intent,phase,local_revision) VALUES(1,?1,?2,'prepared',?3)",params![sequence.as_str(),String::from_utf8(canonical::encode(&intent)?).map_err(|_|SyncError::new("invalid-intent",400))?,local_revision])?;
         tx.execute(
             "UPDATE server_sync_state SET next_sequence=?1 WHERE singleton=1",

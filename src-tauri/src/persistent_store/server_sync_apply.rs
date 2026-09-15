@@ -17,7 +17,7 @@ use crate::{
         encode_logical_record_key, LogicalRecordEnvelope, LogicalRecordLocator,
     },
 };
-use risunest_sync_wire::{RecordVersion, RemoteHead};
+use risunest_sync_wire::{Domain, RecordVersion, RemoteHead};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -44,6 +44,7 @@ pub(crate) struct ReplicaAdvance {
     pub bases: Vec<(String, RecordVersion, Option<String>)>,
     pub finish_operation: bool,
     pub scanned_revision: Option<i64>,
+    pub applied_sections: Vec<Domain>,
 }
 impl Default for ReplicaAdvance {
     fn default() -> Self {
@@ -54,6 +55,7 @@ impl Default for ReplicaAdvance {
             bases: Vec::new(),
             finish_operation: false,
             scanned_revision: None,
+            applied_sections: Vec::new(),
         }
     }
 }
@@ -452,6 +454,15 @@ impl PersistentStore {
             "UPDATE server_sync_state SET head=?1 WHERE singleton=1",
             [serde_json::to_string(next_head)?],
         )?;
+        // Only sections this cycle applied advance. The rest stay unreceived.
+        for domain in advance.applied_sections {
+            let section = next_head
+                .section(domain)
+                .map_err(|_| StoreError::Validation {
+                    message: "Invalid server cursor".into(),
+                })?;
+            tx.execute("INSERT INTO server_sync_remote_sections VALUES(?1,?2,?3) ON CONFLICT(domain) DO UPDATE SET applied_seq=excluded.applied_seq,state_id=excluded.state_id",params![domain.as_str(),next_head.seq.as_str(),section.state_id])?;
+        }
         super::content_change_index::finish_mutation(&tx)?;
         super::commit::set_active(&tx, revision, &generation)?;
         tx.commit()?;

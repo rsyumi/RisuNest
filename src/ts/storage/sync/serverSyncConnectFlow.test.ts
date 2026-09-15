@@ -115,6 +115,11 @@ describe("status and error copy", () => {
               seq: "1",
               headId: "h",
               minRetainedSeq: "0",
+              sections: {
+                hypa: { stateId: "hypa-state", changedSeq: "0", gcFloor: "0" },
+                library: { stateId: "library-state", changedSeq: "0", gcFloor: "0" },
+                "local-plugins": { stateId: "plugins-state", changedSeq: "0", gcFloor: "0" },
+              },
             },
             conflictCount: 2,
             conflicts: [],

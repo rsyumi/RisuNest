@@ -10,7 +10,7 @@ fn backup(root: &Path, index: u128, complete: bool) -> (String, u64) {
     if complete {
         fs::write(directory.join("complete.json"), serde_json::to_vec(&json!({
             "format": "risunest-portable-backup", "scope": "library",
-            "head": { "libraryId":"library", "epoch":"epoch", "seq":"0", "headId":"a".repeat(64), "minRetainedSeq":"0" },
+            "head": risunest_sync_wire::RemoteHead::genesis("library".into(), "epoch".into()).unwrap(),
             "localRevision": 1,
             "localHash": risunest_sync_wire::hash(b"synthetic local"),
             "remoteHash": risunest_sync_wire::hash(b"synthetic remote"),
