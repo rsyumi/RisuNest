@@ -608,7 +608,6 @@ pub(crate) fn endpoint_confirmation(
     .unwrap_or_else(|| "configured repository".into());
     // Warning codes; the UI owns the localized wording.
     let warnings = match config.provider.as_str() {
-        "webdav" => vec!["webdav-cas-unverified".into()],
         "github_releases" => vec!["github-dedicated-repository".into()],
         "gitlab_packages" => vec!["gitlab-cleanup-policy".into()],
         _ => Vec::new(),

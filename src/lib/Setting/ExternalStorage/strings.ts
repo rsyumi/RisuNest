@@ -80,7 +80,6 @@ const english = {
     strategyLabels: { cas: 'Concurrent-use protection', sequential: 'One device at a time', 'backup-only': 'Backup only' },
     historyKinds: { snapshot: 'Sync', 'backup-point': 'Backup', conflict: 'Conflict backup', 'recovery-candidate': 'Recovery candidate' },
     endpointWarnings: {
-        'webdav-cas-unverified': 'Concurrent-use protection has not been confirmed on this server yet. For synchronization, use one device at a time until it is confirmed.',
         'github-dedicated-repository': 'Use a separate private repository. This connection is backup only.',
         'gitlab-cleanup-policy': 'GitLab package cleanup policies can delete backups. Keep cleanup policies off for this project. This connection is backup only.',
     },
@@ -195,7 +194,6 @@ const korean: typeof english = {
     strategyLabels: { cas: '동시 사용 보호', sequential: '한 기기씩 사용', 'backup-only': '백업만' },
     historyKinds: { snapshot: '동기화', 'backup-point': '백업', conflict: '충돌 백업', 'recovery-candidate': '복구 후보' },
     endpointWarnings: {
-        'webdav-cas-unverified': '이 서버에서는 동시 사용 보호를 아직 확인하지 않았습니다. 동기화가 필요하면 확인되기 전까지 한 기기씩 사용 방식을 쓰세요.',
         'github-dedicated-repository': '백업 전용 비공개 저장소를 따로 쓰세요. 이 연결은 백업만 합니다.',
         'gitlab-cleanup-policy': 'GitLab의 패키지 정리 정책이 백업을 지울 수 있습니다. 이 프로젝트에서는 정리 정책을 꺼 두세요. 이 연결은 백업만 합니다.',
     },
