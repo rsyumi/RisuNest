@@ -1210,9 +1210,6 @@ pub(crate) fn external_storage_prepare_recovery_import(
     if strategy == ConnectionStrategy::Sequential {
         acknowledgements.push(SEQUENTIAL_ACKNOWLEDGEMENT.into());
     }
-    if strategy == ConnectionStrategy::BackupOnly {
-        acknowledgements.push(BACKUP_ACKNOWLEDGEMENT.into());
-    }
     if imported.metadata.config.provider == "github_releases" {
         acknowledgements.push(GITHUB_ACKNOWLEDGEMENT.into());
     }
@@ -1285,7 +1282,7 @@ mod tests {
                 device_settings: true,
                 device_plugins: false,
             },
-            acknowledgements: vec![BACKUP_ACKNOWLEDGEMENT.into()],
+            acknowledgements: Vec::new(),
         };
         let result = insert_preparation(&state, request, None).unwrap();
         assert!(result.requires_recovery_key);

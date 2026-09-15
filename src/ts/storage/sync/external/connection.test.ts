@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest'
 import {
-    BACKUP_ONLY_ACKNOWLEDGEMENT,
     SEQUENTIAL_ACKNOWLEDGEMENT,
     buildPrepareConnectionRequest,
     defaultExternalStorageScope,
@@ -34,7 +33,7 @@ describe('external storage connection request', () => {
             providerId: 'gitlab_packages',
             values: { endpoint: 'https://gitlab.example', accountId: 'user', profile: 'selfManaged', projectId: '1', packageName: 'risunest' },
             platform: 'windows', mode: 'create', purpose: 'backup', strategy: 'backup-only',
-            scope: defaultExternalStorageScope('backup'), acknowledgements: [BACKUP_ONLY_ACKNOWLEDGEMENT],
+            scope: defaultExternalStorageScope('backup'), acknowledgements: [],
         })
         expect(request.config).toEqual({
             provider: 'gitlab_packages', profile: 'selfManaged', endpoint: 'https://gitlab.example', accountId: 'user',
@@ -53,7 +52,7 @@ describe('external storage connection request', () => {
             },
             platform: 'android', mode: 'create', purpose: 'backup', strategy: 'backup-only',
             scope: defaultExternalStorageScope('backup'),
-            acknowledgements: [BACKUP_ONLY_ACKNOWLEDGEMENT],
+            acknowledgements: [],
         })
 
         expect(request.config.location.oauthRedirectUri).toBe(
@@ -73,7 +72,7 @@ describe('external storage connection request', () => {
                 password: 'must-not-be-in-preparation',
             },
             platform: 'windows', mode: 'create', purpose: 'backup', strategy: 'backup-only',
-            scope: defaultExternalStorageScope('backup'), acknowledgements: [BACKUP_ONLY_ACKNOWLEDGEMENT],
+            scope: defaultExternalStorageScope('backup'), acknowledgements: [],
         })
         expect(JSON.stringify(request)).not.toContain('must-not-be-in-preparation')
     })

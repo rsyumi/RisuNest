@@ -17,7 +17,6 @@ use zeroize::{Zeroize, Zeroizing};
 
 pub(crate) const PREPARATION_LIFETIME_MS: u64 = 10 * 60 * 1000;
 pub(crate) const SEQUENTIAL_ACKNOWLEDGEMENT: &str = "sequential-single-device";
-pub(crate) const BACKUP_ACKNOWLEDGEMENT: &str = "backup-only-no-automatic-restore";
 pub(crate) const GITHUB_ACKNOWLEDGEMENT: &str = "github-dedicated-private-repository";
 
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -372,10 +371,6 @@ pub(crate) fn validate_preparation(
         (
             request.publication_strategy == ConnectionStrategy::Sequential,
             SEQUENTIAL_ACKNOWLEDGEMENT,
-        ),
-        (
-            request.publication_strategy == ConnectionStrategy::BackupOnly,
-            BACKUP_ACKNOWLEDGEMENT,
         ),
         (
             request.config.provider == "github_releases",
@@ -848,7 +843,7 @@ mod tests {
             },
             acknowledgements: match strategy {
                 ConnectionStrategy::Sequential => vec![SEQUENTIAL_ACKNOWLEDGEMENT.into()],
-                ConnectionStrategy::BackupOnly => vec![BACKUP_ACKNOWLEDGEMENT.into()],
+                ConnectionStrategy::BackupOnly => Vec::new(),
                 ConnectionStrategy::Cas => Vec::new(),
             },
         }

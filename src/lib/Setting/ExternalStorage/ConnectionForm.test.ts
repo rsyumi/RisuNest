@@ -87,8 +87,6 @@ async function settle(): Promise<void> {
 }
 
 async function prepareGoogleConnection(): Promise<void> {
-    labelControl<HTMLInputElement>(strings.backupWarning).click()
-    await settle()
     button(strings.prepare).click()
     await settle()
     labelControl<HTMLInputElement>(strings.confirmEndpoint).click()

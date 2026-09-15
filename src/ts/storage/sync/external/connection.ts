@@ -12,7 +12,6 @@ import type {
 import { buildConnectionConfig, getExternalProviderDefinition } from './providerRegistry'
 
 export const SEQUENTIAL_ACKNOWLEDGEMENT = 'sequential-single-device'
-export const BACKUP_ONLY_ACKNOWLEDGEMENT = 'backup-only-no-automatic-restore'
 export const GITHUB_DEDICATED_REPOSITORY_ACKNOWLEDGEMENT = 'github-dedicated-private-repository'
 
 export function defaultExternalStorageScope(purpose: ExternalConnectionPurpose): ExternalStorageScope {
@@ -30,7 +29,6 @@ export function requiredConnectionAcknowledgements(
 ): string[] {
     const acknowledgements: string[] = []
     if (strategy === 'sequential') acknowledgements.push(SEQUENTIAL_ACKNOWLEDGEMENT)
-    if (strategy === 'backup-only') acknowledgements.push(BACKUP_ONLY_ACKNOWLEDGEMENT)
     if (providerId === 'github_releases')
         acknowledgements.push(GITHUB_DEDICATED_REPOSITORY_ACKNOWLEDGEMENT)
     return acknowledgements

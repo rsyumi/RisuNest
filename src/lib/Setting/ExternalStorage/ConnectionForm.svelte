@@ -10,7 +10,6 @@
     import { isTauriAndroid, isTauriIOS } from 'src/ts/platform'
     import { getExternalStorageBridge } from 'src/ts/storage/sync/external/bridge'
     import {
-        BACKUP_ONLY_ACKNOWLEDGEMENT,
         SEQUENTIAL_ACKNOWLEDGEMENT,
         buildPrepareConnectionRequest,
         defaultExternalStorageScope,
@@ -269,7 +268,6 @@
 
     function acknowledgementText(id: string): { title: string; body: string } {
         if (id === SEQUENTIAL_ACKNOWLEDGEMENT) return { title: strings.sequentialTitle, body: strings.sequentialWarning }
-        if (id === BACKUP_ONLY_ACKNOWLEDGEMENT) return { title: strings.backupWarningTitle, body: strings.backupWarning }
         return { title: strings.githubWarningTitle, body: strings.githubWarning }
     }
 
@@ -423,8 +421,8 @@
         <h4 class="sub-title">{strings.purpose}</h4>
         <div class="field">
             <SegmentedButtons value={purpose} label={strings.purpose} role="radiogroup" onchange={selectPurpose} options={purposeOptions} />
-            {#if !supportsSync}<small>{strings.backupOnlyProvider}</small>
-            {:else if purpose === 'sync'}<small>{strings.syncHelp}</small>{/if}
+            {#if !supportsSync}<small>{strings.backupOnlyProvider}</small>{/if}
+            <small>{strings.purposeHelp}</small>
         </div>
         {#if purpose === 'sync'}
             <div class="field">
@@ -482,7 +480,7 @@
                 </label>
             {/each}
         </div>
-        <p class="sub-help">{definition.oauth ? strings.signInLater : strings.secretsLater}</p>
+        {#if definition.oauth}<p class="sub-help">{strings.signInLater}</p>{/if}
     </section>
 
     <fieldset class="sub" disabled={purpose === 'sync'}>
