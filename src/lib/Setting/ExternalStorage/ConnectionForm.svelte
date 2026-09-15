@@ -263,7 +263,7 @@
         try {
             prepared = await bridge.prepareConnection(request)
         } catch (reason) {
-            error = externalErrorMessage(strings, reason, strategy)
+            error = externalErrorMessage(strings, reason)
         } finally {
             busy = false
         }

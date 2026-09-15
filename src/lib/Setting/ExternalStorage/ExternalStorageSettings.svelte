@@ -272,6 +272,7 @@
 
     function errorLabel(value?: ExternalJobSummary['error']): string {
         if (!value) return strings.failed
+        if (value.action === 'reauthenticate') return strings.reauthenticate
         if (value.action === 'unlock-key') return strings.unlockKey
         if (value.action === 'resolve-conflict') return strings.resolveRequired
         return externalErrorMessage(strings, value)
