@@ -109,7 +109,7 @@ describe('bootstrapPersistentDatabase', () => {
         })
         expect(store.materializeDatabase).not.toHaveBeenCalled()
         expect(store.replaceFromDatabase).toHaveBeenCalledWith(prepared, 0)
-        expect(result).toEqual({ database: prepared, revision: 1, profile: 'scalable-v3' })
+        expect(result).toEqual({ database: prepared, revision: 1 })
     })
 
     it('reads a nonblank persistent revision without rewriting it', async () => {
@@ -130,7 +130,6 @@ describe('bootstrapPersistentDatabase', () => {
         expect(result).toEqual({
             database: persistent,
             revision: 7,
-            profile: 'maximum-compatibility',
         })
     })
 
@@ -184,7 +183,6 @@ describe('bootstrapPersistentDatabase', () => {
         expect(result).toEqual({
             database: changed,
             revision: 5,
-            profile: 'maximum-compatibility',
         })
     })
 
@@ -238,7 +236,6 @@ describe('bootstrapPersistentDatabase', () => {
             }),
         }))
         expect(result.revision).toBe(1)
-        expect(result.profile).toBe('scalable-v3')
         expect(result.database.botPresets[0]).toEqual({
             name: persistent.botPresets[0].name,
             image: persistent.botPresets[0].image,
@@ -301,7 +298,6 @@ describe('bootstrapPersistentDatabase', () => {
         })
 
         expect(materializeDatabase).toHaveBeenCalledOnce()
-        expect(result.profile).toBe('scalable-v3')
         expect(result.database.characters.every(isCatalogCharacterStub)).toBe(true)
         const stored = await store.materializeDatabase(result.revision)
         expect(stored.formatversion).toBe(5)
@@ -431,7 +427,6 @@ describe('bootstrapPersistentDatabase', () => {
             ),
         })
 
-        expect(result.profile).toBe('scalable-v3')
         expect(await store.materializeDatabase(result.revision)).toEqual(prepared)
         expect(result.database.botPresets[0]).toEqual({
             name: prepared.botPresets[0].name,

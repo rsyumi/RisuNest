@@ -9,7 +9,6 @@ import categoryManagerModal from './HypaV3Modal/category-manager-modal.svelte?ra
 import tagManagerModal from './HypaV3Modal/tag-manager-modal.svelte?raw'
 import irisModal from './IrisModal.svelte?raw'
 import nativeFileJobDialog from './NativeFileJobDialog.svelte?raw'
-import pluginAlertModal from './PluginAlertModal.svelte?raw'
 import popupEditor from './PopupEditor.svelte?raw'
 import promptDiffModal from './PromptDiffModal.svelte?raw'
 import easyPanel from './ProTools/EasyPanel.svelte?raw'
@@ -36,7 +35,6 @@ import observer from '../../ts/observer.svelte.ts?raw'
  */
 const modalSources: Record<string, string> = {
     'AlertComp.svelte': alertComp,
-    'PluginAlertModal.svelte': pluginAlertModal,
     'PopupEditor.svelte': popupEditor,
     'IrisModal.svelte': irisModal,
     'CustomSidebarConfig.svelte': customSidebarConfig,

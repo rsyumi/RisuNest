@@ -8,7 +8,6 @@ import { dispatchChatOutputListeners } from '../pluginChatOutputListeners'
 const fixture = vi.hoisted(() => {
     const requestedPermissions: string[] = []
     const listeners = new Set<any>()
-    const listenerProvenance = new WeakMap<any, 'v2.1-live' | 'v3-legacy'>()
     const releaseRevisionLease = vi.fn()
     const projectScalable = vi.fn()
     const scopedAccess = {
@@ -26,7 +25,6 @@ const fixture = vi.hoisted(() => {
     return {
         requestedPermissions,
         listeners,
-        listenerProvenance,
         releaseRevisionLease,
         projectScalable,
         scopedAccess,
@@ -55,17 +53,12 @@ vi.mock('../plugins.svelte', () => {
     return {
         allowedDbKeys: [],
         applyPreparedPluginDatabaseUpdate: vi.fn(),
-        chatOutputListenerProvenance: fixture.listenerProvenance,
         customProviderStore: {
             subscribe(run: (value: string[]) => void) { run([]); return () => undefined },
             set: vi.fn(),
         },
         getV2PluginAPIs: () => oldApis,
         handlePluginInstallViaPlugin: vi.fn(),
-        pluginCompatibility: {
-            profile: 'scalable-v3',
-            allowsEviction: true,
-        },
         pluginStorageStore: {
             snapshot: vi.fn(async () => []), mutate: unrelated, invalidate: unrelated,
             getItem: unrelated, setItem: unrelated, removeItem: unrelated,
@@ -281,14 +274,11 @@ window.acceptance = (async () => {
 
         await dispatchChatOutputListeners({
             listeners: fixture.listeners,
-            provenance: fixture.listenerProvenance,
-            profile: 'scalable-v3',
             char: finalLiveCharacter,
             chat: finalLiveChat,
             characterIndex: 1,
             chatIndex: 0,
             messageIndex: 1,
-            snapshot: structuredClone,
             projectScalable: fixture.projectScalable,
             onError: (error) => { throw error },
         })
@@ -365,14 +355,11 @@ window.ready = (async () => {
         expect(fixture.listeners).toHaveLength(0)
         await dispatchChatOutputListeners({
             listeners: fixture.listeners,
-            provenance: fixture.listenerProvenance,
-            profile: 'scalable-v3',
             char: finalLiveCharacter,
             chat: finalLiveChat,
             characterIndex: 1,
             chatIndex: 0,
             messageIndex: 1,
-            snapshot: structuredClone,
             projectScalable: fixture.projectScalable,
             onError: (error) => { throw error },
         })

@@ -66,7 +66,6 @@ import {
     applyPluginStorageMutationsInPlace,
     orderPluginStorageKeys,
 } from './saveCoordinatorHelpers'
-import { selectPluginCompatibilityProfile } from '../plugins/pluginCompatibility'
 import { getRuntimePerformanceBudgets } from '../runtimePerformanceProfile'
 import type { WindowedConversationPersistenceAuthority } from './saveCoordinator'
 import {
@@ -345,10 +344,6 @@ export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapte
         },
         canUseWindowedSelectedConversation() {
             return workingSetResidency.allowsEviction
-        },
-        isMaximumCompatibilityMode() {
-            return selectPluginCompatibilityProfile(getDatabase().plugins ?? []) ===
-                'maximum-compatibility'
         },
         isConversationOperationActive() {
             return get(doingChat)
@@ -654,9 +649,6 @@ export const materializePersistentDatabaseSnapshotWithRevision = (
     reason: string,
 ): Promise<PersistentDatabaseSnapshot> =>
     getPersistentDataRuntime().materializePersistentDatabaseSnapshotWithRevision(reason)
-
-export const materializeMaximumCompatibilityWorkingSet = (): Promise<void> =>
-    getPersistentDataRuntime().materializeMaximumCompatibilityWorkingSet()
 
 export const releaseInactiveWorkingSet = (
     canRelease?: () => boolean | Promise<boolean>,

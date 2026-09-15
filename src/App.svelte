@@ -24,7 +24,6 @@
     import { hypaV3ModalOpen, hypaV3ProgressStore } from "./ts/stores.svelte";
     import HypaV3Modal from './lib/Others/HypaV3Modal.svelte';
     import HypaV3Progress from './lib/Others/HypaV3Progress.svelte';
-    import PluginAlertModal from './lib/Others/PluginAlertModal.svelte';
     import PopupList from './lib/UI/PopupList.svelte';
     import EasyPanel from './lib/Others/ProTools/EasyPanel.svelte';
     import sendSound from './etc/send.mp3'
@@ -589,7 +588,6 @@
     {#if $hypaV3ProgressStore.open}
         <HypaV3Progress />
     {/if}
-    <PluginAlertModal />
     {#if popupStore.children}
         <PopupList />
     {/if}

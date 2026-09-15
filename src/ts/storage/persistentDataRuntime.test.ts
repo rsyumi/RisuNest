@@ -802,19 +802,6 @@ describe('prepared persistent replacement', () => {
         )
     })
 
-    it('invalidates the resident session after maximum compatibility materialization', async () => {
-        const harness = await createActiveSessionRuntimeHarness()
-        const session = harness.runtime.getActiveConversationSession()!
-
-        await harness.runtime.materializeMaximumCompatibilityWorkingSet()
-
-        expect(session.isActive).toBe(false)
-        expect(harness.runtime.getActiveConversationSession()).toBeNull()
-        expect(() => session.append({ role: 'char', data: 'detached materialization write' })).toThrow(
-            /inactive/,
-        )
-    })
-
     it('invalidates the resident session after scalable working-set projection', async () => {
         const harness = await createActiveSessionRuntimeHarness()
         const session = harness.runtime.getActiveConversationSession()!
@@ -1670,37 +1657,5 @@ describe('native replacement working-set refresh', () => {
                 ],
             }),
         )
-    })
-
-    it('materializes the complete restored working set for enabled v2.1 plugins', async () => {
-        const restored = makeConversationDatabase('After native restore')
-        restored.plugins = [{
-            name: 'Compatibility plugin',
-            version: '2.1',
-            enabled: true,
-        }] as Database['plugins']
-        restored.pluginCustomStorage = { plugin: { retained: true } }
-        restored.characters.push({
-            ...structuredClone(restored.characters[0]),
-            chaId: 'char-b',
-            name: 'Inactive full character',
-            personality: 'retained full detail',
-            chats: [],
-        })
-        const harness = createFenceRuntimeHarness(
-            makeConversationDatabase('Before native restore'),
-            restored,
-        )
-        const { runtime } = harness
-        await runtime.initializeActiveWorkingSet(harness.database)
-        const token = await runtime.capturePersistentMutationToken('native-restore-start')
-        const fence = await runtime.acquireDestructiveReplacementFence(token)
-
-        await fence.refreshCommittedWorkingSet(2)
-
-        expect(harness.store.materializeDatabase).toHaveBeenCalledWith(2)
-        expect(harness.database.pluginCustomStorage).toEqual({ plugin: { retained: true } })
-        expect(harness.database.characters[1]).toHaveProperty('personality')
-        fence.release()
     })
 })

@@ -5,8 +5,6 @@ import type { Database } from '../../storage/database.svelte'
 const fixture = vi.hoisted(() => ({
     api: null as Record<string, (...args: any[]) => any> | null,
     selectedIndex: 0,
-    profile: 'maximum-compatibility' as 'scalable-v3' | 'maximum-compatibility',
-    invalidations: 0,
     databaseAccessDependencies: null as null | { getSelectedCharacterId(): string | null },
     pluginPermissionReads: vi.fn(),
     listeners: new Set<Function>(),
@@ -66,10 +64,6 @@ vi.mock('../plugins.svelte', () => {
         },
         getV2PluginAPIs: () => oldApis,
         handlePluginInstallViaPlugin: vi.fn(),
-        pluginCompatibility: {
-            get profile() { return fixture.profile },
-            get allowsEviction() { return fixture.profile === 'scalable-v3' },
-        },
         pluginStorageStore: {
             snapshot: vi.fn(async () => []), mutate: unrelated, invalidate: unrelated,
             getItem: unrelated, setItem: unrelated, removeItem: unrelated,
@@ -143,23 +137,6 @@ vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
     replacePersistentConversation: vi.fn(),
     replacePersistentDatabase: vi.fn(),
 }))
-vi.mock('../pluginCompatibility', () => ({
-    assertPluginFullObjectCompatibility: vi.fn(),
-    runPluginFullObjectReplacement: vi.fn((
-        _profile: string,
-        _operation: string,
-        affectsActiveConversation: boolean,
-        replacement: () => unknown,
-        invalidate: () => void,
-    ) => {
-        const result = replacement()
-        if (affectsActiveConversation) {
-            fixture.invalidations++
-            invalidate()
-        }
-        return result
-    }),
-}))
 vi.mock('../pluginDatabaseAccess', () => ({
     createProductionPluginDatabaseAccess: vi.fn((dependencies) => {
         fixture.databaseAccessDependencies = dependencies
@@ -186,14 +163,12 @@ function resetDatabase(): void {
     } as unknown as Database
 }
 
-describe('Plugin v3 maximum full-object compatibility', () => {
+describe('Plugin v3 full-object access routing', () => {
     beforeEach(async () => {
         vi.clearAllMocks()
         resetDatabase()
         fixture.api = null
         fixture.selectedIndex = 0
-        fixture.profile = 'maximum-compatibility'
-        fixture.invalidations = 0
         fixture.listeners.clear()
         fixture.scopedAccess.getCurrentCharacter.mockReset()
         fixture.scopedAccess.getCharacterFromIndex.mockReset()
@@ -207,139 +182,7 @@ describe('Plugin v3 maximum full-object compatibility', () => {
         } as any)
     })
 
-    it('keeps maximum getters detached and preserves undefined and null results', async () => {
-        const api = fixture.api!
-        const current = await api.getCharacter()
-        const indexed = await api.getCharacterFromIndex(1)
-        const chat = await api.getChatFromIndex(1, 0)
-
-        expect(current).toEqual(fixture.database.characters[0])
-        expect(indexed).toEqual(fixture.database.characters[1])
-        expect(chat).toEqual(fixture.database.characters[1].chats[0])
-        current.name = 'detached'
-        chat.name = 'detached chat'
-        expect(fixture.database.characters[0].name).toBe('Active')
-        expect(fixture.database.characters[1].chats[0].name).toBe('Trash chat')
-        expect(await api.getCharacterFromIndex(-1)).toBeNull()
-        expect(await api.getChatFromIndex(99, 0)).toBeNull()
-
-        fixture.selectedIndex = -1
-        expect(await api.getCharacter()).toBeUndefined()
-    })
-
-    it('deeply detaches current and indexed character and chat getters', async () => {
-        const api = fixture.api!
-        const current = await api.getCharacter()
-        const indexed = await api.getCharacterFromIndex(1)
-        const indexedChat = await api.getChatFromIndex(1, 0)
-
-        current.chats[0].name = 'mutated current chat'
-        current.chats[0].message[0].data = 'mutated current message'
-        indexed.chats[0].message[0].data = 'mutated indexed message'
-        indexedChat.message[0].data = 'mutated direct chat message'
-
-        expect(fixture.database.characters[0].chats[0]).toMatchObject({
-            name: 'Live',
-            message: [{ role: 'char', data: 'a' }],
-        })
-        expect(fixture.database.characters[1].chats[0].message).toEqual([
-            { role: 'user', data: 'b' },
-        ])
-    })
-
-    it('keeps maximum ID replacement and invalid-index no-op behavior', async () => {
-        const api = fixture.api!
-        const replacementCharacter = structuredClone(fixture.database.characters[1])
-        replacementCharacter.chaId = 'replacement-id'
-        await api.setCharacterToIndex(1, replacementCharacter)
-        expect(fixture.database.characters[1].chaId).toBe('replacement-id')
-
-        const replacementChat = structuredClone(fixture.database.characters[0].chats[0])
-        replacementChat.id = 'replacement-chat-id'
-        await api.setChatToIndex(0, 0, replacementChat)
-        expect(fixture.database.characters[0].chats[0].id).toBe('replacement-chat-id')
-        expect(fixture.invalidations).toBe(1)
-
-        const before = structuredClone(fixture.database)
-        expect(await api.setCharacterToIndex(99, replacementCharacter)).toBeUndefined()
-        expect(await api.setChatToIndex(99, 99, replacementChat)).toBeUndefined()
-        expect(fixture.database).toEqual(before)
-    })
-
-    it('invalidates only maximum replacements affecting the active conversation', async () => {
-        const api = fixture.api!
-        await api.setCharacter(structuredClone(fixture.database.characters[0]))
-        expect(fixture.invalidations).toBe(1)
-
-        await api.setCharacterToIndex(1, structuredClone(fixture.database.characters[1]))
-        await api.setChatToIndex(0, 99, structuredClone(fixture.database.characters[0].chats[0]))
-        expect(fixture.invalidations).toBe(1)
-
-        fixture.database.characters[0].chats.push({
-            id: 'other-chat', name: 'Other', message: [],
-        } as any)
-        await api.setChatToIndex(0, 1, structuredClone(fixture.database.characters[0].chats[1]))
-        expect(fixture.invalidations).toBe(1)
-
-        fixture.selectedIndex = 1
-        await api.setCharacterToIndex(1, structuredClone(fixture.database.characters[1]))
-        expect(fixture.invalidations).toBe(2)
-    })
-
-    it('fully replaces ordinary and nested fields through current and indexed setters', async () => {
-        const api = fixture.api!
-        const currentReplacement = structuredClone(fixture.database.characters[0])
-        currentReplacement.name = 'Current replacement'
-        currentReplacement.chats[0].name = 'Current nested replacement'
-        currentReplacement.chats[0].message = [{ role: 'user', data: 'current body' }]
-
-        await api.setCharacter(currentReplacement)
-        expect(fixture.database.characters[0]).toEqual(currentReplacement)
-
-        const indexedReplacement = structuredClone(fixture.database.characters[1])
-        indexedReplacement.name = 'Indexed replacement'
-        indexedReplacement.chats[0].name = 'Indexed nested replacement'
-        indexedReplacement.chats[0].message = [{ role: 'char', data: 'indexed body' }]
-        await api.setCharacterToIndex(1, indexedReplacement)
-        expect(fixture.database.characters[1]).toEqual(indexedReplacement)
-
-        const chatReplacement = structuredClone(fixture.database.characters[0].chats[0])
-        chatReplacement.name = 'Chat replacement'
-        chatReplacement.message = [{ role: 'char', data: 'chat body' }]
-        await api.setChatToIndex(0, 0, chatReplacement)
-        expect(fixture.database.characters[0].chats[0]).toEqual(chatReplacement)
-    })
-
-    it('keeps valid-character invalid-chat access fulfilled and unchanged', async () => {
-        const api = fixture.api!
-        const before = structuredClone(fixture.database)
-        const replacement = structuredClone(fixture.database.characters[0].chats[0])
-        replacement.name = 'must not be installed'
-
-        expect(await api.getChatFromIndex(0, 99)).toBeNull()
-        expect(await api.setChatToIndex(0, 99, replacement)).toBeUndefined()
-        expect(fixture.database).toEqual(before)
-    })
-
-    it('keeps getChar/setChar aliases aligned with getCharacter/setCharacter', async () => {
-        const api = fixture.api!
-        expect(await api.getChar()).toEqual(await api.getCharacter())
-
-        const legacyReplacement = structuredClone(fixture.database.characters[0])
-        legacyReplacement.name = 'Legacy alias replacement'
-        legacyReplacement.chats[0].message[0].data = 'legacy nested replacement'
-        await api.setChar(legacyReplacement)
-        expect(fixture.database.characters[0]).toEqual(legacyReplacement)
-
-        const namedReplacement = structuredClone(fixture.database.characters[0])
-        namedReplacement.name = 'Named alias replacement'
-        namedReplacement.chats[0].message[0].data = 'named nested replacement'
-        await api.setCharacter(namedReplacement)
-        expect(fixture.database.characters[0]).toEqual(namedReplacement)
-    })
-
-    it('routes scalable getters through scoped access without changing the maximum oracle', async () => {
-        fixture.profile = 'scalable-v3'
+    it('routes getters through scoped access', async () => {
         const active = structuredClone(fixture.database.characters[0])
         const trashed = structuredClone(fixture.database.characters[1])
         fixture.scopedAccess.getCurrentCharacter.mockResolvedValue(active)
@@ -351,12 +194,9 @@ describe('Plugin v3 maximum full-object compatibility', () => {
         await expect(api.getCharacterFromIndex(1)).resolves.toMatchObject({ chaId: 'trashed' })
         await expect(api.getChatFromIndex(1, 0)).resolves.toMatchObject({ id: 'trash-chat' })
 
-        expect(fixture.profile).toBe('scalable-v3')
         expect(fixture.pluginPermissionReads).not.toHaveBeenCalledWith(
             expect.stringContaining('_db'),
         )
-        const { pluginCompatibility } = await import('../plugins.svelte')
-        expect(pluginCompatibility.allowsEviction).toBe(true)
 
         expect(fixture.scopedAccess.getCurrentCharacter.mock.calls[0][0]).toMatchObject({
             pluginName: expect.stringContaining('contract-plugin-'),
@@ -374,7 +214,6 @@ describe('Plugin v3 maximum full-object compatibility', () => {
     })
 
     it('resolves a selected character independently of conversation validity', async () => {
-        fixture.profile = 'scalable-v3'
         fixture.scopedAccess.getCurrentCharacter.mockResolvedValue(
             structuredClone(fixture.database.characters[0]),
         )
@@ -385,8 +224,7 @@ describe('Plugin v3 maximum full-object compatibility', () => {
         expect(fixture.databaseAccessDependencies?.getSelectedCharacterId()).toBe('active')
     })
 
-    it('routes scalable setters through scoped access while maximum ID replacement remains intact', async () => {
-        fixture.profile = 'scalable-v3'
+    it('routes setters through scoped access', async () => {
         const api = fixture.api!
         const character = structuredClone(fixture.database.characters[1])
         const chat = structuredClone(fixture.database.characters[1].chats[0])
@@ -413,11 +251,8 @@ describe('Plugin v3 maximum full-object compatibility', () => {
             expect.objectContaining({ pluginName: expect.stringContaining('contract-plugin-') }),
         )
         expect(fixture.database.characters[1].name).toBe('Trash')
-        expect(fixture.profile).toBe('scalable-v3')
         expect(fixture.pluginPermissionReads).not.toHaveBeenCalledWith(
             expect.stringContaining('_db'),
         )
-        const { pluginCompatibility } = await import('../plugins.svelte')
-        expect(pluginCompatibility.allowsEviction).toBe(true)
     })
 })

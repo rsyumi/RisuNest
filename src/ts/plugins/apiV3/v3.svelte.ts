@@ -1,4 +1,4 @@
-import { allowedDbKeys, applyPreparedPluginDatabaseUpdate, chatOutputListenerProvenance, customProviderStore, getV2PluginAPIs, handlePluginInstallViaPlugin, pluginCompatibility, pluginStorageStore, pluginV2, type PluginV2ProviderArgument, type PluginV2ProviderOptions, type RisuPlugin } from "../plugins.svelte";
+import { allowedDbKeys, applyPreparedPluginDatabaseUpdate, customProviderStore, getV2PluginAPIs, handlePluginInstallViaPlugin, pluginStorageStore, pluginV2, type PluginV2ProviderArgument, type PluginV2ProviderOptions, type RisuPlugin } from "../plugins.svelte";
 import { SandboxHost } from "./factory";
 import { getDatabase } from "src/ts/storage/database.svelte";
 import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
@@ -51,9 +51,6 @@ import {
 import type { CompleteConversationLease } from "src/ts/storage/activeWorkingSet.svelte";
 import { appendCurrentConversationMessage } from "src/ts/conversationMutations";
 import {
-    runPluginFullObjectReplacement,
-} from "../pluginCompatibility";
-import {
     registerChatOutputListener,
     removeChatOutputListener,
     type ChatOutputListener,
@@ -100,7 +97,6 @@ function getPluginDatabaseAccess(): PluginDatabaseAccess {
     return (pluginDatabaseAccess ??= createProductionPluginDatabaseAccess({
         flushPendingData,
         getCompatibilityDatabase: () => DBState.db,
-        getCompatibilityProfile: () => pluginCompatibility.profile,
         getSelectedCharacterId: () =>
             getDatabase().characters[get(selectedCharID)]?.chaId ?? null,
         captureSelectedConversationTarget,
@@ -115,8 +111,6 @@ function getPluginDatabaseAccess(): PluginDatabaseAccess {
         getNavigationGeneration: getPersistentNavigationGeneration,
         applyCompatibilityDatabaseLite: (database) =>
             applyPreparedPluginDatabaseUpdate(database, true),
-        applyCompatibilityDatabase: async (database) =>
-            applyPreparedPluginDatabaseUpdate(database, false),
         readPluginStorageSnapshot: () => pluginStorageStore.snapshot(),
         mutatePluginStorage: (mutations) => pluginStorageStore.mutate(mutations),
         invalidatePluginStorage: () => pluginStorageStore.invalidate(),
@@ -752,22 +746,12 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
         signal: pluginLifetime.signal,
     })
     const getCompleteCurrentCharacter = () =>
-        pluginCompatibility.profile === 'maximum-compatibility'
-            ? oldApis.getChar()
-            : getPluginDatabaseAccess().getCurrentCharacter(fullObjectContext())
+        getPluginDatabaseAccess().getCurrentCharacter(fullObjectContext())
     const setCompleteCurrentCharacter = (character: unknown) =>
-        pluginCompatibility.profile === 'maximum-compatibility'
-            ? runPluginFullObjectReplacement(
-                pluginCompatibility.profile,
-                'setCharacter',
-                true,
-                () => oldApis.setChar(character),
-                invalidateActiveConversationSession,
-            )
-            : getPluginDatabaseAccess().setCurrentCharacter(
-                character as any,
-                fullObjectContext(),
-            )
+        getPluginDatabaseAccess().setCurrentCharacter(
+            character as any,
+            fullObjectContext(),
+        )
     addPluginUnloadCallback(plugin.name, () => pluginLifetime.abort())
     return {
 
@@ -857,25 +841,15 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             }
             if (pluginLifetime.signal.aborted) return
             const listener = func as ChatOutputListener
-            registerChatOutputListener(
-                pluginV2.chatOutput,
-                chatOutputListenerProvenance,
-                listener,
-                'v3-legacy',
-            )
+            registerChatOutputListener(pluginV2.chatOutput, listener)
             addPluginUnloadCallback(plugin.name, () => removeChatOutputListener(
                 pluginV2.chatOutput,
-                chatOutputListenerProvenance,
                 listener,
             ));
         },
         removeRisuChatListener: (mode:'output', func:Function) => {
             if (mode !== 'output') throw (`chat listener mode ${mode} not found`)
-            removeChatOutputListener(
-                pluginV2.chatOutput,
-                chatOutputListenerProvenance,
-                func as ChatOutputListener,
-            )
+            removeChatOutputListener(pluginV2.chatOutput, func as ChatOutputListener)
         },
         setDatabaseLite: (database: Record<string, unknown>) =>
             getPluginDatabaseAccess().setDatabaseLite(database, allowedDbKeys),
@@ -1014,84 +988,28 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             }
         },
         getCharacterFromIndex: (index:number) => {
-            if (pluginCompatibility.profile === 'scalable-v3') {
-                return getPluginDatabaseAccess().getCharacterFromIndex(index, fullObjectContext())
-            }
-            const db = DBState.db
-            const charIds = Object.keys(db.characters);
-            const charId = charIds[index];
-            if(charId){
-                return $state.snapshot(db.characters[charId]);
-            }
-            return null;
+            return getPluginDatabaseAccess().getCharacterFromIndex(index, fullObjectContext())
         },
         setCharacterToIndex: (index:number, char:any) => {
-            if (pluginCompatibility.profile === 'scalable-v3') {
-                return getPluginDatabaseAccess().setCharacterToIndex(
-                    index,
-                    char,
-                    fullObjectContext(),
-                )
-            }
-            const db = DBState.db
-            const charIds = Object.keys(db.characters);
-            const charId = charIds[index];
-            const target = charId ? db.characters[charId] : undefined
-            return runPluginFullObjectReplacement(
-                pluginCompatibility.profile,
-                'setCharacterToIndex',
-                target !== undefined && target === db.characters[get(selectedCharID)],
-                () => {
-                    if(charId) DBState.db.characters[charId] = char
-                },
-                invalidateActiveConversationSession,
+            return getPluginDatabaseAccess().setCharacterToIndex(
+                index,
+                char,
+                fullObjectContext(),
             )
         },
         getChatFromIndex: (characterIndex:number, chatIndex:number) => {
-            if (pluginCompatibility.profile === 'scalable-v3') {
-                return getPluginDatabaseAccess().getChatFromIndex(
-                    characterIndex,
-                    chatIndex,
-                    fullObjectContext(),
-                )
-            }
-            const db = DBState.db
-            const charIds = Object.keys(db.characters);
-            const charId = charIds[characterIndex];
-            if(charId){
-                const chats = db.characters[charId].chats;
-                if(chats && chats[chatIndex]){
-                    return $state.snapshot(chats[chatIndex]);
-                }
-            }
-            return null;
+            return getPluginDatabaseAccess().getChatFromIndex(
+                characterIndex,
+                chatIndex,
+                fullObjectContext(),
+            )
         },
         setChatToIndex: (characterIndex:number, chatIndex:number, chat:any) => {
-            if (pluginCompatibility.profile === 'scalable-v3') {
-                return getPluginDatabaseAccess().setChatToIndex(
-                    characterIndex,
-                    chatIndex,
-                    chat,
-                    fullObjectContext(),
-                )
-            }
-            const db = DBState.db
-            const charIds = Object.keys(db.characters);
-            const charId = charIds[characterIndex];
-            const target = charId ? db.characters[charId] : undefined
-            return runPluginFullObjectReplacement(
-                pluginCompatibility.profile,
-                'setChatToIndex',
-                target !== undefined &&
-                    target === db.characters[get(selectedCharID)] &&
-                    target.chatPage === chatIndex,
-                () => {
-                    const chats = target?.chats
-                    if(chats && chats[chatIndex]){
-                        chats[chatIndex] = chat
-                    }
-                },
-                invalidateActiveConversationSession,
+            return getPluginDatabaseAccess().setChatToIndex(
+                characterIndex,
+                chatIndex,
+                chat,
+                fullObjectContext(),
             )
         },
         getCurrentCharacterIndex: () => {
@@ -1411,8 +1329,35 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             return getPluginPermission(plugin.name, permission as any);
         },
         //Internal use APIs
+        // Global aliases the guest installs through initOldApiGlobal(). The list is
+        // explicit so host API changes cannot silently alter the guest globals.
         _getOldKeys: () => {
-            return Object.keys(oldApis)
+            return [
+                'risuFetch',
+                'nativeFetch',
+                'getArg',
+                'getChar',
+                'setChar',
+                'addProvider',
+                'addRisuScriptHandler',
+                'removeRisuScriptHandler',
+                'addRisuReplacer',
+                'removeRisuReplacer',
+                'addRisuChatListener',
+                'removeRisuChatListener',
+                'onUnload',
+                'setArg',
+                'safeLocalStorage',
+                'apiVersion',
+                'apiVersionCompatibleWith',
+                'getDatabase',
+                'pluginStorage',
+                'setDatabaseLite',
+                'setDatabase',
+                'loadPlugins',
+                'readImage',
+                'saveAsset',
+            ]
         },
         _getPropertiesForInitialization: () => {
             const v = {

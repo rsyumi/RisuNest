@@ -53,7 +53,6 @@ function makeHarness(messageCount = 10_000) {
     let resident = makeCharacter(structuredClone(persistedConversation))
     let selectedCharacterId = resident.chaId
     let allowWindowed = true
-    let maximumCompatibility = false
     let operationActive = false
     let operationActiveListener: ((active: boolean) => void) | null = null
     let pendingPersistence = false
@@ -143,7 +142,6 @@ function makeHarness(messageCount = 10_000) {
         },
         publishConversation: published,
         canUseWindowedSelectedConversation: () => allowWindowed,
-        isMaximumCompatibilityMode: () => maximumCompatibility,
         isConversationOperationActive: () => operationActive,
         subscribeConversationOperationActive: (listener: (active: boolean) => void) => {
             operationActiveListener = listener
@@ -179,9 +177,6 @@ function makeHarness(messageCount = 10_000) {
         },
         setAllowWindowed: (value: boolean) => {
             allowWindowed = value
-        },
-        setMaximumCompatibility: (value: boolean) => {
-            maximumCompatibility = value
         },
         setOperationActive: (value: boolean) => {
             operationActive = value
@@ -716,8 +711,6 @@ describe('selected conversation lifecycle', () => {
     it.each([
         ['scalable policy', (harness: ReturnType<typeof makeHarness>) =>
             harness.setAllowWindowed(false)],
-        ['maximum compatibility', (harness: ReturnType<typeof makeHarness>) =>
-            harness.setMaximumCompatibility(true)],
         ['active operation', (harness: ReturnType<typeof makeHarness>) =>
             harness.setOperationActive(true)],
         ['pending persistence', (harness: ReturnType<typeof makeHarness>) =>
@@ -944,7 +937,6 @@ describe('selected conversation lifecycle', () => {
                 else workingCopy.characters[0].chats[0] = conversation
             },
             canUseWindowedSelectedConversation: () => true,
-            isMaximumCompatibilityMode: () => false,
             isConversationOperationActive: () => false,
         }
         const runtime = createPersistentDataRuntime({
@@ -1074,7 +1066,6 @@ describe('selected conversation lifecycle', () => {
                     else workingCopy.characters[0].chats[0] = conversation
                 },
                 canUseWindowedSelectedConversation: () => true,
-                isMaximumCompatibilityMode: () => false,
                 isConversationOperationActive: () => false,
             }
             const runtime = createPersistentDataRuntime({
@@ -1193,7 +1184,6 @@ describe('selected conversation lifecycle', () => {
                 else workingCopy.characters[0].chats[0] = conversation
             },
             canUseWindowedSelectedConversation: () => true,
-            isMaximumCompatibilityMode: () => false,
             isConversationOperationActive: () => false,
         }
         const runtime = createPersistentDataRuntime({
@@ -1285,7 +1275,6 @@ describe('selected conversation lifecycle', () => {
                 publishPersistentConversationReplacementToWorkingSet(workingCopy, result)
             },
             canUseWindowedSelectedConversation: () => true,
-            isMaximumCompatibilityMode: () => false,
             isConversationOperationActive: () => false,
         }
         const runtime = createPersistentDataRuntime({
@@ -1362,7 +1351,6 @@ describe('selected conversation lifecycle', () => {
                 throw new Error('rollback publication failed')
             },
             canUseWindowedSelectedConversation: () => true,
-            isMaximumCompatibilityMode: () => false,
             isConversationOperationActive: () => false,
         }
         const runtime = createPersistentDataRuntime({
@@ -1421,7 +1409,6 @@ describe('selected conversation lifecycle', () => {
                 else workingCopy.characters[0].chats[0] = conversation
             },
             canUseWindowedSelectedConversation: () => true,
-            isMaximumCompatibilityMode: () => false,
             isConversationOperationActive: () => false,
         }
         const runtime = createPersistentDataRuntime({
@@ -1495,7 +1482,6 @@ describe('selected conversation lifecycle', () => {
                 else workingCopy.characters[index].chats[0] = conversation
             },
             canUseWindowedSelectedConversation: () => true,
-            isMaximumCompatibilityMode: () => false,
             isConversationOperationActive: () => false,
         }
         const runtime = createPersistentDataRuntime({
@@ -1519,67 +1505,6 @@ describe('selected conversation lifecycle', () => {
         })
     })
 
-    it('invalidates windowed ownership before installing maximum compatibility data', async () => {
-        const database = {
-            username: 'Maximum compatibility fixture',
-            characters: [makeCharacter(makeChat(3))],
-        } as unknown as Database
-        let workingCopy = structuredClone(database)
-        const store = new IndexedDbPersistentDataStore(
-            `selected-maximum-compatibility-${crypto.randomUUID()}`,
-            indexedDB,
-            IDBKeyRange,
-        )
-        await store.open()
-        await store.replaceFromDatabase(database)
-        let runtime!: ReturnType<typeof createPersistentDataRuntime>
-        const installCompleteDatabase = vi.fn((next: Database) => {
-            expect(runtime.getSelectedConversationMode()).toBeNull()
-            expect(runtime.captureSelectedConversationAuthority()).toBeNull()
-            workingCopy = next
-        })
-        const state: PersistentDataRuntimeStateAdapter = {
-            captureRoot: () => capturePersistentRoot(workingCopy),
-            captureSelectedCharacter: () => workingCopy.characters[0] ?? null,
-            captureCharacter: (id) =>
-                workingCopy.characters.find((character) => character.chaId === id) ?? null,
-            getSelectedCharacterId: () => workingCopy.characters[0]?.chaId,
-            getSelectedConversationId: () => workingCopy.characters[0]?.chats[0]?.id,
-            replaceDatabase: (next) => {
-                workingCopy = next
-            },
-            installCompleteDatabase,
-            restoreSelection: vi.fn(),
-            publishCharacter: (next) => {
-                workingCopy.characters[0] = next
-            },
-            publishConversation: (_characterId, conversation, nextCharacter) => {
-                if (nextCharacter) workingCopy.characters[0] = nextCharacter
-                else workingCopy.characters[0].chats[0] = conversation
-            },
-            canUseWindowedSelectedConversation: () => true,
-            isMaximumCompatibilityMode: () => false,
-            isConversationOperationActive: () => false,
-        }
-        runtime = createPersistentDataRuntime({
-            store,
-            state,
-            prepareDatabase: async (candidate) => candidate,
-        })
-        await runtime.initializeActiveWorkingSet(workingCopy)
-        expect(runtime.getSelectedConversationMode()).toBe('windowed')
-
-        await runtime.materializeMaximumCompatibilityWorkingSet()
-
-        expect(installCompleteDatabase).toHaveBeenCalledOnce()
-        expect(runtime.getSelectedConversationMode()).toBeNull()
-        expect(runtime.captureSelectedConversationAuthority()).toBeNull()
-        expect(workingCopy.characters[0].chats[0].message).toHaveLength(3)
-        workingCopy.username = 'Safe complete write'
-        runtime.markPersistentDataDirty(1)
-        await runtime.flushPendingData('after-maximum-compatibility')
-        expect((await store.readConversation('char-a', 'chat-a')).value.message).toHaveLength(3)
-    })
 })
 
 it('saves a retained edit after a root-only save of unchanged messages', async () => {

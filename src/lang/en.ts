@@ -1817,7 +1817,7 @@ export const languageEnglish = {
     providerPermissionConsent: "Plugin {} is requesting permission to access the provider, which may allow it to make unauthorized API calls. Do you want to allow this?",
     inlayPermissionConsent: "Plugin {} is requesting permission to access the inlay, which may allow it to read, write or edit the inlay content. Do you want to allow this?",
     sendChatConsent: "Plugin {} is requesting permission to send chat messages on your behalf, which will trigger AI responses. Do you want to allow this?",
-    pluginV2Warning: "Plugin V2 and V2.1 is considered unsafe and will stop working in future versions. **Please do not use these versions of plugins.**. If you are the developer of this plugin, please update to V3 as soon as possible.",
+    pluginV2Warning: "Plugin V2 and V2.1 are no longer supported and do not run. **Please do not use these versions of plugins.** If you are the developer of this plugin, please update to V3.",
     createFolderOnBranch: "Create Folder on Branch",
     hamburgerButtonBottom: "Move Menu Button to Bottom of Sidebar",
     partialBackupFirstConfirm: "⚠️ WARNING: Partial Local Backup ⚠️\n\nThis backup quickly saves only essential information.\n\nIncluded:\n- Database (chat history, characters, modules, plugins, prompts, settings, etc.)\n- Character profile icons (main images)\n- User icons and custom backgrounds\n- Persona icons\n- Folder images\n- Bot preset images\n\n⚠️ NOT Included:\n- Emotion images\n- Additional character assets\n- VITS voice files\n- All other additional media files\n\nThis backup file does NOT include all character assets!\nIf you need a complete backup, use the regular local backup.\n\nDo you want to continue?",
@@ -1924,6 +1924,12 @@ export const languageEnglish = {
     risuNest: {
         exitSaveFailedWarning:
             'Saving failed. Choose Yes to exit without saving, or No to keep the app open and retry.',
+        plugins: {
+            unsupportedApiVersionInstall:
+                'Plugin API {version} is not supported. Install a version updated to API 3.0.',
+            unsupportedApiVersionLoad:
+                'These plugins use an unsupported Plugin API version and did not run. Install versions updated to API 3.0.\n\n{plugins}',
+        },
         exitDrain: {
             title: 'Finishing synchronization',
             saveFailedTitle: 'Could not save changes',

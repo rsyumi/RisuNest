@@ -14,8 +14,7 @@ import { getDeviceSettings } from "./storage/deviceSettings";
 import { setNativeLogFileEnabled } from "./nativeLog";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, LoadingStatusState, bootFailure, type BootFailure } from "./stores.svelte";
-import { loadPlugins, loadPluginsAfterAuthoritativeRestore, pluginCompatibility } from "./plugins/plugins.svelte";
-import { shouldProjectScalableWorkingSet } from "./plugins/pluginCompatibility";
+import { loadPlugins, loadPluginsAfterAuthoritativeRestore } from "./plugins/plugins.svelte";
 import { alertConfirm, alertError, alertInput, alertLogin, alertMd, alertNormal, alertSelect, alertTOS, waitAlert } from "./alert";
 import { checkDriverInit } from "./drive/drive";
 import { characterURLImport, downloadRisuHub, hubURL } from "./characterCards";
@@ -36,7 +35,6 @@ import {
 import {
     getAccountColdStorageItem,
     getColdStorageItem,
-    makeColdData,
     setAccountColdStorageItem,
 } from "./process/coldstorage.svelte";
 import { getRemoteSaveCleanupAction, getRemoteSavePayloadName } from "./storage/remoteSaveCleanup";
@@ -108,7 +106,6 @@ import {
 } from './storage/recoveryMode.svelte'
 import {
     initializeOfficialAccountBootstrap,
-    publishOfficialRevisionIfChanged,
 } from "./storage/sync/officialAccountBootstrap";
 import { createAccountScopedOfficialAssetLedger } from "./storage/sync/officialAssetLedger";
 import {
@@ -319,7 +316,6 @@ export async function loadData() {
             }
             setDatabase(database)
         }
-        pluginCompatibility.initialize(local.profile)
         configurePersistentDataRuntime({
             projectWorkingSet(
                 database,
@@ -328,10 +324,7 @@ export async function loadData() {
                 activeCharacterIds,
                 forceScalableProjection,
             ) {
-                if (!shouldProjectScalableWorkingSet(
-                    pluginCompatibility,
-                    forceScalableProjection,
-                )) return database
+                if (forceScalableProjection === false) return database
                 const projected = isCatalogPresetWorkingSet(database.botPresets)
                     ? database
                     : projectCompleteScalableWorkingSet(
@@ -519,7 +512,6 @@ export async function loadData() {
             ]) === '0' ? 'pull' : 'push',
             confirmInitialPush: async () =>
                 await alertInput('to overwrite your data, type "RISUNEST"') === 'RISUNEST',
-            initializeProfile: (profile) => pluginCompatibility.initialize(profile),
             installDatabase: installPersistentWorkingSet,
             initializeWorkingSet: (database) => initializeActiveWorkingSet(database),
             onRemoteError: (error) => {
@@ -775,14 +767,6 @@ export async function loadData() {
         if (getDatabase().didFirstSetup) void characterURLImport()
 
         await transition('format-update', language.risuNest.startup.data)
-        const fullDatabaseResident = pluginCompatibility.profile === 'maximum-compatibility'
-        const coldStorageChanged = fullDatabaseResident ? await makeColdData() : false
-        await publishOfficialRevisionIfChanged(
-            coldStorageChanged && accountBootstrap.officialEnabled,
-            officialAdapter,
-            runtime.revision,
-        )
-
         performance.mark('boot:cold-storage-ready')
         await transition('plugins', language.risuNest.startup.plugins)
         let pluginsLoaded = excluded('plugins')
@@ -856,7 +840,6 @@ export async function loadData() {
           );
         }
         if (!excluded('modules')) moduleUpdate()
-        if (fullDatabaseResident) cleanChunks()
         void alertTOS().then((accepted) => {
             if (accepted === false) location.reload()
         })

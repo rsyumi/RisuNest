@@ -1,6 +1,5 @@
 import type { PersistenceCanonicalCapture } from './reactivePersistenceCapture.svelte'
 import type { Chat, Database, botPreset, character, groupChat } from './database.svelte'
-import { selectPluginCompatibilityProfile } from '../plugins/pluginCompatibility'
 import { removeGroupMemberReferences } from './groupMembership'
 import {
     ActiveWorkingSet,
@@ -53,11 +52,9 @@ import {
     hasIncompletePersistentWorkingSet,
     isCatalogCharacterStub,
     isCatalogPresetWorkingSet,
-    materializePinnedCompatibilityDatabase,
     patchWorkingSetCharacterDetail,
     projectScalableWorkingSetAtRevision,
 } from './workingSetCatalog'
-import { releasePersistentRevisionLease } from './persistentRecordIterator'
 import {
     createConversationSummaryStubFromChat,
     isConversationSummaryStub,
@@ -283,7 +280,6 @@ export interface PersistentDataRuntimeStateAdapter {
         nextConversationId: string,
     ): boolean
     canUseWindowedSelectedConversation?(): boolean
-    isMaximumCompatibilityMode?(): boolean
     isConversationOperationActive?(): boolean
     subscribeConversationOperationActive?(listener: (active: boolean) => void): () => void
     conversationViewportRowBudget?: number
@@ -443,7 +439,6 @@ export interface PersistentDataRuntime {
     materializePersistentDatabaseSnapshotWithRevision(
         reason: string,
     ): Promise<PersistentDatabaseSnapshot>
-    materializeMaximumCompatibilityWorkingSet(): Promise<void>
     releaseInactiveWorkingSet(
         canRelease?: () => boolean | Promise<boolean>,
         isCurrent?: () => boolean,
@@ -464,76 +459,6 @@ export interface PersistentDestructiveReplacementFence {
 
 export interface PersistentCommittedWorkingSetRefreshOptions {
     forceScalableProjection?: boolean
-}
-
-export interface MaximumCompatibilityWorkingSetDependencies {
-    getSelectedCharacterId(): string | null | undefined
-    getSelectedConversationId(): string | null | undefined
-    flushPendingData(): Promise<void>
-    getRevision(): DataRevision
-    getMutationGeneration(): number
-    getNavigationGeneration(): number
-    acquireRevision(revision: DataRevision): Promise<PersistentRevisionLease>
-    installCompleteDatabase(database: Database): void
-    restoreSelection(characterId: string | null, conversationId: string | null): void
-    adoptMaterializedDatabase(
-        revision: DataRevision,
-        mutationGeneration: number,
-        database: Database,
-    ): boolean
-}
-
-const MAXIMUM_COMPATIBILITY_MATERIALIZATION_ATTEMPTS = 3
-
-async function readMaximumCompatibilityRevision(
-    dependencies: MaximumCompatibilityWorkingSetDependencies,
-    revision: DataRevision,
-): Promise<Database> {
-    const lease = await dependencies.acquireRevision(revision)
-    let primaryError: unknown
-    try {
-        if (lease.revision !== revision) {
-            throw new Error(`Revision lease returned ${lease.revision}, expected ${revision}`)
-        }
-        return await materializePinnedCompatibilityDatabase(lease)
-    } catch (error) {
-        primaryError = error
-        throw error
-    } finally {
-        try {
-            await releasePersistentRevisionLease(lease)
-        } catch (error) {
-            if (primaryError === undefined) throw error
-        }
-    }
-}
-
-export async function installMaximumCompatibilityWorkingSet(
-    dependencies: MaximumCompatibilityWorkingSetDependencies,
-): Promise<void> {
-    for (let attempt = 0; attempt < MAXIMUM_COMPATIBILITY_MATERIALIZATION_ATTEMPTS; attempt++) {
-        await dependencies.flushPendingData()
-        const revision = dependencies.getRevision()
-        const mutationGeneration = dependencies.getMutationGeneration()
-        const navigationGeneration = dependencies.getNavigationGeneration()
-        const selectedCharacterId = dependencies.getSelectedCharacterId() ?? null
-        const selectedConversationId = dependencies.getSelectedConversationId() ?? null
-        const database = await readMaximumCompatibilityRevision(dependencies, revision)
-        if (
-            revision !== dependencies.getRevision() ||
-            mutationGeneration !== dependencies.getMutationGeneration() ||
-            navigationGeneration !== dependencies.getNavigationGeneration() ||
-            selectedCharacterId !== (dependencies.getSelectedCharacterId() ?? null) ||
-            selectedConversationId !== (dependencies.getSelectedConversationId() ?? null)
-        ) continue
-        if (!dependencies.adoptMaterializedDatabase(revision, mutationGeneration, database)) {
-            continue
-        }
-        dependencies.installCompleteDatabase(database)
-        dependencies.restoreSelection(selectedCharacterId, selectedConversationId)
-        return
-    }
-    throw new Error('Working set changed during maximum compatibility materialization')
 }
 
 function createDynamicOfficialPublisher(
@@ -637,7 +562,6 @@ export function createPersistentDataRuntime(
         canReleaseConversation: dependencies.state.canReleaseConversation,
         canUseWindowedSelectedConversation:
             dependencies.state.canUseWindowedSelectedConversation,
-        isMaximumCompatibilityMode: dependencies.state.isMaximumCompatibilityMode,
         isConversationOperationActive: dependencies.state.isConversationOperationActive,
         subscribeConversationOperationActive:
             dependencies.state.subscribeConversationOperationActive,
@@ -686,7 +610,7 @@ export function createPersistentDataRuntime(
         const selectedConversationId =
             dependencies.state.getSelectedConversationId?.() ?? null
         const activeCharacterIds = workingSet.activeCharacterIds
-        let database = await projectScalableWorkingSetAtRevision(
+        const database = await projectScalableWorkingSetAtRevision(
             dependencies.store,
             revision,
             {
@@ -695,12 +619,6 @@ export function createPersistentDataRuntime(
                 activeCharacterIds,
             },
         )
-        const maximumCompatibility =
-            selectPluginCompatibilityProfile(database.plugins ?? []) ===
-            'maximum-compatibility'
-        if (maximumCompatibility) {
-            database = await dependencies.store.materializeDatabase(revision)
-        }
         if (fenceOwner !== undefined) {
             coordinator.assertDestructiveReplacementFence(fenceOwner)
         }
@@ -708,7 +626,7 @@ export function createPersistentDataRuntime(
         dependencies.state.replaceDatabase(
             database,
             activeCharacterIds,
-            options?.forceScalableProjection ?? !maximumCompatibility,
+            options?.forceScalableProjection ?? true,
         )
         workingSet.installCommittedWorkingSet(database, revision)
     }
@@ -940,45 +858,6 @@ export function createPersistentDataRuntime(
             coordinator.materializePersistentDatabaseSnapshotWithRevision(
                 reason,
             ),
-        materializeMaximumCompatibilityWorkingSet: () =>
-            installMaximumCompatibilityWorkingSet({
-                getSelectedCharacterId:
-                    dependencies.state.getSelectedCharacterId,
-                getSelectedConversationId: () =>
-                    dependencies.state.getSelectedConversationId?.() ?? null,
-                flushPendingData: () =>
-                    coordinator.flushPendingData(
-                        'plugin-maximum-compatibility',
-                    ),
-                getRevision: () => coordinator.revision,
-                getMutationGeneration: () => coordinator.mutationGeneration,
-                getNavigationGeneration: () =>
-                    workingSet.navigationGenerationToken,
-                acquireRevision: (revision) =>
-                    dependencies.store.acquireRevision(revision),
-                installCompleteDatabase: (database) => {
-                    workingSet.invalidateNavigation()
-                    const installDatabase =
-                        dependencies.state.installCompleteDatabase ??
-                        dependencies.state.replaceDatabase
-                    installDatabase(database)
-                },
-                restoreSelection: (characterId, conversationId) =>
-                    dependencies.state.restoreSelection?.(
-                        characterId,
-                        conversationId,
-                    ),
-                adoptMaterializedDatabase: (
-                    revision,
-                    mutationGeneration,
-                    database,
-                ) =>
-                    coordinator.adoptMaterializedDatabase(
-                        revision,
-                        mutationGeneration,
-                        database,
-                    ),
-            }),
         async releaseInactiveWorkingSet(canRelease, isCurrent) {
             const token = await coordinator.capturePersistentMutationToken(
                 'plugin-scalable-working-set',

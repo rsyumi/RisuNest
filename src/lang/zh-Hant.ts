@@ -1411,7 +1411,7 @@ export const languageChineseTraditional = {
     "replacerPermissionConsent": "外掛 {} 正在請求替換對話內容的權限，此操作可能被用於操縱對話。是否允許？",
     "providerPermissionConsent": "外掛 {} 正在請求存取提供商的權限，此操作可能允許未授權的 API 呼叫。是否允許？",
     "sendChatConsent": "外掛 {} 正在請求以您的名義發送對話訊息的權限，這將觸發 AI 回應。是否允許？",
-    "pluginV2Warning": "外掛 V2 與 V2.1 版本被視為不安全，並將於未來版本中停用。**請勿使用此版本的外掛。**若您是外掛開發者，請盡快更新至 V3。",
+    "pluginV2Warning": "外掛 V2 與 V2.1 已不再支援，不會執行。**請勿使用此版本的外掛。**若您是外掛開發者，請更新至 V3。",
     "createFolderOnBranch": "在分支上建立資料夾",
     "hamburgerButtonBottom": "將選單按鈕移至側邊欄底部",
     "partialBackupFirstConfirm": "⚠️ 警告：部分本機備份 ⚠️\n\n此備份僅快速儲存必要資訊。\n\n包含：\n- 資料庫（對話記錄、角色、模組、外掛、提示詞、設定等）\n- 角色頭像（主要圖片）\n- 人設頭像及自訂背景\n- 資料夾圖片\n- 角色預設圖片\n\n⚠️ 不包含：\n- 表情圖片\n- 額外角色資源\n- VITS 語音檔案\n- 所有其他額外媒體檔案\n\n此備份不包含所有角色資源！\n如需完整備份，請使用一般本機備份。\n\n是否繼續？",
