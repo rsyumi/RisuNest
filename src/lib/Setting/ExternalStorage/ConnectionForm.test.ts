@@ -91,6 +91,13 @@ async function prepareGoogleConnection(): Promise<void> {
     await settle()
 }
 
+async function selectProvider(id: string): Promise<void> {
+    const select = labelControl<HTMLSelectElement>(strings.provider)
+    select.value = id
+    select.dispatchEvent(new Event('change', { bubbles: true }))
+    await settle()
+}
+
 async function beginGoogleAuthorization(): Promise<void> {
     await prepareGoogleConnection()
     button(strings.signIn).click()
@@ -242,5 +249,29 @@ describe('Android Google authorization lifecycle', () => {
 
         expect(state.cancelAuthorization).toHaveBeenCalledExactlyOnceWith('late-authorization')
         expect(state.openUrl).not.toHaveBeenCalled()
+    })
+})
+
+describe('synchronization mode defaults', () => {
+    it('prefers concurrent-use protection and falls back to one device at a time', async () => {
+        component = mount(ConnectionForm, {
+            target,
+            props: { strings, onconnected: vi.fn(), oncancel: vi.fn() },
+        })
+        await settle()
+        await selectProvider('s3')
+
+        button(strings.sync).click()
+        await settle()
+
+        expect(button(strings.strategyLabels.cas).getAttribute('aria-checked')).toBe('true')
+        expect(button(strings.strategyLabels.sequential).getAttribute('aria-checked')).toBe('false')
+
+        await selectProvider('google_drive')
+        button(strings.sync).click()
+        await settle()
+
+        expect(() => button(strings.strategyLabels.cas)).toThrow()
+        expect(button(strings.strategyLabels.sequential).getAttribute('aria-checked')).toBe('true')
     })
 })

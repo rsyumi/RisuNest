@@ -20,6 +20,7 @@
         buildProviderSecret,
         externalProviderDefinitions,
         getExternalProviderDefinition,
+        type ExternalProviderDefinition,
     } from 'src/ts/storage/sync/external/providerRegistry'
     import type {
         ExternalConnectionResult,
@@ -183,13 +184,17 @@
         busy = false
     }
 
+    function preferredSyncStrategy(provider: ExternalProviderDefinition): ExternalPublicationStrategy {
+        if (provider.strategies.includes('cas')) return 'cas'
+        if (provider.strategies.includes('sequential')) return 'sequential'
+        return provider.strategies[0]
+    }
+
     function selectProvider(value: string): void {
         providerId = value as ExternalProviderId
         const next = getExternalProviderDefinition(providerId)
         if (!next.strategies.some(item => item !== 'backup-only')) purpose = 'backup'
-        strategy = purpose === 'backup'
-            ? 'backup-only'
-            : next.strategies.includes('sequential') ? 'sequential' : next.strategies[0]
+        strategy = purpose === 'backup' ? 'backup-only' : preferredSyncStrategy(next)
         values = {
             space: 'drive', accountType: 'personal', tenant: 'common',
             ...(isTauriAndroid ? {
@@ -204,9 +209,7 @@
 
     function selectPurpose(value: ExternalConnectionPurpose): void {
         purpose = value
-        strategy = value === 'backup'
-            ? 'backup-only'
-            : definition.strategies.includes('sequential') ? 'sequential' : definition.strategies[0]
+        strategy = value === 'backup' ? 'backup-only' : preferredSyncStrategy(definition)
         resetPrepared()
     }
 
@@ -548,6 +551,7 @@
     }
     .field {
         display: grid;
+        align-content: start;
         gap: 0.35rem;
         min-width: 0;
         font-size: 0.875rem;
