@@ -79,9 +79,10 @@
             oauthRedirectUri: 'https://update.rsyumi.workers.dev/oauth/google-drive-callback.html',
         } : {}),
     })
-    let hypa = $state(true)
-    let localPlugins = $state(true)
-    let localSettings = $state(true)
+    // Sections are not captured yet, so a backup holds the library alone.
+    const hypa = false
+    const localPlugins = false
+    const localSettings = false
     let accepted = $state<string[]>([])
     let prepared = $state<PreparedExternalConnection | null>(null)
     let endpointConfirmed = $state(false)
@@ -122,12 +123,7 @@
         ...(supportsSync ? [{ value: 'sync' as const, label: strings.sync }] : []),
     ])
     const strategyOptions = $derived(syncStrategies.map(item => ({ value: item, label: strings.strategyLabels[item] })))
-    const scopeSummary = $derived([
-        strings.library,
-        ...(hypa ? [strings.hypa] : []),
-        ...(localPlugins ? [strings.devicePlugins] : []),
-        ...(localSettings ? [strings.deviceSettings] : []),
-    ].join(', '))
+    const scopeSummary = $derived(strings.library)
     const providerStrategyNote = $derived('strategyNote' in providerStrings ? providerStrings.strategyNote : undefined)
     const providerWarning = $derived('warningTitle' in providerStrings
         ? { title: providerStrings.warningTitle, body: providerStrings.warning }
@@ -488,12 +484,6 @@
         <p class="note"><span>{strings.scopeHelp}</span></p>
         <p class="check fixed"><span>{strings.library}</span><span class="value">{strings.included}</span></p>
         <p class="note"><span>{strings.libraryHelp}</span></p>
-        <label class="check"><input type="checkbox" bind:checked={hypa} onchange={resetPrepared} /><span>{strings.hypa}</span></label>
-        <p class="note"><span>{strings.hypaHelp}</span></p>
-        <label class="check"><input type="checkbox" bind:checked={localPlugins} onchange={resetPrepared} /><span>{strings.devicePlugins}</span></label>
-        <p class="note"><span>{strings.devicePluginsHelp}</span></p>
-        <label class="check"><input type="checkbox" bind:checked={localSettings} onchange={resetPrepared} /><span>{strings.deviceSettings}</span></label>
-        <p class="note"><span>{strings.deviceSettingsHelp}</span></p>
     </fieldset>
     {/if}
     {/if}

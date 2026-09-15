@@ -316,7 +316,7 @@ describe('synchronization mode defaults', () => {
 })
 
 describe('what a connection stores', () => {
-    it('offers the four backup items and no selection at all for synchronization', async () => {
+    it('offers no backup item beyond the library and no selection at all for synchronization', async () => {
         component = mount(ConnectionForm, {
             target,
             props: { strings, onconnected: vi.fn(), oncancel: vi.fn() },
@@ -324,8 +324,9 @@ describe('what a connection stores', () => {
         await settle()
         await selectProvider('s3')
 
+        // Sections are not captured yet, so no row claims to include them.
         for (const item of [strings.hypa, strings.devicePlugins, strings.deviceSettings]) {
-            expect(labelControl<HTMLInputElement>(item).type).toBe('checkbox')
+            expect(() => labelControl<HTMLInputElement>(item)).toThrow()
         }
         // The library is always stored, so its row states the outcome instead
         // of offering a control that does nothing.
@@ -340,14 +341,11 @@ describe('what a connection stores', () => {
 
         // A synchronization connection has no selection screen; local data is
         // chosen per device instead.
-        for (const item of [strings.hypa, strings.devicePlugins, strings.deviceSettings]) {
-            expect(() => labelControl<HTMLInputElement>(item)).toThrow()
-        }
         expect(target.textContent).not.toContain(strings.scopeHelp)
         expect(target.textContent).not.toContain(strings.included)
     })
 
-    it('sends the chosen policy for a backup and none for a synchronization', async () => {
+    it('sends a library-only policy for a backup and none for a synchronization', async () => {
         state.prepareConnection.mockResolvedValue(prepared)
         component = mount(ConnectionForm, {
             target,
@@ -355,14 +353,12 @@ describe('what a connection stores', () => {
         })
         await settle()
         await selectProvider('s3')
-        labelControl<HTMLInputElement>(strings.hypa).click()
-        await settle()
         button(strings.prepare).click()
         await settle()
 
         expect(state.prepareConnection).toHaveBeenCalledWith(expect.objectContaining({
             purpose: 'backup',
-            capturePolicy: { hypa: false, localPlugins: true, localSettings: true },
+            capturePolicy: { hypa: false, localPlugins: false, localSettings: false },
         }))
 
         state.prepareConnection.mockClear()
