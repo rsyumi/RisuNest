@@ -15,7 +15,7 @@ Platform targets: Windows, macOS, Linux, Android, and iOS, all equal. A feature,
 
 - `src/ts/`: TypeScript logic, tests colocated as `*.test.ts`. `storage/` (revisioned persistent store, save coordinator, BlobStore, sync adapters), `process/` (chat, requests, memory, models, templates, MCP), `plugins/`, `gui/`, `drive/`, `translator/`, `model/`, `sync/`; entry points `bootstrap.ts`, `stores.svelte.ts`, `globalApi.svelte.ts`, `parser.svelte.ts`.
 - `src/lib/`: Svelte UI (`ChatScreens/`, `UI/`, `Setting/`, `SideBars/`, `Others/`, `Mobile/`, `Playground/`, `VisualNovel/`, `LiteUI/`). `src/lang/`: i18n (en, ko, cn, zh-Hant, vi, de, es).
-- `src-tauri/`: Rust backend and generated Android shell. `server/node/` and `server/hono/`: self-hosting servers. Also `public/`, `resources/`, `dist/`, `.github/workflows/`.
+- `src-tauri/`: Rust backend and generated Android shell. `server/node/` and `server/hono/`: self-hosting servers. Also `public/`, `dist/`, `.github/workflows/`.
 
 ## Building and Testing
 
