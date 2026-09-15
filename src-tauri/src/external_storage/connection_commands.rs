@@ -776,7 +776,6 @@ async fn commit_preparation(
                 ConnectionOpenMode::Create => (
                     Descriptor::new(
                         uuid::Uuid::new_v4().to_string(),
-                        preparation.request.scope.clone(),
                         preparation.request.publication_strategy.descriptor(),
                     )
                     .map_err(|_| ProviderError::new(ErrorKind::Corrupt))?,
@@ -821,6 +820,7 @@ async fn commit_preparation(
                 id: connection_id.into(),
                 config,
                 descriptor,
+                capture_policy: preparation.request.capture_policy,
                 provider_repository_id: preparation
                     .recovery
                     .as_ref()
@@ -1218,7 +1218,8 @@ pub(crate) fn external_storage_prepare_recovery_import(
         mode: ConnectionOpenMode::Existing,
         purpose,
         publication_strategy: strategy,
-        scope: imported.metadata.descriptor.scope.clone(),
+        capture_policy: (purpose == ConnectionPurpose::Backup)
+            .then(super::connection::CapturePolicy::default),
         acknowledgements,
     };
     insert_preparation(&state, prepare, Some(imported))
@@ -1381,7 +1382,7 @@ mod tests {
                 mode: ConnectionOpenMode::Existing,
                 purpose: ConnectionPurpose::Sync,
                 publication_strategy: ConnectionStrategy::Sequential,
-                scope: descriptor.scope,
+                capture_policy: None,
                 acknowledgements: vec![SEQUENTIAL_ACKNOWLEDGEMENT.into()],
             },
             expires_at_ms: u64::MAX,

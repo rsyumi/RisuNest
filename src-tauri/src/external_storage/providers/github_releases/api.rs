@@ -248,7 +248,8 @@ pub(super) fn role_prefix(role: ObjectRole) -> &'static str {
         ObjectRole::Descriptor => "descriptor",
         ObjectRole::Pack => "pack",
         ObjectRole::Catalog => "catalog",
-        ObjectRole::Snapshot => "snapshot",
+        ObjectRole::SyncState => "state",
+        ObjectRole::BackupBundle => "bundle",
         ObjectRole::BackupPoint => "point",
     }
 }

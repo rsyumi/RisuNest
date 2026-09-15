@@ -7,11 +7,14 @@ use super::{
     connection_commands::ConnectedRepository,
     contract::{Cancellation, ErrorKind, ProviderError, Result, VersionToken},
     control::{
-        self, BackupPointDocument, BackupPointKind, HeadDocument, ObservedHead, PublicationResult,
+        self, BackupPointDocument, HeadDocument, ObservedHead, PublicationResult,
     },
     job_store::{DurableJob, JobKind, JobStore},
     journal::{JobIdentity, TransferJournal},
-    packaging::{CompletedSnapshot, PackageLimits, SnapshotMetadata},
+    packaging::{
+        library_fingerprint_domain, CompletedSnapshot, PackageLimits, SnapshotMetadata,
+        SnapshotPurpose,
+    },
     publication::HeadObservation,
 };
 use crate::persistent_store::{
@@ -21,6 +24,12 @@ use crate::persistent_store::{
     sync_selection::CaptureIdentity,
 };
 use risunest_external_storage_format::format::Descriptor;
+use risunest_sync_wire::head::Sequence;
+
+/// Library and referenced assets are always captured. The persistent store
+/// still addresses its staged captures by this fixed scope.
+const LIBRARY_SCOPE: risunest_external_storage_format::format::Scope =
+    risunest_external_storage_format::format::Scope::LIBRARY;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
@@ -164,9 +173,7 @@ pub(crate) fn decide_sync(input: SyncInputs<'_>) -> Result<SyncAction> {
         return Err(corrupt("missing sync connection"));
     }
     if let Some(remote) = input.remote {
-        if remote.document.repository_id != input.descriptor.repository_id
-            || remote.document.scope_id != hex::encode(input.descriptor.scope_id)
-        {
+        if remote.document.repository_id != input.descriptor.repository_id {
             return Err(corrupt("remote head belongs to another repository"));
         }
     }
@@ -252,7 +259,6 @@ async fn capture_for_publication(
 )> {
     let worker_app = app.clone();
     let worker_job = job.clone();
-    let scope = connected.stored.descriptor.scope.clone();
     let repository_id = connected.stored.descriptor.repository_id.clone();
     let strategy = connected
         .stored
@@ -290,14 +296,14 @@ async fn capture_for_publication(
                 .map_err(local_error)?;
             let fingerprint = capture
                 .catalog
-                .content_fingerprint(&scope.id())
+                .content_fingerprint(&library_fingerprint_domain())
                 .map_err(local_error)?;
             return Ok((capture, fingerprint));
         }
         let hydration = store
             .hydrate_external_capture_dependencies(
                 &worker_job.request.connection_id,
-                &scope,
+                &LIBRARY_SCOPE,
                 &probe,
             )
             .map_err(local_error)?;
@@ -314,7 +320,7 @@ async fn capture_for_publication(
         let capture = store
             .capture_external_library(
                 &worker_job.request.connection_id,
-                &scope,
+                &LIBRARY_SCOPE,
                 &hydration,
                 &probe,
             )
@@ -347,7 +353,7 @@ async fn capture_for_publication(
         jobs.put(&durable)?;
         let fingerprint = capture
             .catalog
-            .content_fingerprint(&scope.id())
+            .content_fingerprint(&library_fingerprint_domain())
             .map_err(local_error)?;
         Ok((capture, fingerprint))
     })
@@ -355,6 +361,16 @@ async fn capture_for_publication(
     .map_err(local_error)?
 }
 
+/// A publication produces a synchronized state. Conflict preservation produces
+/// an immutable bundle instead, because the material it keeps is this device's
+/// own and is never merged.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PackageAs {
+    State,
+    Bundle,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn package_capture(
     app: &AppHandle,
     connected: &ConnectedRepository,
@@ -362,6 +378,7 @@ async fn package_capture(
     capture: crate::persistent_store::external_capture::CapturedSnapshot,
     fingerprint: [u8; 32],
     expected: Option<&ObservedHead>,
+    produce: PackageAs,
     cancel: &Cancellation,
 ) -> Result<(CompletedSnapshot, TransferJournal)> {
     let root = super::runtime::root(app)?;
@@ -377,6 +394,14 @@ async fn package_capture(
             capture: identity.clone(),
         },
     )?;
+    // Step 4 of the publication contract needs the latest state, not just the
+    // head: the new state inherits its sections and continues its commit order.
+    let parent = match (produce, expected) {
+        (PackageAs::State, Some(head)) => Some(
+            control::read_snapshot_document(connected, &head.document.state, cancel).await?,
+        ),
+        _ => None,
+    };
     let metadata = SnapshotMetadata {
         snapshot_id: job.snapshot_id.clone(),
         repository_id: connected.stored.descriptor.repository_id.clone(),
@@ -387,21 +412,27 @@ async fn package_capture(
             .and_then(|value| value.parse().ok())
             .ok_or_else(|| corrupt("invalid job timestamp"))?,
         logical_revision: u64::try_from(identity.revision).map_err(corrupt)?,
-        scope_id: connected.stored.descriptor.scope_id,
-        library_scope_id: {
-            let mut scope = connected.stored.descriptor.scope.clone();
-            scope.device_settings = false;
-            scope.device_plugins = false;
-            scope.id()
-        },
-        parent_snapshot_id: expected.map(|head| {
-            head.document
-                .snapshot
-                .object_id
-                .trim_start_matches("snapshot-")
-                .to_owned()
-        }),
+        parent_snapshot_id: parent.as_ref().map(|view| view.snapshot_id.clone()),
         content_fingerprint: fingerprint,
+        purpose: match produce {
+            PackageAs::State => SnapshotPurpose::SyncState {
+                epoch: identity.generation.clone(),
+                generation: match &parent {
+                    Some(view) => Sequence::try_from(view.revision.clone())
+                        .map_err(corrupt)?
+                        .next()
+                        .map_err(corrupt)?,
+                    None => Sequence::from(1u64),
+                },
+                parent_sections: parent.map(|view| view.sections).unwrap_or_default(),
+            },
+            PackageAs::Bundle => SnapshotPurpose::BackupBundle {
+                source: risunest_external_storage_format::control::BundleSource::Device {
+                    writer_id: identity.store_id.clone(),
+                },
+                remote_generation: None,
+            },
+        },
     };
     let cache = directory
         .parent()
@@ -439,7 +470,7 @@ async fn receive_remote(
         repository_id: &connected.stored.descriptor.repository_id,
         snapshot_id: remote
             .document
-            .snapshot
+            .state
             .object_id
             .trim_start_matches("snapshot-"),
         commit_id: &remote.document.commit_id,
@@ -469,7 +500,7 @@ async fn receive_remote(
     let staging =
         super::runtime::job_directory(&root, &job.request.connection_id, &job.id).join("receive");
     let prepared = super::snapshot_restore::download_snapshot(
-        &remote.document.snapshot,
+        &remote.document.state,
         &staging,
         &connected.root_key,
         connected.provider.as_ref(),
@@ -553,14 +584,14 @@ async fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Resu
             .as_deref()
             .ok_or_else(|| corrupt("missing staged head"))?
         || remote.document.commit_id != authoritative.commit_id
-        || remote.document.snapshot.object_id != format!("snapshot-{}", authoritative.capture_id)
+        || remote.document.state.object_id != format!("snapshot-{}", authoritative.capture_id)
     {
         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
     }
     let staging =
         super::runtime::job_directory(&root, &job.request.connection_id, &job.id).join("receive");
     let prepared = super::snapshot_restore::download_snapshot(
-        &remote.document.snapshot,
+        &remote.document.state,
         &staging,
         &connected.root_key,
         connected.provider.as_ref(),
@@ -593,19 +624,7 @@ async fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Resu
         &job,
         &pds(app)?.external_identity().map_err(local_error)?,
     )?;
-    if prepared.scope_id != hex::encode(connected.stored.descriptor.scope_id) {
-        return Err(corrupt("received descriptor scope differs"));
-    }
-    let mut library_scope = connected.stored.descriptor.scope.clone();
-    library_scope.device_settings = false;
-    library_scope.device_plugins = false;
-    if prepared.library_scope_id != hex::encode(library_scope.id()) {
-        return Err(corrupt("received library scope differs"));
-    }
-    let scope_id = hex::decode(&prepared.library_scope_id)
-        .ok()
-        .and_then(|value| value.try_into().ok())
-        .ok_or_else(|| corrupt("invalid received scope"))?;
+    let scope_id = library_fingerprint_domain();
     let fingerprint = hex::decode(&prepared.library_fingerprint)
         .ok()
         .and_then(|value| value.try_into().ok())
@@ -613,7 +632,7 @@ async fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Resu
     let application = ExternalSnapshotApplication {
         expected_revision: authoritative.identity.revision,
         staging_root: &prepared.staging_root,
-        scope: &library_scope,
+        scope: &LIBRARY_SCOPE,
         scope_id: &scope_id,
         fingerprint: &fingerprint,
     };
@@ -699,7 +718,7 @@ async fn reconcile_unknown(
         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
     };
     if observed.document.commit_id != intent.commit_id
-        || observed.document.snapshot.object_id != format!("snapshot-{}", job.snapshot_id)
+        || observed.document.state.object_id != format!("snapshot-{}", job.snapshot_id)
     {
         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
     }
@@ -749,7 +768,10 @@ fn decode_remote(
     let object: super::packaging::RemoteObject = serde_json::from_str(value).map_err(corrupt)?;
     if serde_json::to_string(&object).map_err(corrupt)? != value
         || object.repository_id != connected.stored.descriptor.repository_id
-        || object.role != super::contract::ObjectRole::Snapshot
+        || !matches!(
+            object.role,
+            super::contract::ObjectRole::SyncState | super::contract::ObjectRole::BackupBundle
+        )
     {
         return Err(corrupt("preserved snapshot binding differs"));
     }
@@ -785,6 +807,7 @@ async fn preserve_conflict(
         capture,
         fingerprint,
         None,
+        PackageAs::Bundle,
         cancel,
     )
     .await?;
@@ -811,7 +834,7 @@ fn record_local_conflict(
         local_snapshot: local.map(encode_remote).transpose()?,
         local_identity: local_identity.clone(),
         remote_snapshot: remote
-            .map(|head| encode_remote(&head.document.snapshot))
+            .map(|head| encode_remote(&head.document.state))
             .transpose()?,
         remote_logical_revision: None,
         remote_commit_id: remote.map(|head| head.document.commit_id.clone()),
@@ -901,7 +924,7 @@ async fn resume_conflict_preservation(
     }
     let fingerprint = capture
         .catalog
-        .content_fingerprint(&connected.stored.descriptor.scope.id())
+        .content_fingerprint(&library_fingerprint_domain())
         .map_err(local_error)?;
     let (local, journal) = package_capture(
         app,
@@ -910,6 +933,7 @@ async fn resume_conflict_preservation(
         capture,
         fingerprint,
         None,
+        PackageAs::Bundle,
         cancel,
     )
     .await?;
@@ -961,7 +985,7 @@ async fn complete_conflict_preservation(
                 .ok_or_else(|| ProviderError::new(ErrorKind::PreconditionFailed))?,
             };
             (
-                remote.document.snapshot.clone(),
+                remote.document.state.clone(),
                 remote.document.commit_id.clone(),
                 observation_json(&remote.observation)?,
             )
@@ -985,15 +1009,33 @@ async fn complete_conflict_preservation(
     {
         return Err(corrupt("conflict snapshot identity differs"));
     }
-    let point = BackupPointDocument::new(
+    let created_at_ms = u64::try_from(record.created_at_ms).map_err(corrupt)?;
+    let remote_bundle = if remote_snapshot.role == super::contract::ObjectRole::BackupBundle {
+        remote_snapshot.clone()
+    } else {
+        let view = control::read_snapshot_document(connected, &remote_snapshot, cancel).await?;
+        control::upload_backup_bundle(
+            &connected.stored.descriptor,
+            &connected.root_key,
+            format!("conflict-{}-remote", job.id),
+            risunest_external_storage_format::control::BundleSource::SyncState {
+                commit_id: remote_commit_id.clone(),
+            },
+            created_at_ms,
+            view.library,
+            &mut journal,
+            connected.provider.as_ref(),
+            &connected.handle,
+            cancel,
+        )
+        .await?
+    };
+    let point = BackupPointDocument::conflict(
         &connected.stored.descriptor,
         format!("conflict-{}", job.id),
-        BackupPointKind::Conflict,
-        u64::try_from(record.created_at_ms).map_err(corrupt)?,
-        u64::try_from(record.local_identity.revision)
-            .map_err(corrupt)?
-            .max(verified_remote.logical_revision),
-        vec![decode_remote(local_snapshot, connected)?, remote_snapshot.clone()],
+        created_at_ms,
+        decode_remote(local_snapshot, connected)?,
+        remote_bundle,
     )?;
     control::upload_backup_point(
         &connected.stored.descriptor,
@@ -1114,13 +1156,53 @@ async fn run_resolve_conflict(
         .publication_strategy
         .ok_or_else(|| ProviderError::new(ErrorKind::Unsupported))?;
     let commit_id = format!("resolve-{}", job.id);
+    // The preserved material is a bundle. A head points at a state, so the
+    // resolution republishes that library reference as one and continues the
+    // remote commit order from the head it is replacing.
+    let remote_state = control::read_snapshot_document(connected, &remote.document.state, cancel)
+        .await?;
+    let mut resolve_journal = TransferJournal::open(
+        &super::runtime::job_directory(
+            &super::runtime::root(app)?,
+            &job.request.connection_id,
+            &job.id,
+        ),
+        JobIdentity {
+            job_id: job.id.clone(),
+            connection_id: job.request.connection_id.clone(),
+            repository_id: connected.handle.repository_id.clone(),
+            capture_id: stored.local_capture_id.clone(),
+            capture: stored.local_identity.clone(),
+        },
+    )?;
+    let (state, state_fingerprint) = control::upload_sync_state(
+        &connected.stored.descriptor,
+        &connected.root_key,
+        commit_id.clone(),
+        remote.document.library_id.clone(),
+        stored.local_identity.generation.clone(),
+        Sequence::try_from(remote_state.revision.clone())
+            .map_err(corrupt)?
+            .next()
+            .map_err(corrupt)?,
+        Some(remote_state.snapshot_id.clone()),
+        stored.local_identity.store_id.clone(),
+        u64::try_from(stored.created_at_ms).map_err(corrupt)?,
+        local_document.library.clone(),
+        remote_state.sections.clone(),
+        &mut resolve_journal,
+        connected.provider.as_ref(),
+        &connected.handle,
+        cancel,
+    )
+    .await?;
     let document = HeadDocument::new(
         &connected.stored.descriptor,
-        local_document.library_id.clone(),
+        remote.document.library_id.clone(),
         commit_id.clone(),
         Some(remote.document.commit_id.clone()),
-        hex::encode(local_document.fingerprint),
-        local.clone(),
+        state_fingerprint,
+        state,
     )?;
     let prepared = control::prepare_head(
         &connected.stored.descriptor,
@@ -1356,7 +1438,7 @@ pub(crate) async fn run_sync(
                         &base.head_observation,
                         remote
                             .document
-                            .snapshot
+                            .state
                             .object_id
                             .trim_start_matches("snapshot-"),
                         &remote.document.commit_id,
@@ -1373,7 +1455,7 @@ pub(crate) async fn run_sync(
                         &base.head_observation,
                         remote
                             .document
-                            .snapshot
+                            .state
                             .object_id
                             .trim_start_matches("snapshot-"),
                         &remote.document.commit_id,
@@ -1383,7 +1465,7 @@ pub(crate) async fn run_sync(
                     .map_err(local_error)?;
             }
             Ok(
-                json!({"snapshotId":remote.document.snapshot.object_id.trim_start_matches("snapshot-"),"publishedRevision":accepted_identity.revision.to_string()}),
+                json!({"snapshotId":remote.document.state.object_id.trim_start_matches("snapshot-"),"publishedRevision":accepted_identity.revision.to_string()}),
             )
         }
         SyncAction::PublishLocal { expected } => {
@@ -1399,6 +1481,7 @@ pub(crate) async fn run_sync(
                 capture,
                 fingerprint,
                 expected.as_ref(),
+                PackageAs::State,
                 cancel,
             )
             .await?;

@@ -26,7 +26,9 @@ pub(super) fn role_folder(role: ObjectRole) -> &'static str {
         ObjectRole::Descriptor => DESCRIPTORS,
         ObjectRole::Pack => PACKS,
         ObjectRole::Catalog => CATALOGS,
-        ObjectRole::Snapshot => SNAPSHOTS,
+        // A published state and a backup bundle share one collection. The
+        // authenticated envelope header, not the path, tells them apart.
+        ObjectRole::SyncState | ObjectRole::BackupBundle => SNAPSHOTS,
         ObjectRole::BackupPoint => BACKUPS,
     }
 }

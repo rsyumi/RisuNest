@@ -12,8 +12,6 @@ pub(crate) mod control;
 #[cfg(test)]
 mod daily_download_resume_tests;
 pub(crate) mod descriptor;
-pub(crate) mod device_capture;
-pub(crate) mod device_commands;
 pub(crate) mod durable_quota;
 #[cfg(test)]
 pub(crate) mod fake;

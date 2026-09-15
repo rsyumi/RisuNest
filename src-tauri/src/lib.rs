@@ -694,7 +694,6 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         external_storage::history::external_storage_list_history,
         external_storage::sync_engine::external_storage_list_conflicts,
         external_storage::sync_engine::external_storage_apply_received,
-        external_storage::device_commands::external_storage_prepare_device_capture,
         external_storage::snapshot_export_commands::external_storage_export_snapshot,
         #[cfg(target_os = "ios")]
         ios_lifecycle::ios_prepare_restart,

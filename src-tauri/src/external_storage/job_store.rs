@@ -92,13 +92,13 @@ pub(crate) struct DurableJob {
 impl DurableJob {
     pub fn new(
         request: StartJobRequest,
-        device: bool,
+        _device: bool,
         now: u64,
         admission_identity: CaptureIdentity,
     ) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         let summary = json!({"id":id,"connectionId":request.connection_id,"kind":request.kind,
-            "state":if device {"waiting"} else {"queued"},"phase":if device {"device-capture"} else {"queued"},
+            "state":"queued","phase":"queued",
             "completedBytes":"0","completedItems":"0","startedAtMs":now.to_string(),"updatedAtMs":now.to_string()});
         Self {
             id,

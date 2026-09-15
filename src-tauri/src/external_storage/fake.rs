@@ -260,7 +260,7 @@ impl Provider for FakeProvider {
                 return Err(ProviderError::new(ErrorKind::Unsupported));
             }
             let role = match collection {
-                Collection::Snapshots => ObjectRole::Snapshot,
+                Collection::Snapshots => ObjectRole::SyncState,
                 Collection::BackupPoints => ObjectRole::BackupPoint,
                 Collection::Descriptors => ObjectRole::Descriptor,
             };

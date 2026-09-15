@@ -7,7 +7,6 @@ use super::{
     control,
     packaging::RemoteObject,
 };
-use risunest_external_storage_format::snapshot as wire;
 use rusqlite::{Connection, OpenFlags};
 use std::{collections::BTreeSet, path::Path};
 
@@ -89,7 +88,7 @@ fn local_upload_lower_bound(
 
 fn direct_reachable(
     snapshot: &RemoteObject,
-    document: &wire::SnapshotDocument,
+    document: &control::SnapshotView,
 ) -> Result<ReachableUsage> {
     let mut identities = BTreeSet::new();
     let mut bytes = 0u64;
@@ -102,13 +101,11 @@ fn direct_reachable(
             .checked_add(snapshot.receipt.byte_length)
             .ok_or_else(corrupt)?;
     }
-    for object in [
-        Some(&document.record_catalog),
-        Some(&document.asset_catalog),
-        document.device_catalog.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
+    // Published sections are reachable too, so a library-only publish does not
+    // make an inherited section look unreferenced.
+    for object in [&document.library.record_catalog, &document.library.asset_catalog]
+        .into_iter()
+        .chain(document.sections.values().map(|section| &section.entries_root))
     {
         let identity = (
             object.locator.collection.clone(),
@@ -151,9 +148,9 @@ pub(crate) async fn summarize(
         {
             Some(head) => {
                 let document =
-                    control::read_snapshot_document(connected, &head.document.snapshot, cancel)
+                    control::read_snapshot_document(connected, &head.document.state, cancel)
                         .await?;
-                Some(direct_reachable(&head.document.snapshot, &document)?)
+                Some(direct_reachable(&head.document.state, &document)?)
             }
             None => None,
         }

@@ -10,16 +10,16 @@ use super::{
     transfer::SpoolSink,
     transfer_job,
 };
-use crate::{
-    asset_repository::PayloadCas, external_storage::device_capture::DeviceSnapshot,
-    persistent_store::external_capture::CapturedSnapshot,
-};
+use crate::{asset_repository::PayloadCas, persistent_store::external_capture::CapturedSnapshot};
 use risunest_external_storage_format::{
     content_identity::{hash, hash_reader},
+    control as wire_control,
     crypto::derive_key,
+    format::Scope,
     pack::{self, Chunk, ChunkEncoder, CompressionPolicy, ENTRY_OVERHEAD, MAX_CHUNK_BYTES},
     snapshot as wire,
 };
+use risunest_sync_wire::head::Sequence;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -75,6 +75,22 @@ impl PackageLimits {
     }
 }
 
+/// What the packaged object is for. A published state inherits the sections
+/// the observed state carried, so a library-only publish preserves them. A
+/// backup bundle instead declares its own coverage and never merges.
+#[derive(Clone, Debug)]
+pub(crate) enum SnapshotPurpose {
+    SyncState {
+        epoch: String,
+        generation: Sequence,
+        parent_sections: BTreeMap<String, wire::SectionSnapshotRef>,
+    },
+    BackupBundle {
+        source: wire_control::BundleSource,
+        remote_generation: Option<Sequence>,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SnapshotMetadata {
     pub snapshot_id: String,
@@ -83,10 +99,15 @@ pub(crate) struct SnapshotMetadata {
     pub author_device_id: String,
     pub created_at_ms: u64,
     pub logical_revision: u64,
-    pub scope_id: [u8; 32],
-    pub library_scope_id: [u8; 32],
     pub parent_snapshot_id: Option<String>,
     pub content_fingerprint: [u8; 32],
+    pub purpose: SnapshotPurpose,
+}
+
+/// The seed that separates library content fingerprints from anything else.
+/// Repository identity no longer depends on a published selection.
+pub(crate) fn library_fingerprint_domain() -> [u8; 32] {
+    Scope::LIBRARY.id()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -169,33 +190,34 @@ pub(crate) struct CompletedSnapshot {
     pub reference: RemoteObject,
     pub snapshot_id: String,
     pub repository_id: String,
-    pub scope_id: String,
-    pub library_scope_id: String,
+    /// The whole-state identifier for a published state, or the bundle
+    /// identifier for a backup. Control changes reach it; library content
+    /// changes reach `library_fingerprint`.
     pub fingerprint: String,
     pub library_fingerprint: String,
     pub logical_revision: u64,
     pub record_catalog: RemoteObject,
     pub asset_catalog: RemoteObject,
-    pub device_catalog: Option<RemoteObject>,
-    pub device_identity: Option<String>,
-    pub device_sections: Vec<String>,
+    pub sections: BTreeMap<String, wire::SectionSnapshotRef>,
     pub referenced_objects: Vec<RemoteObject>,
 }
 
-fn wire_role(role: ObjectRole) -> Result<wire::ObjectRole> {
+pub(crate) fn wire_role(role: ObjectRole) -> Result<wire::ObjectRole> {
     match role {
         ObjectRole::Pack => Ok(wire::ObjectRole::Pack),
         ObjectRole::Catalog => Ok(wire::ObjectRole::Catalog),
-        ObjectRole::Snapshot => Ok(wire::ObjectRole::Snapshot),
+        ObjectRole::SyncState => Ok(wire::ObjectRole::SyncState),
+        ObjectRole::BackupBundle => Ok(wire::ObjectRole::BackupBundle),
         ObjectRole::BackupPoint => Ok(wire::ObjectRole::BackupPoint),
         ObjectRole::Descriptor => Ok(wire::ObjectRole::Descriptor),
     }
 }
-fn native_role(role: wire::ObjectRole) -> Result<ObjectRole> {
+pub(crate) fn native_role(role: wire::ObjectRole) -> Result<ObjectRole> {
     match role {
         wire::ObjectRole::Pack => Ok(ObjectRole::Pack),
         wire::ObjectRole::Catalog => Ok(ObjectRole::Catalog),
-        wire::ObjectRole::Snapshot => Ok(ObjectRole::Snapshot),
+        wire::ObjectRole::SyncState => Ok(ObjectRole::SyncState),
+        wire::ObjectRole::BackupBundle => Ok(ObjectRole::BackupBundle),
         wire::ObjectRole::BackupPoint => Ok(ObjectRole::BackupPoint),
         wire::ObjectRole::Descriptor => Ok(ObjectRole::Descriptor),
         wire::ObjectRole::Head => Err(corrupt("head is not an immutable snapshot object")),
@@ -365,7 +387,7 @@ fn kind_name(kind: wire::CatalogKind) -> &'static str {
     match kind {
         wire::CatalogKind::Records => "records",
         wire::CatalogKind::Assets => "assets",
-        wire::CatalogKind::Device => "device",
+        wire::CatalogKind::Section => "section",
     }
 }
 
@@ -554,39 +576,22 @@ fn capture_sources(
     Ok((records, assets))
 }
 
-fn device_sources(device: DeviceSnapshot) -> Result<(Vec<SourceEntry>, [u8; 32], Vec<String>)> {
-    let device = super::device_capture::verify_snapshot(device).map_err(corrupt)?;
-    let mut sections = device.sections;
-    sections.sort();
-    if sections.is_empty()
-        || sections.iter().any(|section| section.is_empty())
-        || sections.windows(2).any(|pair| pair[0] == pair[1])
-    {
-        return Err(corrupt("invalid device section inventory"));
-    }
-    let mut sources = vec![SourceEntry {
-        kind: wire::CatalogEntryKind::DeviceCatalog,
-        key: "device/catalog".into(),
-        content_sha256: hex::encode(device.sqlite.content_hash),
-        byte_length: device.sqlite.byte_length,
-        path: device.sqlite.path,
-        compression: CompressionPolicy::Text,
-    }];
-    for file in device.blobs {
-        sources.push(SourceEntry {
-            kind: wire::CatalogEntryKind::DeviceObject,
-            key: file.section_id,
-            content_sha256: hex::encode(file.content_hash),
-            byte_length: file.byte_length,
-            path: file.path,
-            compression: CompressionPolicy::AlreadyCompressed,
-        });
-    }
-    sources.sort_by(|a, b| a.key.cmp(&b.key));
-    if sources.windows(2).any(|pair| pair[0].key == pair[1].key) {
-        return Err(corrupt("duplicate device file key"));
-    }
-    Ok((sources, device.device_identity, sections))
+fn max_document_bytes(
+    limits: PackageLimits,
+    repository_id: &str,
+    snapshot_id: &str,
+    role: wire::ObjectRole,
+) -> Result<usize> {
+    usize::try_from(
+        max_plaintext(
+            limits,
+            repository_id,
+            &format!("snapshot-{snapshot_id}"),
+            role,
+        )?
+        .min(wire::MAX_METADATA_BYTES as u64),
+    )
+    .map_err(corrupt)
 }
 
 fn catalog_fingerprint(kind: wire::CatalogKind, sources: &[SourceEntry]) -> String {
@@ -1377,35 +1382,6 @@ pub(crate) async fn package_and_upload(
     repository: &RepositoryHandle,
     cancel: &Cancellation,
 ) -> Result<CompletedSnapshot> {
-    package_and_upload_with_device(
-        capture,
-        None,
-        repository_root,
-        cache_root,
-        metadata,
-        root_key,
-        limits,
-        journal,
-        provider,
-        repository,
-        cancel,
-    )
-    .await
-}
-
-pub(crate) async fn package_and_upload_with_device(
-    capture: CapturedSnapshot,
-    device: Option<DeviceSnapshot>,
-    repository_root: &Path,
-    cache_root: &Path,
-    metadata: SnapshotMetadata,
-    root_key: &[u8; 32],
-    limits: PackageLimits,
-    journal: &mut TransferJournal,
-    provider: &dyn Provider,
-    repository: &RepositoryHandle,
-    cancel: &Cancellation,
-) -> Result<CompletedSnapshot> {
     cancel.check()?;
     if metadata.repository_id.is_empty()
         || metadata.snapshot_id.is_empty()
@@ -1420,21 +1396,16 @@ pub(crate) async fn package_and_upload_with_device(
     let build_root = cache_root.join("build");
     let mut cache = PackageCache::open(cache_root)?;
     let repository_root_owned = repository_root.to_path_buf();
-    let library_scope_id = metadata.library_scope_id;
+    let library_domain = library_fingerprint_domain();
     let cpu = cpu_permit().await?;
-    let (record_sources, asset_sources, device_parts, observed_fingerprint) =
+    let (record_sources, asset_sources, observed_fingerprint) =
         tokio::task::spawn_blocking(move || {
             let (records, assets) = capture_sources(&capture, &repository_root_owned)?;
             let fingerprint = capture
                 .catalog
-                .content_fingerprint(&library_scope_id)
+                .content_fingerprint(&library_domain)
                 .map_err(corrupt)?;
-            Ok((
-                records,
-                assets,
-                device.map(device_sources).transpose()?,
-                fingerprint,
-            ))
+            Ok((records, assets, fingerprint))
         })
         .await
         .map_err(transient)??;
@@ -1515,86 +1486,65 @@ pub(crate) async fn package_and_upload_with_device(
         )
         .await?
     };
-    let (device_catalog, device_identity, device_sections) =
-        if let Some((device_sources, identity, sections)) = device_parts {
-            let mut device_fingerprint =
-                catalog_fingerprint(wire::CatalogKind::Device, &device_sources);
-            device_fingerprint.push_str(&hex::encode(identity));
-            for section in &sections {
-                device_fingerprint.push_str(section);
-            }
-            let (device_entries, uploaded) = build_entries(
-                wire::CatalogKind::Device,
-                device_sources,
-                &metadata.repository_id,
-                &build_root,
-                root_key,
-                limits,
-                &mut cache,
-                journal,
-                provider,
-                repository,
-                cancel,
+    let library = wire::LibrarySnapshotRef {
+        record_catalog: record_catalog.stored(repository)?,
+        asset_catalog: asset_catalog.stored(repository)?,
+        content_fingerprint: metadata.content_fingerprint,
+    };
+    // Sections are carried, never merged here. A published state inherits the
+    // sections the observed state already had; a bundle declares its own.
+    let (bytes, fingerprint, sections, role) = match metadata.purpose {
+        SnapshotPurpose::SyncState {
+            epoch,
+            generation,
+            parent_sections,
+        } => {
+            let document = wire::SyncStateDocument::new(
+                metadata.snapshot_id.clone(),
+                metadata.repository_id.clone(),
+                metadata.library_id,
+                epoch,
+                generation,
+                metadata.parent_snapshot_id,
+                metadata.author_device_id,
+                metadata.created_at_ms,
+                library,
+                parent_sections,
             )
-            .await?;
-            referenced.extend(uploaded);
-            let catalog = build_catalog(
-                wire::CatalogKind::Device,
-                device_entries,
-                &device_fingerprint,
-                &metadata.repository_id,
-                &build_root,
-                root_key,
-                limits,
-                &mut cache,
-                journal,
-                provider,
-                repository,
-                cancel,
-                &mut referenced,
+            .map_err(corrupt)?;
+            let max_state = max_document_bytes(limits, &metadata.repository_id, &metadata.snapshot_id, wire::ObjectRole::SyncState)?;
+            (
+                document.encode(max_state).map_err(corrupt)?,
+                document.state_fingerprint,
+                document.sections,
+                ObjectRole::SyncState,
             )
-            .await?;
-            (Some(catalog), Some(identity), sections)
-        } else {
-            (None, None, Vec::new())
-        };
-    let document = wire::SnapshotDocument::new(
-        metadata.snapshot_id.clone(),
-        metadata.repository_id.clone(),
-        metadata.library_id,
-        metadata.author_device_id,
-        metadata.created_at_ms,
-        metadata.logical_revision,
-        metadata.scope_id,
-        metadata.library_scope_id,
-        metadata.parent_snapshot_id,
-        wire::combine_content_fingerprint(
-            &metadata.scope_id,
-            &metadata.content_fingerprint,
-            device_identity.as_ref(),
-        ),
-        metadata.content_fingerprint,
-        record_catalog.stored(repository)?,
-        asset_catalog.stored(repository)?,
-        device_catalog
-            .as_ref()
-            .map(|catalog| catalog.stored(repository))
-            .transpose()?,
-        device_identity,
-        device_sections.clone(),
-    )
-    .map_err(corrupt)?;
-    let max_snapshot = usize::try_from(
-        max_plaintext(
-            limits,
-            &metadata.repository_id,
-            &format!("snapshot-{}", metadata.snapshot_id),
-            wire::ObjectRole::Snapshot,
-        )?
-        .min(wire::MAX_METADATA_BYTES as u64),
-    )
-    .map_err(corrupt)?;
-    let bytes = document.encode(max_snapshot).map_err(corrupt)?;
+        }
+        SnapshotPurpose::BackupBundle {
+            source,
+            remote_generation,
+        } => {
+            let document = wire_control::BackupBundleDocument::new(
+                metadata.repository_id.clone(),
+                metadata.snapshot_id.clone(),
+                source,
+                metadata.created_at_ms,
+                Some(Sequence::from(metadata.logical_revision)),
+                None,
+                remote_generation,
+                library,
+                std::collections::BTreeMap::new(),
+            )
+            .map_err(corrupt)?;
+            let max_bundle = max_document_bytes(limits, &metadata.repository_id, &metadata.snapshot_id, wire::ObjectRole::BackupBundle)?;
+            (
+                document.encode(max_bundle).map_err(corrupt)?,
+                document.bundle_fingerprint,
+                document.sections,
+                ObjectRole::BackupBundle,
+            )
+        }
+    };
     let metadata_key =
         derive_key(root_key, &metadata.repository_id, "metadata").map_err(corrupt)?;
     let mut file = tempfile::NamedTempFile::new_in(&build_root).map_err(transient)?;
@@ -1607,7 +1557,7 @@ pub(crate) async fn package_and_upload_with_device(
         bytes.len() as u64,
         hash(&bytes),
         format!("snapshot-{}", metadata.snapshot_id),
-        ObjectRole::Snapshot,
+        role,
         &metadata.repository_id,
         &metadata_key,
         limits,
@@ -1624,20 +1574,12 @@ pub(crate) async fn package_and_upload_with_device(
         reference,
         snapshot_id: metadata.snapshot_id,
         repository_id: metadata.repository_id,
-        scope_id: hex::encode(metadata.scope_id),
-        library_scope_id: hex::encode(metadata.library_scope_id),
-        fingerprint: hex::encode(wire::combine_content_fingerprint(
-            &metadata.scope_id,
-            &metadata.content_fingerprint,
-            device_identity.as_ref(),
-        )),
+        fingerprint: hex::encode(fingerprint),
         library_fingerprint: hex::encode(metadata.content_fingerprint),
         logical_revision: metadata.logical_revision,
         record_catalog,
         asset_catalog,
-        device_catalog,
-        device_identity: device_identity.map(hex::encode),
-        device_sections,
+        sections,
         referenced_objects: referenced,
     })
 }

@@ -375,9 +375,9 @@ pub(crate) async fn external_storage_start_job(
         }
         return Ok(pending.summary);
     }
-    let device = request.kind == JobKind::Backup
-        && (connection.descriptor.scope.device_settings
-            || connection.descriptor.scope.device_plugins);
+    // Section publication is not wired yet, so a backup captures the library
+    // only and no device capture phase is scheduled.
+    let device = false;
     let identity = native_store(&app)?
         .external_identity()
         .map_err(local_error)?;
@@ -779,12 +779,12 @@ async fn run_backup(
     use super::{
         control::{BackupPointDocument, BackupPointKind},
         journal::{JobIdentity, TransferJournal},
-        packaging::{PackageLimits, SnapshotMetadata},
+        packaging::{PackageLimits, SnapshotMetadata, SnapshotPurpose},
     };
+    use risunest_external_storage_format::control::BundleSource;
     let root = root(app)?;
     let worker_app = app.clone();
     let worker_job = job.clone();
-    let scope = connected.stored.descriptor.scope.clone();
     let repository_id = connected.stored.descriptor.repository_id.clone();
     let probe = CancelProbe(cancel.clone());
     let (capture, fingerprint) = tokio::task::spawn_blocking(move || -> Result<_> {
@@ -798,9 +798,7 @@ async fn run_backup(
             .as_ref()
             .map(|item| item.capture_id.clone())
             .or(worker_job.capture_id.clone());
-        let mut library_scope = scope.clone();
-        library_scope.device_settings = false;
-        library_scope.device_plugins = false;
+        let library_scope = risunest_external_storage_format::format::Scope::LIBRARY;
         let hydration = if retained.is_none() {
             Some(
                 pds.hydrate_external_capture_dependencies(
@@ -883,41 +881,23 @@ async fn run_backup(
             .as_str()
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))?,
-        scope_id: connected.stored.descriptor.scope_id,
-        library_scope_id: risunest_external_storage_format::format::Scope {
-            library: true,
-            referenced_assets: true,
-            device_settings: false,
-            device_plugins: false,
-        }
-        .id(),
         parent_snapshot_id: None,
         content_fingerprint: fingerprint,
         logical_revision: identity.revision.try_into().map_err(local_error)?,
+        purpose: SnapshotPurpose::BackupBundle {
+            source: BundleSource::Device {
+                writer_id: identity.store_id.clone(),
+            },
+            remote_generation: None,
+        },
     };
     let cache = directory
         .parent()
         .and_then(|path| path.parent())
         .ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))?
         .join("package-cache");
-    let device = match job.device_capture_id.as_deref() {
-        Some(id) => Some(
-            super::device_capture::reopen_device_snapshot(
-                &root.join("external-device-captures"),
-                id,
-            )
-            .map_err(local_error)?,
-        ),
-        None if connected.stored.descriptor.scope.device_settings
-            || connected.stored.descriptor.scope.device_plugins =>
-        {
-            return Err(ProviderError::new(ErrorKind::Corrupt))
-        }
-        None => None,
-    };
-    let completed = super::packaging::package_and_upload_with_device(
+    let completed = super::packaging::package_and_upload(
         capture,
-        device,
         &root,
         &cache,
         metadata,
@@ -934,7 +914,7 @@ async fn run_backup(
     } else {
         BackupPointKind::Manual
     };
-    let document = BackupPointDocument::new(
+    let document = BackupPointDocument::single(
         &connected.stored.descriptor,
         job.snapshot_id.clone(),
         kind,
@@ -942,8 +922,7 @@ async fn run_backup(
             .as_str()
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))?,
-        identity.revision.try_into().map_err(local_error)?,
-        vec![completed.reference.clone()],
+        completed.reference.clone(),
     )?;
     let point = super::control::upload_backup_point(
         &connected.stored.descriptor,

@@ -74,7 +74,10 @@ async fn upload_prepared(
     if record.repository_id != connected.stored.descriptor.repository_id
         || snapshot.repository_id != record.repository_id
         || snapshot.object_id != format!("snapshot-{}", record.snapshot_id)
-        || snapshot.role != ObjectRole::Snapshot
+        || !matches!(
+            snapshot.role,
+            ObjectRole::SyncState | ObjectRole::BackupBundle
+        )
     {
         return Err(corrupt());
     }
@@ -89,13 +92,35 @@ async fn upload_prepared(
             capture: record.identity.clone(),
         },
     )?;
-    let point = BackupPointDocument::new(
+    // A point names a bundle. Pinning a published state wraps its library
+    // reference in one so the retained material stays complete on its own.
+    let bundle = if snapshot.role == ObjectRole::BackupBundle {
+        snapshot
+    } else {
+        let view =
+            super::control::read_snapshot_document(connected, &snapshot, cancel).await?;
+        super::control::upload_backup_bundle(
+            &connected.stored.descriptor,
+            &connected.root_key,
+            format!("{}-pinned", record.point_id),
+            risunest_external_storage_format::control::BundleSource::SyncState {
+                commit_id: record.snapshot_id.clone(),
+            },
+            record.created_at_ms,
+            view.library,
+            &mut journal,
+            connected.provider.as_ref(),
+            &connected.handle,
+            cancel,
+        )
+        .await?
+    };
+    let point = BackupPointDocument::single(
         &connected.stored.descriptor,
         record.point_id.clone(),
         BackupPointKind::Manual,
         record.created_at_ms,
-        record.logical_revision,
-        vec![snapshot],
+        bundle,
     )?;
     let observation = super::control::upload_backup_point(
         &connected.stored.descriptor,
@@ -142,7 +167,7 @@ pub(crate) async fn run_pin_history(
                     snapshot_id,
                     snapshot_reference: &snapshot_reference,
                     point_id: &job.id,
-                    logical_revision: document.logical_revision,
+                    logical_revision: document.revision.parse().unwrap_or_default(),
                     created_at_ms,
                     identity: &job.admission_identity,
                 })

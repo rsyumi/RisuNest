@@ -77,7 +77,8 @@ pub(super) fn role_name(role: ObjectRole) -> &'static str {
         ObjectRole::Descriptor => "descriptor",
         ObjectRole::Pack => "pack",
         ObjectRole::Catalog => "catalog",
-        ObjectRole::Snapshot => "snapshot",
+        ObjectRole::SyncState => "state",
+        ObjectRole::BackupBundle => "bundle",
         ObjectRole::BackupPoint => "point",
     }
 }
@@ -86,14 +87,15 @@ fn role_from_name(name: &str) -> Option<ObjectRole> {
         "descriptor" => ObjectRole::Descriptor,
         "pack" => ObjectRole::Pack,
         "catalog" => ObjectRole::Catalog,
-        "snapshot" => ObjectRole::Snapshot,
+        "state" => ObjectRole::SyncState,
+        "bundle" => ObjectRole::BackupBundle,
         "point" => ObjectRole::BackupPoint,
         _ => return None,
     })
 }
 pub(super) fn collection_role(collection: Collection) -> ObjectRole {
     match collection {
-        Collection::Snapshots => ObjectRole::Snapshot,
+        Collection::Snapshots => ObjectRole::SyncState,
         Collection::BackupPoints => ObjectRole::BackupPoint,
         Collection::Descriptors => ObjectRole::Descriptor,
     }

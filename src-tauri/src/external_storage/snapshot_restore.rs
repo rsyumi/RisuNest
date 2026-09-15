@@ -6,7 +6,6 @@ use super::{
         Cancellation, ErrorKind, ObjectRole, Provider, ProviderError, ReadReceipt,
         RepositoryHandle, Result,
     },
-    device_capture::{self, DeviceSnapshot},
     packaging::{cpu_permit, RemoteObject},
     transfer::SpoolSink,
 };
@@ -66,16 +65,12 @@ pub(crate) struct PreparedObject {
 pub(crate) struct PreparedRemoteSnapshot {
     pub snapshot_id: String,
     pub repository_id: String,
-    pub scope_id: String,
-    pub library_scope_id: String,
     pub fingerprint: String,
     pub library_fingerprint: String,
     pub logical_revision: u64,
     pub staging_root: PathBuf,
     pub records: Vec<PreparedRecord>,
     pub objects: Vec<PreparedObject>,
-    pub device: Option<DeviceSnapshot>,
-    pub device_sections: Vec<String>,
 }
 
 fn ensure_directory(path: &Path) -> Result<()> {
@@ -254,7 +249,8 @@ async fn open_object(
             ObjectRole::Descriptor => wire::ObjectRole::Descriptor,
             ObjectRole::Pack => wire::ObjectRole::Pack,
             ObjectRole::Catalog => wire::ObjectRole::Catalog,
-            ObjectRole::Snapshot => wire::ObjectRole::Snapshot,
+            ObjectRole::SyncState => wire::ObjectRole::SyncState,
+            ObjectRole::BackupBundle => wire::ObjectRole::BackupBundle,
             ObjectRole::BackupPoint => wire::ObjectRole::BackupPoint,
         };
         let expected = wire::PublicObjectHeader::new(
@@ -365,10 +361,10 @@ async fn read_catalog(
                         wire::CatalogEntryKind::Record | wire::CatalogEntryKind::Object
                     ),
                     wire::CatalogKind::Assets => fragment.kind == wire::CatalogEntryKind::Object,
-                    wire::CatalogKind::Device => matches!(
+                    wire::CatalogKind::Section => matches!(
                         fragment.kind,
-                        wire::CatalogEntryKind::DeviceCatalog
-                            | wire::CatalogEntryKind::DeviceObject
+                        wire::CatalogEntryKind::SectionEntry
+                            | wire::CatalogEntryKind::SectionObject
                     ),
                 };
                 if !valid_kind {
@@ -377,8 +373,8 @@ async fn read_catalog(
                 let tag = match fragment.kind {
                     wire::CatalogEntryKind::Record => 0,
                     wire::CatalogEntryKind::Object => 1,
-                    wire::CatalogEntryKind::DeviceCatalog => 2,
-                    wire::CatalogEntryKind::DeviceObject => 3,
+                    wire::CatalogEntryKind::SectionEntry => 2,
+                    wire::CatalogEntryKind::SectionObject => 3,
                 };
                 fragments
                     .entry((tag, fragment.key.clone()))
@@ -472,8 +468,8 @@ fn materialize_entries(
         let destination = match entry.kind {
             wire::CatalogEntryKind::Record => record_root.join(&digest),
             wire::CatalogEntryKind::Object => object_root.join(&digest),
-            wire::CatalogEntryKind::DeviceCatalog | wire::CatalogEntryKind::DeviceObject => {
-                return Err(corrupt("device entry in library catalog"));
+            wire::CatalogEntryKind::SectionEntry | wire::CatalogEntryKind::SectionObject => {
+                return Err(corrupt("section entry in library catalog"));
             }
         };
         if !verify(&destination, entry.byte_length, &digest)? {
@@ -554,118 +550,12 @@ fn materialize_entries(
                     }
                 }
             }
-            wire::CatalogEntryKind::DeviceCatalog | wire::CatalogEntryKind::DeviceObject => {
-                return Err(corrupt("device entry in library catalog"));
+            wire::CatalogEntryKind::SectionEntry | wire::CatalogEntryKind::SectionObject => {
+                return Err(corrupt("section entry in library catalog"));
             }
         }
     }
     Ok(())
-}
-
-fn materialize_device_entries(
-    entries: Vec<CompleteEntry>,
-    packs: &BTreeMap<String, PathBuf>,
-    device_identity: [u8; 32],
-    staging_root: &Path,
-    cancel: &Cancellation,
-) -> Result<DeviceSnapshot> {
-    let capture_id = hex::encode(device_identity);
-    let device_root = staging_root.join("device");
-    let capture_root = device_root.join("captures").join(&capture_id);
-    let object_root = device_root.join("objects");
-    ensure_directory(&device_root)?;
-    ensure_directory(&device_root.join("captures"))?;
-    ensure_directory(&capture_root)?;
-    ensure_directory(&object_root)?;
-    let mut saw_catalog = false;
-    let mut seen_objects = BTreeSet::new();
-    for entry in entries {
-        cancel.check()?;
-        let digest = hex::encode(entry.content_sha256);
-        let destination = match entry.kind {
-            wire::CatalogEntryKind::DeviceCatalog => {
-                if entry.key != "device/catalog" || saw_catalog {
-                    return Err(corrupt("invalid device catalog entry"));
-                }
-                saw_catalog = true;
-                capture_root.join("device.sqlite")
-            }
-            wire::CatalogEntryKind::DeviceObject => {
-                if entry.key != format!("device/object/{digest}")
-                    || !seen_objects.insert(digest.clone())
-                {
-                    return Err(corrupt("invalid device object entry"));
-                }
-                object_root.join(&digest)
-            }
-            wire::CatalogEntryKind::Record | wire::CatalogEntryKind::Object => {
-                return Err(corrupt("library entry in device catalog"));
-            }
-        };
-        if !verify(&destination, entry.byte_length, &digest)? {
-            if destination.exists() {
-                fs::remove_file(&destination).map_err(transient)?;
-            }
-            let partial = destination.with_extension("partial");
-            if partial.exists() {
-                fs::remove_file(&partial).map_err(transient)?;
-            }
-            let mut output = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&partial)
-                .map_err(transient)?;
-            let mut output_hash = Sha256::new();
-            for chunk in &entry.chunks {
-                let pack_path = packs
-                    .get(&chunk.pack_id)
-                    .ok_or_else(|| corrupt("device catalog pack is missing"))?;
-                let mut input =
-                    crate::trust_boundary::open_regular_source(pack_path).map_err(corrupt)?;
-                let input_length = input.metadata().map_err(corrupt)?.len();
-                if chunk
-                    .offset
-                    .checked_add(chunk.stored_length)
-                    .is_none_or(|end| end > input_length)
-                {
-                    return Err(corrupt("device chunk escaped pack"));
-                }
-                input.seek(SeekFrom::Start(chunk.offset)).map_err(corrupt)?;
-                let mut limited = input.take(chunk.stored_length);
-                let decoded =
-                    pack::read_entry(&mut limited, pack::MAX_CHUNK_BYTES).map_err(corrupt)?;
-                if limited.limit() != 0
-                    || decoded.hash != chunk.plaintext_sha256
-                    || decoded.bytes.len() as u64 != chunk.plaintext_length
-                {
-                    return Err(corrupt("device pack chunk differs"));
-                }
-                output.write_all(&decoded.bytes).map_err(transient)?;
-                output_hash.update(&decoded.bytes);
-            }
-            output.sync_all().map_err(transient)?;
-            drop(output);
-            let actual: [u8; 32] = output_hash.finalize().into();
-            if actual != entry.content_sha256 || !verify(&partial, entry.byte_length, &digest)? {
-                return Err(corrupt("restored device entry integrity failed"));
-            }
-            publish_verified(&partial, &destination, entry.byte_length, &digest)?;
-        }
-    }
-    if !saw_catalog {
-        return Err(corrupt("device catalog entry is missing"));
-    }
-    let snapshot =
-        device_capture::reopen_device_snapshot(&device_root, &capture_id).map_err(corrupt)?;
-    let catalog_objects: BTreeSet<_> = snapshot
-        .blobs
-        .iter()
-        .map(|blob| hex::encode(blob.content_hash))
-        .collect();
-    if catalog_objects != seen_objects {
-        return Err(corrupt("device object inventory differs"));
-    }
-    Ok(snapshot)
 }
 
 pub(crate) async fn download_snapshot(
@@ -676,7 +566,10 @@ pub(crate) async fn download_snapshot(
     repository: &RepositoryHandle,
     cancel: &Cancellation,
 ) -> Result<PreparedRemoteSnapshot> {
-    if snapshot.role != ObjectRole::Snapshot {
+    if !matches!(
+        snapshot.role,
+        ObjectRole::SyncState | ObjectRole::BackupBundle
+    ) {
         return Err(corrupt("snapshot root role"));
     }
     ensure_directory(staging_root)?;
@@ -690,28 +583,19 @@ pub(crate) async fn download_snapshot(
     )
     .await?;
     let root_bytes = read_bytes(&root_path, wire::MAX_METADATA_BYTES)?;
-    let document = wire::SnapshotDocument::decode(
-        &root_bytes,
-        usize::try_from(snapshot.plaintext_length).map_err(corrupt)?,
-    )
-    .map_err(corrupt)?;
-    if document.repository_id != snapshot.repository_id
-        || snapshot.object_id != format!("snapshot-{}", document.snapshot_id)
-    {
+    let wire_role = match snapshot.role {
+        ObjectRole::SyncState => wire::ObjectRole::SyncState,
+        _ => wire::ObjectRole::BackupBundle,
+    };
+    let document =
+        super::control::SnapshotView::read(&root_bytes, wire_role, &snapshot.repository_id)?;
+    if snapshot.object_id != format!("snapshot-{}", document.snapshot_id) {
         return Err(corrupt("snapshot identity differs"));
     }
-    let record_catalog = RemoteObject::from_stored(&document.record_catalog, repository)?;
-    let asset_catalog = RemoteObject::from_stored(&document.asset_catalog, repository)?;
-    let device_catalog = document
-        .device_catalog
-        .as_ref()
-        .map(|catalog| RemoteObject::from_stored(catalog, repository))
-        .transpose()?;
+    let record_catalog = RemoteObject::from_stored(&document.library.record_catalog, repository)?;
+    let asset_catalog = RemoteObject::from_stored(&document.library.asset_catalog, repository)?;
     if record_catalog.repository_id != snapshot.repository_id
         || asset_catalog.repository_id != snapshot.repository_id
-        || device_catalog
-            .as_ref()
-            .is_some_and(|catalog| catalog.repository_id != snapshot.repository_id)
     {
         return Err(corrupt("snapshot catalog repository differs"));
     }
@@ -735,22 +619,6 @@ pub(crate) async fn download_snapshot(
         cancel,
     )
     .await?;
-    let device_catalog_result = if let Some(catalog) = &device_catalog {
-        Some(
-            read_catalog(
-                catalog,
-                wire::CatalogKind::Device,
-                root_key,
-                staging_root,
-                provider,
-                repository,
-                cancel,
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
     for (id, object) in asset_packs {
         if let Some(old) = record_packs.insert(id, object.clone()) {
             if old != object {
@@ -788,58 +656,14 @@ pub(crate) async fn download_snapshot(
     .await
     .map_err(transient)??;
     drop(cpu);
-    let device = match (device_catalog_result, document.device_identity) {
-        (Some((device_entries, device_packs)), Some(identity)) => {
-            let device_pack_paths = open_packs(
-                &device_packs,
-                root_key,
-                staging_root,
-                provider,
-                repository,
-                cancel,
-            )
-            .await?;
-            let device_staging = staging_root.to_path_buf();
-            let device_cancel = cancel.clone();
-            let cpu = cpu_permit().await?;
-            let device = tokio::task::spawn_blocking(move || {
-                materialize_device_entries(
-                    device_entries,
-                    &device_pack_paths,
-                    identity,
-                    &device_staging,
-                    &device_cancel,
-                )
-            })
-            .await
-            .map_err(transient)??;
-            drop(cpu);
-            Some(device)
-        }
-        (None, None) => None,
-        _ => return Err(corrupt("snapshot device identity differs")),
-    };
-    if device.as_ref().map(|value| value.sections.as_slice())
-        != if document.device_sections.is_empty() {
-            None
-        } else {
-            Some(document.device_sections.as_slice())
-        }
-    {
-        return Err(corrupt("snapshot device sections differ"));
-    }
     Ok(PreparedRemoteSnapshot {
         snapshot_id: document.snapshot_id,
-        repository_id: document.repository_id,
-        scope_id: hex::encode(document.scope_id),
-        library_scope_id: hex::encode(document.library_scope_id),
-        fingerprint: hex::encode(document.fingerprint),
-        library_fingerprint: hex::encode(document.library_fingerprint),
-        logical_revision: document.logical_revision,
+        repository_id: snapshot.repository_id.clone(),
+        fingerprint: hex::encode(document.library.content_fingerprint),
+        library_fingerprint: hex::encode(document.library.content_fingerprint),
+        logical_revision: document.revision.parse().unwrap_or_default(),
         staging_root: staging_root.to_path_buf(),
         records: records.into_values().collect(),
         objects: objects.into_values().collect(),
-        device,
-        device_sections: document.device_sections,
     })
 }

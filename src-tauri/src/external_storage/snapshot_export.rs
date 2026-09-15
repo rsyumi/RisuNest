@@ -3,12 +3,10 @@
 //! portable-backup writer and verifier.
 use super::{
     contract::{Cancellation, ErrorKind, ProviderError, Result},
-    device_capture::DeviceSnapshot,
     snapshot_restore::PreparedRemoteSnapshot,
 };
 use crate::{
     asset_repository::job_pins::{CasJobKind, CasReleaseOutcome, DurableCasJob},
-    device_backup::validate_archive_catalog,
     local_backup::CancellationProbe,
     persistent_store::{
         external_apply::{
@@ -18,7 +16,6 @@ use crate::{
     },
 };
 use risunest_external_storage_format::format::Scope;
-use rusqlite::{Connection, OpenFlags};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -47,75 +44,9 @@ impl CancellationProbe for Probe<'_> {
     }
 }
 
-fn copy_device_into_catalog(
-    device: &DeviceSnapshot,
-    catalog: &crate::portable_backup::Catalog,
-    probe: &dyn CancellationProbe,
-) -> std::result::Result<(), crate::portable_backup::Error> {
-    let source =
-        Connection::open_with_flags(&device.sqlite.path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    validate_archive_catalog(&source, probe).map_err(|_| {
-        crate::portable_backup::Error::Invalid("device catalog verification failed")
-    })?;
-    let mut sections = source.prepare(
-        "SELECT section,schema_version,included,complete,present,record_count,sha256 \
-         FROM device_sections ORDER BY section",
-    )?;
-    let mut rows = sections.query([])?;
-    while let Some(row) = rows.next()? {
-        if probe.is_cancelled() {
-            return Err(crate::portable_backup::Error::Cancelled);
-        }
-        catalog.db.execute(
-            "INSERT INTO device_sections VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            rusqlite::params![
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, String>(6)?,
-            ],
-        )?;
-    }
-    drop(rows);
-    drop(sections);
-    let mut records = source
-        .prepare("SELECT section,ordinal,metadata FROM device_records ORDER BY section,ordinal")?;
-    let mut rows = records.query([])?;
-    while let Some(row) = rows.next()? {
-        if probe.is_cancelled() {
-            return Err(crate::portable_backup::Error::Cancelled);
-        }
-        catalog.db.execute(
-            "INSERT INTO device_records VALUES(?1,?2,?3)",
-            rusqlite::params![
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-            ],
-        )?;
-    }
-    for blob in &device.blobs {
-        let hash = hex::encode(blob.content_hash);
-        catalog.add_pinned_file(
-            "device",
-            &hash,
-            "{}",
-            &blob.path,
-            blob.byte_length,
-            &hash,
-            probe,
-        )?;
-    }
-    Ok(())
-}
-
 fn create_verified_snapshot_backup(
     store: &mut PersistentStore,
     revision: i64,
-    device: Option<&DeviceSnapshot>,
     destination: &Path,
     scratch: &Path,
     probe: &dyn CancellationProbe,
@@ -140,9 +71,6 @@ fn create_verified_snapshot_backup(
                 "snapshot export requires a valid library",
             ));
         }
-        if let Some(device) = device {
-            copy_device_into_catalog(device, &captured.catalog, probe)?;
-        }
         captured
             .catalog
             .write_candidate(destination, false, probe)?;
@@ -152,9 +80,7 @@ fn create_verified_snapshot_backup(
             probe,
         )?;
         archive.validate_library(probe)?;
-        if !archive.manifest.library_included
-            || archive.manifest.device_included != device.is_some()
-        {
+        if !archive.manifest.library_included || archive.manifest.device_included {
             return Err(crate::portable_backup::Error::Invalid(
                 "snapshot export scope differs",
             ));
@@ -176,36 +102,21 @@ fn create_verified_snapshot_backup(
 /// save dialog. After this returns, restoring the archive needs neither the
 /// cloud provider nor its credentials or repository key.
 pub(crate) fn export_verified_snapshot(
-    mut snapshot: PreparedRemoteSnapshot,
+    snapshot: PreparedRemoteSnapshot,
     scope: &Scope,
     destination: &Path,
     scratch_parent: &Path,
     cancel: &Cancellation,
 ) -> Result<SnapshotExportReceipt> {
     cancel.check()?;
-    let device = snapshot.device.take();
     if destination.extension().and_then(|value| value.to_str()) != Some("risunest")
         || destination.file_name().is_none()
     {
         return Err(ProviderError::new(ErrorKind::Unsupported));
     }
-    let scope_id = decode_hash(&snapshot.scope_id)?;
-    let library_scope_id = decode_hash(&snapshot.library_scope_id)?;
     let fingerprint = decode_hash(&snapshot.library_fingerprint)?;
-    if scope.id() != scope_id {
+    if scope != &Scope::LIBRARY {
         return Err(corrupt("snapshot scope differs"));
-    }
-    let library_scope = Scope {
-        library: scope.library,
-        referenced_assets: scope.referenced_assets,
-        device_settings: false,
-        device_plugins: false,
-    };
-    if library_scope.id() != library_scope_id {
-        return Err(corrupt("snapshot library scope differs"));
-    }
-    if (scope.device_settings || scope.device_plugins) != device.is_some() {
-        return Err(ProviderError::new(ErrorKind::Unsupported));
     }
     std::fs::create_dir_all(scratch_parent).map_err(transient)?;
     let scratch = tempfile::Builder::new()
@@ -216,8 +127,8 @@ pub(crate) fn export_verified_snapshot(
     let application = ExternalSnapshotApplication {
         expected_revision: 0,
         staging_root: &snapshot.staging_root,
-        scope: &library_scope,
-        scope_id: &library_scope_id,
+        scope: &Scope::LIBRARY,
+        scope_id: &Scope::LIBRARY.id(),
         fingerprint: &fingerprint,
     };
     let records = snapshot.records.into_iter().map(|value| {
@@ -250,7 +161,6 @@ pub(crate) fn export_verified_snapshot(
     let sha256 = create_verified_snapshot_backup(
         &mut store,
         revision,
-        device.as_ref(),
         &candidate,
         &archive_scratch,
         &Probe(cancel),

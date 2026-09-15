@@ -11,7 +11,7 @@ use super::{
         Provider, ProviderError, ReadReceipt, RemoteLocator, RepositoryHandle, Result,
     },
     journal::TransferJournal,
-    packaging::RemoteObject,
+    packaging::{native_role, wire_role, RemoteObject},
     publication::{Attempt, ExecutionSession, HeadObservation, Outcome, PublicationWrite},
     transfer::SpoolSink,
     transfer_job,
@@ -55,9 +55,9 @@ pub(crate) struct HeadDocument {
     pub library_id: String,
     pub commit_id: String,
     pub parent_commit_id: Option<String>,
-    pub scope_id: String,
+    /// Identifies the whole published state, control changes included.
     pub content_fingerprint: String,
-    pub snapshot: RemoteObject,
+    pub state: RemoteObject,
 }
 impl HeadDocument {
     pub(crate) fn new(
@@ -66,27 +66,29 @@ impl HeadDocument {
         commit_id: String,
         parent_commit_id: Option<String>,
         content_fingerprint: String,
-        snapshot: RemoteObject,
+        state: RemoteObject,
     ) -> Result<Self> {
         let value = Self {
             repository_id: descriptor.repository_id.clone(),
             library_id,
             commit_id,
             parent_commit_id,
-            scope_id: hex::encode(descriptor.scope_id),
             content_fingerprint,
-            snapshot,
+            state,
         };
         descriptor.validate().map_err(corrupt)?;
-        if value.repository_id != descriptor.repository_id
-            || value.scope_id != hex::encode(descriptor.scope_id)
-            || !crate::trust_boundary::is_lower_hex_256(&value.content_fingerprint)
-            || value.snapshot.repository_id != descriptor.repository_id
-            || value.snapshot.role != ObjectRole::Snapshot
+        value.check(descriptor)?;
+        Ok(value)
+    }
+    fn check(&self, descriptor: &Descriptor) -> Result<()> {
+        if self.repository_id != descriptor.repository_id
+            || !crate::trust_boundary::is_lower_hex_256(&self.content_fingerprint)
+            || self.state.repository_id != descriptor.repository_id
+            || self.state.role != ObjectRole::SyncState
         {
             return Err(corrupt("invalid head document"));
         }
-        Ok(value)
+        Ok(())
     }
     fn to_wire(
         &self,
@@ -94,22 +96,14 @@ impl HeadDocument {
         repository: &RepositoryHandle,
     ) -> Result<wire_control::HeadDocument> {
         descriptor.validate().map_err(corrupt)?;
-        if self.repository_id != descriptor.repository_id
-            || self.scope_id != hex::encode(descriptor.scope_id)
-            || !crate::trust_boundary::is_lower_hex_256(&self.content_fingerprint)
-            || self.snapshot.repository_id != descriptor.repository_id
-            || self.snapshot.role != ObjectRole::Snapshot
-        {
-            return Err(corrupt("invalid head document"));
-        }
+        self.check(descriptor)?;
         wire_control::HeadDocument::new(
             self.repository_id.clone(),
             self.library_id.clone(),
             self.commit_id.clone(),
             self.parent_commit_id.clone(),
-            decode_hash(&self.scope_id)?,
             decode_hash(&self.content_fingerprint)?,
-            self.snapshot.stored(repository)?,
+            self.state.stored(repository)?,
         )
         .map_err(corrupt)
     }
@@ -118,8 +112,7 @@ impl HeadDocument {
         descriptor: &Descriptor,
         repository: &RepositoryHandle,
     ) -> Result<Self> {
-        if value.repository_id != descriptor.repository_id || value.scope_id != descriptor.scope_id
-        {
+        if value.repository_id != descriptor.repository_id {
             return Err(corrupt("head descriptor binding differs"));
         }
         Ok(Self {
@@ -127,9 +120,8 @@ impl HeadDocument {
             library_id: value.library_id,
             commit_id: value.commit_id,
             parent_commit_id: value.parent_commit_id,
-            scope_id: hex::encode(value.scope_id),
-            content_fingerprint: hex::encode(value.fingerprint),
-            snapshot: RemoteObject::from_stored(&value.snapshot, repository)?,
+            content_fingerprint: hex::encode(value.state_fingerprint),
+            state: RemoteObject::from_stored(&value.state, repository)?,
         })
     }
 }
@@ -142,54 +134,104 @@ pub(crate) enum BackupPointKind {
     RecoveryCandidate,
 }
 
+impl BackupPointKind {
+    fn to_wire(self) -> wire_control::BackupPointKind {
+        match self {
+            Self::Automatic => wire_control::BackupPointKind::Backup,
+            Self::Manual => wire_control::BackupPointKind::Manual,
+            Self::Conflict => wire_control::BackupPointKind::Conflict,
+            Self::RecoveryCandidate => wire_control::BackupPointKind::History,
+        }
+    }
+}
+
+/// A point names its bundles by purpose. A conflict preserves both sides; every
+/// other kind carries exactly one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BackupPointDocument {
     pub repository_id: String,
     pub point_id: String,
     pub kind: BackupPointKind,
     pub created_at_ms: u64,
-    pub logical_revision: u64,
-    pub scope_id: String,
-    pub snapshots: Vec<RemoteObject>,
+    pub bundle: Option<RemoteObject>,
+    pub local_bundle: Option<RemoteObject>,
+    pub remote_bundle: Option<RemoteObject>,
 }
 impl BackupPointDocument {
-    pub(crate) fn new(
+    pub(crate) fn single(
         descriptor: &Descriptor,
         point_id: String,
         kind: BackupPointKind,
         created_at_ms: u64,
-        logical_revision: u64,
-        snapshots: Vec<RemoteObject>,
+        bundle: RemoteObject,
     ) -> Result<Self> {
-        let wire_kind = match kind {
-            BackupPointKind::Automatic => wire_control::BackupPointKind::Backup,
-            BackupPointKind::Manual => wire_control::BackupPointKind::Manual,
-            BackupPointKind::Conflict => wire_control::BackupPointKind::Conflict,
-            BackupPointKind::RecoveryCandidate => wire_control::BackupPointKind::History,
-        };
-        wire_kind
-            .validate_snapshot_ids(snapshots.iter().map(|snapshot| snapshot.object_id.as_str()))
-            .map_err(corrupt)?;
+        if kind == BackupPointKind::Conflict {
+            return Err(corrupt("a conflict point needs both bundles"));
+        }
         let value = Self {
             repository_id: descriptor.repository_id.clone(),
             point_id,
             kind,
             created_at_ms,
-            logical_revision,
-            scope_id: hex::encode(descriptor.scope_id),
-            snapshots,
+            bundle: Some(bundle),
+            local_bundle: None,
+            remote_bundle: None,
         };
         descriptor.validate().map_err(corrupt)?;
-        if value.repository_id != descriptor.repository_id
-            || value.scope_id != hex::encode(descriptor.scope_id)
-            || value.snapshots.iter().any(|snapshot| {
-                snapshot.repository_id != descriptor.repository_id
-                    || snapshot.role != ObjectRole::Snapshot
+        value.check(descriptor)?;
+        Ok(value)
+    }
+    pub(crate) fn conflict(
+        descriptor: &Descriptor,
+        point_id: String,
+        created_at_ms: u64,
+        local_bundle: RemoteObject,
+        remote_bundle: RemoteObject,
+    ) -> Result<Self> {
+        let value = Self {
+            repository_id: descriptor.repository_id.clone(),
+            point_id,
+            kind: BackupPointKind::Conflict,
+            created_at_ms,
+            bundle: None,
+            local_bundle: Some(local_bundle),
+            remote_bundle: Some(remote_bundle),
+        };
+        descriptor.validate().map_err(corrupt)?;
+        value.check(descriptor)?;
+        Ok(value)
+    }
+    pub(crate) fn bundles(&self) -> Vec<&RemoteObject> {
+        [&self.bundle, &self.local_bundle, &self.remote_bundle]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+    fn check(&self, descriptor: &Descriptor) -> Result<()> {
+        let complete = match self.kind {
+            BackupPointKind::Conflict => {
+                self.bundle.is_none()
+                    && match (&self.local_bundle, &self.remote_bundle) {
+                        (Some(local), Some(remote)) => local.object_id != remote.object_id,
+                        _ => false,
+                    }
+            }
+            _ => {
+                self.bundle.is_some()
+                    && self.local_bundle.is_none()
+                    && self.remote_bundle.is_none()
+            }
+        };
+        if self.repository_id != descriptor.repository_id
+            || !complete
+            || self.bundles().iter().any(|bundle| {
+                bundle.repository_id != descriptor.repository_id
+                    || bundle.role != ObjectRole::BackupBundle
             })
         {
             return Err(corrupt("invalid backup point"));
         }
-        Ok(value)
+        Ok(())
     }
     fn to_wire(
         &self,
@@ -197,33 +239,34 @@ impl BackupPointDocument {
         repository: &RepositoryHandle,
     ) -> Result<wire_control::BackupPointDocument> {
         descriptor.validate().map_err(corrupt)?;
-        if self.repository_id != descriptor.repository_id
-            || self.scope_id != hex::encode(descriptor.scope_id)
-            || self.snapshots.iter().any(|snapshot| {
-                snapshot.repository_id != descriptor.repository_id
-                    || snapshot.role != ObjectRole::Snapshot
-            })
-        {
-            return Err(corrupt("invalid backup point"));
+        self.check(descriptor)?;
+        match self.kind {
+            BackupPointKind::Conflict => {
+                let (Some(local), Some(remote)) = (&self.local_bundle, &self.remote_bundle) else {
+                    return Err(corrupt("invalid backup point"));
+                };
+                wire_control::BackupPointDocument::conflict(
+                    self.repository_id.clone(),
+                    self.point_id.clone(),
+                    self.created_at_ms,
+                    local.stored(repository)?,
+                    remote.stored(repository)?,
+                )
+            }
+            _ => {
+                let bundle = self
+                    .bundle
+                    .as_ref()
+                    .ok_or_else(|| corrupt("invalid backup point"))?;
+                wire_control::BackupPointDocument::single(
+                    self.repository_id.clone(),
+                    self.point_id.clone(),
+                    self.kind.to_wire(),
+                    self.created_at_ms,
+                    bundle.stored(repository)?,
+                )
+            }
         }
-        let kind = match self.kind {
-            BackupPointKind::Automatic => wire_control::BackupPointKind::Backup,
-            BackupPointKind::Manual => wire_control::BackupPointKind::Manual,
-            BackupPointKind::Conflict => wire_control::BackupPointKind::Conflict,
-            BackupPointKind::RecoveryCandidate => wire_control::BackupPointKind::History,
-        };
-        wire_control::BackupPointDocument::new(
-            self.repository_id.clone(),
-            self.point_id.clone(),
-            kind,
-            self.created_at_ms,
-            self.logical_revision,
-            decode_hash(&self.scope_id)?,
-            self.snapshots
-                .iter()
-                .map(|snapshot| snapshot.stored(repository))
-                .collect::<Result<Vec<_>>>()?,
-        )
         .map_err(corrupt)
     }
     fn from_wire(
@@ -231,8 +274,7 @@ impl BackupPointDocument {
         descriptor: &Descriptor,
         repository: &RepositoryHandle,
     ) -> Result<Self> {
-        if value.repository_id != descriptor.repository_id || value.scope_id != descriptor.scope_id
-        {
+        if value.repository_id != descriptor.repository_id {
             return Err(corrupt("backup point descriptor binding differs"));
         }
         let kind = match value.kind {
@@ -241,18 +283,20 @@ impl BackupPointDocument {
             wire_control::BackupPointKind::Manual => BackupPointKind::Manual,
             wire_control::BackupPointKind::Conflict => BackupPointKind::Conflict,
         };
+        let convert = |object: &Option<wire::StoredObject>| -> Result<Option<RemoteObject>> {
+            object
+                .as_ref()
+                .map(|object| RemoteObject::from_stored(object, repository))
+                .transpose()
+        };
         Ok(Self {
             repository_id: value.repository_id,
             point_id: value.point_id,
             kind,
             created_at_ms: value.created_at_ms,
-            logical_revision: value.logical_revision,
-            scope_id: hex::encode(value.scope_id),
-            snapshots: value
-                .snapshots
-                .iter()
-                .map(|snapshot| RemoteObject::from_stored(snapshot, repository))
-                .collect::<Result<Vec<_>>>()?,
+            bundle: convert(&value.bundle)?,
+            local_bundle: convert(&value.local_bundle)?,
+            remote_bundle: convert(&value.remote_bundle)?,
         })
     }
 }
@@ -570,17 +614,138 @@ pub(crate) async fn upload_backup_point(
     cancel: &Cancellation,
 ) -> Result<RemoteObject> {
     let wire_document = document.to_wire(descriptor, repository)?;
-    let object_id = format!("backup-point-{}", document.point_id);
     let plaintext = wire_document.encode(MAX_POINT_PLAINTEXT).map_err(corrupt)?;
-    let plaintext_sha256 = hex::encode(hash(&plaintext));
+    upload_control_object(
+        descriptor,
+        root_key,
+        format!("backup-point-{}", document.point_id),
+        ObjectRole::BackupPoint,
+        &plaintext,
+        journal,
+        provider,
+        repository,
+        cancel,
+    )
+    .await
+}
+
+/// Wraps an already published library reference in its own immutable bundle so
+/// a retained point names a bundle rather than a synchronized state. A state is
+/// the merged result of several devices, which is why the source says so.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn upload_backup_bundle(
+    descriptor: &Descriptor,
+    root_key: &[u8; 32],
+    bundle_id: String,
+    source: wire_control::BundleSource,
+    captured_at_ms: u64,
+    library: wire::LibrarySnapshotRef,
+    journal: &mut TransferJournal,
+    provider: &dyn Provider,
+    repository: &RepositoryHandle,
+    cancel: &Cancellation,
+) -> Result<RemoteObject> {
+    let document = wire_control::BackupBundleDocument::new(
+        descriptor.repository_id.clone(),
+        bundle_id.clone(),
+        source,
+        captured_at_ms,
+        None,
+        None,
+        None,
+        library,
+        std::collections::BTreeMap::new(),
+    )
+    .map_err(corrupt)?;
+    let plaintext = document.encode(MAX_POINT_PLAINTEXT).map_err(corrupt)?;
+    upload_control_object(
+        descriptor,
+        root_key,
+        format!("snapshot-{bundle_id}"),
+        ObjectRole::BackupBundle,
+        &plaintext,
+        journal,
+        provider,
+        repository,
+        cancel,
+    )
+    .await
+}
+
+/// Republishes an already captured library reference as a synchronized state.
+/// Resolving a conflict in favour of this device publishes the preserved
+/// material, and a head can only point at a state.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn upload_sync_state(
+    descriptor: &Descriptor,
+    root_key: &[u8; 32],
+    state_id: String,
+    library_id: String,
+    epoch: String,
+    generation: risunest_sync_wire::head::Sequence,
+    parent_state_id: Option<String>,
+    author_writer_id: String,
+    created_at_ms: u64,
+    library: wire::LibrarySnapshotRef,
+    sections: std::collections::BTreeMap<String, wire::SectionSnapshotRef>,
+    journal: &mut TransferJournal,
+    provider: &dyn Provider,
+    repository: &RepositoryHandle,
+    cancel: &Cancellation,
+) -> Result<(RemoteObject, String)> {
+    let document = wire::SyncStateDocument::new(
+        state_id.clone(),
+        descriptor.repository_id.clone(),
+        library_id,
+        epoch,
+        generation,
+        parent_state_id,
+        author_writer_id,
+        created_at_ms,
+        library,
+        sections,
+    )
+    .map_err(corrupt)?;
+    let fingerprint = hex::encode(document.state_fingerprint);
+    let plaintext = document
+        .encode(wire::MAX_METADATA_BYTES)
+        .map_err(corrupt)?;
+    let object = upload_control_object(
+        descriptor,
+        root_key,
+        format!("snapshot-{state_id}"),
+        ObjectRole::SyncState,
+        &plaintext,
+        journal,
+        provider,
+        repository,
+        cancel,
+    )
+    .await?;
+    Ok((object, fingerprint))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upload_control_object(
+    descriptor: &Descriptor,
+    root_key: &[u8; 32],
+    object_id: String,
+    role: ObjectRole,
+    plaintext: &[u8],
+    journal: &mut TransferJournal,
+    provider: &dyn Provider,
+    repository: &RepositoryHandle,
+    cancel: &Cancellation,
+) -> Result<RemoteObject> {
+    let plaintext_sha256 = hex::encode(hash(plaintext));
     let spool = journal.spool_path(&object_id);
     if journal.record(&object_id)?.is_none() {
         let ciphertext = seal(
             descriptor,
             root_key,
             &object_id,
-            wire::ObjectRole::BackupPoint,
-            &plaintext,
+            wire_role(role)?,
+            plaintext,
         )?;
         if ciphertext.len() as u64 > MAX_POINT_CIPHERTEXT {
             return Err(ProviderError::new(ErrorKind::FileTooLarge));
@@ -597,7 +762,7 @@ pub(crate) async fn upload_backup_point(
             repository_id: repository.repository_id.clone(),
             job_id: journal.job_id().into(),
             object_id: object_id.clone(),
-            role: ObjectRole::BackupPoint,
+            role,
             byte_length: ciphertext.len() as u64,
             sha256: hex::encode(hash(&ciphertext)),
         };
@@ -605,15 +770,15 @@ pub(crate) async fn upload_backup_point(
     }
     let record = journal
         .record(&object_id)?
-        .ok_or_else(|| corrupt("missing point journal"))?;
-    if record.intent.role != ObjectRole::BackupPoint {
+        .ok_or_else(|| corrupt("missing control journal"))?;
+    if record.intent.role != role {
         return Err(corrupt("history journal role differs"));
     }
     let receipt = transfer_job::upload(journal, &object_id, provider, repository, cancel).await?;
     Ok(RemoteObject {
         repository_id: descriptor.repository_id.clone(),
         object_id,
-        role: ObjectRole::BackupPoint,
+        role,
         receipt,
         ciphertext_sha256: record.intent.sha256,
         plaintext_length: plaintext.len() as u64,
@@ -755,27 +920,25 @@ pub(crate) async fn find_snapshot(
                 wire::MAX_METADATA_BYTES as u64,
             )
             .map_err(corrupt)?;
-            if header.repository_id != connected.stored.descriptor.repository_id
-                || header.role != wire::ObjectRole::Snapshot
-            {
+            if header.repository_id != connected.stored.descriptor.repository_id {
                 return Err(corrupt("snapshot discovery envelope differs"));
             }
-            let document = wire::SnapshotDocument::decode(&plaintext, wire::MAX_METADATA_BYTES)
-                .map_err(corrupt)?;
-            if document.repository_id != connected.stored.descriptor.repository_id
-                || document.scope_id != connected.stored.descriptor.scope_id
-                || header.object_id != format!("snapshot-{}", document.snapshot_id)
-            {
+            let view = SnapshotView::read(
+                &plaintext,
+                header.role,
+                &connected.stored.descriptor.repository_id,
+            )?;
+            if header.object_id != format!("snapshot-{}", view.snapshot_id) {
                 return Err(corrupt("snapshot discovery document differs"));
             }
-            if document.snapshot_id == snapshot_id {
+            if view.snapshot_id == snapshot_id {
                 if header.object_id != expected_object_id {
                     return Err(corrupt("snapshot selection identity differs"));
                 }
                 return Ok(RemoteObject {
                     repository_id: connected.stored.descriptor.repository_id.clone(),
                     object_id: header.object_id,
-                    role: ObjectRole::Snapshot,
+                    role: native_role(header.role)?,
                     receipt,
                     ciphertext_sha256: hex::encode(hash(&bytes)),
                     plaintext_length: header.plaintext_length,
@@ -794,6 +957,67 @@ pub(crate) async fn find_snapshot(
     Err(corrupt("snapshot discovery page limit"))
 }
 
+/// What a listing or a restore needs from either published document. The
+/// authenticated envelope role, not the object name, decides which one was
+/// opened, so a bundle can never be read back as a state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SnapshotView {
+    pub snapshot_id: String,
+    pub library_id: String,
+    pub created_at_ms: u64,
+    /// The local library revision for a bundle, or the remote commit order for
+    /// a published state. These are different counters and are never mixed.
+    pub revision: String,
+    pub library: wire::LibrarySnapshotRef,
+    pub sections: std::collections::BTreeMap<String, wire::SectionSnapshotRef>,
+    pub is_state: bool,
+}
+
+impl SnapshotView {
+    pub(crate) fn read(plaintext: &[u8], role: wire::ObjectRole, repository_id: &str) -> Result<Self> {
+        let view = match role {
+            wire::ObjectRole::SyncState => {
+                let document = wire::SyncStateDocument::decode(plaintext, wire::MAX_METADATA_BYTES)
+                    .map_err(corrupt)?;
+                Self {
+                    snapshot_id: document.state_id,
+                    library_id: document.library_id,
+                    created_at_ms: document.created_at_ms,
+                    revision: document.generation.as_str().to_owned(),
+                    library: document.library,
+                    sections: document.sections,
+                    is_state: true,
+                }
+            }
+            wire::ObjectRole::BackupBundle => {
+                let document =
+                    wire_control::BackupBundleDocument::decode(plaintext, MAX_POINT_PLAINTEXT)
+                        .map_err(corrupt)?;
+                Self {
+                    snapshot_id: document.bundle_id,
+                    library_id: repository_id.to_owned(),
+                    created_at_ms: document.captured_at_ms,
+                    revision: document
+                        .local_library_revision
+                        .as_ref()
+                        .map(|value| value.as_str().to_owned())
+                        .unwrap_or_else(|| "0".into()),
+                    library: document.library,
+                    sections: document.sections,
+                    is_state: false,
+                }
+            }
+            _ => return Err(corrupt("unsupported snapshot document role")),
+        };
+        if view.library.record_catalog.header.repository_id != repository_id
+            || view.library.asset_catalog.header.repository_id != repository_id
+        {
+            return Err(corrupt("snapshot document binding differs"));
+        }
+        Ok(view)
+    }
+}
+
 /// Reads a selected snapshot root through its authenticated direct locator.
 /// This verifies the remote object's ciphertext, RNX1 header, plaintext hash,
 /// repository and scope. Referenced packs remain unverified until restore or a
@@ -802,9 +1026,11 @@ pub(crate) async fn read_snapshot_document(
     connected: &super::connection_commands::ConnectedRepository,
     snapshot: &RemoteObject,
     cancel: &Cancellation,
-) -> Result<wire::SnapshotDocument> {
-    if snapshot.role != ObjectRole::Snapshot
-        || snapshot.repository_id != connected.stored.descriptor.repository_id
+) -> Result<SnapshotView> {
+    if !matches!(
+        snapshot.role,
+        ObjectRole::SyncState | ObjectRole::BackupBundle
+    ) || snapshot.repository_id != connected.stored.descriptor.repository_id
         || snapshot.receipt.byte_length == 0
         || snapshot.receipt.byte_length > MAX_SNAPSHOT_CIPHERTEXT
     {
@@ -843,15 +1069,15 @@ pub(crate) async fn read_snapshot_document(
     {
         return Err(corrupt("snapshot plaintext differs"));
     }
-    let document =
-        wire::SnapshotDocument::decode(&plaintext, wire::MAX_METADATA_BYTES).map_err(corrupt)?;
-    if document.repository_id != connected.stored.descriptor.repository_id
-        || document.scope_id != connected.stored.descriptor.scope_id
-        || snapshot.object_id != format!("snapshot-{}", document.snapshot_id)
-    {
+    let view = SnapshotView::read(
+        &plaintext,
+        header.role,
+        &connected.stored.descriptor.repository_id,
+    )?;
+    if snapshot.object_id != format!("snapshot-{}", view.snapshot_id) {
         return Err(corrupt("snapshot document binding differs"));
     }
-    Ok(document)
+    Ok(view)
 }
 
 pub(crate) async fn list_connected_backup_points_page(

@@ -18,6 +18,10 @@ pub(crate) struct StoredConnection {
     pub root_key_ref: String,
     pub capabilities: Capabilities,
     pub created_at_ms: u64,
+    /// Backup connections only. Changing it applies to work started
+    /// afterwards and never rewrites an existing point.
+    #[serde(default)]
+    pub capture_policy: Option<super::connection::CapturePolicy>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -25,6 +29,8 @@ pub(crate) struct PendingStoredConnection {
     pub id: String,
     pub config: ConnectionConfig,
     pub descriptor: Descriptor,
+    #[serde(default)]
+    pub capture_policy: Option<super::connection::CapturePolicy>,
     pub provider_repository_id: Option<String>,
     pub credential_ref: String,
     pub root_key_ref: String,
@@ -138,6 +144,7 @@ impl ConnectionStore {
             descriptor_locator,
             provider_repository_id,
             credential_ref: pending.credential_ref,
+            capture_policy: pending.capture_policy,
             root_key_ref: pending.root_key_ref,
             capabilities,
             created_at_ms: pending.created_at_ms,

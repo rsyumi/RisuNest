@@ -156,7 +156,7 @@ pub(crate) async fn external_storage_export_snapshot(
         .unwrap_or_else(|| staging.path().join("selected-snapshot.risunest"));
     let receipt = snapshot_export::export_verified_snapshot(
         prepared,
-        &connected.stored.descriptor.scope,
+        &risunest_external_storage_format::format::Scope::LIBRARY,
         &local_destination,
         &staging.path().join("export"),
         &cancel,
