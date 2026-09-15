@@ -24,7 +24,10 @@ fn schema_configures_the_documented_sqlite_profile() {
     assert_eq!(integer_pragma("temp_store"), 2);
     assert_eq!(integer_pragma("journal_size_limit"), 67_108_864);
     assert_eq!(integer_pragma("foreign_keys"), 0);
-    assert_eq!(integer_pragma("user_version"), 2);
+    assert_eq!(
+        integer_pragma("user_version"),
+        i64::from(super::schema::SCHEMA_VERSION)
+    );
 }
 
 #[test]

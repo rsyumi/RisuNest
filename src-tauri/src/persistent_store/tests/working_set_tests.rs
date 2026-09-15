@@ -2748,7 +2748,7 @@ fn pilot_mutated_database_supports_generation_cow_compatible_reopen_read_and_com
         compatibility
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read schema version"),
-        2
+        i64::from(super::schema::SCHEMA_VERSION)
     );
     assert_eq!(
         super::current_revision(&compatibility).expect("read pilot revision through COW path"),

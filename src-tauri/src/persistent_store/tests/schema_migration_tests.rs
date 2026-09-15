@@ -262,7 +262,7 @@ fn existing_current_database_revalidates_on_reopen() {
 
 #[test]
 fn unknown_schema_version_is_rejected() {
-    for version in [1_i64, 17] {
+    for version in [1_i64, 2, 17] {
         let directory = tempfile::tempdir().expect("create unknown version directory");
         let store = PersistentStore::open(directory.path()).expect("create current store");
         drop(store);
