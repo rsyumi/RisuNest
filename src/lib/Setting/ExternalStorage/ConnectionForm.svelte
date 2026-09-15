@@ -480,7 +480,6 @@
                 </label>
             {/each}
         </div>
-        {#if definition.oauth}<p class="sub-help">{strings.signInLater}</p>{/if}
     </section>
 
     <fieldset class="sub" disabled={purpose === 'sync'}>
