@@ -228,6 +228,60 @@ describe('external storage production integration', () => {
         expect(mocks.releaseFence).toHaveBeenCalledOnce()
     })
 
+    it('activates a repository side that a conflict decision received', async () => {
+        const {
+            installExternalStorageProduction,
+            requestExternalStorageResolveConflict,
+        } = await import('./production')
+        mocks.revision = 11
+        mocks.bridge.startJob.mockResolvedValue({
+            ...succeeded('old-sync', '11'),
+            kind: 'resolve-conflict',
+            state: 'waiting',
+            phase: 'remote-apply',
+            result: { receiveReady: true, snapshotId: 'remote', expectedRevision: '11' },
+        })
+        mocks.bridge.applyReceived.mockResolvedValue({
+            snapshotId: 'remote', receivedRevision: '12',
+        })
+        mocks.bridge.getJob.mockResolvedValue({
+            ...succeeded('old-sync', '11'),
+            kind: 'resolve-conflict',
+            result: { snapshotId: 'remote', receivedRevision: '12' },
+        })
+        await installExternalStorageProduction()
+        await expect(requestExternalStorageResolveConflict('old-sync', 'conflict-1', 'remote'))
+            .resolves.toMatchObject({ state: 'succeeded' })
+        expect(mocks.flush).toHaveBeenCalledWith('external-storage-resolve-conflict')
+        expect(mocks.bridge.startJob).toHaveBeenCalledWith(expect.objectContaining({
+            connectionId: 'old-sync', kind: 'resolve-conflict',
+            conflictId: 'conflict-1', choice: 'remote',
+        }))
+        expect(mocks.bridge.applyReceived).toHaveBeenCalledWith('job-old-sync', '11')
+        expect(mocks.refreshWorkingSet).toHaveBeenCalledWith(12)
+        expect(mocks.reloadPlugins).toHaveBeenCalledOnce()
+        expect(mocks.releaseFence).toHaveBeenCalledOnce()
+    })
+
+    it('reports a conflict decision that did not finish instead of returning it', async () => {
+        const {
+            installExternalStorageProduction,
+            requestExternalStorageResolveConflict,
+        } = await import('./production')
+        mocks.bridge.startJob.mockResolvedValue({
+            ...succeeded('old-sync', '11'),
+            kind: 'resolve-conflict',
+            state: 'failed',
+            phase: 'failed',
+            error: { code: 'transient', message: 'Repository unreachable', action: 'retry' },
+            result: undefined,
+        })
+        await installExternalStorageProduction()
+        await expect(requestExternalStorageResolveConflict('old-sync', 'conflict-1', 'remote'))
+            .rejects.toMatchObject({ name: 'transient' })
+        expect(mocks.bridge.applyReceived).not.toHaveBeenCalled()
+    })
+
     it('activates a staged sync receive under the replacement fence before continuing', async () => {
         const { installExternalStorageProduction, requestExternalStorageNow } = await import('./production')
         mocks.revision = 8

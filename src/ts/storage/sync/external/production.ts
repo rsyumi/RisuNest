@@ -251,6 +251,53 @@ export async function requestExternalStorageNow(
     )
 }
 
+/**
+ * Runs a conflict decision to its end. The native side answers a received
+ * repository side with `remote-apply`, which only this layer can activate, so
+ * starting the job through the bridge alone would leave it waiting.
+ */
+export async function requestExternalStorageResolveConflict(
+    connectionId: string,
+    conflictId: string,
+    choice: 'local' | 'remote',
+): Promise<ExternalJobSummary> {
+    const current = runtime
+    if (!current) throw new Error('External storage production is not installed')
+    await flushPendingDataLocally('external-storage-resolve-conflict')
+    await current.scheduler.suspend(destination =>
+        destination.kind === 'sync' && destination.connectionId === connectionId)
+    try {
+        let job = await getExternalStorageBridge().startJob({
+            connectionId,
+            kind: 'resolve-conflict',
+            conflictId,
+            choice,
+            reason: 'manual',
+            session: current.session.kind,
+            sessionId: current.session.id,
+        })
+        while (true) {
+            if (job.state === 'waiting' && job.phase === 'remote-apply') {
+                await applyReceivedSync(current, job)
+                job = await getExternalStorageBridge().getJob(job.id)
+                continue
+            }
+            if (job.state === 'succeeded') break
+            if (['failed', 'cancelled', 'uncertain', 'conflict'].includes(job.state)) {
+                throw restoreFailure(job)
+            }
+            await new Promise(resolve => setTimeout(resolve, job.state === 'waiting' ? 5_000 : 500))
+            job = await getExternalStorageBridge().getJob(job.id)
+        }
+        const state = await getExternalStorageBridge().getState()
+        current.state = state
+        current.controller.replaceState(state)
+        return job
+    } finally {
+        current.scheduler.resume()
+    }
+}
+
 function restoreFailure(job: ExternalJobSummary): Error {
     const error = new Error(job.error?.message ?? 'External storage restore failed')
     error.name = job.error?.code ?? 'ExternalStorageRestoreError'
