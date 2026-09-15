@@ -14,6 +14,8 @@ use uuid::Uuid;
 pub(crate) const DEVICE_SCHEMA_VERSION: u32 = 1;
 pub(crate) const DEVICE_DATABASE_FILE: &str = "device.sqlite";
 
+pub(crate) mod hypa;
+
 const SCHEMA: &str = r#"
 CREATE TABLE device_meta(
   singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -276,7 +278,6 @@ impl DeviceStore {
         Ok(())
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn transaction(&mut self) -> StoreResult<Transaction<'_>> {
         Ok(self
             .connection
@@ -360,7 +361,6 @@ fn validate_schema(db: &Connection) -> StoreResult<()> {
 /// Opens the change context for one mutation and returns the revision the
 /// triggers stamp. Staging and copy work runs outside a context and stays
 /// invisible to the change index.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn begin_mutation(tx: &Transaction<'_>) -> StoreResult<i64> {
     tx.execute(
         "UPDATE device_meta SET revision=revision+1 WHERE singleton=1",
@@ -378,7 +378,6 @@ pub(crate) fn begin_mutation(tx: &Transaction<'_>) -> StoreResult<i64> {
     Ok(revision)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn finish_mutation(tx: &Transaction<'_>) -> StoreResult<()> {
     tx.execute("DELETE FROM device_change_context", [])?;
     Ok(())
@@ -386,7 +385,6 @@ pub(crate) fn finish_mutation(tx: &Transaction<'_>) -> StoreResult<()> {
 
 /// Issues the next write clock for a section. The caller commits the value, the
 /// writer identity and the change index in this same transaction.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn issue_write_clock(tx: &Transaction<'_>, section: Section) -> StoreResult<Sequence> {
     let current: String = tx.query_row(
         "SELECT max_write_clock FROM device_sections WHERE section=?1",
