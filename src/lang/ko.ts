@@ -1732,6 +1732,32 @@ export const languageKorean = {
     risuNest: {
         exitSaveFailedWarning:
             '저장에 실패했습니다. 저장하지 않고 종료하려면 예를, 앱을 열어 두고 다시 시도하려면 아니오를 선택하세요.',
+        archive: {
+            tab: '보관함',
+            action: '보관',
+            restore: '복원',
+            listDescription: '보관된 캐릭터 목록입니다. 압축 상태로 저장되어 있으며, 캐릭터를 사용할 경우 복원해야 합니다.',
+            listedAs: '보관함에 있습니다',
+            listedBadge: '보관함',
+            archivedAt: '대화 {0}개 · {1}에 보관',
+            groupMemberBlocked: '멤버 {0}명을 쓸 수 없습니다',
+            confirmTitle: '캐릭터를 보관하시겠습니까?',
+            confirmBody: '보관하면 대화를 압축해 차지하는 용량을 줄입니다. 캐릭터는 목록에 흑백으로 남고 언제든 되돌릴 수 있습니다. 보관 중에는 캐릭터 사용하거나 조회할 수 없게 됩니다.',
+            confirmCounts: '대화 {0}개 · 메시지 {1}개 · 이미지는 그대로 남습니다.',
+            accountOnlyTitle: 'RisuAI 계정 백업에는 보관한 캐릭터가 저장되지 않습니다.',
+            accountOnlyBody: '현재 RisuAI 계정만 연결되어 있어, 이 기기의 데이터를 잃을 경우 보관한 캐릭터를 복원할 수 없습니다. 파일로 백업하거나 동기화 서버·외부 저장소를 연결한 뒤 진행해주세요.',
+            restoreTitle: '캐릭터를 복원하시겠습니까?',
+            restoreBody: '보관된 캐릭터는 복원해야 사용할 수 있습니다. 캐릭터 용량이 클 경우 시간이 걸릴 수 있습니다.',
+        },
+        exportExcluded: {
+            title: '내보내기 완료',
+            body: 'RisuAI 호환 백업 파일을 생성했습니다. 아래 항목은 RisuAI에서 지원하지 않아 제외되었습니다.',
+            archivedCharacters: '보관한 캐릭터 {0}개',
+            archivedHelp: '보관된 캐릭터를 함께 저장하려면 복원한 뒤 다시 진행해주세요.',
+            collidingPluginValues: '이름이 겹치는 플러그인 값 {0}개',
+            collidingHelp: '서로 다른 플러그인이 같은 이름을 씁니다. 플러그인이 동작하지 못하게 될 수 있으므로 백업에서 제외되었습니다. 플러그인을 확인하고 수동으로 백업해주세요.',
+            copyList: '목록 복사',
+        },
         plugins: {
             unsupportedApiVersionInstall:
                 '플러그인 API {version} 버전은 지원하지 않습니다. API 3.0으로 업데이트된 버전을 설치하세요.',

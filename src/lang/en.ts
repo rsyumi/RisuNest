@@ -1924,6 +1924,32 @@ export const languageEnglish = {
     risuNest: {
         exitSaveFailedWarning:
             'Saving failed. Choose Yes to exit without saving, or No to keep the app open and retry.',
+        archive: {
+            tab: 'Archive',
+            action: 'Archive',
+            restore: 'Restore',
+            listDescription: 'These characters are archived. They are stored compressed, and a character has to be restored before you can use it.',
+            listedAs: 'In the archive',
+            listedBadge: 'Archived',
+            archivedAt: '{0} chats · archived on {1}',
+            groupMemberBlocked: '{0} members cannot be used',
+            confirmTitle: 'Archive this character?',
+            confirmBody: 'Archiving compresses the chats and reduces the space they take. The character stays in the list in grayscale and you can bring it back at any time. While it is archived you cannot use or view the character.',
+            confirmCounts: '{0} chats · {1} messages · images stay as they are.',
+            accountOnlyTitle: 'A RisuAI account backup does not store archived characters.',
+            accountOnlyBody: 'Only a RisuAI account is connected, so an archived character cannot be restored if this device loses its data. Back up to a file, or connect a sync server or external storage, before you continue.',
+            restoreTitle: 'Restore this character?',
+            restoreBody: 'An archived character has to be restored before you can use it. This can take a while for a large character.',
+        },
+        exportExcluded: {
+            title: 'Export finished',
+            body: 'The RisuAI compatible backup file was created. The items below are not supported by RisuAI and were excluded.',
+            archivedCharacters: '{0} archived characters',
+            archivedHelp: 'To store archived characters as well, restore them and run the export again.',
+            collidingPluginValues: '{0} plugin values with the same name',
+            collidingHelp: 'Different plugins use the same name. A plugin could stop working, so these were excluded from the backup. Check the plugins and back them up manually.',
+            copyList: 'Copy list',
+        },
         plugins: {
             unsupportedApiVersionInstall:
                 'Plugin API {version} is not supported. Install a version updated to API 3.0.',
