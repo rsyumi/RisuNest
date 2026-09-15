@@ -46,18 +46,20 @@ fn object(seed: &[u8]) -> RetainedObject {
 }
 
 #[test]
-fn policy_and_custody_survive_reopen_but_are_device_local() {
+fn custody_survives_reopen_but_stays_device_local() {
     let root = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
     let mut store = Residency::open(root.path()).unwrap();
-    assert_eq!(store.policy().unwrap(), AssetPolicy::Full);
-    store.set_policy(AssetPolicy::Remote).unwrap();
     store
         .confirm(&config("device"), &head(), &[object(b"first")])
         .unwrap();
     drop(store);
+    assert!(root
+        .path()
+        .join("server-sync/asset-residency.sqlite")
+        .is_file());
+    assert!(!root.path().join("asset-residency.sqlite").exists());
     let store = Residency::open(root.path()).unwrap();
-    assert_eq!(store.policy().unwrap(), AssetPolicy::Remote);
     let context = Residency::context_id(&config("device"), "epoch");
     assert!(store
         .confirms(&hash(b"payload"), Some(7), &context)
@@ -67,7 +69,6 @@ fn policy_and_custody_survive_reopen_but_are_device_local() {
         .unwrap());
     assert!(!store.confirms(&hash(b"payload"), Some(7), "other").unwrap());
     let other = Residency::open(other.path()).unwrap();
-    assert_eq!(other.policy().unwrap(), AssetPolicy::Full);
     assert!(other.object(&hash(b"payload"), None).unwrap().is_none());
 }
 
