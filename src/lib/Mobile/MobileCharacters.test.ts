@@ -35,6 +35,10 @@ class TestIntersectionObserver {
 
 const catalogMocks = vi.hoisted(() => ({
     getCatalogConversationCount: vi.fn((character: { chats: unknown[] }) => character.chats.length),
+    isArchivedCharacter: vi.fn(() => false),
+}))
+const archiveMocks = vi.hoisted(() => ({
+    restoreArchivedCharacterWithConfirmation: vi.fn(async () => false),
 }))
 const characterMocks = vi.hoisted(() => ({
     addCharacter: vi.fn(),
@@ -54,6 +58,7 @@ const storeMocks = vi.hoisted(() => ({
 vi.mock('src/ts/storage/workingSetCatalog', () => catalogMocks)
 vi.mock('src/ts/stores.svelte', () => storeMocks)
 vi.mock('src/ts/characters', () => characterMocks)
+vi.mock('src/ts/storage/characterArchive', () => archiveMocks)
 
 describe('MobileCharacters', () => {
     let mounted: ReturnType<typeof mount> | null = null

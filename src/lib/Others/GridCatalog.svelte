@@ -249,7 +249,7 @@
                                 }}>
                                     <SquareMousePointer />
                                 </button>
-                                {#if archiveIsAvailable()}
+                                {#if archiveIsAvailable() && char.type !== 'group'}
                                     <button class="hover:text-textcolor text-textcolor2" aria-label={archiveStrings.action} onclick={() => {
                                         archiveCharacterWithConfirmation(char.chaId)
                                     }}>
@@ -258,7 +258,7 @@
                                 {/if}
                             {/if}
                             <button class="hover:text-textcolor text-textcolor2" onclick={() => {
-                                removeChar(char.chaId, char.name)
+                                removeChar(char.chaId, char.name, char.archived ? 'permanent' : 'normal')
                             }}>
                                 <TrashIcon />
                             </button>
@@ -316,7 +316,7 @@
                                 <ArchiveRestoreIcon />
                             </button>
                             <button class="hover:text-textcolor text-textcolor2" onclick={() => {
-                                removeChar(char.chaId, char.name)
+                                removeChar(char.chaId, char.name, 'permanent')
                             }}>
                                 <TrashIcon />
                             </button>

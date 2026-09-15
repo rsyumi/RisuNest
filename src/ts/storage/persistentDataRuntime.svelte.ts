@@ -434,7 +434,13 @@ export const commitCharacterAddition = (
 export const activateCharacter = (
     id: string,
     options?: CharacterActivationOptions,
-): Promise<boolean> => getPersistentDataRuntime().activateCharacter(id, options)
+): Promise<boolean> => {
+    // An archived character has no detail to hydrate, so selection stops here
+    // instead of failing inside the read.
+    const member = getDatabase().characters.find((candidate) => candidate.chaId === id)
+    if (member && isArchivedCharacter(member)) return Promise.resolve(false)
+    return getPersistentDataRuntime().activateCharacter(id, options)
+}
 export function hydrateCurrentGroupMemberDetail(
     groupId: string,
     detail: CharacterDetail,

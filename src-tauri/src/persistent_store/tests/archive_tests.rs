@@ -323,6 +323,21 @@ fn an_archived_character_rejects_every_mutation_except_deleting_it() {
     }));
     assert!(store.commit(&archive_again).is_err());
 
+    // Soft trash is a character detail write, so the archive list deletes
+    // permanently instead.
+    let mut trash_commit = empty_working_set_commit(revision);
+    trash_commit.character = Some(json!({
+        "chaId": "middle-archived",
+        "name": "Middle Archived",
+        "trashTime": 10,
+    }));
+    assert!(matches!(
+        store
+            .commit(&trash_commit)
+            .expect_err("soft trash is refused"),
+        StoreError::Validation { .. }
+    ));
+
     let mut delete_commit = empty_working_set_commit(revision);
     delete_commit.delete_character_id = Some("middle-archived".to_owned());
     store
