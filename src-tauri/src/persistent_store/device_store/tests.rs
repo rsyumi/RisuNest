@@ -425,3 +425,111 @@ fn only_mutations_inside_a_context_reach_the_change_index() {
         ]
     );
 }
+
+#[test]
+fn device_settings_round_trip_whole_values_and_remove_them() {
+    let (_directory, store) = open();
+    assert_eq!(store.read_setting("sync-conflict-backups.index.v1").unwrap(), None);
+
+    let index = serde_json::json!([{ "id": "backup-1", "byteLength": 12 }]);
+    store
+        .write_setting("sync-conflict-backups.index.v1", &index)
+        .unwrap();
+    assert_eq!(
+        store.read_setting("sync-conflict-backups.index.v1").unwrap(),
+        Some(index)
+    );
+
+    store
+        .write_setting("sync-conflict-backups.index.v1", &serde_json::json!([]))
+        .unwrap();
+    assert_eq!(
+        store.read_setting("sync-conflict-backups.index.v1").unwrap(),
+        Some(serde_json::json!([]))
+    );
+
+    store
+        .remove_setting("sync-conflict-backups.index.v1")
+        .unwrap();
+    assert_eq!(store.read_setting("sync-conflict-backups.index.v1").unwrap(), None);
+    store
+        .remove_setting("sync-conflict-backups.index.v1")
+        .unwrap();
+}
+
+#[test]
+fn patching_a_setting_changes_only_the_named_entries() {
+    let (_directory, mut store) = open();
+    let key = "official-account.association.v1";
+
+    store
+        .patch_setting(
+            key,
+            serde_json::json!({ "officialAssociation:one": "{\"revision\":1}" })
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap();
+    store
+        .patch_setting(
+            key,
+            serde_json::json!({ "officialAssociation:two": "{\"revision\":2}" })
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        store.read_setting(key).unwrap(),
+        Some(serde_json::json!({
+            "officialAssociation:one": "{\"revision\":1}",
+            "officialAssociation:two": "{\"revision\":2}",
+        }))
+    );
+
+    store
+        .patch_setting(
+            key,
+            serde_json::json!({ "officialAssociation:one": serde_json::Value::Null })
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        store.read_setting(key).unwrap(),
+        Some(serde_json::json!({ "officialAssociation:two": "{\"revision\":2}" }))
+    );
+}
+
+#[test]
+fn patching_a_setting_that_does_not_hold_entries_is_rejected() {
+    let (_directory, mut store) = open();
+    let key = "sync-conflict-backups.index.v1";
+    store.write_setting(key, &serde_json::json!([1, 2])).unwrap();
+    assert!(store
+        .patch_setting(
+            key,
+            serde_json::json!({ "entry": "value" }).as_object().unwrap()
+        )
+        .is_err());
+    assert_eq!(
+        store.read_setting(key).unwrap(),
+        Some(serde_json::json!([1, 2]))
+    );
+}
+
+#[test]
+fn device_settings_are_not_tracked_as_section_changes() {
+    // Only the two synchronized sections feed the device change index.
+    let (_directory, mut store) = open();
+    let tx = store.transaction().unwrap();
+    let revision = begin_mutation(&tx).unwrap();
+    tx.execute(
+        "INSERT INTO device_settings (key,value) VALUES ('accountst','\"able\"')",
+        [],
+    )
+    .unwrap();
+    finish_mutation(&tx).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(revision, 1);
+    assert!(changes(store.connection()).is_empty());
+}

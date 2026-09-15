@@ -1323,6 +1323,23 @@ fn combine_publication_cleanup_error(
     }
 }
 
+/// `app_kv` carries only the job markers that must land in the same commit as
+/// the replacement they authorize. Everything else a device keeps belongs to
+/// `device.sqlite` or to the OS vault, neither of which a restore replaces.
+const APP_KV_KEY_PREFIXES: [&str; 2] = ["device-backup-commit:", "external-restore-commit:"];
+
+pub(super) fn validate_app_kv_key(key: &str) -> StoreResult<()> {
+    if APP_KV_KEY_PREFIXES
+        .iter()
+        .any(|prefix| key.len() > prefix.len() && key.starts_with(prefix))
+    {
+        return Ok(());
+    }
+    Err(StoreError::Validation {
+        message: "app_kv key is outside the allowed job marker key space".to_owned(),
+    })
+}
+
 fn open_device_store(persistent_dir: &Path) -> Result<device_store::DeviceStore, String> {
     device_store::DeviceStore::open(persistent_dir).map_err(|error| {
         let message = format!("device store is unavailable: {error}");
@@ -1440,6 +1457,14 @@ impl PersistentStore {
     pub(crate) fn device_store(&self) -> StoreResult<&device_store::DeviceStore> {
         self.device_store
             .as_ref()
+            .map_err(|message| StoreError::Store {
+                message: message.clone(),
+            })
+    }
+
+    pub(crate) fn device_store_mut(&mut self) -> StoreResult<&mut device_store::DeviceStore> {
+        self.device_store
+            .as_mut()
             .map_err(|message| StoreError::Store {
                 message: message.clone(),
             })
@@ -2819,6 +2844,7 @@ impl PersistentStore {
     }
 
     pub(crate) fn get_app_kv(&self, key: &str) -> StoreResult<Option<Value>> {
+        validate_app_kv_key(key)?;
         let value: Option<String> = self
             .connection
             .query_row("SELECT value FROM app_kv WHERE key = ?1", [key], |row| {
@@ -2831,6 +2857,7 @@ impl PersistentStore {
     }
 
     pub(crate) fn set_app_kv(&self, key: &str, value: &Value) -> StoreResult<()> {
+        validate_app_kv_key(key)?;
         self.connection.execute(
             "INSERT INTO app_kv (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, serde_json::to_string(value)?],
@@ -2839,6 +2866,7 @@ impl PersistentStore {
     }
 
     pub(crate) fn remove_app_kv(&self, key: &str) -> StoreResult<()> {
+        validate_app_kv_key(key)?;
         self.connection
             .execute("DELETE FROM app_kv WHERE key = ?1", [key])?;
         Ok(())

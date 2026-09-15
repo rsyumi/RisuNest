@@ -1091,28 +1091,38 @@ pub(crate) fn pds_snapshot_restore_request(
 }
 
 #[tauri::command(async)]
-pub(crate) fn pds_get_app_kv(
+pub(crate) fn pds_get_device_setting(
     state: State<'_, PersistentStoreState>,
     key: String,
 ) -> Result<Option<Value>, StoreError> {
-    with_store(state, |store| store.get_app_kv(&key))
+    with_store(state, |store| store.device_store()?.read_setting(&key))
+}
+
+/// A null value removes the setting.
+#[tauri::command(async)]
+pub(crate) fn pds_set_device_setting(
+    state: State<'_, PersistentStoreState>,
+    key: String,
+    value: Option<Value>,
+) -> Result<(), StoreError> {
+    with_store(state, |store| {
+        let device = store.device_store()?;
+        match value {
+            Some(value) => device.write_setting(&key, &value),
+            None => device.remove_setting(&key),
+        }
+    })
 }
 
 #[tauri::command(async)]
-pub(crate) fn pds_set_app_kv(
+pub(crate) fn pds_patch_device_setting(
     state: State<'_, PersistentStoreState>,
     key: String,
-    value: Value,
+    entries: serde_json::Map<String, Value>,
 ) -> Result<(), StoreError> {
-    with_store(state, |store| store.set_app_kv(&key, &value))
-}
-
-#[tauri::command(async)]
-pub(crate) fn pds_remove_app_kv(
-    state: State<'_, PersistentStoreState>,
-    key: String,
-) -> Result<(), StoreError> {
-    with_store(state, |store| store.remove_app_kv(&key))
+    with_store_mut(state, |store| {
+        store.device_store_mut()?.patch_setting(&key, &entries)
+    })
 }
 
 #[cfg(test)]
@@ -1136,7 +1146,9 @@ mod tests {
             assert_eq!(state.renderer_gate.state.lock().unwrap().operations, 1);
             let archive = super::super::snapshot_archive::Archive::open(path)?;
             assert!(archive.list()?.is_empty());
-            with_store_mutex(&state, |store| store.set_app_kv("synthetic", &json!(1)))
+            with_store_mutex(&state, |store| {
+                store.set_app_kv("device-backup-commit:synthetic", &json!(1))
+            })
         })
         .unwrap();
         assert_eq!(state.renderer_gate.state.lock().unwrap().operations, 0);
@@ -1150,7 +1162,10 @@ mod tests {
         let directory = tempdir().unwrap();
         let state = PersistentStoreState::default();
         open_renderer_persistent_store(&state, directory.path()).unwrap();
-        with_store_mutex(&state, |store| store.set_app_kv("synthetic", &json!(1))).unwrap();
+        with_store_mutex(&state, |store| {
+            store.set_app_kv("device-backup-commit:synthetic", &json!(1))
+        })
+        .unwrap();
 
         let maintenance = state.acquire_device_maintenance().unwrap();
         assert!(state.store.lock().unwrap().is_none());
@@ -1161,19 +1176,26 @@ mod tests {
             .expect("active maintenance already owns renderer cleanup");
         assert!(open_renderer_persistent_store(&state, directory.path()).is_err());
         assert!(
-            with_store_mutex(&state, |store| { store.set_app_kv("synthetic", &json!(2)) }).is_err()
+            with_store_mutex(&state, |store| {
+                store.set_app_kv("device-backup-commit:synthetic", &json!(2))
+            })
+            .is_err()
         );
         assert!(with_store_mutex_mut(&state, |store| store.replace_begin()).is_err());
 
         // Only the maintenance worker's independent store can write while the
         // renderer fence is held. A new renderer observes the completed result.
         let native = PersistentStore::open(directory.path()).unwrap();
-        native.set_app_kv("synthetic", &json!(3)).unwrap();
+        native
+            .set_app_kv("device-backup-commit:synthetic", &json!(3))
+            .unwrap();
         drop(native);
         drop(maintenance);
         open_renderer_persistent_store(&state, directory.path()).unwrap();
         assert_eq!(
-            with_store_mutex(&state, |store| store.get_app_kv("synthetic")).unwrap(),
+            with_store_mutex(&state, |store| store
+                .get_app_kv("device-backup-commit:synthetic"))
+            .unwrap(),
             Some(json!(3))
         );
     }
@@ -1209,7 +1231,7 @@ mod tests {
             with_store_mutex_mut(&writer_state, |store| {
                 entered_tx.send(()).unwrap();
                 release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                store.set_app_kv("drained-writer", &json!(true))
+                store.set_app_kv("device-backup-commit:drained-writer", &json!(true))
             })
             .unwrap();
         });
@@ -1241,7 +1263,7 @@ mod tests {
         assert!(state.store.lock().unwrap().is_none());
         let native = PersistentStore::open(directory.path()).unwrap();
         assert_eq!(
-            native.get_app_kv("drained-writer").unwrap(),
+            native.get_app_kv("device-backup-commit:drained-writer").unwrap(),
             Some(json!(true))
         );
         drop(native);
@@ -1276,7 +1298,7 @@ mod tests {
 
         assert!(with_store_mutex_mut(&state, |_| Ok(())).is_err());
         with_store_mutex_mut_admitted(&state, &operation_guard, |store| {
-            store.set_app_kv("admitted-operation", &json!(true))
+            store.set_app_kv("device-backup-commit:admitted-operation", &json!(true))
         })
         .expect("existing permit must finish its store work");
         assert!(matches!(
@@ -1289,7 +1311,7 @@ mod tests {
         maintainer.join().unwrap();
         let native = PersistentStore::open(directory.path()).unwrap();
         assert_eq!(
-            native.get_app_kv("admitted-operation").unwrap(),
+            native.get_app_kv("device-backup-commit:admitted-operation").unwrap(),
             Some(json!(true))
         );
         drop(native);
