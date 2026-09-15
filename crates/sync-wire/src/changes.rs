@@ -1,4 +1,6 @@
-use crate::{canonical, hash, validate_hash, validate_id, RemoteHead, Result, Sequence, WireError};
+use crate::{
+    canonical, hash, validate_hash, validate_id, Domain, RemoteHead, Result, Sequence, WireError,
+};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_KEY_BYTES: usize = 64 * 1024;
@@ -84,17 +86,29 @@ impl RecordVersion {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordChange {
+    pub domain: Domain,
     pub key: String,
     pub before: RecordVersion,
     pub after: RecordVersion,
+}
+impl RecordChange {
+    pub fn address(&self) -> (Domain, &str) {
+        (self.domain, self.key.as_str())
+    }
 }
 
 /// Exact record observations include parent/owner reads even when not written.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReadFence {
+    pub domain: Domain,
     pub key: String,
     pub version: RecordVersion,
+}
+impl ReadFence {
+    pub fn address(&self) -> (Domain, &str) {
+        (self.domain, self.key.as_str())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -149,8 +163,14 @@ impl ChangeSet {
             crate::descriptor::validate_scope(&fence.scope)?;
             validate_hash(&fence.expected_version)?;
         }
-        if self.changes.windows(2).any(|w| w[0].key >= w[1].key)
-            || self.read_fences.windows(2).any(|w| w[0].key >= w[1].key)
+        if self
+            .changes
+            .windows(2)
+            .any(|w| w[0].address() >= w[1].address())
+            || self
+                .read_fences
+                .windows(2)
+                .any(|w| w[0].address() >= w[1].address())
             || self
                 .scope_fences
                 .windows(2)
