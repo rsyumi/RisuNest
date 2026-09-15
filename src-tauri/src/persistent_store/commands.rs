@@ -940,7 +940,21 @@ pub(crate) struct AssetGcMaintenanceResult {
     deleted_count: u64,
     deleted_bytes: u64,
     blockers: Vec<String>,
+    /// What the cleanup looked at and decided, so a preview can be argued with rather than
+    /// only believed. Bounded, because a large library holds more objects than a list can show.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    candidates: Vec<super::AssetGcCandidateDetail>,
+    /// Rows past the bound, counted rather than listed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    omitted: u64,
 }
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// Rows one preview lists before it counts the rest.
+const GC_DETAIL_LIMIT: usize = 500;
 
 fn asset_gc_result(
     report: crate::asset_repository::migration_gc::AssetGcDryRunReport,
@@ -951,6 +965,8 @@ fn asset_gc_result(
         deleted_count: report.deleted_hashes.len() as u64,
         deleted_bytes: report.deleted_bytes,
         blockers: report.blockers,
+        candidates: Vec::new(),
+        omitted: 0,
     }
 }
 
@@ -981,10 +997,12 @@ fn pds_asset_gc_preview_all(
         deleted_count: 0,
         deleted_bytes: 0,
         blockers: Vec::new(),
+        candidates: Vec::new(),
+        omitted: 0,
     };
     loop {
-        let page = with_store_mutex_admitted(state, operation_guard, |store| {
-            store.asset_gc_preview_page(
+        let (page, details) = with_store_mutex_admitted(state, operation_guard, |store| {
+            store.asset_gc_preview_page_detail(
                 &preview,
                 128,
                 cursor.as_deref(),
@@ -996,6 +1014,13 @@ fn pds_asset_gc_preview_all(
         result.candidate_count += page_result.candidate_count;
         result.candidate_bytes += page_result.candidate_bytes;
         result.blockers.extend(page_result.blockers);
+        for detail in details {
+            if result.candidates.len() < GC_DETAIL_LIMIT {
+                result.candidates.push(detail);
+            } else {
+                result.omitted += 1;
+            }
+        }
         match page.next_cursor {
             Some(next) => cursor = Some(next),
             None => break,
@@ -1027,6 +1052,8 @@ fn pds_asset_gc_execute_all(
         deleted_count: 0,
         deleted_bytes: 0,
         blockers: Vec::new(),
+        candidates: Vec::new(),
+        omitted: 0,
     };
     loop {
         let page = pds_asset_gc_execute_page(state, operation_guard, cursor.as_deref(), now)?;
@@ -1737,6 +1764,8 @@ mod tests {
             deleted_count: 0,
             deleted_bytes: 0,
             blockers: Vec::new(),
+            candidates: Vec::new(),
+            omitted: 0,
         };
         loop {
             let page = pds_asset_gc_execute_page(&state, &operation_guard, cursor.as_deref(), now)

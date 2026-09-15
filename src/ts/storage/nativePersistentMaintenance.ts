@@ -56,12 +56,24 @@ export interface NativeStorageDeletionStats extends NativeStorageBytes {
     state: string
 }
 
+/** One stored file the cleanup looked at, and what it decided about it. */
+export interface NativeAssetGcCandidate {
+    objectHash: string
+    bytes: number
+    createdAtMs: number
+    state: 'deletable' | 'recent' | 'held'
+    /** What is holding a kept file. Empty with `held` means the library still uses it. */
+    holders: string[]
+}
+
 export interface NativeAssetGcResult {
     candidateCount: number
     candidateBytes: number
     deletedCount: number
     deletedBytes: number
     blockers: string[]
+    candidates?: NativeAssetGcCandidate[]
+    omitted?: number
 }
 
 export interface NativeSnapshotRestoreActions {

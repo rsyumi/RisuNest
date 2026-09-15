@@ -105,3 +105,59 @@ fn preview_does_not_cache_roots_across_invocations_or_authorize_deletion() {
 fn preview_ten_thousand_assets() {
     run_preview(10_000);
 }
+
+/// A preview that can be argued with: every object it looked at, what it decided and, when it
+/// kept one, what is holding it.
+#[test]
+fn the_preview_says_what_it_decided_about_every_object_it_looked_at() {
+    let (directory, state, _) = preview_fixture(20);
+    let guard = state.admit_renderer_operation().unwrap();
+
+    // One object is held by a repair journal alone, which is what an undo still needs.
+    let held = hex::encode(Sha256::digest(b"held-by-a-repair"));
+    let path = directory
+        .path()
+        .join(crate::asset_repository::object_physical_key(&held));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, b"held-by-a-repair").unwrap();
+    with_store_mutex(&state, |store| {
+        store.connection.execute(
+            "INSERT INTO asset_objects(object_hash, byte_size, created_at_ms) VALUES (?1, ?2, 0)",
+            rusqlite::params![held, 16_i64],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    crate::data_health::journal::write(
+        directory.path(),
+        &crate::data_health::journal::Journal {
+            id: "repair-1".to_owned(),
+            created_at: 0,
+            from_revision: 0,
+            to_revision: 1,
+            applied: Vec::new(),
+            records: Vec::new(),
+            released_objects: std::collections::BTreeSet::from([held.clone()]),
+        },
+    )
+    .unwrap();
+
+    let result = pds_asset_gc_preview_all(&state, &guard).expect("preview every page");
+    let rows = &result.candidates;
+    assert_eq!(rows.len() as u64, 21, "every object it looked at is listed");
+    assert_eq!(result.omitted, 0);
+
+    let kept = rows
+        .iter()
+        .find(|row| row.object_hash == held)
+        .expect("the held object is listed");
+    assert_eq!(kept.state, "held");
+    assert_eq!(kept.holders, ["repair"], "the reason it stayed is named");
+
+    let used = rows
+        .iter()
+        .find(|row| row.state == "held" && row.holders.is_empty())
+        .expect("an object an alias registers is held by the library itself");
+    assert!(used.bytes > 0);
+    assert!(rows.iter().any(|row| row.state == "deletable"));
+}

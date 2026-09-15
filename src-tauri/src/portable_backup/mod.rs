@@ -19,8 +19,8 @@ pub(crate) use validation::{
 pub(crate) use restore_inventory::{PreservationReport, RestoreInventory};
 mod selection;
 pub(crate) use selection::{
-    close as close_selection, inventory as archive_inventory, ArchiveEntry, ArchiveInventory,
-    ArchiveSelection, ClosedSelection,
+    close as close_selection, inventory as archive_inventory, ArchiveInventory, ArchiveSelection,
+    ClosedSelection,
 };
 
 use crate::local_backup::CancellationProbe;

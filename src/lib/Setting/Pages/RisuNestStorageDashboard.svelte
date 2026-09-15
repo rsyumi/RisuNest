@@ -23,6 +23,7 @@
     } from 'src/ts/storage/nativePersistentMaintenance'
     import { getSyncConflictBackupStore } from 'src/ts/storage/sync/syncConflictBackup'
     import { openDataHealthScreen } from 'src/ts/storage/dataHealthNavigation'
+    import type { NativeAssetGcCandidate } from 'src/ts/storage/nativePersistentMaintenance'
     import {
         createRisuNestStorageDashboard,
         formatRisuNestStorageBytes,
@@ -126,6 +127,31 @@
     function isBusy(action: string): boolean {
         return state.busy.includes(action)
     }
+
+    const gcStates: Record<NativeAssetGcCandidate['state'], string> = {
+        deletable: strings.gcStateDeletable,
+        recent: strings.gcStateRecent,
+        held: strings.gcStateHeld,
+    }
+    const gcHolders: Record<string, string> = {
+        snapshot: strings.gcHeldSnapshot,
+        repair: strings.gcHeldRepair,
+        remote: strings.gcHeldRemote,
+        migration: strings.gcHeldMigration,
+        job: strings.gcHeldJob,
+    }
+    // A kept file with no named holder is one the library itself still uses.
+    const gcReason = (candidate: NativeAssetGcCandidate): string =>
+        candidate.state === 'held'
+            ? [
+                  gcStates.held,
+                  candidate.holders.length > 0
+                      ? candidate.holders
+                            .map((holder) => gcHolders[holder] ?? holder)
+                            .join(', ')
+                      : strings.gcHeldLibrary,
+              ].join(' · ')
+            : gcStates[candidate.state]
 
     async function previewGc(): Promise<void> {
         try { await dashboard.previewGc() } catch (error) { await showStorageFailure(error) }
@@ -241,6 +267,7 @@
             </SettingRow>
             <SettingRow data-storage-action="gc" label={strings.gcTitle} help={strings.gcHelp}>
                 {#snippet below()}
+                    <p class="mt-0.5 max-w-[62ch] text-[13px] leading-normal text-textcolor2">{strings.gcSeparation}</p>
                     <div role="status" aria-live="polite">
                         {#if state.gcPreview}
                             <p class="mt-1 text-sm tabular-nums">{strings.gcResult.replace('{0}', formatCount(state.gcPreview.candidateCount)).replace('{1}', formatRisuNestStorageBytes(state.gcPreview.candidateBytes))}</p>
@@ -248,6 +275,26 @@
                             <p class="mt-1 text-sm tabular-nums">{strings.gcDeletedResult.replace('{0}', formatCount(state.gcResult.deletedCount)).replace('{1}', formatRisuNestStorageBytes(state.gcResult.deletedBytes))}</p>
                         {/if}
                     </div>
+                    {#if state.gcPreview?.candidates?.length}
+                        <details data-storage-gc-list class="group mt-2">
+                            <summary class="flex cursor-pointer list-none items-center gap-2 text-sm select-none [&::-webkit-details-marker]:hidden">
+                                <ChevronRight size={16} class="shrink-0 text-textcolor2 transition-transform duration-200 group-open:rotate-90" aria-hidden="true" />
+                                <span>{strings.gcListTitle}</span>
+                            </summary>
+                            <div class="mt-1 divide-y divide-darkborderc/55 rounded-md border border-darkborderc/55">
+                                {#each state.gcPreview.candidates as candidate (candidate.objectHash)}
+                                    <div data-storage-gc-row class="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 px-3 py-1.5 text-sm">
+                                        <span class="font-mono text-xs break-all">{candidate.objectHash.slice(0, 12)}</span>
+                                        <span class="tabular-nums text-textcolor2">{formatRisuNestStorageBytes(candidate.bytes)}</span>
+                                        <span class="min-w-0 flex-1 text-textcolor2">{gcReason(candidate)}</span>
+                                    </div>
+                                {/each}
+                                {#if state.gcPreview.omitted}
+                                    <p class="px-3 py-1.5 text-sm text-textcolor2">{strings.gcListMore.replace('{0}', formatCount(state.gcPreview.omitted))}</p>
+                                {/if}
+                            </div>
+                        </details>
+                    {/if}
                 {/snippet}
                 <Button styled="outlined" disabled={isBusy('preview-gc') || isBusy('execute-gc')} onclick={previewGc}>{isBusy('preview-gc') ? language.loading : strings.gcRun}</Button>
                 {#if state.gcPreview}

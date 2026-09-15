@@ -316,3 +316,55 @@ fn the_journal_and_the_diagnosis_stay_in_the_working_folder() {
         "a diagnosis is not a snapshot and never travels as one"
     );
 }
+
+/// One stored object nothing registers, so the diagnosis can count it and the cleanup can take it.
+fn orphan_object(state: &PersistentStoreState, bytes: &[u8]) -> String {
+    let guard = state.admit_renderer_operation().unwrap();
+    with_store_mutex_admitted(state, &guard, |store| {
+        let cas = crate::asset_repository::PayloadCas::new(store.repository_root())?;
+        let stored = cas.prepare_bytes(bytes)?;
+        store.connection.execute(
+            "INSERT INTO asset_objects(object_hash, byte_size, created_at_ms) VALUES (?1, ?2, 0)",
+            rusqlite::params![stored.content_hash, bytes.len() as i64],
+        )?;
+        Ok(stored.content_hash)
+    })
+    .unwrap()
+}
+
+#[test]
+fn a_file_no_record_uses_is_reported_as_something_to_clean_up_and_nothing_more() {
+    let (_directory, state, _) = damaged_payload_fixture();
+    let health = DataHealthState::default();
+    let hash = orphan_object(&state, b"nothing points at this");
+
+    let result = quick_scan(&state, &health).unwrap();
+    let finding = result
+        .items
+        .iter()
+        .find(|finding| finding.code == codes::OBJECT_UNREFERENCED)
+        .expect("the stored object nothing registers is reported");
+    assert_eq!(finding.severity, Severity::Informational);
+    assert_eq!(finding.owner.id, hash);
+    assert_eq!(result.counts.informational, 1);
+
+    // A cleanup candidate is never something a repair offers to change.
+    assert!(
+        repair::plan(&result)
+            .iter()
+            .all(|candidate| result.items[candidate.finding].code != codes::OBJECT_UNREFERENCED),
+        "deleting a file is the cleanup's decision, never a repair's"
+    );
+}
+
+#[test]
+fn a_registered_file_is_not_reported_as_unused() {
+    let (_directory, state, _) = damaged_payload_fixture();
+    let health = DataHealthState::default();
+    let result = quick_scan(&state, &health).unwrap();
+    assert!(
+        !has(&result, codes::OBJECT_UNREFERENCED),
+        "the fixture's one object is registered by an alias: {:?}",
+        result.items
+    );
+}
