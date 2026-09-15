@@ -1,7 +1,8 @@
-//! OS-protected storage for external provider credentials and repository keys.
+//! OS-protected storage for external provider credentials, repository keys and
+//! the account token.
 //!
-//! The two vaults intentionally use different directories, keychain services,
-//! Android Keystore aliases and reference prefixes. A repository-key reference
+//! Every purpose intentionally uses a different directory, keychain service,
+//! Android Keystore alias and reference prefix. A repository-key reference
 //! therefore cannot be resolved through the provider vault, or vice versa.
 use super::{
     auth::{SecretBytes, SecretVault},
@@ -19,6 +20,7 @@ const MAX_ENVELOPE_BYTES: u64 = 65_536;
 enum Purpose {
     Provider,
     RepositoryKey,
+    AccountCredential,
 }
 
 impl Purpose {
@@ -26,6 +28,7 @@ impl Purpose {
         match self {
             Self::Provider => "provider-v1:",
             Self::RepositoryKey => "repository-key-v1:",
+            Self::AccountCredential => "account-credential-v1:",
         }
     }
 
@@ -33,6 +36,7 @@ impl Purpose {
         match self {
             Self::Provider => "external-storage-secrets",
             Self::RepositoryKey => "external-storage-root-keys",
+            Self::AccountCredential => "account-credentials",
         }
     }
 
@@ -40,6 +44,7 @@ impl Purpose {
         match self {
             Self::Provider => "external-storage-secrets",
             Self::RepositoryKey => "external-storage-root-keys",
+            Self::AccountCredential => "account-credentials",
         }
     }
 }
@@ -66,6 +71,51 @@ pub(crate) fn repository_key_vault(root: &Path) -> Arc<dyn SecretVault> {
         root: root.to_owned(),
         purpose: Purpose::RepositoryKey,
     })
+}
+
+/// One well-known secret addressed by a fixed name instead of an issued
+/// reference, so nothing has to be stored beside it to find it again.
+pub(crate) struct NamedSecretSlot {
+    root: PathBuf,
+    purpose: Purpose,
+    name: &'static str,
+}
+
+/// The account token. An installation holds at most one, and a new device
+/// obtains its own by signing in, so it never travels with stored data.
+pub(crate) fn account_credential_slot(root: &Path) -> NamedSecretSlot {
+    NamedSecretSlot {
+        root: root.to_owned(),
+        purpose: Purpose::AccountCredential,
+        name: "official-account",
+    }
+}
+
+impl NamedSecretSlot {
+    /// An unreadable slot reads as an absent one: the account signs in again.
+    pub(crate) fn read(&self) -> Option<SecretBytes> {
+        platform::read(&self.root, self.purpose, self.name)
+            .ok()
+            .map(|bytes| SecretBytes(zeroize::Zeroizing::new(bytes)))
+    }
+
+    pub(crate) fn write(&self, bytes: &SecretBytes) -> Result<()> {
+        if bytes.0.is_empty() || bytes.0.len() > MAX_PLAINTEXT_BYTES {
+            return Err(ProviderError::new(ErrorKind::Corrupt));
+        }
+        match platform::replace(&self.root, self.purpose, self.name, &bytes.0) {
+            // Every platform reports a missing destination this way, and only
+            // that case may create the slot.
+            Err(error) if error.kind == ErrorKind::ReauthRequired => {
+                platform::write_new(&self.root, self.purpose, self.name, &bytes.0)
+            }
+            result => result,
+        }
+    }
+
+    pub(crate) fn remove(&self) -> Result<()> {
+        platform::remove(&self.root, self.purpose, self.name)
+    }
 }
 
 fn unavailable() -> ProviderError {
@@ -486,6 +536,48 @@ mod tests {
             provider.remove(&reference).await.unwrap();
             assert!(provider.read(&reference).await.is_err());
         });
+    }
+
+    #[test]
+    fn the_account_slot_keeps_one_named_secret_in_its_own_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        let slot = account_credential_slot(root.path());
+        let token = SecretBytes(zeroize::Zeroizing::new(
+            br#"{"id":"synthetic","token":"synthetic-account-token"}"#.to_vec(),
+        ));
+        let rotated = SecretBytes(zeroize::Zeroizing::new(
+            br#"{"id":"synthetic","token":"rotated-account-token"}"#.to_vec(),
+        ));
+
+        assert!(slot.read().is_none());
+        slot.write(&token).unwrap();
+        assert_eq!(slot.read().unwrap().0.as_slice(), token.0.as_slice());
+        slot.write(&rotated).unwrap();
+        assert_eq!(slot.read().unwrap().0.as_slice(), rotated.0.as_slice());
+
+        let sealed = std::fs::read(
+            root.path()
+                .join("account-credentials")
+                .join("official-account"),
+        )
+        .unwrap();
+        assert!(!sealed
+            .windows(rotated.0.len())
+            .any(|part| part == rotated.0.as_slice()));
+
+        // The provider vault namespace cannot reach the account slot.
+        let provider = provider_vault(root.path());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            assert!(provider
+                .read(&SecretRef("provider-v1:official-account".into()))
+                .await
+                .is_err());
+        });
+
+        slot.remove().unwrap();
+        assert!(slot.read().is_none());
+        slot.remove().unwrap();
     }
 
     #[test]
