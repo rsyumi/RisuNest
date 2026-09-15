@@ -44,14 +44,9 @@ fn recovery_package_opens_and_applies_a_real_snapshot_without_the_source_vault()
             let destination = tempfile::tempdir().unwrap();
             let provider = FakeProvider::new(false);
             let repository = fake::repository();
-            let scope = Scope {
-                library: true,
-                referenced_assets: true,
-                device_settings: false,
-                device_plugins: false,
-            };
+            let scope = Scope::LIBRARY;
             let descriptor =
-                Descriptor::new("synthetic-recovery-repository".into(), scope.clone(), None)
+                Descriptor::new("synthetic-recovery-repository".into(), None)
                     .unwrap();
             let root_key = [7; 32];
             let cancel = Cancellation::default();
@@ -128,8 +123,11 @@ fn recovery_package_opens_and_applies_a_real_snapshot_without_the_source_vault()
                     author_device_id: identity.store_id.clone(),
                     created_at_ms: 1,
                     logical_revision: identity.revision as u64,
-                    scope_id: descriptor.scope_id,
-                    library_scope_id: scope.id(),
+                    purpose: crate::external_storage::packaging::SnapshotPurpose::SyncState {
+                        epoch: "epoch".into(),
+                        generation: risunest_sync_wire::head::Sequence::from(1u64),
+                        parent_sections: std::collections::BTreeMap::new(),
+                    },
                     parent_snapshot_id: None,
                     content_fingerprint: fingerprint,
                 },
@@ -162,6 +160,7 @@ fn recovery_package_opens_and_applies_a_real_snapshot_without_the_source_vault()
                 provider_repository_id: repository.repository_id.clone(),
                 credential_ref: "unavailable-source-credential".into(),
                 root_key_ref: "unavailable-source-root-key".into(),
+                capture_policy: None,
                 capabilities: Capabilities::default(),
                 created_at_ms: 1,
             };
@@ -225,8 +224,6 @@ fn recovery_package_opens_and_applies_a_real_snapshot_without_the_source_vault()
             .await
             .unwrap();
             assert_eq!(prepared.snapshot_id, "recovery-snapshot");
-            assert_eq!(prepared.scope_id, hex::encode(descriptor.scope_id));
-            assert_eq!(prepared.library_scope_id, hex::encode(scope.id()));
             assert_eq!(prepared.records.len(), 1);
             assert_eq!(prepared.records[0].key, root_key_name);
             assert_eq!(prepared.records[0].content_hash, root_record.hash);
@@ -258,7 +255,7 @@ fn recovery_package_opens_and_applies_a_real_snapshot_without_the_source_vault()
                 expected_revision: revision_before_import,
                 staging_root: &prepared.staging_root,
                 scope: &scope,
-                scope_id: &descriptor.scope_id,
+                scope_id: &scope.id(),
                 fingerprint: &library_fingerprint,
             };
             let replacement = destination_store

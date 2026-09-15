@@ -878,7 +878,8 @@ mod tests {
         sequential
             .acknowledgements
             .push(SEQUENTIAL_ACKNOWLEDGEMENT.into());
-        sequential.scope.device_settings = true;
+        // A synchronization connection never carries a capture policy.
+        sequential.capture_policy = Some(CapturePolicy::default());
         assert!(validate_preparation(&sequential).is_err());
     }
 

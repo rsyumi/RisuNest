@@ -224,15 +224,7 @@ mod tests {
     use std::{collections::BTreeMap, sync::Arc};
 
     fn descriptor() -> Descriptor {
-        Descriptor::new(
-            "descriptor-repository".into(),
-            Scope {
-                library: true,
-                referenced_assets: true,
-                device_settings: false,
-                device_plugins: false,
-            },
-            Some(Strategy::Cas),
+        Descriptor::new("descriptor-repository".into(), Some(Strategy::Cas),
         )
         .unwrap()
     }
@@ -241,14 +233,14 @@ mod tests {
         let header = wire::PublicObjectHeader::new(
             "descriptor-repository".into(),
             "snapshot-snapshot".into(),
-            wire::ObjectRole::Snapshot,
+            wire::ObjectRole::BackupBundle,
             4,
         )
         .unwrap();
         RemoteObject {
             repository_id: "descriptor-repository".into(),
             object_id: "snapshot-snapshot".into(),
-            role: ObjectRole::Snapshot,
+            role: ObjectRole::BackupBundle,
             receipt: ObjectReceipt {
                 locator: RemoteLocator {
                     connection_identity: fake::repository().connection_identity,
@@ -326,6 +318,7 @@ mod tests {
                 provider_repository_id: fake::repository().repository_id,
                 credential_ref: "credential".into(),
                 root_key_ref: "key".into(),
+                capture_policy: None,
                 capabilities: fake::capabilities(true),
                 created_at_ms: 1_000,
             },

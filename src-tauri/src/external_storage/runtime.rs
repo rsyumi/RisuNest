@@ -369,9 +369,7 @@ pub(crate) async fn external_storage_start_job(
             pending.request.session = request.session;
             pending.request.session_id = request.session_id;
             store.put(&pending)?;
-            if pending.summary["phase"] != "device-capture" {
-                wake_job(app.clone(), pending.id.clone())?;
-            }
+            wake_job(app.clone(), pending.id.clone())?;
         }
         return Ok(pending.summary);
     }
@@ -536,7 +534,7 @@ fn settle_interrupted(job: &mut DurableJob, complete: Option<Value>, uncertain: 
 }
 pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
     let job = JobStore::open(&root(&app)?)?.read(&id)?;
-    if job.terminal() || job.summary["phase"] == "device-capture" {
+    if job.terminal() {
         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
     }
     read_job_session(&app, &id)?;

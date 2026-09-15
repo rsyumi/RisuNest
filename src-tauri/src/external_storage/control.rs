@@ -1105,15 +1105,7 @@ mod tests {
     use crate::persistent_store::sync_selection::CaptureIdentity;
 
     fn descriptor(strategy: Strategy) -> Descriptor {
-        Descriptor::new(
-            "descriptor-repository".into(),
-            risunest_external_storage_format::format::Scope {
-                library: true,
-                referenced_assets: true,
-                device_settings: false,
-                device_plugins: false,
-            },
-            Some(strategy),
+        Descriptor::new("descriptor-repository".into(), Some(strategy),
         )
         .unwrap()
     }
@@ -1122,14 +1114,44 @@ mod tests {
         let header = wire::PublicObjectHeader::new(
             descriptor_id.clone(),
             format!("snapshot-{id}"),
-            wire::ObjectRole::Snapshot,
+            wire::ObjectRole::SyncState,
             4,
         )
         .unwrap();
         RemoteObject {
             repository_id: descriptor_id,
             object_id: header.object_id.clone(),
-            role: ObjectRole::Snapshot,
+            role: ObjectRole::SyncState,
+            receipt: ObjectReceipt {
+                locator: RemoteLocator {
+                    connection_identity: repository.connection_identity.clone(),
+                    collection: None,
+                    object: format!("opaque-{id}"),
+                },
+                byte_length: wire::envelope_length(&header).unwrap(),
+                version: None,
+                checksum: None,
+                complete: true,
+            },
+            ciphertext_sha256: "11".repeat(32),
+            plaintext_length: 4,
+            plaintext_sha256: "22".repeat(32),
+        }
+    }
+
+    fn bundle(repository: &RepositoryHandle, id: &str) -> RemoteObject {
+        let descriptor_id = "descriptor-repository".to_owned();
+        let header = wire::PublicObjectHeader::new(
+            descriptor_id.clone(),
+            format!("snapshot-{id}"),
+            wire::ObjectRole::BackupBundle,
+            4,
+        )
+        .unwrap();
+        RemoteObject {
+            repository_id: descriptor_id,
+            object_id: header.object_id.clone(),
+            role: ObjectRole::BackupBundle,
             receipt: ObjectReceipt {
                 locator: RemoteLocator {
                     connection_identity: repository.connection_identity.clone(),
@@ -1310,22 +1332,20 @@ mod tests {
             let provider = fake::FakeProvider::new(false);
             let repository = fake::repository();
             let descriptor = descriptor(Strategy::Sequential);
-            assert!(BackupPointDocument::new(
+            assert!(BackupPointDocument::conflict(
                 &descriptor,
                 "conflict-1".into(),
-                BackupPointKind::Conflict,
                 1,
-                1,
-                vec![snapshot(&repository, "s1")],
+                bundle(&repository, "s1"),
+                bundle(&repository, "s1"),
             )
             .is_err());
-            let document = BackupPointDocument::new(
+            let document = BackupPointDocument::conflict(
                 &descriptor,
                 "conflict-1".into(),
-                BackupPointKind::Conflict,
                 1,
-                1,
-                vec![snapshot(&repository, "s1"), snapshot(&repository, "s2")],
+                bundle(&repository, "s1"),
+                bundle(&repository, "s2"),
             )
             .unwrap();
             let root = tempfile::tempdir().unwrap();

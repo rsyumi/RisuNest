@@ -552,11 +552,11 @@ fn duplicate_upload_with_matching_bytes_converges_without_resending() {
 fn duplicate_upload_with_other_bytes_or_two_files_is_a_conflict() {
     runtime().block_on(async {
         let payload = b"snapshot-bytes".to_vec();
-        let file = format!("snapshot-{}", encoded("snapshot-1"));
+        let file = format!("state-{}", encoded("snapshot-1"));
         let version = format!("v0-{}", encoded("snapshot-1"));
         let listing = format!(
             "[{}]",
-            package_json(3, &format!("{PACKAGE}.snapshot"), &version)
+            package_json(3, &format!("{PACKAGE}.state"), &version)
         );
         let variants = [
             format!(
@@ -582,7 +582,7 @@ fn duplicate_upload_with_other_bytes_or_two_files_is_a_conflict() {
             );
             let (repository, _) = harness.open(OpenMode::Existing).await.unwrap();
             let directory = tempfile::tempdir().unwrap();
-            let intent = object_intent(&repository, ObjectRole::Snapshot, "snapshot-1", &payload);
+            let intent = object_intent(&repository, ObjectRole::SyncState, "snapshot-1", &payload);
             let source = spool_source(directory.path(), "snapshot", &payload);
             assert_eq!(
                 harness
@@ -692,7 +692,7 @@ fn a_missing_server_digest_falls_back_to_verifying_the_stored_bytes() {
 #[test]
 fn listing_pages_through_the_next_page_header_and_bounds_its_limit() {
     runtime().block_on(async {
-        let snapshots = format!("{PACKAGE}.snapshot");
+        let snapshots = format!("{PACKAGE}.state");
         let first = format!(
             "[{},{}]",
             package_json(1, &snapshots, &format!("v0-{}", encoded("a"))),
@@ -712,14 +712,14 @@ fn listing_pages_through_the_next_page_header_and_bounds_its_limit() {
                     200,
                     &format!(
                         "[{}]",
-                        file_json(&format!("snapshot-{}", encoded("a")), 11, Some(hash(b"a")))
+                        file_json(&format!("state-{}", encoded("a")), 11, Some(hash(b"a")))
                     ),
                 ),
                 json(
                     200,
                     &format!(
                         "[{}]",
-                        file_json(&format!("snapshot-{}", encoded("b")), 22, None)
+                        file_json(&format!("state-{}", encoded("b")), 22, None)
                     ),
                 ),
                 headed(200, &[("x-next-page", "")], &second),
@@ -727,7 +727,7 @@ fn listing_pages_through_the_next_page_header_and_bounds_its_limit() {
                     200,
                     &format!(
                         "[{}]",
-                        file_json(&format!("snapshot-{}", encoded("c")), 33, Some(hash(b"c")))
+                        file_json(&format!("state-{}", encoded("c")), 33, Some(hash(b"c")))
                     ),
                 ),
             ],
@@ -744,7 +744,7 @@ fn listing_pages_through_the_next_page_header_and_bounds_its_limit() {
         assert_eq!(
             page.objects[0].locator.object,
             format!(
-                "{PACKAGE}.snapshot/v0-{}/snapshot-{}",
+                "{PACKAGE}.state/v0-{}/state-{}",
                 encoded("a"),
                 encoded("a")
             )
@@ -805,7 +805,7 @@ fn listing_pages_through_the_next_page_header_and_bounds_its_limit() {
         assert_eq!(
             lines[2],
             format!(
-                "GET {PROJECT_PATH}/packages?package_type=generic&package_name={PACKAGE}.snapshot&order_by=version&sort=asc&per_page=2 HTTP/1.1"
+                "GET {PROJECT_PATH}/packages?package_type=generic&package_name={PACKAGE}.state&order_by=version&sort=asc&per_page=2 HTTP/1.1"
             )
         );
         assert!(lines[5].contains("&per_page=2&page=2 "));
@@ -946,7 +946,7 @@ fn reserved_characters_escape_into_documented_version_and_file_names() {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')));
         let payload = b"escaped".to_vec();
-        let file = format!("snapshot-{token}");
+        let file = format!("state-{token}");
         let harness = fixture(
             vec![
                 marker_present(),
@@ -959,7 +959,7 @@ fn reserved_characters_escape_into_documented_version_and_file_names() {
         );
         let (repository, _) = harness.open(OpenMode::Existing).await.unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let intent = object_intent(&repository, ObjectRole::Snapshot, object_id, &payload);
+        let intent = object_intent(&repository, ObjectRole::SyncState, object_id, &payload);
         let source = spool_source(directory.path(), "snapshot", &payload);
         let receipt = harness
             .provider
@@ -968,7 +968,7 @@ fn reserved_characters_escape_into_documented_version_and_file_names() {
             .unwrap();
         assert_eq!(
             receipt.locator.object,
-            format!("{PACKAGE}.snapshot/v0-{token}/{file}")
+            format!("{PACKAGE}.state/v0-{token}/{file}")
         );
         let mut sink = SpoolSink::create(&directory.path().join("out"), 64).unwrap();
         harness
@@ -986,13 +986,13 @@ fn reserved_characters_escape_into_documented_version_and_file_names() {
         assert_eq!(
             lines[3],
             format!(
-                "PUT {PROJECT_PATH}/packages/generic/{PACKAGE}.snapshot/v0-{token}/{file}?select=package_file HTTP/1.1"
+                "PUT {PROJECT_PATH}/packages/generic/{PACKAGE}.state/v0-{token}/{file}?select=package_file HTTP/1.1"
             )
         );
         assert_eq!(
             lines[4],
             format!(
-                "GET {PROJECT_PATH}/packages/generic/{PACKAGE}.snapshot/v0-{token}/{file} HTTP/1.1"
+                "GET {PROJECT_PATH}/packages/generic/{PACKAGE}.state/v0-{token}/{file} HTTP/1.1"
             )
         );
     });

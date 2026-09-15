@@ -203,26 +203,17 @@ mod tests {
         let snapshot = PreparedRemoteSnapshot {
             snapshot_id: "synthetic".into(),
             repository_id: "repository".into(),
-            scope_id: "00".repeat(32),
-            library_scope_id: "00".repeat(32),
             fingerprint: "00".repeat(32),
             library_fingerprint: "not-a-hash".into(),
             logical_revision: 1,
             staging_root: staging,
             records: Vec::new(),
             objects: Vec::new(),
-            device: None,
-            device_sections: Vec::new(),
         };
         let destination = root.path().join("snapshot.bin");
         assert!(export_verified_snapshot(
             snapshot,
-            &Scope {
-                library: true,
-                referenced_assets: true,
-                device_settings: false,
-                device_plugins: false,
-            },
+            &Scope::LIBRARY,
             &destination,
             &root.path().join("scratch"),
             &Cancellation::default(),
@@ -236,12 +227,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let staging = root.path().join("staging");
         fs::create_dir(&staging).unwrap();
-        let scope = Scope {
-            library: true,
-            referenced_assets: true,
-            device_settings: false,
-            device_plugins: false,
-        };
+        let scope = Scope::LIBRARY;
         let key = encode_logical_record_key(&LogicalRecordLocator::Root).unwrap();
         let encoded = encode_logical_record(&LogicalRecordEnvelope::Root {
             value: serde_json::json!({"marker":"synthetic-remote"}),
@@ -259,8 +245,6 @@ mod tests {
         let snapshot = PreparedRemoteSnapshot {
             snapshot_id: "synthetic-snapshot".into(),
             repository_id: "synthetic-repository".into(),
-            scope_id: hex::encode(scope_id),
-            library_scope_id: hex::encode(scope_id),
             fingerprint: hex::encode(fingerprint(&scope_id, &hashes)),
             library_fingerprint: hex::encode(fingerprint(&scope_id, &hashes)),
             logical_revision: 1,
@@ -272,8 +256,6 @@ mod tests {
                 path: record_path,
             }],
             objects: Vec::new(),
-            device: None,
-            device_sections: Vec::new(),
         };
         let destination = root.path().join("snapshot.risunest");
         let receipt = export_verified_snapshot(

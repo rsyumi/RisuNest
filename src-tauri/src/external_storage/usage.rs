@@ -183,18 +183,18 @@ mod tests {
         let mut locator = fake::locator();
         locator.object = id.into();
         let wire_role = match role {
-            ObjectRole::Snapshot => wire::ObjectRole::Snapshot,
-            ObjectRole::Catalog => wire::ObjectRole::Catalog,
+            ObjectRole::SyncState => risunest_external_storage_format::snapshot::ObjectRole::SyncState,
+            ObjectRole::Catalog => risunest_external_storage_format::snapshot::ObjectRole::Catalog,
             _ => unreachable!(),
         };
-        let header = wire::PublicObjectHeader::new(
+        let header = risunest_external_storage_format::snapshot::PublicObjectHeader::new(
             repository.repository_id.clone(),
             id.into(),
             wire_role,
             1,
         )
         .unwrap();
-        let bytes = wire::envelope_length(&header).unwrap();
+        let bytes = risunest_external_storage_format::snapshot::envelope_length(&header).unwrap();
         RemoteObject {
             repository_id: repository.repository_id.clone(),
             object_id: id.into(),
@@ -215,30 +215,24 @@ mod tests {
     #[test]
     fn direct_reachable_is_an_explicit_incomplete_lower_bound() {
         let repository = fake::repository();
-        let snapshot = object(&repository, "snapshot-root", ObjectRole::Snapshot);
+        let snapshot = object(&repository, "snapshot-root", ObjectRole::SyncState);
         let records_object = object(&repository, "records", ObjectRole::Catalog);
         let assets_object = object(&repository, "assets", ObjectRole::Catalog);
         let records = records_object.stored(&repository).unwrap();
         let assets = assets_object.stored(&repository).unwrap();
-        let document = wire::SnapshotDocument::new(
-            "snapshot".into(),
-            snapshot.repository_id.clone(),
-            "library".into(),
-            "device".into(),
-            1,
-            1,
-            [1; 32],
-            [1; 32],
-            None,
-            [2; 32],
-            [2; 32],
-            records,
-            assets,
-            None,
-            None,
-            Vec::new(),
-        )
-        .unwrap();
+        let document = control::SnapshotView {
+            snapshot_id: "snapshot".into(),
+            library_id: "library".into(),
+            created_at_ms: 1,
+            revision: "1".into(),
+            library: risunest_external_storage_format::snapshot::LibrarySnapshotRef {
+                record_catalog: records,
+                asset_catalog: assets,
+                content_fingerprint: [2; 32],
+            },
+            sections: std::collections::BTreeMap::new(),
+            is_state: true,
+        };
         let usage = direct_reachable(&snapshot, &document).unwrap();
         assert!(!usage.complete);
         assert_eq!(usage.known_direct_objects, 3);

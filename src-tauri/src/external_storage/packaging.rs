@@ -1589,7 +1589,6 @@ mod tests {
     use super::*;
     use crate::{
         external_storage::{
-            device_capture::{self, DeviceFile},
             fake::{self, FakeProvider},
             journal::JobIdentity,
             snapshot_restore,
@@ -1732,10 +1731,13 @@ mod tests {
             author_device_id: capture.identity.store_id.clone(),
             created_at_ms: 1,
             logical_revision: capture.identity.revision as u64,
-            scope_id: [9; 32],
-            library_scope_id: [9; 32],
+            purpose: SnapshotPurpose::SyncState {
+                epoch: "epoch".into(),
+                generation: risunest_sync_wire::head::Sequence::from(1u64),
+                parent_sections: std::collections::BTreeMap::new(),
+            },
             parent_snapshot_id: None,
-            content_fingerprint: capture.catalog.content_fingerprint(&[9; 32]).unwrap(),
+            content_fingerprint: capture.catalog.content_fingerprint(&library_fingerprint_domain()).unwrap(),
         }
     }
 
@@ -1759,95 +1761,6 @@ mod tests {
             sdk_overhead_bytes: 0,
             target_plaintext_bytes: max,
         }
-    }
-
-    fn synthetic_device_snapshot(root: &Path) -> DeviceSnapshot {
-        let directory = root.join("synthetic-device");
-        fs::create_dir(&directory).unwrap();
-        let blob_bytes = b"synthetic safe plugin binary";
-        let blob_hash = hash(blob_bytes);
-        let blob_path = directory.join(hex::encode(blob_hash));
-        fs::write(&blob_path, blob_bytes).unwrap();
-        // This neighboring value models an excluded credential source. It is
-        // deliberately absent from the immutable device catalog and inventory.
-        fs::write(
-            directory.join("excluded-secret"),
-            b"never-package-this-token",
-        )
-        .unwrap();
-        let catalog_path = directory.join("device.sqlite");
-        let db = Connection::open(&catalog_path).unwrap();
-        db.execute_batch(
-            "CREATE TABLE device_sections(section TEXT PRIMARY KEY,schema_version INTEGER NOT NULL,included INTEGER NOT NULL,complete INTEGER NOT NULL,present INTEGER NOT NULL,record_count INTEGER NOT NULL,sha256 TEXT NOT NULL);
-             CREATE TABLE device_records(section TEXT NOT NULL,ordinal INTEGER NOT NULL,metadata TEXT NOT NULL,PRIMARY KEY(section,ordinal));
-             CREATE TABLE device_objects(sha256 TEXT PRIMARY KEY,byte_length INTEGER NOT NULL);",
-        )
-        .unwrap();
-        let section = "local-storage";
-        let metadata = r#"{"present":true,"profile":"risunest.device-section/v1","sectionId":"local-storage"}"#;
-        let row = format!(
-            r#"{{"kind":"value","key":"0073006100660065005f0070006c007500670069006e005f006b00650079","value":{{"version":1,"root":0,"nodes":[{{"type":"blob","reference":"{}","byteLength":{}}}]}}}}"#,
-            hex::encode(blob_hash),
-            blob_bytes.len()
-        );
-        let mut section_digest = Sha256::new();
-        section_digest.update(b"RisuNest-device-section-v1\0");
-        section_digest.update((metadata.len() as u64).to_le_bytes());
-        section_digest.update(metadata.as_bytes());
-        section_digest.update(0u64.to_le_bytes());
-        section_digest.update((row.len() as u64).to_le_bytes());
-        section_digest.update(row.as_bytes());
-        let section_hash: [u8; 32] = section_digest.finalize().into();
-        db.execute(
-            "INSERT INTO device_sections VALUES(?1,1,1,1,1,1,?2)",
-            params![section, hex::encode(section_hash)],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO device_records VALUES(?1,-1,?2)",
-            params![section, metadata],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO device_records VALUES(?1,0,?2)",
-            params![section, row],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO device_objects VALUES(?1,?2)",
-            params![hex::encode(blob_hash), blob_bytes.len() as i64],
-        )
-        .unwrap();
-        drop(db);
-        let mut catalog = crate::trust_boundary::open_regular_source(&catalog_path).unwrap();
-        let catalog_length = catalog.metadata().unwrap().len();
-        let catalog_hash = hash_reader(&mut catalog, catalog_length).unwrap();
-        let mut identity = Sha256::new();
-        identity.update(b"RisuNest-external-device-capture-v1\0");
-        identity.update((section.len() as u64).to_le_bytes());
-        identity.update(section.as_bytes());
-        identity.update(section_hash);
-        identity.update(blob_hash);
-        identity.update((blob_bytes.len() as u64).to_le_bytes());
-        let device_identity: [u8; 32] = identity.finalize().into();
-        device_capture::verify_snapshot(DeviceSnapshot {
-            capture_id: hex::encode(device_identity),
-            device_identity,
-            sqlite: DeviceFile {
-                section_id: "device/catalog".into(),
-                content_hash: catalog_hash,
-                byte_length: catalog_length,
-                path: catalog_path,
-            },
-            blobs: vec![DeviceFile {
-                section_id: format!("device/object/{}", hex::encode(blob_hash)),
-                content_hash: blob_hash,
-                byte_length: blob_bytes.len() as u64,
-                path: blob_path,
-            }],
-            sections: vec![section.into()],
-        })
-        .unwrap()
     }
 
     #[test]
@@ -2008,74 +1921,6 @@ mod tests {
     }
 
     #[test]
-    fn device_catalog_and_objects_round_trip_without_excluded_sources() {
-        runtime().block_on(async {
-            let root = tempfile::tempdir().unwrap();
-            let provider = FakeProvider::new(false);
-            let repository = fake::repository();
-            let key = [19; 32];
-            let device = synthetic_device_snapshot(root.path());
-            let expected_device_identity = device.device_identity;
-            let (capture, _) = captured(
-                root.path(),
-                "capture-device",
-                11,
-                b"record with device backup",
-                b"library asset",
-            );
-            let snapshot_metadata = metadata("snapshot-device", &capture);
-            let expected_library_fingerprint = snapshot_metadata.content_fingerprint;
-            let mut journal = journal(&root.path().join("job-device"), "job-device", &capture);
-            let completed = package_and_upload_with_device(
-                capture,
-                Some(device),
-                root.path(),
-                &root.path().join("package-cache"),
-                snapshot_metadata,
-                &key,
-                limits(128 * 1024),
-                &mut journal,
-                &provider,
-                &repository,
-                &Cancellation::default(),
-            )
-            .await
-            .unwrap();
-            assert_eq!(
-                completed.device_identity.as_deref(),
-                Some(hex::encode(expected_device_identity).as_str())
-            );
-            assert_eq!(completed.device_sections, vec!["local-storage"]);
-            assert_eq!(
-                completed.fingerprint,
-                hex::encode(wire::combine_content_fingerprint(
-                    &[9; 32],
-                    &expected_library_fingerprint,
-                    Some(&expected_device_identity),
-                ))
-            );
-            let restored = snapshot_restore::download_snapshot(
-                &completed.reference,
-                &root.path().join("restore-device"),
-                &key,
-                &provider,
-                &repository,
-                &Cancellation::default(),
-            )
-            .await
-            .unwrap();
-            let restored_device = restored.device.unwrap();
-            assert_eq!(restored_device.device_identity, expected_device_identity);
-            assert_eq!(restored_device.sections, vec!["local-storage"]);
-            assert_eq!(restored.device_sections, restored_device.sections);
-            assert!(!fs::read(restored_device.sqlite.path)
-                .unwrap()
-                .windows(b"never-package-this-token".len())
-                .any(|window| window == b"never-package-this-token"));
-        });
-    }
-
-    #[test]
     fn stable_job_object_id_rejects_changed_plaintext_after_completed_spool_cleanup() {
         runtime().block_on(async {
             let root = tempfile::tempdir().unwrap();
@@ -2096,7 +1941,7 @@ mod tests {
                 24,
                 hash(b"first immutable snapshot"),
                 "snapshot-stable".into(),
-                ObjectRole::Snapshot,
+                ObjectRole::SyncState,
                 "format-repository",
                 &key,
                 limits(128 * 1024),
@@ -2115,7 +1960,7 @@ mod tests {
                 24,
                 hash(b"other immutable snapshot"),
                 "snapshot-stable".into(),
-                ObjectRole::Snapshot,
+                ObjectRole::SyncState,
                 "format-repository",
                 &key,
                 limits(128 * 1024),

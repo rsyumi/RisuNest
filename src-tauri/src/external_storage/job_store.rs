@@ -84,7 +84,6 @@ pub(crate) struct DurableJob {
     pub id: String,
     pub request: StartJobRequest,
     pub summary: Value,
-    pub device_capture_id: Option<String>,
     pub capture_id: Option<String>,
     pub snapshot_id: String,
     pub admission_identity: CaptureIdentity,
@@ -104,7 +103,6 @@ impl DurableJob {
             id,
             request,
             summary,
-            device_capture_id: None,
             capture_id: None,
             snapshot_id: uuid::Uuid::new_v4().to_string(),
             admission_identity,
@@ -243,33 +241,6 @@ impl JobStore {
         );
         Ok(result)
     }
-    pub fn attach_device(&mut self, ids: &[String], capture: &str) -> Result<()> {
-        if ids.is_empty() || capture.is_empty() {
-            return Err(ProviderError::new(ErrorKind::Corrupt));
-        }
-        let mut jobs = ids
-            .iter()
-            .map(|id| self.read(id))
-            .collect::<Result<Vec<_>>>()?;
-        if jobs
-            .iter()
-            .any(|job| job.summary["phase"] != "device-capture" || job.terminal())
-        {
-            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
-        }
-        let tx = self.0.transaction().map_err(failure)?;
-        for job in &mut jobs {
-            job.device_capture_id = Some(capture.into());
-            job.summary["phase"] = json!("queued");
-            job.summary["state"] = json!("queued");
-            tx.execute(
-                "UPDATE external_requests SET value=?2 WHERE id=?1",
-                rusqlite::params![job.id, serde_json::to_string(job).map_err(failure)?],
-            )
-            .map_err(failure)?;
-        }
-        tx.commit().map_err(failure)
-    }
 }
 #[derive(Clone, Default)]
 pub(crate) struct Session {
@@ -296,35 +267,6 @@ mod tests {
             generation: "generation".into(),
             selection_epoch: "selection".into(),
             revision: 1,
-        }
-    }
-    #[test]
-    fn maintenance_capture_attaches_atomically_and_survives_restart() {
-        let root = tempfile::tempdir().unwrap();
-        let mut db = JobStore::open(root.path()).unwrap();
-        let a = DurableJob::new(request(), true, 1, identity());
-        let mut other = request();
-        other.connection_id = "synthetic-other".into();
-        let b = DurableJob::new(other, true, 1, identity());
-        db.put(&a).unwrap();
-        db.put(&b).unwrap();
-        assert!(db
-            .attach_device(&[a.id.clone(), "missing".into()], "capture")
-            .is_err());
-        assert_eq!(db.read(&a.id).unwrap().device_capture_id, None);
-        db.attach_device(&[a.id.clone(), b.id.clone()], "capture")
-            .unwrap();
-        drop(db);
-        let db = JobStore::open(root.path()).unwrap();
-        assert_eq!(
-            db.read(&a.id).unwrap().device_capture_id.as_deref(),
-            Some("capture")
-        );
-        assert!(db.attach_device_for_test(&a.id).is_err());
-    }
-    impl JobStore {
-        fn attach_device_for_test(mut self, id: &str) -> Result<()> {
-            self.attach_device(&[id.into()], "other")
         }
     }
     #[test]

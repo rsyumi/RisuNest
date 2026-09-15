@@ -820,13 +820,13 @@ async fn commit_preparation(
                 id: connection_id.into(),
                 config,
                 descriptor,
-                capture_policy: preparation.request.capture_policy,
                 provider_repository_id: preparation
                     .recovery
                     .as_ref()
                     .map(|recovery| recovery.metadata.provider_repository_id.clone()),
                 credential_ref: credential_ref.0.clone(),
                 root_key_ref: key_ref.0.clone(),
+                capture_policy: preparation.request.capture_policy,
                 created_at_ms: now_ms(),
             };
             if let Err(error) = store.put_pending(&pending) {
@@ -1277,12 +1277,7 @@ mod tests {
             mode: ConnectionOpenMode::Existing,
             purpose: ConnectionPurpose::Backup,
             publication_strategy: ConnectionStrategy::BackupOnly,
-            scope: risunest_external_storage_format::format::Scope {
-                library: true,
-                referenced_assets: true,
-                device_settings: true,
-                device_plugins: false,
-            },
+            capture_policy: Some(super::connection::CapturePolicy::default()),
             acknowledgements: Vec::new(),
         };
         let result = insert_preparation(&state, request, None).unwrap();
@@ -1291,15 +1286,7 @@ mod tests {
 
     #[test]
     fn recovery_payload_is_authenticated_before_endpoint_review() {
-        let descriptor = Descriptor::new(
-            "synthetic-repository".into(),
-            risunest_external_storage_format::format::Scope {
-                library: true,
-                referenced_assets: true,
-                device_settings: true,
-                device_plugins: false,
-            },
-            None,
+        let descriptor = Descriptor::new("synthetic-repository".into(), None,
         )
         .unwrap();
         let stored = StoredConnection {
@@ -1317,6 +1304,7 @@ mod tests {
             provider_repository_id: "synthetic-provider-root".into(),
             credential_ref: "not-exported".into(),
             root_key_ref: "not-exported".into(),
+            capture_policy: None,
             capabilities: super::super::fake::capabilities(false),
             created_at_ms: 1,
         };
@@ -1339,15 +1327,7 @@ mod tests {
 
     #[test]
     fn recovered_google_client_override_must_keep_the_authenticated_project() {
-        let descriptor = Descriptor::new(
-            "synthetic-repository".into(),
-            risunest_external_storage_format::format::Scope {
-                library: true,
-                referenced_assets: true,
-                device_settings: false,
-                device_plugins: false,
-            },
-            Some(super::super::contract::PublicationStrategy::Sequential),
+        let descriptor = Descriptor::new("synthetic-repository".into(), Some(super::super::contract::PublicationStrategy::Sequential),
         )
         .unwrap();
         let config = super::super::contract::ConnectionConfig {

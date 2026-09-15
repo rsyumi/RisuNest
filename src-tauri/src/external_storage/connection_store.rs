@@ -276,20 +276,13 @@ mod tests {
                 location: [("root".into(), "RisuNest".into())].into(),
                 oauth_profile: None,
             },
-            descriptor: Descriptor::new(
-                "synthetic-format-repository".into(),
-                Scope {
-                    library: true,
-                    referenced_assets: true,
-                    device_settings: false,
-                    device_plugins: false,
-                },
-                None,
+            descriptor: Descriptor::new("synthetic-format-repository".into(), None,
             )
             .unwrap(),
             provider_repository_id: Some("synthetic-provider-repository".into()),
             credential_ref: "provider-v1:00000000-0000-4000-8000-000000000001".into(),
             root_key_ref: "repository-key-v1:00000000-0000-4000-8000-000000000002".into(),
+            capture_policy: None,
             created_at_ms: 1,
         }
     }

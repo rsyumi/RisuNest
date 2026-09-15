@@ -904,56 +904,29 @@ mod tests {
     }
 
     fn scope() -> Scope {
-        Scope {
-            library: true,
-            referenced_assets: true,
-            device_settings: true,
-            device_plugins: true,
-        }
+        Scope::LIBRARY
     }
 
     #[test]
     fn restore_area_selection_matches_the_renderer_contract() {
-        let available = vec![
-            "device-settings".into(),
-            "indexed-db:0073006100660065005f0070006c007500670069006e005f00730079006e007400680065007400690063".into(),
-            "local-storage".into(),
-            "localforage".into(),
-        ];
         assert_eq!(
-            restore_selection(&scope(), None, &available).unwrap(),
-            RestoreSelection {
-                library: true,
-                device_sections: available.clone(),
-            }
+            restore_selection(None).unwrap(),
+            RestoreSelection { library: true }
         );
         assert_eq!(
-            restore_selection(
-                &scope(),
-                Some(&["referencedAssets".into(), "devicePlugins".into()]),
-                &available,
-            )
-            .unwrap(),
-            RestoreSelection {
-                library: true,
-                device_sections: available[1..].to_vec(),
-            }
+            restore_selection(Some(&["referencedAssets".into()])).unwrap(),
+            RestoreSelection { library: true }
         );
     }
 
+    /// A bundle declares what it covers. Asking for coverage it does not
+    /// declare fails rather than restoring a narrowed selection.
     #[test]
-    fn restore_area_selection_rejects_duplicates_and_incomplete_device_scope() {
-        let available = vec!["device-settings".into(), "local-storage".into()];
-        assert!(restore_selection(
-            &scope(),
-            Some(&["library".into(), "library".into()]),
-            &available,
-        )
-        .is_err());
-        assert!(restore_selection(&scope(), Some(&["devicePlugins".into()]), &available,).is_err());
-        assert!(restore_selection(&scope(), Some(&["deviceSettings".into()]), &[],).is_err());
-        assert!(restore_selection(&scope(), Some(&[]), &available).is_err());
-        assert!(restore_selection(&scope(), Some(&["library".into()]), &available).is_err());
+    fn restore_area_selection_rejects_duplicates_and_undeclared_areas() {
+        assert!(restore_selection(Some(&["library".into(), "library".into()])).is_err());
+        assert!(restore_selection(Some(&["devicePlugins".into()])).is_err());
+        assert!(restore_selection(Some(&["deviceSettings".into()])).is_err());
+        assert!(restore_selection(Some(&[])).is_err());
     }
 
     #[test]

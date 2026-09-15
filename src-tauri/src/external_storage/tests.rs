@@ -344,7 +344,7 @@ fn fake_snapshot_discovery_and_lost_upload_reconcile_use_complete_immutable_obje
             repository_id: repository.repository_id.clone(),
             job_id: "synthetic-job".into(),
             object_id: "snapshot-a".into(),
-            role: ObjectRole::Snapshot,
+            role: ObjectRole::SyncState,
             byte_length: 18,
             sha256: digest,
         };

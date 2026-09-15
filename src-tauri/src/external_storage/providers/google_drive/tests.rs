@@ -988,7 +988,7 @@ fn a_resumable_session_continues_from_the_offset_the_service_confirmed() {
         let (provider, repository) = opened(&server, &test, &cancel).await;
         let directory = tempfile::tempdir().unwrap();
         let source = spool(directory.path(), "pack", &payload);
-        let intent = intent(&repository, "object-2", ObjectRole::Snapshot, &payload);
+        let intent = intent(&repository, "object-2", ObjectRole::SyncState, &payload);
         let resume = provider
             .begin_upload(&repository, &intent, &cancel)
             .await
@@ -1355,7 +1355,7 @@ fn listing_pages_a_single_role_with_a_cursor_and_bounded_limits() {
             json!({
                 "files": [
                     { "id": "snap-1", "size": "10", "version": "2",
-                      "appProperties": { "risunestRole": "snapshot", "risunestObjectId": "s1" } }
+                      "appProperties": { "risunestRole": "state", "risunestObjectId": "s1" } }
                 ],
                 "nextPageToken": "page-2"
             }),
@@ -1366,7 +1366,7 @@ fn listing_pages_a_single_role_with_a_cursor_and_bounded_limits() {
                 "files": [
                     { "id": "snap-2", "size": "12", "version": "3",
                       "sha256Checksum": hash(b"snapshot-two"),
-                      "appProperties": { "risunestRole": "snapshot", "risunestObjectId": "s2" } }
+                      "appProperties": { "risunestRole": "state", "risunestObjectId": "s2" } }
                 ]
             }),
         ));
@@ -1418,7 +1418,7 @@ fn listing_pages_a_single_role_with_a_cursor_and_bounded_limits() {
         let lines = request_lines(&server);
         assert_eq!(lines.len(), 5);
         assert!(lines[3].contains("pageSize=1"));
-        assert!(lines[3].contains("value%3D%27snapshot%27"));
+        assert!(lines[3].contains("value%3D%27state%27"));
         assert!(lines[4].contains("pageToken=page-2"));
         assert_eq!(reserved_units(&test, "queries"), vec![5, 5, 100, 100, 100]);
     });
