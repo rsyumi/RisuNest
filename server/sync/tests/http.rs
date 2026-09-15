@@ -418,6 +418,7 @@ async fn tcp_vertical_slice_conditional_head_exact_bytes_receipt_and_revoke() {
             ("afterSeq", "0"),
             ("afterOrdinal", "1024"),
             ("throughSeq", "1"),
+            ("domains", "library"),
             ("limit", "1"),
         ])
         .send()
@@ -843,6 +844,7 @@ async fn chunk_upload_delta_download_checkpoint_and_durable_job_over_tcp() {
     assert_eq!(s.head(&s.a).await.seq.as_str(), "1");
     let checkpoint = s
         .auth(s.client.post(format!("{}/checkpoints", s.base)), &s.b)
+        .json(&serde_json::json!({"domains":["library"]}))
         .send()
         .await
         .unwrap()
@@ -866,5 +868,11 @@ async fn chunk_upload_delta_download_checkpoint_and_durable_job_over_tcp() {
         .await
         .unwrap();
     assert_eq!(page["records"].as_array().unwrap().len(), 1);
-    assert!(page["nextKey"].is_string());
+    assert_eq!(
+        page["checkpoint"]["domains"],
+        serde_json::json!(["library"])
+    );
+    assert_eq!(page["records"][0]["domain"], "library");
+    assert_eq!(page["next"]["domain"], "library");
+    assert!(page["next"]["key"].is_string());
 }

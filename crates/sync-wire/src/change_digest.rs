@@ -40,11 +40,7 @@ impl ChangeDigest {
         }
         Ok(())
     }
-    fn add(
-        &mut self,
-        order: (Option<Domain>, &str),
-        value: &impl serde::Serialize,
-    ) -> Result<()> {
+    fn add(&mut self, order: (Option<Domain>, &str), value: &impl serde::Serialize) -> Result<()> {
         if self
             .prior
             .as_ref()

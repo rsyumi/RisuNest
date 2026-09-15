@@ -1,6 +1,7 @@
 mod common;
 use common::*;
 use risunest_sync_server::store::{Device, Store};
+use risunest_sync_wire::Domain;
 use risunest_sync_wire::{
     descriptor::{build_reference_tree, RecordDescriptor},
     hash, ChangeSet, RecordChange, RecordVersion, TerminalStatus,
@@ -22,6 +23,7 @@ fn related(store: &Store, device: &Device, key: &str, target: &str) -> ChangeSet
     store.put_object(device, &digest, &bytes).unwrap();
     ChangeSet {
         changes: vec![RecordChange {
+            domain: Domain::Library,
             key: key.into(),
             before: RecordVersion::Absent,
             after: RecordVersion::Live {
@@ -45,8 +47,9 @@ fn parent_delete_cannot_orphan_child_and_joint_delete_is_atomic() {
     let intent = stage(&store, &a, &head, 1, &c);
     let head = store.commit(&a, &intent, &head.etag()).unwrap().head;
     let delete = |key: &str| RecordChange {
+        domain: Domain::Library,
         key: key.into(),
-        before: store.record(key).unwrap(),
+        before: store.record(Domain::Library, key).unwrap(),
         after: RecordVersion::Tombstone {
             deletion_id: format!("delete-{key}"),
         },
@@ -81,7 +84,10 @@ fn missing_relation_fails_with_terminal_receipt_and_no_partial_record() {
     let intent = stage(&store, &a, &head, 1, &c);
     let failed = store.commit(&a, &intent, &head.etag()).unwrap();
     assert_eq!(failed.error.as_deref(), Some("missing-related-record"));
-    assert_eq!(store.record("child").unwrap(), RecordVersion::Absent);
+    assert_eq!(
+        store.record(Domain::Library, "child").unwrap(),
+        RecordVersion::Absent
+    );
     assert_eq!(store.head().unwrap(), head);
     assert_eq!(store.commit(&a, &intent, &head.etag()).unwrap(), failed);
 }

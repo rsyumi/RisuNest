@@ -13,7 +13,7 @@ use axum::{
     Extension, Json, Router,
 };
 use risunest_sync_wire::{
-    batch, canonical, ChangeSet, CommitIntent, Receipt, Sequence, TerminalStatus,
+    batch, canonical, ChangeSet, CommitIntent, Domain, Receipt, Sequence, TerminalStatus,
     MAX_METADATA_BYTES,
 };
 use serde::Deserialize;
@@ -378,7 +378,15 @@ struct ChangesQuery {
     after_seq: Sequence,
     after_ordinal: Sequence,
     through_seq: Sequence,
+    domains: String,
     limit: Option<usize>,
+}
+/// Sections are named explicitly. There is no implicit all-sections read.
+fn query_domains(value: &str) -> Result<Vec<Domain>> {
+    value
+        .split(',')
+        .map(|name| Ok(Domain::try_from(name)?))
+        .collect()
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -405,6 +413,7 @@ async fn changes(State(app): State<App>, Query(query): Query<ChangesQuery>) -> R
             &query.epoch,
             &cursor,
             &query.through_seq,
+            &query_domains(&query.domains)?,
             query.limit.unwrap_or(128),
         )?)
         .into_response())
@@ -780,7 +789,7 @@ async fn receipt(
 #[serde(deny_unknown_fields)]
 struct Ack {
     epoch: String,
-    seq: Sequence,
+    sections: std::collections::BTreeMap<Domain, Sequence>,
 }
 async fn ack(
     State(app): State<App>,
@@ -788,7 +797,7 @@ async fn ack(
     body: Bytes,
 ) -> Result<StatusCode> {
     let ack: Ack = canonical::decode(&body, MAX_METADATA_BYTES)?;
-    blocking(move || app.store.acknowledge(&device, &ack.epoch, &ack.seq)).await?;
+    blocking(move || app.store.acknowledge(&device, &ack.epoch, &ack.sections)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -880,6 +889,7 @@ async fn cancel_upload(
 struct PinRequest {
     epoch: String,
     after_seq: Sequence,
+    domains: Vec<Domain>,
 }
 async fn pin_changes(
     State(app): State<App>,
@@ -890,10 +900,12 @@ async fn pin_changes(
     blocking(move || {
         Ok((
             StatusCode::CREATED,
-            Json(
-                app.store
-                    .pin_changes(&device, &request.epoch, &request.after_seq)?,
-            ),
+            Json(app.store.pin_changes(
+                &device,
+                &request.epoch,
+                &request.after_seq,
+                &request.domains,
+            )?),
         )
             .into_response())
     })
@@ -934,14 +946,21 @@ async fn release_pin(
     blocking(move || app.store.release_pin(&device, &id)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointRequest {
+    domains: Vec<Domain>,
+}
 async fn create_checkpoint(
     State(app): State<App>,
     Extension(device): Extension<Device>,
+    body: Bytes,
 ) -> Result<Response> {
+    let request: CheckpointRequest = canonical::decode(&body, MAX_METADATA_BYTES)?;
     blocking(move || {
         Ok((
             StatusCode::CREATED,
-            Json(app.store.create_checkpoint(&device)?),
+            Json(app.store.create_checkpoint(&device, &request.domains)?),
         )
             .into_response())
     })
@@ -950,6 +969,7 @@ async fn create_checkpoint(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CheckpointQuery {
+    after_domain: Option<Domain>,
     after_key: Option<String>,
     limit: Option<usize>,
 }
@@ -959,11 +979,16 @@ async fn checkpoint_page(
     Path(id): Path<String>,
     Query(query): Query<CheckpointQuery>,
 ) -> Result<Response> {
+    let after = match (query.after_domain, query.after_key) {
+        (Some(domain), Some(key)) => Some(crate::store::CheckpointCursor { domain, key }),
+        (None, None) => None,
+        _ => return Err(Error::new("invalid-cursor", 400)),
+    };
     blocking(move || {
         Ok(Json(app.store.checkpoint_page(
             &device,
             &id,
-            query.after_key.as_deref(),
+            after.as_ref(),
             query.limit.unwrap_or(128),
         )?)
         .into_response())

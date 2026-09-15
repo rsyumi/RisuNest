@@ -1,7 +1,7 @@
 mod common;
 use common::*;
 use risunest_sync_server::store::Store;
-use risunest_sync_wire::{hash, TerminalStatus};
+use risunest_sync_wire::{hash, Domain, TerminalStatus};
 
 #[test]
 #[ignore = "child process fixture, invoked by abrupt_process_exit_reopens_wal"]
@@ -88,7 +88,7 @@ fn sqlite_failure_rolls_back_records_head_receipt_and_watermark_together() {
     assert!(store.commit(&a, &intent, &head.etag()).is_err());
     assert_eq!(store.head().unwrap(), head);
     assert_eq!(
-        store.record("a").unwrap(),
+        store.record(Domain::Library, "a").unwrap(),
         risunest_sync_wire::RecordVersion::Absent
     );
     db.execute_batch("DROP TRIGGER injected_failure").unwrap();

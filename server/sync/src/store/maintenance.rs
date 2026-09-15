@@ -1,6 +1,6 @@
 use super::{json, random_id, uploads::now, Device, Store};
 use crate::{Error, Result};
-use risunest_sync_wire::{canonical, hash, Sequence};
+use risunest_sync_wire::{Domain, RemoteHead, Sequence};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 
@@ -85,20 +85,40 @@ impl Store {
         tx.execute("DELETE FROM object_leases WHERE expires<=?1 OR device IN (SELECT id FROM devices WHERE revoked=1)",[current])?;
         tx.execute("DELETE FROM staged_changes WHERE (expires<=?1 OR device IN (SELECT id FROM devices WHERE revoked=1)) AND id NOT IN (SELECT stage FROM commit_jobs)",[current])?;
         let mut head = Self::read_head(&tx)?;
-        let mut floor = head.seq.clone();
+        let mut pinned = head.seq.clone();
         {
-            let mut stmt = tx.prepare(
-                "SELECT ack FROM devices WHERE revoked=0 UNION ALL SELECT after_seq FROM read_pins",
-            )?;
+            let mut stmt = tx.prepare("SELECT after_seq FROM read_pins")?;
             for value in stmt.query_map([], |r| r.get::<_, String>(0))? {
-                floor = floor.min(Sequence::try_from(value?)?);
+                pinned = pinned.min(Sequence::try_from(value?)?);
             }
         }
-        floor = floor.max(head.min_retained_seq.clone());
-        tx.execute(
-            "DELETE FROM changes WHERE (length(seq),seq)<=(?1,?2)",
-            params![floor.as_str().len() as i64, floor.as_str()],
-        )?;
+        // One section's acknowledgement never reclaims another section's journal.
+        let mut floor: Option<Sequence> = None;
+        for domain in Domain::ALL {
+            let section_floor = Self::read_section_ack_floor(&tx, domain, &head.seq)?
+                .min(pinned.clone())
+                .max(head.section(domain)?.gc_floor.clone());
+            tx.execute(
+                "DELETE FROM changes WHERE domain=?1 AND (length(seq),seq)<=(?2,?3)",
+                params![
+                    domain.as_str(),
+                    section_floor.as_str().len() as i64,
+                    section_floor.as_str()
+                ],
+            )?;
+            floor = Some(match floor {
+                Some(value) => value.min(section_floor.clone()),
+                None => section_floor.clone(),
+            });
+            let section = head
+                .sections
+                .get_mut(&domain)
+                .ok_or(Error::new("corrupt-metadata", 503))?;
+            section.gc_floor = section_floor;
+        }
+        let floor = floor
+            .ok_or(Error::new("corrupt-metadata", 503))?
+            .max(head.min_retained_seq.clone());
         // Receipts are pruned only once their resulting head is acknowledged.
         tx.execute("DELETE FROM receipts WHERE created<=unixepoch()-86400 AND (length(json_extract(body,'$.head.seq')),json_extract(body,'$.head.seq'))<=(?1,?2)",params![floor.as_str().len() as i64,floor.as_str()])?;
         tx.execute(
@@ -168,16 +188,8 @@ impl Store {
     pub fn rotate_restored_epoch(&self) -> Result<()> {
         let mut db = self.db()?;
         let tx = db.transaction()?;
-        let mut head = Self::read_head(&tx)?;
-        head.epoch = random_id()?;
-        head.seq = 0.into();
-        head.min_retained_seq = 0.into();
-        head.head_id = hash(&canonical::encode(&[
-            "risunest-sync-genesis-v1",
-            &head.library_id,
-            &head.epoch,
-        ])?);
-        tx.execute_batch("DELETE FROM changes; DELETE FROM commits; DELETE FROM receipts; DELETE FROM commit_jobs; DELETE FROM staged_changes; DELETE FROM read_pins; DELETE FROM checkpoints; DELETE FROM uploads; DELETE FROM download_deltas; DELETE FROM transfer_recipes; DELETE FROM object_leases; DELETE FROM scope_versions; UPDATE devices SET ack='0';")?;
+        let head = RemoteHead::genesis(Self::read_head(&tx)?.library_id, random_id()?)?;
+        tx.execute_batch("DELETE FROM changes; DELETE FROM commits; DELETE FROM receipts; DELETE FROM commit_jobs; DELETE FROM staged_changes; DELETE FROM read_pins; DELETE FROM checkpoints; DELETE FROM uploads; DELETE FROM download_deltas; DELETE FROM transfer_recipes; DELETE FROM object_leases; DELETE FROM scope_versions; DELETE FROM device_section_acks;")?;
         tx.execute("UPDATE library SET head=?1", [json(&head)?])?;
         tx.commit()?;
         Ok(())
