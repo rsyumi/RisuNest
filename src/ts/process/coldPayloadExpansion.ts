@@ -60,6 +60,7 @@ export async function expandColdPayloads(
         try {
             value = await read(key)
         } catch (error) {
+            if ((error as { name?: string })?.name === 'AbortError') throw error
             console.error(`Failed to read the cold storage payload ${key}:`, error)
             unavailableKeys.push(key)
             return null

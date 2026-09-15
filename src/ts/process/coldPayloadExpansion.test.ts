@@ -92,6 +92,19 @@ describe('expandColdPayloads', () => {
         expect(result.unavailableKeys).toEqual(['boom'])
     })
 
+    it('rethrows an abort instead of marking every key unavailable', async () => {
+        const db = {
+            characters: [{ chaId: 'cha-1', chats: [placeholderChat('a'), placeholderChat('b')] }],
+        } as any
+
+        const read = vi.fn(async () => {
+            throw new DOMException('aborted', 'AbortError')
+        })
+
+        await expect(expandColdPayloads(db, read)).rejects.toThrow('aborted')
+        expect(read).toHaveBeenCalledTimes(1)
+    })
+
     it('normalizes PocketRisu swipes while expanding', async () => {
         const db = { characters: [{ chaId: 'cha-1', chats: [placeholderChat('pocket')] }] } as any
 

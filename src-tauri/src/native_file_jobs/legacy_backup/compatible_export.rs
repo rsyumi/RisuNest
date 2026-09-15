@@ -1,13 +1,13 @@
 //! Strict foreign-app export. The authoritative detached SQL snapshot is read
 //! one record at a time; no complete database is reconstructed in the WebView.
 use super::compatible_projection::{
-    pocket_swipes, rewrite_assets, rewrite_plugin, Losses, Projector,
+    pocket_swipes, rewrite_assets, rewrite_plugin, Projector,
 };
 use super::*;
 use crate::persistent_store::owner_projection::OwnerManifestProjector;
 use crate::persistent_store::{ReadTarget, StoreError};
-use rusqlite::{params, Connection, OptionalExtension};
-use std::path::{Path, PathBuf};
+use rusqlite::{params, Connection};
+use std::path::Path;
 const COMPRESSED_MAGIC: &[u8] = b"\0RISUSAVE\0\x08";
 
 pub(crate) fn export_compatible_local_backup(
@@ -41,13 +41,10 @@ pub(crate) fn export_compatible_local_backup(
         if !matches!(
             inventory.asset_authority,
             AssetRepositoryAuthorityState::V2 { .. }
-        ) || !matches!(
-            inventory.cold_authority,
-            ColdPayloadAuthorityState::V2 { .. }
         ) {
             return Err(NativeJobError::new(
                 "capability-unavailable",
-                "compatibility export requires migrated attachment repositories",
+                "compatibility export requires a migrated attachment repository",
             ));
         }
         durable = Some(
@@ -136,76 +133,8 @@ pub(crate) fn export_compatible_local_backup(
                 .entries
                 .iter()
                 .map(|entry| entry.logical_name.clone())
-                .chain(
-                    attachments
-                        .cold_sources
-                        .iter()
-                        .map(|cold| cold.logical_name.clone()),
-                )
                 .collect(),
         );
-        let mut cold_paths = HashMap::new();
-        for source in &attachments.cold_sources {
-            let id = source
-                .logical_name
-                .strip_prefix("coldstorage_")
-                .and_then(|s| s.strip_suffix(".json"))
-                .unwrap();
-            cold_paths.insert(id.to_owned(), source.source.clone());
-        }
-        for (old, new) in &attachments.cold_replacements {
-            if let Some(path) = cold_paths.get(new).cloned() {
-                cold_paths.insert(old.clone(), path);
-            }
-        }
-        let mut excluded_cold_groups = 0u64;
-        let mut excluded_cold_bytes = 0u64;
-        for cold in &attachments.cold_sources {
-            let mut value: Value = serde_json::from_reader(BufReader::new(
-                File::open(&cold.source).map_err(io_job_error)?,
-            ))
-            .map_err(|_| NativeJobError::new("invalid-source", "cold JSON is invalid"))?;
-            if target == CompatibilityTarget::PocketRisu
-                && value.get("character").is_some_and(|c| c["type"] == "group")
-            {
-                excluded_cold_groups += 1;
-                let bytes = std::fs::metadata(&cold.source).map_err(io_job_error)?.len();
-                excluded_cold_bytes = excluded_cold_bytes.saturating_add(bytes);
-                attachments.preserved_files = attachments.preserved_files.saturating_sub(1);
-                attachments.preserved_bytes = attachments.preserved_bytes.saturating_sub(bytes);
-                continue;
-            }
-            project_cold(
-                &mut value,
-                &mut projector,
-                &attachments.replacements,
-                &attachments.cold_replacements,
-                &attachments.inlay_replacements,
-            )?;
-            let path = owned_directory.join(format!("projected-{}", cold.logical_name));
-            let mut file = File::create(&path).map_err(io_job_error)?;
-            serde_json::to_writer(&mut file, &value).map_err(|_| {
-                NativeJobError::new("invalid-source", "cold JSON serialization failed")
-            })?;
-            file.sync_all().map_err(io_job_error)?;
-            let source_bytes = std::fs::metadata(&cold.source).map_err(io_job_error)?.len();
-            let target_bytes = file.metadata().map_err(io_job_error)?.len();
-            attachments.preserved_bytes = attachments
-                .preserved_bytes
-                .saturating_sub(source_bytes)
-                .saturating_add(target_bytes);
-            attachments.entries.push(LegacyBackupWriteEntry {
-                logical_name: cold.logical_name.clone(),
-                source: LegacyBackupWriteSource::File(path),
-            });
-        }
-        if excluded_cold_groups > 0 {
-            attachments.losses.push((
-                "unsupported-group-cold-payload".into(),
-                excluded_cold_groups,
-                excluded_cold_bytes,
-            ));
-        }
         let database = owned_directory.join("compatible-database.risudat");
         let counts = write_database(
             &reader.connection,
@@ -213,9 +142,7 @@ pub(crate) fn export_compatible_local_backup(
             &owner,
             &mut projector,
             &attachments.replacements,
-            &attachments.cold_replacements,
             &attachments.inlay_replacements,
-            &cold_paths,
             &database,
             &cancellation,
         )?;
@@ -328,7 +255,6 @@ pub(crate) fn export_compatible_local_backup(
             if !attachments.losses.iter().any(|item| &item.0 == code) {
                 let count = match code.as_str() {
                     "asset-paths-remapped" => attachments.replacements.len(),
-                    "cold-ids-remapped" => attachments.cold_replacements.len(),
                     "inlay-ids-remapped" => attachments.inlay_replacements.len(),
                     _ => 1,
                 };
@@ -464,9 +390,7 @@ fn write_database(
     owner: &OwnerManifestProjector,
     projector: &mut Projector,
     assets: &HashMap<String, String>,
-    cold: &HashMap<String, String>,
     inlays: &HashMap<String, String>,
-    cold_paths: &HashMap<String, PathBuf>,
     path: &Path,
     cancel: &dyn CancellationProbe,
 ) -> Result<(u64, u64, u64, HashSet<String>), NativeJobError> {
@@ -557,39 +481,12 @@ fn write_database(
                 )
                 .map_err(sql)?,
         )?;
-        if projector.target == CompatibilityTarget::PocketRisu
-            && character
-                .get("coldstorage")
-                .and_then(Value::as_str)
-                .is_some()
-        {
-            hydrate_character(&mut character, cold_paths, &mut HashSet::new())?;
-            owner
-                .project_character(id, object(&mut character)?)
-                .map_err(store_job_error)?;
-            project_cold_character(&mut character, projector, assets, cold, inlays, true)?;
-            conversations += character
-                .get("chats")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-                .unwrap_or(0) as u64;
-            write_value(&mut writer, &character)?;
-            projector.losses.add("converted-cold-character", 1);
-            let affected = projector
-                .affected_conversations
-                .get("converted-cold-character")
-                .copied()
-                .unwrap_or(0)
-                + character["chats"].as_array().map(Vec::len).unwrap_or(0) as u64;
-            projector.known_conversation_scope("converted-cold-character", affected);
-            continue;
-        }
         owner
             .project_character(id, object(&mut character)?)
             .map_err(store_job_error)?;
         object(&mut character)?.remove("chats");
         rewrite_assets(&mut character, assets);
-        rewrite_references(&mut character, cold, inlays, false);
+        rewrite_references(&mut character, inlays, false);
         let kind = if character["type"] == "group" {
             "groupChat"
         } else {
@@ -615,30 +512,7 @@ fn write_database(
             let mut chat = parse(row.get(1).map_err(sql)?)?;
             let recovery = object(&mut chat)?.remove("rerollRecovery");
             object(&mut chat)?.remove("message");
-            if projector.target == CompatibilityTarget::PocketRisu {
-                let first:Option<String>=connection.query_row("SELECT value FROM messages WHERE generation=?1 AND character_id=?2 AND conversation_id=?3 ORDER BY message_index ASC LIMIT 1",params![generation,id,chat_id],|r|r.get(0)).optional().map_err(sql)?;
-                if let Some(first) = first {
-                    let first = parse(first)?;
-                    if let Some(key) = first["data"]
-                        .as_str()
-                        .and_then(|s| s.strip_prefix(COLD_HEADER))
-                    {
-                        let payload = load_cold(key, cold_paths)?;
-                        apply_cold_chat(&mut chat, payload)?;
-                        hydrate_chat(&mut chat, cold_paths, &mut HashSet::new())?;
-                        if let Some(recovery) = recovery {
-                            chat["rerollRecovery"] = recovery;
-                        }
-                        project_cold(&mut chat, projector, assets, cold, inlays)?;
-                        write_value(&mut writer, &chat)?;
-                        actual += 1;
-                        projector.losses.add("converted-cold-chat", 1);
-                        projector.record_conversation(&before);
-                        continue;
-                    }
-                }
-            }
-            rewrite_references(&mut chat, cold, inlays, false);
+            rewrite_references(&mut chat, inlays, false);
             let chat = projector.project("Chat", &chat)?;
             map_header(&mut writer, chat.as_object().unwrap().len() as u64 + 1)?;
             write_pairs(&mut writer, &chat)?;
@@ -650,7 +524,6 @@ fn write_database(
                 &chat_id,
                 recovery.as_ref(),
                 projector,
-                cold,
                 inlays,
                 &mut writer,
                 cancel,
@@ -758,7 +631,6 @@ fn write_messages(
     chat: &str,
     recovery: Option<&Value>,
     projector: &mut Projector,
-    cold: &HashMap<String, String>,
     inlays: &HashMap<String, String>,
     writer: &mut dyn Write,
     cancel: &dyn CancellationProbe,
@@ -774,7 +646,7 @@ fn write_messages(
             } else if value.get("responseVariants").is_some() {
                 projector.losses.add("unsupported-reroll-candidates", 1)
             }
-            rewrite_references(&mut value, cold, inlays, true);
+            rewrite_references(&mut value, inlays, true);
             write_value(writer, &projector.project("Message", &value)?)
         })?;
         if actual as u64 != total {
@@ -839,7 +711,7 @@ fn write_messages(
         } else if value.get("responseVariants").is_some() {
             projector.losses.add("unsupported-reroll-candidates", 1)
         }
-        rewrite_references(&mut value, cold, inlays, true);
+        rewrite_references(&mut value, inlays, true);
         write_value(writer, &projector.project("Message", &value)?)?;
         written += 1;
         Ok(())
@@ -876,57 +748,20 @@ fn write_messages(
     Ok(())
 }
 
-const COLD_HEADER: &str = "\u{ef01}COLDSTORAGE\u{ef01}";
-fn rewrite_references(
-    value: &mut Value,
-    cold: &HashMap<String, String>,
-    inlays: &HashMap<String, String>,
-    message: bool,
-) {
+fn rewrite_references(value: &mut Value, inlays: &HashMap<String, String>, message: bool) {
     if let Some(object) = value.as_object_mut() {
-        for key in ["coldstorage", "coldStoragedChats"] {
-            if let Some(value) = object.get_mut(key) {
-                match value {
-                    Value::String(s) => {
-                        if let Some(new) = cold.get(s) {
-                            *s = new.clone()
-                        }
-                    }
-                    Value::Array(items) => {
-                        for item in items {
-                            if let Value::String(s) = item {
-                                if let Some(new) = cold.get(s) {
-                                    *s = new.clone()
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
         if message {
             for key in ["data", "swipes"] {
                 if let Some(value) = object.get_mut(key) {
-                    rewrite_message_text(value, cold, inlays)
+                    rewrite_message_text(value, inlays)
                 }
             }
         }
     }
 }
-fn rewrite_message_text(
-    value: &mut Value,
-    cold: &HashMap<String, String>,
-    inlays: &HashMap<String, String>,
-) {
+fn rewrite_message_text(value: &mut Value, inlays: &HashMap<String, String>) {
     match value {
         Value::String(text) => {
-            if let Some(id) = text.strip_prefix(COLD_HEADER) {
-                if let Some(new) = cold.get(id) {
-                    *text = format!("{COLD_HEADER}{new}");
-                    return;
-                }
-            }
             // Inlay grammar is explicit. Never replace bare IDs or arbitrary substrings.
             for (old, new) in inlays {
                 for kind in ["inlay", "inlayed", "inlayeddata"] {
@@ -939,243 +774,11 @@ fn rewrite_message_text(
         }
         Value::Array(items) => {
             for item in items {
-                rewrite_message_text(item, cold, inlays)
+                rewrite_message_text(item, inlays)
             }
         }
         _ => {}
     }
-}
-fn project_cold(
-    value: &mut Value,
-    projector: &mut Projector,
-    assets: &HashMap<String, String>,
-    cold: &HashMap<String, String>,
-    inlays: &HashMap<String, String>,
-) -> Result<(), NativeJobError> {
-    if let Some(messages) = value.as_array_mut() {
-        for message in messages {
-            if projector.target == CompatibilityTarget::PocketRisu {
-                pocket_swipes(message, &mut projector.losses)
-            }
-            rewrite_references(message, cold, inlays, true);
-            *message = projector.project("Message", message)?;
-        }
-        return Ok(());
-    }
-    if value.get("character").is_some() {
-        projector.losses.add(
-            "unsupported-cold-wrapper-field",
-            value
-                .as_object()
-                .map(|o| o.len().saturating_sub(1) as u64)
-                .unwrap_or(0),
-        );
-        let mut character = value.get_mut("character").unwrap().take();
-        project_cold_character(&mut character, projector, assets, cold, inlays, false)?;
-        *value = serde_json::json!({"character":character});
-        return Ok(());
-    }
-    if value.get("message").is_some() {
-        recover_materialized(value, &mut projector.losses)?;
-        let mut messages = value.get_mut("message").unwrap().take();
-        if !messages.is_array() {
-            return Err(NativeJobError::new(
-                "invalid-source",
-                "cold chat messages must be an array",
-            ));
-        }
-        project_cold(&mut messages, projector, assets, cold, inlays)?;
-        object(value)?.remove("message");
-        rewrite_references(value, cold, inlays, false);
-        *value = projector.project("Chat", value)?;
-        value["message"] = messages;
-        return Ok(());
-    }
-    Err(NativeJobError::new(
-        "unsupported-projection",
-        "cold payload shape is not supported by target",
-    ))
-}
-
-fn load_cold(key: &str, paths: &HashMap<String, PathBuf>) -> Result<Value, NativeJobError> {
-    let path = paths.get(key).ok_or_else(|| {
-        NativeJobError::new("invalid-source", "referenced cold payload is missing")
-    })?;
-    serde_json::from_reader(BufReader::new(File::open(path).map_err(io_job_error)?))
-        .map_err(|_| NativeJobError::new("invalid-source", "cold payload JSON is invalid"))
-}
-fn hydrate_character(
-    character: &mut Value,
-    paths: &HashMap<String, PathBuf>,
-    visiting: &mut HashSet<String>,
-) -> Result<(), NativeJobError> {
-    if let Some(key) = character
-        .get("coldstorage")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-    {
-        if !visiting.insert(key.clone()) || visiting.len() > 128 {
-            return Err(NativeJobError::new(
-                "invalid-source",
-                "cold character reference cycle",
-            ));
-        }
-        let payload = load_cold(&key, paths)?;
-        let payload = payload
-            .get("character")
-            .and_then(Value::as_object)
-            .ok_or_else(|| {
-                NativeJobError::new("invalid-source", "cold character payload is missing")
-            })?;
-        if payload.get("chaId") != character.get("chaId") {
-            return Err(NativeJobError::new(
-                "invalid-source",
-                "cold character identity does not match its owner",
-            ));
-        }
-        let target = object(character)?;
-        target.remove("coldstorage");
-        target.remove("coldStoragedChats");
-        for (key, value) in payload {
-            target.insert(key.clone(), value.clone());
-        }
-        hydrate_character(character, paths, visiting)?;
-        visiting.remove(&key);
-    }
-    if let Some(chats) = character.get_mut("chats").and_then(Value::as_array_mut) {
-        for chat in chats {
-            hydrate_chat(chat, paths, visiting)?;
-        }
-    }
-    Ok(())
-}
-fn apply_cold_chat(chat: &mut Value, payload: Value) -> Result<(), NativeJobError> {
-    if payload.is_array() {
-        chat["message"] = payload;
-        return Ok(());
-    }
-    let payload = payload.as_object().ok_or_else(|| {
-        NativeJobError::new("invalid-source", "cold chat is not an object or array")
-    })?;
-    if !payload.get("message").is_some_and(Value::is_array) {
-        return Err(NativeJobError::new(
-            "invalid-source",
-            "cold chat has no messages",
-        ));
-    }
-    // Pocket server restoreColdStorageChatsInDb explicitly restores these fields.
-    for key in ["message", "hypaV3Data", "scriptstate", "localLore"] {
-        if let Some(value) = payload.get(key) {
-            chat[key] = value.clone();
-        }
-    }
-    Ok(())
-}
-fn hydrate_chat(
-    chat: &mut Value,
-    paths: &HashMap<String, PathBuf>,
-    visiting: &mut HashSet<String>,
-) -> Result<(), NativeJobError> {
-    let key = chat
-        .get("message")
-        .and_then(Value::as_array)
-        .and_then(|m| m.first())
-        .and_then(|m| m.get("data"))
-        .and_then(Value::as_str)
-        .and_then(|s| s.strip_prefix(COLD_HEADER))
-        .map(str::to_owned);
-    if let Some(key) = key {
-        if !visiting.insert(key.clone()) || visiting.len() > 128 {
-            return Err(NativeJobError::new(
-                "invalid-source",
-                "cold chat reference cycle",
-            ));
-        }
-        apply_cold_chat(chat, load_cold(&key, paths)?)?;
-        hydrate_chat(chat, paths, visiting)?;
-        visiting.remove(&key);
-    }
-    Ok(())
-}
-fn recover_materialized(chat: &mut Value, losses: &mut Losses) -> Result<(), NativeJobError> {
-    let recovery = object(chat)?.remove("rerollRecovery");
-    let Some(recovery) = recovery.filter(|r| r["phase"] == "generating") else {
-        return Ok(());
-    };
-    let messages = chat["message"].as_array().ok_or_else(|| {
-        NativeJobError::new("invalid-source", "cold recovery message array is missing")
-    })?;
-    let anchor = recovery["anchorId"]
-        .as_str()
-        .filter(|id| !id.is_empty())
-        .and_then(|id| messages.iter().position(|m| m["chatId"] == id));
-    let start = anchor
-        .map(|n| n + 1)
-        .unwrap_or_else(|| recovery["startIndex"].as_u64().unwrap_or(0) as usize)
-        .min(messages.len());
-    let original = recovery["original"].as_array().ok_or_else(|| {
-        NativeJobError::new("invalid-source", "cold recovery original is missing")
-    })?;
-    let mut recovered = messages[..start].to_vec();
-    recovered.extend(original.iter().cloned());
-    for message in &messages[start..] {
-        let owned = message["chatId"]
-            .as_str()
-            .and_then(|id| recovery["outputs"].get(id));
-        if !owned.is_some_and(|owned| {
-            serde_json::to_string(owned).ok() == serde_json::to_string(message).ok()
-        }) {
-            recovered.push(message.clone());
-        }
-    }
-    chat["message"] = Value::Array(recovered);
-    losses.add("converted-interrupted-reroll", 1);
-    Ok(())
-}
-fn project_cold_character(
-    character: &mut Value,
-    projector: &mut Projector,
-    assets: &HashMap<String, String>,
-    cold: &HashMap<String, String>,
-    inlays: &HashMap<String, String>,
-    record_conversations: bool,
-) -> Result<(), NativeJobError> {
-    let mut chats = object(character)?
-        .remove("chats")
-        .unwrap_or(Value::Array(vec![]));
-    let chat_items = chats.as_array_mut().ok_or_else(|| {
-        NativeJobError::new("invalid-source", "cold character chats must be an array")
-    })?;
-    for chat in chat_items {
-        if !chat.is_object() {
-            return Err(NativeJobError::new(
-                "invalid-source",
-                "cold character chat must be an object",
-            ));
-        }
-        let before = projector.losses.0.clone();
-        project_cold(chat, projector, assets, cold, inlays)?;
-        if record_conversations {
-            projector.record_conversation(&before);
-        }
-    }
-    rewrite_assets(character, assets);
-    rewrite_references(character, cold, inlays, false);
-    let kind = if character["type"] == "group" {
-        "groupChat"
-    } else {
-        "character"
-    };
-    if projector.target == CompatibilityTarget::PocketRisu && kind == "groupChat" {
-        return Err(NativeJobError::new(
-            "unsupported-projection",
-            "Pocket cold payload contains an excluded group",
-        ));
-    }
-    *character = projector.project(kind, character)?;
-    character["chats"] = chats;
-    *character = projector.project(kind, character)?;
-    Ok(())
 }
 fn map_header(writer: &mut dyn Write, len: u64) -> Result<(), NativeJobError> {
     length_header(writer, len, 0xdf)
@@ -1470,15 +1073,6 @@ mod tests {
                     },
                 )
                 .unwrap();
-            store
-                .replace_put_cold_payload_authority(
-                    &staging,
-                    &ColdPayloadAuthorityState::V2 {
-                        migration_id: "synthetic-cold".into(),
-                        compatibility_hash: "cd".repeat(32),
-                    },
-                )
-                .unwrap();
             let revision = store.replace_commit(&staging, Some(0)).unwrap().revision;
             let owned = directory.path().join("owned");
             let handoff = directory.path().join("handoff");
@@ -1629,63 +1223,6 @@ mod tests {
     }
 
     #[test]
-    fn compatible_cold_hydration_resolves_nested_chat_without_changing_source() {
-        let directory = tempfile::tempdir().unwrap();
-        let character_path = directory.path().join("character.json");
-        let chat_path = directory.path().join("chat.json");
-        let character = json!({"character":{"chaId":"synthetic","type":"character","name":"Full","chats":[{"id":"cold-chat","message":[{"role":"char","data":format!("{COLD_HEADER}nested")}],"savedToggleValues":{"a":"1"}}]}});
-        let chat = json!({"message":[{"role":"char","data":"cold body {{inlay::image}}","responseVariants":{"selectedId":"a","candidates":[{"id":"a","messages":[{"role":"char","data":"old"}]},{"id":"b","messages":[{"role":"char","data":"alternative"}]}]}}],"scriptstate":{"a":"value"},"unknownCold":true});
-        std::fs::write(&character_path, serde_json::to_vec(&character).unwrap()).unwrap();
-        std::fs::write(&chat_path, serde_json::to_vec(&chat).unwrap()).unwrap();
-        let paths = HashMap::from([
-            ("outer".into(), character_path.clone()),
-            ("nested".into(), chat_path.clone()),
-        ]);
-        let mut stub = json!({"chaId":"synthetic","type":"character","coldstorage":"outer","coldStoragedChats":["nested"],"chats":[]});
-        hydrate_character(&mut stub, &paths, &mut HashSet::new()).unwrap();
-        assert!(stub.get("coldstorage").is_none());
-        assert_eq!(
-            stub["chats"][0]["message"][0]["data"],
-            "cold body {{inlay::image}}"
-        );
-        let mut projector = Projector::new(CompatibilityTarget::PocketRisu).unwrap();
-        project_cold_character(
-            &mut stub,
-            &mut projector,
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-            true,
-        )
-        .unwrap();
-        assert_eq!(projector.affected_conversations["converted-swipes"], 1);
-        assert_eq!(stub["chats"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            stub["chats"][0]["message"][0]["swipes"],
-            json!(["cold body {{inlay::image}}", "alternative"])
-        );
-        assert!(stub["chats"][0]["message"][0]
-            .get("responseVariants")
-            .is_none());
-        assert_eq!(
-            serde_json::from_slice::<Value>(&std::fs::read(character_path).unwrap()).unwrap(),
-            character
-        );
-        assert_eq!(
-            serde_json::from_slice::<Value>(&std::fs::read(chat_path).unwrap()).unwrap(),
-            chat
-        );
-        let cyclic = json!({"message":[{"role":"char","data":format!("{COLD_HEADER}nested")}]});
-        std::fs::write(
-            paths.get("nested").unwrap(),
-            serde_json::to_vec(&cyclic).unwrap(),
-        )
-        .unwrap();
-        let mut cyclic = cyclic;
-        assert!(hydrate_chat(&mut cyclic, &paths, &mut HashSet::new()).is_err());
-    }
-
-    #[test]
     fn compatible_interrupted_reroll_restores_original_and_retains_independent_edits() {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch("CREATE TABLE messages(generation TEXT,character_id TEXT,conversation_id TEXT,message_index INTEGER,value TEXT)").unwrap();
@@ -1713,7 +1250,6 @@ mod tests {
             "h",
             Some(&recovery),
             &mut projector,
-            &HashMap::new(),
             &HashMap::new(),
             &mut bytes,
             &crate::local_backup::NeverCancelled,

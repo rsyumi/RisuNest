@@ -15,12 +15,9 @@ export const languageKorean = {
             'owner-asset-arrays-rehydrated': '캐릭터·모듈 에셋 목록 복원',
             'asset-paths-remapped': '첨부 파일 경로 변경',
             'inlay-ids-remapped': '인레이 식별자 변경',
-            'cold-ids-remapped': '보관 데이터 식별자 변경',
             'converted-inlay-extension': '인레이 파일 확장자 변경',
             'converted-inlay-sidecars': '인레이 메타데이터 파일 생성',
             'converted-inlay-provenance': '인레이 출처 정보 변환',
-            'converted-cold-character': '보관된 캐릭터 펼치기',
-            'converted-cold-chat': '보관된 대화 펼치기',
             'converted-interrupted-reroll': '중단된 재생성 복구',
             'converted-swipes': '대체 응답 변환',
             'risuai-inlays-excluded': 'RisuAI에서 지원하지 않는 인레이 파일',
@@ -31,7 +28,6 @@ export const languageKorean = {
             'opaque-plugin-inlay-references-unverified':
                 '플러그인 인레이 참조 미검증',
             'opaque-plugin-reference': '직접 확인이 필요한 플러그인 참조',
-            'unsupported-group-cold-payload': '지원하지 않는 보관 그룹 데이터',
             'group-provenance-owner-excluded': '제외된 그룹 소유 정보',
             'unsupported-groups': '지원하지 않는 그룹 채팅',
             'toggle-preset-prompt-name-unmatched':
@@ -46,8 +42,6 @@ export const languageKorean = {
             'invalid-reroll-candidates': '유효하지 않은 대체 응답',
             'reroll-candidate-metadata': '대체 응답 메타데이터',
             'unsupported-reroll-candidates': '지원하지 않는 대체 응답',
-            'unsupported-cold-wrapper-field':
-                '지원하지 않는 보관 데이터 메타데이터',
         },
     },
     portableBackup: {

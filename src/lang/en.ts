@@ -16,12 +16,9 @@ export const languageEnglish = {
                 'Restored character and module asset lists',
             'asset-paths-remapped': 'Renamed attachment paths',
             'inlay-ids-remapped': 'Renamed inlay identifiers',
-            'cold-ids-remapped': 'Renamed archived-data identifiers',
             'converted-inlay-extension': 'Changed inlay file extensions',
             'converted-inlay-sidecars': 'Generated inlay metadata files',
             'converted-inlay-provenance': 'Converted inlay origin metadata',
-            'converted-cold-character': 'Expanded archived characters',
-            'converted-cold-chat': 'Expanded archived conversations',
             'converted-interrupted-reroll':
                 'Recovered interrupted regenerations',
             'converted-swipes': 'Converted alternative replies',
@@ -34,7 +31,6 @@ export const languageEnglish = {
                 'Plugin inlay references not verified',
             'opaque-plugin-reference':
                 'Plugin references requiring manual review',
-            'unsupported-group-cold-payload': 'Unsupported archived group data',
             'group-provenance-owner-excluded':
                 'Excluded group ownership metadata',
             'unsupported-groups': 'Unsupported group chats',
@@ -50,8 +46,6 @@ export const languageEnglish = {
             'invalid-reroll-candidates': 'Invalid alternative replies',
             'reroll-candidate-metadata': 'Alternative reply metadata',
             'unsupported-reroll-candidates': 'Unsupported alternative replies',
-            'unsupported-cold-wrapper-field':
-                'Unsupported archived-data metadata',
         },
     },
     portableBackup: {

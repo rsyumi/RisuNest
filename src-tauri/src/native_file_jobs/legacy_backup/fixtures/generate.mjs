@@ -13,6 +13,20 @@ const requireReference = createRequire(resolve(repository, "package.json"));
 const { Packr } = requireReference("msgpackr");
 const fflate = requireReference("fflate");
 const coldKey = "9f8b7c6d-1a2b-3c4d-5e6f-a1b2c3d4e5f6";
+// Restoring expands the cold payload, so the archive stores a stub instead.
+const coldGroup = {
+  type: "group",
+  chaId: "synthetic-group",
+  name: "Synthetic group",
+  characters: ["synthetic-active"],
+  chats: [
+    {
+      id: "synthetic-cold-chat",
+      name: "Synthetic cold chat",
+      message: [{ role: "user", data: "Synthetic cold message" }],
+    },
+  ],
+};
 const expected = {
   username: "Synthetic PocketRisu restore",
   characters: [
@@ -49,14 +63,7 @@ const expected = {
       ],
       trashTime: 1234,
     },
-    {
-      type: "group",
-      chaId: "synthetic-group",
-      name: "Synthetic group",
-      characters: ["synthetic-active"],
-      chats: [{ id: "group-chat", name: "Synthetic group chat", message: [] }],
-      coldstorage: coldKey,
-    },
+    coldGroup,
   ],
   botPresets: [
     { id: "synthetic-preset", name: "Synthetic preset", apiType: "openai" },
@@ -95,6 +102,23 @@ const expected = {
     { name: "Synthetic folder", data: ["synthetic-group"] },
   ],
   unknownPocketField: { nested: [{ value: "preserve unknown fields" }] },
+};
+const stored = {
+  ...expected,
+  characters: expected.characters.map((character) =>
+    character === coldGroup
+      ? {
+          type: coldGroup.type,
+          chaId: coldGroup.chaId,
+          name: coldGroup.name,
+          characters: coldGroup.characters,
+          chats: [
+            { id: "group-chat", name: "Synthetic group chat", message: [] },
+          ],
+          coldstorage: coldKey,
+        }
+      : character,
+  ),
 };
 const directory = fileURLToPath(new URL(".", import.meta.url));
 writeFileSync(
@@ -161,22 +185,14 @@ for (const [tag, compression] of [
   );
   const archive = await capturePocketExport(
     serverSource,
-    encode(expected, compression),
+    encode(stored, compression),
     new Map([
       ["assets/portrait.png", Buffer.from("synthetic portrait")],
       ["assets/module.png", Buffer.from("synthetic module")],
     ]),
     inlays,
     new Map([
-      [
-        `coldstorage/${coldKey}`,
-        [
-          {
-            id: "synthetic-cold-chat",
-            message: [{ role: "user", data: "Synthetic cold message" }],
-          },
-        ],
-      ],
+      [`coldstorage/${coldKey}`, { character: coldGroup }],
     ]),
   );
   writeFileSync(`${directory}pocket-risu-${tag}.bin`, archive);
