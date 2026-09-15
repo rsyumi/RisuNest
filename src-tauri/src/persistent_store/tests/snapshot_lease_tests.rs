@@ -970,7 +970,7 @@ fn active_lease_rejects_truncate_and_final_release_truncates_the_wal() {
         .expect("disable automatic checkpoints");
     let lease = store.acquire_revision(1).expect("acquire WAL reader");
     store
-        .set_app_kv("after-lease", &json!(true))
+        .set_app_kv("device-backup-commit:after-lease", &json!(true))
         .expect("append WAL frame after lease");
     store
         .checkpoint(CheckpointMode::Passive)
@@ -1006,7 +1006,7 @@ fn renderer_session_release_closes_every_attached_lease_and_truncates_the_wal() 
     let first = store.acquire_revision(1).expect("acquire first reader");
     let second = store.acquire_revision(1).expect("acquire second reader");
     store
-        .set_app_kv("after-session-readers", &json!(true))
+        .set_app_kv("device-backup-commit:after-session-readers", &json!(true))
         .expect("append WAL frame after readers");
 
     store
@@ -1065,7 +1065,7 @@ fn detached_export_reader_rejects_truncate_until_it_is_released() {
         .prepare_risu_save_export(1)
         .expect("prepare detached export reader");
     store
-        .set_app_kv("after-detached-export", &json!(true))
+        .set_app_kv("device-backup-commit:after-detached-export", &json!(true))
         .expect("append WAL frame after detached reader");
 
     let started = std::time::Instant::now();
@@ -1122,7 +1122,7 @@ fn detached_export_release_stays_prompt_while_an_attached_reader_remains() {
         .prepare_risu_save_export(1)
         .expect("prepare detached export reader");
     store
-        .set_app_kv("after-two-readers", &json!(true))
+        .set_app_kv("device-backup-commit:after-two-readers", &json!(true))
         .expect("append WAL frame after both readers");
 
     let reader = prepared.take_reader().expect("take detached export reader");

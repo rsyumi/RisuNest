@@ -1,3 +1,4 @@
+mod account_credential;
 #[cfg(any(test, target_os = "android"))]
 mod android_commit_transport;
 mod app_data_root;
@@ -893,9 +894,12 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         persistent_store::commands::pds_snapshot_create,
         persistent_store::commands::pds_snapshot_list,
         persistent_store::commands::pds_snapshot_restore_request,
-        persistent_store::commands::pds_get_app_kv,
-        persistent_store::commands::pds_set_app_kv,
-        persistent_store::commands::pds_remove_app_kv,
+        persistent_store::commands::pds_get_device_setting,
+        persistent_store::commands::pds_set_device_setting,
+        persistent_store::commands::pds_patch_device_setting,
+        account_credential::account_credential_read,
+        account_credential::account_credential_write,
+        account_credential::account_credential_clear,
         #[cfg(any(
             target_os = "windows",
             target_os = "android",

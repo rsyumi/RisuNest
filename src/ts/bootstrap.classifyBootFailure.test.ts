@@ -75,7 +75,12 @@ vi.mock('./plugins/pluginCompatibility', () => ({ shouldProjectScalableWorkingSe
 vi.mock('./storage/accountStorage', () => ({
     AccountStorage: class { readItem = vi.fn() }, resetAccountStorageSession: vi.fn(),
 }))
-vi.mock('./storage/nativeAppKv', () => ({ createNativeAppKv: () => null, createNativeAppKvStringStorage: vi.fn() }))
+vi.mock('./storage/nativeAccountCredential', () => ({
+    createNativeAccountCredentialVault: () => null,
+}))
+vi.mock('./storage/nativeDeviceSettings', () => ({
+    createNativeDeviceSettings: () => null, createNativeDeviceSettingsBag: vi.fn(),
+}))
 vi.mock('./storage/sync/officialAccountSnapshot', () => ({
     OfficialAccountSnapshotAdapter: class {}, createOfficialAssociationMarkers: () => ({}),
 }))

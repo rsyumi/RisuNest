@@ -112,10 +112,11 @@ import {
     configureOfficialAccountAssetReader,
     createStructuredAccountAssetReader,
 } from "./storage/accountAssetAccess";
+import { createNativeAccountCredentialVault } from "./storage/nativeAccountCredential";
 import {
-    createNativeAppKv,
-    createNativeAppKvStringStorage,
-} from "./storage/nativeAppKv";
+    createNativeDeviceSettings,
+    createNativeDeviceSettingsBag,
+} from "./storage/nativeDeviceSettings";
 import {
     configureNativeOfficialAccountFlow,
     createNativeOfficialAccountFlowService,
@@ -299,12 +300,16 @@ export async function loadData() {
         await transition('asset-repository', language.risuNest.startup.data)
         const assetRepositoryRevision = await activateNativeAssetRepository()
         if (assetRepositoryRevision !== null) local.revision = assetRepositoryRevision
-        const nativeAppKv = isTauri ? createNativeAppKv() : null
-        if (nativeAppKv) localStorage.removeItem('fallbackRisuToken')
-        const nativeCredential = nativeAppKv
-            ? normalizeNativeOfficialAccountCredential(
-                await nativeAppKv.get(nativeOfficialAccountKeys.credential),
-            )
+        // The web build has no OS vault, so it keeps the account token in
+        // localStorage. A native install holds it in the vault alone.
+        const nativeCredentialVault = isTauri ? createNativeAccountCredentialVault() : null
+        const nativeDeviceSettings = isTauri ? createNativeDeviceSettings() : null
+        if (nativeCredentialVault) {
+            localStorage.removeItem('fallbackRisuToken')
+            localStorage.removeItem('risuauth')
+        }
+        const nativeCredential = nativeCredentialVault
+            ? normalizeNativeOfficialAccountCredential(await nativeCredentialVault.read())
             : null
         if (isTauri) local.database.account = nativeCredential ?? undefined
         const installPersistentWorkingSet = (database: Database) => {
@@ -383,15 +388,15 @@ export async function loadData() {
                 },
             })
             : accountStorage
-        const nativeAssociation = nativeAppKv
-            ? await createNativeAppKvStringStorage(
-                nativeAppKv,
+        const nativeAssociation = nativeDeviceSettings
+            ? await createNativeDeviceSettingsBag(
+                nativeDeviceSettings,
                 nativeOfficialAccountKeys.association,
             )
             : null
-        const nativeAssetLedger = nativeAppKv
-            ? await createNativeAppKvStringStorage(
-                nativeAppKv,
+        const nativeAssetLedger = nativeDeviceSettings
+            ? await createNativeDeviceSettingsBag(
+                nativeDeviceSettings,
                 nativeOfficialAccountKeys.assetLedger,
             )
             : null
@@ -404,6 +409,11 @@ export async function loadData() {
         const flushNativeOfficialMetadata = async () => {
             await nativeAssociation?.flush()
             await nativeAssetLedger?.flush()
+        }
+        const clearNativeOfficialMetadata = async () => {
+            await nativeAssociation?.clear()
+            await nativeAssetLedger?.clear()
+            officialAssetLedger.reset()
         }
         let nativePublicationRecovery: NativeOfficialPublicationRecovery | null = null
         const nativeDatabasePublisher = isTauri
@@ -525,11 +535,11 @@ export async function loadData() {
                     : 'Official account pull skipped: local revisions were never published. Republishing local data.')
             },
         })
-        if (nativeAppKv) {
+        if (nativeCredentialVault) {
             const assetReader = createStructuredAccountAssetReader(liveAccountStorage)
             configureOfficialAccountAssetReader(nativeCredential ? assetReader : null)
             const service = createNativeOfficialAccountFlowService({
-                appKv: nativeAppKv,
+                credentialVault: nativeCredentialVault,
                 adapter: officialAdapter,
                 initialCredential: nativeCredential,
                 flushPendingData: (reason) => runtime.flushPendingData(reason),
@@ -543,11 +553,7 @@ export async function loadData() {
                     configureOfficialAccountAssetReader(credential ? assetReader : null)
                 },
                 flushMetadata: flushNativeOfficialMetadata,
-                resetMetadata: () => {
-                    nativeAssociation?.reset()
-                    nativeAssetLedger?.reset()
-                    officialAssetLedger.reset()
-                },
+                clearMetadata: clearNativeOfficialMetadata,
                 resetAccountSession: resetAccountStorageSession,
                 nativeRestore: async (initialCredential) => {
                     let credential = initialCredential

@@ -1354,6 +1354,9 @@ fn replace_commit_transaction(
     app_kv: Option<(&str, &Value)>,
     external_job: Option<&str>,
 ) -> StoreResult<RevisionResult> {
+    if let Some((key, _)) = app_kv {
+        super::validate_app_kv_key(key)?;
+    }
     let serialized_app_kv = app_kv
         .map(|(key, value)| serde_json::to_string(value).map(|value| (key, value)))
         .transpose()?;

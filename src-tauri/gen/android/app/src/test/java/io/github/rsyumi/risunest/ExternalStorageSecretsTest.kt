@@ -1,9 +1,24 @@
 package io.github.rsyumi.risunest
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class ExternalStorageSecretsTest {
+  @Test
+  fun everyNativePurposeMapsToItsOwnKeystoreAlias() {
+    val aliases = listOf(
+      "external-storage-secrets",
+      "external-storage-root-keys",
+      "account-credentials",
+    ).map(ExternalStorageSecrets::alias)
+
+    assertEquals(aliases.size, aliases.toSet().size)
+    assertThrows(IllegalArgumentException::class.java) {
+      ExternalStorageSecrets.alias("account-credentials-2")
+    }
+  }
+
   @Test
   fun plaintextAndEnvelopeBoundsRejectEmptyAndOversizedValues() {
     ExternalStorageSecrets.validatePlaintextSize(1)

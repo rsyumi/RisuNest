@@ -2889,9 +2889,13 @@ fn pilot_mutated_database_supports_generation_cow_compatible_reopen_read_and_com
 fn app_kv_round_trips_json() {
     let (_directory, store, _) = open_fixture();
     let value = json!({ "sourceRevision": 1, "imported": true });
-    store.set_app_kv("migration", &value).expect("write app kv");
+    store
+        .set_app_kv("device-backup-commit:migration", &value)
+        .expect("write app kv");
     assert_eq!(
-        store.get_app_kv("migration").expect("read app kv"),
+        store
+            .get_app_kv("device-backup-commit:migration")
+            .expect("read app kv"),
         Some(value)
     );
 }
@@ -2900,22 +2904,65 @@ fn app_kv_round_trips_json() {
 fn app_kv_remove_deletes_only_the_selected_key() {
     let (_directory, store, _) = open_fixture();
     store
-        .set_app_kv("credential", &json!({ "token": "legacy" }))
-        .expect("write credential");
+        .set_app_kv("device-backup-commit:first", &json!({ "job": "first" }))
+        .expect("write first marker");
     store
-        .set_app_kv("ledger", &json!({ "version": 1 }))
-        .expect("write ledger");
+        .set_app_kv("external-restore-commit:second", &json!({ "job": "second" }))
+        .expect("write second marker");
 
     store
-        .remove_app_kv("credential")
-        .expect("remove credential");
+        .remove_app_kv("device-backup-commit:first")
+        .expect("remove first marker");
 
     assert_eq!(
-        store.get_app_kv("credential").expect("read credential"),
+        store
+            .get_app_kv("device-backup-commit:first")
+            .expect("read removed marker"),
         None
     );
     assert_eq!(
-        store.get_app_kv("ledger").expect("read ledger"),
-        Some(json!({ "version": 1 }))
+        store
+            .get_app_kv("external-restore-commit:second")
+            .expect("read remaining marker"),
+        Some(json!({ "job": "second" }))
+    );
+}
+
+#[test]
+fn app_kv_accepts_only_the_two_job_marker_prefixes() {
+    // Everything a device keeps now lives in device.sqlite or the OS vault.
+    // app_kv holds only the markers that must share a commit with the
+    // replacement they authorize.
+    let (_directory, store, _) = open_fixture();
+    for rejected in [
+        "official-account.credential.v1",
+        "official-account.association.v1",
+        "official-account.asset-ledger.v1",
+        "sync-conflict-backups.index.v1",
+        "device-backup-commit:",
+        "external-restore-commit:",
+        "prefixed-device-backup-commit:job",
+        "",
+    ] {
+        assert!(
+            store.set_app_kv(rejected, &json!(true)).is_err(),
+            "{rejected} must not be writable"
+        );
+        assert!(
+            store.get_app_kv(rejected).is_err(),
+            "{rejected} must not be readable"
+        );
+        assert!(
+            store.remove_app_kv(rejected).is_err(),
+            "{rejected} must not be removable"
+        );
+    }
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT count(*) FROM app_kv", [], |row| row
+                .get::<_, i64>(0))
+            .expect("count app kv rows"),
+        0
     );
 }

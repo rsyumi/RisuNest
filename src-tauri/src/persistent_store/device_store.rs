@@ -4,7 +4,8 @@
 use super::{StoreError, StoreResult};
 use crate::server_sync::residency::AssetPolicy;
 use risunest_sync_wire::Sequence;
-use rusqlite::{params, Connection, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use serde_json::Value;
 use std::{
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
@@ -212,6 +213,10 @@ fn definitions(db: &Connection) -> StoreResult<Vec<(String, String, String)>> {
     Ok(rows)
 }
 
+fn parse_setting(value: &str) -> StoreResult<Value> {
+    serde_json::from_str(value).map_err(|_| invalid("device setting value is not readable"))
+}
+
 fn sequence(value: &str) -> StoreResult<Sequence> {
     Sequence::try_from(value.to_owned()).map_err(|_| invalid("device write clock is invalid"))
 }
@@ -252,6 +257,78 @@ impl DeviceStore {
             [],
             |row| row.get(0),
         )?)
+    }
+
+    pub(crate) fn read_setting(&self, key: &str) -> StoreResult<Option<Value>> {
+        let stored: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT value FROM device_settings WHERE key=?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        stored.map(|value| parse_setting(&value)).transpose()
+    }
+
+    pub(crate) fn write_setting(&self, key: &str, value: &Value) -> StoreResult<()> {
+        let serialized = serde_json::to_string(value)
+            .map_err(|_| invalid("device setting value is not encodable"))?;
+        self.connection.execute(
+            "INSERT INTO device_settings (key,value) VALUES (?1,?2)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, serialized],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn remove_setting(&self, key: &str) -> StoreResult<()> {
+        self.connection
+            .execute("DELETE FROM device_settings WHERE key=?1", [key])?;
+        Ok(())
+    }
+
+    /// Applies single entries of a stored object. A null entry removes it. The
+    /// read, the merge and the write share one transaction so a change to one
+    /// entry never rewrites what another writer stored meanwhile.
+    pub(crate) fn patch_setting(
+        &mut self,
+        key: &str,
+        entries: &serde_json::Map<String, Value>,
+    ) -> StoreResult<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stored: Option<String> = transaction
+            .query_row(
+                "SELECT value FROM device_settings WHERE key=?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let mut object = match stored {
+            Some(value) => match parse_setting(&value)? {
+                Value::Object(object) => object,
+                _ => return Err(invalid("device setting does not hold entries")),
+            },
+            None => serde_json::Map::new(),
+        };
+        for (entry, value) in entries {
+            if value.is_null() {
+                object.remove(entry);
+            } else {
+                object.insert(entry.clone(), value.clone());
+            }
+        }
+        let serialized = serde_json::to_string(&Value::Object(object))
+            .map_err(|_| invalid("device setting value is not encodable"))?;
+        transaction.execute(
+            "INSERT INTO device_settings (key,value) VALUES (?1,?2)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, serialized],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub(crate) fn asset_residency_policy(&self) -> StoreResult<AssetPolicy> {

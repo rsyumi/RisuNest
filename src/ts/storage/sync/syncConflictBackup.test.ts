@@ -1,24 +1,25 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const platformMocks = vi.hoisted(() => {
-    const appValues = new Map<string, unknown>()
+    const settingValues = new Map<string, unknown>()
     const blobValues = new Map<string, Uint8Array>()
     return {
         isTauri: false,
-        appValues,
+        settingValues,
         blobValues,
         localforage: {
             createInstance: vi.fn(() => {
                 throw new Error('LocalForage must not be opened for native conflict backups')
             }),
         },
-        appKv: {
-            get: vi.fn(async (key: string) => appValues.get(key) ?? null),
+        deviceSettings: {
+            get: vi.fn(async (key: string) => settingValues.get(key) ?? null),
             set: vi.fn(async (key: string, value: unknown) => {
-                appValues.set(key, value)
+                if (value === null) settingValues.delete(key)
+                else settingValues.set(key, value)
             }),
-            remove: vi.fn(async (key: string) => {
-                appValues.delete(key)
+            patch: vi.fn(async () => {
+                throw new Error('The conflict index is stored as a whole value')
             }),
         },
         blobStore: {
@@ -45,7 +46,9 @@ vi.mock('localforage', () => ({ default: platformMocks.localforage }))
 vi.mock('../../platform', () => ({
     get isTauri() { return platformMocks.isTauri },
 }))
-vi.mock('../nativeAppKv', () => ({ createNativeAppKv: () => platformMocks.appKv }))
+vi.mock('../nativeDeviceSettings', () => ({
+    createNativeDeviceSettings: () => platformMocks.deviceSettings,
+}))
 vi.mock('../platformBlobStore', () => ({ getBlobStore: () => platformMocks.blobStore }))
 
 import {
@@ -94,7 +97,7 @@ function memoryPayloadStore(): SyncConflictBackupPayloadStore & {
 describe('SyncConflictBackupStore', () => {
     beforeEach(() => {
         platformMocks.isTauri = false
-        platformMocks.appValues.clear()
+        platformMocks.settingValues.clear()
         platformMocks.blobValues.clear()
         vi.clearAllMocks()
     })
@@ -319,7 +322,7 @@ describe('SyncConflictBackupStore', () => {
             characterCount: 2,
         })
 
-        expect(platformMocks.appValues.get('sync-conflict-backups.index.v1')).toEqual([
+        expect(platformMocks.settingValues.get('sync-conflict-backups.index.v1')).toEqual([
             expect.objectContaining({ id: entry.id, scope: 'database-only' }),
         ])
         expect(platformMocks.blobValues.get(`sync-conflict-backups/${entry.id}.risudat`))

@@ -8,19 +8,25 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
-/** Native-only OS protection for external-storage secrets and repository keys. */
+/**
+ * Native-only OS protection for external-storage secrets, repository keys and
+ * the account token. Each purpose holds its own Keystore key.
+ */
 internal object ExternalStorageSecrets {
   private const val PROVIDER_PURPOSE = "external-storage-secrets"
   private const val ROOT_KEY_PURPOSE = "external-storage-root-keys"
+  private const val ACCOUNT_PURPOSE = "account-credentials"
   private const val PROVIDER_ALIAS = "risunest.external-storage.secrets"
   private const val ROOT_KEY_ALIAS = "risunest.external-storage.root-key"
+  private const val ACCOUNT_ALIAS = "risunest.account.credential"
   private const val MAX_ENVELOPE_BYTES = 65_536
 
   @JvmStatic external fun initialize()
 
-  private fun alias(purpose: String): String = when (purpose) {
+  internal fun alias(purpose: String): String = when (purpose) {
     PROVIDER_PURPOSE -> PROVIDER_ALIAS
     ROOT_KEY_PURPOSE -> ROOT_KEY_ALIAS
+    ACCOUNT_PURPOSE -> ACCOUNT_ALIAS
     else -> throw IllegalArgumentException("unsupported external-storage secret purpose")
   }
 

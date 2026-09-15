@@ -1014,7 +1014,12 @@ describe('AccountStorage structured wire contract', () => {
     })
 
     it('completes restore after AccountStorage reauthenticates a 403 inside the flow queue', async () => {
-        const values = new Map<string, unknown>()
+        const vault = {
+            stored: null as unknown,
+            read: vi.fn(async () => vault.stored ?? null),
+            write: vi.fn(async (credential: unknown) => void (vault.stored = credential)),
+            clear: vi.fn(async () => void (vault.stored = null)),
+        }
         const setRouting = vi.fn()
         let flow!: NativeOfficialAccountFlow
         let reauthenticateSnapshotRequest!: (loginResult: string) => Promise<void>
@@ -1035,14 +1040,10 @@ describe('AccountStorage structured wire contract', () => {
                 reauthenticate: (loginResult) => reauthenticateSnapshotRequest(loginResult),
             },
         })
-        const { createNativeOfficialAccountFlowService, nativeOfficialAccountKeys } =
+        const { createNativeOfficialAccountFlowService } =
             await import('./sync/nativeOfficialAccountFlow')
         const service = createNativeOfficialAccountFlowService({
-            appKv: {
-                get: vi.fn(async (key) => values.get(key) ?? null),
-                set: vi.fn(async (key, value) => void values.set(key, value)),
-                remove: vi.fn(async (key) => void values.delete(key)),
-            },
+            credentialVault: vault,
             adapter: {
                 pull: vi.fn(async () => {
                     await storage.readItem('database/database.bin')
@@ -1058,7 +1059,7 @@ describe('AccountStorage structured wire contract', () => {
             setRouting,
             clearLegacyFallback: vi.fn(),
             flushMetadata: vi.fn(async () => undefined),
-            resetMetadata: vi.fn(),
+            clearMetadata: vi.fn(async () => undefined),
             resetAccountSession: vi.fn(),
         })
         flow = service.flow
@@ -1069,7 +1070,7 @@ describe('AccountStorage structured wire contract', () => {
 
         expect(mocks.fetchProtectedResource).toHaveBeenCalledTimes(2)
         expect(flow.getToken()).toBe('refreshed-token')
-        expect(values.get(nativeOfficialAccountKeys.credential)).toEqual({
+        expect(vault.stored).toEqual({
             id: 'account-1',
             token: 'refreshed-token',
             data: {},
@@ -1097,14 +1098,14 @@ describe('AccountStorage structured wire contract', () => {
         })
         const { createNativeOfficialAccountFlowService } =
             await import('./sync/nativeOfficialAccountFlow')
-        const appKv = {
-            get: vi.fn(async () => null),
-            set: vi.fn(async () => undefined),
-            remove: vi.fn(async () => undefined),
+        const vault = {
+            read: vi.fn(async () => null),
+            write: vi.fn(async () => undefined),
+            clear: vi.fn(async () => undefined),
         }
         const setRouting = vi.fn()
         const service = createNativeOfficialAccountFlowService({
-            appKv,
+            credentialVault: vault,
             adapter: {
                 pull: vi.fn(async () => {
                     await storage.readItem('database/database.bin')
@@ -1120,7 +1121,7 @@ describe('AccountStorage structured wire contract', () => {
             setRouting,
             clearLegacyFallback: vi.fn(),
             flushMetadata: vi.fn(async () => undefined),
-            resetMetadata: vi.fn(),
+            clearMetadata: vi.fn(async () => undefined),
             resetAccountSession: vi.fn(),
         })
         flow = service.flow
@@ -1133,7 +1134,7 @@ describe('AccountStorage structured wire contract', () => {
 
         expect(mocks.fetchProtectedResource).toHaveBeenCalledOnce()
         expect(flow.getToken()).toBe('legacy-token')
-        expect(appKv.set).not.toHaveBeenCalled()
+        expect(vault.write).not.toHaveBeenCalled()
         expect(setRouting).not.toHaveBeenCalled()
     })
 
@@ -1161,10 +1162,10 @@ describe('AccountStorage structured wire contract', () => {
         })
         const { createNativeOfficialAccountFlowService } =
             await import('./sync/nativeOfficialAccountFlow')
-        const appKv = {
-            get: vi.fn(async () => null),
-            set: vi.fn(async () => undefined),
-            remove: vi.fn(async () => undefined),
+        const vault = {
+            read: vi.fn(async () => null),
+            write: vi.fn(async () => undefined),
+            clear: vi.fn(async () => undefined),
         }
         const setRouting = vi.fn()
         const publication = {
@@ -1174,7 +1175,7 @@ describe('AccountStorage structured wire contract', () => {
             dispose: vi.fn(async () => undefined),
         }
         const service = createNativeOfficialAccountFlowService({
-            appKv,
+            credentialVault: vault,
             adapter: {
                 pull: vi.fn(),
                 pin: vi.fn(async () => publication),
@@ -1187,7 +1188,7 @@ describe('AccountStorage structured wire contract', () => {
             setRouting,
             clearLegacyFallback: vi.fn(),
             flushMetadata: vi.fn(async () => undefined),
-            resetMetadata: vi.fn(),
+            clearMetadata: vi.fn(async () => undefined),
             resetAccountSession: vi.fn(),
         })
         flow = service.flow
@@ -1202,7 +1203,7 @@ describe('AccountStorage structured wire contract', () => {
         expect(publication.dispose).toHaveBeenCalledOnce()
         expect(mocks.fetchProtectedResource).toHaveBeenCalledTimes(2)
         expect(flow.getToken()).toBe('legacy-token')
-        expect(appKv.set).not.toHaveBeenCalled()
+        expect(vault.write).not.toHaveBeenCalled()
         expect(setRouting).not.toHaveBeenCalled()
     })
 
@@ -1224,23 +1225,21 @@ describe('AccountStorage structured wire contract', () => {
                     flow.reauthenticate(loginResult).then(() => undefined),
             },
         })
-        const { createNativeOfficialAccountFlowService, nativeOfficialAccountKeys } =
+        const { createNativeOfficialAccountFlowService } =
             await import('./sync/nativeOfficialAccountFlow')
-        const values = new Map<string, unknown>([[
-            nativeOfficialAccountKeys.credential,
-            { id: 'account-1', token: 'legacy-token', data: {} },
-        ]])
+        const vault = {
+            stored: { id: 'account-1', token: 'legacy-token', data: {} } as unknown,
+            read: vi.fn(async () => vault.stored ?? null),
+            write: vi.fn(async (credential: unknown) => void (vault.stored = credential)),
+            clear: vi.fn(async () => void (vault.stored = null)),
+        }
         let resolvePull: (result: { kind: 'missing' }) => void = () => undefined
         const pull = vi.fn(async () => new Promise<{ kind: 'missing' }>((resolve) => {
             resolvePull = resolve
         }))
         const setRouting = vi.fn()
         const service = createNativeOfficialAccountFlowService({
-            appKv: {
-                get: vi.fn(async (key) => values.get(key) ?? null),
-                set: vi.fn(async (key, value) => void values.set(key, value)),
-                remove: vi.fn(async (key) => void values.delete(key)),
-            },
+            credentialVault: vault,
             adapter: {
                 pull,
                 pin: vi.fn(),
@@ -1253,7 +1252,7 @@ describe('AccountStorage structured wire contract', () => {
             setRouting,
             clearLegacyFallback: vi.fn(),
             flushMetadata: vi.fn(async () => undefined),
-            resetMetadata: vi.fn(),
+            clearMetadata: vi.fn(async () => undefined),
             resetAccountSession: vi.fn(),
         })
         flow = service.flow
@@ -1271,7 +1270,7 @@ describe('AccountStorage structured wire contract', () => {
             'Native official account session changed during reauthentication',
         )
         expect(flow.getToken()).toBeNull()
-        expect(values.has(nativeOfficialAccountKeys.credential)).toBe(false)
+        expect(vault.stored).toBeNull()
         expect(setRouting).toHaveBeenCalledTimes(1)
         expect(setRouting).toHaveBeenCalledWith(null)
     }, 1_000)
@@ -1290,10 +1289,10 @@ describe('AccountStorage structured wire contract', () => {
         resetAccountStorageSession()
         const { createNativeOfficialAccountFlow } = await import('./sync/nativeOfficialAccountFlow')
         const flow = createNativeOfficialAccountFlow({
-            appKv: {
-                get: vi.fn(async () => null),
-                set: vi.fn(async () => undefined),
-                remove: vi.fn(async () => undefined),
+            credentialVault: {
+                read: vi.fn(async () => null),
+                write: vi.fn(async () => undefined),
+                clear: vi.fn(async () => undefined),
             },
             adapter: {
                 pull: vi.fn(),
@@ -1307,7 +1306,7 @@ describe('AccountStorage structured wire contract', () => {
             setRouting: vi.fn(),
             clearLegacyFallback: vi.fn(),
             flushMetadata: vi.fn(async () => undefined),
-            resetMetadata: vi.fn(),
+            clearMetadata: vi.fn(async () => undefined),
             resetAccountSession: resetAccountStorageSession,
         })
         const storage = new AccountStorage({

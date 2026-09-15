@@ -147,6 +147,8 @@ mod server_sync_projection_tests;
 mod snapshot_lease_tests;
 #[path = "tests/storage_stats_tests.rs"]
 mod storage_stats_tests;
+#[path = "tests/vault_boundary_tests.rs"]
+mod vault_boundary_tests;
 #[path = "tests/working_set_tests.rs"]
 mod working_set_tests;
 
