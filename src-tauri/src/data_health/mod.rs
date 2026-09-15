@@ -201,6 +201,9 @@ impl FindingSink for Report<'_> {
     }
 }
 
+pub(crate) mod journal;
+pub(crate) mod repair;
+
 /// The renderer asked for the stop, so its own loop ends quietly instead of reporting a failure.
 pub(crate) const CANCELLED: &str = "data-health-scan-cancelled";
 

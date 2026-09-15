@@ -1,6 +1,13 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { DataHealthResult } from './dataHealth'
-import { createDataHealthModel } from './dataHealthModel'
+import type {
+    DataHealthResult,
+    RepairCandidate,
+    RepairPreview,
+} from './dataHealth'
+import {
+    createDataHealthModel,
+    type DataHealthDependencies,
+} from './dataHealthModel'
 
 function result(
     overrides: Partial<DataHealthResult> = {},
@@ -33,12 +40,54 @@ function deepPage(
     })
 }
 
-function harness(overrides: Partial<Parameters<typeof createDataHealthModel>[0]> = {}) {
-    const deps = {
+function preview(selection: string[]): RepairPreview {
+    return {
+        selected: candidates().filter((candidate) => selection.includes(candidate.id)),
+        answered: selection.length,
+        remaining: 0,
+        droppedReferences: selection.length,
+        droppedAliases: 0,
+        discarding: [],
+        tables: ['characters'],
+        proposesSnapshot: false,
+    }
+}
+
+function candidates(): RepairCandidate[] {
+    return [
+        {
+            id: '0:drop-reference',
+            action: {
+                action: 'drop-reference',
+                owner: { kind: 'character', id: 'char-1' },
+                sourcePath: '$.image',
+                occurrence: 0,
+            },
+            finding: 0,
+            preferred: true,
+            discards: true,
+        },
+        {
+            id: '0:adopt-stored-payload',
+            action: { action: 'adopt-stored-payload', kind: 'asset', key: 'assets/a.png' },
+            finding: 0,
+            preferred: false,
+            discards: false,
+        },
+    ]
+}
+
+function harness(overrides: Partial<DataHealthDependencies> = {}) {
+    const deps: DataHealthDependencies = {
         getResult: vi.fn().mockResolvedValue(null),
         scan: vi.fn().mockResolvedValue(result()),
         deepScan: vi.fn().mockResolvedValue(deepPage(3, true)),
         cancel: vi.fn().mockResolvedValue(undefined),
+        planRepair: vi.fn().mockResolvedValue(candidates()),
+        previewRepair: vi.fn(async (selection: string[]) => preview(selection)),
+        applyRepair: vi.fn().mockResolvedValue({ result: result() }),
+        listJournals: vi.fn().mockResolvedValue([]),
+        undoRepair: vi.fn().mockResolvedValue({ result: result(), skipped: [] }),
         ...overrides,
     }
     return { deps, model: createDataHealthModel(deps) }
@@ -135,5 +184,104 @@ describe('createDataHealthModel', () => {
         release()
         await running
         expect(scan).toHaveBeenCalledOnce()
+    })
+})
+
+describe('repairing from the model', () => {
+    const damaged = result({
+        items: [
+            {
+                code: 'reference-missing',
+                severity: 'degraded',
+                owner: { kind: 'character', id: 'char-1' },
+                locator: { sourcePath: '$.image', occurrence: 0 },
+                target: { kind: 'asset', key: 'assets/a.png' },
+                detail: 'reference has no target in this library',
+            },
+        ],
+        counts: { blocking: 0, degraded: 1, informational: 0 },
+    })
+
+    it('preselects the fixed choice and previews it', async () => {
+        const { deps, model } = harness({
+            getResult: vi.fn().mockResolvedValue(damaged),
+        })
+        await model.load()
+        await model.loadRepairs()
+        expect(model.snapshot().selection).toEqual(['0:drop-reference'])
+        expect(deps.previewRepair).toHaveBeenCalledWith(['0:drop-reference'])
+        expect(model.snapshot().preview?.answered).toBe(1)
+    })
+
+    it('replaces the other answer to the same finding rather than adding to it', async () => {
+        const { model } = harness({ getResult: vi.fn().mockResolvedValue(damaged) })
+        await model.load()
+        await model.loadRepairs()
+        await model.toggle('0:adopt-stored-payload')
+        expect(model.snapshot().selection).toEqual(['0:adopt-stored-payload'])
+        await model.toggle('0:adopt-stored-payload')
+        expect(model.snapshot().selection).toEqual([])
+        expect(model.snapshot().preview).toBeNull()
+    })
+
+    it('applies the selection and shows the diagnosis of the repaired library', async () => {
+        const repaired = result({ revision: 4 })
+        const applyRepair = vi.fn().mockResolvedValue({ result: repaired })
+        const listJournals = vi.fn().mockResolvedValue([
+            {
+                id: 'repair-1',
+                createdAt: 2,
+                fromRevision: 3,
+                toRevision: 4,
+                changes: 1,
+                heldObjects: 1,
+                current: true,
+            },
+        ])
+        const { model } = harness({
+            getResult: vi.fn().mockResolvedValue(damaged),
+            applyRepair,
+            listJournals,
+        })
+        await model.load()
+        await model.loadRepairs()
+        await model.apply(true)
+        expect(applyRepair).toHaveBeenCalledWith(['0:drop-reference'], true)
+        expect(model.snapshot().result).toEqual(repaired)
+        expect(model.snapshot().journals).toHaveLength(1)
+        expect(model.snapshot().repairing).toBe(false)
+    })
+
+    it('reports the records an undo left alone', async () => {
+        const undoRepair = vi
+            .fn()
+            .mockResolvedValue({ result: damaged, skipped: ['characters:char-2'] })
+        const { model } = harness({
+            getResult: vi.fn().mockResolvedValue(damaged),
+            undoRepair,
+        })
+        await model.load()
+        await model.loadRepairs()
+        await model.undo('repair-1')
+        expect(undoRepair).toHaveBeenCalledWith('repair-1')
+        expect(model.snapshot().skipped).toEqual(['characters:char-2'])
+    })
+
+    it('never asks for a repair while a scan is running', async () => {
+        let release = () => {}
+        const { deps, model } = harness({
+            scan: vi.fn(
+                () =>
+                    new Promise<DataHealthResult>((resolve) => {
+                        release = () => resolve(damaged)
+                    }),
+            ),
+        })
+        const running = model.quickScan()
+        await Promise.resolve()
+        await model.loadRepairs()
+        expect(deps.planRepair).not.toHaveBeenCalled()
+        release()
+        await running
     })
 })

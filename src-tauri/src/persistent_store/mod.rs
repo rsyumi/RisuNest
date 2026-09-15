@@ -25,6 +25,7 @@ pub(crate) mod server_sync_engine;
 pub(crate) mod server_sync_journal;
 pub(crate) mod server_sync_outbox;
 pub(crate) mod server_sync_projection;
+mod repair;
 mod snapshot;
 mod snapshot_archive;
 pub(crate) mod sync_selection;
@@ -2595,6 +2596,8 @@ impl PersistentStore {
         )?);
         roots.extend(snapshot_archive::Archive::open(&self.snapshots_dir)?.roots()?);
         roots.extend(collect_staged_migration_roots(&self.repository_root)?);
+        // A repair journal holds what a repair stopped referencing, so an undo still has it.
+        roots.push(crate::data_health::journal::roots(&self.repository_root)?);
         roots.push(if read_only {
             collect_durable_cas_job_roots_read_only(&self.repository_root)
         } else if repository_guard_held {

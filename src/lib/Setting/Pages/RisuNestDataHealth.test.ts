@@ -8,6 +8,11 @@ const maintenance = vi.hoisted(() => ({
     deepScanNativeDataHealth: vi.fn(),
     getNativeDataHealthResult: vi.fn(),
     cancelNativeDataHealthScan: vi.fn(),
+    planNativeDataHealthRepair: vi.fn(),
+    previewNativeDataHealthRepair: vi.fn(),
+    applyNativeDataHealthRepair: vi.fn(),
+    listNativeDataHealthJournals: vi.fn(),
+    undoNativeDataHealthRepair: vi.fn(),
 }))
 const alerts = vi.hoisted(() => ({
     alertError: vi.fn(),
@@ -55,6 +60,33 @@ const damaged: DataHealthResult = {
     ],
 }
 
+const candidates = [
+    {
+        id: '1:drop-reference',
+        action: {
+            action: 'drop-reference' as const,
+            owner: { kind: 'character', id: 'char-2' },
+            sourcePath: '$.image',
+            occurrence: 0,
+        },
+        finding: 1,
+        preferred: true,
+        discards: true,
+    },
+]
+
+const journals = [
+    {
+        id: 'repair-1',
+        createdAt: Date.UTC(2026, 8, 15, 5, 0, 0),
+        fromRevision: 11,
+        toRevision: 12,
+        changes: 2,
+        heldObjects: 1,
+        current: true,
+    },
+]
+
 async function settle(): Promise<void> {
     for (let index = 0; index < 4; index += 1) await tick()
 }
@@ -72,8 +104,34 @@ describe('RisuNestDataHealth', () => {
     async function setup(
         stored: DataHealthResult | null = null,
         props: Record<string, unknown> = {},
+        plan = candidates,
     ): Promise<HTMLElement> {
         maintenance.getNativeDataHealthResult.mockResolvedValue(stored)
+        maintenance.planNativeDataHealthRepair.mockResolvedValue(plan)
+        maintenance.previewNativeDataHealthRepair.mockImplementation(
+            async (selection: string[]) => ({
+                selected: candidates.filter((candidate) => selection.includes(candidate.id)),
+                answered: selection.length,
+                remaining: 2 - selection.length,
+                droppedReferences: 1,
+                droppedAliases: 0,
+                discarding: selection,
+                tables: ['characters'],
+                proposesSnapshot: true,
+            }),
+        )
+        maintenance.listNativeDataHealthJournals.mockResolvedValue(journals)
+        maintenance.applyNativeDataHealthRepair.mockResolvedValue({
+            revision: 13,
+            journalId: 'repair-1',
+            snapshot: null,
+            result: { ...damaged, items: [], counts: { blocking: 0, degraded: 0, informational: 0 } },
+        })
+        maintenance.undoNativeDataHealthRepair.mockResolvedValue({
+            revision: 14,
+            skipped: ['characters:char-9'],
+            result: damaged,
+        })
         const target = document.createElement('div')
         document.body.append(target)
         mounted = mount(RisuNestDataHealth, { target, props })
@@ -176,6 +234,58 @@ describe('RisuNestDataHealth', () => {
         expect(report).toContain('character:char-1')
         expect(report).toContain('target=asset:assets/portrait.png')
         expect(report).not.toContain('name=')
+    })
+
+
+    it('offers one answer per problem and previews what it will do', async () => {
+        const target = await setup(damaged)
+        const choices = target.querySelectorAll('[data-data-health-choice]')
+        expect(choices).toHaveLength(1)
+        expect(choices[0].textContent).toContain(strings.actionDropReference)
+        const preview = target.querySelector('[data-data-health-preview]')
+        expect(preview?.textContent).toContain(strings.previewTitle)
+        expect(preview?.textContent).toContain(
+            strings.previewAnswered.replace('{0}', '1').replace('{1}', '2'),
+        )
+        expect(preview?.textContent).toContain(
+            strings.previewDiscards.replace('{0}', '1'),
+        )
+    })
+
+    it('applies the selection and shows the diagnosis of the repaired library', async () => {
+        const target = await setup(damaged)
+        const apply = [...target.querySelectorAll('button')].find(
+            (button) => button.textContent?.trim() === strings.repairApply,
+        )
+        apply?.click()
+        await settle()
+        expect(maintenance.applyNativeDataHealthRepair).toHaveBeenCalledWith(
+            ['1:drop-reference'],
+            true,
+        )
+        expect(target.querySelectorAll('[data-data-health-group]')).toHaveLength(0)
+    })
+
+    it('lists the repairs that can still be undone and reports what an undo left', async () => {
+        const target = await setup(damaged)
+        const entries = target.querySelector('[data-data-health-journals]')
+        expect(entries?.textContent).toContain('2')
+        const undo = [...target.querySelectorAll('button')].find(
+            (button) => button.textContent?.trim() === strings.undoAction,
+        )
+        undo?.click()
+        await settle()
+        expect(maintenance.undoNativeDataHealthRepair).toHaveBeenCalledWith('repair-1')
+        expect(
+            target.querySelector('[data-data-health-skipped]')?.textContent,
+        ).toContain('characters:char-9')
+    })
+
+    it('says so when nothing can be fixed automatically', async () => {
+        const target = await setup(damaged, {}, [])
+        expect(
+            target.querySelector('[data-data-health-repair]')?.textContent,
+        ).toContain(strings.repairNone)
     })
 
     it('keeps every string it shows in both shipped languages', () => {

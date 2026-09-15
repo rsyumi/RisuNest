@@ -252,6 +252,23 @@ fn reread_object(cas: &PayloadCas, hash: &str, size: u64) -> std::result::Result
     Ok(read)
 }
 
+/// The gate a backup and an activation use, over a live generation. A repair runs it on its
+/// staged result before that result becomes the library.
+pub(crate) fn validate_live_library(
+    db: &rusqlite::Connection,
+    cas: &PayloadCas,
+    probe: &dyn CancellationProbe,
+) -> Result<ReferenceCounts> {
+    fail_fast(
+        LibraryView {
+            db,
+            objects: cas,
+            depth: ScanDepth::Deep,
+        },
+        probe,
+    )
+}
+
 trait LibraryObjects {
     fn read_object(&self, hash: &str) -> Result<(std::io::Take<std::fs::File>, u64)>;
     /// Every registered alias needs an exact payload binding, independently of reference scans.
@@ -532,7 +549,7 @@ impl LibraryView<'_> {
             )?;
         }
         let mut statement = self.db.prepare(
-            "SELECT character_id,detail FROM conversations ORDER BY character_id,configured_index",
+            "SELECT character_id,conversation_id,detail FROM conversations ORDER BY character_id,configured_index",
         )?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
@@ -540,19 +557,21 @@ impl LibraryView<'_> {
             if !report.running() {
                 return Ok(counts);
             }
-            let id: String = row.get(0)?;
-            let Some(value) = self.parsed(report, "conversation", &id, &row.get::<_, String>(1)?)
+            let character: String = row.get(0)?;
+            // The owner names one conversation, so a repair can address the record it belongs to.
+            let owner = format!("{character}/{}", row.get::<_, String>(1)?);
+            let Some(value) = self.parsed(report, "conversation", &owner, &row.get::<_, String>(2)?)
             else {
                 continue;
             };
             self.validate_fragment(
                 PortableFragment::Conversation {
                     value: &value,
-                    character_id: &id,
+                    character_id: &character,
                 },
                 &root,
                 "conversation",
-                &id,
+                &owner,
                 &mut counts,
                 report,
                 probe,

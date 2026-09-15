@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
+    preferredRepairSelection,
+    repairChoicesByFinding,
+    toggleRepairSelection,
+    type RepairCandidate,
     dataHealthDeepFraction,
     dataHealthReportFileName,
     formatDataHealthReport,
@@ -148,5 +152,62 @@ describe('isDataHealthCancellation', () => {
         expect(isDataHealthCancellation('data-health-scan-cancelled')).toBe(true)
         expect(isDataHealthCancellation(new Error('disk is full'))).toBe(false)
         expect(isDataHealthCancellation(undefined)).toBe(false)
+    })
+})
+
+describe('repair selection', () => {
+    const candidates: RepairCandidate[] = [
+        {
+            id: '0:drop-alias',
+            action: { action: 'drop-alias', kind: 'asset', key: 'assets/a.png' },
+            finding: 0,
+            preferred: true,
+            discards: true,
+        },
+        {
+            id: '0:adopt-stored-payload',
+            action: { action: 'adopt-stored-payload', kind: 'asset', key: 'assets/a.png' },
+            finding: 0,
+            preferred: false,
+            discards: false,
+        },
+        {
+            id: '1:settle-authority',
+            action: { action: 'settle-authority', subject: 'asset' },
+            finding: 1,
+            preferred: true,
+            discards: false,
+        },
+    ]
+
+    it('starts from the choices the planner marked', () => {
+        expect(preferredRepairSelection(candidates)).toEqual([
+            '0:drop-alias',
+            '1:settle-authority',
+        ])
+    })
+
+    it('lets one finding carry only one answer', () => {
+        const selection = toggleRepairSelection(
+            candidates,
+            ['0:drop-alias', '1:settle-authority'],
+            '0:adopt-stored-payload',
+        )
+        expect(selection).toEqual(['1:settle-authority', '0:adopt-stored-payload'])
+    })
+
+    it('deselects what is already chosen and ignores what was never offered', () => {
+        expect(
+            toggleRepairSelection(candidates, ['0:drop-alias'], '0:drop-alias'),
+        ).toEqual([])
+        expect(
+            toggleRepairSelection(candidates, ['0:drop-alias'], 'nothing'),
+        ).toEqual(['0:drop-alias'])
+    })
+
+    it('groups the answers by the finding they belong to', () => {
+        const grouped = repairChoicesByFinding(candidates)
+        expect([...grouped.keys()]).toEqual([0, 1])
+        expect(grouped.get(0)).toHaveLength(2)
     })
 })

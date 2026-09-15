@@ -8,16 +8,23 @@
     import SettingGroup from '../RisuNest/SettingGroup.svelte'
     import SettingRow from '../RisuNest/SettingRow.svelte'
     import {
+        applyNativeDataHealthRepair,
         cancelNativeDataHealthScan,
         deepScanNativeDataHealth,
         getNativeDataHealthResult,
+        listNativeDataHealthJournals,
+        planNativeDataHealthRepair,
+        previewNativeDataHealthRepair,
         scanNativeDataHealth,
+        undoNativeDataHealthRepair,
     } from 'src/ts/storage/nativePersistentMaintenance'
     import {
         dataHealthReportFileName,
         formatDataHealthReport,
+        repairChoicesByFinding,
         type DataHealthFinding,
         type DataHealthSeverity,
+        type RepairCandidate,
     } from 'src/ts/storage/dataHealth'
     import { createDataHealthModel } from 'src/ts/storage/dataHealthModel'
     import { formatRisuNestStorageBytes } from 'src/ts/storage/risuNestStorageDashboard'
@@ -36,9 +43,15 @@
         scan: scanNativeDataHealth,
         deepScan: deepScanNativeDataHealth,
         cancel: cancelNativeDataHealthScan,
+        planRepair: planNativeDataHealthRepair,
+        previewRepair: previewNativeDataHealthRepair,
+        applyRepair: applyNativeDataHealthRepair,
+        listJournals: listNativeDataHealthJournals,
+        undoRepair: undoNativeDataHealthRepair,
     })
     let view = $state(model.snapshot())
     let includeNames = $state(false)
+    let keepSnapshot = $state(false)
 
     const severityLabels: Record<DataHealthSeverity, string> = {
         blocking: strings.severityBlocking,
@@ -132,11 +145,59 @@
         }
     }
 
+    const actionLabels: Record<RepairCandidate['action']['action'], string> = {
+        'drop-reference': strings.actionDropReference,
+        'drop-alias': strings.actionDropAlias,
+        'adopt-stored-payload': strings.actionAdoptStoredPayload,
+        'normalize-records': strings.actionNormalizeRecords,
+        'keep-single-record': strings.actionKeepSingleRecord,
+        'recover-orphans': strings.actionRecoverOrphans,
+        'mark-cold-opaque': strings.actionMarkColdOpaque,
+        'settle-authority': strings.actionSettleAuthority,
+    }
+    let choices = $derived(repairChoicesByFinding(view.candidates))
+    // The snapshot suggestion follows the selection, until the reader decides for themselves.
+    let snapshotTouched = $state(false)
+    $effect(() => {
+        if (!snapshotTouched) keepSnapshot = view.preview?.proposesSnapshot ?? false
+    })
+    let previewLines = $derived.by(() => {
+        const preview = view.preview
+        if (!preview) return []
+        const lines = [
+            strings.previewAnswered
+                .replace('{0}', count(preview.answered))
+                .replace('{1}', count(preview.answered + preview.remaining)),
+        ]
+        if (preview.droppedReferences > 0)
+            lines.push(strings.previewReferences.replace('{0}', count(preview.droppedReferences)))
+        if (preview.droppedAliases > 0)
+            lines.push(strings.previewAliases.replace('{0}', count(preview.droppedAliases)))
+        if (preview.discarding.length > 0)
+            lines.push(strings.previewDiscards.replace('{0}', count(preview.discarding.length)))
+        if (preview.tables.length > 0)
+            lines.push(strings.previewTables.replace('{0}', preview.tables.join(', ')))
+        return lines
+    })
+
+    function findingLabel(index: number): string {
+        const item = view.result?.items[index]
+        return item ? `${codeLabel(item.code)} · ${itemLocation(item)}` : ''
+    }
+
+    async function applyRepair(): Promise<void> {
+        await run(() => model.apply(keepSnapshot))
+    }
+
+    async function undoRepair(id: string): Promise<void> {
+        await run(() => model.undo(id))
+    }
+
     const unsubscribe = model.subscribe((next) => {
         view = next
     })
     onMount(() => {
-        void model.load()
+        void model.load().then(() => model.loadRepairs())
     })
     onDestroy(unsubscribe)
 </script>
@@ -226,6 +287,74 @@
                 {/if}
             </details>
         {/each}
+
+        <SettingGroup id="risunest-data-health-repair" title={strings.repairTitle} description={strings.repairHelp} panelProps={{ 'data-data-health-repair': '' }}>
+            {#if view.candidates.length === 0}
+                <p class="px-4 py-3 text-sm text-textcolor2">{strings.repairNone}</p>
+            {:else}
+                {#each [...choices] as [finding, options] (finding)}
+                    <div data-data-health-choice class="px-4 py-3">
+                        <p class="text-sm break-words">{findingLabel(finding)}</p>
+                        <div class="mt-1.5 flex flex-col gap-1">
+                            {#each options as option (option.id)}
+                                <Check
+                                    check={view.selection.includes(option.id)}
+                                    margin={false}
+                                    name={actionLabels[option.action.action]}
+                                    onChange={() => { void model.toggle(option.id) }}
+                                />
+                                {#if option.discards && view.selection.includes(option.id)}
+                                    <p class="pl-6 text-xs text-textcolor2">{strings.actionDiscards}</p>
+                                {/if}
+                                {#if option.action.action === 'adopt-stored-payload' && view.selection.includes(option.id)}
+                                    <p class="pl-6 text-xs text-textcolor2">{strings.actionRisky}</p>
+                                {/if}
+                            {/each}
+                        </div>
+                    </div>
+                {/each}
+                {#if previewLines.length > 0}
+                    <div data-data-health-preview class="px-4 py-3" role="status" aria-live="polite">
+                        <p class="text-[15px]">{strings.previewTitle}</p>
+                        <ul class="mt-1 text-sm text-textcolor2">
+                            {#each previewLines as line (line)}
+                                <li>{line}</li>
+                            {/each}
+                        </ul>
+                    </div>
+                {/if}
+                <SettingRow data-data-health-apply label={strings.repairSelected.replace('{0}', count(view.selection.length))} help={strings.repairSnapshotHelp}>
+                    {#snippet below()}
+                        <div class="mt-1.5 text-sm">
+                            <Check
+                                check={keepSnapshot}
+                                margin={false}
+                                name={strings.repairSnapshot}
+                                onChange={(next) => { snapshotTouched = true; keepSnapshot = next }}
+                            />
+                        </div>
+                    {/snippet}
+                    <Button disabled={view.repairing || view.selection.length === 0} onclick={applyRepair}>{view.repairing ? language.loading : strings.repairApply}</Button>
+                </SettingRow>
+            {/if}
+            {#if view.skipped.length > 0}
+                <p data-data-health-skipped class="px-4 py-3 text-sm text-textcolor2" role="status">{strings.undoSkipped.replace('{0}', view.skipped.join(', '))}</p>
+            {/if}
+            <div data-data-health-journals class="divide-y divide-darkborderc/55">
+                <p class="px-4 py-2 text-sm text-textcolor2">{strings.undoHelp}</p>
+                {#each view.journals as entry (entry.id)}
+                    <div class="flex flex-wrap items-center gap-3 px-4 py-2 text-sm">
+                        <span class="min-w-0 flex-1 break-words tabular-nums">{strings.undoEntry
+                            .replace('{0}', new Date(entry.createdAt).toLocaleString())
+                            .replace('{1}', count(entry.changes))
+                            .replace('{2}', count(entry.heldObjects))}</span>
+                        <Button size="sm" styled="outlined" disabled={view.repairing || !entry.current} onclick={() => undoRepair(entry.id)}>{strings.undoAction}</Button>
+                    </div>
+                {:else}
+                    <p class="px-4 py-2 text-sm text-textcolor2">{strings.undoNone}</p>
+                {/each}
+            </div>
+        </SettingGroup>
 
         <SettingRow data-data-health-report label={strings.copyReport} help={includeNames ? strings.includeNamesWarning : ''}>
             {#snippet below()}

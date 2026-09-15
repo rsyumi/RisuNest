@@ -6,6 +6,8 @@ use super::{
     current_time_ms, with_store_mutex_admitted, with_store_mutex_mut_admitted,
     PersistentStoreState, RendererOperationGuard,
 };
+use crate::data_health::journal;
+use crate::data_health::repair::{self, RepairCandidate, RepairPreview};
 use crate::data_health::{read_result, write_result, DeepProgress, ScanDepth, ScanResult};
 use crate::local_backup::CancellationProbe;
 use crate::persistent_store::{DataHealthReader, StoreError, StoreResult};
@@ -255,5 +257,196 @@ pub(crate) fn pds_data_health_cancel(health: State<'_, DataHealthState>) -> Resu
     Ok(())
 }
 
+/// The diagnosis a repair is selected against. A repair only applies to the library the scan
+/// judged, so a diagnosis for another revision is refused instead of applied to the wrong rows.
+fn current_diagnosis(
+    state: &PersistentStoreState,
+    operation_guard: &RendererOperationGuard,
+) -> StoreResult<(PathBuf, ScanResult)> {
+    let root = working_root(state, operation_guard)?;
+    let result = stored_result(&root)?.ok_or_else(|| StoreError::Validation {
+        message: "check the data before repairing it".to_owned(),
+    })?;
+    let revision = with_store_mutex_admitted(state, operation_guard, |store| store.revision())?;
+    if revision != result.revision {
+        return Err(StoreError::RevisionConflict {
+            expected: result.revision,
+            actual: revision,
+        });
+    }
+    Ok((root, result))
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_data_health_repair_plan(
+    state: State<'_, PersistentStoreState>,
+) -> Result<Vec<RepairCandidate>, StoreError> {
+    let operation_guard = state.admit_renderer_operation()?;
+    Ok(repair::plan(&current_diagnosis(&state, &operation_guard)?.1))
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_data_health_repair_preview(
+    state: State<'_, PersistentStoreState>,
+    selection: Vec<String>,
+) -> Result<RepairPreview, StoreError> {
+    let operation_guard = state.admit_renderer_operation()?;
+    Ok(repair::preview(
+        &current_diagnosis(&state, &operation_guard)?.1,
+        &selection,
+    ))
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_data_health_repair_apply(
+    state: State<'_, PersistentStoreState>,
+    health: State<'_, DataHealthState>,
+    selection: Vec<String>,
+    snapshot: bool,
+) -> Result<RepairApplied, StoreError> {
+    apply_repair(&state, &health, &selection, snapshot)
+}
+
+fn apply_repair(
+    state: &PersistentStoreState,
+    health: &DataHealthState,
+    selection: &[String],
+    snapshot: bool,
+) -> StoreResult<RepairApplied> {
+    let operation_guard = state.admit_renderer_operation()?;
+    let (root, diagnosis) = current_diagnosis(state, &operation_guard)?;
+    let preview = repair::preview(&diagnosis, selection);
+    if preview.selected.is_empty() {
+        return Err(StoreError::Validation {
+            message: "select at least one change to repair".to_owned(),
+        });
+    }
+    let now = current_time_ms()?;
+    // The snapshot is kept before anything changes, so it holds the library the reader selected
+    // against rather than the repaired one.
+    let snapshot = match snapshot {
+        true => Some(
+            with_store_mutex_mut_admitted(state, &operation_guard, |store| {
+                store.snapshot_create("data-health-repair")
+            })?
+            .id,
+        ),
+        false => None,
+    };
+    let (revision, journal) = with_store_mutex_mut_admitted(state, &operation_guard, |store| {
+        store.apply_repair(diagnosis.revision, &preview.selected, now)
+    })?;
+    journal::write(&root, &journal).map_err(|error| StoreError::Store {
+        message: format!("failed to write the repair journal: {error}"),
+    })?;
+    drop(operation_guard);
+    Ok(RepairApplied {
+        revision: revision.revision,
+        journal_id: journal.id,
+        snapshot,
+        result: quick_scan(state, health)?,
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_data_health_journals(
+    state: State<'_, PersistentStoreState>,
+) -> Result<Vec<JournalSummary>, StoreError> {
+    journals(&state)
+}
+
+fn journals(state: &PersistentStoreState) -> StoreResult<Vec<JournalSummary>> {
+    let operation_guard = state.admit_renderer_operation()?;
+    let root = working_root(state, &operation_guard)?;
+    let revision = with_store_mutex_admitted(state, &operation_guard, |store| store.revision())?;
+    Ok(journal::list(&root)
+        .map_err(|error| StoreError::Store {
+            message: format!("failed to read the repair journals: {error}"),
+        })?
+        .into_iter()
+        .map(|entry| JournalSummary {
+            id: entry.id,
+            created_at: entry.created_at,
+            from_revision: entry.from_revision,
+            to_revision: entry.to_revision,
+            changes: entry.records.len(),
+            held_objects: entry.released_objects.len(),
+            current: entry.to_revision == revision,
+        })
+        .collect())
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_data_health_undo(
+    state: State<'_, PersistentStoreState>,
+    health: State<'_, DataHealthState>,
+    journal_id: String,
+) -> Result<RepairUndone, StoreError> {
+    undo_repair(&state, &health, &journal_id)
+}
+
+fn undo_repair(
+    state: &PersistentStoreState,
+    health: &DataHealthState,
+    journal_id: &str,
+) -> StoreResult<RepairUndone> {
+    let operation_guard = state.admit_renderer_operation()?;
+    let root = working_root(state, &operation_guard)?;
+    let entry = journal::read(&root, journal_id)
+        .map_err(|error| StoreError::Store {
+            message: format!("failed to read the repair journal: {error}"),
+        })?
+        .ok_or_else(|| StoreError::Validation {
+            message: "that repair is no longer kept".to_owned(),
+        })?;
+    let revision = with_store_mutex_admitted(state, &operation_guard, |store| store.revision())?;
+    let (committed, skipped) = with_store_mutex_mut_admitted(state, &operation_guard, |store| {
+        store.undo_repair(&entry, revision)
+    })?;
+    journal::remove(&root, journal_id).map_err(|error| StoreError::Store {
+        message: format!("failed to drop the repair journal: {error}"),
+    })?;
+    drop(operation_guard);
+    Ok(RepairUndone {
+        revision: committed.revision,
+        skipped,
+        result: quick_scan(state, health)?,
+    })
+}
+
 #[cfg(test)]
 mod tests;
+
+/// What a repair changed, with the diagnosis the screen shows next. The rescan is quick, so the
+/// result reflects the repaired library instead of the one the reader selected against.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RepairApplied {
+    revision: i64,
+    journal_id: String,
+    snapshot: Option<String>,
+    result: ScanResult,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RepairUndone {
+    revision: i64,
+    /// Records the reader changed after the repair, which the undo left as they are.
+    skipped: Vec<String>,
+    result: ScanResult,
+}
+
+/// One repair the reader can still undo.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct JournalSummary {
+    id: String,
+    created_at: i64,
+    from_revision: i64,
+    to_revision: i64,
+    changes: usize,
+    held_objects: usize,
+    /// Whether the library is still at the revision this repair produced.
+    current: bool,
+}

@@ -10,7 +10,7 @@ use tempfile::{tempdir, TempDir};
 /// Only a reread can see that, so the two depths differ on exactly this fixture.
 fn damaged_payload_fixture() -> (TempDir, PersistentStoreState, String) {
     let directory = tempdir().unwrap();
-    let mut store = PersistentStore::open(directory.path()).unwrap();
+    let store = PersistentStore::open(directory.path()).unwrap();
     let generation = active_generation(&store.connection).unwrap();
     let declared = b"registered-payload-bytes";
     let hash = hex::encode(Sha256::digest(declared));
@@ -184,4 +184,135 @@ fn a_damaged_library_reports_every_finding_up_to_the_bound() {
             .count() as u64
     );
     assert_eq!(quick.omitted, 0);
+}
+
+/// The candidates that settle the two storage authorities. The fixture also reports references
+/// the empty root has always named, which this leaves alone.
+fn authority_selection(state: &PersistentStoreState) -> Vec<String> {
+    let guard = state.admit_renderer_operation().unwrap();
+    let (_, diagnosis) = current_diagnosis(state, &guard).unwrap();
+    repair::plan(&diagnosis)
+        .into_iter()
+        .filter(|candidate| {
+            matches!(
+                candidate.action,
+                crate::data_health::repair::RepairAction::SettleAuthority { .. }
+            )
+        })
+        .map(|candidate| candidate.id)
+        .collect()
+}
+
+#[test]
+fn a_repair_is_selected_against_the_diagnosis_and_reported_with_a_fresh_one() {
+    let (directory, state, _) = damaged_payload_fixture();
+    let health = DataHealthState::default();
+    let before = quick_scan(&state, &health).unwrap();
+    assert!(has(&before, codes::AUTHORITY_INCOMPLETE));
+
+    let selection = authority_selection(&state);
+    assert_eq!(selection.len(), 2, "one for each storage authority");
+    let applied = apply_repair(&state, &health, &selection, false).unwrap();
+    assert_eq!(applied.revision, before.revision + 1);
+    assert!(
+        !has(&applied.result, codes::AUTHORITY_INCOMPLETE),
+        "the reported diagnosis is the repaired library: {:?}",
+        applied.result.items
+    );
+    assert_eq!(applied.result.revision, applied.revision);
+    assert!(applied.snapshot.is_none());
+
+    let kept = journals(&state).unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].id, applied.journal_id);
+    assert!(kept[0].current);
+    assert!(crate::data_health::journal::read(directory.path(), &applied.journal_id)
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn an_undo_returns_the_library_and_drops_the_repair_it_replayed() {
+    let (_directory, state, _) = damaged_payload_fixture();
+    let health = DataHealthState::default();
+    quick_scan(&state, &health).unwrap();
+    let applied = apply_repair(&state, &health, &authority_selection(&state), false).unwrap();
+
+    let undone = undo_repair(&state, &health, &applied.journal_id).unwrap();
+    assert_eq!(undone.revision, applied.revision + 1);
+    assert!(undone.skipped.is_empty());
+    assert!(
+        has(&undone.result, codes::AUTHORITY_INCOMPLETE),
+        "the library is what it was before the repair"
+    );
+    assert!(journals(&state).unwrap().is_empty());
+}
+
+#[test]
+fn a_repair_selected_against_an_older_diagnosis_is_refused() {
+    let (_directory, state, _) = damaged_payload_fixture();
+    let health = DataHealthState::default();
+    quick_scan(&state, &health).unwrap();
+    let selection = authority_selection(&state);
+
+    let guard = state.admit_renderer_operation().unwrap();
+    with_store_mutex_mut_admitted(&state, &guard, |store| {
+        let staging = store.replace_begin()?;
+        store.replace_put_root(&staging.staging_id, &serde_json::json!({}))?;
+        store.replace_commit(&staging.staging_id, Some(0))?;
+        Ok(())
+    })
+    .unwrap();
+    drop(guard);
+
+    let error = apply_repair(&state, &health, &selection, false).unwrap_err();
+    assert!(
+        matches!(error, StoreError::RevisionConflict { .. }),
+        "check the library again before repairing it: {error:?}"
+    );
+}
+
+#[test]
+fn a_repair_needs_a_diagnosis_and_a_selection() {
+    let (_directory, state, _) = damaged_payload_fixture();
+    let health = DataHealthState::default();
+    assert!(matches!(
+        apply_repair(&state, &health, &[], false).unwrap_err(),
+        StoreError::Validation { .. }
+    ));
+
+    quick_scan(&state, &health).unwrap();
+    assert!(matches!(
+        apply_repair(&state, &health, &["0:nothing".to_owned()], false).unwrap_err(),
+        StoreError::Validation { .. }
+    ));
+}
+
+#[test]
+fn the_repair_keeps_a_snapshot_of_the_library_it_was_selected_against() {
+    let (_directory, state, _) = damaged_payload_fixture();
+    let health = DataHealthState::default();
+    quick_scan(&state, &health).unwrap();
+    let applied = apply_repair(&state, &health, &authority_selection(&state), true).unwrap();
+    let kept = applied.snapshot.expect("a snapshot was asked for");
+    let guard = state.admit_renderer_operation().unwrap();
+    let listed = with_store_mutex_admitted(&state, &guard, |store| store.snapshot_list()).unwrap();
+    assert!(listed.iter().any(|snapshot| snapshot.id == kept));
+}
+
+#[test]
+fn the_journal_and_the_diagnosis_stay_in_the_working_folder() {
+    let (directory, state, _) = damaged_payload_fixture();
+    let health = DataHealthState::default();
+    quick_scan(&state, &health).unwrap();
+    apply_repair(&state, &health, &authority_selection(&state), false).unwrap();
+
+    let working = directory.path().join("persistent").join("data-health");
+    assert!(working.join("result.json").exists());
+    assert!(crate::data_health::journal::directory(directory.path()).starts_with(&working));
+    let snapshots = directory.path().join("persistent").join("snapshots");
+    assert!(
+        !working.starts_with(&snapshots),
+        "a diagnosis is not a snapshot and never travels as one"
+    );
 }

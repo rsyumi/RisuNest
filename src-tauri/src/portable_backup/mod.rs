@@ -13,7 +13,8 @@ pub(crate) use catalog::Catalog;
 pub(crate) use internal::create_verified_library_backup;
 pub(crate) use reader::VerifiedArchive;
 pub(crate) use validation::{
-    registered_object_totals, scan_live_library, scan_registered_objects, ObjectPage, ObjectTotals,
+    registered_object_totals, scan_live_library, scan_registered_objects, validate_live_library,
+    ObjectPage, ObjectTotals,
 };
 pub(crate) use restore_inventory::{PreservationReport, RestoreInventory};
 
