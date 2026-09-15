@@ -74,6 +74,14 @@ export const languageEnglish = {
             'Selected areas replace the data on this device, including keys that exist only here. Unselected areas stay unchanged. No automatic backup will be kept. Back up your current data first if you want to keep it.',
         helpRestoreFirstRun:
             'Selected areas are brought onto this device. Unselected areas can be restored later from settings with the same file.',
+        damaged: 'This backup has {0} problems. You can still bring in the parts that are fine.',
+        choosePart: 'Choose what to bring in',
+        choosePartHelp:
+            'Anything a chosen item contains comes with it. Everything you leave out stays out, and links to it come in broken.',
+        itemCharacters: 'Characters',
+        itemPresets: 'Presets',
+        itemPlugins: 'Plugin data',
+        itemDamaged: '{0} problems',
         repair: 'This file preserves damaged source data. Its library cannot be activated until repaired.',
         continue: 'Continue',
         cancel: 'Cancel',

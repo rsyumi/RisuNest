@@ -17,6 +17,11 @@ pub(crate) use validation::{
     ObjectPage, ObjectTotals,
 };
 pub(crate) use restore_inventory::{PreservationReport, RestoreInventory};
+mod selection;
+pub(crate) use selection::{
+    close as close_selection, inventory as archive_inventory, ArchiveEntry, ArchiveInventory,
+    ArchiveSelection, ClosedSelection,
+};
 
 use crate::local_backup::CancellationProbe;
 use crate::persistent_store::StoreError;

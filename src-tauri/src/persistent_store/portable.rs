@@ -1,7 +1,7 @@
 //! Raw generation projection for portable archives. Never execute source DDL or reserialize JSON.
 use super::{PersistentStore, StoreError, StoreResult};
 use crate::local_backup::CancellationProbe;
-use rusqlite::{types::ValueRef, Connection};
+use rusqlite::{types::ValueRef, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 pub(crate) struct PortableTable {
@@ -327,6 +327,172 @@ impl PersistentStore {
         }
         Ok(stage)
     }
+}
+
+/// Stages only the records a partial import chose, keeping the settings record and the storage
+/// authorities whole. Every row it writes is copied from the archive unchanged except for the
+/// ordering columns, which are renumbered because the records around them are gone.
+///
+/// The stored files all come in: an import that left some out would have to decide which of them
+/// the kept records still need, and the unused image cleanup answers that question afterwards
+/// with the whole library in view.
+pub(crate) fn stage_portable_records_selected(
+    store: &mut PersistentStore,
+    source: &Connection,
+    selection: &crate::portable_backup::ClosedSelection,
+    probe: &dyn CancellationProbe,
+) -> StoreResult<super::StagingResult> {
+    super::portable_validation::validate_records(source, probe)?;
+    let stage = store.replace_begin()?;
+    let result = copy_selected(store, source, &stage.staging_id, selection, probe);
+    if let Err(error) = result {
+        store.replace_abort(&stage.staging_id)?;
+        return Err(error);
+    }
+    Ok(stage)
+}
+
+fn quoted_list(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| format!("'{}'", value.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn copy_selected(
+    store: &mut PersistentStore,
+    source: &Connection,
+    staging: &str,
+    selection: &crate::portable_backup::ClosedSelection,
+    probe: &dyn CancellationProbe,
+) -> StoreResult<()> {
+    let characters = quoted_list(&selection.characters);
+    let filters: Vec<(&str, String)> = vec![
+        ("bot_presets", format!("preset_id IN ({})", quoted_list(&selection.presets))),
+        ("plugin_storage", format!("storage_key IN ({})", quoted_list(&selection.plugins))),
+        ("characters", format!("character_id IN ({characters})")),
+        ("conversations", format!("character_id IN ({characters})")),
+        ("messages", format!("character_id IN ({characters})")),
+    ];
+    let transaction = store.connection.transaction()?;
+    for table in TABLES {
+        cancelled(probe)?;
+        let filter = filters
+            .iter()
+            .find(|(name, _)| *name == table.name)
+            .map(|(_, filter)| filter.as_str())
+            .unwrap_or_default();
+        let columns = table.column_list();
+        transaction.execute(
+            &format!("DELETE FROM {} WHERE generation=?1", table.name),
+            [staging],
+        )?;
+        let mut select = source.prepare(&format!(
+            "SELECT {columns} FROM {}{} ORDER BY {}",
+            table.name,
+            match filter.is_empty() {
+                true => String::new(),
+                false => format!(" WHERE {filter}"),
+            },
+            table.order
+        ))?;
+        let placeholders = (0..=table.columns.len())
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut insert = transaction.prepare(&format!(
+            "INSERT INTO {} (generation,{columns}) VALUES ({placeholders})",
+            table.name
+        ))?;
+        let mut rows = select.query([])?;
+        while let Some(row) = rows.next()? {
+            cancelled(probe)?;
+            insert.raw_bind_parameter(1, staging)?;
+            for index in 0..table.columns.len() {
+                insert.raw_bind_parameter(
+                    index + 2,
+                    rusqlite::types::ToSqlOutput::Borrowed(row.get_ref(index)?),
+                )?;
+            }
+            insert.raw_execute()?;
+        }
+        drop(rows);
+        drop(insert);
+        drop(select);
+    }
+    // An owner head belongs to a record; the ones whose character stayed behind have no owner.
+    transaction.execute(
+        "DELETE FROM asset_owner_heads WHERE generation=?1 AND owner_kind IN ('character','group')
+         AND owner_locator NOT IN (SELECT character_id FROM characters WHERE generation=?1)",
+        [staging],
+    )?;
+    renumber_selected(&transaction, staging)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Closes the gaps the dropped records left in the ordering columns, and points the chosen preset
+/// at wherever it landed. Nothing else about the settings record changes.
+fn renumber_selected(transaction: &Connection, staging: &str) -> StoreResult<()> {
+    for (table, identity, order) in [
+        ("characters", "character_id", "configured_index"),
+        ("plugin_storage", "storage_key", "ordinal"),
+    ] {
+        transaction.execute(
+            &format!(
+                "UPDATE {table} SET \"{order}\"=(
+                     SELECT position-1 FROM (
+                         SELECT \"{identity}\" AS id, row_number() OVER (ORDER BY \"{order}\") AS position
+                         FROM {table} WHERE generation=?1
+                     ) ranked WHERE ranked.id={table}.\"{identity}\"
+                 ) WHERE generation=?1",
+            ),
+            [staging],
+        )?;
+    }
+    // A preset is named by its own position, so renumbering has to carry the identity with it.
+    let kept: Vec<String> = {
+        let mut statement = transaction.prepare(
+            "SELECT preset_id FROM bot_presets WHERE generation=?1 ORDER BY configured_index",
+        )?;
+        let mut rows = statement.query([staging])?;
+        let mut kept = Vec::new();
+        while let Some(row) = rows.next()? {
+            kept.push(row.get(0)?);
+        }
+        kept
+    };
+    let selected: Option<i64> = transaction
+        .query_row(
+            "SELECT CAST(json_extract(value,'$.botPresetsId') AS INTEGER) FROM root WHERE generation=?1",
+            [staging],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    for (position, preset_id) in kept.iter().enumerate() {
+        transaction.execute(
+            "UPDATE bot_presets SET preset_id=?3, configured_index=?4 WHERE generation=?1 AND preset_id=?2",
+            rusqlite::params![staging, preset_id, position.to_string(), position as i64],
+        )?;
+    }
+    if let Some(selected) = selected {
+        // The chosen preset keeps being the chosen one where it landed, or the first that stayed.
+        let landed = kept
+            .iter()
+            .position(|preset_id| preset_id.parse::<i64>() == Ok(selected))
+            .map(|position| position as i64)
+            .unwrap_or(0)
+            .min((kept.len() as i64 - 1).max(0));
+        if landed != selected {
+            transaction.execute(
+                "UPDATE root SET value=json_set(value,'$.botPresetsId',?2) WHERE generation=?1",
+                rusqlite::params![staging, landed],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn digest_raw_tables(

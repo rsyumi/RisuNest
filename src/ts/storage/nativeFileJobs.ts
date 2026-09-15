@@ -10,6 +10,7 @@ import {
     sealPreparedContentCasJob,
 } from './nativeAssetRepository'
 import type { PreparedImmutablePayload } from './payloadCas'
+import type { DataHealthResult } from './dataHealth'
 import {
     copyNativeExportToAndroidSaf,
     discardAndroidSafSource,
@@ -385,11 +386,34 @@ export interface NativeFileJobStatus {
 export interface NativePortableSelection {
     library: boolean
     deviceSections: string[]
+    /** Absent brings the whole library; present brings only the records it names. */
+    items?: NativeArchiveSelection
+}
+/** One record an import can take or leave. */
+export interface NativeArchiveEntry {
+    id: string
+    conversations: number
+    damaged: number
+}
+export interface NativeArchiveInventory {
+    characters: NativeArchiveEntry[]
+    presets: NativeArchiveEntry[]
+    plugins: NativeArchiveEntry[]
+}
+export interface NativeArchiveSelection {
+    characters: string[]
+    presets: string[]
+    plugins: string[]
+    /** Records left out on purpose, whose references come in broken. */
+    excluded: string[]
 }
 export interface NativePortableRestorePreview {
     libraryIncluded: boolean
     repairRequired: boolean
     deviceSections: string[]
+    /** What is wrong with the archive's library, even when the gate refuses it. */
+    diagnosis?: DataHealthResult
+    items?: NativeArchiveInventory
 }
 
 export interface NativeBlockRestoreRuntime {
