@@ -2,9 +2,11 @@ import { mount, unmount } from "svelte";
 import { language } from "../../../lang";
 import PortableBackupSelection from "../../../lib/Setting/PortableBackupSelection.svelte";
 import type {
+  NativeArchiveInventory,
   NativePortableRestorePreview,
   NativePortableSelection,
 } from "../nativeFileJobs";
+import type { DataHealthResult } from "../dataHealth";
 import { sectionDatabaseName, validateDeviceSectionId } from "./scopes";
 import {
   defaultDeviceExportChoices,
@@ -27,12 +29,18 @@ function localize(choice: DeviceSectionChoice): DeviceSectionChoice {
 }
 
 let selectionOpen = false;
+interface ArchiveDetail {
+  diagnosis?: DataHealthResult;
+  items?: NativeArchiveInventory;
+}
+
 function showSelection(
   mode: "export" | "restore",
   choices: DeviceSectionChoice[],
   libraryIncluded: boolean,
   repairRequired = false,
   firstRun = false,
+  detail: ArchiveDetail = {},
 ): Promise<NativePortableSelection | null> {
   if (selectionOpen)
     return Promise.reject(new Error("A backup selection is already open"));
@@ -67,6 +75,8 @@ function showSelection(
           choices: choices.map(localize),
           libraryIncluded,
           repairRequired,
+          diagnosis: detail.diagnosis,
+          items: detail.items,
           firstRun,
           onDone: (selection) => finish(selection),
           onError: (error) => finish(null, error),
@@ -109,5 +119,6 @@ export function selectPortableBackupRestore(
     preview.libraryIncluded,
     preview.repairRequired,
     options.firstRun ?? false,
+    { diagnosis: preview.diagnosis, items: preview.items },
   );
 }

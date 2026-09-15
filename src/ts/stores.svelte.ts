@@ -34,6 +34,11 @@ export type BootFailure = {
     stage?: string
 }
 export const bootFailure = writable<BootFailure | null>(null)
+/**
+ * Set while the recovery shell stands in for the app. Holding the ordinary start here is what
+ * keeps `loadData()` from running behind the shell.
+ */
+export const recoveryStart = writable<(() => void) | null>(null)
 export const DynamicGUI = writable(false)
 export const sideBarClosing = writable(false)
 export const sideBarStore = writable(window.innerWidth > 1024)

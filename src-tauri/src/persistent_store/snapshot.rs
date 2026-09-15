@@ -23,6 +23,7 @@ use uuid::Uuid;
 const DATABASE_FILE: &str = "persistent.db";
 const MIN_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_COLD_DECODED_BYTES: u64 = 64 * 1024 * 1024;
+const UNSCANNABLE_BLOCKER: &str = "record-unscannable";
 const CAS_PHYSICAL_PREFIX: &[u8] = b"assets-v2/objects/";
 const COLD_STORAGE_HEADER: &str = "\u{ef01}COLDSTORAGE\u{ef01}";
 
@@ -336,16 +337,35 @@ pub(super) fn acquire_revision(
     ))
 }
 
-fn open_revision_reader(database_path: &Path) -> StoreResult<Connection> {
+pub(super) fn open_revision_reader(database_path: &Path) -> StoreResult<Connection> {
+    open_reader(database_path, &|_| Ok(()))
+}
+
+/// A reader that presents one generation under the raw table names. The views are temp objects,
+/// so they have to exist before the connection becomes read-only.
+pub(super) fn open_generation_reader(
+    database_path: &Path,
+    generation: &str,
+) -> StoreResult<Connection> {
+    open_reader(database_path, &|connection| {
+        super::portable::install_generation_views(connection, generation)
+    })
+}
+
+fn open_reader(
+    database_path: &Path,
+    prepare: &dyn Fn(&Connection) -> StoreResult<()>,
+) -> StoreResult<Connection> {
     let preferred = revision_reader_open_flags_for_target(cfg!(target_os = "android"));
     if cfg!(target_os = "android") {
-        return configure_revision_reader(database_path, preferred);
+        return configure_revision_reader(database_path, preferred, prepare);
     }
-    match configure_revision_reader(database_path, preferred) {
+    match configure_revision_reader(database_path, preferred, prepare) {
         Ok(connection) => Ok(connection),
         Err(_) => configure_revision_reader(
             database_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            prepare,
         ),
     }
 }
@@ -359,13 +379,18 @@ pub(super) fn revision_reader_open_flags_for_target(is_android: bool) -> OpenFla
     access | OpenFlags::SQLITE_OPEN_NO_MUTEX
 }
 
-fn configure_revision_reader(database_path: &Path, flags: OpenFlags) -> StoreResult<Connection> {
+fn configure_revision_reader(
+    database_path: &Path,
+    flags: OpenFlags,
+    prepare: &dyn Fn(&Connection) -> StoreResult<()>,
+) -> StoreResult<Connection> {
     let connection = Connection::open_with_flags(database_path, flags)?;
     connection.busy_timeout(Duration::ZERO)?;
+    connection.execute_batch("PRAGMA cache_size = -2048;")?;
+    prepare(&connection)?;
     connection.execute_batch(
         "
         PRAGMA query_only = ON;
-        PRAGMA cache_size = -2048;
         BEGIN DEFERRED;
         ",
     )?;
@@ -521,7 +546,8 @@ fn collect_asset_roots_scoped(
             "SELECT manifest_hash FROM asset_owner_heads WHERE present = 1"
         },
         scope_params,
-        &mut roots.manifest_hashes,
+        HashTarget::Manifest,
+        &mut roots,
     )?;
     scan_asset_alias_roots(
         connection,
@@ -552,7 +578,8 @@ fn collect_asset_roots_scoped(
                 connection,
                 "SELECT hash FROM server_sync_objects",
                 [],
-                &mut roots.object_hashes,
+                HashTarget::Object,
+                &mut roots,
             )?;
         }
         let retained_generations: i64 =
@@ -635,10 +662,25 @@ fn scan_cold_alias_roots<P: rusqlite::Params>(
     let mut rows = statement.query(params)?;
     let mut aliases = Vec::new();
     while let Some(row) = rows.next()? {
-        let key: String = row.get(0)?;
-        let object_hash: Option<String> = row.get(1)?;
-        let size: i64 = row.get(2)?;
-        let Ok(size) = u64::try_from(size) else {
+        let ScannedText::Text(key) = scanned_text(row, 0)? else {
+            retain_unscannable_record(roots);
+            continue;
+        };
+        let object_hash = match scanned_text(row, 1)? {
+            ScannedText::Text(object_hash) => Some(object_hash),
+            ScannedText::Null => None,
+            ScannedText::Damaged => {
+                roots.cold_keys.insert(key);
+                retain_unscannable_record(roots);
+                continue;
+            }
+        };
+        let Some(size) = row
+            .get_ref(2)?
+            .as_i64()
+            .ok()
+            .and_then(|size| u64::try_from(size).ok())
+        else {
             roots.cold_keys.insert(key);
             roots.retain_all_objects = true;
             continue;
@@ -733,18 +775,54 @@ fn table_exists(connection: &Connection, table: &str) -> StoreResult<bool> {
         .map_err(StoreError::from)
 }
 
+// A snapshot exists to preserve the rows it captures, so a value whose storage
+// class or encoding is damaged widens retention instead of failing the capture.
+enum ScannedText {
+    Text(String),
+    Null,
+    Damaged,
+}
+
+fn scanned_text(row: &rusqlite::Row<'_>, index: usize) -> StoreResult<ScannedText> {
+    Ok(match row.get_ref(index)? {
+        rusqlite::types::ValueRef::Null => ScannedText::Null,
+        rusqlite::types::ValueRef::Text(bytes) => match std::str::from_utf8(bytes) {
+            Ok(value) => ScannedText::Text(value.to_owned()),
+            Err(_) => ScannedText::Damaged,
+        },
+        _ => ScannedText::Damaged,
+    })
+}
+
+fn retain_unscannable_record(roots: &mut AssetRootSet) {
+    roots.blockers.insert(UNSCANNABLE_BLOCKER.to_owned());
+    roots.retain_all_objects = true;
+}
+
+enum HashTarget {
+    Manifest,
+    Object,
+}
+
 fn scan_optional_hash_column<P: rusqlite::Params>(
     connection: &Connection,
     query: &str,
     params: P,
-    target: &mut std::collections::BTreeSet<String>,
+    target: HashTarget,
+    roots: &mut AssetRootSet,
 ) -> StoreResult<()> {
     let mut statement = connection.prepare(query)?;
     let mut rows = statement.query(params)?;
     while let Some(row) = rows.next()? {
-        let value: Option<String> = row.get(0)?;
-        if let Some(value) = value {
-            target.insert(value);
+        match scanned_text(row, 0)? {
+            ScannedText::Text(value) => {
+                match target {
+                    HashTarget::Manifest => roots.manifest_hashes.insert(value),
+                    HashTarget::Object => roots.object_hashes.insert(value),
+                };
+            }
+            ScannedText::Null => {}
+            ScannedText::Damaged => retain_unscannable_record(roots),
         }
     }
     Ok(())
@@ -759,12 +837,17 @@ fn scan_asset_alias_roots<P: rusqlite::Params>(
     let mut statement = connection.prepare(query)?;
     let mut rows = statement.query(params)?;
     while let Some(row) = rows.next()? {
-        let logical_key: String = row.get(0)?;
-        let object_hash: Option<String> = row.get(1)?;
-        if let Some(object_hash) = object_hash {
-            roots.object_hashes.insert(object_hash);
-        } else {
-            roots.legacy_asset_keys.insert(logical_key);
+        match scanned_text(row, 1)? {
+            ScannedText::Text(object_hash) => {
+                roots.object_hashes.insert(object_hash);
+            }
+            ScannedText::Null => match scanned_text(row, 0)? {
+                ScannedText::Text(logical_key) => {
+                    roots.legacy_asset_keys.insert(logical_key);
+                }
+                _ => retain_unscannable_record(roots),
+            },
+            ScannedText::Damaged => retain_unscannable_record(roots),
         }
     }
     Ok(())
@@ -779,12 +862,14 @@ fn scan_json_column<P: rusqlite::Params>(
     let mut statement = connection.prepare(query)?;
     let mut rows = statement.query(params)?;
     while let Some(row) = rows.next()? {
-        let encoded: String = row.get(0)?;
-        match serde_json::from_str(&encoded) {
-            Ok(value) => observe_json_value(&value, None, roots),
-            // The snapshot contains this exact record. If its references cannot
-            // be decoded, retain objects instead of discarding the raw backup.
-            Err(_) => roots.retain_all_objects = true,
+        // The snapshot contains this exact record. If its references cannot
+        // be decoded, retain objects instead of discarding the raw backup.
+        match scanned_text(row, 0)? {
+            ScannedText::Text(encoded) => match serde_json::from_str(&encoded) {
+                Ok(value) => observe_json_value(&value, None, roots),
+                Err(_) => retain_unscannable_record(roots),
+            },
+            _ => retain_unscannable_record(roots),
         }
     }
     Ok(())
@@ -799,8 +884,10 @@ fn scan_text_column<P: rusqlite::Params>(
     let mut statement = connection.prepare(query)?;
     let mut rows = statement.query(params)?;
     while let Some(row) = rows.next()? {
-        let value: String = row.get(0)?;
-        observe_text(&value, roots);
+        match scanned_text(row, 0)? {
+            ScannedText::Text(value) => observe_text(&value, roots),
+            _ => retain_unscannable_record(roots),
+        }
     }
     Ok(())
 }

@@ -2,37 +2,58 @@ import {
     setRuntimePerformanceProfile,
     type RuntimePerformanceProfile,
 } from '../runtimePerformanceProfile'
+import {
+    RECOVERY_EXCLUSIONS,
+    type RecoveryExclusion,
+} from './startupExclusions'
 
 export interface RisuNestDeviceSettings {
-    schema: 'risunest.device-settings/v1'
+    schema: 'risunest.device-settings/v2'
     performanceProfile: RuntimePerformanceProfile
     androidKeepAliveDuringGeneration: boolean
     nativeFileLogEnabled: boolean
+    /**
+     * What every start on this device leaves switched off. Written only after a start that
+     * finished and only when the reader confirms it, and kept per device rather than in the
+     * library, so it never travels through a backup or a sync.
+     */
+    startupExclusions: RecoveryExclusion[]
 }
 
 const storageKey = 'risuNestDeviceSettings'
 
 const defaults: RisuNestDeviceSettings = {
-    schema: 'risunest.device-settings/v1',
+    schema: 'risunest.device-settings/v2',
     performanceProfile: 'normal',
     androidKeepAliveDuringGeneration: true,
     nativeFileLogEnabled: true,
+    startupExclusions: [],
 }
 
 function snapshot(settings: RisuNestDeviceSettings): RisuNestDeviceSettings {
-    return { ...settings }
+    return { ...settings, startupExclusions: [...settings.startupExclusions] }
+}
+
+function isExclusionList(value: unknown): value is RecoveryExclusion[] {
+    return (
+        Array.isArray(value) &&
+        value.every((item) =>
+            RECOVERY_EXCLUSIONS.includes(item as RecoveryExclusion),
+        )
+    )
 }
 
 function isValidSettings(value: unknown): value is RisuNestDeviceSettings {
     if (!value || typeof value !== 'object') return false
     const settings = value as Record<string, unknown>
     return (
-        Object.keys(settings).length === 4 &&
+        Object.keys(settings).length === 5 &&
         settings.schema === defaults.schema &&
         (settings.performanceProfile === 'normal' ||
             settings.performanceProfile === 'low-spec') &&
         typeof settings.androidKeepAliveDuringGeneration === 'boolean' &&
-        typeof settings.nativeFileLogEnabled === 'boolean'
+        typeof settings.nativeFileLogEnabled === 'boolean' &&
+        isExclusionList(settings.startupExclusions)
     )
 }
 

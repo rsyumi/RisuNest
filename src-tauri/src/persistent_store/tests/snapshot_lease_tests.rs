@@ -97,6 +97,44 @@ fn source_preservation_snapshot_keeps_invalid_json_and_retains_objects() {
 }
 
 #[test]
+fn source_preservation_snapshot_survives_damaged_storage_classes() {
+    for sql in [
+        "UPDATE root SET value=x'00'",
+        "UPDATE characters SET detail=x'00'",
+        "UPDATE characters SET image=x'00' WHERE image IS NOT NULL",
+        "UPDATE conversations SET detail=x'00'",
+        "UPDATE messages SET value=x'00'",
+    ] {
+        let (_directory, store, _) = open_fixture();
+        assert!(
+            store.connection.execute(sql, []).unwrap() > 0,
+            "synthetic damage did not exercise its target: {sql}"
+        );
+        let snapshot = store.snapshot_create("preserve-damaged-column").unwrap();
+        let metadata = Archive::open(&store.snapshots_dir)
+            .unwrap()
+            .metadata(&snapshot.id)
+            .unwrap();
+        assert!(metadata.roots.retain_all_objects, "{sql}");
+        assert!(
+            metadata.roots.blockers.contains("record-unscannable"),
+            "{sql}"
+        );
+    }
+    let (_directory, store, _) = open_fixture();
+    store
+        .connection
+        .execute("UPDATE root SET value=x'0001'", [])
+        .unwrap();
+    let snapshot = store.snapshot_create("preserve-damaged-column").unwrap();
+    let (_capture, connection) = reconstruct_snapshot(&store, &snapshot.id);
+    let value: Vec<u8> = connection
+        .query_row("SELECT value FROM root LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(value, vec![0, 1]);
+}
+
+#[test]
 fn snapshot_delete_requires_a_listed_id_and_removes_its_roots() {
     let (_directory, store, _) = open_fixture();
     let created = store.snapshot_create("delete-test").unwrap();

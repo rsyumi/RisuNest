@@ -218,6 +218,51 @@ describe('RisuNestStorageDashboard', () => {
         )
         expect(server.cleanupServerSyncCache).not.toHaveBeenCalled()
     })
+    it('lists what the cleanup found and why each file stayed', async () => {
+        const target = setup()
+        maintenance.previewNativePersistentAssetGc.mockResolvedValue({
+            candidateCount: 1,
+            candidateBytes: 1024,
+            deletedCount: 0,
+            deletedBytes: 0,
+            blockers: [],
+            candidates: [
+                { objectHash: 'a'.repeat(64), bytes: 1024, createdAtMs: 0, state: 'deletable', holders: [] },
+                { objectHash: 'b'.repeat(64), bytes: 2048, createdAtMs: 0, state: 'held', holders: ['repair'] },
+                { objectHash: 'c'.repeat(64), bytes: 4096, createdAtMs: 0, state: 'held', holders: [] },
+                { objectHash: 'd'.repeat(64), bytes: 512, createdAtMs: 0, state: 'recent', holders: [] },
+            ],
+            omitted: 7,
+        })
+        const find = () =>
+            [...target.querySelectorAll<HTMLButtonElement>('button')].find(
+                (candidate) => candidate.textContent?.trim() === 'Find',
+            )
+        await vi.waitFor(() => expect(find()).toBeDefined())
+        find()!.click()
+        await vi.waitFor(() =>
+            expect(target.querySelectorAll('[data-storage-gc-row]')).toHaveLength(4),
+        )
+        const rows = [...target.querySelectorAll('[data-storage-gc-row]')].map(
+            (row) => row.textContent ?? '',
+        )
+        expect(rows[0]).toContain('Can be deleted')
+        expect(rows[1]).toContain('kept so a fix can be undone')
+        expect(rows[2]).toContain('in use')
+        expect(rows[3]).toContain('Too new to delete yet')
+        expect(target.querySelector('[data-storage-gc-list]')?.textContent).toContain(
+            'and 7 more',
+        )
+    })
+
+    it('says that clearing a link does not delete the file', async () => {
+        const target = setup()
+        await vi.waitFor(() => expect(target.textContent).toContain('Unused images'))
+        expect(target.textContent).toContain(
+            'This is the only place a file is actually deleted.',
+        )
+    })
+
     it('formats large counts with locale separators', async () => {
         const target = setup(Promise.resolve({ ...stats, conversations: { count: 1200, messageCount: 15231 } }))
         await vi.waitFor(() => expect(target.textContent).toContain('Total data'))

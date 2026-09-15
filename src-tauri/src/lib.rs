@@ -3,7 +3,9 @@ mod android_commit_transport;
 mod app_data_root;
 mod app_update;
 mod asset_repository;
+mod boot_marker;
 mod cold_payload_codec;
+mod data_health;
 pub(crate) mod device_backup;
 mod external_storage;
 pub mod import_export_jobs;
@@ -110,6 +112,37 @@ impl NativeStartupState {
 #[tauri::command]
 fn native_startup_status(state: tauri::State<'_, NativeStartupState>) -> Result<(), String> {
     state.ensure_ready()
+}
+
+fn boot_marker_root(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    app_data_root::resolve(app).map_err(|error| {
+        format!("failed to resolve application data directory: {error}")
+    })
+}
+
+fn boot_marker_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
+}
+
+/// Records that a start has begun and reports what the last one left. The renderer calls it
+/// before anything it could fail in, so a start that never reaches the app still counts.
+#[tauri::command(async)]
+fn boot_attempt_begin(app: tauri::AppHandle) -> Result<boot_marker::BootDecision, String> {
+    let version = app.package_info().version.to_string();
+    let root = boot_marker_root(&app)?;
+    boot_marker::begin(&root, &version, boot_marker_now())
+        .map_err(|error| format!("failed to record the start attempt: {error}"))
+}
+
+/// Records that the start finished, so the next one begins from zero.
+#[tauri::command(async)]
+fn boot_attempt_complete(app: tauri::AppHandle) -> Result<(), String> {
+    let root = boot_marker_root(&app)?;
+    boot_marker::complete(&root)
+        .map_err(|error| format!("failed to clear the start attempt: {error}"))
 }
 
 #[tauri::command]
@@ -623,6 +656,7 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         .manage(asset_repository::commands::DurableCasJobState::default())
         .manage(native_media::ipc::NativeMediaIpcState::default())
         .manage(persistent_store::PersistentStoreState::default())
+        .manage(persistent_store::commands::data_health::DataHealthState::default())
         .manage(server_sync::commands::ServerSyncCommandState::default())
         .manage(external_storage::connection_commands::ConnectionCommandState::default())
         .manage(external_storage::job_store::JobCommandState::default())
@@ -699,6 +733,8 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         server_sync::commands::server_sync_publish,
         server_sync::commands::server_sync_cancel,
         greet,
+        boot_attempt_begin,
+        boot_attempt_complete,
         native_request,
         check_auth,
         #[cfg(desktop)]
@@ -707,6 +743,15 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         persistent_store::commands::pds_snapshot_delete,
         persistent_store::commands::pds_asset_gc_preview,
         persistent_store::commands::pds_asset_gc_execute,
+        persistent_store::commands::data_health::pds_data_health_scan,
+        persistent_store::commands::data_health::pds_data_health_deep_scan,
+        persistent_store::commands::data_health::pds_data_health_result,
+        persistent_store::commands::data_health::pds_data_health_cancel,
+        persistent_store::commands::data_health::pds_data_health_repair_plan,
+        persistent_store::commands::data_health::pds_data_health_repair_preview,
+        persistent_store::commands::data_health::pds_data_health_repair_apply,
+        persistent_store::commands::data_health::pds_data_health_journals,
+        persistent_store::commands::data_health::pds_data_health_undo,
         native_log::native_log_tail,
         native_log::native_log_error,
         native_log::native_log_file_path,

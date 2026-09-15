@@ -21,12 +21,17 @@ use tauri::Manager;
 pub(crate) struct PortableSelection {
     pub(crate) library: bool,
     pub(crate) device_sections: Vec<String>,
+    /// Absent brings the whole library; present brings only the records it names, closed over
+    /// what those records refer to.
+    #[serde(default)]
+    pub(crate) items: Option<portable_backup::ArchiveSelection>,
 }
 impl Default for PortableSelection {
     fn default() -> Self {
         Self {
             library: true,
             device_sections: vec![],
+            items: None,
         }
     }
 }
@@ -36,8 +41,18 @@ pub(crate) struct RestorePreview {
     pub(crate) library_included: bool,
     pub(crate) repair_required: bool,
     pub(crate) device_sections: Vec<String>,
+    /// What is wrong with the archive's library. An archive the gate refuses still reports this,
+    /// which is the only way a reader learns what to leave out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) diagnosis: Option<crate::data_health::ScanResult>,
+    /// The records the reader can choose between.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) items: Option<portable_backup::ArchiveInventory>,
 }
-fn restore_preview(archive: &VerifiedArchive) -> Result<RestorePreview, NativeJobError> {
+fn restore_preview(
+    archive: &VerifiedArchive,
+    probe: &dyn CancellationProbe,
+) -> Result<RestorePreview, NativeJobError> {
     let mut sections = Vec::new();
     let mut statement = archive
         .db
@@ -52,11 +67,40 @@ fn restore_preview(archive: &VerifiedArchive) -> Result<RestorePreview, NativeJo
         }
         sections.push(row.get(0).map_err(error)?);
     }
+    let (diagnosis, items) = match archive.manifest.library_included {
+        true => {
+            let mut findings = crate::data_health::Findings::new(2000);
+            archive
+                .scan_library(crate::data_health::ScanDepth::Deep, &mut findings, probe)
+                .map_err(error)?;
+            let items = portable_backup::archive_inventory(&archive.db, &findings.items)
+                .map_err(error)?;
+            (
+                Some(crate::data_health::ScanResult::new(
+                    0,
+                    archive_scanned_at(),
+                    crate::data_health::ScanDepth::Deep,
+                    findings,
+                )),
+                Some(items),
+            )
+        }
+        false => (None, None),
+    };
     Ok(RestorePreview {
         library_included: archive.manifest.library_included,
         repair_required: archive.manifest.repair_required,
         device_sections: sections,
+        diagnosis,
+        items,
     })
+}
+
+fn archive_scanned_at() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
 }
 
 fn begin_device(
@@ -510,7 +554,7 @@ pub(crate) fn restore_portable(
     let archive = VerifiedArchive::open(input, owned, &probe).map_err(error)?;
     let fallback = match device {
         Some((_, None)) => job
-            .wait_for_portable_selection(restore_preview(&archive)?)
+            .wait_for_portable_selection(restore_preview(&archive, &probe)?)
             .map_err(error)?,
         _ => PortableSelection::default(),
     };
@@ -526,20 +570,29 @@ pub(crate) fn restore_portable(
     if !selection.library && selection.device_sections.is_empty() {
         return Err(error("Select at least one backup section"));
     }
-    if selection.library {
+    if selection.library && selection.items.is_none() {
         archive.validate_library(&probe).map_err(error)?;
     }
     let mut pins = new_pins(&store, CasJobKind::LocalBackupRestore)?;
     let outcome = (|| {
         job.set_phase(JobPhase::StagingDatabase).map_err(error)?;
-        let stage = if selection.library {
-            Some(
+        let stage = match (selection.library, selection.items.as_ref()) {
+            (false, _) => None,
+            (true, None) => Some(
                 store
                     .stage_portable_records(&archive.db, &probe)
                     .map_err(error)?,
-            )
-        } else {
-            None
+            ),
+            (true, Some(items)) => {
+                let closed =
+                    portable_backup::close_selection(&archive.db, items).map_err(error)?;
+                Some(
+                    crate::persistent_store::portable::stage_portable_records_selected(
+                        &mut store, &archive.db, &closed, &probe,
+                    )
+                    .map_err(error)?,
+                )
+            }
         };
         let mut committed = false;
         let session = match device {
@@ -1088,6 +1141,21 @@ mod tests {
             .unwrap();
             assert!(archive.manifest.repair_required);
             assert!(archive.validate_library(&NeverCancelled).is_err());
+            if archive.manifest.library_included {
+                // The gate refuses this archive, so only the collecting scan can say what is wrong.
+                let mut findings = crate::data_health::Findings::new(64);
+                archive
+                    .scan_library(
+                        crate::data_health::ScanDepth::Deep,
+                        &mut findings,
+                        &NeverCancelled,
+                    )
+                    .unwrap();
+                assert!(findings
+                    .items
+                    .iter()
+                    .any(|finding| finding.code == crate::data_health::codes::RECORD_INVALID));
+            }
             if unknown {
                 assert_eq!(
                     archive.manifest.profile,

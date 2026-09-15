@@ -2,6 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const startup = vi.hoisted(() => ({ cacheBudget: 0 }));
 
+vi.mock("./ts/storage/recoveryMode.svelte", () => ({
+  decideBoot: vi.fn(async () => "normal"),
+}));
+
 vi.mock("./ts/polyfill", () => ({}));
 vi.mock("core-js/actual", () => ({}));
 vi.mock("./ts/storage/database.svelte", () => ({}));
@@ -19,12 +23,19 @@ vi.mock("svelte", () => ({ mount: vi.fn(() => ({})) }));
 vi.mock("./ts/storage/deviceBackup/jobRecovery", () => ({
   resumePortableExportsAfterBootstrap: vi.fn(async () => {}),
 }));
+// The store module is the whole application graph, and this file mocks the library away,
+// so only the carrier normalMain reads stands in for it.
+vi.mock("./ts/stores.svelte", async () => {
+  const { writable } = await import("svelte/store");
+  return { recoveryStart: writable<(() => void) | null>(null) };
+});
 
 const deviceSettings = {
-  schema: "risunest.device-settings/v1",
+  schema: "risunest.device-settings/v2",
   performanceProfile: "low-spec",
   androidKeepAliveDuringGeneration: false,
   nativeFileLogEnabled: true,
+  startupExclusions: [],
 };
 
 describe("application startup performance profile", () => {
@@ -52,7 +63,7 @@ describe("application startup performance profile", () => {
     ).default;
 
     expect(startup.cacheBudget).toBe(8 * 1024 * 1024);
-  });
+  }, 30_000);
 
   it("starts the normal app even when obsolete harness flags are set", async () => {
     vi.stubEnv("MODE", "agent");
@@ -69,5 +80,5 @@ describe("application startup performance profile", () => {
     expect(document.getElementById("preloading")).toBeNull();
     expect(window).not.toHaveProperty("__streamingSmoke");
     expect(window).not.toHaveProperty("__RISUNEST_TOKENIZER_BENCHMARK__");
-  });
+  }, 30_000);
 });

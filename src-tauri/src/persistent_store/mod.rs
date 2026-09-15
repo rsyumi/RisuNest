@@ -29,6 +29,7 @@ pub(crate) mod server_sync_engine;
 pub(crate) mod server_sync_journal;
 pub(crate) mod server_sync_outbox;
 pub(crate) mod server_sync_projection;
+mod repair;
 mod snapshot;
 mod snapshot_archive;
 pub(crate) mod sync_selection;
@@ -916,10 +917,130 @@ pub(crate) struct PersistentStore {
     pending_restore_failure: Option<String>,
 }
 
+/// One generation, held open for a diagnosis. It outlives the store mutex on purpose: a deep
+/// scan reads every stored object, and the library stays writable while it does.
+pub(crate) struct DataHealthReader {
+    connection: Connection,
+    cas: crate::asset_repository::PayloadCas,
+    revision: i64,
+}
+
+impl DataHealthReader {
+    pub(crate) fn revision(&self) -> i64 {
+        self.revision
+    }
+
+    pub(crate) fn scan(
+        &self,
+        depth: crate::data_health::ScanDepth,
+        limit: usize,
+        probe: &dyn crate::local_backup::CancellationProbe,
+    ) -> StoreResult<crate::data_health::Findings> {
+        let mut findings = crate::data_health::Findings::new(limit);
+        crate::portable_backup::scan_live_library(
+            &self.connection,
+            &self.cas,
+            depth,
+            &mut findings,
+            probe,
+        )
+        .map_err(scan_failure)?;
+        self.note_unreferenced_objects(&mut findings, probe)?;
+        Ok(findings)
+    }
+
+    /// Reports the stored objects no alias in this generation names. They cost space and nothing
+    /// else, so the diagnosis only counts them and sends the reader to the cleanup, which is the
+    /// only place a file is actually deleted.
+    fn note_unreferenced_objects(
+        &self,
+        findings: &mut crate::data_health::Findings,
+        probe: &dyn crate::local_backup::CancellationProbe,
+    ) -> StoreResult<()> {
+        use crate::data_health::{codes, FindingSink, Finding};
+        let mut statement = self.connection.prepare(
+            "SELECT object_hash,byte_size FROM asset_objects WHERE object_hash NOT IN (
+                 SELECT object_hash FROM asset_aliases WHERE object_hash IS NOT NULL
+                 UNION SELECT object_hash FROM cold_aliases WHERE object_hash IS NOT NULL
+             ) ORDER BY object_hash",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            if probe.is_cancelled() {
+                return Err(StoreError::Validation {
+                    message: crate::data_health::CANCELLED.to_owned(),
+                });
+            }
+            let hash: String = row.get(0)?;
+            let bytes: i64 = row.get(1)?;
+            findings.note(
+                Finding::new(
+                    codes::OBJECT_UNREFERENCED,
+                    "asset",
+                    hash,
+                    format!("{bytes} bytes no record uses"),
+                )
+                .targeting("bytes", bytes.to_string()),
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn object_totals(&self) -> StoreResult<crate::portable_backup::ObjectTotals> {
+        crate::portable_backup::registered_object_totals(&self.connection).map_err(scan_failure)
+    }
+
+    pub(crate) fn scan_objects(
+        &self,
+        after: Option<&str>,
+        budget: u64,
+        limit: usize,
+        probe: &dyn crate::local_backup::CancellationProbe,
+    ) -> StoreResult<(crate::portable_backup::ObjectPage, crate::data_health::Findings)> {
+        let mut findings = crate::data_health::Findings::new(limit);
+        let page = crate::portable_backup::scan_registered_objects(
+            &self.connection,
+            &self.cas,
+            after,
+            budget,
+            &mut findings,
+            probe,
+        )
+        .map_err(scan_failure)?;
+        Ok((page, findings))
+    }
+}
+
+fn scan_failure(error: crate::portable_backup::Error) -> StoreError {
+    match error {
+        crate::portable_backup::Error::Cancelled => StoreError::Validation {
+            message: crate::data_health::CANCELLED.to_owned(),
+        },
+        error => StoreError::Store {
+            message: error.to_string(),
+        },
+    }
+}
+
 pub(crate) struct AssetGcPreview {
     cas: crate::asset_repository::PayloadCas,
     residency: crate::server_sync::residency::Residency,
     marks: crate::asset_repository::migration_gc::AssetGcMarks,
+    /// What holds an object besides the library, so a retained candidate can say why.
+    holders: Vec<(&'static str, std::collections::BTreeSet<String>)>,
+}
+
+/// One stored object the cleanup looked at, and what it decided.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AssetGcCandidateDetail {
+    pub(crate) object_hash: String,
+    pub(crate) bytes: u64,
+    pub(crate) created_at_ms: i64,
+    /// `deletable`, `recent` or `held`.
+    pub(crate) state: &'static str,
+    /// Named holders for a retained object. Empty with `held` means the library still uses it.
+    pub(crate) holders: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
@@ -2219,19 +2340,106 @@ impl PersistentStore {
 
     pub(crate) fn prepare_asset_gc_preview(&self) -> StoreResult<AssetGcPreview> {
         let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
-        let roots = self.collect_asset_gc_roots(&cas, false, true)?;
+        let labelled = self.collect_labelled_asset_gc_roots(&cas, false, true)?;
+        // Only the holders that are small and explainable are kept for attribution; the library
+        // itself is the default answer and copying its root set would cost as much as it holds.
+        let holders = labelled
+            .iter()
+            .filter(|(label, _)| *label != "library")
+            .map(|(label, roots)| (*label, roots.object_hashes.clone()))
+            .collect();
         let residency = crate::server_sync::residency::Residency::open(&self.repository_root)
             .map_err(|error| std::io::Error::other(error.code))?;
         let marks = crate::asset_repository::migration_gc::mark_asset_roots_with_remote(
             &cas,
-            roots,
+            labelled.into_iter().map(|(_, roots)| roots),
             |hash| residency.gc_size(hash),
         )?;
         Ok(AssetGcPreview {
             cas,
             residency,
             marks,
+            holders,
         })
+    }
+
+    /// The same page the preview reports, with a row per object saying what the cleanup decided
+    /// and, when it kept one, what is holding it.
+    pub(crate) fn asset_gc_preview_page_detail(
+        &self,
+        preview: &AssetGcPreview,
+        limit: i64,
+        cursor: Option<&str>,
+        now_ms: i64,
+        minimum_grace_ms: i64,
+    ) -> StoreResult<(
+        crate::asset_repository::migration_gc::AssetGcDryRunPage,
+        Vec<AssetGcCandidateDetail>,
+    )> {
+        let candidates = self.query_asset_object_catalog(limit, cursor)?;
+        let looked_at: Vec<(String, u64, i64)> = candidates
+            .items
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.object_hash.clone(),
+                    candidate.byte_size,
+                    candidate.created_at_ms,
+                )
+            })
+            .collect();
+        let report = crate::asset_repository::migration_gc::sweep_asset_candidates_with_remote(
+            &preview.cas,
+            candidates.items,
+            &preview.marks,
+            now_ms,
+            minimum_grace_ms,
+            |hash| preview.residency.gc_size(hash),
+        )
+        .map_err(StoreError::from)?;
+        let deletable: std::collections::BTreeSet<&str> = report
+            .potential_delete_hashes
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let recent: std::collections::BTreeSet<&str> = report
+            .grace_retained_hashes
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let details = looked_at
+            .into_iter()
+            .map(|(object_hash, bytes, created_at_ms)| {
+                let state = match object_hash.as_str() {
+                    hash if deletable.contains(hash) => "deletable",
+                    hash if recent.contains(hash) => "recent",
+                    _ => "held",
+                };
+                let holders = match state {
+                    "held" => preview
+                        .holders
+                        .iter()
+                        .filter(|(_, hashes)| hashes.contains(&object_hash))
+                        .map(|(label, _)| *label)
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                AssetGcCandidateDetail {
+                    object_hash,
+                    bytes,
+                    created_at_ms,
+                    state,
+                    holders,
+                }
+            })
+            .collect();
+        Ok((
+            crate::asset_repository::migration_gc::AssetGcDryRunPage {
+                report,
+                next_cursor: candidates.next_cursor,
+            },
+            details,
+        ))
     }
 
     pub(crate) fn asset_gc_preview_page(
@@ -2515,30 +2723,72 @@ impl PersistentStore {
         repository_guard_held: bool,
         read_only: bool,
     ) -> StoreResult<Vec<crate::asset_repository::migration_gc::AssetRootSet>> {
+        Ok(self
+            .collect_labelled_asset_gc_roots(cas, repository_guard_held, read_only)?
+            .into_iter()
+            .map(|(_, roots)| roots)
+            .collect())
+    }
+
+    /// The same roots, each labelled by what holds it, so a preview can explain a retention.
+    fn collect_labelled_asset_gc_roots(
+        &self,
+        cas: &crate::asset_repository::PayloadCas,
+        repository_guard_held: bool,
+        read_only: bool,
+    ) -> StoreResult<Vec<(&'static str, crate::asset_repository::migration_gc::AssetRootSet)>> {
         use crate::asset_repository::job_pins::{
             collect_durable_cas_job_roots, collect_durable_cas_job_roots_already_guarded,
             collect_durable_cas_job_roots_read_only,
         };
         use crate::asset_repository::migration_gc::collect_staged_migration_roots;
 
-        let mut roots = vec![snapshot::collect_asset_roots(&self.connection, cas)?];
+        let mut roots = vec![("library", snapshot::collect_asset_roots(&self.connection, cas)?)];
         for reader in self.revision_leases.values() {
-            roots.push(snapshot::collect_asset_roots(&reader.connection, cas)?);
+            roots.push((
+                "library",
+                snapshot::collect_asset_roots(&reader.connection, cas)?,
+            ));
         }
-        roots.extend(self.active_readers.detached_asset_roots()?);
-        roots.push(crate::external_storage::capture::registered_roots(
-            &self.connection,
-            &self.repository_root,
-        )?);
-        roots.extend(snapshot_archive::Archive::open(&self.snapshots_dir)?.roots()?);
-        roots.extend(collect_staged_migration_roots(&self.repository_root)?);
-        roots.push(if read_only {
-            collect_durable_cas_job_roots_read_only(&self.repository_root)
-        } else if repository_guard_held {
-            collect_durable_cas_job_roots_already_guarded(&self.repository_root)
-        } else {
-            collect_durable_cas_job_roots(&self.repository_root)
-        });
+        roots.extend(
+            self.active_readers
+                .detached_asset_roots()?
+                .into_iter()
+                .map(|set| ("library", set)),
+        );
+        roots.push((
+            "remote",
+            crate::external_storage::capture::registered_roots(
+                &self.connection,
+                &self.repository_root,
+            )?,
+        ));
+        roots.extend(
+            snapshot_archive::Archive::open(&self.snapshots_dir)?
+                .roots()?
+                .into_iter()
+                .map(|set| ("snapshot", set)),
+        );
+        roots.extend(
+            collect_staged_migration_roots(&self.repository_root)?
+                .into_iter()
+                .map(|set| ("migration", set)),
+        );
+        // A repair journal holds what a repair stopped referencing, so an undo still has it.
+        roots.push((
+            "repair",
+            crate::data_health::journal::roots(&self.repository_root)?,
+        ));
+        roots.push((
+            "job",
+            if read_only {
+                collect_durable_cas_job_roots_read_only(&self.repository_root)
+            } else if repository_guard_held {
+                collect_durable_cas_job_roots_already_guarded(&self.repository_root)
+            } else {
+                collect_durable_cas_job_roots(&self.repository_root)
+            },
+        ));
         Ok(roots)
     }
 
@@ -2566,6 +2816,19 @@ impl PersistentStore {
         self.connection
             .execute("DELETE FROM app_kv WHERE key = ?1", [key])?;
         Ok(())
+    }
+
+    /// Opens the leased generation for diagnosis. The reader owns its connection, so the scan it
+    /// serves runs without the store mutex and never blocks a writer. The lease pins the
+    /// generation against collection, and the caller compares its revision again before applying
+    /// any repair.
+    pub(crate) fn data_health_reader(&self, lease: &str) -> StoreResult<DataHealthReader> {
+        let (_, target) = self.read_view(Some(lease))?;
+        Ok(DataHealthReader {
+            connection: snapshot::open_generation_reader(&self.database_path, &target.generation)?,
+            cas: crate::asset_repository::PayloadCas::new(self.repository_root())?,
+            revision: target.revision,
+        })
     }
 
     fn read_view(&self, lease: Option<&str>) -> StoreResult<(&Connection, ReadTarget)> {

@@ -1011,8 +1011,10 @@ fn cancellation_during_a_download_body_stops_the_transfer() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             cancel.cancel();
         };
+        // A guard against a transfer that never stops, not a latency budget: a loaded test run
+        // can take far longer than the cancellation itself does.
         tokio::time::timeout(
-            std::time::Duration::from_millis(500),
+            std::time::Duration::from_secs(10),
             futures::future::join(read, trigger),
         )
         .await

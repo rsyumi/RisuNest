@@ -100,6 +100,12 @@ import {
 import { initializeIOSNative, installIOSPersistenceLifecycle } from "./iosNative";
 import { restartNativeApp, schedulePeriodicNativeSnapshot } from "./storage/nativePersistentMaintenance";
 import { yieldToUi } from './ui/yieldToUi'
+import { markBootStage, markBootSuspect } from './storage/bootAttempt'
+import {
+    finishBoot,
+    isStartupExcluded,
+    type RecoveryExclusion,
+} from './storage/recoveryMode.svelte'
 import {
     initializeOfficialAccountBootstrap,
     publishOfficialRevisionIfChanged,
@@ -220,9 +226,12 @@ export async function loadData() {
     bootFailure.set(null)
     const transition = async (nextStage: string, text: string) => {
         stage = nextStage
+        markBootStage(nextStage)
         LoadingStatusState.text = text
         await yieldToUi()
     }
+    const excluded = (name: RecoveryExclusion): boolean =>
+        isStartupExcluded(name, getDeviceSettings().startupExclusions)
     LoadingStatusState.text = language.risuNest.startup.storage
     try {
         if (isTauri) {
@@ -747,7 +756,7 @@ export async function loadData() {
 
         if (isTauriDesktop) await changeFullscreen()
 
-        if (!isTauri) {
+        if (!isTauri && !excluded('sync')) {
             await transition('drive-sync', language.risuNest.startup.account)
             if (await checkDriverInit()) return
             await transition('service-worker', language.risuNest.startup.serviceWorker)
@@ -775,9 +784,9 @@ export async function loadData() {
 
         performance.mark('boot:cold-storage-ready')
         await transition('plugins', language.risuNest.startup.plugins)
-        let pluginsLoaded = false
+        let pluginsLoaded = excluded('plugins')
         try {
-            await loadPlugins()
+            if (!pluginsLoaded) await loadPlugins()
             pluginsLoaded = true
         } catch (error) {
             console.error(error)
@@ -809,7 +818,7 @@ export async function loadData() {
         const database = getDatabase()
         await transition('ui-state', language.risuNest.startup.ui)
         updateColorScheme()
-        updateTextThemeAndCSS()
+        if (!excluded('theme')) updateTextThemeAndCSS()
         updateAnimationSpeed()
         updateHeightMode()
         updateErrorHandling()
@@ -831,6 +840,7 @@ export async function loadData() {
         await initializeIOSNative()
         LoadingStatusState.startedAt = null
         loadedStore.set(true)
+        void finishBoot()
         performance.mark('boot:interactive')
         selectedCharID.set(-1)
         await yieldToUi()
@@ -844,7 +854,7 @@ export async function loadData() {
             runtime.flushPendingDataLocally(reason),
           );
         }
-        moduleUpdate()
+        if (!excluded('modules')) moduleUpdate()
         if (fullDatabaseResident) cleanChunks()
         void alertTOS().then((accepted) => {
             if (accepted === false) location.reload()

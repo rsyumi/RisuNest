@@ -3,6 +3,7 @@ import { language } from "../../lang";
 import { getCurrentCharacter, getDatabase, setDatabase, setDatabaseLite } from "../storage/database.svelte";
 import { alertConfirm, alertError, alertPluginConfirm } from "../alert";
 import { selectSingleFile, sleep } from "../util";
+import { markBootSuspect } from "../storage/bootAttempt";
 import type { OpenAIChat } from "../process/index.svelte";
 import { fetchNative, globalFetch, readImage, saveAsset, toGetter } from "../globalApi.svelte";
 import { DBState, hotReloading, pluginAlertModalStore, selectedCharID } from "../stores.svelte";
@@ -1068,6 +1069,9 @@ export async function loadV2Plugin(
 
     for (const plugin of plugins) {
         if (!isCurrent()) return
+        // A start that never returns leaves this behind, which is how the recovery shell names
+        // the plugin it stopped in. The write is synchronous and best effort.
+        markBootSuspect(`plugin:${plugin.name}`)
         let data = ''
         let version = plugin.version || 2
 
@@ -1147,6 +1151,8 @@ export async function loadV2Plugin(
             console.warn(`Plugin 2.0 is removed and no longer supported. Please update plugin "${plugin.name}" to API version 3.0`)
         }
     }
+    // Every plugin returned, so a later failure is not one of theirs.
+    markBootSuspect(null)
 }
 
 export async function translatorPlugin(text: string, from: string, to: string) {

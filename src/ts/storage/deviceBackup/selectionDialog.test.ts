@@ -116,3 +116,88 @@ describe("portable backup scope selection", () => {
     await settings;
   });
 });
+
+describe("a damaged archive offers what is still whole", () => {
+    const damaged = {
+        libraryIncluded: true,
+        repairRequired: true,
+        deviceSections: [],
+        diagnosis: {
+            revision: 0,
+            scannedAt: 1,
+            depth: "quick" as const,
+            counts: { blocking: 1, degraded: 1, informational: 0 },
+            items: [],
+            omitted: 0,
+        },
+        items: {
+            characters: [
+                { id: "char-a", conversations: 2, damaged: 0 },
+                { id: "char-b", conversations: 0, damaged: 3 },
+            ],
+            presets: [{ id: "0", conversations: 0, damaged: 0 }],
+            plugins: [],
+        },
+    };
+
+    it("says what is wrong and preselects only the records that are whole", async () => {
+        const pending = selectPortableBackupRestore(damaged);
+        const current = await dialog();
+        expect(
+            current.querySelector("[data-portable-diagnosis]")?.textContent,
+        ).toContain(language.portableBackup.damaged.replace("{0}", "2"));
+        expect(
+            current.querySelector("[data-portable-items='characters']")
+                ?.textContent,
+        ).toContain(language.portableBackup.itemDamaged.replace("{0}", "3"));
+
+        submit(current);
+        await expect(pending).resolves.toEqual({
+            library: true,
+            deviceSections: [],
+            items: {
+                characters: ["char-a"],
+                presets: ["0"],
+                plugins: [],
+                excluded: ["char-b"],
+            },
+        });
+    });
+
+    it("brings in what the reader adds back, and leaves out what they clear", async () => {
+        const pending = selectPortableBackupRestore(damaged);
+        const current = await dialog();
+        const boxes = [
+            ...current.querySelectorAll<HTMLInputElement>(
+                "[data-portable-items] input[type='checkbox']",
+            ),
+        ];
+        // The damaged character is added back, and the preset is cleared.
+        boxes[1].click();
+        boxes[2].click();
+        await tick();
+        submit(current);
+        await expect(pending).resolves.toEqual({
+            library: true,
+            deviceSections: [],
+            items: {
+                characters: ["char-a", "char-b"],
+                presets: [],
+                plugins: [],
+                excluded: ["0"],
+            },
+        });
+    });
+
+    it("keeps the whole-library choice unavailable while the archive is refused", async () => {
+        const pending = selectPortableBackupRestore(damaged);
+        const current = await dialog();
+        const library = [...current.querySelectorAll("label")]
+            .find((label) => label.textContent?.includes(language.portableBackup.library))
+            ?.querySelector<HTMLInputElement>("input[type='checkbox']");
+        expect(library?.disabled).toBe(true);
+        expect(library?.checked).toBe(false);
+        submit(current);
+        await pending;
+    });
+})
