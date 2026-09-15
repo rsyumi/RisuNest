@@ -743,7 +743,7 @@ impl Provider for GithubReleases {
         &'a self,
         repository: &'a RepositoryHandle,
         intent: &'a ObjectIntent,
-        _resume: &'a ResumeState,
+        _resume: Option<&'a ResumeState>,
         cancel: &'a Cancellation,
     ) -> ProviderFuture<'a, UploadResolution> {
         Box::pin(async move {

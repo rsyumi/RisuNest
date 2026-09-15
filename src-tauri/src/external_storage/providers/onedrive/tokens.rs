@@ -244,7 +244,10 @@ pub(super) fn authorization_policy(
     config: &ConnectionConfig,
     platform: &str,
 ) -> Result<AuthorizationPolicy> {
-    let settings = config::validate(config)?;
+    if platform == "ios" {
+        return Err(unsupported());
+    }
+    let settings = config::validate_authorization(config)?;
     let redirect_url = settings.redirect_uri.clone().ok_or_else(unsupported)?;
     let authorize_url = url::Url::parse(&format!(
         "{}/{}/oauth2/v2.0/authorize",

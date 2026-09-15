@@ -49,6 +49,26 @@ vi.mock('src/ts/storage/nativeFileJobManager', () => ({
 vi.mock('src/ts/gui/nativeFileJobProgress', () => ({
     nativeFileJobProgressText: vi.fn(() => 'Writing backup'),
 }))
+vi.mock('src/ts/storage/sync/external/bridge', () => ({
+    getExternalStorageBridge: () => ({
+        getState: vi.fn(async () => ({
+            supported: false,
+            selection: {
+                kind: 'none',
+                selectionEpoch: 'test-selection',
+                paused: false,
+                decisionRequired: false,
+            },
+            connections: [],
+            jobs: [],
+        })),
+    }),
+}))
+vi.mock('src/ts/storage/sync/external/production', () => ({
+    refreshExternalStorageProductionState: vi.fn(),
+    requestExternalStorageNow: vi.fn(),
+    requestExternalStorageRestore: vi.fn(),
+}))
 
 import RisuNestBackupRestore from './RisuNestBackupRestore.svelte'
 

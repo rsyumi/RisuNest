@@ -1090,7 +1090,7 @@ impl Provider for GoogleDrive {
         &'a self,
         repository: &'a RepositoryHandle,
         intent: &'a ObjectIntent,
-        resume: &'a ResumeState,
+        resume: Option<&'a ResumeState>,
         cancel: &'a Cancellation,
     ) -> ProviderFuture<'a, UploadResolution> {
         Box::pin(async move {
@@ -1098,6 +1098,20 @@ impl Provider for GoogleDrive {
             let context = context(repository)?;
             intent.validate(repository)?;
             let session = context.session();
+            let Some(resume) = resume else {
+                return match self.existing_object(session, intent, cancel).await? {
+                    Some(file) => {
+                        match self.completed_receipt(&context.settings, intent, &file, None) {
+                            Ok(receipt) => Ok(UploadResolution::Complete(receipt)),
+                            Err(error) if error.kind == ErrorKind::PreconditionFailed => {
+                                Ok(UploadResolution::Conflict)
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    None => Ok(UploadResolution::RestartRequired),
+                };
+            };
             let upload = self
                 .open_sealed(&resume.sealed_state, &context.settings)
                 .await?;

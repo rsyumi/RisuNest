@@ -571,6 +571,64 @@ describe('registerLifecycleCommitListeners', () => {
         })
     })
 
+    describe('coordinated exit drain', () => {
+        afterEach(() => {
+            delete (window as any).RisuLifecycleBridge
+        })
+
+        it('delegates the complete local and remote settlement and coalesces duplicate exits', async () => {
+            const bridge = {
+                onFlushComplete: vi.fn(),
+                onFlushHold: vi.fn(),
+                requestExit: vi.fn(),
+            }
+            ;(window as any).RisuLifecycleBridge = bridge
+            let finish!: (result: 'exit' | 'cancelled') => void
+            const coordinator = {
+                requestExit: vi.fn(() => new Promise<'exit' | 'cancelled'>((resolve) => {
+                    finish = resolve
+                })),
+            }
+            const flush = vi.fn(async () => undefined)
+            const dispose = registerLifecycleCommitListeners(flush, coordinator)
+
+            window.dispatchEvent(new CustomEvent('risu-native-lifecycle', {
+                detail: { reason: 'exit', ackToken: 'exit-first' },
+            }))
+            window.dispatchEvent(new CustomEvent('risu-native-lifecycle', {
+                detail: { reason: 'exit', ackToken: 'exit-duplicate' },
+            }))
+
+            expect(coordinator.requestExit).toHaveBeenCalledOnce()
+            expect(flush).not.toHaveBeenCalled()
+            expect(bridge.requestExit).not.toHaveBeenCalled()
+            finish('exit')
+            await vi.waitFor(() => expect(bridge.requestExit).toHaveBeenCalledOnce())
+            expect(bridge.onFlushHold).toHaveBeenCalledExactlyOnceWith('exit-first')
+            dispose()
+        })
+
+        it('keeps the native window open when the coordinated drain cancels exit', async () => {
+            const bridge = {
+                onFlushHold: vi.fn(),
+                requestExit: vi.fn(),
+            }
+            ;(window as any).RisuLifecycleBridge = bridge
+            const coordinator = {
+                requestExit: vi.fn(async () => 'cancelled' as const),
+            }
+            const dispose = registerLifecycleCommitListeners(undefined, coordinator)
+
+            window.dispatchEvent(new CustomEvent('risu-native-lifecycle', {
+                detail: { reason: 'exit', ackToken: 'exit-cancelled' },
+            }))
+
+            await vi.waitFor(() => expect(coordinator.requestExit).toHaveBeenCalledOnce())
+            expect(bridge.requestExit).not.toHaveBeenCalled()
+            dispose()
+        })
+    })
+
     it('removes all listeners and can be disposed twice', () => {
         const flush = vi.fn(async () => undefined)
         const dispose = registerLifecycleCommitListeners(flush)

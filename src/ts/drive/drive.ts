@@ -23,7 +23,91 @@ import { getPersistentDataRuntime, publishCurrentOfficialRevision, replacePersis
 import { installDriveRestore } from "../storage/databaseRestore";
 import { type PinnedRisuSaveExport, withFlushedRisuSaveExport } from "../storage/risuSaveStoreAdapter";
 
+async function openExternalGoogleStorageSetup(): Promise<void> {
+    const { SettingsMenuIndex, settingsOpen } = await import('../stores.svelte')
+    settingsOpen.set(true)
+    SettingsMenuIndex.set(17)
+    setTimeout(() => {
+        window.dispatchEvent(new CustomEvent('risunest:open-external-storage', {
+            detail: { providerId: 'google_drive' },
+        }))
+    })
+}
+
+async function chooseExternalGoogleConnection() {
+    const { getExternalStorageBridge } = await import('../storage/sync/external/bridge')
+    const bridge = getExternalStorageBridge()
+    const storage = await bridge.getState()
+    const connections = storage.connections.filter(connection => (
+        connection.providerId === 'google_drive'
+        && connection.status !== 'error'
+    ))
+    if (connections.length === 0) {
+        await openExternalGoogleStorageSetup()
+        return null
+    }
+    if (connections.length === 1) return { bridge, connection: connections[0] }
+    const selected = await alertSelect([
+        ...connections.map(connection => connection.displayName),
+        language.cancel,
+    ])
+    const selectedIndex = Number(selected)
+    if (!Number.isInteger(selectedIndex) || selectedIndex < 0 || selectedIndex >= connections.length) {
+        return null
+    }
+    return { bridge, connection: connections[selectedIndex] }
+}
+
+export async function runNativeExternalDriveAction(
+    type: 'savetauri' | 'loadtauri',
+): Promise<void> {
+    const selected = await chooseExternalGoogleConnection()
+    if (!selected) return
+    const { connection, bridge } = selected
+    const { requestExternalStorageNow, requestExternalStorageRestore } = await import(
+        '../storage/sync/external/production'
+    )
+    if (type === 'savetauri') {
+        await requestExternalStorageNow(connection.id, 'backup')
+        return
+    }
+
+    const history = (await bridge.listHistory(connection.id)).items.filter(item => (
+        item.complete && item.verified
+    ))
+    if (history.length === 0) {
+        alertNormal(language.risuNest.storage.emptyList)
+        return
+    }
+    const selectedSnapshot = history.length === 1
+        ? history[0]
+        : history[Number(await alertSelect([
+            ...history.map(item => new Date(Number(item.createdAtMs)).toLocaleString()),
+            language.cancel,
+        ]))]
+    if (!selectedSnapshot) return
+    await requestExternalStorageRestore(
+        connection.id,
+        selectedSnapshot.id,
+        [
+            'library',
+            'referencedAssets',
+            ...(connection.scope.deviceSettings ? ['deviceSettings' as const] : []),
+            ...(connection.scope.devicePlugins ? ['devicePlugins' as const] : []),
+        ],
+    )
+}
+
 export async function checkDriver(type:'save'|'load'|'loadtauri'|'savetauri'|'reftoken'){
+    if (isTauri && (type === 'savetauri' || type === 'loadtauri')) {
+        try {
+            await runNativeExternalDriveAction(type)
+        } catch (error) {
+            console.error(error)
+            alertError(language.risuNest.backup.actionFailed)
+        }
+        return
+    }
     const CLIENT_ID = '580075990041-l26k2d3c0nemmqiu3d3aag01npfrkn76.apps.googleusercontent.com';
     const REDIRECT_URI = type === 'reftoken' ? 'https://sv.risuai.xyz/drive' : "https://risuai.xyz/"
     const SCOPE = 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.appdata';
@@ -120,7 +204,7 @@ export async function checkDriverInit() {
 
 let lastSaved:number = parseInt(localStorage.getItem('risu_lastsaved') ?? '-1')
 
-async function backupDrive(ACCESS_TOKEN:string) {
+export async function backupDrive(ACCESS_TOKEN:string) {
     if (!isTauri) await forageStorage.Init()
     const blobStore = await resolveBlobStore()
     alertStore.set({
@@ -219,7 +303,7 @@ type DriveFile = {
     id: string
 }
 
-async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<void|"noSync"> {
+export async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<void|"noSync"> {
     if (!isTauri) await forageStorage.Init()
     const blobStore = await resolveBlobStore()
     if(mode === 'backup'){

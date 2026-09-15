@@ -44,6 +44,88 @@ function fixture() {
 }
 afterEach(() => vi.useRealTimers());
 describe("server sync controller", () => {
+  it("joins an existing synchronization and ignores hidden suspension during an exit drain", async () => {
+    const { controller, facade, status } = fixture();
+    let finish!: (result: unknown) => void;
+    facade.cycle.mockImplementationOnce(
+      () => new Promise((resolve) => { finish = resolve; }),
+    );
+    const running = controller.synchronize();
+    const draining = controller.drainToRevision(3, new AbortController().signal);
+
+    await vi.waitFor(() => expect(facade.cycle).toHaveBeenCalledOnce());
+    await controller.suspend();
+    expect(facade.cancel).not.toHaveBeenCalled();
+
+    finish({
+      phase: "idle",
+      conflictCount: 0,
+      localRevision: 3,
+      head: status.head,
+    });
+    await running;
+    await expect(draining).resolves.toEqual({ kind: "complete" });
+  });
+
+  it("drains through a newer target revision and restores the prior manual pause", async () => {
+    vi.useFakeTimers();
+    const { controller, facade, status } = fixture();
+    const resumed = vi.fn();
+    const pausedController = createServerSyncController(
+      facade as unknown as ServerSyncFacade,
+      { initiallyPaused: true, onExplicitResume: resumed },
+    );
+    facade.cycle
+      .mockResolvedValueOnce({
+        phase: "idle",
+        conflictCount: 0,
+        localRevision: 3,
+        head: status.head,
+      })
+      .mockImplementationOnce(async () => {
+        status.localRevision = 4;
+        return {
+          phase: "idle",
+          conflictCount: 0,
+          localRevision: 4,
+          head: status.head,
+        };
+      });
+
+    const draining = pausedController.drainToRevision(
+      4,
+      new AbortController().signal,
+    );
+    await vi.advanceTimersByTimeAsync(300);
+
+    await expect(draining).resolves.toEqual({ kind: "complete" });
+    expect(facade.cycle).toHaveBeenCalledTimes(2);
+    expect(resumed).not.toHaveBeenCalled();
+    expect(pausedController.snapshot().paused).toBe(true);
+  });
+
+  it("cancels an explicit revision drain through its abort signal", async () => {
+    const { controller, facade } = fixture();
+    let finish!: () => void;
+    facade.cycle.mockImplementationOnce(
+      () => new Promise((resolve) => {
+        finish = () => resolve({
+          phase: "pending",
+          conflictCount: 0,
+          localRevision: 3,
+          head: controller.snapshot().status?.head,
+        });
+      }),
+    );
+    const abort = new AbortController();
+    const draining = controller.drainToRevision(4, abort.signal);
+    await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+    abort.abort();
+    expect(facade.cancel).toHaveBeenCalledOnce();
+    finish();
+    await expect(draining).rejects.toMatchObject({ name: "AbortError" });
+  });
+
   it("holds a restored library across initialization until an explicit sync action", async () => {
     const { facade } = fixture();
     const resumed = vi.fn();

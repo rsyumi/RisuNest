@@ -1175,7 +1175,7 @@ fn reconciliation_uses_the_stored_object_rather_than_local_progress() {
         let state = resume_state();
         match harness
             .provider
-            .reconcile_upload(&repository, &intent, &state, &harness.cancel)
+            .reconcile_upload(&repository, &intent, Some(&state), &harness.cancel)
             .await
             .unwrap()
         {
@@ -1191,7 +1191,7 @@ fn reconciliation_uses_the_stored_object_rather_than_local_progress() {
         assert!(matches!(
             harness
                 .provider
-                .reconcile_upload(&repository, &intent, &state, &harness.cancel)
+                .reconcile_upload(&repository, &intent, Some(&state), &harness.cancel)
                 .await
                 .unwrap(),
             UploadResolution::Conflict
@@ -1199,7 +1199,7 @@ fn reconciliation_uses_the_stored_object_rather_than_local_progress() {
         assert!(matches!(
             harness
                 .provider
-                .reconcile_upload(&repository, &intent, &state, &harness.cancel)
+                .reconcile_upload(&repository, &intent, Some(&state), &harness.cancel)
                 .await
                 .unwrap(),
             UploadResolution::RestartRequired

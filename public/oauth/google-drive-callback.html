@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; base-uri 'none'; form-action 'none'; connect-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-EyknR0MDutiiQ+StzMp/+pkgSo3YK8S87UNDy+DQIgw='">
+  <title>RisuNest · Google Drive</title>
+  <style>
+    :root { color-scheme: dark; --bg: #282a36; --panel: #21222c; --line: #44475a; --text: #f5f5f5; --muted: #bdc2d4; --accent: #a5d6b5; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100svh; background: var(--panel); color: var(--text); font-family: "Segoe UI", "Malgun Gothic", sans-serif; }
+    main { width: min(100% - 40px, 520px); margin: auto; padding: clamp(48px, 12vh, 120px) 0 40px; }
+    header { display: flex; align-items: center; gap: 12px; margin-bottom: 44px; }
+    .mark { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid var(--line); border-radius: 10px; color: var(--accent); font: bold 23px Georgia, serif; }
+    .brand { font-size: 17px; font-weight: 650; letter-spacing: -.3px; }
+    .service { margin: 0 0 12px; font-size: 12px; letter-spacing: 1.8px; color: var(--accent); }
+    h1 { margin: 0; font-size: clamp(27px, 6vw, 34px); line-height: 1.35; letter-spacing: -1px; }
+    #description { margin: 18px 0 28px; color: var(--muted); font-size: 15px; line-height: 1.8; word-break: keep-all; }
+    .actions { display: grid; gap: 12px; }
+    button, .button { display: block; border: 1px solid var(--line); border-radius: 12px; padding: 16px 20px; font: inherit; font-size: 15px; font-weight: 650; text-align: center; text-decoration: none; cursor: pointer; background: var(--bg); color: var(--text); }
+    .primary { border-color: var(--accent); background: var(--accent); color: #18271e; }
+    button:hover, .button:hover { filter: brightness(1.08); }
+    :focus-visible { outline: 3px solid var(--text); outline-offset: 4px; }
+    [hidden] { display: none !important; }
+    #notice { min-height: 24px; margin: 16px 0; font-size: 13px; color: var(--accent); line-height: 1.6; }
+    #manual { margin-top: 16px; padding: 18px; border: 1px solid var(--line); border-radius: 12px; }
+    label { display: block; margin-bottom: 10px; font-size: 13px; color: var(--muted); }
+    textarea { width: 100%; min-height: 100px; resize: vertical; padding: 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); font: 12px/1.6 monospace; overflow-wrap: anywhere; }
+    footer { margin-top: 44px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; line-height: 1.8; }
+  </style>
+</head>
+<body>
+  <main>
+    <header><span class="mark" aria-hidden="true">r</span><span class="brand">RisuNest</span></header>
+    <p class="service">GOOGLE DRIVE</p>
+    <h1 id="title">인증 결과 확인 중</h1>
+    <p id="description">잠시만 기다려 주세요.</p>
+    <div id="actions" class="actions" hidden>
+      <a id="open" class="button primary">RisuNest로 돌아가기</a>
+      <button id="copy" type="button">인증 결과 복사</button>
+    </div>
+    <p id="notice" role="status" aria-live="polite"></p>
+    <div id="manual" hidden>
+      <label id="manual-label" for="result">아래 내용을 복사해 앱의 인증 결과 입력란에 붙여넣으세요.</label>
+      <textarea id="result" readonly autocomplete="off" spellcheck="false"></textarea>
+    </div>
+    <footer id="footer">이 창은 인증이 끝나면 닫아도 됩니다.</footer>
+    <noscript>JavaScript를 켜거나, 주소 표시줄의 전체 주소를 앱의 인증 결과 입력란에 붙여넣으세요.</noscript>
+  </main>
+  <script>
+(() => {
+  'use strict';
+  const korean = navigator.language.toLowerCase().startsWith('ko');
+  const strings = korean ? {
+    ready: '앱에서 연결을 마무리하세요',
+    description: 'RisuNest로 돌아가 Google Drive 연결을 마무리하세요. 앱이 열리지 않으면 인증 결과를 복사해 앱에 붙여넣을 수 있습니다.',
+    denied: '인증이 완료되지 않았습니다',
+    deniedDescription: '앱으로 돌아가 다시 시도할 수 있습니다.',
+    invalid: '인증 결과를 찾을 수 없습니다',
+    invalidDescription: 'RisuNest의 Google Drive 연결 설정에서 인증을 시작한 뒤 이 페이지로 돌아오세요.',
+    open: 'RisuNest로 돌아가기', copy: '인증 결과 복사', copied: '복사했습니다. 앱의 인증 결과 입력란에 붙여넣으세요.',
+    manual: '아래 내용을 복사해 앱의 인증 결과 입력란에 붙여넣으세요.', footer: '연결이 끝나면 이 창을 닫아도 됩니다.'
+  } : {
+    ready: 'Finish connecting in the app',
+    description: 'Return to RisuNest to finish connecting Google Drive. If the app does not open, copy the result and paste it into the app.',
+    denied: 'Authorization was not completed', deniedDescription: 'Return to the app to try again.',
+    invalid: 'No authorization result found', invalidDescription: 'Start authorization from Google Drive connection settings in RisuNest, then return here.',
+    open: 'Return to RisuNest', copy: 'Copy authorization result', copied: 'Copied. Paste it into the authorization result field in the app.',
+    manual: 'Copy the text below and paste it into the authorization result field in the app.', footer: 'You can close this page after connecting.'
+  };
+  document.documentElement.lang = korean ? 'ko' : 'en';
+  const byId = (id) => document.getElementById(id);
+  byId('open').textContent = strings.open;
+  byId('copy').textContent = strings.copy;
+  byId('manual-label').textContent = strings.manual;
+  byId('footer').textContent = strings.footer;
+  const source = new URL(window.location.href);
+  const params = source.searchParams;
+  const state = params.get('state');
+  const code = params.get('code');
+  const error = params.get('error');
+  const single = (name) => params.getAll(name).length <= 1;
+  const valid = state && state.length <= 512 && !/[\x00-\x20\x7f]/.test(state)
+    && single('state') && single('code') && single('error')
+    && !source.hash && ((code && code.length <= 8192 && !error) || (error && error.length <= 256 && !code));
+  const result = new URL(source.origin + source.pathname);
+  const app = new URL('risunestlocal://oauth/google-drive');
+  if (valid) {
+    for (const [name, value] of [['state', state], [code ? 'code' : 'error', code || error]]) {
+      result.searchParams.set(name, value);
+      app.searchParams.set(name, value);
+    }
+  }
+  window.history.replaceState(null, '', source.pathname);
+  byId('title').textContent = valid ? (code ? strings.ready : strings.denied) : strings.invalid;
+  byId('description').textContent = valid ? (code ? strings.description : strings.deniedDescription) : strings.invalidDescription;
+  if (!valid) return;
+  byId('actions').hidden = false;
+  byId('open').href = app.href;
+  byId('copy').addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(result.href);
+      byId('notice').textContent = strings.copied;
+    } catch {
+      byId('manual').hidden = false;
+      byId('result').value = result.href;
+      byId('result').focus();
+      byId('result').select();
+    }
+  });
+  if (/Android/i.test(navigator.userAgent)) {
+    window.setTimeout(() => window.location.assign(app.href), 300);
+  }
+})();
+  </script>
+</body>
+</html>

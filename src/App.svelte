@@ -38,6 +38,7 @@
     import { isTauri, isTauriMobile } from './ts/platform';
     import NativeFileJobDialog from './lib/Others/NativeFileJobDialog.svelte';
     import LoadingIndicator from './lib/UI/GUI/LoadingIndicator.svelte';
+    import SyncExitDialog from './lib/Others/SyncExitDialog.svelte';
 
     import {
         serverSyncNavigation,
@@ -534,4 +535,5 @@
         <CustomSidebarConfig />
     {/if}
     <NativeFileJobDialog />
+    <SyncExitDialog />
 </main>

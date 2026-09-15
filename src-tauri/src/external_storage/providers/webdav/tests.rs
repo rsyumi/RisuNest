@@ -750,21 +750,36 @@ fn a_lost_put_reconciles_from_the_stored_resource() {
         // A truncated resource under the same name is a conflict, not progress.
         let partial = harness
             .provider
-            .reconcile_upload(&repository, &declared, &resume, &Cancellation::default())
+            .reconcile_upload(
+                &repository,
+                &declared,
+                Some(&resume),
+                &Cancellation::default(),
+            )
             .await
             .unwrap();
         assert!(matches!(partial, UploadResolution::Conflict));
 
         let absent = harness
             .provider
-            .reconcile_upload(&repository, &declared, &resume, &Cancellation::default())
+            .reconcile_upload(
+                &repository,
+                &declared,
+                Some(&resume),
+                &Cancellation::default(),
+            )
             .await
             .unwrap();
         assert!(matches!(absent, UploadResolution::RestartRequired));
 
         let complete = harness
             .provider
-            .reconcile_upload(&repository, &declared, &resume, &Cancellation::default())
+            .reconcile_upload(
+                &repository,
+                &declared,
+                Some(&resume),
+                &Cancellation::default(),
+            )
             .await
             .unwrap();
         let UploadResolution::Complete(receipt) = complete else {

@@ -1257,7 +1257,7 @@ fn reconcile_separates_completion_conflict_expiry_and_a_confirmed_offset() {
         let resume = seal_session(&test, "synthetic-upload", "risunest/packs/pack-1", 1024).await;
         let intent = spool.intent(&handle, "pack-1", ObjectRole::Pack);
         match provider
-            .reconcile_upload(&handle, &intent, &resume, &cancel)
+            .reconcile_upload(&handle, &intent, Some(&resume), &cancel)
             .await
             .unwrap()
         {
@@ -1276,7 +1276,7 @@ fn reconcile_separates_completion_conflict_expiry_and_a_confirmed_offset() {
         let intent = spool.intent(&handle, "pack-1", ObjectRole::Pack);
         assert!(matches!(
             provider
-                .reconcile_upload(&handle, &intent, &resume, &cancel)
+                .reconcile_upload(&handle, &intent, Some(&resume), &cancel)
                 .await
                 .unwrap(),
             UploadResolution::Conflict
@@ -1298,7 +1298,7 @@ fn reconcile_separates_completion_conflict_expiry_and_a_confirmed_offset() {
         let intent = spool.intent(&handle, "pack-1", ObjectRole::Pack);
         assert!(matches!(
             provider
-                .reconcile_upload(&handle, &intent, &resume, &cancel)
+                .reconcile_upload(&handle, &intent, Some(&resume), &cancel)
                 .await
                 .unwrap(),
             UploadResolution::RestartRequired
@@ -1323,7 +1323,7 @@ fn reconcile_separates_completion_conflict_expiry_and_a_confirmed_offset() {
         let resume = seal_session(&test, "synthetic-upload", "risunest/packs/pack-1", 1024).await;
         let intent = spool.intent(&handle, "pack-1", ObjectRole::Pack);
         let resumed = match provider
-            .reconcile_upload(&handle, &intent, &resume, &cancel)
+            .reconcile_upload(&handle, &intent, Some(&resume), &cancel)
             .await
             .unwrap()
         {

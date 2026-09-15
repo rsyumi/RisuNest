@@ -53,6 +53,7 @@
     import { exportCompatibilityBackupFromSystemPicker } from "src/ts/storage/compatibleBackupFileRouteProduction.svelte";
     import { formatCompatibilityBackupReport } from "src/ts/storage/compatibleBackupReport";
     import type { NativeCompatibilityTarget } from "src/ts/storage/nativeFileJobs";
+    import { externalStorageStrings } from "../ExternalStorage/strings";
     let openIframe = $state(false);
     let openIframeURL = $state("");
     const drivePopup = createHubPopupController();
@@ -438,6 +439,9 @@
             <h1 class="text-xl font-bold mt-2">
                 {language.googleDriveConnection}
             </h1>
+            <p class="mb-2 text-sm text-textcolor2">
+                {externalStorageStrings(DBState.db.language).oldDriveNote}
+            </p>
             {#if !DBState.db.account.data.refresh_token}
                 <span class="text-sm font-light mb-2 text-textcolor2"
                     >{language.googleDriveInfo}</span

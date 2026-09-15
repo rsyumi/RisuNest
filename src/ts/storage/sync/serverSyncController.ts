@@ -10,6 +10,7 @@ import {
   type ServerSyncFacade,
   type ServerSyncProgress,
 } from "./serverSync";
+import type { SyncExitDrainResult } from "../syncExitCoordinator";
 
 export interface ServerSyncSnapshot {
   status?: ServerStatus;
@@ -49,6 +50,7 @@ export function createServerSyncController(
   let statusFresh = false;
   let statusSequence = 0;
   let byteSample: { at: number; bytes: bigint } | undefined;
+  let exitDrainActive = 0;
   const listeners = new Set<(snapshot: ServerSyncSnapshot) => void>();
   const publish = (): void => {
     state = {
@@ -170,6 +172,52 @@ export function createServerSyncController(
     state.initialSyncComplete = false;
     state.result = undefined;
     state.attemptIdentity = undefined;
+  };
+  const startSynchronization = (
+    options: ServerCycleOptions,
+    explicitResume: boolean,
+  ): Promise<void> => {
+    if (active) return active;
+    if (state.replacing || isLibraryFileOperationReserved())
+      return Promise.reject(new ServerSyncError("library-operation-busy"));
+    if (explicitResume) controllerOptions.onExplicitResume?.();
+    state.paused = false;
+    let complete!: () => void;
+    let fail!: (cause: unknown) => void;
+    const attempt = new Promise<void>((resolve, reject) => {
+      complete = resolve;
+      fail = reject;
+    });
+    active = attempt;
+    void synchronize(options).then(
+      () => {
+        active = undefined;
+        complete();
+      },
+      (cause) => {
+        active = undefined;
+        fail(cause);
+      },
+    );
+    return attempt;
+  };
+  const completedRevision = (targetRevision: number): boolean =>
+    Boolean(
+      state.initialSyncComplete &&
+        state.status &&
+        state.result &&
+        state.status.localRevision >= targetRevision &&
+        state.result.localRevision >= targetRevision,
+    );
+  const exitDrainBlock = (): string | undefined => {
+    if (state.error) return state.error;
+    if (!state.status?.configured) return "server-not-configured";
+    if (state.status.registrationRequired)
+      return "new-device-registration-required";
+    if (state.status.reconciling) return "epoch-reconciliation-required";
+    if (state.result?.phase === "conflict") return "server-sync-conflict";
+    if (state.replacing) return "library-operation-busy";
+    return undefined;
   };
   return {
     holdAutomaticSync(): void {
@@ -328,29 +376,44 @@ export function createServerSyncController(
       publish();
     },
     synchronize(options: ServerCycleOptions = {}): Promise<void> {
-      if (active) return active;
-      if (state.replacing || isLibraryFileOperationReserved())
-        return Promise.reject(new ServerSyncError("library-operation-busy"));
-      controllerOptions.onExplicitResume?.();
+      return startSynchronization(options, true);
+    },
+    async drainToRevision(
+      targetRevision: number,
+      signal: AbortSignal,
+    ): Promise<SyncExitDrainResult> {
+      if (!Number.isSafeInteger(targetRevision) || targetRevision < 0)
+        throw new RangeError("Exit drain revision must be a nonnegative safe integer");
+      const pausedBeforeDrain = state.paused;
+      exitDrainActive += 1;
       state.paused = false;
-      let complete!: () => void;
-      let fail!: (cause: unknown) => void;
-      const attempt = new Promise<void>((resolve, reject) => {
-        complete = resolve;
-        fail = reject;
-      });
-      active = attempt;
-      void synchronize(options).then(
-        () => {
-          active = undefined;
-          complete();
-        },
-        (cause) => {
-          active = undefined;
-          fail(cause);
-        },
-      );
-      return attempt;
+      publish();
+      const cancelOnAbort = () => {
+        void facade.cancel();
+      };
+      signal.addEventListener("abort", cancelOnAbort, { once: true });
+      try {
+        while (true) {
+          if (signal.aborted) throw new DOMException("Exit drain aborted", "AbortError");
+          await startSynchronization({}, false);
+          if (signal.aborted) throw new DOMException("Exit drain aborted", "AbortError");
+          if (completedRevision(targetRevision)) return { kind: "complete" };
+          const reason = exitDrainBlock();
+          if (reason) return { kind: "blocked", reason };
+          await new Promise<void>((resolve) => setTimeout(resolve, 300));
+        }
+      } finally {
+        signal.removeEventListener("abort", cancelOnAbort);
+        exitDrainActive -= 1;
+        if (exitDrainActive === 0) {
+          state.paused = pausedBeforeDrain;
+          publish();
+        }
+      }
+    },
+    async cancelExitDrain(): Promise<void> {
+      await facade.cancel();
+      await (active ?? Promise.resolve());
     },
     async pause(): Promise<void> {
       state.paused = true;
@@ -363,6 +426,7 @@ export function createServerSyncController(
       }
     },
     async suspend(): Promise<void> {
+      if (exitDrainActive > 0) return;
       try {
         await facade.cancel();
       } catch (cause) {

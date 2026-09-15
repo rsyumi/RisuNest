@@ -352,7 +352,7 @@ pub(crate) trait Provider: Send + Sync {
         &'a self,
         repository: &'a RepositoryHandle,
         intent: &'a ObjectIntent,
-        resume: &'a ResumeState,
+        resume: Option<&'a ResumeState>,
         cancel: &'a Cancellation,
     ) -> ProviderFuture<'a, UploadResolution>;
     /// The one mutable head of a repository. Head writes accept only this

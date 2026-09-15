@@ -1024,7 +1024,7 @@ fn reconciliation_reports_the_first_missing_range_as_the_confirmed_offset() {
             expires_at_ms: None,
         };
         let resolution = provider
-            .reconcile_upload(&repository, &intent, &resume, &cancel)
+            .reconcile_upload(&repository, &intent, Some(&resume), &cancel)
             .await
             .unwrap();
         let UploadResolution::Resumable(updated) = resolution else {
@@ -1045,7 +1045,7 @@ fn reconciliation_reports_the_first_missing_range_as_the_confirmed_offset() {
         assert_eq!(
             failed(
                 provider
-                    .reconcile_upload(&repository, &foreign, &resume, &cancel)
+                    .reconcile_upload(&repository, &foreign, Some(&resume), &cancel)
                     .await
             )
             .kind,
@@ -1098,7 +1098,7 @@ fn an_expired_session_restarts_completes_or_conflicts_on_the_remote_truth() {
                 expires_at_ms: None,
             };
             let resolution = provider
-                .reconcile_upload(&repository, &intent, &resume, &cancel)
+                .reconcile_upload(&repository, &intent, Some(&resume), &cancel)
                 .await
                 .unwrap();
             let observed = match resolution {
@@ -1411,7 +1411,7 @@ fn a_rejected_grant_requires_reauthentication_and_a_rotated_token_is_persisted()
         let body = String::from_utf8(records[0].body.clone()).unwrap();
         assert!(body.contains("grant_type=refresh_token"));
         assert!(body.contains("client_id=entra-application"));
-        assert!(body.contains("scope=Files.ReadWrite%20offline_access"));
+        assert!(body.contains("scope=Files.ReadWrite%20User.Read%20offline_access"));
         assert!(!body.contains("client_secret"));
         // The refreshed token is used for the following Graph calls.
         assert!(head(&records[1]).contains("authorization: bearer fresh-access"));
@@ -1504,6 +1504,7 @@ fn a_foreign_handle_or_locator_is_corrupt() {
 fn the_authorization_policy_requests_the_scopes_of_its_account_type() {
     let graph = "https://graph.microsoft.com/v1.0";
     let mut config = config_at(graph, "appFolder");
+    config.account_id.clear();
     // Without a registered reply URL there is no policy to start.
     assert!(authorization_policy(&config, "windows").is_err());
     config.location.insert(
@@ -1525,12 +1526,13 @@ fn the_authorization_policy_requests_the_scopes_of_its_account_type() {
     assert_eq!(policy.client_id, "entra-application");
     assert_eq!(
         policy.scopes,
-        vec!["Files.ReadWrite.AppFolder", "offline_access"]
+        vec!["Files.ReadWrite.AppFolder", "User.Read", "offline_access"]
     );
     assert_eq!(
         authorization_policy(&config, "android").unwrap().client_id,
         "android-client"
     );
+    assert!(authorization_policy(&config, "ios").is_err());
 
     let mut business = config_at(graph, "business");
     business.location.insert(
@@ -1538,7 +1540,10 @@ fn the_authorization_policy_requests_the_scopes_of_its_account_type() {
         "risunest://oauth/callback".to_owned(),
     );
     let policy = authorization_policy(&business, "windows").unwrap();
-    assert_eq!(policy.scopes, vec!["Files.ReadWrite", "offline_access"]);
+    assert_eq!(
+        policy.scopes,
+        vec!["Files.ReadWrite", "User.Read", "offline_access"]
+    );
     assert_eq!(
         policy.authorize_url.as_str(),
         "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize"
@@ -1563,10 +1568,13 @@ fn the_authorization_policy_requests_the_scopes_of_its_account_type() {
 #[test]
 fn redeeming_an_authorization_code_stores_the_first_token_document() {
     runtime().block_on(async {
-        let server = WireServer::start(vec![json(
-            200,
-            "{\"access_token\":\"first-access\",\"refresh_token\":\"first-refresh\",\"expires_in\":3599,\"token_type\":\"Bearer\"}",
-        )]);
+        let server = WireServer::start(vec![
+            json(
+                200,
+                "{\"access_token\":\"first-access\",\"refresh_token\":\"first-refresh\",\"expires_in\":3599,\"token_type\":\"Bearer\"}",
+            ),
+            json(200, "{\"id\":\"signed-in-account\"}"),
+        ]);
         let harness = with_transport(
             Arc::new(crate::external_storage::http::NativeHttpTransport::for_loopback_tests()),
             MemoryVault::default(),
@@ -1575,6 +1583,13 @@ fn redeeming_an_authorization_code_stores_the_first_token_document() {
         let connector = OneDrive::new(harness.dependencies.clone());
         let cancel = Cancellation::default();
         let mut config = config_for(&server, "business");
+        config.account_id.clear();
+        config
+            .oauth_profile
+            .as_mut()
+            .unwrap()
+            .platform_client_ids
+            .insert("windows".to_owned(), "windows-client".to_owned());
         config.location.insert(
             "redirectUri".to_owned(),
             "risunest://oauth/callback".to_owned(),
@@ -1593,11 +1608,13 @@ fn redeeming_an_authorization_code_stores_the_first_token_document() {
             .exchange_authorization_code(&config, &grant, &cancel)
             .await
             .unwrap();
-        let document = String::from_utf8(harness.vault.contents(&stored.0).unwrap()).unwrap();
+        assert_eq!(stored.account_id, "signed-in-account");
+        let document =
+            String::from_utf8(harness.vault.contents(&stored.secret.0).unwrap()).unwrap();
         assert!(document.contains("first-refresh") && document.contains("first-access"));
 
         let records = server.requests.lock().unwrap();
-        assert_eq!(records.len(), 1);
+        assert_eq!(records.len(), 2);
         assert_eq!(
             line(&records[0]),
             "POST /synthetic/organizations/oauth2/v2.0/token HTTP/1.1"
@@ -1609,6 +1626,11 @@ fn redeeming_an_authorization_code_stores_the_first_token_document() {
         assert!(body.contains("code_verifier=synthetic-verifier"));
         assert!(body.contains("redirect_uri=risunest%3A%2F%2Foauth%2Fcallback"));
         assert!(!body.contains("client_secret"));
+        assert_eq!(
+            line(&records[1]),
+            "GET /synthetic/me?$select=id HTTP/1.1"
+        );
+        assert!(head(&records[1]).contains("authorization: bearer first-access"));
     });
 }
 

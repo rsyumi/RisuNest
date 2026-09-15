@@ -3,10 +3,15 @@
     import { alertConfirm } from "src/ts/alert";
     import { checkDriver } from "src/ts/drive/drive";
     import { isTauri, isNodeServer } from "src/ts/platform"
+    import { DBState } from "src/ts/stores.svelte"
+    import { externalStorageStrings } from "../ExternalStorage/strings"
 
 </script>
 
 <h2 class="mb-2 text-2xl font-bold mt-2">{language.files}</h2>
+<p class="mx-2 mb-2 text-sm text-textcolor2">
+    {externalStorageStrings(DBState.db.language).oldDriveNote}
+</p>
 <button
     onclick={async () => {
         if(await alertConfirm(language.backupConfirm)){

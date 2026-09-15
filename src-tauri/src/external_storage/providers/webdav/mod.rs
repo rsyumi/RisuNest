@@ -999,7 +999,7 @@ impl Provider for WebdavProvider {
         &'a self,
         repository: &'a RepositoryHandle,
         intent: &'a ObjectIntent,
-        resume: &'a ResumeState,
+        resume: Option<&'a ResumeState>,
         cancel: &'a Cancellation,
     ) -> ProviderFuture<'a, UploadResolution> {
         Box::pin(async move {

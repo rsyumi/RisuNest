@@ -186,6 +186,15 @@ pub(crate) trait HttpTransport: Send + Sync {
 pub(crate) trait RequestBudget: Send + Sync {
     /// Atomically persist consumption before the actual request is dispatched.
     fn reserve<'a>(&'a self, costs: &'a [RequestCost], now_ms: u64) -> ProviderFuture<'a, ()>;
+    /// Persist a provider-requested pause for the account buckets that incurred
+    /// it. Test budgets and integrations without durable storage may ignore it.
+    fn record_backoff<'a>(
+        &'a self,
+        _costs: &'a [RequestCost],
+        _until_ms: u64,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 pub(crate) trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
@@ -210,17 +219,27 @@ pub(crate) async fn send(
     cancel.check()?;
     budget.reserve(&request.costs, clock.now_ms()).await?;
     cancel.check()?;
-    transport.send(request, cancel).await
+    let costs = request.costs.clone();
+    let response = transport.send(request, cancel).await?;
+    if matches!(response.status, 403 | 429 | 503) {
+        if let Some(until_ms) =
+            super::providers::common::retry_after_ms(&response.headers, clock.now_ms())
+        {
+            budget.record_backoff(&costs, until_ms).await?;
+        }
+    }
+    Ok(response)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     struct Boundary {
         deny: AtomicBool,
         reservations: AtomicUsize,
         sends: AtomicUsize,
+        backoff_until_ms: AtomicU64,
     }
     impl Clock for Boundary {
         fn now_ms(&self) -> u64 {
@@ -236,6 +255,16 @@ mod tests {
                 } else {
                     Ok(())
                 }
+            })
+        }
+        fn record_backoff<'a>(
+            &'a self,
+            _: &'a [RequestCost],
+            until_ms: u64,
+        ) -> ProviderFuture<'a, ()> {
+            Box::pin(async move {
+                self.backoff_until_ms.store(until_ms, Ordering::SeqCst);
+                Ok(())
             })
         }
     }
@@ -268,6 +297,7 @@ mod tests {
             deny: AtomicBool::new(true),
             reservations: AtomicUsize::new(0),
             sends: AtomicUsize::new(0),
+            backoff_until_ms: AtomicU64::new(0),
         };
         let cancel = Cancellation::default();
         assert!(futures::executor::block_on(send(
@@ -290,5 +320,40 @@ mod tests {
         .is_err());
         assert_eq!(boundary.sends.load(Ordering::SeqCst), 1);
         assert_eq!(boundary.reservations.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn retry_after_is_recorded_before_a_throttled_response_is_returned() {
+        struct Throttled;
+        impl HttpTransport for Throttled {
+            fn send<'a>(
+                &'a self,
+                _: HttpRequest,
+                _: &'a Cancellation,
+            ) -> ProviderFuture<'a, HttpResponse> {
+                Box::pin(async {
+                    Ok(HttpResponse {
+                        status: 429,
+                        headers: BTreeMap::from([("retry-after".into(), "2".into())]),
+                        body: Box::pin(std::io::Cursor::new(Vec::new())),
+                    })
+                })
+            }
+        }
+        let boundary = Boundary {
+            deny: AtomicBool::new(false),
+            reservations: AtomicUsize::new(0),
+            sends: AtomicUsize::new(0),
+            backoff_until_ms: AtomicU64::new(0),
+        };
+        futures::executor::block_on(send(
+            &Throttled,
+            &boundary,
+            &boundary,
+            request(),
+            &Cancellation::default(),
+        ))
+        .unwrap();
+        assert_eq!(boundary.backoff_until_ms.load(Ordering::SeqCst), 2_100);
     }
 }

@@ -14,6 +14,7 @@ const state = vi.hoisted(() => ({
     restartNativeApp: vi.fn(async () => undefined),
     alertError: vi.fn(),
     alertInput: vi.fn(async () => 'drive-token'),
+    alertNormal: vi.fn(),
     alertSelect: vi.fn(async () => '0'),
     blobStore: null as BlobStore | null,
     currentDatabase: null as Database | null,
@@ -31,12 +32,23 @@ const state = vi.hoisted(() => ({
     }>,
     restoreEvents: [] as string[],
     getUncleanables: vi.fn(async () => ['assets/second-read.png']),
+    externalGetState: vi.fn(async () => ({
+        supported: true,
+        selection: { kind: 'none', selectionEpoch: 'selection', paused: false, decisionRequired: false },
+        connections: [],
+        jobs: [],
+    })),
+    externalListHistory: vi.fn(async () => ({ items: [] })),
+    requestExternalStorageNow: vi.fn(async () => undefined),
+    requestExternalStorageRestore: vi.fn(async () => undefined),
+    settingsOpenSet: vi.fn(),
+    settingsMenuSet: vi.fn(),
 }))
 
 vi.mock('../alert', () => ({
     alertError: state.alertError,
     alertInput: state.alertInput,
-    alertNormal: vi.fn(),
+    alertNormal: state.alertNormal,
     alertSelect: state.alertSelect,
     alertStore: { set: vi.fn() },
 }))
@@ -75,7 +87,31 @@ vi.mock('../storage/nativePersistentMaintenance', () => ({
 }))
 
 vi.mock('../../lang', () => ({
-    language: { pasteAuthCode: 'Paste code' },
+    language: {
+        pasteAuthCode: 'Paste code',
+        cancel: 'Cancel',
+        risuNest: {
+            storage: { emptyList: 'Nothing saved yet.' },
+            backup: { actionFailed: 'Backup action failed.' },
+        },
+    },
+}))
+
+vi.mock('../storage/sync/external/bridge', () => ({
+    getExternalStorageBridge: () => ({
+        getState: state.externalGetState,
+        listHistory: state.externalListHistory,
+    }),
+}))
+
+vi.mock('../storage/sync/external/production', () => ({
+    requestExternalStorageNow: state.requestExternalStorageNow,
+    requestExternalStorageRestore: state.requestExternalStorageRestore,
+}))
+
+vi.mock('../stores.svelte', () => ({
+    settingsOpen: { set: state.settingsOpenSet },
+    SettingsMenuIndex: { set: state.settingsMenuSet },
 }))
 
 vi.mock('@tauri-apps/plugin-process', () => ({
@@ -164,6 +200,87 @@ function driveDatabase(coldKey: string): Database {
     }]
     return database
 }
+
+describe('native Drive settings routing', () => {
+    const googleConnection = {
+        id: 'google-primary',
+        providerId: 'google_drive',
+        displayName: 'Google backup',
+        status: 'ready',
+        scope: {
+            library: true,
+            referencedAssets: true,
+            deviceSettings: true,
+            devicePlugins: false,
+        },
+    }
+
+    beforeEach(() => {
+        vi.clearAllMocks()
+        state.externalGetState.mockResolvedValue({
+            supported: true,
+            selection: { kind: 'none', selectionEpoch: 'selection', paused: false, decisionRequired: false },
+            connections: [googleConnection],
+            jobs: [],
+        })
+        state.externalListHistory.mockResolvedValue({ items: [] })
+        state.alertSelect.mockResolvedValue('0')
+    })
+
+    it('uses the common external backup orchestration for the native save button', async () => {
+        const { checkDriver } = await import('./drive')
+        await checkDriver('savetauri')
+
+        expect(state.requestExternalStorageNow).toHaveBeenCalledWith('google-primary', 'backup')
+        expect(state.alertInput).not.toHaveBeenCalled()
+    })
+
+    it('restores a verified external snapshot with the configured device scope', async () => {
+        state.externalListHistory.mockResolvedValue({
+            items: [{
+                id: 'snapshot-7',
+                kind: 'backup-point',
+                createdAtMs: '1000',
+                logicalRevision: '7',
+                pinned: false,
+                complete: true,
+                verified: true,
+            }],
+        })
+        const { checkDriver } = await import('./drive')
+        await checkDriver('loadtauri')
+
+        expect(state.requestExternalStorageRestore).toHaveBeenCalledWith(
+            'google-primary',
+            'snapshot-7',
+            ['library', 'referencedAssets', 'deviceSettings'],
+        )
+    })
+
+    it('opens the existing external storage setup when Google is not connected', async () => {
+        state.externalGetState.mockResolvedValue({
+            supported: true,
+            selection: { kind: 'none', selectionEpoch: 'selection', paused: false, decisionRequired: false },
+            connections: [],
+            jobs: [],
+        })
+        const { checkDriver } = await import('./drive')
+        await checkDriver('savetauri')
+
+        expect(state.settingsOpenSet).toHaveBeenCalledWith(true)
+        expect(state.settingsMenuSet).toHaveBeenCalledWith(17)
+        expect(state.requestExternalStorageNow).not.toHaveBeenCalled()
+    })
+
+    it('preserves the official-account refresh-token authorization URL', async () => {
+        const { checkDriver } = await import('./drive')
+        const url = await checkDriver('reftoken')
+
+        expect(url).toContain('redirect_uri=https%3A%2F%2Fsv.risuai.xyz%2Fdrive')
+        expect(url).toContain('state=accesstauri')
+        expect(url).toContain('access_type=offline')
+    })
+})
 
 describe('Drive restore cold snapshot assets', () => {
     beforeEach(() => {
@@ -283,8 +400,8 @@ describe('Drive restore cold snapshot assets', () => {
                 : new Response(null, { status: 404 })
         }))
 
-        const { checkDriver } = await import('./drive')
-        await checkDriver('loadtauri')
+        const { loadDrive } = await import('./drive')
+        await loadDrive('drive-token', 'backup')
 
         expect(state.restartNativeApp).toHaveBeenCalledTimes(ios ? 1 : 0)
         const { relaunch } = await import('@tauri-apps/plugin-process')
@@ -381,8 +498,8 @@ describe('Drive restore cold snapshot assets', () => {
             })
         }))
 
-        const { checkDriver } = await import('./drive')
-        await checkDriver('savetauri')
+        const { backupDrive } = await import('./drive')
+        await backupDrive('drive-token')
 
         const databaseEntry = [...uploads.entries()].find(([name]) =>
             name.endsWith('-database.risudat'),

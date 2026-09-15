@@ -6,12 +6,15 @@ use super::{
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 const SCHEMA: &str = r#"
-CREATE TABLE external_storage_jobs(id TEXT PRIMARY KEY,connection_id TEXT NOT NULL,repository_id TEXT NOT NULL,capture_id TEXT NOT NULL,identity TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('backup','sync','restore','history')),strategy TEXT CHECK(strategy IN ('cas','sequential')),expected_head TEXT,commit_id TEXT NOT NULL,phase TEXT NOT NULL CHECK(phase IN ('preparing','ready','publishing','publicationUnknown','published','historyPending','applying','complete','cancelled','stale')));
+CREATE TABLE external_storage_jobs(id TEXT PRIMARY KEY,connection_id TEXT NOT NULL,repository_id TEXT NOT NULL,capture_id TEXT NOT NULL,identity TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('backup','sync','restore','history')),strategy TEXT CHECK(strategy IN ('cas','sequential')),expected_head TEXT,commit_id TEXT NOT NULL,phase TEXT NOT NULL CHECK(phase IN ('preparing','ready','publishing','publicationUnknown','conflictPreserving','published','historyPending','applying','complete','cancelled','stale')));
 CREATE TABLE external_storage_bases(connection_id TEXT PRIMARY KEY,repository_id TEXT NOT NULL,snapshot_id TEXT NOT NULL,commit_id TEXT NOT NULL,head_observation TEXT NOT NULL,identity TEXT NOT NULL);
+CREATE TABLE external_storage_backup_points(job_id TEXT PRIMARY KEY,connection_id TEXT NOT NULL,repository_id TEXT NOT NULL,snapshot_id TEXT NOT NULL,point_id TEXT NOT NULL,observation TEXT NOT NULL,identity TEXT NOT NULL);
+CREATE TABLE external_storage_history_points(job_id TEXT PRIMARY KEY,connection_id TEXT NOT NULL,repository_id TEXT NOT NULL,snapshot_id TEXT NOT NULL,snapshot_reference TEXT NOT NULL,point_id TEXT NOT NULL,logical_revision TEXT NOT NULL,created_at_ms TEXT NOT NULL,identity TEXT NOT NULL,point_observation TEXT);
 CREATE TABLE external_storage_captures(id TEXT PRIMARY KEY,identity TEXT NOT NULL,scope_id TEXT NOT NULL,codec_id TEXT NOT NULL,device_capture_id TEXT NOT NULL,manifest_hash TEXT NOT NULL CHECK(length(manifest_hash)=64 AND manifest_hash NOT GLOB '*[^0-9a-f]*'),UNIQUE(identity,scope_id,codec_id,device_capture_id));
 CREATE TABLE external_storage_capture_refs(capture_id TEXT NOT NULL,job_id TEXT NOT NULL,PRIMARY KEY(capture_id,job_id));
 CREATE TABLE external_storage_capture_files(capture_id TEXT PRIMARY KEY,catalog_path TEXT NOT NULL,file_hash TEXT NOT NULL CHECK(length(file_hash)=64 AND file_hash NOT GLOB '*[^0-9a-f]*'));
 CREATE TABLE external_storage_content_cache(consumer_id TEXT NOT NULL,generation TEXT NOT NULL,kind TEXT NOT NULL,key1 TEXT NOT NULL,key2 TEXT NOT NULL,content_hash TEXT NOT NULL CHECK(length(content_hash)=64 AND content_hash NOT GLOB '*[^0-9a-f]*'),byte_size INTEGER NOT NULL CHECK(byte_size>=0),PRIMARY KEY(consumer_id,generation,kind,key1,key2));
+CREATE TABLE external_storage_conflicts(id TEXT PRIMARY KEY,connection_id TEXT NOT NULL,repository_id TEXT NOT NULL,local_capture_id TEXT NOT NULL,local_snapshot TEXT,local_identity TEXT NOT NULL,remote_snapshot TEXT,remote_logical_revision INTEGER CHECK(remote_logical_revision>=0),remote_commit_id TEXT,remote_head_observation TEXT,created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0),preservation TEXT NOT NULL CHECK(preservation IN ('localOnly','remoteComplete')),phase TEXT NOT NULL CHECK(phase IN ('pending','resolving','publicationUnknown','resolved')));
 "#;
 
 pub(super) fn create_schema(db: &Connection) -> StoreResult<()> {
@@ -99,6 +102,32 @@ pub(crate) fn prepare_receive(tx: &Transaction<'_>, intent: &ReceiveIntent<'_>) 
     Ok(())
 }
 
+pub(crate) fn prepare_conflict_receive(
+    tx: &Transaction<'_>,
+    intent: &ReceiveIntent<'_>,
+) -> StoreResult<()> {
+    sync_selection::require_publish(tx, intent.identity, intent.connection_id)?;
+    if sync_selection::identity(tx)? != *intent.identity {
+        return Err(invalid("Local revision changed before conflict receive"));
+    }
+    if [
+        intent.repository_id,
+        intent.snapshot_id,
+        intent.commit_id,
+        intent.authenticated_head,
+    ]
+    .iter()
+    .any(|value| value.is_empty())
+    {
+        return Err(invalid("Incomplete conflict receive intent"));
+    }
+    if tx.execute("UPDATE external_storage_jobs SET repository_id=?2,capture_id=?3,identity=?4,role='restore',strategy=NULL,expected_head=?5,commit_id=?6,phase='ready' WHERE id=?1 AND connection_id=?7 AND phase IN ('stale','cancelled')",
+        params![intent.job_id,intent.repository_id,intent.snapshot_id,serde_json::to_string(intent.identity)?,intent.authenticated_head,intent.commit_id,intent.connection_id])?!=1 {
+        return Err(invalid("No preserved conflict receive to prepare"));
+    }
+    Ok(())
+}
+
 /// Called only inside the SAME transaction that switches the staged generation.
 pub(super) fn begin_receive_activation(tx: &Transaction<'_>, job: &str) -> StoreResult<()> {
     let (connection, encoded, phase): (String,String,String) = tx.query_row(
@@ -145,6 +174,203 @@ pub(crate) struct PublishIntent<'a> {
     pub strategy: &'a str,
     pub expected_head: Option<&'a str>,
     pub commit_id: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PinHistoryRecord {
+    pub job_id: String,
+    pub connection_id: String,
+    pub repository_id: String,
+    pub snapshot_id: String,
+    pub snapshot_reference: String,
+    pub point_id: String,
+    pub logical_revision: u64,
+    pub created_at_ms: u64,
+    pub identity: CaptureIdentity,
+    pub point_observation: Option<String>,
+}
+
+pub(crate) struct PinHistoryIntent<'a> {
+    pub job_id: &'a str,
+    pub connection_id: &'a str,
+    pub repository_id: &'a str,
+    pub snapshot_id: &'a str,
+    pub snapshot_reference: &'a str,
+    pub point_id: &'a str,
+    pub logical_revision: u64,
+    pub created_at_ms: u64,
+    pub identity: &'a CaptureIdentity,
+}
+
+fn decode_pin_history_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+)> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+    ))
+}
+
+pub(crate) fn pin_history_record(
+    db: &Connection,
+    job: &str,
+) -> StoreResult<Option<PinHistoryRecord>> {
+    let row = db
+        .query_row(
+            "SELECT job_id,connection_id,repository_id,snapshot_id,snapshot_reference,point_id,logical_revision,created_at_ms,identity,point_observation FROM external_storage_history_points WHERE job_id=?1",
+            [job],
+            decode_pin_history_row,
+        )
+        .optional()?;
+    row.map(
+        |(
+            job_id,
+            connection_id,
+            repository_id,
+            snapshot_id,
+            snapshot_reference,
+            point_id,
+            logical_revision,
+            created_at_ms,
+            identity,
+            point_observation,
+        )| {
+            if snapshot_reference.is_empty()
+                || snapshot_reference.len() > 256 * 1024
+                || point_observation
+                    .as_ref()
+                    .is_some_and(|value| value.is_empty() || value.len() > 256 * 1024)
+            {
+                return Err(invalid("Invalid durable history point"));
+            }
+            Ok(PinHistoryRecord {
+                job_id,
+                connection_id,
+                repository_id,
+                snapshot_id,
+                snapshot_reference,
+                point_id,
+                logical_revision: logical_revision
+                    .parse()
+                    .map_err(|_| invalid("Invalid history logical revision"))?,
+                created_at_ms: created_at_ms
+                    .parse()
+                    .map_err(|_| invalid("Invalid history creation time"))?,
+                identity: serde_json::from_str(&identity)?,
+                point_observation,
+            })
+        },
+    )
+    .transpose()
+}
+
+pub(crate) fn prepare_pin_history(
+    tx: &Transaction<'_>,
+    intent: &PinHistoryIntent<'_>,
+) -> StoreResult<()> {
+    let valid_id = |value: &str| !value.is_empty() && value.len() <= 1024 && !value.contains('\0');
+    if [
+        intent.job_id,
+        intent.connection_id,
+        intent.repository_id,
+        intent.snapshot_id,
+        intent.point_id,
+    ]
+    .iter()
+    .any(|value| !valid_id(value))
+        || intent.point_id != intent.job_id
+        || intent.snapshot_reference.is_empty()
+        || intent.snapshot_reference.len() > 256 * 1024
+        || intent.identity.revision < 0
+    {
+        return Err(invalid("Incomplete history point intent"));
+    }
+    let busy: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM external_storage_jobs WHERE connection_id=?1 AND phase NOT IN ('complete','cancelled','stale'))",
+        [intent.connection_id],
+        |row| row.get(0),
+    )?;
+    if busy {
+        return Err(invalid("External destination already has an active job"));
+    }
+    let identity = serde_json::to_string(intent.identity)?;
+    tx.execute(
+        "INSERT INTO external_storage_jobs VALUES(?1,?2,?3,?4,?5,'history',NULL,NULL,?6,'ready')",
+        params![
+            intent.job_id,
+            intent.connection_id,
+            intent.repository_id,
+            intent.snapshot_id,
+            identity,
+            intent.point_id,
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO external_storage_history_points VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL)",
+        params![
+            intent.job_id,
+            intent.connection_id,
+            intent.repository_id,
+            intent.snapshot_id,
+            intent.snapshot_reference,
+            intent.point_id,
+            intent.logical_revision.to_string(),
+            intent.created_at_ms.to_string(),
+            identity,
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn finish_pin_history(
+    tx: &Transaction<'_>,
+    job: &str,
+    observation: &str,
+) -> StoreResult<()> {
+    if observation.is_empty() || observation.len() > 256 * 1024 {
+        return Err(invalid("Missing confirmed history point"));
+    }
+    let (phase, existing): (String, Option<String>) = tx.query_row(
+        "SELECT j.phase,h.point_observation FROM external_storage_jobs j JOIN external_storage_history_points h ON h.job_id=j.id WHERE j.id=?1 AND j.role='history'",
+        [job],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if phase == "complete" && existing.as_deref() == Some(observation) {
+        return Ok(());
+    }
+    // Library replacement may stale this remote-only job while its immutable
+    // point upload is in flight. The frozen snapshot reference remains valid.
+    if !matches!(phase.as_str(), "ready" | "stale") || existing.is_some() {
+        return Err(invalid("History completion does not match its intent"));
+    }
+    tx.execute(
+        "UPDATE external_storage_history_points SET point_observation=?2 WHERE job_id=?1",
+        params![job, observation],
+    )?;
+    tx.execute(
+        "UPDATE external_storage_jobs SET phase='complete' WHERE id=?1",
+        [job],
+    )?;
+    Ok(())
 }
 
 /// Capture files and their manifest must already be verified and fsynced. The
@@ -221,6 +447,16 @@ pub(crate) fn prepare_backup(
 }
 
 pub(crate) fn cancel_prepared(tx: &Transaction<'_>, job: &str) -> StoreResult<()> {
+    let unresolved_conflict: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM external_storage_conflicts WHERE id=?1 AND phase!='resolved')",
+        [job],
+        |row| row.get(0),
+    )?;
+    if unresolved_conflict {
+        return Err(invalid(
+            "Unresolved external conflict keeps its preserved capture",
+        ));
+    }
     if tx.execute("UPDATE external_storage_jobs SET phase='cancelled' WHERE id=?1 AND phase IN ('preparing','ready','stale')",[job])?!=1 {return Err(invalid("In-flight publication must be reconciled before cancellation"));}
     tx.execute(
         "DELETE FROM external_storage_capture_refs WHERE job_id=?1",
@@ -241,7 +477,24 @@ pub(crate) fn prepare_publication(
     tx: &Transaction<'_>,
     intent: &PublishIntent<'_>,
 ) -> StoreResult<()> {
-    sync_selection::require_publish(tx, intent.identity, intent.connection_id)?;
+    prepare_publication_with_pause(tx, intent, false)
+}
+pub(crate) fn prepare_publication_exit_drain(
+    tx: &Transaction<'_>,
+    intent: &PublishIntent<'_>,
+) -> StoreResult<()> {
+    prepare_publication_with_pause(tx, intent, true)
+}
+fn prepare_publication_with_pause(
+    tx: &Transaction<'_>,
+    intent: &PublishIntent<'_>,
+    allow_paused: bool,
+) -> StoreResult<()> {
+    if allow_paused {
+        sync_selection::require_publish_exit_drain(tx, intent.identity, intent.connection_id)?;
+    } else {
+        sync_selection::require_publish(tx, intent.identity, intent.connection_id)?;
+    }
     let identity = serde_json::to_string(intent.identity)?;
     let exists: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM external_storage_captures WHERE id=?1 AND identity=?2)",
@@ -275,9 +528,34 @@ pub(crate) fn prepare_publication(
     Ok(())
 }
 
+pub(crate) fn prepare_conflict_publication(
+    tx: &Transaction<'_>,
+    intent: &PublishIntent<'_>,
+) -> StoreResult<()> {
+    sync_selection::require_publish(tx, intent.identity, intent.connection_id)?;
+    if sync_selection::identity(tx)? != *intent.identity {
+        return Err(invalid("Conflict local preview changed"));
+    }
+    if tx.execute("UPDATE external_storage_jobs SET repository_id=?2,capture_id=?3,identity=?4,role='sync',strategy=?5,expected_head=?6,commit_id=?7,phase='ready' WHERE id=?1 AND connection_id=?8 AND phase IN ('stale','cancelled')",
+        params![intent.job_id,intent.repository_id,intent.capture_id,serde_json::to_string(intent.identity)?,intent.strategy,intent.expected_head,intent.commit_id,intent.connection_id])?!=1 {
+        return Err(invalid("No preserved conflict publication to prepare"));
+    }
+    Ok(())
+}
+
 /// The caller owns file(false) through the head request AND this result's
 /// settlement. Commit this intent before making the network request.
 pub(crate) fn begin_publication(tx: &Transaction<'_>, job: &str) -> StoreResult<()> {
+    begin_publication_with_pause(tx, job, false)
+}
+pub(crate) fn begin_publication_exit_drain(tx: &Transaction<'_>, job: &str) -> StoreResult<()> {
+    begin_publication_with_pause(tx, job, true)
+}
+fn begin_publication_with_pause(
+    tx: &Transaction<'_>,
+    job: &str,
+    allow_paused: bool,
+) -> StoreResult<()> {
     let (connection, identity, phase): (String, String, String) = tx.query_row(
         "SELECT connection_id,identity,phase FROM external_storage_jobs WHERE id=?1 AND role='sync'",
         [job],
@@ -286,7 +564,12 @@ pub(crate) fn begin_publication(tx: &Transaction<'_>, job: &str) -> StoreResult<
     if phase != "ready" {
         return Err(invalid("Publication cannot blindly retry a head write"));
     }
-    sync_selection::require_publish(tx, &serde_json::from_str(&identity)?, &connection)?;
+    let identity = serde_json::from_str(&identity)?;
+    if allow_paused {
+        sync_selection::require_publish_exit_drain(tx, &identity, &connection)?;
+    } else {
+        sync_selection::require_publish(tx, &identity, &connection)?;
+    }
     tx.execute(
         "UPDATE external_storage_jobs SET phase='publishing' WHERE id=?1",
         [job],
@@ -309,13 +592,55 @@ pub(crate) fn confirm_publication(
     observation: &str,
     history_pending: bool,
 ) -> StoreResult<()> {
+    confirm_publication_with_pause(
+        tx,
+        job,
+        commit,
+        snapshot,
+        observation,
+        history_pending,
+        false,
+    )
+}
+pub(crate) fn confirm_publication_exit_drain(
+    tx: &Transaction<'_>,
+    job: &str,
+    commit: &str,
+    snapshot: &str,
+    observation: &str,
+    history_pending: bool,
+) -> StoreResult<()> {
+    confirm_publication_with_pause(
+        tx,
+        job,
+        commit,
+        snapshot,
+        observation,
+        history_pending,
+        true,
+    )
+}
+fn confirm_publication_with_pause(
+    tx: &Transaction<'_>,
+    job: &str,
+    commit: &str,
+    snapshot: &str,
+    observation: &str,
+    history_pending: bool,
+    allow_paused: bool,
+) -> StoreResult<()> {
     let (connection,repository,identity,expected,phase):(String,String,String,String,String)=tx.query_row("SELECT connection_id,repository_id,identity,commit_id,phase FROM external_storage_jobs WHERE id=?1",[job],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
     if expected != commit || !matches!(phase.as_str(), "publishing" | "publicationUnknown") {
         return Err(invalid(
             "Remote confirmation differs from publication intent",
         ));
     }
-    sync_selection::require_publish(tx, &serde_json::from_str(&identity)?, &connection)?;
+    let capture = serde_json::from_str(&identity)?;
+    if allow_paused {
+        sync_selection::require_publish_exit_drain(tx, &capture, &connection)?;
+    } else {
+        sync_selection::require_publish(tx, &capture, &connection)?;
+    }
     tx.execute("INSERT INTO external_storage_bases VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(connection_id) DO UPDATE SET repository_id=excluded.repository_id,snapshot_id=excluded.snapshot_id,commit_id=excluded.commit_id,head_observation=excluded.head_observation,identity=excluded.identity",params![connection,repository,snapshot,commit,observation,identity])?;
     tx.execute(
         "UPDATE external_storage_jobs SET phase=?1 WHERE id=?2",

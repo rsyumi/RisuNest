@@ -1002,7 +1002,7 @@ fn reconciliation_reports_the_stored_object_or_a_restart() {
         };
         let cancel = Cancellation::default();
         let resolution = provider
-            .reconcile_upload(&handle, &intent, &resume, &cancel)
+            .reconcile_upload(&handle, &intent, Some(&resume), &cancel)
             .await
             .unwrap();
         let UploadResolution::Complete(receipt) = resolution else {
@@ -1010,7 +1010,7 @@ fn reconciliation_reports_the_stored_object_or_a_restart() {
         };
         assert_eq!(receipt.locator.object, "60/12");
         let missing = provider
-            .reconcile_upload(&handle, &intent, &resume, &cancel)
+            .reconcile_upload(&handle, &intent, Some(&resume), &cancel)
             .await
             .unwrap();
         assert!(matches!(missing, UploadResolution::RestartRequired));

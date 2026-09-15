@@ -2,8 +2,8 @@
 //! authorization policy. Token material never leaves this module except as an
 //! `Authorization` header value or a sealed vault payload.
 use super::{
-    config::{self, Settings},
-    wire::{self, AccountScope},
+    config::{self, AuthorizationSettings, Settings},
+    wire::{self, About, AccountScope},
 };
 use crate::external_storage::{
     auth::{AuthorizationCode, AuthorizationPolicy, SecretBytes},
@@ -38,6 +38,7 @@ struct SecretPayload {
     refresh_token: Zeroizing<String>,
     access_token: Option<Zeroizing<String>>,
     expires_at_ms: Option<u64>,
+    client_secret: Option<Zeroizing<String>>,
 }
 
 #[derive(Deserialize)]
@@ -46,6 +47,7 @@ struct StoredSecret {
     refresh_token: String,
     access_token: Option<String>,
     access_token_expires_at_ms: Option<u64>,
+    client_secret: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -53,6 +55,17 @@ struct TokenResponse {
     access_token: Option<String>,
     expires_in: Option<u64>,
     refresh_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TokenInfo {
+    issued_to: Option<String>,
+    scope: Option<String>,
+}
+
+pub(crate) struct AuthorizedSecret {
+    pub secret: SecretBytes,
+    pub account_id: String,
 }
 fn reauth() -> ProviderError {
     ProviderError::new(ErrorKind::ReauthRequired)
@@ -67,6 +80,7 @@ fn decode(bytes: &SecretBytes) -> Result<SecretPayload> {
         refresh_token: Zeroizing::new(stored.refresh_token),
         access_token: stored.access_token.map(Zeroizing::new),
         expires_at_ms: stored.access_token_expires_at_ms,
+        client_secret: stored.client_secret.map(Zeroizing::new),
     })
 }
 
@@ -80,6 +94,10 @@ fn encode(payload: &SecretPayload) -> Result<SecretBytes> {
     }
     if let Some(expires) = payload.expires_at_ms {
         text.push_str(&format!(",\"accessTokenExpiresAtMs\":{expires}"));
+    }
+    if let Some(secret) = &payload.client_secret {
+        text.push_str(",\"clientSecret\":");
+        text.push_str(&serde_json::to_string(secret.as_str()).map_err(|_| corrupt())?);
     }
     text.push('}');
     Ok(SecretBytes(Zeroizing::new(text.as_bytes().to_vec())))
@@ -175,6 +193,100 @@ async fn post_token(
     Err(wire::classify(&mut response, dependencies.clock.now_ms(), cancel).await)
 }
 
+pub(super) async fn verify_google_grant(
+    dependencies: &Dependencies,
+    token_info_endpoint: url::Url,
+    expected_client_id: &str,
+    required_scopes: &[String],
+    access_token: &str,
+    scope: &AccountScope,
+    cancel: &Cancellation,
+) -> Result<()> {
+    let mut url = token_info_endpoint;
+    // Google OAuth2 API v2 documents access_token as a tokeninfo query
+    // parameter. HttpRequest is intentionally neither Debug nor Serialize,
+    // and transport errors discard URLs so this value cannot reach logs.
+    url.query_pairs_mut()
+        .append_pair("access_token", access_token);
+    let request = HttpRequest {
+        method: reqwest::Method::GET,
+        url,
+        headers: BTreeMap::new(),
+        body: None,
+        content_length: None,
+        operation: ProviderOperation::Authenticate,
+        costs: wire::costs(ProviderOperation::Metadata, scope, 0),
+    };
+    let mut response = http::send(
+        dependencies.http.as_ref(),
+        dependencies.budget.as_ref(),
+        dependencies.clock.as_ref(),
+        request,
+        cancel,
+    )
+    .await?;
+    if matches!(response.status, 400 | 401) {
+        return Err(reauth());
+    }
+    wire::require_status(&mut response, &[200], dependencies.clock.now_ms(), cancel).await?;
+    let token = wire::json::<TokenInfo>(&mut response, cancel).await?;
+    if token.issued_to.as_deref() != Some(expected_client_id) {
+        return Err(reauth());
+    }
+    let granted_scopes = token.scope.as_deref().unwrap_or_default();
+    if !required_scopes.iter().all(|required| {
+        granted_scopes
+            .split_ascii_whitespace()
+            .any(|granted| granted == required)
+    }) {
+        return Err(reauth());
+    }
+    Ok(())
+}
+
+async fn account_id(
+    dependencies: &Dependencies,
+    settings: &AuthorizationSettings,
+    access_token: &str,
+    cancel: &Cancellation,
+) -> Result<String> {
+    let mut url = settings.api("/about")?;
+    url.query_pairs_mut()
+        .append_pair("fields", "user(permissionId)");
+    let mut headers = BTreeMap::new();
+    headers.insert("authorization".to_owned(), format!("Bearer {access_token}"));
+    let request = HttpRequest {
+        method: reqwest::Method::GET,
+        url,
+        headers,
+        body: None,
+        content_length: None,
+        operation: ProviderOperation::Metadata,
+        costs: wire::costs(ProviderOperation::Metadata, &settings.quota_scope(), 0),
+    };
+    let mut response = http::send(
+        dependencies.http.as_ref(),
+        dependencies.budget.as_ref(),
+        dependencies.clock.as_ref(),
+        request,
+        cancel,
+    )
+    .await?;
+    if response.status == 401 {
+        return Err(reauth());
+    }
+    wire::require_status(&mut response, &[200], dependencies.clock.now_ms(), cancel).await?;
+    let permission_id = wire::json::<About>(&mut response, cancel)
+        .await?
+        .user
+        .and_then(|user| user.permission_id)
+        .ok_or_else(reauth)?;
+    if permission_id.len() > 128 || !config::is_drive_id(&permission_id) {
+        return Err(reauth());
+    }
+    Ok(permission_id)
+}
+
 /// Returns a usable access token, refreshing and persisting rotation when the
 /// cached and stored tokens are expired or `force_refresh` is set.
 pub(super) async fn access_token(
@@ -213,15 +325,19 @@ pub(super) async fn access_token(
             }
         }
     }
+    let mut refresh_form = vec![
+        ("client_id", settings.client_id.as_str()),
+        ("grant_type", "refresh_token"),
+        ("refresh_token", payload.refresh_token.as_str()),
+    ];
+    if let Some(client_secret) = &payload.client_secret {
+        refresh_form.push(("client_secret", client_secret.as_str()));
+    }
     let granted = post_token(
         dependencies,
         settings.token_endpoint()?,
         scope,
-        form(&[
-            ("client_id", &settings.client_id),
-            ("grant_type", "refresh_token"),
-            ("refresh_token", payload.refresh_token.as_str()),
-        ]),
+        form(&refresh_form),
         cancel,
     )
     .await?;
@@ -234,6 +350,17 @@ pub(super) async fn access_token(
         .clock
         .now_ms()
         .saturating_add(granted.expires_in.unwrap_or(0).saturating_mul(1000));
+    #[cfg(target_os = "android")]
+    verify_google_grant(
+        dependencies,
+        settings.token_info_endpoint()?,
+        &settings.client_id,
+        &settings.scopes(),
+        access.as_str(),
+        scope,
+        cancel,
+    )
+    .await?;
     let rotated = SecretPayload {
         refresh_token: granted
             .refresh_token
@@ -242,6 +369,7 @@ pub(super) async fn access_token(
             .unwrap_or(payload.refresh_token),
         access_token: Some(Zeroizing::new(access.to_string())),
         expires_at_ms: Some(expires_at_ms),
+        client_secret: payload.client_secret,
     };
     dependencies
         .vault
@@ -262,19 +390,10 @@ pub(crate) fn authorization_policy(
     platform: &str,
     redirect_url: url::Url,
 ) -> Result<AuthorizationPolicy> {
-    if config.provider != config::PROVIDER_ID {
+    if platform == "android" || platform == "ios" {
         return Err(config::unsupported());
     }
-    let profile = config
-        .oauth_profile
-        .as_ref()
-        .ok_or_else(config::unsupported)?;
-    let client_id = profile
-        .platform_client_ids
-        .get(platform)
-        .filter(|client_id| !client_id.is_empty())
-        .ok_or_else(config::unsupported)?
-        .clone();
+    let settings = AuthorizationSettings::parse(config, platform)?;
     let loopback = redirect_url.scheme() == "http"
         && matches!(redirect_url.host_str(), Some("127.0.0.1") | Some("[::1]"));
     let custom_scheme =
@@ -282,17 +401,36 @@ pub(crate) fn authorization_policy(
     if !loopback && !custom_scheme {
         return Err(config::unsupported());
     }
-    let scopes = match config.location.get("space").map(String::as_str) {
-        None | Some("drive") => vec![config::DRIVE_FILE_SCOPE.to_owned()],
-        Some(config::APP_DATA_FOLDER) => vec![config::APPDATA_SCOPE.to_owned()],
-        Some(_) => return Err(config::unsupported()),
-    };
     Ok(AuthorizationPolicy {
         authorize_url: url::Url::parse(config::AUTHORIZE_ENDPOINT)
             .map_err(|_| config::unsupported())?,
-        client_id,
+        client_id: settings.client_id,
         redirect_url,
-        scopes,
+        scopes: settings.scopes,
+    })
+}
+
+#[cfg(not(target_os = "android"))]
+pub(crate) fn native_authorization_policy(
+    config: &ConnectionConfig,
+    redirect_url: url::Url,
+) -> Result<AuthorizationPolicy> {
+    authorization_policy(config, config::platform_key(), redirect_url)
+}
+
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn android_web_authorization_policy(
+    config: &ConnectionConfig,
+) -> Result<AuthorizationPolicy> {
+    let settings = AuthorizationSettings::parse(config, "android")?;
+    Ok(AuthorizationPolicy {
+        authorize_url: url::Url::parse(config::AUTHORIZE_ENDPOINT)
+            .map_err(|_| config::unsupported())?,
+        client_id: settings.client_id,
+        redirect_url: settings
+            .android_web_redirect
+            .ok_or_else(config::unsupported)?,
+        scopes: settings.scopes,
     })
 }
 
@@ -302,23 +440,39 @@ pub(crate) async fn exchange_authorization_code(
     dependencies: &Dependencies,
     config: &ConnectionConfig,
     grant: &AuthorizationCode,
+    client_secret: Option<Zeroizing<String>>,
     cancel: &Cancellation,
-) -> Result<SecretBytes> {
-    let settings = Settings::parse(config)?;
-    let scope = AccountScope::of(&settings);
+) -> Result<AuthorizedSecret> {
+    let settings = AuthorizationSettings::parse(config, config::platform_key())?;
+    if grant.client_id != settings.client_id {
+        return Err(reauth());
+    }
+    let scope = settings.quota_scope();
     let code = std::str::from_utf8(&grant.code.0).map_err(|_| reauth())?;
     let verifier = std::str::from_utf8(&grant.verifier.0).map_err(|_| reauth())?;
+    if client_secret.as_ref().is_some_and(|secret| {
+        secret.is_empty()
+            || secret.len() > 4096
+            || secret.trim() != secret.as_str()
+            || secret.chars().any(char::is_control)
+    }) {
+        return Err(config::unsupported());
+    }
+    let mut exchange_form = vec![
+        ("client_id", grant.client_id.as_str()),
+        ("code", code),
+        ("code_verifier", verifier),
+        ("grant_type", "authorization_code"),
+        ("redirect_uri", grant.redirect_url.as_str()),
+    ];
+    if let Some(secret) = &client_secret {
+        exchange_form.push(("client_secret", secret.as_str()));
+    }
     let granted = post_token(
         dependencies,
         settings.token_endpoint()?,
         &scope,
-        form(&[
-            ("client_id", &grant.client_id),
-            ("code", code),
-            ("code_verifier", verifier),
-            ("grant_type", "authorization_code"),
-            ("redirect_uri", grant.redirect_url.as_str()),
-        ]),
+        form(&exchange_form),
         cancel,
     )
     .await?;
@@ -327,16 +481,32 @@ pub(crate) async fn exchange_authorization_code(
         .filter(|token| !token.is_empty())
         .map(Zeroizing::new)
         .ok_or_else(reauth)?;
+    let access_token = granted
+        .access_token
+        .filter(|token| !token.is_empty())
+        .map(Zeroizing::new)
+        .ok_or_else(reauth)?;
     let expires_at_ms = dependencies
         .clock
         .now_ms()
         .saturating_add(granted.expires_in.unwrap_or(0).saturating_mul(1000));
-    encode(&SecretPayload {
+    #[cfg(target_os = "android")]
+    verify_google_grant(
+        dependencies,
+        settings.token_info_endpoint()?,
+        &settings.client_id,
+        &settings.scopes,
+        &access_token,
+        &scope,
+        cancel,
+    )
+    .await?;
+    let account_id = account_id(dependencies, &settings, &access_token, cancel).await?;
+    let secret = encode(&SecretPayload {
         refresh_token,
-        access_token: granted
-            .access_token
-            .filter(|token| !token.is_empty())
-            .map(Zeroizing::new),
+        access_token: Some(access_token),
         expires_at_ms: Some(expires_at_ms),
-    })
+        client_secret,
+    })?;
+    Ok(AuthorizedSecret { secret, account_id })
 }

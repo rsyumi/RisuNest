@@ -941,7 +941,7 @@ impl Provider for S3Provider {
         &'a self,
         repository: &'a RepositoryHandle,
         intent: &'a ObjectIntent,
-        resume: &'a ResumeState,
+        resume: Option<&'a ResumeState>,
         cancel: &'a Cancellation,
     ) -> ProviderFuture<'a, UploadResolution> {
         Box::pin(async move {
@@ -949,10 +949,16 @@ impl Provider for S3Provider {
             let context = context_of(repository)?;
             intent.validate(repository)?;
             let (key, locator) = intent_locator(repository, context, intent)?;
-            let mut state = self.session(resume).await?;
-            if state.key != key {
-                return Err(corrupt());
-            }
+            let mut state = match resume {
+                Some(resume) => {
+                    let state = self.session(resume).await?;
+                    if state.key != key {
+                        return Err(corrupt());
+                    }
+                    Some(state)
+                }
+                None => None,
+            };
             let credentials = self.credentials(context).await?;
             if let Some(existing) = self
                 .head_object(context, &credentials, &key, cancel)
@@ -968,6 +974,9 @@ impl Provider for S3Provider {
                     },
                 );
             }
+            let (Some(resume), Some(mut state)) = (resume, state.take()) else {
+                return Ok(UploadResolution::RestartRequired);
+            };
             let mut response = self
                 .dispatch(
                     context,

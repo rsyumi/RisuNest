@@ -364,7 +364,7 @@ fn fake_snapshot_discovery_and_lost_upload_reconcile_use_complete_immutable_obje
         };
         assert!(matches!(
             provider
-                .reconcile_upload(&repository, &intent, &resume, &cancel)
+                .reconcile_upload(&repository, &intent, Some(&resume), &cancel)
                 .await
                 .unwrap(),
             UploadResolution::Complete(_)

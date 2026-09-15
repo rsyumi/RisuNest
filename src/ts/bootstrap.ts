@@ -132,10 +132,21 @@ import {
     type NativeOfficialPublicationRecovery,
 } from "./storage/sync/nativeOfficialPublicationRecovery";
 import { checkNativeStartupStatus } from './nativeStartup'
+import {
+    createSyncExitCoordinator,
+    type SyncExitDrainAdapter,
+} from './storage/syncExitCoordinator'
+import {
+    configureSyncExitCoordinator,
+    registerWindowCloseDrain,
+} from './storage/syncExitProduction'
+import { getExternalStorageBridge } from './storage/sync/external/bridge'
+import { createServerSyncExitDrainAdapter } from './storage/sync/serverSyncProduction'
 
 const appWindow = isTauri ? getCurrentWebviewWindow() : null
 let disposeLifecycleCommitListeners: (() => void) | undefined
 let disposeMacosLifecycle: (() => void) | undefined
+let disposeWindowCloseDrain: (() => void) | undefined
 let disposeAndroidScreenshotRecovery: (() => void) | undefined
 
 function registerAndroidScreenshotPublicationRecovery() {
@@ -599,11 +610,116 @@ export async function loadData() {
                 console.error('Official reconcile publish failed', error)
             })
         }
-        disposeLifecycleCommitListeners ??= registerLifecycleCommitListeners(undefined, {
-            isSyncActive: () => forageStorage.isAccount,
-            hasPendingSync: () => hasPendingOfficialPublication(),
-            confirmExit: () => alertConfirm(language.exitSyncPendingWarning),
+        if (isTauri) {
+            try {
+                const { installExternalStorageProduction } = await import(
+                    './storage/sync/external/production'
+                )
+                await installExternalStorageProduction()
+            } catch (error) {
+                console.error('External storage scheduler failed to start', error)
+            }
+        }
+        let heldExitRevision: number | undefined
+        let selectedExitDrain: SyncExitDrainAdapter | null = null
+        const syncExitCoordinator = createSyncExitCoordinator({
+            async acquireEditFence() {
+                const token = await runtime.capturePersistentMutationToken(
+                    'normal-exit-fence',
+                )
+                const fence = await runtime.acquireDestructiveReplacementFence(
+                    token,
+                    { allowRevisionAdvance: true },
+                )
+                heldExitRevision = fence.revision
+                return fence
+            },
+            flushLocal: () => runtime.flushPendingDataLocally('normal-exit'),
+            checkpointLocal: async () => {
+                if (!isTauri) return
+                const { checkpointNativePersistentStore } = await import(
+                    './storage/nativePersistentMaintenance'
+                )
+                await checkpointNativePersistentStore('truncate')
+            },
+            async captureTarget() {
+                if (heldExitRevision === undefined) {
+                    throw new Error('Normal exit revision was not fenced')
+                }
+                const capture = await getExternalStorageBridge().captureExitTarget()
+                const revision = Number(capture.revision)
+                if (!Number.isSafeInteger(revision) || revision !== heldExitRevision) {
+                    throw new Error('Normal exit revision changed after the edit fence')
+                }
+                const selection = capture.selection
+                if (selection.kind !== 'none' && selection.decisionRequired) {
+                    throw { code: 'sync-selection-decision-required' }
+                }
+                if (selection.kind !== 'none' && !selection.connectionId) {
+                    throw { code: 'sync-selection-invalid' }
+                }
+                selectedExitDrain = null
+                let selectionId = `none:${selection.selectionEpoch}`
+                if (
+                    !selection.decisionRequired
+                    && selection.kind === 'server'
+                    && selection.connectionId
+                ) {
+                    selectionId = `server:${selection.connectionId}:${selection.selectionEpoch}`
+                    selectedExitDrain = createServerSyncExitDrainAdapter(selectionId)
+                } else if (
+                    !selection.decisionRequired
+                    && selection.kind === 'external'
+                    && selection.connectionId
+                ) {
+                    selectionId = `external:${selection.connectionId}:${selection.selectionEpoch}`
+                    const {
+                        getExternalStorageSyncExitDrainAdapter,
+                        installExternalStorageProduction,
+                    } = await import(
+                        './storage/sync/external/production'
+                    )
+                    await installExternalStorageProduction()
+                    selectedExitDrain = getExternalStorageSyncExitDrainAdapter(capture)
+                    if (!selectedExitDrain || selectedExitDrain.id !== selectionId) {
+                        throw new Error('Selected external synchronization target is unavailable')
+                    }
+                } else if (
+                    selection.kind === 'none'
+                    && forageStorage.isAccount
+                    && hasPendingOfficialPublication()
+                ) {
+                    selectionId = 'official-account'
+                    selectedExitDrain = {
+                        id: selectionId,
+                        async drain() {
+                            await runtime.publishCurrentOfficialRevision()
+                            return hasPendingOfficialPublication()
+                                ? {
+                                    kind: 'blocked',
+                                    reason: 'official-account-sync-pending',
+                                }
+                                : { kind: 'complete' }
+                        },
+                        cancel: async () => {},
+                    }
+                }
+                return {
+                    revision,
+                    libraryEpoch: capture.libraryEpoch,
+                    selectionEpoch: selection.selectionEpoch,
+                    selectionId,
+                }
+            },
+            selectedDrain: () => selectedExitDrain,
+            reportError: (error) =>
+                console.error('Normal exit synchronization cancellation failed', error),
         })
+        configureSyncExitCoordinator(syncExitCoordinator)
+        disposeLifecycleCommitListeners ??= registerLifecycleCommitListeners(
+            undefined,
+            syncExitCoordinator,
+        )
 
         if (
             isTauriDesktop &&
@@ -613,24 +729,21 @@ export async function loadData() {
             const { registerMacosLifecycle } = await import(
                 './storage/macosLifecycle'
             )
-            const { flushPendingDataLocally } = await import(
-                './storage/persistentDataRuntime.svelte'
-            )
-            const { checkpointNativePersistentStore } = await import(
-                './storage/nativePersistentMaintenance'
-            )
             disposeMacosLifecycle = await registerMacosLifecycle({
-                flush: () => flushPendingDataLocally('exit'),
-                checkpoint: () => checkpointNativePersistentStore('truncate'),
-                confirmExitWithoutSaving: () =>
-                    alertConfirm(language.risuNest.exitSaveFailedWarning),
-                sync: {
-                    isSyncActive: () => forageStorage.isAccount,
-                    hasPendingSync: () => hasPendingOfficialPublication(),
-                    confirmExit: () =>
-                        alertConfirm(language.exitSyncPendingWarning),
-                },
+                coordinator: syncExitCoordinator,
             })
+        }
+
+        if (
+            isTauriDesktop
+            && nativePlatform() !== 'macos'
+            && appWindow
+            && !disposeWindowCloseDrain
+        ) {
+            disposeWindowCloseDrain = await registerWindowCloseDrain(
+                appWindow,
+                syncExitCoordinator,
+            )
         }
 
         if (isTauriDesktop) {

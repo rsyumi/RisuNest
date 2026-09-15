@@ -1,15 +1,29 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import type { LifecycleExitSyncPolicy } from './lifecycleCommit'
+import type {
+    LifecycleExitCoordinator,
+    LifecycleExitSyncPolicy,
+} from './lifecycleCommit'
 
-export interface MacosExitDependencies {
+interface MacosExitBaseDependencies {
+    respond(token: string, exit: boolean): Promise<void>
+    reportError(error: unknown): void
+}
+
+interface MacosCoordinatedExitDependencies extends MacosExitBaseDependencies {
+    coordinator: LifecycleExitCoordinator
+}
+
+interface MacosLegacyExitDependencies extends MacosExitBaseDependencies {
     flush(): Promise<void>
     checkpoint(): Promise<void>
     confirmExitWithoutSaving(): Promise<boolean>
     sync: LifecycleExitSyncPolicy
-    respond(token: string, exit: boolean): Promise<void>
-    reportError(error: unknown): void
 }
+
+export type MacosExitDependencies =
+    | MacosCoordinatedExitDependencies
+    | MacosLegacyExitDependencies
 
 /** One quit request settles the real save before any acknowledgement reaches Rust. */
 export function createMacosExitHandler(dependencies: MacosExitDependencies) {
@@ -19,6 +33,10 @@ export function createMacosExitHandler(dependencies: MacosExitDependencies) {
         pending = true
         let exit = false
         try {
+            if ('coordinator' in dependencies) {
+                exit = await dependencies.coordinator.requestExit() === 'exit'
+                return
+            }
             try {
                 await dependencies.flush()
                 await dependencies.checkpoint()
@@ -48,7 +66,9 @@ export function createMacosExitHandler(dependencies: MacosExitDependencies) {
 }
 
 export async function registerMacosLifecycle(
-    dependencies: Omit<MacosExitDependencies, 'respond' | 'reportError'>,
+    dependencies:
+        | Omit<MacosCoordinatedExitDependencies, 'respond' | 'reportError'>
+        | Omit<MacosLegacyExitDependencies, 'respond' | 'reportError'>,
 ): Promise<() => void> {
     const handler = createMacosExitHandler({
         ...dependencies,

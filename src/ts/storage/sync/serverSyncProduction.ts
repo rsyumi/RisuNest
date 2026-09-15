@@ -9,6 +9,7 @@ import { createServerSyncFacade, type ServerHead } from "./serverSync";
 import { createServerSyncController } from "./serverSyncController";
 import { createServerSyncScheduler } from "./serverSyncScheduler";
 import { subscribeLocalPersistentRevision } from "../persistentRevisionEvents";
+import type { SyncExitDrainAdapter } from "../syncExitCoordinator";
 
 let controller: ReturnType<typeof createServerSyncController> | undefined;
 export function getServerSyncController() {
@@ -36,6 +37,22 @@ export function getServerSyncController() {
         localStorage.removeItem("risuNestServerSyncRestoreHold"),
     },
   ));
+}
+export function createServerSyncExitDrainAdapter(
+  id = "server",
+  syncController = getServerSyncController(),
+): SyncExitDrainAdapter {
+  return {
+    id,
+    drain: (target, signal) =>
+      target.selectionId === id
+        ? syncController.drainToRevision(target.revision, signal)
+        : Promise.resolve({
+            kind: "blocked",
+            reason: "server-sync-selection-changed",
+          }),
+    cancel: () => syncController.cancelExitDrain(),
+  };
 }
 /** A restored library waits for an explicit sync action, including across maintenance reloads. */
 export function holdServerSyncAfterRestore(): void {

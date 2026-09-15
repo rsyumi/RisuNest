@@ -1,7 +1,4 @@
 //! Provider-owned modules. Only integrated factories enter the product registry.
-// The product registers no provider until the connection commands exist, so
-// every adapter is reachable from tests only. Remove once the registry is wired.
-#![allow(dead_code)]
 pub(crate) mod common;
 pub(crate) mod github_releases;
 pub(crate) mod gitlab_packages;

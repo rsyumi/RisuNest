@@ -1036,7 +1036,7 @@ fn assert_renderer_mutations_blocked(state: tauri::State<'_, DeviceBackupState>,
         ),
         native_device_backup_blob_finish(state.clone(), id.into(), Spool::Source, "object".into())
             .map(|_| ()),
-        native_device_backup_prepared(state.clone(), id.into()),
+        native_device_backup_prepared_state(state.clone(), id.into()),
         native_device_backup_section_intent(state.clone(), id.into(), SECTION.into(), false),
         native_device_backup_section_complete(
             state.clone(),
@@ -1046,7 +1046,7 @@ fn assert_renderer_mutations_blocked(state: tauri::State<'_, DeviceBackupState>,
             "0".repeat(64),
         ),
         native_device_backup_finish_device(state.clone(), id.into()).map(|_| ()),
-        native_device_backup_recovery_complete(state.clone(), id.into()),
+        native_device_backup_recovery_complete_state(state.clone(), id.into()).map(|_| ()),
         native_device_backup_fail(state.clone(), id.into(), "synthetic-failure".into(), None)
             .map(|_| ()),
         native_device_backup_retry_recovery(state, id.into()).map(|_| ()),
@@ -1147,7 +1147,7 @@ fn renderer_mutations_require_native_completion_and_confirmed_maintenance_entry(
         "device-captured"
     );
     state.confirm_capture(&id).unwrap();
-    native_device_backup_recovery_complete(state.clone(), id).unwrap();
+    native_device_backup_recovery_complete_state(state.clone(), id).unwrap();
     assert!(!state.is_blocking().unwrap());
 }
 
@@ -1184,7 +1184,7 @@ fn native_source_import_remains_available_before_renderer_restore_mutations() {
     .unwrap();
     native_device_backup_section_finish(state.clone(), id.clone(), Spool::Rollback, SECTION.into())
         .unwrap();
-    native_device_backup_prepared(state.clone(), id.clone()).unwrap();
+    native_device_backup_prepared_state(state.clone(), id.clone()).unwrap();
     state.allow_device_apply(&id).unwrap();
     native_device_backup_section_intent(state.clone(), id.clone(), SECTION.into(), false).unwrap();
     native_device_backup_section_complete(
