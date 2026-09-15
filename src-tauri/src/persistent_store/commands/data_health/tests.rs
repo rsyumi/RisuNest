@@ -1,5 +1,6 @@
 use super::*;
 use crate::data_health::{codes, result_path, Severity};
+use crate::local_backup::NeverCancelled;
 use crate::persistent_store::{active_generation, PersistentStore};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -366,5 +367,44 @@ fn a_registered_file_is_not_reported_as_unused() {
         !has(&result, codes::OBJECT_UNREFERENCED),
         "the fixture's one object is registered by an alias: {:?}",
         result.items
+    );
+}
+
+#[test]
+fn a_backup_never_carries_the_diagnosis_or_a_repair_journal() {
+    let (directory, state, _) = damaged_payload_fixture();
+    let health = DataHealthState::default();
+    quick_scan(&state, &health).unwrap();
+    apply_repair(&state, &health, &authority_selection(&state), false).unwrap();
+
+    let guard = state.admit_renderer_operation().unwrap();
+    let working = directory.path().join("persistent").join("data-health");
+    assert!(working.join("result.json").exists());
+    assert!(
+        crate::data_health::journal::list(directory.path())
+            .unwrap()
+            .len()
+            == 1
+    );
+
+    // A library capture reads the leased generation and the stored objects, and the working
+    // folder is neither: a raw capture of the library holds no file from it.
+    let captured = with_store_mutex_mut_admitted(&state, &guard, |store| {
+        let revision = store.revision()?;
+        let lease = store.acquire_revision(revision)?.lease;
+        let mut destination = rusqlite::Connection::open_in_memory()?;
+        crate::persistent_store::portable::create_raw_tables(&destination)?;
+        let digests = store.capture_portable_records(&lease, &mut destination, &NeverCancelled)?;
+        store.release_revision(&lease)?;
+        Ok(digests)
+    })
+    .unwrap();
+    assert!(
+        captured.iter().all(|digest| digest.table != "data_health"),
+        "the capture projects the library's own tables and nothing beside them"
+    );
+    assert!(
+        std::fs::read_dir(&working).unwrap().count() > 0,
+        "the working folder stays where it is"
     );
 }

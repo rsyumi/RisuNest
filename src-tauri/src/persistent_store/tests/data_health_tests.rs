@@ -157,3 +157,91 @@ fn live_scan_keeps_going_past_a_damaged_record() {
         "the reference scan still runs after damaged records"
     );
 }
+
+#[test]
+fn a_cold_payload_the_decoder_cannot_read_is_reported_without_ending_the_scan() {
+    let (_directory, mut store) = v2_fixture();
+    let cas = crate::asset_repository::PayloadCas::new(store.repository_root()).expect("open CAS");
+    // Bytes that are neither a valid compressed frame nor readable JSON.
+    let stored = cas.prepare_bytes(b"\x00not a cold payload").expect("store bytes");
+    let generation = active_generation(&store.connection).expect("read active generation");
+    store
+        .connection
+        .execute(
+            "INSERT INTO cold_aliases (generation,key,object_hash,size,metadata) VALUES (?1,'cold/broken',?2,?3,'{}')",
+            params![generation, stored.content_hash, 18_i64],
+        )
+        .expect("insert synthetic cold alias");
+
+    let findings = scan(&mut store);
+    let finding = findings
+        .items
+        .iter()
+        .find(|finding| finding.code == codes::COLD_UNDECODABLE)
+        .expect("the unreadable cold payload is reported");
+    assert_eq!(finding.owner.id, "cold/broken");
+    assert!(
+        findings
+            .items
+            .iter()
+            .any(|finding| finding.code == codes::REFERENCE_MISSING),
+        "the rest of the scan still runs"
+    );
+}
+
+#[test]
+fn a_conversation_whose_character_is_gone_is_reported_as_an_orphan() {
+    let (_directory, mut store) = v2_fixture();
+    let generation = active_generation(&store.connection).expect("read active generation");
+    store
+        .connection
+        .execute(
+            "UPDATE conversations SET character_id='char-gone' WHERE generation=?1",
+            [&generation],
+        )
+        .expect("orphan the conversations");
+
+    let findings = scan(&mut store);
+    let finding = findings
+        .items
+        .iter()
+        .find(|finding| finding.code == codes::RECORD_ORPHAN)
+        .expect("a conversation with no character is reported");
+    assert_eq!(finding.severity, Severity::Blocking);
+    assert_eq!(finding.owner.kind, "conversations");
+}
+
+#[test]
+fn a_quick_scan_never_opens_a_stored_cold_payload() {
+    let (_directory, mut store) = v2_fixture();
+    let cas = crate::asset_repository::PayloadCas::new(store.repository_root()).expect("open CAS");
+    let stored = cas.prepare_bytes(b"\x00not a cold payload").expect("store bytes");
+    let generation = active_generation(&store.connection).expect("read active generation");
+    store
+        .connection
+        .execute(
+            "INSERT INTO cold_aliases (generation,key,object_hash,size,metadata) VALUES (?1,'cold/broken',?2,?3,'{}')",
+            params![generation, stored.content_hash, 18_i64],
+        )
+        .expect("insert synthetic cold alias");
+
+    let revision = store.revision().expect("read revision");
+    let lease = store
+        .acquire_revision(revision)
+        .expect("acquire revision lease")
+        .lease;
+    let quick = store
+        .data_health_reader(&lease)
+        .expect("open the diagnosis reader")
+        .scan(ScanDepth::Quick, 256, &NeverCancelled)
+        .expect("scan the live library");
+    store.release_revision(&lease).expect("release lease");
+    assert!(
+        !quick
+            .items
+            .iter()
+            .any(|finding| finding.code == codes::COLD_UNDECODABLE),
+        "a quick scan stays proportional to the database: {:?}",
+        quick.items
+    );
+}

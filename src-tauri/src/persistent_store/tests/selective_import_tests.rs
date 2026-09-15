@@ -243,3 +243,39 @@ fn a_damaged_archive_is_refused_before_anything_is_staged() {
     assert!(matches!(error, StoreError::Validation { .. }), "{error:?}");
     assert_eq!(store.revision().unwrap(), 0);
 }
+
+#[test]
+fn a_partial_import_never_writes_to_the_archive_it_read() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = PersistentStore::open(directory.path()).unwrap();
+    let source = archive();
+    let before = crate::persistent_store::portable::digest_raw_tables(&source, &NeverCancelled)
+        .unwrap();
+
+    let staging = stage(&mut store, &source, selection(&["char-b"], &["1"]));
+    store.replace_commit(&staging, Some(0)).unwrap();
+
+    assert_eq!(
+        crate::persistent_store::portable::digest_raw_tables(&source, &NeverCancelled).unwrap(),
+        before,
+        "the archive an import read is exactly what it was"
+    );
+}
+
+#[test]
+fn a_selection_that_is_refused_leaves_the_library_exactly_as_it_was() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = PersistentStore::open(directory.path()).unwrap();
+    let source = archive();
+    source
+        .execute("UPDATE conversations SET message_count=9", [])
+        .unwrap();
+    let before = active_generation(&store.connection).unwrap();
+
+    let closed = close_selection(&source, &selection(&["char-a"], &[])).unwrap();
+    assert!(
+        stage_portable_records_selected(&mut store, &source, &closed, &NeverCancelled).is_err()
+    );
+    assert_eq!(store.revision().unwrap(), 0);
+    assert_eq!(active_generation(&store.connection).unwrap(), before);
+}
