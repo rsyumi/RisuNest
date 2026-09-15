@@ -84,7 +84,7 @@ const english = {
         'gitlab-cleanup-policy': 'GitLab package cleanup policies can delete backups. Keep cleanup policies off for this project. This connection is backup only.',
     },
     providers: {
-        webdav: { name: 'WebDAV / Koofr', description: 'Connects to an HTTPS WebDAV folder with an application password.', strategyNote: 'Concurrent-use protection can be chosen only after this server has been confirmed to support it.' },
+        webdav: { name: 'WebDAV / Koofr', description: 'Connects to an HTTPS WebDAV folder with an application password.', strategyNote: 'Concurrent-use protection is checked against the server when you connect.' },
         s3: { name: 'S3-compatible storage', description: 'Uses an S3-compatible bucket such as Cloudflare R2, Backblaze B2 or Hugging Face.' },
         google_drive: { name: 'Google Drive', description: 'Signs in with a Google account and uses a Drive folder or the hidden app data space.', warningTitle: 'Google Drive synchronization works one device at a time', warning: 'If you choose the hidden app data space, deleting the app data in Drive also deletes the backups.' },
         onedrive: { name: 'OneDrive', description: 'Signs in with a Microsoft account and uses a personal, work or app-only folder.' },
@@ -198,7 +198,7 @@ const korean: typeof english = {
         'gitlab-cleanup-policy': 'GitLab의 패키지 정리 정책이 백업을 지울 수 있습니다. 이 프로젝트에서는 정리 정책을 꺼 두세요. 이 연결은 백업만 합니다.',
     },
     providers: {
-        webdav: { name: 'WebDAV / Koofr', description: 'HTTPS WebDAV 폴더에 앱 비밀번호로 연결합니다.', strategyNote: '동시 사용 보호는 이 서버가 지원하는지 확인한 뒤에만 고를 수 있습니다.' },
+        webdav: { name: 'WebDAV / Koofr', description: 'HTTPS WebDAV 폴더에 앱 비밀번호로 연결합니다.', strategyNote: '동시 사용 보호는 연결할 때 서버가 지원하는지 확인합니다.' },
         s3: { name: 'S3 호환 저장소', description: 'Cloudflare R2, Backblaze B2, Hugging Face 같은 S3 호환 버킷을 씁니다.' },
         google_drive: { name: 'Google Drive', description: 'Google 계정으로 로그인해 Drive 폴더나 숨겨진 앱 데이터 공간을 씁니다.', warningTitle: 'Google Drive 동기화는 한 기기씩만 가능합니다', warning: '숨겨진 앱 데이터 공간을 고른 경우, Drive에서 앱 데이터를 삭제하면 백업도 함께 지워집니다.' },
         onedrive: { name: 'OneDrive', description: 'Microsoft 계정으로 로그인해 개인·회사·앱 전용 폴더를 씁니다.' },
