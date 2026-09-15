@@ -243,6 +243,7 @@ impl DeviceStore {
         Ok(Self { connection })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn writer_id(&self) -> StoreResult<String> {
         Ok(self.connection.query_row(
             "SELECT writer_id FROM device_meta WHERE singleton=1",
