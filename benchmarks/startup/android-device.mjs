@@ -85,14 +85,14 @@ async function launch() {
 }
 
 function walBytes() {
-    command(['shell', 'run-as', packageName, 'sh', '-c', '"test -f persistent/persistent.db"'])
+    command(['shell', 'run-as', packageName, 'sh', '-c', '"test -f persistent/persistent.sqlite"'])
     const value = command([
         'shell',
         'run-as',
         packageName,
         'sh',
         '-c',
-        '"if [ -f persistent/persistent.db-wal ]; then stat -c %s persistent/persistent.db-wal; else echo 0; fi"',
+        '"if [ -f persistent/persistent.sqlite-wal ]; then stat -c %s persistent/persistent.sqlite-wal; else echo 0; fi"',
     ])
     const bytes = Number(value)
     if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error('Invalid WAL size')
@@ -230,7 +230,7 @@ async function main() {
         client.close()
         client = null
         command(['shell', 'am', 'force-stop', packageName])
-        command(['shell', 'run-as', packageName, 'sh', '-c', '"test -f persistent/persistent.db"'])
+        command(['shell', 'run-as', packageName, 'sh', '-c', '"test -f persistent/persistent.sqlite"'])
         const identifier = 'RisuNest.phase3benchmark.r000000000000.androidm0'
         const root = path.join(directory, identifier)
         await mkdir(root, { recursive: true })

@@ -113,7 +113,7 @@ impl PersistentStore {
         {
             return Err(SyncError::new("server-config-changed", 409));
         }
-        if self.repository_root.join("asset-residency.sqlite").exists() {
+        if crate::server_sync::residency::Residency::exists(&self.repository_root) {
             crate::server_sync::residency::Residency::open(&self.repository_root)?
                 .replace_access_config(&stored)?;
         }

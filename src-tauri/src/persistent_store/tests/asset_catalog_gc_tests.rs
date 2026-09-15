@@ -9,7 +9,7 @@ fn fresh_schema_adds_only_the_global_empty_asset_object_catalog() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read current version"),
-        2
+        i64::from(super::schema::SCHEMA_VERSION)
     );
     assert_eq!(
         table_columns(&store.connection, "asset_objects")
@@ -81,7 +81,7 @@ fn fresh_schema_adds_generation_scoped_exact_replacement_alias_provenance() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .unwrap(),
-        2
+        super::schema::SCHEMA_VERSION
     );
     assert_eq!(
         table_columns(&store.connection, "asset_alias_replacement_candidates")
@@ -111,7 +111,7 @@ fn fresh_schema_adds_one_validated_asset_gc_maintenance_cursor_row() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .unwrap(),
-        2
+        super::schema::SCHEMA_VERSION
     );
     assert_eq!(
         table_columns(&store.connection, "asset_gc_maintenance_state")
@@ -244,7 +244,7 @@ fn direct_asset_object_registration_uses_the_initialized_store_database() {
 #[test]
 fn direct_asset_object_registration_does_not_create_a_missing_database() {
     let directory = tempfile::tempdir().expect("create missing database directory");
-    let database_path = directory.path().join("persistent").join("persistent.db");
+    let database_path = directory.path().join("persistent").join("persistent.sqlite");
 
     assert!(super::super::register_asset_objects_at_root(directory.path(), &[], 0).is_err());
     assert!(!database_path.exists());
@@ -420,7 +420,7 @@ fn asset_gc_delete_page_recollects_a_late_root_under_writer_exclusion() {
     let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
     let prepared = cas.prepare_bytes(b"late rooted object").unwrap();
     register_gc_candidate(&mut store, &prepared);
-    let database_path = directory.path().join("persistent/persistent.db");
+    let database_path = directory.path().join("persistent/persistent.sqlite");
     let generation = super::active_generation(&store.connection).unwrap();
     let mut injected = false;
 
@@ -1263,7 +1263,7 @@ fn asset_gc_recovery_rejects_a_noncanonical_tombstone_path_without_data_loss() {
         cas.stat_object(&prepared.content_hash).unwrap(),
         Some(prepared.byte_size)
     );
-    let connection = Connection::open(directory.path().join("persistent/persistent.db")).unwrap();
+    let connection = Connection::open(directory.path().join("persistent/persistent.sqlite")).unwrap();
     assert_eq!(
         connection
             .query_row(

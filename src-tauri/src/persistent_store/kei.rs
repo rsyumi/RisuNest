@@ -219,7 +219,7 @@ fn prepare_upload_inner(
         })?;
         reader.publish_detached_asset_roots()?;
         Ok((
-            persistent_directory.join("persistent.db"),
+            persistent_directory.join(super::DATABASE_FILE),
             persistent_directory.join("kei-upload"),
             url,
         ))

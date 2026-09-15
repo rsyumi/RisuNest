@@ -119,7 +119,7 @@ export function seedExpression({
 // The app must be stopped before calling this offline fixture writer.
 export async function addSyntheticAssets(root, identifier, count, images = false) {
     assertSyntheticProfile(root, identifier)
-    const db = new DatabaseSync(path.join(root, 'persistent/persistent.db'))
+    const db = new DatabaseSync(path.join(root, 'persistent/persistent.sqlite'))
     try {
         const active = JSON.parse(
             db.prepare("SELECT value FROM meta WHERE key='activeGeneration'").get().value,

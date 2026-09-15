@@ -45,7 +45,7 @@ impl PersistentStore {
         &self,
         check: impl Fn() -> Result<()>,
     ) -> Result<()> {
-        if !self.repository_root.join("asset-residency.sqlite").exists() {
+        if !Residency::exists(&self.repository_root) {
             return Ok(());
         }
         let residency = Residency::open(&self.repository_root)?;
@@ -206,7 +206,7 @@ impl PersistentStore {
         let inventory = self.residency_inventory(&residency, false)?;
         let cas = PayloadCas::new(&self.repository_root)?;
         let mut status = ResidencyStatus {
-            policy: residency.policy()?,
+            policy: self.device_store()?.asset_residency_policy()?,
             local_bytes: 0,
             remote_bytes: 0,
             remote_objects: 0,
@@ -235,7 +235,7 @@ impl PersistentStore {
         if policy == AssetPolicy::Remote && self.server_stored_config()?.is_none() {
             return Err(SyncError::new("server-not-bound", 409));
         }
-        residency.set_policy(policy)?;
+        self.device_store()?.set_asset_residency_policy(policy)?;
         if policy == AssetPolicy::Full {
             let inventory = self.residency_inventory(&residency, false)?;
             for hash in inventory.referenced {
@@ -255,7 +255,7 @@ impl PersistentStore {
     ) -> Result<ResidencyStatus> {
         check()?;
         let mut residency = Residency::open(&self.repository_root)?;
-        if residency.policy()? != AssetPolicy::Remote {
+        if self.device_store()?.asset_residency_policy()? != AssetPolicy::Remote {
             return Err(SyncError::new("remote-asset-policy-required", 409));
         }
         if self.server_status()?.operation_pending {

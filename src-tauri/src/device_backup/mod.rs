@@ -940,7 +940,7 @@ fn marker_key(job_id: &str) -> String {
 
 /// Reads the sole commit authority without opening or migrating the PDS.
 fn read_commit_marker(root: &Path, session: &Session) -> Result<Option<CommitMarker>> {
-    let path = root.join("persistent").join("persistent.db");
+    let path = root.join("persistent").join(crate::persistent_store::DATABASE_FILE);
     match std::fs::symlink_metadata(&path) {
         Ok(metadata) => require(
             metadata.is_file() && !crate::trust_boundary::is_link_like(&metadata),

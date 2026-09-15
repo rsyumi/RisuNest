@@ -24,7 +24,10 @@ fn schema_configures_the_documented_sqlite_profile() {
     assert_eq!(integer_pragma("temp_store"), 2);
     assert_eq!(integer_pragma("journal_size_limit"), 67_108_864);
     assert_eq!(integer_pragma("foreign_keys"), 0);
-    assert_eq!(integer_pragma("user_version"), 2);
+    assert_eq!(
+        integer_pragma("user_version"),
+        i64::from(super::schema::SCHEMA_VERSION)
+    );
 }
 
 #[test]
@@ -988,7 +991,7 @@ fn active_lease_rejects_truncate_and_final_release_truncates_the_wal() {
     store
         .release_revision(&lease.lease)
         .expect("release final lease and truncate WAL");
-    let database_path = directory.path().join("persistent/persistent.db");
+    let database_path = directory.path().join("persistent/persistent.sqlite");
     let wal_path = PathBuf::from(format!("{}-wal", database_path.display()));
     assert_eq!(fs::metadata(wal_path).expect("read final WAL").len(), 0);
 }
@@ -1019,7 +1022,7 @@ fn renderer_session_release_closes_every_attached_lease_and_truncates_the_wal() 
         store.read_root(Some(&second.lease)),
         Err(StoreError::SnapshotReleased)
     ));
-    let database_path = directory.path().join("persistent/persistent.db");
+    let database_path = directory.path().join("persistent/persistent.sqlite");
     let wal_path = PathBuf::from(format!("{}-wal", database_path.display()));
     assert_eq!(fs::metadata(wal_path).expect("read final WAL").len(), 0);
 }
@@ -1080,7 +1083,7 @@ fn detached_export_reader_rejects_truncate_until_it_is_released() {
     prepared
         .release(reader)
         .expect("release detached export reader");
-    let database_path = directory.path().join("persistent/persistent.db");
+    let database_path = directory.path().join("persistent/persistent.sqlite");
     let wal_path = PathBuf::from(format!("{}-wal", database_path.display()));
     assert_eq!(fs::metadata(wal_path).expect("read final WAL").len(), 0);
 }
@@ -1136,7 +1139,7 @@ fn detached_export_release_stays_prompt_while_an_attached_reader_remains() {
             .revision,
         1
     );
-    let database_path = directory.path().join("persistent/persistent.db");
+    let database_path = directory.path().join("persistent/persistent.sqlite");
     let wal_path = PathBuf::from(format!("{}-wal", database_path.display()));
     assert!(fs::metadata(&wal_path).expect("read pinned WAL").len() > 0);
 
@@ -1160,7 +1163,7 @@ fn dropping_store_with_active_lease_reopens_latest_state_and_truncates_recovered
             ..empty_working_set_commit(1)
         })
         .expect("append writer state while lease is active");
-    let database_path = directory.path().join("persistent/persistent.db");
+    let database_path = directory.path().join("persistent/persistent.sqlite");
     let wal_path = PathBuf::from(format!("{}-wal", database_path.display()));
     assert!(fs::metadata(&wal_path).expect("read pinned WAL").len() > 0);
     drop(store);

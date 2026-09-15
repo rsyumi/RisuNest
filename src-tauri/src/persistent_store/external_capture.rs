@@ -567,11 +567,7 @@ impl PersistentStore {
                 _ => HydrationMode::Rebuild,
             }
         };
-        if self
-            .repository_root
-            .join("asset-residency.sqlite")
-            .is_file()
-        {
+        if crate::server_sync::residency::Residency::exists(&self.repository_root) {
             match mode {
                 HydrationMode::Reuse => {}
                 HydrationMode::Incremental => {

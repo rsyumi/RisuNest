@@ -9,7 +9,7 @@ const execute = promisify(execFile)
 
 export async function observeWal(root, identifier) {
     assertSyntheticProfile(root, identifier)
-    const file = path.join(root, 'persistent/persistent.db-wal')
+    const file = path.join(root, 'persistent/persistent.sqlite-wal')
     const read = async () => {
         try {
             return (await stat(file)).size

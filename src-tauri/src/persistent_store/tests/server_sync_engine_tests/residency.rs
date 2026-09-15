@@ -257,9 +257,10 @@ fn remote_replica_skips_body_displays_directly_hydrates_bytes_and_exports_comple
         .unwrap()
         .has_remote_or_missing());
     assert_eq!(
-        Residency::open(first.repository_root())
+        first
+            .device_store()
             .unwrap()
-            .policy()
+            .asset_residency_policy()
             .unwrap(),
         AssetPolicy::Full
     );

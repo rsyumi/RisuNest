@@ -63,7 +63,7 @@ impl PersistentStore {
     }
 
     pub(crate) fn external_revision_at_root(root: &Path) -> StoreResult<i64> {
-        let path = root.join("persistent").join("persistent.db");
+        let path = root.join("persistent").join(super::DATABASE_FILE);
         let metadata = fs::symlink_metadata(&path)?;
         if !metadata.is_file() || crate::trust_boundary::is_link_like(&metadata) {
             return invalid("Persistent database must be a regular file");

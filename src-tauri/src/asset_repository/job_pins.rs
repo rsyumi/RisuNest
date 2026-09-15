@@ -1250,7 +1250,7 @@ mod tests {
         let store = PersistentStore::open(directory.path()).expect("open persistent store");
         drop(store);
         let connection =
-            rusqlite::Connection::open(directory.path().join("persistent/persistent.db"))
+            rusqlite::Connection::open(directory.path().join("persistent/persistent.sqlite"))
                 .expect("open catalog database");
         connection
             .execute_batch(
@@ -1289,7 +1289,7 @@ mod tests {
         let journal_path = job.journal_path().to_path_buf();
 
         assert!(job.release(CasReleaseOutcome::Aborted).is_err());
-        assert!(!directory.path().join("persistent/persistent.db").exists());
+        assert!(!directory.path().join("persistent/persistent.sqlite").exists());
         assert!(journal_path.is_file());
         assert!(!job.is_released());
     }

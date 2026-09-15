@@ -71,7 +71,7 @@ fn complete(state: &DeviceBackupState, id: &str, spool: Spool, manifest: &Sectio
 
 fn write_marker(root: &Path, key: &str, marker: &CommitMarker) {
     std::fs::create_dir_all(root.join("persistent")).unwrap();
-    let connection = Connection::open(root.join("persistent/persistent.db")).unwrap();
+    let connection = Connection::open(root.join("persistent/persistent.sqlite")).unwrap();
     connection
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS app_kv(key TEXT PRIMARY KEY,value TEXT NOT NULL)",

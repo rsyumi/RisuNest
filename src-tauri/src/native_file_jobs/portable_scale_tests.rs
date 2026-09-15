@@ -33,7 +33,7 @@ fn native_portable_scale_acceptance() {
     let store = scale_library(&source, &mode);
     let revision = store.revision().unwrap();
     drop(store);
-    let mut db = Connection::open(source.join("persistent/persistent.db")).unwrap();
+    let mut db = Connection::open(source.join("persistent/persistent.sqlite")).unwrap();
     let generation: String = serde_json::from_str(
         &db.query_row::<String, _, _>(
             "SELECT value FROM meta WHERE key='activeGeneration'",
@@ -130,7 +130,7 @@ fn native_portable_scale_acceptance() {
     }
     db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
     drop(db);
-    let source_db_bytes = fs::metadata(source.join("persistent/persistent.db"))
+    let source_db_bytes = fs::metadata(source.join("persistent/persistent.sqlite"))
         .unwrap()
         .len();
     if mode == "database-1g" {
@@ -331,7 +331,7 @@ fn scale_library(root: &Path, mode: &str) -> PersistentStore {
     if mode.ends_with("small") {
         // Compare the shared, normally restorable domain. The old reader rejects omitted
         // optional root blocks. Separate portable fixtures preserve those exact omissions.
-        let db = Connection::open(root.join("persistent/persistent.db")).unwrap();
+        let db = Connection::open(root.join("persistent/persistent.sqlite")).unwrap();
         let generation: String = serde_json::from_str(
             &db.query_row::<String, _, _>(
                 "SELECT value FROM meta WHERE key='activeGeneration'",

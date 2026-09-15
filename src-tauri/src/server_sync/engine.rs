@@ -1097,8 +1097,8 @@ impl PersistentStore {
         }
         let clear_acknowledged = clear && scope_fences.is_empty();
         let mut residency = crate::server_sync::residency::Residency::open(&self.repository_root)?;
-        let remote_assets =
-            residency.policy()? == crate::server_sync::residency::AssetPolicy::Remote;
+        let remote_assets = self.device_store()?.asset_residency_policy()?
+            == crate::server_sync::residency::AssetPolicy::Remote;
         let stored_config = self
             .server_stored_config()?
             .ok_or_else(|| SyncError::new("server-not-bound", 409))?;

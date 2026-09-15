@@ -1,7 +1,7 @@
 use super::snapshot_archive::Archive;
 use super::{
     active_generation, current_revision, CheckpointMode, ReadTarget, SnapshotCreated, SnapshotInfo,
-    StoreError, StoreResult, GENERATION_TABLES,
+    StoreError, StoreResult, DATABASE_FILE, GENERATION_TABLES,
 };
 use crate::asset_repository::migration_gc::AssetRootSet;
 use crate::asset_repository::PayloadCas;
@@ -20,7 +20,6 @@ use std::{
 };
 use uuid::Uuid;
 
-const DATABASE_FILE: &str = "persistent.db";
 const MIN_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_COLD_DECODED_BYTES: u64 = 64 * 1024 * 1024;
 const UNSCANNABLE_BLOCKER: &str = "record-unscannable";
@@ -203,7 +202,7 @@ pub(super) fn apply_pending_restore(
 
 fn prepare_restore_candidate(persistent_dir: &Path, target: &Path) -> StoreResult<PathBuf> {
     let candidate = persistent_dir.join(format!(
-        "persistent.db.restore-candidate-{}",
+        "{DATABASE_FILE}.restore-candidate-{}",
         Uuid::new_v4()
     ));
     fs::copy(target, &candidate)
@@ -1031,7 +1030,7 @@ fn validate_restore_database(path: &Path) -> StoreResult<()> {
         return Err(validation("snapshot integrity check failed"));
     }
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if !(1..=i64::from(super::schema::SCHEMA_VERSION)).contains(&version) {
+    if version != i64::from(super::schema::SCHEMA_VERSION) {
         return Err(validation("snapshot schema version is not supported"));
     }
     Ok(())
@@ -1049,7 +1048,7 @@ fn remove_database_files(database_path: &Path) -> StoreResult<()> {
 }
 
 fn replace_database(database_path: &Path, target: &Path) -> StoreResult<()> {
-    let next = database_path.with_extension(format!("db.restore-next-{}", Uuid::new_v4()));
+    let next = database_path.with_extension(format!("sqlite.restore-next-{}", Uuid::new_v4()));
     fs::copy(target, &next).map_err(|error| path_error("copy restore candidate", &next, error))?;
     fs::OpenOptions::new()
         .read(true)
@@ -1063,7 +1062,7 @@ fn replace_database(database_path: &Path, target: &Path) -> StoreResult<()> {
         return Ok(());
     }
 
-    let previous = database_path.with_extension("db.restore-previous");
+    let previous = database_path.with_extension("sqlite.restore-previous");
     if previous.exists() {
         fs::remove_file(&previous)?;
     }

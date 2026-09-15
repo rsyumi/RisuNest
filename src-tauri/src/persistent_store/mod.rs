@@ -5,6 +5,7 @@ mod commit;
 pub(crate) mod content_capture;
 pub(crate) mod content_change_index;
 mod content_locators;
+pub(crate) mod device_store;
 pub(crate) mod export;
 pub(crate) mod external_apply;
 pub(crate) mod external_capture;
@@ -52,6 +53,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 pub(super) type StoreResult<T> = Result<T, StoreError>;
+
+pub(crate) const DATABASE_FILE: &str = "persistent.sqlite";
 
 pub(super) const CONVERSATION_RANGE_MAX_LIMIT: i64 = 4_096;
 pub(super) const JAVASCRIPT_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
@@ -915,6 +918,9 @@ pub(crate) struct PersistentStore {
     database_path: PathBuf,
     snapshots_dir: PathBuf,
     pending_restore_failure: Option<String>,
+    // A device store that cannot be opened must not block the library, so the
+    // failure is carried until something actually needs per-device state.
+    device_store: Result<device_store::DeviceStore, String>,
 }
 
 /// One generation, held open for a diagnosis. It outlives the store mutex on purpose: a deep
@@ -1317,12 +1323,20 @@ fn combine_publication_cleanup_error(
     }
 }
 
+fn open_device_store(persistent_dir: &Path) -> Result<device_store::DeviceStore, String> {
+    device_store::DeviceStore::open(persistent_dir).map_err(|error| {
+        let message = format!("device store is unavailable: {error}");
+        crate::nlog!("warn", "{message}");
+        message
+    })
+}
+
 pub(crate) fn register_asset_objects_at_root(
     repository_root: &Path,
     objects: &[asset_object_catalog::AssetObjectRegistration],
     created_at_ms: i64,
 ) -> StoreResult<()> {
-    let database_path = repository_root.join("persistent").join("persistent.db");
+    let database_path = repository_root.join("persistent").join(DATABASE_FILE);
     let mut connection =
         Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     connection.busy_timeout(Duration::from_secs(5))?;
@@ -1353,7 +1367,7 @@ impl PersistentStore {
         let pending_restore_failure =
             snapshot::apply_pending_restore(&persistent_dir, &snapshots_dir)?;
 
-        let database_path = persistent_dir.join("persistent.db");
+        let database_path = persistent_dir.join(DATABASE_FILE);
         let mut connection = Connection::open(&database_path)?;
         schema::initialize(&mut connection)?;
         recover_asset_object_deletions(&mut connection, app_data_dir)?;
@@ -1387,6 +1401,7 @@ impl PersistentStore {
         snapshot::checkpoint(&connection, CheckpointMode::Truncate)?;
 
         let active_readers = Arc::new(snapshot::ActiveReaderRegistry::default());
+        let device_store = open_device_store(&persistent_dir);
         Ok(Self {
             revision_leases: HashMap::new(),
             active_readers,
@@ -1395,6 +1410,7 @@ impl PersistentStore {
             database_path,
             snapshots_dir,
             pending_restore_failure,
+            device_store,
         })
     }
 
@@ -1408,6 +1424,7 @@ impl PersistentStore {
     pub(crate) fn open_native_job_store(&self) -> StoreResult<Self> {
         let mut connection = Connection::open(&self.database_path)?;
         schema::initialize(&mut connection)?;
+        let device_store = open_device_store(&self.repository_root.join("persistent"));
         Ok(Self {
             revision_leases: HashMap::new(),
             active_readers: Arc::clone(&self.active_readers),
@@ -1416,7 +1433,16 @@ impl PersistentStore {
             database_path: self.database_path.clone(),
             snapshots_dir: self.snapshots_dir.clone(),
             pending_restore_failure: None,
+            device_store,
         })
+    }
+
+    pub(crate) fn device_store(&self) -> StoreResult<&device_store::DeviceStore> {
+        self.device_store
+            .as_ref()
+            .map_err(|message| StoreError::Store {
+                message: message.clone(),
+            })
     }
 
     pub(crate) fn revision(&self) -> StoreResult<i64> {
