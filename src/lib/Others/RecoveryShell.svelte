@@ -3,7 +3,7 @@
     // commands only: no library, plugin, module or sync state has been initialised behind it.
     import { invoke } from '@tauri-apps/api/core'
     import { language } from 'src/lang'
-    import Button from 'src/lib/UI/GUI/Button.svelte'
+    import SettingButton from 'src/lib/Setting/RisuNest/SettingButton.svelte'
     import Check from 'src/lib/UI/GUI/CheckInput.svelte'
     import RisuNestDataHealth from 'src/lib/Setting/Pages/RisuNestDataHealth.svelte'
     import {
@@ -104,11 +104,11 @@
         <section data-recovery-export class="rounded-lg border border-darkborderc bg-bgcolor p-4">
             <h2 class="text-lg font-bold">{strings.exportTitle}</h2>
             <p class="mt-1 mb-2 text-sm text-textcolor2">{strings.exportHelp}</p>
-            <Button styled="outlined" disabled={!onExportSource} onclick={() => onExportSource?.()}>{strings.exportAction}</Button>
+            <SettingButton variant="secondary" disabled={!onExportSource} onclick={() => onExportSource?.()}>{strings.exportAction}</SettingButton>
         </section>
 
         <div class="flex flex-wrap gap-2">
-            <Button onclick={() => onStart(startNormally())}>{strings.startNormally}</Button>
+            <SettingButton onclick={() => onStart(startNormally())}>{strings.startNormally}</SettingButton>
         </div>
     </div>
 </div>

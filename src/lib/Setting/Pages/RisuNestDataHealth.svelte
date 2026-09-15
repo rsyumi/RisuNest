@@ -3,7 +3,7 @@
     import { ChevronRight } from '@lucide/svelte'
     import { language } from 'src/lang'
     import { alertError, alertNormal } from 'src/ts/alert'
-    import Button from 'src/lib/UI/GUI/Button.svelte'
+    import SettingButton from '../RisuNest/SettingButton.svelte'
     import Check from 'src/lib/UI/GUI/CheckInput.svelte'
     import SettingGroup from '../RisuNest/SettingGroup.svelte'
     import SettingRow from '../RisuNest/SettingRow.svelte'
@@ -247,23 +247,24 @@
     </div>
 
     <SettingRow data-data-health-actions label={strings.quickScan} help={strings.quickScanHelp}>
-        <Button
-            styled="outlined"
+        <SettingButton
+            variant="secondary"
+            busy={view.running === 'quick'}
             disabled={Boolean(view.running) || view.loading}
             onclick={() => run(() => model.quickScan())}
-        >{view.running === 'quick' ? language.loading : strings.quickScan}</Button>
+        >{strings.quickScan}</SettingButton>
     </SettingRow>
     <SettingRow data-data-health-deep label={strings.deepScan} help={strings.deepScanHelp}>
         {#if view.running === 'deep'}
-            <Button styled="outlined" onclick={() => run(() => model.cancel())}>{strings.cancel}</Button>
+            <SettingButton variant="secondary" onclick={() => run(() => model.cancel())}>{strings.cancel}</SettingButton>
         {:else}
             {#if view.resumable}
-                <Button styled="outlined" disabled={Boolean(view.running) || view.loading} onclick={() => run(() => model.deepScan(true))}>{strings.resume}</Button>
+                <SettingButton variant="secondary" disabled={Boolean(view.running) || view.loading} onclick={() => run(() => model.deepScan(true))}>{strings.resume}</SettingButton>
             {/if}
-            <Button
+            <SettingButton
                 disabled={Boolean(view.running) || view.loading}
                 onclick={() => run(() => model.deepScan(false))}
-            >{view.resumable ? strings.restart : strings.deepScan}</Button>
+            >{view.resumable ? strings.restart : strings.deepScan}</SettingButton>
         {/if}
     </SettingRow>
 
@@ -290,7 +291,7 @@
                 {/if}
                 {#if group.code === 'object-unreferenced' && onOpenUnusedImages}
                     <div class="border-t border-darkborderc/55 py-2 pr-4 pl-10">
-                        <Button size="sm" styled="outlined" onclick={onOpenUnusedImages}>{strings.gcLink}</Button>
+                        <SettingButton variant="secondary" onclick={onOpenUnusedImages}>{strings.gcLink}</SettingButton>
                     </div>
                 {/if}
             </details>
@@ -342,7 +343,7 @@
                             />
                         </div>
                     {/snippet}
-                    <Button disabled={view.repairing || view.selection.length === 0} onclick={applyRepair}>{view.repairing ? language.loading : strings.repairApply}</Button>
+                    <SettingButton busy={view.repairing} disabled={view.selection.length === 0} onclick={applyRepair}>{strings.repairApply}</SettingButton>
                 </SettingRow>
             {/if}
             {#if view.skipped.length > 0}
@@ -356,7 +357,7 @@
                             .replace('{0}', new Date(entry.createdAt).toLocaleString())
                             .replace('{1}', count(entry.changes))
                             .replace('{2}', count(entry.heldObjects))}</span>
-                        <Button size="sm" styled="outlined" disabled={view.repairing || !entry.current} onclick={() => undoRepair(entry.id)}>{strings.undoAction}</Button>
+                        <SettingButton variant="secondary" disabled={view.repairing || !entry.current} onclick={() => undoRepair(entry.id)}>{strings.undoAction}</SettingButton>
                     </div>
                 {:else}
                     <p class="px-4 py-2 text-sm text-textcolor2">{strings.undoNone}</p>
@@ -370,8 +371,8 @@
                     <Check bind:check={includeNames} name={strings.includeNames} margin={false} />
                 </div>
             {/snippet}
-            <Button size="sm" styled="outlined" onclick={copyReport}>{strings.copyReport}</Button>
-            <Button size="sm" styled="outlined" onclick={saveReport}>{strings.saveReport}</Button>
+            <SettingButton variant="secondary" onclick={copyReport}>{strings.copyReport}</SettingButton>
+            <SettingButton variant="secondary" onclick={saveReport}>{strings.saveReport}</SettingButton>
         </SettingRow>
     {/if}
 </SettingGroup>
