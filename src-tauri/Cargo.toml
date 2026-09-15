@@ -2,7 +2,7 @@
 name = "risunest"
 version = "0.0.0"
 description = "RisuNest"
-authors = ["you"]
+authors = ["Yumi"]
 license = ""
 repository = "https://github.com/rsyumi/RisuNest"
 edition = "2021"
