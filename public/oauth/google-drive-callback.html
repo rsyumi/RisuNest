@@ -2,52 +2,260 @@
 <html lang="ko">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="referrer" content="no-referrer">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; base-uri 'none'; form-action 'none'; connect-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-EyknR0MDutiiQ+StzMp/+pkgSo3YK8S87UNDy+DQIgw='">
   <title>RisuNest · Google Drive</title>
   <style>
-    :root { color-scheme: dark; --bg: #282a36; --panel: #21222c; --line: #44475a; --text: #f5f5f5; --muted: #bdc2d4; --accent: #a5d6b5; }
+    /* The onboarding screen's palette and shapes, written out as literals
+       because this page is served on its own and cannot read the app theme. */
+    :root {
+      color-scheme: dark;
+      --o-bg: #282a36;
+      --o-panel: #21222c;
+      --o-line: #4b5563;
+      --o-btn: #374151;
+      --o-hover: #44475a;
+      --o-ink: #f5f5f5;
+      --o-soft: rgba(245, 245, 245, .64);
+      --o-faint: rgba(245, 245, 245, .4);
+      --o-blue: #3b82f6;
+      --o-blue-strong: #2563eb;
+      --o-teal: #22c8c6;
+    }
     * { box-sizing: border-box; }
-    body { margin: 0; min-height: 100svh; background: var(--panel); color: var(--text); font-family: "Segoe UI", "Malgun Gothic", sans-serif; }
-    main { width: min(100% - 40px, 520px); margin: auto; padding: clamp(48px, 12vh, 120px) 0 40px; }
-    header { display: flex; align-items: center; gap: 12px; margin-bottom: 44px; }
-    .mark { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid var(--line); border-radius: 10px; color: var(--accent); font: bold 23px Georgia, serif; }
-    .brand { font-size: 17px; font-weight: 650; letter-spacing: -.3px; }
-    .service { margin: 0 0 12px; font-size: 12px; letter-spacing: 1.8px; color: var(--accent); }
-    h1 { margin: 0; font-size: clamp(27px, 6vw, 34px); line-height: 1.35; letter-spacing: -1px; }
-    #description { margin: 18px 0 28px; color: var(--muted); font-size: 15px; line-height: 1.8; word-break: keep-all; }
-    .actions { display: grid; gap: 12px; }
-    button, .button { display: block; border: 1px solid var(--line); border-radius: 12px; padding: 16px 20px; font: inherit; font-size: 15px; font-weight: 650; text-align: center; text-decoration: none; cursor: pointer; background: var(--bg); color: var(--text); }
-    .primary { border-color: var(--accent); background: var(--accent); color: #18271e; }
-    button:hover, .button:hover { filter: brightness(1.08); }
-    :focus-visible { outline: 3px solid var(--text); outline-offset: 4px; }
+    body {
+      display: grid;
+      place-items: center;
+      min-height: 100svh;
+      margin: 0;
+      padding: 24px;
+      background: var(--o-bg);
+      color: var(--o-ink);
+      font: 14px/1.5 Arial, "Malgun Gothic", sans-serif;
+    }
+    /* Korean has no spaces inside a word, so the default break rule splits
+       words mid-syllable. */
+    html:lang(ko) body { word-break: keep-all; }
+    .onb {
+      display: grid;
+      grid-template-rows: 200px auto;
+      width: min(100%, 560px);
+      overflow: hidden;
+      border-radius: 22px;
+      box-shadow: 0 18px 48px rgba(0, 0, 0, .34);
+    }
+    .brand {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      padding: calc(22px + env(safe-area-inset-top, 0px)) 24px 30px;
+      overflow: hidden;
+    }
+    .weave { position: absolute; inset: 0; width: 100%; height: 100%; }
+    .wm { position: relative; display: block; width: 132px; height: auto; }
+    .eyebrow {
+      position: relative;
+      margin: 0;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: .14em;
+      color: var(--o-teal);
+    }
+    .panel {
+      position: relative;
+      margin-top: -18px;
+      padding: 26px 24px 24px;
+      border-radius: 22px 22px 0 0;
+      background: var(--o-panel);
+    }
+    h1 {
+      margin: 0 0 6px;
+      font-size: 22px;
+      font-weight: 700;
+      line-height: 1.28;
+      letter-spacing: -.01em;
+      text-wrap: balance;
+    }
+    .lead { margin: 0 0 20px; font-size: 13.5px; color: var(--o-soft); }
+    .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 13px 22px;
+      border: 1px solid var(--o-line);
+      border-radius: 10px;
+      background: var(--o-btn);
+      color: inherit;
+      font: inherit;
+      font-size: 15px;
+      font-weight: 600;
+      text-align: center;
+      text-decoration: none;
+      cursor: pointer;
+      transition: background .15s;
+    }
+    .btn:hover { background: var(--o-hover); }
+    .btn.primary { border-color: transparent; background: var(--o-blue); color: #fff; }
+    .btn.primary:hover { background: var(--o-blue-strong); }
+    :focus-visible { outline: 2px solid var(--o-blue); outline-offset: 2px; }
     [hidden] { display: none !important; }
-    #notice { min-height: 24px; margin: 16px 0; font-size: 13px; color: var(--accent); line-height: 1.6; }
-    #manual { margin-top: 16px; padding: 18px; border: 1px solid var(--line); border-radius: 12px; }
-    label { display: block; margin-bottom: 10px; font-size: 13px; color: var(--muted); }
-    textarea { width: 100%; min-height: 100px; resize: vertical; padding: 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); font: 12px/1.6 monospace; overflow-wrap: anywhere; }
-    footer { margin-top: 44px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; line-height: 1.8; }
+    #notice { min-height: 22px; margin: 14px 0 0; font-size: 12.5px; line-height: 1.5; color: var(--o-teal); }
+    #manual { margin-top: 14px; }
+    label { display: block; margin-bottom: 10px; font-size: 12.5px; color: var(--o-soft); }
+    textarea {
+      width: 100%;
+      min-height: 96px;
+      resize: vertical;
+      padding: 10px 12px;
+      border: 1px solid var(--o-line);
+      border-radius: 10px;
+      background: rgba(245, 245, 245, .03);
+      color: var(--o-soft);
+      font: 12px/1.6 monospace;
+      overflow-wrap: anywhere;
+    }
+    .foot { display: block; margin: 0; padding-top: 22px; font-size: 12px; color: var(--o-faint); }
+    @media (max-width: 600px) {
+      body { padding: 0; }
+      .onb {
+        grid-template-rows: 236px 1fr;
+        width: 100%;
+        min-height: 100svh;
+        border-radius: 0;
+        box-shadow: none;
+      }
+      .btn { width: 100%; }
+      .panel { padding-bottom: calc(24px + env(safe-area-inset-bottom, 0px)); }
+    }
   </style>
 </head>
 <body>
-  <main>
-    <header><span class="mark" aria-hidden="true">r</span><span class="brand">RisuNest</span></header>
-    <p class="service">GOOGLE DRIVE</p>
-    <h1 id="title">인증 결과 확인 중</h1>
-    <p id="description">잠시만 기다려 주세요.</p>
-    <div id="actions" class="actions" hidden>
-      <a id="open" class="button primary">RisuNest로 돌아가기</a>
-      <button id="copy" type="button">인증 결과 복사</button>
+  <div class="onb">
+    <div class="brand">
+      <svg class="weave" viewBox="0 0 560 200" preserveAspectRatio="xMidYMid slice" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <linearGradient id="weave-base" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="560" y2="200">
+            <stop offset="0" stop-color="#1b2a44"/>
+            <stop offset="1" stop-color="#232338"/>
+          </linearGradient>
+          <radialGradient id="weave-glow" gradientUnits="userSpaceOnUse" cx="280" cy="132" r="347.2">
+            <stop offset="0" stop-color="#22c8c6" stop-opacity=".34"/>
+            <stop offset=".45" stop-color="#3b82f6" stop-opacity=".14"/>
+            <stop offset="1" stop-color="#000000" stop-opacity="0"/>
+          </radialGradient>
+        </defs>
+        <rect width="560" height="200" fill="url(#weave-base)"/>
+        <rect width="560" height="200" fill="url(#weave-glow)"/>
+        <g fill="none">
+          <path d="M346.3 236.1A278.6 106 1.1 0 1 11.8 98.7" stroke="rgba(34,200,198,0.106)" stroke-width="2.08"/>
+          <path d="M141.9 87.9A197.4 86 -8.9 0 1 474.4 98.5" stroke="rgba(73,161,224,0.114)" stroke-width="2.00"/>
+          <path d="M189.7 123.3A92.2 40.2 10.6 0 1 342.7 111.9" stroke="rgba(64,170,218,0.071)" stroke-width="1.67"/>
+          <path d="M95 38.3A228.7 98.4 14 0 1 501.7 165.1" stroke="rgba(98,136,240,0.113)" stroke-width="1.37"/>
+          <path d="M241.9 189.6A152.1 55 -7.1 0 1 131.9 137" stroke="rgba(85,149,232,0.209)" stroke-width="1.75"/>
+          <path d="M239.9 224.6A269.4 93.8 0.3 0 1 26.4 99.2" stroke="rgba(69,165,221,0.122)" stroke-width="1.13"/>
+          <path d="M222.6 148.1A92.4 36.2 14.6 0 1 238 90" stroke="rgba(96,138,239,0.138)" stroke-width="1.08"/>
+          <path d="M153.8 155.1A141.6 55.4 1.1 0 1 187.8 88.5" stroke="rgba(54,143,237,0.154)" stroke-width="1.20"/>
+          <path d="M162.3 68.9A179.1 82.5 0.6 0 1 446.1 102.4" stroke="rgba(96,138,239,0.136)" stroke-width="1.97"/>
+          <path d="M285.4 204.7A166 72.9 -5.1 0 1 118.3 128.3" stroke="rgba(101,133,242,0.106)" stroke-width="1.47"/>
+          <path d="M388.4 38.9A269.3 95.8 -3.2 0 1 536.3 90.4" stroke="rgba(79,155,227,0.076)" stroke-width="0.93"/>
+          <path d="M356.4 179.5A127.9 54.8 3.2 0 1 177.7 160.3" stroke="rgba(109,125,248,0.073)" stroke-width="2.37"/>
+          <path d="M496.4 32.9A272.1 126.3 -7.7 0 1 298.1 257" stroke="rgba(92,142,236,0.052)" stroke-width="1.22"/>
+          <path d="M289.7 166.2A81 34.5 -0.4 0 1 206 118.4" stroke="rgba(38,189,205,0.167)" stroke-width="1.20"/>
+          <path d="M383.1 99.6A131.2 51.5 -0.4 0 1 406.9 144.4" stroke="rgba(92,142,236,0.051)" stroke-width="2.35"/>
+          <path d="M512.4 140.7A278.9 95.7 16.1 0 1 512.6 240.7" stroke="rgba(55,179,212,0.146)" stroke-width="1.95"/>
+          <path d="M166.4 94.5A128.5 47.5 9.3 0 1 241.7 80.8" stroke="rgba(47,163,224,0.169)" stroke-width="2.01"/>
+          <path d="M357.8 125.5A87.7 31.2 6.5 0 1 357.3 154.1" stroke="rgba(59,130,246,0.202)" stroke-width="0.86"/>
+          <path d="M532.9 83.7A265.9 127.3 -2.8 0 1 208.6 257.4" stroke="rgba(92,142,236,0.092)" stroke-width="2.04"/>
+          <path d="M141.4 162A166.3 62 2 0 1 317.9 72.7" stroke="rgba(92,142,236,0.110)" stroke-width="1.86"/>
+          <path d="M149.4 178.5A152.7 67.4 -6.5 0 1 149.9 108.9" stroke="rgba(70,164,221,0.218)" stroke-width="2.49"/>
+          <path d="M387.5 230.4A268.2 125.7 -12.5 0 1 17.3 185.5" stroke="rgba(54,180,211,0.135)" stroke-width="1.75"/>
+          <path d="M408.3 214.9A284 115.7 -11.5 0 1 34.8 229.6" stroke="rgba(75,159,225,0.163)" stroke-width="1.69"/>
+          <path d="M179.9 228.3A189.6 84.6 -16.3 0 1 202.2 70.8" stroke="rgba(43,191,204,0.101)" stroke-width="1.72"/>
+          <path d="M304.9 220.5A236.1 89.9 -2.4 0 1 53 115.7" stroke="rgba(44,172,217,0.063)" stroke-width="2.11"/>
+          <path d="M134.9 51.9A277.5 129.7 -16.3 0 1 529.5 125.7" stroke="rgba(83,151,230,0.180)" stroke-width="1.82"/>
+          <path d="M471.5 159.4A273.8 94.5 -13.5 0 1 265.7 231.7" stroke="rgba(68,166,220,0.064)" stroke-width="0.82"/>
+          <path d="M460.5 229A284 104.2 6 0 1 172.1 218.9" stroke="rgba(50,184,209,0.091)" stroke-width="1.58"/>
+          <path d="M302.4 57.2A171.5 74.5 -2.9 0 1 451.3 126.1" stroke="rgba(109,125,247,0.060)" stroke-width="1.19"/>
+          <path d="M521.7 27.7A290.2 104.8 -13 0 1 404.7 203.5" stroke="rgba(81,153,229,0.086)" stroke-width="1.82"/>
+          <path d="M220.7 103.4A97.4 36.8 -0.7 0 1 366.9 114.5" stroke="rgba(43,176,214,0.219)" stroke-width="0.93"/>
+          <path d="M424.2 97.9A148.3 50.5 -14 0 1 298.9 179.3" stroke="rgba(55,142,238,0.090)" stroke-width="2.37"/>
+          <path d="M441.5 82.6A244.9 98.2 10.3 0 1 251.2 226.5" stroke="rgba(76,158,226,0.163)" stroke-width="1.77"/>
+          <path d="M113.1 111.9A168.2 68.9 7.6 0 1 318 68.7" stroke="rgba(51,151,231,0.163)" stroke-width="1.88"/>
+          <path d="M550 120.7A270.8 124.1 -0.4 0 1 311.3 255.1" stroke="rgba(69,165,221,0.213)" stroke-width="2.46"/>
+          <path d="M355.2 117.1A97.7 37.9 8.2 0 1 299.8 171.8" stroke="rgba(52,150,232,0.212)" stroke-width="2.14"/>
+          <path d="M376.4 186.4A131.9 59.6 10.3 0 1 149.9 111.2" stroke="rgba(44,171,218,0.158)" stroke-width="2.01"/>
+          <path d="M115.1 123A175.9 81.3 -7.9 0 1 437.4 79.5" stroke="rgba(39,195,202,0.167)" stroke-width="1.54"/>
+          <path d="M284.1 184.5A121 51.1 11.1 0 1 197.3 81.5" stroke="rgba(54,145,236,0.107)" stroke-width="1.96"/>
+          <path d="M366.3 92.9A105.6 40.4 -12.7 0 1 382.6 117.4" stroke="rgba(91,143,236,0.118)" stroke-width="0.84"/>
+          <path d="M332.6 235.9A273.7 99.7 6.9 0 1 78.1 43.7" stroke="rgba(63,171,217,0.080)" stroke-width="1.00"/>
+          <path d="M206.6 127.4A84.1 38.1 -12.8 0 1 350.6 99.4" stroke="rgba(53,181,211,0.106)" stroke-width="2.02"/>
+          <path d="M325.3 55A198.4 83.8 8 0 1 431.1 203.6" stroke="rgba(103,131,244,0.152)" stroke-width="0.97"/>
+          <path d="M90.7 124.7A212.5 78.9 -9.5 0 1 291.2 50.6" stroke="rgba(36,194,202,0.155)" stroke-width="1.87"/>
+          <path d="M405.9 145.1A132.1 61.7 -3.2 0 1 190.3 181.2" stroke="rgba(82,152,229,0.185)" stroke-width="1.92"/>
+          <path d="M176.9 136.4A103.1 48.3 -2.6 0 1 344.6 92" stroke="rgba(80,154,228,0.197)" stroke-width="2.14"/>
+          <path d="M403.3 226.8A275.9 126.9 -11.9 0 1 8.9 173.3" stroke="rgba(69,165,221,0.071)" stroke-width="2.41"/>
+          <path d="M266.1 162.1A92.8 32.5 12.7 0 1 236.5 94.3" stroke="rgba(103,131,243,0.213)" stroke-width="1.27"/>
+          <path d="M198 127.8A87 35.3 -6.1 0 1 256.8 99.9" stroke="rgba(44,172,217,0.132)" stroke-width="1.19"/>
+          <path d="M223.3 97.9A90.2 31.8 10.6 0 1 349.4 123.1" stroke="rgba(37,192,203,0.174)" stroke-width="1.67"/>
+          <path d="M438.2 161.3A164.1 69.9 15.9 0 1 204.4 178.1" stroke="rgba(64,170,218,0.171)" stroke-width="1.83"/>
+          <path d="M261.1 92.2A117.5 41 -2.4 0 1 395.1 135.8" stroke="rgba(80,154,228,0.143)" stroke-width="1.46"/>
+          <path d="M375.2 141A106.9 37.3 -5.3 0 1 251.9 170.4" stroke="rgba(59,131,245,0.084)" stroke-width="1.89"/>
+          <path d="M318.2 93.4A91.9 31.3 -15.7 0 1 310.1 155" stroke="rgba(40,182,210,0.181)" stroke-width="1.34"/>
+          <path d="M552.5 92.6A275.9 124.6 -10.1 0 1 49.4 231.8" stroke="rgba(54,144,237,0.159)" stroke-width="1.53"/>
+          <path d="M294 81.3A117.8 52.5 12.3 0 1 391.2 136.6" stroke="rgba(36,195,201,0.188)" stroke-width="1.34"/>
+          <path d="M389.9 106.7A144.9 54.4 6.1 0 1 268.7 185.5" stroke="rgba(57,136,242,0.135)" stroke-width="2.27"/>
+          <path d="M526.3 78.8A255.5 114.1 -7.4 0 1 229.9 249.8" stroke="rgba(83,151,230,0.171)" stroke-width="1.35"/>
+          <path d="M216.2 88.8A115.7 53 -1.1 0 1 395.1 135.3" stroke="rgba(89,145,234,0.185)" stroke-width="2.21"/>
+          <path d="M405.5 162.9A130.5 47.9 10.7 0 1 224.9 167" stroke="rgba(36,194,202,0.157)" stroke-width="2.25"/>
+          <path d="M42 112.1A255.6 94.3 -3.9 0 1 372.2 38.4" stroke="rgba(90,144,235,0.141)" stroke-width="2.08"/>
+          <path d="M274.4 198.8A163.2 66.9 9.3 0 1 138.4 80.3" stroke="rgba(37,197,200,0.101)" stroke-width="1.23"/>
+          <path d="M101.5 82.1A199.3 93.9 3.4 0 1 317.2 41.3" stroke="rgba(51,183,209,0.148)" stroke-width="1.88"/>
+          <path d="M362.3 167.6A115.4 42.6 4.6 0 1 221.3 164.6" stroke="rgba(45,189,205,0.199)" stroke-width="1.89"/>
+          <path d="M397.1 145.1A155.3 61.5 -15.4 0 1 264.3 198.6" stroke="rgba(53,146,235,0.131)" stroke-width="1.44"/>
+          <path d="M70.4 111.8A217 86.1 11.7 0 1 117.5 47.1" stroke="rgba(39,187,207,0.097)" stroke-width="1.32"/>
+          <path d="M316.4 181.1A124.3 49.9 2.7 0 1 155.9 127.8" stroke="rgba(40,183,210,0.178)" stroke-width="2.13"/>
+          <path d="M460.8 238.6A267.1 116.4 8.1 0 1 39.9 153.9" stroke="rgba(59,131,245,0.201)" stroke-width="1.79"/>
+          <path d="M420.1 131.9A143.1 68.6 -6.6 0 1 347.6 186.7" stroke="rgba(105,129,245,0.196)" stroke-width="2.33"/>
+          <path d="M86.9 152.6A198.2 74 -10.8 0 1 413.1 55.3" stroke="rgba(68,166,220,0.188)" stroke-width="1.96"/>
+          <path d="M560.5 153.8A285.2 109.2 0.5 0 1 94.8 213.6" stroke="rgba(46,188,206,0.154)" stroke-width="1.98"/>
+          <path d="M369.8 137A90.4 39.7 6.2 0 1 224.6 158.6" stroke="rgba(62,172,216,0.146)" stroke-width="1.17"/>
+        </g>
+      </svg>
+      <svg class="wm" viewBox="60.5 61.5 1184.0 251.5" role="img" aria-label="RisuNest" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <linearGradient id="risu-inner" gradientUnits="userSpaceOnUse" x1="0" y1="234" x2="0" y2="296">
+          <stop offset="0" stop-color="#CEE1FD"/>
+          <stop offset="1" stop-color="#B3CFFC"/>
+          </linearGradient>
+          <linearGradient id="risu-bowl" gradientUnits="userSpaceOnUse" x1="0" y1="290" x2="0" y2="392">
+          <stop offset="0" stop-color="#FEFEFE"/>
+          <stop offset="1" stop-color="#DCEAFD"/>
+          </linearGradient>
+        </defs>
+        <g transform="translate(20.421 -20.518) scale(0.7773)"><path fill="url(#risu-inner)" d="M 217.47 282.425 C 220.018 282.137 224.36 281.539 226.34 281.37 C 232.093 280.879 236.35 280.6 241.21 280.22 C 248.37 279.65 255.47 278.52 262.48 276.99 C 269.65 275.42 276.74 273.42 283.7 271.12 C 316.67 260.23 372.15 229.92 350.89 186.69 C 347.9 180.61 343.38 175.77 338.62 171.04 C 375.56 175.69 402.25 194.39 419.84 227.12 L 420.24 229.95 C 418.43 241.63 418.85 253.19 412.79 263.79 C 389.25 304.96 322.97 305.62 281.69 300.71 C 267.59 299.04 227.18 291.925 217.47 282.425 Z"></path><path fill="url(#risu-bowl)" fill-rule="evenodd" d="M 249.5 126.77 C 237.36 130.41 225.03 133.02 213.33 138.1 C 172.93 155.66 125.66 204.78 165.14 247.43 C 171.82 254.65 179.86 260.52 188.34 265.46 C 199.16 271.76 211.081 276.383 222.92 280.92 C 266.34 297.37 319.61 305.05 362.65 292.59 C 388.71 285.05 414.01 266.12 415.1 236.82 C 415.38 229.17 413.72 221.49 411.85 214.11 C 414.7 218.17 417.36 222.51 419.84 227.12 C 441.74 267.85 440.65 324.06 409.9 359.98 C 399.44 372.2 385.88 381.21 371.4 388.01 C 351.73 397.25 330.49 402.47 309.04 405.43 C 295.15 407.35 281.21 408.54 267.2 408.93 C 194.52 410.96 94.22 399.38 75.24 314 C 72.24 300.5 71.49 286.52 72.49 272.74 C 73.77 255.13 77.88 237.69 84.57 221.36 C 95.93 193.67 115.26 170.18 140.31 153.76 C 174.48 131.35 209.4 125.56 249.5 126.77 Z"></path></g>
+        <path fill="#FFFFFF" d="M420.00 255.00V119.00H480.81Q510.54 119.00 526.57 132.50Q542.59 146.01 542.59 169.32Q542.59 184.67 535.21 195.84Q527.83 207.01 514.33 212.94Q500.82 218.86 482.17 218.86H441.37L458.47 202.74V255.00ZM504.13 255.00 470.32 205.46H511.31L545.31 255.00ZM458.47 206.82 441.37 189.14H479.84Q491.89 189.14 497.81 183.89Q503.74 178.65 503.74 169.32Q503.74 159.80 497.81 154.55Q491.89 149.31 479.84 149.31H441.37L458.47 131.63Z M548.42 255.00V149.70H585.34V255.00ZM566.88 138.04Q556.78 138.04 550.56 132.41Q544.34 126.77 544.34 118.42Q544.34 110.06 550.56 104.43Q556.78 98.79 566.88 98.79Q576.98 98.79 583.20 104.14Q589.42 109.48 589.42 117.83Q589.42 126.58 583.30 132.31Q577.18 138.04 566.88 138.04Z M633.91 256.75Q620.50 256.75 607.78 253.64Q595.05 250.53 587.28 245.87L598.35 220.61Q605.74 225.08 615.65 227.70Q625.55 230.33 635.07 230.33Q644.40 230.33 647.99 228.38Q651.59 226.44 651.59 223.14Q651.59 220.03 648.19 218.57Q644.79 217.11 639.25 216.34Q633.71 215.56 627.11 214.59Q620.50 213.62 613.80 211.97Q607.10 210.31 601.56 206.91Q596.02 203.51 592.72 197.69Q589.42 191.86 589.42 182.92Q589.42 172.82 595.34 164.95Q601.27 157.08 612.73 152.51Q624.19 147.95 640.71 147.95Q651.78 147.95 663.15 150.18Q674.51 152.42 682.29 156.89L671.21 181.95Q663.44 177.48 655.67 175.83Q647.90 174.18 640.90 174.18Q631.58 174.18 627.79 176.31Q624.00 178.45 624.00 181.56Q624.00 184.67 627.30 186.32Q630.61 187.97 636.14 188.85Q641.68 189.72 648.29 190.59Q654.89 191.47 661.59 193.22Q668.30 194.97 673.83 198.37Q679.37 201.77 682.67 207.50Q685.98 213.23 685.98 222.17Q685.98 231.88 680.05 239.65Q674.13 247.42 662.57 252.09Q651.01 256.75 633.91 256.75Z M732.61 256.75Q719.78 256.75 709.58 251.70Q699.38 246.65 693.65 235.86Q687.92 225.08 687.92 208.57V149.70H724.83V202.54Q724.83 214.78 729.40 220.03Q733.97 225.27 742.32 225.27Q747.76 225.27 752.23 222.75Q756.70 220.22 759.42 214.69Q762.14 209.15 762.14 200.41V149.70H799.05V255.00H763.89V225.27L770.69 233.63Q765.25 245.29 754.95 251.02Q744.65 256.75 732.61 256.75Z M810.90 255.00V119.00H842.57L917.57 209.54H902.61V119.00H940.30V255.00H908.63L833.63 164.46H848.59V255.00Z M1007.33 256.75Q988.67 256.75 974.78 249.66Q960.89 242.57 953.22 230.23Q945.54 217.89 945.54 202.15Q945.54 186.42 953.02 174.08Q960.50 161.74 973.71 154.85Q986.93 147.95 1003.44 147.95Q1018.98 147.95 1031.81 154.26Q1044.63 160.58 1052.21 172.82Q1059.78 185.06 1059.78 202.54Q1059.78 204.49 1059.59 207.01Q1059.39 209.54 1059.20 211.67H975.85V192.25H1039.58L1025.59 197.69Q1025.78 190.50 1022.97 185.25Q1020.15 180.01 1015.19 177.09Q1010.24 174.18 1003.63 174.18Q997.03 174.18 992.07 177.09Q987.12 180.01 984.40 185.35Q981.68 190.69 981.68 197.88V203.51Q981.68 211.29 984.89 216.92Q988.09 222.55 994.11 225.57Q1000.14 228.58 1008.49 228.58Q1016.26 228.58 1021.80 226.34Q1027.34 224.11 1032.78 219.45L1052.21 239.65Q1044.63 248.01 1033.55 252.38Q1022.48 256.75 1007.33 256.75Z M1101.55 256.75Q1088.15 256.75 1075.42 253.64Q1062.70 250.53 1054.93 245.87L1066.00 220.61Q1073.38 225.08 1083.29 227.70Q1093.20 230.33 1102.72 230.33Q1112.05 230.33 1115.64 228.38Q1119.23 226.44 1119.23 223.14Q1119.23 220.03 1115.83 218.57Q1112.43 217.11 1106.90 216.34Q1101.36 215.56 1094.75 214.59Q1088.15 213.62 1081.45 211.97Q1074.74 210.31 1069.21 206.91Q1063.67 203.51 1060.37 197.69Q1057.06 191.86 1057.06 182.92Q1057.06 172.82 1062.99 164.95Q1068.91 157.08 1080.38 152.51Q1091.84 147.95 1108.35 147.95Q1119.43 147.95 1130.79 150.18Q1142.16 152.42 1149.93 156.89L1138.86 181.95Q1131.09 177.48 1123.31 175.83Q1115.54 174.18 1108.55 174.18Q1099.22 174.18 1095.43 176.31Q1091.65 178.45 1091.65 181.56Q1091.65 184.67 1094.95 186.32Q1098.25 187.97 1103.79 188.85Q1109.33 189.72 1115.93 190.59Q1122.54 191.47 1129.24 193.22Q1135.94 194.97 1141.48 198.37Q1147.02 201.77 1150.32 207.50Q1153.62 213.23 1153.62 222.17Q1153.62 231.88 1147.70 239.65Q1141.77 247.42 1130.21 252.09Q1118.65 256.75 1101.55 256.75Z M1202.97 256.75Q1182.77 256.75 1171.50 246.74Q1160.23 236.74 1160.23 216.53V126.19H1197.14V216.14Q1197.14 221.78 1200.25 224.98Q1203.36 228.19 1208.22 228.19Q1214.82 228.19 1219.49 224.89L1228.62 250.73Q1223.95 253.83 1217.15 255.29Q1210.35 256.75 1202.97 256.75ZM1144.88 177.09V149.70H1221.23V177.09Z"/>
+      </svg>
+      <p class="eyebrow">GOOGLE DRIVE</p>
     </div>
-    <p id="notice" role="status" aria-live="polite"></p>
-    <div id="manual" hidden>
-      <label id="manual-label" for="result">아래 내용을 복사해 앱의 인증 결과 입력란에 붙여넣으세요.</label>
-      <textarea id="result" readonly autocomplete="off" spellcheck="false"></textarea>
+    <div class="panel">
+      <h1 id="title">인증 결과 확인 중</h1>
+      <p id="description" class="lead">잠시만 기다려 주세요.</p>
+      <div id="actions" class="actions" hidden>
+        <a id="open" class="btn primary">RisuNest로 돌아가기</a>
+        <button id="copy" type="button" class="btn">인증 결과 복사</button>
+      </div>
+      <p id="notice" role="status" aria-live="polite"></p>
+      <div id="manual" hidden>
+        <label id="manual-label" for="result">아래 내용을 복사해 앱의 인증 결과 입력란에 붙여넣으세요.</label>
+        <textarea id="result" readonly autocomplete="off" spellcheck="false"></textarea>
+      </div>
+      <footer id="footer" class="foot">이 창은 인증이 끝나면 닫아도 됩니다.</footer>
+      <noscript class="foot">JavaScript를 켜거나, 주소 표시줄의 전체 주소를 앱의 인증 결과 입력란에 붙여넣으세요.</noscript>
     </div>
-    <footer id="footer">이 창은 인증이 끝나면 닫아도 됩니다.</footer>
-    <noscript>JavaScript를 켜거나, 주소 표시줄의 전체 주소를 앱의 인증 결과 입력란에 붙여넣으세요.</noscript>
-  </main>
+  </div>
   <script>
 (() => {
   'use strict';
