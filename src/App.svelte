@@ -1,6 +1,6 @@
 <script lang="ts">
     import ChatBindingLifecycle from './lib/SideBars/ChatBindingLifecycle.svelte'
-    import { DynamicGUI, settingsOpen, sideBarStore, ShowRealmFrameStore, openPresetList, openPersonaList, MobileGUI, CustomGUISettingMenuStore, loadedStore, alertStore, LoadingStatusState, bookmarkListOpen, popupStore, easyPanelStore, popUpEditorStore, loadoutModalStore, irisStore, customSideBarConfigDialogStore, bootFailure, type BootFailure } from './ts/stores.svelte';
+    import { DynamicGUI, settingsOpen, sideBarStore, ShowRealmFrameStore, openPresetList, openPersonaList, MobileGUI, CustomGUISettingMenuStore, loadedStore, alertStore, LoadingStatusState, bookmarkListOpen, popupStore, easyPanelStore, popUpEditorStore, loadoutModalStore, irisStore, customSideBarConfigDialogStore, bootFailure, recoveryStart, type BootFailure } from './ts/stores.svelte';
     import Sidebar from './lib/SideBars/Sidebar.svelte';
     import { DBState } from './ts/stores.svelte';
     import ChatScreen from './lib/ChatScreens/ChatScreen.svelte';
@@ -12,7 +12,7 @@
     import { showRealmInfoStore, importCharacterProcess } from './ts/characterCards';
     import { importPreset, getDatabase, setDatabase } from './ts/storage/database.svelte';
     import { readModule } from './ts/process/modules';
-    import { alertNormal, alertToast } from './ts/alert';
+    import { alertConfirm, alertNormal, alertToast } from './ts/alert';
     import { language } from './lang';
     import RealmFrame from './lib/UI/Realm/RealmFrame.svelte';
     import SavePopupIconComp from './lib/Others/SavePopupIcon.svelte';
@@ -37,6 +37,14 @@
     import { keepFocusedInputVisible } from './ts/gui/imeVisibility';
     import { isTauri, isTauriMobile } from './ts/platform';
     import NativeFileJobDialog from './lib/Others/NativeFileJobDialog.svelte';
+    import RecoveryShell from './lib/Others/RecoveryShell.svelte';
+    import {
+        confirmRecoveryExclusions,
+        RECOVERY_EXCLUSIONS,
+        type RecoveryExclusion,
+    } from './ts/storage/recoveryMode.svelte';
+    import { getDeviceSettings, updateDeviceSettings } from './ts/storage/deviceSettings';
+    import { openDataHealthScreen } from './ts/storage/dataHealthNavigation';
     import LoadingIndicator from './lib/UI/GUI/LoadingIndicator.svelte';
 
     import {
@@ -71,6 +79,40 @@
                     ?.scrollIntoView({ block: 'start' })
             })
         })
+    })
+
+    let recoveryExcluded: RecoveryExclusion[] = $state([])
+    const exclusionName = (exclusion: RecoveryExclusion): string =>
+        ({
+            plugins: language.risuNest.recovery.excludePlugins,
+            modules: language.risuNest.recovery.excludeModules,
+            regex: language.risuNest.recovery.excludeRegex,
+            theme: language.risuNest.recovery.excludeTheme,
+            sync: language.risuNest.recovery.excludeSync,
+            autoUpdate: language.risuNest.recovery.excludeAutoUpdate,
+            account: language.risuNest.recovery.excludeAccount,
+        })[exclusion]
+    // A start that finished is the proof the exclusions helped, so the offer to keep them comes
+    // only then, and only the reader's answer writes anything.
+    $effect(() => {
+        if (!$loadedStore || recoveryExcluded.length === 0) return
+        const excluded = recoveryExcluded
+        recoveryExcluded = []
+        void confirmRecoveryExclusions(
+            excluded,
+            alertConfirm,
+            (exclusions) => {
+                const kept = new Set([
+                    ...getDeviceSettings().startupExclusions,
+                    ...exclusions,
+                ])
+                updateDeviceSettings({
+                    startupExclusions: RECOVERY_EXCLUSIONS.filter((item) => kept.has(item)),
+                })
+            },
+            exclusionName,
+            language.risuNest.recovery.keepBody,
+        )
     })
 
     let startupElapsedSeconds = $state(0)
@@ -313,7 +355,17 @@
             <span class="absolute top-4 left-4 font-bold text-[#bbbbbb] text-md md:text-lg">RisyGTP 9+ Mytho Ultra Free</span>
         </div>
     {:else if !$loadedStore}
-        {#if $bootFailure}
+        {#if $recoveryStart}
+            <RecoveryShell
+                onStart={(excluded) => {
+                    const start = $recoveryStart
+                    recoveryStart.set(null)
+                    recoveryExcluded = [...excluded]
+                    start?.()
+                }}
+                onExportSource={() => openDataHealthScreen()}
+            />
+        {:else if $bootFailure}
             <div class="w-full h-full overflow-y-auto bg-darkbg text-textcolor flex justify-center items-start">
                 <div class="w-full max-w-xl flex flex-col p-4 sm:p-6 gap-3">
                     <h1 class="text-xl font-bold">{language.risuNest.boot.title}</h1>

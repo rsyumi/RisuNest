@@ -3,6 +3,8 @@ import { Mutex } from '../mutex';
 import { CharEmotion, selectedCharID } from "../stores.svelte";
 import { type Chat, type character, type customscript, type Database, type groupChat, type loreBook, getDatabase, getCurrentCharacter, getCurrentChat } from "../storage/database.svelte";
 import { downloadFile } from "../globalApi.svelte";
+import { getDeviceSettings } from "../storage/deviceSettings";
+import { isStartupExcluded } from "../storage/recoveryMode.svelte";
 import { alertError, alertNormal } from "../alert";
 import { language } from "src/lang";
 import { selectSingleFile } from "../util";
@@ -604,11 +606,17 @@ async function processScriptFullImpl(char:character|groupChat|simpleCharacterArg
     let conversationAccess: ConversationAccess = 'none'
     let readPin: ActiveConversationPin | null = null
     try {
-        scripts = [
-            ...(captureContext?.presetRegex ?? db.presetRegex ?? []),
-            ...char.customscript,
-            ...(captureContext?.moduleRegexScripts ?? getModuleRegexScripts()),
-        ]
+        const globalRegexOff = isStartupExcluded(
+            'regex',
+            getDeviceSettings().startupExclusions,
+        )
+        scripts = globalRegexOff
+            ? [...char.customscript]
+            : [
+                  ...(captureContext?.presetRegex ?? db.presetRegex ?? []),
+                  ...char.customscript,
+                  ...(captureContext?.moduleRegexScripts ?? getModuleRegexScripts()),
+              ]
         plan = getRegexExecutionPlan(scripts, mode)
         conversationAccess = captureContext
             ? 'none'

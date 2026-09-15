@@ -233,14 +233,15 @@ describe("device plugin storage scopes", () => {
     );
   });
 
-  it("preserves the current four-field settings exactly and normal startup accepts them", async () => {
+  it("preserves the current settings exactly and normal startup accepts them", async () => {
     const environment = fixtureEnvironment();
     const spool = fixtureSpool();
     const settings = {
-      schema: "risunest.device-settings/v1",
+      schema: "risunest.device-settings/v2",
       performanceProfile: "low-spec",
       androidKeepAliveDuringGeneration: true,
       nativeFileLogEnabled: false,
+      startupExclusions: ["plugins"],
     } satisfies RisuNestDeviceSettings;
     const raw = JSON.stringify(settings, null, 2);
     environment.localStorage.setItem("risuNestDeviceSettings", raw);
@@ -275,10 +276,11 @@ describe("device plugin storage scopes", () => {
     async (key, value) => {
       const environment = fixtureEnvironment();
       const raw = JSON.stringify({
-        schema: "risunest.device-settings/v1",
+        schema: "risunest.device-settings/v2",
         performanceProfile: "low-spec",
         androidKeepAliveDuringGeneration: true,
         nativeFileLogEnabled: false,
+        startupExclusions: [],
         [key]: value,
       });
       environment.localStorage.setItem("risuNestDeviceSettings", raw);

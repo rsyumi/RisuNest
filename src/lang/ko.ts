@@ -1911,6 +1911,38 @@ export const languageKorean = {
             unsupportedAnimated:
                 'GIF와 애니메이션 이미지는 아직 첨부할 수 없습니다.',
         },
+        recovery: {
+            title: '복구',
+            chooseHelp:
+                '지난번 시작이 끝나지 않았습니다. 그대로 시작하거나, 먼저 무엇이 잘못됐는지 살펴볼 수 있습니다.',
+            recoveryHelp:
+                '지난 두 번의 시작이 끝나지 않아서, 데이터를 불러오지 않고 여기서 기다리고 있습니다.',
+            summaryTitle: '무슨 일이 있었나',
+            failures: '끝나지 않은 시작 {0}회',
+            stage: '멈춘 지점: {0}',
+            stageUnknown: '어디서 멈췄는지 기록되지 않았습니다.',
+            suspect: '불러오던 것: {0}',
+            lastAttempt: '마지막 시도 {0} (버전 {1})',
+            excludeTitle: '이번에만 끄기',
+            excludeHelp:
+                '이번 시작에만 적용됩니다. 나중에 확인하기 전까지는 저장되지 않습니다.',
+            excludePlugins: '플러그인',
+            excludeModules: '모듈',
+            excludeRegex: '전역 정규식',
+            excludeTheme: '커스텀 CSS·테마',
+            excludeSync: '동기화',
+            excludeAutoUpdate: '자동 업데이트',
+            excludeAccount: '계정',
+            exportTitle: '원본 데이터 저장',
+            exportHelp:
+                '데이터베이스와 파일을 지금 상태 그대로 복사해 둡니다. 이 기기가 망가져도 내용을 지킬 수 있습니다.',
+            exportAction: '사본 저장',
+            startNormally: '그대로 시작',
+            keepTitle: '계속 꺼 둘까요?',
+            keepBody: '{0}을(를) 끈 채로 시작했습니다. 앞으로도 꺼 둘까요?',
+            keepConfirm: '계속 끄기',
+            keptNothing: '다음 시작에는 모두 다시 켜집니다.',
+        },
         storage: {
             snapshotSizeNote:
                 '합계는 공유 저장 공간을 한 번만 계산합니다. 각 스냅샷에는 복원했을 때의 크기를 표시합니다.',

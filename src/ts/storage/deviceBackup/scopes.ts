@@ -131,10 +131,12 @@ export function validateSettings(raw: unknown): Record<string, unknown> {
     throw new Error("Invalid device settings");
   const settings = value as Record<string, unknown>;
   if (
-    settings.schema !== "risunest.device-settings/v1" ||
+    settings.schema !== "risunest.device-settings/v2" ||
     !["normal", "low-spec"].includes(settings.performanceProfile as string) ||
     typeof settings.androidKeepAliveDuringGeneration !== "boolean" ||
-    typeof settings.nativeFileLogEnabled !== "boolean"
+    typeof settings.nativeFileLogEnabled !== "boolean" ||
+    !Array.isArray(settings.startupExclusions) ||
+    settings.startupExclusions.some((item) => typeof item !== "string")
   )
     throw new Error("Device settings schema or values are invalid");
   if (
@@ -145,6 +147,7 @@ export function validateSettings(raw: unknown): Record<string, unknown> {
           "performanceProfile",
           "androidKeepAliveDuringGeneration",
           "nativeFileLogEnabled",
+          "startupExclusions",
         ].includes(key),
     )
   )

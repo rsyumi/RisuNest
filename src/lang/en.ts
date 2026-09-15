@@ -2104,6 +2104,39 @@ export const languageEnglish = {
             unsupportedAnimated:
                 "GIF and animated images can't be attached yet.",
         },
+        recovery: {
+            title: 'Recovery',
+            chooseHelp:
+                "The last start didn't finish. You can start normally, or look for what went wrong first.",
+            recoveryHelp:
+                "The last two starts didn't finish, so the app is waiting here instead of loading your data.",
+            summaryTitle: 'What happened',
+            failures: "Starts that didn't finish: {0}",
+            stage: 'Stopped at: {0}',
+            stageUnknown: "Where it stopped wasn't recorded.",
+            suspect: 'Was loading: {0}',
+            lastAttempt: 'Last try {0} (version {1})',
+            excludeTitle: 'Leave off this time',
+            excludeHelp:
+                'Only for this start. Nothing is saved until you confirm it afterwards.',
+            excludePlugins: 'Plugins',
+            excludeModules: 'Modules',
+            excludeRegex: 'Global regex',
+            excludeTheme: 'Custom CSS and theme',
+            excludeSync: 'Synchronization',
+            excludeAutoUpdate: 'Automatic updates',
+            excludeAccount: 'Account',
+            exportTitle: 'Save your original data',
+            exportHelp:
+                'Copies the database and files as they are, so you can keep them even if this device stops working.',
+            exportAction: 'Save a copy',
+            startNormally: 'Start normally',
+            keepTitle: 'Keep these off?',
+            keepBody:
+                'The app started with {0} left off. Keep them off from now on?',
+            keepConfirm: 'Keep off',
+            keptNothing: 'Everything is back on for the next start.',
+        },
         storage: {
             snapshotSizeNote:
                 'The total counts shared storage once. Each snapshot shows its size when restored.',

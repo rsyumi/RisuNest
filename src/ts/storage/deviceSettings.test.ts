@@ -4,7 +4,7 @@ import { setRuntimePerformanceProfile } from '../runtimePerformanceProfile'
 type DeviceSettingsUpdate = Parameters<typeof import('./deviceSettings').updateDeviceSettings>[0]
 
 // @ts-expect-error The persisted settings schema is not caller-configurable.
-const schemaUpdate: DeviceSettingsUpdate = { schema: 'risunest.device-settings/v1' }
+const schemaUpdate: DeviceSettingsUpdate = { schema: 'risunest.device-settings/v2' }
 void schemaUpdate
 
 async function loadDeviceSettings() {
@@ -13,10 +13,11 @@ async function loadDeviceSettings() {
 }
 
 const defaults = {
-    schema: 'risunest.device-settings/v1',
+    schema: 'risunest.device-settings/v2',
     performanceProfile: 'normal',
     androidKeepAliveDuringGeneration: true,
     nativeFileLogEnabled: true,
+    startupExclusions: [],
 }
 
 describe('device settings', () => {
@@ -108,12 +109,14 @@ describe('device settings', () => {
 
         const updated = deviceSettings.updateDeviceSettings({
             nativeFileLogEnabled: false,
+            startupExclusions: [],
         })
 
         expect(updated).toEqual({
             ...defaults,
             performanceProfile: 'low-spec',
             nativeFileLogEnabled: false,
+            startupExclusions: [],
         })
         expect(getItem).toHaveBeenCalledOnce()
         expect(setProfile).toHaveBeenCalledOnce()
@@ -158,6 +161,7 @@ describe('device settings', () => {
         expect(() =>
             deviceSettings.updateDeviceSettings({
                 nativeFileLogEnabled: false,
+                startupExclusions: [],
             }),
         ).not.toThrow()
         expect(deviceSettings.getDeviceSettings().nativeFileLogEnabled).toBe(
@@ -173,6 +177,7 @@ describe('device settings', () => {
             performanceProfile: 'low-spec',
             androidKeepAliveDuringGeneration: true,
             nativeFileLogEnabled: false,
+            startupExclusions: [],
         })
 
         expect(getDeviceSettings()).toEqual({
@@ -180,6 +185,7 @@ describe('device settings', () => {
             performanceProfile: 'low-spec',
             androidKeepAliveDuringGeneration: true,
             nativeFileLogEnabled: false,
+            startupExclusions: [],
         })
         expect(JSON.parse(localStorage.getItem('risuNestDeviceSettings') ?? '')).toEqual(getDeviceSettings())
     })
@@ -191,11 +197,13 @@ describe('device settings', () => {
         updateDeviceSettings({
             schema: 'not-a-device-settings-schema',
             nativeFileLogEnabled: false,
+            startupExclusions: [],
         } as never)
 
         expect(getDeviceSettings()).toEqual({
             ...defaults,
             nativeFileLogEnabled: false,
+            startupExclusions: [],
         })
     })
 

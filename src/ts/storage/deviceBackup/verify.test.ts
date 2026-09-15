@@ -258,10 +258,11 @@ describe("read-only device section verification", () => {
   it("verifies the exact current device settings without changing their raw JSON", async () => {
     const state = fixture();
     const settings = {
-      schema: "risunest.device-settings/v1",
+      schema: "risunest.device-settings/v2",
       performanceProfile: "low-spec",
       androidKeepAliveDuringGeneration: true,
       nativeFileLogEnabled: false,
+      startupExclusions: [],
     };
     const raw = JSON.stringify(settings, null, 2);
     state.local.set("risuNestDeviceSettings", raw);
