@@ -83,7 +83,7 @@ It must be placed at the very top of your plugin script.
 
   We do not recommend changing this after publishing, as it may break existing installations.
 
-- **`//@api`** - API version (use `3.0` for new plugins)
+- **`//@api`** - API version. `3.0` is the only supported value; RisuNest refuses to install a plugin that declares anything else.
   ```javascript
   //@api 3.0
   ```
@@ -686,7 +686,7 @@ const deviceId = await Risuai.safeLocalStorage.getItem('device_id');
 
 `getLocalPluginStorage()` is also device-local and is not included in save snapshots or cross-device sync. Unlike `safeLocalStorage`, it accepts JSON-serializable values and is appropriate for structured device-only settings or caches. Its keys are shared under the safe local plugin-storage prefix, so use a stable plugin prefix and do not call `clear()` unless deleting every value in that local shared keyspace is intended.
 
-Native `.risunest` full file backups are a separate, selectable exception: plugin local storage, local plugin data, and raw IndexedDB databases whose names start with `safe_plugin_` are included by default. Restore selects the included areas by default and allows each area to be excluded. Selected areas are replaced in full, including removal of keys absent from the backup. An included empty area clears that area; an omitted or unselected area is left alone. These are shared storage areas, not per-plugin ownership boundaries.
+Native `.risunest` full file backups are a separate, selectable exception: plugin local storage and local plugin data are included by default. Restore selects the included areas by default and allows each area to be excluded. Selected areas are replaced in full, including removal of keys absent from the backup. An included empty area clears that area; an omitted or unselected area is left alone. These are shared storage areas, not per-plugin ownership boundaries.
 
 This does not change the plugin API storage scope, ordinary save snapshots, RisuAI/PocketRisu exports, or sync. Plugin permissions and OS-issued handles are not transferred. Unsupported structured-clone values prevent the selected area from completing backup or restore; they are never silently converted to JSON. Native maintenance pauses normal plugin startup through capture, application and any required rollback, and restoration results are acknowledged before normal startup resumes.
 
@@ -739,9 +739,7 @@ await Risuai.setDatabaseLite(db);
 
 `getDatabase()` returns `null` if the user has not granted database access consent.
 
-`getDatabase()` is the explicit full compatibility snapshot boundary. The default `'all'` request includes `characters`; requesting `characters` can temporarily materialize the complete library and use memory proportional to it. All requested fields come from one detached snapshot. In scalable mode that snapshot is one authoritative committed revision; in maximum compatibility mode it includes the current live database, including API v2.1 edits that are not yet persisted. Prefer `queryCharacters`, `queryConversations`, and `queryConversationMessages` for bounded reads.
-
-While maximum compatibility remains active, synchronous API v2.1 writes through the live database Proxy update the in-memory compatibility database first. They are persisted at the existing persistence boundary before maximum compatibility is released, not synchronously at each Proxy assignment. A process crash before that boundary can lose unpersisted edits.
+`getDatabase()` is the explicit full compatibility snapshot boundary. The default `'all'` request includes `characters`; requesting `characters` can temporarily materialize the complete library and use memory proportional to it. All requested fields come from one detached snapshot of one authoritative committed revision. Prefer `queryCharacters`, `queryConversations`, and `queryConversationMessages` for bounded reads.
 
 **Allowed database keys:**
 - `characters`
@@ -818,9 +816,8 @@ await Risuai.setChatToIndex(charIndex, chatIndex, chat);
 ```
 
 Indexes are resolved to stable internal targets when each call starts. Invalid character or
-chat indexes keep the existing `null` getter and fulfilled no-op setter behavior. In the scalable
-v3 profile, setters reject changes to `chaId` or `chat.id` and emit a structured development
-diagnostic. Maximum compatibility keeps the legacy live-object replacement behavior.
+chat indexes keep the existing `null` getter and fulfilled no-op setter behavior. Setters reject
+changes to `chaId` or `chat.id` and emit a structured development diagnostic.
 
 A full character read costs one target character plus its conversations. A full chat read costs
 one target conversation plus the configured character and conversation catalog lookup. Prefer the
@@ -1159,7 +1156,7 @@ if (interceptor) {
 
 `addRisuChatListener('output', callback)` is the full-object compatibility listener. It runs after the model output and host-side output transformations. Listeners run sequentially, so a slow callback delays later chat flow. The callback receives the event snapshot supplied for that output event. To remove it, pass the same callback reference to `removeRisuChatListener`.
 
-Registration asks the user for the same consent as `addRisuReplacer` (the "replacer" permission). If the user declines, `addRisuChatListener` still resolves normally, but the listener is never registered and will not fire. In scalable mode, every output event with a registered listener materializes the full character (including all conversation histories) for the event snapshot, so registering a listener has a per-message cost proportional to the character's stored history.
+Registration asks the user for the same consent as `addRisuReplacer` (the "replacer" permission). If the user declines, `addRisuChatListener` still resolves normally, but the listener is never registered and will not fire. Every output event with a registered listener materializes the full character (including all conversation histories) for the event snapshot, so registering a listener has a per-message cost proportional to the character's stored history.
 
 ```javascript
 const onOutput = async ({ chat, messageIndex, characterIndex, chatIndex }) => {
@@ -1686,7 +1683,7 @@ await Risuai.setDatabase(db); // Or setDatabaseLite(db)
 
 ## Migration from API v2.1
 
-If you're updating an older plugin, see the [Migration Guide](./migrationGuide.md) for detailed migration instructions from API v2.1 to v3.0.
+RisuNest does not run API v2.1 plugins. An installed v2.1 record is reported and skipped at load, and a v2.1 bundle cannot be installed. If you're updating an older plugin, see the [Migration Guide](./src/ts/plugins/migrationGuide.md) for detailed migration instructions from API v2.1 to v3.0.
 
 **Key differences:**
 - All APIs are now async (use `await`)

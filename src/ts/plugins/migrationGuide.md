@@ -7,7 +7,9 @@ This is due to the fact that plugins can run arbitrary code, which may lead to s
 
 So plugin 2.1 and 3.0 introduced a new plugin API versioning system. 2.1 is mostly compatible with 2.0, but with some restricted APIs and added safe alternatives. however, 2.1 were just a transitional version, and still have some security issues due to API's structure. 3.0 will introduce API overhaul with many breaking changes, with focus on security and stability.
 
-2.1 can be deprecated in the future, but it will still be supported for a long time for compatibility reasons. however, 3.0 will be the recommended version for new plugins, and 2.1 might show security warnings in future versions.
+3.0 is the recommended version for new plugins.
+
+**RisuNest runs API 3.0 plugins only.** A bundle that declares 2.0 or 2.1 cannot be installed, and a stored 2.1 record is reported and skipped at load. The API 2.1 sections below describe upstream RisuAI behavior and are kept for authors porting an older plugin; the globals they name (`safeGlobalThis`, `safeDocument`, `safeIdbFactory`, `SafeFunction`, the synchronous `pluginStorage` and the live database Proxy) do not exist in RisuNest.
 
 ## Declaring Plugin Version
 
@@ -36,7 +38,7 @@ API 2.1 works like 2.0, mostly compatible and working in same document context, 
 - Document: Direct access to the Document object has been removed. instead, `safeDocument` is provided for secure DOM manipulations. `document` will be redirected to `safeDocument`.
 
 - Storage APIs: Direct access to localStorage, sessionStorage, cookieStorage, and IndexedDB has been removed. instead, `safeLocalStorage`, and `safeIdbFactory` are provided for secure storage operations.
-`localStorage` will be redirected to `safeLocalStorage`, and `indexedDB` will be redirected to `safeIdbFactory`. `sessionStorage` and `cookieStorage` are no longer accessible.
+`localStorage` will be redirected to `safeLocalStorage`, and `indexedDB` will be redirected to `safeIdbFactory`. `sessionStorage` and `cookieStorage` are no longer accessible. RisuNest provides no IndexedDB access to plugins at all: `safeIdbFactory` is removed, and API 3.0 has no equivalent.
 
 - Internal APIs: Although it wasn't never intended for plugins to access internal APIs, due to wrongful implementation, internal APIs were accessible. This has been fixed, and plugins can no longer access internal APIs. however, some APIs are added officially for plugin usage, but with limitations. 
 
@@ -64,7 +66,6 @@ If your plugin relies on any of the above APIs, you will need to modify your cod
 - `innerHeight`
 - `navigator`
 - `localStorage` (redirected to `safeLocalStorage`)
-- `indexedDB` (redirected to `safeIdbFactory`)
 - `Object`
 - `Array`
 - `String`
@@ -80,8 +81,6 @@ If your plugin relies on any of the above APIs, you will need to modify your cod
 - `removeEventListener` (proxied to the main window)
 
 `safeLocalStorage`: A secure wrapper around localStorage that restricts access to internal data. still it can be shared between plugins. can also be accessed using `localStorage`. It is device-local, is not included in save snapshots, and does not sync between devices.
-
-`safeIdbFactory`: A secure wrapper around IndexedDB that restricts access to internal databases. still it can be shared between plugins. can also be accessed using `indexedDB`.
 
 `safeDocument`: A secure wrapper around the Document object that restricts access to sensitive data and methods. still it can be used to create elements, query elements, and manipulate the DOM. can also be accessed using `document`.
 
@@ -242,28 +241,18 @@ const aroundMessage = await risuai.queryConversationMessages({
 })
 ```
 
-V3-only plugin sets use the scalable profile automatically. Any enabled API v2.1 plugin
-selects maximum compatibility, while disabled API v2.1 plugins do not. Maximum compatibility
-preserves the synchronous live database Proxy, root DOM behavior, visual plugins, and global
-CSS, but cannot guarantee memory independent of library size. The scalable profile does not
-remove V3 root DOM access, visual APIs, or global CSS compatibility.
-Before leaving maximum compatibility, RisuAI persists a detached complete database snapshot so
-changes made through the live Proxy are durable before compatibility data can be evicted.
-While maximum compatibility remains active, synchronous API v2.1 writes through the live database
-Proxy update the in-memory compatibility database first. They are persisted at the existing
-persistence boundary before maximum compatibility is released, not synchronously at each Proxy
-assignment. A process crash before that boundary can lose unpersisted edits.
+RisuNest always uses the scalable path. There is no alternate profile to fall back to, and
+V3 root DOM access, visual APIs, and global CSS compatibility are unaffected by it.
 
 `getDatabase()` remains supported as the explicit compatibility snapshot. Requesting
 `characters`, including its default `'all'`, can temporarily materialize the complete library.
-Every requested key comes from the same detached snapshot. Scalable mode uses one authoritative
-committed revision. Maximum compatibility snapshots the current live database, including API v2.1
-edits that have not yet been persisted.
+Every requested key comes from the same detached snapshot of one authoritative committed
+revision.
 The default `'all'` request includes `characters`, so `getDatabase(['characters'])` and the default
 `getDatabase()` are explicit full-snapshot cost boundaries and can use memory proportional to the
 complete library. Prefer `queryCharacters`, `queryConversations`, and `queryConversationMessages`
 for bounded reads.
-The bounded query methods flush pending compatibility changes before exposing committed data
+The bounded query methods flush pending changes before exposing committed data
 and return cloned values rather than mutable live references. Existing index-based APIs remain
 compatible, but stable IDs and opaque cursors are the scalable path. A denied permission returns
 `null`, and an anchored message query also returns `null` when its character, conversation, or
@@ -825,6 +814,9 @@ first, declare the api version at the top of your plugin script:
 //@api 2.0 2.1 3.0
 ```
 
+RisuNest refuses such a bundle: it installs a plugin only when the declared version is exactly
+`3.0`. The rest of this section describes upstream RisuAI.
+
 This will make the software load the plugin in the highest supported api version. then, you can use feature detection to check which api version is currently running, and adjust your code accordingly:
 
 ```javascript
@@ -855,6 +847,6 @@ This will make the software load the plugin in the highest supported api version
 | Version | Deprecation Date | Notes |
 |---------|------------------|-------|
 | 1.0    | Already Deprecated | No longer supported, plugins using this version will not work in current versions. |
-| 2.0     | After Account System Release | Transitional support for legacy plugins, it will quickly be deprecated after account system release. |
-| 2.1     | Unknown (Long-term support) | Will be supported for a long time for compatibility, but security warnings will be shown after 2.0 deprecation. |
-| 3.0     | N/A              | Recommended version for new plugins, will be supported indefinitely, unless major security issues arise. |
+| 2.0     | After Account System Release | Transitional support for legacy plugins, it will quickly be deprecated after account system release. Not supported in RisuNest. |
+| 2.1     | Unknown (Long-term support) | Will be supported for a long time for compatibility, but security warnings will be shown after 2.0 deprecation. Not supported in RisuNest. |
+| 3.0     | N/A              | Recommended version for new plugins, will be supported indefinitely, unless major security issues arise. The only version RisuNest runs. |
