@@ -261,6 +261,42 @@ fn existing_current_database_revalidates_on_reopen() {
 }
 
 #[test]
+fn a_broken_device_store_is_reported_without_blocking_the_library() {
+    let directory = tempfile::tempdir().expect("create device failure directory");
+    let store = PersistentStore::open(directory.path()).expect("create current store");
+    assert!(store.device_store().is_ok());
+    assert!(store
+        .open_native_job_store()
+        .expect("open native job store")
+        .device_store()
+        .is_ok());
+    drop(store);
+
+    let device_path = directory
+        .path()
+        .join("persistent")
+        .join(super::super::device_store::DEVICE_DATABASE_FILE);
+    let connection = rusqlite::Connection::open(&device_path).expect("open device database");
+    connection
+        .execute_batch("PRAGMA user_version = 17;")
+        .expect("stamp unknown device schema version");
+    drop(connection);
+
+    let store =
+        PersistentStore::open(directory.path()).expect("library opens without the device store");
+    assert_eq!(store.revision().expect("read library revision"), 0);
+    let Err(error) = store.device_store() else {
+        panic!("a damaged device store must be reported");
+    };
+    assert_eq!(
+        error,
+        StoreError::Store {
+            message: "device store is unavailable: unsupported device schema version 17".to_owned(),
+        }
+    );
+}
+
+#[test]
 fn unknown_schema_version_is_rejected() {
     for version in [1_i64, 2, 17] {
         let directory = tempfile::tempdir().expect("create unknown version directory");
