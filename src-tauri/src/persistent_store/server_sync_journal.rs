@@ -546,12 +546,16 @@ impl PersistentStore {
         tx.commit()?;
         Ok(committed)
     }
-    pub(crate) fn server_base(&self, key: &str) -> Result<(RecordVersion, Option<String>)> {
+    pub(crate) fn server_base(
+        &self,
+        domain: Domain,
+        key: &str,
+    ) -> Result<(RecordVersion, Option<String>)> {
         let row = self
             .connection
             .query_row(
-                "SELECT version,local_hash FROM server_sync_base WHERE key=?1",
-                [key],
+                "SELECT version,local_hash FROM server_sync_base WHERE domain=?1 AND key=?2",
+                params![domain.as_str(), key],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
             )
             .optional()?;
@@ -565,12 +569,13 @@ impl PersistentStore {
     }
     pub(crate) fn server_record_prepared(
         &self,
+        domain: Domain,
         key: &str,
         version: &RecordVersion,
         local_hash: Option<&str>,
         dirty: &ServerDirtyKey,
     ) -> Result<()> {
-        self.connection.execute("INSERT INTO server_sync_operation_records VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(key) DO UPDATE SET version=excluded.version,local_hash=excluded.local_hash,revision=excluded.revision",params![key,String::from_utf8(canonical::encode(version)?).map_err(|_|SyncError::new("invalid-version",400))?,local_hash,dirty.kind,dirty.key1,dirty.key2,dirty.revision])?;
+        self.connection.execute("INSERT INTO server_sync_operation_records VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(domain,key) DO UPDATE SET version=excluded.version,local_hash=excluded.local_hash,revision=excluded.revision",params![domain.as_str(),key,String::from_utf8(canonical::encode(version)?).map_err(|_|SyncError::new("invalid-version",400))?,local_hash,dirty.kind,dirty.key1,dirty.key2,dirty.revision])?;
         Ok(())
     }
 }

@@ -264,7 +264,7 @@ pub(crate) struct PreparedCycle {
     previous: Option<RemoteHead>,
     pub through: RemoteHead,
     records: ValidatedRecords,
-    bases: Vec<(String, RecordVersion, Option<String>)>,
+    bases: Vec<(Domain, String, RecordVersion, Option<String>)>,
     acknowledged: Vec<outbox::ServerDirtyKey>,
     publish_keys: Vec<outbox::ServerDirtyKey>,
     scope_versions: Vec<(String, String)>,
@@ -462,6 +462,7 @@ impl PersistentStore {
                 digest.change(&change)?;
                 builder.change(change)?;
                 self.server_record_prepared(
+                    Domain::Library,
                     &item.key,
                     &after,
                     item.local_hash.as_deref(),
@@ -690,13 +691,17 @@ impl PersistentStore {
     ) -> Result<()> {
         let mut remote_context = None;
         self.connection.execute_batch("CREATE TEMP TABLE IF NOT EXISTS server_upload_objects(hash TEXT PRIMARY KEY); DELETE FROM server_upload_objects;")?;
-        let mut after = String::new();
+        let mut after = (Domain::Hypa, String::new());
         loop {
             let records = {
-                let mut stmt=self.connection.prepare("SELECT key,version FROM server_sync_operation_records WHERE key>?1 ORDER BY key LIMIT 1024")?;
+                let mut stmt=self.connection.prepare("SELECT domain,key,version FROM server_sync_operation_records WHERE (domain,key)>(?1,?2) ORDER BY domain,key LIMIT 1024")?;
                 let rows = stmt
-                    .query_map([&after], |r| {
-                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    .query_map(params![after.0.as_str(), after.1], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
                     })?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 rows
@@ -704,13 +709,15 @@ impl PersistentStore {
             if records.is_empty() {
                 break;
             }
-            for (key, version) in records {
+            for (domain, key, version) in records {
                 transfer.client.ensure_active()?;
-                after = key.clone();
+                let domain = Domain::try_from(domain.as_str())
+                    .map_err(|_| SyncError::new("invalid-local-section", 409))?;
+                after = (domain, key.clone());
                 let version: RecordVersion = parse(&version)?;
                 let mut objects = transfer.cache.closure(&version)?;
                 let mut base_lease = false;
-                let (base, _) = self.server_base(&key)?;
+                let (base, _) = self.server_base(domain, &key)?;
                 if let Ok(previous) = transfer.cache.closure(&base) {
                     let roots = base
                         .object_hashes()
@@ -741,7 +748,7 @@ impl PersistentStore {
                         unsent.push(hash);
                     }
                 }
-                let bases = self.server_base_candidates(&key, transfer.cache, false)?;
+                let bases = self.server_base_candidates(domain, &key, transfer.cache, false)?;
                 let mut local = Vec::new();
                 let mut remote = Vec::new();
                 for hash in unsent {
@@ -880,7 +887,7 @@ impl PersistentStore {
                 after = item.key.clone();
                 let key = key_parts(&item.key, revision)?;
                 any_plugin |= key.kind == "plugin";
-                let (base, _) = self.effective_server_base(&item.key, committed)?;
+                let (base, _) = self.effective_server_base(Domain::Library, &item.key, committed)?;
                 let remote = remote_version(&self.connection, Domain::Library, &item.key)?;
                 let local: RecordVersion = parse(&item.version)?;
                 let mut decision = planner::decide(&base, &local, &remote);
@@ -903,7 +910,7 @@ impl PersistentStore {
                 }
                 if matches!(decision, Decision::PublishLocal | Decision::Conflict) {
                     for parent in relations(&key)? {
-                        let (parent_base, _) = self.effective_server_base(&parent, committed)?;
+                        let (parent_base, _) = self.effective_server_base(Domain::Library, &parent, committed)?;
                         let parent_remote =
                             remote_version(&self.connection, Domain::Library, &parent)?;
                         if planner::read_dependency_conflicts(&parent_base, &parent_remote, true) {
@@ -1126,12 +1133,12 @@ impl PersistentStore {
                 let applying = item.action == "apply";
                 let remote: RecordVersion = parse(&item.remote)?;
                 let dirty = key_parts(&item.key, revision)?;
-                let (base_version, base_hash) = self.effective_server_base(&item.key, committed)?;
+                let (base_version, base_hash) = self.effective_server_base(Domain::Library, &item.key, committed)?;
                 let remote_hash = match item.action.as_str() {
                     "apply" => {
                         let (payload, hash) = if matches!(remote, RecordVersion::Live { .. }) {
                             let base_candidates =
-                                self.server_base_candidates(&item.key, &cache, committed)?;
+                                self.server_base_candidates(Domain::Library, &item.key, &cache, committed)?;
                             if remote_assets {
                                 transfer.download_record_metadata(
                                     &remote,
@@ -1240,7 +1247,7 @@ impl PersistentStore {
                     }
                     _ => return Err(SyncError::new("unresolved-conflict", 409)),
                 };
-                bases.push((item.key, remote, remote_hash));
+                bases.push((Domain::Library, item.key, remote, remote_hash));
                 if applying {
                     CycleItemCounter::advance(options.cycle_items.as_deref());
                 }
@@ -1380,6 +1387,7 @@ impl PersistentStore {
     }
     fn effective_server_base(
         &self,
+        domain: Domain,
         key: &str,
         committed: bool,
     ) -> Result<(RecordVersion, Option<String>)> {
@@ -1387,8 +1395,8 @@ impl PersistentStore {
             let value: Option<(String, Option<String>)> = self
                 .connection
                 .query_row(
-                    "SELECT version,local_hash FROM server_sync_operation_records WHERE key=?1",
-                    [key],
+                    "SELECT version,local_hash FROM server_sync_operation_records WHERE domain=?1 AND key=?2",
+                    params![domain.as_str(), key],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
@@ -1396,15 +1404,21 @@ impl PersistentStore {
                 return Ok((parse(&version)?, hash));
             }
         }
-        self.server_base(key)
+        self.server_base(domain, key)
     }
     fn server_base_candidates(
         &self,
+        domain: Domain,
         key: &str,
         cache: &Cache,
         committed: bool,
     ) -> Result<Vec<String>> {
-        let (base, _) = self.effective_server_base(key, committed)?;
+        let (base, _) = self.effective_server_base(domain, key, committed)?;
+        if domain != Domain::Library {
+            // Section entries are small and carry no logical record key, so a
+            // delta base inventory buys nothing here.
+            return Ok(Vec::new());
+        }
         // Missing local bases use the protocol's explicit full transfer path.
         Ok(cache.base_candidates(key, &base).unwrap_or_default())
     }
@@ -1470,7 +1484,7 @@ impl PersistentStore {
                 }
             }
             self.connection.execute(
-                "INSERT OR IGNORE INTO server_cycle_keys SELECT key FROM server_sync_base",
+                "INSERT OR IGNORE INTO server_cycle_keys SELECT key FROM server_sync_base WHERE domain='library'",
                 [],
             )?;
         }
@@ -1479,7 +1493,7 @@ impl PersistentStore {
             [],
         )?;
         if committed {
-            self.connection.execute("INSERT OR IGNORE INTO server_cycle_keys SELECT key FROM server_sync_operation_records",[])?;
+            self.connection.execute("INSERT OR IGNORE INTO server_cycle_keys SELECT key FROM server_sync_operation_records WHERE domain='library'",[])?;
         }
         let mut after = String::new();
         loop {
@@ -1497,7 +1511,7 @@ impl PersistentStore {
                 client.ensure_active()?;
                 after = key.clone();
                 let dirty = key_parts(&key, target.revision)?;
-                let (base, base_hash) = self.effective_server_base(&key, committed)?;
+                let (base, base_hash) = self.effective_server_base(Domain::Library, &key, committed)?;
                 let (version, local_hash) = if let Some(payload) =
                     projection::project(db, &cas, &target.generation, &dirty)?
                 {
@@ -1657,8 +1671,8 @@ impl PersistentStore {
                 if matches!(remote, RecordVersion::Live { .. }) {
                     transfer.download_record_metadata(
                         &remote,
-                        &self.server_base_candidates(&item.key, cache, false)?,
-                        &self.server_base(&item.key)?.0,
+                        &self.server_base_candidates(Domain::Library, &item.key, cache, false)?,
+                        &self.server_base(Domain::Library, &item.key)?.0,
                     )?;
                     let (payload, _) = cache.restore(&remote)?;
                     let position = match payload.record {
@@ -1794,8 +1808,8 @@ impl PersistentStore {
                 }
                 transfer.download_record(
                     &version,
-                    &self.server_base_candidates(&key, cache, false)?,
-                    &self.server_base(&key)?.0,
+                    &self.server_base_candidates(Domain::Library, &key, cache, false)?,
+                    &self.server_base(Domain::Library, &key)?.0,
                 )?;
                 let (payload, hash) = cache.restore(&version)?;
                 let dependencies = projection::dependencies(&payload, &cache.cas)?;

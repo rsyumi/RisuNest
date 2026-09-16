@@ -41,7 +41,7 @@ pub(crate) struct ReplicaAdvance {
     pub scope_clears: Vec<(String, String)>,
     pub publish_keys: Vec<ServerDirtyKey>,
     pub clear_revision: Option<i64>,
-    pub bases: Vec<(String, RecordVersion, Option<String>)>,
+    pub bases: Vec<(Domain, String, RecordVersion, Option<String>)>,
     pub finish_operation: bool,
     pub scanned_revision: Option<i64>,
     pub applied_sections: Vec<Domain>,
@@ -371,7 +371,7 @@ impl PersistentStore {
             } else {
                 rows::apply_delete(&tx, &generation, &item.locator).map_err(semantic)?;
             }
-            tx.execute("INSERT INTO server_sync_base(key,version,local_hash) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET version=excluded.version,local_hash=excluded.local_hash",params![item.record.key,serde_json::to_string(&item.record.version)?,item.record.local_hash])?;
+            tx.execute("INSERT INTO server_sync_base(domain,key,version,local_hash) VALUES('library',?1,?2,?3) ON CONFLICT(domain,key) DO UPDATE SET version=excluded.version,local_hash=excluded.local_hash",params![item.record.key,serde_json::to_string(&item.record.version)?,item.record.local_hash])?;
             Ok(())
         })?;
         for id in touched {
@@ -395,8 +395,8 @@ impl PersistentStore {
                 [revision],
             )?;
         }
-        for (key, version, local_hash) in advance.bases {
-            tx.execute("INSERT INTO server_sync_base VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET version=excluded.version,local_hash=excluded.local_hash",params![key,serde_json::to_string(&version)?,local_hash])?;
+        for (domain, key, version, local_hash) in advance.bases {
+            tx.execute("INSERT INTO server_sync_base VALUES(?1,?2,?3,?4) ON CONFLICT(domain,key) DO UPDATE SET version=excluded.version,local_hash=excluded.local_hash",params![domain.as_str(),key,serde_json::to_string(&version)?,local_hash])?;
         }
         if advance.finish_operation {
             let (phase, operation_revision): (String, i64) = tx.query_row(
