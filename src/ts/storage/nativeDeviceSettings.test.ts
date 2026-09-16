@@ -23,6 +23,7 @@ function pendingSettings() {
     const failures: ((error: Error) => void)[] = []
     const settings: NativeDeviceSettings = {
         get: vi.fn(async () => null),
+        readMany: vi.fn(async (keys: readonly string[]) => keys.map(() => null)),
         set: vi.fn(() => new Promise<void>((resolve, reject) => {
             commits.push(() => resolve())
             failures.push(reject)
@@ -83,6 +84,7 @@ describe('native device settings', () => {
     it('loads stored entries and reads back what it just wrote', async () => {
         const settings: NativeDeviceSettings = {
             get: vi.fn(async () => ({ 'marker:one': 'stored' })),
+            readMany: vi.fn(async (keys: readonly string[]) => keys.map(() => null)),
             set: vi.fn(async () => undefined),
             patch: vi.fn(async () => undefined),
         }
@@ -143,6 +145,7 @@ describe('native device settings', () => {
     it('skips a write that changes nothing', async () => {
         const settings: NativeDeviceSettings = {
             get: vi.fn(async () => ({ 'marker:one': 'stored' })),
+            readMany: vi.fn(async (keys: readonly string[]) => keys.map(() => null)),
             set: vi.fn(async () => undefined),
             patch: vi.fn(async () => undefined),
         }
@@ -162,6 +165,7 @@ describe('native device settings', () => {
         const order: string[] = []
         const settings: NativeDeviceSettings = {
             get: vi.fn(async () => ({ 'marker:one': 'stored' })),
+            readMany: vi.fn(async (keys: readonly string[]) => keys.map(() => null)),
             set: vi.fn(async () => void order.push('set')),
             patch: vi.fn(async () => void order.push('patch')),
         }
@@ -182,6 +186,7 @@ describe('native device settings', () => {
     it('reports a stored value that does not hold entries at the first flush', async () => {
         const settings: NativeDeviceSettings = {
             get: vi.fn(async () => ['not', 'entries']),
+            readMany: vi.fn(async (keys: readonly string[]) => keys.map(() => null)),
             set: vi.fn(async () => undefined),
             patch: vi.fn(async () => undefined),
         }
@@ -200,6 +205,7 @@ describe('native device settings', () => {
             get: vi.fn(async () => {
                 throw new Error('device store is unavailable')
             }),
+            readMany: vi.fn(async (keys: readonly string[]) => keys.map(() => null)),
             set: vi.fn(async () => undefined),
             patch: vi.fn(async () => undefined),
         }

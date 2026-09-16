@@ -52,7 +52,7 @@
         loading = true
         loadFailed = false
         try {
-            assets = await listInlayAssetMetadata({ migrateLegacy: !isTauri })
+            assets = await listInlayAssetMetadata()
         } catch (error) {
             void error
             loadFailed = true

@@ -15,7 +15,6 @@
 <button
     onclick={async () => {
         if(await alertConfirm(language.backupConfirm)){
-            localStorage.setItem('backup', 'save')
             if(isTauri || isNodeServer){
                 checkDriver('savetauri')
             }
@@ -31,7 +30,6 @@
 <button
     onclick={async () => {
         if((await alertConfirm(language.backupLoadConfirm)) && (await alertConfirm(language.backupLoadConfirm2))){
-            localStorage.setItem('backup', 'load')
             if(isTauri || isNodeServer){
                 checkDriver('loadtauri')
             }
@@ -48,7 +46,6 @@
 <!-- <button
     onclick={async () => {
         if((await alertConfirm(language.backupLoadConfirm)) && (await alertConfirm(language.backupLoadConfirm2))){
-            localStorage.setItem('backup', 'load')
             checkDriver('reftoken')
         }
     }}

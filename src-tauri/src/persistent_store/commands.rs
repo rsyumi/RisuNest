@@ -1082,6 +1082,97 @@ pub(crate) fn pds_patch_device_setting(
     })
 }
 
+/// Answers in request order so one call can fill the whole boot cache.
+#[tauri::command(async)]
+pub(crate) fn pds_read_device_settings(
+    state: State<'_, PersistentStoreState>,
+    keys: Vec<String>,
+) -> Result<Vec<Option<Value>>, StoreError> {
+    with_store(state, |store| store.device_store()?.read_settings(&keys))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PluginPermissionRow {
+    code_hash: String,
+    permission: String,
+    granted: bool,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PluginPermissionGrantRow {
+    plugin_name: String,
+    permission: String,
+    last_grant_at: i64,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PluginPermissionState {
+    permissions: Vec<PluginPermissionRow>,
+    grants: Vec<PluginPermissionGrantRow>,
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_read_plugin_permissions(
+    state: State<'_, PersistentStoreState>,
+) -> Result<PluginPermissionState, StoreError> {
+    with_store(state, |store| {
+        let device = store.device_store()?;
+        Ok(PluginPermissionState {
+            permissions: device
+                .read_plugin_permissions()?
+                .into_iter()
+                .map(|row| PluginPermissionRow {
+                    code_hash: row.code_hash,
+                    permission: row.permission,
+                    granted: row.granted,
+                })
+                .collect(),
+            grants: device
+                .read_plugin_permission_grants()?
+                .into_iter()
+                .map(|row| PluginPermissionGrantRow {
+                    plugin_name: row.plugin_name,
+                    permission: row.permission,
+                    last_grant_at: row.last_grant_at,
+                })
+                .collect(),
+        })
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_write_plugin_permission(
+    state: State<'_, PersistentStoreState>,
+    code_hash: String,
+    permission: String,
+    granted: bool,
+) -> Result<(), StoreError> {
+    with_store(state, |store| {
+        store
+            .device_store()?
+            .write_plugin_permission(&code_hash, &permission, granted)
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_write_plugin_permission_grant(
+    state: State<'_, PersistentStoreState>,
+    plugin_name: String,
+    permission: String,
+    last_grant_at: i64,
+) -> Result<(), StoreError> {
+    with_store(state, |store| {
+        store.device_store()?.write_plugin_permission_grant(
+            &plugin_name,
+            &permission,
+            last_grant_at,
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     mod asset_gc_performance;

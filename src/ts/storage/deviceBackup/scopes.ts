@@ -525,6 +525,7 @@ export async function stageDeviceSection(
         throw new Error("Restored device key set differs from its source");
       if (
         sectionId === "device-settings" &&
+        sourceKeys.size > 0 &&
         typeof localStorage !== "undefined" &&
         environment.localStorage === localStorage
       ) reloadAppUpdateSettings();

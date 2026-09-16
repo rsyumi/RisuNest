@@ -21,6 +21,7 @@ import { readFile } from "@tauri-apps/plugin-fs"
 import { open } from "@tauri-apps/plugin-dialog"
 import { REALM_HUB_URL, REALM_NIGHTLY_HUB_URL, REALM_NODE_PROXY_BASE, REALM_SITE_URL } from "./realmEndpoints"
 import { registerOpenedFileListeners } from "./openedFiles"
+import { type DeviceMarkerStorage } from './storage/deviceMarkers'
 import { importDesktopNativeCharacterPath } from './storage/nativeCharacterFileRoute'
 import type { NativeFileJobOptions, NativeFileJobSource } from './storage/nativeFileJobs'
 import {
@@ -33,10 +34,12 @@ import { exportNativeCharacterCardFromPicker } from './storage/nativeCharacterCa
 
 const EXTERNAL_HUB_URL = 'https://sv.risuai.xyz';
 const NIGHTLY_HUB_URL = 'https://nightly.sv.risuai.xyz'
-const useNightlyHub = import.meta.env.VITE_RISU_NIGHTLY_BUILD === 'TRUE' || localStorage.getItem('hub') === 'nightly'
-export const hubURL = isNodeServer
+const nightlyBuild = import.meta.env.VITE_RISU_NIGHTLY_BUILD === 'TRUE'
+// The hub choice belongs to the device file, which only opens once the start
+// reaches it, so the start applies the choice before anything requests a hub.
+export let hubURL = isNodeServer
     ? '/hub-proxy'
-    : useNightlyHub
+    : nightlyBuild
     ? NIGHTLY_HUB_URL
     : EXTERNAL_HUB_URL;
 
@@ -44,11 +47,18 @@ export const hubURL = isNodeServer
 // Drive callbacks keep using `hubURL`, so agent mode does not affect them.
 // `/rs/` serves both account and Realm-shared assets, so it is classified as Realm
 // by scripts/realmBlocklist.mjs. Build every `/rs/` URL from this value.
-export const realmHubURL = isNodeServer
+export let realmHubURL = isNodeServer
     ? REALM_NODE_PROXY_BASE
-    : useNightlyHub
+    : nightlyBuild
     ? REALM_NIGHTLY_HUB_URL
     : REALM_HUB_URL;
+
+export function applyHubSelection(markers: DeviceMarkerStorage): void {
+    if (isNodeServer) return
+    const nightly = nightlyBuild || markers.getItem('hub') === 'nightly'
+    hubURL = nightly ? NIGHTLY_HUB_URL : EXTERNAL_HUB_URL
+    realmHubURL = nightly ? REALM_NIGHTLY_HUB_URL : REALM_HUB_URL
+}
 
 const nativeCharacterContentImportEnabled = true
 

@@ -95,7 +95,7 @@ describe('RisuNestInlayInventory', () => {
         press(target, 'Load')
         await vi.waitFor(() => expect(rows(target)).toHaveLength(4))
 
-        expect(inlays.listInlayAssetMetadata).toHaveBeenCalledWith({ migrateLegacy: false })
+        expect(inlays.listInlayAssetMetadata).toHaveBeenCalledWith()
         expect(target.querySelector('[data-inlay-inventory-summary]')?.textContent).toBe('6 files, 9.5 KiB')
         expect(rows(target)).toEqual([
             'webp 3 3.0 KiB',

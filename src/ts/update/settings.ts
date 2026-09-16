@@ -1,3 +1,5 @@
+import { getDeviceMarkers } from '../storage/deviceMarkers'
+
 export interface AppUpdateSettings {
     schema: 'risunest.app-update-settings/v1'
     autoUpdateCheck: boolean
@@ -35,7 +37,7 @@ export function validateAppUpdateSettings(value: unknown): AppUpdateSettings {
 
 export function getAppUpdateSettings(): AppUpdateSettings {
     if (current) return { ...current }
-    const raw = localStorage.getItem(appUpdateSettingsKey)
+    const raw = getDeviceMarkers().getItem(appUpdateSettingsKey)
     if (raw === null) {
         current = { ...defaults }
         return { ...current }
@@ -66,11 +68,20 @@ export function updateAppUpdateSettings(
     patch: Partial<Omit<AppUpdateSettings, 'schema'>>,
 ): AppUpdateSettings {
     const next = validateAppUpdateSettings({ ...getAppUpdateSettings(), ...patch })
-    localStorage.setItem(appUpdateSettingsKey, JSON.stringify(next))
+    getDeviceMarkers().setItem(appUpdateSettingsKey, JSON.stringify(next))
+    void flushAppUpdateSettings().catch((error) => {
+        // The settings stay available in memory for this run.
+        console.error('A device setting could not be stored', error)
+    })
     current = next
     readError = null
     for (const listener of listeners) listener({ ...next })
     return { ...next }
+}
+
+/** Resolves once every stored change has committed. */
+export async function flushAppUpdateSettings(): Promise<void> {
+    await getDeviceMarkers().flush()
 }
 
 export function subscribeAppUpdateSettings(listener: (settings: AppUpdateSettings) => void): () => void {

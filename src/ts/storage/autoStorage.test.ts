@@ -40,7 +40,7 @@ vi.mock('../globalApi.svelte', () => ({
     replaceDbResources: (value: unknown) => value,
 }))
 
-vi.mock('src/ts/platform', () => ({ isNodeServer: false }))
+vi.mock('src/ts/platform', () => ({ isNodeServer: false, isTauri: false }))
 vi.mock('./nodeStorage', () => ({ NodeStorage: class {} }))
 vi.mock('./opfsStorage', () => ({ OpfsStorage: class {} }))
 

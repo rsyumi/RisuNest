@@ -103,7 +103,6 @@ import {
     getInlayAssetMetadata,
     listInlayAssets,
     listInlayAssetMetadata,
-    migrateLegacyInlayAsset,
     postInlayAsset,
     removeInlayAsset,
     setInlayAsset,
@@ -143,10 +142,9 @@ describe('native inlay fresh-install boundary', () => {
         legacy.removes = 0
     })
 
-    test('migration and ID-scoped metadata lookup never inspect legacy storage', async () => {
+    test('ID-scoped metadata lookup never inspects legacy storage', async () => {
         seedLegacyInlay('legacy-id')
 
-        await expect(migrateLegacyInlayAsset('legacy-id')).resolves.toBeNull()
         await expect(getInlayAssetMetadata('legacy-id')).resolves.toBeNull()
 
         expectNoLegacyAccess()

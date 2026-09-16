@@ -17,7 +17,7 @@ import { registerMCPModule, unregisterMCPModule } from "src/ts/process/mcp/plugi
 import { getInlayAsset } from "src/ts/process/files/inlays";
 import { getLLMCache, searchLLMCache } from "src/ts/translator/translator";
 import { hasher } from "src/ts/parser/parser.svelte";
-import localforage from "localforage";
+import { getPluginPermissionStore } from "src/ts/storage/nativePluginPermissions";
 import { LLMFlags, LLMFormat, LLMProvider, LLMTokenizer, type LLMModel } from "src/ts/model/types";
 import { sendChat as processSendChat, doingChat } from "src/ts/process/index.svelte";
 import { reserveGeneration } from "src/ts/process/generationState";
@@ -638,10 +638,6 @@ const permissionCacheKey = (pluginName: string, permissionDesc: PluginPermission
 
 const permissionGivenPlugins: Set<string> = new Set();
 const permissionDeniedPlugins: Set<string> = new Set();
-const permissionForage = localforage.createInstance({
-    name: 'plugin_permissions',
-    storeName: 'plugin_permissions'
-});
 
 type PluginV3ProviderOptions = PluginV2ProviderOptions & {
     model?: LLMModel
@@ -662,8 +658,10 @@ const getPluginPermission = async (pluginName: string, permissionDesc: PluginPer
 
     let requiresReconfirm = false;
 
+    const permissions = getPluginPermissionStore();
+
     if(reconfirm === 'periodically'){
-        const lastGrantTime:number = await permissionForage.getItem(pluginName + '_' + permissionDesc + '_lastGrantTime');
+        const lastGrantTime = await permissions.lastGrantAt(pluginName, permissionDesc);
         const now = Date.now();
         if(!lastGrantTime || now - lastGrantTime > 3 * 24 * 60 * 60 * 1000){ //3 days
             requiresReconfirm = true;
@@ -677,9 +675,9 @@ const getPluginPermission = async (pluginName: string, permissionDesc: PluginPer
         new TextEncoder().encode(
             DBState.db.plugins.find(p => p.name === pluginName)?.script
         )
-    ) + `_${permissionDesc}`;
+    );
 
-    if(!requiresReconfirm &&await permissionForage.getItem(pluginHash)){
+    if(!requiresReconfirm && await permissions.isGranted(pluginHash, permissionDesc)){
         permissionGivenPlugins.add(cacheKey);
         return true;
     }   
@@ -700,9 +698,9 @@ const getPluginPermission = async (pluginName: string, permissionDesc: PluginPer
     const conf = await alertConfirm(alertTitle)
     if(conf && pluginHash){
         permissionGivenPlugins.add(cacheKey);
-        await permissionForage.setItem(pluginHash, true);
+        await permissions.grant(pluginHash, permissionDesc);
         if(reconfirm === 'periodically'){
-            await permissionForage.setItem(pluginName + '_' + permissionDesc + '_lastGrantTime', Date.now());
+            await permissions.recordGrant(pluginName, permissionDesc, Date.now());
         }
         return true;
     }

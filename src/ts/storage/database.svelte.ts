@@ -1174,6 +1174,9 @@ export interface Database{
     risunestInlaySkipReencode?: boolean
     risunestInlayAnimationMaxFps?: number
     risunestInlayAnimationStillFrame?: boolean
+    risunestGoogleSearchApiKey?: string
+    risunestGoogleSearchEngineId?: string
+    risunestIrisDialogue?: IrisDialogueLine[]
     reasoningEffort:number
     bulkEnabling:boolean
     showTranslationLoading: boolean
@@ -1873,6 +1876,13 @@ export interface Chat{
     bookmarkNames?: { [chatId: string]: string };
     useLocallySetGlobalVariables?: boolean
     GLGlobalVariables?: { [key: string]: string }
+    toolCalls?: { [callId: string]: import('../process/mcp/mcp').toolCallData }
+}
+
+export interface IrisDialogueLine{
+    speaker: string
+    text: string
+    tip?: string
 }
 
 export interface ChatFolder{

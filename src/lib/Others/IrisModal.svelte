@@ -7,14 +7,10 @@
     import { alertError } from "src/ts/alert";
     import { getIrisSystemPrompt } from "src/ts/iris";
     import { RisuAccessClient } from "src/ts/process/mcp/risuaccess";
-    import localforage from "localforage";
+    import type { IrisDialogueLine } from "src/ts/storage/database.svelte";
     import { getModelInfo, LLMFormat } from "src/ts/model/modellist";
 
-    interface DialogueLine {
-        speaker: string;
-        text: string;
-        tip?: string; // Optional tooltip for the line
-    }
+    type DialogueLine = IrisDialogueLine;
 
     interface OpenAIChat {
         role: 'system' | 'user' | 'assistant';
@@ -44,11 +40,6 @@
             { speaker: "Iris", text: "看起来您当前的模型不支持我响应... 请切换到兼容的模型，如 GPT、Claude 或 Gemini，这些都不是插件。" },
         ],
     };
-
-    const forageInstance = localforage.createInstance({
-        name: "iris_dialogues",
-        storeName: "iris_dialogues",
-    });
 
     let dialogue = $state<DialogueLine[]>(
         introDialogue[DBState.db.language] ?? introDialogue.en
@@ -156,10 +147,7 @@
     }
 
     function saveDialogue() {
-        forageInstance.setItem("current_dialogue", safeStructuredClone(dialogue)).catch((e) => {
-            
-            console.warn("Failed to save dialogue to localforage.", e);
-        });
+        DBState.db.risunestIrisDialogue = safeStructuredClone(dialogue);
     }
 
     async function submitUserInput() {
@@ -239,21 +227,15 @@
 
     onMount(() => {
 
-        //get dialogue from localforage if exists
-        forageInstance.getItem<DialogueLine[]>("current_dialogue").then((saved) => {
-            if (saved && saved.length > 0) {
-                dialogue = saved;
-                currentIndex = dialogue.length - 1;
-            } else {
-                dialogue = introDialogue[DBState.db.language] ?? introDialogue.en;
-                currentIndex = 0;
-            }
-            startTyping(dialogue[currentIndex].text);
-        }).catch(() => {
+        const saved = DBState.db.risunestIrisDialogue;
+        if (saved && saved.length > 0) {
+            dialogue = safeStructuredClone(saved);
+            currentIndex = dialogue.length - 1;
+        } else {
             dialogue = introDialogue[DBState.db.language] ?? introDialogue.en;
             currentIndex = 0;
-            startTyping(dialogue[currentIndex].text);
-        });
+        }
+        startTyping(dialogue[currentIndex].text);
 
         
 

@@ -16,6 +16,30 @@ pub(crate) const DEVICE_SCHEMA_VERSION: u32 = 1;
 pub(crate) const DEVICE_DATABASE_FILE: &str = "device.sqlite";
 
 pub(crate) mod hypa;
+pub(crate) mod plugin_permissions;
+
+/// The complete set of settings this device file holds. A key outside it is a
+/// caller mistake, so both directions reject it rather than storing a row no
+/// reader will ever ask for.
+pub(crate) const DEVICE_SETTING_KEYS: [&str; 14] = [
+    "accountst",
+    "ignoreRisuAuth",
+    "dosync",
+    "hub",
+    "risunest_tos_v1",
+    "risu_service_tos_v1",
+    "risu_lastsaved",
+    "nightlyWarned",
+    "risuNestDeviceSettings",
+    "risuNestUpdateSettings",
+    "risuNestServerSyncRestoreHold",
+    "official-account.association.v1",
+    "official-account.asset-ledger.v1",
+    "sync-conflict-backups.index.v1",
+];
+
+/// The largest batch a single settings read may ask for.
+pub(crate) const MAX_SETTING_READ_KEYS: usize = DEVICE_SETTING_KEYS.len();
 
 const SCHEMA: &str = r#"
 CREATE TABLE device_meta(
@@ -217,6 +241,14 @@ fn parse_setting(value: &str) -> StoreResult<Value> {
     serde_json::from_str(value).map_err(|_| invalid("device setting value is not readable"))
 }
 
+fn check_setting_key(key: &str) -> StoreResult<()> {
+    if DEVICE_SETTING_KEYS.contains(&key) {
+        Ok(())
+    } else {
+        Err(invalid("device setting key is not a device setting"))
+    }
+}
+
 fn sequence(value: &str) -> StoreResult<Sequence> {
     Sequence::try_from(value.to_owned()).map_err(|_| invalid("device write clock is invalid"))
 }
@@ -260,6 +292,7 @@ impl DeviceStore {
     }
 
     pub(crate) fn read_setting(&self, key: &str) -> StoreResult<Option<Value>> {
+        check_setting_key(key)?;
         let stored: Option<String> = self
             .connection
             .query_row(
@@ -271,7 +304,30 @@ impl DeviceStore {
         stored.map(|value| parse_setting(&value)).transpose()
     }
 
+    /// One call for the whole boot load. Answers in request order so the caller
+    /// can build its cache without matching keys back up.
+    pub(crate) fn read_settings(&self, keys: &[String]) -> StoreResult<Vec<Option<Value>>> {
+        if keys.len() > MAX_SETTING_READ_KEYS {
+            return Err(invalid("device setting read batch is too large"));
+        }
+        for key in keys {
+            check_setting_key(key)?;
+        }
+        let mut statement = self
+            .connection
+            .prepare("SELECT value FROM device_settings WHERE key=?1")?;
+        let mut results = Vec::with_capacity(keys.len());
+        for key in keys {
+            let stored: Option<String> = statement
+                .query_row([key], |row| row.get(0))
+                .optional()?;
+            results.push(stored.map(|value| parse_setting(&value)).transpose()?);
+        }
+        Ok(results)
+    }
+
     pub(crate) fn write_setting(&self, key: &str, value: &Value) -> StoreResult<()> {
+        check_setting_key(key)?;
         let serialized = serde_json::to_string(value)
             .map_err(|_| invalid("device setting value is not encodable"))?;
         self.connection.execute(
@@ -283,6 +339,7 @@ impl DeviceStore {
     }
 
     pub(crate) fn remove_setting(&self, key: &str) -> StoreResult<()> {
+        check_setting_key(key)?;
         self.connection
             .execute("DELETE FROM device_settings WHERE key=?1", [key])?;
         Ok(())
@@ -296,6 +353,7 @@ impl DeviceStore {
         key: &str,
         entries: &serde_json::Map<String, Value>,
     ) -> StoreResult<()> {
+        check_setting_key(key)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
