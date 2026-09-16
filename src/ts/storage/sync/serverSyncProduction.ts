@@ -1,5 +1,6 @@
 import { isTauri } from "../../platform";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   flushPendingData,
   capturePersistentMutationToken,
@@ -9,6 +10,7 @@ import { createServerSyncFacade, type ServerHead } from "./serverSync";
 import { createServerSyncController } from "./serverSyncController";
 import { createServerSyncScheduler } from "./serverSyncScheduler";
 import { subscribeLocalPersistentRevision } from "../persistentRevisionEvents";
+import { subscribeNativeServerSyncSignals } from "./serverSyncNativeSignals";
 import type { SyncExitDrainAdapter } from "../syncExitCoordinator";
 
 let controller: ReturnType<typeof createServerSyncController> | undefined;
@@ -164,6 +166,17 @@ export function startServerSync(): void {
     controller.invalidateCompletion();
     scheduler.localCommit();
   });
+  subscribeNativeServerSyncSignals(
+    {
+      // Device sections have their own revision, so their writes wake the
+      // scheduler the same way a library revision does.
+      deviceChanged: () => {
+        controller.invalidateCompletion();
+        scheduler.localCommit();
+      },
+    },
+    (event, handler) => listen(event, handler),
+  );
   void controller.initialize().then(() => resumeServerSyncAfterBackup());
   window.addEventListener("online", () => resumeServerSyncAfterBackup());
   window.addEventListener("offline", () => scheduler.suspend());

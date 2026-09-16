@@ -10,7 +10,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tauri::{
     ipc::{InvokeBody, Request, Response},
-    State,
+    AppHandle, State,
 };
 
 const HEADER_LENGTH_BYTES: usize = 4;
@@ -167,13 +167,21 @@ pub(crate) fn pds_read_hypa_embeddings(
 
 #[tauri::command(async)]
 pub(crate) fn pds_write_hypa_embeddings(
+    app: AppHandle,
     state: State<'_, PersistentStoreState>,
     request: Request<'_>,
 ) -> StoreResult<()> {
     let entries = decode_write_frame(&request_frame(&request)?)?;
-    with_store_mut(state, |store| {
-        store.device_store_mut()?.write_hypa_embeddings(&entries)
-    })
+    let changed = with_store_mut(state, |store| {
+        let device = store.device_store_mut()?;
+        let before = device.revision()?;
+        device.write_hypa_embeddings(&entries)?;
+        Ok(device.revision()? != before)
+    })?;
+    if changed {
+        crate::server_sync::events::notify_device_changed(&app);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

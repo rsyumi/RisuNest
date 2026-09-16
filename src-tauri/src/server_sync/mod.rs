@@ -3,6 +3,7 @@ pub(crate) mod cache;
 pub(crate) mod client;
 pub(crate) mod commands;
 pub(crate) mod credentials;
+pub(crate) mod events;
 pub(crate) mod management;
 pub(crate) mod media;
 pub(crate) mod planner;

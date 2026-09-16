@@ -13,6 +13,7 @@ export function createServerSyncScheduler(
   let timer: ReturnType<typeof setTimeout> | undefined;
   let localSince: number | undefined;
   let localDue: number | undefined;
+  let hintDue: number | undefined;
   let failures = 0;
   let poll = 60_000;
   let previousHead: string | undefined;
@@ -29,10 +30,16 @@ export function createServerSyncScheduler(
     if (stopped || !options.available() || !controller.canAutoSync()) return;
     timer = setTimeout(run, delay);
   };
+  const due = () => {
+    const pending = [localDue, hintDue].filter(
+      (value): value is number => value !== undefined,
+    );
+    return pending.length ? Math.min(...pending) : undefined;
+  };
   const run = () => {
     clear();
     if (stopped || !options.available() || !controller.canAutoSync()) return;
-    localSince = localDue = undefined;
+    localSince = localDue = hintDue = undefined;
     automatic = true;
     void controller.synchronize();
     automatic = false;
@@ -51,7 +58,8 @@ export function createServerSyncScheduler(
       Boolean(state.result?.appliedRecords || state.result?.proposedRecords);
     previousHead = head;
     poll = changed ? 60_000 : Math.min(300_000, poll * 2);
-    if (localDue !== undefined) schedule(Math.max(0, localDue - Date.now()));
+    const next = due();
+    if (next !== undefined) schedule(Math.max(0, next - Date.now()));
     else schedule(state.result?.phase === "pending" ? 1000 : poll);
   };
   const unsubscribe = controller.subscribe((state) => {
@@ -80,7 +88,15 @@ export function createServerSyncScheduler(
       localSince ??= now;
       localDue = Math.min(now + 500, localSince + 5000);
       // Ongoing edits cannot continuously postpone retries after a failure.
-      if (failures === 0) schedule(Math.max(0, localDue - now));
+      if (failures === 0) schedule(Math.max(0, (due() ?? localDue) - now));
+    },
+    /** A notification that the remote may have moved. The run it brings forward
+     * confirms the head; a missed notification only costs the poll interval. */
+    remoteHint() {
+      const now = Date.now();
+      if (hintDue !== undefined && hintDue > now) return;
+      hintDue = now + 250;
+      if (failures === 0) schedule(Math.max(0, (due() ?? hintDue) - now));
     },
     resume() {
       failures = 0;

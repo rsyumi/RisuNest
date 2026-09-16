@@ -1578,3 +1578,60 @@ mod section_exchange {
             .is_none());
     }
 }
+
+/// Synchronisation subscribes to the device counter the way it subscribes to
+/// the library revision, so a stored section value has to advance it and a
+/// device-fixed write has to leave it alone.
+#[test]
+fn a_synchronised_section_write_advances_the_device_revision_and_a_fixed_write_does_not() {
+    use super::hypa::HypaEmbeddingWrite;
+    use super::plugin_values::PluginDeviceMutation;
+    let (_directory, mut store) = open();
+    let start = store.revision().expect("read device revision");
+
+    store
+        .write_hypa_embeddings(&[])
+        .expect("write no embeddings");
+    assert_eq!(store.revision().unwrap(), start);
+
+    store
+        .write_hypa_embeddings(&[HypaEmbeddingWrite {
+            cache_key: "a".repeat(64),
+            producer: "hypa-v2".into(),
+            model: "synthetic-embedding".into(),
+            endpoint: None,
+            preprocess_version: 1,
+            dimensions: 4,
+            vector: vec![0x11; 16],
+            metadata: None,
+        }])
+        .expect("write an embedding");
+    let after_hypa = store.revision().unwrap();
+    assert!(after_hypa > start);
+
+    store
+        .write_plugin_device_values(
+            "synthetic-plugin",
+            &[PluginDeviceMutation::Set {
+                space: "string".into(),
+                key: "token".into(),
+                value: "held".into(),
+            }],
+        )
+        .expect("write a plugin value");
+    let after_plugin = store.revision().unwrap();
+    assert!(after_plugin > after_hypa);
+
+    store
+        .patch_setting(
+            "risuNestDeviceSettings",
+            serde_json::json!({ "performanceProfile": "balanced" })
+                .as_object()
+                .unwrap(),
+        )
+        .expect("patch a device setting");
+    store
+        .write_plugin_permission_grant("synthetic-plugin", "network", 1)
+        .expect("grant a plugin permission");
+    assert_eq!(store.revision().unwrap(), after_plugin);
+}
