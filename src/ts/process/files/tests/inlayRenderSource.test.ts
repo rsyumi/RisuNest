@@ -353,7 +353,7 @@ describe('getInlayRenderSource', () => {
         inlayMocks.getInlayAssetMetadata.mockResolvedValue(null)
 
         await expect(getInlayRenderSource('legacy-audio', true)).resolves.toBeNull()
-        expect(inlayMocks.getInlayAssetMetadata).toHaveBeenCalledWith('legacy-audio', { migrateLegacy: false })
+        expect(inlayMocks.getInlayAssetMetadata).toHaveBeenCalledWith('legacy-audio')
         expect(inlayMocks.getInlayAssetBlob).not.toHaveBeenCalled()
         expect(inlayMocks.getInlayAssetRenderUrl).not.toHaveBeenCalled()
     })
@@ -383,8 +383,8 @@ describe('getInlayRenderSource', () => {
 
         expect([...sources.keys()]).toEqual(['shown-a', 'shown-b'])
         expect(inlayMocks.getInlayAssetMetadata).toHaveBeenCalledTimes(2)
-        expect(inlayMocks.getInlayAssetMetadata).toHaveBeenNthCalledWith(1, 'shown-a', { migrateLegacy: false })
-        expect(inlayMocks.getInlayAssetMetadata).toHaveBeenNthCalledWith(2, 'shown-b', { migrateLegacy: false })
+        expect(inlayMocks.getInlayAssetMetadata).toHaveBeenNthCalledWith(1, 'shown-a')
+        expect(inlayMocks.getInlayAssetMetadata).toHaveBeenNthCalledWith(2, 'shown-b')
         expect(inlayMocks.listInlayAssetMetadata).not.toHaveBeenCalled()
         expect(inlayMocks.getInlayAssetBlob).not.toHaveBeenCalled()
     })

@@ -289,7 +289,9 @@ describe('AccountStorage structured wire contract', () => {
             const { AccountStorage, AccountWarning } = await loadStorage()
             const warnings: string[] = []
             const unsubscribe = AccountWarning.subscribe((value) => warnings.push(value))
-            const result = await new AccountStorage().writeItem(
+            const result = await new AccountStorage({
+                databaseCache: mocks.cachedForage,
+            }).writeItem(
                 'database/database.bin',
                 Uint8Array.of(1),
             )
@@ -801,7 +803,7 @@ describe('AccountStorage structured wire contract', () => {
             .mockResolvedValueOnce(response(new Uint8Array([4, 5])))
             .mockResolvedValueOnce(response(new Uint8Array([6])))
         const { AccountStorage } = await loadStorage()
-        const storage = new AccountStorage()
+        const storage = new AccountStorage({ databaseCache: mocks.cachedForage })
 
         await storage.readItem('database/database.bin')
         await storage.readItem('assets/database-icon.png')
@@ -832,7 +834,7 @@ describe('AccountStorage structured wire contract', () => {
                 'content-type': 'application/json',
             }))
         const { AccountStorage } = await loadStorage()
-        const storage = new AccountStorage()
+        const storage = new AccountStorage({ databaseCache: mocks.cachedForage })
 
         await expect(storage.readItem('missing')).resolves.toEqual({ kind: 'missing' })
         await expect(storage.readItem('database/database.bin')).resolves.toEqual({
@@ -1366,7 +1368,7 @@ describe('AccountStorage structured wire contract', () => {
             .mockResolvedValueOnce(response('retry', 403))
             .mockResolvedValueOnce(response('database/database.bin'))
         const { AccountStorage } = await loadStorage()
-        const storage = new AccountStorage()
+        const storage = new AccountStorage({ databaseCache: mocks.cachedForage })
         const bytes = new Uint8Array([8, 1])
         let settled = false
 

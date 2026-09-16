@@ -157,7 +157,7 @@ describe('PlaygroundInlayExplorer native previews', () => {
         await tick()
 
         expect(inlayMocks.listInlayAssetMetadata).toHaveBeenCalledOnce()
-        expect(inlayMocks.listInlayAssetMetadata).toHaveBeenCalledWith({ migrateLegacy: false })
+        expect(inlayMocks.listInlayAssetMetadata).toHaveBeenCalledWith()
         expect(inlayMocks.listInlayAssets).not.toHaveBeenCalled()
         expect(inlayMocks.getInlayAssetRenderUrl).toHaveBeenCalledWith('photo-id')
         expect(inlayMocks.getInlayAssetBlob).not.toHaveBeenCalled()

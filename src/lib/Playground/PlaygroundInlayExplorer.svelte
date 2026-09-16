@@ -303,7 +303,7 @@
 
   const loadAssets = async () => {
     loading = true
-    allAssets = await listInlayAssetMetadata({ migrateLegacy: !isTauri })
+    allAssets = await listInlayAssetMetadata()
     loading = false
   }
   loadAssets()

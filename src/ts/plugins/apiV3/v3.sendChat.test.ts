@@ -215,7 +215,7 @@ describe('Plugin v3 sendChat complete mutation gateway', () => {
         let releaseCount = 0
 
         const sending = mocks.api.sendChat('hello')
-        for (let index = 0; index < 10; index++) await Promise.resolve()
+        while (mocks.acquireCompleteConversation.mock.calls.length === 0) await Promise.resolve()
 
         expect(mocks.acquireCompleteConversation).toHaveBeenCalledOnce()
         expect(chat.message.map((message: any) => message.data)).toEqual(['before'])

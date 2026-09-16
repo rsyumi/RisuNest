@@ -1,11 +1,10 @@
-import { getDatabase } from "src/ts/storage/database.svelte";
+import { getCurrentChat, getDatabase } from "src/ts/storage/database.svelte";
 import { MCPClient, type JsonRPC, type MCPTool, type RPCToolCallContent } from "./mcplib";
 import { DBState } from "src/ts/stores.svelte";
 import { getModuleMcps } from "../modules";
 import { alertError, alertInput, alertNormal } from "src/ts/alert";
 import { v4 } from "uuid";
 import type { MCPClientLike } from "./internalmcp";
-import localforage from "localforage";
 import { isTauriDesktop } from "src/ts/platform"
 import { sleep } from "src/ts/util";
 import { registeredCustomPluginMCPs } from "./pluginmcp";
@@ -348,14 +347,15 @@ export type toolCallData = {
     response: RPCToolCallContent[],
 }
 
-const inst = localforage.createInstance({
-    name: 'mcp-tool-calls',
-    storeName: 'mcp-tool-calls'
-});
-
+// A tool call belongs to the conversation whose message references it, so it
+// travels with that conversation instead of living beside it on one device.
 export async function encodeToolCall(call:toolCallData){
     call.call.id = call.call.id || v4();
-    await inst.setItem(call.call.id, call)
+    const chat = getCurrentChat()
+    if(chat){
+        chat.toolCalls ??= {}
+        chat.toolCalls[call.call.id] = call
+    }
     return `<tool_call>${call.call.id}\uf100${call.call.name}</tool_call>\n\n`;
 }
 
@@ -371,9 +371,5 @@ export async function decodeToolCall(text:string):Promise<toolCallData|undefined
     if(!callId) {
         return undefined;
     }
-    const call = await inst.getItem<toolCallData>(callId);
-    if(!call) {
-        return undefined;
-    }
-    return call;
+    return getCurrentChat()?.toolCalls?.[callId];
 }

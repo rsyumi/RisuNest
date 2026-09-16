@@ -387,7 +387,7 @@ export async function getInlayRenderSource(
 ): Promise<InlayRenderSource | null> {
     if (native) {
         const metadata = knownMetadata
-            ?? await getInlayAssetMetadata(id, { migrateLegacy: false })
+            ?? await getInlayAssetMetadata(id)
         if (!metadata) return null
         const url = await getInlayAssetRenderUrl(id)
         return url ? sourceFromMetadata(metadata, url, false) : null

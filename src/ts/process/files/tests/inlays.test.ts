@@ -9,8 +9,6 @@ import {
     getInlayAssetRenderUrl,
     listInlayAssets,
     listInlayAssetMetadata,
-    migrateLegacyInlayAsset,
-    readLegacyInlayPayload,
     postInlayAsset,
     reencodeImage,
     removeInlayAsset,
@@ -417,38 +415,22 @@ describe('getInlayAsset', () => {
         expect(result).toBeNull()
     })
 
-    test('returns asset with base64 data URI when stored as Blob', async () => {
-        const blob = new Blob(['test-data'], { type: 'text/plain' })
-        const asset: InlayAsset = {
-            data: blob,
+    test('returns asset with base64 data URI', async () => {
+        loadedImageWidth = 50
+        loadedImageHeight = 50
+        await setInlayAsset('blob-id', {
+            data: new Blob([new Uint8Array([1, 2])], { type: 'image/png' }),
             ext: 'png',
             height: 50,
             width: 50,
             name: 'blob-asset.png',
             type: 'image',
-        }
-        store.set('blob-id', asset)
+        })
 
         const result = await getInlayAsset('blob-id')
 
         expect(result!.data).toMatch(/^data:/)
         expect(result!.name).toBe('blob-asset.png')
-    })
-
-    test('returns asset with string data as-is when stored as string', async () => {
-        const b64 = 'data:image/png;base64,aGVsbG8='
-        const asset: InlayAsset = {
-            data: b64,
-            ext: 'png',
-            height: 50,
-            width: 50,
-            name: 'string-asset.png',
-            type: 'image',
-        }
-        store.set('str-id', asset)
-
-        const result = await getInlayAsset('str-id')
-        expect(result!.data).toBe(b64)
     })
 })
 
@@ -458,39 +440,20 @@ describe('getInlayAssetBlob', () => {
         expect(result).toBeNull()
     })
 
-    test('returns Blob data when stored as Blob', async () => {
-        const blob = new Blob(['binary-data'], { type: 'image/png' })
-        const asset: InlayAsset = {
-            data: blob,
+    test('returns Blob data', async () => {
+        loadedImageWidth = 64
+        loadedImageHeight = 64
+        await setInlayAsset('blob-id', {
+            data: new Blob([new Uint8Array([1, 2])], { type: 'image/png' }),
             ext: 'png',
             height: 64,
             width: 64,
             name: 'blob.png',
             type: 'image',
-        }
-        store.set('blob-id', asset)
+        })
 
         const result = await getInlayAssetBlob('blob-id')
         expect(result!.data).toBeInstanceOf(Blob)
-    })
-
-    test('migrates string data to Blob and updates storage', async () => {
-        const b64 = 'data:image/png;base64,aGVsbG8='
-        const asset: InlayAsset = {
-            data: b64,
-            ext: 'png',
-            height: 32,
-            width: 32,
-            name: 'legacy.png',
-            type: 'image',
-        }
-        store.set('legacy-id', asset)
-
-        const result = await getInlayAssetBlob('legacy-id')
-        expect(result!.data).toBeInstanceOf(Blob)
-
-        const retained = store.get('legacy-id') as InlayAsset
-        expect(retained.data).toBe(b64)
     })
 })
 
@@ -517,8 +480,10 @@ describe('listInlayAssets', () => {
             name: 'b.mp3',
             type: 'audio',
         }
-        store.set('id-a', asset1)
-        store.set('id-b', asset2)
+        loadedImageWidth = 10
+        loadedImageHeight = 10
+        await setInlayAsset('id-a', asset1)
+        await setInlayAsset('id-b', asset2)
 
         const result = await listInlayAssets()
         expect(result).toMatchObject([
@@ -542,32 +507,12 @@ describe('native inlay rendering', () => {
             inlayType: 'image',
         })))
 
-        await expect(listInlayAssetMetadata({ migrateLegacy: false })).resolves.toMatchObject([{ key: 'new-id' }])
+        await expect(listInlayAssetMetadata()).resolves.toMatchObject([{ key: 'new-id' }])
         expect(legacyReads).toBe(0)
         expect(legacyKeyLists).toBe(0)
         expect(payloadReads).toBe(0)
     })
 
-    test('migrates legacy entries once before returning metadata-only listings', async () => {
-        store.set('legacy-id', {
-            data: new Blob(['legacy'], { type: 'image/webp' }),
-            ext: 'webp',
-            height: 2,
-            width: 3,
-            name: 'legacy.webp',
-            type: 'image',
-        } satisfies InlayAsset)
-
-        await expect(listInlayAssetMetadata()).resolves.toEqual([{
-            key: 'legacy-id', kind: 'inlay', size: 6, mime: 'image/webp', name: 'legacy.webp', ext: 'webp',
-            inlayType: 'image', width: 3, height: 2,
-        }])
-        expect(payloadReads).toBeGreaterThan(0)
-
-        payloadReads = 0
-        await expect(listInlayAssetMetadata()).resolves.toHaveLength(1)
-        expect(payloadReads).toBe(0)
-    })
 
     test('lists metadata without reading payload bytes', async () => {
         store.set('blobstore/inlays/69642d61.bin', new Uint8Array([1, 2, 3]))
@@ -990,30 +935,6 @@ describe('set -> remove -> get', () => {
 })
 
 describe('BlobStore inlay compatibility', () => {
-    test('reads all historical inlay kinds as exact bytes and metadata without mutation', async () => {
-        const fixtures: Array<[string, InlayAsset, Uint8Array, string]> = [
-            ['image', { data: new Blob([new Uint8Array([1, 2])], { type: 'image/png' }), ext: 'png', name: 'a.png', type: 'image', width: 2, height: 1 }, new Uint8Array([1, 2]), 'image/png'],
-            ['audio', { data: 'data:audio/mpeg;base64,AwQ=', ext: 'mp3', name: 'a.mp3', type: 'audio' }, new Uint8Array([3, 4]), 'audio/mpeg'],
-            ['video', { data: new Blob([new Uint8Array()], { type: 'video/webm' }), ext: 'webm', name: 'a.webm', type: 'video' }, new Uint8Array(), 'video/webm'],
-            ['signature', { data: '{"source":"synthetic"}', ext: 'json', name: 'sig', type: 'signature' }, new TextEncoder().encode('{"source":"synthetic"}'), 'application/json'],
-        ]
-        for (const [id, asset, bytes, mime] of fixtures) store.set(id, asset)
-        const before = new Map(store)
-
-        for (const [id, asset, bytes, mime] of fixtures) {
-            expect(await readLegacyInlayPayload(id)).toEqual({
-                data: bytes,
-                metadata: {
-                    kind: 'inlay', inlayType: asset.type, mime, name: asset.name, ext: asset.ext,
-                    ...(asset.width === undefined ? {} : { width: asset.width }),
-                    ...(asset.height === undefined ? {} : { height: asset.height }),
-                },
-            })
-        }
-        expect(store).toEqual(before)
-        expect(await readLegacyInlayPayload('missing')).toBeNull()
-    })
-
     test('optimizes new images and round trips audio, video, and signature bytes', async () => {
         const fixtures: [string, InlayAsset, Uint8Array][] = [
             ['image', { data: new Blob([new Uint8Array([1, 2])], { type: 'image/png' }), ext: 'png', name: 'a.png', type: 'image', width: 2, height: 1 }, new Uint8Array([1, 2])],
@@ -1038,33 +959,5 @@ describe('BlobStore inlay compatibility', () => {
         const signature = { signatures: [{ type: 'text' as const, content: 'synthetic' }], sourceFormat: 0 as any, source: 'local' }
         await saveInlayedSignature('signature', signature)
         expect((await getInlayAsset('signature'))?.data).toBe(JSON.stringify(signature))
-    })
-
-    test('removes a failed verification destination before retrying migration', async () => {
-        store.set('retry-id', {
-            data: new Blob([new Uint8Array([7, 8])], { type: 'image/png' }),
-            ext: 'png', name: 'retry.png', type: 'image', width: 2, height: 1,
-        } satisfies InlayAsset)
-        corruptReadKey = `blobstore/inlays/${Buffer.from('retry-id').toString('hex')}.bin`
-
-        expect(await migrateLegacyInlayAsset('retry-id')).toBeNull()
-        expect([...store.keys()].some((key) => key.includes(Buffer.from('retry-id').toString('hex')))).toBe(false)
-        expect(store.get('retry-id')).toBeDefined()
-
-        expect(await migrateLegacyInlayAsset('retry-id')).toMatchObject({ kind: 'inlay', size: 2 })
-    })
-
-    test('removes a destination when verification throws before retrying migration', async () => {
-        store.set('throw-id', {
-            data: new Blob([new Uint8Array([4, 5])], { type: 'image/png' }),
-            ext: 'png', name: 'throw.png', type: 'image', width: 2, height: 1,
-        } satisfies InlayAsset)
-        throwReadKey = `blobstore/inlays/${Buffer.from('throw-id').toString('hex')}.bin`
-
-        await expect(migrateLegacyInlayAsset('throw-id')).rejects.toThrow('verification read failed')
-        expect([...store.keys()].some((key) => key.includes(Buffer.from('throw-id').toString('hex')))).toBe(false)
-        expect(store.get('throw-id')).toBeDefined()
-
-        expect(await migrateLegacyInlayAsset('throw-id')).toMatchObject({ kind: 'inlay', size: 2 })
     })
 })

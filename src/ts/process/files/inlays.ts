@@ -1,4 +1,3 @@
-import localforage from "localforage";
 import { v4 } from "uuid";
 import { getImageType } from "src/ts/media";
 import { getDatabase, type Database } from "../../storage/database.svelte";
@@ -60,11 +59,6 @@ function inlayWriteId(id?: string): string {
     if (inlayId.length === 0) throw new TypeError('Inlay image id is empty after removing the asset namespace')
     return inlayId
 }
-
-const inlayStorage = localforage.createInstance({
-    name: 'inlay',
-    storeName: 'inlay'
-})
 
 export function getInlayEncodeOptions(): InlayEncodeOptions {
     const db = (getDatabase() ?? {}) as Partial<Pick<Database,
@@ -288,94 +282,16 @@ function metadataToAsset<T extends string | Blob>(metadata: InlayBlobMetadata, d
     }
 }
 
-export async function listLegacyInlayAssetIds(): Promise<string[]> {
-    return await inlayStorage.keys()
-}
-
-export async function readLegacyInlayAsset(id: string): Promise<InlayAsset | null> {
-    return await inlayStorage.getItem<InlayAsset | null>(id)
-}
-
-export async function readLegacyInlayPayload(id: string): Promise<{
-    data: Uint8Array
-    metadata: BlobWriteMetadata
-} | null> {
-    const asset = await readLegacyInlayAsset(id)
-    if (!asset) return null
-    const { bytes, mime } = await inlayBytes(asset)
-    return {
-        data: bytes,
-        metadata: {
-            kind: 'inlay',
-            inlayType: asset.type,
-            mime,
-            name: asset.name,
-            ext: asset.ext,
-            ...(asset.width === undefined ? {} : { width: asset.width }),
-            ...(asset.height === undefined ? {} : { height: asset.height }),
-        },
-    }
-}
-
-async function migrateLegacyInlayAssetInStore(id: string, blobStore: BlobStore): Promise<BlobMetadata | null> {
-    const existing = await blobStore.stat(id)
-    if (existing?.kind === 'inlay') return existing
-    const legacy = await readLegacyInlayPayload(id)
-    if (!legacy || legacy.metadata.kind !== 'inlay') return null
-    const { data: bytes, metadata } = legacy
-    let written: BlobMetadata
-    try {
-        written = await blobStore.put(id, bytes, metadata)
-        const verifiedMetadata = await blobStore.stat(id)
-        const verifiedBytes = await blobStore.read(id)
-        if (!verifiedMetadata || verifiedMetadata.kind !== 'inlay' || !verifiedBytes
-            || written.kind !== 'inlay' || verifiedMetadata.inlayType !== metadata.inlayType
-            || verifiedMetadata.name !== metadata.name
-            || verifiedMetadata.ext !== metadata.ext.replace(/^\.+/, '').toLowerCase()
-            || verifiedMetadata.width !== metadata.width || verifiedMetadata.height !== metadata.height
-            || verifiedMetadata.mime !== written.mime || verifiedMetadata.size !== bytes.byteLength
-            || !bytesEqual(verifiedBytes, bytes)) {
-            await blobStore.remove(id)
-            return null
-        }
-        return verifiedMetadata
-    } catch (error) {
-        await blobStore.remove(id)
-        throw error
-    }
-}
-
-export async function migrateLegacyInlayAsset(id: string): Promise<BlobMetadata | null> {
-    const blobStore = await resolveBlobStore()
-    if (isTauri) {
-        const metadata = await blobStore.stat(id)
-        return metadata?.kind === 'inlay' ? metadata : null
-    }
-    return migrateLegacyInlayAssetInStore(id, blobStore)
-}
-
-async function migrateLegacyInlayAssetsInStore(blobStore: BlobStore): Promise<void> {
-    for (const id of await listLegacyInlayAssetIds()) {
-        if (!id.startsWith('blobstore/')) await migrateLegacyInlayAssetInStore(id, blobStore)
-    }
-}
-
 async function getInlayAssetMetadataInStore(
     id: string,
     blobStore: BlobStore,
-    options: { migrateLegacy?: boolean } = {},
 ): Promise<InlayBlobMetadata | null> {
-    const metadata = isTauri || options.migrateLegacy === false
-        ? await blobStore.stat(id)
-        : await migrateLegacyInlayAssetInStore(id, blobStore)
+    const metadata = await blobStore.stat(id)
     return metadata?.kind === 'inlay' ? metadata : null
 }
 
-export async function getInlayAssetMetadata(
-    id: string,
-    options: { migrateLegacy?: boolean } = {},
-): Promise<InlayBlobMetadata | null> {
-    return getInlayAssetMetadataInStore(id, await resolveBlobStore(), options)
+export async function getInlayAssetMetadata(id: string): Promise<InlayBlobMetadata | null> {
+    return getInlayAssetMetadataInStore(id, await resolveBlobStore())
 }
 
 // Returns with base64 data URI
@@ -403,7 +319,6 @@ export async function getInlayAssetBlob(id: string){
 
 export async function listInlayAssets(): Promise<[id: string, InlayAsset][]> {
     const blobStore = await resolveBlobStore()
-    if (!isTauri) await migrateLegacyInlayAssetsInStore(blobStore)
     const assets: [id: string, InlayAsset][] = []
     for (const metadata of await blobStore.list({ kind: 'inlay' })) {
         if (metadata.kind !== 'inlay') continue
@@ -417,11 +332,8 @@ export async function listInlayAssets(): Promise<[id: string, InlayAsset][]> {
     return assets
 }
 
-export async function listInlayAssetMetadata(
-    options: { migrateLegacy?: boolean } = {},
-): Promise<InlayBlobMetadata[]> {
+export async function listInlayAssetMetadata(): Promise<InlayBlobMetadata[]> {
     const blobStore = await resolveBlobStore()
-    if (!isTauri && options.migrateLegacy !== false) await migrateLegacyInlayAssetsInStore(blobStore)
     const metadata = await blobStore.list({ kind: 'inlay' })
     return metadata.filter((item): item is InlayBlobMetadata => item.kind === 'inlay')
 }
@@ -482,7 +394,6 @@ export async function setInlayAsset(id: string, img: InlayAsset): Promise<string
 
 export async function removeInlayAsset(id: string){
     await (await resolveBlobStore()).remove(id)
-    if (!isTauri) await inlayStorage.removeItem(id)
 }
 
 export function supportsInlayImage(){

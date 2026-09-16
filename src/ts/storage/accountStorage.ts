@@ -82,6 +82,12 @@ export interface AccountRecoveredOfficialWrite {
     reloadSession?: boolean
 }
 
+/** Nothing caches the account database locally. */
+const uncachedDatabase: AccountStorageCache = {
+    getItem: async () => null,
+    setItem: async () => undefined,
+}
+
 export interface AccountStorageCache {
     getItem(key: string): Promise<unknown | null>
     setItem(key: string, value: unknown): Promise<unknown>
@@ -178,8 +184,7 @@ export class AccountStorage{
     private readonly credentialRouting?: AccountCredentialRouting
 
     constructor(options: AccountStorageOptions = {}) {
-        this.databaseCache = options.databaseCache
-            ?? localforage.createInstance({ name: 'risuaiAccountCached' })
+        this.databaseCache = options.databaseCache ?? uncachedDatabase
         this.assetCache = options.assetCache ?? localforage
         this.credentialRouting = options.credentialRouting
     }
