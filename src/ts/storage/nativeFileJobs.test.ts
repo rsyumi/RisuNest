@@ -574,6 +574,111 @@ describe('native file jobs', () => {
         expect(JSON.stringify(calls)).not.toContain('Uint8Array')
     })
 
+    it('assigns the plugin values a save left unowned before the replacement is applied', async () => {
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const statuses: NativeFileJobStatus[] = [
+            {
+                ...status('waitingForInput'),
+                phase: 'awaiting-activation',
+                pluginValuePreview: [
+                    { key: 'pm_store', byteSize: 24, valueType: 'json' },
+                    { key: 'yt_glossary', byteSize: 12, valueType: 'string' },
+                ],
+            },
+            {
+                ...status('succeeded', {
+                    revision: 9,
+                    sourceBytes: 128,
+                    sourceSha256: 'c'.repeat(64),
+                    characterCount: 1,
+                    presetCount: 0,
+                    warningCodes: [],
+                }),
+            },
+        ]
+
+        await runNativeBlockRisuSaveRestore(
+            restoreRuntime(8),
+            { type: 'desktopPath', path: 'save.risudat' },
+            {
+                assignPluginValues: async (preview) => {
+                    expect(preview.map((value) => value.key)).toEqual([
+                        'pm_store',
+                        'yt_glossary',
+                    ])
+                    return {
+                        assignments: [
+                            { owner: 'provider-manager', keys: ['pm_store'] },
+                        ],
+                        automatic: false,
+                    }
+                },
+            },
+            {
+                isTauri: () => true,
+                invoke: async (command, args) => {
+                    calls.push([command, args])
+                    if (command === 'native_file_job_start') return { jobId: 'job-1' }
+                    if (command === 'native_file_job_status') return statuses.shift()
+                    if (command === 'native_plugin_values_assign') return undefined
+                    if (command === 'native_file_job_finalize') return 'requested'
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )
+
+        const assigned = calls.find(([command]) => command === 'native_plugin_values_assign')
+        expect(assigned?.[1]).toEqual({
+            jobId: 'job-1',
+            assignments: [{ owner: 'provider-manager', keys: ['pm_store'] }],
+            automatic: false,
+        })
+        const order = calls.map(([command]) => command)
+        expect(order.indexOf('native_plugin_values_assign')).toBeLessThan(
+            order.indexOf('native_file_job_finalize'),
+        )
+    })
+
+    it('cancels the import when the plugin value pass is closed without an answer', async () => {
+        const commands: string[] = []
+        const acquire = vi.fn()
+        const statuses: NativeFileJobStatus[] = [
+            {
+                ...status('waitingForInput'),
+                phase: 'awaiting-activation',
+                pluginValuePreview: [{ key: 'pm_store', byteSize: 24, valueType: 'json' }],
+            },
+            { ...status('cancelled'), phase: 'awaiting-activation' },
+        ]
+
+        await expect(
+            runNativeBlockRisuSaveRestore(
+                restoreRuntime(8, { acquire }),
+                { type: 'desktopPath', path: 'save.risudat' },
+                { assignPluginValues: async () => null },
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        commands.push(command)
+                        if (command === 'native_file_job_start') return { jobId: 'job-1' }
+                        if (command === 'native_file_job_status') return statuses.shift()
+                        if (command === 'native_file_job_cancel') return 'requested'
+                        if (command === 'native_file_job_forget') return true
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
+                },
+            ),
+        ).rejects.toThrow()
+
+        expect(commands).toContain('native_file_job_cancel')
+        expect(commands).not.toContain('native_plugin_values_assign')
+        expect(commands).not.toContain('native_file_job_finalize')
+        expect(acquire).not.toHaveBeenCalled()
+    })
+
     it('restores an official snapshot without transferring its database bytes through IPC', async () => {
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
         const events: string[] = []

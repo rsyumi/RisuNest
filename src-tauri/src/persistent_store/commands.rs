@@ -195,7 +195,7 @@ fn current_time_ms() -> StoreResult<i64> {
     })
 }
 
-fn with_store<T>(
+pub(crate) fn with_store<T>(
     state: State<'_, PersistentStoreState>,
     operation: impl FnOnce(&PersistentStore) -> StoreResult<T>,
 ) -> StoreResult<T> {

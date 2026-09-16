@@ -26,6 +26,7 @@ import {
 import { describeDesktopSource } from './nativeFileSourceInfo'
 import { getPersistentDataRuntime } from './persistentDataRuntime.svelte'
 import { decodeRisuSave } from './risuSave'
+import { selectPluginValueAssignment } from './pluginValueAssignDialog'
 import {
     exportRisuSaveFromPicker,
     importRisuSaveFromPicker,
@@ -70,6 +71,7 @@ const productionDependencies: RisuSaveFileRouteDependencies = {
     },
     chooseWebImport: () => selectFileByDom(['risudat'], 'single'),
     runNativeImport: runNativeBlockRisuSaveRestore,
+    assignPluginValues: selectPluginValueAssignment,
     cleanupNativeImport: async (path) => {
         if (isTauriIOS)
             await discardIOSFile(path).catch((error) =>

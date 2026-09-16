@@ -996,6 +996,15 @@ impl restore::ReplacementSink for LegacyReplacementSink {
         })
     }
 
+    fn staged_unowned_plugin_values(
+        &self,
+        staging_id: &str,
+    ) -> StoreResult<Vec<crate::persistent_store::commit::StagedPluginValue>> {
+        crate::persistent_store::commands::with_store(self.app.state(), |store| {
+            store.staged_unowned_plugin_values(staging_id)
+        })
+    }
+
     fn commit(&self, staging_id: &str, expected_revision: i64) -> StoreResult<RevisionResult> {
         crate::persistent_store::commands::with_store_mut(self.app.state(), |store| {
             store.replace_put_asset_aliases(staging_id, &self.payloads.asset_aliases)?;

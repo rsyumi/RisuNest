@@ -2,7 +2,7 @@ pub(crate) mod archive;
 pub(crate) mod asset_object_catalog;
 pub(crate) mod asset_residency;
 pub(crate) mod commands;
-mod commit;
+pub(crate) mod commit;
 pub(crate) mod content_capture;
 pub(crate) mod content_change_index;
 mod content_locators;
@@ -1956,6 +1956,27 @@ impl PersistentStore {
 
     pub(crate) fn replace_put_root(&mut self, staging_id: &str, root: &Value) -> StoreResult<()> {
         commit::replace_put_root(&mut self.connection, staging_id, root)
+    }
+
+    pub(crate) fn staged_unowned_plugin_values(
+        &self,
+        staging_id: &str,
+    ) -> StoreResult<Vec<commit::StagedPluginValue>> {
+        commit::staged_unowned_plugin_values(&self.connection, staging_id)
+    }
+
+    pub(crate) fn assign_staged_plugin_values(
+        &mut self,
+        staging_id: &str,
+        assignments: &[commit::StagedPluginAssignment],
+        automatic: bool,
+    ) -> StoreResult<()> {
+        commit::assign_staged_plugin_values(
+            &mut self.connection,
+            staging_id,
+            assignments,
+            automatic,
+        )
     }
 
     pub(crate) fn replace_put_presets(

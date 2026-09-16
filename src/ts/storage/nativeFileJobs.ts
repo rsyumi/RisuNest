@@ -195,6 +195,7 @@ export type NativeFileJobStage =
     | 'decoding-database'
     | 'staging-characters'
     | 'finalizing-staging'
+    | 'assign-plugin-values'
     | 'awaiting-activation'
     | 'activating'
     | 'copying-source'
@@ -244,6 +245,11 @@ export function resolveNativeFileJobStage(
     status: NativeFileJobStatus,
     format?: NativeFileOperationFormat,
 ): NativeFileJobStage | null {
+    // The assignment pass happens inside the activation wait, so it is named
+    // before the wait's own stage.
+    if (status.phase === 'awaiting-activation' && status.pluginValuePreview?.length) {
+        return 'assign-plugin-values'
+    }
     if (status.detail) return status.detail.stage
     switch (status.phase) {
         case 'reading-source':
@@ -341,6 +347,7 @@ export interface NativeFileJobStatus {
     expectedRevision?: number
     deviceSessionId?: string
     restorePreview?: NativePortableRestorePreview
+    pluginValuePreview?: NativeStagedPluginValue[]
     warningCodes?: string[]
     state: NativeFileJobState
     phase:
@@ -458,9 +465,34 @@ export interface PreparedNativeContentReceipt extends PreparedNativeContentActiv
     cancel(): Promise<void>
 }
 
+/** One staged value a save left without an owner. Sizes only, never values. */
+export interface NativeStagedPluginValue {
+    key: string
+    byteSize: number
+    valueType: 'json' | 'string'
+}
+
+export interface NativeStagedPluginAssignment {
+    owner: string
+    keys: string[]
+}
+
+export interface NativeStagedPluginChoice {
+    assignments: NativeStagedPluginAssignment[]
+    /** Whether the values left here may go to the first plugin that asks. */
+    automatic: boolean
+}
+
 export interface NativeFileRestoreJobOptions extends NativeFileJobOptions {
     /** Runs after staging and before taking the destructive replacement fence. */
     beforeActivation?(): void | Promise<void>
+    /**
+     * Asks who owns the plugin values a save left unassigned. Answering with
+     * nothing cancels the import, which is what a person closing the pass means.
+     */
+    assignPluginValues?(
+        preview: NativeStagedPluginValue[],
+    ): Promise<NativeStagedPluginChoice | null>
     afterRefresh?(): void | Promise<void>
     onBlockingChange?(blocking: boolean): void
 }
@@ -1276,6 +1308,28 @@ async function runNativeReplacementRestore(
                         invoke: dependencies.invoke as import('./deviceBackup/nativeSpool').DeviceNativeInvoke,
                     },
                 )
+            }
+            if (
+                status.state === 'waitingForInput' &&
+                status.phase === 'awaiting-activation' &&
+                !replacementFence &&
+                !cancellationRequested &&
+                status.pluginValuePreview?.length &&
+                options.assignPluginValues
+            ) {
+                const choice = await options.assignPluginValues(status.pluginValuePreview)
+                if (!choice || options.signal?.aborted) {
+                    cancellationRequested = true
+                    await invokeNative(dependencies, 'native_file_job_cancel', {
+                        jobId: started.jobId,
+                    })
+                    continue
+                }
+                await invokeNative(dependencies, 'native_plugin_values_assign', {
+                    jobId: started.jobId,
+                    assignments: choice.assignments,
+                    automatic: choice.automatic,
+                })
             }
             if (
                 status.state === 'waitingForInput' &&

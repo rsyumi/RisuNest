@@ -5,6 +5,7 @@ use super::{
     StoreResult, WorkingSetCommit, GENERATION_TABLES,
 };
 use super::plugin_owner;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 pub(super) fn incremental_commit<T>(
@@ -2753,4 +2754,96 @@ pub(super) fn colliding_plugin_storage_keys(
         }
     }
     Ok(colliding)
+}
+
+/// One staged value a save left without an owner. The list carries sizes, never
+/// the values themselves.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StagedPluginValue {
+    pub(crate) key: String,
+    pub(crate) byte_size: i64,
+    pub(crate) value_type: String,
+}
+
+/// Keys a person handed to one plugin before the import is applied.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct StagedPluginAssignment {
+    pub(crate) owner: String,
+    pub(crate) keys: Vec<String>,
+}
+
+pub(super) fn staged_unowned_plugin_values(
+    connection: &Connection,
+    staging_id: &str,
+) -> StoreResult<Vec<StagedPluginValue>> {
+    let mut statement = connection.prepare(
+        "SELECT storage_key, byte_size,
+                CASE WHEN substr(value, 1, 1) = '\"' THEN 'string' ELSE 'json' END
+         FROM plugin_storage
+         WHERE generation = ?1 AND owner = ?2
+         ORDER BY ordinal",
+    )?;
+    let values = statement
+        .query_map(params![staging_id, plugin_owner::UNOWNED_OWNER], |row| {
+            Ok(StagedPluginValue {
+                key: row.get(0)?,
+                byte_size: row.get(1)?,
+                value_type: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(values)
+}
+
+/// Applies the choices made before an import is activated. Staging is invisible
+/// to the change index, so this is an ordinary write. Turning automatic
+/// assignment off clears the import the remaining values arrived in, which is
+/// what stops a plugin from being offered them later.
+pub(super) fn assign_staged_plugin_values(
+    connection: &mut Connection,
+    staging_id: &str,
+    assignments: &[StagedPluginAssignment],
+    automatic: bool,
+) -> StoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_staging(&transaction, staging_id)?;
+    for assignment in assignments {
+        if !plugin_owner::validate_owner(&assignment.owner)
+            || plugin_owner::is_unowned(&assignment.owner)
+        {
+            return Err(validation("plugin storage owner is invalid"));
+        }
+        for key in &assignment.keys {
+            let held: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM plugin_storage
+                 WHERE generation = ?1 AND owner = ?2 AND storage_key = ?3",
+                params![staging_id, assignment.owner, key],
+                |row| row.get(0),
+            )?;
+            if held != 0 {
+                continue;
+            }
+            transaction.execute(
+                "UPDATE plugin_storage SET owner = ?2
+                 WHERE generation = ?1 AND owner = ?3 AND storage_key = ?4",
+                params![
+                    staging_id,
+                    assignment.owner,
+                    plugin_owner::UNOWNED_OWNER,
+                    key
+                ],
+            )?;
+        }
+    }
+    if !automatic {
+        transaction.execute(
+            "UPDATE plugin_storage SET import_batch_id = NULL
+             WHERE generation = ?1 AND owner = ?2",
+            params![staging_id, plugin_owner::UNOWNED_OWNER],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
 }

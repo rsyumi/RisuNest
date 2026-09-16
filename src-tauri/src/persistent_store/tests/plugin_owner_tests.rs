@@ -653,3 +653,126 @@ fn discarding_a_colliding_value_removes_only_the_incoming_one() {
         .expect("read unowned row")
         .is_none());
 }
+
+/// The import stage hands values to plugins before the replacement is applied,
+/// and its checkbox decides whether the rest may be taken automatically later.
+#[test]
+fn the_import_stage_assigns_staged_values_and_can_close_the_window_for_the_rest() {
+    use crate::persistent_store::commit::StagedPluginAssignment;
+    let directory = tempfile::tempdir().expect("create import stage directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let staging = store.replace_begin().expect("begin replacement");
+    store
+        .replace_put_root(
+            &staging.staging_id,
+            &json!({
+                "pluginCustomStorage": {
+                    "pm_store": { "apiKey": "imported" },
+                    "pm_keys": "imported keys",
+                    "yt_glossary": ["term"]
+                }
+            }),
+        )
+        .expect("stage imported plugin storage");
+
+    let preview = store
+        .staged_unowned_plugin_values(&staging.staging_id)
+        .expect("read the staged values");
+    assert_eq!(
+        preview
+            .iter()
+            .map(|value| (value.key.as_str(), value.value_type.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("pm_store", "json"),
+            ("pm_keys", "string"),
+            ("yt_glossary", "json"),
+        ]
+    );
+    assert!(preview.iter().all(|value| value.byte_size > 0));
+
+    store
+        .assign_staged_plugin_values(
+            &staging.staging_id,
+            &[StagedPluginAssignment {
+                owner: "provider-manager".to_owned(),
+                keys: vec!["pm_store".to_owned(), "pm_keys".to_owned()],
+            }],
+            false,
+        )
+        .expect("assign the chosen values");
+    store
+        .replace_commit(&staging.staging_id, Some(0))
+        .expect("activate the import");
+
+    assert_eq!(
+        store
+            .read_plugin_storage("provider-manager", "pm_store", None)
+            .expect("read assigned row")
+            .expect("assigned row exists")
+            .value,
+        json!({ "apiKey": "imported" })
+    );
+    assert!(store
+        .read_plugin_storage(UNOWNED_OWNER, "yt_glossary", None)
+        .expect("read the value left alone")
+        .is_some());
+    // Automatic assignment was refused, so nothing is offered afterwards.
+    assert!(store
+        .begin_plugin_claim_session("yumi-translator", "hash-one", "run-one")
+        .expect("open a claim session")
+        .is_none());
+}
+
+#[test]
+fn leaving_automatic_assignment_on_offers_the_rest_to_the_first_plugin_that_asks() {
+    use crate::persistent_store::commit::StagedPluginAssignment;
+    let directory = tempfile::tempdir().expect("create import stage directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let staging = store.replace_begin().expect("begin replacement");
+    store
+        .replace_put_root(
+            &staging.staging_id,
+            &json!({ "pluginCustomStorage": { "pm_store": "imported", "yt_glossary": "left" } }),
+        )
+        .expect("stage imported plugin storage");
+    store
+        .assign_staged_plugin_values(
+            &staging.staging_id,
+            &[StagedPluginAssignment {
+                owner: "provider-manager".to_owned(),
+                keys: vec!["pm_store".to_owned()],
+            }],
+            true,
+        )
+        .expect("assign the chosen values");
+    store
+        .replace_commit(&staging.staging_id, Some(0))
+        .expect("activate the import");
+
+    let session = store
+        .begin_plugin_claim_session("yumi-translator", "hash-one", "run-one")
+        .expect("open a claim session")
+        .expect("a waiting import opens a window");
+    assert_eq!(
+        claim(
+            &mut store,
+            &session,
+            "yumi-translator",
+            "hash-one",
+            "run-one",
+            "yt_glossary",
+        ),
+        Some(json!("left"))
+    );
+    // The key a person already assigned is never on offer.
+    assert!(claim(
+        &mut store,
+        &session,
+        "yumi-translator",
+        "hash-one",
+        "run-one",
+        "pm_store",
+    )
+    .is_none());
+}

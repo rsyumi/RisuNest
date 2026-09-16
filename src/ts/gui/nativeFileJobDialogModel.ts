@@ -76,6 +76,7 @@ const STAGE_ORDER: DialogStageId[] = [
     'decoding-database',
     'staging-characters',
     'finalizing-staging',
+    'assign-plugin-values',
     'activating',
     'refreshing-app',
     'reloading-plugins',
@@ -223,6 +224,7 @@ function stageLabel(stage: NativeFileJobDialogStage): string {
         case 'decoding-database': return copy.stageDecodingDatabase
         case 'staging-characters': return copy.stageStagingCharacters
         case 'finalizing-staging': return copy.stageFinalizingStaging
+        case 'assign-plugin-values': return copy.stageAssignPluginValues
         case 'activating': return copy.stageActivating
         case 'refreshing-app': return copy.stageRefreshingApp
         case 'reloading-plugins': return copy.stageReloadingPlugins

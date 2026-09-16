@@ -25,11 +25,13 @@
     interface Props {
         /** The import stage assigns staged values and never shows the device scope. */
         place?: 'settings' | 'import'
+        /** Values still being staged, which are not in the store yet. */
+        staged?: PluginDataItem[]
         /** Selection the import stage reads back when the person continues. */
         onselectionchange?: (assignments: { owner: string; items: PluginDataItem[] }[]) => void
     }
 
-    let { place = 'settings', onselectionchange }: Props = $props()
+    let { place = 'settings', staged, onselectionchange }: Props = $props()
 
     const strings = language.risuNest.pluginData
     const assignStrings = strings.assign
@@ -264,7 +266,10 @@
         await loadPlugins()
     }
 
-    onMount(load)
+    onMount(() => {
+        if (staged) items = [...staged]
+        else void load()
+    })
 </script>
 
 {#snippet ownerChips()}

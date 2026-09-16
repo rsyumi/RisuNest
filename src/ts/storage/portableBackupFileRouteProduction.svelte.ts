@@ -13,6 +13,7 @@ import {
     selectPortableBackupExport,
     selectPortableBackupRestore,
 } from './deviceBackup/selectionDialog'
+import { selectPluginValueAssignment } from './pluginValueAssignDialog'
 import { runSharedNativeFileOperation } from './nativeFileJobManager'
 import {
     NativeFileJobError,
@@ -246,6 +247,7 @@ export async function restoreBackupFromNativeSource(
                     ...options,
                     signal: joined.signal,
                     onStatus,
+                    assignPluginValues: selectPluginValueAssignment,
                     onBlockingChange(blocking) {
                         context.setBlocking(blocking)
                         options.onBlockingChange?.(blocking)

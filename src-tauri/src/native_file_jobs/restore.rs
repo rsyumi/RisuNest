@@ -46,6 +46,14 @@ pub(crate) trait ReplacementSink: Send + Sync {
     ) -> StoreResult<()> {
         Ok(())
     }
+    /// Values the staged save left without an owner. A file RisuNest wrote
+    /// carries ownership, so this is empty for it.
+    fn staged_unowned_plugin_values(
+        &self,
+        _staging_id: &str,
+    ) -> StoreResult<Vec<crate::persistent_store::commit::StagedPluginValue>> {
+        Ok(Vec::new())
+    }
     fn commit(&self, staging_id: &str, expected_revision: i64) -> StoreResult<RevisionResult>;
     fn abort(&self, staging_id: &str) -> StoreResult<()>;
 }
@@ -295,6 +303,13 @@ fn restore_risu_save_reader_controlled<R: Read>(
         if job.is_cancel_requested() {
             return Err(cancelled("restore cancelled before activation"));
         }
+        // A save that says nothing about ownership gets one pass over its
+        // plugin values before the replacement is applied.
+        let unowned = sink
+            .staged_unowned_plugin_values(&staging_id)
+            .map_err(store_error)?;
+        job.set_plugin_value_preview(&staging_id, unowned)
+            .map_err(|error| job_error(job, error))?;
         let activation_revision = job
             .wait_for_restore_finalization()
             .map_err(|error| job_error(job, error))?
