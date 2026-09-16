@@ -394,11 +394,12 @@ impl DeviceStore {
     /// Changes whether a section takes part in synchronization. The generation
     /// moves with the choice, so work planned under the previous one is
     /// recognizable as stale.
-    pub(crate) fn set_section_participation(
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_section_participating(
         &mut self,
         section: Section,
         participating: bool,
-    ) -> StoreResult<String> {
+    ) -> StoreResult<()> {
         let transaction = self.transaction()?;
         let (current, generation): (bool, String) = transaction.query_row(
             "SELECT participating,participation_generation FROM device_sections WHERE section=?1",
@@ -407,7 +408,7 @@ impl DeviceStore {
         )?;
         if current == participating {
             transaction.commit()?;
-            return Ok(generation);
+            return Ok(());
         }
         let next = sequence(&generation)?
             .next()
@@ -418,7 +419,7 @@ impl DeviceStore {
             params![participating, next.as_str(), section.as_str()],
         )?;
         transaction.commit()?;
-        Ok(next.as_str().to_owned())
+        Ok(())
     }
 
     pub(crate) fn asset_residency_policy(&self) -> StoreResult<AssetPolicy> {

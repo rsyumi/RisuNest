@@ -154,7 +154,9 @@ impl PersistentStore {
         })();
         if outcome.is_err() {
             let _ = stored.remove(&root);
+            return outcome;
         }
+        super::server_sync_sections::forget_publications(self.device_store_mut()?)?;
         outcome
     }
     /// Disconnect keeps PDS and cached immutable bytes. An unresolved operation
@@ -205,6 +207,7 @@ impl PersistentStore {
             tx.execute(&format!("DELETE FROM {table}"), [])?;
         }
         tx.commit()?;
+        super::server_sync_sections::forget_publications(self.device_store_mut()?)?;
         if let Some(stored) = stored {
             let _ = stored.remove(self.repository_root());
         }
@@ -340,6 +343,9 @@ impl PersistentStore {
             }
         } else if let Some(replacement) = replacement {
             let _ = replacement.remove(&root);
+        }
+        if outcome.is_ok() {
+            super::server_sync_sections::forget_publications(self.device_store_mut()?)?;
         }
         outcome
     }

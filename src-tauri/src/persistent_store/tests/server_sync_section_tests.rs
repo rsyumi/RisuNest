@@ -189,7 +189,7 @@ fn an_applied_hypa_section_does_not_advance_the_plugin_section_floor() {
     author
         .device_store_mut()
         .unwrap()
-        .set_section_participation(Section::LocalPlugins, true)
+        .set_section_participating(Section::LocalPlugins, true)
         .unwrap();
     fleet.bind(&mut author);
     fleet.bind(&mut reader);
@@ -282,7 +282,7 @@ fn a_participation_change_during_a_cycle_cancels_its_section_work() {
     reader
         .device_store_mut()
         .unwrap()
-        .set_section_participation(Section::Hypa, false)
+        .set_section_participating(Section::Hypa, false)
         .unwrap();
     reader.server_activate_cycle(&mut ready).unwrap();
     assert_eq!(reader.server_publish_cycle(&ready).unwrap().phase, "idle");
@@ -441,4 +441,54 @@ fn both_sync_adapters_settle_on_the_same_section_values_whatever_the_order() {
     assert_eq!(settled[0].4, "writer-b");
     assert!(settled[1].2);
     assert_eq!(settled[2].1.as_deref(), Some("only"));
+}
+
+/// Publication is recorded against the binding that received it, so a device
+/// bound to another server proposes everything it holds again.
+#[test]
+fn a_rebound_replica_proposes_the_section_values_it_already_holds() {
+    let first = fleet();
+    let (_store_dir, mut store) = prepared();
+    first.bind(&mut store);
+    store
+        .device_store_mut()
+        .unwrap()
+        .write_hypa_embeddings(&[embedding(9, 4, 0x88)])
+        .unwrap();
+    assert_eq!(settle(&mut store).phase, "idle");
+    assert_eq!(settle(&mut store).phase, "idle");
+    assert_ne!(
+        first
+            .server
+            .head()
+            .unwrap()
+            .section(Domain::Hypa)
+            .unwrap()
+            .changed_seq
+            .as_str(),
+        "0"
+    );
+
+    store.server_unbind().unwrap();
+    let second = fleet();
+    second.bind(&mut store);
+    assert_eq!(settle(&mut store).phase, "idle");
+    assert_eq!(settle(&mut store).phase, "idle");
+    assert_ne!(
+        second
+            .server
+            .head()
+            .unwrap()
+            .section(Domain::Hypa)
+            .unwrap()
+            .changed_seq
+            .as_str(),
+        "0"
+    );
+    let (_reader_dir, mut reader) = prepared();
+    second.bind(&mut reader);
+    assert_eq!(settle(&mut reader).phase, "idle");
+    assert_eq!(read_vector(&reader, 9), Some(vec![0x88; 16]));
+    first.task.abort();
+    second.task.abort();
 }

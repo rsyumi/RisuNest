@@ -1,9 +1,7 @@
 //! Device sections on the server replica. Their rows live in the device file
 //! and settle on their own write clock, so the library's three way base plays
 //! no part in deciding a winner here.
-use super::device_store::{
-    begin_mutation, finish_mutation, observe_remote_clock, DeviceStore, Section,
-};
+use super::device_store::{observe_remote_clock, DeviceStore, Section};
 use super::{StoreError, StoreResult};
 use risunest_external_storage_format::section::{
     decode_local_plugin_entry_key, hypa_entry_key, local_plugin_entry_key, HypaValue,
@@ -13,6 +11,7 @@ use risunest_external_storage_format::section::{
 use risunest_sync_wire::{Domain, Sequence};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 /// One page of section keys, bounded like every other replica scan.
 pub(crate) const SECTION_PAGE: usize = 512;
@@ -359,6 +358,20 @@ pub(crate) fn pending_page(
     }
 }
 
+/// Forgets which values reached a remote. Publication is recorded against the
+/// binding that received it, so a new or reset binding starts from nothing.
+pub(crate) fn forget_publications(device: &mut DeviceStore) -> StoreResult<()> {
+    let tx = device.transaction()?;
+    for table in ["hypa_embeddings", "plugin_device_storage"] {
+        tx.execute(
+            &format!("UPDATE {table} SET published_clock=NULL WHERE published_clock IS NOT NULL"),
+            [],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn mark_row(tx: &Transaction<'_>, domain: Domain, key: &str) -> StoreResult<()> {
     // Publication bookkeeping is control metadata, so it runs outside a change
     // context and never reaches the device change index.
@@ -454,14 +467,21 @@ fn apply_row(
                     ],
                 )?;
             }
-            // A deletion applies to a row this device holds. With no such row
-            // there is nothing to delete and nothing to invent.
+            // A deletion is kept as a row even for a key this device never
+            // held, so a later delivery of an older value cannot revive it.
             SectionValue::Tombstone => {
                 tx.execute(
-                    "UPDATE hypa_embeddings
-                        SET vector=NULL,metadata=NULL,tombstone=1,write_clock=?2,writer_id=?3,
-                            published_clock=?2
-                        WHERE cache_key=?1",
+                    "INSERT INTO hypa_embeddings
+                        (cache_key,producer,model,endpoint,preprocess_version,dimensions,vector,
+                         metadata,tombstone,write_clock,writer_id,published_clock)
+                        VALUES (?1,'','',NULL,0,1,NULL,NULL,1,?2,?3,?2)
+                        ON CONFLICT(cache_key) DO UPDATE SET
+                            vector=NULL,
+                            metadata=NULL,
+                            tombstone=1,
+                            write_clock=excluded.write_clock,
+                            writer_id=excluded.writer_id,
+                            published_clock=excluded.published_clock",
                     params![entry.key, version.write_clock.as_str(), version.writer_id],
                 )?;
             }
@@ -557,17 +577,14 @@ pub(crate) enum SectionWrite {
 /// Applies received entries and publication bookkeeping in one device
 /// transaction. The persistent store commits separately, so a section that
 /// landed here stays landed even when the library activation fails afterwards.
+/// Received rows are written outside a change context, so the change index does
+/// not offer them back as this device's own writes.
 pub(crate) fn write_sections(device: &mut DeviceStore, writes: &[SectionWrite]) -> StoreResult<()> {
     if writes.is_empty() {
         return Ok(());
     }
-    let applies = writes
-        .iter()
-        .any(|write| matches!(write, SectionWrite::Apply { .. }));
     let tx = device.transaction()?;
-    if applies {
-        begin_mutation(&tx)?;
-    }
+    let mut observed: BTreeMap<&'static str, (Section, Sequence)> = BTreeMap::new();
     for write in writes {
         match write {
             SectionWrite::Apply {
@@ -584,19 +601,19 @@ pub(crate) fn write_sections(device: &mut DeviceStore, writes: &[SectionWrite]) 
                     .ok_or_else(|| StoreError::Validation {
                         message: "Section entry carries no version".into(),
                     })?;
-                observe_remote_clock(&tx, section, &version.write_clock)?;
+                let highest = observed
+                    .entry(section.as_str())
+                    .or_insert_with(|| (section, Sequence::from(0u64)));
+                if version.write_clock > highest.1 {
+                    highest.1 = version.write_clock.clone();
+                }
                 apply_row(&tx, *domain, entry, object.as_deref())?;
             }
-            SectionWrite::Mark { .. } => (),
+            SectionWrite::Mark { domain, key } => mark_row(&tx, *domain, key)?,
         }
     }
-    if applies {
-        finish_mutation(&tx)?;
-    }
-    for write in writes {
-        if let SectionWrite::Mark { domain, key } = write {
-            mark_row(&tx, *domain, key)?;
-        }
+    for (section, highest) in observed.into_values() {
+        observe_remote_clock(&tx, section, &highest)?;
     }
     tx.commit()?;
     Ok(())
