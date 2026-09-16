@@ -5,7 +5,7 @@ use super::{invalid, observe_remote_clock, sequence, DeviceStore, Section};
 use crate::persistent_store::StoreResult;
 use risunest_sync_wire::Sequence;
 use rusqlite::{params, OptionalExtension, Transaction};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Device settings a restored installation wants back, as opposed to the
 /// coordination state it must never inherit from another run.
@@ -93,6 +93,35 @@ pub(crate) struct SectionCursor {
 
 fn setting_is_local(key: &str) -> bool {
     LOCAL_SETTING_KEYS.contains(&key)
+}
+
+/// Keys no remote has been told about yet. A restore uses them to tell its own
+/// interrupted attempt apart from a value some remote already carries.
+fn unpublished_keys(
+    tx: &Transaction<'_>,
+    section: Section,
+) -> StoreResult<BTreeSet<(String, String, String)>> {
+    let mut keys = BTreeSet::new();
+    match section {
+        Section::Hypa => {
+            let mut statement = tx
+                .prepare("SELECT cache_key FROM hypa_embeddings WHERE published_clock IS NULL")?;
+            let mut query = statement.query([])?;
+            while let Some(row) = query.next()? {
+                keys.insert((row.get(0)?, String::new(), String::new()));
+            }
+        }
+        Section::LocalPlugins => {
+            let mut statement = tx.prepare(
+                "SELECT owner,space,key FROM plugin_device_storage WHERE published_clock IS NULL",
+            )?;
+            let mut query = statement.query([])?;
+            while let Some(row) = query.next()? {
+                keys.insert((row.get(0)?, row.get(1)?, row.get(2)?));
+            }
+        }
+    }
+    Ok(keys)
 }
 
 fn read_rows(tx: &Transaction<'_>, section: Section) -> StoreResult<Vec<SectionRow>> {
@@ -438,7 +467,11 @@ impl DeviceStore {
 
     /// Installs backup material for the same device. A restored value is this
     /// device's own write, so it takes a freshly issued clock and this writer
-    /// rather than whatever produced the bundle.
+    /// rather than whatever produced the bundle. The section is replaced: a key
+    /// the material leaves out is removed, so restoring an empty section empties
+    /// it. A value this device already holds unpublished under its own writer is
+    /// left alone, which keeps a retried restore from issuing a second clock for
+    /// something it already wrote.
     pub(crate) fn restore_section_rows(
         &mut self,
         section: Section,
@@ -450,10 +483,28 @@ impl DeviceStore {
             [],
             |row| row.get(0),
         )?;
+        let restored: BTreeSet<(String, String, String)> =
+            rows.iter().map(SectionRow::key).collect();
+        if restored.len() != rows.len() {
+            return Err(invalid("restored section rows repeat a key"));
+        }
+        let unpublished = unpublished_keys(&transaction, section)?;
+        let held: BTreeMap<(String, String, String), SectionRow> = read_rows(&transaction, section)?
+            .into_iter()
+            .map(|row| (row.key(), row))
+            .collect();
         super::begin_mutation(&transaction)?;
         for row in rows {
             if row.value == SectionValueRow::Tombstone {
                 return Err(invalid("restored section row has no value"));
+            }
+            let settled = held.get(&row.key()).is_some_and(|current| {
+                current.value == row.value
+                    && current.writer_id == writer_id
+                    && unpublished.contains(&row.key())
+            });
+            if settled {
+                continue;
             }
             let clock = super::issue_write_clock(&transaction, section)?;
             write_row(
@@ -467,20 +518,45 @@ impl DeviceStore {
                 false,
             )?;
         }
+        for (key, current) in &held {
+            if restored.contains(key) || current.value == SectionValueRow::Tombstone {
+                continue;
+            }
+            let clock = super::issue_write_clock(&transaction, section)?;
+            write_row(
+                &transaction,
+                section,
+                &SectionRow {
+                    value: SectionValueRow::Tombstone,
+                    write_clock: clock,
+                    writer_id: writer_id.clone(),
+                    ..current.clone()
+                },
+                false,
+            )?;
+        }
         super::finish_mutation(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
 
     /// Installs backup material for the same device. Versions are reissued
-    /// locally because a bundle carries user values without them.
+    /// locally because a bundle carries user values without them. The area is
+    /// replaced within its own bounds: a local setting or permission the
+    /// material leaves out is removed, while every device setting outside the
+    /// backed-up list keeps whatever this device holds.
     pub(crate) fn restore_local_setting_rows(&mut self, rows: &[SectionRow]) -> StoreResult<()> {
         let transaction = self.transaction()?;
+        let mut settings = BTreeSet::new();
+        let mut permissions = BTreeSet::new();
         for row in rows {
             match &row.value {
                 SectionValueRow::Setting { value } => {
                     if row.key1 != "setting" || !setting_is_local(&row.key2) {
                         return Err(invalid("restored device setting is not a device setting"));
+                    }
+                    if !settings.insert(row.key2.clone()) {
+                        return Err(invalid("restored device settings repeat a key"));
                     }
                     transaction.execute(
                         "INSERT INTO device_settings (key,value) VALUES (?1,?2)
@@ -493,6 +569,9 @@ impl DeviceStore {
                     {
                         return Err(invalid("restored plugin permission is incomplete"));
                     }
+                    if !permissions.insert((row.key2.clone(), row.key3.clone())) {
+                        return Err(invalid("restored plugin permissions repeat a key"));
+                    }
                     transaction.execute(
                         "INSERT INTO plugin_permissions (code_hash,permission,granted)
                             VALUES (?1,?2,?3)
@@ -501,6 +580,29 @@ impl DeviceStore {
                     )?;
                 }
                 _ => return Err(invalid("restored device setting has the wrong shape")),
+            }
+        }
+        for key in LOCAL_SETTING_KEYS {
+            if !settings.contains(key) {
+                transaction.execute("DELETE FROM device_settings WHERE key=?1", [key])?;
+            }
+        }
+        let held = {
+            let mut statement =
+                transaction.prepare("SELECT code_hash,permission FROM plugin_permissions")?;
+            let mut query = statement.query([])?;
+            let mut held = Vec::new();
+            while let Some(row) = query.next()? {
+                held.push((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
+            }
+            held
+        };
+        for key in held {
+            if !permissions.contains(&key) {
+                transaction.execute(
+                    "DELETE FROM plugin_permissions WHERE code_hash=?1 AND permission=?2",
+                    params![key.0, key.1],
+                )?;
             }
         }
         transaction.commit()?;

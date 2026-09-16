@@ -22,8 +22,11 @@
         ExternalJobSummary,
         ExternalQuotaSummary,
         ExternalRecoveryMaterial,
+        ExternalRestoreArea,
+        ExternalRestoreSection,
         ExternalStorageState,
     } from 'src/ts/storage/sync/external/types'
+    import { externalRestorableSections, externalRestoreAreas } from 'src/ts/storage/sync/external/restoreScope'
     import ConnectionForm from './ConnectionForm.svelte'
     import { externalConnectionTitle, externalErrorMessage, externalStorageStrings } from './strings'
 
@@ -43,7 +46,49 @@
     let quota = $state<Record<string, ExternalQuotaSummary>>({})
     let recovery = $state<ExternalRecoveryMaterial | null>(null)
     let recoveryQr = $state('')
+    /** The history entry whose restore scope is open, and what is ticked in it. */
+    let restoreScope = $state<{ id: string; sections: ExternalRestoreSection[] } | null>(null)
     let pollTimer: ReturnType<typeof setTimeout> | undefined
+
+    const sectionLabels: Record<ExternalRestoreSection, keyof typeof strings> = {
+        hypa: 'hypa',
+        'local-plugins': 'devicePlugins',
+        'local-settings': 'deviceSettings',
+    }
+    const sectionHelp: Record<ExternalRestoreSection, keyof typeof strings> = {
+        hypa: 'hypaHelp',
+        'local-plugins': 'devicePluginsHelp',
+        'local-settings': 'deviceSettingsHelp',
+    }
+
+    /**
+     * A backup that carries nothing beside the library has nothing to choose,
+     * so it restores straight away. Otherwise the areas it covers are offered,
+     * ticked, because they are what the backup was made to keep.
+     */
+    function beginRestore(
+        connection: ExternalConnectionSummary,
+        item: ExternalHistoryItem,
+    ): void {
+        const sections = externalRestorableSections(item)
+        if (sections.length === 0) {
+            void runJob(connection, 'restore', {
+                snapshotId: item.id,
+                restoreAreas: externalRestoreAreas(item, []),
+            })
+            return
+        }
+        restoreScope = { id: item.id, sections }
+    }
+
+    function toggleRestoreSection(section: ExternalRestoreSection, included: boolean): void {
+        if (!restoreScope) return
+        const sections = restoreScope.sections.filter(current => current !== section)
+        restoreScope = {
+            ...restoreScope,
+            sections: included ? [...sections, section] : sections,
+        }
+    }
 
     onMount(() => {
         const openExternalStorage = (event: Event) => {
@@ -97,7 +142,12 @@
     async function runJob(
         connection: ExternalConnectionSummary,
         job: 'backup' | 'sync' | 'restore' | 'pin-history' | 'resolve-conflict',
-        details: { snapshotId?: string; conflictId?: string; choice?: 'local' | 'remote' } = {},
+        details: {
+            snapshotId?: string
+            conflictId?: string
+            choice?: 'local' | 'remote'
+            restoreAreas?: ExternalRestoreArea[]
+        } = {},
     ): Promise<void> {
         if (job === 'restore' && !(await alertConfirm(strings.restore))) return
         busy = true
@@ -107,11 +157,14 @@
                 schedulePoll(true)
                 await operation
             } else if (job === 'restore') {
-                if (!details.snapshotId) throw new Error('Missing snapshot identifier')
+                if (!details.snapshotId || !details.restoreAreas) {
+                    throw new Error('Missing restore request')
+                }
+                restoreScope = null
                 const operation = requestExternalStorageRestore(
                     connection.id,
                     details.snapshotId,
-                    ['library', 'referencedAssets'],
+                    details.restoreAreas,
                 )
                 schedulePoll(true)
                 await operation
@@ -157,6 +210,7 @@
     }
 
     async function openDetails(connection: ExternalConnectionSummary, kind: 'history' | 'conflicts' | 'quota'): Promise<void> {
+        restoreScope = null
         if (expanded[connection.id] === kind) {
             expanded[connection.id] = ''
             return
@@ -452,12 +506,27 @@
                                 <div class="line">
                                     <span>{historyLine(item)}</span>
                                     <span class="item-actions">
-                                        <SettingButton variant="secondary" disabled={!item.complete || !item.verified} onclick={() => runJob(connection, 'restore', { snapshotId: item.id })}>{strings.restore}</SettingButton>
+                                        <SettingButton variant="secondary" disabled={!item.complete || !item.verified} onclick={() => beginRestore(connection, item)}>{strings.restore}</SettingButton>
                                         <SettingButton variant="secondary" disabled={!item.complete || !item.verified} onclick={() => exportSnapshot(connection.id, item.id)}>{strings.download}</SettingButton>
                                         {#if item.pinned}<SettingButton variant="secondary" disabled>{strings.pinned}</SettingButton>
                                         {:else}<SettingButton variant="secondary" onclick={() => runJob(connection, 'pin-history', { snapshotId: item.id })}>{strings.pin}</SettingButton>{/if}
                                     </span>
                                 </div>
+                                {#if restoreScope && restoreScope.id === item.id}
+                                    {@const chosen = restoreScope.sections}
+                                    <div class="scope">
+                                        <h4 class="policy-title">{strings.chooseRestore}</h4>
+                                        <p class="policy-row fixed"><span>{strings.library}</span><span class="value">{strings.included}</span></p>
+                                        {#each externalRestorableSections(item) as section (section)}
+                                            <label class="policy-row"><input type="checkbox" disabled={busy} checked={chosen.includes(section)} onchange={event => toggleRestoreSection(section, event.currentTarget.checked)} /><span>{strings[sectionLabels[section]]}</span></label>
+                                            <p class="policy-note">{strings[sectionHelp[section]]}</p>
+                                        {/each}
+                                        <div class="actions">
+                                            <SettingButton disabled={busy} onclick={() => runJob(connection, 'restore', { snapshotId: item.id, restoreAreas: externalRestoreAreas(item, chosen) })}>{strings.restore}</SettingButton>
+                                            <SettingButton variant="secondary" disabled={busy} onclick={() => { restoreScope = null }}>{strings.cancel}</SettingButton>
+                                        </div>
+                                    </div>
+                                {/if}
                                 {#if item.warning}<p class="text-xs text-danger-400">{item.warning}</p>{/if}
                             </div>
                         {/each}
@@ -705,6 +774,12 @@
         align-items: center;
         justify-content: space-between;
         gap: 0.5rem;
+    }
+    .scope {
+        display: grid;
+        gap: 0.35rem;
+        padding-top: 0.5rem;
+        border-top: 1px solid color-mix(in srgb, var(--risu-theme-darkborderc) 55%, transparent);
     }
     .conflict {
         display: grid;

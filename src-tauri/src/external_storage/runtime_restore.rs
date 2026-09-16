@@ -222,6 +222,24 @@ fn restore_selection(restore_areas: Option<&[String]>) -> Result<RestoreSelectio
     Ok(RestoreSelection { library, sections })
 }
 
+/// Local settings belong to the device that wrote them, so only that device's
+/// own backup may bring them back. Published states and another device's
+/// bundles are refused here rather than at the screen, because the request
+/// names the areas and the screen is not the only caller.
+fn require_restorable_sections(
+    selection: &RestoreSelection,
+    snapshot: &PreparedRemoteSnapshot,
+    store_id: &str,
+) -> Result<()> {
+    if !selection.sections.contains(SectionKind::LocalSettings.id()) {
+        return Ok(());
+    }
+    if store_id.is_empty() || snapshot.captured_by_device.as_deref() != Some(store_id) {
+        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+    }
+    Ok(())
+}
+
 fn checked_required_bytes(
     snapshot: &PreparedRemoteSnapshot,
     selection: &RestoreSelection,
@@ -341,6 +359,7 @@ pub(crate) async fn run_restore(
     cancel.check()?;
     validate_download(connected, snapshot_id, &snapshot)?;
     let selection = restore_selection(job.request.restore_areas.as_deref())?;
+    require_restorable_sections(&selection, &snapshot, &job.admission_identity.store_id)?;
     let sections = snapshot_restore::download_sections(
         &remote,
         &selection.sections,
@@ -978,6 +997,53 @@ mod tests {
         assert!(restore_selection(Some(&["deviceSettings".into()])).is_err());
         assert!(restore_selection(Some(&["hypa".into()])).is_err());
         assert!(restore_selection(Some(&[])).is_err());
+    }
+
+    fn prepared(captured_by_device: Option<&str>) -> PreparedRemoteSnapshot {
+        PreparedRemoteSnapshot {
+            snapshot_id: "synthetic-snapshot".into(),
+            repository_id: "synthetic-repository".into(),
+            fingerprint: "00".repeat(32),
+            library_fingerprint: "00".repeat(32),
+            logical_revision: 1,
+            staging_root: std::path::PathBuf::from("staging"),
+            records: Vec::new(),
+            objects: Vec::new(),
+            captured_by_device: captured_by_device.map(ToOwned::to_owned),
+        }
+    }
+
+    /// Invariant 32 on the restore side. Local settings belong to the device
+    /// that wrote them, so only that device's own backup installs them. Another
+    /// device's backup and a published state are refused even when the request
+    /// names the area, and the areas beside them are unaffected.
+    #[test]
+    fn another_devices_backup_does_not_install_local_settings() {
+        let areas = [
+            "library".to_owned(),
+            "hypa".to_owned(),
+            "local-settings".to_owned(),
+        ];
+        let selection = restore_selection(Some(&areas)).unwrap();
+        assert!(require_restorable_sections(&selection, &prepared(Some("this-device")), "this-device").is_ok());
+        assert!(require_restorable_sections(
+            &selection,
+            &prepared(Some("other-device")),
+            "this-device"
+        )
+        .is_err());
+        assert!(require_restorable_sections(&selection, &prepared(None), "this-device").is_err());
+        assert!(require_restorable_sections(&selection, &prepared(Some("")), "").is_err());
+
+        let without = ["library".to_owned(), "hypa".to_owned(), "local-plugins".to_owned()];
+        let selection = restore_selection(Some(&without)).unwrap();
+        assert!(require_restorable_sections(&selection, &prepared(None), "this-device").is_ok());
+        assert!(require_restorable_sections(
+            &selection,
+            &prepared(Some("other-device")),
+            "this-device"
+        )
+        .is_ok());
     }
 
     #[test]

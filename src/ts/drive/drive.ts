@@ -22,6 +22,7 @@ import { confirmIncompleteColdStorageRestore, getColdStorageBackupName, isColdSt
 import { expandColdPayloads } from "../process/coldPayloadExpansion";
 import { getPersistentDataRuntime, publishCurrentOfficialRevision, replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte";
 import { installDriveRestore } from "../storage/databaseRestore";
+import { externalRestorableSections, externalRestoreAreas } from "../storage/sync/external/restoreScope";
 import { type PinnedRisuSaveExport, withFlushedRisuSaveExport } from "../storage/risuSaveStoreAdapter";
 
 async function openExternalGoogleStorageSetup(): Promise<void> {
@@ -90,7 +91,7 @@ export async function runNativeExternalDriveAction(
     await requestExternalStorageRestore(
         connection.id,
         selectedSnapshot.id,
-        ['library', 'referencedAssets'],
+        externalRestoreAreas(selectedSnapshot, externalRestorableSections(selectedSnapshot)),
     )
 }
 

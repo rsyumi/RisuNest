@@ -5,10 +5,15 @@
  */
 
 import { externalConflictActions, restorableExternalHistoryItems } from 'src/ts/storage/sync/external/connection'
+import {
+    externalRestorableSections,
+    externalRestoreAreas,
+} from 'src/ts/storage/sync/external/restoreScope'
 import type {
     ExternalConflictSummary,
     ExternalConnectionSummary,
     ExternalHistoryItem,
+    ExternalRestoreArea,
 } from 'src/ts/storage/sync/external/types'
 
 /**
@@ -38,9 +43,15 @@ export function externalOnboardingRestorable(
     return restorableExternalHistoryItems(items)
 }
 
-/** The areas a restore replaces, following what the selected bundle covers. */
-export function externalOnboardingRestoreAreas(): Array<'library' | 'referencedAssets'> {
-    return ['library', 'referencedAssets']
+/**
+ * The areas a restore replaces, following what the selected backup covers.
+ * This screen runs on a device with nothing of its own to keep, so everything
+ * the backup carries and this device may take comes over.
+ */
+export function externalOnboardingRestoreAreas(
+    item: Pick<ExternalHistoryItem, 'includedSections' | 'sameDevice'>,
+): ExternalRestoreArea[] {
+    return externalRestoreAreas(item, externalRestorableSections(item))
 }
 
 /** True when a restore replaces device sections, which restarts the app. */

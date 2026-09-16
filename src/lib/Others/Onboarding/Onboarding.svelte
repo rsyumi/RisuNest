@@ -611,15 +611,16 @@
 
     async function restoreExternalBackup(): Promise<void> {
         const connection = externalConnection
-        if (!connection || !externalSelected || externalWorking) return
+        const item = externalRestorable.find((entry) => entry.id === externalSelected)
+        if (!connection || !item || externalWorking) return
         externalWorking = true
         externalError = ''
         externalStage = 'working'
         try {
             await requestExternalStorageRestore(
                 connection.id,
-                externalSelected,
-                externalOnboardingRestoreAreas(),
+                item.id,
+                externalOnboardingRestoreAreas(item),
             )
             flow = goToOnboardingState(flow, 'done', 'external')
         } catch (cause) {

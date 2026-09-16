@@ -142,12 +142,13 @@ export type ExternalJobKind =
     | 'pin-history'
     | 'resolve-conflict'
 
+/** The areas beside the library that a backup can carry. */
+export type ExternalRestoreSection = 'hypa' | 'local-plugins' | 'local-settings'
+
 export type ExternalRestoreArea =
     | 'library'
     | 'referencedAssets'
-    | 'hypa'
-    | 'local-plugins'
-    | 'local-settings'
+    | ExternalRestoreSection
 
 export interface StartExternalJobRequest {
     connectionId: string
@@ -216,6 +217,10 @@ export interface ExternalHistoryItem {
     pinned: boolean
     complete: boolean
     verified: boolean
+    /** The areas this entry carries beside the library. */
+    includedSections: ExternalRestoreSection[]
+    /** Whether these values are the ones this device wrote. */
+    sameDevice: boolean
     deviceName?: string
     warning?: string
 }

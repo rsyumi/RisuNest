@@ -974,6 +974,10 @@ pub(crate) struct SnapshotView {
     pub library: wire::LibrarySnapshotRef,
     pub sections: std::collections::BTreeMap<String, wire::SectionSnapshotRef>,
     pub is_state: bool,
+    /// The device whose own values these sections are, when there is one. A
+    /// published state and a bundle wrapped around one hold merged material
+    /// instead, so neither names a device.
+    pub captured_by_device: Option<String>,
 }
 
 impl SnapshotView {
@@ -990,6 +994,7 @@ impl SnapshotView {
                     library: document.library,
                     sections: document.sections,
                     is_state: true,
+                    captured_by_device: None,
                 }
             }
             wire::ObjectRole::BackupBundle => {
@@ -1005,6 +1010,12 @@ impl SnapshotView {
                         .as_ref()
                         .map(|value| value.as_str().to_owned())
                         .unwrap_or_else(|| "0".into()),
+                    captured_by_device: match &document.source {
+                        wire_control::BundleSource::Device { writer_id } => {
+                            Some(writer_id.clone())
+                        }
+                        wire_control::BundleSource::SyncState { .. } => None,
+                    },
                     library: document.library,
                     sections: document.sections,
                     is_state: false,
