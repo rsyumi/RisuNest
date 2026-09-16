@@ -69,6 +69,10 @@ export function updateAppUpdateSettings(
 ): AppUpdateSettings {
     const next = validateAppUpdateSettings({ ...getAppUpdateSettings(), ...patch })
     getDeviceMarkers().setItem(appUpdateSettingsKey, JSON.stringify(next))
+    void flushAppUpdateSettings().catch((error) => {
+        // The settings stay available in memory for this run.
+        console.error('A device setting could not be stored', error)
+    })
     current = next
     readError = null
     for (const listener of listeners) listener({ ...next })

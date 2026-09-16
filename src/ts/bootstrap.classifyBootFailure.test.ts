@@ -151,7 +151,7 @@ describe('classifyBootFailure', () => {
         ).kind).toBe('schema-unsupported')
     })
 
-    it.each(['persistent-storage', 'persistent-database'])(
+    it.each(['persistent-storage', 'device-settings', 'persistent-database'])(
         'treats a failure in the %s stage as a store that could not be opened',
         (stage) => {
             expect(classifyBootFailure(new Error('disk I/O error'), stage)).toEqual({

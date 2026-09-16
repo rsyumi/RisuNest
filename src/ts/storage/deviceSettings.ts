@@ -115,14 +115,21 @@ export function updateDeviceSettings(
     }
     try {
         storage?.setItem(storageKey, JSON.stringify(settings))
+        // The change is durable only once its transaction commits, so a commit
+        // that fails is reported rather than left in memory unnoticed.
+        void flushDeviceSettings().catch(reportStoreFailure)
     } catch (error) {
-        // Device settings remain available in memory when the store rejects them.
-        console.error('Device settings could not be stored', error)
+        reportStoreFailure(error)
     }
     for (const listener of listeners) {
         listener(snapshot(settings))
     }
     return snapshot(settings)
+}
+
+function reportStoreFailure(error: unknown): void {
+    // The settings stay available in memory for this run.
+    console.error('A device setting could not be stored', error)
 }
 
 /** Resolves once every stored change has committed. */

@@ -184,7 +184,11 @@ function registerAndroidScreenshotPublicationRecovery() {
  * Boot stages whose failures mean the local persistent store could not be
  * opened or bootstrapped. Both of them go through `store.open()`.
  */
-const persistentStoreOpenStages = new Set(['persistent-storage', 'persistent-database'])
+const persistentStoreOpenStages = new Set([
+    'persistent-storage',
+    'device-settings',
+    'persistent-database',
+])
 
 function describeBootFailureError(error: unknown): string {
     if (error instanceof Error) return error.message
