@@ -1,4 +1,4 @@
-pub const VERSION: i64 = 9;
+pub const VERSION: i64 = 1;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE library (singleton INTEGER PRIMARY KEY CHECK(singleton=1), head TEXT NOT NULL);
@@ -60,5 +60,5 @@ CREATE TABLE changes (
 );
 CREATE INDEX changes_cursor ON changes(length(seq),seq,ordinal);
 CREATE INDEX changes_section_cursor ON changes(domain,length(seq),seq,ordinal);
-PRAGMA user_version=9;
+PRAGMA user_version=1;
 "#;
