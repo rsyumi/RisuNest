@@ -1,5 +1,8 @@
 use super::super::super::device_store::{
-    hypa::HypaEmbeddingWrite, plugin_values::PluginDeviceMutation, Section,
+    hypa::HypaEmbeddingWrite,
+    plugin_values::PluginDeviceMutation,
+    sections::{SectionRow, SectionValueRow},
+    Section,
 };
 use super::super::super::server_sync_sections as sections;
 use super::*;
@@ -8,6 +11,7 @@ use risunest_external_storage_format::section::{
     SectionKind, SectionValue,
 };
 use risunest_sync_wire::Sequence;
+use crate::persistent_store::StoreResult;
 
 fn cache_key(seed: u8) -> String {
     hex::encode(Sha256::digest([seed]))
@@ -351,85 +355,30 @@ fn a_restored_replica_installs_no_section_cursor_and_reissues_no_operation() {
     fleet.task.abort();
 }
 
-/// Invariant 37. The rule both remote adapters share settles on one state no
-/// matter which order the entries arrive in.
+/// Invariant 37. The server ledger and the external storage adapter settle on
+/// the same section rows, whichever order the values arrive in.
 #[test]
 fn both_sync_adapters_settle_on_the_same_section_values_whatever_the_order() {
-    let plugin = |key: &str, clock: u64, writer: &str, value: Option<&str>| {
-        SectionEntry::new(
-            SectionKind::LocalPlugins,
-            local_plugin_entry_key("synthetic-plugin", "string", key).unwrap(),
-            match value {
-                Some(value) => SectionValue::LocalPlugin(LocalPluginValue {
-                    space: PluginSpace::String,
-                    value: json!(value),
-                }),
-                None => SectionValue::Tombstone,
-            },
-            Some(SectionEntryVersion {
-                write_clock: Sequence::from(clock),
-                writer_id: writer.into(),
-            }),
-        )
-        .unwrap()
-    };
-    let entries = vec![
-        plugin("alpha", 1, "writer-a", Some("first")),
-        plugin("alpha", 4, "writer-b", Some("second")),
-        plugin("alpha", 4, "writer-a", Some("loser")),
-        plugin("beta", 2, "writer-b", Some("kept")),
-        plugin("beta", 7, "writer-a", None),
-        plugin("gamma", 3, "writer-a", Some("only")),
-    ];
+    let entries = plugin_case_table();
     let orders = [
         vec![0, 1, 2, 3, 4, 5],
         vec![5, 4, 3, 2, 1, 0],
         vec![2, 4, 0, 5, 1, 3],
         vec![4, 1, 3, 0, 2, 5],
     ];
-    let mut settled: Option<Vec<(String, Option<String>, bool, String, String)>> = None;
+    let mut settled: Option<Vec<PluginRowSnapshot>> = None;
     for order in orders {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = PersistentStore::open(dir.path()).unwrap();
+        let ledger = tempfile::tempdir().unwrap();
+        let mut over_ledger = PersistentStore::open(ledger.path()).unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let mut over_external = PersistentStore::open(external.path()).unwrap();
         for index in order {
             let entry = &entries[index];
-            let device = store.device_store().unwrap();
-            let local = sections::read_local(device, Domain::LocalPlugins, &entry.key).unwrap();
-            if sections::resolve(local.as_ref(), entry).unwrap() != sections::Outcome::Apply {
-                continue;
-            }
-            sections::write_sections(
-                store.device_store_mut().unwrap(),
-                &[sections::SectionWrite::Apply {
-                    domain: Domain::LocalPlugins,
-                    entry: entry.clone(),
-                    object: None,
-                }],
-            )
-            .unwrap();
+            apply_over_the_ledger(&mut over_ledger, entry).unwrap();
+            apply_over_external_storage(&mut over_external, entry).unwrap();
         }
-        let device = store.device_store().unwrap();
-        let mut statement = device
-            .connection()
-            .prepare(
-                "SELECT key,value,tombstone,write_clock,writer_id FROM plugin_device_storage
-                    ORDER BY owner,space,key",
-            )
-            .unwrap();
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, bool>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        drop(statement);
+        let rows = plugin_rows(&over_ledger);
+        assert_eq!(plugin_rows(&over_external), rows);
         match &settled {
             None => settled = Some(rows),
             Some(expected) => assert_eq!(&rows, expected),
@@ -437,10 +386,146 @@ fn both_sync_adapters_settle_on_the_same_section_values_whatever_the_order() {
     }
     let settled = settled.unwrap();
     assert_eq!(settled.len(), 3);
-    assert_eq!(settled[0].1.as_deref(), Some("second"));
-    assert_eq!(settled[0].4, "writer-b");
-    assert!(settled[1].2);
-    assert_eq!(settled[2].1.as_deref(), Some("only"));
+    assert_eq!(settled[0].value.as_deref(), Some("second"));
+    assert_eq!(settled[0].writer_id, "writer-b");
+    assert!(settled[1].tombstone);
+    assert_eq!(settled[2].value.as_deref(), Some("only"));
+}
+
+/// Invariant 37. One version can only ever stand for one value, and both
+/// adapters refuse the second one rather than picking a winner.
+#[test]
+fn neither_adapter_accepts_a_second_value_for_a_version_it_already_holds() {
+    let first = plugin_entry("alpha", 3, "writer-a", Some("first"));
+    let forged = plugin_entry("alpha", 3, "writer-a", Some("forged"));
+
+    let ledger = tempfile::tempdir().unwrap();
+    let mut over_ledger = PersistentStore::open(ledger.path()).unwrap();
+    apply_over_the_ledger(&mut over_ledger, &first).unwrap();
+    assert!(apply_over_the_ledger(&mut over_ledger, &forged).is_err());
+
+    let external = tempfile::tempdir().unwrap();
+    let mut over_external = PersistentStore::open(external.path()).unwrap();
+    apply_over_external_storage(&mut over_external, &first).unwrap();
+    assert!(apply_over_external_storage(&mut over_external, &forged).is_err());
+
+    assert_eq!(plugin_rows(&over_ledger), plugin_rows(&over_external));
+    assert_eq!(plugin_rows(&over_ledger)[0].value.as_deref(), Some("first"));
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PluginRowSnapshot {
+    key: String,
+    value: Option<String>,
+    tombstone: bool,
+    write_clock: String,
+    writer_id: String,
+}
+
+fn plugin_entry(key: &str, clock: u64, writer: &str, value: Option<&str>) -> SectionEntry {
+    SectionEntry::new(
+        SectionKind::LocalPlugins,
+        local_plugin_entry_key("synthetic-plugin", "string", key).unwrap(),
+        match value {
+            Some(value) => SectionValue::LocalPlugin(LocalPluginValue {
+                space: PluginSpace::String,
+                value: json!(value),
+            }),
+            None => SectionValue::Tombstone,
+        },
+        Some(SectionEntryVersion {
+            write_clock: Sequence::from(clock),
+            writer_id: writer.into(),
+        }),
+    )
+    .unwrap()
+}
+
+/// A local miss, an older arrival, a newer arrival, a tie the writer identity
+/// breaks, a removal and a key only one side ever held.
+fn plugin_case_table() -> Vec<SectionEntry> {
+    vec![
+        plugin_entry("alpha", 1, "writer-a", Some("first")),
+        plugin_entry("alpha", 4, "writer-b", Some("second")),
+        plugin_entry("alpha", 4, "writer-a", Some("loser")),
+        plugin_entry("beta", 2, "writer-b", Some("kept")),
+        plugin_entry("beta", 7, "writer-a", None),
+        plugin_entry("gamma", 3, "writer-a", Some("only")),
+    ]
+}
+
+/// The server adapter decides per key and then writes what it decided.
+fn apply_over_the_ledger(store: &mut PersistentStore, entry: &SectionEntry) -> StoreResult<()> {
+    let local = sections::read_local(store.device_store()?, Domain::LocalPlugins, &entry.key)?;
+    if sections::resolve(local.as_ref(), entry)? != sections::Outcome::Apply {
+        return Ok(());
+    }
+    sections::write_sections(
+        store.device_store_mut()?,
+        &[sections::SectionWrite::Apply {
+            domain: Domain::LocalPlugins,
+            entry: entry.clone(),
+            object: None,
+        }],
+    )
+}
+
+/// The external storage adapter hands the whole row to the device file, which
+/// decides and writes in one place.
+fn apply_over_external_storage(
+    store: &mut PersistentStore,
+    entry: &SectionEntry,
+) -> StoreResult<()> {
+    let (owner, space, key) =
+        risunest_external_storage_format::section::decode_local_plugin_entry_key(&entry.key)
+            .expect("decode the plugin entry key");
+    let version = entry.version.as_ref().expect("the case table sets a version");
+    let row = SectionRow {
+        key1: owner,
+        key2: space.clone(),
+        key3: key,
+        value: match &entry.value {
+            SectionValue::LocalPlugin(value) => SectionValueRow::Plugin {
+                space,
+                value: match &value.value {
+                    Value::String(text) => text.clone(),
+                    other => serde_json::to_string(other)?,
+                },
+            },
+            _ => SectionValueRow::Tombstone,
+        },
+        write_clock: version.write_clock.clone(),
+        writer_id: version.writer_id.clone(),
+    };
+    store
+        .device_store_mut()?
+        .apply_section_rows(Section::LocalPlugins, &[row])
+        .map(|_| ())
+}
+
+fn plugin_rows(store: &PersistentStore) -> Vec<PluginRowSnapshot> {
+    let device = store.device_store().unwrap();
+    let mut statement = device
+        .connection()
+        .prepare(
+            "SELECT key,value,tombstone,write_clock,writer_id FROM plugin_device_storage
+                ORDER BY owner,space,key",
+        )
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| {
+            Ok(PluginRowSnapshot {
+                key: row.get(0)?,
+                value: row.get(1)?,
+                tombstone: row.get(2)?,
+                write_clock: row.get(3)?,
+                writer_id: row.get(4)?,
+            })
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    rows
 }
 
 /// Publication is recorded against the binding that received it, so a device
