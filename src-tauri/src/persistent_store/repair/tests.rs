@@ -1,6 +1,6 @@
 use super::*;
 use crate::data_health::repair::RepairCandidate;
-use crate::persistent_store::{active_generation, AssetRepositoryAuthorityState, ColdPayloadAuthorityState};
+use crate::persistent_store::{active_generation, AssetRepositoryAuthorityState};
 use serde_json::json;
 
 fn candidate(action: RepairAction) -> RepairCandidate {
@@ -35,15 +35,6 @@ fn fixture() -> (tempfile::TempDir, PersistentStore) {
             &AssetRepositoryAuthorityState::V2 {
                 migration_id: "fixture".to_owned(),
                 compatibility_hash: "1a".repeat(32),
-            },
-        )
-        .unwrap();
-    store
-        .replace_put_cold_payload_authority(
-            &staging,
-            &ColdPayloadAuthorityState::V2 {
-                migration_id: "fixture".to_owned(),
-                compatibility_hash: "2b".repeat(32),
             },
         )
         .unwrap();

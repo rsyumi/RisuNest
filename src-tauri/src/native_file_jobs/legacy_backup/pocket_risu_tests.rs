@@ -1,7 +1,7 @@
 use super::*;
 use crate::local_backup::{parse_legacy_local_backup_v1, NeverCancelled};
 use crate::native_file_jobs::{JobKind, JobRegistry};
-use std::io::Cursor;
+use std::io::{Cursor, Seek, SeekFrom};
 
 const V110: &[u8] = include_bytes!("fixtures/pocket-risu-v1.10.0.bin");
 const V112: &[u8] = include_bytes!("fixtures/pocket-risu-v1.12.0.bin");
@@ -23,25 +23,20 @@ impl restore::ReplacementSink for StoreSink {
         self.store.lock().unwrap().replace_put_presets(id, presets)
     }
     fn add_characters(&self, id: &str, characters: &[Value]) -> StoreResult<()> {
+        let expanded =
+            cold_expansion::expand_cold_payloads(characters, &self.payloads.cold_payloads)
+                .map_err(|message| crate::persistent_store::StoreError::Store { message })?;
         self.store
             .lock()
             .unwrap()
-            .replace_add_characters(id, characters)
+            .replace_add_characters(id, expanded.as_deref().unwrap_or(characters))
     }
     fn commit(&self, id: &str, revision: i64) -> StoreResult<RevisionResult> {
         let mut store = self.store.lock().unwrap();
         store.replace_put_asset_aliases(id, &self.payloads.asset_aliases)?;
-        store.replace_put_cold_aliases(id, &self.payloads.cold_aliases)?;
         store.replace_put_asset_repository_authority(
             id,
             &AssetRepositoryAuthorityState::V2 {
-                migration_id: "synthetic-pocket-restore".to_owned(),
-                compatibility_hash: payload_compatibility_hash(&self.payloads),
-            },
-        )?;
-        store.replace_put_cold_payload_authority(
-            id,
-            &ColdPayloadAuthorityState::V2 {
                 migration_id: "synthetic-pocket-restore".to_owned(),
                 compatibility_hash: payload_compatibility_hash(&self.payloads),
             },
@@ -166,20 +161,6 @@ fn both_pocket_versions_restore_database_and_media_into_the_persistent_store() {
             assert_eq!(&actual[key], expected_value, "lost database field: {key}");
         }
         let cas = PayloadCas::new(directory.path()).unwrap();
-        let cold = store
-            .read_cold_alias("9f8b7c6d-1a2b-3c4d-5e6f-a1b2c3d4e5f6", None)
-            .unwrap()
-            .unwrap()
-            .value;
-        let cold_file = cas
-            .open_object(cold.object_hash.as_deref().unwrap())
-            .unwrap()
-            .unwrap();
-        let cold_value: Value = serde_json::from_reader(GzDecoder::new(cold_file)).unwrap();
-        assert_eq!(
-            cold_value,
-            serde_json::json!([{ "id": "synthetic-cold-chat", "message": [{ "role": "user", "data": "Synthetic cold message" }] }])
-        );
         for (key, payload, kind, mime) in [
             ("picture", "synthetic picture", "image", "image/webp"),
             ("voice", "synthetic voice", "audio", "audio/mpeg"),
@@ -327,15 +308,15 @@ fn private_backup_diagnostic() {
 }
 
 #[test]
-fn pocket_namespaced_cold_storage_is_restored_as_cold_payload() {
+fn pocket_namespaced_cold_storage_is_staged_for_expansion() {
     for key in ["9f8b7c6d-1a2b-3c4d-5e6f-a1b2c3d4e5f6", "custom-cold-key"] {
         let result = plan(
             archive_entry(&format!("coldstorage/{key}.json"), br#"[{"message":[]}]"#),
             &NeverCancelled,
         )
         .unwrap();
-        assert_eq!(result.cold_aliases.len(), 1);
-        assert_eq!(result.cold_aliases[0].key, key);
+        assert_eq!(result.cold_payloads.len(), 1);
+        assert!(result.cold_payloads.contains_key(key));
         assert!(result.asset_aliases.is_empty());
     }
 }

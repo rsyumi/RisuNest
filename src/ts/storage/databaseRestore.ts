@@ -28,9 +28,7 @@ interface AccountUnmigrationResourceDependencies {
     readLocalAsset(key: string): Promise<Uint8Array | null>
     readRemoteAsset(key: string): Promise<Uint8Array | null>
     writeLocalAsset(key: string, bytes: Uint8Array): Promise<void>
-    readLocalCold(key: string): Promise<unknown | null>
     readRemoteCold(key: string): Promise<unknown | null>
-    writeLocalCold(key: string, value: unknown): Promise<void>
     onProgress?(stage: 'cold' | 'assets', completed: number, total: number): void
 }
 
@@ -41,32 +39,18 @@ function equalBytes(left: Uint8Array | null, right: Uint8Array): boolean {
 
 export async function materializeAccountUnmigrationResources(
     dependencies: AccountUnmigrationResourceDependencies,
-): Promise<void> {
+): Promise<ReadonlyMap<string, unknown>> {
     const selectedCold = new Map<string, unknown>()
     const coldKeys = [...new Set(dependencies.coldKeys)]
     let completed = 0
     dependencies.onProgress?.('cold', completed, coldKeys.length)
     for (const key of coldKeys) {
-        const local = await dependencies.readLocalCold(key)
-        if (local !== null) {
-            if (!dependencies.isValidCold(local)) {
-                throw new Error(`Invalid local cold payload: ${key}`)
-            }
-            selectedCold.set(key, local)
-            dependencies.onProgress?.('cold', ++completed, coldKeys.length)
-            continue
-        }
         const remote = await dependencies.readRemoteCold(key)
         if (remote === null) throw new Error(`Missing account cold payload: ${key}`)
         if (!dependencies.isValidCold(remote)) {
             throw new Error(`Invalid account cold payload: ${key}`)
         }
-        await dependencies.writeLocalCold(key, remote)
-        const verified = await dependencies.readLocalCold(key)
-        if (verified === null || JSON.stringify(verified) !== JSON.stringify(remote)) {
-            throw new Error(`Failed to verify local cold payload: ${key}`)
-        }
-        selectedCold.set(key, verified)
+        selectedCold.set(key, remote)
         dependencies.onProgress?.('cold', ++completed, coldKeys.length)
     }
 
@@ -86,6 +70,8 @@ export async function materializeAccountUnmigrationResources(
         }
         dependencies.onProgress?.('assets', ++completed, assetKeys.length)
     }
+
+    return selectedCold
 }
 
 export async function installLocalBackup(
@@ -117,7 +103,7 @@ export async function installDriveRestore(
 export async function completeAccountUnmigration(
     database: Database,
     dependencies: {
-        prepareResources: () => Promise<void>
+        prepareResources: (candidate: Database) => Promise<void>
         replaceDatabase: (database: Database, reason: string) => Promise<void>
         finalize: () => void
     },
@@ -125,7 +111,7 @@ export async function completeAccountUnmigration(
     const candidate = safeStructuredClone(database)
     candidate.account = null
 
-    await dependencies.prepareResources()
+    await dependencies.prepareResources(candidate)
     await dependencies.replaceDatabase(candidate, 'account-unmigration')
     dependencies.finalize()
 }

@@ -51,11 +51,6 @@ fn prepared() -> (tempfile::TempDir, PersistentStore) {
         compatibility_hash: "a".repeat(64),
     })
     .unwrap();
-    let cold = serde_json::to_string(&ColdPayloadAuthorityState::V2 {
-        migration_id: "synthetic".into(),
-        compatibility_hash: "b".repeat(64),
-    })
-    .unwrap();
     store
         .connection
         .execute(
@@ -63,7 +58,6 @@ fn prepared() -> (tempfile::TempDir, PersistentStore) {
             params![generation, assets],
         )
         .unwrap();
-    store.connection.execute("INSERT INTO cold_payload_authority(generation,value) VALUES(?1,?2) ON CONFLICT(generation) DO UPDATE SET value=excluded.value",params![generation,cold]).unwrap();
     (directory, store)
 }
 fn settle(store: &mut PersistentStore) -> CycleResult {

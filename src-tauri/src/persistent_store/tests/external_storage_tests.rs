@@ -810,7 +810,7 @@ fn capture_fixture() -> (tempfile::TempDir, PersistentStore, Value) {
     // This synthetic library has a complete empty alias inventory. Its missing
     // fixture images are explicitly absent, not undiscovered legacy files.
     let authority=json!({"format":"v2","migrationId":"synthetic-external","compatibilityHash":"a".repeat(64)}).to_string();
-    for table in ["asset_repository_authority", "cold_payload_authority"] {
+    for table in ["asset_repository_authority"] {
         store
             .connection
             .execute(

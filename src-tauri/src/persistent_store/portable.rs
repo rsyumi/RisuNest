@@ -114,21 +114,6 @@ pub(crate) const TABLES: &[PortableTable] = &[
         columns: &[("value", "TEXT")],
         order: "value",
     },
-    PortableTable {
-        name: "cold_aliases",
-        columns: &[
-            ("key", "TEXT"),
-            ("object_hash", "TEXT"),
-            ("size", "INTEGER"),
-            ("metadata", "TEXT"),
-        ],
-        order: "key",
-    },
-    PortableTable {
-        name: "cold_payload_authority",
-        columns: &[("value", "TEXT")],
-        order: "value",
-    },
 ];
 
 impl PortableTable {

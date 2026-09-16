@@ -15,12 +15,9 @@ export const languageKorean = {
             'owner-asset-arrays-rehydrated': '캐릭터·모듈 에셋 목록 복원',
             'asset-paths-remapped': '첨부 파일 경로 변경',
             'inlay-ids-remapped': '인레이 식별자 변경',
-            'cold-ids-remapped': '보관 데이터 식별자 변경',
             'converted-inlay-extension': '인레이 파일 확장자 변경',
             'converted-inlay-sidecars': '인레이 메타데이터 파일 생성',
             'converted-inlay-provenance': '인레이 출처 정보 변환',
-            'converted-cold-character': '보관된 캐릭터 펼치기',
-            'converted-cold-chat': '보관된 대화 펼치기',
             'converted-interrupted-reroll': '중단된 재생성 복구',
             'converted-swipes': '대체 응답 변환',
             'risuai-inlays-excluded': 'RisuAI에서 지원하지 않는 인레이 파일',
@@ -31,7 +28,6 @@ export const languageKorean = {
             'opaque-plugin-inlay-references-unverified':
                 '플러그인 인레이 참조 미검증',
             'opaque-plugin-reference': '직접 확인이 필요한 플러그인 참조',
-            'unsupported-group-cold-payload': '지원하지 않는 보관 그룹 데이터',
             'group-provenance-owner-excluded': '제외된 그룹 소유 정보',
             'unsupported-groups': '지원하지 않는 그룹 채팅',
             'toggle-preset-prompt-name-unmatched':
@@ -46,8 +42,6 @@ export const languageKorean = {
             'invalid-reroll-candidates': '유효하지 않은 대체 응답',
             'reroll-candidate-metadata': '대체 응답 메타데이터',
             'unsupported-reroll-candidates': '지원하지 않는 대체 응답',
-            'unsupported-cold-wrapper-field':
-                '지원하지 않는 보관 데이터 메타데이터',
         },
     },
     portableBackup: {
@@ -189,11 +183,6 @@ export const languageKorean = {
         "requestLogRemoved": "요청 로그가 삭제되었습니다.",
         "requestLogRemovedDesc": "요청 로그는 앱이 재시작되거나 새로고침되면 삭제됩니다.",
         "vertexAuthError": "Vertex AI 인증 정보가 누락되었습니다.",
-        "coldStorageWriteFailed": "콜드 스토리지 저장에 실패했습니다. 채팅 데이터는 보존되었습니다.",
-        "coldStorageVerifyFailed": "콜드 스토리지 검증에 실패했습니다. 채팅 데이터는 보존되었습니다.",
-        "coldStorageRestoreFailed": "콜드 스토리지 데이터를 불러올 수 없습니다. 해당 캐릭터의 데이터가 영구적으로 손실되었을 수 있습니다.",
-        "coldStorageIncompleteBackupConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number) =>
-            `${characterNames || "알 수 없는 캐릭터"}의 콜드 스토리지 데이터가 없거나 손상되었습니다.${unresolvedCount > 0 ? ` 캐릭터를 확인할 수 없는 항목이 ${unresolvedCount}개 있습니다.` : ""}\n\n계속하면 이 백업에서 콜드 스토리지 항목 ${unavailableCount}개가 누락되며, 해당 캐릭터 또는 채팅 데이터를 이 백업으로 복구하지 못할 수 있습니다.\n\n그래도 불완전한 백업을 생성하시겠습니까?`,
         "coldStorageIncompleteRestoreConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number) =>
             `${characterNames || "알 수 없는 캐릭터"}의 콜드 스토리지 데이터를 복원하지 못했습니다.${unresolvedCount > 0 ? ` 캐릭터를 확인할 수 없는 항목이 ${unresolvedCount}개 있습니다.` : ""}\n\n계속하면 콜드 스토리지 항목 ${unavailableCount}개를 사용할 수 없으며, 해당 캐릭터 또는 채팅 데이터가 영구적으로 손실될 수 있습니다.\n\n그래도 불완전한 복원을 계속하시겠습니까?`
     },
@@ -2203,7 +2192,6 @@ export const languageKorean = {
             actionNormalizeRecords: '값 다시 계산',
             actionKeepSingleRecord: '하나만 남기고 정리',
             actionRecoverOrphans: '주인 아래로 되돌리기',
-            actionMarkColdOpaque: '그대로 두고 실패만 멈추기',
             actionSettleAuthority: '저장소 준비 마무리',
             actionDiscards: '값이 없어짐',
             actionRisky: '그 파일이 원래 가리키려던 것이라는 보장은 없습니다.',
@@ -2217,7 +2205,6 @@ export const languageKorean = {
             codeAliasObjectMismatch: '내용이 달라진 파일',
             codeRecordInvalid: '형식이 어긋난 기록',
             codeRecordOrphan: '주인이 없는 기록',
-            codeColdUndecodable: '읽을 수 없는 보관 대화',
             codeAuthorityIncomplete: '끝나지 않은 저장소 준비',
             codeObjectUnreferenced: '아무 데서도 쓰지 않는 파일',
             codeUnclassified: '분류하지 못한 문제',

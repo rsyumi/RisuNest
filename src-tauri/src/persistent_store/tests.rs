@@ -2,9 +2,9 @@ use super::{
     active_generation, archive, asset_object_catalog, current_revision, hash_exact_file, schema,
     snapshot,
     AnchorOccurrence, AssetAlias, AssetAliasListQuery, AssetOwnerHead, AssetOwnerLocator,
-    AssetRepositoryAuthorityState, CharacterQuery, CheckpointMode, ColdAlias,
-    ColdPayloadAuthorityState, ColdPayloadMigrationInput, ConversationMutation, ConversationPage,
-    ConversationQuery, ConversationWindowQuery, PersistentStore, PluginStorageMutation, QueryOrder,
+    AssetRepositoryAuthorityState, CharacterQuery, CheckpointMode, ConversationMutation,
+    ConversationPage, ConversationQuery, ConversationWindowQuery, PersistentStore,
+    PluginStorageMutation, QueryOrder,
     StoreError, Versioned, WorkingSetCommit, ASSET_GC_PRODUCT_MINIMUM_GRACE_MS,
     ASSET_GC_PRODUCT_PAGE_LIMIT, GENERATION_TABLES, JAVASCRIPT_MAX_SAFE_INTEGER,
 };
@@ -127,8 +127,6 @@ mod archive_tests;
 mod asset_alias_tests;
 #[path = "tests/asset_catalog_gc_tests.rs"]
 mod asset_catalog_gc_tests;
-#[path = "tests/cold_payload_tests.rs"]
-mod cold_payload_tests;
 #[path = "tests/data_health_tests.rs"]
 mod data_health_tests;
 mod selective_import_tests;

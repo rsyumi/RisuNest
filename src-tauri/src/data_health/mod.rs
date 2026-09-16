@@ -10,7 +10,6 @@ pub(crate) mod codes {
     pub(crate) const ALIAS_OBJECT_MISMATCH: &str = "alias-object-mismatch";
     pub(crate) const RECORD_INVALID: &str = "record-invalid";
     pub(crate) const RECORD_ORPHAN: &str = "record-orphan";
-    pub(crate) const COLD_UNDECODABLE: &str = "cold-undecodable";
     pub(crate) const AUTHORITY_INCOMPLETE: &str = "authority-incomplete";
     pub(crate) const OBJECT_UNREFERENCED: &str = "object-unreferenced";
     pub(crate) const UNCLASSIFIED: &str = "unclassified";

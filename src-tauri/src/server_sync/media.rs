@@ -90,7 +90,7 @@ impl MediaProvider {
             .issuing
             .lock()
             .map_err(|_| SyncError::new("media-cache-unavailable", 503))?;
-        let mut client = ServerClient::new(proof.config.resolve(&self.root)?)?;
+        let client = ServerClient::new(proof.config.resolve(&self.root)?)?;
         let head = client.resolve_identity(false)?;
         let request = MediaRequest {
             object: object.clone(),

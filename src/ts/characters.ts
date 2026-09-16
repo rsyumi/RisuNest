@@ -30,7 +30,6 @@ import {
 } from "./storage/persistentDataRuntime.svelte";
 import type { groupChat } from "./storage/database.svelte";
 import { removeCharacterIdFromOrder } from './storage/characterOrderMutation'
-import { restoreColdPersistentCharacter } from './process/coldCharacterRestore'
 import { safeStructuredClone } from './polyfill'
 import { isConversationSummaryStub } from './storage/conversationResidency'
 import { isMetadataOnlySelectedConversation } from './storage/selectedConversationLifecycle'
@@ -1059,23 +1058,6 @@ export async function changeChar(index: number, arg:{
         reseter()
         await yieldToUi()
         if (!isRestoreCurrent()) return false
-        const restoreColdCharacter = async (characterId: string) => {
-            return restoreColdPersistentCharacter(
-                characterId,
-                {
-                    errorMessage: language.errors.coldStorageRestoreFailed,
-                    isCurrent: isRestoreCurrent,
-                },
-            )
-        }
-        const detail = await restoreColdCharacter(chaId)
-        if (!isRestoreCurrent()) return false
-        if (detail?.type === 'group') {
-            for (const memberId of new Set(detail.characters as string[])) {
-                if (memberId !== chaId) await restoreColdCharacter(memberId)
-                if (!isRestoreCurrent()) return false
-            }
-        }
         if (!isRestoreCurrent()) return false
         const expectedNavigationGeneration = restoreNavigationGeneration + 1
         const activationOptions = {

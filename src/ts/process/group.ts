@@ -13,9 +13,9 @@ import {
     getPersistentNavigationGeneration,
     hydrateCurrentGroupMemberDetail,
     markPersistentDataDirty,
+    readPersistentCharacterDetail,
     reconcilePersistentActiveCharacterIds,
 } from "../storage/persistentDataRuntime.svelte";
-import { restoreColdPersistentCharacter } from './coldCharacterRestore'
 import { doingChat } from './generationState'
 import { appendCurrentConversationMessage } from '../conversationMutations'
 import type { groupChat } from '../storage/database.svelte'
@@ -109,13 +109,10 @@ export async function addGroupChar(): Promise<boolean> {
                         !activeSession.matchesConversation(groupId, selectedChat)
                     ) return false
                     const restoreGeneration = getPersistentNavigationGeneration()
-                    const member = await restoreColdPersistentCharacter(res, {
-                        errorMessage: language.errors.coldStorageRestoreFailed,
-                        isCurrent: () => (
-                            getPersistentNavigationGeneration() === restoreGeneration &&
-                            isSelectedGroup(groupId)
-                        ),
-                    })
+                    const member = await readPersistentCharacterDetail(
+                        res,
+                        'group-member-inspection',
+                    )
                     if (
                         !member ||
                         getPersistentNavigationGeneration() !== restoreGeneration ||

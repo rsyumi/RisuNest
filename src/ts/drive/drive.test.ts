@@ -19,17 +19,10 @@ const state = vi.hoisted(() => ({
     blobStore: null as BlobStore | null,
     currentDatabase: null as Database | null,
     forageInit: vi.fn(async () => undefined),
-    localCold: new Map<string, unknown>(),
     officialCold: new Map<string, unknown>(),
     publishCurrentOfficialRevision: vi.fn<() => Promise<void>>(),
     replacePersistentDatabase: vi.fn<(database: Database, reason: string) => Promise<void>>(),
     runtime: null as PersistentDataRuntime | null,
-    snapshotSeenByColdStorage: null as Database | null,
-    coldStoragePayloads: [] as Array<{
-        key: string
-        backupName: string
-        value: unknown
-    }>,
     restoreEvents: [] as string[],
     getUncleanables: vi.fn(async () => ['assets/second-read.png']),
     externalGetState: vi.fn(async () => ({
@@ -63,9 +56,9 @@ vi.mock('../globalApi.svelte', () => ({
         Init: state.forageInit,
         isAccount: true,
     },
-    getUncleanablesSync: vi.fn((_database: Database, _mode: string, options: {
+    getUncleanablesSync: vi.fn((database: Database, _mode: string, options?: {
         chars: Array<{ image?: string }>
-    }) => options.chars.flatMap((character) => (
+    }) => (options?.chars ?? database.characters).flatMap((character) => (
         character.image?.split('/').at(-1) ? [character.image.split('/').at(-1)!] : []
     ))),
     getUncleanables: state.getUncleanables,
@@ -127,15 +120,8 @@ vi.mock('../characterCards', () => ({
 }))
 
 vi.mock('../process/coldstorage.svelte', () => ({
-    collectColdStorageBackupPayloads: vi.fn(async (database: Database) => {
-        state.snapshotSeenByColdStorage = database
-        return { payloads: state.coldStoragePayloads, missingKeys: [], invalidKeys: [] }
-    }),
-    confirmIncompleteColdStorageOperation: vi.fn(async () => true),
+    confirmIncompleteColdStorageRestore: vi.fn(async () => true),
     getColdStorageBackupName: (key: string) => `coldstorage_${key}.json`,
-    getColdStorageItem: async (key: string, options?: { accountFallback?: boolean }) => (
-        options?.accountFallback ? structuredClone(state.localCold.get(key) ?? null) : null
-    ),
     isColdStorageBackupData: (value: unknown) => Boolean(
         value
         && typeof value === 'object'
@@ -144,11 +130,6 @@ vi.mock('../process/coldstorage.svelte', () => ({
     listColdDataKeys: async (database: Database) => database.characters
         .map((character) => character.coldstorage)
         .filter((key): key is string => Boolean(key)),
-    setLocalColdStorageItem: vi.fn(async (key: string, value: unknown) => {
-        state.restoreEvents.push(`cold:${key}`)
-        state.localCold.set(key, structuredClone(value))
-        return true
-    }),
 }))
 
 vi.mock('../storage/persistentDataRuntime.svelte', () => ({
@@ -286,13 +267,10 @@ describe('Drive restore cold snapshot assets', () => {
     beforeEach(() => {
         vi.clearAllMocks()
         state.ios = false
-        state.localCold.clear()
         state.officialCold.clear()
         state.blobStore = null
         state.currentDatabase = driveDatabase('current-cold')
         state.runtime = null
-        state.snapshotSeenByColdStorage = null
-        state.coldStoragePayloads = []
         state.restoreEvents = []
     })
 
@@ -352,9 +330,7 @@ describe('Drive restore cold snapshot assets', () => {
                 },
             },
             cold: {
-                readLocal: async (key) => structuredClone(state.localCold.get(key) ?? null),
                 readRemote: async (key) => structuredClone(state.officialCold.get(key) ?? null),
-                writeRemote: async () => undefined,
             },
             prepareCandidate: async (candidate) => structuredClone(candidate),
             markPublished: vi.fn(),
@@ -415,7 +391,6 @@ describe('Drive restore cold snapshot assets', () => {
         expect(accountWrites).not.toContain('assets/account-only.png')
         expect(accountWrites.at(-1)).toBe('database/database.bin')
         expect(state.restoreEvents).toEqual([
-            `cold:${coldKey}`,
             'asset:assets/drive-only.png',
             `asset:${pluginAssetKey}`,
             'database',
@@ -424,7 +399,7 @@ describe('Drive restore cold snapshot assets', () => {
         expect(state.alertError).not.toHaveBeenCalled()
     })
 
-    it('uploads database and pinned cold assets without rereading mutable cold storage', async () => {
+    it('uploads the pinned database and its referenced assets', async () => {
         const persisted = structuredClone(risuSaveFixtureDatabase) as Database
         const pluginAssetKey = 'assets/plugin-drive-upload.bin'
         const pluginAssetBytes = Uint8Array.of(8, 9)
@@ -436,6 +411,7 @@ describe('Drive restore cold snapshot assets', () => {
             ],
             prose: 'prefix assets/not-a-reference.bin',
         }
+        persisted.characters[0].image = 'assets/cold-pinned.png'
         const store = new IndexedDbPersistentDataStore(
             `drive-backup-${crypto.randomUUID()}`,
             new IDBFactory(),
@@ -456,20 +432,6 @@ describe('Drive restore cold snapshot assets', () => {
             ['assets/first/shared.bin', Uint8Array.of(1)],
             ['assets/second/shared.bin', Uint8Array.of(2)],
         ]))
-        state.coldStoragePayloads = [{
-            key: 'cold-char',
-            backupName: 'coldstorage_cold-char.json',
-            value: {
-                character: {
-                    ...persisted.characters[0],
-                    image: 'assets/cold-pinned.png',
-                },
-            },
-        }, {
-            key: 'cold-message',
-            backupName: 'coldstorage_cold-message.json',
-            value: { message: [{ role: 'user', data: 'second payload' }] },
-        }]
         state.runtime = {
             store,
             revision: imported.revision,
@@ -510,19 +472,13 @@ describe('Drive restore cold snapshot assets', () => {
             persisted.characters[0].chats[0].message,
         )
         expect(backedUp.pluginCustomStorage).toEqual(persisted.pluginCustomStorage)
-        expect(state.snapshotSeenByColdStorage).toEqual({ characters: [] })
         expect(materializeDatabase).not.toHaveBeenCalled()
         expect(uploads.has('cold-pinned.png.bin')).toBe(true)
         expect(uploads.has('second-read.png.bin')).toBe(false)
         expect(uploads.get('plugin-drive-upload.bin.bin')).toEqual(pluginAssetBytes)
         expect(uploads.has('shared.bin.bin')).toBe(false)
         expect(uploads.has('not-a-reference.bin.bin')).toBe(false)
-        expect([...uploads.entries()].filter(([name]) => name.startsWith('coldstorage_'))).toEqual(
-            state.coldStoragePayloads.map((payload) => [
-                payload.backupName,
-                new TextEncoder().encode(JSON.stringify(payload.value)),
-            ]),
-        )
+        expect([...uploads.keys()].some((name) => name.startsWith('coldstorage_'))).toBe(false)
         expect(state.getUncleanables).not.toHaveBeenCalled()
         expect(state.runtime.capturePersistentMutationToken).toHaveBeenCalledWith('drive-backup')
     })

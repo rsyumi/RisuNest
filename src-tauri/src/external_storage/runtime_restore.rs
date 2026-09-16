@@ -17,7 +17,6 @@ use crate::{
         PersistentStore, StoreError,
     },
 };
-use risunest_external_storage_format::format::library_fingerprint_domain;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeSet, path::Path, sync::Mutex, time::Duration};

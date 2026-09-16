@@ -1,7 +1,7 @@
 use super::{
     active_generation, current_revision, AssetAlias, AssetOwnerHead, AssetOwnerLocator,
-    AssetRepositoryAuthorityState, ColdAlias, ColdPayloadAuthorityState, ColdPayloadMigrationInput,
-    ConversationMutation, PluginStorageMutation, RevisionResult, StagingResult, StoreError,
+    AssetRepositoryAuthorityState, ConversationMutation, PluginStorageMutation, RevisionResult,
+    StagingResult, StoreError,
     StoreResult, WorkingSetCommit, GENERATION_TABLES,
 };
 use std::collections::{BTreeSet, HashSet};
@@ -71,94 +71,6 @@ pub(super) fn delete_asset_alias(
     )
 }
 
-pub(super) fn commit_cold_alias(
-    connection: &mut Connection,
-    alias: &ColdAlias,
-    expected_revision: i64,
-) -> StoreResult<RevisionResult> {
-    incremental_commit(
-        connection,
-        expected_revision,
-        |transaction, active| {
-            alias.validate()?;
-            if alias.object_hash.is_none() {
-                return Err(validation("Cold payload v2 alias requires an objectHash"));
-            }
-            require_cold_v2_authority(transaction, active)
-        },
-        |transaction, generation, ()| {
-            put_cold_alias(transaction, generation, alias)?;
-            Ok(())
-        },
-    )
-}
-
-pub(super) fn delete_cold_alias(
-    connection: &mut Connection,
-    key: &str,
-    expected_revision: i64,
-) -> StoreResult<RevisionResult> {
-    ColdAlias {
-        key: key.to_owned(),
-        object_hash: None,
-        size: 0,
-        metadata: Value::Object(Map::new()),
-    }
-    .validate()?;
-    incremental_commit(
-        connection,
-        expected_revision,
-        |transaction, active| require_cold_v2_authority(transaction, active),
-        |transaction, generation, ()| {
-            transaction.execute(
-                "DELETE FROM cold_aliases WHERE generation = ?1 AND key = ?2",
-                params![generation, key],
-            )?;
-            Ok(())
-        },
-    )
-}
-
-pub(super) fn activate_cold_payload_migration(
-    connection: &mut Connection,
-    input: &ColdPayloadMigrationInput,
-) -> StoreResult<RevisionResult> {
-    input.authority().validate()?;
-    let mut keys = HashSet::new();
-    for alias in &input.cold_aliases {
-        alias.validate()?;
-        if alias.object_hash.is_none() {
-            return Err(validation("Cold payload v2 alias requires an objectHash"));
-        }
-        if !keys.insert(alias.key.as_str()) {
-            return Err(validation("Duplicate cold alias"));
-        }
-    }
-    incremental_commit(
-        connection,
-        input.source_revision,
-        |transaction, active| {
-            let authority = read_cold_payload_authority(transaction, active)?;
-            if !matches!(authority, ColdPayloadAuthorityState::Legacy) {
-                return Err(validation(
-                    "Cold payload migration requires legacy authority",
-                ));
-            }
-            Ok(())
-        },
-        |transaction, generation, ()| {
-            transaction.execute(
-                "DELETE FROM cold_aliases WHERE generation = ?1",
-                [generation],
-            )?;
-            for alias in &input.cold_aliases {
-                put_cold_alias(transaction, generation, alias)?;
-            }
-            put_cold_payload_authority(transaction, generation, &input.authority())?;
-            Ok(())
-        },
-    )
-}
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{Map, Value};
 
@@ -594,11 +506,6 @@ pub(super) fn replace_begin(connection: &mut Connection) -> StoreResult<StagingR
         &staging_id,
         &AssetRepositoryAuthorityState::Legacy,
     )?;
-    put_cold_payload_authority(
-        &transaction,
-        &staging_id,
-        &ColdPayloadAuthorityState::Legacy,
-    )?;
     transaction.commit()?;
     Ok(StagingResult { staging_id })
 }
@@ -707,19 +614,6 @@ pub(super) fn replace_put_asset_repository_authority(
     Ok(())
 }
 
-pub(super) fn replace_put_cold_payload_authority(
-    connection: &mut Connection,
-    staging_id: &str,
-    authority: &ColdPayloadAuthorityState,
-) -> StoreResult<()> {
-    authority.validate()?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    require_staging(&transaction, staging_id)?;
-    put_cold_payload_authority(&transaction, staging_id, authority)?;
-    transaction.commit()?;
-    Ok(())
-}
-
 pub(super) fn replace_preserve_repositories(
     connection: &mut Connection,
     staging_id: &str,
@@ -744,12 +638,6 @@ pub(super) fn replace_preserve_repositories(
     ) {
         return Err(validation(
             "Active asset repository generation cannot be preparing",
-        ));
-    }
-    let cold_authority = read_cold_payload_authority(&transaction, &active)?;
-    if matches!(cold_authority, ColdPayloadAuthorityState::Preparing { .. }) {
-        return Err(validation(
-            "Active cold payload generation cannot be preparing",
         ));
     }
     let source_root = replacement_root(&transaction, &active)?;
@@ -798,18 +686,7 @@ pub(super) fn replace_preserve_repositories(
     )?;
     put_asset_repository_authority(&transaction, staging_id, &asset_authority)?;
 
-    transaction.execute(
-        "DELETE FROM cold_aliases WHERE generation = ?1",
-        [staging_id],
-    )?;
-    transaction.execute(
-        "INSERT INTO cold_aliases (generation, key, object_hash, size, metadata)
-         SELECT ?1, key, object_hash, size, metadata
-         FROM cold_aliases WHERE generation = ?2",
-        params![staging_id, active],
-    )?;
     prune_proven_unreachable_forwarded_aliases(&transaction, staging_id)?;
-    put_cold_payload_authority(&transaction, staging_id, &cold_authority)?;
 
     transaction.execute(
         "DELETE FROM asset_owner_heads WHERE generation = ?1",
@@ -896,12 +773,7 @@ fn prune_proven_unreachable_forwarded_aliases(
         [generation],
         |row| row.get(0),
     )?;
-    let cold_rows: i64 = transaction.query_row(
-        "SELECT COUNT(*) FROM cold_aliases WHERE generation = ?1",
-        [generation],
-        |row| row.get(0),
-    )?;
-    if plugin_rows != 0 || cold_rows != 0 {
+    if plugin_rows != 0 {
         return Ok(());
     }
 
@@ -1074,19 +946,6 @@ fn put_asset_repository_authority(
 ) -> StoreResult<()> {
     transaction.execute(
         "INSERT INTO asset_repository_authority (generation, value) VALUES (?1, ?2)
-         ON CONFLICT(generation) DO UPDATE SET value = excluded.value",
-        params![generation, serde_json::to_string(authority)?],
-    )?;
-    Ok(())
-}
-
-fn put_cold_payload_authority(
-    transaction: &Transaction<'_>,
-    generation: &str,
-    authority: &ColdPayloadAuthorityState,
-) -> StoreResult<()> {
-    transaction.execute(
-        "INSERT INTO cold_payload_authority (generation, value) VALUES (?1, ?2)
          ON CONFLICT(generation) DO UPDATE SET value = excluded.value",
         params![generation, serde_json::to_string(authority)?],
     )?;
@@ -1336,46 +1195,6 @@ fn replacement_owner_tuple_from_parent(
     }
 }
 
-pub(super) fn replace_put_cold_aliases(
-    connection: &mut Connection,
-    staging_id: &str,
-    aliases: &[ColdAlias],
-) -> StoreResult<()> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    require_staging(&transaction, staging_id)?;
-    for alias in aliases {
-        alias.validate()?;
-    }
-    for alias in aliases {
-        put_cold_alias(&transaction, staging_id, alias)?;
-    }
-    transaction.commit()?;
-    Ok(())
-}
-
-fn put_cold_alias(
-    transaction: &Transaction<'_>,
-    generation: &str,
-    alias: &ColdAlias,
-) -> StoreResult<()> {
-    transaction.execute(
-        "INSERT INTO cold_aliases (generation, key, object_hash, size, metadata)
-         VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(generation, key) DO UPDATE SET
-            object_hash = excluded.object_hash,
-            size = excluded.size,
-            metadata = excluded.metadata",
-        params![
-            generation,
-            alias.key,
-            alias.object_hash,
-            alias.size,
-            serde_json::to_string(&alias.metadata)?,
-        ],
-    )?;
-    Ok(())
-}
-
 fn put_asset_alias(
     transaction: &Transaction<'_>,
     generation: &str,
@@ -1539,27 +1358,6 @@ fn require_activatable_authority(connection: &Connection, staging_id: &str) -> S
             "Asset repository preparing generation cannot be activated",
         ));
     }
-    let cold_authority = read_cold_payload_authority(connection, staging_id)?;
-    if matches!(cold_authority, ColdPayloadAuthorityState::Preparing { .. }) {
-        return Err(validation(
-            "Cold payload preparing generation cannot be activated",
-        ));
-    }
-    if matches!(cold_authority, ColdPayloadAuthorityState::V2 { .. }) {
-        let incomplete: bool = connection.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM cold_aliases
-                WHERE generation = ?1 AND object_hash IS NULL
-            )",
-            [staging_id],
-            |row| row.get(0),
-        )?;
-        if incomplete {
-            return Err(validation(
-                "Cold payload v2 generation contains a legacy alias",
-            ));
-        }
-    }
     Ok(())
 }
 
@@ -1581,34 +1379,6 @@ pub(super) fn read_asset_repository_authority(
         .map_err(|_| validation("Asset repository authority state is invalid"))?;
     authority.validate()?;
     Ok(authority)
-}
-
-pub(super) fn read_cold_payload_authority(
-    connection: &Connection,
-    generation: &str,
-) -> StoreResult<ColdPayloadAuthorityState> {
-    let stored: Option<String> = connection
-        .query_row(
-            "SELECT value FROM cold_payload_authority WHERE generation = ?1",
-            [generation],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let stored = stored.ok_or_else(|| validation("Cold payload authority state is missing"))?;
-    let authority: ColdPayloadAuthorityState = serde_json::from_str(&stored)
-        .map_err(|_| validation("Cold payload authority state is invalid"))?;
-    authority.validate()?;
-    Ok(authority)
-}
-
-fn require_cold_v2_authority(connection: &Connection, generation: &str) -> StoreResult<()> {
-    if !matches!(
-        read_cold_payload_authority(connection, generation)?,
-        ColdPayloadAuthorityState::V2 { .. }
-    ) {
-        return Err(validation("Cold payload mutation requires v2 authority"));
-    }
-    Ok(())
 }
 
 pub(super) fn replace_abort(connection: &mut Connection, staging_id: &str) -> StoreResult<()> {

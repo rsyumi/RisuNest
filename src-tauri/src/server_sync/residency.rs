@@ -75,7 +75,6 @@ impl Residency {
             tx.execute_batch("CREATE TABLE contexts(id TEXT PRIMARY KEY,library_id TEXT NOT NULL,device_id TEXT NOT NULL,epoch TEXT NOT NULL,config TEXT NOT NULL);
                 CREATE TABLE objects(context TEXT NOT NULL REFERENCES contexts(id),hash TEXT NOT NULL,size INTEGER NOT NULL CHECK(size>=0),retention_id TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('active','releasing','released')),PRIMARY KEY(context,hash));
                 CREATE INDEX objects_hash ON objects(hash);
-                CREATE TABLE snapshot_roles(id TEXT PRIMARY KEY,hashes TEXT NOT NULL);
                 PRAGMA user_version=1;")?;
             tx.commit()?;
         } else if version != 1 {
@@ -230,27 +229,6 @@ impl Residency {
         self.db.execute("UPDATE objects SET state='released' WHERE context=?1 AND hash=?2 AND retention_id=?3 AND state='releasing'",params![object.context,object.hash,object.retention_id])?;
         Ok(())
     }
-    pub fn snapshot_roles(&self, id: &str) -> Result<Option<Vec<String>>> {
-        let value: Option<String> = self
-            .db
-            .query_row("SELECT hashes FROM snapshot_roles WHERE id=?1", [id], |r| {
-                r.get(0)
-            })
-            .optional()?;
-        value
-            .map(|value| {
-                serde_json::from_str(&value)
-                    .map_err(|_| SyncError::new("invalid-snapshot-roles", 409))
-            })
-            .transpose()
-    }
-    pub fn save_snapshot_roles(&self, id: &str, hashes: &[String]) -> Result<()> {
-        for hash in hashes {
-            validate_hash(hash)?;
-        }
-        self.db.execute("INSERT INTO snapshot_roles VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET hashes=excluded.hashes",params![id,serde_json::to_string(hashes).map_err(|_|SyncError::new("invalid-snapshot-roles",409))?])?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -304,7 +282,7 @@ pub(crate) fn open_or_hydrate_with_check(
     // parallel chunks; unrelated attachments must not multiply those buffers.
     static TRANSFER_BUDGET: Mutex<()> = Mutex::new(());
     let _budget = lock_with_check(&TRANSFER_BUDGET, check)?;
-    let mut client = super::client::ServerClient::new(proof.config.resolve(&root)?)?;
+    let client = super::client::ServerClient::new(proof.config.resolve(&root)?)?;
     client.resolve_identity(false)?;
     check()?;
     let directory = tempfile::Builder::new()

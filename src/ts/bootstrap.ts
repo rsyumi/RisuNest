@@ -32,11 +32,7 @@ import {
     resetAccountStorageSession,
     type AccountStorageCache,
 } from "./storage/accountStorage";
-import {
-    getAccountColdStorageItem,
-    getColdStorageItem,
-    setAccountColdStorageItem,
-} from "./process/coldstorage.svelte";
+import { getAccountColdStorageItem } from "./process/coldstorage.svelte";
 import { getRemoteSaveCleanupAction, getRemoteSavePayloadName } from "./storage/remoteSaveCleanup";
 import {
     forageStorage,
@@ -436,15 +432,7 @@ export async function loadData() {
             store: runtime.store,
             resolveBlobs: resolveBlobStore,
             account: accountStorage,
-            cold: {
-                readRemote: getAccountColdStorageItem,
-                async writeRemote(key, value, signal) {
-                    if (!await setAccountColdStorageItem(key, value, signal)) {
-                        throw new Error(`Failed to write official cold payload: ${key}`)
-                    }
-                },
-                readLocal: (key) => getColdStorageItem(key, { accountFallback: true }),
-            },
+            cold: { readRemote: getAccountColdStorageItem },
             prepareCandidate: prepareDatabaseForPersistence,
             markPublished: () => undefined,
             ledger: officialAssetLedger,
@@ -927,16 +915,10 @@ function updateHeightMode() {
 /**
  * Purges chunks of data that are not needed.
  */
-async function cleanChunks(options:{
-    cleanColdStorage?: boolean
-} = {}) {
-    const cleanColdStorage = options.cleanColdStorage ?? false
+async function cleanChunks() {
     const db = getDatabase()
     if (hasIncompletePersistentWorkingSet(db, workingSetResidency)) return
     if (db.account?.useSync) {
-        return
-    }
-    if(db.coldstorage && !cleanColdStorage){
         return
     }
 

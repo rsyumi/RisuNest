@@ -1843,12 +1843,6 @@ impl PersistentStore {
             "UPDATE asset_repository_authority SET value=?2 WHERE generation=?1",
             params![generation, authority],
         )?;
-        let authority = serde_json::to_string(&super::ColdPayloadAuthorityState::V2 {
-            migration_id: head.head_id.clone(),
-            compatibility_hash: head.head_id.clone(),
-        })
-        .map_err(|_| SyncError::new("backup-metadata", 409))?;
-        remote_store.connection.execute("INSERT INTO cold_payload_authority(generation,value) VALUES(?1,?2) ON CONFLICT(generation) DO UPDATE SET value=excluded.value",params![generation,authority])?;
         let remote = crate::portable_backup::create_verified_library_backup(
             &mut remote_store,
             remote_revision,

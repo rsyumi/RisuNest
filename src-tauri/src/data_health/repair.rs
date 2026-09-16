@@ -40,9 +40,6 @@ pub(crate) enum RepairAction {
     KeepSingleRecord { table: String },
     /// Gives orphans an owner again by restoring the missing container as a trashed record.
     RecoverOrphans { table: String },
-    /// Marks a cold payload the decoder cannot read, so a backup carries it instead of stopping.
-    /// The stored bytes are untouched.
-    MarkColdOpaque { key: String },
     /// Re-examines the stored files and settles a storage authority that stopped half-way.
     SettleAuthority { subject: String },
 }
@@ -56,7 +53,6 @@ impl RepairAction {
             Self::NormalizeRecords { table }
             | Self::KeepSingleRecord { table }
             | Self::RecoverOrphans { table } => table,
-            Self::MarkColdOpaque { .. } => "cold",
             Self::SettleAuthority { subject } => subject,
         }
     }
@@ -85,7 +81,6 @@ fn action_id(action: &RepairAction) -> String {
         RepairAction::NormalizeRecords { .. } => "normalize-records".to_owned(),
         RepairAction::KeepSingleRecord { .. } => "keep-single-record".to_owned(),
         RepairAction::RecoverOrphans { .. } => "recover-orphans".to_owned(),
-        RepairAction::MarkColdOpaque { .. } => "mark-cold-opaque".to_owned(),
         RepairAction::SettleAuthority { .. } => "settle-authority".to_owned(),
     }
 }
@@ -192,14 +187,6 @@ pub(crate) fn plan(result: &ScanResult) -> Vec<RepairCandidate> {
                     ));
                 }
             }
-            codes::COLD_UNDECODABLE => candidates.push(candidate(
-                index,
-                RepairAction::MarkColdOpaque {
-                    key: finding.owner.id.clone(),
-                },
-                true,
-                false,
-            )),
             codes::AUTHORITY_INCOMPLETE => candidates.push(candidate(
                 index,
                 RepairAction::SettleAuthority {

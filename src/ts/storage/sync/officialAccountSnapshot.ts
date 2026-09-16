@@ -3,12 +3,10 @@ import {
     isLegacyBackupAssetKey,
 } from '../../drive/backupAssets'
 import {
-    isColdStorageBackupData,
     listCharacterResources,
-    listColdDataKeysFromCharacter,
     listDatabaseRootResources,
-    replaceColdStoragePayloadResources,
 } from '../../process/coldstorageData'
+import { expandColdPayloads } from '../../process/coldPayloadExpansion'
 import type {
     AccountStorage,
     AccountWriteResult,
@@ -44,8 +42,6 @@ const databaseKey = 'database/database.bin'
 
 export interface OfficialColdStorageTransport {
     readRemote(key: string, signal?: AbortSignal): Promise<unknown | null>
-    writeRemote(key: string, value: unknown, signal?: AbortSignal): Promise<void>
-    readLocal(key: string): Promise<unknown | null>
 }
 
 export interface OfficialAssociationRecord {
@@ -122,12 +118,6 @@ export type OfficialPullResult =
     | { kind: 'kept-local'; conflict: boolean }
     | { kind: 'activated'; revision: DataRevision }
 
-interface PinnedColdReference {
-    key: string
-    source: 'local' | 'remote'
-    fingerprint: string
-}
-
 interface PinnedAsset {
     key: string
     /** The local blob key holding this asset's payload. */
@@ -148,25 +138,6 @@ function addOfficialAssets(target: Set<string>, values: readonly string[]): void
     for (const key of values) {
         if (isOfficialAssetKey(key)) target.add(key)
     }
-}
-
-function addColdCharacterAssets(target: Set<string>, value: unknown): void {
-    if (
-        value
-        && typeof value === 'object'
-        && 'character' in value
-        && value.character
-        && typeof value.character === 'object'
-    ) {
-        addOfficialAssets(
-            target,
-            listCharacterResources(value.character as Database['characters'][number]),
-        )
-    }
-}
-
-async function fingerprintText(value: string): Promise<string> {
-    return fingerprintDatabase(new TextEncoder().encode(value))
 }
 
 async function fingerprintDatabase(bytes: Uint8Array): Promise<string> {
@@ -271,7 +242,6 @@ export function createOfficialAssociationMarkers(storage: {
 async function collectPinnedReferences(reader: PersistentRevisionReader): Promise<{
     accountId: string | undefined
     assets: string[]
-    coldKeys: string[]
 }> {
     const rootRecord = await reader.readRoot()
     assertPinnedRevision(reader.revision, rootRecord.revision, 'Root')
@@ -293,27 +263,16 @@ async function collectPinnedReferences(reader: PersistentRevisionReader): Promis
             collectExactPluginStorageAssetReferences(value.value),
         )
     }
-    const coldKeys = new Set<string>()
     for await (const character of iteratePinnedCharacters(reader)) {
         const detail = {
             ...character.detail,
             chats: [],
         } as Database['characters'][number]
         addOfficialAssets(assets, listCharacterResources(detail))
-        for (const key of listColdDataKeysFromCharacter(detail)) coldKeys.add(key)
-        for await (const conversation of iteratePinnedConversations(reader, character.summary.id)) {
-            for (const key of listColdDataKeysFromCharacter({
-                ...detail,
-                coldstorage: undefined,
-                coldStoragedChats: [],
-                chats: [conversation.value],
-            })) coldKeys.add(key)
-        }
     }
     return {
         accountId: root.account?.id,
         assets: [...assets].sort(),
-        coldKeys: [...coldKeys].sort(),
     }
 }
 
@@ -335,7 +294,6 @@ async function concatenate(chunks: AsyncIterable<Uint8Array>): Promise<Uint8Arra
 
 class OfficialPinnedPublication implements PinnedPublication {
     private readonly replacements = new Map<string, string>()
-    private readonly completedColdKeys = new Set<string>()
     private databaseBytes: Uint8Array | null = null
     private databaseFingerprint: string | null = null
     private released = false
@@ -357,7 +315,6 @@ class OfficialPinnedPublication implements PinnedPublication {
         private lease: PersistentRevisionLease,
         private readonly blobs: BlobStore,
         private readonly assets: readonly PinnedAsset[],
-        private readonly coldReferences: readonly PinnedColdReference[],
         private readonly accountId: string | undefined,
         private readonly dependencies: OfficialAccountSnapshotDependencies,
         private readonly onPublished: (
@@ -398,31 +355,6 @@ class OfficialPinnedPublication implements PinnedPublication {
         }
 
         const replacementRecord = Object.fromEntries(this.replacements)
-        for (const pinned of this.coldReferences) {
-            const key = pinned.key
-            if (this.completedColdKeys.has(key)) continue
-            throwIfAborted(signal)
-            const value = pinned.source === 'local'
-                ? await this.dependencies.cold.readLocal(key)
-                : await this.dependencies.cold.readRemote(key, signal)
-            throwIfAborted(signal)
-            if (value === null || !isColdStorageBackupData(value)) {
-                throw new Error(`Pinned cold payload became unavailable before publication: ${key}`)
-            }
-            const fingerprint = await fingerprintText(canonicalJson(value))
-            if (fingerprint !== pinned.fingerprint) {
-                throw new Error(`Pinned cold payload changed before publication: ${key}`)
-            }
-            const projected = replaceColdStoragePayloadResources(value, replacementRecord)
-            const digest = await fingerprintText(canonicalJson(projected))
-            if (digest !== this.dependencies.ledger.coldDigest(key)) {
-                await this.dependencies.cold.writeRemote(key, projected, signal)
-                this.dependencies.ledger.recordCold(key, digest)
-            }
-            this.completedColdKeys.add(key)
-            throwIfAborted(signal)
-        }
-
         throwIfAborted(signal)
         if (this.dependencies.nativeDatabasePublisher && this.accountId) {
             if (!this.dependencies.flushPublicationMetadata) {
@@ -604,32 +536,6 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
             const blobs = await this.dependencies.resolveBlobs()
             const references = await collectPinnedReferences(lease)
             const assetKeys = new Set(references.assets)
-            const coldReferences: PinnedColdReference[] = []
-            for (const key of references.coldKeys) {
-                const local = await this.dependencies.cold.readLocal(key)
-                if (local !== null && isColdStorageBackupData(local)) {
-                    coldReferences.push({
-                        key,
-                        source: 'local',
-                        fingerprint: await fingerprintText(canonicalJson(local)),
-                    })
-                    addColdCharacterAssets(assetKeys, local)
-                    continue
-                }
-                if (local !== null) {
-                    console.warn(`Ignoring an invalid local cold payload: ${key}`)
-                }
-                const remote = await this.dependencies.cold.readRemote(key)
-                if (remote === null || !isColdStorageBackupData(remote)) {
-                    console.warn(`Skipping the official publish of an unavailable cold payload: ${key}`)
-                    continue
-                }
-                const fingerprint = await fingerprintText(canonicalJson(remote))
-                coldReferences.push({ key, source: 'remote', fingerprint })
-                this.dependencies.ledger.recordCold(key, fingerprint)
-                addColdCharacterAssets(assetKeys, remote)
-            }
-
             const assets: PinnedAsset[] = []
             for (const key of [...assetKeys].sort()) {
                 const publishedAs = this.dependencies.ledger.publishedAs(key)
@@ -662,7 +568,6 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
                 lease,
                 blobs,
                 assets,
-                coldReferences,
                 references.accountId,
                 this.dependencies,
                 (publishedRevision, databaseFingerprint) => {
@@ -730,7 +635,12 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
         const candidate = await this.dependencies.prepareCandidate(decoded)
         validateCandidate(candidate)
 
-        // Referenced assets and cold payloads load lazily on use, matching the upstream client;
+        // Upstream account data can reference cold payloads. They become record bodies here,
+        // because nothing downstream resolves a reference; a missing one degrades that item.
+        throwIfAborted(signal)
+        await expandColdPayloads(candidate, (key) => this.dependencies.cold.readRemote(key, signal))
+
+        // Referenced assets load lazily on use, matching the upstream client;
         // a missing one degrades that item instead of failing the whole pull.
         throwIfAborted(signal)
         const activated = await this.dependencies.store.replaceFromDatabase(

@@ -13,7 +13,7 @@ const mocks = vi.hoisted(() => ({
     markPersistentDataDirty: vi.fn(),
     flushPendingData: vi.fn(async () => undefined),
     reconcilePersistentActiveCharacterIds: vi.fn(),
-    restoreColdPersistentCharacter: vi.fn(),
+    readPersistentCharacterDetail: vi.fn(),
     hydrateCurrentGroupMemberDetail: vi.fn(),
     selectedTarget: null as any,
     acquireCompleteConversation: vi.fn(),
@@ -58,9 +58,7 @@ vi.mock('../storage/persistentDataRuntime.svelte', () => ({
     markPersistentDataDirty: mocks.markPersistentDataDirty,
     reconcilePersistentActiveCharacterIds: mocks.reconcilePersistentActiveCharacterIds,
     hydrateCurrentGroupMemberDetail: mocks.hydrateCurrentGroupMemberDetail,
-}))
-vi.mock('./coldCharacterRestore', () => ({
-    restoreColdPersistentCharacter: mocks.restoreColdPersistentCharacter,
+    readPersistentCharacterDetail: mocks.readPersistentCharacterDetail,
 }))
 
 import { addGroupChar, groupOrder, rmCharFromGroup } from './group'
@@ -103,7 +101,7 @@ describe('group working-set residency', () => {
         ]
         mocks.alertConfirm.mockResolvedValue(true)
         mocks.alertSelectChar.mockResolvedValue('member-b')
-        mocks.restoreColdPersistentCharacter.mockResolvedValue({
+        mocks.readPersistentCharacterDetail.mockResolvedValue({
             type: 'character',
             chaId: 'member-b',
             firstMessage: 'Hydrated B',
@@ -167,7 +165,7 @@ describe('group working-set residency', () => {
             recentAt: 0,
             trashed: false,
         })
-        mocks.restoreColdPersistentCharacter.mockResolvedValue(detail)
+        mocks.readPersistentCharacterDetail.mockResolvedValue(detail)
         mocks.alertConfirm.mockResolvedValue(false)
 
         await expect(addGroupChar()).resolves.toBe(true)
@@ -205,7 +203,7 @@ describe('group working-set residency', () => {
             recentAt: 0,
             trashed: false,
         })
-        mocks.restoreColdPersistentCharacter.mockImplementation(async () => ({
+        mocks.readPersistentCharacterDetail.mockImplementation(async () => ({
             ...persistentDetail,
         }))
         mocks.alertConfirm.mockResolvedValue(false)
@@ -230,7 +228,7 @@ describe('group working-set residency', () => {
             scenario: 'Revision R+1 prompt',
         })
         expect(mocks.activateCharacter).toHaveBeenCalledTimes(2)
-        expect(mocks.restoreColdPersistentCharacter.mock.invocationCallOrder[0]).toBeGreaterThan(
+        expect(mocks.readPersistentCharacterDetail.mock.invocationCallOrder[0]).toBeGreaterThan(
             mocks.activateCharacter.mock.invocationCallOrder[1],
         )
     })
@@ -516,8 +514,8 @@ describe('group working-set residency', () => {
         expect(mocks.database.characters[2].chats).toEqual([])
     })
 
-    it('does not mutate membership when generation starts during cold restore', async () => {
-        mocks.restoreColdPersistentCharacter.mockImplementationOnce(async () => {
+    it('does not mutate membership when generation starts during the member detail read', async () => {
+        mocks.readPersistentCharacterDetail.mockImplementationOnce(async () => {
             mocks.doingChat = true
             return {
                 type: 'character',
@@ -543,7 +541,7 @@ describe('group working-set residency', () => {
         await expect(addGroupChar()).resolves.toBe(false)
 
         const group = mocks.database.characters[0]
-        expect(mocks.restoreColdPersistentCharacter).not.toHaveBeenCalled()
+        expect(mocks.readPersistentCharacterDetail).not.toHaveBeenCalled()
         expect(group.characters).toEqual(['member-a'])
         expect(group.chats[0].message).toEqual([])
         expect(mocks.activateCharacter).toHaveBeenCalledTimes(2)

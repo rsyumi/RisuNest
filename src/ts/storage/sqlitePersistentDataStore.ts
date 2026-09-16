@@ -28,9 +28,6 @@ import {
     type DataRevision,
     type AssetRepositoryAuthorityState,
     type AssetRepositoryMigrationInput,
-    type ColdAlias,
-    type ColdPayloadAuthorityState,
-    type ColdPayloadMigrationInput,
     type PersistentDataStore,
     type PersistentConversationMetadata,
     type PersistentRevisionLease,
@@ -224,18 +221,6 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
         return invokeStore('pds_read_asset_owner_head', { owner })
     }
 
-    readColdPayloadAuthority(): Promise<Versioned<ColdPayloadAuthorityState>> {
-        return invokeStore('pds_read_cold_payload_authority', {})
-    }
-
-    readColdAlias(key: string): Promise<Versioned<ColdAlias> | null> {
-        return invokeStore('pds_read_cold_alias', { key })
-    }
-
-    listColdAliases(): Promise<Versioned<ColdAlias[]>> {
-        return invokeStore('pds_list_cold_aliases', {})
-    }
-
     commitAssetAlias(
         alias: AssetAlias,
         expectedRevision: DataRevision,
@@ -305,26 +290,6 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
             } catch {}
             throw error
         }
-    }
-
-    commitColdAlias(
-        alias: ColdAlias,
-        expectedRevision: DataRevision,
-    ): Promise<{ revision: DataRevision }> {
-        return invokeStore('pds_commit_cold_alias', { alias, expectedRevision })
-    }
-
-    deleteColdAlias(
-        key: string,
-        expectedRevision: DataRevision,
-    ): Promise<{ revision: DataRevision }> {
-        return invokeStore('pds_delete_cold_alias', { key, expectedRevision })
-    }
-
-    activateColdPayloadMigration(
-        input: ColdPayloadMigrationInput,
-    ): Promise<{ revision: DataRevision }> {
-        return invokeStore('pds_activate_cold_payload_migration', { input })
     }
 
     commit(input: WorkingSetCommit): Promise<{ revision: DataRevision }> {
@@ -487,18 +452,6 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
             readAssetOwnerHead: async (owner) => {
                 assertActive()
                 return invokeStore('pds_read_asset_owner_head', { owner, lease })
-            },
-            readColdPayloadAuthority: async () => {
-                assertActive()
-                return invokeStore('pds_read_cold_payload_authority', { lease })
-            },
-            readColdAlias: async (key) => {
-                assertActive()
-                return invokeStore('pds_read_cold_alias', { key, lease })
-            },
-            listColdAliases: async () => {
-                assertActive()
-                return invokeStore('pds_list_cold_aliases', { lease })
             },
             release: () => {
                 if (releasePromise) return releasePromise

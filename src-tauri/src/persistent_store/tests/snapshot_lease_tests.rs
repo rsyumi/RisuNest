@@ -201,7 +201,6 @@ fn snapshot_creation_persists_asset_roots_before_returning() {
     let generation = super::active_generation(&store.connection).expect("read active generation");
     let manifest_hash = "a".repeat(64);
     let object_hash = "b".repeat(64);
-    let cold_object_hash = "c".repeat(64);
     store
         .connection
         .execute(
@@ -242,14 +241,6 @@ fn snapshot_creation_persists_asset_roots_before_returning() {
     store
         .connection
         .execute(
-            "INSERT INTO cold_aliases (generation, key, object_hash, size, metadata)
-             VALUES (?1, 'cold-chat', ?2, 1, '{}')",
-            rusqlite::params![generation, cold_object_hash],
-        )
-        .unwrap();
-    store
-        .connection
-        .execute(
             "INSERT INTO asset_owner_heads (
                 generation, owner_kind, owner_locator, present, manifest_hash, entry_count
              ) VALUES (?1, 'root-module-assets', 'module-1', 1, ?2, 1)",
@@ -273,10 +264,7 @@ fn snapshot_creation_persists_asset_roots_before_returning() {
 
     assert_eq!(metadata.revision, 1);
     assert_eq!(metadata.roots.manifest_hashes, [manifest_hash].into());
-    assert_eq!(
-        metadata.roots.object_hashes,
-        [object_hash, cold_object_hash].into()
-    );
+    assert_eq!(metadata.roots.object_hashes, [object_hash].into());
     assert_eq!(
         metadata.roots.legacy_asset_keys,
         [
@@ -457,363 +445,6 @@ fn asset_gc_dry_run_retains_every_catalog_object_for_opaque_plugin_storage() {
 }
 
 #[test]
-fn asset_gc_dry_run_marks_native_cas_references_nested_in_cold_payloads() {
-    use super::asset_object_catalog::AssetObjectRegistration;
-    use flate2::{
-        write::{DeflateEncoder, GzEncoder, ZlibEncoder},
-        Compression,
-    };
-    use std::io::Write;
-
-    let directory = tempfile::tempdir().expect("create temporary directory");
-    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
-    let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
-    let nested = cas.prepare_bytes(b"nested-cold-resource").unwrap();
-    let nested_url = cas.prepare_bytes(b"nested-cold-url-resource").unwrap();
-    let collectable = cas.prepare_bytes(b"not-referenced-by-cold").unwrap();
-    let nested_physical_key = format!(
-        "assets-v2/objects/{}/{}",
-        &nested.content_hash[..2],
-        &nested.content_hash[2..]
-    );
-    let nested_url_physical_key = format!(
-        "assets-v2/objects/{}/{}",
-        &nested_url.content_hash[..2],
-        &nested_url.content_hash[2..]
-    );
-    let nested_render_url = format!(
-        "HTTP://user@RISUASSET.LOCALHOST:8080/{}",
-        hex::encode(nested_url_physical_key)
-    );
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder
-        .write_all(
-            serde_json::to_string(&json!({
-                "character": {
-                    "name": "Cold fixture",
-                    "roadmap14Unknown": {
-                        "nested": [nested_physical_key.clone(), nested_render_url]
-                    },
-                    "chats": [{
-                        "message": [{
-                            "data": "\u{ef01}COLDSTORAGE\u{ef01}cold-zlib"
-                        }]
-                    }]
-                }
-            }))
-            .unwrap()
-            .as_bytes(),
-        )
-        .unwrap();
-    let mut cold_bytes = encoder.finish().unwrap();
-    let cold = cas.prepare_bytes(&cold_bytes).unwrap();
-    let oversized = super::snapshot::decode_cold_payload_with_limit(
-        &cas,
-        &cold.content_hash,
-        cold.byte_size,
-        32,
-    )
-    .expect_err("decoded output over the configured limit must fail closed");
-    assert!(oversized.to_string().contains("exceeds the decoded limit"));
-    let mut zlib_encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    zlib_encoder
-        .write_all(
-            serde_json::to_string(&json!({
-                "message": { "data": "\u{ef01}COLDSTORAGE\u{ef01}cold-raw" }
-            }))
-            .unwrap()
-            .as_bytes(),
-        )
-        .unwrap();
-    let cold_zlib = cas.prepare_bytes(&zlib_encoder.finish().unwrap()).unwrap();
-    let mut deflate_encoder = DeflateEncoder::new(Vec::new(), Compression::default());
-    deflate_encoder
-        .write_all(
-            serde_json::to_string(&json!([nested_physical_key]))
-                .unwrap()
-                .as_bytes(),
-        )
-        .unwrap();
-    let cold_raw = cas
-        .prepare_bytes(&deflate_encoder.finish().unwrap())
-        .unwrap();
-    let generation = super::active_generation(&store.connection).expect("read generation");
-    store
-        .connection
-        .execute(
-            "UPDATE root SET value = ?2 WHERE generation = ?1",
-            rusqlite::params![
-                generation,
-                serde_json::to_string(&json!({ "coldstorage": "cold-root" })).unwrap()
-            ],
-        )
-        .unwrap();
-    for (key, alias) in [("cold-zlib", &cold_zlib), ("cold-raw", &cold_raw)] {
-        store
-            .connection
-            .execute(
-                "INSERT INTO cold_aliases (generation, key, object_hash, size, metadata)
-                 VALUES (?1, ?2, ?3, ?4, '{}')",
-                rusqlite::params![generation, key, alias.content_hash, alias.byte_size as i64],
-            )
-            .unwrap();
-    }
-    store
-        .connection
-        .execute(
-            "INSERT INTO cold_aliases (generation, key, object_hash, size, metadata)
-             VALUES (?1, 'cold-root', ?2, ?3, '{}')",
-            rusqlite::params![generation, cold.content_hash, cold.byte_size as i64],
-        )
-        .unwrap();
-    store
-        .asset_object_catalog()
-        .register(
-            &[
-                AssetObjectRegistration {
-                    object_hash: cold.content_hash.clone(),
-                    byte_size: cold.byte_size,
-                },
-                AssetObjectRegistration {
-                    object_hash: cold_zlib.content_hash.clone(),
-                    byte_size: cold_zlib.byte_size,
-                },
-                AssetObjectRegistration {
-                    object_hash: cold_raw.content_hash.clone(),
-                    byte_size: cold_raw.byte_size,
-                },
-                AssetObjectRegistration {
-                    object_hash: nested.content_hash.clone(),
-                    byte_size: nested.byte_size,
-                },
-                AssetObjectRegistration {
-                    object_hash: nested_url.content_hash.clone(),
-                    byte_size: nested_url.byte_size,
-                },
-                AssetObjectRegistration {
-                    object_hash: collectable.content_hash.clone(),
-                    byte_size: collectable.byte_size,
-                },
-            ],
-            0,
-        )
-        .expect("register cold liveness candidates");
-
-    let report = store.asset_gc_dry_run(16, None, 100, 10).unwrap().report;
-
-    assert!(report.marked_hashes.contains(&cold.content_hash));
-    assert!(report.marked_hashes.contains(&cold_zlib.content_hash));
-    assert!(report.marked_hashes.contains(&cold_raw.content_hash));
-    assert!(report.marked_hashes.contains(&nested.content_hash));
-    assert!(report.marked_hashes.contains(&nested_url.content_hash));
-    assert_eq!(
-        report.potential_delete_hashes,
-        vec![collectable.content_hash.clone()]
-    );
-    assert!(!report
-        .blockers
-        .contains(&"cold-payload-unscanned".to_owned()));
-    assert!(!report
-        .blockers
-        .contains(&"native-asset-url-unresolved".to_owned()));
-    assert!(!report.deletion_enabled);
-
-    store
-        .connection
-        .execute(
-            "DELETE FROM cold_aliases WHERE generation = ?1 AND key = 'cold-raw'",
-            [&generation],
-        )
-        .unwrap();
-    let missing_nested = store.asset_gc_dry_run(16, None, 100, 10).unwrap().report;
-    assert!(missing_nested.potential_delete_hashes.is_empty());
-    assert!(missing_nested
-        .blockers
-        .contains(&"cold-payload-unscanned".to_owned()));
-    store
-        .connection
-        .execute(
-            "INSERT INTO cold_aliases (generation, key, object_hash, size, metadata)
-             VALUES (?1, 'cold-raw', ?2, ?3, '{}')",
-            rusqlite::params![generation, cold_raw.content_hash, cold_raw.byte_size as i64],
-        )
-        .unwrap();
-
-    let mut unknown_encoder = GzEncoder::new(Vec::new(), Compression::default());
-    unknown_encoder
-        .write_all(b"{\"roadmap14Unknown\":true}")
-        .unwrap();
-    let unknown = cas
-        .prepare_bytes(&unknown_encoder.finish().unwrap())
-        .unwrap();
-    store
-        .connection
-        .execute(
-            "INSERT INTO cold_aliases (generation, key, object_hash, size, metadata)
-             VALUES (?1, 'cold-unknown', ?2, ?3, '{}')",
-            rusqlite::params![generation, unknown.content_hash, unknown.byte_size as i64],
-        )
-        .unwrap();
-    store
-        .asset_object_catalog()
-        .register(
-            &[AssetObjectRegistration {
-                object_hash: unknown.content_hash.clone(),
-                byte_size: unknown.byte_size,
-            }],
-            0,
-        )
-        .unwrap();
-    let unknown_report = store.asset_gc_dry_run(16, None, 100, 10).unwrap().report;
-    assert!(unknown_report
-        .marked_hashes
-        .contains(&collectable.content_hash));
-    assert!(unknown_report.potential_delete_hashes.is_empty());
-    assert!(unknown_report
-        .blockers
-        .contains(&"cold-payload-unscanned".to_owned()));
-    store
-        .connection
-        .execute(
-            "DELETE FROM cold_aliases WHERE generation = ?1 AND key = 'cold-unknown'",
-            [&generation],
-        )
-        .unwrap();
-
-    let mut unknown_url_encoder = GzEncoder::new(Vec::new(), Compression::default());
-    unknown_url_encoder
-        .write_all(b"{\"message\":{\"data\":\"HTTP://RISUASSET.LOCALHOST/not-hex\"}}")
-        .unwrap();
-    let unknown_url = cas
-        .prepare_bytes(&unknown_url_encoder.finish().unwrap())
-        .unwrap();
-    store
-        .connection
-        .execute(
-            "INSERT INTO cold_aliases (generation, key, object_hash, size, metadata)
-             VALUES (?1, 'cold-unknown-url', ?2, ?3, '{}')",
-            rusqlite::params![
-                generation,
-                unknown_url.content_hash,
-                unknown_url.byte_size as i64
-            ],
-        )
-        .unwrap();
-    store
-        .asset_object_catalog()
-        .register(
-            &[AssetObjectRegistration {
-                object_hash: unknown_url.content_hash.clone(),
-                byte_size: unknown_url.byte_size,
-            }],
-            0,
-        )
-        .unwrap();
-    let unknown_url_report = store.asset_gc_dry_run(16, None, 100, 10).unwrap().report;
-    assert!(unknown_url_report.potential_delete_hashes.is_empty());
-    assert!(unknown_url_report
-        .blockers
-        .contains(&"native-asset-url-unresolved".to_owned()));
-    store
-        .connection
-        .execute(
-            "DELETE FROM cold_aliases WHERE generation = ?1 AND key = 'cold-unknown-url'",
-            [generation],
-        )
-        .unwrap();
-
-    cold_bytes[0] ^= 0xff;
-    fs::write(directory.path().join(&cold.physical_key), cold_bytes).unwrap();
-    let blocked = store.asset_gc_dry_run(16, None, 100, 10).unwrap().report;
-    assert!(blocked.marked_hashes.contains(&cold.content_hash));
-    assert!(blocked.marked_hashes.contains(&nested.content_hash));
-    assert!(blocked.marked_hashes.contains(&nested_url.content_hash));
-    assert!(blocked.marked_hashes.contains(&collectable.content_hash));
-    assert!(blocked.potential_delete_hashes.is_empty());
-    assert!(blocked
-        .blockers
-        .contains(&"cold-payload-unscanned".to_owned()));
-    assert!(!blocked.deletion_enabled);
-}
-
-#[test]
-fn asset_gc_dry_run_retains_ambiguous_cross_generation_cold_keys() {
-    use super::asset_object_catalog::AssetObjectRegistration;
-    use flate2::{write::GzEncoder, Compression};
-    use std::io::Write;
-
-    let directory = tempfile::tempdir().expect("create temporary directory");
-    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
-    let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder
-        .write_all(b"{\"message\":[]}")
-        .expect("encode cold fixture");
-    let cold = cas.prepare_bytes(&encoder.finish().unwrap()).unwrap();
-    let collectable = cas.prepare_bytes(b"cross-generation-candidate").unwrap();
-    let generation = super::active_generation(&store.connection).expect("read generation");
-    store
-        .connection
-        .execute(
-            "UPDATE root SET value = ?2 WHERE generation = ?1",
-            rusqlite::params![
-                generation,
-                serde_json::to_string(&json!({ "coldstorage": "shared-cold-key" })).unwrap()
-            ],
-        )
-        .unwrap();
-    store
-        .connection
-        .execute(
-            "INSERT INTO root (generation, value) VALUES ('retained-shadow', ?1)",
-            [serde_json::to_string(&json!({ "coldstorage": "shared-cold-key" })).unwrap()],
-        )
-        .unwrap();
-    store
-        .connection
-        .execute(
-            "INSERT INTO cold_aliases (generation, key, object_hash, size, metadata)
-             VALUES (?1, 'shared-cold-key', ?2, ?3, '{}')",
-            rusqlite::params![generation, cold.content_hash, cold.byte_size as i64],
-        )
-        .unwrap();
-    store
-        .connection
-        .execute(
-            "INSERT INTO cold_aliases (generation, key, object_hash, size, metadata)
-             VALUES ('retained-shadow', 'shared-cold-key', NULL, 0, '{}')",
-            [],
-        )
-        .unwrap();
-    store
-        .asset_object_catalog()
-        .register(
-            &[
-                AssetObjectRegistration {
-                    object_hash: cold.content_hash.clone(),
-                    byte_size: cold.byte_size,
-                },
-                AssetObjectRegistration {
-                    object_hash: collectable.content_hash.clone(),
-                    byte_size: collectable.byte_size,
-                },
-            ],
-            0,
-        )
-        .unwrap();
-
-    let report = store.asset_gc_dry_run(16, None, 100, 10).unwrap().report;
-
-    assert!(report.marked_hashes.contains(&cold.content_hash));
-    assert!(report.marked_hashes.contains(&collectable.content_hash));
-    assert!(report.potential_delete_hashes.is_empty());
-    assert!(report
-        .blockers
-        .contains(&"cold-payload-unscanned".to_owned()));
-    assert!(!report.deletion_enabled);
-}
-
-#[test]
 fn asset_gc_dry_run_keeps_detached_export_roots_until_reader_release() {
     use super::asset_object_catalog::AssetObjectRegistration;
 
@@ -909,14 +540,6 @@ fn detached_export_registry_keeps_exact_v8_roots_until_reader_release() {
             rusqlite::params![generation, "cd".repeat(32)],
         )
         .expect("insert detached owner head root");
-    store
-        .connection
-        .execute(
-            "INSERT INTO cold_aliases (generation, key, object_hash, size, metadata)
-             VALUES (?1, 'cold/detached', ?2, 1, '{}')",
-            rusqlite::params![generation, "ef".repeat(32)],
-        )
-        .expect("insert detached cold alias root");
 
     let mut prepared = store
         .prepare_risu_save_export(0)
@@ -927,10 +550,7 @@ fn detached_export_registry_keeps_exact_v8_roots_until_reader_release() {
         .expect("read detached roots");
     assert_eq!(roots.len(), 1);
     assert_eq!(roots[0].manifest_hashes, ["cd".repeat(32)].into());
-    assert_eq!(
-        roots[0].object_hashes,
-        ["ab".repeat(32), "ef".repeat(32)].into()
-    );
+    assert_eq!(roots[0].object_hashes, ["ab".repeat(32)].into());
 
     let reader = prepared.take_reader().expect("take detached reader");
     prepared.release(reader).expect("release detached reader");

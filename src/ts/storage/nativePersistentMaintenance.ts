@@ -40,7 +40,6 @@ export interface NativePersistentStorageStats {
     databaseBytes: number
     assetObjects: NativeStorageBytes
     assetAliases: NativeStorageAliasStats[]
-    coldAliases: NativeStorageBytes
     pluginStorage: NativeStorageBytes
     characters: { active: NativeStorageBytes; trashedCount: number }
     conversations: { count: number; messageCount: number }

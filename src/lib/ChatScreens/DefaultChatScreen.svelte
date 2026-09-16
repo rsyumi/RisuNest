@@ -27,7 +27,6 @@
     import { postChatFile } from 'src/ts/process/files/multisend';
     import InlayFilePreview from './InlayFilePreview.svelte';
     import { ConnectionOpenStore } from 'src/ts/sync/multiuser';
-    import { coldStorageHeader, preLoadChat } from 'src/ts/process/coldstorage.svelte';
     import Chats from './Chats.svelte';
     import Button from '../UI/GUI/Button.svelte';
     import PluginDefinedIcon from '../Others/PluginDefinedIcon.svelte';
@@ -156,12 +155,6 @@
         return conversationViewportSource
             ? selectedConversationViewport.totalMessages
             : currentChat?.length ?? 0
-    })
-    let firstCurrentMessage = $derived.by(() => {
-        void viewportBindingRevision
-        return conversationViewportSource
-            ? selectedConversationViewport.firstMessage
-            : currentChat?.[0]
     })
     let tailCurrentMessage = $derived.by(() => {
         void viewportBindingRevision
@@ -581,17 +574,6 @@
                 autoMode = false
             }
         }
-    }
-
-    async function preLoadSelectedChat() {
-        return runSelectedConversationOperation(
-            'preload-cold-conversation',
-            async (context) => {
-                const authority = context.requireCurrent()
-                await preLoadChat($selectedCharID, authority.character.chatPage)
-                context.requireCurrent()
-            },
-        )
     }
 
     async function appendPlaygroundMessage() {
@@ -1377,16 +1359,6 @@
                 </div>
             {/if}
 
-            {#if firstCurrentMessage?.data?.startsWith(coldStorageHeader)}
-                {#await preLoadSelectedChat()}
-                    <div class="w-full flex justify-center text-textcolor2 italic mb-12">
-                        {language.loadingChatData}
-                    </div>
-                {:then a}
-                    <div></div>
-                {/await}
-            {:else}
-
             {#if chatFoldedStateMessageIndex.index !== -1}
                 <button class="w-full flex justify-center max-w-full p-4">
                     <Button className="max-w-xl w-full" onclick={() => {
@@ -1421,8 +1393,6 @@
                 userIconPortrait={userIconPortrait}
                 bind:hasNewUnreadMessage={showNewMessageButton}
             />
-
-            {/if}
 
             {#if openMenu}
                 <div class="{DBState.db.fixedChatTextarea ? 'fixed' : 'absolute'} right-2 bottom-16 p-5 bg-darkbg flex flex-col gap-3 text-textcolor rounded-md" onclick={(e) => {

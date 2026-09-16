@@ -157,10 +157,6 @@ pub(crate) enum PortableFragment<'a> {
         conversation_id: &'a str,
         index: i64,
     },
-    Cold {
-        value: &'a Value,
-        key: &'a str,
-    },
 }
 
 pub(crate) fn scan_portable_fragment(
@@ -295,16 +291,6 @@ pub(crate) fn scan_portable_fragment(
                 }
             }
             scan_inlays(value, owner, &format!("$.message[{index}]"), &mut collector);
-        }
-        PortableFragment::Cold { value, key } => {
-            let owner = Owner {
-                kind: "cold",
-                id: key,
-            };
-            if let Some(character) = value.get("character").and_then(Value::as_object) {
-                scan_character_assets(character, owner, "$.value.character", &mut collector);
-            }
-            scan_inlays(value, owner, "$.value", &mut collector);
         }
     }
     Ok(collector.references)

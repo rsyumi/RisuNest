@@ -35,14 +35,11 @@ describe('createAccountScopedOfficialAssetLedger', () => {
         let accountId: string | undefined = 'acct-1'
         const ledger = createAccountScopedOfficialAssetLedger(storage, () => accountId)
         ledger.record('assets/a.png', 'remote/a')
-        ledger.recordCold('cold-1', 'digest-1')
 
         accountId = 'acct-2'
         expect(ledger.publishedAs('assets/a.png')).toBeNull()
-        expect(ledger.coldDigest('cold-1')).toBeNull()
 
         accountId = 'acct-1'
         expect(ledger.publishedAs('assets/a.png')).toBe('remote/a')
-        expect(ledger.coldDigest('cold-1')).toBe('digest-1')
     })
 })

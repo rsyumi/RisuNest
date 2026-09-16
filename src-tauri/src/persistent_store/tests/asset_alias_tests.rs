@@ -564,19 +564,9 @@ fn staged_payload_namespaces_with_the_same_key_activate_atomically() {
             "height": 20
         }),
     };
-    let cold = ColdAlias {
-        key: key.to_owned(),
-        object_hash: Some("33".repeat(32)),
-        size: 3,
-        metadata: json!({ "source": "cold-storage", "ordinal": 7 }),
-    };
-
     store
         .replace_put_asset_aliases(&staging.staging_id, &[inlay.clone(), asset.clone()])
         .expect("stage asset and Inlay aliases");
-    store
-        .replace_put_cold_aliases(&staging.staging_id, std::slice::from_ref(&cold))
-        .expect("stage cold alias");
     assert_eq!(
         store
             .read_asset_alias("asset", key, None)
@@ -587,12 +577,6 @@ fn staged_payload_namespaces_with_the_same_key_activate_atomically() {
         store
             .read_asset_alias("inlay", key, None)
             .expect("read pre-activation Inlay"),
-        None
-    );
-    assert_eq!(
-        store
-            .read_cold_alias(key, None)
-            .expect("read pre-activation cold alias"),
         None
     );
     assert_eq!(store.revision().expect("read pre-activation revision"), 0);
@@ -619,14 +603,6 @@ fn staged_payload_namespaces_with_the_same_key_activate_atomically() {
             .expect("Inlay exists")
             .value,
         inlay
-    );
-    assert_eq!(
-        store
-            .read_cold_alias(key, None)
-            .expect("read cold alias")
-            .expect("cold alias exists")
-            .value,
-        cold
     );
 }
 
@@ -1214,18 +1190,6 @@ fn payload_inventories_and_typed_reads_are_deterministic_at_a_pinned_revision() 
         height: Some(2),
         metadata: json!({}),
     };
-    let cold_a = ColdAlias {
-        key: "a-first".to_owned(),
-        object_hash: Some("33".repeat(32)),
-        size: 3,
-        metadata: json!({ "kind": "memory" }),
-    };
-    let cold_z = ColdAlias {
-        key: "z-last".to_owned(),
-        object_hash: None,
-        size: 0,
-        metadata: json!({ "kind": "embedding", "missing": true }),
-    };
     let first_staging = store.replace_begin().expect("begin first inventory");
     store
         .replace_put_asset_aliases(
@@ -1233,9 +1197,6 @@ fn payload_inventories_and_typed_reads_are_deterministic_at_a_pinned_revision() 
             &[z_asset.clone(), shared_inlay.clone(), shared_asset.clone()],
         )
         .expect("stage first asset inventory");
-    store
-        .replace_put_cold_aliases(&first_staging.staging_id, &[cold_z.clone(), cold_a.clone()])
-        .expect("stage first cold inventory");
     let first = store
         .replace_commit(&first_staging.staging_id, Some(0))
         .expect("activate first inventory");
@@ -1248,11 +1209,6 @@ fn payload_inventories_and_typed_reads_are_deterministic_at_a_pinned_revision() 
         name: "Current asset".to_owned(),
         ..shared_asset.clone()
     };
-    let replacement_cold = ColdAlias {
-        object_hash: Some("55".repeat(32)),
-        metadata: json!({ "kind": "current" }),
-        ..cold_a.clone()
-    };
     let second_staging = store.replace_begin().expect("begin second inventory");
     store
         .replace_put_asset_aliases(
@@ -1260,12 +1216,6 @@ fn payload_inventories_and_typed_reads_are_deterministic_at_a_pinned_revision() 
             std::slice::from_ref(&replacement_asset),
         )
         .expect("stage replacement asset inventory");
-    store
-        .replace_put_cold_aliases(
-            &second_staging.staging_id,
-            std::slice::from_ref(&replacement_cold),
-        )
-        .expect("stage replacement cold inventory");
     let second = store
         .replace_commit(&second_staging.staging_id, Some(first.revision))
         .expect("activate second inventory");
@@ -1277,15 +1227,6 @@ fn payload_inventories_and_typed_reads_are_deterministic_at_a_pinned_revision() 
         super::Versioned {
             revision: first.revision,
             value: vec![shared_asset.clone(), z_asset, shared_inlay.clone()],
-        }
-    );
-    assert_eq!(
-        store
-            .list_cold_aliases(Some(&lease.lease))
-            .expect("list pinned cold aliases"),
-        super::Versioned {
-            revision: first.revision,
-            value: vec![cold_a.clone(), cold_z],
         }
     );
     assert_eq!(
@@ -1305,82 +1246,6 @@ fn payload_inventories_and_typed_reads_are_deterministic_at_a_pinned_revision() 
             revision: second.revision,
             value: replacement_asset.clone(),
         }
-    );
-    assert_eq!(
-        store
-            .read_cold_alias("a-first", Some(&lease.lease))
-            .expect("read pinned cold alias")
-            .expect("pinned cold alias exists")
-            .value,
-        cold_a
-    );
-    assert_eq!(
-        store
-            .read_cold_alias("a-first", None)
-            .expect("read current cold alias")
-            .expect("current cold alias exists"),
-        super::Versioned {
-            revision: second.revision,
-            value: replacement_cold,
-        }
-    );
-}
-
-#[test]
-fn cold_aliases_follow_copy_on_write_without_leaking_between_revisions() {
-    let directory = tempfile::tempdir().expect("create cold COW directory");
-    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
-    let cold = ColdAlias {
-        key: "cold/cow".to_owned(),
-        object_hash: Some("66".repeat(32)),
-        size: 6,
-        metadata: json!({ "scope": "both revisions" }),
-    };
-    let staging = store.replace_begin().expect("begin cold COW fixture");
-    store
-        .replace_put_cold_aliases(&staging.staging_id, std::slice::from_ref(&cold))
-        .expect("stage cold COW fixture");
-    let first = store
-        .replace_commit(&staging.staging_id, Some(0))
-        .expect("activate cold COW fixture");
-    let lease = store
-        .acquire_revision(first.revision)
-        .expect("pin cold COW fixture");
-    let second = store
-        .commit(&WorkingSetCommit {
-            root: Some(json!({ "username": "copy-on-write" })),
-            ..empty_working_set_commit(first.revision)
-        })
-        .expect("commit copy-on-write revision");
-
-    assert_eq!(
-        store
-            .read_cold_alias(&cold.key, None)
-            .expect("read current copied cold alias"),
-        Some(super::Versioned {
-            revision: second.revision,
-            value: cold.clone(),
-        })
-    );
-    assert_eq!(
-        store
-            .read_cold_alias(&cold.key, Some(&lease.lease))
-            .expect("read pinned cold alias"),
-        Some(super::Versioned {
-            revision: first.revision,
-            value: cold.clone(),
-        })
-    );
-    store
-        .release_revision(&lease.lease)
-        .expect("release pinned cold revision");
-    assert_eq!(
-        store
-            .read_cold_alias(&cold.key, None)
-            .expect("read current cold alias after lease release")
-            .expect("current cold alias remains")
-            .value,
-        cold
     );
 }
 
@@ -1806,19 +1671,10 @@ fn payload_alias_abort_and_reopen_sweep_remove_all_staged_rows() {
         height: None,
         metadata: json!({}),
     };
-    let cold = ColdAlias {
-        key: alias.key.clone(),
-        object_hash: Some("77".repeat(32)),
-        size: 7,
-        metadata: json!({ "retained": true }),
-    };
     let aborted = store.replace_begin().expect("begin aborted replacement");
     store
         .replace_put_asset_aliases(&aborted.staging_id, std::slice::from_ref(&alias))
         .expect("stage aborted alias");
-    store
-        .replace_put_cold_aliases(&aborted.staging_id, std::slice::from_ref(&cold))
-        .expect("stage aborted cold alias");
     store
         .replace_abort(&aborted.staging_id)
         .expect("abort staged aliases");
@@ -1831,23 +1687,11 @@ fn payload_alias_abort_and_reopen_sweep_remove_all_staged_rows() {
         )
         .expect("count aborted alias rows");
     assert_eq!(aborted_rows, 0);
-    let aborted_cold_rows: i64 = store
-        .connection
-        .query_row(
-            "SELECT COUNT(*) FROM cold_aliases WHERE generation = ?1",
-            [&aborted.staging_id],
-            |row| row.get(0),
-        )
-        .expect("count aborted cold alias rows");
-    assert_eq!(aborted_cold_rows, 0);
 
     let abandoned = store.replace_begin().expect("begin abandoned replacement");
     store
         .replace_put_asset_aliases(&abandoned.staging_id, &[alias])
         .expect("stage abandoned alias");
-    store
-        .replace_put_cold_aliases(&abandoned.staging_id, &[cold])
-        .expect("stage abandoned cold alias");
     drop(store);
     let store = PersistentStore::open(directory.path()).expect("reopen persistent store");
     let abandoned_rows: i64 = store
@@ -1859,15 +1703,6 @@ fn payload_alias_abort_and_reopen_sweep_remove_all_staged_rows() {
         )
         .expect("count swept alias rows");
     assert_eq!(abandoned_rows, 0);
-    let abandoned_cold_rows: i64 = store
-        .connection
-        .query_row(
-            "SELECT COUNT(*) FROM cold_aliases WHERE generation = ?1",
-            [&abandoned.staging_id],
-            |row| row.get(0),
-        )
-        .expect("count swept cold alias rows");
-    assert_eq!(abandoned_cold_rows, 0);
 }
 
 #[test]
@@ -1942,60 +1777,6 @@ fn invalid_asset_aliases_leave_revision_and_staging_rows_unchanged() {
         .expect("count rejected staged aliases");
     assert_eq!(staged_rows, 0);
     assert_eq!(store.revision().expect("read staged failure revision"), 0);
-}
-
-#[test]
-fn invalid_cold_alias_batch_leaves_staging_and_revision_unchanged() {
-    let directory = tempfile::tempdir().expect("create cold validation directory");
-    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
-    let valid = ColdAlias {
-        key: "cold/valid".to_owned(),
-        object_hash: Some("aa".repeat(32)),
-        size: 1,
-        metadata: json!({ "type": "memory" }),
-    };
-    let invalid_cases = [
-        ColdAlias {
-            key: String::new(),
-            ..valid.clone()
-        },
-        ColdAlias {
-            key: "cold\0invalid".to_owned(),
-            ..valid.clone()
-        },
-        ColdAlias {
-            object_hash: Some("AA".repeat(32)),
-            ..valid.clone()
-        },
-        ColdAlias {
-            size: -1,
-            ..valid.clone()
-        },
-        ColdAlias {
-            metadata: json!(["not", "an", "object"]),
-            ..valid.clone()
-        },
-    ];
-
-    for invalid in invalid_cases {
-        let staging = store.replace_begin().expect("begin invalid cold batch");
-        assert!(store
-            .replace_put_cold_aliases(&staging.staging_id, &[valid.clone(), invalid])
-            .is_err());
-        let rows: i64 = store
-            .connection
-            .query_row(
-                "SELECT COUNT(*) FROM cold_aliases WHERE generation = ?1",
-                [&staging.staging_id],
-                |row| row.get(0),
-            )
-            .expect("count rejected cold batch");
-        assert_eq!(rows, 0);
-        assert_eq!(store.revision().expect("read unchanged revision"), 0);
-        store
-            .replace_abort(&staging.staging_id)
-            .expect("abort rejected cold staging");
-    }
 }
 
 #[test]

@@ -201,12 +201,6 @@ function createReader(
             value: { format: 'legacy' },
         }),
         readAssetOwnerHead: async () => null,
-        readColdPayloadAuthority: async () => ({
-            revision,
-            value: { format: 'legacy' },
-        }),
-        readColdAlias: async () => null,
-        listColdAliases: async () => ({ revision, value: [] }),
         release: onRelease,
     }
     return reader

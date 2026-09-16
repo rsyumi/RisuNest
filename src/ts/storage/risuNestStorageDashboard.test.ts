@@ -14,7 +14,6 @@ const stats = {
         { kind: 'inlay', inlayType: null, count: 1, bytes: 1024 * 1024 },
         { kind: 'image', inlayType: 'image', count: 1, bytes: 2 * 1024 * 1024 },
     ],
-    coldAliases: { count: 0, bytes: 0 },
     pluginStorage: { count: 2, bytes: 512 * 1024 },
     characters: { active: { count: 3, bytes: 0 }, trashedCount: 1 },
     conversations: { count: 4, messageCount: 5 },

@@ -158,7 +158,6 @@ impl PersistentStore {
              AND NOT EXISTS(SELECT 1 FROM plugin_storage WHERE generation=?1)
              AND NOT EXISTS(SELECT 1 FROM asset_aliases WHERE generation=?1)
              AND NOT EXISTS(SELECT 1 FROM asset_owner_heads WHERE generation=?1)
-             AND NOT EXISTS(SELECT 1 FROM cold_aliases WHERE generation=?1)
              FROM root WHERE generation=?1",
             [&identity.generation],
             |row| row.get(0),

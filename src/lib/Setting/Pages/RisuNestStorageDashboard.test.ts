@@ -64,7 +64,7 @@ const serverBackup: ManagedServerSyncBackup = {
 const stats = {
     snapshotBytes: 2 * 1024 * 1024,
     databaseBytes: 1024 * 1024,
-    assetObjects: { count: 2, bytes: 2 * 1024 * 1024 }, assetAliases: [{ kind: 'inlay', inlayType: null, count: 1, bytes: 1024 * 1024 }], coldAliases: { count: 0, bytes: 0 }, pluginStorage: { count: 1, bytes: 1024 },
+    assetObjects: { count: 2, bytes: 2 * 1024 * 1024 }, assetAliases: [{ kind: 'inlay', inlayType: null, count: 1, bytes: 1024 * 1024 }], pluginStorage: { count: 1, bytes: 1024 },
     characters: { active: { count: 2, bytes: 0 }, trashedCount: 1 }, conversations: { count: 3, messageCount: 4 }, assetObjectDeletions: [],
 }
 

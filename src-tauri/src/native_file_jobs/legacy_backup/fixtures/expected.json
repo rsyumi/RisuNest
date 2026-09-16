@@ -18,7 +18,13 @@
           ]
         }
       ],
-      "additionalAssets": [["module-art", "assets/module.png", "png"]],
+      "additionalAssets": [
+        [
+          "module-art",
+          "assets/module.png",
+          "png"
+        ]
+      ],
       "emotionImages": []
     },
     {
@@ -43,15 +49,21 @@
       "type": "group",
       "chaId": "synthetic-group",
       "name": "Synthetic group",
-      "characters": ["synthetic-active"],
+      "characters": [
+        "synthetic-active"
+      ],
       "chats": [
         {
-          "id": "group-chat",
-          "name": "Synthetic group chat",
-          "message": []
+          "id": "synthetic-cold-chat",
+          "name": "Synthetic cold chat",
+          "message": [
+            {
+              "role": "user",
+              "data": "Synthetic cold message"
+            }
+          ]
         }
-      ],
-      "coldstorage": "9f8b7c6d-1a2b-3c4d-5e6f-a1b2c3d4e5f6"
+      ]
     }
   ],
   "botPresets": [
@@ -65,7 +77,13 @@
     {
       "id": "synthetic-module",
       "name": "Synthetic module",
-      "assets": [["art", "assets/module.png", "png"]]
+      "assets": [
+        [
+          "art",
+          "assets/module.png",
+          "png"
+        ]
+      ]
     }
   ],
   "plugins": [
@@ -77,7 +95,11 @@
   "pluginCustomStorage": {
     "synthetic-plugin": {
       "text": "한글 보존",
-      "values": [1, false, null]
+      "values": [
+        1,
+        false,
+        null
+      ]
     }
   },
   "loadouts": [],
@@ -87,7 +109,11 @@
       "name": "Synthetic persona",
       "icon": "assets/portrait.png",
       "customField": {
-        "nested": [true, null, "한글"]
+        "nested": [
+          true,
+          null,
+          "한글"
+        ]
       }
     }
   ],
@@ -113,7 +139,9 @@
     "synthetic-active",
     {
       "name": "Synthetic folder",
-      "data": ["synthetic-group"]
+      "data": [
+        "synthetic-group"
+      ]
     }
   ],
   "unknownPocketField": {

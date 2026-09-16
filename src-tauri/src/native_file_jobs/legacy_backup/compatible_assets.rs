@@ -2,13 +2,7 @@
 use super::*;
 use crate::server_sync::residency::RemotePayloadAccess;
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
-
-pub(super) struct PreparedCold {
-    pub(super) logical_name: String,
-    /// Plain JSON, requiring the same target projection as the database.
-    pub(super) source: PathBuf,
-}
+use std::path::Path;
 
 #[derive(Default)]
 pub(super) struct PreparedAttachments {
@@ -16,8 +10,6 @@ pub(super) struct PreparedAttachments {
     pub(super) owner_replacement_keys: HashMap<AssetOwnerLocator, Vec<String>>,
     pub(super) replacements: HashMap<String, String>,
     pub(super) inlay_replacements: HashMap<String, String>,
-    pub(super) cold_replacements: HashMap<String, String>,
-    pub(super) cold_sources: Vec<PreparedCold>,
     pub(super) warning_codes: Vec<String>,
     /// Code, affected item count, source bytes. No record content is exposed.
     pub(super) losses: Vec<(String, u64, u64)>,
@@ -90,19 +82,6 @@ fn reserve_inlay_files(id: &str, ext: &str, used: &mut HashSet<String>) -> bool 
 
 fn stable_id(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
-}
-
-fn stable_uuid(value: &str) -> String {
-    let digest = Sha256::digest(value.as_bytes());
-    let mut bytes = [0; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x50;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    Uuid::from_bytes(bytes).to_string()
-}
-
-fn valid_cold_id(value: &str) -> bool {
-    value.len() == 36 && Uuid::parse_str(value).is_ok()
 }
 
 fn normalized_extension(value: &str) -> String {
@@ -549,73 +528,6 @@ pub(super) fn prepare(
             .owner_replacement_keys
             .insert(head.owner.clone(), keys);
     }
-    let mut cold: Vec<_> = inventory.cold.iter().collect();
-    cold.sort_by(|a, b| a.key.cmp(&b.key));
-    let mut cold_ids = HashSet::new();
-    let mut original_cold_ids = HashSet::new();
-    for alias in &cold {
-        if valid_cold_id(&alias.key) && cold_ids.insert(name_identity(&alias.key)) {
-            original_cold_ids.insert(alias.key.as_str());
-        }
-    }
-    let mut seen_cold = HashSet::new();
-    for (index, alias) in cold.iter().enumerate() {
-        if !seen_cold.insert(&alias.key) {
-            return Err(invalid_source("duplicate cold alias"));
-        }
-        let id = if original_cold_ids.contains(alias.key.as_str()) {
-            alias.key.clone()
-        } else {
-            let mut index = 0u64;
-            loop {
-                let value = stable_uuid(&format!("cold:{}:{index}", alias.key));
-                if cold_ids.insert(name_identity(&value)) {
-                    break value;
-                }
-                index += 1;
-            }
-        };
-        if id != alias.key {
-            result
-                .cold_replacements
-                .insert(alias.key.clone(), id.clone());
-            warning(&mut result, "cold-ids-remapped");
-        }
-        let hash = alias
-            .object_hash
-            .as_deref()
-            .ok_or_else(|| invalid_source("cold alias has no payload"))?;
-        let size = u64::try_from(alias.size)
-            .map_err(|_| invalid_source("cold payload length is invalid"))?;
-        let compressed = owned_directory.join(format!("compatible-cold-{index}.gz"));
-        copy_verified(cas, pins, hash, size, role(hash), &compressed, cancellation)?;
-        let source = owned_directory.join(format!("compatible-cold-{index}.json"));
-        let mut decoder = GzDecoder::new(CancellationReader::new(
-            File::open(compressed).map_err(io_job_error)?,
-            cancellation,
-        ))
-        .take(u64::from(u32::MAX) + 1);
-        let mut output = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&source)
-            .map_err(io_job_error)?;
-        let size = io::copy(&mut decoder, &mut output)
-            .map_err(|e| local_backup_error(cancellation_io(e, cancellation)))?;
-        if size > u64::from(u32::MAX) {
-            return Err(NativeJobError::new(
-                "length-overflow",
-                "cold payload exceeds the target's 4 GiB entry limit",
-            ));
-        }
-        output.sync_all().map_err(io_job_error)?;
-        result.preserved_files += 1;
-        result.preserved_bytes = result.preserved_bytes.saturating_add(size);
-        result.cold_sources.push(PreparedCold {
-            logical_name: format!("coldstorage_{id}.json"),
-            source,
-        });
-    }
     Ok(result)
 }
 
@@ -625,8 +537,6 @@ type ImpactCodes = HashSet<String>;
 struct AttachmentImpactIndex {
     assets: HashMap<String, ImpactCodes>,
     inlays: HashMap<String, ImpactCodes>,
-    cold: HashMap<String, ImpactCodes>,
-    paths: HashMap<String, PathBuf>,
     provenance: HashMap<(String, String), ImpactCodes>,
 }
 
@@ -709,41 +619,6 @@ impl AttachmentImpactIndex {
         }
     }
 
-    fn cold_value(
-        &self,
-        key: &str,
-        cancel: &dyn CancellationProbe,
-    ) -> Result<Value, NativeJobError> {
-        check_cancelled(cancel).map_err(local_backup_error)?;
-        let path = self
-            .paths
-            .get(key)
-            .ok_or_else(|| invalid_source("referenced cold attachment is missing"))?;
-        serde_json::from_reader(BufReader::new(CancellationReader::new(
-            File::open(path).map_err(io_job_error)?,
-            cancel,
-        )))
-        .map_err(|_| invalid_source("cold attachment JSON is invalid"))
-    }
-
-    fn cold(
-        &self,
-        key: &str,
-        found: &mut ImpactCodes,
-        visiting: &mut HashSet<String>,
-        cancel: &dyn CancellationProbe,
-    ) -> Result<(), NativeJobError> {
-        if let Some(codes) = self.cold.get(key) {
-            found.extend(codes.iter().cloned());
-        }
-        if !visiting.insert(key.to_owned()) || visiting.len() > 128 {
-            return Err(invalid_source("cold attachment reference cycle"));
-        }
-        self.value(&self.cold_value(key, cancel)?, found, visiting, cancel)?;
-        visiting.remove(key);
-        Ok(())
-    }
-
     fn text(
         &self,
         value: &Value,
@@ -753,9 +628,6 @@ impl AttachmentImpactIndex {
     ) -> Result<(), NativeJobError> {
         match value {
             Value::String(text) => {
-                if let Some(key) = text.strip_prefix("\u{ef01}COLDSTORAGE\u{ef01}") {
-                    return self.cold(key, found, visiting, cancel);
-                }
                 // Scan the exact inlay grammar, never arbitrary ID substrings.
                 for fragment in text.split("{{").skip(1) {
                     let Some(token) = fragment.split_once("}}").map(|part| part.0) else {
@@ -797,9 +669,6 @@ impl AttachmentImpactIndex {
                 }
             }
             Value::Object(object) => {
-                if let Some(key) = object.get("coldstorage").and_then(Value::as_str) {
-                    self.cold(key, found, visiting, cancel)?;
-                }
                 // These are the app's structural message/conversation boundaries.
                 for key in [
                     "message",
@@ -891,15 +760,6 @@ pub(super) fn count_affected_conversations(
             }
         }
     }
-    for source in &prepared.cold_sources {
-        if let Some(id) = source
-            .logical_name
-            .strip_prefix("coldstorage_")
-            .and_then(|name| name.strip_suffix(".json"))
-        {
-            index.paths.insert(id.to_owned(), source.source.clone());
-        }
-    }
     for alias in inventory
         .assets
         .iter()
@@ -922,17 +782,10 @@ pub(super) fn count_affected_conversations(
                 .extend(codes.iter().cloned());
         }
     }
-    for (old, new) in &prepared.cold_replacements {
-        if let Some(path) = index.paths.get(new).cloned() {
-            index.paths.insert(old.clone(), path);
-        }
-        impact_reference(&mut index.cold, old, "cold-ids-remapped");
-    }
     let mut known_codes: ImpactCodes = index
         .assets
         .values()
         .chain(index.inlays.values())
-        .chain(index.cold.values())
         .flat_map(|codes| codes.iter().cloned())
         .collect();
     if !prepared.owner_replacement_keys.is_empty() {
@@ -1014,14 +867,7 @@ pub(super) fn count_affected_conversations(
     while let Some(row) = rows.next().map_err(sql_error)? {
         check_cancelled(cancel).map_err(local_backup_error)?;
         let character_id: String = row.get(0).map_err(sql_error)?;
-        let mut character = parse_json(row.get(1).map_err(sql_error)?)?;
-        if let Some(keys) = character.get("coldStoragedChats").and_then(Value::as_array) {
-            for key in keys.iter().filter_map(Value::as_str) {
-                if let Some(codes) = index.cold.get(key) {
-                    unknown.extend(codes.iter().cloned());
-                }
-            }
-        }
+        let character = parse_json(row.get(1).map_err(sql_error)?)?;
         let mut shared = global.clone();
         let owner = AssetOwnerLocator::CharacterAdditionalAssets {
             character_id: character_id.clone(),
@@ -1032,28 +878,6 @@ pub(super) fn count_affected_conversations(
         if prepared.owner_playback_unverified.contains(&owner) {
             shared.insert("asset-playback-unverified".to_owned());
         }
-        let cold_character = character
-            .get("coldstorage")
-            .and_then(Value::as_str)
-            .is_some();
-        let mut chain = HashSet::new();
-        while let Some(key) = character
-            .get("coldstorage")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-        {
-            if !chain.insert(key.clone()) || chain.len() > 128 {
-                return Err(invalid_source("cold character reference cycle"));
-            }
-            if let Some(codes) = index.cold.get(&key) {
-                shared.extend(codes.iter().cloned());
-            }
-            character = index
-                .cold_value(&key, cancel)?
-                .get("character")
-                .cloned()
-                .ok_or_else(|| invalid_source("cold character payload is missing"))?;
-        }
         index.assets(&character, &mut shared);
         let mut record = |conversation_id: String, codes: ImpactCodes| {
             for code in codes {
@@ -1063,62 +887,42 @@ pub(super) fn count_affected_conversations(
                     .insert((character_id.clone(), conversation_id.clone()));
             }
         };
-        if cold_character {
-            let chats = character
-                .get("chats")
-                .and_then(Value::as_array)
-                .ok_or_else(|| invalid_source("cold character conversations are missing"))?;
-            for (ordinal, chat) in chats.iter().enumerate() {
-                let mut found = shared.clone();
-                if let Some(codes) = chat
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .and_then(|id| index.provenance.get(&(character_id.clone(), id.to_owned())))
-                {
-                    found.extend(codes.iter().cloned());
-                }
-                index.value(chat, &mut found, &mut HashSet::new(), cancel)?;
-                // Positional identity remains distinct even when source IDs are absent.
-                record(format!("cold:{ordinal}"), found);
+        let mut statement = connection.prepare("SELECT conversation_id,detail FROM conversations WHERE generation=?1 AND character_id=?2 ORDER BY configured_index").map_err(sql_error)?;
+        let mut chats = statement
+            .query(rusqlite::params![&target.generation, &character_id])
+            .map_err(sql_error)?;
+        while let Some(row) = chats.next().map_err(sql_error)? {
+            let conversation_id: String = row.get(0).map_err(sql_error)?;
+            let mut found = shared.clone();
+            if let Some(codes) = index
+                .provenance
+                .get(&(character_id.clone(), conversation_id.clone()))
+            {
+                found.extend(codes.iter().cloned());
             }
-        } else {
-            let mut statement = connection.prepare("SELECT conversation_id,detail FROM conversations WHERE generation=?1 AND character_id=?2 ORDER BY configured_index").map_err(sql_error)?;
-            let mut chats = statement
-                .query(rusqlite::params![&target.generation, &character_id])
+            index.value(
+                &parse_json(row.get(1).map_err(sql_error)?)?,
+                &mut found,
+                &mut HashSet::new(),
+                cancel,
+            )?;
+            let mut statement = connection.prepare("SELECT value FROM messages WHERE generation=?1 AND character_id=?2 AND conversation_id=?3 ORDER BY message_index").map_err(sql_error)?;
+            let mut messages = statement
+                .query(rusqlite::params![
+                    &target.generation,
+                    &character_id,
+                    &conversation_id
+                ])
                 .map_err(sql_error)?;
-            while let Some(row) = chats.next().map_err(sql_error)? {
-                let conversation_id: String = row.get(0).map_err(sql_error)?;
-                let mut found = shared.clone();
-                if let Some(codes) = index
-                    .provenance
-                    .get(&(character_id.clone(), conversation_id.clone()))
-                {
-                    found.extend(codes.iter().cloned());
-                }
+            while let Some(row) = messages.next().map_err(sql_error)? {
                 index.value(
-                    &parse_json(row.get(1).map_err(sql_error)?)?,
+                    &parse_json(row.get(0).map_err(sql_error)?)?,
                     &mut found,
                     &mut HashSet::new(),
                     cancel,
                 )?;
-                let mut statement = connection.prepare("SELECT value FROM messages WHERE generation=?1 AND character_id=?2 AND conversation_id=?3 ORDER BY message_index").map_err(sql_error)?;
-                let mut messages = statement
-                    .query(rusqlite::params![
-                        &target.generation,
-                        &character_id,
-                        &conversation_id
-                    ])
-                    .map_err(sql_error)?;
-                while let Some(row) = messages.next().map_err(sql_error)? {
-                    index.value(
-                        &parse_json(row.get(0).map_err(sql_error)?)?,
-                        &mut found,
-                        &mut HashSet::new(),
-                        cancel,
-                    )?;
-                }
-                record(conversation_id, found);
             }
+            record(conversation_id, found);
         }
     }
     for (code, identities) in affected {
@@ -1192,11 +996,6 @@ mod tests {
         ])
         .unwrap();
         let manifest = cas.prepare_bytes(&manifest).unwrap();
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder
-            .write_all(br#"{"messages":[{"data":"synthetic"}]}"#)
-            .unwrap();
-        let cold = cas.prepare_bytes(&encoder.finish().unwrap()).unwrap();
         let inventory = export::PinnedLegacyBackupInventory {
             revision: 1,
             assets: vec![alias, nested, inlay],
@@ -1206,14 +1005,7 @@ mod tests {
                 manifest_hash: Some(manifest.content_hash),
                 entry_count: 1,
             }],
-            cold: vec![ColdAlias {
-                key: "raw-cold".to_owned(),
-                object_hash: Some(cold.content_hash),
-                size: cold.byte_size as i64,
-                metadata: serde_json::json!({}),
-            }],
             asset_authority: AssetRepositoryAuthorityState::Legacy,
-            cold_authority: ColdPayloadAuthorityState::Legacy,
         };
         for target in [CompatibilityTarget::RisuAi, CompatibilityTarget::PocketRisu] {
             let output = root.join(if target == CompatibilityTarget::RisuAi {
@@ -1249,11 +1041,6 @@ mod tests {
                 read_entry(&result, owner_key.strip_prefix("assets/").unwrap()),
                 b"synthetic first"
             );
-            assert!(valid_cold_id(&result.cold_replacements["raw-cold"]));
-            let cold: Value =
-                serde_json::from_slice(&std::fs::read(&result.cold_sources[0].source).unwrap())
-                    .unwrap();
-            assert_eq!(cold["messages"][0]["data"], "synthetic");
             if target == CompatibilityTarget::RisuAi {
                 assert!(result
                     .entries
@@ -1319,9 +1106,7 @@ mod tests {
                 synthetic_alias(&cas, &reserved_id, "inlay", b"reserved inlay"),
             ],
             owner_heads: vec![],
-            cold: vec![],
             asset_authority: AssetRepositoryAuthorityState::Legacy,
-            cold_authority: ColdPayloadAuthorityState::Legacy,
         };
         let mut pins = DurableCasJob::begin(
             &root.join("repository"),
@@ -1400,29 +1185,11 @@ mod tests {
             }
             assets.push(alias);
         }
-        let cold_keys = [
-            "AAAAAAAA-AAAA-4AAA-AAAA-AAAAAAAAAAAA",
-            "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa",
-        ];
-        let mut cold = Vec::new();
-        for key in cold_keys {
-            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-            serde_json::to_writer(&mut encoder, &serde_json::json!({"synthetic": key})).unwrap();
-            let payload = cas.prepare_bytes(&encoder.finish().unwrap()).unwrap();
-            cold.push(ColdAlias {
-                key: key.to_owned(),
-                object_hash: Some(payload.content_hash),
-                size: payload.byte_size as i64,
-                metadata: serde_json::json!({}),
-            });
-        }
         let inventory = export::PinnedLegacyBackupInventory {
             revision: 1,
             assets,
-            cold,
             owner_heads: vec![],
             asset_authority: AssetRepositoryAuthorityState::Legacy,
-            cold_authority: ColdPayloadAuthorityState::Legacy,
         };
         for target in [CompatibilityTarget::RisuAi, CompatibilityTarget::PocketRisu] {
             let output = root.join(if target == CompatibilityTarget::RisuAi {
@@ -1470,27 +1237,6 @@ mod tests {
                     .open(imported_assets.join(mapped))
                     .unwrap();
             }
-            for alias in &inventory.cold {
-                let mapped = result
-                    .cold_replacements
-                    .get(&alias.key)
-                    .unwrap_or(&alias.key);
-                let name = format!("coldstorage_{mapped}.json");
-                assert!(flat_names.insert(name_identity(&name)));
-                std::fs::OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .open(imported_assets.join(&name))
-                    .unwrap();
-                let source = result
-                    .cold_sources
-                    .iter()
-                    .find(|c| c.logical_name == name)
-                    .unwrap();
-                let value: Value =
-                    serde_json::from_slice(&std::fs::read(&source.source).unwrap()).unwrap();
-                assert_eq!(value["synthetic"], alias.key);
-            }
             if target == CompatibilityTarget::PocketRisu {
                 assert!(!result.inlay_replacements.contains_key("Clip"));
                 for id in ["clip", "NUL", "trailing.", "item.meta"] {
@@ -1526,7 +1272,7 @@ mod tests {
     }
 
     #[test]
-    fn attachment_impact_counts_leased_conversations_nested_cold_and_true_zero() {
+    fn attachment_impact_counts_leased_conversations_and_true_zero() {
         let root = std::env::temp_dir().join(format!("compatible-impact-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(root.join("repository")).unwrap();
         let cas = PayloadCas::new(root.join("repository")).unwrap();
@@ -1539,9 +1285,7 @@ mod tests {
             revision: 1,
             assets: vec![asset, inlay, unused],
             owner_heads: vec![],
-            cold: vec![],
             asset_authority: AssetRepositoryAuthorityState::Legacy,
-            cold_authority: ColdPayloadAuthorityState::Legacy,
         };
         let mut prepared = PreparedAttachments::default();
         prepared
@@ -1563,29 +1307,6 @@ mod tests {
             .owner_replacement_keys
             .insert(owner.clone(), vec!["assets/owner.png".into()]);
         prepared.owner_playback_unverified.insert(owner);
-        for (key, value) in [
-            (
-                "outer-raw",
-                serde_json::json!({"message":[{"role":"char","data":"\u{ef01}COLDSTORAGE\u{ef01}inner-raw"}]}),
-            ),
-            (
-                "inner-raw",
-                serde_json::json!([{"role":"char","data":"{{inlay::bad/id}} {{inlay::bad/id}}"}]),
-            ),
-            (
-                "character-raw",
-                serde_json::json!({"character":{"chaId":"cold","chats":[{"message":[{"role":"char","data":"{{inlay::bad/id}}"}]},{"message":[{"role":"char","data":"untouched"}]}]}}),
-            ),
-        ] {
-            let mapped = stable_uuid(key);
-            let path = root.join(format!("{mapped}.json"));
-            write_json(&path, &value).unwrap();
-            prepared.cold_sources.push(PreparedCold {
-                logical_name: format!("coldstorage_{mapped}.json"),
-                source: path,
-            });
-            prepared.cold_replacements.insert(key.into(), mapped);
-        }
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         connection.execute_batch("CREATE TABLE root(generation TEXT,value TEXT); CREATE TABLE bot_presets(generation TEXT,value TEXT); CREATE TABLE plugin_storage(generation TEXT,value TEXT); CREATE TABLE characters(generation TEXT,character_id TEXT,detail TEXT,configured_index INTEGER); CREATE TABLE conversations(generation TEXT,character_id TEXT,conversation_id TEXT,detail TEXT,configured_index INTEGER); CREATE TABLE messages(generation TEXT,character_id TEXT,conversation_id TEXT,value TEXT,message_index INTEGER);").unwrap();
         connection
@@ -1594,10 +1315,6 @@ mod tests {
         for (id, detail) in [
             ("c1", serde_json::json!({"image":"assets/bad.png"})),
             ("c3", serde_json::json!({})),
-            (
-                "cold",
-                serde_json::json!({"chaId":"cold","coldstorage":"character-raw"}),
-            ),
         ] {
             connection
                 .execute(
@@ -1658,7 +1375,7 @@ mod tests {
         ] {
             assert_eq!(
                 prepared.affected_conversations[code],
-                Some(4),
+                Some(2),
                 "unexpected synthetic count category"
             );
         }
@@ -1672,10 +1389,6 @@ mod tests {
         );
         assert_eq!(
             prepared.affected_conversations["asset-playback-unverified"],
-            Some(3)
-        );
-        assert_eq!(
-            prepared.affected_conversations["cold-ids-remapped"],
             Some(3)
         );
         assert_eq!(
@@ -1750,8 +1463,6 @@ mod tests {
         assert!(!supported_image_mime("audio/mpeg"));
         assert!(supported_image_extension("JPEG"));
         assert!(!supported_image_extension("mp3"));
-        assert_eq!(stable_uuid("synthetic"), stable_uuid("synthetic"));
-        assert!(Uuid::parse_str(&stable_uuid("synthetic")).is_ok());
         let mut names = HashSet::new();
         assert_ne!(
             allocate_asset_name("a", "png", &mut names),

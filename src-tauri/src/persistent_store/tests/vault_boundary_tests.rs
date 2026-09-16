@@ -72,15 +72,13 @@ fn the_account_token_never_reaches_a_snapshot_an_export_or_a_sync_capture() {
         "compatibilityHash": "a".repeat(64),
     })
     .to_string();
-    for table in ["asset_repository_authority", "cold_payload_authority"] {
-        store
-            .connection
-            .execute(
-                &format!("UPDATE {table} SET value=?2 WHERE generation=?1"),
-                params![generation, authority],
-            )
-            .expect("stamp the capture authority");
-    }
+    store
+        .connection
+        .execute(
+            "UPDATE asset_repository_authority SET value=?2 WHERE generation=?1",
+            params![generation, authority],
+        )
+        .expect("stamp the capture authority");
 
     let snapshot = store
         .snapshot_create("vault-boundary")

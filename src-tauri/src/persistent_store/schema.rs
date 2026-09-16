@@ -199,24 +199,6 @@ fn create_schema(connection: &mut Connection) -> StoreResult<()> {
             generation TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
-        CREATE TABLE cold_aliases (
-            generation TEXT NOT NULL,
-            key TEXT NOT NULL,
-            object_hash TEXT CHECK (
-                object_hash IS NULL OR (
-                    length(object_hash) = 64
-                    AND object_hash NOT GLOB '*[^0-9a-f]*'
-                )
-            ),
-            size INTEGER NOT NULL CHECK (size >= 0),
-            metadata TEXT NOT NULL,
-            PRIMARY KEY (generation, key)
-        );
-        CREATE INDEX cold_aliases_generation ON cold_aliases (generation);
-        CREATE TABLE cold_payload_authority (
-            generation TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
         CREATE TABLE asset_objects (
             object_hash TEXT PRIMARY KEY CHECK (
                 length(object_hash) = 64
