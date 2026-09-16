@@ -138,6 +138,15 @@ pub(crate) struct SectionCursor {
     pub observed_max_write_clock: Sequence,
 }
 
+impl SectionCursor {
+    /// Whether this lineage has carried the section to this device. A cursor
+    /// reset to no commit at all says the markers this device holds came from
+    /// this lineage while nothing it holds has reached the remote state.
+    pub(crate) fn joined(&self) -> bool {
+        self.applied_generation > Sequence::from(0u64)
+    }
+}
+
 fn setting_is_local(key: &str) -> bool {
     LOCAL_SETTING_KEYS.contains(&key)
 }
@@ -415,7 +424,10 @@ impl DeviceStore {
             if !state.participating {
                 continue;
             }
-            match self.read_section_cursor(connection_id, library_lineage, section)? {
+            match self
+                .read_section_cursor(connection_id, library_lineage, section)?
+                .filter(SectionCursor::joined)
+            {
                 Some(_) => {
                     if !unpublished_keys(&self.connection, section)?.is_empty() {
                         return Ok(true);
@@ -804,7 +816,9 @@ impl DeviceStore {
     }
 
     /// Forgets how far one lineage has been applied, so the section goes back
-    /// through the rejoin path before this device publishes over it again.
+    /// through the rejoin path before this device publishes over it again. The
+    /// row stays, because it is what says the markers this device holds were
+    /// issued by this lineage. This is the one place a cursor moves backwards.
     pub(crate) fn forget_section_cursor(
         &mut self,
         connection_id: &str,
@@ -812,7 +826,7 @@ impl DeviceStore {
         section: Section,
     ) -> StoreResult<()> {
         self.connection.execute(
-            "DELETE FROM device_remote_cursors
+            "UPDATE device_remote_cursors SET applied_generation='0',applied_gc_floor='0'
                 WHERE connection_id=?1 AND library_lineage=?2 AND section=?3",
             params![connection_id, library_lineage, section.as_str()],
         )?;

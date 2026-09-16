@@ -157,9 +157,38 @@ pub(crate) fn resolve(local: Option<&LocalEntry>, received: &SectionEntry) -> St
         return Ok(Outcome::Publish);
     }
     if &current.entry != received {
-        return invalid("Section version carries two different values");
+        // Two devices can hold different first publication markers for one
+        // removal when a confirmed publication did not finish its local
+        // bookkeeping. The earliest marker is the one that happened, so the
+        // rule that orders versions orders these too and both sides converge
+        // on it. A version still stands for exactly one value.
+        let (Some(held), Some(arrived)) = (
+            removal_marker(&current.entry),
+            removal_marker(received),
+        ) else {
+            return invalid("Section version carries two different values");
+        };
+        if current.entry.kind != received.kind || current.entry.key != received.key {
+            return invalid("Section version carries two different values");
+        }
+        return Ok(if arrived < held {
+            Outcome::Apply
+        } else {
+            Outcome::Publish
+        });
     }
     Ok(Outcome::Settled)
+}
+
+/// The first publication marker of a removal, as the ordering rule reads it.
+fn removal_marker(entry: &SectionEntry) -> Option<(&Sequence, u64)> {
+    match &entry.value {
+        SectionValue::Tombstone {
+            first_published_generation,
+            first_published_at_ms,
+        } => Some((first_published_generation, *first_published_at_ms)),
+        _ => None,
+    }
 }
 
 /// A stored removal as the exchange format carries it. A removal this device

@@ -487,7 +487,7 @@ pub(crate) fn rejoining_sections(
         if device
             .read_section_cursor(connection_id, library_lineage, section)
             .map_err(device_error)?
-            .is_none()
+            .is_none_or(|cursor| !cursor.joined())
         {
             wanted.insert(kind.id().to_owned());
         }
@@ -1682,18 +1682,41 @@ mod tests {
         let spool = tempfile::tempdir().expect("create spool");
         let root = tempfile::tempdir().expect("create store root");
         let mut store = participating_plugin_store(root.path());
-        store
-            .device_store_mut()
-            .expect("open device store")
-            .write_plugin_device_values(
-                "plugin-a",
-                &[PluginDeviceMutation::Set {
-                    space: "string".into(),
-                    key: "mine".into(),
-                    value: "local".into(),
-                }],
-            )
-            .expect("write a local plugin value");
+        {
+            let device = store.device_store_mut().expect("open device store");
+            device
+                .write_plugin_device_values(
+                    "plugin-a",
+                    &[PluginDeviceMutation::Set {
+                        space: "string".into(),
+                        key: "mine".into(),
+                        value: "local".into(),
+                    }],
+                )
+                .expect("write a local plugin value");
+            device
+                .apply_section_rows(
+                    Section::LocalPlugins,
+                    &[plugin_tombstone("reclaimed", 10, "writer-a", Some((10, 1)))],
+                )
+                .expect("take the remote removal");
+            device
+                .write_plugin_device_values(
+                    "plugin-a",
+                    &[
+                        PluginDeviceMutation::Set {
+                            space: "string".into(),
+                            key: "fresh".into(),
+                            value: "value".into(),
+                        },
+                        PluginDeviceMutation::Delete {
+                            space: "string".into(),
+                            key: "fresh".into(),
+                        },
+                    ],
+                )
+                .expect("remove a value this device never published");
+        }
         joined(&mut store, 5, 1);
 
         assert!(capture_state_sections(
@@ -1709,6 +1732,64 @@ mod tests {
         assert_eq!(
             rejoining_sections(&mut store, "connection", "library").expect("read rejoining"),
             BTreeSet::from(["local-plugins".to_owned()])
+        );
+        assert!(store
+            .device_store_mut()
+            .expect("open device store")
+            .sections_await_publication("connection", "library")
+            .expect("read awaiting publication"));
+
+        // The rejoin that follows still knows these markers came from this
+        // lineage, so it drops what the remote reclaimed before reissuing.
+        // Reissuing first would put the removal back under a new version and
+        // bury whatever another device wrote for that key since.
+        let remote = remote_section(
+            &[plugin_row("theirs", "from-a", 50, "writer-a")],
+            12,
+            11,
+            50,
+            &spool.path().join("remote"),
+        );
+        apply_received_section(
+            &mut store,
+            "connection",
+            "library",
+            SectionArrival::Rejoining,
+            &prepared(&remote),
+        )
+        .expect("rejoin the plugin section");
+        assert_eq!(
+            held_plugin_keys(&mut store),
+            vec![
+                ("fresh".to_owned(), true),
+                ("mine".to_owned(), false),
+                ("theirs".to_owned(), false),
+            ]
+        );
+        let (captured, _) = capture_state_sections(
+            &mut store,
+            &Sequence::from(13u64),
+            &parent_sections(12, 11),
+            "connection",
+            "library",
+            &spool.path().join("republished"),
+            &Cancellation::default(),
+        )
+        .expect("capture the state sections after the rejoin");
+        assert_eq!(
+            published_plugin_values(
+                captured
+                    .iter()
+                    .find(|section| section.kind == SectionKind::LocalPlugins)
+                    .expect("a published plugin section")
+            )
+            .into_iter()
+            .collect::<Vec<_>>(),
+            vec![
+                ("fresh".to_owned(), None),
+                ("mine".to_owned(), Some("local".to_owned())),
+                ("theirs".to_owned(), Some("from-a".to_owned())),
+            ]
         );
     }
 

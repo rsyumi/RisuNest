@@ -272,6 +272,76 @@ fn an_applied_hypa_section_does_not_advance_the_plugin_section_floor() {
     fleet.task.abort();
 }
 
+/// Two devices can name different first publications for one removal when a
+/// confirmed publication did not finish its local bookkeeping. The earliest one
+/// wins whichever side reads it, so neither adapter stalls on a version it
+/// already holds and both converge. A forged value at a held version is still
+/// refused.
+#[test]
+fn a_removal_settles_on_the_earliest_first_publication_marker() {
+    let (_directory, mut store) = prepared();
+    let removal = |generation: u64, at_ms: u64| {
+        SectionEntry::new(
+            SectionKind::LocalPlugins,
+            local_plugin_entry_key("synthetic-plugin", "string", "gone").unwrap(),
+            SectionValue::tombstone(Sequence::from(generation), at_ms),
+            Some(SectionEntryVersion {
+                write_clock: Sequence::from(4u64),
+                writer_id: "writer-a".into(),
+            }),
+        )
+        .unwrap()
+    };
+    let held = removal(5, 1_760_000_000_000);
+    sections::write_sections(
+        store.device_store_mut().unwrap(),
+        &[sections::SectionWrite::Apply {
+            domain: Domain::LocalPlugins,
+            entry: held.clone(),
+            object: None,
+        }],
+    )
+    .unwrap();
+    let local = |store: &PersistentStore| {
+        sections::read_local(store.device_store().unwrap(), Domain::LocalPlugins, &held.key)
+            .unwrap()
+            .expect("the removal is held")
+    };
+
+    assert_eq!(
+        sections::resolve(Some(&local(&store)), &removal(3, 1_760_000_000_000)).unwrap(),
+        sections::Outcome::Apply
+    );
+    assert_eq!(
+        sections::resolve(Some(&local(&store)), &removal(9, 1_760_000_000_000)).unwrap(),
+        sections::Outcome::Publish
+    );
+    assert_eq!(
+        sections::resolve(Some(&local(&store)), &held).unwrap(),
+        sections::Outcome::Settled
+    );
+    assert!(sections::resolve(
+        Some(&local(&store)),
+        &plugin_entry("gone", 4, "writer-a", Some("forged"))
+    )
+    .is_err());
+
+    // Taking the earlier marker leaves nothing for the next cycle to propose.
+    sections::write_sections(
+        store.device_store_mut().unwrap(),
+        &[sections::SectionWrite::Apply {
+            domain: Domain::LocalPlugins,
+            entry: removal(3, 1_760_000_000_000),
+            object: None,
+        }],
+    )
+    .unwrap();
+    assert_eq!(
+        sections::resolve(Some(&local(&store)), &removal(3, 1_760_000_000_000)).unwrap(),
+        sections::Outcome::Settled
+    );
+}
+
 fn removal_marker(store: &PersistentStore, key: &str) -> Option<(String, i64)> {
     use rusqlite::OptionalExtension;
     store
