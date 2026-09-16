@@ -1382,6 +1382,174 @@ mod section_exchange {
         );
     }
 
+    /// Invariant 31 on the device side. The material decides the section: a key
+    /// it carries is installed, a key it leaves out is removed, and a section it
+    /// says nothing about keeps everything this device holds.
+    #[test]
+    fn restoring_a_section_replaces_only_what_the_material_covers() {
+        let (_directory, mut store) = open();
+        set(&mut store, "kept", "before");
+        set(&mut store, "dropped", "before");
+        store
+            .write_hypa_embeddings(&[super::embedding("kept-embedding", &[1.0])])
+            .expect("write embedding");
+        store
+            .restore_section_rows(
+                Section::LocalPlugins,
+                &[
+                    plugin_row("kept", "after", 0, ""),
+                    plugin_row("added", "after", 0, ""),
+                ],
+            )
+            .expect("restore plugin values");
+        assert_eq!(
+            live(&mut store),
+            vec![
+                ("added".to_owned(), Some("after".to_owned())),
+                ("dropped".to_owned(), None),
+                ("kept".to_owned(), Some("after".to_owned())),
+            ]
+        );
+        assert_eq!(
+            store
+                .read_backup_section_rows(Section::Hypa)
+                .expect("read embeddings")
+                .len(),
+            1
+        );
+    }
+
+    /// Invariant 31. A selected area that the material covers with nothing is an
+    /// emptied area, not an untouched one.
+    #[test]
+    fn restoring_an_empty_selected_section_clears_it() {
+        let (_directory, mut store) = open();
+        set(&mut store, "alpha", "before");
+        set(&mut store, "beta", "before");
+        store
+            .restore_section_rows(Section::LocalPlugins, &[])
+            .expect("restore an empty section");
+        assert_eq!(
+            live(&mut store),
+            vec![("alpha".to_owned(), None), ("beta".to_owned(), None)]
+        );
+        assert!(store
+            .read_backup_section_rows(Section::LocalPlugins)
+            .expect("read backup rows")
+            .is_empty());
+    }
+
+    /// Invariant 19 at the restore site. A restore that is interrupted before
+    /// its library commit runs again, and the second run finds its own
+    /// unpublished writes already in place instead of issuing new clocks for
+    /// them.
+    #[test]
+    fn a_retried_section_restore_does_not_reissue_write_clocks() {
+        let (_directory, mut store) = open();
+        set(&mut store, "dropped", "before");
+        let material = [
+            plugin_row("alpha", "from-backup", 0, ""),
+            plugin_row("beta", "from-backup", 0, ""),
+        ];
+        store
+            .restore_section_rows(Section::LocalPlugins, &material)
+            .expect("restore plugin values");
+        let after_first = store
+            .section_state(Section::LocalPlugins)
+            .expect("read section state")
+            .max_write_clock;
+        let rows = store
+            .read_section_rows(Section::LocalPlugins)
+            .expect("read section rows");
+
+        store
+            .restore_section_rows(Section::LocalPlugins, &material)
+            .expect("retry the restore");
+        assert_eq!(
+            store
+                .section_state(Section::LocalPlugins)
+                .expect("read section state")
+                .max_write_clock,
+            after_first
+        );
+        assert_eq!(
+            store
+                .read_section_rows(Section::LocalPlugins)
+                .expect("read section rows"),
+            rows
+        );
+    }
+
+    /// Invariant 31. The local settings area covers the backed-up list and
+    /// nothing else, so a coordination setting beside it keeps its value even
+    /// when the material leaves the whole area empty.
+    #[test]
+    fn a_local_settings_restore_leaves_coordination_settings_untouched() {
+        let (_directory, mut store) = open();
+        store
+            .write_setting("risuNestDeviceSettings", &serde_json::json!({ "a": 1 }))
+            .expect("write device setting");
+        store
+            .write_setting("dosync", &serde_json::json!(true))
+            .expect("write sync setting");
+        store
+            .write_setting("risu_lastsaved", &serde_json::json!("control"))
+            .expect("write control setting");
+        store
+            .write_plugin_permission("code-a", "network", true)
+            .expect("write permission");
+        store
+            .write_plugin_permission("code-b", "network", true)
+            .expect("write permission");
+
+        store
+            .restore_local_setting_rows(&[
+                SectionRow {
+                    key1: "setting".into(),
+                    key2: "dosync".into(),
+                    key3: String::new(),
+                    value: SectionValueRow::Setting {
+                        value: "false".into(),
+                    },
+                    write_clock: Sequence::from(0u64),
+                    writer_id: String::new(),
+                },
+                SectionRow {
+                    key1: "pluginPermission".into(),
+                    key2: "code-b".into(),
+                    key3: "network".into(),
+                    value: SectionValueRow::PluginPermission { granted: false },
+                    write_clock: Sequence::from(0u64),
+                    writer_id: String::new(),
+                },
+            ])
+            .expect("restore local settings");
+
+        assert_eq!(
+            store.read_setting("dosync").expect("read sync setting"),
+            Some(serde_json::json!(false))
+        );
+        assert!(store
+            .read_setting("risuNestDeviceSettings")
+            .expect("read device setting")
+            .is_none());
+        assert_eq!(
+            store
+                .read_setting("risu_lastsaved")
+                .expect("read control setting"),
+            Some(serde_json::json!("control"))
+        );
+        assert_eq!(
+            store
+                .read_plugin_permissions()
+                .expect("read permissions")
+                .into_iter()
+                .map(|permission| (permission.code_hash, permission.granted))
+                .collect::<Vec<_>>(),
+            vec![("code-b".to_owned(), false)]
+        );
+    }
+
     /// A cursor only moves forward, so a replayed apply cannot lose ground and
     /// a published section does not offer the same values again.
     #[test]
