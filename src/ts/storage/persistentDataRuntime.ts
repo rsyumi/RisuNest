@@ -634,24 +634,30 @@ export function createPersistentDataRuntime(
             assertPinnedRevision(revision, lease.revision, 'Revision lease')
             const previous = dependencies.state.captureWorkingSetDatabase?.() ?? null
             if (previous) {
-                const keys = await readWorkingSetChangeWindow(lease)
-                if (keys) {
-                    const generating =
-                        dependencies.state.isConversationOperationActive?.() === true
-                            ? dependencies.state.getGeneratingConversation?.() ?? null
-                            : null
-                    const targeted = await applyTargetedWorkingSetInvalidation(
-                        previous,
-                        keys,
-                        lease,
-                        {
-                            ...pinned,
-                            deferredConversation: generating,
-                            onPluginStorageChanged:
-                                dependencies.state.onPluginStorageChanged,
-                        },
-                    )
-                    if (targeted) return targeted
+                try {
+                    const keys = await readWorkingSetChangeWindow(lease)
+                    if (keys) {
+                        const generating =
+                            dependencies.state.isConversationOperationActive?.() === true
+                                ? dependencies.state.getGeneratingConversation?.() ?? null
+                                : null
+                        const targeted = await applyTargetedWorkingSetInvalidation(
+                            previous,
+                            keys,
+                            lease,
+                            {
+                                ...pinned,
+                                deferredConversation: generating,
+                                onPluginStorageChanged:
+                                    dependencies.state.onPluginStorageChanged,
+                            },
+                        )
+                        if (targeted) return targeted
+                    }
+                } catch (error) {
+                    // A failed pass leaves the cursor where it was and the whole
+                    // working set is reprojected instead.
+                    dependencies.onBackgroundError?.(error)
                 }
             }
             return {
@@ -746,19 +752,29 @@ export function createPersistentDataRuntime(
             }
         }
     // A change held back from a generating conversation is applied once that
-    // generation ends; until then the cursor stays behind it.
+    // generation ends; until then the cursor stays behind it. The generated
+    // reply is persisted first, so reprojecting cannot discard it.
     dependencies.state.subscribeConversationOperationActive?.((active) => {
         if (active || !deferredContentPending) return
         deferredContentPending = false
         void (async () => {
             try {
-                const fence = await acquireCommittedWorkingSetRefreshFence()
+                await coordinator.flushPendingDataLocally('deferred-content-change')
+                const token = await coordinator.capturePersistentMutationToken(
+                    'deferred-content-change',
+                )
+                const owner = await coordinator.acquireDestructiveReplacementFence(
+                    token,
+                    { allowRevisionAdvance: true },
+                )
                 try {
-                    await fence.refreshCommittedWorkingSet(0)
+                    await refreshCommittedWorkingSet(token.revision, owner)
                 } finally {
-                    fence.release()
+                    coordinator.releaseDestructiveReplacementFence(owner)
                 }
             } catch (error) {
+                // The cursor still sits behind the held change, so the next
+                // refresh applies it.
                 dependencies.onBackgroundError?.(error)
             }
         })()

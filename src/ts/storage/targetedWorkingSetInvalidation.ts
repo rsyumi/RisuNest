@@ -33,7 +33,6 @@ export interface TargetedWorkingSetInvalidationOptions
     /** The conversation a reply is being generated into, if any. */
     deferredConversation?: DeferredConversationTarget | null
     onPluginStorageChanged?(owner: string, key: string): void
-    onAssetAliasChanged?(kind: string, key: string): void
 }
 
 export interface TargetedWorkingSetInvalidationResult {
@@ -90,7 +89,8 @@ function planChanges(
                 break
             case 'asset':
             case 'inlay':
-                options.onAssetAliasChanged?.(key.kind, key.key1)
+                // Alias reads reach the store on every call, so there is no
+                // WebView cache for a reference change to drop.
                 break
             case 'owner':
                 if (key.key1 === 'character-additional-assets') {

@@ -331,42 +331,80 @@ fn archiving_and_restoring_record_the_character_and_its_conversations() {
 /// consumers as the character and conversation locators above.
 #[test]
 fn the_recorded_kinds_stay_inside_the_published_vocabulary() {
-    let (_directory, mut store, _) = open_fixture();
+    let (_directory, mut store, database) = open_fixture();
     store
         .commit(&WorkingSetCommit {
             root_mutations: Some(vec![super::super::RootMutation::Set {
                 key: "theme".to_owned(),
                 value: json!("changed"),
             }]),
-            ..empty_working_set_commit(store.revision().unwrap())
+            replace_presets: Some(database["botPresets"].as_array().unwrap().clone()),
+            plugin_storage: Some(vec![PluginStorageMutation::Set {
+                owner: "alpha".to_owned(),
+                key: "shared".to_owned(),
+                value: json!(1),
+            }]),
+            conversations: Some(vec![ConversationMutation::Delete {
+                character_id: "char-b".to_owned(),
+                conversation_id: "conv-beta".to_owned(),
+            }]),
+            ..empty_working_set_commit(1)
         })
         .unwrap();
+    store
+        .commit_asset_alias(
+            &AssetAlias {
+                key: "asset-one".to_owned(),
+                object_hash: Some("aa".repeat(32)),
+                kind: "asset".to_owned(),
+                size: 3,
+                mime: "application/octet-stream".to_owned(),
+                name: "one".to_owned(),
+                ext: "bin".to_owned(),
+                inlay_type: None,
+                width: None,
+                height: None,
+                metadata: json!({}),
+            },
+            2,
+        )
+        .unwrap();
+    let mut value = root(&database);
+    value["modules"] = json!([{ "id": "one", "assets": [["a", "assets/a", "bin"]] }]);
+    store
+        .commit(&WorkingSetCommit {
+            root: Some(value),
+            asset_owner_heads: Some(vec![AssetOwnerHead::present(
+                AssetOwnerLocator::RootModuleAssets { index: 0 },
+                "11".repeat(32),
+                1,
+            )]),
+            ..empty_working_set_commit(3)
+        })
+        .unwrap();
+    store.archive_character("char-a", 4, 1_700_000_000_000).unwrap();
+
     let mut kinds = store
         .connection
-        .prepare("SELECT DISTINCT kind FROM content_changes")
+        .prepare("SELECT DISTINCT kind FROM content_changes ORDER BY kind")
         .unwrap()
         .query_map([], |row| row.get::<_, String>(0))
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    kinds.sort();
-    for kind in &kinds {
-        assert!(
-            matches!(
-                kind.as_str(),
-                "root"
-                    | "preset"
-                    | "character"
-                    | "conversation"
-                    | "plugin"
-                    | "asset"
-                    | "inlay"
-                    | "owner"
-                    | "full"
-            ),
-            "unexpected content change kind {kind}"
-        );
-    }
+    kinds.dedup();
+    assert_eq!(
+        kinds,
+        vec![
+            "asset".to_owned(),
+            "character".to_owned(),
+            "conversation".to_owned(),
+            "owner".to_owned(),
+            "plugin".to_owned(),
+            "preset".to_owned(),
+            "root".to_owned(),
+        ]
+    );
 }
 
 #[test]

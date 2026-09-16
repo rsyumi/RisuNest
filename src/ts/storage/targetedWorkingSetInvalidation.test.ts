@@ -710,7 +710,7 @@ describe('targeted invalidation equals a full reprojection', () => {
         ).toBeNull()
     })
 
-    it('invalidates the host caches a locator names', async () => {
+    it('drops the host cache of every owner a plugin locator names', async () => {
         const model = newModel()
         const options = {
             selectedCharacterId: null,
@@ -719,20 +719,20 @@ describe('targeted invalidation equals a full reprojection', () => {
         }
         const previous = await projectPinnedScalableWorkingSet(createReader(model), options)
         const onPluginStorageChanged = vi.fn()
-        const onAssetAliasChanged = vi.fn()
         await applyTargetedWorkingSetInvalidation(
             previous,
             [
                 { kind: 'plugin', key1: 'alpha', key2: 'shared' },
+                { kind: 'plugin', key1: 'beta', key2: 'shared' },
                 { kind: 'asset', key1: 'asset-one', key2: '' },
-                { kind: 'inlay', key1: 'inlay-one', key2: '' },
             ],
             createReader(model),
-            { ...options, onPluginStorageChanged, onAssetAliasChanged },
+            { ...options, onPluginStorageChanged },
         )
-        expect(onPluginStorageChanged).toHaveBeenCalledWith('alpha', 'shared')
-        expect(onAssetAliasChanged).toHaveBeenCalledWith('asset', 'asset-one')
-        expect(onAssetAliasChanged).toHaveBeenCalledWith('inlay', 'inlay-one')
+        expect(onPluginStorageChanged.mock.calls).toEqual([
+            ['alpha', 'shared'],
+            ['beta', 'shared'],
+        ])
     })
 })
 
