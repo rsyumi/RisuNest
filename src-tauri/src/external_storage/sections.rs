@@ -444,12 +444,37 @@ pub(crate) fn apply_received_section(
     if !device.section_state(section).map_err(device_error)?.participating {
         return Ok(());
     }
+    let cursor = device
+        .read_section_cursor(connection_id, library_lineage, section)
+        .map_err(device_error)?;
+    // A floor above what this device has applied means the removals between
+    // them were reclaimed before this device ever saw them, so the section
+    // cannot be carried forward as an increment.
+    let arrival = match &cursor {
+        Some(cursor) if prepared.gc_floor > cursor.applied_generation => SectionArrival::Rejoining,
+        _ => arrival,
+    };
+    // Markers name commits of one lineage only, so a section from a lineage
+    // this device holds no cursor for decides nothing about them.
+    let reclaim_floor = cursor
+        .map(|_| prepared.gc_floor.clone())
+        .unwrap_or_else(|| Sequence::from(0u64));
     if arrival == SectionArrival::Rejoining {
+        // Reissuing rewrites this device's rows as new writes, so a removal the
+        // remote reclaimed has to go before it can come back with a new version.
+        device
+            .reclaim_section_tombstones(section, &reclaim_floor, &rows)
+            .map_err(device_error)?;
         device
             .reissue_section_rows(section, &prepared.max_write_clock, &rows)
             .map_err(device_error)?;
     }
     device.apply_section_rows(section, &rows).map_err(device_error)?;
+    if arrival == SectionArrival::Continuing {
+        device
+            .reclaim_section_tombstones(section, &reclaim_floor, &rows)
+            .map_err(device_error)?;
+    }
     device
         .write_section_cursor(
             connection_id,
@@ -602,6 +627,84 @@ mod tests {
             write_clock: Sequence::from(clock),
             writer_id: writer.into(),
         }
+    }
+
+    fn plugin_tombstone(
+        key: &str,
+        clock: u64,
+        writer: &str,
+        marker: Option<(u64, u64)>,
+    ) -> SectionRow {
+        SectionRow {
+            value: SectionValueRow::Tombstone {
+                first_published: marker.map(|(generation, at_ms)| TombstonePublication {
+                    generation: Sequence::from(generation),
+                    at_ms,
+                }),
+            },
+            ..plugin_row(key, "", clock, writer)
+        }
+    }
+
+    /// Every plugin key the device file still holds, with the removals marked.
+    fn held_plugin_keys(store: &mut PersistentStore) -> Vec<(String, bool)> {
+        store
+            .device_store_mut()
+            .expect("open device store")
+            .read_section_rows(Section::LocalPlugins)
+            .expect("read section rows")
+            .into_iter()
+            .map(|row| (row.key3, row.value.is_tombstone()))
+            .collect()
+    }
+
+    fn remote_section(
+        rows: &[SectionRow],
+        generation: u64,
+        gc_floor: u64,
+        max_write_clock: u64,
+        spool: &Path,
+    ) -> CapturedSection {
+        capture_section(
+            SectionKind::LocalPlugins,
+            rows,
+            true,
+            Sequence::from(generation),
+            Sequence::from(gc_floor),
+            Sequence::from(max_write_clock),
+            spool,
+            &Cancellation::default(),
+        )
+        .expect("capture a remote plugin section")
+    }
+
+    fn joined(store: &mut PersistentStore, generation: u64, observed: u64) {
+        store
+            .device_store_mut()
+            .expect("open device store")
+            .write_section_cursor(
+                "connection",
+                "library",
+                Section::LocalPlugins,
+                &SectionCursor {
+                    applied_generation: Sequence::from(generation),
+                    applied_gc_floor: Sequence::from(0u64),
+                    observed_max_write_clock: Sequence::from(observed),
+                },
+            )
+            .expect("record what this lineage carried");
+    }
+
+    fn participating_plugin_store(root: &Path) -> PersistentStore {
+        let mut store = PersistentStore::open(root).expect("open persistent store");
+        let device = store.device_store_mut().expect("open device store");
+        device
+            .set_section_participating(Section::LocalPlugins, true)
+            .expect("take part in the plugin section");
+        device
+            .set_section_participating(Section::Hypa, false)
+            .expect("leave the embedding section out");
+        store
     }
 
     fn hypa_row(key: &str, clock: u64, writer: &str, dimensions: i64) -> SectionRow {
@@ -1141,6 +1244,177 @@ mod tests {
         SectionValueRow::Tombstone {
             first_published: removal_marker(store, key),
         }
+    }
+
+    /// A removal the remote reclaimed goes, and one it still carries stays even
+    /// when the floor stands above it: a floor is the boundary for rejoining,
+    /// not a verdict on every removal below it. A removal this device has not
+    /// published is its own new one and is never judged by a remote's floor,
+    /// and a section from a lineage this device never exchanged with decides
+    /// nothing, because commit numbers mean nothing across lineages.
+    #[test]
+    fn only_the_removals_a_remote_reclaimed_leave_this_device() {
+        let spool = tempfile::tempdir().expect("create spool");
+        let root = tempfile::tempdir().expect("create store root");
+        let mut store = participating_plugin_store(root.path());
+        {
+            let device = store.device_store_mut().expect("open device store");
+            device
+                .apply_section_rows(
+                    Section::LocalPlugins,
+                    &[
+                        plugin_tombstone("reclaimed", 10, "writer-a", Some((10, 1))),
+                        plugin_tombstone("held", 11, "writer-a", Some((10, 2))),
+                        plugin_row("kept", "from-a", 12, "writer-a"),
+                    ],
+                )
+                .expect("take the remote removals");
+            device
+                .write_plugin_device_values(
+                    "plugin-a",
+                    &[PluginDeviceMutation::Set {
+                        space: "string".into(),
+                        key: "fresh".into(),
+                        value: "value".into(),
+                    }],
+                )
+                .expect("write a local plugin value");
+            device
+                .write_plugin_device_values(
+                    "plugin-a",
+                    &[PluginDeviceMutation::Delete {
+                        space: "string".into(),
+                        key: "fresh".into(),
+                    }],
+                )
+                .expect("remove the local plugin value");
+        }
+        joined(&mut store, 11, 13);
+        // The remote reclaimed the removal at commit 10 and kept the other,
+        // so its floor stands at 11 while it still carries the held one.
+        let remote = remote_section(
+            &[
+                plugin_tombstone("held", 11, "writer-a", Some((10, 2))),
+                plugin_row("kept", "from-a", 12, "writer-a"),
+            ],
+            12,
+            11,
+            13,
+            &spool.path().join("remote"),
+        );
+
+        // Another lineage numbers its commits differently, so its floor says
+        // nothing about markers this lineage issued.
+        apply_received_section(
+            &mut store,
+            "connection",
+            "other-library",
+            SectionArrival::Continuing,
+            &prepared(&remote),
+        )
+        .expect("apply the section of another lineage");
+        assert!(held_plugin_keys(&mut store).contains(&("reclaimed".to_owned(), true)));
+
+        apply_received_section(
+            &mut store,
+            "connection",
+            "library",
+            SectionArrival::Continuing,
+            &prepared(&remote),
+        )
+        .expect("apply the received section");
+        assert_eq!(
+            held_plugin_keys(&mut store),
+            vec![
+                ("fresh".to_owned(), true),
+                ("held".to_owned(), true),
+                ("kept".to_owned(), false),
+            ]
+        );
+
+        // The next full capture carries exactly what is left: the removal the
+        // remote still holds, this device's own unpublished removal, and the
+        // value. The reclaimed key does not come back in any form.
+        let (captured, _) = capture_state_sections(
+            &mut store,
+            &Sequence::from(13u64),
+            &spool.path().join("published"),
+            &Cancellation::default(),
+        )
+        .expect("capture the state sections");
+        let plugins = captured
+            .iter()
+            .find(|section| section.kind == SectionKind::LocalPlugins)
+            .expect("published plugin section");
+        assert_eq!(
+            published_plugin_values(plugins),
+            vec![
+                ("fresh".to_owned(), None),
+                ("held".to_owned(), None),
+                ("kept".to_owned(), Some("from-a".to_owned())),
+            ]
+        );
+    }
+
+    /// A device behind a remote's floor has never seen the removals the floor
+    /// covers, so the section arrives as a rejoin however it was offered. Its
+    /// own rows are reissued above everything the remote carries rather than
+    /// published as an increment over a state it never applied.
+    #[test]
+    fn a_floor_above_what_this_device_applied_turns_the_section_into_a_rejoin() {
+        let spool = tempfile::tempdir().expect("create spool");
+        let root = tempfile::tempdir().expect("create store root");
+        let mut store = participating_plugin_store(root.path());
+        {
+            let device = store.device_store_mut().expect("open device store");
+            device
+                .write_plugin_device_values(
+                    "plugin-a",
+                    &[PluginDeviceMutation::Set {
+                        space: "string".into(),
+                        key: "mine".into(),
+                        value: "local".into(),
+                    }],
+                )
+                .expect("write a local plugin value");
+            device
+                .apply_section_rows(
+                    Section::LocalPlugins,
+                    &[plugin_tombstone("reclaimed", 10, "writer-a", Some((10, 1)))],
+                )
+                .expect("take the remote removal");
+        }
+        joined(&mut store, 5, 1);
+        let remote = remote_section(
+            &[plugin_row("theirs", "from-a", 50, "writer-a")],
+            12,
+            11,
+            50,
+            &spool.path().join("remote"),
+        );
+
+        apply_received_section(
+            &mut store,
+            "connection",
+            "library",
+            SectionArrival::Continuing,
+            &prepared(&remote),
+        )
+        .expect("apply the received section");
+        let held = store
+            .device_store_mut()
+            .expect("open device store")
+            .read_section_rows(Section::LocalPlugins)
+            .expect("read section rows");
+        let mine = held
+            .iter()
+            .find(|row| row.key3 == "mine")
+            .expect("this device keeps its own value");
+        assert!(mine.write_clock > Sequence::from(50u64));
+        // Reissuing turns this device's rows into its own newest writes, so a
+        // removal the remote reclaimed has to be gone before that happens or it
+        // returns to the remote under a new version.
+        assert!(held.iter().all(|row| row.key3 != "reclaimed"));
     }
 
     #[test]

@@ -584,6 +584,60 @@ impl DeviceStore {
         Ok(pending.len())
     }
 
+    /// Drops the removals a remote has reclaimed. A removal goes only when the
+    /// received section declares a floor at or above the commit the removal was
+    /// first published in and no longer carries that removal itself: a floor can
+    /// stand above a removal the remote still holds, and dropping that one would
+    /// let another device's older value come back. A removal this device has not
+    /// published carries no marker and stays. The caller has already established
+    /// that the received section comes from the lineage the markers name.
+    ///
+    /// This is bookkeeping about a removal rather than a write, so it runs
+    /// outside a change context and never reaches the device change index.
+    pub(crate) fn reclaim_section_tombstones(
+        &mut self,
+        section: Section,
+        gc_floor: &Sequence,
+        received: &[SectionRow],
+    ) -> StoreResult<usize> {
+        if *gc_floor == Sequence::from(0u64) {
+            return Ok(0);
+        }
+        let carried: BTreeSet<SectionKey> = received
+            .iter()
+            .filter(|row| row.value.is_tombstone())
+            .map(SectionRow::key)
+            .collect();
+        let transaction = self.transaction()?;
+        let reclaimable: Vec<SectionKey> = read_rows(&transaction, section)?
+            .into_iter()
+            .filter(|row| {
+                row.value
+                    .first_published()
+                    .is_some_and(|marker| marker.generation <= *gc_floor)
+                    && !carried.contains(&row.key())
+            })
+            .map(|row| row.key())
+            .collect();
+        for (key1, key2, key3) in &reclaimable {
+            match section {
+                Section::Hypa => {
+                    transaction
+                        .execute("DELETE FROM hypa_embeddings WHERE cache_key=?1", [key1])?;
+                }
+                Section::LocalPlugins => {
+                    transaction.execute(
+                        "DELETE FROM plugin_device_storage
+                            WHERE owner=?1 AND space=?2 AND key=?3",
+                        params![key1, key2, key3],
+                    )?;
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(reclaimable.len())
+    }
+
     /// Merges a received section. The higher `(write_clock, writer_id)` wins,
     /// the same version with different content is refused, and a received row
     /// keeps the version it arrived with instead of becoming a local write.
