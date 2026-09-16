@@ -92,6 +92,7 @@ describe('external storage connection request', () => {
         const first = {
             id: 'snapshot-1', kind: 'snapshot' as const, createdAtMs: '1' as const,
             logicalRevision: '1' as const, pinned: false, complete: true, verified: true,
+            includedSections: [], sameDevice: false,
         }
         const updated = { ...first, pinned: true }
         const second = { ...first, id: 'snapshot-2', logicalRevision: '2' as const }
@@ -103,6 +104,7 @@ describe('external storage connection request', () => {
         const base = {
             kind: 'recovery-candidate' as const, logicalRevision: '1' as const,
             pinned: false, complete: true, verified: true,
+            includedSections: [], sameDevice: false,
         }
 
         expect(mergeExternalHistoryItems(
@@ -118,6 +120,7 @@ describe('external storage connection request', () => {
         const base = {
             kind: 'recovery-candidate' as const, createdAtMs: '1' as const,
             logicalRevision: '1' as const, pinned: false,
+            includedSections: [], sameDevice: false,
         }
 
         expect(restorableExternalHistoryItems([
@@ -131,6 +134,7 @@ describe('external storage connection request', () => {
         const conflict = {
             id: 'snapshot-1', kind: 'conflict' as const, createdAtMs: '1' as const,
             logicalRevision: '1' as const, pinned: true, complete: false, verified: false,
+            includedSections: [], sameDevice: false,
         }
         const verifiedRoot = {
             ...conflict,

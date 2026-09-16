@@ -33,6 +33,8 @@ function item(
         pinned: false,
         complete: true,
         verified: true,
+        includedSections: [],
+        sameDevice: false,
         ...overrides,
     }
 }
@@ -59,8 +61,26 @@ describe('external storage onboarding action', () => {
         expect(externalOnboardingAction(connection('backup'))).toBe('restore')
     })
 
-    it('replaces only what a bundle covers, so no restore restarts the app', () => {
-        expect(externalOnboardingRestoreAreas()).toEqual(['library', 'referencedAssets'])
+    it('replaces only what a backup covers, so no restore restarts the app', () => {
+        expect(externalOnboardingRestoreAreas(item('one', '1'))).toEqual([
+            'library',
+            'referencedAssets',
+        ])
+        expect(
+            externalOnboardingRestoreAreas(
+                item('two', '1', {
+                    includedSections: ['hypa', 'local-plugins', 'local-settings'],
+                }),
+            ),
+        ).toEqual(['library', 'referencedAssets', 'hypa', 'local-plugins'])
+        expect(
+            externalOnboardingRestoreAreas(
+                item('three', '1', {
+                    includedSections: ['hypa', 'local-settings'],
+                    sameDevice: true,
+                }),
+            ),
+        ).toEqual(['library', 'referencedAssets', 'hypa', 'local-settings'])
         expect(externalOnboardingRestoreRestarts()).toBe(false)
     })
 })

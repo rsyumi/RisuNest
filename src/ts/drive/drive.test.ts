@@ -226,6 +226,8 @@ describe('native Drive settings routing', () => {
                 pinned: false,
                 complete: true,
                 verified: true,
+                includedSections: ['hypa', 'local-plugins', 'local-settings'],
+                sameDevice: false,
             }],
         })
         const { checkDriver } = await import('./drive')
@@ -234,7 +236,7 @@ describe('native Drive settings routing', () => {
         expect(state.requestExternalStorageRestore).toHaveBeenCalledWith(
             'google-primary',
             'snapshot-7',
-            ['library', 'referencedAssets'],
+            ['library', 'referencedAssets', 'hypa', 'local-plugins'],
         )
     })
 
