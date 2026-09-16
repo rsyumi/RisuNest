@@ -210,6 +210,7 @@
     }
 
     async function openDetails(connection: ExternalConnectionSummary, kind: 'history' | 'conflicts' | 'quota'): Promise<void> {
+        restoreScope = null
         if (expanded[connection.id] === kind) {
             expanded[connection.id] = ''
             return
