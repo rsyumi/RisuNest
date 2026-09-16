@@ -996,12 +996,12 @@ impl restore::ReplacementSink for LegacyReplacementSink {
         })
     }
 
-    fn staged_unowned_plugin_values(
+    fn staged_plugin_preview(
         &self,
         staging_id: &str,
-    ) -> StoreResult<Vec<crate::persistent_store::commit::StagedPluginValue>> {
+    ) -> StoreResult<crate::persistent_store::commit::StagedPluginPreview> {
         crate::persistent_store::commands::with_store(self.app.state(), |store| {
-            store.staged_unowned_plugin_values(staging_id)
+            store.staged_plugin_preview(staging_id)
         })
     }
 

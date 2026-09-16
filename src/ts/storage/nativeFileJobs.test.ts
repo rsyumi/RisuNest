@@ -580,10 +580,13 @@ describe('native file jobs', () => {
             {
                 ...status('waitingForInput'),
                 phase: 'awaiting-activation',
-                pluginValuePreview: [
-                    { key: 'pm_store', byteSize: 24, valueType: 'json' },
-                    { key: 'yt_glossary', byteSize: 12, valueType: 'string' },
-                ],
+                pluginValuePreview: {
+                    values: [
+                        { key: 'pm_store', byteSize: 24, valueType: 'json' },
+                        { key: 'yt_glossary', byteSize: 12, valueType: 'string' },
+                    ],
+                    pluginNames: ['provider-manager', 'yumi-translator'],
+                },
             },
             {
                 ...status('succeeded', {
@@ -602,9 +605,13 @@ describe('native file jobs', () => {
             { type: 'desktopPath', path: 'save.risudat' },
             {
                 assignPluginValues: async (preview) => {
-                    expect(preview.map((value) => value.key)).toEqual([
+                    expect(preview.values.map((value) => value.key)).toEqual([
                         'pm_store',
                         'yt_glossary',
+                    ])
+                    expect(preview.pluginNames).toEqual([
+                        'provider-manager',
+                        'yumi-translator',
                     ])
                     return {
                         assignments: [
@@ -648,7 +655,10 @@ describe('native file jobs', () => {
             {
                 ...status('waitingForInput'),
                 phase: 'awaiting-activation',
-                pluginValuePreview: [{ key: 'pm_store', byteSize: 24, valueType: 'json' }],
+                pluginValuePreview: {
+                    values: [{ key: 'pm_store', byteSize: 24, valueType: 'json' }],
+                    pluginNames: [],
+                },
             },
             { ...status('cancelled'), phase: 'awaiting-activation' },
         ]

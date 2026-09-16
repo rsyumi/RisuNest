@@ -666,6 +666,10 @@ fn the_import_stage_assigns_staged_values_and_can_close_the_window_for_the_rest(
         .replace_put_root(
             &staging.staging_id,
             &json!({
+                "plugins": [
+                    { "name": "provider-manager" },
+                    { "name": "yumi-translator" }
+                ],
                 "pluginCustomStorage": {
                     "pm_store": { "apiKey": "imported" },
                     "pm_keys": "imported keys",
@@ -676,10 +680,11 @@ fn the_import_stage_assigns_staged_values_and_can_close_the_window_for_the_rest(
         .expect("stage imported plugin storage");
 
     let preview = store
-        .staged_unowned_plugin_values(&staging.staging_id)
+        .staged_plugin_preview(&staging.staging_id)
         .expect("read the staged values");
     assert_eq!(
         preview
+            .values
             .iter()
             .map(|value| (value.key.as_str(), value.value_type.as_str()))
             .collect::<Vec<_>>(),
@@ -689,7 +694,11 @@ fn the_import_stage_assigns_staged_values_and_can_close_the_window_for_the_rest(
             ("yt_glossary", "json"),
         ]
     );
-    assert!(preview.iter().all(|value| value.byte_size > 0));
+    assert!(preview.values.iter().all(|value| value.byte_size > 0));
+    assert_eq!(
+        preview.plugin_names,
+        vec!["provider-manager".to_owned(), "yumi-translator".to_owned()]
+    );
 
     store
         .assign_staged_plugin_values(

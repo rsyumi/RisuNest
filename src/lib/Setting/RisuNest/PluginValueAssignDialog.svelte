@@ -11,10 +11,12 @@
 
     interface Props {
         values: NativeStagedPluginValue[]
+        /** Plugins the imported save carries, which are the owners to choose from. */
+        pluginNames: string[]
         onchoose: (choice: NativeStagedPluginChoice | null) => void
     }
 
-    let { values, onchoose }: Props = $props()
+    let { values, pluginNames, onchoose }: Props = $props()
 
     const strings = language.risuNest.pluginData.import
     let automatic = $state(true)
@@ -60,6 +62,7 @@
             <PluginDataManager
                 place="import"
                 {staged}
+                {pluginNames}
                 onselectionchange={(chosen) => { assignments = chosen }}
             />
         </div>

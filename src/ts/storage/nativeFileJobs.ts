@@ -247,7 +247,7 @@ export function resolveNativeFileJobStage(
 ): NativeFileJobStage | null {
     // The assignment pass happens inside the activation wait, so it is named
     // before the wait's own stage.
-    if (status.phase === 'awaiting-activation' && status.pluginValuePreview?.length) {
+    if (status.phase === 'awaiting-activation' && status.pluginValuePreview?.values.length) {
         return 'assign-plugin-values'
     }
     if (status.detail) return status.detail.stage
@@ -347,7 +347,7 @@ export interface NativeFileJobStatus {
     expectedRevision?: number
     deviceSessionId?: string
     restorePreview?: NativePortableRestorePreview
-    pluginValuePreview?: NativeStagedPluginValue[]
+    pluginValuePreview?: NativeStagedPluginPreview
     warningCodes?: string[]
     state: NativeFileJobState
     phase:
@@ -472,6 +472,15 @@ export interface NativeStagedPluginValue {
     valueType: 'json' | 'string'
 }
 
+/**
+ * What the one assignment pass is offered. The plugin names come from the
+ * staged save, because the working set still holds the database it replaces.
+ */
+export interface NativeStagedPluginPreview {
+    values: NativeStagedPluginValue[]
+    pluginNames: string[]
+}
+
 export interface NativeStagedPluginAssignment {
     owner: string
     keys: string[]
@@ -491,7 +500,7 @@ export interface NativeFileRestoreJobOptions extends NativeFileJobOptions {
      * nothing cancels the import, which is what a person closing the pass means.
      */
     assignPluginValues?(
-        preview: NativeStagedPluginValue[],
+        preview: NativeStagedPluginPreview,
     ): Promise<NativeStagedPluginChoice | null>
     afterRefresh?(): void | Promise<void>
     onBlockingChange?(blocking: boolean): void
@@ -1314,7 +1323,7 @@ async function runNativeReplacementRestore(
                 status.phase === 'awaiting-activation' &&
                 !replacementFence &&
                 !cancellationRequested &&
-                status.pluginValuePreview?.length &&
+                status.pluginValuePreview?.values.length &&
                 options.assignPluginValues
             ) {
                 const choice = await options.assignPluginValues(status.pluginValuePreview)

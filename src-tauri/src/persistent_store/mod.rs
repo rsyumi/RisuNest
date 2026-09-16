@@ -1958,11 +1958,11 @@ impl PersistentStore {
         commit::replace_put_root(&mut self.connection, staging_id, root)
     }
 
-    pub(crate) fn staged_unowned_plugin_values(
+    pub(crate) fn staged_plugin_preview(
         &self,
         staging_id: &str,
-    ) -> StoreResult<Vec<commit::StagedPluginValue>> {
-        commit::staged_unowned_plugin_values(&self.connection, staging_id)
+    ) -> StoreResult<commit::StagedPluginPreview> {
+        commit::staged_plugin_preview(&self.connection, staging_id)
     }
 
     pub(crate) fn assign_staged_plugin_values(

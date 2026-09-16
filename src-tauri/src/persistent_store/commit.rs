@@ -2774,10 +2774,19 @@ pub(crate) struct StagedPluginAssignment {
     pub(crate) keys: Vec<String>,
 }
 
-pub(super) fn staged_unowned_plugin_values(
+/// What a staged save offers the one assignment pass: the values it left
+/// without an owner, and the plugins it carries to hand them to.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StagedPluginPreview {
+    pub(crate) values: Vec<StagedPluginValue>,
+    pub(crate) plugin_names: Vec<String>,
+}
+
+pub(super) fn staged_plugin_preview(
     connection: &Connection,
     staging_id: &str,
-) -> StoreResult<Vec<StagedPluginValue>> {
+) -> StoreResult<StagedPluginPreview> {
     let mut statement = connection.prepare(
         "SELECT storage_key, byte_size,
                 CASE WHEN substr(value, 1, 1) = '\"' THEN 'string' ELSE 'json' END
@@ -2794,7 +2803,36 @@ pub(super) fn staged_unowned_plugin_values(
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(values)
+    Ok(StagedPluginPreview {
+        values,
+        plugin_names: staged_plugin_names(connection, staging_id)?,
+    })
+}
+
+/// The plugins the staged save carries. The working set still holds the
+/// database being replaced, so the names have to come from the staging.
+fn staged_plugin_names(connection: &Connection, staging_id: &str) -> StoreResult<Vec<String>> {
+    let plugins: Option<String> = connection
+        .query_row(
+            "SELECT json_extract(value, '$.plugins') FROM root WHERE generation = ?1",
+            params![staging_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(plugins) = plugins else {
+        return Ok(Vec::new());
+    };
+    let Ok(Value::Array(entries)) = serde_json::from_str::<Value>(&plugins) else {
+        return Ok(Vec::new());
+    };
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| match entry.get("name") {
+            Some(Value::String(name)) if !name.is_empty() => Some(name.clone()),
+            _ => None,
+        })
+        .collect())
 }
 
 /// Applies the choices made before an import is activated. Staging is invisible

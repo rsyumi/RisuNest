@@ -2678,14 +2678,13 @@ impl restore::ReplacementSink for PersistentReplacementSink {
         })
     }
 
-    fn staged_unowned_plugin_values(
+    fn staged_plugin_preview(
         &self,
         staging_id: &str,
-    ) -> crate::persistent_store::StoreResult<
-        Vec<crate::persistent_store::commit::StagedPluginValue>,
-    > {
+    ) -> crate::persistent_store::StoreResult<crate::persistent_store::commit::StagedPluginPreview>
+    {
         crate::persistent_store::commands::with_store(self.app.state(), |store| {
-            store.staged_unowned_plugin_values(staging_id)
+            store.staged_plugin_preview(staging_id)
         })
     }
 
@@ -3180,7 +3179,7 @@ pub(crate) struct JobStatus {
     /// Values the staged save left without an owner, shown while the job waits
     /// for activation so a person can hand them to a plugin first.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) plugin_value_preview: Option<Vec<crate::persistent_store::commit::StagedPluginValue>>,
+    pub(crate) plugin_value_preview: Option<crate::persistent_store::commit::StagedPluginPreview>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -3452,7 +3451,7 @@ impl JobControl {
     pub(crate) fn set_plugin_value_preview(
         &self,
         staging_id: &str,
-        values: Vec<crate::persistent_store::commit::StagedPluginValue>,
+        preview: crate::persistent_store::commit::StagedPluginPreview,
     ) -> Result<(), String> {
         let mut wait = self
             .wait_state
@@ -3467,7 +3466,11 @@ impl JobControl {
         if status.state.is_terminal() {
             return Err("cannot change a completed job".into());
         }
-        status.plugin_value_preview = if values.is_empty() { None } else { Some(values) };
+        status.plugin_value_preview = if preview.values.is_empty() {
+            None
+        } else {
+            Some(preview)
+        };
         Ok(())
     }
 

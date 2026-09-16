@@ -1,5 +1,5 @@
 import { mount, unmount } from 'svelte'
-import type { NativeStagedPluginChoice, NativeStagedPluginValue } from './nativeFileJobs'
+import type { NativeStagedPluginChoice, NativeStagedPluginPreview } from './nativeFileJobs'
 
 let open = false
 
@@ -8,9 +8,9 @@ let open = false
  * replacement is applied. Answering with nothing cancels the import.
  */
 export async function selectPluginValueAssignment(
-    values: NativeStagedPluginValue[],
+    preview: NativeStagedPluginPreview,
 ): Promise<NativeStagedPluginChoice | null> {
-    if (values.length === 0) return { assignments: [], automatic: true }
+    if (preview.values.length === 0) return { assignments: [], automatic: true }
     if (open) throw new Error('A plugin value assignment is already open')
     // Loaded here so an import that never meets an unowned value never pays for
     // the screen it would have shown.
@@ -36,7 +36,11 @@ export async function selectPluginValueAssignment(
         }
         component = mount(PluginValueAssignDialog, {
             target,
-            props: { values, onchoose: finish },
+            props: {
+                values: preview.values,
+                pluginNames: preview.pluginNames,
+                onchoose: finish,
+            },
         })
     })
 }

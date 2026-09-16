@@ -27,11 +27,13 @@
         place?: 'settings' | 'import'
         /** Values still being staged, which are not in the store yet. */
         staged?: PluginDataItem[]
+        /** Plugins to offer as owners, when the installed list is not the right one. */
+        pluginNames?: string[]
         /** Selection the import stage reads back when the person continues. */
         onselectionchange?: (assignments: { owner: string; items: PluginDataItem[] }[]) => void
     }
 
-    let { place = 'settings', staged, onselectionchange }: Props = $props()
+    let { place = 'settings', staged, pluginNames, onselectionchange }: Props = $props()
 
     const strings = language.risuNest.pluginData
     const assignStrings = strings.assign
@@ -63,7 +65,9 @@
     let reloadPrompt = $state(false)
 
     const installedPlugins = $derived(
-        (DBState.db?.plugins ?? []).map((plugin) => plugin.name).filter((name) => name.length > 0),
+        (pluginNames ?? (DBState.db?.plugins ?? []).map((plugin) => plugin.name)).filter(
+            (name) => name.length > 0,
+        ),
     )
     const buckets = $derived(pluginDataOwnerBuckets(items))
     const visible = $derived(
