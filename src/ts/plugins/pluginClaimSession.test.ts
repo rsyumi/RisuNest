@@ -8,6 +8,12 @@ vi.mock('../platform', () => ({ isTauri: true }))
 vi.mock('./plugins.svelte', () => ({
     pluginStorageStore: { invalidateOwner },
 }))
+vi.mock('../storage/persistentDataRuntime.svelte', () => ({
+    getPersistentDataRuntime: () => ({
+        runStorageOnlyMutation: (operation: (revision: number) => Promise<number>) =>
+            operation(7),
+    }),
+}))
 
 import { PLUGIN_CLAIM_SESSION_LIMIT_MS, beginPluginClaimSession } from './pluginClaimSession'
 
@@ -17,7 +23,9 @@ function answers(overrides: Record<string, unknown> = {}) {
     invoke.mockImplementation(async (command: string) => {
         if (command in overrides) return overrides[command]
         if (command === 'pds_begin_plugin_claim_session') return 'session-one'
-        if (command === 'pds_claim_plugin_storage_value') return { apiKey: 'imported' }
+        if (command === 'pds_claim_plugin_storage_value') {
+            return { value: { apiKey: 'imported' }, revision: 8 }
+        }
         return undefined
     })
 }
@@ -49,6 +57,7 @@ describe('plugin claim session', () => {
             codeHash: expect.stringMatching(/^[0-9a-f]{64}$/),
             runtimeInstance: expect.any(String),
             key: 'pm_store',
+            expectedRevision: 7,
         })
         expect(invalidateOwner).toHaveBeenCalledWith('provider-manager')
     })

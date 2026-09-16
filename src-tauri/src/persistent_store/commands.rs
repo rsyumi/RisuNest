@@ -10,6 +10,7 @@ use super::export::ExportedRisuSave;
 use super::kei::KeiUploadResult;
 use super::{
     AssetAlias, AssetAliasListQuery, AssetAliasPage, AssetOwnerHead, AssetOwnerLocator,
+    AssignedPluginStorage, ClaimedPluginValue,
     AssetRepositoryAuthorityState, CharacterPage, CharacterQuery, CheckpointMode, ColdAlias,
     ColdPayloadAuthorityState, ColdPayloadMigrationInput, ConversationPage, ConversationQuery,
     ConversationWindow, ConversationWindowQuery, LeaseResult, PersistentStorageStats,
@@ -1162,13 +1163,14 @@ pub(crate) fn pds_assign_plugin_storage(
     owner: String,
     sources: Vec<PluginStorageSource>,
     collision: super::commit::AssignCollision,
-) -> Result<super::commit::AssignOutcome, StoreError> {
+    expected_revision: i64,
+) -> Result<AssignedPluginStorage, StoreError> {
     let sources: Vec<(String, String)> = sources
         .into_iter()
         .map(|source| (source.owner, source.key))
         .collect();
     with_store_mut(state, |store| {
-        store.assign_plugin_storage(&sources, &owner, collision)
+        store.assign_plugin_storage(&sources, &owner, collision, expected_revision)
     })
 }
 
@@ -1192,7 +1194,8 @@ pub(crate) fn pds_claim_plugin_storage_value(
     code_hash: String,
     runtime_instance: String,
     key: String,
-) -> Result<Option<Value>, StoreError> {
+    expected_revision: i64,
+) -> Result<ClaimedPluginValue, StoreError> {
     with_store_mut(state, |store| {
         store.claim_plugin_storage_value(
             &session_id,
@@ -1200,6 +1203,7 @@ pub(crate) fn pds_claim_plugin_storage_value(
             &code_hash,
             &runtime_instance,
             &key,
+            expected_revision,
         )
     })
 }

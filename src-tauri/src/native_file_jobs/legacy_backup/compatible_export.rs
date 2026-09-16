@@ -1482,6 +1482,42 @@ mod tests {
                 )
                 .unwrap();
             let revision = store.replace_commit(&staging, Some(0)).unwrap().revision;
+            // A key two plugins both hold cannot go out without handing one of
+            // them the other's value, so neither side is written.
+            let revision = store
+                .commit(&crate::persistent_store::WorkingSetCommit {
+                    expected_revision: revision,
+                    root: None,
+                    root_mutations: None,
+                    replace_presets: None,
+                    character: None,
+                    character_details: None,
+                    replace_character: None,
+                    add_character: None,
+                    conversations: None,
+                    delete_character_id: None,
+                    plugin_storage: Some(vec![
+                        crate::persistent_store::PluginStorageMutation::Set {
+                            owner: "plugin-a".to_owned(),
+                            key: "shared_key".to_owned(),
+                            value: json!("a value"),
+                        },
+                        crate::persistent_store::PluginStorageMutation::Set {
+                            owner: crate::persistent_store::plugin_owner::UNOWNED_OWNER
+                                .to_owned(),
+                            key: "shared_key".to_owned(),
+                            value: json!("imported value"),
+                        },
+                        crate::persistent_store::PluginStorageMutation::Set {
+                            owner: "plugin-a".to_owned(),
+                            key: "owned_key".to_owned(),
+                            value: json!("kept"),
+                        },
+                    ]),
+                    asset_owner_heads: None,
+                })
+                .unwrap()
+                .revision;
             let owned = directory.path().join("owned");
             let handoff = directory.path().join("handoff");
             std::fs::create_dir(&owned).unwrap();
@@ -1537,8 +1573,9 @@ mod tests {
                     .keys()
                     .map(String::as_str)
                     .collect::<Vec<_>>(),
-                vec!["2", "10", "01", "z", "4294967295"]
+                vec!["2", "10", "01", "z", "4294967295", "owned_key"]
             );
+            assert!(db["pluginCustomStorage"].get("shared_key").is_none());
             assert_eq!(
                 db["pluginCustomStorage"]["z"]["exact"],
                 db["botPresets"][0]["image"]

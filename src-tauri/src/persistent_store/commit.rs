@@ -2520,11 +2520,19 @@ pub(super) fn claim_unowned_plugin_value(
     key: &str,
     import_batch_id: &str,
     assigned_at: i64,
-) -> StoreResult<Option<Value>> {
+    expected_revision: i64,
+) -> StoreResult<(Option<Value>, i64)> {
     if !plugin_owner::validate_owner(owner) || plugin_owner::is_unowned(owner) {
         return Err(validation("plugin storage owner is invalid"));
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actual_revision = current_revision(&transaction)?;
+    if actual_revision != expected_revision {
+        return Err(StoreError::RevisionConflict {
+            expected: expected_revision,
+            actual: actual_revision,
+        });
+    }
     let generation = active_generation(&transaction)?;
     let held: i64 = transaction.query_row(
         "SELECT COUNT(*) FROM plugin_storage
@@ -2533,7 +2541,7 @@ pub(super) fn claim_unowned_plugin_value(
         |row| row.get(0),
     )?;
     if held != 0 {
-        return Ok(None);
+        return Ok((None, actual_revision));
     }
     let source: Option<(i64, i64, String)> = transaction
         .query_row(
@@ -2550,10 +2558,10 @@ pub(super) fn claim_unowned_plugin_value(
         )
         .optional()?;
     let Some((byte_size, ordinal, serialized)) = source else {
-        return Ok(None);
+        return Ok((None, actual_revision));
     };
     let value: Value = serde_json::from_str(&serialized)?;
-    let revision = current_revision(&transaction)? + 1;
+    let revision = actual_revision + 1;
     super::server_sync_outbox::begin_mutation(&transaction, &generation, revision)?;
     super::content_change_index::begin_mutation(&transaction, &generation, revision, "local")?;
     // A delete and an insert, so both sides of the move reach the change index.
@@ -2583,7 +2591,7 @@ pub(super) fn claim_unowned_plugin_value(
     super::server_sync_outbox::finish_mutation(&transaction)?;
     set_active(&transaction, revision, &generation)?;
     transaction.commit()?;
-    Ok(Some(value))
+    Ok((Some(value), revision))
 }
 
 /// The import whose unassigned values a plugin may still be offered, when there
@@ -2636,17 +2644,25 @@ pub(super) fn assign_plugin_storage(
     to_owner: &str,
     collision: AssignCollision,
     assigned_at: i64,
-) -> StoreResult<AssignOutcome> {
+    expected_revision: i64,
+) -> StoreResult<(AssignOutcome, i64)> {
     if !plugin_owner::validate_owner(to_owner) || plugin_owner::is_unowned(to_owner) {
         return Err(validation("plugin storage owner is invalid"));
     }
     let mut outcome = AssignOutcome::default();
     if sources.is_empty() {
-        return Ok(outcome);
+        return Ok((outcome, expected_revision));
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actual_revision = current_revision(&transaction)?;
+    if actual_revision != expected_revision {
+        return Err(StoreError::RevisionConflict {
+            expected: expected_revision,
+            actual: actual_revision,
+        });
+    }
     let generation = active_generation(&transaction)?;
-    let revision = current_revision(&transaction)? + 1;
+    let revision = actual_revision + 1;
     super::server_sync_outbox::begin_mutation(&transaction, &generation, revision)?;
     super::content_change_index::begin_mutation(&transaction, &generation, revision, "local")?;
     for (from_owner, key) in sources {
@@ -2713,7 +2729,7 @@ pub(super) fn assign_plugin_storage(
     super::server_sync_outbox::finish_mutation(&transaction)?;
     set_active(&transaction, revision, &generation)?;
     transaction.commit()?;
-    Ok(outcome)
+    Ok((outcome, revision))
 }
 
 /// The keys a plugin already holds among the ones a person is about to hand it.

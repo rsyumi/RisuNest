@@ -329,6 +329,45 @@ fn imported_store(
     (directory, store)
 }
 
+/// Every claim and assignment answers with the revision it left, so the
+/// renderer's write coordinator can adopt it instead of conflicting.
+fn claim(
+    store: &mut PersistentStore,
+    session: &str,
+    owner: &str,
+    code_hash: &str,
+    runtime: &str,
+    key: &str,
+) -> Option<Value> {
+    let expected = store.revision().expect("read revision");
+    let claimed = store
+        .claim_plugin_storage_value(session, owner, code_hash, runtime, key, expected)
+        .expect("claim plugin value");
+    assert_eq!(
+        claimed.revision,
+        store.revision().expect("read revision after claim")
+    );
+    assert_eq!(claimed.revision >= expected, true);
+    claimed.value
+}
+
+fn assign(
+    store: &mut PersistentStore,
+    sources: &[(String, String)],
+    owner: &str,
+    collision: crate::persistent_store::commit::AssignCollision,
+) -> crate::persistent_store::commit::AssignOutcome {
+    let expected = store.revision().expect("read revision");
+    let assigned = store
+        .assign_plugin_storage(sources, owner, collision, expected)
+        .expect("assign plugin storage");
+    assert_eq!(
+        assigned.revision,
+        store.revision().expect("read revision after assignment")
+    );
+    assigned.outcome
+}
+
 /// Invariant 24. One window per import, opened once and never again.
 #[test]
 fn an_import_offers_each_plugin_one_claim_window_that_never_reopens() {
@@ -342,15 +381,14 @@ fn an_import_offers_each_plugin_one_claim_window_that_never_reopens() {
         .expect("open claim session")
         .expect("a waiting import opens a window");
     assert_eq!(
-        store
-            .claim_plugin_storage_value(
-                &session,
-                "provider-manager",
-                "hash-one",
-                "run-one",
-                "pm_store",
-            )
-            .expect("claim the unowned value"),
+        claim(
+            &mut store,
+            &session,
+            "provider-manager",
+            "hash-one",
+            "run-one",
+            "pm_store",
+        ),
         Some(json!({ "apiKey": "imported" }))
     );
     assert_eq!(
@@ -379,16 +417,15 @@ fn an_import_offers_each_plugin_one_claim_window_that_never_reopens() {
     store
         .close_plugin_claim_session(&session)
         .expect("close the window");
-    assert!(store
-        .claim_plugin_storage_value(
-            &session,
-            "provider-manager",
-            "hash-one",
-            "run-one",
-            "other",
-        )
-        .expect("claim after close")
-        .is_none());
+    assert!(claim(
+        &mut store,
+        &session,
+        "provider-manager",
+        "hash-one",
+        "run-one",
+        "other",
+    )
+    .is_none());
     // A later run of the same plugin gets no second window for this import.
     assert!(store
         .begin_plugin_claim_session("provider-manager", "hash-one", "run-two")
@@ -420,10 +457,7 @@ fn a_claim_refuses_a_key_the_plugin_already_holds_and_a_foreign_caller() {
         .begin_plugin_claim_session("plugin-a", "hash-one", "run-one")
         .expect("open claim session")
         .expect("a waiting import opens a window");
-    assert!(store
-        .claim_plugin_storage_value(&session, "plugin-a", "hash-one", "run-one", "shared")
-        .expect("claim a held key")
-        .is_none());
+    assert!(claim(&mut store, &session, "plugin-a", "hash-one", "run-one", "shared").is_none());
     assert_eq!(
         store
             .read_plugin_storage("plugin-a", "shared", None)
@@ -443,10 +477,7 @@ fn a_claim_refuses_a_key_the_plugin_already_holds_and_a_foreign_caller() {
         ("plugin-a", "hash-two", "run-one"),
         ("plugin-a", "hash-one", "run-two"),
     ] {
-        assert!(store
-            .claim_plugin_storage_value(&session, owner, code_hash, runtime, "shared")
-            .expect("claim from a foreign caller")
-            .is_none());
+        assert!(claim(&mut store, &session, owner, code_hash, runtime, "shared").is_none());
     }
 }
 
@@ -537,9 +568,7 @@ fn a_manual_assignment_follows_the_choice_made_for_a_name_collision() {
         (UNOWNED_OWNER.to_owned(), "pm_keys".to_owned()),
     ];
 
-    let deferred = store
-        .assign_plugin_storage(&sources, "provider-manager", AssignCollision::Defer)
-        .expect("assign, deferring the collision");
+    let deferred = assign(&mut store, &sources, "provider-manager", AssignCollision::Defer);
     assert_eq!(deferred.moved, 1);
     assert_eq!(deferred.deferred, 1);
     assert_eq!(
@@ -573,13 +602,12 @@ fn a_manual_assignment_follows_the_choice_made_for_a_name_collision() {
         .expect("report collisions");
     assert_eq!(colliding, vec!["pm_store".to_owned()]);
 
-    let replaced = store
-        .assign_plugin_storage(
-            &[(UNOWNED_OWNER.to_owned(), "pm_store".to_owned())],
-            "provider-manager",
-            AssignCollision::Replace,
-        )
-        .expect("assign, replacing the collision");
+    let replaced = assign(
+        &mut store,
+        &[(UNOWNED_OWNER.to_owned(), "pm_store".to_owned())],
+        "provider-manager",
+        AssignCollision::Replace,
+    );
     assert_eq!(replaced.replaced, 1);
     assert_eq!(replaced.moved, 1);
     assert_eq!(
@@ -604,13 +632,12 @@ fn discarding_a_colliding_value_removes_only_the_incoming_one() {
         ("provider-manager", "pm_store", json!("own")),
     ]);
 
-    let outcome = store
-        .assign_plugin_storage(
-            &[(UNOWNED_OWNER.to_owned(), "pm_store".to_owned())],
-            "provider-manager",
-            AssignCollision::Discard,
-        )
-        .expect("assign, discarding the collision");
+    let outcome = assign(
+        &mut store,
+        &[(UNOWNED_OWNER.to_owned(), "pm_store".to_owned())],
+        "provider-manager",
+        AssignCollision::Discard,
+    );
     assert_eq!(outcome.discarded, 1);
     assert_eq!(outcome.moved, 0);
     assert_eq!(

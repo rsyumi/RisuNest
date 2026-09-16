@@ -252,6 +252,23 @@ pub(crate) struct PluginStorageSummary {
 
 /// What the plugin data screen lists. Values stay in the store; the screen asks
 /// for one when the reader opens it.
+/// A claim answers with the value it handed over and the revision it left the
+/// library at, so the renderer's write coordinator stays in step.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClaimedPluginValue {
+    pub(crate) value: Option<Value>,
+    pub(crate) revision: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AssignedPluginStorage {
+    #[serde(flatten)]
+    pub(crate) outcome: commit::AssignOutcome,
+    pub(crate) revision: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PluginStorageListItem {
@@ -1636,7 +1653,8 @@ impl PersistentStore {
         code_hash: &str,
         runtime_instance: &str,
         key: &str,
-    ) -> StoreResult<Option<Value>> {
+        expected_revision: i64,
+    ) -> StoreResult<ClaimedPluginValue> {
         let now = device_store::now_ms()?;
         let batch = self.device_store()?.plugin_claim_session_batch(
             session_id,
@@ -1646,9 +1664,20 @@ impl PersistentStore {
             now,
         )?;
         let Some(batch) = batch else {
-            return Ok(None);
+            return Ok(ClaimedPluginValue {
+                value: None,
+                revision: expected_revision,
+            });
         };
-        commit::claim_unowned_plugin_value(&mut self.connection, owner, key, &batch, now)
+        let (value, revision) = commit::claim_unowned_plugin_value(
+            &mut self.connection,
+            owner,
+            key,
+            &batch,
+            now,
+            expected_revision,
+        )?;
+        Ok(ClaimedPluginValue { value, revision })
     }
 
     pub(crate) fn close_plugin_claim_session(&self, session_id: &str) -> StoreResult<()> {
@@ -1668,15 +1697,18 @@ impl PersistentStore {
         sources: &[(String, String)],
         owner: &str,
         collision: commit::AssignCollision,
-    ) -> StoreResult<commit::AssignOutcome> {
+        expected_revision: i64,
+    ) -> StoreResult<AssignedPluginStorage> {
         let assigned_at = device_store::now_ms()?;
-        commit::assign_plugin_storage(
+        let (outcome, revision) = commit::assign_plugin_storage(
             &mut self.connection,
             sources,
             owner,
             collision,
             assigned_at,
-        )
+            expected_revision,
+        )?;
+        Ok(AssignedPluginStorage { outcome, revision })
     }
 
     pub(crate) fn read_plugin_storage(

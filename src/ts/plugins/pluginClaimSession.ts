@@ -51,16 +51,32 @@ export async function beginPluginClaimSession(plugin: {
     return {
         async claim(key: string): Promise<unknown | null> {
             if (closed) return null
-            const value = await invoke<unknown | null>('pds_claim_plugin_storage_value', {
-                sessionId,
-                owner,
-                codeHash: hash,
-                runtimeInstance,
-                key,
-            })
-            if (value === null || value === undefined) return null
+            // A claim moves a row, so the write coordinator has to own the
+            // revision it leaves behind rather than meet it as a conflict.
+            let claimed: unknown | null = null
+            const { getPersistentDataRuntime } = await import(
+                '../storage/persistentDataRuntime.svelte'
+            )
+            await getPersistentDataRuntime().runStorageOnlyMutation(
+                async (expectedRevision) => {
+                    const answer = await invoke<{ value: unknown | null; revision: number }>(
+                        'pds_claim_plugin_storage_value',
+                        {
+                            sessionId,
+                            owner,
+                            codeHash: hash,
+                            runtimeInstance,
+                            key,
+                            expectedRevision,
+                        },
+                    )
+                    claimed = answer.value ?? null
+                    return answer.revision
+                },
+            )
+            if (claimed === null) return null
             pluginStorageStore.invalidateOwner(owner)
-            return value
+            return claimed
         },
         close,
     }

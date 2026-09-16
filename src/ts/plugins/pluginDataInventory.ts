@@ -137,10 +137,26 @@ export async function assignPluginDataItems(
     if (!isTauri || items.length === 0) {
         return { moved: 0, replaced: 0, discarded: 0, deferred: 0 }
     }
-    const outcome = await invoke<PluginAssignOutcome>('pds_assign_plugin_storage', {
-        owner,
-        sources: items.map((item) => ({ owner: item.owner, key: item.key })),
-        collision,
+    // An assignment moves rows, so the write coordinator owns the revision.
+    const { getPersistentDataRuntime } = await import('../storage/persistentDataRuntime.svelte')
+    let outcome: PluginAssignOutcome = { moved: 0, replaced: 0, discarded: 0, deferred: 0 }
+    await getPersistentDataRuntime().runStorageOnlyMutation(async (expectedRevision) => {
+        const answer = await invoke<PluginAssignOutcome & { revision: number }>(
+            'pds_assign_plugin_storage',
+            {
+                owner,
+                sources: items.map((item) => ({ owner: item.owner, key: item.key })),
+                collision,
+                expectedRevision,
+            },
+        )
+        outcome = {
+            moved: answer.moved,
+            replaced: answer.replaced,
+            discarded: answer.discarded,
+            deferred: answer.deferred,
+        }
+        return answer.revision
     })
     pluginStorageStore.invalidate()
     return outcome
