@@ -307,6 +307,85 @@ impl GitlabPackages {
         self.json(&mut response, cancel).await
     }
 
+    /// One offset page of the package a role lives in, appended to `objects`.
+    /// The answer is the following page inside that same package.
+    #[allow(clippy::too_many_arguments)]
+    async fn list_package_page(
+        &self,
+        context: &Repository,
+        credential: &Credential,
+        role: ObjectRole,
+        page: Option<&str>,
+        limit: u16,
+        objects: &mut Vec<ObjectReceipt>,
+        cancel: &Cancellation,
+    ) -> Result<Option<String>> {
+        let settings = &context.settings;
+        let package = settings.package(role);
+        let per_page = limit.min(100).to_string();
+        let mut query = vec![
+            ("package_type", "generic"),
+            ("package_name", package.as_str()),
+            ("order_by", "version"),
+            ("sort", "asc"),
+            ("per_page", per_page.as_str()),
+        ];
+        if let Some(page) = page {
+            query.push(("page", page));
+        }
+        let url = api::packages_url(settings, &query)?;
+        let mut response = self
+            .send(
+                settings,
+                Outgoing {
+                    method: reqwest::Method::GET,
+                    url,
+                    operation: ProviderOperation::List,
+                    credential: Some(credential),
+                    body: None,
+                    content_length: None,
+                },
+                cancel,
+            )
+            .await?;
+        if response.status != 200 {
+            return Err(api::classify(
+                response.status,
+                &response.headers,
+                self.now(),
+            ));
+        }
+        let next_page = api::next_page(&response.headers);
+        let packages: Vec<PackageJson> = self.json(&mut response, cancel).await?;
+        for entry in packages.into_iter().filter(|entry| entry.name == package) {
+            let Ok(placement) = settings.place_version(role, &entry.version) else {
+                continue;
+            };
+            let files = self
+                .package_files(settings, credential, entry.id, cancel)
+                .await?;
+            let mut matching = files.iter().filter(|file| file.file_name == placement.file);
+            let Some(file) = matching.next() else {
+                continue;
+            };
+            if matching.next().is_some() {
+                continue;
+            }
+            objects.push(ObjectReceipt {
+                locator: settings.locator(&placement),
+                byte_length: file.size,
+                version: None,
+                checksum: file.file_sha256.as_ref().map(|value| Checksum {
+                    algorithm: "sha256".into(),
+                    value: value.clone(),
+                    provider_verified: false,
+                }),
+                complete: true,
+            });
+        }
+        Ok(next_page)
+    }
+
     /// Remote truth for one intended object. Two files under one name mean a
     /// duplicate accumulated under an instance that allows duplicates, which is
     /// conflict evidence rather than a converged upload.
@@ -796,74 +875,41 @@ impl Provider for GitlabPackages {
             if limit == 0 || limit > 1000 {
                 return Err(unsupported());
             }
-            let page = api::page_cursor(cursor)?;
+            let roles = config::collection_roles(collection);
+            let (mut index, mut page) = api::list_cursor(cursor, roles.len())?;
             if !context.can_list {
                 return Err(unsupported());
             }
-            let role = config::collection_role(collection);
-            let package = context.settings.package(role);
-            let per_page = limit.min(100).to_string();
-            let mut query = vec![
-                ("package_type", "generic"),
-                ("package_name", package.as_str()),
-                ("order_by", "version"),
-                ("sort", "asc"),
-                ("per_page", per_page.as_str()),
-            ];
-            if let Some(page) = page.as_deref() {
-                query.push(("page", page));
-            }
-            let url = api::packages_url(&context.settings, &query)?;
             let credential = self.credential(&context.secret).await?;
-            let mut response = self
-                .send(
-                    &context.settings,
-                    Outgoing {
-                        method: reqwest::Method::GET,
-                        url,
-                        operation: ProviderOperation::List,
-                        credential: Some(&credential),
-                        body: None,
-                        content_length: None,
-                    },
-                    cancel,
-                )
-                .await?;
-            if response.status != 200 {
-                return Err(api::classify(
-                    response.status,
-                    &response.headers,
-                    self.now(),
-                ));
-            }
-            let next_cursor = api::next_page(&response.headers);
-            let packages: Vec<PackageJson> = self.json(&mut response, cancel).await?;
             let mut objects = Vec::new();
-            for entry in packages.into_iter().filter(|entry| entry.name == package) {
-                let Ok(placement) = context.settings.place_version(role, &entry.version) else {
-                    continue;
-                };
-                let files = self
-                    .package_files(&context.settings, &credential, entry.id, cancel)
+            let mut next_cursor = None;
+            loop {
+                let next_page = self
+                    .list_package_page(
+                        context,
+                        &credential,
+                        roles[index],
+                        page.as_deref(),
+                        limit,
+                        &mut objects,
+                        cancel,
+                    )
                     .await?;
-                let mut matching = files.iter().filter(|file| file.file_name == placement.file);
-                let Some(file) = matching.next() else {
-                    continue;
-                };
-                if matching.next().is_some() {
-                    continue;
+                if let Some(next) = next_page {
+                    next_cursor = Some(format!("{index}:{next}"));
+                    break;
                 }
-                objects.push(ObjectReceipt {
-                    locator: context.settings.locator(&placement),
-                    byte_length: file.size,
-                    version: None,
-                    checksum: file.file_sha256.as_ref().map(|value| Checksum {
-                        algorithm: "sha256".into(),
-                        value: value.clone(),
-                        provider_verified: false,
-                    }),
-                    complete: true,
-                });
+                index += 1;
+                page = None;
+                if index >= roles.len() {
+                    break;
+                }
+                // An exhausted package must not end the page empty handed: the
+                // remaining packages of this collection are read in the same call.
+                if !objects.is_empty() {
+                    next_cursor = Some(format!("{index}:1"));
+                    break;
+                }
             }
             Ok(ObjectPage {
                 objects,

@@ -93,14 +93,15 @@ fn role_from_name(name: &str) -> Option<ObjectRole> {
         _ => return None,
     })
 }
-/// Only names the container a collection lives in. States and bundles share
-/// one, so the role returned here never classifies a listed object; the
-/// authenticated envelope header does that.
-pub(super) fn collection_role(collection: Collection) -> ObjectRole {
+/// Every package a collection is spread over. Roles live in separate packages
+/// here, so a snapshot listing has to walk both of them; the role named for a
+/// package never classifies a listed object, the authenticated envelope header
+/// does that.
+pub(super) fn collection_roles(collection: Collection) -> &'static [ObjectRole] {
     match collection {
-        Collection::Snapshots => ObjectRole::SyncState,
-        Collection::BackupPoints => ObjectRole::BackupPoint,
-        Collection::Descriptors => ObjectRole::Descriptor,
+        Collection::Snapshots => &[ObjectRole::SyncState, ObjectRole::BackupBundle],
+        Collection::BackupPoints => &[ObjectRole::BackupPoint],
+        Collection::Descriptors => &[ObjectRole::Descriptor],
     }
 }
 

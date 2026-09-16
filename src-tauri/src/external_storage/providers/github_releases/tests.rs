@@ -575,14 +575,15 @@ fn snapshot_discovery_pages_across_releases_with_a_resumable_cursor() {
             reply(
                 200,
                 json!([
-                    asset(1, "snapshot-a", 10, None),
+                    asset(1, "state-a", 10, None),
                     asset(2, "pack-a", 20, None),
-                    asset(3, "snapshot-b", 30, None)
+                    asset(3, "bundle-b", 30, None),
+                    asset(5, "point-a", 50, None)
                 ]),
             ),
-            reply(200, json!([asset(4, "snapshot-c", 40, None)])),
+            reply(200, json!([asset(4, "state-c", 40, None)])),
             reply(200, releases.clone()),
-            reply(200, json!([asset(4, "snapshot-c", 40, None)])),
+            reply(200, json!([asset(4, "state-c", 40, None)])),
         ]);
         let test = dependencies();
         let provider = adapter(test.dependencies.clone());

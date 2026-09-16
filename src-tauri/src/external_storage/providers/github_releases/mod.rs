@@ -661,7 +661,6 @@ impl Provider for GithubReleases {
             }
             let (mut release_page, mut release_index, mut asset_page, mut asset_index) =
                 parse_cursor(cursor)?;
-            let prefix = format!("{}-", api::collection_prefix(collection));
             let mut objects = Vec::new();
             let mut next_cursor = None;
             let mut releases: Option<Vec<ReleaseView>> = None;
@@ -695,7 +694,7 @@ impl Provider for GithubReleases {
                 let exhausted = assets.len() < api::ASSET_PAGE_SIZE;
                 let matching: Vec<&AssetView> = assets
                     .iter()
-                    .filter(|asset| asset.name.starts_with(&prefix))
+                    .filter(|asset| api::collection_holds(collection, &asset.name))
                     .collect();
                 let mut stopped = false;
                 for (index, asset) in matching.iter().enumerate().skip(asset_index) {

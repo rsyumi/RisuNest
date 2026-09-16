@@ -254,12 +254,26 @@ pub(super) fn role_prefix(role: ObjectRole) -> &'static str {
     }
 }
 
-pub(super) fn collection_prefix(collection: Collection) -> &'static str {
+/// Every role a collection holds. A published state and a backup bundle share
+/// the snapshot listing, and each role keeps its own asset name prefix.
+pub(super) fn collection_roles(collection: Collection) -> &'static [ObjectRole] {
     match collection {
-        Collection::Snapshots => "snapshot",
-        Collection::BackupPoints => "point",
-        Collection::Descriptors => "descriptor",
+        Collection::Snapshots => &[ObjectRole::SyncState, ObjectRole::BackupBundle],
+        Collection::BackupPoints => &[ObjectRole::BackupPoint],
+        Collection::Descriptors => &[ObjectRole::Descriptor],
     }
+}
+
+/// True when `asset_name` produced this name for a role the collection holds.
+pub(super) fn collection_holds(collection: Collection, name: &str) -> bool {
+    collection_roles(collection)
+        .iter()
+        .any(|role| holds_role(*role, name))
+}
+
+fn holds_role(role: ObjectRole, name: &str) -> bool {
+    name.strip_prefix(role_prefix(role))
+        .is_some_and(|rest| rest.starts_with('-'))
 }
 
 pub(super) fn asset_name(role: ObjectRole, object_id: &str) -> String {
