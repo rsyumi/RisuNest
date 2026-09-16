@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { onMount } from 'svelte'
     import { language } from 'src/lang'
     import { isTauri } from 'src/ts/platform'
     import { DBState } from 'src/ts/stores.svelte'
@@ -47,6 +48,11 @@
     let groupOwners = $state(new Map<string, string>())
     let openItem: PluginDataItem | null = $state(null)
     let openValue = $state('')
+    let confirming: {
+        owner: string
+        items: PluginDataItem[]
+        prefix: string | null
+    } | null = $state(null)
     let collision: {
         owner: string
         items: PluginDataItem[]
@@ -202,31 +208,28 @@
         await load()
     }
 
-    async function startAssign(owner: string, targets: readonly PluginDataItem[]): Promise<void> {
-        if (targets.length === 0 || busy) return
-        const prefixes = new Set(targets.map((item) => item.key.slice(0, 3)))
-        const summary = assignStrings.confirmSummary
-            .replace('{0}', prefixes.size === 1 ? [...prefixes][0] : '')
-            .replace('{1}', String(targets.length))
-            .replace('{2}', formatRisuNestStorageBytes(totalPluginDataBytes(targets)))
-        const { alertConfirm } = await import('src/ts/alert')
-        const accepted = await alertConfirm(
-            [
-                assignStrings.confirmTitle.replace('{0}', owner),
-                summary,
-                assignStrings.confirmBody.replace('{0}', owner),
-            ].join('\n\n'),
-        )
-        if (!accepted) return
+    function startAssign(
+        owner: string,
+        targets: readonly PluginDataItem[],
+        prefix: string | null,
+    ): void {
+        if (owner.length === 0 || targets.length === 0 || busy) return
+        confirming = { owner, items: [...targets], prefix }
+    }
+
+    async function confirmAssign(): Promise<void> {
+        const pending = confirming
+        if (!pending) return
+        confirming = null
         const colliding = await collidingPluginDataKeys(
-            owner,
-            targets.map((item) => item.key),
+            pending.owner,
+            pending.items.map((item) => item.key),
         )
         if (colliding.length > 0) {
-            collision = { owner, items: [...targets], colliding }
+            collision = { owner: pending.owner, items: pending.items, colliding }
             return
         }
-        await applyAssign(owner, targets, 'defer')
+        await applyAssign(pending.owner, pending.items, 'defer')
     }
 
     async function applyAssign(
@@ -252,7 +255,7 @@
         const index = Number(await alertSelect(installedPlugins, strings.choosePlugin))
         const owner = installedPlugins[index]
         if (!owner) return
-        await startAssign(owner, visible)
+        startAssign(owner, visible, null)
     }
 
     async function reloadPlugins(): Promise<void> {
@@ -261,9 +264,7 @@
         await loadPlugins()
     }
 
-    $effect(() => {
-        if (items.length === 0 && !loading) void load()
-    })
+    onMount(load)
 </script>
 
 {#snippet ownerChips()}
@@ -417,7 +418,7 @@
                         <SettingButton
                             disabled={chosen.length === 0 || !groupOwners.get(groupKey(group.prefix))}
                             busy={busy}
-                            onclick={() => startAssign(groupOwners.get(groupKey(group.prefix)) ?? '', chosen)}
+                            onclick={() => startAssign(groupOwners.get(groupKey(group.prefix)) ?? '', chosen, group.prefix)}
                         >{strings.assignSelected}</SettingButton>
                     {/if}
                 </div>
@@ -488,6 +489,28 @@
             <div class="flex justify-end gap-2">
                 <SettingButton variant="danger" busy={busy} onclick={() => remove(openItem ? [openItem] : [])}>{language.remove}</SettingButton>
                 <SettingButton variant="secondary" onclick={() => { openItem = null }}>{language.risuNest.importDialog.close}</SettingButton>
+            </div>
+        </div>
+    </div>
+{/if}
+
+{#if confirming}
+    {@const pending = confirming}
+    <div class="fixed inset-0 z-[1200] flex items-center justify-center bg-black/65 p-4">
+        <div role="dialog" aria-modal="true" class="flex w-full max-w-md flex-col gap-3 rounded-xl border border-darkborderc bg-darkbg p-5 text-textcolor">
+            <h3 class="text-base font-bold">{assignStrings.confirmTitle.replace('{0}', pending.owner)}</h3>
+            {#if pending.prefix !== null}
+                <p class="text-sm text-textcolor2">
+                    {assignStrings.confirmSummary
+                        .replace('{0}', pending.prefix)
+                        .replace('{1}', String(pending.items.length))
+                        .replace('{2}', formatRisuNestStorageBytes(totalPluginDataBytes(pending.items)))}
+                </p>
+            {/if}
+            <p class="text-sm text-textcolor2">{assignStrings.confirmBody.replace('{0}', pending.owner)}</p>
+            <div class="flex justify-end gap-2">
+                <SettingButton variant="secondary" onclick={() => { confirming = null }}>{language.cancel}</SettingButton>
+                <SettingButton busy={busy} onclick={confirmAssign}>{assignStrings.confirmAction}</SettingButton>
             </div>
         </div>
     </div>
