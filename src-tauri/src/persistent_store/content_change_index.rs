@@ -1,7 +1,12 @@
 //! Coalesced content changes for external consumers. Never acknowledges the server outbox.
 //! Only actual mutations open a context; staging/copy operations stay invisible.
-use super::{active_generation, current_revision, StoreError, StoreResult};
+use super::{active_generation, current_revision, PersistentStore, StoreError, StoreResult};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use serde::{Deserialize, Serialize};
+
+/// The working set inside the WebView. Every other consumer is a connection id,
+/// so the renderer never names its own consumer and cannot move another cursor.
+pub(crate) const WORKING_SET_CONSUMER: &str = "ui-working-set";
 
 const SCHEMA: &str = r#"
 CREATE TABLE content_change_context(singleton INTEGER PRIMARY KEY CHECK(singleton=1),generation TEXT NOT NULL,revision INTEGER NOT NULL CHECK(revision>=0),origin TEXT NOT NULL CHECK(origin IN ('local','server','external')));
@@ -13,11 +18,20 @@ CREATE TABLE content_capture_reservations(id TEXT PRIMARY KEY,generation TEXT NO
 INSERT INTO content_change_floor VALUES(1,'revision-0',0);
 "#;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ContentKey {
     pub kind: String,
     pub key1: String,
     pub key2: String,
+}
+
+/// What the renderer needs to decide between a targeted pass and a reprojection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ContentChangeWindow {
+    pub revision: i64,
+    pub after_revision: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -292,4 +306,48 @@ pub(crate) fn prune(tx: &Transaction<'_>) -> StoreResult<i64> {
         [floor],
     )?;
     Ok(floor)
+}
+
+impl PersistentStore {
+    /// The window and every record reprojected for it come from one lease, so the
+    /// change list and the content that explains it share a revision.
+    pub(crate) fn working_set_change_window(
+        &self,
+        lease: &str,
+    ) -> StoreResult<ContentChangeWindow> {
+        let reader = self.working_set_reader(lease)?;
+        Ok(ContentChangeWindow {
+            revision: reader.target.revision,
+            after_revision: match window(reader, WORKING_SET_CONSUMER)? {
+                ChangeWindow::Rebuild => None,
+                ChangeWindow::Incremental { after_revision } => Some(after_revision),
+            },
+        })
+    }
+
+    pub(crate) fn working_set_change_page(
+        &self,
+        lease: &str,
+        after_revision: i64,
+        after_key: Option<ContentKey>,
+        limit: usize,
+    ) -> StoreResult<Vec<ContentKey>> {
+        let reader = self.working_set_reader(lease)?;
+        page(reader, after_revision, after_key.as_ref(), limit)
+    }
+
+    /// Called only once the renderer has installed the projection for `revision`.
+    pub(crate) fn commit_working_set_change_cursor(&mut self, revision: i64) -> StoreResult<()> {
+        let transaction = self.connection.transaction()?;
+        let generation = active_generation(&transaction)?;
+        commit_cursor(&transaction, WORKING_SET_CONSUMER, &generation, revision)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn working_set_reader(&self, lease: &str) -> StoreResult<&super::RevisionReadLease> {
+        self.revision_leases
+            .get(lease)
+            .ok_or(StoreError::SnapshotReleased)
+    }
 }

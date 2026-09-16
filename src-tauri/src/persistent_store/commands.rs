@@ -8,10 +8,11 @@ use super::device_store::plugin_values::{
 use super::export::ExportedRisuSave;
 #[cfg(feature = "native-kei-upload-pilot")]
 use super::kei::KeiUploadResult;
+use super::content_change_index::{ContentChangeWindow, ContentKey};
 use super::{
     AssetAlias, AssetAliasListQuery, AssetAliasPage, AssetOwnerHead, AssetOwnerLocator,
     AssetRepositoryAuthorityState, AssignedPluginStorage, CharacterPage, CharacterQuery,
-    CheckpointMode, ClaimedPluginValue, ConversationPage, ConversationQuery,
+    CharacterSummary, CheckpointMode, ClaimedPluginValue, ConversationPage, ConversationQuery,
     ConversationWindow, ConversationWindowQuery, LeaseResult, PersistentStorageStats,
     PersistentStore, PluginStorageCatalog, PluginStorageListItem, PresetCatalog, RevisionResult,
     SnapshotCreated, SnapshotInfo, StagingResult, StoreError, StoreResult, Versioned, WorkingSetCommit,
@@ -435,6 +436,50 @@ pub(crate) fn pds_read_character(
     lease: Option<String>,
 ) -> Result<Option<Versioned<Value>>, StoreError> {
     with_store(state, |store| store.read_character(&id, lease.as_deref()))
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_read_character_summary(
+    state: State<'_, PersistentStoreState>,
+    id: String,
+    lease: Option<String>,
+) -> Result<Option<CharacterSummary>, StoreError> {
+    with_store(state, |store| {
+        store.read_character_summary(&id, lease.as_deref())
+    })
+}
+
+/// Reading the window and the records it names through one lease is what keeps
+/// a targeted pass equivalent to a reprojection.
+#[tauri::command(async)]
+pub(crate) fn pds_working_set_change_window(
+    state: State<'_, PersistentStoreState>,
+    lease: String,
+) -> Result<ContentChangeWindow, StoreError> {
+    with_store(state, |store| store.working_set_change_window(&lease))
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_working_set_change_page(
+    state: State<'_, PersistentStoreState>,
+    lease: String,
+    after_revision: i64,
+    after_key: Option<ContentKey>,
+    limit: usize,
+) -> Result<Vec<ContentKey>, StoreError> {
+    with_store(state, |store| {
+        store.working_set_change_page(&lease, after_revision, after_key, limit)
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_commit_working_set_change_cursor(
+    state: State<'_, PersistentStoreState>,
+    revision: i64,
+) -> Result<(), StoreError> {
+    with_store_mut(state, |store| {
+        store.commit_working_set_change_cursor(revision)
+    })
 }
 
 #[tauri::command(async)]

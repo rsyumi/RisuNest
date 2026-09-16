@@ -402,3 +402,78 @@ fn a_full_replacement_clears_the_window_and_demands_a_rebuild() {
         .unwrap();
     assert_eq!(rebuild, 1);
 }
+
+#[test]
+fn the_working_set_window_starts_as_a_rebuild_and_then_pages_through_one_lease() {
+    let (_directory, mut store, _) = open_fixture();
+    let lease = store.acquire_revision(1).unwrap().lease;
+    assert_eq!(
+        store.working_set_change_window(&lease).unwrap(),
+        changes::ContentChangeWindow {
+            revision: 1,
+            after_revision: None,
+        }
+    );
+    store.commit_working_set_change_cursor(1).unwrap();
+    store.release_revision(&lease).unwrap();
+
+    store
+        .commit(&WorkingSetCommit {
+            root_mutations: Some(vec![super::super::RootMutation::Set {
+                key: "theme".to_owned(),
+                value: json!("changed"),
+            }]),
+            ..empty_working_set_commit(1)
+        })
+        .unwrap();
+    let lease = store.acquire_revision(2).unwrap().lease;
+    // A later commit must not reach a window pinned to revision 2.
+    store
+        .commit(&WorkingSetCommit {
+            delete_character_id: Some("char-c".to_owned()),
+            ..empty_working_set_commit(2)
+        })
+        .unwrap();
+    let window = store.working_set_change_window(&lease).unwrap();
+    assert_eq!(
+        window,
+        changes::ContentChangeWindow {
+            revision: 2,
+            after_revision: Some(1),
+        }
+    );
+    let page = store
+        .working_set_change_page(&lease, window.after_revision.unwrap(), None, 128)
+        .unwrap();
+    assert_eq!(
+        page,
+        vec![changes::ContentKey {
+            kind: "root".to_owned(),
+            key1: String::new(),
+            key2: String::new(),
+        }]
+    );
+    store.release_revision(&lease).unwrap();
+}
+
+#[test]
+fn the_working_set_window_refuses_a_released_lease_and_a_backwards_cursor() {
+    let (_directory, mut store, _) = open_fixture();
+    assert!(matches!(
+        store.working_set_change_window("snapshot-missing"),
+        Err(StoreError::SnapshotReleased)
+    ));
+
+    store
+        .commit(&WorkingSetCommit {
+            root_mutations: Some(vec![super::super::RootMutation::Set {
+                key: "theme".to_owned(),
+                value: json!("changed"),
+            }]),
+            ..empty_working_set_commit(1)
+        })
+        .unwrap();
+    store.commit_working_set_change_cursor(2).unwrap();
+    assert!(store.commit_working_set_change_cursor(1).is_err());
+    assert!(store.commit_working_set_change_cursor(3).is_err());
+}

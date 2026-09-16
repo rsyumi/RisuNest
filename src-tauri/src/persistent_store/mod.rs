@@ -1435,6 +1435,15 @@ impl PersistentStore {
         query::read_character(connection, id, &target)
     }
 
+    pub(crate) fn read_character_summary(
+        &self,
+        id: &str,
+        lease: Option<&str>,
+    ) -> StoreResult<Option<CharacterSummary>> {
+        let (connection, target) = self.read_view(lease)?;
+        query::read_character_summary(connection, id, &target)
+    }
+
     pub(crate) fn query_conversations(
         &self,
         query: &ConversationQuery,
