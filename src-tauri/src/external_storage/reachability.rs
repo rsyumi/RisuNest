@@ -6,11 +6,10 @@
 #![cfg_attr(not(test), allow(dead_code))]
 use super::{
     contract::{
-        Cancellation, ErrorKind, ObjectReceipt, ObjectRole, ProviderError, ProviderFuture,
-        RemoteLocator, Result,
+        Cancellation, ErrorKind, ObjectReceipt, ObjectRole, ProviderError, ProviderFuture, Result,
     },
     control,
-    gc_store::{locator_key, GcStore},
+    gc_store::{locator_key, CommittedDeletion, GcStore},
     packaging::RemoteObject,
 };
 use risunest_external_storage_format::snapshot as wire;
@@ -86,29 +85,28 @@ pub(crate) struct MarkRequest<'a> {
     pub listed: Vec<ObjectReceipt>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Candidate {
-    pub locator: RemoteLocator,
-    pub role: ObjectRole,
-    pub byte_length: u64,
-}
-
 pub(crate) struct Mark {
     /// Every object the roots reach, keyed the way the cleanup tables key one.
     pub reachable: BTreeSet<String>,
     pub reachable_bytes: u64,
-    /// What this run may remove, each parent ahead of the objects below it.
-    pub candidates: Vec<Candidate>,
+    /// The committed list this run left behind, each parent ahead of the
+    /// objects below it. It is already stored when the mark answers.
+    pub candidates: Vec<CommittedDeletion>,
     /// Enumerated documents this run could not read. It removes neither them
     /// nor anything under them.
     pub skipped: usize,
+    /// The stored list could not be read, so this run started a new one and
+    /// whatever the old one named is no longer nameable.
+    pub list_recomputed: bool,
 }
 
-fn candidate_of(object: &RemoteObject) -> Candidate {
-    Candidate {
+fn candidate_of(object: &RemoteObject, now_ms: u64) -> CommittedDeletion {
+    CommittedDeletion {
         locator: object.receipt.locator.clone(),
         role: object.role,
         byte_length: object.receipt.byte_length,
+        decided_at_ms: now_ms,
+        done: false,
     }
 }
 
@@ -271,8 +269,12 @@ pub(crate) async fn mark(
         .await
         {
             Ok(reached) => {
-                documents.push(candidate_of(object));
-                below.extend(reached.iter().map(candidate_of));
+                documents.push(candidate_of(object, request.now_ms));
+                below.extend(
+                    reached
+                        .iter()
+                        .map(|object| candidate_of(object, request.now_ms)),
+                );
                 visited = subtree;
             }
             // Removing a document whose fragments cannot be listed would leave
@@ -282,20 +284,45 @@ pub(crate) async fn mark(
     }
     documents.extend(below);
 
+    // Once a parent document is gone nothing enumerates the fragments under it
+    // again, so what an interrupted run still owes is written down rather than
+    // rediscovered. A list this device can no longer read costs it those
+    // fragments and the run says so.
+    let (carried, list_recomputed) = match store.committed_deletions(request.connection_id) {
+        Ok(rows) => (rows, false),
+        Err(_) => (Vec::new(), true),
+    };
+    let mut committed = Vec::new();
+    let mut named = BTreeSet::new();
+    for entry in carried
+        .into_iter()
+        .filter(|entry| !entry.done)
+        .chain(documents)
+    {
+        let key = locator_key(&entry.locator)?;
+        // A target the current roots reach again leaves the list instead of
+        // being removed.
+        if reachable.contains(&key) || !named.insert(key) {
+            continue;
+        }
+        committed.push(entry);
+    }
+    store.replace_deletions(request.connection_id, &committed)?;
     store.prune_observations(request.connection_id, &observed)?;
     store.set_last_reachable_bytes(request.connection_id, reachable_bytes)?;
     Ok(Mark {
         reachable,
         reachable_bytes,
-        candidates: documents,
+        candidates: committed,
         skipped,
+        list_recomputed,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::external_storage::{contract::ObjectReceipt, gc_store::CommittedDeletion};
+    use crate::external_storage::contract::{ObjectReceipt, RemoteLocator};
     use std::sync::Mutex;
 
     const DAY: u64 = 24 * 60 * 60 * 1000;
@@ -560,6 +587,10 @@ mod tests {
         repository.with_document(&head, None, library.references());
         repository.with_document(&stale, None, Vec::new());
         repository.broken.insert(key(&library.records));
+        let carried = leftover(&object("orphan-pack", ObjectRole::Pack, 11), false);
+        store
+            .replace_deletions("connection", &[carried.clone()])
+            .unwrap();
         store
             .record_observations(
                 "connection",
@@ -580,7 +611,11 @@ mod tests {
         ));
         assert!(error.is_err());
         assert_eq!(store.last_reachable_bytes("connection").unwrap(), None);
-        assert!(store.committed_deletions("connection").unwrap().is_empty());
+        // The run added nothing to the list and took nothing off it.
+        assert_eq!(
+            store.committed_deletions("connection").unwrap(),
+            vec![carried]
+        );
         let ledger = store
             .record_observations(
                 "connection",
@@ -784,23 +819,34 @@ mod tests {
         );
     }
 
-    /// A committed row the store already holds is untouched by a mark; joining
-    /// it to this run's candidates belongs to the deletion list itself.
+    fn leftover(object: &RemoteObject, done: bool) -> CommittedDeletion {
+        CommittedDeletion {
+            locator: object.receipt.locator.clone(),
+            role: object.role,
+            byte_length: object.receipt.byte_length,
+            decided_at_ms: NOW - DAY,
+            done,
+        }
+    }
+
+    /// What an earlier run committed to but never finished joins this run, and
+    /// what it did finish leaves the list once this mark is over. The list this
+    /// run answers with is the one it stored.
     #[test]
-    fn a_mark_does_not_rewrite_the_committed_list() {
+    fn an_unfinished_target_rejoins_the_run_and_a_finished_one_leaves() {
         let (_root, store) = store();
         let mut repository = Repository::default();
         let head = object("snapshot-head", ObjectRole::SyncState, 2);
         repository.with_document(&head, None, Vec::new());
-        let row = CommittedDeletion {
-            locator: object("leftover", ObjectRole::Pack, 1).receipt.locator,
-            role: ObjectRole::Pack,
-            byte_length: 1,
-            decided_at_ms: NOW - DAY,
-            done: false,
-        };
-        store.replace_deletions("connection", &[row.clone()]).unwrap();
-        runtime()
+        let unfinished = object("orphan-pack", ObjectRole::Pack, 11);
+        let finished = object("removed-pack", ObjectRole::Pack, 22);
+        store
+            .replace_deletions(
+                "connection",
+                &[leftover(&unfinished, false), leftover(&finished, true)],
+            )
+            .unwrap();
+        let mark = runtime()
             .block_on(mark(
                 MarkRequest {
                     connection_id: "connection",
@@ -813,6 +859,79 @@ mod tests {
                 &Cancellation::default(),
             ))
             .unwrap();
-        assert_eq!(store.committed_deletions("connection").unwrap(), vec![row]);
+        assert!(!mark.list_recomputed);
+        assert_eq!(names(&mark), vec!["orphan-pack"]);
+        // The decision time of a carried target is the one it was given.
+        assert_eq!(mark.candidates[0].decided_at_ms, NOW - DAY);
+        assert_eq!(store.committed_deletions("connection").unwrap(), mark.candidates);
+    }
+
+    /// Invariant GC25. A target on the list that the current roots reach again
+    /// is dropped from the list instead of being removed.
+    #[test]
+    fn a_target_that_is_reachable_again_leaves_the_list() {
+        let (_root, store) = store();
+        let mut repository = Repository::default();
+        let library = Library::new("head");
+        library.install(&mut repository);
+        let head = object("snapshot-head", ObjectRole::SyncState, 2);
+        repository.with_document(&head, None, library.references());
+        store
+            .replace_deletions(
+                "connection",
+                &[
+                    leftover(&library.record_pack, false),
+                    leftover(&object("orphan-pack", ObjectRole::Pack, 11), false),
+                ],
+            )
+            .unwrap();
+        let mark = runtime()
+            .block_on(mark(
+                MarkRequest {
+                    connection_id: "connection",
+                    now_ms: NOW,
+                    roots: roots(Some(&head)),
+                    listed: receipts(&[&head]),
+                },
+                &repository,
+                &store,
+                &Cancellation::default(),
+            ))
+            .unwrap();
+        assert!(mark.reachable.contains(&key(&library.record_pack)));
+        assert_eq!(names(&mark), vec!["orphan-pack"]);
+        assert_eq!(store.committed_deletions("connection").unwrap(), mark.candidates);
+    }
+
+    #[test]
+    fn a_list_this_device_cannot_read_is_replaced_and_reported() {
+        let (root, store) = store();
+        let mut repository = Repository::default();
+        let head = object("snapshot-head", ObjectRole::SyncState, 2);
+        repository.with_document(&head, None, Vec::new());
+        rusqlite::Connection::open(root.path().join("external-gc.sqlite"))
+            .unwrap()
+            .execute(
+                "INSERT INTO deletions(connection_id,locator,role,byte_length,decided_at_ms,done)
+                 VALUES('connection','not-a-locator','pack',1,1,0)",
+                [],
+            )
+            .unwrap();
+        let mark = runtime()
+            .block_on(mark(
+                MarkRequest {
+                    connection_id: "connection",
+                    now_ms: NOW,
+                    roots: roots(Some(&head)),
+                    listed: receipts(&[&head]),
+                },
+                &repository,
+                &store,
+                &Cancellation::default(),
+            ))
+            .unwrap();
+        assert!(mark.list_recomputed);
+        assert!(mark.candidates.is_empty());
+        assert!(store.committed_deletions("connection").unwrap().is_empty());
     }
 }
