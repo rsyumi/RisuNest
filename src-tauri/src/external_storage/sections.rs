@@ -3,7 +3,7 @@
 //! change without changing what the repository holds.
 use super::contract::{Cancellation, ErrorKind, ProviderError, Result};
 use crate::persistent_store::device_store::{
-    sections::{SectionRow, SectionValueRow},
+    sections::{SectionCursor, SectionRow, SectionValueRow},
     Section,
 };
 use risunest_external_storage_format::{
@@ -18,7 +18,7 @@ use risunest_external_storage_format::{
 };
 use risunest_sync_wire::head::Sequence;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -319,6 +319,84 @@ pub(crate) fn capture_state_sections(
     Ok(captured)
 }
 
+/// The sections this device takes part in that this remote lineage holds no
+/// cursor for. Taking one back on has to bring the remote content in before a
+/// publication puts local rows in its place.
+pub(crate) fn rejoining_sections(
+    store: &mut crate::persistent_store::PersistentStore,
+    connection_id: &str,
+    library_lineage: &str,
+) -> Result<BTreeSet<String>> {
+    let device = store.device_store_mut().map_err(device_error)?;
+    let mut wanted = BTreeSet::new();
+    for kind in [SectionKind::Hypa, SectionKind::LocalPlugins] {
+        let section = section_of(kind).expect("synchronizable section");
+        if !device.section_state(section).map_err(device_error)?.participating {
+            continue;
+        }
+        if device
+            .read_section_cursor(connection_id, library_lineage, section)
+            .map_err(device_error)?
+            .is_none()
+        {
+            wanted.insert(kind.id().to_owned());
+        }
+    }
+    Ok(wanted)
+}
+
+/// Whether this remote lineage has carried the section to this device before.
+/// A rejoined one records this device's own values as its newest writes first,
+/// so the merge keeps them wherever both sides hold the same key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SectionArrival {
+    Continuing,
+    Rejoining,
+}
+
+/// Merges one received section into the device file and records how far this
+/// remote lineage has been applied. The cursor is written last, so an
+/// interrupted apply runs again from the same remote state instead of
+/// reporting the section as done.
+pub(crate) fn apply_received_section(
+    store: &mut crate::persistent_store::PersistentStore,
+    connection_id: &str,
+    library_lineage: &str,
+    arrival: SectionArrival,
+    prepared: &super::snapshot_restore::PreparedSection,
+) -> Result<()> {
+    let Some(section) = section_of(prepared.kind) else {
+        return Err(corrupt("device-fixed section in a synchronized state"));
+    };
+    let rows = decode_section(
+        prepared.kind,
+        &prepared.entries,
+        &prepared.content_fingerprint,
+    )?;
+    let device = store.device_store_mut().map_err(device_error)?;
+    if !device.section_state(section).map_err(device_error)?.participating {
+        return Ok(());
+    }
+    if arrival == SectionArrival::Rejoining {
+        device
+            .reissue_section_rows(section, &prepared.max_write_clock, &rows)
+            .map_err(device_error)?;
+    }
+    device.apply_section_rows(section, &rows).map_err(device_error)?;
+    device
+        .write_section_cursor(
+            connection_id,
+            library_lineage,
+            section,
+            &SectionCursor {
+                applied_generation: prepared.generation.clone(),
+                applied_gc_floor: prepared.gc_floor.clone(),
+                observed_max_write_clock: prepared.max_write_clock.clone(),
+            },
+        )
+        .map_err(device_error)
+}
+
 /// A decoded section as it arrived. Object bodies are resolved by content hash
 /// before a row is produced, so a missing object fails the whole section.
 pub(crate) fn decode_section(
@@ -433,6 +511,23 @@ fn row_of(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistent_store::{
+        device_store::plugin_values::PluginDeviceMutation, PersistentStore,
+    };
+
+    fn plugin_row(key: &str, value: &str, clock: u64, writer: &str) -> SectionRow {
+        SectionRow {
+            key1: "plugin-a".into(),
+            key2: "string".into(),
+            key3: key.into(),
+            value: SectionValueRow::Plugin {
+                space: "string".into(),
+                value: value.into(),
+            },
+            write_clock: Sequence::from(clock),
+            writer_id: writer.into(),
+        }
+    }
 
     fn hypa_row(key: &str, clock: u64, writer: &str, dimensions: i64) -> SectionRow {
         SectionRow {
@@ -607,6 +702,170 @@ mod tests {
         assert_ne!(hypa.content_fingerprint, plugins.content_fingerprint);
         assert!(decode_section(SectionKind::Hypa, &[], &hypa.content_fingerprint).is_ok());
         assert!(decode_section(SectionKind::Hypa, &[], &plugins.content_fingerprint).is_err());
+    }
+
+    fn prepared(section: &CapturedSection) -> super::super::snapshot_restore::PreparedSection {
+        super::super::snapshot_restore::PreparedSection {
+            kind: section.kind,
+            generation: section.generation.clone(),
+            gc_floor: section.gc_floor.clone(),
+            max_write_clock: section.max_write_clock.clone(),
+            content_fingerprint: section.content_fingerprint,
+            entries: carried(section),
+        }
+    }
+
+    fn published_plugin_values(section: &CapturedSection) -> Vec<(String, Option<String>)> {
+        decode_section(
+            SectionKind::LocalPlugins,
+            &carried(section),
+            &section.content_fingerprint,
+        )
+        .expect("decode the published section")
+        .into_iter()
+        .map(|row| {
+            (
+                row.key3,
+                match row.value {
+                    SectionValueRow::Plugin { value, .. } => Some(value),
+                    _ => None,
+                },
+            )
+        })
+        .collect()
+    }
+
+    /// A device that takes a section back on merges the remote rows before it
+    /// publishes. The keys only the remote holds join the published section and
+    /// the keys both sides hold keep the local value, so no other device's
+    /// value is dropped by the device that rejoined.
+    #[test]
+    fn rejoining_a_section_publishes_both_devices_keys_and_keeps_the_local_value() {
+        let spool = tempfile::tempdir().expect("create spool");
+        let root = tempfile::tempdir().expect("create store root");
+        let mut store = PersistentStore::open(root.path()).expect("open persistent store");
+        {
+            let device = store.device_store_mut().expect("open device store");
+            device
+                .set_section_participating(Section::LocalPlugins, true)
+                .expect("take part in the plugin section");
+            device
+                .write_plugin_device_values(
+                    "plugin-a",
+                    &[
+                        PluginDeviceMutation::Set {
+                            space: "string".into(),
+                            key: "shared".into(),
+                            value: "from-b".into(),
+                        },
+                        PluginDeviceMutation::Set {
+                            space: "string".into(),
+                            key: "only-b".into(),
+                            value: "from-b".into(),
+                        },
+                    ],
+                )
+                .expect("write local plugin values");
+        }
+        let remote = capture_section(
+            SectionKind::LocalPlugins,
+            &[
+                plugin_row("only-a", "from-a", 40, "writer-a"),
+                plugin_row("shared", "from-a", 41, "writer-a"),
+            ],
+            true,
+            Sequence::from(3u64),
+            Sequence::from(0u64),
+            Sequence::from(41u64),
+            &spool.path().join("remote"),
+            &Cancellation::default(),
+        )
+        .expect("capture the remote section");
+
+        assert_eq!(
+            rejoining_sections(&mut store, "connection", "library").expect("read rejoining"),
+            BTreeSet::from(["hypa".to_owned(), "local-plugins".to_owned()])
+        );
+        apply_received_section(
+            &mut store,
+            "connection",
+            "library",
+            SectionArrival::Rejoining,
+            &prepared(&remote),
+        )
+        .expect("rejoin the plugin section");
+
+        let published = capture_state_sections(
+            &mut store,
+            &Sequence::from(4u64),
+            &spool.path().join("published"),
+            &Cancellation::default(),
+        )
+        .expect("capture the state sections");
+        let plugins = published
+            .iter()
+            .find(|section| section.kind == SectionKind::LocalPlugins)
+            .expect("published plugin section");
+        assert_eq!(
+            published_plugin_values(plugins),
+            vec![
+                ("only-a".to_owned(), Some("from-a".to_owned())),
+                ("only-b".to_owned(), Some("from-b".to_owned())),
+                ("shared".to_owned(), Some("from-b".to_owned())),
+            ]
+        );
+
+        // The merged section still owes the remote a publication, and the
+        // section the remote never carried keeps no cursor, so it is rejoined
+        // whenever that remote does carry it.
+        let device = store.device_store_mut().expect("open device store");
+        assert!(device
+            .sections_await_publication("connection", "library")
+            .expect("read awaiting publication"));
+        let settled = device
+            .section_state(Section::LocalPlugins)
+            .expect("read section state")
+            .max_write_clock;
+        assert_eq!(
+            rejoining_sections(&mut store, "connection", "library").expect("read rejoining"),
+            BTreeSet::from(["hypa".to_owned()])
+        );
+
+        // An automatic retry is not a fresh reactivation, so it stamps no
+        // second version and publishes the same section again.
+        apply_received_section(
+            &mut store,
+            "connection",
+            "library",
+            SectionArrival::Rejoining,
+            &prepared(&remote),
+        )
+        .expect("rejoin the plugin section again");
+        assert_eq!(
+            store
+                .device_store_mut()
+                .expect("open device store")
+                .section_state(Section::LocalPlugins)
+                .expect("read section state")
+                .max_write_clock,
+            settled
+        );
+        let republished = capture_state_sections(
+            &mut store,
+            &Sequence::from(5u64),
+            &spool.path().join("republished"),
+            &Cancellation::default(),
+        )
+        .expect("capture the state sections again");
+        assert_eq!(
+            published_plugin_values(
+                republished
+                    .iter()
+                    .find(|section| section.kind == SectionKind::LocalPlugins)
+                    .expect("published plugin section")
+            ),
+            published_plugin_values(plugins)
+        );
     }
 
     #[test]

@@ -1266,6 +1266,67 @@ mod section_exchange {
         );
     }
 
+    /// Rejoining a remote lineage records this device's values and removals
+    /// above every version that lineage carries, so the merge that follows
+    /// keeps them. A row the remote already holds unchanged needs no new
+    /// version, and neither does a retried attempt.
+    #[test]
+    fn a_reissued_section_keeps_local_values_and_removals_above_the_remote() {
+        let (_directory, mut store) = open();
+        set(&mut store, "kept", "local");
+        set(&mut store, "gone", "local");
+        store
+            .write_plugin_device_values(
+                "plugin-a",
+                &[PluginDeviceMutation::Delete {
+                    space: "string".to_owned(),
+                    key: "gone".to_owned(),
+                }],
+            )
+            .expect("delete a plugin value");
+        let remote = [
+            plugin_row("kept", "from-b", 40, "writer-b"),
+            plugin_row("gone", "from-b", 41, "writer-b"),
+            plugin_row("theirs", "from-b", 42, "writer-b"),
+        ];
+        assert_eq!(
+            store
+                .reissue_section_rows(Section::LocalPlugins, &Sequence::from(42u64), &remote)
+                .expect("reissue the local rows"),
+            2
+        );
+        store
+            .apply_section_rows(Section::LocalPlugins, &remote)
+            .expect("merge the remote rows");
+        assert_eq!(
+            live(&mut store),
+            vec![
+                ("gone".to_owned(), None),
+                ("kept".to_owned(), Some("local".to_owned())),
+                ("theirs".to_owned(), Some("from-b".to_owned())),
+            ]
+        );
+
+        let settled = store
+            .section_state(Section::LocalPlugins)
+            .expect("read section state")
+            .max_write_clock;
+        assert!(settled > Sequence::from(42u64));
+        assert_eq!(
+            store
+                .reissue_section_rows(Section::LocalPlugins, &Sequence::from(42u64), &remote)
+                .expect("reissue after the merge"),
+            0
+        );
+        assert_eq!(
+            store
+                .section_state(Section::LocalPlugins)
+                .expect("read section state")
+                .max_write_clock,
+            settled
+        );
+    }
+
     /// Invariant 16. The same values and tombstones in either order leave the
     /// same user state behind.
     #[test]

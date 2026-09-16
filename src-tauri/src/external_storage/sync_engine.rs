@@ -159,6 +159,23 @@ pub(crate) enum SyncAction {
     RecoveryRequired,
 }
 
+/// The head this device agreed to, checked against the base row carrying it.
+fn stored_observation(base: &ExternalBase) -> Result<StoredHeadObservation> {
+    let stored = parse_observation(&base.head_observation)?;
+    if stored.commit_id != base.commit_id {
+        return Err(corrupt("stored base and head observation differ"));
+    }
+    Ok(stored)
+}
+
+/// Whether the remote carries other content than the base. A version token can
+/// move without the content moving, so only the commit and the body it
+/// authenticates count.
+fn remote_content_differs(stored: &StoredHeadObservation, remote: &ObservedHead) -> bool {
+    stored.commit_id != remote.observation.commit_id
+        || stored.authenticated_body_hash != remote.observation.authenticated_body_hash
+}
+
 fn same_local_lineage(a: &CaptureIdentity, b: &CaptureIdentity) -> bool {
     a.store_id == b.store_id
         && a.library_epoch == b.library_epoch
@@ -198,13 +215,9 @@ pub(crate) fn decide_sync(input: SyncInputs<'_>) -> Result<SyncAction> {
     let Some(remote) = input.remote else {
         return Ok(SyncAction::RecoveryRequired);
     };
-    let stored = parse_observation(&base.head_observation)?;
-    if stored.commit_id != base.commit_id {
-        return Err(corrupt("stored base and head observation differ"));
-    }
+    let stored = stored_observation(base)?;
     let local_changed = input.current_identity.revision != base.identity.revision;
-    let remote_content_changed = stored.commit_id != remote.observation.commit_id
-        || stored.authenticated_body_hash != remote.observation.authenticated_body_hash;
+    let remote_content_changed = remote_content_differs(&stored, remote);
     let remote_version_changed = stored.version != remote.observation.version;
 
     match (local_changed, remote_content_changed) {
@@ -620,38 +633,90 @@ fn apply_received_sections(
     app: &AppHandle,
     connection_id: &str,
     library_lineage: &str,
-    sections: Vec<super::snapshot_restore::PreparedSection>,
+    sections: &[super::snapshot_restore::PreparedSection],
 ) -> Result<()> {
     if sections.is_empty() {
         return Ok(());
     }
     let mut store = pds(app)?;
     for prepared in sections {
-        let Some(section) = super::sections::section_of(prepared.kind) else {
-            return Err(corrupt("device-fixed section in a synchronized state"));
-        };
-        let rows = super::sections::decode_section(
-            prepared.kind,
-            &prepared.entries,
-            &prepared.content_fingerprint,
+        super::sections::apply_received_section(
+            &mut store,
+            connection_id,
+            library_lineage,
+            super::sections::SectionArrival::Continuing,
+            prepared,
         )?;
-        let device = store.device_store_mut().map_err(local_error)?;
-        if !device.section_state(section).map_err(local_error)?.participating {
-            continue;
-        }
-        device.apply_section_rows(section, &rows).map_err(local_error)?;
-        device
-            .write_section_cursor(
-                connection_id,
-                library_lineage,
-                section,
-                &crate::persistent_store::device_store::sections::SectionCursor {
-                    applied_generation: prepared.generation,
-                    applied_gc_floor: prepared.gc_floor,
-                    observed_max_write_clock: prepared.max_write_clock,
-                },
-            )
+    }
+    Ok(())
+}
+
+/// Brings in the sections this remote lineage has never exchanged with this
+/// device, before a publication can put local rows in their place. Without it
+/// a device that takes a section back on publishes over whatever the other
+/// devices left there.
+async fn rejoin_sections(
+    app: &AppHandle,
+    connected: &ConnectedRepository,
+    job: &DurableJob,
+    identity: &CaptureIdentity,
+    base: &ExternalBase,
+    remote: &ObservedHead,
+    cancel: &Cancellation,
+) -> Result<()> {
+    if base.repository_id != connected.stored.descriptor.repository_id
+        || !same_local_lineage(identity, &base.identity)
+        || identity.revision < base.identity.revision
+    {
+        return Ok(());
+    }
+    let lineage = &base.identity.library_epoch;
+    let (wanted, awaiting) = {
+        let mut store = pds(app)?;
+        let wanted =
+            super::sections::rejoining_sections(&mut store, &job.request.connection_id, lineage)?;
+        let awaiting = store
+            .device_store_mut()
+            .map_err(local_error)?
+            .sections_await_publication(&job.request.connection_id, lineage)
             .map_err(local_error)?;
+        (wanted, awaiting)
+    };
+    // Nothing takes their place while the library and the remote both stay
+    // where they are, so the remote content is read only on a cycle that can
+    // publish or receive.
+    if wanted.is_empty()
+        || !(awaiting
+            || identity.revision != base.identity.revision
+            || remote_content_differs(&stored_observation(base)?, remote))
+    {
+        return Ok(());
+    }
+    let staging = super::runtime::job_directory(
+        &super::runtime::root(app)?,
+        &job.request.connection_id,
+        &job.id,
+    )
+    .join("rejoin");
+    let received = super::snapshot_restore::download_sections(
+        &remote.document.state,
+        &wanted,
+        &staging,
+        &connected.root_key,
+        connected.provider.as_ref(),
+        &connected.handle,
+        cancel,
+    )
+    .await?;
+    let mut store = pds(app)?;
+    for prepared in &received {
+        super::sections::apply_received_section(
+            &mut store,
+            &job.request.connection_id,
+            lineage,
+            super::sections::SectionArrival::Rejoining,
+            prepared,
+        )?;
     }
     Ok(())
 }
@@ -787,7 +852,7 @@ async fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Resu
         app,
         &job.request.connection_id,
         &authoritative.identity.library_epoch,
-        received_sections,
+        &received_sections,
     )?;
     let mut store = pds(app)?;
     let commit = store
@@ -1516,6 +1581,12 @@ pub(crate) async fn run_sync(
         .external_base(&job.request.connection_id)
         .map_err(local_error)?;
     drop(store);
+    // A section this lineage has not exchanged with yet is merged before the
+    // decision, so neither a publication nor a receive settles it against a
+    // local copy that never saw the remote rows.
+    if let (Some(base), Some(remote)) = (base.as_ref(), remote.as_ref()) {
+        rejoin_sections(app, connected, job, &identity, base, remote, cancel).await?;
+    }
     let local_changed = base.as_ref().is_none_or(|base| {
         identity.revision != base.identity.revision
             || !same_local_lineage(&identity, &base.identity)
