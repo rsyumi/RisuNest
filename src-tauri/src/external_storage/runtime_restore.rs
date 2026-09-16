@@ -17,6 +17,7 @@ use crate::{
         PersistentStore, StoreError,
     },
 };
+use risunest_external_storage_format::section::SectionKind;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeSet, path::Path, sync::Mutex, time::Duration};
@@ -25,6 +26,7 @@ use tauri::{AppHandle, Manager};
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RestoreSelection {
     library: bool,
+    sections: BTreeSet<String>,
 }
 
 const RESTORE_COMMIT_SCHEMA: &str = "risunest.external-restore-commit/v1";
@@ -187,9 +189,9 @@ fn decode_hash(value: &str) -> Result<[u8; 32]> {
         .ok_or_else(corrupt)
 }
 
-/// A bundle declares what it covers. Until section publication lands the only
-/// coverage is the library, so a request for anything else is rejected rather
-/// than quietly narrowed.
+/// A bundle declares what it covers, and a restore asks for a subset of that.
+/// An area the request does not name is left alone on this device, and an
+/// unknown one is rejected rather than quietly narrowed.
 fn restore_selection(restore_areas: Option<&[String]>) -> Result<RestoreSelection> {
     let defaults;
     let areas = match restore_areas {
@@ -203,15 +205,21 @@ fn restore_selection(restore_areas: Option<&[String]>) -> Result<RestoreSelectio
     if unique.len() != areas.len() {
         return Err(corrupt());
     }
-    let known = ["library", "referencedAssets"];
-    if areas.iter().any(|area| !known.contains(&area.as_str())) {
-        return Err(corrupt());
+    let library_areas = ["library", "referencedAssets"];
+    let mut sections = BTreeSet::new();
+    for area in areas {
+        if library_areas.contains(&area.as_str()) {
+            continue;
+        }
+        sections.insert(SectionKind::parse(area).map_err(|_| corrupt())?.id().to_owned());
     }
-    let library = areas.iter().any(|area| known.contains(&area.as_str()));
+    let library = areas
+        .iter()
+        .any(|area| library_areas.contains(&area.as_str()));
     if !library {
         return Err(corrupt());
     }
-    Ok(RestoreSelection { library })
+    Ok(RestoreSelection { library, sections })
 }
 
 fn checked_required_bytes(
@@ -333,6 +341,19 @@ pub(crate) async fn run_restore(
     cancel.check()?;
     validate_download(connected, snapshot_id, &snapshot)?;
     let selection = restore_selection(job.request.restore_areas.as_deref())?;
+    let sections = snapshot_restore::download_sections(
+        &remote,
+        &selection.sections,
+        &staging_root,
+        &connected.root_key,
+        connected.provider.as_ref(),
+        &connected.handle,
+        cancel,
+    )
+    .await?;
+    if sections.len() != selection.sections.len() {
+        return Err(ProviderError::new(ErrorKind::NotFound));
+    }
     let required = checked_required_bytes(&snapshot, &selection)?;
     if available_space(&staging_root).map_err(runtime::local_error)? < required {
         return Err(ProviderError::new(ErrorKind::StorageFull));
@@ -349,6 +370,7 @@ pub(crate) async fn run_restore(
             expected_revision,
             snapshot,
             selection,
+            sections,
             worker_cancel,
         )
     })
@@ -357,12 +379,14 @@ pub(crate) async fn run_restore(
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_local_restore(
     app: &AppHandle,
     job: &DurableJob,
     expected_revision: i64,
     snapshot: PreparedRemoteSnapshot,
     selection: RestoreSelection,
+    sections: Vec<snapshot_restore::PreparedSection>,
     cancel: Cancellation,
 ) -> Result<Value> {
     cancel.check()?;
@@ -421,6 +445,27 @@ fn prepare_local_restore(
     };
 
     let prepared = prepared.ok_or_else(corrupt)?;
+    // Decoding every selected section before touching the device file keeps a
+    // bundle with a missing object from installing half of itself.
+    let decoded = sections
+        .into_iter()
+        .map(|section| {
+            let rows = super::sections::decode_section(
+                section.kind,
+                &section.entries,
+                &section.content_fingerprint,
+            )?;
+            Ok((section.kind, rows))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (kind, rows) in decoded {
+        cancel.check()?;
+        let device = store.device_store_mut().map_err(pds_error)?;
+        match super::sections::section_of(kind) {
+            Some(section) => device.restore_section_rows(section, &rows).map_err(pds_error)?,
+            None => device.restore_local_setting_rows(&rows).map_err(pds_error)?,
+        }
+    }
     let marker = restore_marker(job, expected_revision)?;
     let revision = store
         .finish_prepared_replace_with_app_kv(
@@ -902,11 +947,25 @@ mod tests {
     fn restore_area_selection_matches_the_renderer_contract() {
         assert_eq!(
             restore_selection(None).unwrap(),
-            RestoreSelection { library: true }
+            RestoreSelection {
+                library: true,
+                sections: BTreeSet::new()
+            }
         );
         assert_eq!(
             restore_selection(Some(&["referencedAssets".into()])).unwrap(),
-            RestoreSelection { library: true }
+            RestoreSelection {
+                library: true,
+                sections: BTreeSet::new()
+            }
+        );
+        assert_eq!(
+            restore_selection(Some(&["library".into(), "hypa".into(), "local-settings".into()]))
+                .unwrap(),
+            RestoreSelection {
+                library: true,
+                sections: BTreeSet::from(["hypa".to_owned(), "local-settings".to_owned()])
+            }
         );
     }
 
@@ -917,6 +976,7 @@ mod tests {
         assert!(restore_selection(Some(&["library".into(), "library".into()])).is_err());
         assert!(restore_selection(Some(&["devicePlugins".into()])).is_err());
         assert!(restore_selection(Some(&["deviceSettings".into()])).is_err());
+        assert!(restore_selection(Some(&["hypa".into()])).is_err());
         assert!(restore_selection(Some(&[])).is_err());
     }
 

@@ -323,7 +323,7 @@ impl DeviceStore {
         // Received rows are staged outside a mutation context so the change
         // index does not offer them back as this device's own writes.
         for row in &applied {
-            write_row(&transaction, section, row)?;
+            write_row(&transaction, section, row, true)?;
             outcome.applied += 1;
         }
         observe_remote_clock(&transaction, section, &highest)?;
@@ -445,6 +445,42 @@ impl DeviceStore {
         Ok(())
     }
 
+    /// Installs backup material for the same device. A restored value is this
+    /// device's own write, so it takes a freshly issued clock and this writer
+    /// rather than whatever produced the bundle.
+    pub(crate) fn restore_section_rows(
+        &mut self,
+        section: Section,
+        rows: &[SectionRow],
+    ) -> StoreResult<()> {
+        let transaction = self.transaction()?;
+        let writer_id: String = transaction.query_row(
+            "SELECT writer_id FROM device_meta WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        super::begin_mutation(&transaction)?;
+        for row in rows {
+            if row.value == SectionValueRow::Tombstone {
+                return Err(invalid("restored section row has no value"));
+            }
+            let clock = super::issue_write_clock(&transaction, section)?;
+            write_row(
+                &transaction,
+                section,
+                &SectionRow {
+                    write_clock: clock,
+                    writer_id: writer_id.clone(),
+                    ..row.clone()
+                },
+                false,
+            )?;
+        }
+        super::finish_mutation(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Installs backup material for the same device. Versions are reissued
     /// locally because a bundle carries user values without them.
     pub(crate) fn restore_local_setting_rows(&mut self, rows: &[SectionRow]) -> StoreResult<()> {
@@ -481,19 +517,32 @@ impl DeviceStore {
     }
 }
 
-fn write_row(tx: &Transaction<'_>, section: Section, row: &SectionRow) -> StoreResult<()> {
+/// `published` is false for a restored value: it is a new local write that no
+/// remote has seen yet.
+fn write_row(
+    tx: &Transaction<'_>,
+    section: Section,
+    row: &SectionRow,
+    published: bool,
+) -> StoreResult<()> {
+    let published_clock = published.then(|| row.write_clock.as_str().to_owned());
     match (section, &row.value) {
         (Section::Hypa, SectionValueRow::Tombstone) => {
             tx.execute(
                 "INSERT INTO hypa_embeddings
                     (cache_key,producer,model,endpoint,preprocess_version,dimensions,vector,
                      metadata,tombstone,write_clock,writer_id,published_clock)
-                    VALUES (?1,'','',NULL,0,1,NULL,NULL,1,?2,?3,?2)
+                    VALUES (?1,'','',NULL,0,1,NULL,NULL,1,?2,?3,?4)
                     ON CONFLICT(cache_key) DO UPDATE SET
                         vector=NULL,metadata=NULL,tombstone=1,
                         write_clock=excluded.write_clock,writer_id=excluded.writer_id,
-                        published_clock=excluded.write_clock",
-                params![row.key1, row.write_clock.as_str(), row.writer_id],
+                        published_clock=excluded.published_clock",
+                params![
+                    row.key1,
+                    row.write_clock.as_str(),
+                    row.writer_id,
+                    published_clock
+                ],
             )?;
         }
         (
@@ -512,7 +561,7 @@ fn write_row(tx: &Transaction<'_>, section: Section, row: &SectionRow) -> StoreR
                 "INSERT INTO hypa_embeddings
                     (cache_key,producer,model,endpoint,preprocess_version,dimensions,vector,
                      metadata,tombstone,write_clock,writer_id,published_clock)
-                    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,?9,?10,?9)
+                    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,?9,?10,?11)
                     ON CONFLICT(cache_key) DO UPDATE SET
                         producer=excluded.producer,model=excluded.model,
                         endpoint=excluded.endpoint,
@@ -520,7 +569,7 @@ fn write_row(tx: &Transaction<'_>, section: Section, row: &SectionRow) -> StoreR
                         dimensions=excluded.dimensions,vector=excluded.vector,
                         metadata=excluded.metadata,tombstone=0,
                         write_clock=excluded.write_clock,writer_id=excluded.writer_id,
-                        published_clock=excluded.write_clock",
+                        published_clock=excluded.published_clock",
                 params![
                     row.key1,
                     producer,
@@ -531,7 +580,8 @@ fn write_row(tx: &Transaction<'_>, section: Section, row: &SectionRow) -> StoreR
                     vector,
                     metadata,
                     row.write_clock.as_str(),
-                    row.writer_id
+                    row.writer_id,
+                    published_clock
                 ],
             )?;
         }
@@ -540,17 +590,18 @@ fn write_row(tx: &Transaction<'_>, section: Section, row: &SectionRow) -> StoreR
                 "INSERT INTO plugin_device_storage
                     (owner,space,key,value,byte_size,tombstone,write_clock,writer_id,
                      published_clock)
-                    VALUES (?1,?2,?3,NULL,0,1,?4,?5,?4)
+                    VALUES (?1,?2,?3,NULL,0,1,?4,?5,?6)
                     ON CONFLICT(owner,space,key) DO UPDATE SET
                         value=NULL,byte_size=0,tombstone=1,
                         write_clock=excluded.write_clock,writer_id=excluded.writer_id,
-                        published_clock=excluded.write_clock",
+                        published_clock=excluded.published_clock",
                 params![
                     row.key1,
                     row.key2,
                     row.key3,
                     row.write_clock.as_str(),
-                    row.writer_id
+                    row.writer_id,
+                    published_clock
                 ],
             )?;
         }
@@ -564,11 +615,11 @@ fn write_row(tx: &Transaction<'_>, section: Section, row: &SectionRow) -> StoreR
                 "INSERT INTO plugin_device_storage
                     (owner,space,key,value,byte_size,tombstone,write_clock,writer_id,
                      published_clock)
-                    VALUES (?1,?2,?3,?4,?5,0,?6,?7,?6)
+                    VALUES (?1,?2,?3,?4,?5,0,?6,?7,?8)
                     ON CONFLICT(owner,space,key) DO UPDATE SET
                         value=excluded.value,byte_size=excluded.byte_size,tombstone=0,
                         write_clock=excluded.write_clock,writer_id=excluded.writer_id,
-                        published_clock=excluded.write_clock",
+                        published_clock=excluded.published_clock",
                 params![
                     row.key1,
                     row.key2,
@@ -576,7 +627,8 @@ fn write_row(tx: &Transaction<'_>, section: Section, row: &SectionRow) -> StoreR
                     value,
                     byte_size,
                     row.write_clock.as_str(),
-                    row.writer_id
+                    row.writer_id,
+                    published_clock
                 ],
             )?;
         }

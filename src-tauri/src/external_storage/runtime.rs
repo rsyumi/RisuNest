@@ -1045,7 +1045,7 @@ mod tests {
         incoming.snapshot_id = Some("b".into());
         assert!(!same_requested_operation(&existing, &incoming));
         incoming.snapshot_id = existing.snapshot_id.clone();
-        incoming.restore_areas = Some(vec!["deviceSettings".into()]);
+        incoming.restore_areas = Some(vec!["hypa".into()]);
         assert!(!same_requested_operation(&existing, &incoming));
         let existing: StartJobRequest = serde_json::from_value(json!({"connectionId":"x", "kind":"resolve-conflict", "conflictId":"conflict", "choice":"remote"})).unwrap();
         let mut incoming = existing.clone();

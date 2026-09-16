@@ -61,13 +61,14 @@ impl StartJobRequest {
                 .as_deref()
                 .is_some_and(|s| !["local", "remote"].contains(&s))
             || self.restore_areas.as_ref().is_some_and(|areas| {
-                areas.len() > 4
+                areas.len() > 5
                     || areas.iter().any(|s| {
                         ![
                             "library",
                             "referencedAssets",
-                            "deviceSettings",
-                            "devicePlugins",
+                            "hypa",
+                            "local-plugins",
+                            "local-settings",
                         ]
                         .contains(&s.as_str())
                     })

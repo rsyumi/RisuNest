@@ -15,12 +15,16 @@ use super::{
     publication::HeadObservation,
 };
 use crate::persistent_store::{
+    device_store::Section as PdsSection,
     external_apply::{ExternalSnapshotApplication, ExternalSnapshotObject, ExternalSnapshotRecord},
     external_conflicts::{ConflictPhase, ConflictPreservation, ConflictRecord},
     external_runtime::ExternalBase,
     sync_selection::CaptureIdentity,
 };
-use risunest_external_storage_format::format::{library_fingerprint_domain, Descriptor};
+use risunest_external_storage_format::{
+    format::{library_fingerprint_domain, Descriptor},
+    section::SectionKind,
+};
 use risunest_sync_wire::head::Sequence;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -550,6 +554,66 @@ pub(crate) struct ApplyReceivedRequest {
     expected_revision: String,
 }
 
+/// The sections this device takes part in right now. A section left out is not
+/// downloaded at all, so its values never reach this installation.
+fn participating_sections(app: &AppHandle) -> Result<std::collections::BTreeSet<String>> {
+    let mut store = pds(app)?;
+    let device = store.device_store_mut().map_err(local_error)?;
+    let mut wanted = std::collections::BTreeSet::new();
+    for (kind, section) in [
+        (SectionKind::Hypa, PdsSection::Hypa),
+        (SectionKind::LocalPlugins, PdsSection::LocalPlugins),
+    ] {
+        if device.section_state(section).map_err(local_error)?.participating {
+            wanted.insert(kind.id().to_owned());
+        }
+    }
+    Ok(wanted)
+}
+
+/// Merges received sections into the device file. Each section is its own
+/// transaction, so an interrupted apply resumes from the same remote state
+/// instead of reporting the whole receive as done.
+fn apply_received_sections(
+    app: &AppHandle,
+    connection_id: &str,
+    library_lineage: &str,
+    sections: Vec<super::snapshot_restore::PreparedSection>,
+) -> Result<()> {
+    if sections.is_empty() {
+        return Ok(());
+    }
+    let mut store = pds(app)?;
+    for prepared in sections {
+        let Some(section) = super::sections::section_of(prepared.kind) else {
+            return Err(corrupt("device-fixed section in a synchronized state"));
+        };
+        let rows = super::sections::decode_section(
+            prepared.kind,
+            &prepared.entries,
+            &prepared.content_fingerprint,
+        )?;
+        let device = store.device_store_mut().map_err(local_error)?;
+        if !device.section_state(section).map_err(local_error)?.participating {
+            continue;
+        }
+        device.apply_section_rows(section, &rows).map_err(local_error)?;
+        device
+            .write_section_cursor(
+                connection_id,
+                library_lineage,
+                section,
+                &crate::persistent_store::device_store::sections::SectionCursor {
+                    applied_generation: prepared.generation,
+                    applied_gc_floor: prepared.gc_floor,
+                    observed_max_write_clock: prepared.max_write_clock,
+                },
+            )
+            .map_err(local_error)?;
+    }
+    Ok(())
+}
+
 async fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Result<Value> {
     if request.job_id.is_empty()
         || request.job_id.len() > 1024
@@ -605,6 +669,17 @@ async fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Resu
         super::runtime::job_directory(&root, &job.request.connection_id, &job.id).join("receive");
     let prepared = super::snapshot_restore::download_snapshot(
         &remote.document.state,
+        &staging,
+        &connected.root_key,
+        connected.provider.as_ref(),
+        &connected.handle,
+        &cancel,
+    )
+    .await?;
+    let wanted = participating_sections(app)?;
+    let received_sections = super::snapshot_restore::download_sections(
+        &remote.document.state,
+        &wanted,
         &staging,
         &connected.root_key,
         connected.provider.as_ref(),
@@ -679,6 +754,13 @@ async fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Resu
             );
         }
     }
+    drop(store);
+    apply_received_sections(
+        app,
+        &job.request.connection_id,
+        &remote.document.library_id,
+        received_sections,
+    )?;
     let result = json!({"snapshotId":prepared.snapshot_id,"receivedRevision":revision.to_string()});
     job.summary["state"] = json!("succeeded");
     job.summary["phase"] = json!("complete");
