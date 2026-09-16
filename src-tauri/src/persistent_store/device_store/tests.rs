@@ -1086,7 +1086,9 @@ fn a_committed_device_value_survives_reopening_the_device_file() {
 
 
 mod section_exchange {
-    use super::super::sections::{SectionCursor, SectionRow, SectionValueRow, LOCAL_SETTING_KEYS};
+    use super::super::sections::{
+        SectionCursor, SectionKey, SectionRow, SectionValueRow, LOCAL_SETTING_KEYS,
+    };
     use super::super::{plugin_values::PluginDeviceMutation, DeviceStore, Section};
     use super::open;
     use risunest_sync_wire::Sequence;
@@ -1637,6 +1639,114 @@ mod section_exchange {
             .read_section_cursor("other", "library", Section::Hypa)
             .unwrap()
             .is_none());
+    }
+
+    /// A row this device wrote below the highest version the remote carries is
+    /// still unpublished, so counters cannot stand in for the question. A
+    /// confirmed publication marks the version it captured, and a write that
+    /// landed after that capture keeps owing one.
+    #[test]
+    fn a_local_write_below_the_remote_counter_still_owes_a_publication() {
+        let (_directory, mut store) = open();
+        store
+            .set_section_participating(Section::LocalPlugins, true)
+            .unwrap();
+        set(&mut store, "mine", "local");
+        store
+            .apply_section_rows(
+                Section::LocalPlugins,
+                &[plugin_row("theirs", "remote", 40, "writer-b")],
+            )
+            .expect("apply a remote row above every local write");
+        store
+            .write_section_cursor(
+                "connection",
+                "library",
+                Section::LocalPlugins,
+                &SectionCursor {
+                    applied_generation: Sequence::from(3u64),
+                    applied_gc_floor: Sequence::from(0u64),
+                    observed_max_write_clock: Sequence::from(40u64),
+                },
+            )
+            .unwrap();
+        assert!(store
+            .sections_await_publication("connection", "library")
+            .unwrap());
+
+        let captured: Vec<(SectionKey, Sequence)> = store
+            .read_section_rows(Section::LocalPlugins)
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.key(), row.write_clock))
+            .collect();
+        set(&mut store, "late", "after the capture");
+        store
+            .note_section_published(Section::LocalPlugins, &captured)
+            .expect("record the confirmed publication");
+        assert!(store
+            .sections_await_publication("connection", "library")
+            .unwrap());
+
+        let captured: Vec<(SectionKey, Sequence)> = store
+            .read_section_rows(Section::LocalPlugins)
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.key(), row.write_clock))
+            .collect();
+        store
+            .note_section_published(Section::LocalPlugins, &captured)
+            .expect("record the second publication");
+        assert!(!store
+            .sections_await_publication("connection", "library")
+            .unwrap());
+
+        // A lineage this device never exchanged with holds none of these rows.
+        assert!(store
+            .sections_await_publication("connection", "other-library")
+            .unwrap());
+    }
+
+    /// A row rewritten above the version it was published at owes another
+    /// publication, and the stale mark is not mistaken for a current one.
+    #[test]
+    fn a_reissued_row_owes_another_publication() {
+        let (_directory, mut store) = open();
+        store
+            .set_section_participating(Section::LocalPlugins, true)
+            .unwrap();
+        set(&mut store, "mine", "local");
+        let captured: Vec<(SectionKey, Sequence)> = store
+            .read_section_rows(Section::LocalPlugins)
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.key(), row.write_clock))
+            .collect();
+        store
+            .note_section_published(Section::LocalPlugins, &captured)
+            .unwrap();
+        store
+            .write_section_cursor(
+                "connection",
+                "library",
+                Section::LocalPlugins,
+                &SectionCursor {
+                    applied_generation: Sequence::from(1u64),
+                    applied_gc_floor: Sequence::from(0u64),
+                    observed_max_write_clock: Sequence::from(1u64),
+                },
+            )
+            .unwrap();
+        assert!(!store
+            .sections_await_publication("connection", "library")
+            .unwrap());
+
+        store
+            .reissue_section_rows(Section::LocalPlugins, &Sequence::from(42u64), &[])
+            .expect("reissue the local rows above the remote");
+        assert!(store
+            .sections_await_publication("connection", "library")
+            .unwrap());
     }
 }
 

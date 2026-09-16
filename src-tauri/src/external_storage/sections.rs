@@ -3,7 +3,7 @@
 //! change without changing what the repository holds.
 use super::contract::{Cancellation, ErrorKind, ProviderError, Result};
 use crate::persistent_store::device_store::{
-    sections::{SectionCursor, SectionRow, SectionValueRow},
+    sections::{SectionCursor, SectionKey, SectionRow, SectionValueRow},
     Section,
 };
 use risunest_external_storage_format::{
@@ -50,6 +50,15 @@ pub(crate) struct CapturedSection {
     pub max_write_clock: Sequence,
     pub content_fingerprint: [u8; 32],
     pub sources: Vec<SectionSource>,
+}
+
+/// What a confirmed publication has to record locally for one section. Nothing
+/// here is written before the remote holds the captured content, so a failed
+/// publication leaves the device file as it was.
+#[derive(Clone, Debug)]
+pub(crate) struct SectionPublication {
+    pub section: Section,
+    pub published: Vec<(SectionKey, Sequence)>,
 }
 
 pub(crate) fn section_of(kind: SectionKind) -> Option<Section> {
@@ -295,9 +304,10 @@ pub(crate) fn capture_state_sections(
     generation: &Sequence,
     spool: &Path,
     cancel: &Cancellation,
-) -> Result<Vec<CapturedSection>> {
+) -> Result<(Vec<CapturedSection>, Vec<SectionPublication>)> {
     let device = store.device_store_mut().map_err(device_error)?;
     let mut captured = Vec::new();
+    let mut publications = Vec::new();
     for kind in [SectionKind::Hypa, SectionKind::LocalPlugins] {
         let section = section_of(kind).expect("synchronizable section");
         let state = device.section_state(section).map_err(device_error)?;
@@ -315,8 +325,15 @@ pub(crate) fn capture_state_sections(
             &spool.join(kind.id()),
             cancel,
         )?);
+        publications.push(SectionPublication {
+            section,
+            published: rows
+                .iter()
+                .map(|row| (row.key(), row.write_clock.clone()))
+                .collect(),
+        });
     }
-    Ok(captured)
+    Ok((captured, publications))
 }
 
 /// The sections this device takes part in that this remote lineage holds no
@@ -795,7 +812,7 @@ mod tests {
         )
         .expect("rejoin the plugin section");
 
-        let published = capture_state_sections(
+        let (published, _) = capture_state_sections(
             &mut store,
             &Sequence::from(4u64),
             &spool.path().join("published"),
@@ -850,7 +867,7 @@ mod tests {
                 .max_write_clock,
             settled
         );
-        let republished = capture_state_sections(
+        let (republished, _) = capture_state_sections(
             &mut store,
             &Sequence::from(5u64),
             &spool.path().join("republished"),
@@ -866,6 +883,82 @@ mod tests {
             ),
             published_plugin_values(plugins)
         );
+    }
+
+    /// A confirmed publication records the versions it carried, so the next
+    /// cycle stops offering the same section. A write that landed after the
+    /// capture is outside that record and still owes a publication.
+    #[test]
+    fn a_recorded_publication_does_not_make_every_cycle_capture_again() {
+        let spool = tempfile::tempdir().expect("create spool");
+        let root = tempfile::tempdir().expect("create store root");
+        let mut store = PersistentStore::open(root.path()).expect("open persistent store");
+        {
+            let device = store.device_store_mut().expect("open device store");
+            device
+                .set_section_participating(Section::LocalPlugins, true)
+                .expect("take part in the plugin section");
+            device
+                .set_section_participating(Section::Hypa, false)
+                .expect("leave the embedding section out");
+            device
+                .write_plugin_device_values(
+                    "plugin-a",
+                    &[PluginDeviceMutation::Set {
+                        space: "string".into(),
+                        key: "mine".into(),
+                        value: "local".into(),
+                    }],
+                )
+                .expect("write a local plugin value");
+            device
+                .write_section_cursor(
+                    "connection",
+                    "library",
+                    Section::LocalPlugins,
+                    &SectionCursor {
+                        applied_generation: Sequence::from(3u64),
+                        applied_gc_floor: Sequence::from(0u64),
+                        observed_max_write_clock: Sequence::from(1u64),
+                    },
+                )
+                .expect("record what this lineage carried");
+        }
+        let (_, publications) = capture_state_sections(
+            &mut store,
+            &Sequence::from(4u64),
+            &spool.path().join("published"),
+            &Cancellation::default(),
+        )
+        .expect("capture the state sections");
+        assert_eq!(publications.len(), 1);
+
+        let device = store.device_store_mut().expect("open device store");
+        assert!(device
+            .sections_await_publication("connection", "library")
+            .expect("read awaiting publication"));
+        for publication in &publications {
+            device
+                .note_section_published(publication.section, &publication.published)
+                .expect("record the confirmed publication");
+        }
+        assert!(!device
+            .sections_await_publication("connection", "library")
+            .expect("read awaiting publication"));
+
+        device
+            .write_plugin_device_values(
+                "plugin-a",
+                &[PluginDeviceMutation::Set {
+                    space: "string".into(),
+                    key: "mine".into(),
+                    value: "changed".into(),
+                }],
+            )
+            .expect("write over the published value");
+        assert!(device
+            .sections_await_publication("connection", "library")
+            .expect("read awaiting publication"));
     }
 
     #[test]

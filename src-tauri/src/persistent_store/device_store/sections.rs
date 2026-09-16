@@ -4,7 +4,7 @@
 use super::{invalid, observe_remote_clock, sequence, DeviceStore, Section};
 use crate::persistent_store::StoreResult;
 use risunest_sync_wire::Sequence;
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Device settings a restored installation wants back, as opposed to the
@@ -58,6 +58,9 @@ pub(crate) enum SectionValueRow {
     Tombstone,
 }
 
+/// The triple a section row is named by, in the order the change index holds.
+pub(crate) type SectionKey = (String, String, String);
+
 /// The key triple matches the change index, so a row and its change entry name
 /// the same thing without a second encoding.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,25 +110,30 @@ fn setting_is_local(key: &str) -> bool {
     LOCAL_SETTING_KEYS.contains(&key)
 }
 
-/// Keys no remote has been told about yet. A restore uses them to tell its own
-/// interrupted attempt apart from a value some remote already carries.
+/// Keys whose current value no remote has been told about. A restore uses them
+/// to tell its own interrupted attempt apart from a value some remote already
+/// carries, and publication uses them to decide whether it owes one at all. A
+/// row reissued above the version it was published at counts as unpublished.
 fn unpublished_keys(
-    tx: &Transaction<'_>,
+    db: &Connection,
     section: Section,
 ) -> StoreResult<BTreeSet<(String, String, String)>> {
     let mut keys = BTreeSet::new();
     match section {
         Section::Hypa => {
-            let mut statement = tx
-                .prepare("SELECT cache_key FROM hypa_embeddings WHERE published_clock IS NULL")?;
+            let mut statement = db.prepare(
+                "SELECT cache_key FROM hypa_embeddings
+                    WHERE published_clock IS NULL OR published_clock<>write_clock",
+            )?;
             let mut query = statement.query([])?;
             while let Some(row) = query.next()? {
                 keys.insert((row.get(0)?, String::new(), String::new()));
             }
         }
         Section::LocalPlugins => {
-            let mut statement = tx.prepare(
-                "SELECT owner,space,key FROM plugin_device_storage WHERE published_clock IS NULL",
+            let mut statement = db.prepare(
+                "SELECT owner,space,key FROM plugin_device_storage
+                    WHERE published_clock IS NULL OR published_clock<>write_clock",
             )?;
             let mut query = statement.query([])?;
             while let Some(row) = query.next()? {
@@ -339,11 +347,13 @@ impl DeviceStore {
                 continue;
             }
             match self.read_section_cursor(connection_id, library_lineage, section)? {
-                Some(cursor) => {
-                    if state.max_write_clock > cursor.observed_max_write_clock {
+                Some(_) => {
+                    if !unpublished_keys(&self.connection, section)?.is_empty() {
                         return Ok(true);
                     }
                 }
+                // A lineage this device never exchanged with holds none of its
+                // rows, however far the local counter has already travelled.
                 None => {
                     if state.max_write_clock > Sequence::from(0u64) {
                         return Ok(true);
@@ -352,6 +362,46 @@ impl DeviceStore {
             }
         }
         Ok(false)
+    }
+
+    /// Records the versions a confirmed publication put on the remote. Each row
+    /// is matched at the version it was captured at, so a local write that
+    /// landed between the capture and the publication stays unpublished.
+    /// Publication bookkeeping is control metadata, so it runs outside a change
+    /// context and never reaches the device change index.
+    pub(crate) fn note_section_published(
+        &mut self,
+        section: Section,
+        published: &[(SectionKey, Sequence)],
+    ) -> StoreResult<()> {
+        if published.is_empty() {
+            return Ok(());
+        }
+        let transaction = self.transaction()?;
+        {
+            let mut statement = match section {
+                Section::Hypa => transaction.prepare(
+                    "UPDATE hypa_embeddings SET published_clock=?2
+                        WHERE cache_key=?1 AND write_clock=?2",
+                )?,
+                Section::LocalPlugins => transaction.prepare(
+                    "UPDATE plugin_device_storage SET published_clock=?4
+                        WHERE owner=?1 AND space=?2 AND key=?3 AND write_clock=?4",
+                )?,
+            };
+            for ((key1, key2, key3), clock) in published {
+                match section {
+                    Section::Hypa => {
+                        statement.execute(params![key1, clock.as_str()])?;
+                    }
+                    Section::LocalPlugins => {
+                        statement.execute(params![key1, key2, key3, clock.as_str()])?;
+                    }
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Rewrites this device's section as its own newest writes, above every
