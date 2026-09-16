@@ -1306,6 +1306,23 @@ fn platform_key() -> &'static str {
 mod tests {
     use super::*;
 
+    /// The form reads the kind to tell a repository this device already holds
+    /// from a provider failure, and a provider failure keeps its own shape.
+    #[test]
+    fn a_refused_connection_reports_its_own_kind() {
+        assert_eq!(
+            serde_json::to_value(ConnectionFailure::ALREADY_CONNECTED).unwrap(),
+            serde_json::json!({"kind":"alreadyConnected"})
+        );
+        assert_eq!(
+            serde_json::to_value(ConnectionFailure::from(ProviderError::new(
+                ErrorKind::Transient
+            )))
+            .unwrap(),
+            serde_json::to_value(ProviderError::new(ErrorKind::Transient)).unwrap()
+        );
+    }
+
     #[test]
     fn incomplete_authorization_is_not_a_connection_or_consumed_error() {
         let pending = CompleteAuthorizationResult::Pending {
