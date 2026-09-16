@@ -12,6 +12,7 @@ const state = vi.hoisted(() => ({
     localCommit: vi.fn(),
     remoteHint: vi.fn(),
   },
+  controllerListener: undefined as undefined | ((state: unknown) => void),
   nativeListeners: new Map<string, () => void>(),
   listen: vi.fn(async (event: string, handler: () => void) => {
     return (
@@ -38,7 +39,10 @@ const state = vi.hoisted(() => ({
     cancelExitDrain: vi.fn(async () => {}),
     waitForIdle: vi.fn(async () => {}),
     canRestore: vi.fn(() => true),
-    subscribe: vi.fn(() => () => {}),
+    subscribe: vi.fn((listener: (state: unknown) => void) => {
+      state.controllerListener = listener;
+      return () => {};
+    }),
   },
 }));
 vi.mock("../../platform", () => ({
@@ -86,6 +90,7 @@ beforeEach(() => {
   state.available = undefined;
   state.revisionListener = undefined;
   state.nativeListeners.clear();
+  state.controllerListener = undefined;
   state.ready = true;
   state.running = false;
   state.controller.canRestore.mockReturnValue(true);
@@ -283,6 +288,17 @@ describe("native server synchronization scheduling", () => {
     visibility.mockReturnValue("hidden");
     listeners.get("visibilitychange")!(new Event("visibilitychange"));
     expect(state.invoke).toHaveBeenCalledWith("server_sync_events_stop");
+  });
+  it("starts holding as soon as this device has a binding", async () => {
+    const { startServerSync } = await import("./serverSyncProduction");
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    startServerSync();
+    await Promise.resolve();
+    state.invoke.mockClear();
+    state.controllerListener!({ status: { configured: false } });
+    expect(state.invoke).not.toHaveBeenCalledWith("server_sync_events_start");
+    state.controllerListener!({ status: { configured: true } });
+    expect(state.invoke).toHaveBeenCalledWith("server_sync_events_start");
   });
   it("does not install a native scheduler in the browser build", async () => {
     state.native = false;

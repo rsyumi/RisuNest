@@ -50,7 +50,7 @@ hmac = "0.12"
 quick-xml = { version = "0.41", features = ["serialize"] }
 percent-encoding = "2"
 httpdate = "1"
-tokio = { version = "1.47.1", features = ["net", "rt", "time", "fs", "io-util", "sync"] }
+tokio = { version = "1.47.1", features = ["macros", "net", "rt", "time", "fs", "io-util", "sync"] }
 tokio-util = { version = "0.7.19", features = ["io"] }
 libc = { version = "0.2", optional = true }
 hex = "0.4.3"

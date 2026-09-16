@@ -182,6 +182,35 @@ fn every_reconnection_confirms_the_head_even_when_nothing_was_announced() {
     assert_eq!(outcome.hints, 3);
 }
 
+/// Stopping before the holder has run once still stops it. Nothing connects.
+#[test]
+fn a_stop_that_arrives_before_the_first_attempt_is_still_observed() {
+    let peer = fake(vec![once(HEADERS)]);
+    let sink = Arc::new(Counter::default());
+    let observed = sink.clone();
+    let resolve: Resolve = {
+        let config = binding(&peer.endpoint);
+        Arc::new(move || Some(config.clone()))
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let released = runtime.block_on(async move {
+        let stop = Stop::new();
+        let holder = tokio::spawn(hold(resolve, Arc::new(sink), stop.clone(), quick()));
+        stop.stop();
+        tokio::time::timeout(Duration::from_secs(10), holder)
+            .await
+            .is_ok()
+    });
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    assert!(released);
+    assert_eq!(peer.connections.load(Ordering::Relaxed), 0);
+    assert_eq!(observed.count(), 0);
+}
+
 /// A binding the server does not accept is not retried on a timer. The user
 /// sees the same refusal from the ordinary synchronisation attempt.
 #[test]

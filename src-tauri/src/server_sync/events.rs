@@ -74,7 +74,9 @@ impl Stop {
         Self(Arc::new(tokio::sync::watch::Sender::new(false)))
     }
     pub(crate) fn stop(&self) {
-        let _ = self.0.send(true);
+        // Stored rather than sent: a holder between two waits has no receiver
+        // yet, and a stop it never observes would keep the connection.
+        self.0.send_replace(true);
     }
     fn stopped(&self) -> bool {
         *self.0.borrow()
