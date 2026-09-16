@@ -511,17 +511,18 @@ pub(super) fn reconstruct_record_with_owner_objects(
                 value: serde_json::from_str(&raw)?,
             }
         }
-        LogicalRecordLocator::Plugin { storage_key } => {
+        LogicalRecordLocator::Plugin { owner, storage_key } => {
             let (ordinal, raw): (i64, String) = connection
                 .query_row(
                     "SELECT ordinal, value FROM plugin_storage
-                     WHERE generation = ?1 AND storage_key = ?2",
-                    params![pds_generation, storage_key],
+                     WHERE generation = ?1 AND owner = ?2 AND storage_key = ?3",
+                    params![pds_generation, owner, storage_key],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?
                 .ok_or_else(|| missing_source("plugin"))?;
             LogicalRecordEnvelope::Plugin {
+                owner: owner.clone(),
                 ordinal: nonnegative_u64(ordinal, "plugin storage ordinal")?,
                 value: serde_json::from_str(&raw)?,
             }

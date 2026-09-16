@@ -1,3 +1,4 @@
+import { UNOWNED_PLUGIN_OWNER } from '../plugins/pluginOwner'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { get } from 'svelte/store'
 
@@ -349,15 +350,22 @@ describe('production persistent working-set publication', () => {
     })
 
     it('preloads nested maximum plugin values from the installed plain database', async () => {
-        const storage = createPluginStorageStore({
-            store: {} as PersistentDataStore,
-            mutate: async () => undefined,
-        })
-        const unregister = registerPluginStorageLifecycle(storage)
         const nestedValue = {
             list: [{ enabled: true }],
             settings: { mode: 'maximum' },
         }
+        const storage = createPluginStorageStore({
+            store: {
+                open: async () => undefined,
+                queryPluginStorage: async () => ({
+                    revision: 1,
+                    items: [{ owner: UNOWNED_PLUGIN_OWNER, key: 'nested', byteSize: 1 }],
+                }),
+                readPluginStorage: async () => ({ revision: 1, value: nestedValue }),
+            } as unknown as PersistentDataStore,
+            mutate: async () => undefined,
+        })
+        const unregister = registerPluginStorageLifecycle(storage)
         const complete = {
             botPresets: [],
             pluginCustomStorage: { nested: nestedValue },
@@ -366,9 +374,9 @@ describe('production persistent working-set publication', () => {
         try {
             createProductionStateAdapter().installCompleteDatabase!(complete)
 
-            await expect(storage.keys()).resolves.toEqual(['nested'])
-            await expect(storage.getItem('nested')).resolves.toEqual(nestedValue)
-            expect(await storage.getItem('nested')).not.toBe(nestedValue)
+            await expect(storage.forOwner(UNOWNED_PLUGIN_OWNER).keys()).resolves.toEqual(['nested'])
+            await expect(storage.forOwner(UNOWNED_PLUGIN_OWNER).getItem('nested')).resolves.toEqual(nestedValue)
+            expect(await storage.forOwner(UNOWNED_PLUGIN_OWNER).getItem('nested')).not.toBe(nestedValue)
         } finally {
             unregister()
         }

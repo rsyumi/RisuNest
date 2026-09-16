@@ -1,3 +1,4 @@
+import { UNOWNED_PLUGIN_OWNER } from '../plugins/pluginOwner'
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { BlobStore } from '../storage/blobStore'
@@ -592,8 +593,8 @@ describe('local backup persistent snapshot', () => {
         expect(state.written.has('plugin-partial.bin')).toBe(false)
         expect(state.written.has(getBackupInlayName('plugin-partial-inlay'))).toBe(false)
         expect(readPluginStorage).toHaveBeenCalledTimes(2)
-        expect(readPluginStorage).toHaveBeenNthCalledWith(1, 'zero')
-        expect(readPluginStorage).toHaveBeenNthCalledWith(2, 'nested')
+        expect(readPluginStorage).toHaveBeenNthCalledWith(1, UNOWNED_PLUGIN_OWNER, 'zero')
+        expect(readPluginStorage).toHaveBeenNthCalledWith(2, UNOWNED_PLUGIN_OWNER, 'nested')
         expect(materializeDatabase).not.toHaveBeenCalled()
         expect(state.runtime.capturePersistentMutationToken).toHaveBeenCalledWith(
             'partial-local-backup',

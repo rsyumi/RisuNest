@@ -2,7 +2,7 @@ pub(crate) mod archive;
 pub(crate) mod asset_object_catalog;
 pub(crate) mod asset_residency;
 pub(crate) mod commands;
-mod commit;
+pub(crate) mod commit;
 pub(crate) mod content_capture;
 pub(crate) mod content_change_index;
 mod content_locators;
@@ -16,6 +16,7 @@ pub(crate) mod external_storage_state;
 #[cfg(feature = "native-kei-upload-pilot")]
 pub(crate) mod kei;
 pub(crate) mod owner_projection;
+pub(crate) mod plugin_owner;
 pub(crate) mod portable;
 pub(crate) mod portable_validation;
 mod preservation;
@@ -83,7 +84,7 @@ pub(super) const GENERATION_TABLES: &[(&str, &str)] = &[
     ),
     (
         "plugin_storage",
-        "storage_key, byte_size, ordinal, value",
+        "owner, storage_key, byte_size, ordinal, value, claimed_from, import_batch_id, assigned_at",
     ),
     (
         "asset_aliases",
@@ -242,8 +243,45 @@ pub(crate) struct PresetCatalog {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PluginStorageSummary {
+    pub(crate) owner: String,
     pub(crate) key: String,
     pub(crate) byte_size: i64,
+}
+
+/// What the plugin data screen lists. Values stay in the store; the screen asks
+/// for one when the reader opens it.
+/// A claim answers with the value it handed over and the revision it left the
+/// library at, so the renderer's write coordinator stays in step.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClaimedPluginValue {
+    pub(crate) value: Option<Value>,
+    pub(crate) revision: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AssignedPluginStorage {
+    #[serde(flatten)]
+    pub(crate) outcome: commit::AssignOutcome,
+    pub(crate) revision: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PluginStorageListItem {
+    pub(crate) owner: String,
+    pub(crate) key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) space: Option<String>,
+    pub(crate) value_type: String,
+    pub(crate) byte_size: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) claimed_from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) import_batch_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) assigned_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -715,9 +753,18 @@ pub(crate) enum ConversationMutation {
     rename_all_fields = "camelCase"
 )]
 pub(crate) enum PluginStorageMutation {
-    Set { key: String, value: Value },
-    Delete { key: String },
-    Clear,
+    Set {
+        owner: String,
+        key: String,
+        value: Value,
+    },
+    Delete {
+        owner: String,
+        key: String,
+    },
+    Clear {
+        owner: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1433,13 +1480,108 @@ impl PersistentStore {
         query::query_plugin_storage(connection, &target)
     }
 
+    pub(crate) fn list_plugin_storage(
+        &self,
+        lease: Option<&str>,
+    ) -> StoreResult<Vec<PluginStorageListItem>> {
+        let (connection, target) = self.read_view(lease)?;
+        query::list_plugin_storage(connection, &target)
+    }
+
+    /// Opens this plugin's one chance to take values an upstream save left
+    /// without an owner. Answers with nothing when no import is waiting or when
+    /// this plugin already had its window for that import.
+    pub(crate) fn begin_plugin_claim_session(
+        &self,
+        owner: &str,
+        code_hash: &str,
+        runtime_instance: &str,
+    ) -> StoreResult<Option<String>> {
+        let Some(batch) = commit::pending_plugin_import_batch(&self.connection)? else {
+            return Ok(None);
+        };
+        self.device_store()?.open_plugin_claim_session(
+            &batch,
+            owner,
+            code_hash,
+            runtime_instance,
+            device_store::now_ms()?,
+        )
+    }
+
+    pub(crate) fn claim_plugin_storage_value(
+        &mut self,
+        session_id: &str,
+        owner: &str,
+        code_hash: &str,
+        runtime_instance: &str,
+        key: &str,
+        expected_revision: i64,
+    ) -> StoreResult<ClaimedPluginValue> {
+        let now = device_store::now_ms()?;
+        let batch = self.device_store()?.plugin_claim_session_batch(
+            session_id,
+            owner,
+            code_hash,
+            runtime_instance,
+            now,
+        )?;
+        let Some(batch) = batch else {
+            return Ok(ClaimedPluginValue {
+                value: None,
+                revision: expected_revision,
+            });
+        };
+        let (value, revision) = commit::claim_unowned_plugin_value(
+            &mut self.connection,
+            owner,
+            key,
+            &batch,
+            now,
+            expected_revision,
+        )?;
+        Ok(ClaimedPluginValue { value, revision })
+    }
+
+    pub(crate) fn close_plugin_claim_session(&self, session_id: &str) -> StoreResult<()> {
+        self.device_store()?.close_plugin_claim_session(session_id)
+    }
+
+    pub(crate) fn colliding_plugin_storage_keys(
+        &self,
+        owner: &str,
+        keys: &[String],
+    ) -> StoreResult<Vec<String>> {
+        commit::colliding_plugin_storage_keys(&self.connection, owner, keys)
+    }
+
+    pub(crate) fn assign_plugin_storage(
+        &mut self,
+        sources: &[(String, String)],
+        owner: &str,
+        collision: commit::AssignCollision,
+        expected_revision: i64,
+    ) -> StoreResult<AssignedPluginStorage> {
+        let assigned_at = device_store::now_ms()?;
+        let (outcome, revision) = commit::assign_plugin_storage(
+            &mut self.connection,
+            sources,
+            owner,
+            collision,
+            assigned_at,
+            expected_revision,
+        )?;
+        Ok(AssignedPluginStorage { outcome, revision })
+    }
+
     pub(crate) fn read_plugin_storage(
         &self,
+        owner: &str,
         key: &str,
         lease: Option<&str>,
     ) -> StoreResult<Option<Versioned<Value>>> {
         let (connection, target) = self.read_view(lease)?;
-        query::read_plugin_storage(connection, key, &target)
+        query::read_plugin_storage(connection, owner, key, &target)
     }
 
     pub(crate) fn read_asset_alias(
@@ -1623,6 +1765,27 @@ impl PersistentStore {
 
     pub(crate) fn replace_put_root(&mut self, staging_id: &str, root: &Value) -> StoreResult<()> {
         commit::replace_put_root(&mut self.connection, staging_id, root)
+    }
+
+    pub(crate) fn staged_plugin_preview(
+        &self,
+        staging_id: &str,
+    ) -> StoreResult<commit::StagedPluginPreview> {
+        commit::staged_plugin_preview(&self.connection, staging_id)
+    }
+
+    pub(crate) fn assign_staged_plugin_values(
+        &mut self,
+        staging_id: &str,
+        assignments: &[commit::StagedPluginAssignment],
+        automatic: bool,
+    ) -> StoreResult<()> {
+        commit::assign_staged_plugin_values(
+            &mut self.connection,
+            staging_id,
+            assignments,
+            automatic,
+        )
     }
 
     pub(crate) fn replace_put_presets(

@@ -29,7 +29,8 @@ pub(crate) fn locator(key: &ServerDirtyKey) -> StoreResult<LogicalRecordLocator>
             preset_id: key.key1.clone(),
         },
         "plugin" => LogicalRecordLocator::Plugin {
-            storage_key: key.key1.clone(),
+            owner: key.key1.clone(),
+            storage_key: key.key2.clone(),
         },
         "character" => LogicalRecordLocator::Character {
             character_id: key.key1.clone(),
@@ -74,12 +75,12 @@ pub(crate) fn project(
         LogicalRecordLocator::Preset { preset_id } => {
             ("bot_presets", "preset_id", None, preset_id.as_str(), "")
         }
-        LogicalRecordLocator::Plugin { storage_key } => (
+        LogicalRecordLocator::Plugin { owner, storage_key } => (
             "plugin_storage",
-            "storage_key",
-            None,
+            "owner",
+            Some("storage_key"),
+            owner.as_str(),
             storage_key.as_str(),
-            "",
         ),
         LogicalRecordLocator::Character { character_id } => (
             "characters",
@@ -332,7 +333,7 @@ pub(crate) fn all_keys_page(
             "''",
             "AND kind='inlay'",
         ),
-        ("plugin", "plugin_storage", "storage_key", "''", ""),
+        ("plugin", "plugin_storage", "owner", "storage_key", ""),
         ("preset", "bot_presets", "preset_id", "''", ""),
         ("root", "root", "''", "''", ""),
     ] {

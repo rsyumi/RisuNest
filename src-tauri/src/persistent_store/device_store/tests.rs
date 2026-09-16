@@ -852,3 +852,235 @@ fn plugin_permissions_and_their_reconfirmation_times_stay_in_their_own_tables() 
         .write_plugin_permission_grant("Plugin A", "db", -1)
         .is_err());
 }
+
+#[test]
+fn a_plugin_reads_lists_and_clears_only_its_own_device_space() {
+    use super::plugin_values::PluginDeviceMutation;
+    let (_directory, mut store) = open();
+    for owner in ["plugin-a", "plugin-b"] {
+        store
+            .write_plugin_device_values(
+                owner,
+                &[
+                    PluginDeviceMutation::Set {
+                        space: "string".to_owned(),
+                        key: "shared".to_owned(),
+                        value: owner.to_owned(),
+                    },
+                    PluginDeviceMutation::Set {
+                        space: "json".to_owned(),
+                        key: "shared".to_owned(),
+                        value: format!("{{\"owner\":\"{owner}\"}}"),
+                    },
+                ],
+            )
+            .expect("seed device values");
+    }
+
+    assert_eq!(
+        store
+            .read_plugin_device_value("plugin-a", "string", "shared")
+            .unwrap(),
+        Some("plugin-a".to_owned())
+    );
+    assert_eq!(
+        store
+            .list_plugin_device_keys("plugin-a", "string")
+            .unwrap(),
+        vec!["shared".to_owned()]
+    );
+
+    // The two spaces never answer for each other, so clearing one leaves the
+    // other alone.
+    store
+        .write_plugin_device_values(
+            "plugin-a",
+            &[PluginDeviceMutation::Clear {
+                space: "string".to_owned(),
+            }],
+        )
+        .expect("clear one space");
+    assert!(store
+        .read_plugin_device_value("plugin-a", "string", "shared")
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store
+            .read_plugin_device_value("plugin-a", "json", "shared")
+            .unwrap(),
+        Some("{\"owner\":\"plugin-a\"}".to_owned())
+    );
+    assert_eq!(
+        store
+            .read_plugin_device_value("plugin-b", "string", "shared")
+            .unwrap(),
+        Some("plugin-b".to_owned())
+    );
+
+    let hydrated = store.hydrate_plugin_device_storage("plugin-b").unwrap();
+    assert!(hydrated.complete);
+    assert_eq!(
+        hydrated
+            .entries
+            .iter()
+            .map(|entry| (entry.space.clone(), entry.key.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("json".to_owned(), "shared".to_owned()),
+            ("string".to_owned(), "shared".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn a_removed_device_value_leaves_a_tombstone_with_its_own_clock() {
+    use super::plugin_values::PluginDeviceMutation;
+    let (_directory, mut store) = open();
+    store
+        .write_plugin_device_values(
+            "plugin-a",
+            &[PluginDeviceMutation::Set {
+                space: "string".to_owned(),
+                key: "gone".to_owned(),
+                value: "value".to_owned(),
+            }],
+        )
+        .unwrap();
+    store
+        .write_plugin_device_values(
+            "plugin-a",
+            &[PluginDeviceMutation::Delete {
+                space: "string".to_owned(),
+                key: "gone".to_owned(),
+            }],
+        )
+        .unwrap();
+
+    let (tombstone, value, byte_size, clock): (i64, Option<String>, i64, String) = store
+        .connection()
+        .query_row(
+            "SELECT tombstone,value,byte_size,write_clock FROM plugin_device_storage
+                WHERE owner='plugin-a' AND space='string' AND key='gone'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("read tombstone row");
+    assert_eq!(tombstone, 1);
+    assert!(value.is_none());
+    assert_eq!(byte_size, 0);
+    let section: String = store
+        .connection()
+        .query_row(
+            "SELECT max_write_clock FROM device_sections WHERE section='local-plugins'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(section, clock);
+    assert!(store
+        .hydrate_plugin_device_storage("plugin-a")
+        .unwrap()
+        .entries
+        .is_empty());
+}
+
+#[test]
+fn a_keyspace_past_the_hydration_limit_reports_only_its_size() {
+    use super::plugin_values::{PluginDeviceMutation, HYDRATION_LIMIT_BYTES};
+    let (_directory, mut store) = open();
+    let chunk = "x".repeat(64 * 1024);
+    let mut written = 0i64;
+    let mut index = 0usize;
+    while written <= HYDRATION_LIMIT_BYTES {
+        store
+            .write_plugin_device_values(
+                "plugin-a",
+                &[PluginDeviceMutation::Set {
+                    space: "string".to_owned(),
+                    key: format!("key-{index}"),
+                    value: chunk.clone(),
+                }],
+            )
+            .unwrap();
+        written += chunk.len() as i64;
+        index += 1;
+    }
+
+    let refused = store.hydrate_plugin_device_storage("plugin-a").unwrap();
+    assert!(!refused.complete);
+    assert!(refused.entries.is_empty());
+    assert_eq!(refused.byte_size, written);
+    // The keyspace is still readable one key at a time.
+    assert_eq!(
+        store
+            .read_plugin_device_value("plugin-a", "string", "key-0")
+            .unwrap(),
+        Some(chunk.clone())
+    );
+    assert_eq!(store.list_plugin_device_keys("plugin-a", "string").unwrap().len(), index);
+
+    store
+        .write_plugin_device_values(
+            "plugin-a",
+            &[PluginDeviceMutation::Delete {
+                space: "string".to_owned(),
+                key: "key-0".to_owned(),
+            }],
+        )
+        .unwrap();
+    let accepted = store.hydrate_plugin_device_storage("plugin-a").unwrap();
+    assert!(accepted.complete);
+    assert_eq!(accepted.byte_size, written - chunk.len() as i64);
+    assert_eq!(accepted.entries.len(), index - 1);
+}
+
+#[test]
+fn the_device_value_list_reports_sizes_without_carrying_values() {
+    use super::plugin_values::PluginDeviceMutation;
+    let (_directory, mut store) = open();
+    store
+        .write_plugin_device_values(
+            "plugin-a",
+            &[PluginDeviceMutation::Set {
+                space: "json".to_owned(),
+                key: "settings".to_owned(),
+                value: "{\"secret\":\"value\"}".to_owned(),
+            }],
+        )
+        .unwrap();
+    let listed = store.list_plugin_device_storage().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].owner, "plugin-a");
+    assert_eq!(listed[0].space, "json");
+    assert_eq!(listed[0].key, "settings");
+    assert_eq!(listed[0].byte_size, 18);
+    let encoded = serde_json::to_string(&listed).unwrap();
+    assert!(!encoded.contains("secret"));
+}
+
+#[test]
+fn a_committed_device_value_survives_reopening_the_device_file() {
+    use super::plugin_values::PluginDeviceMutation;
+    let directory = tempfile::tempdir().expect("create device durability directory");
+    {
+        let mut store = DeviceStore::open(directory.path()).expect("open device store");
+        store
+            .write_plugin_device_values(
+                "plugin-a",
+                &[PluginDeviceMutation::Set {
+                    space: "string".to_owned(),
+                    key: "durable".to_owned(),
+                    value: "kept".to_owned(),
+                }],
+            )
+            .unwrap();
+    }
+    let reopened = DeviceStore::open(directory.path()).expect("reopen device store");
+    assert_eq!(
+        reopened
+            .read_plugin_device_value("plugin-a", "string", "durable")
+            .unwrap(),
+        Some("kept".to_owned())
+    );
+}
+

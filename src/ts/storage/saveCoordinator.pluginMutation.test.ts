@@ -1,3 +1,4 @@
+import { UNOWNED_PLUGIN_OWNER } from '../plugins/pluginOwner'
 import { describe, expect, it, vi } from 'vitest'
 import {
     SaveCoordinator,
@@ -10,7 +11,10 @@ import type { PluginStorageMutation } from './persistentDataStore'
 import { createProductionStateAdapter } from './persistentDataRuntime.svelte'
 import * as persistentRuntime from './persistentDataRuntime.svelte'
 import { getDatabase, setDatabaseLite } from './database.svelte'
-import { registerPluginStorageLifecycle } from '../plugins/pluginStorageStore'
+import {
+    createPluginStorageStore,
+    registerPluginStorageLifecycle,
+} from '../plugins/pluginStorageStore'
 import {
     pluginStorageStore as productionPluginStorageStore,
 } from '../plugins/plugins.svelte'
@@ -35,6 +39,37 @@ vi.mock('../parser/parser.svelte', () => ({
     ParseMarkdown: vi.fn(async (value: string) => value),
     risuChatParser: (value: string) => value,
 }))
+
+/** A durable authority the V3 store can read, standing apart from DBState. */
+function durablePluginStore(entries: Record<string, unknown>) {
+    const values = { ...entries }
+    const backing = {
+        open: async () => undefined,
+        queryPluginStorage: async () => ({
+            revision: 1,
+            items: Object.keys(values).map((key) => ({
+                owner: UNOWNED_PLUGIN_OWNER,
+                key,
+                byteSize: JSON.stringify(values[key]).length,
+            })),
+        }),
+        readPluginStorage: async (_owner: string, key: string) =>
+            Object.hasOwn(values, key)
+                ? { revision: 1, value: JSON.parse(JSON.stringify(values[key])) }
+                : null,
+    } as never
+    return createPluginStorageStore({
+        store: backing,
+        mutate: async (mutations) => {
+            for (const mutation of mutations) {
+                if (mutation.type === 'clear') {
+                    for (const key of Object.keys(values)) delete values[key]
+                } else if (mutation.type === 'delete') delete values[mutation.key]
+                else values[mutation.key] = mutation.value
+            }
+        },
+    })
+}
 
 function apply(
     storage: Record<string, unknown>,
@@ -76,7 +111,7 @@ describe('key-scoped plugin storage publication', () => {
         try {
             for (let counter = 1; counter <= 10; counter++) {
                 await coordinator.mutatePersistentPluginStorage('small-write', [
-                    { type: 'set', key: 'counter', value: counter },
+                    { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'counter', value: counter },
                 ])
             }
             await coordinator.flushPendingData('unchanged')
@@ -97,7 +132,7 @@ describe('key-scoped plugin storage publication', () => {
             await coordinator.flushPendingData('raw-nested-write')
             expect(commit).toHaveBeenCalledTimes(11)
             expect(commit.mock.calls[10][0].pluginStorage).toEqual([
-                { type: 'set', key: 'nested', value: { count: 1 } },
+                { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'nested', value: { count: 1 } },
             ])
         } finally {
             stringify.mockRestore()
@@ -120,27 +155,26 @@ describe('key-scoped plugin storage publication', () => {
                         : [],
                 pluginCustomStorage: { liveOnly: 'not-authoritative' },
             } as any)
-            productionPluginStorageStore.synchronizeCompatibilityStorage({
-                durableOnly: 'saved',
-            })
+            const durable = durablePluginStore({ durableOnly: 'saved' })
+            const unregisterDurable = registerPluginStorageLifecycle(durable)
             try {
                 await expect(
-                    productionPluginStorageStore.getItem('durableOnly'),
+                    durable.forOwner(UNOWNED_PLUGIN_OWNER).getItem('durableOnly'),
                 ).resolves.toBe('saved')
                 await expect(
-                    productionPluginStorageStore.getItem('liveOnly'),
+                    durable.forOwner(UNOWNED_PLUGIN_OWNER).getItem('liveOnly'),
                 ).resolves.toBeNull()
                 await expect(
-                    productionPluginStorageStore.keys(),
+                    durable.forOwner(UNOWNED_PLUGIN_OWNER).keys(),
                 ).resolves.toEqual(['durableOnly'])
-                await expect(productionPluginStorageStore.key(0)).resolves.toBe(
+                await expect(durable.forOwner(UNOWNED_PLUGIN_OWNER).key(0)).resolves.toBe(
                     'durableOnly',
                 )
                 await expect(
-                    productionPluginStorageStore.length(),
+                    durable.forOwner(UNOWNED_PLUGIN_OWNER).length(),
                 ).resolves.toBe(1)
             } finally {
-                productionPluginStorageStore.invalidate()
+                unregisterDurable()
             }
         },
     )
@@ -165,7 +199,7 @@ describe('key-scoped plugin storage publication', () => {
         coordinator.initialize(1)
         await expect(
             coordinator.mutatePersistentPluginStorage('failed', [
-                { type: 'set', key: 'target', value: { after: true } },
+                { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'target', value: { after: true } },
             ]),
         ).rejects.toThrow('synthetic commit failure')
         expect(coordinator.revision).toBe(1)
@@ -174,7 +208,7 @@ describe('key-scoped plugin storage publication', () => {
         await coordinator.flushPendingData('unchanged-after-failure')
         expect(commit).toHaveBeenCalledOnce()
         await coordinator.mutatePersistentPluginStorage('retry', [
-            { type: 'delete', key: 'target' },
+            { type: 'delete', owner: UNOWNED_PLUGIN_OWNER, key: 'target' },
         ])
         expect(coordinator.revision).toBe(2)
         expect(Object.keys(storage)).toEqual(['unrelated'])
@@ -202,7 +236,7 @@ describe('key-scoped plugin storage publication', () => {
             })
             try {
                 adapter.publishPluginStorageMutations!(
-                    [{ type: 'set', key, value: { nested: { count: 1 } } }],
+                    [{ type: 'set', owner: 'test-plugin', key, value: { nested: { count: 1 } } }],
                     [key],
                 )
                 flushSync()
@@ -219,25 +253,25 @@ describe('key-scoped plugin storage publication', () => {
     it('matches full publication for overlapping key edits and ordering changes', () => {
         const original = { first: { count: 1 }, middle: 2, last: 3 }
         const changes: PluginStorageMutation[][] = [
-            [{ type: 'set', key: 'new', value: 4 }],
+            [{ type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'new', value: 4 }],
             [
-                { type: 'delete', key: 'first' },
-                { type: 'set', key: 'first', value: { count: 2 } },
+                { type: 'delete', owner: UNOWNED_PLUGIN_OWNER, key: 'first' },
+                { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'first', value: { count: 2 } },
             ],
-            [{ type: 'delete', key: 'first' }],
-            [{ type: 'delete', key: 'last' }],
-            [{ type: 'set', key: 'first', value: { count: 3 } }],
+            [{ type: 'delete', owner: UNOWNED_PLUGIN_OWNER, key: 'first' }],
+            [{ type: 'delete', owner: UNOWNED_PLUGIN_OWNER, key: 'last' }],
+            [{ type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'first', value: { count: 3 } }],
             [
-                { type: 'delete', key: 'middle' },
-                { type: 'set', key: 'middle', value: 2 },
-                { type: 'set', key: 'other', value: 5 },
+                { type: 'delete', owner: UNOWNED_PLUGIN_OWNER, key: 'middle' },
+                { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'middle', value: 2 },
+                { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'other', value: 5 },
             ],
-            [{ type: 'set', key: '__proto__', value: false }],
-            [{ type: 'set', key: '1', value: false }],
-            [{ type: 'clear' }],
+            [{ type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: '__proto__', value: false }],
+            [{ type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: '1', value: false }],
+            [{ type: 'clear', owner: UNOWNED_PLUGIN_OWNER }],
             [
-                { type: 'clear' },
-                { type: 'set', key: 'first', value: { count: 9 } },
+                { type: 'clear', owner: UNOWNED_PLUGIN_OWNER },
+                { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'first', value: { count: 9 } },
             ],
         ]
         for (const committed of changes)
@@ -276,14 +310,14 @@ describe('key-scoped plugin storage publication', () => {
         const baseline = new PluginStorageBaseline(JSON.stringify(storage))
         for (const mutations of [
             [
-                { type: 'delete', key: 'first' },
-                { type: 'set', key: 'first', value: { a: 3, z: 1 } },
+                { type: 'delete', owner: UNOWNED_PLUGIN_OWNER, key: 'first' },
+                { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'first', value: { a: 3, z: 1 } },
             ],
             [
-                { type: 'set', key: '__proto__', value: false },
-                { type: 'set', key: '1', value: 'integer' },
+                { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: '__proto__', value: false },
+                { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: '1', value: 'integer' },
             ],
-            [{ type: 'clear' }, { type: 'set', key: 'after', value: null }],
+            [{ type: 'clear', owner: UNOWNED_PLUGIN_OWNER }, { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'after', value: null }],
         ] as PluginStorageMutation[][]) {
             baseline.apply(mutations)
             storage = applyPluginStorageMutations(storage, mutations)
@@ -314,8 +348,8 @@ describe('key-scoped plugin storage publication', () => {
                     revision: expectedRevision + 1,
                 }))
             const store = makeStore(commit)
-            const cache = productionPluginStorageStore
-            cache.synchronizeCompatibilityStorage(storage)
+            const cache = durablePluginStore(storage as Record<string, unknown>)
+            await cache.forOwner(UNOWNED_PLUGIN_OWNER).keys()
             const unregister = registerPluginStorageLifecycle(cache)
             try {
                 const coordinator = new SaveCoordinator({
@@ -331,10 +365,10 @@ describe('key-scoped plugin storage publication', () => {
                 const mutations: PluginStorageMutation[] =
                     operation === 'reinsert'
                         ? [
-                              { type: 'delete', key: 'target' },
-                              { type: 'set', key: 'target', value: 2 },
+                              { type: 'delete', owner: UNOWNED_PLUGIN_OWNER, key: 'target' },
+                              { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'target', value: 2 },
                           ]
-                        : [{ type: 'set', key: 'target', value: 2 }]
+                        : [{ type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'target', value: 2 }]
                 const writing = coordinator.mutatePersistentPluginStorage(
                     'ordered-overlap',
                     mutations,
@@ -354,19 +388,20 @@ describe('key-scoped plugin storage publication', () => {
                 ])
                 expect(published.first).toBe(identity)
                 expect(published.concurrent).toBe(concurrentIdentity)
-                await expect(cache.getItem('target')).resolves.toBe(2)
-                const cachedKeys = await cache.keys()
+                await expect(cache.forOwner(UNOWNED_PLUGIN_OWNER).getItem('target')).resolves.toBe(2)
+                const cachedKeys = await cache.forOwner(UNOWNED_PLUGIN_OWNER).keys()
                 // The cache follows published order for the keys it observed and
                 // does not invent one for an unobserved concurrent write.
-                expect(cachedKeys).toEqual(
-                    Object.keys(published).filter((key) => cachedKeys.includes(key)),
+                const publishedKeys = Object.keys(published)
+                expect(cachedKeys.filter((key) => publishedKeys.includes(key))).toEqual(
+                    publishedKeys.filter((key) => cachedKeys.includes(key)),
                 )
                 expect(cachedKeys).toContain('target')
                 expect(cachedKeys).not.toContain('concurrent')
-                await expect(cache.key(-1)).resolves.toBeNull()
-                await expect(cache.key(cachedKeys.length)).resolves.toBeNull()
-                await expect(cache.length()).resolves.toBe(cachedKeys.length)
-                const detached = (await cache.getItem('first')) as {
+                await expect(cache.forOwner(UNOWNED_PLUGIN_OWNER).key(-1)).resolves.toBeNull()
+                await expect(cache.forOwner(UNOWNED_PLUGIN_OWNER).key(cachedKeys.length)).resolves.toBeNull()
+                await expect(cache.forOwner(UNOWNED_PLUGIN_OWNER).length()).resolves.toBe(cachedKeys.length)
+                const detached = (await cache.forOwner(UNOWNED_PLUGIN_OWNER).getItem('first')) as {
                     count: number
                 }
                 detached.count = 99
@@ -408,7 +443,7 @@ describe('key-scoped plugin storage publication', () => {
         }
         try {
             await coordinator.mutatePersistentPluginStorage('small', [
-                { type: 'set', key: 'target', value: 2 },
+                { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'target', value: 2 },
             ])
             expect(
                 parses!.mock.calls.some(([value]) =>
@@ -478,7 +513,7 @@ describe('key-scoped plugin storage publication', () => {
         coordinator.initialize(1)
 
         await coordinator.mutatePersistentPluginStorage('tiny-key-write', [
-            { type: 'set', key: 'target', value: 'after' },
+            { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'target', value: 'after' },
         ])
         expect(storage.target).toBe('after')
         committing = false
@@ -513,10 +548,11 @@ describe('key-scoped plugin storage publication', () => {
             coordinator.initialize(1)
             const mutations: PluginStorageMutation[] =
                 operation === 'clear'
-                    ? [{ type: 'clear' }]
+                    ? [{ type: 'clear', owner: UNOWNED_PLUGIN_OWNER }]
                     : [
                           {
                               type: 'set',
+                              owner: UNOWNED_PLUGIN_OWNER,
                               key: 'shared',
                               value: { first: 2, later: 0 },
                           },
@@ -560,9 +596,9 @@ describe('key-scoped plugin storage publication', () => {
         })
         coordinator.initialize(1)
         await coordinator.mutatePersistentPluginStorage('ordered', [
-            { type: 'delete', key: 'first' },
-            { type: 'set', key: 'first', value: 1 },
-            { type: 'set', key: '__proto__', value: 0 },
+            { type: 'delete', owner: UNOWNED_PLUGIN_OWNER, key: 'first' },
+            { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'first', value: 1 },
+            { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: '__proto__', value: 0 },
         ])
         expect(Object.keys(storage)).toEqual(['second', 'first', '__proto__'])
         expect(storage.__proto__).toBe(0)

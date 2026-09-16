@@ -374,7 +374,7 @@ fn key_parts(key: &str, revision: i64) -> Result<outbox::ServerDirtyKey> {
     {
         LogicalRecordLocator::Root => ("root", String::new(), String::new()),
         LogicalRecordLocator::Preset { preset_id } => ("preset", preset_id, String::new()),
-        LogicalRecordLocator::Plugin { storage_key } => ("plugin", storage_key, String::new()),
+        LogicalRecordLocator::Plugin { owner, storage_key } => ("plugin", owner, storage_key),
         LogicalRecordLocator::Character { character_id } => {
             ("character", character_id, String::new())
         }
@@ -1579,7 +1579,7 @@ impl PersistentStore {
         self.connection.execute_batch("CREATE TEMP TABLE IF NOT EXISTS server_cycle_order(key TEXT PRIMARY KEY,scope TEXT NOT NULL,position INTEGER NOT NULL); DELETE FROM server_cycle_order;")?;
         // Only index columns are copied, never plugin values or chat payloads.
         for (kind, table, id, parent, position) in [
-            ("plugin", "plugin_storage", "storage_key", "''", "ordinal"),
+            ("plugin", "plugin_storage", "storage_key", "owner", "ordinal"),
             (
                 "preset",
                 "bot_presets",
@@ -1612,12 +1612,12 @@ impl PersistentStore {
                 let position: i64 = row.get(2)?;
                 let key = outbox::ServerDirtyKey {
                     kind: kind.into(),
-                    key1: if kind == "conversation" {
+                    key1: if kind == "conversation" || kind == "plugin" {
                         parent.clone()
                     } else {
                         id.clone()
                     },
-                    key2: if kind == "conversation" {
+                    key2: if kind == "conversation" || kind == "plugin" {
                         id
                     } else {
                         String::new()

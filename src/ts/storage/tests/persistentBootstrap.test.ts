@@ -1,3 +1,4 @@
+import { UNOWNED_PLUGIN_OWNER } from '../../plugins/pluginOwner'
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Database } from '../database.svelte'
@@ -61,7 +62,8 @@ function createStore(input?: {
         readConversation: vi.fn(),
         readConversationMetadata: vi.fn(),
         readConversationWindow: vi.fn(),
-        queryPluginStorage: vi.fn(async () => ({ revision, items: [] })),
+        listPluginStorage: vi.fn(async () => []),
+        queryPluginStorage: vi.fn(async () => ({ revision, items: [] as never[] })),
         readPluginStorage: vi.fn(async () => null),
         readAssetAlias: vi.fn(async () => null),
         readAssetAliasesByKeys: vi.fn(async () => ({ revision, value: [] })),
@@ -248,7 +250,7 @@ describe('bootstrapPersistentDatabase', () => {
         ])
         expect(result.database.characters.map(getCatalogConversationCount)).toEqual([1, 2, 1])
         expect(result.database.pluginCustomStorage).toEqual({})
-        expect((await store.readPluginStorage('plugin-memory'))?.value).toEqual(
+        expect((await store.readPluginStorage(UNOWNED_PLUGIN_OWNER, 'plugin-memory'))?.value).toEqual(
             persistent.pluginCustomStorage['plugin-memory'],
         )
     })

@@ -1,6 +1,7 @@
 import type { Database, botPreset, character, groupChat } from './database.svelte'
 import type { PersistentRoot, PluginStorageMutation } from './persistentDataStore'
 import { defineOwnEnumerableProperty } from './ownEnumerableProperty'
+import { UNOWNED_PLUGIN_OWNER } from '../plugins/pluginOwner'
 
 function canonicalize(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(canonicalize)
@@ -501,7 +502,13 @@ export function splitDatabase(database: Database): {
     presets: botPreset[]
     pluginStorage: Database['pluginCustomStorage']
 } {
-    const { characters, botPresets, pluginCustomStorage, ...root } = database
+    const {
+        characters,
+        botPresets,
+        pluginCustomStorage,
+        pluginStorageMeta: _pluginStorageMeta,
+        ...root
+    } = database
     return {
         root,
         characters,
@@ -510,21 +517,30 @@ export function splitDatabase(database: Database): {
     }
 }
 
+/**
+ * The flat compatibility projection cannot express ownership, so a change that
+ * reaches the store through it is attributed by the resolver. A key the resolver
+ * cannot place lands on the sentinel owner, where the plugin data screen shows
+ * it rather than handing it to a plugin that did not write it.
+ */
+export type PluginStorageOwnerResolver = (key: string) => string
+
+const resolveUnowned: PluginStorageOwnerResolver = () => UNOWNED_PLUGIN_OWNER
+
 export function diffPluginStorage(
     baseline: string | null,
     current: Database['pluginCustomStorage'],
+    ownerOf: PluginStorageOwnerResolver = resolveUnowned,
 ): PluginStorageMutation[] {
     const previous = baseline
         ? JSON.parse(baseline) as Database['pluginCustomStorage']
         : {}
     const currentKeys = Object.keys(current)
-    if (currentKeys.length === 0 && Object.keys(previous).length > 0) {
-        return [{ type: 'clear' }]
-    }
     const mutations: PluginStorageMutation[] = []
     const previousKeys = Object.keys(previous)
     for (const key of previousKeys) {
-        if (!Object.hasOwn(current, key)) mutations.push({ type: 'delete', key })
+        if (!Object.hasOwn(current, key))
+            mutations.push({ type: 'delete', owner: ownerOf(key), key })
     }
     const previousStringKeys = previousKeys.filter((key) =>
         !isPluginStorageArrayIndex(key) && Object.hasOwn(current, key),
@@ -545,7 +561,7 @@ export function diffPluginStorage(
             .filter((key) => Object.hasOwn(previous, key)),
     )
     for (const key of previousKeys) {
-        if (movedKeys.has(key)) mutations.push({ type: 'delete', key })
+        if (movedKeys.has(key)) mutations.push({ type: 'delete', owner: ownerOf(key), key })
     }
     for (const key of currentKeys) {
         if (
@@ -553,7 +569,7 @@ export function diffPluginStorage(
             !Object.hasOwn(previous, key) ||
             !canonicalValuesEqual(previous[key], current[key])
         ) {
-            mutations.push({ type: 'set', key, value: current[key] })
+            mutations.push({ type: 'set', owner: ownerOf(key), key, value: current[key] })
         }
     }
     return mutations
@@ -562,9 +578,10 @@ export function diffPluginStorage(
 export function applyPluginStorageMutations(
     storage: Database['pluginCustomStorage'],
     mutations: readonly PluginStorageMutation[],
+    ownerOf?: PluginStorageOwnerResolver,
 ): Database['pluginCustomStorage'] {
     const next = pluginStorageClone(storage)
-    applyPluginStorageMutationsInPlace(next, mutations)
+    applyPluginStorageMutationsInPlace(next, mutations, ownerOf)
     return next
 }
 
@@ -586,9 +603,19 @@ export class PluginStorageBaseline {
         this.serialized = serialized
     }
 
-    apply(mutations: readonly PluginStorageMutation[]): void {
+    apply(
+        mutations: readonly PluginStorageMutation[],
+        ownerOf?: PluginStorageOwnerResolver,
+    ): void {
         for (const mutation of mutations) {
-            if (mutation.type === 'clear') this.entries.clear()
+            if (mutation.type === 'clear') {
+                if (!ownerOf) this.entries.clear()
+                else {
+                    for (const key of [...this.entries.keys()]) {
+                        if (ownerOf(key) === mutation.owner) this.entries.delete(key)
+                    }
+                }
+            }
             else if (mutation.type === 'delete') this.entries.delete(mutation.key)
             else if (mutation.value === undefined) this.entries.delete(mutation.key)
             else this.entries.set(mutation.key, canonicalJson(mutation.value))
@@ -641,10 +668,14 @@ export function orderPluginStorageKeys<T extends Record<string, unknown>>(
 export function applyPluginStorageMutationsInPlace(
     next: Database['pluginCustomStorage'],
     mutations: readonly PluginStorageMutation[],
+    ownerOf?: PluginStorageOwnerResolver,
 ): void {
     for (const mutation of mutations) {
         if (mutation.type === 'clear') {
-            for (const key of Object.keys(next)) delete next[key]
+            for (const key of Object.keys(next)) {
+                if (ownerOf && ownerOf(key) !== mutation.owner) continue
+                delete next[key]
+            }
         } else if (mutation.type === 'delete') {
             delete next[mutation.key]
         } else if (mutation.value === undefined) {

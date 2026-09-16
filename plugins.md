@@ -645,7 +645,11 @@ await Risuai.setArgument('max_retries', 5);
 
 ### Plugin Storage (Recommended)
 
-`pluginStorage` is a **save-file shared keyspace**. Its values are included in save snapshots and sync with the same save file on another device, so large values increase snapshot and sync work. It is not automatically namespaced by plugin name, so new plugins should use a stable key prefix such as `my-plugin:`.
+`pluginStorage` is **your plugin's own keyspace inside the save file**. Its values are included in save snapshots and sync with the same save file on another device, so large values increase snapshot and sync work.
+
+> **RisuNest difference.** In upstream RisuAI this keyspace is shared between plugins. RisuNest keys every stored value by the plugin that wrote it, taken from your `//@name` banner, and answers every call within that plugin alone. A key another plugin wrote reads as `null`, never appears in `keys()`, and is not removed by your `clear()`. This is a restriction, not a new API: the call shapes are unchanged, and a plugin that deliberately read another plugin's key in RisuAI silently gets nothing in RisuNest. Renaming a plugin starts a new keyspace, which matches how a rename already installs a separate plugin.
+
+A key prefix such as `my-plugin:` is still worth keeping, because the RisuSave export writes one flat object for RisuAI and drops any key two plugins both hold rather than handing either plugin the other's value.
 
 ```javascript
 // All operations are asynchronous across the plugin iframe boundary
@@ -660,7 +664,7 @@ await Risuai.pluginStorage.removeItem('last_sync');
 await Risuai.pluginStorage.clear(); // Remove all items
 ```
 
-`clear()` removes every key in the save-file shared keyspace, including keys written by other plugins. Prefer `removeItem()` for keys your plugin owns.
+`clear()` removes every key your plugin wrote and nothing else.
 
 **Use `pluginStorage` when:**
 - You want data to sync across devices
@@ -669,7 +673,7 @@ await Risuai.pluginStorage.clear(); // Remove all items
 
 ### Safe Local Storage
 
-`safeLocalStorage` is **device-local**, shared between plugins, and string-only. It is not included in save snapshots and does not sync to another device, making it suitable for device-specific cache or settings data. Use a stable key prefix when data may coexist with another plugin.
+`safeLocalStorage` is **device-local**, string-only, and confined to your plugin in RisuNest the same way `pluginStorage` is. It is not included in save snapshots and does not sync to another device, making it suitable for device-specific cache or settings data.
 
 ```javascript
 // Same API as pluginStorage
@@ -680,15 +684,12 @@ const deviceId = await Risuai.safeLocalStorage.getItem('device_id');
 **Use `safeLocalStorage` when:**
 - Data should stay on one device
 - Storing device-specific settings
-- Sharing data between plugins
 
 ### Local Plugin Storage
 
-`getLocalPluginStorage()` is also device-local and is not included in save snapshots or cross-device sync. Unlike `safeLocalStorage`, it accepts JSON-serializable values and is appropriate for structured device-only settings or caches. Its keys are shared under the safe local plugin-storage prefix, so use a stable plugin prefix and do not call `clear()` unless deleting every value in that local shared keyspace is intended.
+`getLocalPluginStorage()` is also device-local and is not included in save snapshots or cross-device sync. Unlike `safeLocalStorage`, it accepts JSON-serializable values and is appropriate for structured device-only settings or caches. In RisuNest it is confined to your plugin, and it is a separate space from `safeLocalStorage`, so clearing one leaves the other alone.
 
-Native `.risunest` full file backups are a separate, selectable exception: plugin local storage and local plugin data are included by default. Restore selects the included areas by default and allows each area to be excluded. Selected areas are replaced in full, including removal of keys absent from the backup. An included empty area clears that area; an omitted or unselected area is left alone. These are shared storage areas, not per-plugin ownership boundaries.
-
-This does not change the plugin API storage scope, ordinary save snapshots, RisuAI/PocketRisu exports, or sync. Plugin permissions and OS-issued handles are not transferred. Unsupported structured-clone values prevent the selected area from completing backup or restore; they are never silently converted to JSON. Native maintenance pauses normal plugin startup through capture, application and any required rollback, and restoration results are acknowledged before normal startup resumes.
+On the native app both device spaces are kept in the installation's own device file, which a save snapshot restore never replaces. They are not included in ordinary save snapshots, RisuAI/PocketRisu exports, or sync. Plugin permissions and OS-issued handles are not transferred either.
 
 `getLocalPluginStorage()` returns a `SafeLocalPluginStorage` instance: device-local storage that supports any JSON-serializable value (unlike `safeLocalStorage` which is strings-only), with generic type support:
 
@@ -1619,7 +1620,7 @@ await element.removeEventListener('click', listenerId);
 **Problem:** Confusing `pluginStorage` with `safeLocalStorage`.
 
 - **`pluginStorage`**: Save-file specific, syncs across devices
-- **`safeLocalStorage`**: Device-specific, shared between plugins
+- **`safeLocalStorage`**: Device-specific, stays on one device
 
 ```javascript
 // For user preferences (syncs)

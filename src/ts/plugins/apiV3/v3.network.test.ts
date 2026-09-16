@@ -13,6 +13,12 @@ const mocks = vi.hoisted(() => ({
     doingChat: false,
 }))
 
+const ownedStorageStub = {
+    getItem: vi.fn(), setItem: vi.fn(), removeItem: vi.fn(), clear: vi.fn(),
+    key: vi.fn(), keys: vi.fn(), length: vi.fn(), snapshot: vi.fn(async () => ({})),
+    mutate: vi.fn(),
+}
+
 vi.mock('../plugins.svelte', () => {
     const oldApis = new Proxy(
         { nativeFetch: mocks.nativeFetch, risuFetch: mocks.risuFetch },
@@ -34,6 +40,10 @@ vi.mock('../plugins.svelte', () => {
         handlePluginInstallViaPlugin: vi.fn(),
         pluginCompatibility: { profile: 'scalable' },
         pluginStorageStore: {
+            forOwner: () => ownedStorageStub,
+            ownerOf: () => 'test-plugin',
+            invalidateOwner: vi.fn(),
+            synchronizeCommittedMutation: vi.fn(),
             snapshot: () => [],
             mutate: vi.fn(),
             invalidate: vi.fn(),
@@ -62,6 +72,7 @@ vi.mock('src/ts/storage/database.svelte', () => ({
 }))
 vi.mock('../pluginSafeClass', () => ({
     SafeLocalPluginStorage: class {},
+    SafeLocalStorage: class {},
     tagWhitelist: [],
 }))
 vi.mock('src/ts/stores.svelte', () => ({

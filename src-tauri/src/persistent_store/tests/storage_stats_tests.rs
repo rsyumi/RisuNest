@@ -27,8 +27,8 @@ fn storage_stats_only_counts_active_generation_rows() {
          INSERT INTO conversations (generation, character_id, conversation_id, configured_index, recent_at, name, message_count, detail) VALUES
          ('revision-0', 'active', 'chat', 0, 0, 'chat', 3, '{}'),
          ('revision-old', 'inactive', 'chat', 0, 0, 'chat', 9, '{}');
-         INSERT INTO plugin_storage (generation, storage_key, byte_size, ordinal, value) VALUES
-         ('revision-0', 'plugin-active', 7, 0, '{}'), ('revision-old', 'plugin-old', 13, 0, '{}');
+         INSERT INTO plugin_storage (generation, owner, storage_key, byte_size, ordinal, value) VALUES
+         ('revision-0', 'synthetic-plugin', 'plugin-active', 7, 0, '{}'), ('revision-old', 'synthetic-plugin', 'plugin-old', 13, 0, '{}');
          INSERT INTO asset_aliases (generation, logical_key, object_hash, kind, size, mime, name, ext, inlay_type, width, height, metadata) VALUES
          ('revision-0', 'asset-active', NULL, 'asset', 17, '', '', '', NULL, NULL, NULL, '{}'),
          ('revision-old', 'asset-old', NULL, 'asset', 19, '', '', '', NULL, NULL, NULL, '{}');

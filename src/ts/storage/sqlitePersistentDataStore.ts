@@ -33,6 +33,7 @@ import {
     type PersistentRevisionLease,
     type PersistentRoot,
     type PluginStorageCatalog,
+    type PluginStorageListItem,
     type PresetCatalog,
     type Versioned,
     type WorkingSetCommit,
@@ -192,8 +193,12 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
         return invokeStore('pds_query_plugin_storage', {})
     }
 
-    readPluginStorage(key: string): Promise<Versioned<unknown> | null> {
-        return invokeStore('pds_read_plugin_storage', { key })
+    readPluginStorage(owner: string, key: string): Promise<Versioned<unknown> | null> {
+        return invokeStore('pds_read_plugin_storage', { owner, key })
+    }
+
+    listPluginStorage(): Promise<PluginStorageListItem[]> {
+        return invokeStore('pds_list_plugin_storage', {})
     }
 
     readAssetAlias(identity: AssetAliasIdentity): Promise<Versioned<AssetAlias> | null> {
@@ -429,9 +434,9 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
                 assertActive()
                 return invokeStore('pds_query_plugin_storage', { lease })
             },
-            readPluginStorage: async (key) => {
+            readPluginStorage: async (owner, key) => {
                 assertActive()
-                return invokeStore('pds_read_plugin_storage', { key, lease })
+                return invokeStore('pds_read_plugin_storage', { owner, key, lease })
             },
             readAssetAlias: async (identity) => {
                 assertActive()

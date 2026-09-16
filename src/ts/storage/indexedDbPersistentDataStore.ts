@@ -28,6 +28,7 @@ import type {
     PersistentRevisionLease,
     PersistentRoot,
     PluginStorageCatalog,
+    PluginStorageListItem,
     PluginStorageMutation,
     PresetCatalog,
     PresetSummary,
@@ -44,6 +45,8 @@ import {
     validateConversationWindowQuery,
     validateAssetOwnerHead,
 } from './persistentDataStore'
+import type { PluginStorageMeta } from '../plugins/pluginOwner'
+import { readPluginStorageMetaOwner } from '../plugins/pluginOwner'
 import { parseAssetRepositoryAuthorityState } from './assetRepositoryAuthority'
 
 const DATABASE_VERSION = 1
@@ -100,7 +103,9 @@ interface StoredPluginStorage extends StoredRecord<unknown> {
 interface StoredPluginStorageMetadata {
     key: string
     generation: string
+    owner: string
     storageKey: string
+    valueType: 'string' | 'json'
     byteSize: number
     ordinal: number
 }
@@ -671,10 +676,28 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         return this.queryPluginStorageFromTransaction(transaction, revision, generation)
     }
 
-    async readPluginStorage(key: string): Promise<Versioned<unknown> | null> {
+    async readPluginStorage(owner: string, key: string): Promise<Versioned<unknown> | null> {
         const transaction = this.requireDatabase().transaction(['meta', 'pluginStorage'], 'readonly')
         const { revision, generation } = await this.readActive(transaction)
-        return this.readPluginStorageFromTransaction(transaction, revision, generation, key)
+        return this.readPluginStorageFromTransaction(transaction, revision, generation, owner, key)
+    }
+
+    async listPluginStorage(): Promise<PluginStorageListItem[]> {
+        const transaction = this.requireDatabase().transaction(
+            ['meta', 'pluginStorageMetadata'],
+            'readonly',
+        )
+        const { generation } = await this.readActive(transaction)
+        const records = (await requestResult(
+            transaction.objectStore('pluginStorageMetadata').index('byGeneration').getAll(generation),
+        )) as StoredPluginStorageMetadata[]
+        await transactionDone(transaction)
+        return records.sort(comparePluginStorageRecords).map((record) => ({
+            owner: record.owner,
+            key: record.storageKey,
+            valueType: record.valueType,
+            byteSize: record.byteSize,
+        }))
     }
 
     async readAssetAlias(identity: AssetAliasIdentity): Promise<Versioned<AssetAlias> | null> {
@@ -803,8 +826,13 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             compatibilityHash: input.compatibilityHash,
         })
         for (const alias of input.assetAliases) validateAssetAlias(alias)
-        const { characters, botPresets: _botPresets, pluginCustomStorage: _pluginStorage, ...root } =
-            input.database
+        const {
+            characters,
+            botPresets: _botPresets,
+            pluginCustomStorage: _pluginStorage,
+            pluginStorageMeta: _pluginStorageMeta,
+            ...root
+        } = input.database
         const characterDetails = characters.map(({ chats: _chats, ...detail }) => detail)
         validateOwnerHeadsForCommit({
             expectedRevision: input.sourceRevision,
@@ -1276,7 +1304,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                     generation,
                 )
             },
-            readPluginStorage: async (key) => {
+            readPluginStorage: async (owner, key) => {
                 assertActive()
                 const transaction = this.requireDatabase().transaction(
                     ['meta', 'pluginStorage'],
@@ -1287,6 +1315,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                     transaction,
                     revision,
                     generation,
+                    owner,
                     key,
                 )
             },
@@ -1764,7 +1793,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             revision,
             items: records
                 .sort(comparePluginStorageRecords)
-                .map(({ storageKey: key, byteSize }) => ({ key, byteSize })),
+                .map(({ owner, storageKey: key, byteSize }) => ({ owner, key, byteSize })),
         }
     }
 
@@ -1772,10 +1801,13 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         transaction: IDBTransaction,
         revision: DataRevision,
         generation: string,
+        owner: string,
         key: string,
     ): Promise<Versioned<unknown> | null> {
         const record = (await requestResult(
-            transaction.objectStore('pluginStorage').get(this.pluginStorageKey(generation, key)),
+            transaction
+                .objectStore('pluginStorage')
+                .get(this.pluginStorageKey(generation, owner, key)),
         )) as StoredPluginStorage | undefined
         await transactionDone(transaction)
         return record ? { revision, value: record.value } : null
@@ -2197,11 +2229,22 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         for (const alias of assetAliases) validateAssetAlias(alias)
         const ids = new Set<string>()
         const conversationIds = new Set<string>()
-        const { characters, botPresets, pluginCustomStorage, ...root } = databaseValue
+        const {
+            characters,
+            botPresets,
+            pluginCustomStorage,
+            pluginStorageMeta,
+            ...root
+        } = databaseValue as Database & { pluginStorageMeta?: PluginStorageMeta }
         this.putRoot(transaction, generation, root)
         this.putAssetRepositoryAuthority(transaction, generation, { format: 'legacy' })
         this.writePresetRows(transaction, generation, botPresets ?? [])
-        this.writePluginStorageRows(transaction, generation, pluginCustomStorage ?? {})
+        this.writePluginStorageRows(
+            transaction,
+            generation,
+            pluginCustomStorage ?? {},
+            pluginStorageMeta,
+        )
         for (const alias of assetAliases) {
             transaction.objectStore('assetAliases').put({
                 key: this.assetAliasKey(generation, alias.kind, alias.key),
@@ -3061,15 +3104,19 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         transaction: IDBTransaction,
         generation: string,
         values: Record<string, unknown>,
+        meta?: PluginStorageMeta,
     ): void {
         const valueStore = transaction.objectStore('pluginStorage')
         const metadataStore = transaction.objectStore('pluginStorageMetadata')
         for (const [ordinal, storageKey] of Object.keys(values).entries()) {
             const value = values[storageKey]
+            const owner = readPluginStorageMetaOwner(meta, storageKey)
             const metadata = {
-                key: this.pluginStorageKey(generation, storageKey),
+                key: this.pluginStorageKey(generation, owner, storageKey),
                 generation,
+                owner,
                 storageKey,
+                valueType: typeof value === 'string' ? 'string' : 'json',
                 byteSize: serializedByteSize(value),
                 ordinal,
             } satisfies StoredPluginStorageMetadata
@@ -3089,35 +3136,35 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         const valueStore = transaction.objectStore('pluginStorage')
         const metadataStore = transaction.objectStore('pluginStorageMetadata')
         if (mutation.type === 'clear') {
-            await Promise.all([
-                this.deleteIndexRange(
-                    valueStore.index('byGeneration'),
-                    this.keyRangeFactory.only(generation),
-                ),
-                this.deleteIndexRange(
-                    metadataStore.index('byGeneration'),
-                    this.keyRangeFactory.only(generation),
-                ),
-            ])
+            const owned = (await requestResult(
+                metadataStore.index('byGeneration').getAll(generation),
+            )) as StoredPluginStorageMetadata[]
+            for (const record of owned) {
+                if (record.owner !== mutation.owner) continue
+                valueStore.delete(record.key)
+                metadataStore.delete(record.key)
+            }
             return
         }
         if (mutation.type === 'delete') {
-            const key = this.pluginStorageKey(generation, mutation.key)
+            const key = this.pluginStorageKey(generation, mutation.owner, mutation.key)
             valueStore.delete(key)
             metadataStore.delete(key)
             return
         }
         const existing = (await requestResult(
-            metadataStore.get(this.pluginStorageKey(generation, mutation.key)),
+            metadataStore.get(this.pluginStorageKey(generation, mutation.owner, mutation.key)),
         )) as StoredPluginStorageMetadata | undefined
         const ordinal = existing?.ordinal ?? await this.nextPluginStorageOrdinal(
             metadataStore,
             generation,
         )
         const metadata = {
-            key: this.pluginStorageKey(generation, mutation.key),
+            key: this.pluginStorageKey(generation, mutation.owner, mutation.key),
             generation,
+            owner: mutation.owner,
             storageKey: mutation.key,
+            valueType: typeof mutation.value === 'string' ? 'string' : 'json',
             byteSize: serializedByteSize(mutation.value),
             ordinal,
         } satisfies StoredPluginStorageMetadata
@@ -3295,8 +3342,8 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         })
     }
 
-    private pluginStorageKey(generation: string, key: string): string {
-        return `${generation}:plugin-storage:${key}`
+    private pluginStorageKey(generation: string, owner: string, key: string): string {
+        return `${generation}:plugin-storage:${JSON.stringify([owner, key])}`
     }
 
     private assetAliasKey(generation: string, kind: AssetAlias['kind'], key: string): string {

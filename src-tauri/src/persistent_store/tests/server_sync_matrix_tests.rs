@@ -236,6 +236,7 @@ fn server_sync_large_value_and_sequence_http_matrix() {
         store
             .commit(&WorkingSetCommit {
                 plugin_storage: Some(vec![PluginStorageMutation::Set {
+                    owner: "synthetic-plugin".to_owned(),
                     key: "large-synthetic".into(),
                     value: Value::String(text.into()),
                 }]),
@@ -382,6 +383,7 @@ fn server_sync_large_value_and_sequence_http_matrix() {
         first
             .commit(&WorkingSetCommit {
                 plugin_storage: Some(vec![PluginStorageMutation::Set {
+                    owner: "synthetic-plugin".to_owned(),
                     key: "작은/키".into(),
                     value: json!(value),
                 }]),

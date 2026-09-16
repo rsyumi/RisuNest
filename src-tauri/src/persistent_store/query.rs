@@ -3,7 +3,8 @@ use super::{
     ArchivedCharacterSummary, AssetAlias, AssetAliasListQuery, AssetAliasPage, AssetOwnerHead,
     AssetOwnerLocator, AssetRepositoryAuthorityState, CharacterPage, CharacterQuery,
     CharacterSummary, ConversationPage, ConversationQuery, ConversationSummary,
-    ConversationWindow, ConversationWindowQuery, PluginStorageCatalog, PluginStorageSummary,
+    ConversationWindow, ConversationWindowQuery, PluginStorageCatalog, PluginStorageListItem,
+    PluginStorageSummary,
     PresetCatalog, PresetSummary, QueryOrder, ReadTarget, StoreError, StoreResult, Versioned,
     CONVERSATION_RANGE_MAX_LIMIT, JAVASCRIPT_MAX_SAFE_INTEGER,
 };
@@ -81,22 +82,24 @@ pub(super) fn query_plugin_storage(
     target: &ReadTarget,
 ) -> StoreResult<PluginStorageCatalog> {
     let mut statement = connection.prepare(
-        "SELECT storage_key, byte_size, ordinal FROM plugin_storage
+        "SELECT owner, storage_key, byte_size, ordinal FROM plugin_storage
          WHERE generation = ?1",
     )?;
     let mut items = statement
         .query_map([&target.generation], |row| {
             Ok((
                 PluginStorageSummary {
-                    key: row.get(0)?,
-                    byte_size: row.get(1)?,
+                    owner: row.get(0)?,
+                    key: row.get(1)?,
+                    byte_size: row.get(2)?,
                 },
-                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     items.sort_by(|(left, left_ordinal), (right, right_ordinal)| {
         compare_plugin_storage_keys(&left.key, *left_ordinal, &right.key, *right_ordinal)
+            .then_with(|| left.owner.cmp(&right.owner))
     });
     Ok(PluginStorageCatalog {
         revision: target.revision,
@@ -104,15 +107,53 @@ pub(super) fn query_plugin_storage(
     })
 }
 
+/// Ordered by owner then legacy key order. No value body crosses the boundary.
+pub(super) fn list_plugin_storage(
+    connection: &Connection,
+    target: &ReadTarget,
+) -> StoreResult<Vec<PluginStorageListItem>> {
+    let mut statement = connection.prepare(
+        "SELECT owner, storage_key, byte_size, ordinal,
+                CASE WHEN substr(value, 1, 1) = '\"' THEN 'string' ELSE 'json' END,
+                claimed_from, import_batch_id, assigned_at
+         FROM plugin_storage WHERE generation = ?1",
+    )?;
+    let mut items = statement
+        .query_map([&target.generation], |row| {
+            Ok((
+                PluginStorageListItem {
+                    owner: row.get(0)?,
+                    key: row.get(1)?,
+                    space: None,
+                    value_type: row.get(4)?,
+                    byte_size: row.get(2)?,
+                    claimed_from: row.get(5)?,
+                    import_batch_id: row.get(6)?,
+                    assigned_at: row.get(7)?,
+                },
+                row.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    items.sort_by(|(left, left_ordinal), (right, right_ordinal)| {
+        left.owner.cmp(&right.owner).then_with(|| {
+            compare_plugin_storage_keys(&left.key, *left_ordinal, &right.key, *right_ordinal)
+        })
+    });
+    Ok(items.into_iter().map(|(item, _)| item).collect())
+}
+
 pub(super) fn read_plugin_storage(
     connection: &Connection,
+    owner: &str,
     key: &str,
     target: &ReadTarget,
 ) -> StoreResult<Option<Versioned<Value>>> {
     let value: Option<String> = connection
         .query_row(
-            "SELECT value FROM plugin_storage WHERE generation = ?1 AND storage_key = ?2",
-            params![target.generation, key],
+            "SELECT value FROM plugin_storage
+             WHERE generation = ?1 AND owner = ?2 AND storage_key = ?3",
+            params![target.generation, owner, key],
             |row| row.get(0),
         )
         .optional()?;
@@ -927,30 +968,7 @@ fn materialize_generation(connection: &Connection, generation: &str) -> StoreRes
     };
     database.insert("botPresets".to_owned(), Value::Array(presets));
     let plugin_storage = {
-        let mut statement = connection.prepare(
-            "SELECT storage_key, value, ordinal FROM plugin_storage
-             WHERE generation = ?1",
-        )?;
-        let mut values = statement
-            .query_map([&generation], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?
-            .map(|row| {
-                let (key, value, ordinal) = row?;
-                Ok((key, serde_json::from_str(&value)?, ordinal))
-            })
-            .collect::<StoreResult<Vec<(String, Value, i64)>>>()?;
-        values.sort_by(|(left, _, left_ordinal), (right, _, right_ordinal)| {
-            compare_plugin_storage_keys(left, *left_ordinal, right, *right_ordinal)
-        });
-        values
-            .into_iter()
-            .map(|(key, value, _)| (key, value))
-            .collect::<Map<String, Value>>()
+        super::export::flattened_plugin_storage(connection, &generation)?.values
     };
     database.insert(
         "pluginCustomStorage".to_owned(),

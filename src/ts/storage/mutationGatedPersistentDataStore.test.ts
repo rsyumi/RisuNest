@@ -44,7 +44,7 @@ describe('createMutationGatedPersistentDataStore', () => {
         const commit = {
             expectedRevision: 3,
             characterDetails: [{ type: 'group', chaId: 'group-a', name: 'Group' }],
-            pluginStorage: [{ type: 'set', key: 'plugin', value: true }],
+            pluginStorage: [{ type: 'set', owner: 'test-plugin', key: 'plugin', value: true }],
         } as WorkingSetCommit
         const database = { username: 'Fixture', characters: [] } as unknown as Database
         const commitResult = { revision: 4 }
@@ -84,7 +84,7 @@ describe('createMutationGatedPersistentDataStore', () => {
         await gated.queryPresets()
         await gated.readPreset('0')
         await gated.queryPluginStorage()
-        await gated.readPluginStorage('plugin')
+        await gated.readPluginStorage('test-plugin', 'plugin')
         await gated.readConversationMetadata('char-a', 'conv-a')
         await gated.readAssetAliasesByKeys('asset', ['assets/batch.bin'])
 

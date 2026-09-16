@@ -8,7 +8,6 @@ import type { OpenAIChat } from "../process/index.svelte";
 import { fetchNative, globalFetch, readImage, saveAsset } from "../globalApi.svelte";
 import { DBState, hotReloading } from "../stores.svelte";
 import type { ScriptMode } from "../process/scripts";
-import { SafeLocalStorage } from "./pluginSafeClass";
 import { loadV3Plugins } from "./apiV3/v3.svelte";
 import { pluginCodeTranspiler } from "./apiV3/transpiler";
 import {
@@ -22,6 +21,7 @@ import {
     createPluginStorageStore,
     registerPluginStorageLifecycle,
 } from "./pluginStorageStore";
+import { UNOWNED_PLUGIN_OWNER } from "./pluginOwner";
 import { applyPluginDatabaseUpdate } from "./pluginDatabaseAccess";
 import type { ChatOutputListener } from './pluginChatOutputListeners'
 
@@ -529,7 +529,9 @@ export function applyPreparedPluginDatabaseUpdate(
     lite: boolean,
 ): void {
     const db = getDatabase()
-    applyPluginDatabaseUpdate(db, database, allowedDbKeys)
+    // The compatibility path has no calling plugin, so nothing it writes gains
+    // an owner it did not already have.
+    applyPluginDatabaseUpdate(db, database, allowedDbKeys, UNOWNED_PLUGIN_OWNER)
     if (lite) DBState.db = db
     else setDatabase(db)
 }
@@ -604,7 +606,6 @@ export const getV2PluginAPIs = () => {
                 }
             }
         },
-        safeLocalStorage: new SafeLocalStorage(),
         loadPlugins: loadPluginsFromPlugin,
         readImage: (path:string) => {
             if(path.startsWith('assets/')){

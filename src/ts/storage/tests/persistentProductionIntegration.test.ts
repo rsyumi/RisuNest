@@ -1,3 +1,4 @@
+const PLUGIN_ACCESS_OWNER = 'test-plugin'
 import 'fake-indexeddb/auto'
 import { describe, expect, it, vi } from 'vitest'
 import type { Database } from '../database.svelte'
@@ -166,6 +167,7 @@ describe('persistent production runtime', () => {
         await runtime.initializeActiveWorkingSet(database)
         const oldSession = runtime.getActiveConversationSession()!
         const access = createPluginDatabaseAccess({
+        owner: PLUGIN_ACCESS_OWNER,
             store,
             flushPendingData: (reason) => runtime.flushPendingData(reason),
             getCompatibilityDatabase: () => adapter.current(),
@@ -268,6 +270,7 @@ describe('persistent production runtime', () => {
         const materializeDatabaseSnapshot = vi.fn()
         const replacePersistentDatabase = vi.fn()
         const access = createPluginDatabaseAccess({
+        owner: PLUGIN_ACCESS_OWNER,
             store,
             flushPendingData: (reason) => runtime.flushPendingData(reason),
             getCompatibilityDatabase: () => adapter.current(),

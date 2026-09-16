@@ -1,3 +1,4 @@
+import { UNOWNED_PLUGIN_OWNER } from '../../plugins/pluginOwner'
 import { IDBFactory, IDBIndex, IDBKeyRange, IDBObjectStore } from 'fake-indexeddb'
 import { describe, expect, it, vi } from 'vitest'
 import { IndexedDbPersistentDataStore } from '../indexedDbPersistentDataStore'
@@ -536,8 +537,8 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
             await expect(store.queryPluginStorage()).resolves.toEqual({
                 revision: imported.revision,
                 items: [
-                    { key: 'alpha', byteSize: 2 * 1024 * 1024 + 2 },
-                    { key: 'beta', byteSize: 2 * 1024 * 1024 + 2 },
+                    { owner: UNOWNED_PLUGIN_OWNER, key: 'alpha', byteSize: 2 * 1024 * 1024 + 2 },
+                    { owner: UNOWNED_PLUGIN_OWNER, key: 'beta', byteSize: 2 * 1024 * 1024 + 2 },
                 ],
             })
         } finally {
@@ -564,7 +565,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         try {
             await expect(store.commit({
                 expectedRevision: imported.revision,
-                pluginStorage: [{ type: 'set', key: 'third', value: 3 }],
+                pluginStorage: [{ type: 'set', owner: 'test-plugin', key: 'third', value: 3 }],
             })).resolves.toEqual({ revision: imported.revision + 1 })
             await expect(store.queryPluginStorage()).resolves.toMatchObject({
                 items: [
@@ -841,7 +842,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         let imported = await store.replaceFromDatabase(fixtureDatabase)
         imported = await store.commit({
             expectedRevision: imported.revision,
-            pluginStorage: [{ type: 'set', key: 'counted-zero', value: 0 }],
+            pluginStorage: [{ type: 'set', owner: 'test-plugin', key: 'counted-zero', value: 0 }],
         })
         const before = await countPersistentDataRecords(indexedDB, databaseName)
 
@@ -1380,7 +1381,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
             }),
         ).rejects.toBeInstanceOf(SnapshotReleasedError)
         await expect(lease.queryPluginStorage()).rejects.toBeInstanceOf(SnapshotReleasedError)
-        await expect(lease.readPluginStorage('missing')).rejects.toBeInstanceOf(
+        await expect(lease.readPluginStorage('test-plugin', 'missing')).rejects.toBeInstanceOf(
             SnapshotReleasedError,
         )
     })
@@ -1589,7 +1590,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         let imported = await store.replaceFromDatabase(fixtureDatabase)
         imported = await store.commit({
             expectedRevision: imported.revision,
-            pluginStorage: [{ type: 'set', key: 'pinned-zero', value: 0 }],
+            pluginStorage: [{ type: 'set', owner: 'test-plugin', key: 'pinned-zero', value: 0 }],
         })
         const lease = await store.acquireRevision(imported.revision)
 
@@ -1612,7 +1613,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         const committed = await store.commit({
             expectedRevision: imported.revision,
             root: { ...root, username: 'Committed after external lease expiry' },
-            pluginStorage: [{ type: 'set', key: 'pinned-zero', value: 1 }],
+            pluginStorage: [{ type: 'set', owner: 'test-plugin', key: 'pinned-zero', value: 1 }],
         })
         expect((await store.readRoot()).value.username).toBe(
             'Committed after external lease expiry',
@@ -1641,7 +1642,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
             }),
         ).rejects.toBeInstanceOf(SnapshotReleasedError)
         await expect(lease.queryPluginStorage()).rejects.toBeInstanceOf(SnapshotReleasedError)
-        await expect(lease.readPluginStorage('pinned-zero')).rejects.toBeInstanceOf(
+        await expect(lease.readPluginStorage('test-plugin', 'pinned-zero')).rejects.toBeInstanceOf(
             SnapshotReleasedError,
         )
 
@@ -1649,7 +1650,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
             username: 'Committed after external lease expiry',
         })
         expect((await store.readRoot()).revision).toBe(committed.revision)
-        await expect(store.readPluginStorage('pinned-zero')).resolves.toMatchObject({
+        await expect(store.readPluginStorage('test-plugin', 'pinned-zero')).resolves.toMatchObject({
             revision: committed.revision,
             value: 1,
         })
@@ -1663,7 +1664,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         let imported = await store.replaceFromDatabase(fixtureDatabase)
         imported = await store.commit({
             expectedRevision: imported.revision,
-            pluginStorage: [{ type: 'set', key: 'rollback-zero', value: 0 }],
+            pluginStorage: [{ type: 'set', owner: 'test-plugin', key: 'rollback-zero', value: 0 }],
         })
         const lease = await store.acquireRevision(imported.revision)
         const countsBefore = await countPersistentDataRecords(indexedDB, databaseName)
@@ -1698,11 +1699,11 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
             revision: imported.revision,
             value: { username: fixtureDatabase.username },
         })
-        await expect(store.readPluginStorage('rollback-zero')).resolves.toMatchObject({
+        await expect(store.readPluginStorage('test-plugin', 'rollback-zero')).resolves.toMatchObject({
             revision: imported.revision,
             value: 0,
         })
-        await expect(lease.readPluginStorage('rollback-zero')).resolves.toMatchObject({
+        await expect(lease.readPluginStorage('test-plugin', 'rollback-zero')).resolves.toMatchObject({
             revision: imported.revision,
             value: 0,
         })

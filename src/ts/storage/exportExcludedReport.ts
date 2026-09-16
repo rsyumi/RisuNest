@@ -1,6 +1,9 @@
 import { language } from 'src/lang'
 import type { character, groupChat } from './database.svelte'
 import { countArchivedCharacters } from './characterArchiveView'
+import { isUnownedPluginOwner } from '../plugins/pluginOwner'
+import { getPersistentDataStore } from './persistentDataStoreFactory'
+import type { PluginStorageListItem } from './persistentDataStore'
 
 export interface ExportExcludedPluginValue {
     key: string
@@ -16,12 +19,42 @@ export function isEmptyExportExcludedReport(report: ExportExcludedReport): boole
     return report.archivedCharacters === 0 && report.collidingPluginValues.length === 0
 }
 
-export function collectExportExcludedReport(
+/**
+ * An upstream save holds one value per key, so a key two plugins both hold
+ * cannot go out without handing one plugin the other's value. The list carries
+ * owners and keys only, never the values themselves.
+ */
+export function collidingPluginValues(
+    items: readonly PluginStorageListItem[],
+): ExportExcludedPluginValue[] {
+    const owners = new Map<string, string[]>()
+    for (const item of items) {
+        if (item.space !== undefined) continue
+        const holders = owners.get(item.key) ?? []
+        holders.push(item.owner)
+        owners.set(item.key, holders)
+    }
+    const colliding: ExportExcludedPluginValue[] = []
+    for (const [key, holders] of owners) {
+        if (holders.length < 2) continue
+        colliding.push({
+            key,
+            owners: holders.map((owner) =>
+                isUnownedPluginOwner(owner) ? language.risuNest.pluginData.ownerUnknown : owner,
+            ),
+        })
+    }
+    return colliding
+}
+
+export async function collectExportExcludedReport(
     characters: readonly (character | groupChat)[],
-): ExportExcludedReport {
+    listPluginStorage: () => Promise<PluginStorageListItem[]> = () =>
+        getPersistentDataStore().listPluginStorage(),
+): Promise<ExportExcludedReport> {
     return {
         archivedCharacters: countArchivedCharacters(characters),
-        collidingPluginValues: [],
+        collidingPluginValues: collidingPluginValues(await listPluginStorage()),
     }
 }
 

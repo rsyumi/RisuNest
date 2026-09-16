@@ -223,6 +223,7 @@ fn two_native_replicas_seed_publish_pull_and_preserve_same_key_conflicts() {
     first
         .commit(&WorkingSetCommit {
             plugin_storage: Some(vec![PluginStorageMutation::Set {
+                owner: "synthetic-plugin".to_owned(),
                 key: "synthetic-shared".into(),
                 value: json!({"text":"payload","unicode":"가🦀"}),
             }]),
@@ -266,6 +267,7 @@ fn two_native_replicas_seed_publish_pull_and_preserve_same_key_conflicts() {
         store
             .commit(&WorkingSetCommit {
                 plugin_storage: Some(vec![PluginStorageMutation::Set {
+                    owner: "synthetic-plugin".to_owned(),
                     key: "synthetic-shared".into(),
                     value: json!(value),
                 }]),
@@ -448,8 +450,9 @@ fn two_native_replicas_seed_publish_pull_and_preserve_same_key_conflicts() {
         first
             .commit(&WorkingSetCommit {
                 plugin_storage: Some(vec![
-                    PluginStorageMutation::Clear,
+                    PluginStorageMutation::Clear { owner: "synthetic-plugin".to_owned() },
                     PluginStorageMutation::Set {
+                        owner: "synthetic-plugin".to_owned(),
                         key: local_key.clone(),
                         value: json!("local new"),
                     },
@@ -460,6 +463,7 @@ fn two_native_replicas_seed_publish_pull_and_preserve_same_key_conflicts() {
         second
             .commit(&WorkingSetCommit {
                 plugin_storage: Some(vec![PluginStorageMutation::Set {
+                    owner: "synthetic-plugin".to_owned(),
                     key: remote_key.clone(),
                     value: json!("remote new"),
                 }]),
@@ -503,6 +507,7 @@ fn two_native_replicas_seed_publish_pull_and_preserve_same_key_conflicts() {
     first
         .commit(&WorkingSetCommit {
             plugin_storage: Some(vec![PluginStorageMutation::Set {
+                owner: "synthetic-plugin".to_owned(),
                 key: "offline-after-remote-clear".into(),
                 value: json!("pending"),
             }]),
@@ -511,7 +516,7 @@ fn two_native_replicas_seed_publish_pull_and_preserve_same_key_conflicts() {
         .unwrap();
     second
         .commit(&WorkingSetCommit {
-            plugin_storage: Some(vec![PluginStorageMutation::Clear]),
+            plugin_storage: Some(vec![PluginStorageMutation::Clear { owner: "synthetic-plugin".to_owned() }]),
             ..empty_working_set_commit(second.revision().unwrap())
         })
         .unwrap();
@@ -533,7 +538,7 @@ fn two_native_replicas_seed_publish_pull_and_preserve_same_key_conflicts() {
     let before = server.scope_state("plugin-storage").unwrap();
     first
         .commit(&WorkingSetCommit {
-            plugin_storage: Some(vec![PluginStorageMutation::Clear]),
+            plugin_storage: Some(vec![PluginStorageMutation::Clear { owner: "synthetic-plugin".to_owned() }]),
             ..empty_working_set_commit(first.revision().unwrap())
         })
         .unwrap();

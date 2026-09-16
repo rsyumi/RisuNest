@@ -1,3 +1,4 @@
+const OWNER = 'test-plugin'
 import { describe, expect, it, vi } from 'vitest'
 import {
     RevisionConflictError,
@@ -21,7 +22,7 @@ function deferred<T>() {
 
 function harness(entries: Record<string, { byteSize: number; value: unknown }>, budget = 10) {
     let revision = 4
-    const readPluginStorage = vi.fn(async (key: string) => {
+    const readPluginStorage = vi.fn(async (_owner: string, key: string) => {
         const entry = entries[key]
         return entry ? { revision, value: structuredClone(entry.value) } : null
     })
@@ -31,7 +32,7 @@ function harness(entries: Record<string, { byteSize: number; value: unknown }>, 
             revision,
             items: Object.entries(entries)
                 .sort(([left], [right]) => left.localeCompare(right))
-                .map(([key, entry]) => ({ key, byteSize: entry.byteSize })),
+                .map(([key, entry]) => ({ owner: OWNER, key, byteSize: entry.byteSize })),
         })),
         readPluginStorage,
         acquireRevision: vi.fn(async (requestedRevision: number) => ({
@@ -40,9 +41,9 @@ function harness(entries: Record<string, { byteSize: number; value: unknown }>, 
                 revision: requestedRevision,
                 items: Object.entries(entries)
                     .sort(([left], [right]) => left.localeCompare(right))
-                    .map(([key, entry]) => ({ key, byteSize: entry.byteSize })),
+                    .map(([key, entry]) => ({ owner: OWNER, key, byteSize: entry.byteSize })),
             }),
-            readPluginStorage: async (key: string) => {
+            readPluginStorage: async (_owner: string, key: string) => {
                 const entry = entries[key]
                 return entry
                     ? { revision: requestedRevision, value: structuredClone(entry.value) }
@@ -51,7 +52,7 @@ function harness(entries: Record<string, { byteSize: number; value: unknown }>, 
             release: vi.fn(async () => undefined),
         })),
     } as unknown as PersistentDataStore
-    const mutate = vi.fn(async (mutations: PluginStorageMutation[]) => {
+    const mutate = vi.fn(async (mutations: readonly PluginStorageMutation[]) => {
         for (const mutation of mutations) {
             if (mutation.type === 'clear') {
                 for (const key of Object.keys(entries)) delete entries[key]
@@ -91,8 +92,15 @@ describe('plugin storage V3 residency', () => {
                     { alpha: { value, byteSize } },
                     budget,
                 )
-                storage.synchronizeCompatibilityStorage({ alpha: value })
-                await expect(storage.getItem('alpha')).resolves.toBe(value)
+                await storage.forOwner(OWNER).keys()
+                readPluginStorage.mockClear()
+                storage.synchronizeCommittedMutation({
+                type: 'set',
+                owner: OWNER,
+                key: 'alpha',
+                value,
+            })
+                await expect(storage.forOwner(OWNER).getItem('alpha')).resolves.toBe(value)
                 expect(readPluginStorage).toHaveBeenCalledTimes(budget < byteSize ? 1 : 0)
             }
         }
@@ -101,11 +109,17 @@ describe('plugin storage V3 residency', () => {
     it('adopts large immutable strings without serialization, encoding or cloning copies', async () => {
         const value = 'x'.repeat(16 * 1024 * 1024)
         const { storage, readPluginStorage } = harness({}, 32 * 1024 * 1024)
+        await storage.forOwner(OWNER).keys()
         const stringify = vi.spyOn(JSON, 'stringify')
         const encode = vi.spyOn(TextEncoder.prototype, 'encode')
         const clone = vi.spyOn(globalThis, 'structuredClone')
         try {
-            storage.synchronizeCompatibilityStorage({ alpha: value })
+            storage.synchronizeCommittedMutation({
+                type: 'set',
+                owner: OWNER,
+                key: 'alpha',
+                value,
+            })
             expect(stringify).not.toHaveBeenCalled()
             expect(encode).not.toHaveBeenCalled()
             expect(clone).not.toHaveBeenCalled()
@@ -114,7 +128,7 @@ describe('plugin storage V3 residency', () => {
             encode.mockRestore()
             clone.mockRestore()
         }
-        await expect(storage.getItem('alpha')).resolves.toBe(value)
+        await expect(storage.forOwner(OWNER).getItem('alpha')).resolves.toBe(value)
         expect(readPluginStorage).not.toHaveBeenCalled()
     })
 
@@ -124,14 +138,14 @@ describe('plugin storage V3 residency', () => {
             beta: { byteSize: 6, value: 'beta' },
         })
 
-        await expect(storage.keys()).resolves.toEqual(['alpha', 'beta'])
+        await expect(storage.forOwner(OWNER).keys()).resolves.toEqual(['alpha', 'beta'])
         expect(store.queryPluginStorage).toHaveBeenCalledOnce()
         expect(readPluginStorage).not.toHaveBeenCalled()
 
-        await expect(storage.getItem('alpha')).resolves.toBe('alpha')
-        await expect(storage.getItem('beta')).resolves.toBe('beta')
-        await expect(storage.getItem('alpha')).resolves.toBe('alpha')
-        expect(readPluginStorage.mock.calls.map(([key]) => key)).toEqual([
+        await expect(storage.forOwner(OWNER).getItem('alpha')).resolves.toBe('alpha')
+        await expect(storage.forOwner(OWNER).getItem('beta')).resolves.toBe('beta')
+        await expect(storage.forOwner(OWNER).getItem('alpha')).resolves.toBe('alpha')
+        expect(readPluginStorage.mock.calls.map(([, key]) => key)).toEqual([
             'alpha',
             'beta',
             'alpha',
@@ -144,17 +158,17 @@ describe('plugin storage V3 residency', () => {
             100,
         )
 
-        await storage.setItem('beta', { enabled: true })
-        await expect(storage.getItem('beta')).resolves.toEqual({ enabled: true })
-        await storage.removeItem('alpha')
-        await expect(storage.getItem('alpha')).resolves.toBeNull()
-        await storage.clear()
-        await expect(storage.length()).resolves.toBe(0)
+        await storage.forOwner(OWNER).setItem('beta', { enabled: true })
+        await expect(storage.forOwner(OWNER).getItem('beta')).resolves.toEqual({ enabled: true })
+        await storage.forOwner(OWNER).removeItem('alpha')
+        await expect(storage.forOwner(OWNER).getItem('alpha')).resolves.toBeNull()
+        await storage.forOwner(OWNER).clear()
+        await expect(storage.forOwner(OWNER).length()).resolves.toBe(0)
 
         expect(mutate.mock.calls.map(([mutations]) => mutations)).toEqual([
-            [{ type: 'set', key: 'beta', value: { enabled: true } }],
-            [{ type: 'delete', key: 'alpha' }],
-            [{ type: 'clear' }],
+            [{ type: 'set', owner: 'test-plugin', key: 'beta', value: { enabled: true } }],
+            [{ type: 'delete', owner: 'test-plugin', key: 'alpha' }],
+            [{ type: 'clear', owner: 'test-plugin' }],
         ])
         expect(readPluginStorage).not.toHaveBeenCalled()
     })
@@ -165,10 +179,10 @@ describe('plugin storage V3 residency', () => {
             100,
         )
 
-        await storage.setItem('alpha', undefined)
+        await storage.forOwner(OWNER).setItem('alpha', undefined)
 
-        expect(mutate).toHaveBeenCalledWith([{ type: 'delete', key: 'alpha' }])
-        await expect(storage.getItem('alpha')).resolves.toBeNull()
+        expect(mutate).toHaveBeenCalledWith([{ type: 'delete', owner: 'test-plugin', key: 'alpha' }])
+        await expect(storage.forOwner(OWNER).getItem('alpha')).resolves.toBeNull()
         expect(readPluginStorage).not.toHaveBeenCalled()
     })
 
@@ -176,40 +190,50 @@ describe('plugin storage V3 residency', () => {
         const { storage, readPluginStorage } = harness({
             alpha: { byteSize: 6, value: 'alpha' },
         }, 1024)
-        storage.synchronizeCompatibilityStorage({ alpha: 'alpha' })
+        await expect(storage.forOwner(OWNER).keys()).resolves.toEqual(['alpha'])
+        storage.synchronizeCommittedMutation({ type: 'set', owner: OWNER, key: 'alpha', value: 'alpha' })
         readPluginStorage.mockClear()
 
-        storage.synchronizeCompatibilityMutation({
+        storage.synchronizeCommittedMutation({
             type: 'set',
+            owner: 'test-plugin',
             key: 'beta',
             value: { enabled: true },
         })
-        storage.synchronizeCompatibilityMutation({ type: 'delete', key: 'alpha' })
+        storage.synchronizeCommittedMutation({ type: 'delete', owner: 'test-plugin', key: 'alpha' })
 
-        await expect(storage.keys()).resolves.toEqual(['beta'])
-        await expect(storage.getItem('beta')).resolves.toEqual({ enabled: true })
-        await expect(storage.getItem('alpha')).resolves.toBeNull()
+        await expect(storage.forOwner(OWNER).getItem('beta')).resolves.toEqual({ enabled: true })
+        await expect(storage.forOwner(OWNER).getItem('alpha')).resolves.toBeNull()
         expect(readPluginStorage).not.toHaveBeenCalled()
 
-        storage.synchronizeCompatibilityMutation({ type: 'clear' })
-        await expect(storage.length()).resolves.toBe(0)
+        storage.synchronizeCommittedMutation({ type: 'clear', owner: 'test-plugin' })
+        await expect(storage.forOwner(OWNER).length()).resolves.toBe(0)
 
-        storage.synchronizeCompatibilityStorage({ gamma: 'replacement' })
-        await expect(storage.keys()).resolves.toEqual(['gamma'])
-        await expect(storage.getItem('gamma')).resolves.toBe('replacement')
+        storage.synchronizeCommittedMutation({ type: 'set', owner: OWNER, key: 'gamma', value: 'replacement' })
+        await expect(storage.forOwner(OWNER).keys()).resolves.toEqual(['gamma'])
+        await expect(storage.forOwner(OWNER).getItem('gamma')).resolves.toBe('replacement')
     })
 
     it('adopts published storage values without rereading records', async () => {
         const { storage, store, readPluginStorage } = harness({}, 1024)
 
-        storage.synchronizeCompatibilityStorage({
-            alpha: 'materialized',
-            beta: { nested: true },
+        await storage.forOwner(OWNER).keys()
+        storage.synchronizeCommittedMutation({
+            type: 'set',
+            owner: OWNER,
+            key: 'alpha',
+            value: 'materialized',
+        })
+        storage.synchronizeCommittedMutation({
+            type: 'set',
+            owner: OWNER,
+            key: 'beta',
+            value: { nested: true },
         })
 
-        await expect(storage.keys()).resolves.toEqual(['alpha', 'beta'])
-        await expect(storage.getItem('beta')).resolves.toEqual({ nested: true })
-        expect(store.queryPluginStorage).not.toHaveBeenCalled()
+        await expect(storage.forOwner(OWNER).getItem('alpha')).resolves.toBe('materialized')
+        await expect(storage.forOwner(OWNER).getItem('beta')).resolves.toEqual({ nested: true })
+        expect(store.queryPluginStorage).toHaveBeenCalledOnce()
         expect(readPluginStorage).not.toHaveBeenCalled()
     })
 
@@ -221,13 +245,13 @@ describe('plugin storage V3 residency', () => {
         const oldRead = deferred<{ revision: number; value: unknown }>()
         readPluginStorage.mockImplementationOnce(() => oldRead.promise)
 
-        const readingOldValue = storage.getItem('alpha')
+        const readingOldValue = storage.forOwner(OWNER).getItem('alpha')
         await vi.waitFor(() => expect(readPluginStorage).toHaveBeenCalledOnce())
-        await storage.setItem('alpha', 'new')
+        await storage.forOwner(OWNER).setItem('alpha', 'new')
         oldRead.resolve({ revision: 4, value: 'old' })
 
         await expect(readingOldValue).resolves.toBe('old')
-        await expect(storage.getItem('alpha')).resolves.toBe('new')
+        await expect(storage.forOwner(OWNER).getItem('alpha')).resolves.toBe('new')
         expect(readPluginStorage).toHaveBeenCalledOnce()
     })
 
@@ -237,18 +261,18 @@ describe('plugin storage V3 residency', () => {
         const oldRead = deferred<null>()
         readPluginStorage.mockImplementationOnce(() => oldRead.promise)
 
-        const readingOldValue = storage.getItem('alpha')
+        const readingOldValue = storage.forOwner(OWNER).getItem('alpha')
         await vi.waitFor(() => expect(readPluginStorage).toHaveBeenCalledOnce())
         const newValue = 'larger than the cache budget'
-        await storage.setItem('alpha', newValue)
+        await storage.forOwner(OWNER).setItem('alpha', newValue)
 
-        const readingNewValue = storage.getItem('alpha')
+        const readingNewValue = storage.forOwner(OWNER).getItem('alpha')
         await vi.waitFor(() => expect(readPluginStorage).toHaveBeenCalledTimes(2))
         await expect(readingNewValue).resolves.toBe(newValue)
         oldRead.resolve(null)
 
         await expect(readingOldValue).resolves.toBeNull()
-        await expect(storage.keys()).resolves.toEqual(['alpha'])
+        await expect(storage.forOwner(OWNER).keys()).resolves.toEqual(['alpha'])
     })
 
     it('rebinds its catalog and cache after an authoritative replacement', async () => {
@@ -260,13 +284,13 @@ describe('plugin storage V3 residency', () => {
             mutate: first.mutate,
         }, 100)
 
-        await expect(storage.getItem('alpha')).resolves.toBe('first')
+        await expect(storage.forOwner(OWNER).getItem('alpha')).resolves.toBe('first')
         authority = second.store
         storage.invalidate()
 
-        await expect(storage.keys()).resolves.toEqual(['beta'])
-        await expect(storage.getItem('alpha')).resolves.toBeNull()
-        await expect(storage.getItem('beta')).resolves.toBe('second')
+        await expect(storage.forOwner(OWNER).keys()).resolves.toEqual(['beta'])
+        await expect(storage.forOwner(OWNER).getItem('alpha')).resolves.toBeNull()
+        await expect(storage.forOwner(OWNER).getItem('beta')).resolves.toBe('second')
         expect(second.store.queryPluginStorage).toHaveBeenCalledOnce()
     })
 
@@ -275,18 +299,18 @@ describe('plugin storage V3 residency', () => {
         const { storage, store } = harness(entries, 100)
         const firstCatalog = deferred<{
             revision: number
-            items: Array<{ key: string; byteSize: number }>
+            items: Array<{ owner: string; key: string; byteSize: number }>
         }>()
         vi.mocked(store.queryPluginStorage).mockImplementationOnce(() => firstCatalog.promise)
 
-        const keys = storage.keys()
+        const keys = storage.forOwner(OWNER).keys()
         await vi.waitFor(() => expect(store.queryPluginStorage).toHaveBeenCalledOnce())
         delete entries.alpha
         Object.assign(entries, { beta: { byteSize: 6, value: 'second' } })
         storage.invalidate()
         firstCatalog.resolve({
             revision: 4,
-            items: [{ key: 'alpha', byteSize: 5 }],
+            items: [{ owner: 'test-plugin', key: 'alpha', byteSize: 5 }],
         })
 
         await expect(keys).resolves.toEqual(['beta'])
@@ -297,13 +321,13 @@ describe('plugin storage V3 residency', () => {
         const entries = { alpha: { byteSize: 5, value: 'first' as unknown } }
         const { storage, store } = harness(entries, 100)
         const unregister = registerPluginStorageLifecycle(storage)
-        await expect(storage.getItem('alpha')).resolves.toBe('first')
+        await expect(storage.forOwner(OWNER).getItem('alpha')).resolves.toBe('first')
         delete entries.alpha
         Object.assign(entries, { beta: { byteSize: 6, value: 'second' } })
 
-        notifyPluginStorageAuthorityReplacement(null)
+        notifyPluginStorageAuthorityReplacement()
 
-        await expect(storage.keys()).resolves.toEqual(['beta'])
+        await expect(storage.forOwner(OWNER).keys()).resolves.toEqual(['beta'])
         expect(store.queryPluginStorage).toHaveBeenCalledTimes(2)
         unregister()
     })
@@ -328,7 +352,7 @@ describe('plugin storage V3 residency', () => {
     it('uses legacy Object.keys ordering for key and keys after mutations', async () => {
         const { storage } = harness({}, 100)
 
-        await storage.mutate([
+        await storage.forOwner(OWNER).mutate([
             { type: 'set', key: 'zeta', value: 1 },
             { type: 'set', key: '10', value: 10 },
             { type: 'set', key: '2', value: 0 },
@@ -339,13 +363,13 @@ describe('plugin storage V3 residency', () => {
         ])
 
         const expected = ['2', '10', '4294967294', 'zeta', '01', '4294967295', '\uffffx']
-        await expect(storage.keys()).resolves.toEqual(expected)
-        await expect(Promise.all(expected.map((_, index) => storage.key(index)))).resolves.toEqual(
+        await expect(storage.forOwner(OWNER).keys()).resolves.toEqual(expected)
+        await expect(Promise.all(expected.map((_, index) => storage.forOwner(OWNER).key(index)))).resolves.toEqual(
             expected,
         )
-        await storage.removeItem('zeta')
-        await storage.setItem('zeta', 2)
-        await expect(storage.keys()).resolves.toEqual([
+        await storage.forOwner(OWNER).removeItem('zeta')
+        await storage.forOwner(OWNER).setItem('zeta', 2)
+        await expect(storage.forOwner(OWNER).keys()).resolves.toEqual([
             '2',
             '10',
             '4294967294',
@@ -362,7 +386,7 @@ describe('plugin storage V3 residency', () => {
             memory: { byteSize: 8, value: { ok: true } },
         }, 1)
 
-        await expect(storage.snapshot()).resolves.toEqual({
+        await expect(storage.forOwner(OWNER).snapshot()).resolves.toEqual({
             memory: { ok: true },
             zero: 0,
         })
@@ -378,13 +402,13 @@ describe('plugin storage V3 residency', () => {
             revision: 4,
             queryPluginStorage: async () => ({
                 revision: 4,
-                items: [{ key: 'zero', byteSize: 1 }],
+                items: [{ owner: 'test-plugin', key: 'zero', byteSize: 1 }],
             }),
             readPluginStorage: async () => ({ revision: 4, value: 0 }),
             release,
         } as any)
 
-        await expect(storage.snapshot()).resolves.toEqual({ zero: 0 })
+        await expect(storage.forOwner(OWNER).snapshot()).resolves.toEqual({ zero: 0 })
         expect(release).toHaveBeenCalledTimes(2)
     })
 
@@ -395,20 +419,20 @@ describe('plugin storage V3 residency', () => {
             queryPluginStorage: async () => ({
                 revision: 4,
                 items: [
-                    { key: 'zeta', byteSize: 1 },
-                    { key: '0', byteSize: 1 },
-                    { key: '__proto__', byteSize: 1 },
-                    { key: 'alpha', byteSize: 1 },
+                    { owner: 'test-plugin', key: 'zeta', byteSize: 1 },
+                    { owner: 'test-plugin', key: '0', byteSize: 1 },
+                    { owner: 'test-plugin', key: '__proto__', byteSize: 1 },
+                    { owner: 'test-plugin', key: 'alpha', byteSize: 1 },
                 ],
             }),
-            readPluginStorage: async (key: string) => ({
+            readPluginStorage: async (_owner: string, key: string) => ({
                 revision: 4,
                 value: key === '__proto__' ? false : key === '0' ? 0 : '',
             }),
             release: vi.fn(async () => undefined),
         } as any)
 
-        const snapshot = await storage.snapshot()
+        const snapshot = await storage.forOwner(OWNER).snapshot()
 
         expect(Object.keys(snapshot)).toEqual(['0', 'zeta', '__proto__', 'alpha'])
         expect(Object.hasOwn(snapshot, '__proto__')).toBe(true)
@@ -425,16 +449,16 @@ describe('plugin storage V3 residency', () => {
         vi.mocked(store.queryPluginStorage)
             .mockResolvedValueOnce({
                 revision: 4,
-                items: [{ key: 'zero', byteSize: 1 }],
+                items: [{ owner: 'test-plugin', key: 'zero', byteSize: 1 }],
             })
             .mockResolvedValueOnce({
                 revision: 5,
-                items: [{ key: 'zero', byteSize: 1 }],
+                items: [{ owner: 'test-plugin', key: 'zero', byteSize: 1 }],
             })
         vi.mocked(store.acquireRevision)
             .mockRejectedValueOnce(new RevisionConflictError(4, 5))
 
-        await expect(storage.snapshot()).resolves.toEqual({ zero: 0 })
+        await expect(storage.forOwner(OWNER).snapshot()).resolves.toEqual({ zero: 0 })
         expect(vi.mocked(store.acquireRevision).mock.calls.map(([revision]) => revision)).toEqual([
             4,
             5,
@@ -449,7 +473,7 @@ describe('plugin storage V3 residency', () => {
             new RevisionConflictError(4, 5),
         )
 
-        await expect(storage.snapshot()).rejects.toBeInstanceOf(RevisionConflictError)
+        await expect(storage.forOwner(OWNER).snapshot()).rejects.toBeInstanceOf(RevisionConflictError)
         expect(store.acquireRevision).toHaveBeenCalledTimes(3)
     })
 })

@@ -1011,9 +1011,10 @@ interface SafeMutationObserver extends SafeRemoteRef {
 // ============================================================================
 
 /**
- * Save-file shared storage that participates in save snapshots and cross-device sync.
- * It is one keyspace for all plugins in the save file. Use a stable plugin prefix for new keys.
- * `clear()` removes every key in that shared keyspace.
+ * Save-file storage that participates in save snapshots and cross-device sync.
+ * In RisuNest each plugin sees only the values it wrote, and `clear()` removes only
+ * those. A stable plugin prefix still helps, because a RisuAI export writes one flat
+ * object and drops a key two plugins both hold.
  *
  * **All methods return Promises** due to iframe message passing.
  *
@@ -1082,7 +1083,7 @@ interface PluginStorage {
 /**
  * Device-local storage that persists outside of save files.
  * Uses generic types for flexible value storage.
- * Storage is shared between all plugins under a common prefix.
+ * In RisuNest each plugin sees only the values it wrote.
  *
  * **All methods return Promises** due to iframe message passing.
  *
@@ -1140,8 +1141,9 @@ interface SafeLocalPluginStorage {
 }
 
 /**
- * Device-local string storage shared between plugins. It is not stored in a save file
- * and does not sync to another device. `clear()` removes every key in this safe-local keyspace.
+ * Device-local string storage. It is not stored in a save file and does not sync to
+ * another device. In RisuNest each plugin sees only the values it wrote, and `clear()`
+ * removes only those.
  *
  * **All methods return Promises** due to iframe message passing.
  *
@@ -1498,11 +1500,11 @@ interface RisuaiPluginAPI {
     /** Plugin-specific storage (syncs with save files) */
     pluginStorage: PluginStorage;
 
-    /** Device-specific storage (shared between plugins) */
+    /** Device-specific storage */
     safeLocalStorage: SafeLocalStorage;
 
     /**
-     * Gets a device-local storage instance shared between plugins
+     * Gets a device-local storage instance for this plugin
      * @returns SafeLocalPluginStorage instance for device-local storage
      *
      * @example

@@ -132,6 +132,7 @@ function createReader(
     const pluginCatalog: PluginStorageCatalog = {
         revision,
         items: Object.keys(pluginCustomStorage).map((key) => ({
+            owner: 'test-plugin',
             key,
             byteSize: JSON.stringify(pluginCustomStorage[key]).length,
         })),
@@ -190,7 +191,7 @@ function createReader(
         readConversationMetadata: vi.fn(async () => null),
         readConversationWindow: async () => null,
         queryPluginStorage: vi.fn(async () => clone(pluginCatalog)),
-        readPluginStorage: async (key) => Object.hasOwn(pluginCustomStorage, key)
+        readPluginStorage: async (_owner, key) => Object.hasOwn(pluginCustomStorage, key)
             ? { revision, value: clone(pluginCustomStorage[key]) }
             : null,
         readAssetAlias: async () => null,

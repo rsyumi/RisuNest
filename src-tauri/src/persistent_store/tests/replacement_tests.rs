@@ -11,7 +11,7 @@ fn bounded_generation_replacement_rolls_back_deleted_and_partly_moved_batches() 
         let transaction = store.connection.transaction().unwrap();
         for index in 0..513 {
             transaction.execute(
-                "INSERT INTO plugin_storage(generation,storage_key,byte_size,ordinal,value) VALUES(?1,?2,1,?3,?4)",
+                "INSERT INTO plugin_storage(generation,owner,storage_key,byte_size,ordinal,value) VALUES(?1,'synthetic-plugin',?2,1,?3,?4)",
                 params![generation, format!("synthetic-{index:04}"), index, value],
             ).unwrap();
         }

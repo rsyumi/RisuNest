@@ -103,6 +103,7 @@ export enum RisuSaveType {
     PLUGINS = 9,
     LOADOUTS = 10,
     PLUGIN_STORAGE = 11,
+    PLUGIN_STORAGE_META = 12,
 }
 
 type EncodeBlockArg = {
@@ -556,6 +557,13 @@ export class RisuSaveDecoder {
                     }
                     case RisuSaveType.PLUGIN_STORAGE:{
                         db.pluginCustomStorage = JSON.parse(this.blocks[key].content);
+                        break;
+                    }
+                    case RisuSaveType.PLUGIN_STORAGE_META:{
+                        const meta = JSON.parse(this.blocks[key].content);
+                        if(meta && Object.keys(meta).length > 0){
+                            db.pluginStorageMeta = meta;
+                        }
                         break;
                     }
                     case RisuSaveType.REMOTE:{

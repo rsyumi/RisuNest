@@ -46,6 +46,14 @@ pub(crate) trait ReplacementSink: Send + Sync {
     ) -> StoreResult<()> {
         Ok(())
     }
+    /// Values the staged save left without an owner. A file RisuNest wrote
+    /// carries ownership, so this is empty for it.
+    fn staged_plugin_preview(
+        &self,
+        _staging_id: &str,
+    ) -> StoreResult<crate::persistent_store::commit::StagedPluginPreview> {
+        Ok(crate::persistent_store::commit::StagedPluginPreview::default())
+    }
     fn commit(&self, staging_id: &str, expected_revision: i64) -> StoreResult<RevisionResult>;
     fn abort(&self, staging_id: &str) -> StoreResult<()>;
 }
@@ -295,6 +303,13 @@ fn restore_risu_save_reader_controlled<R: Read>(
         if job.is_cancel_requested() {
             return Err(cancelled("restore cancelled before activation"));
         }
+        // A save that says nothing about ownership gets one pass over its
+        // plugin values before the replacement is applied.
+        let preview = sink
+            .staged_plugin_preview(&staging_id)
+            .map_err(store_error)?;
+        job.set_plugin_value_preview(&staging_id, preview)
+            .map_err(|error| job_error(job, error))?;
         let activation_revision = job
             .wait_for_restore_finalization()
             .map_err(|error| job_error(job, error))?
@@ -810,6 +825,7 @@ fn parse_and_stage<R: Read>(
     let mut loadouts = None;
     let mut plugins = None;
     let mut plugin_storage = None;
+    let mut plugin_storage_meta = None;
     let mut character_batch = Vec::new();
     let mut character_batch_bytes = 0usize;
     let mut character_count = 0u64;
@@ -925,6 +941,12 @@ fn parse_and_stage<R: Read>(
                 }
                 plugin_storage = Some(value);
             }
+            12 if name == "pluginStorageMeta" => {
+                if !value.is_object() {
+                    return Err(invalid("pluginStorageMeta block must be a JSON object"));
+                }
+                plugin_storage_meta = Some(value);
+            }
             3 | 6 | 8 => {
                 return Err(unsupported(format!(
                     "block type {block_type} for {name} requires the compatibility parser"
@@ -992,6 +1014,9 @@ fn parse_and_stage<R: Read>(
         "pluginCustomStorage".to_owned(),
         plugin_storage.ok_or_else(|| invalid("missing required block pluginStorage"))?,
     );
+    if let Some(meta) = plugin_storage_meta {
+        root.insert("pluginStorageMeta".to_owned(), meta);
+    }
     let presets = presets.ok_or_else(|| invalid("missing required block preset"))?;
     pocket_features::root(&root).map_err(invalid)?;
     sink.put_root(staging_id, &Value::Object(root))

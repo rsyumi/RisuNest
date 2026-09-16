@@ -47,7 +47,7 @@ pub(super) fn validate_locator_envelope(
     match (locator, envelope) {
         (LogicalRecordLocator::Root, LogicalRecordEnvelope::Root { value, .. }) => {
             let root = json_object(value, "logical root")?;
-            if ["characters", "botPresets", "pluginCustomStorage"]
+            if ["characters", "botPresets", "pluginCustomStorage", "pluginStorageMeta"]
                 .iter()
                 .any(|key| root.contains_key(*key))
             {
@@ -310,11 +310,12 @@ pub(super) fn apply_delete(
                 .map_err(sql_error)?;
             Ok(())
         }
-        LogicalRecordLocator::Plugin { storage_key } => {
+        LogicalRecordLocator::Plugin { owner, storage_key } => {
             transaction
                 .execute(
-                    "DELETE FROM plugin_storage WHERE generation = ?1 AND storage_key = ?2",
-                    params![generation, storage_key],
+                    "DELETE FROM plugin_storage
+                     WHERE generation = ?1 AND owner = ?2 AND storage_key = ?3",
+                    params![generation, owner, storage_key],
                 )
                 .map_err(sql_error)?;
             Ok(())
@@ -504,21 +505,29 @@ pub(super) fn apply_record_rows(
             Ok(())
         }
         (
-            LogicalRecordLocator::Plugin { storage_key },
-            LogicalRecordEnvelope::Plugin { ordinal, value },
+            LogicalRecordLocator::Plugin { owner, storage_key },
+            LogicalRecordEnvelope::Plugin {
+                owner: envelope_owner,
+                ordinal,
+                value,
+            },
         ) => {
+            if envelope_owner != owner {
+                return validation("plugin record owner does not match its key");
+            }
             let serialized = serde_json::to_string(value).map_err(json_error)?;
             transaction
                 .execute(
                     "INSERT INTO plugin_storage (
-                        generation, storage_key, byte_size, ordinal, value
-                     ) VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(generation, storage_key) DO UPDATE SET
+                        generation, owner, storage_key, byte_size, ordinal, value
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(generation, owner, storage_key) DO UPDATE SET
                         byte_size = excluded.byte_size,
                         ordinal = excluded.ordinal,
                         value = excluded.value",
                     params![
                         generation,
+                        owner,
                         storage_key,
                         sqlite_i64(serialized.len() as u64, "plugin storage byte size")?,
                         sqlite_i64(*ordinal, "plugin storage ordinal")?,

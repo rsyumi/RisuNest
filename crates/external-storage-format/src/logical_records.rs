@@ -19,6 +19,7 @@ pub enum LogicalRecordLocator {
         preset_id: String,
     },
     Plugin {
+        owner: String,
         storage_key: String,
     },
     Character {
@@ -232,6 +233,7 @@ pub enum LogicalRecordEnvelope {
         value: Value,
     },
     Plugin {
+        owner: String,
         ordinal: u64,
         value: Value,
     },
@@ -521,9 +523,10 @@ fn locator_parts(
             validate_component(preset_id, "presetId", false)?;
             ("preset", vec![preset_id.as_str()])
         }
-        LogicalRecordLocator::Plugin { storage_key } => {
+        LogicalRecordLocator::Plugin { owner, storage_key } => {
+            validate_component(owner, "owner", false)?;
             validate_component(storage_key, "storageKey", true)?;
-            ("plugin", vec![storage_key.as_str()])
+            ("plugin", vec![owner.as_str(), storage_key.as_str()])
         }
         LogicalRecordLocator::Character { character_id } => {
             validate_component(character_id, "characterId", false)?;
@@ -604,7 +607,8 @@ pub fn decode_logical_record_key(
         ("preset", [preset_id]) => LogicalRecordLocator::Preset {
             preset_id: preset_id.clone(),
         },
-        ("plugin", [storage_key]) => LogicalRecordLocator::Plugin {
+        ("plugin", [owner, storage_key]) => LogicalRecordLocator::Plugin {
+            owner: owner.clone(),
             storage_key: storage_key.clone(),
         },
         ("character", [character_id]) => LogicalRecordLocator::Character {
@@ -662,6 +666,7 @@ mod tests {
                 preset_id: field("presetId"),
             },
             "plugin" => LogicalRecordLocator::Plugin {
+                owner: field("owner"),
                 storage_key: field("storageKey"),
             },
             "character" => LogicalRecordLocator::Character {
@@ -740,6 +745,7 @@ mod tests {
                 value: json!({ "name": "Preset" }),
             },
             LogicalRecordEnvelope::Plugin {
+                owner: "provider-manager".to_owned(),
                 ordinal: 7,
                 value: json!({ "enabled": false }),
             },

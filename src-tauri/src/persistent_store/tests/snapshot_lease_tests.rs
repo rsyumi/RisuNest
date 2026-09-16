@@ -250,8 +250,8 @@ fn snapshot_creation_persists_asset_roots_before_returning() {
     store
         .connection
         .execute(
-            "INSERT INTO plugin_storage (generation, storage_key, byte_size, ordinal, value)
-             VALUES (?1, 'opaque', 2, 0, '{}')",
+            "INSERT INTO plugin_storage (generation, owner, storage_key, byte_size, ordinal, value)
+             VALUES (?1, 'synthetic-plugin', 'opaque', 2, 0, '{}')",
             [generation],
         )
         .unwrap();
@@ -387,8 +387,8 @@ fn asset_gc_dry_run_retains_every_catalog_object_for_opaque_plugin_storage() {
     store
         .connection
         .execute(
-            "INSERT INTO plugin_storage (generation, storage_key, byte_size, ordinal, value)
-             VALUES (?1, 'opaque-plugin', 22, 0, ?2)",
+            "INSERT INTO plugin_storage (generation, owner, storage_key, byte_size, ordinal, value)
+             VALUES (?1, 'synthetic-plugin', 'opaque-plugin', 22, 0, ?2)",
             rusqlite::params![
                 generation,
                 serde_json::to_string(&json!({

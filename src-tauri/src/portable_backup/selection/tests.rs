@@ -42,7 +42,7 @@ fn fixture() -> Connection {
         .unwrap();
     }
     db.execute(
-        "INSERT INTO plugin_storage (storage_key,byte_size,ordinal,value) VALUES ('p-1',2,0,'{}')",
+        "INSERT INTO plugin_storage (owner,storage_key,byte_size,ordinal,value) VALUES ('synthetic-plugin','p-1',2,0,'{}')",
         [],
     )
     .unwrap();

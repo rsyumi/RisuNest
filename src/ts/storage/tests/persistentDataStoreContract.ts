@@ -1,3 +1,4 @@
+import { UNOWNED_PLUGIN_OWNER } from '../../plugins/pluginOwner'
 import { describe, expect, it } from 'vitest'
 import type { Database, groupChat } from '../database.svelte'
 import type {
@@ -1389,6 +1390,7 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
                 revision: imported.revision,
                 items: [
                     {
+                        owner: UNOWNED_PLUGIN_OWNER,
                         key: 'fixture',
                         byteSize: new TextEncoder().encode(
                             JSON.stringify(database.pluginCustomStorage.fixture),
@@ -1396,10 +1398,10 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
                     },
                 ],
             })
-            expect((await store.readPluginStorage('fixture'))?.value).toEqual(
+            expect((await store.readPluginStorage(UNOWNED_PLUGIN_OWNER, 'fixture'))?.value).toEqual(
                 database.pluginCustomStorage.fixture,
             )
-            expect(await store.readPluginStorage('missing')).toBeNull()
+            expect(await store.readPluginStorage(UNOWNED_PLUGIN_OWNER, 'missing')).toBeNull()
             expect((await store.materializeDatabase()).pluginCustomStorage).toEqual(
                 database.pluginCustomStorage,
             )
@@ -1416,9 +1418,9 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
                 expectedRevision: imported.revision,
                 root: { ...root, username: 'Plugin commit' },
                 pluginStorage: [
-                    { type: 'set', key: 'alpha', value: 'new' },
-                    { type: 'delete', key: 'beta' },
-                    { type: 'set', key: 'gamma', value: [1, 2, 3] },
+                    { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'alpha', value: 'new' },
+                    { type: 'delete', owner: UNOWNED_PLUGIN_OWNER, key: 'beta' },
+                    { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'gamma', value: [1, 2, 3] },
                 ],
             })
 
@@ -1435,7 +1437,7 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             await expect(store.commit({
                 expectedRevision: imported.revision,
                 root: { ...root, username: 'Stale plugin commit' },
-                pluginStorage: [{ type: 'clear' }],
+                pluginStorage: [{ type: 'clear', owner: UNOWNED_PLUGIN_OWNER }],
             })).rejects.toBeInstanceOf(RevisionConflictError)
             expect((await store.readRoot()).revision).toBe(committed.revision)
             expect((await store.readRoot()).value.username).toBe('Plugin commit')
@@ -1446,7 +1448,7 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
 
             await store.commit({
                 expectedRevision: committed.revision,
-                pluginStorage: [{ type: 'clear' }],
+                pluginStorage: [{ type: 'clear', owner: UNOWNED_PLUGIN_OWNER }],
             })
             expect((await store.queryPluginStorage()).items).toEqual([])
         })
@@ -1460,16 +1462,16 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
 
             await store.commit({
                 expectedRevision: imported.revision,
-                pluginStorage: [{ type: 'set', key: 'memory', value: { revision: 2 } }],
+                pluginStorage: [{ type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'memory', value: { revision: 2 } }],
             })
 
             expect((await lease.queryPluginStorage()).items.map((item) => item.key)).toEqual([
                 'memory',
             ])
-            expect((await lease.readPluginStorage('memory'))?.value).toEqual({ revision: 1 })
-            expect((await store.readPluginStorage('memory'))?.value).toEqual({ revision: 2 })
+            expect((await lease.readPluginStorage(UNOWNED_PLUGIN_OWNER, 'memory'))?.value).toEqual({ revision: 1 })
+            expect((await store.readPluginStorage(UNOWNED_PLUGIN_OWNER, 'memory'))?.value).toEqual({ revision: 2 })
             await lease.release()
-            await expect(lease.readPluginStorage('memory')).rejects.toBeInstanceOf(
+            await expect(lease.readPluginStorage(UNOWNED_PLUGIN_OWNER, 'memory')).rejects.toBeInstanceOf(
                 SnapshotReleasedError,
             )
         })
@@ -1495,14 +1497,14 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             expect(Object.keys((await store.materializeDatabase()).pluginCustomStorage)).toEqual(
                 originalOrder,
             )
-            expect((await store.readPluginStorage('\uffffx'))?.value).toBe('high unicode')
+            expect((await store.readPluginStorage(UNOWNED_PLUGIN_OWNER, '\uffffx'))?.value).toBe('high unicode')
 
             const updated = await store.commit({
                 expectedRevision: imported.revision,
                 pluginStorage: [
-                    { type: 'set', key: 'zeta', value: 'updated in place' },
-                    { type: 'delete', key: 'zeta' },
-                    { type: 'set', key: 'zeta', value: 'reinserted last' },
+                    { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'zeta', value: 'updated in place' },
+                    { type: 'delete', owner: UNOWNED_PLUGIN_OWNER, key: 'zeta' },
+                    { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'zeta', value: 'reinserted last' },
                 ],
             })
             const expectedAfterReinsert = originalOrder.filter((key) => key !== 'zeta')
@@ -1519,10 +1521,10 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             const cleared = await reopened.commit({
                 expectedRevision: updated.revision,
                 pluginStorage: [
-                    { type: 'clear' },
-                    { type: 'set', key: 'zeta', value: 'fresh string' },
-                    { type: 'set', key: '2', value: 2 },
-                    { type: 'set', key: '1', value: 1 },
+                    { type: 'clear', owner: UNOWNED_PLUGIN_OWNER },
+                    { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'zeta', value: 'fresh string' },
+                    { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: '2', value: 2 },
+                    { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: '1', value: 1 },
                 ],
             })
             expect((await reopened.queryPluginStorage()).items.map((item) => item.key)).toEqual([
@@ -2318,14 +2320,14 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             expect((await store.readCharacter('group-unreferenced'))?.value).toMatchObject({
                 characters: ['char-b'],
             })
-            expect((await store.readPluginStorage('zero'))?.value).toBe(0)
+            expect((await store.readPluginStorage(UNOWNED_PLUGIN_OWNER, 'zero'))?.value).toBe(0)
             expect((await lease.readCharacter('char-a'))?.value.name).toBe('Alpha')
             expect((await lease.readCharacter('group-active'))?.value).toMatchObject({
                 characters: ['char-b', 'char-a'],
                 characterTalks: [0.25, 1.25],
                 characterActive: [true, false],
             })
-            expect((await lease.readPluginStorage('zero'))?.value).toBe(0)
+            expect((await lease.readPluginStorage(UNOWNED_PLUGIN_OWNER, 'zero'))?.value).toBe(0)
             await lease.release()
 
             await expect(store.commit({
@@ -2333,7 +2335,7 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
                 characterDetails: [active],
             })).rejects.toBeInstanceOf(RevisionConflictError)
             expect((await store.readRoot()).revision).toBe(committed.revision)
-            expect((await store.readPluginStorage('zero'))?.value).toBe(0)
+            expect((await store.readPluginStorage(UNOWNED_PLUGIN_OWNER, 'zero'))?.value).toBe(0)
         })
 
         it.each(['empty', 'duplicate', 'deleted', 'missing'] as const)(
@@ -2725,7 +2727,7 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             expect(await store.readRoot()).toEqual(rootBefore)
             expect((await store.readCharacter('char-a'))?.value.name).toBe('Alpha')
             expect((await store.readCharacter('group-a'))?.value).toEqual(groupBefore)
-            expect((await store.readPluginStorage('zero'))?.value).toBe(0)
+            expect((await store.readPluginStorage(UNOWNED_PLUGIN_OWNER, 'zero'))?.value).toBe(0)
         })
 
         it('does not activate an invalid staged replacement', async () => {

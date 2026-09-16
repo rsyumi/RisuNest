@@ -102,9 +102,9 @@ fn locate(owner_kind: &str, owner_id: &str) -> Option<Located> {
             key: vec![owner_id.to_owned()],
             column: "value",
         }),
-        "plugin" => Some(Located {
+        "plugin" if parts.len() == 2 => Some(Located {
             table: "plugin_storage",
-            key: vec![owner_id.to_owned()],
+            key: parts,
             column: "value",
         }),
         "character" => Some(Located {
@@ -129,7 +129,7 @@ fn locate(owner_kind: &str, owner_id: &str) -> Option<Located> {
 fn identity_columns(table: &str) -> &'static [&'static str] {
     match table {
         "bot_presets" => &["preset_id"],
-        "plugin_storage" => &["storage_key"],
+        "plugin_storage" => &["owner", "storage_key"],
         "characters" => &["character_id"],
         "conversations" => &["character_id", "conversation_id"],
         "messages" => &["character_id", "conversation_id", "message_index"],

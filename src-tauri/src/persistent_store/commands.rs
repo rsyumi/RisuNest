@@ -2,16 +2,19 @@ pub(crate) mod data_health;
 pub(crate) mod hypa;
 
 use super::archive::ArchivePreview;
+use super::device_store::plugin_values::{
+    PluginDeviceHydration, PluginDeviceListItem, PluginDeviceMutation,
+};
 use super::export::ExportedRisuSave;
 #[cfg(feature = "native-kei-upload-pilot")]
 use super::kei::KeiUploadResult;
 use super::{
     AssetAlias, AssetAliasListQuery, AssetAliasPage, AssetOwnerHead, AssetOwnerLocator,
-    AssetRepositoryAuthorityState, CharacterPage, CharacterQuery, CheckpointMode,
-    ConversationPage, ConversationQuery,
+    AssetRepositoryAuthorityState, AssignedPluginStorage, CharacterPage, CharacterQuery,
+    CheckpointMode, ClaimedPluginValue, ConversationPage, ConversationQuery,
     ConversationWindow, ConversationWindowQuery, LeaseResult, PersistentStorageStats,
-    PersistentStore, PluginStorageCatalog, PresetCatalog, RevisionResult, SnapshotCreated,
-    SnapshotInfo, StagingResult, StoreError, StoreResult, Versioned, WorkingSetCommit,
+    PersistentStore, PluginStorageCatalog, PluginStorageListItem, PresetCatalog, RevisionResult,
+    SnapshotCreated, SnapshotInfo, StagingResult, StoreError, StoreResult, Versioned, WorkingSetCommit,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -191,7 +194,7 @@ fn current_time_ms() -> StoreResult<i64> {
     })
 }
 
-fn with_store<T>(
+pub(crate) fn with_store<T>(
     state: State<'_, PersistentStoreState>,
     operation: impl FnOnce(&PersistentStore) -> StoreResult<T>,
 ) -> StoreResult<T> {
@@ -489,13 +492,22 @@ pub(crate) fn pds_query_plugin_storage(
 }
 
 #[tauri::command(async)]
+pub(crate) fn pds_list_plugin_storage(
+    state: State<'_, PersistentStoreState>,
+    lease: Option<String>,
+) -> Result<Vec<PluginStorageListItem>, StoreError> {
+    with_store(state, |store| store.list_plugin_storage(lease.as_deref()))
+}
+
+#[tauri::command(async)]
 pub(crate) fn pds_read_plugin_storage(
     state: State<'_, PersistentStoreState>,
+    owner: String,
     key: String,
     lease: Option<String>,
 ) -> Result<Option<Versioned<Value>>, StoreError> {
     with_store(state, |store| {
-        store.read_plugin_storage(&key, lease.as_deref())
+        store.read_plugin_storage(&owner, &key, lease.as_deref())
     })
 }
 
@@ -1045,6 +1057,140 @@ pub(crate) fn pds_snapshot_restore_request(
     id: String,
 ) -> Result<(), StoreError> {
     with_store(state, |store| store.snapshot_restore_request(&id))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PluginStorageSource {
+    owner: String,
+    key: String,
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_colliding_plugin_storage_keys(
+    state: State<'_, PersistentStoreState>,
+    owner: String,
+    keys: Vec<String>,
+) -> Result<Vec<String>, StoreError> {
+    with_store(state, |store| {
+        store.colliding_plugin_storage_keys(&owner, &keys)
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_assign_plugin_storage(
+    state: State<'_, PersistentStoreState>,
+    owner: String,
+    sources: Vec<PluginStorageSource>,
+    collision: super::commit::AssignCollision,
+    expected_revision: i64,
+) -> Result<AssignedPluginStorage, StoreError> {
+    let sources: Vec<(String, String)> = sources
+        .into_iter()
+        .map(|source| (source.owner, source.key))
+        .collect();
+    with_store_mut(state, |store| {
+        store.assign_plugin_storage(&sources, &owner, collision, expected_revision)
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_begin_plugin_claim_session(
+    state: State<'_, PersistentStoreState>,
+    owner: String,
+    code_hash: String,
+    runtime_instance: String,
+) -> Result<Option<String>, StoreError> {
+    with_store(state, |store| {
+        store.begin_plugin_claim_session(&owner, &code_hash, &runtime_instance)
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_claim_plugin_storage_value(
+    state: State<'_, PersistentStoreState>,
+    session_id: String,
+    owner: String,
+    code_hash: String,
+    runtime_instance: String,
+    key: String,
+    expected_revision: i64,
+) -> Result<ClaimedPluginValue, StoreError> {
+    with_store_mut(state, |store| {
+        store.claim_plugin_storage_value(
+            &session_id,
+            &owner,
+            &code_hash,
+            &runtime_instance,
+            &key,
+            expected_revision,
+        )
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_close_plugin_claim_session(
+    state: State<'_, PersistentStoreState>,
+    session_id: String,
+) -> Result<(), StoreError> {
+    with_store(state, |store| store.close_plugin_claim_session(&session_id))
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_hydrate_plugin_device_storage(
+    state: State<'_, PersistentStoreState>,
+    owner: String,
+) -> Result<PluginDeviceHydration, StoreError> {
+    with_store(state, |store| {
+        store.device_store()?.hydrate_plugin_device_storage(&owner)
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_read_plugin_device_value(
+    state: State<'_, PersistentStoreState>,
+    owner: String,
+    space: String,
+    key: String,
+) -> Result<Option<String>, StoreError> {
+    with_store(state, |store| {
+        store
+            .device_store()?
+            .read_plugin_device_value(&owner, &space, &key)
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_list_plugin_device_keys(
+    state: State<'_, PersistentStoreState>,
+    owner: String,
+    space: String,
+) -> Result<Vec<String>, StoreError> {
+    with_store(state, |store| {
+        store.device_store()?.list_plugin_device_keys(&owner, &space)
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_list_plugin_device_storage(
+    state: State<'_, PersistentStoreState>,
+) -> Result<Vec<PluginDeviceListItem>, StoreError> {
+    with_store(state, |store| {
+        store.device_store()?.list_plugin_device_storage()
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_write_plugin_device_values(
+    state: State<'_, PersistentStoreState>,
+    owner: String,
+    mutations: Vec<PluginDeviceMutation>,
+) -> Result<(), StoreError> {
+    with_store_mut(state, |store| {
+        store
+            .device_store_mut()?
+            .write_plugin_device_values(&owner, &mutations)
+    })
 }
 
 #[tauri::command(async)]

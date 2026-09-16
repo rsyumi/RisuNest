@@ -5,7 +5,8 @@ type MsgType =
     | 'CALLBACK_RETURN'
     | 'RESPONSE'
     | 'RELEASE_INSTANCE'
-    | 'ABORT_SIGNAL';
+    | 'ABORT_SIGNAL'
+    | 'SCRIPT_SETTLED';
 
 interface RpcMessage {
     type: MsgType;
@@ -493,6 +494,13 @@ export class SandboxHost {
 
     private pendingCallbacks = new Map<string, { resolve: Function, reject: Function }>();
 
+    // The guest reports when its top level script has settled. Until the calls
+    // it made before that have answered, the script is not finished.
+    private scriptSettledListener: (() => void) | null = null;
+    private scriptSettledReported = false;
+    private guestReportedSettled = false;
+    private pendingHostCalls = 0;
+
     // Teardown hooks for streams bridged over MessagePort. MessagePort has no
     // 'close' event in stable browsers, so without these the other side of an
     // active stream would wait forever once the iframe is gone.
@@ -500,6 +508,20 @@ export class SandboxHost {
 
     constructor(apiFactory: any) {
         this.apiFactory = apiFactory;
+    }
+
+    /** Called once, after the guest script settles and its calls have answered. */
+    public onScriptSettled(listener: () => void) {
+        this.scriptSettledListener = listener;
+    }
+
+    private reportScriptSettled() {
+        if (this.scriptSettledReported) return;
+        if (!this.guestReportedSettled || this.pendingHostCalls > 0) return;
+        this.scriptSettledReported = true;
+        const listener = this.scriptSettledListener;
+        this.scriptSettledListener = null;
+        listener?.();
     }
 
     public executeInIframe(code: string): Promise<any> {
@@ -881,6 +903,12 @@ export class SandboxHost {
                 return;
             }
 
+            if (data.type === 'SCRIPT_SETTLED') {
+                this.guestReportedSettled = true;
+                this.reportScriptSettled();
+                return;
+            }
+
 
             if (data.type === 'CALL_ROOT' || data.type === 'CALL_INSTANCE') {
                 const response: RpcMessage = { type: 'RESPONSE', reqId: data.reqId };
@@ -895,6 +923,7 @@ export class SandboxHost {
                     streamCleanups = [];
                 };
 
+                this.pendingHostCalls += 1;
                 try {
 
                     const args = this.deserializeArgs(data.args || [], usedAbortIds);
@@ -927,6 +956,8 @@ export class SandboxHost {
                     response.error = `[Plugin API: ${method}] ` + (err?.message || String(err || "Host execution error"));
                 } finally {
                     for (const id of usedAbortIds) this.abortControllers.delete(id);
+                    this.pendingHostCalls -= 1;
+                    this.reportScriptSettled();
                 }
 
                 if (import.meta.env.DEV) {
@@ -971,9 +1002,12 @@ export class SandboxHost {
             (async () => {
                 ${GUEST_BRIDGE_SCRIPT}
                     
+                const settled = () => {
+                    try { parent.postMessage({ type: 'SCRIPT_SETTLED' }, '*'); } catch (_) {}
+                };
                 (async () => {
                     ${userCode}
-                })()
+                })().then(settled, settled)
             })();
             //# sourceURL=risu-plugin-v3/${encodeURIComponent(sourceLabel)}.js
         </script>

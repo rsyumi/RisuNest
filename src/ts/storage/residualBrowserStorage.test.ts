@@ -30,8 +30,6 @@ const NATIVE_RESIDUAL: Record<string, string> = {
         'risunest-boot-stage and risunest-boot-suspect are written while the native store is unavailable',
     'localStorage strongBan_*':
         'token bias recomputed from the current input',
-    'localStorage safe_plugin_*':
-        'the plugin isolation work moves these to the device file',
     'localStorage risuNestServerSyncRestoreHold':
         'the device maintenance that writes it runs before any store opens',
     'indexedDB DPoPDB':
@@ -40,8 +38,6 @@ const NATIVE_RESIDUAL: Record<string, string> = {
         'translation cache, not assigned a tier',
     'indexedDB risuSaveCache':
         'export block cache, not assigned a tier',
-    'indexedDB plugin':
-        'the plugin isolation work moves it to the device file',
     'indexedDB dynamic src/ts/translator/bergamotTranslator.ts':
         'local translation model cache, not assigned a tier',
 }
@@ -56,6 +52,9 @@ const WEB_ONLY: Record<string, string> = {
     'indexedDB risunest': 'the browser data store and its migration',
     'indexedDB hypaVector': 'the browser embedding cache',
     'indexedDB plugin_permissions': 'the browser plugin consent store',
+    'indexedDB plugin': 'the browser plugin device keyspace',
+    'localStorage dynamic src/ts/plugins/pluginDeviceKeyspace.ts':
+        'the browser backend addresses one keyspace out of an opaque key',
     'indexedDB risuaiSyncConflictBackup': 'the browser conflict backup store',
     'indexedDB dynamic src/ts/storage/indexedDbPersistentDataStore.ts':
         'the browser data store opens the name it was built with',

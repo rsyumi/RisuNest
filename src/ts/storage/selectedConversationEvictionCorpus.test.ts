@@ -1,3 +1,4 @@
+const PLUGIN_ACCESS_OWNER = 'test-plugin'
 // @vitest-environment node
 
 import './tests/selectedConversationEvictionNodeDom.setup'
@@ -270,6 +271,7 @@ describe('selected conversation eviction correctness corpus', () => {
         const materializeDatabaseSnapshot = vi.fn()
         const replacePersistentDatabase = vi.fn()
         const pluginAccess = createPluginDatabaseAccess({
+        owner: PLUGIN_ACCESS_OWNER,
             store,
             flushPendingData: (reason) => runtime.flushPendingData(reason),
             getCompatibilityDatabase: () => workingCopy,

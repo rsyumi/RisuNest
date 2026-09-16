@@ -4,7 +4,7 @@ import {
     type SaveCoordinatorDependencies,
 } from './saveCoordinator'
 import type { Database } from './database.svelte'
-import type { PersistentDataStore } from './persistentDataStore'
+import type { PersistentDataStore, PersistentRoot } from './persistentDataStore'
 
 export function makeDatabase(): Database {
     return {
@@ -38,13 +38,12 @@ export function makeStore(commit = vi.fn()) {
     } as unknown as PersistentDataStore
 }
 
-export function captureRoot(
-    database: Database,
-): Omit<Database, 'characters' | 'botPresets' | 'pluginCustomStorage'> {
+export function captureRoot(database: Database): PersistentRoot {
     const {
         characters: _characters,
         botPresets: _botPresets,
         pluginCustomStorage: _pluginCustomStorage,
+        pluginStorageMeta: _pluginStorageMeta,
         ...root
     } = database
     return root

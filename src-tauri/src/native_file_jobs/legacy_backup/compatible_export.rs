@@ -560,13 +560,15 @@ fn write_database(
         ));
     }
     string(&mut writer, "pluginCustomStorage")?;
+    // A legacy entry holds one value per key, so a key two plugins both hold
+    // cannot go out without handing one plugin the other's value.
     let storage_count = count(
         connection,
-        "SELECT count(*) FROM plugin_storage WHERE generation=?1",
+        "SELECT count(*) FROM plugin_storage WHERE generation=?1 AND storage_key NOT IN (SELECT storage_key FROM plugin_storage WHERE generation=?1 GROUP BY storage_key HAVING count(*)>1)",
         &[generation],
     )?;
     map_header(&mut writer, storage_count)?;
-    let mut statement=connection.prepare("SELECT storage_key,value FROM plugin_storage WHERE generation=?1 ORDER BY CASE WHEN storage_key NOT GLOB '*[^0-9]*' AND storage_key != '' AND CAST(CAST(storage_key AS INTEGER) AS TEXT)=storage_key AND CAST(storage_key AS INTEGER)<4294967295 THEN 0 ELSE 1 END, CASE WHEN storage_key NOT GLOB '*[^0-9]*' AND storage_key != '' AND CAST(CAST(storage_key AS INTEGER) AS TEXT)=storage_key AND CAST(storage_key AS INTEGER)<4294967295 THEN CAST(storage_key AS INTEGER) END, ordinal ASC").map_err(sql)?;
+    let mut statement=connection.prepare("SELECT storage_key,value FROM plugin_storage WHERE generation=?1 AND storage_key NOT IN (SELECT storage_key FROM plugin_storage WHERE generation=?1 GROUP BY storage_key HAVING count(*)>1) ORDER BY CASE WHEN storage_key NOT GLOB '*[^0-9]*' AND storage_key != '' AND CAST(CAST(storage_key AS INTEGER) AS TEXT)=storage_key AND CAST(storage_key AS INTEGER)<4294967295 THEN 0 ELSE 1 END, CASE WHEN storage_key NOT GLOB '*[^0-9]*' AND storage_key != '' AND CAST(CAST(storage_key AS INTEGER) AS TEXT)=storage_key AND CAST(storage_key AS INTEGER)<4294967295 THEN CAST(storage_key AS INTEGER) END, ordinal ASC").map_err(sql)?;
     let mut rows = statement.query([generation]).map_err(sql)?;
     let mut actual = 0;
     while let Some(row) = rows.next().map_err(sql)? {
@@ -1074,6 +1076,42 @@ mod tests {
                 )
                 .unwrap();
             let revision = store.replace_commit(&staging, Some(0)).unwrap().revision;
+            // A key two plugins both hold cannot go out without handing one of
+            // them the other's value, so neither side is written.
+            let revision = store
+                .commit(&crate::persistent_store::WorkingSetCommit {
+                    expected_revision: revision,
+                    root: None,
+                    root_mutations: None,
+                    replace_presets: None,
+                    character: None,
+                    character_details: None,
+                    replace_character: None,
+                    add_character: None,
+                    conversations: None,
+                    delete_character_id: None,
+                    plugin_storage: Some(vec![
+                        crate::persistent_store::PluginStorageMutation::Set {
+                            owner: "plugin-a".to_owned(),
+                            key: "shared_key".to_owned(),
+                            value: json!("a value"),
+                        },
+                        crate::persistent_store::PluginStorageMutation::Set {
+                            owner: crate::persistent_store::plugin_owner::UNOWNED_OWNER
+                                .to_owned(),
+                            key: "shared_key".to_owned(),
+                            value: json!("imported value"),
+                        },
+                        crate::persistent_store::PluginStorageMutation::Set {
+                            owner: "plugin-a".to_owned(),
+                            key: "owned_key".to_owned(),
+                            value: json!("kept"),
+                        },
+                    ]),
+                    asset_owner_heads: None,
+                })
+                .unwrap()
+                .revision;
             let owned = directory.path().join("owned");
             let handoff = directory.path().join("handoff");
             std::fs::create_dir(&owned).unwrap();
@@ -1129,8 +1167,9 @@ mod tests {
                     .keys()
                     .map(String::as_str)
                     .collect::<Vec<_>>(),
-                vec!["2", "10", "01", "z", "4294967295"]
+                vec!["2", "10", "01", "z", "4294967295", "owned_key"]
             );
+            assert!(db["pluginCustomStorage"].get("shared_key").is_none());
             assert_eq!(
                 db["pluginCustomStorage"]["z"]["exact"],
                 db["botPresets"][0]["image"]

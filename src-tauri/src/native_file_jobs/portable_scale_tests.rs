@@ -342,7 +342,7 @@ fn scale_library(root: &Path, mode: &str) -> PersistentStore {
         )
         .unwrap();
         db.execute("UPDATE root SET value=json_set(value,'$.modules',json('[]'),'$.loadouts',json('[]'),'$.plugins',json('[]')) WHERE generation=?1", [&generation]).unwrap();
-        db.execute("INSERT INTO plugin_storage(generation,storage_key,byte_size,ordinal,value) VALUES(?1,'synthetic-baseline',2,0,'{}')", [&generation]).unwrap();
+        db.execute("INSERT INTO plugin_storage(generation,owner,storage_key,byte_size,ordinal,value) VALUES(?1,'synthetic-plugin','synthetic-baseline',2,0,'{}')", [&generation]).unwrap();
     }
     store
 }

@@ -74,12 +74,16 @@ pub(crate) const TABLES: &[PortableTable] = &[
     PortableTable {
         name: "plugin_storage",
         columns: &[
+            ("owner", "TEXT"),
             ("storage_key", "TEXT"),
             ("byte_size", "INTEGER"),
             ("ordinal", "INTEGER"),
             ("value", "TEXT"),
+            ("claimed_from", "TEXT"),
+            ("import_batch_id", "TEXT"),
+            ("assigned_at", "INTEGER"),
         ],
-        order: "storage_key",
+        order: "owner, storage_key",
     },
     PortableTable {
         name: "asset_aliases",
@@ -421,17 +425,27 @@ fn copy_selected(
 /// Closes the gaps the dropped records left in the ordering columns, and points the chosen preset
 /// at wherever it landed. Nothing else about the settings record changes.
 fn renumber_selected(transaction: &Connection, staging: &str) -> StoreResult<()> {
-    for (table, identity, order) in [
-        ("characters", "character_id", "configured_index"),
-        ("plugin_storage", "storage_key", "ordinal"),
+    for (table, identity_columns, order) in [
+        ("characters", &["character_id"][..], "configured_index"),
+        ("plugin_storage", &["owner", "storage_key"][..], "ordinal"),
     ] {
+        let identity = identity_columns
+            .iter()
+            .map(|column| format!("\"{column}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let prefixed = identity_columns
+            .iter()
+            .map(|column| format!("{table}.\"{column}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
         transaction.execute(
             &format!(
                 "UPDATE {table} SET \"{order}\"=(
                      SELECT position-1 FROM (
-                         SELECT \"{identity}\" AS id, row_number() OVER (ORDER BY \"{order}\") AS position
+                         SELECT {identity}, row_number() OVER (ORDER BY \"{order}\") AS position
                          FROM {table} WHERE generation=?1
-                     ) ranked WHERE ranked.id={table}.\"{identity}\"
+                     ) ranked WHERE ({identity})=({prefixed})
                  ) WHERE generation=?1",
             ),
             [staging],
@@ -689,13 +703,13 @@ mod tests {
             .unwrap();
         source
             .execute(
-                "INSERT INTO plugin_storage VALUES('chosen','blob',3,8,?1)",
+                "INSERT INTO plugin_storage VALUES('chosen','synthetic-plugin','blob',3,8,?1,NULL,NULL,NULL)",
                 params![vec![0_u8, 0xff, 0x20]],
             )
             .unwrap();
         source
             .execute(
-                "INSERT INTO plugin_storage VALUES('chosen','bad-text',1,9,CAST(x'ff' AS TEXT))",
+                "INSERT INTO plugin_storage VALUES('chosen','synthetic-plugin','bad-text',1,9,CAST(x'ff' AS TEXT),NULL,NULL,NULL)",
                 [],
             )
             .unwrap();

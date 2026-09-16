@@ -2678,6 +2678,16 @@ impl restore::ReplacementSink for PersistentReplacementSink {
         })
     }
 
+    fn staged_plugin_preview(
+        &self,
+        staging_id: &str,
+    ) -> crate::persistent_store::StoreResult<crate::persistent_store::commit::StagedPluginPreview>
+    {
+        crate::persistent_store::commands::with_store(self.app.state(), |store| {
+            store.staged_plugin_preview(staging_id)
+        })
+    }
+
     fn put_presets(
         &self,
         staging_id: &str,
@@ -2769,6 +2779,34 @@ pub(crate) fn native_portable_select_sections(
         })?;
     job.select_portable_sections(selection, expected_revision)
         .map_err(|e| NativeJobError::new("invalid-selection", e))
+}
+
+#[tauri::command(async)]
+pub(crate) fn native_plugin_values_assign(
+    state: State<'_, NativeFileJobState>,
+    app: AppHandle,
+    job_id: String,
+    assignments: Vec<crate::persistent_store::commit::StagedPluginAssignment>,
+    automatic: bool,
+) -> Result<(), NativeJobError> {
+    let job = state
+        .registry
+        .lookup(&job_id)
+        .map_err(|e| NativeJobError::new("store-error", e))?
+        .ok_or_else(|| NativeJobError::new("job-not-found", "Import job is unavailable"))?;
+    let staging_id = job
+        .plugin_value_staging_id()
+        .map_err(|e| NativeJobError::new("store-error", e))?
+        .ok_or_else(|| {
+            NativeJobError::new(
+                "invalid-selection",
+                "Import job is no longer waiting for plugin value assignment",
+            )
+        })?;
+    crate::persistent_store::commands::with_store_mut(app.state(), |store| {
+        store.assign_staged_plugin_values(&staging_id, &assignments, automatic)
+    })
+    .map_err(|error| NativeJobError::new("store-error", error.to_string()))
 }
 
 #[tauri::command(async)]
@@ -3138,6 +3176,10 @@ pub(crate) struct JobStatus {
     pub(crate) device_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) restore_preview: Option<portable::RestorePreview>,
+    /// Values the staged save left without an owner, shown while the job waits
+    /// for activation so a person can hand them to a plugin first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) plugin_value_preview: Option<crate::persistent_store::commit::StagedPluginPreview>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -3197,6 +3239,9 @@ struct JobWaitState {
     /// start request, decides which revision the replacement applies to.
     activation_expected_revision: Option<i64>,
     official_publication_retry: Option<OfficialPublicationRetryInput>,
+    /// Staging this job holds while it waits for activation, so the renderer's
+    /// assignment reaches the right replacement.
+    plugin_value_staging_id: Option<String>,
 }
 
 impl Default for JobRegistry {
@@ -3273,6 +3318,7 @@ impl JobRegistry {
                 preservation_report: None,
                 device_session_id: None,
                 restore_preview: None,
+                plugin_value_preview: None,
             }),
         });
         self.jobs
@@ -3400,6 +3446,46 @@ pub(crate) struct JobControl {
 }
 
 impl JobControl {
+    /// Records what the staged save left unowned, and which staging holds it, so
+    /// the renderer can assign before the replacement is applied.
+    pub(crate) fn set_plugin_value_preview(
+        &self,
+        staging_id: &str,
+        preview: crate::persistent_store::commit::StagedPluginPreview,
+    ) -> Result<(), String> {
+        let mut wait = self
+            .wait_state
+            .lock()
+            .map_err(|_| "native job mutex poisoned".to_owned())?;
+        wait.plugin_value_staging_id = Some(staging_id.to_owned());
+        drop(wait);
+        let mut status = self
+            .status
+            .lock()
+            .map_err(|_| "native job mutex poisoned".to_owned())?;
+        if status.state.is_terminal() {
+            return Err("cannot change a completed job".into());
+        }
+        status.plugin_value_preview = if preview.values.is_empty() {
+            None
+        } else {
+            Some(preview)
+        };
+        Ok(())
+    }
+
+    /// The staging a pending assignment applies to, while the job still waits.
+    pub(crate) fn plugin_value_staging_id(&self) -> Result<Option<String>, String> {
+        let wait = self
+            .wait_state
+            .lock()
+            .map_err(|_| "native job mutex poisoned".to_owned())?;
+        if wait.restore_finalized {
+            return Ok(None);
+        }
+        Ok(wait.plugin_value_staging_id.clone())
+    }
+
     fn set_preservation_report(
         &self,
         report: crate::portable_backup::PreservationReport,

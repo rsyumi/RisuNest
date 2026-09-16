@@ -17,16 +17,26 @@
         {
             "locator": {
                 "kind": "plugin",
-                "storageKey": "plugin:key/with spaces"
+                "storageKey": "plugin:key/with spaces",
+                "owner": "provider-manager"
             },
-            "encoded": "r1:plugin:WyJwbHVnaW46a2V5L3dpdGggc3BhY2VzIl0"
+            "encoded": "r1:plugin:WyJwcm92aWRlci1tYW5hZ2VyIiwicGx1Z2luOmtleS93aXRoIHNwYWNlcyJd"
         },
         {
             "locator": {
                 "kind": "plugin",
-                "storageKey": "unicode-한국어\\path"
+                "storageKey": "unicode-한국어\\path",
+                "owner": "플러그인\\이름"
             },
-            "encoded": "r1:plugin:WyJ1bmljb2RlLe2VnOq1reyWtFxccGF0aCJd"
+            "encoded": "r1:plugin:WyLtlIzrn6zqt7jsnbhcXOydtOumhCIsInVuaWNvZGUt7ZWc6rWt7Ja0XFxwYXRoIl0"
+        },
+        {
+            "locator": {
+                "kind": "plugin",
+                "owner": "\u0000unowned",
+                "storageKey": "pm_store"
+            },
+            "encoded": "r1:plugin:WyJcdTAwMDB1bm93bmVkIiwicG1fc3RvcmUiXQ"
         },
         {
             "locator": {

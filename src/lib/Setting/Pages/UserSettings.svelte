@@ -283,7 +283,7 @@
         disabled={risuSaveOperation !== null}
         onclick={async () => {
             try {
-                const excluded = collectExportExcludedReport(DBState.db.characters);
+                const excluded = await collectExportExcludedReport(DBState.db.characters);
                 const result = await exportRisuSaveFromSystemPicker();
                 if (result)
                     alertNormal(

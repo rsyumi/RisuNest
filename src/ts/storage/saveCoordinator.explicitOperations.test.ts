@@ -1,3 +1,4 @@
+import { UNOWNED_PLUGIN_OWNER } from '../plugins/pluginOwner'
 import { describe, expect, it, vi } from 'vitest'
 import {
     PersistentRootModuleAppendRejectedError,
@@ -1194,9 +1195,9 @@ describe('SaveCoordinator', () => {
             expectedRevision: 4,
             rootMutations: [{ type: 'set', key: 'username', value: 'Root changed too' }],
             pluginStorage: [
-                { type: 'delete', key: 'removed' },
-                { type: 'set', key: 'alpha', value: 'new' },
-                { type: 'set', key: 'beta', value: { nested: true } },
+                { type: 'delete', owner: UNOWNED_PLUGIN_OWNER, key: 'removed' },
+                { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'alpha', value: 'new' },
+                { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'beta', value: { nested: true } },
             ],
         })
         expect(commit.mock.calls[0][0]).not.toHaveProperty('root')
@@ -1245,13 +1246,13 @@ describe('SaveCoordinator', () => {
         coordinator.initialize(7)
 
         const mutation = coordinator.mutatePersistentPluginStorage('v3-plugin-storage', [
-            { type: 'set', key: 'alpha', value: { large: true } },
+            { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'alpha', value: { large: true } },
         ])
         await vi.waitFor(() => expect(commit).toHaveBeenCalledOnce())
         expect(commit).toHaveBeenCalledWith({
             expectedRevision: 7,
             pluginStorage: [
-                { type: 'set', key: 'alpha', value: { large: true } },
+                { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'alpha', value: { large: true } },
             ],
         })
         expect(coordinator.revision).toBe(7)
@@ -1282,12 +1283,12 @@ describe('SaveCoordinator', () => {
         coordinator.initialize(7, database)
 
         await coordinator.mutatePersistentPluginStorage('undefined-plugin-value', [
-            { type: 'set', key: 'alpha', value: undefined },
+            { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'alpha', value: undefined },
         ])
 
         expect(commit).toHaveBeenCalledWith({
             expectedRevision: 7,
-            pluginStorage: [{ type: 'delete', key: 'alpha' }],
+            pluginStorage: [{ type: 'delete', owner: UNOWNED_PLUGIN_OWNER, key: 'alpha' }],
         })
         expect(database.pluginCustomStorage).toEqual({})
         await expect(coordinator.flushPendingData('after-undefined')).resolves.toBeUndefined()
@@ -1312,12 +1313,12 @@ describe('SaveCoordinator', () => {
         coordinator.initialize(7, database)
 
         await coordinator.mutatePersistentPluginStorage('scalable-v3', [
-            { type: 'set', key: 'large', value: 'external-only' },
+            { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'large', value: 'external-only' },
         ])
 
         expect(commit).toHaveBeenCalledWith({
             expectedRevision: 7,
-            pluginStorage: [{ type: 'set', key: 'large', value: 'external-only' }],
+            pluginStorage: [{ type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'large', value: 'external-only' }],
         })
         expect(publishPluginStorageWorkingSet).not.toHaveBeenCalled()
         expect(database).not.toHaveProperty('pluginCustomStorage')
@@ -1343,8 +1344,8 @@ describe('SaveCoordinator', () => {
         coordinator.initialize(2, database)
 
         await coordinator.mutatePersistentPluginStorage('maximum-compatibility', [
-            { type: 'set', key: 'added', value: 42 },
-            { type: 'set', key: '__proto__', value: 0 },
+            { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'added', value: 42 },
+            { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: '__proto__', value: 0 },
         ])
 
         expect(Object.keys(database.pluginCustomStorage)).toEqual([
@@ -1381,7 +1382,7 @@ describe('SaveCoordinator', () => {
         coordinator.initialize(3, database)
 
         const v3Mutation = coordinator.mutatePersistentPluginStorage('v3-race', [
-            { type: 'set', key: 'shared', value: 'v3-first' },
+            { type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'shared', value: 'v3-first' },
         ])
         await vi.waitFor(() => expect(commit).toHaveBeenCalledOnce())
         database.pluginCustomStorage.shared = 'v2-later'
@@ -1393,7 +1394,7 @@ describe('SaveCoordinator', () => {
         await coordinator.flushPendingData('persist-v2-winner')
         expect(commit).toHaveBeenLastCalledWith({
             expectedRevision: 4,
-            pluginStorage: [{ type: 'set', key: 'shared', value: 'v2-later' }],
+            pluginStorage: [{ type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'shared', value: 'v2-later' }],
         })
     })
 
@@ -1424,9 +1425,13 @@ describe('SaveCoordinator', () => {
             open: vi.fn(async () => undefined),
             queryPluginStorage: vi.fn(async () => ({
                 revision,
-                items: Object.keys(durableStorage).map((key) => ({ key, byteSize: 1 })),
+                items: Object.keys(durableStorage).map((key) => ({
+                    owner: UNOWNED_PLUGIN_OWNER,
+                    key,
+                    byteSize: 1,
+                })),
             })),
-            readPluginStorage: vi.fn(async (key: string) =>
+            readPluginStorage: vi.fn(async (_owner: string, key: string) =>
                 Object.prototype.hasOwnProperty.call(durableStorage, key)
                     ? { revision, value: structuredClone(durableStorage[key]) }
                     : null),
@@ -1440,7 +1445,7 @@ describe('SaveCoordinator', () => {
             replaceDatabase: () => undefined,
             publishPluginStorageWorkingSet: (storage) => {
                 database.pluginCustomStorage = storage
-                v3Storage?.synchronizeCompatibilityStorage(storage)
+                v3Storage?.invalidate()
             },
         })
         coordinator.initialize(3, database)
@@ -1452,11 +1457,12 @@ describe('SaveCoordinator', () => {
             ),
         }, 100)
 
-        const v3Mutation = v3Storage.setItem('shared', 'v3-first')
+        const v3Mutation = v3Storage.forOwner(UNOWNED_PLUGIN_OWNER).setItem('shared', 'v3-first')
         await vi.waitFor(() => expect(commit).toHaveBeenCalledOnce())
         database.pluginCustomStorage.shared = 'v2-later'
-        v3Storage.synchronizeCompatibilityMutation({
+        v3Storage.synchronizeCommittedMutation({
             type: 'set',
+            owner: UNOWNED_PLUGIN_OWNER,
             key: 'shared',
             value: 'v2-later',
         })
@@ -1467,7 +1473,7 @@ describe('SaveCoordinator', () => {
 
         expect(durableStorage.shared).toBe('v2-later')
         expect(database.pluginCustomStorage.shared).toBe('v2-later')
-        await expect(v3Storage.getItem('shared')).resolves.toBe('v2-later')
+        await expect(v3Storage.forOwner(UNOWNED_PLUGIN_OWNER).getItem('shared')).resolves.toBe('v2-later')
     })
 
     it('commits the complete preset array atomically with a changed root', async () => {
@@ -1523,6 +1529,7 @@ describe('SaveCoordinator', () => {
             rootMutations: [
                 {
                     type: 'set',
+                   
                     key: 'username',
                     value: 'Root edit with a partial preset working set',
                 },

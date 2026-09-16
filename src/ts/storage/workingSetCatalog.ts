@@ -308,7 +308,7 @@ async function readPinnedPluginStorage(
     assertPinnedRevision(reader.revision, catalog.revision, 'Plugin storage catalog')
     const values: Database['pluginCustomStorage'] = {}
     for (const summary of catalog.items) {
-        const value = await reader.readPluginStorage(summary.key)
+        const value = await reader.readPluginStorage(summary.owner, summary.key)
         if (!value) throw new Error(`Missing plugin storage value for ${summary.key}`)
         assertPinnedRevision(
             reader.revision,
@@ -512,7 +512,13 @@ export function projectCompleteScalableWorkingSet(
     activeCharacterIds?: ReadonlySet<string>,
     selectedConversationId?: string | null,
 ): Database {
-    const { characters, botPresets, pluginCustomStorage: _pluginCustomStorage, ...root } = database
+    const {
+        characters,
+        botPresets,
+        pluginCustomStorage: _pluginCustomStorage,
+        pluginStorageMeta: _pluginStorageMeta,
+        ...root
+    } = database
     const summaries: CharacterSummary[] = characters.map((character, configuredIndex) => ({
         id: character.chaId,
         name: character.name,

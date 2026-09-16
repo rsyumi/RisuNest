@@ -1258,6 +1258,8 @@ export interface Database{
     dynamicOutput?:DynamicOutput
     hubServerType?:string
     pluginCustomStorage:{[key:string]:any}
+    /** Ownership beside the flattened values, shared with PocketRisu. */
+    pluginStorageMeta?:{[key:string]:{plugin:string,updatedAt:number}}
     ImagenModel:string
     ImagenImageSize:string
     ImagenAspectRatio:string

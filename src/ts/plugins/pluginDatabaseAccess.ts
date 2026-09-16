@@ -30,6 +30,9 @@ import {
 } from '../storage/persistentRecordIterator'
 import { defineOwnEnumerableProperty } from '../storage/ownEnumerableProperty'
 import { isConversationSummaryStub } from '../storage/conversationResidency'
+import type { OwnerScopedStorageMutation } from './pluginStorageStore'
+import { resolveLifecyclePluginStorageOwner } from './pluginStorageStore'
+import type { PluginStorageMeta } from './pluginOwner'
 
 export const PLUGIN_SUMMARY_QUERY_DEFAULT_LIMIT = 50
 export const PLUGIN_SUMMARY_QUERY_MAX_LIMIT = 100
@@ -133,6 +136,8 @@ export class PluginFullObjectTargetStaleError extends Error {
 }
 
 export interface PluginDatabaseAccessDependencies {
+    /** The plugin every call in this instance is confined to. */
+    owner: string
     store: PersistentDataStore
     flushPendingData(reason: string): Promise<void>
     getCompatibilityDatabase(): Database
@@ -166,7 +171,7 @@ export interface PluginDatabaseAccessDependencies {
     getNavigationGeneration(): number
     applyCompatibilityDatabaseLite(database: Record<string, unknown>): void
     readPluginStorageSnapshot(): Promise<Record<string, unknown>>
-    mutatePluginStorage(mutations: readonly PluginStorageMutation[]): Promise<void>
+    mutatePluginStorage(mutations: readonly OwnerScopedStorageMutation[]): Promise<void>
     invalidatePluginStorage(): void
     materializeDatabaseSnapshot(reason: string): Promise<{
         database: Database
@@ -366,12 +371,12 @@ function hasCharacterUpdate(database: Record<string, unknown>): boolean {
 function pluginStorageMutations(
     update: Record<string, unknown>,
     allowedKeys: readonly string[],
-): PluginStorageMutation[] {
+): OwnerScopedStorageMutation[] {
     const allowedKeySet = new Set(allowedKeys)
     const hasExplicitStorage =
         allowedKeySet.has('pluginCustomStorage') &&
         Object.prototype.hasOwnProperty.call(update, 'pluginCustomStorage')
-    const mutations: PluginStorageMutation[] = []
+    const mutations: OwnerScopedStorageMutation[] = []
     if (hasExplicitStorage) {
         mutations.push({ type: 'clear' })
         const storage = { ...(update.pluginCustomStorage as Record<string, unknown>) }
@@ -489,10 +494,19 @@ function validateCompleteCharacters(value: unknown): asserts value is Database['
     }
 }
 
+/**
+ * A full replacement writes the flat projection back, so the ownership sidecar
+ * has to ride along or every row would land unowned. Keys the calling plugin
+ * supplied belong to it; the rest keep the owner the store already records. A
+ * plugin that sends an explicit `pluginCustomStorage` replaces its own keys
+ * only, because the snapshot it read never showed it anyone else's.
+ */
 export function applyPluginDatabaseUpdate(
     candidate: Database,
     update: Record<string, unknown>,
     allowedKeys: readonly string[],
+    owner: string,
+    ownerOf: (key: string) => string = resolveLifecyclePluginStorageOwner,
 ): void {
     validatePluginDatabaseUpdate(update)
     const mutableCandidate = candidate as unknown as Record<string, unknown>
@@ -505,17 +519,35 @@ export function applyPluginDatabaseUpdate(
     if (!isPlainRecord(existingCustomStorage)) {
         throw new TypeError('Existing pluginCustomStorage must be a plain record')
     }
-    const customStorage = hasExplicitCustomStorage
-        ? { ...(update.pluginCustomStorage as Record<string, unknown>) }
-        : { ...existingCustomStorage }
+    const customStorage: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(existingCustomStorage)) {
+        if (hasExplicitCustomStorage && ownerOf(key) === owner) continue
+        customStorage[key] = value
+    }
+    if (hasExplicitCustomStorage) {
+        Object.assign(customStorage, update.pluginCustomStorage as Record<string, unknown>)
+    }
 
     for (const key of Object.keys(update).filter((key) => allowedKeySet.has(key)).sort()) {
         if (key !== 'pluginCustomStorage') mutableCandidate[key] = update[key]
     }
+    const updatedKeys = new Set<string>()
     for (const key of Object.keys(update).filter((key) => !allowedKeySet.has(key)).sort()) {
         customStorage[key] = update[key]
+        updatedKeys.add(key)
+    }
+    if (hasExplicitCustomStorage) {
+        for (const key of Object.keys(update.pluginCustomStorage as Record<string, unknown>)) {
+            updatedKeys.add(key)
+        }
     }
     candidate.pluginCustomStorage = customStorage
+    const meta: PluginStorageMeta = {}
+    const now = Date.now()
+    for (const key of Object.keys(customStorage)) {
+        meta[key] = { plugin: updatedKeys.has(key) ? owner : ownerOf(key), updatedAt: now }
+    }
+    ;(candidate as Database & { pluginStorageMeta?: PluginStorageMeta }).pluginStorageMeta = meta
 }
 
 export function createPluginDatabaseAccess(
@@ -1011,7 +1043,11 @@ export function createPluginDatabaseAccess(
                         )
                         const storage: Record<string, unknown> = {}
                         for (const summary of catalog.items) {
-                            const value = await reader.readPluginStorage(summary.key)
+                            if (summary.owner !== dependencies.owner) continue
+                            const value = await reader.readPluginStorage(
+                                dependencies.owner,
+                                summary.key,
+                            )
                             if (!value) {
                                 throw new Error(
                                     `Missing plugin storage value for ${summary.key}`,
@@ -1094,6 +1130,7 @@ export function createPluginDatabaseAccess(
                 candidate,
                 dependencies.snapshot(preparedUpdate),
                 allowedKeys,
+                dependencies.owner,
             )
             await dependencies.replacePersistentDatabase(candidate, 'plugin-database-set', {
                 authoritative: true,

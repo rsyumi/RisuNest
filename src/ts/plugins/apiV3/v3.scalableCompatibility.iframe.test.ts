@@ -37,6 +37,12 @@ const fixture = vi.hoisted(() => {
     }
 })
 
+const ownedStorageStub = {
+    getItem: vi.fn(), setItem: vi.fn(), removeItem: vi.fn(), clear: vi.fn(),
+    key: vi.fn(), keys: vi.fn(), length: vi.fn(), snapshot: vi.fn(async () => ({})),
+    mutate: vi.fn(),
+}
+
 vi.mock('../plugins.svelte', () => {
     const unrelated = vi.fn()
     const oldApis = new Proxy({
@@ -60,6 +66,10 @@ vi.mock('../plugins.svelte', () => {
         getV2PluginAPIs: () => oldApis,
         handlePluginInstallViaPlugin: vi.fn(),
         pluginStorageStore: {
+            forOwner: () => ownedStorageStub,
+            ownerOf: () => 'test-plugin',
+            invalidateOwner: vi.fn(),
+            synchronizeCommittedMutation: vi.fn(),
             snapshot: vi.fn(async () => []), mutate: unrelated, invalidate: unrelated,
             getItem: unrelated, setItem: unrelated, removeItem: unrelated,
             clear: unrelated, key: unrelated, keys: unrelated, length: unrelated,
@@ -72,7 +82,7 @@ vi.mock('../plugins.svelte', () => {
     }
 })
 vi.mock('src/ts/storage/database.svelte', () => ({ getDatabase: () => fixture.database }))
-vi.mock('../pluginSafeClass', () => ({ SafeLocalPluginStorage: class {}, tagWhitelist: [] }))
+vi.mock('../pluginSafeClass', () => ({ SafeLocalPluginStorage: class {}, SafeLocalStorage: class {}, tagWhitelist: [] }))
 vi.mock('src/ts/stores.svelte', () => ({
     DBState: { get db() { return fixture.database } },
     selectedCharID: {
