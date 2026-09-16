@@ -191,6 +191,13 @@ export function startServerSync(): void {
     },
     (event, handler) => listen(event, handler),
   );
+  let configured = false;
+  controller.subscribe((state) => {
+    const bound = Boolean(state.status?.configured);
+    // A connection can only be held once this device has a binding to hold.
+    if (bound && !configured) resumeServerSyncAfterBackup();
+    configured = bound;
+  });
   void controller.initialize().then(() => resumeServerSyncAfterBackup());
   window.addEventListener("online", () => resumeServerSyncAfterBackup());
   window.addEventListener("offline", () => suspendServerSync(scheduler));

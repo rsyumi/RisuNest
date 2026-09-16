@@ -6,7 +6,18 @@ const state = vi.hoisted(() => ({
   running: false,
   available: undefined as undefined | (() => boolean),
   revisionListener: undefined as undefined | (() => void),
-  scheduler: { resume: vi.fn(), suspend: vi.fn(), localCommit: vi.fn() },
+  scheduler: {
+    resume: vi.fn(),
+    suspend: vi.fn(),
+    localCommit: vi.fn(),
+    remoteHint: vi.fn(),
+  },
+  nativeListeners: new Map<string, () => void>(),
+  listen: vi.fn(async (event: string, handler: () => void) => {
+    return (
+      state.nativeListeners.set(event, handler), () => {}
+    );
+  }),
   invoke: vi.fn(async (command: string) =>
     command === "server_sync_backup_source"
       ? { path: "synthetic-backup-path", lease: "synthetic-source-lease" }
@@ -27,6 +38,7 @@ const state = vi.hoisted(() => ({
     cancelExitDrain: vi.fn(async () => {}),
     waitForIdle: vi.fn(async () => {}),
     canRestore: vi.fn(() => true),
+    subscribe: vi.fn(() => () => {}),
   },
 }));
 vi.mock("../../platform", () => ({
@@ -40,6 +52,7 @@ vi.mock("../persistentDataRuntime.svelte", () => ({
   acquireDestructiveReplacementFence: vi.fn(),
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: state.invoke }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: state.listen }));
 vi.mock("../portableBackupFileRouteProduction.svelte", () => ({
   restoreBackupFromNativeSource: state.restore,
 }));
@@ -72,6 +85,7 @@ beforeEach(() => {
   state.native = true;
   state.available = undefined;
   state.revisionListener = undefined;
+  state.nativeListeners.clear();
   state.ready = true;
   state.running = false;
   state.controller.canRestore.mockReturnValue(true);
@@ -218,6 +232,10 @@ describe("native server synchronization scheduling", () => {
     const { startServerSync, resumeServerSyncAfterBackup } = await import(
       "./serverSyncProduction"
     );
+    const cleanups = () =>
+      state.invoke.mock.calls.filter(
+        ([command]) => command === "server_sync_backup_cleanup",
+      ).length;
     let reject!: (reason: unknown) => void;
     state.invoke.mockImplementationOnce(
       () =>
@@ -230,15 +248,41 @@ describe("native server synchronization scheduling", () => {
     expect(state.invoke).toHaveBeenCalledWith("server_sync_backup_cleanup");
     expect(state.scheduler.resume).toHaveBeenCalledTimes(1);
     resumeServerSyncAfterBackup();
-    expect(state.invoke).toHaveBeenCalledTimes(1);
+    expect(cleanups()).toBe(1);
     expect(state.scheduler.resume).toHaveBeenCalledTimes(2);
     reject(new Error("synthetic busy"));
-    await vi.waitFor(() => expect(state.invoke).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(cleanups()).toBe(1));
     await Promise.resolve();
     await Promise.resolve();
     resumeServerSyncAfterBackup();
-    expect(state.invoke).toHaveBeenCalledTimes(2);
+    expect(cleanups()).toBe(2);
     expect(state.controller.pause).not.toHaveBeenCalled();
+  });
+  it("holds and releases notifications with the rest of foreground synchronization", async () => {
+    const { startServerSync } = await import("./serverSyncProduction");
+    const listeners = new Map<string, (event: Event) => void>();
+    vi.spyOn(document, "addEventListener").mockImplementation(
+      (type, listener) =>
+        void listeners.set(type, listener as (event: Event) => void),
+    );
+    const visibility = vi
+      .spyOn(document, "visibilityState", "get")
+      .mockReturnValue("visible");
+    startServerSync();
+    await Promise.resolve();
+    expect(state.invoke).toHaveBeenCalledWith("server_sync_events_start");
+
+    // A device revision and a remote notification both wake the scheduler; the
+    // notification only brings a head confirmation forward.
+    state.nativeListeners.get("risu-server-sync-device-changed")!();
+    expect(state.controller.invalidateCompletion).toHaveBeenCalled();
+    expect(state.scheduler.localCommit).toHaveBeenCalledTimes(1);
+    state.nativeListeners.get("risu-server-sync-remote-hint")!();
+    expect(state.scheduler.remoteHint).toHaveBeenCalledTimes(1);
+
+    visibility.mockReturnValue("hidden");
+    listeners.get("visibilitychange")!(new Event("visibilitychange"));
+    expect(state.invoke).toHaveBeenCalledWith("server_sync_events_stop");
   });
   it("does not install a native scheduler in the browser build", async () => {
     state.native = false;

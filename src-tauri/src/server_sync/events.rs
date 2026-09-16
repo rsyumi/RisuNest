@@ -79,6 +79,9 @@ impl Stop {
     fn stopped(&self) -> bool {
         *self.0.borrow()
     }
+    fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
     async fn settle(&self) {
         let mut observer = self.0.subscribe();
         let _ = observer.wait_for(|stopped| *stopped).await;
@@ -115,15 +118,19 @@ pub(crate) async fn hold(resolve: Resolve, sink: Arc<dyn HintSink>, stop: Stop, 
             Ok(config) => config,
             Err(_) => None,
         };
-        if let Some(config) = config {
-            let started = Instant::now();
-            match attempt(&config, sink.as_ref(), &stop, timing.idle).await {
-                Attempt::Refused => return,
-                Attempt::Ended if started.elapsed() >= SETTLED_CONNECTION => {
-                    delay = timing.first_retry
-                }
-                Attempt::Ended => (),
+        let Some(config) = config else {
+            // Nothing is bound yet. Look again later rather than treating an
+            // unbound install as a failing connection.
+            stop.wait(MAX_RETRY).await;
+            continue;
+        };
+        let started = Instant::now();
+        match attempt(&config, sink.as_ref(), &stop, timing.idle).await {
+            Attempt::Refused => return,
+            Attempt::Ended if started.elapsed() >= SETTLED_CONNECTION => {
+                delay = timing.first_retry
             }
+            Attempt::Ended => (),
         }
         if stop.stopped() {
             return;
@@ -236,7 +243,25 @@ pub(crate) fn start<R: Runtime>(app: &AppHandle<R>) {
         .flatten()
     });
     let sink = Arc::new(RendererSink(app.clone()));
-    tauri::async_runtime::spawn(hold(resolve, sink, stop, Timing::default()));
+    let host = app.clone();
+    tauri::async_runtime::spawn(async move {
+        hold(resolve, sink, stop.clone(), Timing::default()).await;
+        // A holder that gave up frees its place, so a later binding or a
+        // renewed lifecycle can hold a connection again.
+        release_held(&host, &stop);
+    });
+}
+
+/// Clears the slot only if it still holds this connection, so a holder that
+/// ended long ago cannot cancel the one that replaced it.
+fn release_held<R: Runtime>(app: &AppHandle<R>, stop: &Stop) {
+    let state = app.state::<ServerSyncEventsState>();
+    let Ok(mut held) = state.held.lock() else {
+        return;
+    };
+    if held.as_ref().is_some_and(|current| current.same(stop)) {
+        *held = None;
+    }
 }
 
 pub(crate) fn release<R: Runtime>(app: &AppHandle<R>) {
