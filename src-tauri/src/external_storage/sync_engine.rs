@@ -780,6 +780,15 @@ async fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Resu
             path: object.path,
         })
     });
+    // Sections go in before the library swap. A failure here leaves the job
+    // ready, so the retry applies the same remote rows again and only then
+    // replaces the library.
+    apply_received_sections(
+        app,
+        &job.request.connection_id,
+        &authoritative.identity.library_epoch,
+        received_sections,
+    )?;
     let mut store = pds(app)?;
     let commit = store
         .prepare_external_snapshot_application(&application, records, objects)
@@ -796,13 +805,6 @@ async fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Resu
             );
         }
     }
-    drop(store);
-    apply_received_sections(
-        app,
-        &job.request.connection_id,
-        &authoritative.identity.library_epoch,
-        received_sections,
-    )?;
     let result = json!({"snapshotId":prepared.snapshot_id,"receivedRevision":revision.to_string()});
     job.summary["state"] = json!("succeeded");
     job.summary["phase"] = json!("complete");
