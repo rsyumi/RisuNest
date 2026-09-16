@@ -2350,7 +2350,6 @@ export const languageEnglish = {
             actionNormalizeRecords: 'Recalculate the values',
             actionKeepSingleRecord: 'Keep one and drop the rest',
             actionRecoverOrphans: 'Put them back under an owner',
-            actionMarkColdOpaque: 'Keep it as is and stop failing',
             actionSettleAuthority: 'Finish the storage setup',
             actionDiscards: 'drops a value',
             actionRisky:
@@ -2365,7 +2364,6 @@ export const languageEnglish = {
             codeAliasObjectMismatch: 'Files whose contents changed',
             codeRecordInvalid: 'Records in the wrong shape',
             codeRecordOrphan: 'Records with no owner',
-            codeColdUndecodable: 'Archived chats that cannot be read',
             codeAuthorityIncomplete: 'Storage setup left unfinished',
             codeObjectUnreferenced: 'Files nothing uses',
             codeUnclassified: 'Problems that could not be sorted',

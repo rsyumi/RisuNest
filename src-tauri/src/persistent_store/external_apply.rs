@@ -452,7 +452,7 @@ fn resolve_dependencies(
             require_object(cas, objects, hash, Some(*size))?;
             Ok(None)
         }
-        // The store no longer holds cold payloads; P2a-ext still carries the variant.
+        // The store no longer holds cold payloads; the shared record format still carries the variant.
         LogicalRecordEnvelope::Cold { .. } => {
             Err(validation("External cold records are unsupported"))
         }

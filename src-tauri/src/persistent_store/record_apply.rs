@@ -352,7 +352,7 @@ pub(super) fn apply_delete(
         LogicalRecordLocator::Inlay { logical_key } => {
             delete_alias(transaction, generation, "inlay", logical_key)
         }
-        // The store no longer holds cold payloads; P2a-ext still carries the variant.
+        // The store no longer holds cold payloads; the shared record format still carries the variant.
         LogicalRecordLocator::Cold { .. } => validation("logical cold records are unsupported"),
     }
 }

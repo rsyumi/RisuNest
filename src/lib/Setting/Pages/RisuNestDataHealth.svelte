@@ -70,7 +70,6 @@
         'alias-object-mismatch': strings.codeAliasObjectMismatch,
         'record-invalid': strings.codeRecordInvalid,
         'record-orphan': strings.codeRecordOrphan,
-        'cold-undecodable': strings.codeColdUndecodable,
         'authority-incomplete': strings.codeAuthorityIncomplete,
         'object-unreferenced': strings.codeObjectUnreferenced,
         unclassified: strings.codeUnclassified,
@@ -157,7 +156,6 @@
         'normalize-records': strings.actionNormalizeRecords,
         'keep-single-record': strings.actionKeepSingleRecord,
         'recover-orphans': strings.actionRecoverOrphans,
-        'mark-cold-opaque': strings.actionMarkColdOpaque,
         'settle-authority': strings.actionSettleAuthority,
     }
     let choices = $derived(repairChoicesByFinding(view.candidates))

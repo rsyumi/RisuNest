@@ -586,7 +586,7 @@ pub(super) fn reconstruct_record_with_owner_objects(
         LogicalRecordLocator::Inlay { logical_key } => {
             reconstruct_asset_alias(connection, pds_generation, "inlay", &logical_key)?
         }
-        // The store no longer holds cold payloads; P2a-ext still carries the variant.
+        // The store no longer holds cold payloads; the shared record format still carries the variant.
         LogicalRecordLocator::Cold { .. } => return Err(missing_source("cold")),
     };
     Ok(encode_logical_record(&envelope).map_err(codec_error)?.bytes)

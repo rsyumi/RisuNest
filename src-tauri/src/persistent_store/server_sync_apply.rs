@@ -204,7 +204,7 @@ pub(crate) fn validate_remote_with_residency(
                         return invalid("Inlay type is missing");
                     }
                 }
-                // The store no longer holds cold payloads; P2a-ext still carries the variant.
+                // The store no longer holds cold payloads; the shared record format still carries the variant.
                 LogicalRecordEnvelope::Cold { .. } => {
                     return invalid("Cold records are unsupported")
                 }

@@ -112,7 +112,7 @@ pub(crate) fn project(
             logical_key.as_str(),
             "inlay",
         ),
-        // The store no longer holds cold payloads; P2a-ext still carries the variant.
+        // The store no longer holds cold payloads; the shared record format still carries the variant.
         LogicalRecordLocator::Cold { .. } => return invalid("Cold records are unsupported"),
     };
     let suffix = column2
