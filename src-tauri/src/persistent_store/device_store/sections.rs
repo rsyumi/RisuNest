@@ -354,6 +354,64 @@ impl DeviceStore {
         Ok(false)
     }
 
+    /// Rewrites this device's section as its own newest writes, above every
+    /// version `observed` covers. Values and preserved removals both travel,
+    /// so the merge that follows keeps them wherever `remote` holds the same
+    /// key and the keys only this device holds still reach the remote. A row
+    /// the remote already carries unchanged needs neither, and a row this
+    /// device issued above `observed` and has not published is already the
+    /// newest, so a retried attempt stamps no second version.
+    pub(crate) fn reissue_section_rows(
+        &mut self,
+        section: Section,
+        observed: &Sequence,
+        remote: &[SectionRow],
+    ) -> StoreResult<usize> {
+        let transaction = self.transaction()?;
+        let writer_id: String = transaction.query_row(
+            "SELECT writer_id FROM device_meta WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let carried: BTreeMap<(String, String, String), &SectionRow> =
+            remote.iter().map(|row| (row.key(), row)).collect();
+        let unpublished = unpublished_keys(&transaction, section)?;
+        let pending: Vec<SectionRow> = read_rows(&transaction, section)?
+            .into_iter()
+            .filter(|row| {
+                let held = row.writer_id == writer_id
+                    && row.write_clock > *observed
+                    && unpublished.contains(&row.key());
+                let settled = carried
+                    .get(&row.key())
+                    .is_some_and(|other| row.same_version(other) && row.value == other.value);
+                !held && !settled
+            })
+            .collect();
+        // The issued clock has to clear the remote as well as this device, so
+        // a value held here under another writer cannot lose its version.
+        observe_remote_clock(&transaction, section, observed)?;
+        if !pending.is_empty() {
+            super::begin_mutation(&transaction)?;
+            let clock = super::issue_write_clock(&transaction, section)?;
+            for row in &pending {
+                write_row(
+                    &transaction,
+                    section,
+                    &SectionRow {
+                        write_clock: clock.clone(),
+                        writer_id: writer_id.clone(),
+                        ..row.clone()
+                    },
+                    false,
+                )?;
+            }
+            super::finish_mutation(&transaction)?;
+        }
+        transaction.commit()?;
+        Ok(pending.len())
+    }
+
     /// Merges a received section. The higher `(write_clock, writer_id)` wins,
     /// the same version with different content is refused, and a received row
     /// keeps the version it arrived with instead of becoming a local write.
