@@ -1598,7 +1598,14 @@ impl PersistentStore {
                 let (action, version) = if remote == base {
                     match &local {
                         Some(entry) if !entry.published => {
-                            ("publish", self.project_section(cache, entry)?)
+                            // The remote may already carry this exact value from
+                            // an earlier operation whose receipt arrived late.
+                            let version = self.project_section(cache, entry)?;
+                            if version == remote {
+                                ("mark", version)
+                            } else {
+                                ("publish", version)
+                            }
                         }
                         _ => continue,
                     }
@@ -1607,26 +1614,23 @@ impl PersistentStore {
                     let (bytes, _) = cache.restore_bytes(&remote)?;
                     let entry = SectionEntry::decode(&bytes)
                         .map_err(|_| SyncError::new("invalid-remote-section-entry", 502))?;
-                    let received = entry
-                        .version
-                        .clone()
-                        .ok_or_else(|| SyncError::new("invalid-remote-section-entry", 502))?;
                     if sections::kind_of(domain) != Some(entry.kind) || entry.key != key {
                         return Err(SyncError::new("invalid-remote-section-entry", 502));
                     }
-                    match &local {
-                        None => ("apply", remote.clone()),
-                        Some(current) if sections::newer(&received, &current.version) => {
-                            ("apply", remote.clone())
-                        }
-                        Some(current) if sections::newer(&current.version, &received) => {
-                            ("publish", self.project_section(cache, current)?)
-                        }
-                        // One version can only ever stand for one value.
-                        Some(current) if current.entry != entry => {
-                            return Err(SyncError::new("section-version-conflict", 409))
-                        }
-                        Some(_) => ("mark", remote.clone()),
+                    match sections::resolve(local.as_ref(), &entry)
+                        .map_err(|_| SyncError::new("section-version-conflict", 409))?
+                    {
+                        sections::Outcome::Apply => ("apply", remote.clone()),
+                        sections::Outcome::Publish => (
+                            "publish",
+                            self.project_section(
+                                cache,
+                                local.as_ref().ok_or_else(|| {
+                                    SyncError::new("invalid-local-section-entry", 409)
+                                })?,
+                            )?,
+                        ),
+                        sections::Outcome::Settled => ("mark", remote.clone()),
                     }
                 } else {
                     match &local {

@@ -351,9 +351,10 @@ impl PersistentStore {
             .query_row(
                 "SELECT head FROM server_sync_state WHERE singleton=1",
                 [],
-                |r| r.get(0),
+                |r| r.get::<_, Option<String>>(0),
             )
-            .optional()?;
+            .optional()?
+            .flatten();
         let stored: Option<RemoteHead> = stored
             .map(|value| serde_json::from_str(&value))
             .transpose()

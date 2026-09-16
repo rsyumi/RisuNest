@@ -94,6 +94,36 @@ pub(crate) fn newer(candidate: &SectionEntryVersion, current: &SectionEntryVersi
     (&candidate.write_clock, &candidate.writer_id) > (&current.write_clock, &current.writer_id)
 }
 
+/// What the replica does with one key once both sides are known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    Apply,
+    Publish,
+    Settled,
+}
+
+/// The merge rule both remote adapters share. The larger clock wins, a tie is
+/// broken on the writer identity, and one version can only ever stand for one
+/// value.
+pub(crate) fn resolve(local: Option<&LocalEntry>, received: &SectionEntry) -> StoreResult<Outcome> {
+    let Some(version) = received.version.as_ref() else {
+        return invalid("Section entry carries no version");
+    };
+    let Some(current) = local else {
+        return Ok(Outcome::Apply);
+    };
+    if newer(version, &current.version) {
+        return Ok(Outcome::Apply);
+    }
+    if newer(&current.version, version) {
+        return Ok(Outcome::Publish);
+    }
+    if &current.entry != received {
+        return invalid("Section version carries two different values");
+    }
+    Ok(Outcome::Settled)
+}
+
 fn vector_value(bytes: &[u8]) -> StoreResult<(InlineOrObject, Option<Vec<u8>>)> {
     if bytes.len() <= MAX_INLINE_VALUE_BYTES {
         return Ok((InlineOrObject::inline(bytes).map_err(format_error)?, None));
@@ -479,12 +509,21 @@ fn apply_row(
                         ],
                     )?;
                 }
+                // A deletion is kept as a row even for a key this device never
+                // held, so a later delivery of an older value cannot revive it.
                 SectionValue::Tombstone => {
                     tx.execute(
-                        "UPDATE plugin_device_storage
-                            SET value=NULL,byte_size=0,tombstone=1,write_clock=?4,writer_id=?5,
-                                published_clock=?4
-                            WHERE owner=?1 AND space=?2 AND key=?3",
+                        "INSERT INTO plugin_device_storage
+                            (owner,space,key,value,byte_size,tombstone,write_clock,writer_id,
+                             published_clock)
+                            VALUES (?1,?2,?3,NULL,0,1,?4,?5,?4)
+                            ON CONFLICT(owner,space,key) DO UPDATE SET
+                                value=NULL,
+                                byte_size=0,
+                                tombstone=1,
+                                write_clock=excluded.write_clock,
+                                writer_id=excluded.writer_id,
+                                published_clock=excluded.published_clock",
                         params![
                             owner,
                             space,
