@@ -2008,6 +2008,26 @@ export const languageEnglish = {
                 reloadNow: 'Reload',
             },
         },
+        localData: {
+            title: 'Local data',
+            description:
+                'Choose which of the data kept on this device only is synchronized with your other devices. The choice applies to the sync server and to external storage alike, and what a backup keeps is chosen on the external storage connection.',
+            notConnected: 'No sync server or external storage is connected yet.',
+            hypaTitle: 'Hypa embedding data',
+            hypaDescription:
+                'The embedding data Hypa uses. Synchronizing it keeps Hypa data intact on your other devices, and leaving it out means they have to call the embedding API to build the data again.',
+            pluginTitle: 'Local plugin data',
+            pluginDescription:
+                'The values plugins store per device. Plugins differ in how they use them, and changing this during a synchronization can overwrite the plugin data on another device.',
+            includeInSync: 'Include in sync',
+            enableTitle: 'Turning synchronization on makes this device the reference',
+            enableBody:
+                'The values chosen on this device are synchronized to your other devices. Changes made on another device can be overwritten.',
+            enableBodyPlugin:
+                'To manage individual plugin values, open plugin data in RisuNest settings.',
+            enableConfirm: 'Turn on',
+            cancel: 'Cancel',
+        },
         plugins: {
             unsupportedApiVersionInstall:
                 'Plugin API {version} is not supported. Install a version updated to API 3.0.',

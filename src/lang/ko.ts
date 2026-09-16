@@ -1820,6 +1820,26 @@ export const languageKorean = {
                 reloadNow: '다시 불러오기',
             },
         },
+        localData: {
+            title: '로컬 데이터',
+            description:
+                '현재 기기에만 저장되는 로컬 데이터 중에서 다른 기기와 동기화할 항목을 선택할 수 있습니다. 동기화 서버와 외부 저장소에 동일하게 적용되며, 백업에 포함할 데이터는 외부 저장소 연결에서 선택할 수 있습니다.',
+            notConnected: '동기화 서버와 외부 저장소가 아직 연결되지 않았습니다.',
+            hypaTitle: '하이파 임베딩 데이터',
+            hypaDescription:
+                '하이파에서 쓰는 임베딩 데이터입니다. 동기화를 하면 다른 기기에서도 하이파 데이터가 그대로 유지되며, 동기화 하지 않을 경우 다시 계산을 위해 임베딩 API를 사용해야 합니다.',
+            pluginTitle: '로컬 플러그인 데이터',
+            pluginDescription:
+                '플러그인이 기기마다 저장하는 값입니다. 플러그인에 따라 동작에 차이가 있을 수 있으며, 동기화 도중에 설정을 변경하면 다른 기기의 플러그인 데이터를 덮어쓸 수 있습니다.',
+            includeInSync: '동기화에 포함',
+            enableTitle: '동기화를 켜면 현재 기기의 값이 기준이 됩니다',
+            enableBody:
+                '현재 기기의 선택한 값이 다른 기기로 동기화됩니다. 만약 다른 기기에 변경 사항이 있는 경우 덮어씌워질 수 있습니다.',
+            enableBodyPlugin:
+                '개별 플러그인 데이터를 직접 관리하려면 RisuNest 설정의 플러그인 데이터에서 확인할 수 있습니다.',
+            enableConfirm: '켜기',
+            cancel: '취소',
+        },
         plugins: {
             unsupportedApiVersionInstall:
                 '플러그인 API {version} 버전은 지원하지 않습니다. API 3.0으로 업데이트된 버전을 설치하세요.',

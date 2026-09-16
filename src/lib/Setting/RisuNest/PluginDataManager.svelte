@@ -20,6 +20,7 @@
         type PluginDataItem,
         type PluginDataScope,
     } from 'src/ts/plugins/pluginDataInventory'
+    import { readLocalDataParticipation } from 'src/ts/storage/localDataSections'
     import SettingButton from './SettingButton.svelte'
 
     interface Props {
@@ -39,6 +40,8 @@
     const assignStrings = strings.assign
 
     let scope: PluginDataScope = $state('library')
+    /** Whether this device takes the plugin section into synchronization. */
+    let deviceSynced = $state(false)
     let items: PluginDataItem[] = $state([])
     let loading = $state(false)
     let busy = $state(false)
@@ -273,6 +276,14 @@
     onMount(() => {
         if (staged) items = [...staged]
         else void load()
+        if (place !== 'settings') return
+        void readLocalDataParticipation()
+            .then((rows) => {
+                deviceSynced = rows.some(
+                    (row) => row.section === 'local-plugins' && row.participating,
+                )
+            })
+            .catch(() => { deviceSynced = false })
     })
 </script>
 
@@ -366,7 +377,7 @@
         </div>
     {/if}
 
-    {#if scope === 'device' && place === 'settings'}
+    {#if scope === 'device' && place === 'settings' && !deviceSynced}
         <div class="rounded-md border border-darkborderc px-3 py-2 text-[13px] leading-normal">
             <span class="font-semibold">{strings.deviceNotSyncedTitle}</span>
             <span class="text-textcolor2">{strings.deviceNotSyncedHelp}</span>

@@ -6,6 +6,7 @@
     import RisuNestPerformanceSettings from './RisuNestPerformanceSettings.svelte'
     import RisuNestInlayInventory from './RisuNestInlayInventory.svelte'
     import RisuNestPluginData from './RisuNestPluginData.svelte'
+    import RisuNestLocalData from './RisuNestLocalData.svelte'
     import RisuNestStorageDashboard from './RisuNestStorageDashboard.svelte'
     import RisuNestDataHealth from './RisuNestDataHealth.svelte'
     import RisuNestBackupRestore from './RisuNestBackupRestore.svelte'
@@ -20,6 +21,7 @@
         { id: 'risunest-streaming', label: language.risuNest.streaming.title },
         { id: 'risunest-inlay', label: language.risuNest.inlay.title },
         { id: 'risunest-plugin-data', label: language.risuNest.pluginData.title },
+        ...(isTauri ? [{ id: 'risunest-local-data', label: language.risuNest.localData.title }] : []),
         ...(isTauri ? [{ id: 'risunest-update', label: language.risuNest.update.title }] : []),
         ...(isTauri ? [{ id: 'risunest-server-sync', label: language.risuNest.serverSync.title }] : []),
         ...(isTauri ? [{ id: 'risunest-storage', label: language.risuNest.storage.title }] : []),
@@ -46,6 +48,9 @@
     <RisuNestSettingRows items={risuNestInlaySettingsItems} />
     <RisuNestInlayInventory />
     <RisuNestPluginData />
+    {#if isTauri}
+        <RisuNestLocalData />
+    {/if}
     {#if isTauri}
         <RisuNestUpdateSettings />
     {/if}
