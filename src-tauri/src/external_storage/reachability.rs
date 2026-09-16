@@ -83,6 +83,16 @@ pub(crate) struct MarkRequest<'a> {
     pub roots: Roots,
     /// Everything the snapshot collection answered, read to the end.
     pub listed: Vec<ObjectReceipt>,
+    /// Backup point documents the retention decision dropped. The bundles they
+    /// named come back from the snapshot enumeration on their own.
+    pub dropped_points: Vec<RemoteObject>,
+}
+
+/// The ledger target that carries when this device first saw one state take the
+/// position that displaces its parent. A state identifier never holds a slash,
+/// so this can never collide with the state's own row.
+fn displacement_of(snapshot_id: &str) -> String {
+    format!("head/{snapshot_id}")
 }
 
 pub(crate) struct Mark {
@@ -189,7 +199,11 @@ pub(crate) async fn mark(
             let key = locator_key(&head.receipt.locator)?;
             Some(match listed.get(&key) {
                 Some((_, node)) => node.clone(),
-                None => source.document(head).await?,
+                None => {
+                    let node = source.document(head).await?;
+                    listed.insert(key, (head.clone(), node.clone()));
+                    node
+                }
             })
         }
         None => None,
@@ -223,13 +237,25 @@ pub(crate) async fn mark(
             roots.push(listed[key].0.clone());
         }
     }
-    // The lineage stops at the first child whose own grace window has closed,
-    // so a long chain of old states is never walked to its beginning.
+    // An ancestor is protected from the moment this device saw the state that
+    // displaced it, which is not the moment that state was uploaded: a job can
+    // spend longer than the grace window between its upload and its head write.
+    // The walk stops at the first child whose window has closed, so a long
+    // chain of old states is never followed to its beginning.
+    let mut displaced = BTreeSet::new();
     if let Some(node) = head_node {
         let mut child = node;
-        let mut seen_ancestors = BTreeSet::new();
+        let mut ancestors = BTreeSet::new();
         while let Some(parent) = child.parent_snapshot_id.clone() {
-            if !inside_grace(&child.snapshot_id) || !seen_ancestors.insert(parent.clone()) {
+            let target = displacement_of(&child.snapshot_id);
+            match first_seen.get(&target) {
+                Some(seen) if request.now_ms.saturating_sub(*seen) >= GRACE_MS => break,
+                Some(_) => {}
+                None => {
+                    displaced.insert(target);
+                }
+            }
+            if !ancestors.insert(parent.clone()) {
                 break;
             }
             let key = by_snapshot.get(&parent).ok_or_else(missing)?;
@@ -237,6 +263,9 @@ pub(crate) async fn mark(
             roots.push(object.clone());
             child = ancestor.clone();
         }
+    }
+    if !displaced.is_empty() {
+        store.record_observations(request.connection_id, &displaced, request.now_ms)?;
     }
 
     let mut reachable = BTreeSet::new();
@@ -248,7 +277,14 @@ pub(crate) async fn mark(
             .ok_or_else(corrupt)?;
     }
 
-    let mut documents = Vec::new();
+    // A dropped point goes before the documents it named, so an interrupted run
+    // leaves fragments nothing points at rather than a point pointing at
+    // nothing.
+    let mut documents: Vec<CommittedDeletion> = request
+        .dropped_points
+        .iter()
+        .map(|object| candidate_of(object, request.now_ms))
+        .collect();
     let mut below = Vec::new();
     let mut visited = reachable.clone();
     for (id, key) in &by_snapshot {
@@ -308,7 +344,14 @@ pub(crate) async fn mark(
         committed.push(entry);
     }
     store.replace_deletions(request.connection_id, &committed)?;
-    store.prune_observations(request.connection_id, &observed)?;
+    let mut keep = observed.clone();
+    keep.extend(
+        observed
+            .iter()
+            .map(|id| displacement_of(id))
+            .collect::<Vec<_>>(),
+    );
+    store.prune_observations(request.connection_id, &keep)?;
     store.set_last_reachable_bytes(request.connection_id, reachable_bytes)?;
     Ok(Mark {
         reachable,
@@ -536,7 +579,9 @@ mod tests {
         store
             .record_observations(
                 "connection",
-                &["head".to_owned(), "parent".to_owned()].into_iter().collect(),
+                &["head".to_owned(), "parent".to_owned(), "head/head".to_owned()]
+                    .into_iter()
+                    .collect(),
                 NOW - 60 * DAY,
             )
             .unwrap();
@@ -547,6 +592,7 @@ mod tests {
                     now_ms: NOW,
                     roots: roots(Some(&head)),
                     listed: receipts(&[&head, &parent]),
+                    dropped_points: Vec::new(),
                 },
                 &repository,
                 &store,
@@ -604,6 +650,7 @@ mod tests {
                 now_ms: NOW,
                 roots: roots(Some(&head)),
                 listed: receipts(&[&head, &stale]),
+                dropped_points: Vec::new(),
             },
             &repository,
             &store,
@@ -646,9 +693,13 @@ mod tests {
         store
             .record_observations(
                 "connection",
-                &["displaced".to_owned(), "older".to_owned()]
-                    .into_iter()
-                    .collect(),
+                &[
+                    "displaced".to_owned(),
+                    "older".to_owned(),
+                    "head/displaced".to_owned(),
+                ]
+                .into_iter()
+                .collect(),
                 NOW - 40 * DAY,
             )
             .unwrap();
@@ -659,6 +710,7 @@ mod tests {
                     now_ms: NOW,
                     roots: roots(Some(&head)),
                     listed: receipts(&[&head, &displaced, &older]),
+                    dropped_points: Vec::new(),
                 },
                 &repository,
                 &store,
@@ -690,6 +742,7 @@ mod tests {
             now_ms: now,
             roots: roots(Some(&head)),
             listed: receipts(&[&head, &slow]),
+            dropped_points: Vec::new(),
         };
         let first = runtime()
             .block_on(mark(
@@ -723,7 +776,9 @@ mod tests {
         store
             .record_observations(
                 "connection",
-                &["head".to_owned()].into_iter().collect(),
+                &["head".to_owned(), "head/head".to_owned()]
+                    .into_iter()
+                    .collect(),
                 NOW - 40 * DAY,
             )
             .unwrap();
@@ -734,6 +789,7 @@ mod tests {
                     now_ms: NOW,
                     roots: roots(Some(&head)),
                     listed: receipts(&[&head]),
+                    dropped_points: Vec::new(),
                 },
                 &repository,
                 &store,
@@ -773,6 +829,7 @@ mod tests {
                     now_ms: NOW,
                     roots: roots(Some(&head)),
                     listed: receipts(&[&head, &stale, &broken]),
+                    dropped_points: Vec::new(),
                 },
                 &repository,
                 &store,
@@ -802,6 +859,7 @@ mod tests {
                     now_ms: NOW,
                     roots,
                     listed: receipts(&[&head]),
+                    dropped_points: Vec::new(),
                 },
                 &repository,
                 &store,
@@ -817,6 +875,90 @@ mod tests {
             mark.reachable_bytes,
             head.receipt.byte_length + 10 + 20 + 30 + 400 + 500 + 700
         );
+    }
+
+    /// Invariant GC22. A job that spends longer than the grace window between
+    /// uploading its state and writing the head does not make the state it
+    /// replaced removable the moment that publication lands. The remote
+    /// document's own times never enter the decision.
+    #[test]
+    fn a_state_published_long_after_it_was_uploaded_still_protects_its_parent() {
+        let (_root, store) = store();
+        let mut repository = Repository::default();
+        let library = Library::new("parent");
+        library.install(&mut repository);
+        let parent = object("snapshot-s0", ObjectRole::SyncState, 2);
+        let published = object("snapshot-s1", ObjectRole::SyncState, 3);
+        repository.with_document(&parent, None, library.references());
+        repository.with_document(&published, Some("s0"), Vec::new());
+        let run = |now: u64, head: &RemoteObject, job: &[&str]| {
+            runtime()
+                .block_on(mark(
+                    MarkRequest {
+                        connection_id: "connection",
+                        now_ms: now,
+                        roots: Roots {
+                            head: Some(head.clone()),
+                            job_snapshot_ids: job
+                                .iter()
+                                .map(|id| (*id).to_owned())
+                                .collect(),
+                            ..roots(None)
+                        },
+                        listed: receipts(&[&parent, &published]),
+                        dropped_points: Vec::new(),
+                    },
+                    &repository,
+                    &store,
+                    &Cancellation::default(),
+                ))
+                .unwrap()
+        };
+        // The state is uploaded and enumerated while its job waits on budget.
+        assert!(run(NOW, &parent, &["s1"]).candidates.is_empty());
+        // The head write lands past the window the upload opened.
+        let landed = run(NOW + 8 * DAY, &published, &[]);
+        assert!(landed.candidates.is_empty());
+        assert!(landed.reachable.contains(&key(&library.section_pack)));
+        // The parent's own window runs from the publication this device saw,
+        // so it becomes removable a window after that, not before.
+        let later = run(NOW + 16 * DAY, &published, &[]);
+        assert!(names(&later).contains(&"snapshot-s0".to_owned()));
+    }
+
+    /// A point the retention decision dropped leads the list, ahead of the
+    /// documents it named.
+    #[test]
+    fn a_dropped_backup_point_is_removed_before_what_it_named() {
+        let (_root, store) = store();
+        let mut repository = Repository::default();
+        let head = object("snapshot-head", ObjectRole::SyncState, 2);
+        let bundle = object("snapshot-bundle", ObjectRole::BackupBundle, 3);
+        let point = object("point-old", ObjectRole::BackupPoint, 4);
+        repository.with_document(&head, None, Vec::new());
+        repository.with_document(&bundle, None, Vec::new());
+        store
+            .record_observations(
+                "connection",
+                &["bundle".to_owned()].into_iter().collect(),
+                NOW - 40 * DAY,
+            )
+            .unwrap();
+        let mark = runtime()
+            .block_on(mark(
+                MarkRequest {
+                    connection_id: "connection",
+                    now_ms: NOW,
+                    roots: roots(Some(&head)),
+                    listed: receipts(&[&head, &bundle]),
+                    dropped_points: vec![point.clone()],
+                },
+                &repository,
+                &store,
+                &Cancellation::default(),
+            ))
+            .unwrap();
+        assert_eq!(names(&mark), vec!["point-old", "snapshot-bundle"]);
     }
 
     fn leftover(object: &RemoteObject, done: bool) -> CommittedDeletion {
@@ -853,6 +995,7 @@ mod tests {
                     now_ms: NOW,
                     roots: roots(Some(&head)),
                     listed: receipts(&[&head]),
+                    dropped_points: Vec::new(),
                 },
                 &repository,
                 &store,
@@ -892,6 +1035,7 @@ mod tests {
                     now_ms: NOW,
                     roots: roots(Some(&head)),
                     listed: receipts(&[&head]),
+                    dropped_points: Vec::new(),
                 },
                 &repository,
                 &store,
@@ -924,6 +1068,7 @@ mod tests {
                     now_ms: NOW,
                     roots: roots(Some(&head)),
                     listed: receipts(&[&head]),
+                    dropped_points: Vec::new(),
                 },
                 &repository,
                 &store,

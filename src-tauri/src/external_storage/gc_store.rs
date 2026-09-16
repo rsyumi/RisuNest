@@ -121,9 +121,10 @@ impl GcStore {
         Ok(Self(db))
     }
 
-    /// Stamps every target this run enumerated and answers with the local time
-    /// each one was first seen. A target with no row yet is recorded now, so
-    /// something seen for the first time is always inside the grace window.
+    /// Stamps the given targets and answers with every target this connection
+    /// holds a row for, each with the local time it was first seen. A target
+    /// with no row yet is recorded now, so something seen for the first time is
+    /// always inside the grace window.
     pub(crate) fn record_observations(
         &self,
         connection_id: &str,
@@ -148,15 +149,17 @@ impl GcStore {
         transaction.commit().map_err(storage)?;
         let mut query = self
             .0
-            .prepare("SELECT first_seen_ms FROM observations WHERE connection_id=?1 AND target_id=?2")
+            .prepare("SELECT target_id,first_seen_ms FROM observations WHERE connection_id=?1")
+            .map_err(storage)?;
+        let rows = query
+            .query_map([connection_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
             .map_err(storage)?;
         let mut seen = BTreeMap::new();
-        for target in targets {
-            let value: Option<i64> = query
-                .query_row(rusqlite::params![connection_id, target], |row| row.get(0))
-                .optional()
-                .map_err(storage)?;
-            seen.insert(target.clone(), amount(value.ok_or_else(corrupt)?)?);
+        for row in rows {
+            let (target, first_seen) = row.map_err(storage)?;
+            seen.insert(target, amount(first_seen)?);
         }
         Ok(seen)
     }
