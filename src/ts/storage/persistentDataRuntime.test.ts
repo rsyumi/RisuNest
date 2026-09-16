@@ -156,7 +156,25 @@ function makeDatabaseLease(database: Database, revision: number): PersistentRevi
                     trashTime: character.trashTime,
                 }] : []),
         })),
-        readCharacterSummary: vi.fn(async () => null),
+        readCharacterSummary: vi.fn(async (id) => {
+            const configuredIndex = characters.findIndex(
+                (candidate) => candidate.chaId === id,
+            )
+            if (configuredIndex < 0) return null
+            const character = characters[configuredIndex]
+            return {
+                id: character.chaId,
+                name: character.name,
+                image: character.image,
+                configuredIndex,
+                recentAt: character.lastInteraction ?? 0,
+                trashed: character.trashTime !== undefined,
+                conversationCount: character.chats.length,
+                type: character.type,
+                creatorNotes: character.creatorNotes,
+                trashTime: character.trashTime,
+            }
+        }),
         readCharacter: vi.fn(async (id) => {
             const character = characters.find((candidate) => candidate.chaId === id)
             if (!character) return null
