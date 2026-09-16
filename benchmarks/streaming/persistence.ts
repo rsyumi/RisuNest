@@ -16,6 +16,9 @@ import {
 } from "../../src/ts/storage/androidBinaryCommitBridge";
 import syntheticDatabase from "../../src-tauri/fixtures/persistent-fixture.json";
 
+/** Plugin storage is per owner, so the harness writes and reads as one. */
+const benchmarkPluginOwner = "streaming-persistence-benchmark";
+
 const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export async function runPersistenceSpike() {
@@ -177,6 +180,7 @@ export async function runPersistenceSuite(api: {
                 commit.pluginStorage = [
                   {
                     type: "set",
+                    owner: benchmarkPluginOwner,
                     key: "android-persistence",
                     value: { nested: [text] },
                   },
@@ -306,6 +310,7 @@ export async function runPersistenceSuite(api: {
                   ? await invoke<any>("pds_read_root")
                   : scope === "plugin"
                     ? await invoke<any>("pds_read_plugin_storage", {
+                        owner: benchmarkPluginOwner,
                         key: "android-persistence",
                       })
                     : await invoke<any>("pds_read_conversation", {
