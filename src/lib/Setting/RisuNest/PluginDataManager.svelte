@@ -136,11 +136,25 @@
         values = loaded
     }
 
+    /** The choice lives on the same settings page, so it is read again here. */
+    async function loadParticipation(): Promise<void> {
+        if (place !== 'settings') return
+        try {
+            const rows = await readLocalDataParticipation()
+            deviceSynced = rows.some(
+                (row) => row.section === 'local-plugins' && row.participating,
+            )
+        } catch {
+            deviceSynced = false
+        }
+    }
+
     async function chooseScope(next: PluginDataScope): Promise<void> {
         if (scope === next) return
         scope = next
         ownerFilter = null
         automaticOnly = false
+        if (next === 'device') await loadParticipation()
         await load()
     }
 
@@ -276,14 +290,7 @@
     onMount(() => {
         if (staged) items = [...staged]
         else void load()
-        if (place !== 'settings') return
-        void readLocalDataParticipation()
-            .then((rows) => {
-                deviceSynced = rows.some(
-                    (row) => row.section === 'local-plugins' && row.participating,
-                )
-            })
-            .catch(() => { deviceSynced = false })
+        void loadParticipation()
     })
 </script>
 
