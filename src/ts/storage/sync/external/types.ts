@@ -142,13 +142,20 @@ export type ExternalJobKind =
     | 'pin-history'
     | 'resolve-conflict'
 
+export type ExternalRestoreArea =
+    | 'library'
+    | 'referencedAssets'
+    | 'hypa'
+    | 'local-plugins'
+    | 'local-settings'
+
 export interface StartExternalJobRequest {
     connectionId: string
     kind: ExternalJobKind
     snapshotId?: string
     conflictId?: string
     choice?: 'local' | 'remote'
-    restoreAreas?: Array<'library' | 'referencedAssets'>
+    restoreAreas?: ExternalRestoreArea[]
     targetRevision?: DecimalString
     session?: 'foreground' | 'exitDrain'
     sessionId?: string

@@ -17,7 +17,12 @@ import {
     type ExternalScheduledDestination,
     type ExternalStorageScheduler,
 } from './scheduler'
-import type { DecimalString, ExternalJobSummary, ExternalStorageState } from './types'
+import type {
+    DecimalString,
+    ExternalJobSummary,
+    ExternalRestoreArea,
+    ExternalStorageState,
+} from './types'
 
 interface ProductionRuntime {
     state: ExternalStorageState
@@ -273,7 +278,7 @@ function restoreFailure(job: ExternalJobSummary): Error {
 export async function requestExternalStorageRestore(
     connectionId: string,
     snapshotId: string,
-    restoreAreas: Array<'library' | 'referencedAssets'>,
+    restoreAreas: ExternalRestoreArea[],
 ): Promise<ExternalJobSummary> {
     const current = runtime
     if (!current) throw new Error('External storage production is not installed')

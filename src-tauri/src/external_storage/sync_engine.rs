@@ -15,12 +15,16 @@ use super::{
     publication::HeadObservation,
 };
 use crate::persistent_store::{
+    device_store::Section as PdsSection,
     external_apply::{ExternalSnapshotApplication, ExternalSnapshotObject, ExternalSnapshotRecord},
     external_conflicts::{ConflictPhase, ConflictPreservation, ConflictRecord},
     external_runtime::ExternalBase,
     sync_selection::CaptureIdentity,
 };
-use risunest_external_storage_format::format::{library_fingerprint_domain, Descriptor};
+use risunest_external_storage_format::{
+    format::{library_fingerprint_domain, Descriptor},
+    section::SectionKind,
+};
 use risunest_sync_wire::head::Sequence;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -124,6 +128,9 @@ pub(crate) struct SyncInputs<'a> {
     pub local_pristine: bool,
     /// Required once the local side is known to differ from its base.
     pub local_fingerprint: Option<&'a str>,
+    /// A participating section holds a write this remote has not seen. Device
+    /// values move without the library moving, so they need their own signal.
+    pub local_sections_changed: bool,
     pub base: Option<&'a ExternalBase>,
     pub remote: Option<&'a ObservedHead>,
 }
@@ -201,6 +208,9 @@ pub(crate) fn decide_sync(input: SyncInputs<'_>) -> Result<SyncAction> {
     let remote_version_changed = stored.version != remote.observation.version;
 
     match (local_changed, remote_content_changed) {
+        (false, false) if input.local_sections_changed => Ok(SyncAction::PublishLocal {
+            expected: Some(remote.clone()),
+        }),
         (false, false) if remote_version_changed => Ok(SyncAction::AcceptEquivalent {
             remote: remote.clone(),
         }),
@@ -392,6 +402,34 @@ async fn package_capture(
         ),
         _ => None,
     };
+    // A section this device publishes takes the commit number the new state
+    // gets. A bundle preserves this device's own material instead of joining a
+    // commit order, so it carries none.
+    let generation = match (produce, &parent) {
+        (PackageAs::State, Some(view)) => Sequence::try_from(view.revision.clone())
+            .map_err(corrupt)?
+            .next()
+            .map_err(corrupt)?,
+        (PackageAs::State, None) => Sequence::from(1u64),
+        (PackageAs::Bundle, _) => Sequence::from(0u64),
+    };
+    let sections = {
+        let worker_app = app.clone();
+        let worker_spool = directory.join("sections");
+        let worker_generation = generation.clone();
+        let worker_cancel = cancel.clone();
+        tokio::task::spawn_blocking(move || -> Result<_> {
+            let mut store = pds(&worker_app)?;
+            super::sections::capture_state_sections(
+                &mut store,
+                &worker_generation,
+                &worker_spool,
+                &worker_cancel,
+            )
+        })
+        .await
+        .map_err(local_error)??
+    };
     let metadata = SnapshotMetadata {
         snapshot_id: job.snapshot_id.clone(),
         repository_id: connected.stored.descriptor.repository_id.clone(),
@@ -407,13 +445,7 @@ async fn package_capture(
         purpose: match produce {
             PackageAs::State => SnapshotPurpose::SyncState {
                 epoch: identity.generation.clone(),
-                generation: match &parent {
-                    Some(view) => Sequence::try_from(view.revision.clone())
-                        .map_err(corrupt)?
-                        .next()
-                        .map_err(corrupt)?,
-                    None => Sequence::from(1u64),
-                },
+                generation,
                 parent_sections: parent.map(|view| view.sections).unwrap_or_default(),
             },
             PackageAs::Bundle => SnapshotPurpose::BackupBundle {
@@ -431,6 +463,7 @@ async fn package_capture(
         .join("package-cache");
     let completed = super::snapshot::package_and_upload(
         capture,
+        sections,
         &root,
         &cache,
         metadata,
@@ -527,6 +560,102 @@ pub(crate) struct ApplyReceivedRequest {
     expected_revision: String,
 }
 
+/// The sections this device takes part in right now. A section left out is not
+/// downloaded at all, so its values never reach this installation.
+fn participating_sections(app: &AppHandle) -> Result<std::collections::BTreeSet<String>> {
+    let mut store = pds(app)?;
+    let device = store.device_store_mut().map_err(local_error)?;
+    let mut wanted = std::collections::BTreeSet::new();
+    for (kind, section) in [
+        (SectionKind::Hypa, PdsSection::Hypa),
+        (SectionKind::LocalPlugins, PdsSection::LocalPlugins),
+    ] {
+        if device.section_state(section).map_err(local_error)?.participating {
+            wanted.insert(kind.id().to_owned());
+        }
+    }
+    Ok(wanted)
+}
+
+/// Records what a confirmed publication put on the remote, so the next cycle
+/// does not offer the same values again.
+fn note_sections_published(
+    app: &AppHandle,
+    connection_id: &str,
+    library_lineage: &str,
+    sections: &std::collections::BTreeMap<
+        String,
+        risunest_external_storage_format::snapshot::SectionSnapshotRef,
+    >,
+) -> Result<()> {
+    if sections.is_empty() {
+        return Ok(());
+    }
+    let mut store = pds(app)?;
+    let device = store.device_store_mut().map_err(local_error)?;
+    for reference in sections.values() {
+        let Some(section) = super::sections::section_of(reference.kind) else {
+            continue;
+        };
+        device
+            .write_section_cursor(
+                connection_id,
+                library_lineage,
+                section,
+                &crate::persistent_store::device_store::sections::SectionCursor {
+                    applied_generation: reference.generation.clone(),
+                    applied_gc_floor: reference.gc_floor.clone(),
+                    observed_max_write_clock: reference.max_write_clock.clone(),
+                },
+            )
+            .map_err(local_error)?;
+    }
+    Ok(())
+}
+
+/// Merges received sections into the device file. Each section is its own
+/// transaction, so an interrupted apply resumes from the same remote state
+/// instead of reporting the whole receive as done.
+fn apply_received_sections(
+    app: &AppHandle,
+    connection_id: &str,
+    library_lineage: &str,
+    sections: Vec<super::snapshot_restore::PreparedSection>,
+) -> Result<()> {
+    if sections.is_empty() {
+        return Ok(());
+    }
+    let mut store = pds(app)?;
+    for prepared in sections {
+        let Some(section) = super::sections::section_of(prepared.kind) else {
+            return Err(corrupt("device-fixed section in a synchronized state"));
+        };
+        let rows = super::sections::decode_section(
+            prepared.kind,
+            &prepared.entries,
+            &prepared.content_fingerprint,
+        )?;
+        let device = store.device_store_mut().map_err(local_error)?;
+        if !device.section_state(section).map_err(local_error)?.participating {
+            continue;
+        }
+        device.apply_section_rows(section, &rows).map_err(local_error)?;
+        device
+            .write_section_cursor(
+                connection_id,
+                library_lineage,
+                section,
+                &crate::persistent_store::device_store::sections::SectionCursor {
+                    applied_generation: prepared.generation,
+                    applied_gc_floor: prepared.gc_floor,
+                    observed_max_write_clock: prepared.max_write_clock,
+                },
+            )
+            .map_err(local_error)?;
+    }
+    Ok(())
+}
+
 async fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Result<Value> {
     if request.job_id.is_empty()
         || request.job_id.len() > 1024
@@ -589,6 +718,17 @@ async fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Resu
         &cancel,
     )
     .await?;
+    let wanted = participating_sections(app)?;
+    let received_sections = super::snapshot_restore::download_sections(
+        &remote.document.state,
+        &wanted,
+        &staging,
+        &connected.root_key,
+        connected.provider.as_ref(),
+        &connected.handle,
+        &cancel,
+    )
+    .await?;
     let _permit = app
         .state::<crate::native_file_jobs::NativeFileJobState>()
         .admission
@@ -640,6 +780,15 @@ async fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Resu
             path: object.path,
         })
     });
+    // Sections go in before the library swap. A failure here leaves the job
+    // ready, so the retry applies the same remote rows again and only then
+    // replaces the library.
+    apply_received_sections(
+        app,
+        &job.request.connection_id,
+        &authoritative.identity.library_epoch,
+        received_sections,
+    )?;
     let mut store = pds(app)?;
     let commit = store
         .prepare_external_snapshot_application(&application, records, objects)
@@ -1012,6 +1161,7 @@ async fn complete_conflict_preservation(
             },
             created_at_ms,
             view.library,
+            view.sections,
             &mut journal,
             connected.provider.as_ref(),
             &connected.handle,
@@ -1370,9 +1520,23 @@ pub(crate) async fn run_sync(
         identity.revision != base.identity.revision
             || !same_local_lineage(&identity, &base.identity)
     });
+    let sections_changed = match (&base, &remote) {
+        (Some(base), Some(_)) => {
+            let mut store = pds(app)?;
+            let device = store.device_store_mut().map_err(local_error)?;
+            device
+                .sections_await_publication(
+                    &job.request.connection_id,
+                    &base.identity.library_epoch,
+                )
+                .map_err(local_error)?
+        }
+        _ => false,
+    };
     let mut captured = None;
     let mut fingerprint = None;
-    if local_changed && !(base.is_none() && remote.is_some() && local_pristine) {
+    if (local_changed || sections_changed) && !(base.is_none() && remote.is_some() && local_pristine)
+    {
         let value = capture_for_publication(app, connected, job, remote.as_ref(), cancel).await?;
         fingerprint = Some(hex::encode(value.1));
         captured = Some(value);
@@ -1391,6 +1555,7 @@ pub(crate) async fn run_sync(
         current_identity: decision_identity,
         local_pristine,
         local_fingerprint: fingerprint.as_deref(),
+        local_sections_changed: sections_changed,
         base: base.as_ref(),
         remote: remote.as_ref(),
     })?;
@@ -1557,6 +1722,12 @@ pub(crate) async fn run_sync(
                     let _ = journal
                         .release_completed_sessions(connected.dependencies.vault.as_ref())
                         .await;
+                    note_sections_published(
+                        app,
+                        &job.request.connection_id,
+                        &published_identity.library_epoch,
+                        &completed.sections,
+                    )?;
                     Ok(
                         json!({"snapshotId":completed.snapshot_id,"publishedRevision":published_identity.revision.to_string()}),
                     )
@@ -1698,6 +1869,44 @@ mod tests {
         }
     }
 
+    /// Invariant 30. A device value that moved on its own publishes; it never
+    /// turns into a library disagreement.
+    #[test]
+    fn a_section_only_change_publishes_instead_of_becoming_a_library_conflict() {
+        let remote = remote("remote", "55".repeat(32).as_str(), 1, "1");
+        let base = base(identity(4), &remote);
+        assert_eq!(
+            decide_sync(SyncInputs {
+                descriptor: &descriptor(),
+                connection_id: "connection",
+                current_identity: &identity(4),
+                local_pristine: false,
+                local_fingerprint: None,
+                local_sections_changed: true,
+                base: Some(&base),
+                remote: Some(&remote),
+            })
+            .unwrap(),
+            SyncAction::PublishLocal {
+                expected: Some(remote.clone())
+            }
+        );
+        assert_eq!(
+            decide_sync(SyncInputs {
+                descriptor: &descriptor(),
+                connection_id: "connection",
+                current_identity: &identity(4),
+                local_pristine: false,
+                local_fingerprint: None,
+                local_sections_changed: false,
+                base: Some(&base),
+                remote: Some(&remote),
+            })
+            .unwrap(),
+            SyncAction::UpToDate
+        );
+    }
+
     #[test]
     fn first_attach_never_overwrites_an_existing_remote_head() {
         let remote = remote("remote", "44".repeat(32).as_str(), 1, "1");
@@ -1708,6 +1917,7 @@ mod tests {
                 current_identity: &identity(1),
                 local_pristine: false,
                 local_fingerprint: None,
+                local_sections_changed: false,
                 base: None,
                 remote: Some(&remote)
             })
@@ -1721,6 +1931,7 @@ mod tests {
                 current_identity: &identity(1),
                 local_pristine: false,
                 local_fingerprint: None,
+                local_sections_changed: false,
                 base: None,
                 remote: None
             })
@@ -1734,6 +1945,7 @@ mod tests {
                 current_identity: &identity(0),
                 local_pristine: true,
                 local_fingerprint: None,
+                local_sections_changed: false,
                 base: None,
                 remote: Some(&remote)
             })
@@ -1752,6 +1964,7 @@ mod tests {
                 current_identity: &identity(2),
                 local_pristine: false,
                 local_fingerprint: Some(&"55".repeat(32)),
+                local_sections_changed: false,
                 base: Some(&base),
                 remote: Some(&old)
             })
@@ -1768,6 +1981,7 @@ mod tests {
                 current_identity: &identity(1),
                 local_pristine: false,
                 local_fingerprint: None,
+                local_sections_changed: false,
                 base: Some(&base),
                 remote: Some(&new)
             })
@@ -1783,6 +1997,7 @@ mod tests {
                 current_identity: &identity(2),
                 local_pristine: false,
                 local_fingerprint: Some(&"66".repeat(32)),
+                local_sections_changed: false,
                 base: Some(&base),
                 remote: Some(&new)
             })
@@ -1798,6 +2013,7 @@ mod tests {
                 current_identity: &identity(2),
                 local_pristine: false,
                 local_fingerprint: Some(&"44".repeat(32)),
+                local_sections_changed: false,
                 base: Some(&base),
                 remote: Some(&new)
             })
@@ -1816,6 +2032,7 @@ mod tests {
                 current_identity: &identity(1),
                 local_pristine: false,
                 local_fingerprint: None,
+                local_sections_changed: false,
                 base: Some(&base),
                 remote: None
             })
@@ -1831,6 +2048,7 @@ mod tests {
                 current_identity: &replaced,
                 local_pristine: false,
                 local_fingerprint: None,
+                local_sections_changed: false,
                 base: Some(&base),
                 remote: Some(&old)
             })

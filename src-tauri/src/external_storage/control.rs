@@ -631,7 +631,9 @@ pub(crate) async fn upload_backup_point(
 
 /// Wraps an already published library reference in its own immutable bundle so
 /// a retained point names a bundle rather than a synchronized state. A state is
-/// the merged result of several devices, which is why the source says so.
+/// the merged result of several devices, which is why the source says so. The
+/// sections it carried travel with it, or the retained point would name a
+/// library without the device data that state published.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn upload_backup_bundle(
     descriptor: &Descriptor,
@@ -640,6 +642,7 @@ pub(crate) async fn upload_backup_bundle(
     source: wire_control::BundleSource,
     captured_at_ms: u64,
     library: wire::LibrarySnapshotRef,
+    sections: std::collections::BTreeMap<String, wire::SectionSnapshotRef>,
     journal: &mut TransferJournal,
     provider: &dyn Provider,
     repository: &RepositoryHandle,
@@ -654,7 +657,7 @@ pub(crate) async fn upload_backup_bundle(
         None,
         None,
         library,
-        std::collections::BTreeMap::new(),
+        sections,
     )
     .map_err(corrupt)?;
     let plaintext = document.encode(MAX_POINT_PLAINTEXT).map_err(corrupt)?;

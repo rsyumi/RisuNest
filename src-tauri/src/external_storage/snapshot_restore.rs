@@ -558,6 +558,131 @@ fn materialize_entries(
     Ok(())
 }
 
+/// One received section with the control values its reference declared. The
+/// entries stay in memory because applying them needs them there anyway.
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedSection {
+    pub kind: risunest_external_storage_format::section::SectionKind,
+    pub generation: risunest_sync_wire::head::Sequence,
+    pub gc_floor: risunest_sync_wire::head::Sequence,
+    pub max_write_clock: risunest_sync_wire::head::Sequence,
+    pub content_fingerprint: [u8; 32],
+    pub entries: Vec<(wire::CatalogEntryKind, String, Vec<u8>)>,
+}
+
+fn assemble(entry: &CompleteEntry, packs: &BTreeMap<String, PathBuf>) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(usize::try_from(entry.byte_length).map_err(corrupt)?);
+    let mut digest = Sha256::new();
+    for chunk in &entry.chunks {
+        let pack_path = packs
+            .get(&chunk.pack_id)
+            .ok_or_else(|| corrupt("catalog pack is missing"))?;
+        let mut input = crate::trust_boundary::open_regular_source(pack_path).map_err(corrupt)?;
+        let input_length = input.metadata().map_err(corrupt)?.len();
+        if chunk
+            .offset
+            .checked_add(chunk.stored_length)
+            .is_none_or(|end| end > input_length)
+        {
+            return Err(corrupt("chunk escaped pack"));
+        }
+        input.seek(SeekFrom::Start(chunk.offset)).map_err(corrupt)?;
+        let mut limited = input.take(chunk.stored_length);
+        let decoded = pack::read_entry(&mut limited, pack::MAX_CHUNK_BYTES).map_err(corrupt)?;
+        if limited.limit() != 0
+            || decoded.hash != chunk.plaintext_sha256
+            || decoded.bytes.len() as u64 != chunk.plaintext_length
+        {
+            return Err(corrupt("pack chunk differs"));
+        }
+        digest.update(&decoded.bytes);
+        bytes.extend_from_slice(&decoded.bytes);
+    }
+    let actual: [u8; 32] = digest.finalize().into();
+    if actual != entry.content_sha256 || bytes.len() as u64 != entry.byte_length {
+        return Err(corrupt("received section entry integrity failed"));
+    }
+    Ok(bytes)
+}
+
+/// Downloads only the sections the caller asked for. A section left out of
+/// `wanted` is never read, so its values never reach this device.
+pub(crate) async fn download_sections(
+    snapshot: &RemoteObject,
+    wanted: &BTreeSet<String>,
+    staging_root: &Path,
+    root_key: &[u8; 32],
+    provider: &dyn Provider,
+    repository: &RepositoryHandle,
+    cancel: &Cancellation,
+) -> Result<Vec<PreparedSection>> {
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    ensure_directory(staging_root)?;
+    let root_path = open_object(
+        snapshot,
+        root_key,
+        staging_root,
+        provider,
+        repository,
+        cancel,
+    )
+    .await?;
+    let root_bytes = read_bytes(&root_path, wire::MAX_METADATA_BYTES)?;
+    let wire_role = match snapshot.role {
+        ObjectRole::SyncState => wire::ObjectRole::SyncState,
+        ObjectRole::BackupBundle => wire::ObjectRole::BackupBundle,
+        _ => return Err(corrupt("snapshot root role")),
+    };
+    let document =
+        super::control::SnapshotView::read(&root_bytes, wire_role, &snapshot.repository_id)?;
+    let mut prepared = Vec::new();
+    for (id, reference) in &document.sections {
+        if !wanted.contains(id) {
+            continue;
+        }
+        let entries_root = RemoteObject::from_stored(&reference.entries_root, repository)?;
+        if entries_root.repository_id != snapshot.repository_id {
+            return Err(corrupt("section catalog repository differs"));
+        }
+        let (complete, packs) = read_catalog(
+            &entries_root,
+            wire::CatalogKind::Section,
+            root_key,
+            staging_root,
+            provider,
+            repository,
+            cancel,
+        )
+        .await?;
+        let pack_paths =
+            open_packs(&packs, root_key, staging_root, provider, repository, cancel).await?;
+        let cpu = cpu_permit().await?;
+        let section_cancel = cancel.clone();
+        let entries = tokio::task::spawn_blocking(move || -> Result<_> {
+            let mut entries = Vec::with_capacity(complete.len());
+            for entry in &complete {
+                section_cancel.check()?;
+                entries.push((entry.kind, entry.key.clone(), assemble(entry, &pack_paths)?));
+            }
+            Ok(entries)
+        })
+        .await
+        .map_err(transient)??;
+        drop(cpu);
+        prepared.push(PreparedSection {
+            kind: reference.kind,
+            generation: reference.generation.clone(),
+            gc_floor: reference.gc_floor.clone(),
+            max_write_clock: reference.max_write_clock.clone(),
+            content_fingerprint: reference.content_fingerprint,
+            entries,
+        });
+    }
+    Ok(prepared)
+}
+
 pub(crate) async fn download_snapshot(
     snapshot: &RemoteObject,
     staging_root: &Path,
