@@ -909,6 +909,8 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         persistent_store::commands::pds_begin_plugin_claim_session,
         persistent_store::commands::pds_claim_plugin_storage_value,
         persistent_store::commands::pds_close_plugin_claim_session,
+        persistent_store::commands::pds_colliding_plugin_storage_keys,
+        persistent_store::commands::pds_assign_plugin_storage,
         account_credential::account_credential_read,
         account_credential::account_credential_write,
         account_credential::account_credential_clear,

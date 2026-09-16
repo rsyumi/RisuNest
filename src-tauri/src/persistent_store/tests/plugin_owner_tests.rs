@@ -521,3 +521,108 @@ fn values_that_reached_the_store_outside_an_import_open_no_window() {
         .expect("open claim session")
         .is_none());
 }
+
+/// Invariant 26. The manual screen decides what a name collision does, and a
+/// value never silently replaces another.
+#[test]
+fn a_manual_assignment_follows_the_choice_made_for_a_name_collision() {
+    use crate::persistent_store::commit::AssignCollision;
+    let (_directory, mut store) = store_with_rows(&[
+        (UNOWNED_OWNER, "pm_store", json!("imported")),
+        (UNOWNED_OWNER, "pm_keys", json!("imported keys")),
+        ("provider-manager", "pm_store", json!("own")),
+    ]);
+    let sources = vec![
+        (UNOWNED_OWNER.to_owned(), "pm_store".to_owned()),
+        (UNOWNED_OWNER.to_owned(), "pm_keys".to_owned()),
+    ];
+
+    let deferred = store
+        .assign_plugin_storage(&sources, "provider-manager", AssignCollision::Defer)
+        .expect("assign, deferring the collision");
+    assert_eq!(deferred.moved, 1);
+    assert_eq!(deferred.deferred, 1);
+    assert_eq!(
+        store
+            .read_plugin_storage("provider-manager", "pm_store", None)
+            .expect("read own row")
+            .expect("own row exists")
+            .value,
+        json!("own")
+    );
+    assert_eq!(
+        store
+            .read_plugin_storage("provider-manager", "pm_keys", None)
+            .expect("read moved row")
+            .expect("moved row exists")
+            .value,
+        json!("imported keys")
+    );
+    let moved = store
+        .list_plugin_storage(None)
+        .expect("list plugin storage")
+        .into_iter()
+        .find(|item| item.key == "pm_keys")
+        .expect("moved item is listed");
+    // A manual assignment is not the automatic bucket.
+    assert!(moved.claimed_from.is_none());
+    assert!(moved.assigned_at.is_some());
+
+    let colliding = store
+        .colliding_plugin_storage_keys("provider-manager", &["pm_store".to_owned()])
+        .expect("report collisions");
+    assert_eq!(colliding, vec!["pm_store".to_owned()]);
+
+    let replaced = store
+        .assign_plugin_storage(
+            &[(UNOWNED_OWNER.to_owned(), "pm_store".to_owned())],
+            "provider-manager",
+            AssignCollision::Replace,
+        )
+        .expect("assign, replacing the collision");
+    assert_eq!(replaced.replaced, 1);
+    assert_eq!(replaced.moved, 1);
+    assert_eq!(
+        store
+            .read_plugin_storage("provider-manager", "pm_store", None)
+            .expect("read replaced row")
+            .expect("replaced row exists")
+            .value,
+        json!("imported")
+    );
+    assert!(store
+        .read_plugin_storage(UNOWNED_OWNER, "pm_store", None)
+        .expect("read unowned row")
+        .is_none());
+}
+
+#[test]
+fn discarding_a_colliding_value_removes_only_the_incoming_one() {
+    use crate::persistent_store::commit::AssignCollision;
+    let (_directory, mut store) = store_with_rows(&[
+        (UNOWNED_OWNER, "pm_store", json!("imported")),
+        ("provider-manager", "pm_store", json!("own")),
+    ]);
+
+    let outcome = store
+        .assign_plugin_storage(
+            &[(UNOWNED_OWNER.to_owned(), "pm_store".to_owned())],
+            "provider-manager",
+            AssignCollision::Discard,
+        )
+        .expect("assign, discarding the collision");
+    assert_eq!(outcome.discarded, 1);
+    assert_eq!(outcome.moved, 0);
+    assert_eq!(
+        store
+            .read_plugin_storage("provider-manager", "pm_store", None)
+            .expect("read own row")
+            .expect("own row exists")
+            .value,
+        json!("own")
+    );
+    assert!(store
+        .read_plugin_storage(UNOWNED_OWNER, "pm_store", None)
+        .expect("read unowned row")
+        .is_none());
+}

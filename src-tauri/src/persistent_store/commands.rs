@@ -1138,6 +1138,40 @@ pub(crate) fn pds_snapshot_restore_request(
     with_store(state, |store| store.snapshot_restore_request(&id))
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PluginStorageSource {
+    owner: String,
+    key: String,
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_colliding_plugin_storage_keys(
+    state: State<'_, PersistentStoreState>,
+    owner: String,
+    keys: Vec<String>,
+) -> Result<Vec<String>, StoreError> {
+    with_store(state, |store| {
+        store.colliding_plugin_storage_keys(&owner, &keys)
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_assign_plugin_storage(
+    state: State<'_, PersistentStoreState>,
+    owner: String,
+    sources: Vec<PluginStorageSource>,
+    collision: super::commit::AssignCollision,
+) -> Result<super::commit::AssignOutcome, StoreError> {
+    let sources: Vec<(String, String)> = sources
+        .into_iter()
+        .map(|source| (source.owner, source.key))
+        .collect();
+    with_store_mut(state, |store| {
+        store.assign_plugin_storage(&sources, &owner, collision)
+    })
+}
+
 #[tauri::command(async)]
 pub(crate) fn pds_begin_plugin_claim_session(
     state: State<'_, PersistentStoreState>,

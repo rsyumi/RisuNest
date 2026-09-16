@@ -94,7 +94,7 @@
             return
         }
         try {
-            const excluded = collectExportExcludedReport(DBState.db.characters)
+            const excluded = await collectExportExcludedReport(DBState.db.characters)
             const result = await exportRisuSaveFromSystemPicker()
             if (!result) return
             alertNormal(

@@ -1655,6 +1655,30 @@ impl PersistentStore {
         self.device_store()?.close_plugin_claim_session(session_id)
     }
 
+    pub(crate) fn colliding_plugin_storage_keys(
+        &self,
+        owner: &str,
+        keys: &[String],
+    ) -> StoreResult<Vec<String>> {
+        commit::colliding_plugin_storage_keys(&self.connection, owner, keys)
+    }
+
+    pub(crate) fn assign_plugin_storage(
+        &mut self,
+        sources: &[(String, String)],
+        owner: &str,
+        collision: commit::AssignCollision,
+    ) -> StoreResult<commit::AssignOutcome> {
+        let assigned_at = device_store::now_ms()?;
+        commit::assign_plugin_storage(
+            &mut self.connection,
+            sources,
+            owner,
+            collision,
+            assigned_at,
+        )
+    }
+
     pub(crate) fn read_plugin_storage(
         &self,
         owner: &str,

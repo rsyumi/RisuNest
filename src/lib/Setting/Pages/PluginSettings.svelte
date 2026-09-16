@@ -4,7 +4,7 @@
     import { alertConfirm, alertMd, alertSelect } from "src/ts/alert";
     import { TriangleAlert } from '@lucide/svelte';
 
-    import { DBState, hotReloading } from "src/ts/stores.svelte";
+    import { DBState, hotReloading, SettingsMenuIndex } from "src/ts/stores.svelte";
     import { checkPluginUpdate, createBlankPlugin, importPlugin, loadPlugins, updatePlugin } from "src/ts/plugins/plugins.svelte";
     import TextInput from "src/lib/UI/GUI/TextInput.svelte";
     import NumberInput from "src/lib/UI/GUI/NumberInput.svelte";
@@ -20,6 +20,8 @@
 <h2 class="mb-2 text-2xl font-bold mt-2">{language.plugin}</h2>
 
 <span class="text-draculared text-xs mb-4">{language.pluginWarn}</span>
+
+<button type="button" class="text-textcolor2 hover:text-textcolor text-sm underline self-start mb-2" onclick={() => { $SettingsMenuIndex = 17; setTimeout(() => document.getElementById('risunest-plugin-data')?.scrollIntoView({ block: 'start' }), 0) }}>{language.risuNest.pluginData.title}</button>
 
 <div class="border-solid border-darkborderc p-2 flex flex-col border-1">
     {#if !DBState.db.plugins || DBState.db.plugins?.length === 0}

@@ -2607,3 +2607,134 @@ pub(super) fn pending_plugin_import_batch(connection: &Connection) -> StoreResul
         _ => None,
     })
 }
+
+/// What to do with a key the target plugin already holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum AssignCollision {
+    Replace,
+    Discard,
+    Defer,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AssignOutcome {
+    pub(crate) moved: u64,
+    pub(crate) replaced: u64,
+    pub(crate) discarded: u64,
+    pub(crate) deferred: u64,
+}
+
+/// Hands chosen values to one plugin. A key the target already holds follows the
+/// choice the person made for the whole batch, so a value never silently
+/// replaces another. The move is a delete and an insert so both sides reach the
+/// change index.
+pub(super) fn assign_plugin_storage(
+    connection: &mut Connection,
+    sources: &[(String, String)],
+    to_owner: &str,
+    collision: AssignCollision,
+    assigned_at: i64,
+) -> StoreResult<AssignOutcome> {
+    if !plugin_owner::validate_owner(to_owner) || plugin_owner::is_unowned(to_owner) {
+        return Err(validation("plugin storage owner is invalid"));
+    }
+    let mut outcome = AssignOutcome::default();
+    if sources.is_empty() {
+        return Ok(outcome);
+    }
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let generation = active_generation(&transaction)?;
+    let revision = current_revision(&transaction)? + 1;
+    super::server_sync_outbox::begin_mutation(&transaction, &generation, revision)?;
+    super::content_change_index::begin_mutation(&transaction, &generation, revision, "local")?;
+    for (from_owner, key) in sources {
+        if from_owner == to_owner {
+            continue;
+        }
+        let source: Option<(i64, i64, String)> = transaction
+            .query_row(
+                "SELECT byte_size, ordinal, value FROM plugin_storage
+                 WHERE generation = ?1 AND owner = ?2 AND storage_key = ?3",
+                params![generation, from_owner, key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((byte_size, ordinal, value)) = source else {
+            continue;
+        };
+        let held: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM plugin_storage
+             WHERE generation = ?1 AND owner = ?2 AND storage_key = ?3",
+            params![generation, to_owner, key],
+            |row| row.get(0),
+        )?;
+        if held != 0 {
+            match collision {
+                AssignCollision::Defer => {
+                    outcome.deferred += 1;
+                    continue;
+                }
+                AssignCollision::Discard => {
+                    transaction.execute(
+                        "DELETE FROM plugin_storage
+                         WHERE generation = ?1 AND owner = ?2 AND storage_key = ?3",
+                        params![generation, from_owner, key],
+                    )?;
+                    outcome.discarded += 1;
+                    continue;
+                }
+                AssignCollision::Replace => {
+                    transaction.execute(
+                        "DELETE FROM plugin_storage
+                         WHERE generation = ?1 AND owner = ?2 AND storage_key = ?3",
+                        params![generation, to_owner, key],
+                    )?;
+                    outcome.replaced += 1;
+                }
+            }
+        }
+        transaction.execute(
+            "DELETE FROM plugin_storage
+             WHERE generation = ?1 AND owner = ?2 AND storage_key = ?3",
+            params![generation, from_owner, key],
+        )?;
+        transaction.execute(
+            "INSERT INTO plugin_storage
+                 (generation, owner, storage_key, byte_size, ordinal, value, claimed_from,
+                  import_batch_id, assigned_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7)",
+            params![generation, to_owner, key, byte_size, ordinal, value, assigned_at],
+        )?;
+        outcome.moved += 1;
+    }
+    super::content_change_index::finish_mutation(&transaction)?;
+    super::server_sync_outbox::finish_mutation(&transaction)?;
+    set_active(&transaction, revision, &generation)?;
+    transaction.commit()?;
+    Ok(outcome)
+}
+
+/// The keys a plugin already holds among the ones a person is about to hand it.
+pub(super) fn colliding_plugin_storage_keys(
+    connection: &Connection,
+    to_owner: &str,
+    keys: &[String],
+) -> StoreResult<Vec<String>> {
+    let generation = active_generation(connection)?;
+    let mut statement = connection.prepare(
+        "SELECT 1 FROM plugin_storage
+         WHERE generation = ?1 AND owner = ?2 AND storage_key = ?3",
+    )?;
+    let mut colliding = Vec::new();
+    for key in keys {
+        let held = statement
+            .query_row(params![generation, to_owner, key], |_| Ok(()))
+            .optional()?;
+        if held.is_some() {
+            colliding.push(key.clone());
+        }
+    }
+    Ok(colliding)
+}
