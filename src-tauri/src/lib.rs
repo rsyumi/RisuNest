@@ -929,6 +929,8 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         regex_shadow::regex_cancel_batch,
         #[cfg(windows)]
         windows_appearance::windows_set_appearance,
+        persistent_store::commands::pds_read_section_participation,
+        persistent_store::commands::pds_set_section_participating,
     ]
 }
 
