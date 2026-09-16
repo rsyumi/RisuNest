@@ -866,3 +866,7 @@ its own plugin data settings instead.
 The host cannot reach a running plugin's JavaScript memory, so a value assigned to a
 plugin after it has already read and cached a default only takes effect when plugins
 are loaded again. There is no change notification for this and none is planned.
+
+On the native app both device-local spaces are kept in the installation's own device
+file. A `setItem`, `removeItem` or `clear` there settles only after the store has kept
+the change, so a call that resolved is already durable.

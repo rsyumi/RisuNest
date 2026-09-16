@@ -1406,7 +1406,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
         _clearSafeLocalStorage: () => ownedSafeLocalStorage.clear(),
         _keySafeLocalStorage: (index: number) => ownedSafeLocalStorage.key(index),
         _keysSafeLocalStorage: () => ownedSafeLocalStorage.keys(),
-        _lengthSafeLocalStorage: () => ownedSafeLocalStorage.length,
+        _lengthSafeLocalStorage: () => ownedSafeLocalStorage.length(),
         searchTranslationCache: async (partialKey: string) => {
             return searchLLMCache(partialKey)
         },

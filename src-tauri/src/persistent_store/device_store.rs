@@ -16,6 +16,7 @@ pub(crate) const DEVICE_SCHEMA_VERSION: u32 = 1;
 pub(crate) const DEVICE_DATABASE_FILE: &str = "device.sqlite";
 
 pub(crate) mod hypa;
+pub(crate) mod plugin_values;
 
 const SCHEMA: &str = r#"
 CREATE TABLE device_meta(

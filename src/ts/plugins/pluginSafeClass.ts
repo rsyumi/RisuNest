@@ -1,28 +1,9 @@
-import { pluginDeviceStorage as pluginStorage, pluginDevicePrefix } from "./pluginDeviceStorage";
+import { getPluginDeviceKeyspace } from "./pluginDeviceKeyspace";
 
-// Structured so an owner or key holding the separator cannot reach another
-// plugin's keyspace.
-function deviceKey(owner: string, space: 'string' | 'json', key: string): string {
-    return `${pluginDevicePrefix}${JSON.stringify([owner, space, key])}`;
-}
-
-function deviceKeyOwnerSpace(
-    stored: string,
-    owner: string,
-    space: 'string' | 'json',
-): string | null {
-    if (!stored.startsWith(pluginDevicePrefix)) return null;
-    try {
-        const parsed = JSON.parse(stored.substring(pluginDevicePrefix.length));
-        if (!Array.isArray(parsed) || parsed.length !== 3) return null;
-        const [storedOwner, storedSpace, key] = parsed as unknown[];
-        if (storedOwner !== owner || storedSpace !== space) return null;
-        return typeof key === 'string' ? key : null;
-    } catch {
-        return null;
-    }
-}
-
+/**
+ * Device-local strings for one plugin. Every call is answered from that
+ * plugin's keyspace alone, and a write settles only once the store has kept it.
+ */
 export class SafeLocalStorage {
     readonly #owner: string;
 
@@ -30,48 +11,35 @@ export class SafeLocalStorage {
         this.#owner = owner;
     }
 
-    getItem(key: string): string | null {
-        return localStorage.getItem(deviceKey(this.#owner, 'string', key));
+    async getItem(key: string): Promise<string | null> {
+        return await getPluginDeviceKeyspace(this.#owner).getItem('string', key);
     }
-    setItem(key: string, value: string): void {
-        localStorage.setItem(deviceKey(this.#owner, 'string', key), value);
+    async setItem(key: string, value: string): Promise<void> {
+        await getPluginDeviceKeyspace(this.#owner).setItem('string', key, value);
     }
-    removeItem(key: string): void {
-        localStorage.removeItem(deviceKey(this.#owner, 'string', key));
+    async removeItem(key: string): Promise<void> {
+        await getPluginDeviceKeyspace(this.#owner).removeItem('string', key);
     }
     //not a standard localStorage method, but useful
-    keys(): string[] {
-        const keys: string[] = [];
-        for (let i = 0; i < localStorage.length; i++) {
-            const stored = localStorage.key(i);
-            const key = stored === null
-                ? null
-                : deviceKeyOwnerSpace(stored, this.#owner, 'string');
-            if (key !== null) keys.push(key);
-        }
-        return keys;
+    async keys(): Promise<string[]> {
+        return await getPluginDeviceKeyspace(this.#owner).keys('string');
     }
 
-    key(index: number): string | null {
-        const safeKeys = this.keys();
-        return safeKeys[index] || null;
+    async key(index: number): Promise<string | null> {
+        const safeKeys = await this.keys();
+        return safeKeys[index] ?? null;
     }
 
-    clear(): void {
-        const keys = this.keys();
-        for (const key of keys) {
-            this.removeItem(key);
-        }
+    async clear(): Promise<void> {
+        await getPluginDeviceKeyspace(this.#owner).clear('string');
     }
 
-    get length(): number {
-        return this.keys().length;
+    async length(): Promise<number> {
+        return (await this.keys()).length;
     }
-
-
 }
 
-
+/** The same device keyspace, holding JSON values under their own space. */
 export class SafeLocalPluginStorage {
     __classType = 'REMOTE_REQUIRED' as const;
     readonly #owner: string;
@@ -81,30 +49,28 @@ export class SafeLocalPluginStorage {
     }
 
     async getItem<T>(key: string): Promise<T | null> {
-        return await pluginStorage.getItem<T>(deviceKey(this.#owner, 'json', key));
-    }
-    async setItem<T>(key: string, value: T): Promise<void> {
-        await pluginStorage.setItem(deviceKey(this.#owner, 'json', key), value);
-    }
-    async removeItem(key: string): Promise<void> {
-        await pluginStorage.removeItem(deviceKey(this.#owner, 'json', key));
-    }
-    async keys(): Promise<string[]> {
-        const keys: string[] = [];
-        const owner = this.#owner;
-        await pluginStorage.iterate((value, stored) => {
-            const key = deviceKeyOwnerSpace(stored, owner, 'json');
-            if (key !== null) keys.push(key);
-        });
-        return keys;
-    }
-    async clear(): Promise<void> {
-        const keys = await this.keys();
-        for (const key of keys) {
-            await this.removeItem(key);
+        const stored = await getPluginDeviceKeyspace(this.#owner).getItem('json', key);
+        if (stored === null) return null;
+        try {
+            return JSON.parse(stored) as T;
+        } catch {
+            return null;
         }
     }
+    async setItem<T>(key: string, value: T): Promise<void> {
+        await getPluginDeviceKeyspace(this.#owner).setItem('json', key, JSON.stringify(value));
+    }
+    async removeItem(key: string): Promise<void> {
+        await getPluginDeviceKeyspace(this.#owner).removeItem('json', key);
+    }
+    async keys(): Promise<string[]> {
+        return await getPluginDeviceKeyspace(this.#owner).keys('json');
+    }
+    async clear(): Promise<void> {
+        await getPluginDeviceKeyspace(this.#owner).clear('json');
+    }
 }
+
 
 export const tagWhitelist = [
     'a',

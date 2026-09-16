@@ -2,6 +2,9 @@ pub(crate) mod data_health;
 pub(crate) mod hypa;
 
 use super::archive::ArchivePreview;
+use super::device_store::plugin_values::{
+    PluginDeviceHydration, PluginDeviceListItem, PluginDeviceMutation,
+};
 use super::export::ExportedRisuSave;
 #[cfg(feature = "native-kei-upload-pilot")]
 use super::kei::KeiUploadResult;
@@ -1133,6 +1136,63 @@ pub(crate) fn pds_snapshot_restore_request(
     id: String,
 ) -> Result<(), StoreError> {
     with_store(state, |store| store.snapshot_restore_request(&id))
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_hydrate_plugin_device_storage(
+    state: State<'_, PersistentStoreState>,
+    owner: String,
+) -> Result<PluginDeviceHydration, StoreError> {
+    with_store(state, |store| {
+        store.device_store()?.hydrate_plugin_device_storage(&owner)
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_read_plugin_device_value(
+    state: State<'_, PersistentStoreState>,
+    owner: String,
+    space: String,
+    key: String,
+) -> Result<Option<String>, StoreError> {
+    with_store(state, |store| {
+        store
+            .device_store()?
+            .read_plugin_device_value(&owner, &space, &key)
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_list_plugin_device_keys(
+    state: State<'_, PersistentStoreState>,
+    owner: String,
+    space: String,
+) -> Result<Vec<String>, StoreError> {
+    with_store(state, |store| {
+        store.device_store()?.list_plugin_device_keys(&owner, &space)
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_list_plugin_device_storage(
+    state: State<'_, PersistentStoreState>,
+) -> Result<Vec<PluginDeviceListItem>, StoreError> {
+    with_store(state, |store| {
+        store.device_store()?.list_plugin_device_storage()
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_write_plugin_device_values(
+    state: State<'_, PersistentStoreState>,
+    owner: String,
+    mutations: Vec<PluginDeviceMutation>,
+) -> Result<(), StoreError> {
+    with_store_mut(state, |store| {
+        store
+            .device_store_mut()?
+            .write_plugin_device_values(&owner, &mutations)
+    })
 }
 
 #[tauri::command(async)]
