@@ -21,6 +21,18 @@ pub(crate) const LOCAL_SETTING_KEYS: [&str; 9] = [
     "risunest_tos_v1",
 ];
 
+/// The sections a device chooses to take part in, in the order the settings
+/// screen lists them.
+pub(crate) const CHOOSABLE_SECTIONS: [Section; 2] = [Section::Hypa, Section::LocalPlugins];
+
+/// Resolves the identifier a renderer sends. An unknown one is refused rather
+/// than silently treated as one of the known sections.
+pub(crate) fn section_from_id(id: &str) -> Option<Section> {
+    CHOOSABLE_SECTIONS
+        .into_iter()
+        .find(|section| section.as_str() == id)
+}
+
 /// Every section value a device can publish, plus the removal of one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SectionValueRow {
@@ -213,7 +225,6 @@ impl DeviceStore {
 
     /// Turning a section on or off changes what this device exchanges from the
     /// next publication onward. The stored values are left alone either way.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_section_participating(
         &mut self,
         section: Section,

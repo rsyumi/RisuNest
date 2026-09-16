@@ -5,6 +5,7 @@ use super::archive::ArchivePreview;
 use super::device_store::plugin_values::{
     PluginDeviceHydration, PluginDeviceListItem, PluginDeviceMutation,
 };
+use super::device_store::sections::{section_from_id, CHOOSABLE_SECTIONS};
 use super::export::ExportedRisuSave;
 #[cfg(feature = "native-kei-upload-pilot")]
 use super::kei::KeiUploadResult;
@@ -1319,6 +1320,64 @@ pub(crate) fn pds_write_plugin_permission_grant(
     })
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SectionParticipationRow {
+    section: String,
+    participating: bool,
+}
+
+fn read_section_participation(
+    state: &PersistentStoreState,
+) -> Result<Vec<SectionParticipationRow>, StoreError> {
+    with_store_mutex(state, |store| {
+        let device = store.device_store()?;
+        CHOOSABLE_SECTIONS
+            .into_iter()
+            .map(|section| {
+                Ok(SectionParticipationRow {
+                    section: section.as_str().to_owned(),
+                    participating: device.section_state(section)?.participating,
+                })
+            })
+            .collect()
+    })
+}
+
+fn set_section_participation(
+    state: &PersistentStoreState,
+    section: &str,
+    participating: bool,
+) -> Result<(), StoreError> {
+    let Some(section) = section_from_id(section) else {
+        return Err(StoreError::Validation {
+            message: "unknown device section".to_owned(),
+        });
+    };
+    with_store_mutex_mut(state, |store| {
+        store
+            .device_store_mut()?
+            .set_section_participating(section, participating)
+    })
+}
+
+/// Which sections this device currently exchanges with a remote.
+#[tauri::command(async)]
+pub(crate) fn pds_read_section_participation(
+    state: State<'_, PersistentStoreState>,
+) -> Result<Vec<SectionParticipationRow>, StoreError> {
+    read_section_participation(&state)
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_set_section_participating(
+    state: State<'_, PersistentStoreState>,
+    section: String,
+    participating: bool,
+) -> Result<(), StoreError> {
+    set_section_participation(&state, &section, participating)
+}
+
 #[cfg(test)]
 mod tests {
     mod asset_gc_performance;
@@ -2021,5 +2080,44 @@ mod tests {
                 .expect("stat deleted candidate")
                 .is_none()
         }));
+    }
+    /// The local data screen reads the shipped defaults, then writes the one
+    /// row the user changed.
+    #[test]
+    fn local_data_command_sets_device_sections_participating() {
+        let directory = tempdir().unwrap();
+        let state = PersistentStoreState::default();
+        open_renderer_persistent_store(&state, directory.path()).unwrap();
+
+        let initial = read_section_participation(&state).unwrap();
+        assert_eq!(
+            initial
+                .iter()
+                .map(|row| (row.section.as_str(), row.participating))
+                .collect::<Vec<_>>(),
+            vec![("hypa", true), ("local-plugins", false)]
+        );
+
+        set_section_participation(&state, "local-plugins", true).unwrap();
+        assert!(with_store_mutex(&state, |store| Ok(store
+            .device_store()?
+            .section_state(super::super::device_store::Section::LocalPlugins)?
+            .participating))
+        .unwrap());
+
+        set_section_participation(&state, "hypa", false).unwrap();
+        assert_eq!(
+            read_section_participation(&state)
+                .unwrap()
+                .iter()
+                .map(|row| (row.section.as_str(), row.participating))
+                .collect::<Vec<_>>(),
+            vec![("hypa", false), ("local-plugins", true)]
+        );
+
+        assert!(matches!(
+            set_section_participation(&state, "library", true),
+            Err(StoreError::Validation { .. })
+        ));
     }
 }
