@@ -17,6 +17,11 @@ import {
     type AndroidSafDestinationRequest,
     type AndroidSafDestinationResult,
 } from './androidSafBridge'
+import {
+    forgetPluginValueAssignment,
+    recallPluginValueAssignment,
+    rememberPluginValueAssignment,
+} from './pluginValueAssignmentRetention'
 
 export type NativeFileJobSource =
     | { type: 'desktopPath'; path: string }
@@ -498,9 +503,12 @@ export interface NativeFileRestoreJobOptions extends NativeFileJobOptions {
     /**
      * Asks who owns the plugin values a save left unassigned. Answering with
      * nothing cancels the import, which is what a person closing the pass means.
+     * The answers an earlier attempt over the same save gave arrive with it, so
+     * the pass opens on them instead of on nothing.
      */
     assignPluginValues?(
         preview: NativeStagedPluginPreview,
+        remembered: NativeStagedPluginChoice | null,
     ): Promise<NativeStagedPluginChoice | null>
     afterRefresh?(): void | Promise<void>
     onBlockingChange?(blocking: boolean): void
@@ -1211,6 +1219,7 @@ async function runNativeReplacementRestore(
     let cancellationRequested = false
     let terminal: NativeFileJobStatus | undefined
     let mutationConflict: NativeFileJobError | undefined
+    let assignedPreview: NativeStagedPluginPreview | undefined
     let replacementFence:
         | Awaited<
               ReturnType<
@@ -1326,7 +1335,18 @@ async function runNativeReplacementRestore(
                 status.pluginValuePreview?.values.length &&
                 options.assignPluginValues
             ) {
-                const choice = await options.assignPluginValues(status.pluginValuePreview)
+                const preview = status.pluginValuePreview
+                const choice = await options.assignPluginValues(
+                    preview,
+                    recallPluginValueAssignment(preview),
+                )
+                // Held before anything else can go wrong, because losing the
+                // replacement fence past this point cancels the job and the
+                // person answers the same pass again on the next attempt.
+                if (choice) {
+                    rememberPluginValueAssignment(preview, choice)
+                    assignedPreview = preview
+                }
                 if (!choice || options.signal?.aborted) {
                     cancellationRequested = true
                     await invokeNative(dependencies, 'native_file_job_cancel', {
@@ -1402,6 +1422,7 @@ async function runNativeReplacementRestore(
         }
 
         if (terminal.state === 'succeeded') {
+            if (assignedPreview) forgetPluginValueAssignment(assignedPreview)
             if (!terminal.result) {
                 throw new NativeFileJobError(
                     'missing-result',

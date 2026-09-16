@@ -12,11 +12,13 @@
         filterPluginDataItems,
         groupPluginDataByPrefix,
         listPluginDataItems,
+        pluginDataAssignmentPrefill,
         pluginDataItemId,
         pluginDataOwnerBuckets,
         readPluginDataValue,
         totalPluginDataBytes,
         type PluginAssignCollision,
+        type PluginDataAssignmentChoice,
         type PluginDataItem,
         type PluginDataScope,
     } from 'src/ts/plugins/pluginDataInventory'
@@ -30,11 +32,19 @@
         staged?: PluginDataItem[]
         /** Plugins to offer as owners, when the installed list is not the right one. */
         pluginNames?: string[]
+        /** Assignments to open on, which an import that was cancelled kept. */
+        initialAssignments?: readonly PluginDataAssignmentChoice[]
         /** Selection the import stage reads back when the person continues. */
         onselectionchange?: (assignments: { owner: string; items: PluginDataItem[] }[]) => void
     }
 
-    let { place = 'settings', staged, pluginNames, onselectionchange }: Props = $props()
+    let {
+        place = 'settings',
+        staged,
+        pluginNames,
+        initialAssignments,
+        onselectionchange,
+    }: Props = $props()
 
     const strings = language.risuNest.pluginData
     const assignStrings = strings.assign
@@ -287,10 +297,26 @@
         await loadPlugins()
     }
 
+    /** Opens on the answers an import kept, so they are confirmed, not redone. */
+    function applyInitialAssignments(): void {
+        if (!staged || !initialAssignments?.length) return
+        const prefill = pluginDataAssignmentPrefill(
+            items,
+            initialAssignments,
+            installedPlugins,
+        )
+        selected = new Set(prefill.selectedIds)
+        groupOwners = new Map(
+            prefill.groupOwners.map((group) => [groupKey(group.prefix), group.owner]),
+        )
+        publishSelection()
+    }
+
     onMount(() => {
         if (staged) items = [...staged]
         else void load()
         void loadParticipation()
+        applyInitialAssignments()
     })
 </script>
 

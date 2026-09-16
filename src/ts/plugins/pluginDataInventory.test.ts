@@ -10,6 +10,7 @@ vi.mock('../storage/persistentDataStoreFactory', () => ({
 import {
     filterPluginDataItems,
     groupPluginDataByPrefix,
+    pluginDataAssignmentPrefill,
     pluginDataItemId,
     pluginDataOwnerBuckets,
     pluginKeyPrefix,
@@ -101,6 +102,50 @@ describe('plugin data inventory', () => {
                 values,
             ).map((row) => row.key),
         ).toEqual(['auto_value'])
+    })
+
+    it('opens on the assignments a cancelled import kept', () => {
+        const items = [
+            item(UNOWNED_PLUGIN_OWNER, 'pm_store'),
+            item(UNOWNED_PLUGIN_OWNER, 'pm_keys'),
+            item(UNOWNED_PLUGIN_OWNER, 'yt_glossary'),
+        ]
+
+        const prefill = pluginDataAssignmentPrefill(
+            items,
+            [
+                { owner: 'provider-manager', keys: ['pm_store', 'pm_keys'] },
+                { owner: 'yumi-translator', keys: ['yt_glossary'] },
+            ],
+            ['provider-manager', 'yumi-translator'],
+        )
+
+        expect(prefill.selectedIds).toEqual(items.map(pluginDataItemId))
+        expect(prefill.groupOwners).toEqual([
+            { prefix: 'pm_', owner: 'provider-manager' },
+            { prefix: null, owner: 'yumi-translator' },
+        ])
+    })
+
+    it('leaves out plugins that are not offered and keys the save no longer carries', () => {
+        const items = [
+            item(UNOWNED_PLUGIN_OWNER, 'pm_store'),
+            item(UNOWNED_PLUGIN_OWNER, 'pm_keys'),
+        ]
+
+        const prefill = pluginDataAssignmentPrefill(
+            items,
+            [
+                { owner: 'uninstalled-plugin', keys: ['pm_store'] },
+                { owner: 'provider-manager', keys: ['pm_keys', 'pm_dropped'] },
+            ],
+            ['provider-manager'],
+        )
+
+        expect(prefill.selectedIds).toEqual([pluginDataItemId(items[1])])
+        expect(prefill.groupOwners).toEqual([
+            { prefix: 'pm_', owner: 'provider-manager' },
+        ])
     })
 
     it('tells two plugins holding the same key apart', () => {
