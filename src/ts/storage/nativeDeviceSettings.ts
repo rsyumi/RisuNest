@@ -3,6 +3,8 @@ import { isTauri } from '../platform'
 
 export interface NativeDeviceSettings {
     get(key: string): Promise<unknown | null>
+    /** Reads several settings at once, answering in request order. */
+    readMany(keys: readonly string[]): Promise<(unknown | null)[]>
     /** A null value removes the setting. */
     set(key: string, value: unknown | null): Promise<void>
     /** Merges single entries of a stored object. A null entry removes it. */
@@ -28,6 +30,10 @@ export function createNativeDeviceSettings(): NativeDeviceSettings {
         async get(key: string): Promise<unknown | null> {
             requireTauri()
             return invoke<unknown | null>('pds_get_device_setting', { key })
+        },
+        async readMany(keys: readonly string[]): Promise<(unknown | null)[]> {
+            requireTauri()
+            return invoke<(unknown | null)[]>('pds_read_device_settings', { keys: [...keys] })
         },
         async set(key: string, value: unknown | null): Promise<void> {
             requireTauri()

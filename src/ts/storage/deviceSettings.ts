@@ -6,6 +6,7 @@ import {
     RECOVERY_EXCLUSIONS,
     type RecoveryExclusion,
 } from './startupExclusions'
+import { getDeviceMarkers, type DeviceMarkerStorage } from './deviceMarkers'
 
 export interface RisuNestDeviceSettings {
     schema: 'risunest.device-settings/v2'
@@ -57,10 +58,10 @@ function isValidSettings(value: unknown): value is RisuNestDeviceSettings {
     )
 }
 
-function readSettings(): RisuNestDeviceSettings {
+function readSettings(markers: DeviceMarkerStorage): RisuNestDeviceSettings {
     let stored: string | null
     try {
-        stored = localStorage.getItem(storageKey)
+        stored = markers.getItem(storageKey)
     } catch {
         return snapshot(defaults)
     }
@@ -80,11 +81,19 @@ function readSettings(): RisuNestDeviceSettings {
 }
 
 let settings: RisuNestDeviceSettings | undefined
+let storage: DeviceMarkerStorage | undefined
 const listeners = new Set<(settings: RisuNestDeviceSettings) => void>()
 
 function initializeSettings(): RisuNestDeviceSettings {
     if (settings) return settings
-    settings = readSettings()
+    return loadDeviceSettings(getDeviceMarkers())
+}
+
+/** Reads the stored settings once and keeps them in memory from then on. */
+export function loadDeviceSettings(markers: DeviceMarkerStorage): RisuNestDeviceSettings {
+    if (settings && storage === markers) return settings
+    storage = markers
+    settings = readSettings(markers)
     setRuntimePerformanceProfile(settings.performanceProfile)
     return settings
 }
@@ -105,14 +114,20 @@ export function updateDeviceSettings(
         setRuntimePerformanceProfile(settings.performanceProfile)
     }
     try {
-        localStorage.setItem(storageKey, JSON.stringify(settings))
-    } catch {
-        // Device settings remain available in memory when local storage is unavailable.
+        storage?.setItem(storageKey, JSON.stringify(settings))
+    } catch (error) {
+        // Device settings remain available in memory when the store rejects them.
+        console.error('Device settings could not be stored', error)
     }
     for (const listener of listeners) {
         listener(snapshot(settings))
     }
     return snapshot(settings)
+}
+
+/** Resolves once every stored change has committed. */
+export async function flushDeviceSettings(): Promise<void> {
+    await storage?.flush()
 }
 
 export function subscribeDeviceSettings(

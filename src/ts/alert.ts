@@ -4,6 +4,7 @@ import { language } from "../lang"
 import { isTauri, isNodeServer } from "src/ts/platform"
 import { getDatabase, type Message, type MessageGenerationInfo } from "./storage/database.svelte"
 import { alertStore as alertStoreImported } from "./stores.svelte"
+import { getDeviceMarkers } from "./storage/deviceMarkers"
 
 export interface alertData{
     type: 'error'|'normal'|'none'|'ask'|'wait'|'selectChar'
@@ -247,7 +248,8 @@ export async function alertRisuServiceTOS(){
 
 async function askLegalAcceptance(type: 'tos'|'risu-tos', acceptanceKey: string){
 
-    if(localStorage.getItem(acceptanceKey) === 'true'){
+    const markers = getDeviceMarkers()
+    if(markers.getItem(acceptanceKey) === 'true'){
         return true
     }
 
@@ -259,7 +261,8 @@ async function askLegalAcceptance(type: 'tos'|'risu-tos', acceptanceKey: string)
     await waitAlert()
 
     if(get(alertStoreImported).msg === 'yes'){
-        localStorage.setItem(acceptanceKey, 'true')
+        markers.setItem(acceptanceKey, 'true')
+        await markers.flush()
         return true
     }
 

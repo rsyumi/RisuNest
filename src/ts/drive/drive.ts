@@ -16,6 +16,7 @@ import { language } from "../../lang";
 import { relaunch } from '@tauri-apps/plugin-process';
 import { sleep } from "../util";
 import { hubURL } from "../characterCards";
+import { getDeviceMarkers } from "../storage/deviceMarkers";
 import { decodeRisuSave } from "../storage/risuSave";
 import { confirmIncompleteColdStorageRestore, getColdStorageBackupName, isColdStorageBackupData, listColdDataKeys } from "../process/coldstorage.svelte";
 import { expandColdPayloads } from "../process/coldPayloadExpansion";
@@ -197,7 +198,9 @@ export async function checkDriverInit() {
     }
 }
 
-let lastSaved:number = parseInt(localStorage.getItem('risu_lastsaved') ?? '-1')
+let lastSavedCache:number|undefined
+const lastSaved = () => lastSavedCache
+    ?? (lastSavedCache = parseInt(getDeviceMarkers().getItem('risu_lastsaved') ?? '-1'))
 
 export async function backupDrive(ACCESS_TOKEN:string) {
     if (!isTauri) await forageStorage.Init()
@@ -325,7 +328,7 @@ export async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Prom
                     continue
                 }
                 else{
-                    if(tm > lastSaved){
+                    if(tm > lastSaved()){
                         dbs.push([f,tm])
                     }
                     noSyncData = false
@@ -426,8 +429,10 @@ export async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Prom
             replaceDatabase: replacePersistentDatabase,
             publishAcceptedRevision: publishCurrentOfficialRevision,
             relaunch: async () => {
-                lastSaved = Date.now()
-                localStorage.setItem('risu_lastsaved', `${lastSaved}`)
+                lastSavedCache = Date.now()
+                const markers = getDeviceMarkers()
+                markers.setItem('risu_lastsaved', `${lastSavedCache}`)
+                await markers.flush()
                 alertStore.set({
                     type: "wait",
                     msg: "Success, Refreshing your app."

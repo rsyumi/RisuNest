@@ -406,6 +406,8 @@ describe('explicit native official account flow', () => {
         ])
         const settings: NativeDeviceSettings = {
             get: vi.fn(async (key) => backend.get(key) ?? null),
+            readMany: vi.fn(async (keys: readonly string[]) =>
+                keys.map((key) => backend.get(key) ?? null)),
             set: vi.fn(async (key, value) => {
                 if (value === null) backend.delete(key)
                 else backend.set(key, value)

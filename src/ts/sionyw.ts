@@ -1,6 +1,7 @@
 import { hubURL } from "./characterCards";
 import { fetchNative } from "./globalApi.svelte";
 import { DBState } from "./stores.svelte";
+import { getDeviceMarkers } from "./storage/deviceMarkers";
 import { readFile, BaseDirectory, writeFile } from "@tauri-apps/plugin-fs";
 import { isTauri } from "src/ts/platform"
 import * as client from 'openid-client'
@@ -43,7 +44,7 @@ export async function fetchProtectedResource(url: string, options: RequestInit =
 
     //this option is for development and debugging purposes only
     //for production, DBState.db.account.token should be removed entirely
-    if(localStorage.getItem('ignoreRisuAuth') !== 'true'){
+    if(getDeviceMarkers().getItem('ignoreRisuAuth') !== 'true'){
         risuAuth = DBState.db?.account?.token
         let fallBackRisuToken = localStorage.getItem("fallbackRisuToken")
         if(!risuAuth && fallBackRisuToken){

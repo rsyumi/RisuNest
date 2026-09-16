@@ -1,6 +1,7 @@
 <script lang="ts">
     import { language } from "src/lang";
     import { hubURL } from "src/ts/characterCards";
+    import { getDeviceMarkers } from "src/ts/storage/deviceMarkers";
     import {
         loadRisuAccountBackup,
         loadRisuAccountData,
@@ -502,8 +503,9 @@
                         name={language.SaveDataInAccount}
                         onChange={(v) => {
                             if (v) {
-                                localStorage.setItem("dosync", "sync");
-                                location.reload();
+                                const markers = getDeviceMarkers();
+                                markers.setItem("dosync", "sync");
+                                void markers.flush().then(() => location.reload());
                             }
                         }}
                     />

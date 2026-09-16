@@ -10,14 +10,14 @@ import {
 import { changeFullscreen, sleep } from "./util"
 import { get } from "svelte/store";
 import { setDatabase, getDatabase, type Database } from "./storage/database.svelte";
-import { getDeviceSettings } from "./storage/deviceSettings";
+import { getDeviceSettings, loadDeviceSettings } from "./storage/deviceSettings";
 import { setNativeLogFileEnabled } from "./nativeLog";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, LoadingStatusState, bootFailure, type BootFailure } from "./stores.svelte";
 import { loadPlugins, loadPluginsAfterAuthoritativeRestore } from "./plugins/plugins.svelte";
 import { alertConfirm, alertError, alertInput, alertLogin, alertMd, alertNormal, alertSelect, alertTOS, waitAlert } from "./alert";
 import { checkDriverInit } from "./drive/drive";
-import { characterURLImport, downloadRisuHub, hubURL } from "./characterCards";
+import { applyHubSelection, characterURLImport, downloadRisuHub, hubURL } from "./characterCards";
 import { initializeNativeLocalUrls } from "./nativeLocalUrls";
 import { loadRisuAccountData } from "./drive/accounter";
 import { updateAnimationSpeed } from "./gui/animation";
@@ -113,6 +113,7 @@ import {
     createNativeDeviceSettings,
     createNativeDeviceSettingsBag,
 } from "./storage/nativeDeviceSettings";
+import { getDeviceMarkers, initializeDeviceMarkers } from "./storage/deviceMarkers";
 import {
     configureNativeOfficialAccountFlow,
     createNativeOfficialAccountFlowService,
@@ -232,15 +233,6 @@ export async function loadData() {
             stage = 'native-setup'
             await checkNativeStartupStatus()
         }
-        const deviceSettings = getDeviceSettings()
-        if (isTauri) {
-            stage = 'native-log'
-            try {
-                await setNativeLogFileEnabled(deviceSettings.nativeFileLogEnabled)
-            } catch (error) {
-                console.error('Native file logging reconciliation failed', error)
-            }
-        }
         if (isTauri) {
             await transition('app-data-directories', language.risuNest.startup.storage)
             if (isTauriDesktop) appWindow.maximize()
@@ -257,6 +249,21 @@ export async function loadData() {
 
         await transition('persistent-storage', language.risuNest.startup.storage)
         await initializePersistentStorage()
+        if (isTauri) {
+            stage = 'device-settings'
+            await initializeDeviceMarkers()
+        }
+        const markers = getDeviceMarkers()
+        applyHubSelection(markers)
+        const deviceSettings = loadDeviceSettings(markers)
+        if (isTauri) {
+            stage = 'native-log'
+            try {
+                await setNativeLogFileEnabled(deviceSettings.nativeFileLogEnabled)
+            } catch (error) {
+                console.error('Native file logging reconciliation failed', error)
+            }
+        }
         stage = 'native-file-jobs'
         const recoveredNativeFileJobs = isTauri
             ? await reconcileNativeFileJobsBeforeBootstrap(undefined, {
@@ -802,10 +809,11 @@ export async function loadData() {
         updateHeightMode()
         updateErrorHandling()
         updateGuisize()
-        if (!localStorage.getItem('nightlyWarned') && import.meta.env.VITE_RISU_NIGHTLY_BUILD === 'TRUE') {
+        if (!markers.getItem('nightlyWarned') && import.meta.env.VITE_RISU_NIGHTLY_BUILD === 'TRUE') {
             alertMd(language.nightlyWarning)
             await waitAlert()
-            localStorage.setItem('nightlyWarned', 'true')
+            markers.setItem('nightlyWarned', 'true')
+            await markers.flush()
         }
         if (database.botSettingAtStart) botMakerMode.set(true)
         if (

@@ -3,6 +3,7 @@ import { isNodeServer } from "src/ts/platform"
 import { NodeStorage } from "./nodeStorage"
 import { OpfsStorage } from "./opfsStorage"
 import { alertStore } from "../alert"
+import { getDeviceMarkers } from "./deviceMarkers"
 
 export class AutoStorage{
     isAccount:boolean = false
@@ -37,7 +38,7 @@ export class AutoStorage{
 
     async Init(){
         this.isAccount = this.sessionAccountMode
-            ?? localStorage.getItem('accountst') === 'able'
+            ?? getDeviceMarkers().getItem('accountst') === 'able'
         if(!this.realStorage){
             if(isNodeServer){
                 console.log("using node storage")

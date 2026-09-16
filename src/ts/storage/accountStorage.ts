@@ -7,6 +7,7 @@ import { v4 } from "uuid"
 import { language } from "src/lang"
 import { fetchProtectedResource } from "../sionyw"
 import { completeAccountUnmigration } from "./databaseRestore"
+import { getDeviceMarkers } from "./deviceMarkers"
 import {
     materializePersistentDatabaseSnapshotWithRevision,
     replacePersistentDatabase,
@@ -279,7 +280,7 @@ export class AccountStorage{
     ): Promise<AccountNativeOfficialWriteResult<T> | null> {
         for (let attemptNumber = 1; attemptNumber <= maxNativeOfficialWriteAttempts; attemptNumber += 1) {
             this.checkAuth()
-            if (localStorage.getItem('ignoreRisuAuth') === 'true' || !this.auth) return null
+            if (getDeviceMarkers().getItem('ignoreRisuAuth') === 'true' || !this.auth) return null
 
             const result = await attempt({
                 credential: { kind: 'risu-auth', token: this.auth },
@@ -538,10 +539,12 @@ async function performAccountUnmigration(): Promise<void> {
                 expectedMutationGeneration,
             })
         },
-        finalize: () => {
+        finalize: async () => {
             alertStore.set({ type: "none", msg: "" })
-            localStorage.setItem('dosync', 'avoid')
-            localStorage.removeItem('accountst')
+            const markers = getDeviceMarkers()
+            markers.setItem('dosync', 'avoid')
+            markers.removeItem('accountst')
+            await markers.flush()
             localStorage.removeItem('fallbackRisuToken')
             location.reload()
         },
