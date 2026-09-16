@@ -5,6 +5,7 @@ use super::{
     connection_commands::ConnectedRepository,
     contract::{Cancellation, ErrorKind, ProviderError, Result},
     control,
+    gc_store::GcStore,
     packaging::RemoteObject,
 };
 use rusqlite::{Connection, OpenFlags};
@@ -101,12 +102,7 @@ fn direct_reachable(
             .checked_add(snapshot.receipt.byte_length)
             .ok_or_else(corrupt)?;
     }
-    // Published sections are reachable too, so a library-only publish does not
-    // make an inherited section look unreferenced.
-    for object in [&document.library.record_catalog, &document.library.asset_catalog]
-        .into_iter()
-        .chain(document.sections.values().map(|section| &section.entries_root))
-    {
+    for object in super::reachability::document_references(document) {
         let identity = (
             object.locator.collection.clone(),
             object.locator.object.clone(),
@@ -150,7 +146,15 @@ pub(crate) async fn summarize(
                 let document =
                     control::read_snapshot_document(connected, &head.document.state, cancel)
                         .await?;
-                Some(direct_reachable(&head.document.state, &document)?)
+                let mut reachable = direct_reachable(&head.document.state, &document)?;
+                // Only a cleanup walks the catalogs, so a repository no
+                // cleanup has finished keeps reporting the lower bound rather
+                // than paying for that walk on every inspection.
+                if let Some(bytes) = GcStore::open(root)?.last_reachable_bytes(connection_id)? {
+                    reachable.known_direct_bytes = bytes;
+                    reachable.complete = true;
+                }
+                Some(reachable)
             }
             None => None,
         }
