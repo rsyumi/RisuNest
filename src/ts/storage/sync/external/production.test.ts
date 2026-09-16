@@ -60,6 +60,7 @@ const initialState: ExternalStorageState = {
             providerId: 'webdav', authority: 'synthetic.invalid', repositoryHint: 'old',
             warnings: [], remoteVerified: true,
         },
+        retentionPolicy: { keepCount: 10, keepDays: 30 },
         capabilities: {
             cas: false, sequential: true, backupOnly: true, resumableUpload: false,
             rangeDownload: false, snapshotDiscovery: true, evidence: 'synthetic',

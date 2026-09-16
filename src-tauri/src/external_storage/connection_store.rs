@@ -22,6 +22,10 @@ pub(crate) struct StoredConnection {
     /// afterwards and never rewrites an existing point.
     #[serde(default)]
     pub capture_policy: Option<super::connection::CapturePolicy>,
+    /// All connections. `None` means `RetentionPolicy::DEFAULT`; it is the
+    /// default for a connection that never set one.
+    #[serde(default)]
+    pub retention_policy: Option<super::connection::RetentionPolicy>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -141,6 +145,21 @@ impl ConnectionStore {
             return Err(ProviderError::new(ErrorKind::Unsupported));
         }
         connection.capture_policy = Some(policy);
+        self.write(id, connection)
+    }
+    /// Replaces how long a connection keeps the automatic backup points this
+    /// device made. A cleanup already running keeps the policy it fixed.
+    pub fn set_retention_policy(
+        &mut self,
+        id: &str,
+        policy: super::connection::RetentionPolicy,
+    ) -> Result<StoredConnection> {
+        policy.validate()?;
+        let mut connection = self.read(id)?;
+        connection.retention_policy = Some(policy);
+        self.write(id, connection)
+    }
+    fn write(&mut self, id: &str, connection: StoredConnection) -> Result<StoredConnection> {
         let encoded = serde_json::to_string(&connection).map_err(storage)?;
         decode(&encoded)?;
         self.0
@@ -193,6 +212,7 @@ impl ConnectionStore {
             provider_repository_id,
             credential_ref: pending.credential_ref,
             capture_policy: pending.capture_policy,
+            retention_policy: None,
             root_key_ref: pending.root_key_ref,
             capabilities,
             created_at_ms: pending.created_at_ms,
@@ -407,6 +427,51 @@ mod tests {
                 ..
             })
         ));
+    }
+    /// A synchronization connection holds backup points too, so it carries a
+    /// retention policy as well. Until one is set the connection has none and
+    /// the default applies.
+    #[test]
+    fn every_connection_kind_carries_a_retention_policy() {
+        use super::super::connection::RetentionPolicy;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut store = ConnectionStore::open(root.path()).unwrap();
+        let sync = pending();
+        store.put_pending(&sync).unwrap();
+        store
+            .promote_pending(&sync.id, locator("synthetic"), Capabilities::default())
+            .unwrap();
+        assert_eq!(store.read(&sync.id).unwrap().retention_policy, None);
+
+        let narrowed = RetentionPolicy {
+            keep_count: 3,
+            keep_days: RetentionPolicy::MIN_KEEP_DAYS,
+        };
+        let updated = store.set_retention_policy(&sync.id, narrowed).unwrap();
+        assert_eq!(updated.retention_policy, Some(narrowed));
+        assert_eq!(
+            store.read(&sync.id).unwrap().retention_policy,
+            Some(narrowed)
+        );
+
+        assert!(matches!(
+            store.set_retention_policy(
+                &sync.id,
+                RetentionPolicy {
+                    keep_count: 3,
+                    keep_days: RetentionPolicy::MIN_KEEP_DAYS - 1,
+                },
+            ),
+            Err(ProviderError {
+                kind: ErrorKind::PreconditionFailed,
+                ..
+            })
+        ));
+        assert_eq!(
+            store.read(&sync.id).unwrap().retention_policy,
+            Some(narrowed)
+        );
     }
     /// Changing a backup connection's policy applies to work started later. A
     /// synchronization connection has none to change.

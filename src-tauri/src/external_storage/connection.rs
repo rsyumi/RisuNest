@@ -5,13 +5,19 @@ use super::{
     capabilities::{Capabilities, Evidence},
     connection_store::StoredConnection,
     contract::{ConnectionConfig, ErrorKind, OpenMode, ProviderError, PublicationStrategy, Result},
+    control::BackupPointKind,
     durable_quota::DurableBudget,
     http::{NativeHttpTransport, SystemClock},
     providers::{self, Dependencies},
     secrets,
 };
+use risunest_external_storage_format::control::BundleSource;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    sync::Arc,
+};
 use zeroize::{Zeroize, Zeroizing};
 
 pub(crate) const PREPARATION_LIFETIME_MS: u64 = 10 * 60 * 1000;
@@ -78,6 +84,110 @@ impl Default for CapturePolicy {
             local_settings: true,
         }
     }
+}
+
+/// Automatic backup points this device made are removed only once they are past
+/// both limits. Manual, conflict and recovery-candidate points are never removed.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RetentionPolicy {
+    pub keep_count: u32,
+    pub keep_days: u32,
+}
+
+impl RetentionPolicy {
+    pub const DEFAULT: Self = Self {
+        keep_count: 10,
+        keep_days: 30,
+    };
+    /// A point another device still expects to reach may not be removed before
+    /// that device has had the chance to see it replaced.
+    pub const MIN_KEEP_DAYS: u32 = 7;
+
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=1000).contains(&self.keep_count)
+            || !(Self::MIN_KEEP_DAYS..=3650).contains(&self.keep_days)
+        {
+            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+        }
+        Ok(())
+    }
+}
+
+/// One backup point as a cleanup reads it. A point document names its bundles
+/// but not who made them, so each bundle arrives with the source its own
+/// document declares.
+pub(crate) struct RetentionPoint {
+    pub point_id: String,
+    pub kind: BackupPointKind,
+    pub created_at_ms: u64,
+    pub bundles: Vec<RetentionBundle>,
+}
+
+pub(crate) struct RetentionBundle {
+    pub object_id: String,
+    pub source: BundleSource,
+}
+
+/// What a cleanup removes and what it keeps. `roots` names every bundle a kept
+/// point holds, both sides of a conflict included.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct RetentionDecision {
+    pub remove: Vec<String>,
+    pub keep: Vec<String>,
+    pub roots: Vec<String>,
+}
+
+/// Automatic points are counted newest first for each device that made them,
+/// and only a point past both the count and the length is expired. Removal is
+/// limited to what this device made: another device's points are counted for
+/// its own limit and kept here, and so is a point whose bundle came from a
+/// synchronized state rather than from a device.
+pub(crate) fn decide_retention(
+    points: &[RetentionPoint],
+    writer_id: &str,
+    policy: RetentionPolicy,
+    now_ms: u64,
+) -> RetentionDecision {
+    let keep_for_ms = u64::from(policy.keep_days) * 24 * 60 * 60 * 1000;
+    let mut made: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (index, point) in points.iter().enumerate() {
+        let [bundle] = point.bundles.as_slice() else {
+            continue;
+        };
+        let BundleSource::Device { writer_id: maker } = &bundle.source else {
+            continue;
+        };
+        if point.kind == BackupPointKind::Automatic {
+            made.entry(maker.as_str()).or_default().push(index);
+        }
+    }
+    let mut expired: BTreeMap<usize, &str> = BTreeMap::new();
+    for (maker, mut group) in made {
+        group.sort_by(|left, right| {
+            points[*right]
+                .created_at_ms
+                .cmp(&points[*left].created_at_ms)
+                .then_with(|| points[*left].point_id.cmp(&points[*right].point_id))
+        });
+        for index in group.into_iter().skip(policy.keep_count as usize) {
+            if now_ms.saturating_sub(points[index].created_at_ms) > keep_for_ms {
+                expired.insert(index, maker);
+            }
+        }
+    }
+    let mut decision = RetentionDecision::default();
+    let mut roots = BTreeSet::new();
+    for (index, point) in points.iter().enumerate() {
+        if expired.get(&index).is_some_and(|maker| *maker == writer_id) {
+            decision.remove.push(point.point_id.clone());
+            continue;
+        }
+        decision.keep.push(point.point_id.clone());
+        roots.extend(point.bundles.iter().map(|bundle| bundle.object_id.clone()));
+    }
+    decision.roots = roots.into_iter().collect();
+    decision
 }
 
 #[derive(Clone, Deserialize)]
@@ -253,6 +363,8 @@ pub(crate) struct ConnectionSummary {
     pub endpoint: EndpointConfirmation,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capture_policy: Option<CapturePolicy>,
+    /// The policy in force, which is the default until the user changes it.
+    pub retention_policy: RetentionPolicy,
     pub capabilities: ConnectionCapabilities,
     pub status: ConnectionStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -715,6 +827,9 @@ pub(crate) fn summary(connection: &StoredConnection) -> ConnectionSummary {
             remote_verified: false,
         }),
         capture_policy: connection.capture_policy,
+        retention_policy: connection
+            .retention_policy
+            .unwrap_or(RetentionPolicy::DEFAULT),
         capabilities: capabilities(&connection.capabilities),
         status: ConnectionStatus::Ready,
         last_verified_at_ms: Some(connection.created_at_ms.to_string()),
@@ -863,6 +978,214 @@ mod tests {
                 ConnectionStrategy::BackupOnly => Vec::new(),
                 ConnectionStrategy::Cas => Vec::new(),
             },
+        }
+    }
+
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    const NOW_MS: u64 = 1000 * DAY_MS;
+
+    fn made_by(object_id: &str, writer_id: &str) -> RetentionBundle {
+        RetentionBundle {
+            object_id: object_id.into(),
+            source: BundleSource::Device {
+                writer_id: writer_id.into(),
+            },
+        }
+    }
+
+    fn point(
+        point_id: &str,
+        kind: BackupPointKind,
+        days_old: u64,
+        bundles: Vec<RetentionBundle>,
+    ) -> RetentionPoint {
+        RetentionPoint {
+            point_id: point_id.into(),
+            kind,
+            created_at_ms: NOW_MS - days_old * DAY_MS,
+            bundles,
+        }
+    }
+
+    fn automatic(point_id: &str, writer_id: &str, days_old: u64) -> RetentionPoint {
+        point(
+            point_id,
+            BackupPointKind::Automatic,
+            days_old,
+            vec![made_by(&format!("bundle-{point_id}"), writer_id)],
+        )
+    }
+
+    /// Counting is per device, so a device that has been away keeps its own
+    /// backups whatever this device's policy says.
+    #[test]
+    fn a_cleanup_removes_only_the_automatic_points_this_device_made() {
+        let points = [
+            automatic("mine-new", "this-device", 1),
+            automatic("mine-old", "this-device", 90),
+            automatic("mine-older", "this-device", 120),
+            automatic("theirs-new", "other-device", 2),
+            automatic("theirs-old", "other-device", 95),
+            automatic("theirs-older", "other-device", 130),
+        ];
+        let decision = decide_retention(
+            &points,
+            "this-device",
+            RetentionPolicy {
+                keep_count: 1,
+                keep_days: 7,
+            },
+            NOW_MS,
+        );
+        assert_eq!(decision.remove, ["mine-old", "mine-older"]);
+        assert_eq!(
+            decision.keep,
+            ["mine-new", "theirs-new", "theirs-old", "theirs-older"]
+        );
+        assert!(decision.roots.contains(&"bundle-theirs-older".to_string()));
+        assert!(!decision.roots.contains(&"bundle-mine-old".to_string()));
+    }
+
+    /// A kept point, a conflict and a recovery candidate outlive any policy,
+    /// and a conflict keeps both of the sides it preserved.
+    #[test]
+    fn kept_conflict_and_recovery_points_survive_the_narrowest_policy() {
+        let points = [
+            point(
+                "manual",
+                BackupPointKind::Manual,
+                400,
+                vec![made_by("bundle-manual", "this-device")],
+            ),
+            point(
+                "conflict",
+                BackupPointKind::Conflict,
+                400,
+                vec![
+                    made_by("bundle-local", "this-device"),
+                    made_by("bundle-remote", "other-device"),
+                ],
+            ),
+            point(
+                "recovery",
+                BackupPointKind::RecoveryCandidate,
+                400,
+                vec![made_by("bundle-recovery", "this-device")],
+            ),
+            automatic("automatic", "this-device", 400),
+        ];
+        let decision = decide_retention(
+            &points,
+            "this-device",
+            RetentionPolicy {
+                keep_count: 1,
+                keep_days: RetentionPolicy::MIN_KEEP_DAYS,
+            },
+            NOW_MS,
+        );
+        assert_eq!(decision.remove, Vec::<String>::new());
+        assert_eq!(decision.keep, ["manual", "conflict", "recovery", "automatic"]);
+        assert!(decision.roots.contains(&"bundle-local".to_string()));
+        assert!(decision.roots.contains(&"bundle-remote".to_string()));
+    }
+
+    /// One limit alone never removes anything, and a bundle a synchronized
+    /// state produced belongs to no device.
+    #[test]
+    fn one_limit_alone_and_a_state_bundle_never_remove_a_point() {
+        let points = [
+            automatic("first", "this-device", 400),
+            automatic("second", "this-device", 300),
+            automatic("third", "this-device", 200),
+        ];
+        let within_count = decide_retention(
+            &points,
+            "this-device",
+            RetentionPolicy {
+                keep_count: 3,
+                keep_days: 7,
+            },
+            NOW_MS,
+        );
+        assert_eq!(within_count.remove, Vec::<String>::new());
+        let within_days = decide_retention(
+            &points,
+            "this-device",
+            RetentionPolicy {
+                keep_count: 1,
+                keep_days: 3650,
+            },
+            NOW_MS,
+        );
+        assert_eq!(within_days.remove, Vec::<String>::new());
+
+        let synchronized = [
+            automatic("device", "this-device", 400),
+            point(
+                "state",
+                BackupPointKind::Automatic,
+                400,
+                vec![RetentionBundle {
+                    object_id: "bundle-state".into(),
+                    source: BundleSource::SyncState {
+                        commit_id: "commit".into(),
+                    },
+                }],
+            ),
+        ];
+        let decision = decide_retention(
+            &synchronized,
+            "this-device",
+            RetentionPolicy {
+                keep_count: 1,
+                keep_days: 7,
+            },
+            NOW_MS,
+        );
+        assert_eq!(decision.remove, Vec::<String>::new());
+        assert_eq!(decision.keep, ["device", "state"]);
+    }
+
+    #[test]
+    fn a_retention_policy_holds_the_shortest_grace_and_a_first_backup() {
+        assert!(RetentionPolicy::DEFAULT.validate().is_ok());
+        for policy in [
+            RetentionPolicy {
+                keep_count: 1,
+                keep_days: RetentionPolicy::MIN_KEEP_DAYS,
+            },
+            RetentionPolicy {
+                keep_count: 1000,
+                keep_days: 3650,
+            },
+        ] {
+            assert!(policy.validate().is_ok());
+        }
+        for policy in [
+            RetentionPolicy {
+                keep_count: 0,
+                keep_days: 30,
+            },
+            RetentionPolicy {
+                keep_count: 1001,
+                keep_days: 30,
+            },
+            RetentionPolicy {
+                keep_count: 10,
+                keep_days: RetentionPolicy::MIN_KEEP_DAYS - 1,
+            },
+            RetentionPolicy {
+                keep_count: 10,
+                keep_days: 3651,
+            },
+        ] {
+            assert!(matches!(
+                policy.validate(),
+                Err(ProviderError {
+                    kind: ErrorKind::PreconditionFailed,
+                    ..
+                })
+            ));
         }
     }
 

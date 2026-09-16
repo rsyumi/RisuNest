@@ -682,6 +682,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         external_storage::connection_commands::external_storage_complete_authorization,
         external_storage::connection_commands::external_storage_cancel_authorization,
         external_storage::connection_commands::external_storage_set_capture_policy,
+        external_storage::connection_commands::external_storage_set_retention_policy,
         external_storage::connection_commands::external_storage_remove_connection,
         external_storage::connection_commands::external_storage_begin_recovery_export,
         external_storage::connection_commands::external_storage_save_recovery_file,

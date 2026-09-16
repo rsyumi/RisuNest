@@ -1089,6 +1089,20 @@ pub(crate) fn external_storage_set_capture_policy(
     Ok(())
 }
 
+/// Changes how much of what this device backed up a connection keeps. The new
+/// policy applies to cleanups started afterwards.
+#[tauri::command]
+pub(crate) fn external_storage_set_retention_policy(
+    app: AppHandle,
+    connection_id: String,
+    policy: super::connection::RetentionPolicy,
+) -> Result<()> {
+    let root = connection_root(&app)?;
+    let mut store = ConnectionStore::open(&root)?;
+    store.set_retention_policy(&connection_id, policy)?;
+    Ok(())
+}
+
 #[tauri::command]
 pub(crate) async fn external_storage_remove_connection(
     app: AppHandle,
@@ -1356,6 +1370,7 @@ mod tests {
             credential_ref: "not-exported".into(),
             root_key_ref: "not-exported".into(),
             capture_policy: None,
+            retention_policy: None,
             capabilities: super::super::fake::capabilities(false),
             created_at_ms: 1,
         };

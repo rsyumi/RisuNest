@@ -97,6 +97,7 @@ mod tests {
             credential_ref: "not-exported-credential".into(),
             root_key_ref: "not-exported-os-key".into(),
             capture_policy: None,
+            retention_policy: None,
             capabilities: Capabilities::default(),
             created_at_ms: 1,
         };
