@@ -650,3 +650,75 @@ fn a_head_change_in_a_section_this_device_left_out_reads_no_record() {
     assert_eq!(read_vector(&reader, 11), None);
     fleet.task.abort();
 }
+
+fn remote_cursor(store: &PersistentStore) -> Option<(String, String)> {
+    store
+        .connection
+        .query_row(
+            "SELECT head,domains FROM server_sync_remote_cursor WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok()
+}
+
+fn rebuilt_the_mirror(fleet: &Fleet, mark: usize) -> bool {
+    fleet
+        .requests_since(mark)
+        .iter()
+        .any(|path| path.starts_with("/checkpoints"))
+}
+
+/// Letting a section go asks for nothing the mirror does not already hold, so
+/// the reader keeps its place. Taking one on leaves the mirror short of that
+/// section's records, which only a checkpoint over every domain can fill.
+#[test]
+fn leaving_a_section_keeps_the_mirror_and_taking_one_on_rebuilds_it() {
+    let fleet = fleet();
+    let (_author_dir, mut author) = prepared();
+    let (_reader_dir, mut reader) = prepared();
+    fleet.bind(&mut author);
+    fleet.bind(&mut reader);
+    for store in [&mut author, &mut reader] {
+        store
+            .device_store_mut()
+            .unwrap()
+            .set_section_participating(Section::LocalPlugins, true)
+            .unwrap();
+    }
+    author
+        .device_store_mut()
+        .unwrap()
+        .write_hypa_embeddings(&[embedding(21, 4, 0x41)])
+        .unwrap();
+    assert_eq!(settle(&mut author).phase, "idle");
+    assert_eq!(settle(&mut reader).phase, "idle");
+    let settled = remote_cursor(&reader).expect("a settled reader holds a cursor");
+
+    let mark = fleet.requests();
+    reader
+        .device_store_mut()
+        .unwrap()
+        .set_section_participating(Section::Hypa, false)
+        .unwrap();
+    assert_eq!(settle(&mut reader).phase, "idle");
+    let narrowed = remote_cursor(&reader).expect("the cursor survives a narrowing");
+    assert_eq!(narrowed.0, settled.0);
+    assert_ne!(narrowed.1, settled.1);
+    assert!(!rebuilt_the_mirror(&fleet, mark));
+
+    let mark = fleet.requests();
+    reader
+        .device_store_mut()
+        .unwrap()
+        .set_section_participating(Section::Hypa, true)
+        .unwrap();
+    assert_eq!(settle(&mut reader).phase, "idle");
+    assert_eq!(
+        remote_cursor(&reader).expect("the rebuilt cursor is stored").1,
+        settled.1
+    );
+    assert!(rebuilt_the_mirror(&fleet, mark));
+    assert_eq!(read_vector(&reader, 21), read_vector(&author, 21));
+    fleet.task.abort();
+}

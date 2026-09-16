@@ -172,14 +172,30 @@ fn refresh_once(
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
-    // A changed participation choice invalidates the mirror's coverage rather
-    // than its contents, so the next fetch starts from a checkpoint.
+    // A participation choice that takes on a section leaves the mirror short of
+    // that section's records, so the next fetch starts from a checkpoint over
+    // every domain. Letting a section go asks for nothing the mirror does not
+    // already hold, so a settled cursor narrows in place and keeps its position.
+    // A fetch still in flight cannot narrow: the server checks the domain list
+    // on every page of the checkpoint or pin it issued.
     let saved = match saved {
-        Some((_, _, _, ref stored)) if decode::<Vec<Domain>>(stored)? != domains => {
-            db.execute("DELETE FROM server_sync_remote_cursor", [])?;
-            None
+        Some(entry) => {
+            let stored = decode::<Vec<Domain>>(&entry.3)?;
+            if stored == domains {
+                Some(entry)
+            } else if entry.2 && domains.iter().all(|domain| stored.contains(domain)) {
+                let narrowed = json(&domains)?;
+                db.execute(
+                    "UPDATE server_sync_remote_cursor SET domains=?1 WHERE singleton=1",
+                    [&narrowed],
+                )?;
+                Some((entry.0, entry.1, entry.2, narrowed))
+            } else {
+                db.execute("DELETE FROM server_sync_remote_cursor", [])?;
+                None
+            }
         }
-        other => other,
+        None => None,
     };
     let through;
     let mut fetch;
