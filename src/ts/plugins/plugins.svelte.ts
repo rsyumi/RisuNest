@@ -8,7 +8,6 @@ import type { OpenAIChat } from "../process/index.svelte";
 import { fetchNative, globalFetch, readImage, saveAsset } from "../globalApi.svelte";
 import { DBState, hotReloading } from "../stores.svelte";
 import type { ScriptMode } from "../process/scripts";
-import { SafeLocalStorage } from "./pluginSafeClass";
 import { loadV3Plugins } from "./apiV3/v3.svelte";
 import { pluginCodeTranspiler } from "./apiV3/transpiler";
 import {
@@ -607,7 +606,6 @@ export const getV2PluginAPIs = () => {
                 }
             }
         },
-        safeLocalStorage: new SafeLocalStorage(UNOWNED_PLUGIN_OWNER),
         loadPlugins: loadPluginsFromPlugin,
         readImage: (path:string) => {
             if(path.startsWith('assets/')){
