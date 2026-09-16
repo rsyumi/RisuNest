@@ -357,7 +357,6 @@
 <Button
     onclick={async () => {
         if (await alertConfirm(language.backupConfirm)) {
-            localStorage.setItem("backup", "save");
 
             if (isTauri || isNodeServer) {
                 checkDriver("savetauri");
@@ -377,7 +376,6 @@
             (await alertConfirm(language.backupLoadConfirm)) &&
             (await alertConfirm(language.backupLoadConfirm2))
         ) {
-            localStorage.setItem("backup", "load");
             if (isTauri || isNodeServer) {
                 checkDriver("loadtauri");
             } else {
