@@ -214,6 +214,49 @@ export function totalPluginDataBytes(items: readonly PluginDataItem[]): number {
     return items.reduce((total, item) => total + item.byteSize, 0)
 }
 
+export interface PluginDataAssignmentChoice {
+    owner: string
+    keys: readonly string[]
+}
+
+export interface PluginDataAssignmentPrefill {
+    selectedIds: string[]
+    groupOwners: { prefix: string | null; owner: string }[]
+}
+
+/**
+ * Reads assignments back into the selection they were made in. Keys the items
+ * no longer hold and plugins the list no longer offers are left out, and a
+ * bundle keeps the one owner it can show.
+ */
+export function pluginDataAssignmentPrefill(
+    items: readonly PluginDataItem[],
+    assignments: readonly PluginDataAssignmentChoice[],
+    owners: readonly string[],
+): PluginDataAssignmentPrefill {
+    const offered = new Set(owners)
+    const ownerByKey = new Map<string, string>()
+    for (const assignment of assignments) {
+        if (!offered.has(assignment.owner)) continue
+        for (const key of assignment.keys) {
+            if (!ownerByKey.has(key)) ownerByKey.set(key, assignment.owner)
+        }
+    }
+    const prefill: PluginDataAssignmentPrefill = { selectedIds: [], groupOwners: [] }
+    for (const group of groupPluginDataByPrefix(items)) {
+        let owner: string | undefined
+        for (const item of group.items) {
+            const chosen = ownerByKey.get(item.key)
+            if (chosen === undefined) continue
+            owner ??= chosen
+            if (chosen !== owner) continue
+            prefill.selectedIds.push(pluginDataItemId(item))
+        }
+        if (owner !== undefined) prefill.groupOwners.push({ prefix: group.prefix, owner })
+    }
+    return prefill
+}
+
 export interface PluginOwnerBucket {
     owner: string
     count: number

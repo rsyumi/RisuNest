@@ -9,6 +9,7 @@ let open = false
  */
 export async function selectPluginValueAssignment(
     preview: NativeStagedPluginPreview,
+    remembered: NativeStagedPluginChoice | null = null,
 ): Promise<NativeStagedPluginChoice | null> {
     if (preview.values.length === 0) return { assignments: [], automatic: true }
     if (open) throw new Error('A plugin value assignment is already open')
@@ -39,6 +40,7 @@ export async function selectPluginValueAssignment(
             props: {
                 values: preview.values,
                 pluginNames: preview.pluginNames,
+                remembered,
                 onchoose: finish,
             },
         })

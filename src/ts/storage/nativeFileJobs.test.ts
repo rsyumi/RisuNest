@@ -19,6 +19,8 @@ import {
     type NativeFileJobStatus,
     type NativeOfficialPublicationAttemptResult,
     type NativeOfficialPublicationRetryRequest,
+    type NativeStagedPluginChoice,
+    type NativeStagedPluginPreview,
 } from './nativeFileJobs'
 
 function status(
@@ -68,6 +70,89 @@ function restoreRuntime(
             }
         },
     }
+}
+
+function pluginValuePreview(keys: readonly string[]): NativeStagedPluginPreview {
+    return {
+        values: keys.map((key, index) => ({
+            key,
+            byteSize: 12 + index,
+            valueType: 'json',
+        })),
+        pluginNames: ['provider-manager', 'yumi-translator'],
+    }
+}
+
+/** One import that reaches the plugin value pass, answers it, and ends. */
+async function restoreOverPluginValues(options: {
+    jobId: string
+    preview: NativeStagedPluginPreview
+    fenceFails?: boolean
+    answer: NativeStagedPluginChoice | null
+    onOffer(remembered: NativeStagedPluginChoice | null | undefined): void
+}): Promise<void> {
+    const cancels = options.fenceFails === true || options.answer === null
+    const statuses: NativeFileJobStatus[] = [
+        {
+            ...status('waitingForInput'),
+            jobId: options.jobId,
+            phase: 'awaiting-activation',
+            pluginValuePreview: options.preview,
+        },
+        cancels
+            ? {
+                  ...status('cancelled'),
+                  jobId: options.jobId,
+                  phase: 'awaiting-activation',
+              }
+            : {
+                  ...status('succeeded', {
+                      revision: 9,
+                      sourceBytes: 128,
+                      sourceSha256: 'c'.repeat(64),
+                      characterCount: 1,
+                      presetCount: 0,
+                      warningCodes: [],
+                  }),
+                  jobId: options.jobId,
+              },
+    ]
+    const runtime = restoreRuntime(
+        8,
+        options.fenceFails
+            ? {
+                  acquire: () => {
+                      throw new Error('another mutation advanced the revision')
+                  },
+              }
+            : {},
+    )
+    const running = runNativeBlockRisuSaveRestore(
+        runtime,
+        { type: 'desktopPath', path: 'save.risudat' },
+        {
+            assignPluginValues: async (_preview, remembered) => {
+                options.onOffer(remembered)
+                return options.answer
+            },
+        },
+        {
+            isTauri: () => true,
+            invoke: async (command) => {
+                if (command === 'native_file_job_start')
+                    return { jobId: options.jobId }
+                if (command === 'native_file_job_status') return statuses.shift()
+                if (command === 'native_plugin_values_assign') return undefined
+                if (command === 'native_file_job_cancel') return 'requested'
+                if (command === 'native_file_job_finalize') return 'requested'
+                if (command === 'native_file_job_forget') return true
+                throw new Error(`Unexpected command: ${command}`)
+            },
+            wait: async () => undefined,
+        },
+    )
+    if (cancels) await expect(running).rejects.toThrow()
+    else await running
 }
 
 describe('native file jobs', () => {
@@ -687,6 +772,90 @@ describe('native file jobs', () => {
         expect(commands).not.toContain('native_plugin_values_assign')
         expect(commands).not.toContain('native_file_job_finalize')
         expect(acquire).not.toHaveBeenCalled()
+    })
+
+    it('keeps the plugin value answers for the attempt after a lost fence', async () => {
+        const preview = pluginValuePreview(['pm_store', 'pm_keys'])
+        const answer: NativeStagedPluginChoice = {
+            assignments: [{ owner: 'provider-manager', keys: ['pm_store'] }],
+            automatic: false,
+        }
+        const offered: (NativeStagedPluginChoice | null | undefined)[] = []
+
+        await restoreOverPluginValues({
+            jobId: 'job-1',
+            preview,
+            fenceFails: true,
+            answer,
+            onOffer: (remembered) => offered.push(remembered),
+        })
+        await restoreOverPluginValues({
+            jobId: 'job-2',
+            preview,
+            answer,
+            onOffer: (remembered) => offered.push(remembered),
+        })
+
+        expect(offered[1]).toEqual(answer)
+        expect(offered[0]).toBeNull()
+    })
+
+    it('drops the plugin value answers once the import carrying them is applied', async () => {
+        const preview = pluginValuePreview(['yt_glossary', 'yt_terms'])
+        const answer: NativeStagedPluginChoice = {
+            assignments: [{ owner: 'yumi-translator', keys: ['yt_glossary'] }],
+            automatic: true,
+        }
+        const offered: (NativeStagedPluginChoice | null | undefined)[] = []
+
+        await restoreOverPluginValues({
+            jobId: 'job-1',
+            preview,
+            fenceFails: true,
+            answer,
+            onOffer: (remembered) => offered.push(remembered),
+        })
+        await restoreOverPluginValues({
+            jobId: 'job-2',
+            preview,
+            answer,
+            onOffer: (remembered) => offered.push(remembered),
+        })
+        await restoreOverPluginValues({
+            jobId: 'job-3',
+            preview,
+            answer,
+            onOffer: (remembered) => offered.push(remembered),
+        })
+
+        expect(offered[1]).toEqual(answer)
+        expect(offered[2]).toBeNull()
+    })
+
+    it('offers nothing to a save that left a different set of values unowned', async () => {
+        const answered = pluginValuePreview(['hp_index', 'hp_chunks'])
+        const other = pluginValuePreview(['hp_index', 'hp_vectors'])
+        const answer: NativeStagedPluginChoice = {
+            assignments: [{ owner: 'provider-manager', keys: ['hp_index'] }],
+            automatic: false,
+        }
+        const offered: (NativeStagedPluginChoice | null | undefined)[] = []
+
+        await restoreOverPluginValues({
+            jobId: 'job-1',
+            preview: answered,
+            fenceFails: true,
+            answer,
+            onOffer: (remembered) => offered.push(remembered),
+        })
+        await restoreOverPluginValues({
+            jobId: 'job-2',
+            preview: other,
+            answer: null,
+            onOffer: (remembered) => offered.push(remembered),
+        })
+
+        expect(offered[1]).toBeNull()
     })
 
     it('restores an official snapshot without transferring its database bytes through IPC', async () => {

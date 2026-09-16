@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { untrack } from 'svelte'
     import { language } from 'src/lang'
     import { UNOWNED_PLUGIN_OWNER } from 'src/ts/plugins/pluginOwner'
     import type { PluginDataItem } from 'src/ts/plugins/pluginDataInventory'
@@ -13,13 +14,15 @@
         values: NativeStagedPluginValue[]
         /** Plugins the imported save carries, which are the owners to choose from. */
         pluginNames: string[]
+        /** Answers an attempt over the same save gave before it was cancelled. */
+        remembered?: NativeStagedPluginChoice | null
         onchoose: (choice: NativeStagedPluginChoice | null) => void
     }
 
-    let { values, pluginNames, onchoose }: Props = $props()
+    let { values, pluginNames, remembered = null, onchoose }: Props = $props()
 
     const strings = language.risuNest.pluginData.import
-    let automatic = $state(true)
+    let automatic = $state(untrack(() => remembered?.automatic ?? true))
     let assignments: { owner: string; items: PluginDataItem[] }[] = $state([])
 
     const staged: PluginDataItem[] = $derived(
@@ -63,6 +66,7 @@
                 place="import"
                 {staged}
                 {pluginNames}
+                initialAssignments={remembered?.assignments}
                 onselectionchange={(chosen) => { assignments = chosen }}
             />
         </div>
