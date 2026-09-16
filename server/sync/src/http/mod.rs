@@ -9,6 +9,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
+    response::sse::{Event, KeepAlive, Sse},
     routing::{get, post, put},
     Extension, Json, Router,
 };
@@ -24,6 +25,10 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
+/// How long a held notification stream waits before confirming the head on its
+/// own. It bounds the delay of a change no writer announced.
+const HEAD_NOTICE_INTERVAL: Duration = Duration::from_secs(20);
+
 #[derive(Clone)]
 struct App {
     store: Arc<Store>,
@@ -32,6 +37,7 @@ struct App {
     buffers: Arc<Semaphore>,
     materializers: Arc<Semaphore>,
     media_slots: Arc<Semaphore>,
+    notice_slots: Arc<Semaphore>,
     devices: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     workload: Workload,
     _lifetime: Arc<()>,
@@ -147,6 +153,7 @@ pub fn router_with_workload(store: Arc<Store>, workload: Workload) -> Router {
         buffers: Arc::new(Semaphore::new(4)),
         materializers: Arc::new(Semaphore::new(1)),
         media_slots: Arc::new(Semaphore::new(16)),
+        notice_slots: Arc::new(Semaphore::new(32)),
         devices: Arc::new(Mutex::new(HashMap::new())),
         workload,
         _lifetime: lifetime,
@@ -200,6 +207,9 @@ pub fn router_with_workload(store: Arc<Store>, workload: Workload) -> Router {
         .route("/acks", post(ack))
         .layer(DefaultBodyLimit::max(batch::MAX_BATCH_BYTES))
         .route_layer(middleware::from_fn_with_state(app.clone(), authorize))
+        // A held notification stream must not occupy an admission slot or a
+        // device slot for its whole life, so it authenticates on its own.
+        .route("/events", get(events))
         .route("/media/{token}", get(media))
         .with_state(app)
 }
@@ -354,6 +364,56 @@ async fn head(State(app): State<App>, headers: HeaderMap) -> Result<Response> {
     };
     response.headers_mut().insert("etag", etag.parse().unwrap());
     Ok(response)
+}
+/// Notifies a held client that the ledger head may have moved. The change
+/// itself still travels over the ordinary endpoints, so a client that never
+/// connects here, or whose connection drops, reaches the same state by asking.
+async fn events(State(app): State<App>, headers: HeaderMap) -> Result<Response> {
+    let token = header(&headers, "authorization")
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or(Error::new("unauthorized", 401))?
+        .to_owned();
+    let library = header(&headers, "x-risu-library")
+        .ok_or(Error::new("unauthorized", 401))?
+        .to_owned();
+    let store = app.store.clone();
+    blocking(move || store.authenticate(&library, &token)).await?;
+    let permit = app
+        .notice_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| Error::new("server-busy", 429))?;
+    let announced = app.store.head_announcements();
+    let stream = futures_util::stream::unfold(
+        (app, announced, None::<String>, permit),
+        |(app, mut announced, last, permit)| async move {
+            loop {
+                // A stream outlives the drain a maintenance owner waits for, so
+                // it closes as soon as admission does.
+                if !app
+                    .workload
+                    .status()
+                    .is_ok_and(|status| status.state == "open")
+                {
+                    return None;
+                }
+                let store = app.store.clone();
+                let head = blocking(move || store.head()).await.ok()?;
+                if last.as_deref() != Some(head.head_id.as_str()) {
+                    let event = Event::default().event("head").data(&head.head_id);
+                    return Some((
+                        Ok::<_, std::convert::Infallible>(event),
+                        (app, announced, Some(head.head_id), permit),
+                    ));
+                }
+                let _ =
+                    tokio::time::timeout(HEAD_NOTICE_INTERVAL, announced.changed()).await;
+            }
+        },
+    );
+    Ok(Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response())
 }
 async fn session(State(app): State<App>, Extension(device): Extension<Device>) -> Result<Response> {
     blocking(move || Ok(Json(app.store.device_session(&device)?).into_response())).await

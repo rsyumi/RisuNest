@@ -1,5 +1,6 @@
 import { isTauri } from "../../platform";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   flushPendingData,
   capturePersistentMutationToken,
@@ -9,6 +10,7 @@ import { createServerSyncFacade, type ServerHead } from "./serverSync";
 import { createServerSyncController } from "./serverSyncController";
 import { createServerSyncScheduler } from "./serverSyncScheduler";
 import { subscribeLocalPersistentRevision } from "../persistentRevisionEvents";
+import { subscribeNativeServerSyncSignals } from "./serverSyncNativeSignals";
 import type { SyncExitDrainAdapter } from "../syncExitCoordinator";
 
 let controller: ReturnType<typeof createServerSyncController> | undefined;
@@ -61,11 +63,15 @@ export function holdServerSyncAfterRestore(): void {
 }
 let started = false;
 let activeScheduler: ReturnType<typeof createServerSyncScheduler> | undefined;
+let syncAvailable: (() => boolean) | undefined;
 /** A read-only file backup may outlive the scheduled timer. Resume the existing
  * scheduler when it settles; restoring a library deliberately does not do this. */
 export function resumeServerSyncAfterBackup(): void {
   activeScheduler?.resume();
-  if (activeScheduler) cleanupDeletedBackups();
+  if (activeScheduler) {
+    cleanupDeletedBackups();
+    if (syncAvailable?.()) void invoke("server_sync_events_start").catch(() => {});
+  }
 }
 export interface ServerSyncBackup {
   id: string;
@@ -152,23 +158,51 @@ export async function restoreServerSyncBackup(
     if (lease) await invoke<void>("server_sync_backup_release", { lease });
   }
 }
+/** Notifications and polling stop together: neither runs while the app is not
+ * in a state to act on them. */
+function suspendServerSync(
+  scheduler: ReturnType<typeof createServerSyncScheduler>,
+): void {
+  scheduler.suspend();
+  void invoke("server_sync_events_stop").catch(() => {});
+}
 export function startServerSync(): void {
   if (started || !isTauri) return;
   started = true;
   const controller = getServerSyncController();
-  const scheduler = createServerSyncScheduler(controller, {
-    available: () => document.visibilityState !== "hidden" && navigator.onLine,
-  });
+  const available = () =>
+    document.visibilityState !== "hidden" && navigator.onLine;
+  const scheduler = createServerSyncScheduler(controller, { available });
   activeScheduler = scheduler;
+  syncAvailable = available;
   subscribeLocalPersistentRevision(() => {
     controller.invalidateCompletion();
     scheduler.localCommit();
   });
+  subscribeNativeServerSyncSignals(
+    {
+      // Device sections have their own revision, so their writes wake the
+      // scheduler the same way a library revision does.
+      deviceChanged: () => {
+        controller.invalidateCompletion();
+        scheduler.localCommit();
+      },
+      remoteHint: () => scheduler.remoteHint(),
+    },
+    (event, handler) => listen(event, handler),
+  );
+  let configured = false;
+  controller.subscribe((state) => {
+    const bound = Boolean(state.status?.configured);
+    // A connection can only be held once this device has a binding to hold.
+    if (bound && !configured) resumeServerSyncAfterBackup();
+    configured = bound;
+  });
   void controller.initialize().then(() => resumeServerSyncAfterBackup());
   window.addEventListener("online", () => resumeServerSyncAfterBackup());
-  window.addEventListener("offline", () => scheduler.suspend());
+  window.addEventListener("offline", () => suspendServerSync(scheduler));
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") scheduler.suspend();
+    if (document.visibilityState === "hidden") suspendServerSync(scheduler);
     else resumeServerSyncAfterBackup();
   });
 }

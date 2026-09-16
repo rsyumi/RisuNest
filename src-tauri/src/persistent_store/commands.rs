@@ -1228,15 +1228,21 @@ pub(crate) fn pds_list_plugin_device_storage(
 
 #[tauri::command(async)]
 pub(crate) fn pds_write_plugin_device_values(
+    app: AppHandle,
     state: State<'_, PersistentStoreState>,
     owner: String,
     mutations: Vec<PluginDeviceMutation>,
 ) -> Result<(), StoreError> {
-    with_store_mut(state, |store| {
-        store
-            .device_store_mut()?
-            .write_plugin_device_values(&owner, &mutations)
-    })
+    let changed = with_store_mut(state, |store| {
+        let device = store.device_store_mut()?;
+        let before = device.revision()?;
+        device.write_plugin_device_values(&owner, &mutations)?;
+        Ok(device.revision()? != before)
+    })?;
+    if changed {
+        crate::server_sync::events::notify_device_changed(&app);
+    }
+    Ok(())
 }
 
 #[tauri::command(async)]

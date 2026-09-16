@@ -426,6 +426,16 @@ impl DeviceStore {
     pub(crate) fn connection(&self) -> &Connection {
         &self.connection
     }
+
+    /// The device counter every tracked mutation advances. Synchronisation
+    /// subscribes to it the way it subscribes to the library revision.
+    pub(crate) fn revision(&self) -> StoreResult<i64> {
+        Ok(self.connection.query_row(
+            "SELECT revision FROM device_meta WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?)
+    }
 }
 
 pub(crate) fn now_ms() -> StoreResult<i64> {

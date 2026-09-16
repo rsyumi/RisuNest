@@ -230,6 +230,7 @@ impl Store {
         )?;
         tx.execute("DELETE FROM commit_jobs WHERE operation=?1", [&operation])?;
         tx.commit()?;
+        self.announce_head();
         Ok(receipt)
     }
     pub fn receipt(&self, device: &Device, operation: &str) -> Result<Receipt> {

@@ -154,6 +154,7 @@ impl Store {
             DELETE FROM objects WHERE hash NOT IN gc_alive;
             DELETE FROM gc_versions; DELETE FROM gc_roots; DELETE FROM gc_alive;")?;
         tx.commit()?;
+        self.announce_head();
         self.drain_staging_trash(&db)?;
         let hashes = {
             let mut statement = db.prepare("SELECT hash FROM object_trash LIMIT 1024")?;
@@ -192,6 +193,7 @@ impl Store {
         tx.execute_batch("DELETE FROM changes; DELETE FROM commits; DELETE FROM receipts; DELETE FROM commit_jobs; DELETE FROM staged_changes; DELETE FROM read_pins; DELETE FROM checkpoints; DELETE FROM uploads; DELETE FROM download_deltas; DELETE FROM transfer_recipes; DELETE FROM object_leases; DELETE FROM scope_versions; DELETE FROM device_section_acks;")?;
         tx.execute("UPDATE library SET head=?1", [json(&head)?])?;
         tx.commit()?;
+        self.announce_head();
         Ok(())
     }
 }
