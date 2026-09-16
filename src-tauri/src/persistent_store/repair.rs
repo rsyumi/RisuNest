@@ -135,7 +135,6 @@ fn identity_columns(table: &str) -> &'static [&'static str] {
         "messages" => &["character_id", "conversation_id", "message_index"],
         "asset_aliases" => &["kind", "logical_key"],
         "asset_owner_heads" => &["owner_kind", "owner_locator"],
-        "cold_aliases" => &["key"],
         _ => &[],
     }
 }
@@ -358,7 +357,7 @@ fn derive_json_columns(transaction: &Connection, staging: &str, table: &str) -> 
 fn keep_single(transaction: &Connection, staging: &str, table: &str) -> StoreResult<()> {
     let names: &[&str] = match table {
         "root" => &["root"],
-        "authority" => &["asset_repository_authority", "cold_payload_authority"],
+        "authority" => &["asset_repository_authority"],
         _ => return Err(validation(format!("{table} is not a single-record table"))),
     };
     for name in names {
@@ -405,13 +404,6 @@ fn recover_orphans(transaction: &Connection, staging: &str, table: &str, now_ms:
 }
 
 fn drop_alias(transaction: &Connection, staging: &str, kind: &str, key: &str) -> StoreResult<()> {
-    if kind == "cold" {
-        transaction.execute(
-            "DELETE FROM cold_aliases WHERE generation=?1 AND key=?2",
-            rusqlite::params![staging, key],
-        )?;
-        return Ok(());
-    }
     transaction.execute(
         "DELETE FROM asset_aliases WHERE generation=?1 AND kind=?2 AND logical_key=?3",
         rusqlite::params![staging, kind, key],
@@ -428,14 +420,8 @@ fn adopt_stored_payload(
     kind: &str,
     key: &str,
 ) -> StoreResult<()> {
-    let (table, filter): (&str, &str) = match kind {
-        "cold" => ("cold_aliases", "key=?2"),
-        _ => ("asset_aliases", "kind=?2 AND logical_key=?3"),
-    };
-    let parameters: Vec<String> = match kind {
-        "cold" => vec![staging.to_owned(), key.to_owned()],
-        _ => vec![staging.to_owned(), kind.to_owned(), key.to_owned()],
-    };
+    let (table, filter): (&str, &str) = ("asset_aliases", "kind=?2 AND logical_key=?3");
+    let parameters: Vec<String> = vec![staging.to_owned(), kind.to_owned(), key.to_owned()];
     let hash: Option<String> = transaction
         .query_row(
             &format!("SELECT object_hash FROM {table} WHERE generation=?1 AND {filter}"),
@@ -463,22 +449,11 @@ fn adopt_stored_payload(
     Ok(())
 }
 
-/// Marks a cold payload the decoder cannot read. The bytes stay; a backup carries them as they
-/// are instead of stopping, and the unused file cleanup keeps holding them.
-fn mark_cold_opaque(transaction: &Connection, staging: &str, key: &str) -> StoreResult<()> {
-    transaction.execute(
-        "UPDATE cold_aliases SET metadata=json_set(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.opaque', json('true')) WHERE generation=?1 AND key=?2",
-        rusqlite::params![staging, key],
-    )?;
-    Ok(())
-}
-
 /// Settles a storage authority by re-examining the aliases that are actually stored. The
 /// compatibility hash is recomputed from those aliases, never declared.
 fn settle_authority(transaction: &Connection, staging: &str, subject: &str) -> StoreResult<()> {
     let table = match subject {
         "asset" => "asset_repository_authority",
-        "cold" => "cold_payload_authority",
         _ => return Err(validation(format!("{subject} is not a storage authority"))),
     };
     let migration_id: String = transaction
@@ -507,16 +482,10 @@ fn settle_authority(transaction: &Connection, staging: &str, subject: &str) -> S
 fn alias_compatibility_hash(transaction: &Connection, staging: &str) -> StoreResult<String> {
     use sha2::{Digest, Sha256};
     let mut digest = Sha256::new();
-    for (sql, label) in [
-        (
-            "SELECT kind,logical_key,object_hash,size FROM asset_aliases WHERE generation=?1 ORDER BY kind,logical_key",
-            "asset",
-        ),
-        (
-            "SELECT 'cold',key,object_hash,size FROM cold_aliases WHERE generation=?1 ORDER BY key",
-            "cold",
-        ),
-    ] {
+    for (sql, label) in [(
+        "SELECT kind,logical_key,object_hash,size FROM asset_aliases WHERE generation=?1 ORDER BY kind,logical_key",
+        "asset",
+    )] {
         digest.update(label.as_bytes());
         let mut statement = transaction.prepare(sql)?;
         let mut rows = statement.query([staging])?;
@@ -635,13 +604,10 @@ fn released_objects(
 ) -> StoreResult<BTreeSet<String>> {
     let mut released = BTreeSet::new();
     let mut statement = connection.prepare(
-        "SELECT object_hash FROM (
-             SELECT object_hash FROM asset_aliases WHERE generation=?1 AND object_hash IS NOT NULL
-             UNION SELECT object_hash FROM cold_aliases WHERE generation=?1 AND object_hash IS NOT NULL
-         ) EXCEPT SELECT object_hash FROM (
-             SELECT object_hash FROM asset_aliases WHERE generation=?2 AND object_hash IS NOT NULL
-             UNION SELECT object_hash FROM cold_aliases WHERE generation=?2 AND object_hash IS NOT NULL
-         )",
+        "SELECT object_hash FROM asset_aliases
+         WHERE generation=?1 AND object_hash IS NOT NULL
+         EXCEPT SELECT object_hash FROM asset_aliases
+         WHERE generation=?2 AND object_hash IS NOT NULL",
     )?;
     let mut rows = statement.query(rusqlite::params![active, staging])?;
     while let Some(row) = rows.next()? {
@@ -735,9 +701,6 @@ impl PersistentStore {
                 }
                 RepairAction::RecoverOrphans { table } => {
                     recover_orphans(&transaction, staging, table, now_ms)?
-                }
-                RepairAction::MarkColdOpaque { key } => {
-                    mark_cold_opaque(&transaction, staging, key)?
                 }
                 RepairAction::SettleAuthority { subject } => {
                     settle_authority(&transaction, staging, subject)?

@@ -1,7 +1,7 @@
 use super::owner_projection::OwnerManifestProjector;
 use super::{
     compare_plugin_storage_keys, AssetAlias, AssetOwnerHead, AssetOwnerLocator,
-    AssetRepositoryAuthorityState, ColdAlias, ColdPayloadAuthorityState, ReadTarget, StoreError,
+    AssetRepositoryAuthorityState, ReadTarget, StoreError,
     StoreResult,
 };
 use crate::asset_repository::owner_manifest_codec::OwnerManifestEntry;
@@ -35,9 +35,7 @@ pub(crate) struct PinnedLegacyBackupInventory {
     pub(crate) revision: i64,
     pub(crate) assets: Vec<AssetAlias>,
     pub(crate) owner_heads: Vec<AssetOwnerHead>,
-    pub(crate) cold: Vec<ColdAlias>,
     pub(crate) asset_authority: AssetRepositoryAuthorityState,
-    pub(crate) cold_authority: ColdPayloadAuthorityState,
 }
 
 pub(crate) fn pinned_legacy_backup_inventory(
@@ -48,9 +46,7 @@ pub(crate) fn pinned_legacy_backup_inventory(
         revision: target.revision,
         assets: super::query::list_asset_aliases(connection, target)?.value,
         owner_heads: super::query::list_asset_owner_heads(connection, target)?.value,
-        cold: super::query::list_cold_aliases(connection, target)?.value,
         asset_authority: super::query::read_asset_repository_authority(connection, target)?.value,
-        cold_authority: super::query::read_cold_payload_authority(connection, target)?.value,
     })
 }
 

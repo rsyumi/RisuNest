@@ -1,7 +1,7 @@
 use super::{StoreError, StoreResult};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
-pub(crate) const SCHEMA_VERSION: u32 = 3;
+pub(crate) const SCHEMA_VERSION: u32 = 4;
 
 const ASSET_GC_MAINTENANCE_STATE_TABLE_SQL: &str = r#"
 CREATE TABLE asset_gc_maintenance_state (
@@ -195,24 +195,6 @@ fn create_schema(connection: &mut Connection) -> StoreResult<()> {
         );
         CREATE INDEX asset_owner_heads_generation ON asset_owner_heads (generation);
         CREATE TABLE asset_repository_authority (
-            generation TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-        CREATE TABLE cold_aliases (
-            generation TEXT NOT NULL,
-            key TEXT NOT NULL,
-            object_hash TEXT CHECK (
-                object_hash IS NULL OR (
-                    length(object_hash) = 64
-                    AND object_hash NOT GLOB '*[^0-9a-f]*'
-                )
-            ),
-            size INTEGER NOT NULL CHECK (size >= 0),
-            metadata TEXT NOT NULL,
-            PRIMARY KEY (generation, key)
-        );
-        CREATE INDEX cold_aliases_generation ON cold_aliases (generation);
-        CREATE TABLE cold_payload_authority (
             generation TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );

@@ -72,7 +72,6 @@ impl Catalog {
         for (sql,kind) in [
             ("SELECT logical_key,object_hash,size FROM asset_aliases WHERE kind='asset'","asset"),
             ("SELECT logical_key,object_hash,size FROM asset_aliases WHERE kind='inlay'","inlay"),
-            ("SELECT key,object_hash,size FROM cold_aliases","cold"),
             ("SELECT owner_kind||':'||owner_locator,manifest_hash,NULL FROM asset_owner_heads WHERE present=1","owner"),
         ] {
             let mut statement=self.db.prepare(sql)?;let mut rows=statement.query([])?;

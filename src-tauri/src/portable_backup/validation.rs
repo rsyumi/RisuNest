@@ -2,10 +2,10 @@
 use super::*;
 use crate::{
     asset_repository::PayloadCas,
-    data_health::{codes, Finding, FindingSink, FirstFinding, Report, ScanDepth},
+    data_health::{codes, Finding, FindingSink, FirstFinding, Report},
     lossless_f0::{scan_portable_fragment, F0Reference, F0ReferenceStatus, PortableFragment},
     persistent_store::{
-        portable_validation, AssetRepositoryAuthorityState, ColdPayloadAuthorityState,
+        portable_validation, AssetRepositoryAuthorityState,
     },
 };
 use rusqlite::{params, OptionalExtension};
@@ -81,7 +81,6 @@ impl VerifiedArchive {
             LibraryView {
                 db: &self.db,
                 objects: self,
-                depth: ScanDepth::Deep,
             },
             probe,
         )
@@ -91,7 +90,6 @@ impl VerifiedArchive {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn scan_library(
         &self,
-        depth: ScanDepth,
         sink: &mut dyn FindingSink,
         probe: &dyn CancellationProbe,
     ) -> Result<ReferenceCounts> {
@@ -102,7 +100,6 @@ impl VerifiedArchive {
             LibraryView {
                 db: &self.db,
                 objects: self,
-                depth,
             },
             sink,
             probe,
@@ -118,7 +115,6 @@ impl Catalog {
             LibraryView {
                 db: &self.db,
                 objects: self,
-                depth: ScanDepth::Deep,
             },
             probe,
         )
@@ -131,7 +127,6 @@ impl Catalog {
 pub(crate) fn scan_live_library(
     db: &rusqlite::Connection,
     cas: &PayloadCas,
-    depth: ScanDepth,
     sink: &mut dyn FindingSink,
     probe: &dyn CancellationProbe,
 ) -> Result<ReferenceCounts> {
@@ -139,7 +134,6 @@ pub(crate) fn scan_live_library(
         LibraryView {
             db,
             objects: cas,
-            depth,
         },
         sink,
         probe,
@@ -180,13 +174,11 @@ pub(crate) fn registered_object_totals(db: &rusqlite::Connection) -> Result<Obje
 
 const REGISTERED_OBJECTS: &str = "SELECT object_hash,MAX(size),MAX(kind) FROM (
             SELECT object_hash,size,kind FROM asset_aliases WHERE object_hash IS NOT NULL
-            UNION ALL SELECT object_hash,size,'cold' FROM cold_aliases WHERE object_hash IS NOT NULL
         ) WHERE object_hash>?1 GROUP BY object_hash ORDER BY object_hash";
 
 const REGISTERED_OBJECT_TOTALS: &str = "SELECT COUNT(*),COALESCE(SUM(size),0) FROM (
             SELECT object_hash,MAX(size) AS size FROM (
                 SELECT object_hash,size FROM asset_aliases WHERE object_hash IS NOT NULL
-                UNION ALL SELECT object_hash,size FROM cold_aliases WHERE object_hash IS NOT NULL
             ) GROUP BY object_hash
         )";
 
@@ -263,7 +255,6 @@ pub(crate) fn validate_live_library(
         LibraryView {
             db,
             objects: cas,
-            depth: ScanDepth::Deep,
         },
         probe,
     )
@@ -329,10 +320,9 @@ impl LibraryObjects for PayloadCas {
         report: &mut Report<'_>,
         probe: &dyn CancellationProbe,
     ) -> Result<()> {
-        for sql in [
-            "SELECT kind,logical_key,object_hash,size FROM asset_aliases ORDER BY kind,logical_key",
-            "SELECT 'cold',key,object_hash,size FROM cold_aliases ORDER BY key",
-        ] {
+        for sql in
+            ["SELECT kind,logical_key,object_hash,size FROM asset_aliases ORDER BY kind,logical_key"]
+        {
             let mut statement = db.prepare(sql)?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
@@ -371,7 +361,6 @@ fn validate_catalog_payloads(
 ) -> Result<()> {
     for sql in [
         "SELECT a.kind,a.logical_key,EXISTS(SELECT 1 FROM files f WHERE f.kind=a.kind AND f.logical_key=a.logical_key AND f.state='present') FROM asset_aliases a WHERE a.object_hash IS NULL OR NOT EXISTS(SELECT 1 FROM files f JOIN objects o ON f.object_hash=o.sha256 WHERE f.kind=a.kind AND f.logical_key=a.logical_key AND f.state='present' AND lower(hex(o.sha256))=a.object_hash AND o.byte_length=a.size) ORDER BY a.kind,a.logical_key",
-        "SELECT 'cold',a.key,EXISTS(SELECT 1 FROM files f WHERE f.kind='cold' AND f.logical_key=a.key AND f.state='present') FROM cold_aliases a WHERE a.object_hash IS NULL OR NOT EXISTS(SELECT 1 FROM files f JOIN objects o ON f.object_hash=o.sha256 WHERE f.kind='cold' AND f.logical_key=a.key AND f.state='present' AND lower(hex(o.sha256))=a.object_hash AND o.byte_length=a.size) ORDER BY a.key",
     ] {
         let mut statement = db.prepare(sql)?;
         let mut rows = statement.query([])?;
@@ -432,9 +421,6 @@ fn alias_finding(stored: bool, kind: &str, key: &str) -> Finding {
 struct LibraryView<'a> {
     db: &'a rusqlite::Connection,
     objects: &'a dyn LibraryObjects,
-    /// A quick scan stays proportional to the database, so it leaves the stored cold payloads
-    /// closed. Every gate keeps the deep depth the activation contract has always required.
-    depth: ScanDepth,
 }
 impl LibraryView<'_> {
     fn open_object(&self, hash: &str) -> Result<(std::io::Take<std::fs::File>, u64)> {
@@ -607,78 +593,20 @@ impl LibraryView<'_> {
                 probe,
             )?;
         }
-        // Decoding a cold payload reads its stored bytes, so only the deep depth walks them. The
-        // references a cold payload holds are scanned there too.
-        if self.depth == ScanDepth::Quick {
-            return Ok(counts);
-        }
-        let mut statement = self
-            .db
-            .prepare("SELECT key,object_hash FROM cold_aliases ORDER BY key")?;
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            check(probe)?;
-            if !report.running() {
-                return Ok(counts);
-            }
-            let key: String = row.get(0)?;
-            // A cold alias with no object was already reported as an absent payload binding.
-            let Some(hash) = row.get::<_, Option<String>>(1)? else {
-                continue;
-            };
-            let value = match self
-                .open_object(&hash)
-                .and_then(|(input, _)| Ok(crate::cold_payload_codec::decode_cold_json(input, 64 * 1024 * 1024)?))
-            {
-                Ok(value) => value,
-                Err(Error::Invalid(_) | Error::Json(_) | Error::Io(_)) => {
-                    report.record(Finding::new(
-                        codes::COLD_UNDECODABLE,
-                        "cold",
-                        key,
-                        "cold payload cannot be decoded",
-                    ));
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            self.validate_fragment(
-                PortableFragment::Cold {
-                    value: &value,
-                    key: &key,
-                },
-                &root,
-                "cold",
-                &key,
-                &mut counts,
-                report,
-                probe,
-            )?;
-        }
         Ok(counts)
     }
 
     fn validate_authority(&self, report: &mut Report<'_>) -> Result<()> {
-        for (table, subject) in [
-            ("asset_repository_authority", "asset"),
-            ("cold_payload_authority", "cold"),
-        ] {
+        for (table, subject) in [("asset_repository_authority", "asset")] {
             let serialized: Option<String> = self
                 .db
                 .query_row(&format!("SELECT value FROM {table}"), [], |r| r.get(0))
                 .optional()?;
             let complete = serialized.is_some_and(|serialized| {
-                if subject == "asset" {
-                    matches!(
-                        serde_json::from_str::<AssetRepositoryAuthorityState>(&serialized),
-                        Ok(AssetRepositoryAuthorityState::V2 { .. })
-                    )
-                } else {
-                    matches!(
-                        serde_json::from_str::<ColdPayloadAuthorityState>(&serialized),
-                        Ok(ColdPayloadAuthorityState::V2 { .. })
-                    )
-                }
+                matches!(
+                    serde_json::from_str::<AssetRepositoryAuthorityState>(&serialized),
+                    Ok(AssetRepositoryAuthorityState::V2 { .. })
+                )
             });
             if !complete
                 && !report.record(Finding::new(
@@ -749,11 +677,6 @@ impl LibraryView<'_> {
             "asset" | "inlay" => self.db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM asset_aliases WHERE kind=?1 AND logical_key=?2)",
                 params![r.target_kind, key],
-                |row| row.get(0),
-            )?,
-            "cold" => self.db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM cold_aliases WHERE key=?1)",
-                [key],
                 |row| row.get(0),
             )?,
             "character" => self.db.query_row(

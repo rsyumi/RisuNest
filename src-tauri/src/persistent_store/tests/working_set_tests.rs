@@ -1590,12 +1590,6 @@ fn leased_family_canonical(store: &PersistentStore, lease: &str) -> Vec<u8> {
             .expect("read leased asset owner head"),
         "assetRepositoryAuthority": store.read_asset_repository_authority(Some(lease))
             .expect("read leased asset repository authority"),
-        "coldPayloadAuthority": store.read_cold_payload_authority(Some(lease))
-            .expect("read leased cold payload authority"),
-        "coldAliases": store.list_cold_aliases(Some(lease))
-            .expect("list leased cold aliases"),
-        "coldAlias": store.read_cold_alias("cold/lease", Some(lease))
-            .expect("read leased cold alias"),
         "materialized": store.materialize_lease(lease).expect("materialize leased revision"),
     }))
     .expect("serialize leased record families")
@@ -1607,7 +1601,7 @@ fn sha256(bytes: &[u8]) -> String {
 
 #[test]
 fn wal_lease_keeps_every_final_record_family_and_native_export_canonical() {
-    let (directory, mut store, database) = open_fixture();
+    let (_directory, mut store, database) = open_fixture();
     let alias = AssetAlias {
         key: "assets/lease.bin".to_owned(),
         object_hash: Some("11".repeat(32)),
@@ -1626,16 +1620,6 @@ fn wal_lease_keeps_every_final_record_family_and_native_export_canonical() {
         "22".repeat(32),
         1,
     );
-    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open payload CAS");
-    let prepared_cold = cas
-        .prepare_bytes(b"cold-data")
-        .expect("prepare leased cold payload");
-    let cold = ColdAlias {
-        key: "cold/lease".to_owned(),
-        object_hash: Some(prepared_cold.content_hash),
-        size: prepared_cold.byte_size as i64,
-        metadata: json!({ "codec": "fixture" }),
-    };
     let mut final_root = staged_root(&database);
     final_root["modules"] = json!([{
         "id": "lease-module",
@@ -1665,18 +1649,6 @@ fn wal_lease_keeps_every_final_record_family_and_native_export_canonical() {
     store
         .replace_put_asset_owner_heads(&staging.staging_id, std::slice::from_ref(&owner))
         .expect("stage final-family owner head");
-    store
-        .replace_put_cold_aliases(&staging.staging_id, std::slice::from_ref(&cold))
-        .expect("stage final-family cold alias");
-    store
-        .replace_put_cold_payload_authority(
-            &staging.staging_id,
-            &ColdPayloadAuthorityState::V2 {
-                migration_id: "lease-cold-migration".to_owned(),
-                compatibility_hash: "44".repeat(32),
-            },
-        )
-        .expect("stage final-family cold authority");
     let seeded = store
         .replace_commit(&staging.staging_id, Some(1))
         .expect("activate final-family staging");

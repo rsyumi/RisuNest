@@ -32,7 +32,7 @@ impl RestoreInventory {
             .tempdir_in(owned)?;
         let db = Connection::open(directory.path().join("inventory.sqlite"))?;
         db.execute_batch("PRAGMA cache_size=-16384; PRAGMA temp_store=FILE; CREATE TABLE live_objects (hash TEXT PRIMARY KEY, owner INTEGER NOT NULL); BEGIN IMMEDIATE;")?;
-        let mut statement=archive.db.prepare("SELECT DISTINCT lower(hex(object_hash)),kind='owner' FROM files WHERE kind IN ('asset','inlay','cold','owner') AND state='present'")?;
+        let mut statement=archive.db.prepare("SELECT DISTINCT lower(hex(object_hash)),kind='owner' FROM files WHERE kind IN ('asset','inlay','owner') AND state='present'")?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             check(probe)?;

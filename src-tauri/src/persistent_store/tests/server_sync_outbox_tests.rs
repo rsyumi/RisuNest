@@ -262,14 +262,6 @@ fn plugin_clear_keeps_original_membership_and_scope_then_local_set_remains_dirty
 #[test]
 fn server_outbox_tracks_each_public_record_mutation_and_alias_deletion() {
     let (directory, mut store, database) = open_fixture();
-    store
-        .activate_cold_payload_migration(&ColdPayloadMigrationInput {
-            source_revision: store.revision().unwrap(),
-            migration_id: "synthetic-cold".into(),
-            compatibility_hash: "a".repeat(64),
-            cold_aliases: vec![],
-        })
-        .unwrap();
     bind(&store);
     let mut character = database["characters"][0].clone();
     character.as_object_mut().unwrap().shift_remove("chats");
@@ -320,15 +312,6 @@ fn server_outbox_tracks_each_public_record_mutation_and_alias_deletion() {
             .commit_asset_alias(&alias, store.revision().unwrap())
             .unwrap();
     }
-    let cold = ColdAlias {
-        key: "synthetic/cold".into(),
-        object_hash: Some(object.content_hash),
-        size: object.byte_size as i64,
-        metadata: json!({}),
-    };
-    store
-        .commit_cold_alias(&cold, store.revision().unwrap())
-        .unwrap();
     let dirty = outbox::dirty_page(&store.connection, None, 1024).unwrap();
     let families = dirty
         .iter()
@@ -342,7 +325,6 @@ fn server_outbox_tracks_each_public_record_mutation_and_alias_deletion() {
         "plugin",
         "asset",
         "inlay",
-        "cold",
     ] {
         assert!(
             families.contains(family),
@@ -357,16 +339,13 @@ fn server_outbox_tracks_each_public_record_mutation_and_alias_deletion() {
             .delete_asset_alias(kind, "synthetic/shared", store.revision().unwrap())
             .unwrap();
     }
-    store
-        .delete_cold_alias("synthetic/cold", store.revision().unwrap())
-        .unwrap();
     let dirty = outbox::dirty_page(&store.connection, None, 1024).unwrap();
     assert_eq!(
         dirty
             .iter()
             .map(|key| key.kind.as_str())
             .collect::<std::collections::BTreeSet<_>>(),
-        ["asset", "inlay", "cold"].into_iter().collect()
+        ["asset", "inlay"].into_iter().collect()
     );
     assert!(store
         .read_asset_alias("asset", "synthetic/shared", None)
@@ -374,10 +353,6 @@ fn server_outbox_tracks_each_public_record_mutation_and_alias_deletion() {
         .is_none());
     assert!(store
         .read_asset_alias("inlay", "synthetic/shared", None)
-        .unwrap()
-        .is_none());
-    assert!(store
-        .read_cold_alias("synthetic/cold", None)
         .unwrap()
         .is_none());
 }

@@ -1005,9 +1005,7 @@ mod tests {
                 manifest_hash: Some(manifest.content_hash),
                 entry_count: 1,
             }],
-            cold: vec![],
             asset_authority: AssetRepositoryAuthorityState::Legacy,
-            cold_authority: crate::persistent_store::ColdPayloadAuthorityState::Legacy,
         };
         for target in [CompatibilityTarget::RisuAi, CompatibilityTarget::PocketRisu] {
             let output = root.join(if target == CompatibilityTarget::RisuAi {
@@ -1108,9 +1106,7 @@ mod tests {
                 synthetic_alias(&cas, &reserved_id, "inlay", b"reserved inlay"),
             ],
             owner_heads: vec![],
-            cold: vec![],
             asset_authority: AssetRepositoryAuthorityState::Legacy,
-            cold_authority: crate::persistent_store::ColdPayloadAuthorityState::Legacy,
         };
         let mut pins = DurableCasJob::begin(
             &root.join("repository"),
@@ -1192,10 +1188,8 @@ mod tests {
         let inventory = export::PinnedLegacyBackupInventory {
             revision: 1,
             assets,
-            cold: vec![],
             owner_heads: vec![],
             asset_authority: AssetRepositoryAuthorityState::Legacy,
-            cold_authority: crate::persistent_store::ColdPayloadAuthorityState::Legacy,
         };
         for target in [CompatibilityTarget::RisuAi, CompatibilityTarget::PocketRisu] {
             let output = root.join(if target == CompatibilityTarget::RisuAi {
@@ -1291,9 +1285,7 @@ mod tests {
             revision: 1,
             assets: vec![asset, inlay, unused],
             owner_heads: vec![],
-            cold: vec![],
             asset_authority: AssetRepositoryAuthorityState::Legacy,
-            cold_authority: crate::persistent_store::ColdPayloadAuthorityState::Legacy,
         };
         let mut prepared = PreparedAttachments::default();
         prepared

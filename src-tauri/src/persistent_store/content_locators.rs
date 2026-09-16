@@ -18,7 +18,6 @@ pub(super) fn tracked_tables() -> Vec<(&'static str, &'static str, &'static str,
         ),
         ("plugin_storage", "'plugin'", "ROW.storage_key", "''"),
         ("asset_aliases", "ROW.kind", "ROW.logical_key", "''"),
-        ("cold_aliases", "'cold'", "ROW.key", "''"),
         (
             "asset_owner_heads",
             "'owner'",
@@ -26,6 +25,5 @@ pub(super) fn tracked_tables() -> Vec<(&'static str, &'static str, &'static str,
             "ROW.owner_locator",
         ),
         ("asset_repository_authority", "'full'", "''", "''"),
-        ("cold_payload_authority", "'full'", "''", "''"),
     ]
 }

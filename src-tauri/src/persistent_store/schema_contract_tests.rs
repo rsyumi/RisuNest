@@ -12,8 +12,6 @@ fn all_live_tables_have_an_explicit_preservation_owner() {
         "asset_aliases",
         "asset_owner_heads",
         "asset_repository_authority",
-        "cold_aliases",
-        "cold_payload_authority",
     ];
     let local_operations = [
         "meta",

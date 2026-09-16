@@ -10,7 +10,6 @@ fn storage_stats_reports_database_pages_and_zero_global_catalogs_for_a_new_store
     assert!(stats.database_bytes > 0);
     assert_eq!(stats.asset_objects.count, 0);
     assert_eq!(stats.asset_objects.bytes, 0);
-    assert_eq!(stats.cold_aliases.count, 0);
     assert_eq!(stats.plugin_storage.count, 0);
     assert_eq!(stats.characters.active.count, 0);
     assert_eq!(stats.characters.trashed_count, 0);
@@ -28,8 +27,6 @@ fn storage_stats_only_counts_active_generation_rows() {
          INSERT INTO conversations (generation, character_id, conversation_id, configured_index, recent_at, name, message_count, detail) VALUES
          ('revision-0', 'active', 'chat', 0, 0, 'chat', 3, '{}'),
          ('revision-old', 'inactive', 'chat', 0, 0, 'chat', 9, '{}');
-         INSERT INTO cold_aliases (generation, key, object_hash, size, metadata) VALUES
-         ('revision-0', 'cold-active', NULL, 5, '{}'), ('revision-old', 'cold-old', NULL, 11, '{}');
          INSERT INTO plugin_storage (generation, storage_key, byte_size, ordinal, value) VALUES
          ('revision-0', 'plugin-active', 7, 0, '{}'), ('revision-old', 'plugin-old', 13, 0, '{}');
          INSERT INTO asset_aliases (generation, logical_key, object_hash, kind, size, mime, name, ext, inlay_type, width, height, metadata) VALUES
@@ -43,7 +40,6 @@ fn storage_stats_only_counts_active_generation_rows() {
     assert_eq!(stats.characters.active.count, 1);
     assert_eq!(stats.conversations.count, 1);
     assert_eq!(stats.conversations.message_count, 3);
-    assert_eq!(stats.cold_aliases.bytes, 5);
     assert_eq!(stats.plugin_storage.bytes, 7);
     assert_eq!(stats.asset_aliases[0].bytes, 17);
     assert_eq!(stats.asset_objects.bytes, 23);

@@ -355,7 +355,7 @@ impl VerifiedArchive {
             let found: Option<Vec<u8>> = row.get(5)?;
             if !matches!(
                 kind.as_str(),
-                "asset" | "inlay" | "cold" | "owner" | "preserved" | "device"
+                "asset" | "inlay" | "owner" | "preserved" | "device"
             ) || key.is_empty()
                 || key.contains('\0')
                 || expected.as_deref().is_some_and(|v| !hash_valid(v))

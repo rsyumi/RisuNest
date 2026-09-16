@@ -181,39 +181,32 @@ pub(crate) fn validate_remote_with_residency(
                     object_hash,
                     size,
                     metadata,
-                }
-                | LogicalRecordEnvelope::Cold {
-                    object_hash,
-                    size,
-                    metadata,
                 } => {
                     if let Some(hash) = object_hash {
-                        if cas.stat_object(hash)? != Some(*size)
-                            && (matches!(locator, LogicalRecordLocator::Cold { .. })
-                                || !remote(hash, Some(*size))?)
-                        {
+                        if cas.stat_object(hash)? != Some(*size) && !remote(hash, Some(*size))? {
                             return invalid("Server payload size differs from alias");
                         }
                     }
-                    if !matches!(locator, LogicalRecordLocator::Cold { .. }) {
-                        let typed = decode_asset_alias_metadata(metadata).map_err(|_| {
-                            StoreError::Validation {
-                                message: "Invalid server alias metadata".into(),
-                            }
+                    let typed =
+                        decode_asset_alias_metadata(metadata).map_err(|_| StoreError::Validation {
+                            message: "Invalid server alias metadata".into(),
                         })?;
-                        if matches!(locator, LogicalRecordLocator::Asset { .. })
-                            && (typed.inlay_type.is_some()
-                                || typed.width.is_some()
-                                || typed.height.is_some())
-                        {
-                            return invalid("Asset contains inlay-only metadata");
-                        }
-                        if matches!(locator, LogicalRecordLocator::Inlay { .. })
-                            && typed.inlay_type.is_none()
-                        {
-                            return invalid("Inlay type is missing");
-                        }
+                    if matches!(locator, LogicalRecordLocator::Asset { .. })
+                        && (typed.inlay_type.is_some()
+                            || typed.width.is_some()
+                            || typed.height.is_some())
+                    {
+                        return invalid("Asset contains inlay-only metadata");
                     }
+                    if matches!(locator, LogicalRecordLocator::Inlay { .. })
+                        && typed.inlay_type.is_none()
+                    {
+                        return invalid("Inlay type is missing");
+                    }
+                }
+                // The store no longer holds cold payloads; P2a-ext still carries the variant.
+                LogicalRecordEnvelope::Cold { .. } => {
+                    return invalid("Cold records are unsupported")
                 }
                 _ => (),
             }

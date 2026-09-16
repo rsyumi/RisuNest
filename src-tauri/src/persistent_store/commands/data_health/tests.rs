@@ -212,7 +212,7 @@ fn a_repair_is_selected_against_the_diagnosis_and_reported_with_a_fresh_one() {
     assert!(has(&before, codes::AUTHORITY_INCOMPLETE));
 
     let selection = authority_selection(&state);
-    assert_eq!(selection.len(), 2, "one for each storage authority");
+    assert_eq!(selection.len(), 1, "one for the storage authority");
     let applied = apply_repair(&state, &health, &selection, false).unwrap();
     assert_eq!(applied.revision, before.revision + 1);
     assert!(

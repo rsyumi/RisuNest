@@ -39,9 +39,6 @@ pub(super) fn validate_locator_envelope(
         ) | (
             LogicalRecordLocator::Inlay { .. },
             LogicalRecordEnvelope::Inlay { .. }
-        ) | (
-            LogicalRecordLocator::Cold { .. },
-            LogicalRecordEnvelope::Cold { .. }
         )
     );
     if !kind_matches {
@@ -355,15 +352,8 @@ pub(super) fn apply_delete(
         LogicalRecordLocator::Inlay { logical_key } => {
             delete_alias(transaction, generation, "inlay", logical_key)
         }
-        LogicalRecordLocator::Cold { logical_key } => {
-            transaction
-                .execute(
-                    "DELETE FROM cold_aliases WHERE generation = ?1 AND key = ?2",
-                    params![generation, logical_key],
-                )
-                .map_err(sql_error)?;
-            Ok(())
-        }
+        // The store no longer holds cold payloads; P2a-ext still carries the variant.
+        LogicalRecordLocator::Cold { .. } => validation("logical cold records are unsupported"),
     }
 }
 
@@ -676,34 +666,6 @@ pub(super) fn apply_record_rows(
             *size,
             metadata,
         ),
-        (
-            LogicalRecordLocator::Cold { logical_key },
-            LogicalRecordEnvelope::Cold {
-                object_hash,
-                size,
-                metadata,
-            },
-        ) => {
-            transaction
-                .execute(
-                    "INSERT INTO cold_aliases (
-                        generation, key, object_hash, size, metadata
-                     ) VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(generation, key) DO UPDATE SET
-                        object_hash = excluded.object_hash,
-                        size = excluded.size,
-                        metadata = excluded.metadata",
-                    params![
-                        generation,
-                        logical_key,
-                        object_hash,
-                        sqlite_i64(*size, "cold alias size")?,
-                        serde_json::to_string(metadata).map_err(json_error)?,
-                    ],
-                )
-                .map_err(sql_error)?;
-            Ok(())
-        }
         _ => validation(format!(
             "logical prepared record {} changed kind before apply",
             key

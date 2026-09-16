@@ -97,8 +97,6 @@ pub(super) const GENERATION_TABLES: &[(&str, &str)] = &[
         "owner_kind, owner_locator, present, manifest_hash, entry_count",
     ),
     ("asset_repository_authority", "value"),
-    ("cold_payload_authority", "value"),
-    ("cold_aliases", "key, object_hash, size, metadata"),
 ];
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -299,52 +297,6 @@ impl AssetRepositoryAuthorityState {
                 compatibility_hash,
             } => validate_authority_fields(
                 "Asset repository",
-                migration_id,
-                None,
-                Some(compatibility_hash),
-            ),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(
-    tag = "format",
-    rename_all = "lowercase",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
-pub(crate) enum ColdPayloadAuthorityState {
-    Legacy,
-    Preparing {
-        migration_id: String,
-        source_revision: i64,
-    },
-    #[serde(rename = "v2")]
-    V2 {
-        migration_id: String,
-        compatibility_hash: String,
-    },
-}
-
-impl ColdPayloadAuthorityState {
-    pub(crate) fn validate(&self) -> StoreResult<()> {
-        match self {
-            Self::Legacy => Ok(()),
-            Self::Preparing {
-                migration_id,
-                source_revision,
-            } => validate_authority_fields(
-                "Cold payload",
-                migration_id,
-                Some(*source_revision),
-                None,
-            ),
-            Self::V2 {
-                migration_id,
-                compatibility_hash,
-            } => validate_authority_fields(
-                "Cold payload",
                 migration_id,
                 None,
                 Some(compatibility_hash),
@@ -577,55 +529,6 @@ impl AssetOwnerHead {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ColdAlias {
-    pub(crate) key: String,
-    pub(crate) object_hash: Option<String>,
-    pub(crate) size: i64,
-    pub(crate) metadata: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ColdPayloadMigrationInput {
-    pub(crate) source_revision: i64,
-    pub(crate) migration_id: String,
-    pub(crate) compatibility_hash: String,
-    pub(crate) cold_aliases: Vec<ColdAlias>,
-}
-
-impl ColdPayloadMigrationInput {
-    fn authority(&self) -> ColdPayloadAuthorityState {
-        ColdPayloadAuthorityState::V2 {
-            migration_id: self.migration_id.clone(),
-            compatibility_hash: self.compatibility_hash.clone(),
-        }
-    }
-}
-
-impl ColdAlias {
-    pub(super) fn validate(&self) -> StoreResult<()> {
-        if self.key.is_empty() || self.key.contains('\0') {
-            return Err(StoreError::Validation {
-                message: "Cold alias key must be nonempty and contain no NUL characters".to_owned(),
-            });
-        }
-        validate_object_hash(&self.object_hash, "Cold alias")?;
-        if self.size < 0 {
-            return Err(StoreError::Validation {
-                message: "Cold alias size must be nonnegative".to_owned(),
-            });
-        }
-        if !self.metadata.is_object() {
-            return Err(StoreError::Validation {
-                message: "Cold alias metadata must be a JSON object".to_owned(),
-            });
-        }
-        Ok(())
-    }
-}
-
 pub(crate) use crate::trust_boundary::is_lower_hex_256 as is_lowercase_sha256_hex;
 
 fn validate_object_hash(hash: &Option<String>, subject: &str) -> StoreResult<()> {
@@ -646,33 +549,6 @@ fn validate_hash(hash: &str, subject: &str) -> StoreResult<()> {
     if !is_lowercase_sha256_hex(hash) {
         return Err(StoreError::Validation {
             message: format!("{subject} must be 64 lowercase hexadecimal characters"),
-        });
-    }
-    Ok(())
-}
-
-fn verify_cold_alias_object(
-    cas: &crate::asset_repository::PayloadCas,
-    alias: &ColdAlias,
-) -> StoreResult<()> {
-    alias.validate()?;
-    let hash = alias
-        .object_hash
-        .as_deref()
-        .ok_or_else(|| StoreError::Validation {
-            message: "Cold payload v2 alias requires an objectHash".to_owned(),
-        })?;
-    let actual_size = cas
-        .stat_object(hash)?
-        .ok_or_else(|| StoreError::Validation {
-            message: format!("Cold payload CAS object {hash} is missing"),
-        })?;
-    if actual_size != alias.size as u64 {
-        return Err(StoreError::Validation {
-            message: format!(
-                "Cold payload alias size {} does not match CAS size {actual_size}",
-                alias.size
-            ),
         });
     }
     Ok(())
@@ -938,18 +814,11 @@ impl DataHealthReader {
 
     pub(crate) fn scan(
         &self,
-        depth: crate::data_health::ScanDepth,
         limit: usize,
         probe: &dyn crate::local_backup::CancellationProbe,
     ) -> StoreResult<crate::data_health::Findings> {
         let mut findings = crate::data_health::Findings::new(limit);
-        crate::portable_backup::scan_live_library(
-            &self.connection,
-            &self.cas,
-            depth,
-            &mut findings,
-            probe,
-        )
+        crate::portable_backup::scan_live_library(&self.connection, &self.cas, &mut findings, probe)
         .map_err(scan_failure)?;
         self.note_unreferenced_objects(&mut findings, probe)?;
         Ok(findings)
@@ -967,7 +836,6 @@ impl DataHealthReader {
         let mut statement = self.connection.prepare(
             "SELECT object_hash,byte_size FROM asset_objects WHERE object_hash NOT IN (
                  SELECT object_hash FROM asset_aliases WHERE object_hash IS NOT NULL
-                 UNION SELECT object_hash FROM cold_aliases WHERE object_hash IS NOT NULL
              ) ORDER BY object_hash",
         )?;
         let mut rows = statement.query([])?;
@@ -1094,7 +962,6 @@ pub(crate) struct PersistentStorageStats {
     pub(crate) database_bytes: u64,
     pub(crate) asset_objects: StorageCountBytes,
     pub(crate) asset_aliases: Vec<StorageAliasStats>,
-    pub(crate) cold_aliases: StorageCountBytes,
     pub(crate) plugin_storage: StorageCountBytes,
     pub(crate) characters: StorageCharacterStats,
     pub(crate) conversations: StorageConversationStats,
@@ -1389,10 +1256,6 @@ impl PersistentStore {
             "INSERT OR IGNORE INTO asset_repository_authority (generation, value) VALUES (?1, ?2)",
             params!["revision-0", r#"{"format":"legacy"}"#],
         )?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO cold_payload_authority (generation, value) VALUES (?1, ?2)",
-            params!["revision-0", r#"{"format":"legacy"}"#],
-        )?;
         transaction.commit()?;
         export::sweep_abandoned(&snapshots_dir)?;
         #[cfg(feature = "native-kei-upload-pilot")]
@@ -1578,14 +1441,6 @@ impl PersistentStore {
         query::read_asset_repository_authority(connection, &target)
     }
 
-    pub(crate) fn read_cold_payload_authority(
-        &self,
-        lease: Option<&str>,
-    ) -> StoreResult<Versioned<ColdPayloadAuthorityState>> {
-        let (connection, target) = self.read_view(lease)?;
-        query::read_cold_payload_authority(connection, &target)
-    }
-
     pub(crate) fn read_asset_owner_head(
         &self,
         owner: &AssetOwnerLocator,
@@ -1593,15 +1448,6 @@ impl PersistentStore {
     ) -> StoreResult<Option<Versioned<AssetOwnerHead>>> {
         let (connection, target) = self.read_view(lease)?;
         query::read_asset_owner_head(connection, owner, &target)
-    }
-
-    pub(crate) fn read_cold_alias(
-        &self,
-        key: &str,
-        lease: Option<&str>,
-    ) -> StoreResult<Option<Versioned<ColdAlias>>> {
-        let (connection, target) = self.read_view(lease)?;
-        query::read_cold_alias(connection, key, &target)
     }
 
     pub(crate) fn list_asset_aliases(
@@ -1618,14 +1464,6 @@ impl PersistentStore {
     ) -> StoreResult<Versioned<Vec<AssetOwnerHead>>> {
         let (connection, target) = self.read_view(lease)?;
         query::list_asset_owner_heads(connection, &target)
-    }
-
-    pub(crate) fn list_cold_aliases(
-        &self,
-        lease: Option<&str>,
-    ) -> StoreResult<Versioned<Vec<ColdAlias>>> {
-        let (connection, target) = self.read_view(lease)?;
-        query::list_cold_aliases(connection, &target)
     }
 
     pub(crate) fn materialize(&self, revision: Option<i64>) -> StoreResult<Value> {
@@ -1707,35 +1545,6 @@ impl PersistentStore {
         commit::delete_asset_alias(&mut self.connection, kind, key, expected_revision)
     }
 
-    pub(crate) fn commit_cold_alias(
-        &mut self,
-        alias: &ColdAlias,
-        expected_revision: i64,
-    ) -> StoreResult<RevisionResult> {
-        let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
-        verify_cold_alias_object(&cas, alias)?;
-        commit::commit_cold_alias(&mut self.connection, alias, expected_revision)
-    }
-
-    pub(crate) fn delete_cold_alias(
-        &mut self,
-        key: &str,
-        expected_revision: i64,
-    ) -> StoreResult<RevisionResult> {
-        commit::delete_cold_alias(&mut self.connection, key, expected_revision)
-    }
-
-    pub(crate) fn activate_cold_payload_migration(
-        &mut self,
-        input: &ColdPayloadMigrationInput,
-    ) -> StoreResult<RevisionResult> {
-        let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
-        for alias in &input.cold_aliases {
-            verify_cold_alias_object(&cas, alias)?;
-        }
-        commit::activate_cold_payload_migration(&mut self.connection, input)
-    }
-
     pub(crate) fn replace_begin(&mut self) -> StoreResult<StagingResult> {
         commit::replace_begin(&mut self.connection)
     }
@@ -1776,14 +1585,6 @@ impl PersistentStore {
         commit::replace_put_asset_repository_authority(&mut self.connection, staging_id, authority)
     }
 
-    pub(crate) fn replace_put_cold_payload_authority(
-        &mut self,
-        staging_id: &str,
-        authority: &ColdPayloadAuthorityState,
-    ) -> StoreResult<()> {
-        commit::replace_put_cold_payload_authority(&mut self.connection, staging_id, authority)
-    }
-
     pub(crate) fn replace_preserve_repositories(
         &mut self,
         staging_id: &str,
@@ -1795,14 +1596,6 @@ impl PersistentStore {
             expected_revision,
         )?;
         Ok(RevisionResult { revision })
-    }
-
-    pub(crate) fn replace_put_cold_aliases(
-        &mut self,
-        staging_id: &str,
-        aliases: &[ColdAlias],
-    ) -> StoreResult<()> {
-        commit::replace_put_cold_aliases(&mut self.connection, staging_id, aliases)
     }
 
     pub(crate) fn replace_add_characters(
@@ -1823,30 +1616,6 @@ impl PersistentStore {
         self.finish_prepared_replace(prepared)
     }
 
-    fn verify_staged_cold_payload_objects(&self, staging_id: &str) -> StoreResult<()> {
-        let authority = commit::read_cold_payload_authority(&self.connection, staging_id)?;
-        if !matches!(authority, ColdPayloadAuthorityState::V2 { .. }) {
-            return Ok(());
-        }
-        let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
-        let mut statement = self.connection.prepare(
-            "SELECT key, object_hash, size, metadata
-             FROM cold_aliases WHERE generation = ?1 ORDER BY key ASC",
-        )?;
-        let mut rows = statement.query([staging_id])?;
-        while let Some(row) = rows.next()? {
-            let metadata: String = row.get(3)?;
-            let alias = ColdAlias {
-                key: row.get(0)?,
-                object_hash: row.get(1)?,
-                size: row.get(2)?,
-                metadata: serde_json::from_str(&metadata)?,
-            };
-            verify_cold_alias_object(&cas, &alias)?;
-        }
-        Ok(())
-    }
-
     pub(crate) fn prepare_replace_commit(
         &self,
         staging_id: &str,
@@ -1854,7 +1623,6 @@ impl PersistentStore {
     ) -> StoreResult<PreparedReplaceCommit> {
         let revision =
             commit::validate_replace_commit(&self.connection, staging_id, expected_revision)?;
-        self.verify_staged_cold_payload_objects(staging_id)?;
         Ok(PreparedReplaceCommit {
             staging_id: staging_id.to_owned(),
             revision,
@@ -1865,7 +1633,6 @@ impl PersistentStore {
         &mut self,
         prepared: PreparedReplaceCommit,
     ) -> StoreResult<RevisionResult> {
-        self.verify_staged_cold_payload_objects(&prepared.staging_id)?;
         commit::replace_commit(
             &mut self.connection,
             &prepared.staging_id,
@@ -1879,7 +1646,6 @@ impl PersistentStore {
         key: &str,
         value: &Value,
     ) -> StoreResult<RevisionResult> {
-        self.verify_staged_cold_payload_objects(&prepared.staging_id)?;
         commit::replace_commit_with_app_kv(
             &mut self.connection,
             &prepared.staging_id,
@@ -1896,7 +1662,6 @@ impl PersistentStore {
         prepared: PreparedReplaceCommit,
         job: &str,
     ) -> StoreResult<RevisionResult> {
-        self.verify_staged_cold_payload_objects(&prepared.staging_id)?;
         commit::replace_commit_from_external(
             &mut self.connection,
             &prepared.staging_id,
@@ -2261,11 +2026,6 @@ impl PersistentStore {
             "SELECT COUNT(*), COALESCE(SUM(byte_size), 0) FROM asset_objects",
             [],
         )?;
-        let cold_aliases = query_count_bytes(
-            &transaction,
-            "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM cold_aliases WHERE generation = ?1",
-            [&active],
-        )?;
         let plugin_storage = query_count_bytes(
             &transaction,
             "SELECT COUNT(*), COALESCE(SUM(byte_size), 0) FROM plugin_storage WHERE generation = ?1",
@@ -2334,7 +2094,6 @@ impl PersistentStore {
             database_bytes,
             asset_objects,
             asset_aliases: aliases,
-            cold_aliases,
             plugin_storage,
             characters: StorageCharacterStats {
                 active: active_characters,
@@ -2366,7 +2125,7 @@ impl PersistentStore {
 
     pub(crate) fn prepare_asset_gc_preview(&self) -> StoreResult<AssetGcPreview> {
         let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
-        let labelled = self.collect_labelled_asset_gc_roots(&cas, false, true)?;
+        let labelled = self.collect_labelled_asset_gc_roots(false, true)?;
         // Only the holders that are small and explainable are kept for attribution; the library
         // itself is the default answer and copying its root set would cost as much as it holds.
         let holders = labelled
@@ -2613,7 +2372,7 @@ impl PersistentStore {
         let initial_report = dry_run_mark_and_sweep_with_remote(
             &cas,
             initial_candidates.items.clone(),
-            self.collect_asset_gc_roots(&cas, false, false)?,
+            self.collect_asset_gc_roots(false, false)?,
             now_ms,
             minimum_grace_ms,
             |hash| residency.gc_size(hash),
@@ -2644,7 +2403,7 @@ impl PersistentStore {
         let mut report = dry_run_mark_and_sweep_with_remote(
             &cas,
             final_candidates.items.clone(),
-            self.collect_asset_gc_roots(&cas, true, false)?,
+            self.collect_asset_gc_roots(true, false)?,
             now_ms,
             minimum_grace_ms,
             |hash| residency.gc_size(hash),
@@ -2745,12 +2504,11 @@ impl PersistentStore {
 
     fn collect_asset_gc_roots(
         &self,
-        cas: &crate::asset_repository::PayloadCas,
         repository_guard_held: bool,
         read_only: bool,
     ) -> StoreResult<Vec<crate::asset_repository::migration_gc::AssetRootSet>> {
         Ok(self
-            .collect_labelled_asset_gc_roots(cas, repository_guard_held, read_only)?
+            .collect_labelled_asset_gc_roots(repository_guard_held, read_only)?
             .into_iter()
             .map(|(_, roots)| roots)
             .collect())
@@ -2759,7 +2517,6 @@ impl PersistentStore {
     /// The same roots, each labelled by what holds it, so a preview can explain a retention.
     fn collect_labelled_asset_gc_roots(
         &self,
-        cas: &crate::asset_repository::PayloadCas,
         repository_guard_held: bool,
         read_only: bool,
     ) -> StoreResult<Vec<(&'static str, crate::asset_repository::migration_gc::AssetRootSet)>> {
@@ -2769,11 +2526,11 @@ impl PersistentStore {
         };
         use crate::asset_repository::migration_gc::collect_staged_migration_roots;
 
-        let mut roots = vec![("library", snapshot::collect_asset_roots(&self.connection, cas)?)];
+        let mut roots = vec![("library", snapshot::collect_asset_roots(&self.connection)?)];
         for reader in self.revision_leases.values() {
             roots.push((
                 "library",
-                snapshot::collect_asset_roots(&reader.connection, cas)?,
+                snapshot::collect_asset_roots(&reader.connection)?,
             ));
         }
         roots.extend(

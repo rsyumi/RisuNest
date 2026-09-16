@@ -264,13 +264,6 @@ fn validate_row(table: &PortableTable, row: &Row<'_>) -> StoreResult<()> {
                 "portable asset key is invalid",
             )?;
         }
-        "cold_aliases" => super::ColdAlias {
-            key: row.get(0)?,
-            object_hash: row.get(1)?,
-            size: row.get(2)?,
-            metadata: json(row, 3)?,
-        }
-        .validate()?,
         "asset_repository_authority" => {
             let authority: super::AssetRepositoryAuthorityState =
                 parse_json(&row.get::<_, String>(0)?)?;
@@ -281,18 +274,6 @@ fn validate_row(table: &PortableTable, row: &Row<'_>) -> StoreResult<()> {
                     super::AssetRepositoryAuthorityState::Preparing { .. }
                 ),
                 "portable asset authority is preparing",
-            )?;
-        }
-        "cold_payload_authority" => {
-            let authority: super::ColdPayloadAuthorityState =
-                parse_json(&row.get::<_, String>(0)?)?;
-            authority.validate()?;
-            require(
-                !matches!(
-                    authority,
-                    super::ColdPayloadAuthorityState::Preparing { .. }
-                ),
-                "portable cold authority is preparing",
             )?;
         }
         "asset_owner_heads" => {
@@ -358,7 +339,7 @@ const RELATIONSHIPS: &[(&str, &str, &str, &str)] = &[
         "portable root record count is not one",
     ),
     (
-        "SELECT (SELECT count(*) FROM asset_repository_authority)>1 OR (SELECT count(*) FROM cold_payload_authority)>1",
+        "SELECT (SELECT count(*) FROM asset_repository_authority)>1",
         codes::RECORD_INVALID,
         "authority",
         "portable storage authority has more than one record",

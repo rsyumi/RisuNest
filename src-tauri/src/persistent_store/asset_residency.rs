@@ -32,14 +32,6 @@ impl ResidencyStatus {
     }
 }
 
-fn cold_hashes(db: &rusqlite::Connection) -> Result<Vec<String>> {
-    let mut statement =
-        db.prepare("SELECT DISTINCT object_hash FROM cold_aliases WHERE object_hash IS NOT NULL")?;
-    let hashes = statement
-        .query_map([], |r| r.get(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(hashes)
-}
 impl PersistentStore {
     pub(crate) fn hydrate_registered_remote_assets(
         &self,
@@ -105,9 +97,9 @@ impl PersistentStore {
         }
         check()
     }
-    fn residency_inventory(&self, residency: &Residency, guarded: bool) -> Result<Inventory> {
+    fn residency_inventory(&self, guarded: bool) -> Result<Inventory> {
         let cas = PayloadCas::new(&self.repository_root)?;
-        let roots = self.collect_asset_gc_roots(&cas, guarded, false)?;
+        let roots = self.collect_asset_gc_roots(guarded, false)?;
         let mut referenced = BTreeSet::new();
         let mut local = BTreeSet::new();
         let mut release_blocked = false;
@@ -133,12 +125,7 @@ impl PersistentStore {
                 }
             }
         }
-        local.extend(cold_hashes(&self.connection)?);
-        for reader in self.revision_leases.values() {
-            local.extend(cold_hashes(&reader.connection)?);
-        }
-        // Detached consumers and staged imports still require their physical
-        // inputs. Their roots do not distinguish media from cold record bytes.
+        // Detached consumers and staged imports still require their physical inputs.
         for root in self
             .active_readers
             .detached_asset_roots()?
@@ -161,28 +148,6 @@ impl PersistentStore {
             )?
             .object_hashes,
         );
-        // Archive SQLite holds only metadata. Cache the role list by immutable
-        // snapshot ID so later cleanups do not reconstruct each historical DB.
-        let archive = snapshot_archive::Archive::open(&self.snapshots_dir)?;
-        for info in archive.list()? {
-            let hashes = match residency.snapshot_roles(&info.id)? {
-                Some(hashes) => hashes,
-                None => {
-                    let scratch = archive.scratch()?;
-                    archive.restore(&info.id, &scratch.path)?;
-                    let db = rusqlite::Connection::open_with_flags(
-                        &scratch.path,
-                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                    )?;
-                    let hashes = cold_hashes(&db)?;
-                    drop(db);
-                    residency.save_snapshot_roles(&info.id, &hashes)?;
-                    hashes
-                }
-            };
-            local.extend(hashes);
-        }
-        drop(archive);
         let jobs = if guarded {
             crate::asset_repository::job_pins::collect_durable_cas_job_roots_already_guarded(
                 &self.repository_root,
@@ -203,7 +168,7 @@ impl PersistentStore {
     }
     pub(crate) fn asset_residency_status(&self) -> Result<ResidencyStatus> {
         let residency = Residency::open(&self.repository_root)?;
-        let inventory = self.residency_inventory(&residency, false)?;
+        let inventory = self.residency_inventory(false)?;
         let cas = PayloadCas::new(&self.repository_root)?;
         let mut status = ResidencyStatus {
             policy: self.device_store()?.asset_residency_policy()?,
@@ -231,13 +196,12 @@ impl PersistentStore {
         check: impl Fn() -> Result<()>,
     ) -> Result<ResidencyStatus> {
         check()?;
-        let residency = Residency::open(&self.repository_root)?;
         if policy == AssetPolicy::Remote && self.server_stored_config()?.is_none() {
             return Err(SyncError::new("server-not-bound", 409));
         }
         self.device_store()?.set_asset_residency_policy(policy)?;
         if policy == AssetPolicy::Full {
-            let inventory = self.residency_inventory(&residency, false)?;
+            let inventory = self.residency_inventory(false)?;
             for hash in inventory.referenced {
                 check()?;
                 if open_or_hydrate_with_check(&self.repository_root, &hash, &check)?.is_none() {
@@ -268,7 +232,7 @@ impl PersistentStore {
         let head = client.resolve_identity(false)?;
         check()?;
         config.endpoint = client.config().endpoint.clone();
-        let inventory = self.residency_inventory(&residency, false)?;
+        let inventory = self.residency_inventory(false)?;
         let candidates = inventory
             .referenced
             .difference(&inventory.local)
@@ -336,7 +300,7 @@ impl PersistentStore {
             )?;
             check()?;
             let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
-            let fresh = self.residency_inventory(&residency, true)?;
+            let fresh = self.residency_inventory(true)?;
             let sync_cache_root =
                 self.repository_root
                     .join("server-sync")
@@ -388,7 +352,7 @@ impl PersistentStore {
             >::new();
             {
                 let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
-                let inventory = self.residency_inventory(&residency, true)?;
+                let inventory = self.residency_inventory(true)?;
                 if inventory.release_blocked {
                     return Ok(());
                 }

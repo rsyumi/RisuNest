@@ -5,8 +5,8 @@ use super::export::ExportedRisuSave;
 use super::kei::KeiUploadResult;
 use super::{
     AssetAlias, AssetAliasListQuery, AssetAliasPage, AssetOwnerHead, AssetOwnerLocator,
-    AssetRepositoryAuthorityState, CharacterPage, CharacterQuery, CheckpointMode, ColdAlias,
-    ColdPayloadAuthorityState, ColdPayloadMigrationInput, ConversationPage, ConversationQuery,
+    AssetRepositoryAuthorityState, CharacterPage, CharacterQuery, CheckpointMode,
+    ConversationPage, ConversationQuery,
     ConversationWindow, ConversationWindowQuery, LeaseResult, PersistentStorageStats,
     PersistentStore, PluginStorageCatalog, PresetCatalog, RevisionResult, SnapshotCreated,
     SnapshotInfo, StagingResult, StoreError, StoreResult, Versioned, WorkingSetCommit,
@@ -554,33 +554,6 @@ pub(crate) fn pds_read_asset_owner_head(
 }
 
 #[tauri::command(async)]
-pub(crate) fn pds_read_cold_payload_authority(
-    state: State<'_, PersistentStoreState>,
-    lease: Option<String>,
-) -> Result<Versioned<ColdPayloadAuthorityState>, StoreError> {
-    with_store(state, |store| {
-        store.read_cold_payload_authority(lease.as_deref())
-    })
-}
-
-#[tauri::command(async)]
-pub(crate) fn pds_read_cold_alias(
-    state: State<'_, PersistentStoreState>,
-    key: String,
-    lease: Option<String>,
-) -> Result<Option<Versioned<ColdAlias>>, StoreError> {
-    with_store(state, |store| store.read_cold_alias(&key, lease.as_deref()))
-}
-
-#[tauri::command(async)]
-pub(crate) fn pds_list_cold_aliases(
-    state: State<'_, PersistentStoreState>,
-    lease: Option<String>,
-) -> Result<Versioned<Vec<ColdAlias>>, StoreError> {
-    with_store(state, |store| store.list_cold_aliases(lease.as_deref()))
-}
-
-#[tauri::command(async)]
 pub(crate) fn pds_commit_asset_alias(
     state: State<'_, PersistentStoreState>,
     alias: AssetAlias,
@@ -601,36 +574,6 @@ pub(crate) fn pds_delete_asset_alias(
     with_store_mut(state, |store| {
         store.delete_asset_alias(&kind, &key, expected_revision)
     })
-}
-
-#[tauri::command(async)]
-pub(crate) fn pds_commit_cold_alias(
-    state: State<'_, PersistentStoreState>,
-    alias: ColdAlias,
-    expected_revision: i64,
-) -> Result<RevisionResult, StoreError> {
-    with_store_mut(state, |store| {
-        store.commit_cold_alias(&alias, expected_revision)
-    })
-}
-
-#[tauri::command(async)]
-pub(crate) fn pds_delete_cold_alias(
-    state: State<'_, PersistentStoreState>,
-    key: String,
-    expected_revision: i64,
-) -> Result<RevisionResult, StoreError> {
-    with_store_mut(state, |store| {
-        store.delete_cold_alias(&key, expected_revision)
-    })
-}
-
-#[tauri::command(async)]
-pub(crate) fn pds_activate_cold_payload_migration(
-    state: State<'_, PersistentStoreState>,
-    input: ColdPayloadMigrationInput,
-) -> Result<RevisionResult, StoreError> {
-    with_store_mut(state, |store| store.activate_cold_payload_migration(&input))
 }
 
 #[tauri::command(async)]
@@ -716,17 +659,6 @@ pub(crate) fn pds_replace_put_asset_repository_authority(
 }
 
 #[tauri::command(async)]
-pub(crate) fn pds_replace_put_cold_payload_authority(
-    state: State<'_, PersistentStoreState>,
-    staging_id: String,
-    authority: ColdPayloadAuthorityState,
-) -> Result<(), StoreError> {
-    with_store_mut(state, |store| {
-        store.replace_put_cold_payload_authority(&staging_id, &authority)
-    })
-}
-
-#[tauri::command(async)]
 pub(crate) fn pds_replace_preserve_repositories(
     state: State<'_, PersistentStoreState>,
     staging_id: String,
@@ -734,17 +666,6 @@ pub(crate) fn pds_replace_preserve_repositories(
 ) -> Result<RevisionResult, StoreError> {
     with_store_mut(state, |store| {
         store.replace_preserve_repositories(&staging_id, expected_revision)
-    })
-}
-
-#[tauri::command(async)]
-pub(crate) fn pds_replace_put_cold_aliases(
-    state: State<'_, PersistentStoreState>,
-    staging_id: String,
-    aliases: Vec<ColdAlias>,
-) -> Result<(), StoreError> {
-    with_store_mut(state, |store| {
-        store.replace_put_cold_aliases(&staging_id, &aliases)
     })
 }
 

@@ -71,7 +71,7 @@ fn restore_preview(
         true => {
             let mut findings = crate::data_health::Findings::new(2000);
             archive
-                .scan_library(crate::data_health::ScanDepth::Deep, &mut findings, probe)
+                .scan_library(&mut findings, probe)
                 .map_err(error)?;
             let items = portable_backup::archive_inventory(&archive.db, &findings.items)
                 .map_err(error)?;
@@ -809,7 +809,7 @@ mod tests {
     use super::*;
     use crate::local_backup::NeverCancelled;
     use crate::persistent_store::{
-        portable::digest_raw_tables, AssetRepositoryAuthorityState, ColdPayloadAuthorityState,
+        portable::digest_raw_tables, AssetRepositoryAuthorityState,
     };
     pub(super) fn library(root: &Path) -> PersistentStore {
         let mut store = PersistentStore::open(root).unwrap();
@@ -838,15 +838,6 @@ mod tests {
                 &AssetRepositoryAuthorityState::V2 {
                     migration_id: "synthetic".into(),
                     compatibility_hash: "ab".repeat(32),
-                },
-            )
-            .unwrap();
-        store
-            .replace_put_cold_payload_authority(
-                &stage.staging_id,
-                &ColdPayloadAuthorityState::V2 {
-                    migration_id: "synthetic".into(),
-                    compatibility_hash: "cd".repeat(32),
                 },
             )
             .unwrap();
@@ -1145,11 +1136,7 @@ mod tests {
                 // The gate refuses this archive, so only the collecting scan can say what is wrong.
                 let mut findings = crate::data_health::Findings::new(64);
                 archive
-                    .scan_library(
-                        crate::data_health::ScanDepth::Deep,
-                        &mut findings,
-                        &NeverCancelled,
-                    )
+                    .scan_library(&mut findings, &NeverCancelled)
                     .unwrap();
                 assert!(findings
                     .items

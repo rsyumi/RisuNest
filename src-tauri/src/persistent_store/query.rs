@@ -1,8 +1,8 @@
 use super::{
     active_generation, compare_plugin_storage_keys, current_revision, AnchorOccurrence, AssetAlias,
     AssetAliasListQuery, AssetAliasPage, AssetOwnerHead, AssetOwnerLocator,
-    AssetRepositoryAuthorityState, CharacterPage, CharacterQuery, CharacterSummary, ColdAlias,
-    ColdPayloadAuthorityState, ConversationPage, ConversationQuery, ConversationSummary,
+    AssetRepositoryAuthorityState, CharacterPage, CharacterQuery, CharacterSummary,
+    ConversationPage, ConversationQuery, ConversationSummary,
     ConversationWindow, ConversationWindowQuery, PluginStorageCatalog, PluginStorageSummary,
     PresetCatalog, PresetSummary, QueryOrder, ReadTarget, StoreError, StoreResult, Versioned,
     CONVERSATION_RANGE_MAX_LIMIT, JAVASCRIPT_MAX_SAFE_INTEGER,
@@ -299,31 +299,6 @@ pub(super) fn read_asset_repository_authority(
     })
 }
 
-pub(super) fn read_cold_payload_authority(
-    connection: &Connection,
-    target: &ReadTarget,
-) -> StoreResult<Versioned<ColdPayloadAuthorityState>> {
-    let stored: Option<String> = connection
-        .query_row(
-            "SELECT value FROM cold_payload_authority WHERE generation = ?1",
-            [&target.generation],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let stored = stored.ok_or_else(|| StoreError::Validation {
-        message: "Cold payload authority state is missing".to_owned(),
-    })?;
-    let value: ColdPayloadAuthorityState =
-        serde_json::from_str(&stored).map_err(|_| StoreError::Validation {
-            message: "Cold payload authority state is invalid".to_owned(),
-        })?;
-    value.validate()?;
-    Ok(Versioned {
-        revision: target.revision,
-        value,
-    })
-}
-
 pub(super) fn read_asset_owner_head(
     connection: &Connection,
     owner: &AssetOwnerLocator,
@@ -349,43 +324,6 @@ pub(super) fn read_asset_owner_head(
         .optional()?;
     value
         .map(|value| {
-            value.validate()?;
-            Ok(Versioned {
-                revision: target.revision,
-                value,
-            })
-        })
-        .transpose()
-}
-
-pub(super) fn read_cold_alias(
-    connection: &Connection,
-    key: &str,
-    target: &ReadTarget,
-) -> StoreResult<Option<Versioned<ColdAlias>>> {
-    let value = connection
-        .query_row(
-            "SELECT key, object_hash, size, metadata FROM cold_aliases
-             WHERE generation = ?1 AND key = ?2",
-            params![target.generation, key],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            },
-        )
-        .optional()?;
-    value
-        .map(|(key, object_hash, size, metadata)| {
-            let value = ColdAlias {
-                key,
-                object_hash,
-                size,
-                metadata: serde_json::from_str(&metadata)?,
-            };
             value.validate()?;
             Ok(Versioned {
                 revision: target.revision,
@@ -487,46 +425,6 @@ fn stored_asset_owner_index(value: &str, subject: &str) -> StoreResult<i64> {
         });
     }
     Ok(index)
-}
-
-pub(super) fn list_cold_aliases(
-    connection: &Connection,
-    target: &ReadTarget,
-) -> StoreResult<Versioned<Vec<ColdAlias>>> {
-    let rows = {
-        let mut statement = connection.prepare(
-            "SELECT key, object_hash, size, metadata FROM cold_aliases
-             WHERE generation = ?1 ORDER BY key ASC",
-        )?;
-        let rows = statement
-            .query_map([&target.generation], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        rows
-    };
-    let values = rows
-        .into_iter()
-        .map(|(key, object_hash, size, metadata)| {
-            let value = ColdAlias {
-                key,
-                object_hash,
-                size,
-                metadata: serde_json::from_str(&metadata)?,
-            };
-            value.validate()?;
-            Ok(value)
-        })
-        .collect::<StoreResult<Vec<_>>>()?;
-    Ok(Versioned {
-        revision: target.revision,
-        value: values,
-    })
 }
 
 fn asset_alias_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetAlias> {

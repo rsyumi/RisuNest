@@ -29,14 +29,6 @@ fn fresh_schema_adds_only_the_global_empty_asset_object_catalog() {
     assert!(super::GENERATION_TABLES
         .iter()
         .all(|(table, _)| *table != "asset_objects"));
-    assert_eq!(
-        store
-            .connection
-            .query_row("SELECT COUNT(*) FROM cold_payload_authority", [], |row| row
-                .get::<_, i64>(0))
-            .expect("count cold authority rows"),
-        1
-    );
 }
 
 #[test]

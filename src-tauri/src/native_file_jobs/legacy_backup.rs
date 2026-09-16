@@ -1595,7 +1595,7 @@ mod tests {
         character_json_export::export_character_json, JobKind, JobRegistry, JobState,
     };
     use crate::persistent_store::{
-        AssetOwnerHead, AssetOwnerLocator, AssetRepositoryAuthorityState, ColdPayloadAuthorityState,
+        AssetOwnerHead, AssetOwnerLocator, AssetRepositoryAuthorityState,
     };
     use sha2::{Digest, Sha256};
     use std::fs;
@@ -1963,15 +1963,6 @@ mod tests {
                 },
             )
             .unwrap();
-        store
-            .replace_put_cold_payload_authority(
-                &staging,
-                &ColdPayloadAuthorityState::V2 {
-                    migration_id: "legacy-owner-cold".to_owned(),
-                    compatibility_hash: "cd".repeat(32),
-                },
-            )
-            .unwrap();
         let revision = store.replace_commit(&staging, Some(0)).unwrap().revision;
         let owned = directory.path().join("export-owned");
         let handoff = directory.path().join("handoff");
@@ -2100,15 +2091,6 @@ mod tests {
                 &AssetRepositoryAuthorityState::V2 {
                     migration_id: "ordinary-assets".to_owned(),
                     compatibility_hash: "ab".repeat(32),
-                },
-            )
-            .unwrap();
-        store
-            .replace_put_cold_payload_authority(
-                &staging,
-                &ColdPayloadAuthorityState::V2 {
-                    migration_id: "ordinary-cold".to_owned(),
-                    compatibility_hash: "cd".repeat(32),
                 },
             )
             .unwrap();

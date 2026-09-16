@@ -5,7 +5,7 @@
 use super::{
     active_generation, current_revision, record_apply as rows,
     server_sync_projection::{preserve_local_view, ServerPayload},
-    AssetRepositoryAuthorityState, ColdPayloadAuthorityState, PersistentStore,
+    AssetRepositoryAuthorityState, PersistentStore,
     PreparedReplaceCommit, StoreError, StoreResult,
 };
 use crate::{
@@ -122,13 +122,6 @@ impl PersistentStore {
             self.replace_put_asset_repository_authority(
                 &stage.staging_id,
                 &AssetRepositoryAuthorityState::V2 {
-                    migration_id: migration_id.clone(),
-                    compatibility_hash: compatibility_hash.clone(),
-                },
-            )?;
-            self.replace_put_cold_payload_authority(
-                &stage.staging_id,
-                &ColdPayloadAuthorityState::V2 {
                     migration_id,
                     compatibility_hash,
                 },
@@ -452,15 +445,16 @@ fn resolve_dependencies(
         }
         | LogicalRecordEnvelope::Inlay {
             object_hash, size, ..
-        }
-        | LogicalRecordEnvelope::Cold {
-            object_hash, size, ..
         } => {
             let hash = object_hash
                 .as_deref()
                 .ok_or_else(|| validation("External alias is missing its complete payload"))?;
             require_object(cas, objects, hash, Some(*size))?;
             Ok(None)
+        }
+        // The store no longer holds cold payloads; P2a-ext still carries the variant.
+        LogicalRecordEnvelope::Cold { .. } => {
+            Err(validation("External cold records are unsupported"))
         }
         LogicalRecordEnvelope::Preset { .. } | LogicalRecordEnvelope::Plugin { .. } => Ok(None),
     }

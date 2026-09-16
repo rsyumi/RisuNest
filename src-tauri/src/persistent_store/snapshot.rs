@@ -4,13 +4,10 @@ use super::{
     StoreError, StoreResult, DATABASE_FILE, GENERATION_TABLES,
 };
 use crate::asset_repository::migration_gc::AssetRootSet;
-use crate::asset_repository::PayloadCas;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
-use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::HashMap,
     fs,
-    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -21,7 +18,6 @@ use std::{
 use uuid::Uuid;
 
 const MIN_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_COLD_DECODED_BYTES: u64 = 64 * 1024 * 1024;
 const UNSCANNABLE_BLOCKER: &str = "record-unscannable";
 const CAS_PHYSICAL_PREFIX: &[u8] = b"assets-v2/objects/";
 const COLD_STORAGE_HEADER: &str = "\u{ef01}COLDSTORAGE\u{ef01}";
@@ -122,16 +118,14 @@ impl RevisionReadLease {
     }
 
     pub(crate) fn publish_detached_asset_roots(&self) -> StoreResult<()> {
-        let cas = PayloadCas::new(&self.repository_root)?;
-        let roots = collect_asset_roots(&self.connection, &cas)?;
+        let roots = collect_asset_roots(&self.connection)?;
         self.active_readers
             .publish_detached_asset_roots(&self.lease, roots)
     }
 
     #[cfg(feature = "native-official-publication")]
     pub(crate) fn asset_roots(&self) -> StoreResult<AssetRootSet> {
-        let cas = PayloadCas::new(&self.repository_root)?;
-        collect_asset_roots_for_generation(&self.connection, &cas, &self.target.generation)
+        collect_asset_roots_for_generation(&self.connection, &self.target.generation)
     }
 }
 
@@ -176,7 +170,7 @@ pub(super) fn apply_pending_restore(
         let replacement = (|| -> StoreResult<()> {
             if database_path.is_file() {
                 let connection = Connection::open(&database_path)?;
-                create_in_archive(&connection, &mut archive, snapshots_dir, "pre-restore")?;
+                create_in_archive(&connection, &mut archive, "pre-restore")?;
             }
             replace_database(&database_path, &candidate)
         })();
@@ -431,13 +425,12 @@ pub(super) fn create(
     reason: &str,
 ) -> StoreResult<SnapshotCreated> {
     let mut archive = Archive::open(snapshots_dir)?;
-    create_in_archive(connection, &mut archive, snapshots_dir, reason)
+    create_in_archive(connection, &mut archive, reason)
 }
 
 fn create_in_archive(
     connection: &Connection,
     archive: &mut Archive,
-    snapshots_dir: &Path,
     reason: &str,
 ) -> StoreResult<SnapshotCreated> {
     let started = Instant::now();
@@ -446,8 +439,7 @@ fn create_in_archive(
     connection.execute("VACUUM INTO ?1", [scratch.path.to_string_lossy().as_ref()])?;
     let captured = Connection::open(&scratch.path)?;
     let revision = current_revision(&captured)?;
-    let cas = PayloadCas::new(repository_root_from_snapshots_dir(snapshots_dir)?)?;
-    let roots = collect_asset_roots(&captured, &cas)?;
+    let roots = collect_asset_roots(&captured)?;
     drop(captured);
     let metadata = archive.insert(&scratch.path, revision, reason, roots)?;
     archive.rotate(byte_budget(current_bytes), &metadata.id)?;
@@ -503,29 +495,26 @@ fn logical_database_bytes(connection: &Connection) -> StoreResult<u64> {
 
 pub(super) fn collect_asset_roots(
     connection: &Connection,
-    cas: &PayloadCas,
 ) -> StoreResult<AssetRootSet> {
     #[cfg(test)]
     ASSET_ROOT_SCANS.with(|count| count.set(count.get() + 1));
-    collect_asset_roots_scoped(connection, cas, None)
+    collect_asset_roots_scoped(connection, None)
 }
 
 #[cfg(feature = "native-official-publication")]
 fn collect_asset_roots_for_generation(
     connection: &Connection,
-    cas: &PayloadCas,
     generation: &str,
 ) -> StoreResult<AssetRootSet> {
-    collect_asset_roots_scoped(connection, cas, Some(generation))
+    collect_asset_roots_scoped(connection, Some(generation))
 }
 
 // One scanner serves both the global GC-root collection and the per-generation
 // publication pinning so the two table lists can never drift apart. The global
-// scope additionally covers the logical-sync manifests and the cross-generation
-// cold-alias blocker, which are meaningless for a single generation.
+// scope additionally covers the logical-sync manifests, which are meaningless
+// for a single generation.
 fn collect_asset_roots_scoped(
     connection: &Connection,
-    cas: &PayloadCas,
     generation: Option<&str>,
 ) -> StoreResult<AssetRootSet> {
     let mut roots = AssetRootSet::default();
@@ -558,19 +547,6 @@ fn collect_asset_roots_scoped(
         scope_params,
         &mut roots,
     )?;
-    let cold_aliases = scan_cold_alias_roots(
-        connection,
-        if scoped {
-            "SELECT key, object_hash, size FROM cold_aliases
-         WHERE generation = ?1 ORDER BY key ASC"
-        } else {
-            "SELECT key, object_hash, size FROM cold_aliases
-         ORDER BY generation ASC, key ASC"
-        },
-        scope_params,
-        &mut roots,
-    )?;
-    let mut has_cross_generation_cold_aliases = false;
     if !scoped {
         if table_exists(connection, "server_sync_objects")? {
             scan_optional_hash_column(
@@ -581,9 +557,6 @@ fn collect_asset_roots_scoped(
                 &mut roots,
             )?;
         }
-        let retained_generations: i64 =
-            connection.query_row("SELECT COUNT(*) FROM root", [], |row| row.get(0))?;
-        has_cross_generation_cold_aliases = retained_generations > 1 && !cold_aliases.is_empty();
     }
 
     for (table, column) in [
@@ -622,25 +595,13 @@ fn collect_asset_roots_scoped(
         roots.blockers.insert("plugin-storage-opaque".to_owned());
         roots.retain_all_objects = true;
     }
-    let cross_generation_cold_aliases =
-        has_cross_generation_cold_aliases && !roots.cold_keys.is_empty();
-    resolve_nested_cold_roots(cas, cold_aliases, &mut roots)?;
-    if cross_generation_cold_aliases {
-        roots.blockers.insert("cold-payload-unscanned".to_owned());
-        roots.retain_all_objects = true;
-    }
+    // Nothing stores a cold payload any more, so a record that still references
+    // one hides an unknowable set of attachments. Keep every object instead.
     if !roots.cold_keys.is_empty() {
         roots.blockers.insert("cold-payload-unscanned".to_owned());
         roots.retain_all_objects = true;
     }
     Ok(roots)
-}
-
-fn repository_root_from_snapshots_dir(snapshots_dir: &Path) -> StoreResult<&Path> {
-    snapshots_dir
-        .parent()
-        .and_then(Path::parent)
-        .ok_or_else(|| validation("snapshot directory has no repository root"))
 }
 
 fn repository_root_from_database_path(database_path: &Path) -> StoreResult<PathBuf> {
@@ -649,117 +610,6 @@ fn repository_root_from_database_path(database_path: &Path) -> StoreResult<PathB
         .and_then(Path::parent)
         .map(Path::to_path_buf)
         .ok_or_else(|| validation("persistent database has no repository root"))
-}
-
-fn scan_cold_alias_roots<P: rusqlite::Params>(
-    connection: &Connection,
-    query: &str,
-    params: P,
-    roots: &mut AssetRootSet,
-) -> StoreResult<Vec<(String, String, u64)>> {
-    let mut statement = connection.prepare(query)?;
-    let mut rows = statement.query(params)?;
-    let mut aliases = Vec::new();
-    while let Some(row) = rows.next()? {
-        let ScannedText::Text(key) = scanned_text(row, 0)? else {
-            retain_unscannable_record(roots);
-            continue;
-        };
-        let object_hash = match scanned_text(row, 1)? {
-            ScannedText::Text(object_hash) => Some(object_hash),
-            ScannedText::Null => None,
-            ScannedText::Damaged => {
-                roots.cold_keys.insert(key);
-                retain_unscannable_record(roots);
-                continue;
-            }
-        };
-        let Some(size) = row
-            .get_ref(2)?
-            .as_i64()
-            .ok()
-            .and_then(|size| u64::try_from(size).ok())
-        else {
-            roots.cold_keys.insert(key);
-            roots.retain_all_objects = true;
-            continue;
-        };
-        if let Some(object_hash) = object_hash {
-            roots.object_hashes.insert(object_hash.clone());
-            aliases.push((key, object_hash, size));
-        } else {
-            roots.cold_keys.insert(key);
-        }
-    }
-    Ok(aliases)
-}
-
-fn resolve_nested_cold_roots(
-    cas: &PayloadCas,
-    aliases: Vec<(String, String, u64)>,
-    roots: &mut AssetRootSet,
-) -> StoreResult<()> {
-    let mut resolved_keys = BTreeSet::new();
-    let mut opaque_keys = BTreeSet::new();
-    for (key, object_hash, expected_size) in aliases {
-        match decode_cold_payload(cas, &object_hash, expected_size) {
-            Ok(value) => {
-                observe_json_value(&value, None, roots);
-                resolved_keys.insert(key);
-            }
-            Err(_) => {
-                opaque_keys.insert(key);
-                roots.retain_all_objects = true;
-            }
-        }
-    }
-    roots
-        .cold_keys
-        .retain(|key| !resolved_keys.contains(key) || opaque_keys.contains(key));
-    roots.cold_keys.extend(opaque_keys);
-    Ok(())
-}
-
-fn decode_cold_payload(
-    cas: &PayloadCas,
-    object_hash: &str,
-    expected_size: u64,
-) -> StoreResult<serde_json::Value> {
-    decode_cold_payload_with_limit(cas, object_hash, expected_size, MAX_COLD_DECODED_BYTES)
-}
-
-pub(super) fn decode_cold_payload_with_limit(
-    cas: &PayloadCas,
-    object_hash: &str,
-    expected_size: u64,
-    decoded_limit: u64,
-) -> StoreResult<serde_json::Value> {
-    let mut object = cas
-        .open_object(object_hash)?
-        .ok_or_else(|| validation("cold payload CAS object is missing"))?;
-    if object.metadata()?.len() != expected_size {
-        return Err(validation("cold payload CAS object is corrupt"));
-    }
-    let mut hasher = Sha256::new();
-    let mut copied = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = object.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-        copied = copied
-            .checked_add(read as u64)
-            .ok_or_else(|| validation("cold payload size overflow"))?;
-    }
-    if copied != expected_size || hex::encode(hasher.finalize()) != object_hash {
-        return Err(validation("cold payload CAS object is corrupt"));
-    }
-    object.seek(SeekFrom::Start(0))?;
-    let decoded_limit = usize::try_from(decoded_limit)
-        .map_err(|_| validation("cold payload decoded limit is unsupported"))?;
-    crate::cold_payload_codec::decode_cold_json(object, decoded_limit).map_err(StoreError::from)
 }
 
 fn table_exists(connection: &Connection, table: &str) -> StoreResult<bool> {

@@ -74,7 +74,7 @@ impl Catalog {
         check(probe)?;
         if !matches!(
             kind,
-            "asset" | "inlay" | "cold" | "owner" | "preserved" | "device"
+            "asset" | "inlay" | "owner" | "preserved" | "device"
         ) || key.is_empty()
             || key.contains('\0')
             || !hash_valid(hash)
@@ -189,7 +189,7 @@ impl Catalog {
         check(probe)?;
         if !matches!(
             kind,
-            "asset" | "inlay" | "cold" | "owner" | "preserved" | "device"
+            "asset" | "inlay" | "owner" | "preserved" | "device"
         ) || key.is_empty()
             || key.contains('\0')
             || expected_hash.is_some_and(|v| !hash_valid(v))

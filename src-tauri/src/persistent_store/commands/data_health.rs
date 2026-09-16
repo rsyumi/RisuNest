@@ -135,7 +135,7 @@ fn quick_scan(
 }
 
 fn scan_quick(session: &Session, probe: &dyn CancellationProbe) -> StoreResult<ScanResult> {
-    let findings = session.reader.scan(ScanDepth::Quick, FINDING_LIMIT, probe)?;
+    let findings = session.reader.scan(FINDING_LIMIT, probe)?;
     Ok(ScanResult::new(
         session.reader.revision(),
         current_time_ms()?,
@@ -191,10 +191,10 @@ fn resumable(
     }))
 }
 
-/// The first step of a deep scan is the library itself, including the stored cold payloads a
-/// quick scan leaves closed. The object pass that follows is what the pages continue.
+/// The first step of a deep scan is the library itself. The object pass that follows is what
+/// the pages continue.
 fn scan_deep_first(session: &Session, probe: &dyn CancellationProbe) -> StoreResult<ScanResult> {
-    let findings = session.reader.scan(ScanDepth::Deep, FINDING_LIMIT, probe)?;
+    let findings = session.reader.scan(FINDING_LIMIT, probe)?;
     let totals = session.reader.object_totals()?;
     let mut result = ScanResult::new(
         session.reader.revision(),

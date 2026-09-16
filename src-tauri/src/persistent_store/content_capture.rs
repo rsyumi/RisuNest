@@ -171,9 +171,6 @@ impl PreparedContentCapture {
         if !matches!(
             super::commit::read_asset_repository_authority(db, &self.identity.generation)?,
             super::AssetRepositoryAuthorityState::V2 { .. }
-        ) || !matches!(
-            super::commit::read_cold_payload_authority(db, &self.identity.generation)?,
-            super::ColdPayloadAuthorityState::V2 { .. }
         ) {
             return Err(StoreError::Validation {
                 message: "Canonical asset authority required before external capture".into(),
@@ -241,7 +238,6 @@ const FAMILIES: &[(&str, &str, &str, &str, &str)] = &[
         "AND kind='asset'",
     ),
     ("character", "characters", "character_id", "''", ""),
-    ("cold", "cold_aliases", "key", "''", ""),
     (
         "conversation",
         "conversations",
@@ -321,9 +317,6 @@ fn locator(key: &ContentKey) -> StoreResult<LogicalRecordLocator> {
             logical_key: key.key1.clone(),
         },
         "inlay" => LogicalRecordLocator::Inlay {
-            logical_key: key.key1.clone(),
-        },
-        "cold" => LogicalRecordLocator::Cold {
             logical_key: key.key1.clone(),
         },
         "owner" if key.key1 == "character-additional-assets" => LogicalRecordLocator::Character {
@@ -433,9 +426,6 @@ fn project_record(
         object_hash, size, ..
     }
     | LogicalRecordEnvelope::Inlay {
-        object_hash, size, ..
-    }
-    | LogicalRecordEnvelope::Cold {
         object_hash, size, ..
     } = &envelope
     {

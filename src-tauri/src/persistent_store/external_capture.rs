@@ -394,7 +394,6 @@ impl PersistentStore {
         let mut query = self.connection.prepare(
             "WITH dependencies(hash,manifest) AS (
                 SELECT object_hash,0 FROM asset_aliases WHERE generation=?1 AND object_hash IS NOT NULL
-                UNION SELECT object_hash,0 FROM cold_aliases WHERE generation=?1 AND object_hash IS NOT NULL
                 UNION SELECT manifest_hash,1 FROM asset_owner_heads WHERE generation=?1 AND manifest_hash IS NOT NULL
              ) SELECT hash,max(manifest) FROM dependencies WHERE hash>?2 GROUP BY hash ORDER BY hash LIMIT ?3",
         )?;
@@ -445,10 +444,6 @@ impl PersistentStore {
             "asset" | "inlay" => self.connection.query_row(
                 "SELECT object_hash FROM asset_aliases WHERE generation=?1 AND kind=?2 AND logical_key=?3",
                 params![generation, key.kind, key.key1], |row| row.get::<_, Option<String>>(0),
-            ).optional()?.flatten(),
-            "cold" => self.connection.query_row(
-                "SELECT object_hash FROM cold_aliases WHERE generation=?1 AND key=?2",
-                params![generation, key.key1], |row| row.get::<_, Option<String>>(0),
             ).optional()?.flatten(),
             _ => None,
         };

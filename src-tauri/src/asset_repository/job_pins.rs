@@ -23,8 +23,6 @@ pub(crate) enum CasJobKind {
     LocalBackupRestore,
     CardOrModuleContentImport,
     OfficialPublicationOrExportPreparation,
-    ColdMigration,
-    ColdDirectWrite,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1039,7 +1037,7 @@ mod tests {
         let (ready_sent, ready_received) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             ready_sent.send(()).expect("signal begin attempt");
-            let job = DurableCasJob::begin(&root, "coordinated-job", CasJobKind::ColdMigration, 1)
+            let job = DurableCasJob::begin(&root, "coordinated-job", CasJobKind::LocalBackupRestore, 1)
                 .expect("begin coordinated job");
             sent.send(job).expect("send coordinated job");
         });
@@ -1740,7 +1738,7 @@ mod tests {
         let job = DurableCasJob::begin(
             directory.path(),
             "separate-owner-job",
-            CasJobKind::ColdMigration,
+            CasJobKind::LocalBackupRestore,
             1,
         )
         .expect("begin CAS liveness job");

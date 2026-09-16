@@ -59,7 +59,7 @@ fn archive() -> rusqlite::Connection {
         [],
     )
     .unwrap();
-    for table in ["asset_repository_authority", "cold_payload_authority"] {
+    for table in ["asset_repository_authority"] {
         db.execute(
             &format!("INSERT INTO {table} (value) VALUES ('{{\"format\":\"legacy\"}}')"),
             [],
