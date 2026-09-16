@@ -11,6 +11,13 @@ describe('externalErrorMessage', () => {
             .toBe(strings.corrupted)
     })
 
+    it('names a repository this device has already connected', () => {
+        expect(externalErrorMessage(strings, { kind: 'alreadyConnected' }))
+            .toBe(strings.connectionAlreadyAdded)
+        expect(externalErrorMessage(strings, { kind: 'alreadyConnected' }, 'cas'))
+            .toBe(strings.connectionAlreadyAdded)
+    })
+
     it('names the refused strategy only for a concurrent-use attempt', () => {
         const refused = { kind: 'unsupported', httpStatus: null, retryAtMs: null }
         expect(externalErrorMessage(strings, refused, 'cas')).toBe(strings.casUnsupported)
@@ -29,7 +36,7 @@ describe('externalErrorMessage', () => {
         const kinds = [
             'unauthorized', 'reauthRequired', 'notFound', 'preconditionFailed',
             'rateLimited', 'dailyQuotaExhausted', 'storageFull', 'fileTooLarge',
-            'corrupt', 'unsupported', 'cancelled', 'transient',
+            'corrupt', 'unsupported', 'cancelled', 'transient', 'alreadyConnected',
         ]
         for (const kind of kinds) {
             expect(externalErrorMessage(korean, { kind })).not.toBe(korean.errorGeneric)

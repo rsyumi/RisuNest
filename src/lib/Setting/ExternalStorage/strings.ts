@@ -65,6 +65,14 @@ const english = {
     completed: 'Completed', failed: 'Failed', queued: 'Queued', running: 'Working…', waiting: 'Waiting', uncertain: 'Could not confirm that the repository was updated. The next sync checks again.',
     loadMore: 'Show older history', statusReady: 'Connected', statusPaused: 'Paused', statusReauth: 'Sign-in required', statusLocked: 'Recovery key required', statusError: 'Needs attention',
     usedByService: 'Used on the service', unknownUsage: 'Unknown', unknownUsageHelp: 'This service does not report it.', uploadedLowerBound: 'Uploaded from this device', latestReachable: 'Size of the latest backup', atLeast: '{0} or more', files: '{0} files or more',
+    cleanup: 'Clean up now', retentionCount: 'Backups to keep', retentionDays: 'Keep for', lastCleanup: 'Last cleanup', cleanupNever: 'Not cleaned up yet',
+    retentionHelp: 'An automatic backup made on this device is removed only once it is past both the number to keep and the length to keep. Kept items and conflict records are never removed.',
+    retentionOtherDevices: 'Backups made on other devices are left alone.',
+    cleanupSummary: 'Removed {0} files ({1}).',
+    cleanupPartial: 'Some files are left for the next cleanup.',
+    cleanupDeferred: 'Cleanup is waiting for another storage task to finish.',
+    cleanupUncertain: 'Could not confirm that cleanup has finished. Storage tasks will wait until the result is confirmed.',
+    cleanupTrashNotice: 'Some services move deleted files to a recycle bin, so the space may not be free right away.',
     invalidConfiguration: 'Some fields are empty or invalid. Check the connection details.',
     retry: 'Could not reach the repository. Check your internet connection and try again.', retryAction: 'Try again',
     reauthenticate: 'The sign-in expired or the key is no longer valid. Sign in again or enter a new key.',
@@ -72,6 +80,7 @@ const english = {
     resolveRequired: 'Resolve the conflict first. The Conflicts tab lets you choose which side to keep.',
     freeSpace: 'The repository is out of space. Free space on the service and try again.',
     credentialsRejected: 'The service did not accept this sign-in or key. Check what you entered and try again.',
+    connectionAlreadyAdded: 'This storage is already connected.',
     repositoryNotFound: 'Could not find the repository. Check the folder, bucket and address.',
     stateChanged: 'The repository changed while this was running. Refresh and try again.',
     requestBudget: 'The service request limit was reached. Try again later.',
@@ -186,6 +195,14 @@ const korean: typeof english = {
     completed: '완료', failed: '실패', queued: '대기열에 추가됨', running: '처리 중…', waiting: '대기 중', uncertain: '저장소에 반영됐는지 확인하지 못했습니다. 다음 동기화에서 다시 확인합니다.',
     loadMore: '이전 이력 더 보기', statusReady: '연결됨', statusPaused: '일시 중지됨', statusReauth: '다시 로그인 필요', statusLocked: '복구 키 필요', statusError: '확인 필요',
     usedByService: '서비스에서 쓰는 용량', unknownUsage: '알 수 없음', unknownUsageHelp: '이 서비스는 알려주지 않습니다.', uploadedLowerBound: '이 기기에서 올린 데이터', latestReachable: '최신 백업 하나의 크기', atLeast: '{0} 이상', files: '파일 {0}개 이상',
+    cleanup: '지금 정리', retentionCount: '보관 개수', retentionDays: '보관 기간', lastCleanup: '마지막 정리', cleanupNever: '아직 정리하지 않았습니다',
+    retentionHelp: '이 기기에서 만든 자동 백업은 보관 개수와 보관 기간을 모두 넘긴 경우에만 지웁니다. 「지우지 않고 보관」한 항목과 충돌 기록은 지우지 않습니다.',
+    retentionOtherDevices: '다른 기기에서 만든 백업은 이 기기가 지우지 않습니다.',
+    cleanupSummary: '{0}개를 지웠습니다 ({1}).',
+    cleanupPartial: '남은 파일은 다음 정리에서 지웁니다.',
+    cleanupDeferred: '다른 저장소 작업이 완료되기를 기다리고 있습니다.',
+    cleanupUncertain: '정리 완료 여부를 확인할 수 없습니다. 결과가 확인될 때까지 저장소 작업이 대기합니다.',
+    cleanupTrashNotice: '서비스에 따라 지운 파일이 휴지통으로 가며, 용량이 바로 줄지 않을 수 있습니다.',
     invalidConfiguration: '비어 있거나 잘못된 항목이 있습니다. 연결 정보를 확인하세요.',
     retry: '저장소에 연결하지 못했습니다. 인터넷 연결을 확인하고 다시 시도하세요.', retryAction: '다시 시도',
     reauthenticate: '로그인이 만료되었거나 키가 더 이상 유효하지 않습니다. 다시 로그인하거나 새 키를 입력하세요.',
@@ -193,6 +210,7 @@ const korean: typeof english = {
     resolveRequired: '충돌을 먼저 해결하세요. 충돌 탭에서 어느 쪽을 남길지 고를 수 있습니다.',
     freeSpace: '저장소 공간이 부족합니다. 서비스에서 공간을 확보한 뒤 다시 시도하세요.',
     credentialsRejected: '서비스가 이 로그인이나 키를 받아들이지 않았습니다. 입력한 내용을 확인하고 다시 시도하세요.',
+    connectionAlreadyAdded: '이 저장소는 이미 연결되어 있습니다.',
     repositoryNotFound: '저장소를 찾지 못했습니다. 폴더·버킷과 주소를 확인하세요.',
     stateChanged: '작업하는 사이에 저장소가 바뀌었습니다. 새로 고침한 뒤 다시 시도하세요.',
     requestBudget: '서비스의 요청 한도에 걸렸습니다. 잠시 뒤 다시 시도하세요.',
@@ -300,6 +318,7 @@ export function externalErrorMessage(
     const kind = externalErrorKind(value)
     if (kind === 'unsupported' && strategy === 'cas') return strings.casUnsupported
     switch (kind) {
+        case 'alreadyConnected': return strings.connectionAlreadyAdded
         case 'unauthorized': return strings.credentialsRejected
         case 'reauthRequired': return strings.reauthenticate
         case 'notFound': return strings.repositoryNotFound

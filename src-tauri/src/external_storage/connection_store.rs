@@ -4,7 +4,7 @@ use super::{capabilities::Capabilities, contract::*};
 use risunest_external_storage_format::format::Descriptor;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -91,8 +91,34 @@ impl ConnectionStore {
         }
         Ok(result)
     }
+    /// The connection that already holds this remote repository, if there is
+    /// one. Retention settings and the one-job-per-connection rule are per
+    /// connection while the repository is not, so a repository two connections
+    /// already hold is a state this build cannot produce and is reported.
+    pub fn identity_holder(&self, identity: &str) -> Result<Option<String>> {
+        let mut held: BTreeMap<String, String> = BTreeMap::new();
+        for connection in self.list()? {
+            if held
+                .insert(
+                    connection.descriptor_locator.connection_identity,
+                    connection.id,
+                )
+                .is_some()
+            {
+                return Err(corrupt());
+            }
+        }
+        Ok(held.remove(identity))
+    }
+    fn require_unheld_identity(&self, identity: &str) -> Result<()> {
+        match self.identity_holder(identity)? {
+            Some(_) => Err(ProviderError::new(ErrorKind::PreconditionFailed)),
+            None => Ok(()),
+        }
+    }
     pub fn insert(&mut self, connection: &StoredConnection) -> Result<()> {
         connection.descriptor.validate().map_err(|_| corrupt())?;
+        self.require_unheld_identity(&connection.descriptor_locator.connection_identity)?;
         let encoded = serde_json::to_string(connection).map_err(storage)?;
         decode(&encoded)?;
         self.0
@@ -172,6 +198,7 @@ impl ConnectionStore {
             created_at_ms: pending.created_at_ms,
         };
         connection.descriptor.validate().map_err(|_| corrupt())?;
+        self.require_unheld_identity(&connection.descriptor_locator.connection_identity)?;
         let encoded = serde_json::to_string(&connection).map_err(storage)?;
         decode(&encoded)?;
         let tx = self.0.transaction().map_err(storage)?;
@@ -308,6 +335,14 @@ mod tests {
         }
     }
 
+    fn locator(identity: &str) -> RemoteLocator {
+        RemoteLocator {
+            connection_identity: identity.into(),
+            collection: Some("descriptors".into()),
+            object: "descriptor".into(),
+        }
+    }
+
     #[test]
     fn pending_connection_is_invisible_until_atomic_promotion() {
         let root = tempfile::tempdir().unwrap();
@@ -318,11 +353,7 @@ mod tests {
         assert!(store.list().unwrap().is_empty());
         assert_eq!(store.pending(&pending.id).unwrap().id, pending.id);
 
-        let locator = RemoteLocator {
-            connection_identity: "synthetic-identity".into(),
-            collection: Some("descriptors".into()),
-            object: "descriptor".into(),
-        };
+        let locator = locator("synthetic-identity");
         let stored = store
             .promote_pending(&pending.id, locator.clone(), Capabilities::default())
             .unwrap();
@@ -336,6 +367,47 @@ mod tests {
             })
         ));
     }
+    /// A second connection to one repository would apply its own retention to
+    /// the backups the first one made, so the store refuses it.
+    #[test]
+    fn one_repository_holds_one_connection() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = ConnectionStore::open(root.path()).unwrap();
+        let first = pending();
+        store.put_pending(&first).unwrap();
+        store
+            .promote_pending(&first.id, locator("shared"), Capabilities::default())
+            .unwrap();
+
+        let mut second = pending();
+        second.id = "synthetic-second".into();
+        store.put_pending(&second).unwrap();
+        assert!(matches!(
+            store.promote_pending(&second.id, locator("shared"), Capabilities::default()),
+            Err(ProviderError {
+                kind: ErrorKind::PreconditionFailed,
+                ..
+            })
+        ));
+        assert_eq!(
+            store.identity_holder("shared").unwrap().as_deref(),
+            Some(first.id.as_str())
+        );
+        assert_eq!(store.identity_holder("elsewhere").unwrap(), None);
+        assert_eq!(store.list().unwrap().len(), 1);
+
+        let promoted = store
+            .promote_pending(&second.id, locator("elsewhere"), Capabilities::default())
+            .unwrap();
+        assert_eq!(promoted.id, second.id);
+        assert!(matches!(
+            store.insert(&promoted),
+            Err(ProviderError {
+                kind: ErrorKind::PreconditionFailed,
+                ..
+            })
+        ));
+    }
     /// Changing a backup connection's policy applies to work started later. A
     /// synchronization connection has none to change.
     #[test]
@@ -345,13 +417,12 @@ mod tests {
         let mut backup = pending();
         backup.capture_policy = Some(super::super::connection::CapturePolicy::default());
         store.put_pending(&backup).unwrap();
-        let locator = RemoteLocator {
-            connection_identity: "synthetic-identity".into(),
-            collection: Some("descriptors".into()),
-            object: "descriptor".into(),
-        };
         store
-            .promote_pending(&backup.id, locator.clone(), Capabilities::default())
+            .promote_pending(
+                &backup.id,
+                locator("synthetic-backup"),
+                Capabilities::default(),
+            )
             .unwrap();
 
         let narrowed = super::super::connection::CapturePolicy {
@@ -371,7 +442,7 @@ mod tests {
         sync.capture_policy = None;
         store.put_pending(&sync).unwrap();
         store
-            .promote_pending(&sync.id, locator, Capabilities::default())
+            .promote_pending(&sync.id, locator("synthetic-sync"), Capabilities::default())
             .unwrap();
         assert!(matches!(
             store.set_capture_policy(&sync.id, narrowed),
