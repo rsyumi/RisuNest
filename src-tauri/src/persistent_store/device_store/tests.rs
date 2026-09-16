@@ -1234,6 +1234,38 @@ mod section_exchange {
         );
     }
 
+
+    /// Invariant 36 on the receiving side. Applying the same remote section
+    /// again changes nothing, so an interrupted receive resumes from the same
+    /// state instead of writing a second time.
+    #[test]
+    fn replaying_a_section_apply_changes_nothing() {
+        let (_directory, mut store) = open();
+        set(&mut store, "mine", "local");
+        let batch = [
+            plugin_row("alpha", "from-b", 30, "writer-b"),
+            plugin_tombstone("beta", 31, "writer-b"),
+        ];
+        let first = store
+            .apply_section_rows(Section::LocalPlugins, &batch)
+            .expect("apply once");
+        let after_first = live(&mut store);
+        let second = store
+            .apply_section_rows(Section::LocalPlugins, &batch)
+            .expect("apply again");
+        assert_eq!(first.applied, 2);
+        assert_eq!(second.applied, 0);
+        assert_eq!(second.kept, 2);
+        assert_eq!(live(&mut store), after_first);
+        assert_eq!(
+            store
+                .section_state(Section::LocalPlugins)
+                .unwrap()
+                .max_write_clock,
+            Sequence::from(31u64)
+        );
+    }
+
     /// Invariant 16. The same values and tombstones in either order leave the
     /// same user state behind.
     #[test]

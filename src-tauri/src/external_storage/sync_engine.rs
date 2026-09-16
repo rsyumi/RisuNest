@@ -1867,6 +1867,44 @@ mod tests {
         }
     }
 
+    /// Invariant 30. A device value that moved on its own publishes; it never
+    /// turns into a library disagreement.
+    #[test]
+    fn a_section_only_change_publishes_instead_of_becoming_a_library_conflict() {
+        let remote = remote("remote", "55".repeat(32).as_str(), 1, "1");
+        let base = base(identity(4), &remote);
+        assert_eq!(
+            decide_sync(SyncInputs {
+                descriptor: &descriptor(),
+                connection_id: "connection",
+                current_identity: &identity(4),
+                local_pristine: false,
+                local_fingerprint: None,
+                local_sections_changed: true,
+                base: Some(&base),
+                remote: Some(&remote),
+            })
+            .unwrap(),
+            SyncAction::PublishLocal {
+                expected: Some(remote.clone())
+            }
+        );
+        assert_eq!(
+            decide_sync(SyncInputs {
+                descriptor: &descriptor(),
+                connection_id: "connection",
+                current_identity: &identity(4),
+                local_pristine: false,
+                local_fingerprint: None,
+                local_sections_changed: false,
+                base: Some(&base),
+                remote: Some(&remote),
+            })
+            .unwrap(),
+            SyncAction::UpToDate
+        );
+    }
+
     #[test]
     fn first_attach_never_overwrites_an_existing_remote_head() {
         let remote = remote("remote", "44".repeat(32).as_str(), 1, "1");
