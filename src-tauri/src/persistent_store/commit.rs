@@ -4,6 +4,7 @@ use super::{
     ConversationMutation, PluginStorageMutation, RevisionResult, StagingResult, StoreError,
     StoreResult, WorkingSetCommit, GENERATION_TABLES,
 };
+use super::plugin_owner;
 use std::collections::{BTreeSet, HashSet};
 
 pub(super) fn incremental_commit<T>(
@@ -611,11 +612,17 @@ pub(super) fn replace_put_root(
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     require_staging(&transaction, staging_id)?;
     let mut staged_root = object(root, "Persistent root")?.clone();
+    let plugin_storage_meta = staged_root.shift_remove("pluginStorageMeta");
     if let Some(plugin_storage) = staged_root.shift_remove("pluginCustomStorage") {
         let plugin_storage = plugin_storage
             .as_object()
             .ok_or_else(|| validation("pluginCustomStorage must be a JSON object"))?;
-        replace_plugin_storage(&transaction, staging_id, plugin_storage)?;
+        replace_plugin_storage(
+            &transaction,
+            staging_id,
+            plugin_storage,
+            plugin_storage_meta.as_ref().and_then(Value::as_object),
+        )?;
     }
     put_root(&transaction, staging_id, &Value::Object(staged_root))?;
     transaction.commit()?;
@@ -1633,47 +1640,74 @@ fn put_root(transaction: &Transaction<'_>, generation: &str, root: &Value) -> St
     Ok(())
 }
 
-fn replace_plugin_storage(
+/// Upstream saves carry a flat object. Without an ownership sidecar every key
+/// lands on the sentinel owner and the management screen assigns it later.
+pub(super) fn replace_plugin_storage(
     transaction: &Transaction<'_>,
     generation: &str,
     values: &Map<String, Value>,
+    meta: Option<&Map<String, Value>>,
 ) -> StoreResult<()> {
     transaction.execute(
         "DELETE FROM plugin_storage WHERE generation = ?1",
         [generation],
     )?;
     for (ordinal, (key, value)) in values.iter().enumerate() {
-        put_plugin_storage(transaction, generation, key, value, Some(ordinal as i64))?;
+        let owner = sidecar_owner(meta, key);
+        put_plugin_storage(
+            transaction,
+            generation,
+            owner,
+            key,
+            value,
+            Some(ordinal as i64),
+        )?;
     }
     Ok(())
+}
+
+fn sidecar_owner<'a>(meta: Option<&'a Map<String, Value>>, key: &str) -> &'a str {
+    meta.and_then(|meta| meta.get(key))
+        .and_then(|entry| entry.get("plugin"))
+        .and_then(Value::as_str)
+        .filter(|owner| {
+            !plugin_owner::is_unowned(owner) && plugin_owner::validate_owner(owner)
+        })
+        .unwrap_or(plugin_owner::UNOWNED_OWNER)
 }
 
 fn put_plugin_storage(
     transaction: &Transaction<'_>,
     generation: &str,
+    owner: &str,
     key: &str,
     value: &Value,
     ordinal: Option<i64>,
 ) -> StoreResult<()> {
+    if !plugin_owner::validate_owner(owner) {
+        return Err(validation("plugin storage owner is invalid"));
+    }
     let serialized = serde_json::to_string(value)?;
     transaction.execute(
-        "INSERT INTO plugin_storage (generation, storage_key, byte_size, ordinal, value)
+        "INSERT INTO plugin_storage (generation, owner, storage_key, byte_size, ordinal, value)
          VALUES (
              ?1,
              ?2,
              ?3,
+             ?4,
              COALESCE(
-                 ?4,
+                 ?5,
                  (SELECT COALESCE(MAX(ordinal) + 1, 0)
                   FROM plugin_storage WHERE generation = ?1)
              ),
-             ?5
+             ?6
          )
-         ON CONFLICT(generation, storage_key) DO UPDATE SET
+         ON CONFLICT(generation, owner, storage_key) DO UPDATE SET
              byte_size = excluded.byte_size,
              value = excluded.value",
         params![
             generation,
+            owner,
             key,
             serialized.len() as i64,
             ordinal,
@@ -1689,21 +1723,22 @@ fn apply_plugin_storage_mutation(
     mutation: &PluginStorageMutation,
 ) -> StoreResult<()> {
     match mutation {
-        PluginStorageMutation::Set { key, value } => {
-            put_plugin_storage(transaction, generation, key, value, None)
+        PluginStorageMutation::Set { owner, key, value } => {
+            put_plugin_storage(transaction, generation, owner, key, value, None)
         }
-        PluginStorageMutation::Delete { key } => {
+        PluginStorageMutation::Delete { owner, key } => {
             transaction.execute(
-                "DELETE FROM plugin_storage WHERE generation = ?1 AND storage_key = ?2",
-                params![generation, key],
+                "DELETE FROM plugin_storage
+                 WHERE generation = ?1 AND owner = ?2 AND storage_key = ?3",
+                params![generation, owner, key],
             )?;
             Ok(())
         }
-        PluginStorageMutation::Clear => {
-            super::server_sync_outbox::capture_clear(transaction, generation)?;
+        PluginStorageMutation::Clear { owner } => {
+            super::server_sync_outbox::capture_clear(transaction, generation, owner)?;
             transaction.execute(
-                "DELETE FROM plugin_storage WHERE generation = ?1",
-                [generation],
+                "DELETE FROM plugin_storage WHERE generation = ?1 AND owner = ?2",
+                params![generation, owner],
             )?;
             Ok(())
         }

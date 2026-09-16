@@ -117,6 +117,9 @@ fn validate_row(table: &PortableTable, row: &Row<'_>) -> StoreResult<()> {
                 | "inlay_type"
                 | "width"
                 | "height"
+                | "claimed_from"
+                | "import_batch_id"
+                | "assigned_at"
         );
         require(
             actual
@@ -139,7 +142,7 @@ fn validate_row(table: &PortableTable, row: &Row<'_>) -> StoreResult<()> {
             let value = json(row, 0)?;
             require(
                 value.is_object()
-                    && ["characters", "botPresets", "pluginCustomStorage"]
+                    && ["characters", "botPresets", "pluginCustomStorage", "pluginStorageMeta"]
                         .iter()
                         .all(|k| value.get(k).is_none()),
                 "portable root contains separated records",
@@ -237,11 +240,16 @@ fn validate_row(table: &PortableTable, row: &Row<'_>) -> StoreResult<()> {
             optional_text_equal(row, 3, value.get("chatId").and_then(Value::as_str))?;
         }
         "plugin_storage" => {
-            let serialized: String = row.get(3)?;
+            let serialized: String = row.get(4)?;
             let _: Value = parse_json(&serialized)?;
+            let owner: String = row.get(0)?;
             require(
-                row.get::<_, i64>(1)? == serialized.len() as i64
-                    && row.get::<_, i64>(2)? >= 0,
+                super::plugin_owner::validate_owner(&owner),
+                "portable plugin owner is invalid",
+            )?;
+            require(
+                row.get::<_, i64>(2)? == serialized.len() as i64
+                    && row.get::<_, i64>(3)? >= 0,
                 "portable plugin size or ordinal mismatch",
             )?;
         }

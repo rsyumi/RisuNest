@@ -44,6 +44,7 @@ fn server_sync_local_commit_and_large_json_costs() {
         store
             .commit(&WorkingSetCommit {
                 plugin_storage: Some(vec![PluginStorageMutation::Set {
+                    owner: "synthetic-plugin".to_owned(),
                     key: "synthetic-large".into(),
                     value: json!("x".repeat(10 * 1024 * 1024)),
                 }]),
@@ -156,6 +157,7 @@ fn incremental_outbox_is_atomic_sparse_across_generation_copy_and_tail_ack() {
     assert!(store
         .commit(&WorkingSetCommit {
             plugin_storage: Some(vec![PluginStorageMutation::Set {
+                owner: "synthetic-plugin".to_owned(),
                 key: "uncommitted".into(),
                 value: json!(true)
             }]),
@@ -190,10 +192,12 @@ fn plugin_clear_keeps_original_membership_and_scope_then_local_set_remains_dirty
         .commit(&WorkingSetCommit {
             plugin_storage: Some(vec![
                 PluginStorageMutation::Set {
+                    owner: "synthetic-plugin".to_owned(),
                     key: "first".into(),
                     value: json!(1),
                 },
                 PluginStorageMutation::Set {
+                    owner: "synthetic-plugin".to_owned(),
                     key: "second".into(),
                     value: json!(2),
                 },
@@ -219,8 +223,9 @@ fn plugin_clear_keeps_original_membership_and_scope_then_local_set_remains_dirty
     store
         .commit(&WorkingSetCommit {
             plugin_storage: Some(vec![
-                PluginStorageMutation::Clear,
+                PluginStorageMutation::Clear { owner: "synthetic-plugin".to_owned() },
                 PluginStorageMutation::Set {
+                    owner: "synthetic-plugin".to_owned(),
                     key: "later".into(),
                     value: json!(3),
                 },
@@ -245,7 +250,7 @@ fn plugin_clear_keeps_original_membership_and_scope_then_local_set_remains_dirty
     assert!(outbox::dirty_page(&store.connection, None, 1024)
         .unwrap()
         .iter()
-        .any(|k| k.kind == "plugin" && k.key1 == "later"));
+        .any(|k| k.kind == "plugin" && k.key2 == "later"));
     assert_eq!(
         store
             .connection
@@ -294,6 +299,7 @@ fn server_outbox_tracks_each_public_record_mutation_and_alias_deletion() {
                 configured_index: None,
             }]),
             plugin_storage: Some(vec![PluginStorageMutation::Set {
+                owner: "synthetic-plugin".to_owned(),
                 key: "공용/🦀".into(),
                 value: json!({"empty":{},"value":null}),
             }]),

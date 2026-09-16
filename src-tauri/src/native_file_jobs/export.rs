@@ -323,16 +323,16 @@ mod tests {
         if omit_account {
             (
                 include_str!("../../fixtures/risusave/pre-native-job-export-omit-account-true.b64"),
-                796,
-                "29dfc33b0f964cd3d54791fb92a12565f393e7710f713622cd52b667e66d3921",
+                848,
+                "4b3d5181f8c62258eab24beb29568b93ecca67ee57e041c532ecf6100518969d",
             )
         } else {
             (
                 include_str!(
                     "../../fixtures/risusave/pre-native-job-export-omit-account-false.b64"
                 ),
-                813,
-                "2b84dcc0abeafc7354354e0d1fb3360443011bc73bb364ffa24180f29f0e0baa",
+                866,
+                "ce94f335eae92da88fdb70f9411a00b7d0a8c28d23f5f09ecc7d897350506359",
             )
         }
     }

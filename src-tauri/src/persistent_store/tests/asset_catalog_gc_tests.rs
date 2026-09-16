@@ -533,8 +533,8 @@ fn asset_gc_delete_page_refuses_unsealed_jobs_and_unready_migrations() {
     store
         .connection
         .execute(
-            "INSERT INTO plugin_storage (generation, storage_key, byte_size, ordinal, value)
-             VALUES (?1, 'gc-blocker-plugin', 2, 0, '{}')",
+            "INSERT INTO plugin_storage (generation, owner, storage_key, byte_size, ordinal, value)
+             VALUES (?1, 'synthetic-plugin', 'gc-blocker-plugin', 2, 0, '{}')",
             [generation],
         )
         .unwrap();

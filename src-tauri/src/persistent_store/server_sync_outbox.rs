@@ -12,7 +12,7 @@ CREATE TABLE server_sync_base(key TEXT PRIMARY KEY,version TEXT NOT NULL,local_h
 CREATE TABLE server_sync_scope_base(scope TEXT PRIMARY KEY,version TEXT NOT NULL);
 CREATE TABLE server_sync_scope_clear_base(scope TEXT PRIMARY KEY,version TEXT NOT NULL);
 CREATE TABLE server_sync_clears(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,expected_version TEXT);
-CREATE TABLE server_sync_clear_members(clear_id TEXT NOT NULL REFERENCES server_sync_clears(id) ON DELETE CASCADE,key TEXT NOT NULL,PRIMARY KEY(clear_id,key));
+CREATE TABLE server_sync_clear_members(clear_id TEXT NOT NULL REFERENCES server_sync_clears(id) ON DELETE CASCADE,owner TEXT NOT NULL,key TEXT NOT NULL,PRIMARY KEY(clear_id,owner,key));
 CREATE TABLE server_sync_operation(singleton INTEGER PRIMARY KEY CHECK(singleton=1),sequence TEXT NOT NULL,intent TEXT NOT NULL,phase TEXT NOT NULL,local_revision INTEGER NOT NULL);
 CREATE TABLE server_sync_objects(hash TEXT PRIMARY KEY,size INTEGER NOT NULL,path TEXT NOT NULL);
 CREATE TABLE server_sync_operation_records(key TEXT PRIMARY KEY,version TEXT NOT NULL,local_hash TEXT,kind TEXT NOT NULL,key1 TEXT NOT NULL,key2 TEXT NOT NULL,revision INTEGER NOT NULL);
@@ -124,11 +124,15 @@ pub(super) fn full_replacement(tx: &Transaction<'_>) -> StoreResult<()> {
     tx.execute("UPDATE server_sync_state SET full_scan=1", [])?;
     Ok(())
 }
-pub(super) fn capture_clear(tx: &Transaction<'_>, generation: &str) -> StoreResult<()> {
+pub(super) fn capture_clear(
+    tx: &Transaction<'_>,
+    generation: &str,
+    owner: &str,
+) -> StoreResult<()> {
     let id = uuid::Uuid::new_v4().to_string();
     let inserted=tx.execute("INSERT INTO server_sync_clears SELECT ?1,revision,(SELECT version FROM server_sync_scope_base WHERE scope='plugin-storage') FROM server_sync_context WHERE singleton=1",[&id])?;
     if inserted > 0 {
-        tx.execute("INSERT INTO server_sync_clear_members SELECT ?1,storage_key FROM plugin_storage WHERE generation=?2",params![id,generation])?;
+        tx.execute("INSERT INTO server_sync_clear_members SELECT ?1,owner,storage_key FROM plugin_storage WHERE generation=?2 AND owner=?3",params![id,generation,owner])?;
     }
     Ok(())
 }

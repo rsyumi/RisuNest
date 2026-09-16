@@ -101,6 +101,7 @@ mod tests {
         let mut staged = ValidatedRecords::new().unwrap();
         for i in 0..256u64 {
             let locator = LogicalRecordLocator::Plugin {
+                owner: "synthetic-plugin".to_owned(),
                 storage_key: format!("synthetic-{i:04}"),
             };
             let record = RemoteRecord {
@@ -111,6 +112,7 @@ mod tests {
                 },
                 payload: Some(ServerPayload {
                     record: LogicalRecordEnvelope::Plugin {
+                        owner: "synthetic-plugin".to_owned(),
                         ordinal: i,
                         value: Value::String("x".repeat(16 * 1024)),
                     },
@@ -127,13 +129,13 @@ mod tests {
         staged
             .visit(false, |item| {
                 let Some(ServerPayload {
-                    record: LogicalRecordEnvelope::Plugin { ordinal, value },
+                    record: LogicalRecordEnvelope::Plugin { ordinal, value, .. },
                     ..
                 }) = item.record.payload
                 else {
                     panic!("wrong staged family")
                 };
-                let LogicalRecordLocator::Plugin { storage_key } = item.locator else {
+                let LogicalRecordLocator::Plugin { storage_key, .. } = item.locator else {
                     panic!("wrong locator")
                 };
                 assert_eq!(storage_key, format!("synthetic-{ordinal:04}"));

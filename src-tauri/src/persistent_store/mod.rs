@@ -16,6 +16,7 @@ pub(crate) mod external_storage_state;
 #[cfg(feature = "native-kei-upload-pilot")]
 pub(crate) mod kei;
 pub(crate) mod owner_projection;
+pub(crate) mod plugin_owner;
 pub(crate) mod portable;
 pub(crate) mod portable_validation;
 mod preservation;
@@ -83,7 +84,7 @@ pub(super) const GENERATION_TABLES: &[(&str, &str)] = &[
     ),
     (
         "plugin_storage",
-        "storage_key, byte_size, ordinal, value",
+        "owner, storage_key, byte_size, ordinal, value, claimed_from, import_batch_id, assigned_at",
     ),
     (
         "asset_aliases",
@@ -244,8 +245,28 @@ pub(crate) struct PresetCatalog {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PluginStorageSummary {
+    pub(crate) owner: String,
     pub(crate) key: String,
     pub(crate) byte_size: i64,
+}
+
+/// What the plugin data screen lists. Values stay in the store; the screen asks
+/// for one when the reader opens it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PluginStorageListItem {
+    pub(crate) owner: String,
+    pub(crate) key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) space: Option<String>,
+    pub(crate) value_type: String,
+    pub(crate) byte_size: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) claimed_from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) import_batch_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) assigned_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -839,9 +860,18 @@ pub(crate) enum ConversationMutation {
     rename_all_fields = "camelCase"
 )]
 pub(crate) enum PluginStorageMutation {
-    Set { key: String, value: Value },
-    Delete { key: String },
-    Clear,
+    Set {
+        owner: String,
+        key: String,
+        value: Value,
+    },
+    Delete {
+        owner: String,
+        key: String,
+    },
+    Clear {
+        owner: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1570,13 +1600,22 @@ impl PersistentStore {
         query::query_plugin_storage(connection, &target)
     }
 
+    pub(crate) fn list_plugin_storage(
+        &self,
+        lease: Option<&str>,
+    ) -> StoreResult<Vec<PluginStorageListItem>> {
+        let (connection, target) = self.read_view(lease)?;
+        query::list_plugin_storage(connection, &target)
+    }
+
     pub(crate) fn read_plugin_storage(
         &self,
+        owner: &str,
         key: &str,
         lease: Option<&str>,
     ) -> StoreResult<Option<Versioned<Value>>> {
         let (connection, target) = self.read_view(lease)?;
-        query::read_plugin_storage(connection, key, &target)
+        query::read_plugin_storage(connection, owner, key, &target)
     }
 
     pub(crate) fn read_asset_alias(

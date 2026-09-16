@@ -61,6 +61,7 @@ fn server_projection_preserves_all_families_and_removes_only_local_activity() {
         .commit(&WorkingSetCommit {
             root: Some(root),
             plugin_storage: Some(vec![PluginStorageMutation::Set {
+                owner: "synthetic-plugin".to_owned(),
                 key: "synthetic-secret-contract".into(),
                 value: plugin_value.clone(),
             }]),

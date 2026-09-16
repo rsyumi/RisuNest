@@ -810,6 +810,7 @@ fn parse_and_stage<R: Read>(
     let mut loadouts = None;
     let mut plugins = None;
     let mut plugin_storage = None;
+    let mut plugin_storage_meta = None;
     let mut character_batch = Vec::new();
     let mut character_batch_bytes = 0usize;
     let mut character_count = 0u64;
@@ -925,6 +926,12 @@ fn parse_and_stage<R: Read>(
                 }
                 plugin_storage = Some(value);
             }
+            12 if name == "pluginStorageMeta" => {
+                if !value.is_object() {
+                    return Err(invalid("pluginStorageMeta block must be a JSON object"));
+                }
+                plugin_storage_meta = Some(value);
+            }
             3 | 6 | 8 => {
                 return Err(unsupported(format!(
                     "block type {block_type} for {name} requires the compatibility parser"
@@ -992,6 +999,9 @@ fn parse_and_stage<R: Read>(
         "pluginCustomStorage".to_owned(),
         plugin_storage.ok_or_else(|| invalid("missing required block pluginStorage"))?,
     );
+    if let Some(meta) = plugin_storage_meta {
+        root.insert("pluginStorageMeta".to_owned(), meta);
+    }
     let presets = presets.ok_or_else(|| invalid("missing required block preset"))?;
     pocket_features::root(&root).map_err(invalid)?;
     sink.put_root(staging_id, &Value::Object(root))

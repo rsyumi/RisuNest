@@ -292,6 +292,7 @@ mod tests {
         let cache = Cache::open(dir.path()).unwrap();
         let payload = ServerPayload {
             record: LogicalRecordEnvelope::Plugin {
+                owner: "synthetic-plugin".to_owned(),
                 ordinal: 0,
                 value: serde_json::json!("synthetic"),
             },
@@ -306,6 +307,7 @@ mod tests {
             .project(&payload, &dependencies, &[], vec!["plugin-storage".into()])
             .unwrap();
         let key = encode_logical_record_key(&LogicalRecordLocator::Plugin {
+            owner: "synthetic-plugin".into(),
             storage_key: "synthetic".into(),
         })
         .unwrap();
@@ -330,6 +332,7 @@ mod tests {
         let payload = ServerPayload {
             derived_objects: Default::default(),
             record: LogicalRecordEnvelope::Plugin {
+                owner: "synthetic-plugin".to_owned(),
                 ordinal: 0,
                 value: serde_json::json!({"synthetic":"가🦀x".repeat(1_000_000),"empty":"","ordered":[null,false,1]}),
             },

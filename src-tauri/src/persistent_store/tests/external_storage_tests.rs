@@ -90,7 +90,7 @@ fn external_delete_recreate_projects_final_state_and_messages_dirty_conversation
     let tx = store.connection.transaction().unwrap();
     changes::begin_mutation(&tx, &generation, 2, "local").unwrap();
     tx.execute(
-        "INSERT INTO plugin_storage VALUES(?1,'synthetic',1,0,'1')",
+        "INSERT INTO plugin_storage VALUES(?1,'synthetic-plugin','synthetic',1,0,'1',NULL,NULL,NULL)",
         [&generation],
     )
     .unwrap();
@@ -100,7 +100,7 @@ fn external_delete_recreate_projects_final_state_and_messages_dirty_conversation
     )
     .unwrap();
     tx.execute(
-        "INSERT INTO plugin_storage VALUES(?1,'synthetic',1,0,'2')",
+        "INSERT INTO plugin_storage VALUES(?1,'synthetic-plugin','synthetic',1,0,'2',NULL,NULL,NULL)",
         [&generation],
     )
     .unwrap();
@@ -1035,6 +1035,7 @@ fn external_capture_text_delta_does_not_hydrate_unchanged_remote_only_payloads()
     store
         .commit(&WorkingSetCommit {
             plugin_storage: Some(vec![PluginStorageMutation::Set {
+                owner: "synthetic-plugin".to_owned(),
                 key: "synthetic-text-setting".into(),
                 value: json!("edited"),
             }]),

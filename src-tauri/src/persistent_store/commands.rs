@@ -10,8 +10,8 @@ use super::{
     AssetRepositoryAuthorityState, CharacterPage, CharacterQuery, CheckpointMode, ColdAlias,
     ColdPayloadAuthorityState, ColdPayloadMigrationInput, ConversationPage, ConversationQuery,
     ConversationWindow, ConversationWindowQuery, LeaseResult, PersistentStorageStats,
-    PersistentStore, PluginStorageCatalog, PresetCatalog, RevisionResult, SnapshotCreated,
-    SnapshotInfo, StagingResult, StoreError, StoreResult, Versioned, WorkingSetCommit,
+    PersistentStore, PluginStorageCatalog, PluginStorageListItem, PresetCatalog, RevisionResult,
+    SnapshotCreated, SnapshotInfo, StagingResult, StoreError, StoreResult, Versioned, WorkingSetCommit,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -489,13 +489,22 @@ pub(crate) fn pds_query_plugin_storage(
 }
 
 #[tauri::command(async)]
+pub(crate) fn pds_list_plugin_storage(
+    state: State<'_, PersistentStoreState>,
+    lease: Option<String>,
+) -> Result<Vec<PluginStorageListItem>, StoreError> {
+    with_store(state, |store| store.list_plugin_storage(lease.as_deref()))
+}
+
+#[tauri::command(async)]
 pub(crate) fn pds_read_plugin_storage(
     state: State<'_, PersistentStoreState>,
+    owner: String,
     key: String,
     lease: Option<String>,
 ) -> Result<Option<Versioned<Value>>, StoreError> {
     with_store(state, |store| {
-        store.read_plugin_storage(&key, lease.as_deref())
+        store.read_plugin_storage(&owner, &key, lease.as_deref())
     })
 }
 

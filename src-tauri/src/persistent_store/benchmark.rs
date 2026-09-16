@@ -906,6 +906,7 @@ fn run_post_lease_commit_benchmark(database: &Value) -> Vec<PostLeaseCommitSampl
                     delete_character_id: None,
                     asset_owner_heads: None,
                     plugin_storage: Some(vec![PluginStorageMutation::Set {
+                        owner: "synthetic-plugin".to_owned(),
                         key: "benchmark-plugin".to_owned(),
                         value: json!(deterministic_text(run, 1024)),
                     }]),

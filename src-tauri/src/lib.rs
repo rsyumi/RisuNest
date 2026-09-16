@@ -834,6 +834,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         persistent_store::commands::pds_read_conversation_metadata,
         persistent_store::commands::pds_read_conversation_window,
         persistent_store::commands::pds_query_plugin_storage,
+        persistent_store::commands::pds_list_plugin_storage,
         persistent_store::commands::pds_read_plugin_storage,
         persistent_store::commands::hypa::pds_read_hypa_embeddings,
         persistent_store::commands::hypa::pds_write_hypa_embeddings,

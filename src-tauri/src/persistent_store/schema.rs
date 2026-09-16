@@ -1,7 +1,7 @@
 use super::{StoreError, StoreResult};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
-pub(crate) const SCHEMA_VERSION: u32 = 4;
+pub(crate) const SCHEMA_VERSION: u32 = 5;
 
 const ASSET_GC_MAINTENANCE_STATE_TABLE_SQL: &str = r#"
 CREATE TABLE asset_gc_maintenance_state (
@@ -85,12 +85,17 @@ fn create_schema(connection: &mut Connection) -> StoreResult<()> {
         CREATE TABLE root (generation TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE plugin_storage (
             generation TEXT NOT NULL,
+            owner TEXT NOT NULL,
             storage_key TEXT NOT NULL,
             byte_size INTEGER NOT NULL,
             ordinal INTEGER NOT NULL,
             value TEXT NOT NULL,
-            PRIMARY KEY (generation, storage_key)
+            claimed_from TEXT,
+            import_batch_id TEXT,
+            assigned_at INTEGER,
+            PRIMARY KEY (generation, owner, storage_key)
         );
+        CREATE INDEX plugin_storage_owner ON plugin_storage (generation, owner, ordinal);
         CREATE TABLE bot_presets (
             generation TEXT NOT NULL,
             preset_id TEXT NOT NULL,

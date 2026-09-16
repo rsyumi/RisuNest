@@ -8,7 +8,7 @@ const base64urlAlphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0
 export type LogicalRecordLocator =
     | { kind: 'root' }
     | { kind: 'preset'; presetId: string }
-    | { kind: 'plugin'; storageKey: string }
+    | { kind: 'plugin'; owner: string; storageKey: string }
     | { kind: 'character'; characterId: string }
     | { kind: 'conversation'; characterId: string; conversationId: string }
     | { kind: 'asset'; logicalKey: string }
@@ -91,7 +91,10 @@ function locatorParts(locator: LogicalRecordLocator): { kind: string; components
         case 'plugin':
             return {
                 kind: locator.kind,
-                components: [validateComponent(locator.storageKey, 'storageKey', true)],
+                components: [
+                    validateComponent(locator.owner, 'owner', false),
+                    validateComponent(locator.storageKey, 'storageKey', true),
+                ],
             }
         case 'character':
             return {
@@ -139,8 +142,12 @@ function locatorFromParts(kind: string, components: unknown[]): LogicalRecordLoc
             }
             break
         case 'plugin':
-            if (components.length === 1) {
-                return { kind, storageKey: validateComponent(components[0], 'storageKey', true) }
+            if (components.length === 2) {
+                return {
+                    kind,
+                    owner: validateComponent(components[0], 'owner', false),
+                    storageKey: validateComponent(components[1], 'storageKey', true),
+                }
             }
             break
         case 'character':

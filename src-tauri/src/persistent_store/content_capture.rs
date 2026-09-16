@@ -256,7 +256,7 @@ const FAMILIES: &[(&str, &str, &str, &str, &str)] = &[
         "''",
         "AND kind='inlay'",
     ),
-    ("plugin", "plugin_storage", "storage_key", "''", ""),
+    ("plugin", "plugin_storage", "owner", "storage_key", ""),
     ("preset", "bot_presets", "preset_id", "''", ""),
     ("root", "root", "''", "''", ""),
 ];
@@ -308,7 +308,8 @@ fn locator(key: &ContentKey) -> StoreResult<LogicalRecordLocator> {
             preset_id: key.key1.clone(),
         },
         "plugin" => LogicalRecordLocator::Plugin {
-            storage_key: key.key1.clone(),
+            owner: key.key1.clone(),
+            storage_key: key.key2.clone(),
         },
         "character" => LogicalRecordLocator::Character {
             character_id: key.key1.clone(),
