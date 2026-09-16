@@ -32,6 +32,7 @@ export function createMutationGatedPersistentDataStore(
         readPreset: (id: string) => store.readPreset(id),
         queryCharacters: (input: CharacterQuery): Promise<CharacterPage> =>
             store.queryCharacters(input),
+        readCharacterSummary: (id: string) => store.readCharacterSummary(id),
         readCharacter: (id: string): Promise<Versioned<CharacterDetail> | null> =>
             store.readCharacter(id),
         queryConversations: (input: ConversationQuery): Promise<ConversationPage> =>
@@ -46,6 +47,12 @@ export function createMutationGatedPersistentDataStore(
         queryPluginStorage: () => store.queryPluginStorage(),
         readPluginStorage: (owner: string, key: string) => store.readPluginStorage(owner, key),
         listPluginStorage: () => store.listPluginStorage(),
+        ...(store.commitWorkingSetChangeCursor === undefined
+            ? {}
+            : {
+                commitWorkingSetChangeCursor: (revision: DataRevision) =>
+                    store.commitWorkingSetChangeCursor!(revision),
+            }),
         readAssetAlias: (identity: AssetAliasIdentity) => store.readAssetAlias(identity),
         readAssetAliasesByKeys: (kind: AssetAliasKind, keys: string[]) =>
             store.readAssetAliasesByKeys(kind, keys),

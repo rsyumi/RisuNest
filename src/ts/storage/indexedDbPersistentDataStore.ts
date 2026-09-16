@@ -607,6 +607,12 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         return this.queryCharactersFromTransaction(transaction, revision, generation, input)
     }
 
+    async readCharacterSummary(id: string): Promise<CharacterSummary | null> {
+        const transaction = this.requireDatabase().transaction(['meta', 'catalog'], 'readonly')
+        const { generation } = await this.readActive(transaction)
+        return this.readCharacterSummaryFromTransaction(transaction, generation, id)
+    }
+
     async readCharacter(id: string): Promise<Versioned<CharacterDetail> | null> {
         const transaction = this.requireDatabase().transaction(['meta', 'characters'], 'readonly')
         const { revision, generation } = await this.readActive(transaction)
@@ -1212,6 +1218,15 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                     generation,
                     input,
                 )
+            },
+            readCharacterSummary: async (id) => {
+                assertActive()
+                const transaction = this.requireDatabase().transaction(
+                    ['meta', 'catalog'],
+                    'readonly',
+                )
+                await this.validateSnapshotLease(transaction, lease, generation, revision)
+                return this.readCharacterSummaryFromTransaction(transaction, generation, id)
             },
             readCharacter: async (id) => {
                 assertActive()
@@ -1870,6 +1885,18 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         )
         await transactionDone(transaction)
         return { revision, ...result }
+    }
+
+    private async readCharacterSummaryFromTransaction(
+        transaction: IDBTransaction,
+        generation: string,
+        id: string,
+    ): Promise<CharacterSummary | null> {
+        const record = (await requestResult(
+            transaction.objectStore('catalog').get(this.characterKey(generation, id)),
+        )) as StoredRecord<CharacterSummary> | undefined
+        await transactionDone(transaction)
+        return record ? record.value : null
     }
 
     private async readCharacterFromTransaction(

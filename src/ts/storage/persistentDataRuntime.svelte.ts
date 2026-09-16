@@ -61,6 +61,7 @@ import {
 import {
     notifyPluginStorageAuthorityReplacement,
     notifyPluginStorageCompatibilityMutation,
+    notifyPluginStorageOwnerChanged,
     resolveLifecyclePluginStorageOwner,
 } from '../plugins/pluginStorageStore'
 import {
@@ -347,6 +348,20 @@ export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapte
         },
         isConversationOperationActive() {
             return get(doingChat)
+        },
+        captureWorkingSetDatabase() {
+            return getDatabase()
+        },
+        onPluginStorageChanged(owner) {
+            notifyPluginStorageOwnerChanged(owner)
+        },
+        getGeneratingConversation() {
+            const database = getDatabase()
+            const character = database.characters[get(selectedCharID)]
+            if (!character) return null
+            const conversation = character.chats[character.chatPage ?? 0]
+            if (!conversation) return null
+            return { characterId: character.chaId, conversationId: conversation.id }
         },
         subscribeConversationOperationActive(listener) {
             return doingChat.subscribe(listener)

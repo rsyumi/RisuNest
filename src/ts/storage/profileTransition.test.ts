@@ -156,6 +156,7 @@ function createReader(
             const values = characterSummaries.filter((summary) => summary.trashed === query.trash)
             return { revision, ...page(values, query.cursor) }
         },
+        readCharacterSummary: vi.fn(async () => null),
         readCharacter: async (id) => {
             const character = characters.find((candidate) => candidate.chaId === id)
             if (!character) return null

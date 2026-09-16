@@ -280,7 +280,7 @@ async function readPinnedPresets(
     return { catalog, values }
 }
 
-async function readPinnedActivePreset(
+export async function readPinnedActivePreset(
     reader: PersistentRevisionReader,
     configuredIndex: number,
 ): Promise<{ catalog: PresetCatalog; active: ActiveCatalogPreset | null }> {
@@ -378,11 +378,12 @@ async function readPinnedConversationSummaries(
     return summaries
 }
 
-async function createPinnedResidentCharacter(
+export async function createPinnedResidentCharacter(
     reader: PersistentRevisionReader,
     summary: CharacterSummary,
     detail: CharacterDetail,
     selectedConversationId?: string | null,
+    keepConversation?: (conversationId: string) => Chat | null,
 ): Promise<CompleteCharacter> {
     const summaries = await readPinnedConversationSummaries(reader, summary.id)
     const chats = summaries.map(createConversationSummaryStub)
@@ -400,13 +401,18 @@ async function createPinnedResidentCharacter(
     }
     if (selectedIndex >= 0) {
         const selected = summaries[selectedIndex]
-        const value = await reader.readConversation(summary.id, selected.id)
-        if (!value) throw new Error(`Missing conversation ${selected.id}`)
-        assertPinnedRevision(reader.revision, value.revision, `Conversation ${selected.id}`)
-        if (value.value.id !== selected.id) {
-            throw new Error(`Conversation ${selected.id} returned mismatched ID`)
+        const kept = keepConversation?.(selected.id) ?? null
+        if (kept) {
+            chats[selectedIndex] = kept
+        } else {
+            const value = await reader.readConversation(summary.id, selected.id)
+            if (!value) throw new Error(`Missing conversation ${selected.id}`)
+            assertPinnedRevision(reader.revision, value.revision, `Conversation ${selected.id}`)
+            if (value.value.id !== selected.id) {
+                throw new Error(`Conversation ${selected.id} returned mismatched ID`)
+            }
+            chats[selectedIndex] = value.value
         }
-        chats[selectedIndex] = value.value
     }
     const character = createPinnedDetailOnlyCharacter(summary, detail)
     character.chats = chats
@@ -414,7 +420,7 @@ async function createPinnedResidentCharacter(
     return character
 }
 
-function createPinnedDetailOnlyCharacter(
+export function createPinnedDetailOnlyCharacter(
     summary: CharacterSummary,
     detail: CharacterDetail,
 ): CompleteCharacter {
@@ -435,23 +441,28 @@ export async function projectPinnedScalableWorkingSet(
     if (options.selectedCharacterId) residentIds.add(options.selectedCharacterId)
     let selectedDetail: CharacterDetail | null = null
     if (options.selectedCharacterId) {
-        const value = await reader.readCharacter(options.selectedCharacterId)
-        if (value) {
-            assertPinnedRevision(
-                reader.revision,
-                value.revision,
-                `Character ${options.selectedCharacterId}`,
-            )
-            selectedDetail = value.value
-            if (value.value.type === 'group') {
-                for (const id of value.value.characters) residentIds.add(id)
+        // An archived character has no detail to read, so the selection keeps its
+        // stub instead of failing the whole projection.
+        const selectedSummary = await reader.readCharacterSummary(options.selectedCharacterId)
+        if (selectedSummary && !selectedSummary.archived) {
+            const value = await reader.readCharacter(options.selectedCharacterId)
+            if (value) {
+                assertPinnedRevision(
+                    reader.revision,
+                    value.revision,
+                    `Character ${options.selectedCharacterId}`,
+                )
+                selectedDetail = value.value
+                if (value.value.type === 'group') {
+                    for (const id of value.value.characters) residentIds.add(id)
+                }
             }
         }
     }
 
     const characters: Database['characters'] = []
     for await (const summary of iteratePinnedCharacterSummaries(reader)) {
-        if (!residentIds.has(summary.id)) {
+        if (summary.archived || !residentIds.has(summary.id)) {
             characters.push(createCatalogCharacterStub(summary))
             continue
         }

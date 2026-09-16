@@ -21,6 +21,9 @@ import {
     type CharacterDetail,
     type CharacterPage,
     type CharacterQuery,
+    type CharacterSummary,
+    type ContentChangeKey,
+    type ContentChangeWindow,
     type ConversationPage,
     type ConversationQuery,
     type ConversationWindow,
@@ -157,6 +160,10 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
         return invokeStore('pds_query_characters', { query: input })
     }
 
+    readCharacterSummary(id: string): Promise<CharacterSummary | null> {
+        return invokeStore('pds_read_character_summary', { id })
+    }
+
     readCharacter(id: string): Promise<Versioned<CharacterDetail> | null> {
         return invokeStore('pds_read_character', { id })
     }
@@ -199,6 +206,10 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
 
     listPluginStorage(): Promise<PluginStorageListItem[]> {
         return invokeStore('pds_list_plugin_storage', {})
+    }
+
+    commitWorkingSetChangeCursor(revision: DataRevision): Promise<void> {
+        return invokeStore('pds_commit_working_set_change_cursor', { revision })
     }
 
     readAssetAlias(identity: AssetAliasIdentity): Promise<Versioned<AssetAlias> | null> {
@@ -401,9 +412,28 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
                 assertActive()
                 return invokeStore('pds_query_characters', { query: input, lease })
             },
+            readCharacterSummary: async (id) => {
+                assertActive()
+                return invokeStore('pds_read_character_summary', { id, lease })
+            },
             readCharacter: async (id) => {
                 assertActive()
                 return invokeStore('pds_read_character', { id, lease })
+            },
+            readWorkingSetChangeWindow: async () => {
+                assertActive()
+                return invokeStore<ContentChangeWindow>('pds_working_set_change_window', {
+                    lease,
+                })
+            },
+            readWorkingSetChangePage: async (afterRevision, afterKey, limit) => {
+                assertActive()
+                return invokeStore<ContentChangeKey[]>('pds_working_set_change_page', {
+                    lease,
+                    afterRevision,
+                    afterKey,
+                    limit,
+                })
             },
             queryConversations: async (input) => {
                 assertActive()

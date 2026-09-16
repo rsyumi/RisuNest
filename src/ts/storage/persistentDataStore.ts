@@ -284,6 +284,22 @@ export class ArchivedCharacterError extends Error {
     }
 }
 
+/// One coalesced change locator. `messages` and `conversations` share a
+/// locator, so a message edit arrives as a change to its conversation.
+export interface ContentChangeKey {
+    kind: string
+    key1: string
+    key2: string
+}
+
+export interface ContentChangeWindow {
+    revision: DataRevision
+    /// Null asks for a full reprojection; the cursor is unusable for this window.
+    afterRevision: DataRevision | null
+}
+
+export const CONTENT_CHANGE_PAGE_LIMIT = 1_024
+
 export interface PresetSummary {
     id: string
     name: string
@@ -454,6 +470,7 @@ export interface PersistentRevisionReader {
     queryPresets(): Promise<PresetCatalog>
     readPreset(id: string): Promise<Versioned<botPreset> | null>
     queryCharacters(input: CharacterQuery): Promise<CharacterPage>
+    readCharacterSummary(id: string): Promise<CharacterSummary | null>
     readCharacter(id: string): Promise<Versioned<CharacterDetail> | null>
     queryConversations(input: ConversationQuery): Promise<ConversationPage>
     readConversation(characterId: string, conversationId: string): Promise<Versioned<Chat> | null>
@@ -471,6 +488,14 @@ export interface PersistentRevisionReader {
     listAssetAliases(query: AssetAliasListQuery): Promise<AssetAliasPage>
     readAssetRepositoryAuthority(): Promise<Versioned<AssetRepositoryAuthorityState>>
     readAssetOwnerHead(owner: AssetOwnerLocator): Promise<Versioned<AssetOwnerHead> | null>
+    /// Present only where the store tracks changes. The window and every record
+    /// reprojected for it must be read through this one lease.
+    readWorkingSetChangeWindow?(): Promise<ContentChangeWindow>
+    readWorkingSetChangePage?(
+        afterRevision: DataRevision,
+        afterKey: ContentChangeKey | null,
+        limit: number,
+    ): Promise<ContentChangeKey[]>
 }
 
 export interface PersistentRevisionLease extends PersistentRevisionReader {
@@ -483,6 +508,7 @@ export interface PersistentDataStore {
     queryPresets(): Promise<PresetCatalog>
     readPreset(id: string): Promise<Versioned<botPreset> | null>
     queryCharacters(input: CharacterQuery): Promise<CharacterPage>
+    readCharacterSummary(id: string): Promise<CharacterSummary | null>
     readCharacter(id: string): Promise<Versioned<CharacterDetail> | null>
     queryConversations(input: ConversationQuery): Promise<ConversationPage>
     readConversation(characterId: string, conversationId: string): Promise<Versioned<Chat> | null>
@@ -497,6 +523,8 @@ export interface PersistentDataStore {
     readPluginStorage(owner: string, key: string): Promise<Versioned<unknown> | null>
     /** Sizes and ownership only. Values stay in the store until one is opened. */
     listPluginStorage(): Promise<PluginStorageListItem[]>
+    /// Advances only once the working set for `revision` has been installed.
+    commitWorkingSetChangeCursor?(revision: DataRevision): Promise<void>
     readAssetAlias(identity: AssetAliasIdentity): Promise<Versioned<AssetAlias> | null>
     readAssetAliasesByKeys(kind: AssetAliasKind, keys: string[]): Promise<Versioned<AssetAlias[]>>
     listAssetAliases(query: AssetAliasListQuery): Promise<AssetAliasPage>

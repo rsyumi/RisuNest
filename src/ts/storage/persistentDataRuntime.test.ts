@@ -156,6 +156,7 @@ function makeDatabaseLease(database: Database, revision: number): PersistentRevi
                     trashTime: character.trashTime,
                 }] : []),
         })),
+        readCharacterSummary: vi.fn(async () => null),
         readCharacter: vi.fn(async (id) => {
             const character = characters.find((candidate) => candidate.chaId === id)
             if (!character) return null

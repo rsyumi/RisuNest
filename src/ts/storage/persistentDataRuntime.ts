@@ -54,8 +54,17 @@ import {
     isWorkingSetCharacterStub,
     isCatalogPresetWorkingSet,
     patchWorkingSetCharacterDetail,
+    projectPinnedScalableWorkingSet,
     projectScalableWorkingSetAtRevision,
 } from './workingSetCatalog'
+import {
+    applyTargetedWorkingSetInvalidation,
+    readWorkingSetChangeWindow,
+} from './targetedWorkingSetInvalidation'
+import {
+    assertPinnedRevision,
+    releasePersistentRevisionLease,
+} from './persistentRecordIterator'
 import {
     createConversationSummaryStubFromChat,
     isConversationSummaryStub,
@@ -283,6 +292,11 @@ export interface PersistentDataRuntimeStateAdapter {
     canUseWindowedSelectedConversation?(): boolean
     isConversationOperationActive?(): boolean
     subscribeConversationOperationActive?(listener: (active: boolean) => void): () => void
+    /** The working set a targeted pass patches in place of a full reprojection. */
+    captureWorkingSetDatabase?(): Database | null
+    /** Host caches outside the working set that a remote change invalidates. */
+    onPluginStorageChanged?(owner: string, key: string): void
+    getGeneratingConversation?(): { characterId: string; conversationId: string } | null
     conversationViewportRowBudget?: number
     canActivateWorkingSet?(): boolean
     canDeactivateWorkingSet?(): boolean
@@ -592,6 +606,69 @@ export function createPersistentDataRuntime(
             },
         })
     }
+    let deferredContentPending = false
+    const commitContentCursor = async (revision: DataRevision): Promise<void> => {
+        const commit = dependencies.store.commitWorkingSetChangeCursor
+        if (!commit) return
+        try {
+            await commit.call(dependencies.store, revision)
+        } catch (error) {
+            // The projection is installed either way; a stale cursor only costs
+            // the next window an idempotent replay.
+            dependencies.onBackgroundError?.(error)
+        }
+    }
+    /// The change window and every record reprojected for it are read through
+    /// one lease, so a targeted pass sees exactly the content it explains.
+    const projectRefreshedWorkingSet = async (
+        revision: DataRevision,
+        pinned: {
+            selectedCharacterId: string | null
+            selectedConversationId: string | null
+            activeCharacterIds: ReadonlySet<string>
+        },
+    ): Promise<{ database: Database; deferred: boolean }> => {
+        const lease = await dependencies.store.acquireRevision(revision)
+        let primaryError: unknown
+        try {
+            assertPinnedRevision(revision, lease.revision, 'Revision lease')
+            const previous = dependencies.state.captureWorkingSetDatabase?.() ?? null
+            if (previous) {
+                const keys = await readWorkingSetChangeWindow(lease)
+                if (keys) {
+                    const generating =
+                        dependencies.state.isConversationOperationActive?.() === true
+                            ? dependencies.state.getGeneratingConversation?.() ?? null
+                            : null
+                    const targeted = await applyTargetedWorkingSetInvalidation(
+                        previous,
+                        keys,
+                        lease,
+                        {
+                            ...pinned,
+                            deferredConversation: generating,
+                            onPluginStorageChanged:
+                                dependencies.state.onPluginStorageChanged,
+                        },
+                    )
+                    if (targeted) return targeted
+                }
+            }
+            return {
+                database: await projectPinnedScalableWorkingSet(lease, pinned),
+                deferred: false,
+            }
+        } catch (error) {
+            primaryError = error
+            throw error
+        } finally {
+            try {
+                await releasePersistentRevisionLease(lease)
+            } catch (error) {
+                if (primaryError === undefined) throw error
+            }
+        }
+    }
     const refreshCommittedWorkingSet = async (
         revision: DataRevision,
         fenceOwner?: symbol,
@@ -611,34 +688,94 @@ export function createPersistentDataRuntime(
         const selectedConversationId =
             dependencies.state.getSelectedConversationId?.() ?? null
         const activeCharacterIds = workingSet.activeCharacterIds
-        const database = await projectScalableWorkingSetAtRevision(
-            dependencies.store,
-            revision,
-            {
-                selectedCharacterId,
-                selectedConversationId,
-                activeCharacterIds,
-            },
-        )
+        const projected = await projectRefreshedWorkingSet(revision, {
+            selectedCharacterId,
+            selectedConversationId,
+            activeCharacterIds,
+        })
         if (fenceOwner !== undefined) {
             coordinator.assertDestructiveReplacementFence(fenceOwner)
         }
         workingSet.invalidateNavigation()
         dependencies.state.replaceDatabase(
-            database,
+            projected.database,
             activeCharacterIds,
             options?.forceScalableProjection ?? true,
         )
-        workingSet.installCommittedWorkingSet(database, revision)
+        workingSet.installCommittedWorkingSet(projected.database, revision)
+        if (projected.deferred) {
+            deferredContentPending = true
+            return
+        }
+        await commitContentCursor(revision)
     }
+    const acquireCommittedWorkingSetRefreshFence =
+        async (): Promise<PersistentDestructiveReplacementFence> => {
+            const owner =
+                await coordinator.acquireCommittedWorkingSetRefreshFence()
+            const heldRevision = coordinator.revision
+            let released = false
+            return {
+                revision: heldRevision,
+                async refreshCommittedWorkingSet(minimumRevision, options) {
+                    if (released) {
+                        throw new Error(
+                            'Destructive persistent replacement fence was released',
+                        )
+                    }
+                    coordinator.assertDestructiveReplacementFence(owner)
+                    const latest = await dependencies.store.readRoot()
+                    coordinator.assertDestructiveReplacementFence(owner)
+                    if (latest.revision < minimumRevision) {
+                        throw new RevisionConflictError(
+                            minimumRevision,
+                            latest.revision,
+                        )
+                    }
+                    return refreshCommittedWorkingSet(
+                        latest.revision,
+                        owner,
+                        options,
+                    )
+                },
+                release() {
+                    if (released) return
+                    coordinator.releaseDestructiveReplacementFence(owner)
+                    released = true
+                },
+            }
+        }
+    // A change held back from a generating conversation is applied once that
+    // generation ends; until then the cursor stays behind it.
+    dependencies.state.subscribeConversationOperationActive?.((active) => {
+        if (active || !deferredContentPending) return
+        deferredContentPending = false
+        void (async () => {
+            try {
+                const fence = await acquireCommittedWorkingSetRefreshFence()
+                try {
+                    await fence.refreshCommittedWorkingSet(0)
+                } finally {
+                    fence.release()
+                }
+            } catch (error) {
+                dependencies.onBackgroundError?.(error)
+            }
+        })()
+    })
     return {
         store: dependencies.store,
         get revision() {
             return coordinator.revision
         },
         getStorageAuthorityEpoch: () => coordinator.storageAuthorityEpoch,
-        initializeActiveWorkingSet: (database) =>
-            workingSet.initializeActiveWorkingSet(database),
+        async initializeActiveWorkingSet(database) {
+            const result = await workingSet.initializeActiveWorkingSet(database)
+            // A recreated WebView starts from a projection of the current
+            // revision, so the cursor is realigned with it.
+            await commitContentCursor(coordinator.revision)
+            return result
+        },
         refreshActiveWorkingSetFromStore: (revision) =>
             refreshCommittedWorkingSet(revision),
         runStorageOnlyMutation: (operation) =>
@@ -818,41 +955,7 @@ export function createPersistentDataRuntime(
                 },
             }
         },
-        async acquireCommittedWorkingSetRefreshFence() {
-            const owner =
-                await coordinator.acquireCommittedWorkingSetRefreshFence()
-            const heldRevision = coordinator.revision
-            let released = false
-            return {
-                revision: heldRevision,
-                async refreshCommittedWorkingSet(minimumRevision, options) {
-                    if (released) {
-                        throw new Error(
-                            'Destructive persistent replacement fence was released',
-                        )
-                    }
-                    coordinator.assertDestructiveReplacementFence(owner)
-                    const latest = await dependencies.store.readRoot()
-                    coordinator.assertDestructiveReplacementFence(owner)
-                    if (latest.revision < minimumRevision) {
-                        throw new RevisionConflictError(
-                            minimumRevision,
-                            latest.revision,
-                        )
-                    }
-                    return refreshCommittedWorkingSet(
-                        latest.revision,
-                        owner,
-                        options,
-                    )
-                },
-                release() {
-                    if (released) return
-                    coordinator.releaseDestructiveReplacementFence(owner)
-                    released = true
-                },
-            }
-        },
+        acquireCommittedWorkingSetRefreshFence,
         materializePersistentDatabaseSnapshot: (reason) =>
             coordinator.materializePersistentDatabaseSnapshot(reason),
         materializePersistentDatabaseSnapshotWithRevision: (reason) =>
