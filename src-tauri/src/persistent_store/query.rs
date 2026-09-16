@@ -500,6 +500,38 @@ pub(super) fn validate_asset_kind(kind: &str) -> StoreResult<()> {
     }
 }
 
+const CHARACTER_SUMMARY_COLUMNS: &str =
+    "character_id, name, image, configured_index, recent_at, trashed, conversation_count,
+     type, creator_notes, trash_time, archived_object";
+
+fn character_summary_from_row(row: &rusqlite::Row<'_>) -> StoreResult<CharacterSummary> {
+    let archived = row
+        .get::<_, Option<String>>(10)?
+        .map(|stored| {
+            serde_json::from_str::<super::archive::ArchivedObject>(&stored).map(|archived| {
+                ArchivedCharacterSummary {
+                    archived_at: archived.archived_at,
+                    conversation_count: archived.conversation_count,
+                    message_count: archived.message_count,
+                }
+            })
+        })
+        .transpose()?;
+    Ok(CharacterSummary {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        image: row.get(2)?,
+        configured_index: row.get(3)?,
+        recent_at: row.get(4)?,
+        trashed: row.get::<_, i64>(5)? != 0,
+        conversation_count: row.get(6)?,
+        r#type: row.get(7)?,
+        creator_notes: row.get(8)?,
+        trash_time: row.get(9)?,
+        archived,
+    })
+}
+
 pub(super) fn query_characters(
     connection: &Connection,
     query: &CharacterQuery,
@@ -514,8 +546,7 @@ pub(super) fn query_characters(
         .filter(|value| !value.is_empty())
         .map(str::to_lowercase);
     let mut statement = connection.prepare(&format!(
-        "SELECT character_id, name, image, configured_index, recent_at, trashed, conversation_count,
-                type, creator_notes, trash_time, archived_object
+        "SELECT {CHARACTER_SUMMARY_COLUMNS}
          FROM characters
          WHERE generation = ?1 AND trashed = ?2
          ORDER BY {order}"
@@ -525,31 +556,7 @@ pub(super) fn query_characters(
     let mut matched = 0;
     let mut has_more = false;
     while let Some(row) = rows.next()? {
-        let archived = row
-            .get::<_, Option<String>>(10)?
-            .map(|stored| {
-                serde_json::from_str::<super::archive::ArchivedObject>(&stored).map(|archived| {
-                    ArchivedCharacterSummary {
-                        archived_at: archived.archived_at,
-                        conversation_count: archived.conversation_count,
-                        message_count: archived.message_count,
-                    }
-                })
-            })
-            .transpose()?;
-        let summary = CharacterSummary {
-            id: row.get(0)?,
-            name: row.get(1)?,
-            image: row.get(2)?,
-            configured_index: row.get(3)?,
-            recent_at: row.get(4)?,
-            trashed: row.get::<_, i64>(5)? != 0,
-            conversation_count: row.get(6)?,
-            r#type: row.get(7)?,
-            creator_notes: row.get(8)?,
-            trash_time: row.get(9)?,
-            archived,
-        };
+        let summary = character_summary_from_row(row)?;
         if search
             .as_ref()
             .is_some_and(|search| !summary.name.to_lowercase().contains(search))
@@ -572,6 +579,24 @@ pub(super) fn query_characters(
         next_cursor: has_more.then(|| (offset + items.len() as i64).to_string()),
         items,
     })
+}
+
+/// One summary by identity. Targeted invalidation reprojects a single changed
+/// character without walking the catalog.
+pub(super) fn read_character_summary(
+    connection: &Connection,
+    id: &str,
+    target: &ReadTarget,
+) -> StoreResult<Option<CharacterSummary>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT {CHARACTER_SUMMARY_COLUMNS} FROM characters
+         WHERE generation = ?1 AND character_id = ?2"
+    ))?;
+    let mut rows = statement.query(params![target.generation, id])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(character_summary_from_row(row)?)),
+        None => Ok(None),
+    }
 }
 
 pub(super) fn read_character(

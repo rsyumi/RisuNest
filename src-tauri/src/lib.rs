@@ -931,6 +931,10 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         windows_appearance::windows_set_appearance,
         persistent_store::commands::pds_read_section_participation,
         persistent_store::commands::pds_set_section_participating,
+        persistent_store::commands::pds_read_character_summary,
+        persistent_store::commands::pds_working_set_change_window,
+        persistent_store::commands::pds_working_set_change_page,
+        persistent_store::commands::pds_commit_working_set_change_cursor,
     ]
 }
 

@@ -27,6 +27,7 @@ function pinnedLease(): NativePersistentRevisionLease {
         queryPresets: vi.fn(),
         readPreset: vi.fn(),
         queryCharacters: vi.fn(),
+        readCharacterSummary: vi.fn(async () => null),
         readCharacter: vi.fn(),
         queryConversations: vi.fn(),
         readConversation: vi.fn(),

@@ -127,6 +127,8 @@ mod archive_tests;
 mod asset_alias_tests;
 #[path = "tests/asset_catalog_gc_tests.rs"]
 mod asset_catalog_gc_tests;
+#[path = "tests/content_change_vocabulary_tests.rs"]
+mod content_change_vocabulary_tests;
 #[path = "tests/data_health_tests.rs"]
 mod data_health_tests;
 mod selective_import_tests;

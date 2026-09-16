@@ -63,6 +63,11 @@ export function notifyPluginStorageAuthorityReplacement(): void {
     lifecycleStore?.invalidate()
 }
 
+/** One owner's rows changed outside this WebView; that owner reloads on demand. */
+export function notifyPluginStorageOwnerChanged(owner: string): void {
+    lifecycleStore?.invalidateOwner(owner)
+}
+
 export function notifyPluginStorageCompatibilityMutation(
     mutation: PluginStorageMutation,
 ): void {

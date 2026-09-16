@@ -57,6 +57,7 @@ function createStore(input?: {
             revision: input?.replacementRevision ?? revision + 1,
         })),
         queryCharacters: vi.fn(),
+        readCharacterSummary: vi.fn(async () => null),
         readCharacter: vi.fn(),
         queryConversations: vi.fn(),
         readConversation: vi.fn(),

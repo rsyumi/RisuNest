@@ -60,6 +60,7 @@ function makeLease(input: {
         readPreset: vi.fn(async () => null),
         readRoot: vi.fn(),
         queryCharacters: vi.fn(),
+        readCharacterSummary: vi.fn(async () => null),
         readCharacter:
             input.readCharacter ??
             vi.fn(async () => ({
