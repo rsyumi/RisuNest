@@ -15,6 +15,7 @@ use uuid::Uuid;
 pub(crate) const DEVICE_SCHEMA_VERSION: u32 = 1;
 pub(crate) const DEVICE_DATABASE_FILE: &str = "device.sqlite";
 
+pub(crate) mod claim_sessions;
 pub(crate) mod hypa;
 pub(crate) mod plugin_values;
 
@@ -368,7 +369,7 @@ impl DeviceStore {
     }
 }
 
-fn now_ms() -> StoreResult<i64> {
+pub(crate) fn now_ms() -> StoreResult<i64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| invalid("device clock is before the epoch"))?

@@ -309,3 +309,215 @@ fn a_committed_plugin_write_survives_reopening_the_store() {
         .expect("read unowned row")
         .is_none());
 }
+
+fn imported_store(
+    values: Value,
+    meta: Value,
+) -> (tempfile::TempDir, PersistentStore) {
+    let directory = tempfile::tempdir().expect("create claim directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let staging = store.replace_begin().expect("begin replacement");
+    store
+        .replace_put_root(
+            &staging.staging_id,
+            &json!({ "pluginCustomStorage": values, "pluginStorageMeta": meta }),
+        )
+        .expect("stage imported plugin storage");
+    store
+        .replace_commit(&staging.staging_id, Some(0))
+        .expect("activate import");
+    (directory, store)
+}
+
+/// Invariant 24. One window per import, opened once and never again.
+#[test]
+fn an_import_offers_each_plugin_one_claim_window_that_never_reopens() {
+    let (_directory, mut store) = imported_store(
+        json!({ "pm_store": { "apiKey": "imported" }, "other": "value" }),
+        json!({}),
+    );
+
+    let session = store
+        .begin_plugin_claim_session("provider-manager", "hash-one", "run-one")
+        .expect("open claim session")
+        .expect("a waiting import opens a window");
+    assert_eq!(
+        store
+            .claim_plugin_storage_value(
+                &session,
+                "provider-manager",
+                "hash-one",
+                "run-one",
+                "pm_store",
+            )
+            .expect("claim the unowned value"),
+        Some(json!({ "apiKey": "imported" }))
+    );
+    assert_eq!(
+        store
+            .read_plugin_storage("provider-manager", "pm_store", None)
+            .expect("read claimed row")
+            .expect("claimed row exists")
+            .value,
+        json!({ "apiKey": "imported" })
+    );
+    assert!(store
+        .read_plugin_storage(UNOWNED_OWNER, "pm_store", None)
+        .expect("read unowned row")
+        .is_none());
+
+    let claimed = store
+        .list_plugin_storage(None)
+        .expect("list plugin storage")
+        .into_iter()
+        .find(|item| item.key == "pm_store")
+        .expect("claimed item is listed");
+    assert_eq!(claimed.claimed_from.as_deref(), Some("unowned"));
+    assert!(claimed.assigned_at.is_some());
+    assert!(claimed.import_batch_id.is_some());
+
+    store
+        .close_plugin_claim_session(&session)
+        .expect("close the window");
+    assert!(store
+        .claim_plugin_storage_value(
+            &session,
+            "provider-manager",
+            "hash-one",
+            "run-one",
+            "other",
+        )
+        .expect("claim after close")
+        .is_none());
+    // A later run of the same plugin gets no second window for this import.
+    assert!(store
+        .begin_plugin_claim_session("provider-manager", "hash-one", "run-two")
+        .expect("reopen attempt")
+        .is_none());
+    assert!(store
+        .read_plugin_storage(UNOWNED_OWNER, "other", None)
+        .expect("read remaining unowned row")
+        .is_some());
+}
+
+#[test]
+fn a_claim_refuses_a_key_the_plugin_already_holds_and_a_foreign_caller() {
+    let (_directory, mut store) =
+        imported_store(json!({ "shared": "imported" }), json!({}));
+    let revision = store.revision().expect("read revision");
+    store
+        .commit(&WorkingSetCommit {
+            plugin_storage: Some(vec![PluginStorageMutation::Set {
+                owner: "plugin-a".to_owned(),
+                key: "shared".to_owned(),
+                value: json!("own"),
+            }]),
+            ..empty_working_set_commit(revision)
+        })
+        .expect("write the plugin's own value");
+
+    let session = store
+        .begin_plugin_claim_session("plugin-a", "hash-one", "run-one")
+        .expect("open claim session")
+        .expect("a waiting import opens a window");
+    assert!(store
+        .claim_plugin_storage_value(&session, "plugin-a", "hash-one", "run-one", "shared")
+        .expect("claim a held key")
+        .is_none());
+    assert_eq!(
+        store
+            .read_plugin_storage("plugin-a", "shared", None)
+            .expect("read own row")
+            .expect("own row exists")
+            .value,
+        json!("own")
+    );
+    assert!(store
+        .read_plugin_storage(UNOWNED_OWNER, "shared", None)
+        .expect("read unowned row")
+        .is_some());
+
+    // The window belongs to one plugin, one code and one run.
+    for (owner, code_hash, runtime) in [
+        ("plugin-b", "hash-one", "run-one"),
+        ("plugin-a", "hash-two", "run-one"),
+        ("plugin-a", "hash-one", "run-two"),
+    ] {
+        assert!(store
+            .claim_plugin_storage_value(&session, owner, code_hash, runtime, "shared")
+            .expect("claim from a foreign caller")
+            .is_none());
+    }
+}
+
+/// A full replacement written later must not mint a fresh window for values a
+/// person deliberately left alone.
+#[test]
+fn a_later_full_replacement_keeps_the_import_a_waiting_value_arrived_in() {
+    let (_directory, mut store) = imported_store(json!({ "waiting": "value" }), json!({}));
+    let batch = store
+        .list_plugin_storage(None)
+        .expect("list plugin storage")
+        .into_iter()
+        .find(|item| item.key == "waiting")
+        .expect("waiting item is listed")
+        .import_batch_id
+        .expect("waiting item carries its import");
+
+    let session = store
+        .begin_plugin_claim_session("plugin-a", "hash-one", "run-one")
+        .expect("open claim session")
+        .expect("a waiting import opens a window");
+    store
+        .close_plugin_claim_session(&session)
+        .expect("close without claiming");
+
+    let staging = store.replace_begin().expect("begin replacement");
+    store
+        .replace_put_root(
+            &staging.staging_id,
+            &json!({ "pluginCustomStorage": { "waiting": "value" } }),
+        )
+        .expect("stage a full replacement");
+    let revision = store.revision().expect("read revision");
+    store
+        .replace_commit(&staging.staging_id, Some(revision))
+        .expect("activate the replacement");
+
+    assert_eq!(
+        store
+            .list_plugin_storage(None)
+            .expect("list plugin storage")
+            .into_iter()
+            .find(|item| item.key == "waiting")
+            .expect("waiting item is still listed")
+            .import_batch_id,
+        Some(batch)
+    );
+    assert!(store
+        .begin_plugin_claim_session("plugin-a", "hash-one", "run-three")
+        .expect("reopen attempt after a replacement")
+        .is_none());
+}
+
+#[test]
+fn values_that_reached_the_store_outside_an_import_open_no_window() {
+    let directory = tempfile::tempdir().expect("create claim directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let revision = store.revision().expect("read revision");
+    store
+        .commit(&WorkingSetCommit {
+            plugin_storage: Some(vec![PluginStorageMutation::Set {
+                owner: UNOWNED_OWNER.to_owned(),
+                key: "stray".to_owned(),
+                value: json!("value"),
+            }]),
+            ..empty_working_set_commit(revision)
+        })
+        .expect("write an unowned value outside an import");
+
+    assert!(store
+        .begin_plugin_claim_session("plugin-a", "hash-one", "run-one")
+        .expect("open claim session")
+        .is_none());
+}

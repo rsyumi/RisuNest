@@ -3,6 +3,7 @@ import { SandboxHost } from "./factory";
 import { getDatabase } from "src/ts/storage/database.svelte";
 import { isArchivedCharacter } from "src/ts/storage/workingSetCatalog";
 import { SafeLocalPluginStorage, SafeLocalStorage, tagWhitelist } from "../pluginSafeClass";
+import { beginPluginClaimSession, type PluginClaimSession } from "../pluginClaimSession";
 import DOMPurify from 'dompurify';
 import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburgerMenu, additionalSettingsMenu, bodyIntercepterStore, chatPanelStore, DBState, selectedCharID, type MenuDef } from "src/ts/stores.svelte";
 import { v4 } from "uuid";
@@ -746,7 +747,11 @@ function throwIfPluginReadAborted(signal: AbortSignal): void {
     throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError')
 }
 
-const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
+const makeRisuaiAPIV3 = (
+    iframe: HTMLIFrameElement,
+    plugin: RisuPlugin,
+    claimSession: { current: PluginClaimSession | null } = { current: null },
+) => {
 
     const oldApis = getV2PluginAPIs();
     // Every storage entry point below is bound to this plugin's name, which the
@@ -1391,7 +1396,11 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             
             return v;
         },
-        _getPluginStorage: (key: string) => ownedPluginStorage.getItem(key),
+        _getPluginStorage: async (key: string) => {
+            const own = await ownedPluginStorage.getItem(key)
+            if (own !== null && own !== undefined) return own
+            return (await claimSession.current?.claim(key)) ?? null
+        },
         _setPluginStorage: (key: string, value: unknown) =>
             ownedPluginStorage.setItem(key, value),
         _removePluginStorage: (key: string) => ownedPluginStorage.removeItem(key),
@@ -1629,11 +1638,26 @@ export async function executePluginV3(plugin:RisuPlugin){
     const iframe = document.createElement('iframe');
     iframe.style.display = "none";
     document.body.appendChild(iframe);
-    const host = new SandboxHost(makeRisuaiAPIV3(iframe, plugin));
+    const claimSession: { current: PluginClaimSession | null } = { current: null };
+    const host = new SandboxHost(makeRisuaiAPIV3(iframe, plugin, claimSession));
     v3PluginInstances.push({
         name: plugin.name,
         host
     });
+    const closeClaimSession = () => {
+        const session = claimSession.current;
+        claimSession.current = null;
+        void session?.close().catch(() => undefined);
+    };
+    try {
+        claimSession.current = await beginPluginClaimSession(plugin);
+    } catch (error) {
+        console.error(`[RisuAI Plugin: ${plugin.name}] Could not open the value assignment window.`, error);
+    }
+    if (claimSession.current) {
+        host.onScriptSettled(closeClaimSession);
+        addPluginUnloadCallback(plugin.name, closeClaimSession);
+    }
     host.run(iframe, plugin.script, plugin.name);
     console.log(`[RisuAI Plugin: ${plugin.name}] Loaded API V3 plugin.`);
 }

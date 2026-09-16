@@ -1139,6 +1139,46 @@ pub(crate) fn pds_snapshot_restore_request(
 }
 
 #[tauri::command(async)]
+pub(crate) fn pds_begin_plugin_claim_session(
+    state: State<'_, PersistentStoreState>,
+    owner: String,
+    code_hash: String,
+    runtime_instance: String,
+) -> Result<Option<String>, StoreError> {
+    with_store(state, |store| {
+        store.begin_plugin_claim_session(&owner, &code_hash, &runtime_instance)
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_claim_plugin_storage_value(
+    state: State<'_, PersistentStoreState>,
+    session_id: String,
+    owner: String,
+    code_hash: String,
+    runtime_instance: String,
+    key: String,
+) -> Result<Option<Value>, StoreError> {
+    with_store_mut(state, |store| {
+        store.claim_plugin_storage_value(
+            &session_id,
+            &owner,
+            &code_hash,
+            &runtime_instance,
+            &key,
+        )
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_close_plugin_claim_session(
+    state: State<'_, PersistentStoreState>,
+    session_id: String,
+) -> Result<(), StoreError> {
+    with_store(state, |store| store.close_plugin_claim_session(&session_id))
+}
+
+#[tauri::command(async)]
 pub(crate) fn pds_hydrate_plugin_device_storage(
     state: State<'_, PersistentStoreState>,
     owner: String,

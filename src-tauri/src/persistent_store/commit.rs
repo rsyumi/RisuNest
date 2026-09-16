@@ -5,7 +5,7 @@ use super::{
     StoreResult, WorkingSetCommit, GENERATION_TABLES,
 };
 use super::plugin_owner;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 pub(super) fn incremental_commit<T>(
     connection: &mut Connection,
@@ -617,11 +617,13 @@ pub(super) fn replace_put_root(
         let plugin_storage = plugin_storage
             .as_object()
             .ok_or_else(|| validation("pluginCustomStorage must be a JSON object"))?;
+        let carried = carried_plugin_import_batches(&transaction)?;
         replace_plugin_storage(
             &transaction,
             staging_id,
             plugin_storage,
             plugin_storage_meta.as_ref().and_then(Value::as_object),
+            &carried,
         )?;
     }
     put_root(&transaction, staging_id, &Value::Object(staged_root))?;
@@ -1642,11 +1644,29 @@ fn put_root(transaction: &Transaction<'_>, generation: &str, root: &Value) -> St
 
 /// Upstream saves carry a flat object. Without an ownership sidecar every key
 /// lands on the sentinel owner and the management screen assigns it later.
+/// A key that still waits for an owner keeps the import it arrived in, so a
+/// full replacement written afterwards cannot hand a plugin a second chance at
+/// the values a person left alone.
+fn carried_plugin_import_batches(
+    transaction: &Transaction<'_>,
+) -> StoreResult<HashMap<String, String>> {
+    let active = active_generation(transaction)?;
+    let mut statement = transaction.prepare(
+        "SELECT storage_key, import_batch_id FROM plugin_storage
+         WHERE generation = ?1 AND import_batch_id IS NOT NULL AND assigned_at IS NULL",
+    )?;
+    let rows = statement
+        .query_map([&active], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<Vec<(String, String)>, _>>()?;
+    Ok(rows.into_iter().collect())
+}
+
 pub(super) fn replace_plugin_storage(
     transaction: &Transaction<'_>,
     generation: &str,
     values: &Map<String, Value>,
     meta: Option<&Map<String, Value>>,
+    carried: &HashMap<String, String>,
 ) -> StoreResult<()> {
     transaction.execute(
         "DELETE FROM plugin_storage WHERE generation = ?1",
@@ -1654,6 +1674,10 @@ pub(super) fn replace_plugin_storage(
     )?;
     for (ordinal, (key, value)) in values.iter().enumerate() {
         let owner = sidecar_owner(meta, key);
+        // The staging identity names this import, so a plugin that starts once
+        // afterwards can take a value the save left without an owner.
+        let import_batch = plugin_owner::is_unowned(owner)
+            .then(|| carried.get(key.as_str()).map(String::as_str).unwrap_or(generation));
         put_plugin_storage(
             transaction,
             generation,
@@ -1661,6 +1685,7 @@ pub(super) fn replace_plugin_storage(
             key,
             value,
             Some(ordinal as i64),
+            import_batch,
         )?;
     }
     Ok(())
@@ -1683,13 +1708,15 @@ fn put_plugin_storage(
     key: &str,
     value: &Value,
     ordinal: Option<i64>,
+    import_batch: Option<&str>,
 ) -> StoreResult<()> {
     if !plugin_owner::validate_owner(owner) {
         return Err(validation("plugin storage owner is invalid"));
     }
     let serialized = serde_json::to_string(value)?;
     transaction.execute(
-        "INSERT INTO plugin_storage (generation, owner, storage_key, byte_size, ordinal, value)
+        "INSERT INTO plugin_storage
+             (generation, owner, storage_key, byte_size, ordinal, value, import_batch_id)
          VALUES (
              ?1,
              ?2,
@@ -1700,7 +1727,8 @@ fn put_plugin_storage(
                  (SELECT COALESCE(MAX(ordinal) + 1, 0)
                   FROM plugin_storage WHERE generation = ?1)
              ),
-             ?6
+             ?6,
+             ?7
          )
          ON CONFLICT(generation, owner, storage_key) DO UPDATE SET
              byte_size = excluded.byte_size,
@@ -1711,7 +1739,8 @@ fn put_plugin_storage(
             key,
             serialized.len() as i64,
             ordinal,
-            serialized
+            serialized,
+            import_batch
         ],
     )?;
     Ok(())
@@ -1724,7 +1753,7 @@ fn apply_plugin_storage_mutation(
 ) -> StoreResult<()> {
     match mutation {
         PluginStorageMutation::Set { owner, key, value } => {
-            put_plugin_storage(transaction, generation, owner, key, value, None)
+            put_plugin_storage(transaction, generation, owner, key, value, None, None)
         }
         PluginStorageMutation::Delete { owner, key } => {
             transaction.execute(
@@ -2479,4 +2508,102 @@ fn validation(message: impl Into<String>) -> StoreError {
     StoreError::Validation {
         message: message.into(),
     }
+}
+
+/// Moves one value from the unowned side to the plugin that asked for it, in
+/// the revision path so the change index and the outbox see it. Answers with
+/// nothing when the plugin already holds that key or no unassigned row from
+/// this import carries it, and then nothing is written.
+pub(super) fn claim_unowned_plugin_value(
+    connection: &mut Connection,
+    owner: &str,
+    key: &str,
+    import_batch_id: &str,
+    assigned_at: i64,
+) -> StoreResult<Option<Value>> {
+    if !plugin_owner::validate_owner(owner) || plugin_owner::is_unowned(owner) {
+        return Err(validation("plugin storage owner is invalid"));
+    }
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let generation = active_generation(&transaction)?;
+    let held: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM plugin_storage
+         WHERE generation = ?1 AND owner = ?2 AND storage_key = ?3",
+        params![generation, owner, key],
+        |row| row.get(0),
+    )?;
+    if held != 0 {
+        return Ok(None);
+    }
+    let source: Option<(i64, i64, String)> = transaction
+        .query_row(
+            "SELECT byte_size, ordinal, value FROM plugin_storage
+             WHERE generation = ?1 AND owner = ?2 AND storage_key = ?3
+               AND import_batch_id = ?4 AND assigned_at IS NULL",
+            params![
+                generation,
+                plugin_owner::UNOWNED_OWNER,
+                key,
+                import_batch_id
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((byte_size, ordinal, serialized)) = source else {
+        return Ok(None);
+    };
+    let value: Value = serde_json::from_str(&serialized)?;
+    let revision = current_revision(&transaction)? + 1;
+    super::server_sync_outbox::begin_mutation(&transaction, &generation, revision)?;
+    super::content_change_index::begin_mutation(&transaction, &generation, revision, "local")?;
+    // A delete and an insert, so both sides of the move reach the change index.
+    transaction.execute(
+        "DELETE FROM plugin_storage
+         WHERE generation = ?1 AND owner = ?2 AND storage_key = ?3",
+        params![generation, plugin_owner::UNOWNED_OWNER, key],
+    )?;
+    transaction.execute(
+        "INSERT INTO plugin_storage
+             (generation, owner, storage_key, byte_size, ordinal, value, claimed_from,
+              import_batch_id, assigned_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            generation,
+            owner,
+            key,
+            byte_size,
+            ordinal,
+            serialized,
+            plugin_owner::CLAIMED_FROM_UNOWNED,
+            import_batch_id,
+            assigned_at
+        ],
+    )?;
+    super::content_change_index::finish_mutation(&transaction)?;
+    super::server_sync_outbox::finish_mutation(&transaction)?;
+    set_active(&transaction, revision, &generation)?;
+    transaction.commit()?;
+    Ok(Some(value))
+}
+
+/// The import whose unassigned values a plugin may still be offered, when there
+/// is exactly one. Values that reached the store any other way carry no import
+/// and are never offered.
+pub(super) fn pending_plugin_import_batch(connection: &Connection) -> StoreResult<Option<String>> {
+    let generation = active_generation(connection)?;
+    let mut statement = connection.prepare(
+        "SELECT DISTINCT import_batch_id FROM plugin_storage
+         WHERE generation = ?1 AND owner = ?2 AND import_batch_id IS NOT NULL
+           AND assigned_at IS NULL
+         LIMIT 2",
+    )?;
+    let batches = statement
+        .query_map(params![generation, plugin_owner::UNOWNED_OWNER], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(match batches.len() {
+        1 => batches.into_iter().next(),
+        _ => None,
+    })
 }

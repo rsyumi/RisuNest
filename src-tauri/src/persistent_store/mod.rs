@@ -1608,6 +1608,53 @@ impl PersistentStore {
         query::list_plugin_storage(connection, &target)
     }
 
+    /// Opens this plugin's one chance to take values an upstream save left
+    /// without an owner. Answers with nothing when no import is waiting or when
+    /// this plugin already had its window for that import.
+    pub(crate) fn begin_plugin_claim_session(
+        &self,
+        owner: &str,
+        code_hash: &str,
+        runtime_instance: &str,
+    ) -> StoreResult<Option<String>> {
+        let Some(batch) = commit::pending_plugin_import_batch(&self.connection)? else {
+            return Ok(None);
+        };
+        self.device_store()?.open_plugin_claim_session(
+            &batch,
+            owner,
+            code_hash,
+            runtime_instance,
+            device_store::now_ms()?,
+        )
+    }
+
+    pub(crate) fn claim_plugin_storage_value(
+        &mut self,
+        session_id: &str,
+        owner: &str,
+        code_hash: &str,
+        runtime_instance: &str,
+        key: &str,
+    ) -> StoreResult<Option<Value>> {
+        let now = device_store::now_ms()?;
+        let batch = self.device_store()?.plugin_claim_session_batch(
+            session_id,
+            owner,
+            code_hash,
+            runtime_instance,
+            now,
+        )?;
+        let Some(batch) = batch else {
+            return Ok(None);
+        };
+        commit::claim_unowned_plugin_value(&mut self.connection, owner, key, &batch, now)
+    }
+
+    pub(crate) fn close_plugin_claim_session(&self, session_id: &str) -> StoreResult<()> {
+        self.device_store()?.close_plugin_claim_session(session_id)
+    }
+
     pub(crate) fn read_plugin_storage(
         &self,
         owner: &str,
