@@ -726,3 +726,129 @@ fn device_settings_are_not_tracked_as_section_changes() {
     assert_eq!(revision, 1);
     assert!(changes(store.connection()).is_empty());
 }
+
+#[test]
+fn device_settings_accept_only_the_assigned_keys() {
+    let (_directory, mut store) = open();
+    assert_eq!(
+        DEVICE_SETTING_KEYS,
+        [
+            "accountst",
+            "ignoreRisuAuth",
+            "dosync",
+            "hub",
+            "risunest_tos_v1",
+            "risu_service_tos_v1",
+            "risu_lastsaved",
+            "nightlyWarned",
+            "risuNestDeviceSettings",
+            "risuNestUpdateSettings",
+            "risuNestServerSyncRestoreHold",
+            "official-account.association.v1",
+            "official-account.asset-ledger.v1",
+            "sync-conflict-backups.index.v1",
+        ]
+    );
+
+    for key in DEVICE_SETTING_KEYS {
+        store
+            .write_setting(key, &serde_json::json!("value"))
+            .expect("write an assigned key");
+    }
+
+    let value = serde_json::json!("value");
+    assert!(store.write_setting("mainpage", &value).is_err());
+    assert!(store.read_setting("mainpage").is_err());
+    assert!(store.remove_setting("mainpage").is_err());
+    assert!(store
+        .patch_setting(
+            "mainpage",
+            serde_json::json!({ "entry": "value" }).as_object().unwrap()
+        )
+        .is_err());
+    assert!(store
+        .read_settings(&["accountst".to_owned(), "mainpage".to_owned()])
+        .is_err());
+
+    let stored: i64 = store
+        .connection()
+        .query_row("SELECT count(*) FROM device_settings", [], |row| row.get(0))
+        .expect("count settings");
+    assert_eq!(stored, DEVICE_SETTING_KEYS.len() as i64);
+}
+
+#[test]
+fn a_settings_batch_answers_in_request_order() {
+    let (_directory, store) = open();
+    store
+        .write_setting("accountst", &serde_json::json!("able"))
+        .unwrap();
+    store
+        .write_setting("dosync", &serde_json::json!("sync"))
+        .unwrap();
+
+    assert_eq!(
+        store
+            .read_settings(&[
+                "dosync".to_owned(),
+                "hub".to_owned(),
+                "accountst".to_owned(),
+            ])
+            .unwrap(),
+        vec![
+            Some(serde_json::json!("sync")),
+            None,
+            Some(serde_json::json!("able")),
+        ]
+    );
+    assert!(store
+        .read_settings(
+            &DEVICE_SETTING_KEYS
+                .iter()
+                .chain(["accountst"].iter())
+                .map(|key| (*key).to_owned())
+                .collect::<Vec<_>>()
+        )
+        .is_err());
+}
+
+#[test]
+fn plugin_permissions_and_their_reconfirmation_times_stay_in_their_own_tables() {
+    let (_directory, store) = open();
+    assert!(store.read_plugin_permissions().unwrap().is_empty());
+    assert!(store.read_plugin_permission_grants().unwrap().is_empty());
+
+    store.write_plugin_permission("hash-a", "db", true).unwrap();
+    store
+        .write_plugin_permission("hash-b", "fetchLogs", false)
+        .unwrap();
+    store
+        .write_plugin_permission_grant("Plugin A", "db", 1_700_000_000_000)
+        .unwrap();
+
+    let permissions = store.read_plugin_permissions().unwrap();
+    assert_eq!(permissions.len(), 2);
+    assert_eq!(permissions[0].code_hash, "hash-a");
+    assert_eq!(permissions[0].permission, "db");
+    assert!(permissions[0].granted);
+    assert!(!permissions[1].granted);
+
+    let grants = store.read_plugin_permission_grants().unwrap();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0].plugin_name, "Plugin A");
+    assert_eq!(grants[0].last_grant_at, 1_700_000_000_000);
+
+    store
+        .write_plugin_permission_grant("Plugin A", "db", 1_700_000_001_000)
+        .unwrap();
+    assert_eq!(
+        store.read_plugin_permission_grants().unwrap()[0].last_grant_at,
+        1_700_000_001_000
+    );
+
+    assert!(store.write_plugin_permission("", "db", true).is_err());
+    assert!(store.write_plugin_permission("hash-a", "", true).is_err());
+    assert!(store
+        .write_plugin_permission_grant("Plugin A", "db", -1)
+        .is_err());
+}
