@@ -63,13 +63,14 @@ export function holdServerSyncAfterRestore(): void {
 }
 let started = false;
 let activeScheduler: ReturnType<typeof createServerSyncScheduler> | undefined;
+let syncAvailable: (() => boolean) | undefined;
 /** A read-only file backup may outlive the scheduled timer. Resume the existing
  * scheduler when it settles; restoring a library deliberately does not do this. */
 export function resumeServerSyncAfterBackup(): void {
   activeScheduler?.resume();
   if (activeScheduler) {
     cleanupDeletedBackups();
-    void invoke("server_sync_events_start").catch(() => {});
+    if (syncAvailable?.()) void invoke("server_sync_events_start").catch(() => {});
   }
 }
 export interface ServerSyncBackup {
@@ -169,10 +170,11 @@ export function startServerSync(): void {
   if (started || !isTauri) return;
   started = true;
   const controller = getServerSyncController();
-  const scheduler = createServerSyncScheduler(controller, {
-    available: () => document.visibilityState !== "hidden" && navigator.onLine,
-  });
+  const available = () =>
+    document.visibilityState !== "hidden" && navigator.onLine;
+  const scheduler = createServerSyncScheduler(controller, { available });
   activeScheduler = scheduler;
+  syncAvailable = available;
   subscribeLocalPersistentRevision(() => {
     controller.invalidateCompletion();
     scheduler.localCommit();

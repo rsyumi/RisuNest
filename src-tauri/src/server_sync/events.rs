@@ -22,13 +22,28 @@ pub(crate) const DEVICE_CHANGED_EVENT: &str = "risu-server-sync-device-changed";
 pub(crate) const REMOTE_HINT_EVENT: &str = "risu-server-sync-remote-hint";
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const FIRST_RETRY: Duration = Duration::from_millis(1000);
 const MAX_RETRY: Duration = Duration::from_secs(60);
 /// A connection that stood this long is treated as healthy, so the next drop
 /// retries promptly instead of inheriting the previous delay.
 const SETTLED_CONNECTION: Duration = Duration::from_secs(30);
 /// A peer that never completes a frame is not speaking this protocol.
 const MAX_PENDING_BYTES: usize = 64 * 1024;
+
+/// How long a connection may go quiet before it is replaced. A live peer keeps
+/// it open, so silence past this is a connection that only looks alive.
+#[derive(Clone, Copy)]
+pub(crate) struct Timing {
+    pub first_retry: Duration,
+    pub idle: Duration,
+}
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            first_retry: Duration::from_secs(1),
+            idle: Duration::from_secs(90),
+        }
+    }
+}
 
 pub(crate) fn notify_device_changed<R: Runtime>(app: &AppHandle<R>) {
     // A lost notification costs latency; the scheduler still polls.
@@ -92,8 +107,8 @@ type Resolve = Arc<dyn Fn() -> Option<ServerConfig> + Send + Sync>;
 
 /// Holds one connection at a time, reconnecting with a bounded delay. Both the
 /// credential and the retry policy stay on this side.
-pub(crate) async fn hold(resolve: Resolve, sink: Arc<dyn HintSink>, stop: Stop, first: Duration) {
-    let mut delay = first;
+pub(crate) async fn hold(resolve: Resolve, sink: Arc<dyn HintSink>, stop: Stop, timing: Timing) {
+    let mut delay = timing.first_retry;
     while !stop.stopped() {
         let read = resolve.clone();
         let config = match tokio::task::spawn_blocking(move || read()).await {
@@ -102,9 +117,11 @@ pub(crate) async fn hold(resolve: Resolve, sink: Arc<dyn HintSink>, stop: Stop, 
         };
         if let Some(config) = config {
             let started = Instant::now();
-            match attempt(&config, sink.as_ref(), &stop).await {
+            match attempt(&config, sink.as_ref(), &stop, timing.idle).await {
                 Attempt::Refused => return,
-                Attempt::Ended if started.elapsed() >= SETTLED_CONNECTION => delay = first,
+                Attempt::Ended if started.elapsed() >= SETTLED_CONNECTION => {
+                    delay = timing.first_retry
+                }
                 Attempt::Ended => (),
             }
         }
@@ -116,7 +133,12 @@ pub(crate) async fn hold(resolve: Resolve, sink: Arc<dyn HintSink>, stop: Stop, 
     }
 }
 
-async fn attempt(config: &ServerConfig, sink: &dyn HintSink, stop: &Stop) -> Attempt {
+async fn attempt(
+    config: &ServerConfig,
+    sink: &dyn HintSink,
+    stop: &Stop,
+    idle: Duration,
+) -> Attempt {
     let Ok(base) = config.validate() else {
         return Attempt::Refused;
     };
@@ -156,7 +178,9 @@ async fn attempt(config: &ServerConfig, sink: &dyn HintSink, stop: &Stop) -> Att
     sink.hint();
     let mut pending: Vec<u8> = Vec::new();
     loop {
-        let Some(Ok(Some(chunk))) = stop.race(response.chunk()).await else {
+        let Some(Ok(Ok(Some(chunk)))) =
+            stop.race(tokio::time::timeout(idle, response.chunk())).await
+        else {
             return Attempt::Ended;
         };
         pending.extend(chunk.iter().copied().filter(|byte| *byte != b'\r'));
@@ -212,7 +236,7 @@ pub(crate) fn start<R: Runtime>(app: &AppHandle<R>) {
         .flatten()
     });
     let sink = Arc::new(RendererSink(app.clone()));
-    tauri::async_runtime::spawn(hold(resolve, sink, stop, FIRST_RETRY));
+    tauri::async_runtime::spawn(hold(resolve, sink, stop, Timing::default()));
 }
 
 pub(crate) fn release<R: Runtime>(app: &AppHandle<R>) {
