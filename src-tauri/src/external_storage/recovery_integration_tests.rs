@@ -114,6 +114,7 @@ fn recovery_package_opens_and_applies_a_real_snapshot_without_the_source_vault()
             .unwrap();
             let completed = package_and_upload(
                 capture,
+                Vec::new(),
                 source.path(),
                 &source.path().join("package-cache"),
                 SnapshotMetadata {

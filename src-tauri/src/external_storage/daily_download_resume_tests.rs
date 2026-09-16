@@ -358,6 +358,7 @@ fn daily_download_resume_preserves_verified_packs_and_durable_budget() {
         let root_key = [7; 32];
         let completed = packaging::package_and_upload(
             capture,
+            Vec::new(),
             &repository_root,
             &cache_root,
             metadata,

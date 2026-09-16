@@ -392,6 +392,34 @@ async fn package_capture(
         ),
         _ => None,
     };
+    // A section this device publishes takes the commit number the new state
+    // gets. A bundle preserves this device's own material instead of joining a
+    // commit order, so it carries none.
+    let generation = match (produce, &parent) {
+        (PackageAs::State, Some(view)) => Sequence::try_from(view.revision.clone())
+            .map_err(corrupt)?
+            .next()
+            .map_err(corrupt)?,
+        (PackageAs::State, None) => Sequence::from(1u64),
+        (PackageAs::Bundle, _) => Sequence::from(0u64),
+    };
+    let sections = {
+        let worker_app = app.clone();
+        let worker_spool = directory.join("sections");
+        let worker_generation = generation.clone();
+        let worker_cancel = cancel.clone();
+        tokio::task::spawn_blocking(move || -> Result<_> {
+            let mut store = pds(&worker_app)?;
+            super::sections::capture_state_sections(
+                &mut store,
+                &worker_generation,
+                &worker_spool,
+                &worker_cancel,
+            )
+        })
+        .await
+        .map_err(local_error)??
+    };
     let metadata = SnapshotMetadata {
         snapshot_id: job.snapshot_id.clone(),
         repository_id: connected.stored.descriptor.repository_id.clone(),
@@ -407,13 +435,7 @@ async fn package_capture(
         purpose: match produce {
             PackageAs::State => SnapshotPurpose::SyncState {
                 epoch: identity.generation.clone(),
-                generation: match &parent {
-                    Some(view) => Sequence::try_from(view.revision.clone())
-                        .map_err(corrupt)?
-                        .next()
-                        .map_err(corrupt)?,
-                    None => Sequence::from(1u64),
-                },
+                generation,
                 parent_sections: parent.map(|view| view.sections).unwrap_or_default(),
             },
             PackageAs::Bundle => SnapshotPurpose::BackupBundle {
@@ -431,6 +453,7 @@ async fn package_capture(
         .join("package-cache");
     let completed = super::snapshot::package_and_upload(
         capture,
+        sections,
         &root,
         &cache,
         metadata,
@@ -1012,6 +1035,7 @@ async fn complete_conflict_preservation(
             },
             created_at_ms,
             view.library,
+            view.sections,
             &mut journal,
             connected.provider.as_ref(),
             &connected.handle,

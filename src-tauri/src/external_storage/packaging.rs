@@ -7,6 +7,7 @@ use super::{
         ReadReceipt, RemoteLocator, RepositoryHandle, Result,
     },
     journal::{validate_receipt, TransferJournal},
+    sections::CapturedSection,
     transfer::SpoolSink,
     transfer_job,
 };
@@ -17,6 +18,7 @@ use risunest_external_storage_format::{
     crypto::derive_key,
     format::library_fingerprint_domain,
     pack::{self, Chunk, ChunkEncoder, CompressionPolicy, ENTRY_OVERHEAD, MAX_CHUNK_BYTES},
+    section::SECTION_CODEC,
     snapshot as wire,
 };
 use risunest_sync_wire::head::Sequence;
@@ -586,6 +588,15 @@ fn max_document_bytes(
         .min(wire::MAX_METADATA_BYTES as u64),
     )
     .map_err(corrupt)
+}
+
+/// One section per catalog, so the package cache key names the section as well
+/// as its content. Two sections with the same entries are still two catalogs.
+fn section_catalog_fingerprint(id: &str, sources: &[SourceEntry]) -> String {
+    format!(
+        "{id}-{}",
+        catalog_fingerprint(wire::CatalogKind::Section, sources)
+    )
 }
 
 fn catalog_fingerprint(kind: wire::CatalogKind, sources: &[SourceEntry]) -> String {
@@ -1364,8 +1375,10 @@ async fn upload_metadata_bytes(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn package_and_upload(
     capture: CapturedSnapshot,
+    sections: Vec<CapturedSection>,
     repository_root: &Path,
     cache_root: &Path,
     metadata: SnapshotMetadata,
@@ -1485,13 +1498,89 @@ pub(crate) async fn package_and_upload(
         asset_catalog: asset_catalog.stored(repository)?,
         content_fingerprint: metadata.content_fingerprint,
     };
-    // Sections are carried, never merged here. A published state inherits the
-    // sections the observed state already had; a bundle declares its own.
+    // A published state keeps the sections the observed state already had and
+    // replaces only the ones this device captured. A bundle starts empty and
+    // declares exactly what it covers.
+    let mut published_sections = match &metadata.purpose {
+        SnapshotPurpose::SyncState {
+            parent_sections, ..
+        } => parent_sections.clone(),
+        SnapshotPurpose::BackupBundle { .. } => BTreeMap::new(),
+    };
+    for captured in sections {
+        // An unchanged section keeps the reference the observed state carried,
+        // so its commit number still names the publication that changed it.
+        if published_sections.get(captured.kind.id()).is_some_and(|carried| {
+            carried.content_fingerprint == captured.content_fingerprint
+                && carried.gc_floor == captured.gc_floor
+                && carried.max_write_clock == captured.max_write_clock
+        }) {
+            continue;
+        }
+        let sources: Vec<SourceEntry> = captured
+            .sources
+            .iter()
+            .map(|source| SourceEntry {
+                kind: source.kind,
+                key: source.key.clone(),
+                content_sha256: source.content_sha256.clone(),
+                byte_length: source.byte_length,
+                path: source.path.clone(),
+                compression: match source.kind {
+                    wire::CatalogEntryKind::SectionObject => CompressionPolicy::AlreadyCompressed,
+                    _ => CompressionPolicy::Text,
+                },
+            })
+            .collect();
+        let id = captured.kind.id();
+        let section_fingerprint = section_catalog_fingerprint(id, &sources);
+        let (section_entries, uploaded) = build_entries(
+            wire::CatalogKind::Section,
+            sources,
+            &metadata.repository_id,
+            &build_root,
+            root_key,
+            limits,
+            &mut cache,
+            journal,
+            provider,
+            repository,
+            cancel,
+        )
+        .await?;
+        referenced.extend(uploaded);
+        let entries_root = build_catalog(
+            wire::CatalogKind::Section,
+            section_entries,
+            &section_fingerprint,
+            &metadata.repository_id,
+            &build_root,
+            root_key,
+            limits,
+            &mut cache,
+            journal,
+            provider,
+            repository,
+            cancel,
+            &mut referenced,
+        )
+        .await?;
+        published_sections.insert(
+            id.to_owned(),
+            wire::SectionSnapshotRef {
+                kind: captured.kind,
+                codec: SECTION_CODEC.into(),
+                generation: captured.generation,
+                gc_floor: captured.gc_floor,
+                max_write_clock: captured.max_write_clock,
+                entries_root: entries_root.stored(repository)?,
+                content_fingerprint: captured.content_fingerprint,
+            },
+        );
+    }
     let (bytes, fingerprint, sections, role) = match metadata.purpose {
         SnapshotPurpose::SyncState {
-            epoch,
-            generation,
-            parent_sections,
+            epoch, generation, ..
         } => {
             let document = wire::SyncStateDocument::new(
                 metadata.snapshot_id.clone(),
@@ -1503,7 +1592,7 @@ pub(crate) async fn package_and_upload(
                 metadata.author_device_id,
                 metadata.created_at_ms,
                 library,
-                parent_sections,
+                published_sections,
             )
             .map_err(corrupt)?;
             let max_state = max_document_bytes(limits, &metadata.repository_id, &metadata.snapshot_id, wire::ObjectRole::SyncState)?;
@@ -1527,7 +1616,7 @@ pub(crate) async fn package_and_upload(
                 None,
                 remote_generation,
                 library,
-                std::collections::BTreeMap::new(),
+                published_sections,
             )
             .map_err(corrupt)?;
             let max_bundle = max_document_bytes(limits, &metadata.repository_id, &metadata.snapshot_id, wire::ObjectRole::BackupBundle)?;
@@ -1772,6 +1861,7 @@ mod tests {
             let mut first_journal = journal(&root.path().join("job-1"), "job-1", &first_capture);
             let first = package_and_upload(
                 first_capture,
+                Vec::new(),
                 root.path(),
                 &cache,
                 first_metadata,
@@ -1810,6 +1900,7 @@ mod tests {
             let mut second_journal = journal(&root.path().join("job-2"), "job-2", &second_capture);
             let second = package_and_upload(
                 second_capture,
+                Vec::new(),
                 root.path(),
                 &cache,
                 second_metadata,
@@ -1990,6 +2081,7 @@ mod tests {
             let mut journal = journal(&root.path().join("job"), "job", &capture);
             let completed = package_and_upload(
                 capture,
+                Vec::new(),
                 root.path(),
                 &root.path().join("cache"),
                 snapshot_metadata,
@@ -2068,6 +2160,7 @@ mod tests {
             let mut journal = journal(&root.path().join("job"), "job", &capture);
             let error = package_and_upload(
                 capture,
+                Vec::new(),
                 root.path(),
                 &root.path().join("cache"),
                 snapshot_metadata,
@@ -2103,6 +2196,7 @@ mod tests {
             );
             let completed = package_and_upload(
                 first_capture,
+                Vec::new(),
                 root.path(),
                 &root.path().join("inventory-cache"),
                 first_metadata,
@@ -2197,6 +2291,7 @@ mod tests {
                 let before = provider.state.lock().unwrap().objects.len();
                 let completed = package_and_upload(
                     capture,
+                    Vec::new(),
                     root.path(),
                     &cache,
                     snapshot_metadata,

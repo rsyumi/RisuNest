@@ -19,6 +19,7 @@ pub(crate) mod claim_sessions;
 pub(crate) mod hypa;
 pub(crate) mod plugin_permissions;
 pub(crate) mod plugin_values;
+pub(crate) mod sections;
 
 /// The complete set of settings this device file holds. A key outside it is a
 /// caller mistake, so both directions reject it rather than storing a row no
@@ -540,7 +541,6 @@ pub(crate) fn issue_write_clock(tx: &Transaction<'_>, section: Section) -> Store
 
 /// Advances the section counter past a clock observed on a remote record.
 /// Recovered tombstones are included, so the counter never moves backwards.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn observe_remote_clock(
     tx: &Transaction<'_>,
     section: Section,
