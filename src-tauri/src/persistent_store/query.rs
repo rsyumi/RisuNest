@@ -967,9 +967,7 @@ fn materialize_generation(connection: &Connection, generation: &str) -> StoreRes
         presets
     };
     database.insert("botPresets".to_owned(), Value::Array(presets));
-    let plugin_storage = {
-        super::export::flattened_plugin_storage(connection, &generation)?.values
-    };
+    let plugin_storage = super::export::materialized_plugin_storage(connection, &generation)?;
     database.insert(
         "pluginCustomStorage".to_owned(),
         Value::Object(plugin_storage),

@@ -217,6 +217,14 @@ fn exporting_drops_only_the_keys_two_plugins_both_hold() {
     assert_eq!(meta["unique-a"]["plugin"], json!("plugin-a"));
     assert_eq!(meta["unique-b"]["plugin"], json!("plugin-b"));
     assert!(meta.get("shared").is_none());
+
+    // Only the export drops the key. The in-app projection still answers with
+    // it, taking the later position so the object stays deterministic.
+    let projected = store.materialize(None).expect("materialize the working set");
+    assert_eq!(
+        projected["pluginCustomStorage"],
+        json!({ "shared": "from b", "unique-a": "a", "unique-b": "b" })
+    );
 }
 
 /// The sidecar restores ownership; a save without one lands on the sentinel.
