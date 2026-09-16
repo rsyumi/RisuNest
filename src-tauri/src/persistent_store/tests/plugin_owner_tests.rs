@@ -237,12 +237,12 @@ fn an_import_restores_ownership_from_the_sidecar_and_otherwise_stays_unowned() {
             }),
         )
         .expect("stage imported plugin storage");
-    let imported = store
+    store
         .replace_commit(&staging.staging_id, Some(0))
         .expect("activate import");
 
     assert!(store
-        .read_root(Some(imported.revision))
+        .read_root(None)
         .expect("read root")
         .value
         .get("pluginStorageMeta")
@@ -266,5 +266,46 @@ fn an_import_restores_ownership_from_the_sidecar_and_otherwise_stays_unowned() {
     assert!(store
         .read_plugin_storage("plugin-b", "forged", None)
         .expect("read sidecar only key")
+        .is_none());
+}
+
+/// Invariant 12. A plugin write is durable once the commit returns, so a fresh
+/// process reading the same directory finds it without any further step.
+#[test]
+fn a_committed_plugin_write_survives_reopening_the_store() {
+    let directory = tempfile::tempdir().expect("create durability directory");
+    let generation;
+    {
+        let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+        let revision = store.revision().expect("read revision");
+        store
+            .commit(&WorkingSetCommit {
+                plugin_storage: Some(vec![PluginStorageMutation::Set {
+                    owner: "plugin-a".to_owned(),
+                    key: "durable".to_owned(),
+                    value: json!({ "kept": true }),
+                }]),
+                ..empty_working_set_commit(revision)
+            })
+            .expect("commit plugin write");
+        generation = active_generation(&store.connection).expect("read generation");
+    }
+
+    let reopened = PersistentStore::open(directory.path()).expect("reopen persistent store");
+    assert_eq!(
+        active_generation(&reopened.connection).expect("read generation again"),
+        generation
+    );
+    assert_eq!(
+        reopened
+            .read_plugin_storage("plugin-a", "durable", None)
+            .expect("read durable row")
+            .expect("durable row exists")
+            .value,
+        json!({ "kept": true })
+    );
+    assert!(reopened
+        .read_plugin_storage(UNOWNED_OWNER, "durable", None)
+        .expect("read unowned row")
         .is_none());
 }

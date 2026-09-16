@@ -136,8 +136,9 @@ mod selective_import_tests;
 mod display_name_tests;
 #[path = "tests/external_storage_tests.rs"]
 mod external_storage_tests;
-#[path = "tests/replacement_tests.rs"]
+#[path = "tests/plugin_owner_tests.rs"]
 mod plugin_owner_tests;
+#[path = "tests/replacement_tests.rs"]
 mod replacement_tests;
 #[path = "tests/schema_migration_tests.rs"]
 mod schema_migration_tests;

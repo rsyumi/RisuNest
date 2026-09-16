@@ -16,7 +16,10 @@ export interface PersistentConversationMetadata {
     totalMessages: number
 }
 
-export type PersistentRoot = Omit<Database, 'characters' | 'botPresets' | 'pluginCustomStorage'>
+export type PersistentRoot = Omit<
+    Database,
+    'characters' | 'botPresets' | 'pluginCustomStorage' | 'pluginStorageMeta'
+>
 
 export interface PluginStorageSummary {
     owner: string

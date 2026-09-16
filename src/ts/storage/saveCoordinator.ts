@@ -3993,7 +3993,13 @@ export class SaveCoordinator {
     }
 
     private captureDatabase(database: Database): CapturedState {
-        const { characters, botPresets, pluginCustomStorage, ...rootValue } = database
+        const {
+            characters,
+            botPresets,
+            pluginCustomStorage,
+            pluginStorageMeta: _pluginStorageMeta,
+            ...rootValue
+        } = database
         const rootCanonical = canonicalJson(rootValue)
         const presetsCanonical = canonicalJson(botPresets ?? [])
         const pluginStorageUnavailable =

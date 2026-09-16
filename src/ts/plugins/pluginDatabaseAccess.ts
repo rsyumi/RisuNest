@@ -497,7 +497,9 @@ function validateCompleteCharacters(value: unknown): asserts value is Database['
 /**
  * A full replacement writes the flat projection back, so the ownership sidecar
  * has to ride along or every row would land unowned. Keys the calling plugin
- * supplied belong to it; the rest keep the owner the store already records.
+ * supplied belong to it; the rest keep the owner the store already records. A
+ * plugin that sends an explicit `pluginCustomStorage` replaces its own keys
+ * only, because the snapshot it read never showed it anyone else's.
  */
 export function applyPluginDatabaseUpdate(
     candidate: Database,
@@ -517,9 +519,14 @@ export function applyPluginDatabaseUpdate(
     if (!isPlainRecord(existingCustomStorage)) {
         throw new TypeError('Existing pluginCustomStorage must be a plain record')
     }
-    const customStorage = hasExplicitCustomStorage
-        ? { ...(update.pluginCustomStorage as Record<string, unknown>) }
-        : { ...existingCustomStorage }
+    const customStorage: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(existingCustomStorage)) {
+        if (hasExplicitCustomStorage && ownerOf(key) === owner) continue
+        customStorage[key] = value
+    }
+    if (hasExplicitCustomStorage) {
+        Object.assign(customStorage, update.pluginCustomStorage as Record<string, unknown>)
+    }
 
     for (const key of Object.keys(update).filter((key) => allowedKeySet.has(key)).sort()) {
         if (key !== 'pluginCustomStorage') mutableCandidate[key] = update[key]

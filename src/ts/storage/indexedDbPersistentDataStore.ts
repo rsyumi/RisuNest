@@ -878,8 +878,13 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             compatibilityHash: input.compatibilityHash,
         })
         for (const alias of input.assetAliases) validateAssetAlias(alias)
-        const { characters, botPresets: _botPresets, pluginCustomStorage: _pluginStorage, ...root } =
-            input.database
+        const {
+            characters,
+            botPresets: _botPresets,
+            pluginCustomStorage: _pluginStorage,
+            pluginStorageMeta: _pluginStorageMeta,
+            ...root
+        } = input.database
         const characterDetails = characters.map(({ chats: _chats, ...detail }) => detail)
         validateOwnerHeadsForCommit({
             expectedRevision: input.sourceRevision,

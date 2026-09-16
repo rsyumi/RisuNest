@@ -148,6 +148,7 @@ export async function* streamRisuSaveFromLease(
         'loadouts',
         'plugins',
         'pluginStorage',
+        'pluginStorageMeta',
     ]
     const characterIds = await collectPinnedCharacterIds(reader)
     directory.push(...characterIds, 'config')
@@ -158,8 +159,9 @@ export async function* streamRisuSaveFromLease(
         loadouts,
         plugins,
         pluginCustomStorage,
+        pluginStorageMeta,
         ...rootData
-    } = root
+    } = root as Database & { pluginStorageMeta?: PluginStorageMeta }
     const exportedRoot = options?.omitAccount
         ? Object.fromEntries(Object.entries(rootData).filter(([key]) => key !== 'account'))
         : rootData
@@ -176,6 +178,7 @@ export async function* streamRisuSaveFromLease(
         [RisuSaveType.LOADOUTS, 'loadouts', loadouts],
         [RisuSaveType.PLUGINS, 'plugins', plugins],
         [RisuSaveType.PLUGIN_STORAGE, 'pluginStorage', pluginCustomStorage],
+        [RisuSaveType.PLUGIN_STORAGE_META, 'pluginStorageMeta', pluginStorageMeta ?? {}],
     ] as const) {
         yield await encodeRisuSaveBlock({
             compression: true,

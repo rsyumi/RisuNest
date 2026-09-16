@@ -167,4 +167,71 @@ describe('plugin storage isolation', () => {
         expect(meta?.theirs.plugin).toBe('plugin-b')
         expect(meta?.mine.plugin).toBe('plugin-a')
     })
+
+    /** Invariant 11, for the read-modify-write round trip plugins usually make. */
+    it('keeps the other plugin keys a full replacement never showed the caller', () => {
+        const candidate = {
+            pluginCustomStorage: { theirs: 'kept', mine: 'old' },
+        } as unknown as Database
+        applyPluginDatabaseUpdate(
+            candidate,
+            { pluginCustomStorage: { mine2: 'new' }, characters: [] },
+            ['pluginCustomStorage', 'characters'],
+            'plugin-a',
+            (key) => (key === 'theirs' ? 'plugin-b' : 'plugin-a'),
+        )
+
+        expect(candidate.pluginCustomStorage).toEqual({ theirs: 'kept', mine2: 'new' })
+        const meta = (candidate as Database & {
+            pluginStorageMeta?: Record<string, { plugin: string }>
+        }).pluginStorageMeta
+        expect(meta?.theirs.plugin).toBe('plugin-b')
+        expect(meta?.mine2.plugin).toBe('plugin-a')
+    })
+
+    /** Invariant 12. */
+    it('resolves a write only once the store has committed it', async () => {
+        let release: (() => void) | null = null
+        const gate = new Promise<void>((resolve) => {
+            release = resolve
+        })
+        const rows: Row[] = []
+        const store = {
+            open: vi.fn(async () => undefined),
+            queryPluginStorage: vi.fn(async () => ({ revision: 1, items: [] })),
+            readPluginStorage: vi.fn(async () => null),
+        } as unknown as PersistentDataStore
+        const storage = createPluginStorageStore({
+            store,
+            mutate: async (mutations) => {
+                await gate
+                for (const mutation of mutations) {
+                    if (mutation.type === 'set') {
+                        rows.push({
+                            owner: mutation.owner,
+                            key: mutation.key,
+                            value: mutation.value,
+                        })
+                    }
+                }
+            },
+        })
+
+        let settled = false
+        const write = storage
+            .forOwner('plugin-a')
+            .setItem('durable', 'value')
+            .then(() => {
+                settled = true
+            })
+        await Promise.resolve()
+        await Promise.resolve()
+        expect(settled).toBe(false)
+        expect(rows).toEqual([])
+
+        release?.()
+        await write
+        expect(settled).toBe(true)
+        expect(rows).toEqual([{ owner: 'plugin-a', key: 'durable', value: 'value' }])
+    })
 })

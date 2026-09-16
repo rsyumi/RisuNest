@@ -512,7 +512,13 @@ export function projectCompleteScalableWorkingSet(
     activeCharacterIds?: ReadonlySet<string>,
     selectedConversationId?: string | null,
 ): Database {
-    const { characters, botPresets, pluginCustomStorage: _pluginCustomStorage, ...root } = database
+    const {
+        characters,
+        botPresets,
+        pluginCustomStorage: _pluginCustomStorage,
+        pluginStorageMeta: _pluginStorageMeta,
+        ...root
+    } = database
     const summaries: CharacterSummary[] = characters.map((character, configuredIndex) => ({
         id: character.chaId,
         name: character.name,

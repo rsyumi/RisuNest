@@ -502,7 +502,13 @@ export function splitDatabase(database: Database): {
     presets: botPreset[]
     pluginStorage: Database['pluginCustomStorage']
 } {
-    const { characters, botPresets, pluginCustomStorage, ...root } = database
+    const {
+        characters,
+        botPresets,
+        pluginCustomStorage,
+        pluginStorageMeta: _pluginStorageMeta,
+        ...root
+    } = database
     return {
         root,
         characters,
