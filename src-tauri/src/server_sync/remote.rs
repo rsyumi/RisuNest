@@ -11,6 +11,15 @@ use risunest_sync_wire::{
 /// The library is the only section this replica applies today. Hypa and local
 /// plugin sections are requested by the section-aware paths added later.
 const SECTIONS: [Domain; 1] = [Domain::Library];
+
+/// Builds a SQL list from schema-owned wire identifiers, never from input.
+fn domain_filter(domains: &[Domain]) -> String {
+    domains
+        .iter()
+        .map(|domain| format!("'{}'", domain.as_str()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -90,13 +99,10 @@ fn json<T: Serialize>(value: &T) -> Result<String> {
         .map_err(|_| SyncError::new("invalid-remote-metadata", 502))
 }
 fn version(db: &Connection, domain: Domain, key: &str) -> Result<RecordVersion> {
-    if domain != Domain::Library {
-        return Err(SyncError::new("unsupported-remote-section", 502));
-    }
     let value: Option<String> = db
         .query_row(
-            "SELECT version FROM server_sync_remote WHERE key=?1",
-            [key],
+            "SELECT version FROM server_sync_remote WHERE domain=?1 AND key=?2",
+            params![domain.as_str(), key],
             |r| r.get(0),
         )
         .optional()?;
@@ -217,11 +223,17 @@ fn refresh_once(
         let tx = db.transaction()?;
         if matches!(fetch, Fetch::Checkpoint { .. }) {
             // Preserve removals from the previous remote snapshot in the work set.
+            // Only the sections this checkpoint covers are rebuilt; the rest keep
+            // the mirror they already had.
+            let scope = domain_filter(&SECTIONS);
             tx.execute(
-                "INSERT OR IGNORE INTO server_sync_remote_dirty SELECT key FROM server_sync_remote",
+                &format!("INSERT OR IGNORE INTO server_sync_remote_dirty SELECT domain,key FROM server_sync_remote WHERE domain IN ({scope})"),
                 [],
             )?;
-            tx.execute("DELETE FROM server_sync_remote", [])?;
+            tx.execute(
+                &format!("DELETE FROM server_sync_remote WHERE domain IN ({scope})"),
+                [],
+            )?;
         }
         tx.execute("INSERT INTO server_sync_remote_cursor VALUES(1,?1,?2,?3,0) ON CONFLICT(singleton) DO UPDATE SET head=excluded.head,domains=excluded.domains,cursor=excluded.cursor,complete=0",params![json(&through)?,json(&SECTIONS)?,json(&fetch)?])?;
         tx.commit()?;
@@ -335,10 +347,10 @@ fn refresh_once(
                 return Err(SyncError::new("invalid-remote-record", 502));
             }
             entry.version.validate()?;
-            tx.execute("INSERT INTO server_sync_remote VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET version=excluded.version",params![entry.key,json(&entry.version)?])?;
+            tx.execute("INSERT INTO server_sync_remote VALUES(?1,?2,?3) ON CONFLICT(domain,key) DO UPDATE SET version=excluded.version",params![entry.domain.as_str(),entry.key,json(&entry.version)?])?;
             tx.execute(
-                "INSERT OR IGNORE INTO server_sync_remote_dirty VALUES(?1)",
-                [entry.key],
+                "INSERT OR IGNORE INTO server_sync_remote_dirty VALUES(?1,?2)",
+                params![entry.domain.as_str(), entry.key],
             )?;
         }
         tx.execute(

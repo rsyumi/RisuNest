@@ -355,11 +355,11 @@ fn submit_commit(client: &ServerClient, intent: &CommitIntent) -> Result<Reply> 
         }
     }
 }
-fn lookup(db: &Connection, table: &str, key: &str) -> Result<RecordVersion> {
+fn remote_version(db: &Connection, domain: Domain, key: &str) -> Result<RecordVersion> {
     let value: Option<String> = db
         .query_row(
-            &format!("SELECT version FROM {table} WHERE key=?1"),
-            [key],
+            "SELECT version FROM server_sync_remote WHERE domain=?1 AND key=?2",
+            params![domain.as_str(), key],
             |r| r.get(0),
         )
         .optional()?;
@@ -881,7 +881,7 @@ impl PersistentStore {
                 let key = key_parts(&item.key, revision)?;
                 any_plugin |= key.kind == "plugin";
                 let (base, _) = self.effective_server_base(&item.key, committed)?;
-                let remote = lookup(&self.connection, "server_sync_remote", &item.key)?;
+                let remote = remote_version(&self.connection, Domain::Library, &item.key)?;
                 let local: RecordVersion = parse(&item.version)?;
                 let mut decision = planner::decide(&base, &local, &remote);
                 local_plugin_change |= key.kind == "plugin"
@@ -905,7 +905,7 @@ impl PersistentStore {
                     for parent in relations(&key)? {
                         let (parent_base, _) = self.effective_server_base(&parent, committed)?;
                         let parent_remote =
-                            lookup(&self.connection, "server_sync_remote", &parent)?;
+                            remote_version(&self.connection, Domain::Library, &parent)?;
                         if planner::read_dependency_conflicts(&parent_base, &parent_remote, true) {
                             decision = Decision::Conflict;
                             required_groups.insert(format!("family:{}", key.key1));
@@ -1475,7 +1475,7 @@ impl PersistentStore {
             )?;
         }
         self.connection.execute(
-            "INSERT OR IGNORE INTO server_cycle_keys SELECT key FROM server_sync_remote_dirty",
+            "INSERT OR IGNORE INTO server_cycle_keys SELECT key FROM server_sync_remote_dirty WHERE domain='library'",
             [],
         )?;
         if committed {
@@ -1774,7 +1774,7 @@ impl PersistentStore {
         let mut after = String::new();
         loop {
             let page = {
-                let mut stmt=self.connection.prepare("SELECT key,version FROM server_sync_remote WHERE key>?1 ORDER BY key LIMIT 1024")?;
+                let mut stmt=self.connection.prepare("SELECT key,version FROM server_sync_remote WHERE domain='library' AND key>?1 ORDER BY key LIMIT 1024")?;
                 let result = stmt
                     .query_map([&after], |r| {
                         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
