@@ -391,6 +391,36 @@ impl DeviceStore {
         Ok(())
     }
 
+    /// Changes whether a section takes part in synchronization. The generation
+    /// moves with the choice, so work planned under the previous one is
+    /// recognizable as stale.
+    pub(crate) fn set_section_participation(
+        &mut self,
+        section: Section,
+        participating: bool,
+    ) -> StoreResult<String> {
+        let transaction = self.transaction()?;
+        let (current, generation): (bool, String) = transaction.query_row(
+            "SELECT participating,participation_generation FROM device_sections WHERE section=?1",
+            [section.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if current == participating {
+            transaction.commit()?;
+            return Ok(generation);
+        }
+        let next = sequence(&generation)?
+            .next()
+            .map_err(|_| invalid("device participation generation is exhausted"))?;
+        transaction.execute(
+            "UPDATE device_sections SET participating=?1,participation_generation=?2
+                WHERE section=?3",
+            params![participating, next.as_str(), section.as_str()],
+        )?;
+        transaction.commit()?;
+        Ok(next.as_str().to_owned())
+    }
+
     pub(crate) fn asset_residency_policy(&self) -> StoreResult<AssetPolicy> {
         let value: String = self.connection.query_row(
             "SELECT policy FROM asset_residency_policy WHERE singleton=1",
@@ -421,7 +451,6 @@ impl DeviceStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?)
     }
 
-    #[cfg(test)]
     pub(crate) fn connection(&self) -> &Connection {
         &self.connection
     }
@@ -540,7 +569,6 @@ pub(crate) fn issue_write_clock(tx: &Transaction<'_>, section: Section) -> Store
 
 /// Advances the section counter past a clock observed on a remote record.
 /// Recovered tombstones are included, so the counter never moves backwards.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn observe_remote_clock(
     tx: &Transaction<'_>,
     section: Section,

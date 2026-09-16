@@ -425,7 +425,18 @@ impl PersistentStore {
                 tx.execute(&format!("DELETE FROM {table}"), [])?;
             }
         }
-        tx.execute("DELETE FROM server_sync_remote_dirty", [])?;
+        // Only the sections this activation reconciled release their work set.
+        // A section left unreceived keeps its marks for the next cycle.
+        let reconciled = advance
+            .applied_sections
+            .iter()
+            .map(|domain| format!("'{}'", domain.as_str()))
+            .collect::<Vec<_>>()
+            .join(",");
+        tx.execute(
+            &format!("DELETE FROM server_sync_remote_dirty WHERE domain IN ({reconciled})"),
+            [],
+        )?;
         tx.execute("UPDATE server_sync_state SET reconciling=0", [])?;
         if advance.scanned_revision == Some(actual) {
             tx.execute(

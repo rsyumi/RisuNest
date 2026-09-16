@@ -10,7 +10,8 @@ use super::{
         validate_remote, validate_remote_with_residency, RemoteRecord, ReplicaAdvance,
         ValidatedRecords,
     },
-    server_sync_outbox as outbox, server_sync_projection as projection, PersistentStore,
+    server_sync_outbox as outbox, server_sync_projection as projection,
+    server_sync_sections as sections, PersistentStore,
 };
 use crate::{
     asset_repository::PayloadCas,
@@ -28,6 +29,7 @@ use crate::{
     },
 };
 use reqwest::Method;
+use risunest_external_storage_format::section::{InlineOrObject, SectionEntry, SectionValue};
 use risunest_sync_wire::{
     canonical, change_digest::ChangeDigest, ChangeSet, CommitIntent, Domain, ReadFence, Receipt,
     RecordChange, RecordVersion, RemoteHead, ScopeFence, MAX_METADATA_BYTES,
@@ -275,6 +277,10 @@ pub(crate) struct PreparedCycle {
     pub applied: usize,
     pub proposals: usize,
     clear_acknowledged: bool,
+    section_honored: bool,
+    section_participation: Vec<(Domain, String)>,
+    section_applied: usize,
+    section_proposals: usize,
     activated: Option<i64>,
     cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     verified_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
@@ -282,6 +288,9 @@ pub(crate) struct PreparedCycle {
     cycle_items: Option<std::sync::Arc<CycleItemCounter>>,
     retry_budget: std::sync::Arc<RetryBudget>,
 }
+/// A published embedding body is bounded by the store's own dimension limit.
+const MAX_SECTION_OBJECT_BYTES: usize = 1024 * 1024;
+
 fn json<T: Serialize>(value: &T) -> Result<String> {
     String::from_utf8(canonical::encode(value)?)
         .map_err(|_| SyncError::new("invalid-metadata", 409))
@@ -423,6 +432,53 @@ fn delete_version(base: &RecordVersion) -> RecordVersion {
 }
 
 impl PersistentStore {
+    /// Emits one section's proposals. Sections bracket the library in the
+    /// change order, so hypa is written before it and local plugins after it.
+    fn publish_section_changes(
+        &self,
+        domain: Domain,
+        digest: &mut ChangeDigest,
+        builder: &mut PageBuilder<'_>,
+        revision: i64,
+    ) -> Result<()> {
+        let mut after = (domain.as_str().to_owned(), String::new());
+        loop {
+            let page = self.section_page(&after)?;
+            if page.is_empty() {
+                return Ok(());
+            }
+            for (name, key, action, remote, version) in page {
+                if name != domain.as_str() {
+                    return Ok(());
+                }
+                after = (name, key.clone());
+                if action != "publish" {
+                    continue;
+                }
+                let proposed: RecordVersion = parse(&version)?;
+                let change = RecordChange {
+                    domain,
+                    key: key.clone(),
+                    before: parse(&remote)?,
+                    after: proposed.clone(),
+                };
+                digest.change(&change)?;
+                builder.change(change)?;
+                self.server_record_prepared(
+                    domain,
+                    &key,
+                    &proposed,
+                    None,
+                    &outbox::ServerDirtyKey {
+                        kind: String::new(),
+                        key1: String::new(),
+                        key2: String::new(),
+                        revision,
+                    },
+                )?;
+            }
+        }
+    }
     fn publish_server_cycle(
         &mut self,
         client: &ServerClient,
@@ -433,6 +489,7 @@ impl PersistentStore {
         reads: &BTreeMap<String, RecordVersion>,
         scopes: &[ScopeFence],
         cycle_items: Option<&CycleItemCounter>,
+        sections_included: bool,
     ) -> Result<()> {
         if self.server_pending()?.is_some() {
             return Err(SyncError::new("operation-already-pending", 409));
@@ -440,6 +497,9 @@ impl PersistentStore {
         self.connection.execute_batch("DELETE FROM server_sync_operation_records; DELETE FROM server_sync_operation_pages; DELETE FROM server_sync_operation_scopes;")?;
         let mut digest = ChangeDigest::new();
         let mut builder = PageBuilder::new(&self.connection);
+        if sections_included {
+            self.publish_section_changes(Domain::Hypa, &mut digest, &mut builder, revision)?;
+        }
         let mut after = String::new();
         loop {
             let page = cycle_page(&self.connection, &after)?;
@@ -469,6 +529,14 @@ impl PersistentStore {
                     &key_parts(&item.key, revision)?,
                 )?;
             }
+        }
+        if sections_included {
+            self.publish_section_changes(
+                Domain::LocalPlugins,
+                &mut digest,
+                &mut builder,
+                revision,
+            )?;
         }
         for (key, version) in reads {
             let fence = ReadFence {
@@ -850,7 +918,15 @@ impl PersistentStore {
         {
             return Err(SyncError::new("epoch-reconciliation-required", 409));
         }
-        let through = remote::refresh(&mut self.connection, &client, &observed)?;
+        let participation = sections::participation(self.device_store()?)?;
+        let fetched = Domain::ALL
+            .into_iter()
+            .filter(|domain| {
+                *domain == Domain::Library
+                    || participation.iter().any(|(chosen, _)| chosen == domain)
+            })
+            .collect::<Vec<_>>();
+        let through = remote::refresh(&mut self.connection, &client, &observed, &fetched)?;
         let pending = self.server_pending()?;
         let committed = pending.as_ref().is_some_and(|p| p.phase.starts_with('{'));
         if let Some(pending) = pending.as_ref().filter(|_| committed) {
@@ -1253,6 +1329,8 @@ impl PersistentStore {
                 }
             }
         }
+        let (section_applied, section_proposals) =
+            self.prepare_server_sections(&client, &transfer, &cache, &participation, committed)?;
         let applied = records.len();
         Ok(Preparation::Ready(PreparedCycle {
             revision,
@@ -1270,6 +1348,10 @@ impl PersistentStore {
             applied,
             proposals,
             clear_acknowledged,
+            section_honored: false,
+            section_participation: participation,
+            section_applied,
+            section_proposals,
             activated: None,
             cancellation: options.cancellation.clone(),
             verified_bytes: options.verified_bytes.clone(),
@@ -1284,6 +1366,44 @@ impl PersistentStore {
         if let Some(revision) = ready.activated {
             return Ok(revision);
         }
+        // A participation choice made after this cycle was planned cancels the
+        // section work rather than applying the previous choice.
+        let honored = sections::participation(self.device_store()?)? == ready.section_participation;
+        let mut bases = ready.bases.clone();
+        let mut applied_sections = vec![Domain::Library];
+        if honored {
+            let cache = self.server_cache()?;
+            let mut writes = Vec::new();
+            let mut after = (String::new(), String::new());
+            loop {
+                let page = self.section_page(&after)?;
+                if page.is_empty() {
+                    break;
+                }
+                for (name, key, action, remote, version) in page {
+                    after = (name.clone(), key.clone());
+                    let domain = Domain::try_from(name.as_str())
+                        .map_err(|_| SyncError::new("invalid-local-section", 409))?;
+                    match action.as_str() {
+                        "apply" => writes.push(self.section_apply_write(
+                            &cache,
+                            domain,
+                            &parse::<RecordVersion>(&version)?,
+                        )?),
+                        "mark" => writes.push(sections::SectionWrite::Mark {
+                            domain,
+                            key: key.clone(),
+                        }),
+                        _ => (),
+                    }
+                    bases.push((domain, key, parse::<RecordVersion>(&remote)?, None));
+                }
+            }
+            sections::write_sections(self.device_store_mut()?, &writes)?;
+            applied_sections.extend(ready.section_participation.iter().map(|(domain, _)| *domain));
+            applied_sections.sort();
+        }
+        ready.section_honored = honored;
         let revision = self.server_apply_advance(
             ready.revision,
             ready.previous.as_ref(),
@@ -1294,10 +1414,10 @@ impl PersistentStore {
             ReplicaAdvance {
                 scope_clears: ready.scope_clears.clone(),
                 publish_keys: ready.publish_keys.clone(),
-                bases: ready.bases.clone(),
+                bases,
                 finish_operation: ready.committed,
                 clear_revision: ready.clear_acknowledged.then_some(ready.revision),
-                applied_sections: vec![Domain::Library],
+                applied_sections,
                 scanned_revision: if ready.proposals == 0 {
                     Some(ready.revision)
                 } else {
@@ -1334,6 +1454,9 @@ impl PersistentStore {
         ))?;
         let transfer = Transfer::new(&client, &cache)?;
         let through = &ready.through;
+        let sections_included = ready.section_honored
+            && sections::participation(self.device_store()?)? == ready.section_participation;
+        let proposals = ready.proposals + if sections_included { ready.section_proposals } else { 0 };
         // Only the sections this device actually applied are acknowledged. With
         // none applied there is nothing to report, so no request is made.
         let sections = self.server_applied_sections(&through.epoch)?;
@@ -1352,7 +1475,8 @@ impl PersistentStore {
                 return Err(response_error(ack));
             }
         }
-        if ready.proposals == 0 && ready.scope_fences.is_empty() {
+        let applied_records = ready.applied + if ready.section_honored { ready.section_applied } else { 0 };
+        if proposals == 0 && ready.scope_fences.is_empty() {
             return Ok(CycleResult {
                 endpoint: client.config().endpoint.clone(),
                 phase: "idle".into(),
@@ -1360,7 +1484,7 @@ impl PersistentStore {
                 head: through.clone(),
                 conflict_count: 0,
                 conflicts: Vec::new(),
-                applied_records: ready.applied,
+                applied_records,
                 proposed_records: 0,
             });
         }
@@ -1373,6 +1497,7 @@ impl PersistentStore {
             &ready.reads,
             &ready.scope_fences,
             ready.cycle_items.as_deref(),
+            sections_included,
         )?;
         Ok(CycleResult {
             endpoint: client.config().endpoint.clone(),
@@ -1381,8 +1506,190 @@ impl PersistentStore {
             head: through.clone(),
             conflict_count: 0,
             conflicts: Vec::new(),
-            applied_records: ready.applied,
-            proposed_records: ready.proposals,
+            applied_records,
+            proposed_records: proposals,
+        })
+    }
+
+    fn server_cache(&self) -> Result<Cache> {
+        let config = self
+            .server_config()?
+            .ok_or_else(|| SyncError::new("server-not-bound", 409))?;
+        Cache::open(&self.repository_root.join("server-sync").join(
+            risunest_sync_wire::hash(
+                format!("{}:{}", config.library_id, config.device_id).as_bytes(),
+            ),
+        ))
+    }
+    fn project_section(&self, cache: &Cache, entry: &sections::LocalEntry) -> Result<RecordVersion> {
+        let bytes = entry
+            .entry
+            .encode()
+            .map_err(|_| SyncError::new("invalid-local-section-entry", 409))?;
+        let mut dependencies = Vec::new();
+        if let Some(object) = &entry.object {
+            dependencies.push(cache.put(object)?);
+        }
+        Ok(cache
+            .project_bytes(&bytes, &dependencies, &[], Vec::new())?
+            .version)
+    }
+    /// Decides every section key this cycle touches. A section settles on the
+    /// entry's own write clock, so there is always one winner and no conflict
+    /// for the caller to resolve.
+    fn prepare_server_sections(
+        &self,
+        client: &ServerClient,
+        transfer: &Transfer<'_>,
+        cache: &Cache,
+        participation: &[(Domain, String)],
+        committed: bool,
+    ) -> Result<(usize, usize)> {
+        self.connection.execute_batch("CREATE TEMP TABLE IF NOT EXISTS server_section_keys(domain TEXT NOT NULL,key TEXT NOT NULL,PRIMARY KEY(domain,key)); DELETE FROM server_section_keys; CREATE TEMP TABLE IF NOT EXISTS server_section_records(domain TEXT NOT NULL,key TEXT NOT NULL,action TEXT NOT NULL,remote TEXT NOT NULL,version TEXT NOT NULL,PRIMARY KEY(domain,key)); DELETE FROM server_section_records;")?;
+        if participation.is_empty() {
+            return Ok((0, 0));
+        }
+        for (domain, _) in participation {
+            let mut after = String::new();
+            loop {
+                let page = sections::pending_page(
+                    self.device_store()?,
+                    *domain,
+                    &after,
+                    sections::SECTION_PAGE,
+                )?;
+                if page.is_empty() {
+                    break;
+                }
+                for key in page {
+                    after.clone_from(&key);
+                    self.connection.execute(
+                        "INSERT OR IGNORE INTO server_section_keys VALUES(?1,?2)",
+                        params![domain.as_str(), key],
+                    )?;
+                }
+            }
+            self.connection.execute("INSERT OR IGNORE INTO server_section_keys SELECT domain,key FROM server_sync_remote_dirty WHERE domain=?1",[domain.as_str()])?;
+        }
+        let mut applied = 0usize;
+        let mut proposals = 0usize;
+        let mut after = (String::new(), String::new());
+        loop {
+            let page = {
+                let mut statement = self.connection.prepare("SELECT domain,key FROM server_section_keys WHERE (domain,key)>(?1,?2) ORDER BY domain,key LIMIT 512")?;
+                let rows = statement
+                    .query_map(params![after.0, after.1], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows
+            };
+            if page.is_empty() {
+                break;
+            }
+            for (name, key) in page {
+                client.ensure_active()?;
+                after = (name.clone(), key.clone());
+                let domain = Domain::try_from(name.as_str())
+                    .map_err(|_| SyncError::new("invalid-local-section", 409))?;
+                let remote = remote_version(&self.connection, domain, &key)?;
+                let (base, _) = self.effective_server_base(domain, &key, committed)?;
+                let local = sections::read_local(self.device_store()?, domain, &key)?;
+                let (action, version) = if remote == base {
+                    match &local {
+                        Some(entry) if !entry.published => {
+                            ("publish", self.project_section(cache, entry)?)
+                        }
+                        _ => continue,
+                    }
+                } else if matches!(remote, RecordVersion::Live { .. }) {
+                    transfer.download_record(&remote, &[], &base)?;
+                    let (bytes, _) = cache.restore_bytes(&remote)?;
+                    let entry = SectionEntry::decode(&bytes)
+                        .map_err(|_| SyncError::new("invalid-remote-section-entry", 502))?;
+                    let received = entry
+                        .version
+                        .clone()
+                        .ok_or_else(|| SyncError::new("invalid-remote-section-entry", 502))?;
+                    if sections::kind_of(domain) != Some(entry.kind) || entry.key != key {
+                        return Err(SyncError::new("invalid-remote-section-entry", 502));
+                    }
+                    match &local {
+                        None => ("apply", remote.clone()),
+                        Some(current) if sections::newer(&received, &current.version) => {
+                            ("apply", remote.clone())
+                        }
+                        Some(current) if sections::newer(&current.version, &received) => {
+                            ("publish", self.project_section(cache, current)?)
+                        }
+                        // One version can only ever stand for one value.
+                        Some(current) if current.entry != entry => {
+                            return Err(SyncError::new("section-version-conflict", 409))
+                        }
+                        Some(_) => ("mark", remote.clone()),
+                    }
+                } else {
+                    match &local {
+                        Some(entry) => ("publish", self.project_section(cache, entry)?),
+                        None => ("mark", remote.clone()),
+                    }
+                };
+                match action {
+                    "apply" => applied += 1,
+                    "publish" => proposals += 1,
+                    _ => (),
+                }
+                self.connection.execute(
+                    "INSERT INTO server_section_records VALUES(?1,?2,?3,?4,?5)",
+                    params![name, key, action, json(&remote)?, json(&version)?],
+                )?;
+            }
+        }
+        Ok((applied, proposals))
+    }
+    fn section_page(
+        &self,
+        after: &(String, String),
+    ) -> Result<Vec<(String, String, String, String, String)>> {
+        let mut statement = self.connection.prepare("SELECT domain,key,action,remote,version FROM server_section_records WHERE (domain,key)>(?1,?2) ORDER BY domain,key LIMIT 512")?;
+        let rows = statement
+            .query_map(params![after.0, after.1], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+    /// Reads back the entry this cycle decided to take, with the vector body
+    /// when the value was too large to ride inside the entry.
+    fn section_apply_write(
+        &self,
+        cache: &Cache,
+        domain: Domain,
+        version: &RecordVersion,
+    ) -> Result<sections::SectionWrite> {
+        let (bytes, _) = cache.restore_bytes(version)?;
+        let entry = SectionEntry::decode(&bytes)
+            .map_err(|_| SyncError::new("invalid-remote-section-entry", 502))?;
+        let object = match &entry.value {
+            SectionValue::Hypa(value) => match &value.vector {
+                InlineOrObject::Object(reference) => Some(cache.read(
+                    &hex::encode(reference.content_sha256),
+                    MAX_SECTION_OBJECT_BYTES,
+                )?),
+                InlineOrObject::Inline(_) => None,
+            },
+            _ => None,
+        };
+        Ok(sections::SectionWrite::Apply {
+            domain,
+            entry,
+            object,
         })
     }
     fn effective_server_base(

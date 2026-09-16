@@ -203,7 +203,9 @@ fn two_native_replicas_seed_publish_pull_and_preserve_same_key_conflicts() {
         "second replica: {:?}",
         second_result.conflicts
     );
-    // Only the library section is published and acknowledged by this replica.
+    // This profile holds no device section values, so only the library has
+    // published anything. Hypa still travels with the replica and reports what
+    // it applied; local plugin values stay out until the user opts in.
     let published = server.head().unwrap();
     assert_eq!(
         published.section(Domain::Library).unwrap().changed_seq,
@@ -211,12 +213,17 @@ fn two_native_replicas_seed_publish_pull_and_preserve_same_key_conflicts() {
     );
     for domain in [Domain::Hypa, Domain::LocalPlugins] {
         assert_eq!(published.section(domain).unwrap().changed_seq.as_str(), "0");
-        assert_eq!(server.section_ack_floor(domain).unwrap().as_str(), "0");
     }
-    assert_ne!(
-        server.section_ack_floor(Domain::Library).unwrap().as_str(),
+    assert_eq!(
+        server
+            .section_ack_floor(Domain::LocalPlugins)
+            .unwrap()
+            .as_str(),
         "0"
     );
+    for domain in [Domain::Library, Domain::Hypa] {
+        assert_ne!(server.section_ack_floor(domain).unwrap().as_str(), "0");
+    }
     assert_eq!(first.server_status().unwrap().dirty_records, 0);
     assert!(!first.server_status().unwrap().full_scan);
     let revision = first.revision().unwrap();
@@ -325,7 +332,12 @@ fn two_native_replicas_seed_publish_pull_and_preserve_same_key_conflicts() {
             .unwrap();
         let dirty = second.server_status().unwrap().dirty_records;
         assert_eq!(
-            crate::server_sync::remote::refresh(&mut second.connection, &client, &observed)
+            crate::server_sync::remote::refresh(
+                &mut second.connection,
+                &client,
+                &observed,
+                &[Domain::Library],
+            )
                 .unwrap(),
             observed
         );
