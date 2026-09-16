@@ -412,23 +412,25 @@
                                   .replace('{1}', String(group.items.length))
                                   .replace('{2}', formatRisuNestStorageBytes(group.byteSize))}
                     </span>
-                    <select
-                        class="ml-auto min-w-0 max-w-full rounded-md border border-darkborderc bg-bgcolor px-2 py-1 text-sm"
-                        aria-label={strings.choosePlugin}
-                        value={groupOwners.get(groupKey(group.prefix)) ?? ''}
-                        onchange={(event) => setGroupOwner(group.prefix, event.currentTarget.value)}
-                    >
-                        <option value="">{strings.choosePlugin}</option>
-                        {#each installedPlugins as name (name)}
-                            <option value={name}>{name}</option>
-                        {/each}
-                    </select>
-                    {#if place === 'settings'}
-                        <SettingButton
-                            disabled={chosen.length === 0 || !groupOwners.get(groupKey(group.prefix))}
-                            busy={busy}
-                            onclick={() => startAssign(groupOwners.get(groupKey(group.prefix)) ?? '', chosen, group.prefix)}
-                        >{strings.assignSelected}</SettingButton>
+                    {#if installedPlugins.length > 0}
+                        <select
+                            class="ml-auto min-w-0 max-w-full rounded-md border border-darkborderc bg-bgcolor px-2 py-1 text-sm"
+                            aria-label={strings.choosePlugin}
+                            value={groupOwners.get(groupKey(group.prefix)) ?? ''}
+                            onchange={(event) => setGroupOwner(group.prefix, event.currentTarget.value)}
+                        >
+                            <option value="">{strings.choosePlugin}</option>
+                            {#each installedPlugins as name (name)}
+                                <option value={name}>{name}</option>
+                            {/each}
+                        </select>
+                        {#if place === 'settings'}
+                            <SettingButton
+                                disabled={chosen.length === 0 || !groupOwners.get(groupKey(group.prefix))}
+                                busy={busy}
+                                onclick={() => startAssign(groupOwners.get(groupKey(group.prefix)) ?? '', chosen, group.prefix)}
+                            >{strings.assignSelected}</SettingButton>
+                        {/if}
                     {/if}
                 </div>
                 <div class="flex flex-wrap gap-x-3 gap-y-1 border-t border-darkborderc/55 px-3 py-1.5 font-mono text-xs text-textcolor2">
