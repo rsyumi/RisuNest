@@ -80,11 +80,11 @@ If your plugin relies on any of the above APIs, you will need to modify your cod
 - `addEventListener` (proxied to the main window)
 - `removeEventListener` (proxied to the main window)
 
-`safeLocalStorage`: A secure wrapper around localStorage that restricts access to internal data. still it can be shared between plugins. can also be accessed using `localStorage`. It is device-local, is not included in save snapshots, and does not sync between devices.
+`safeLocalStorage`: A secure wrapper around localStorage that restricts access to internal data. can also be accessed using `localStorage`. It is device-local, is not included in save snapshots, and does not sync between devices. In RisuNest it holds only the calling plugin's own keys.
 
 `safeDocument`: A secure wrapper around the Document object that restricts access to sensitive data and methods. still it can be used to create elements, query elements, and manipulate the DOM. can also be accessed using `document`.
 
-`pluginStorage`: A save-file shared keyspace for all plugins. Its values participate in save snapshots and sync with the same save file on another device. It is not automatically namespaced, so use a stable plugin prefix, and remember that `clear()` removes keys written by every plugin.
+`pluginStorage`: A keyspace inside the save file. Its values participate in save snapshots and sync with the same save file on another device. In RisuNest every value is keyed by the plugin that wrote it, so a call answers within that plugin alone and `clear()` removes only its own keys. A key another plugin wrote reads as `null`.
 - `getItem(key: string): any | null`
 - `setItem(key: string, value: any): void`
 - `removeItem(key: string): void`
@@ -131,7 +131,7 @@ API 3.0 introduces significant changes to enhance security and stability. It is 
 
 - Works in sandboxed iframe, preventing access to the main document context.
 - Uses structured cloning for data exchange between the plugin and main application, ensuring data integrity and security.
-- Data is not shared between plugins, each plugin has its own isolated context, unless APIs like safeLocalStorage or pluginStorage are used.
+- Data is not shared between plugins, each plugin has its own isolated context. In RisuNest the storage APIs are part of that boundary rather than a way around it.
 - More restricted APIs, with focus on security. some APIs from 2.1 are removed or modified.
 - All APIs are asynchronous, returning Promises.
 - API is in `risuai` object in the global scope.
@@ -159,7 +159,7 @@ The following APIs from v2.1 are still available in v3.0:
 - `removeRisuReplacer`: Remove a text replacer
 - `safeLocalStorage`: Secure localStorage wrapper (device-specific)
 - `getDatabase`: Get database with limited access
-- `pluginStorage`: Save-file shared storage for all plugins (included in snapshots and syncable)
+- `pluginStorage`: Per plugin storage inside the save file (included in snapshots and syncable)
 - `setDatabaseLite`: Set database (lightweight)
 - `setDatabase`: Set database (full)
 - `loadPlugins`: Load additional plugins
@@ -588,7 +588,7 @@ API v3.0 implements multiple security layers:
 3. **DOM Access**: Must use `getRootDocument()` instead of `document`
 4. **Element Type**: DOM methods return `SafeElement` instead of standard HTMLElement
 5. **Event Listeners**: Return unique IDs instead of using direct function references
-6. **Isolation**: Data is not shared between plugins unless explicitly using shared storage APIs
+6. **Isolation**: Data is not shared between plugins. In RisuNest that includes the three storage keyspaces
 
 #### Migration Steps
 
@@ -850,3 +850,19 @@ This will make the software load the plugin in the highest supported api version
 | 2.0     | After Account System Release | Transitional support for legacy plugins, it will quickly be deprecated after account system release. Not supported in RisuNest. |
 | 2.1     | Unknown (Long-term support) | Will be supported for a long time for compatibility, but security warnings will be shown after 2.0 deprecation. Not supported in RisuNest. |
 | 3.0     | N/A              | Recommended version for new plugins, will be supported indefinitely, unless major security issues arise. The only version RisuNest runs. |
+
+## RisuNest plugin storage isolation
+
+`pluginStorage`, `safeLocalStorage` and `getLocalPluginStorage()` each answer within
+the calling plugin, identified by its `//@name` banner. Upstream RisuAI shares all
+three between plugins, and the RisuNest difference is a restriction rather than an
+extension: no new call, no new option, and no behavior upstream lacks. A plugin that
+read another plugin's key now receives `null`.
+
+A plugin whose whole purpose was to list and tidy other plugins' values cannot work
+under this boundary. RisuNest provides that inspection, deletion and assignment in
+its own plugin data settings instead.
+
+The host cannot reach a running plugin's JavaScript memory, so a value assigned to a
+plugin after it has already read and cached a default only takes effect when plugins
+are loaded again. There is no change notification for this and none is planned.
