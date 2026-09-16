@@ -2,7 +2,7 @@ import { MCPClientLike } from "./internalmcp";
 import type { MCPTool, RPCToolCallContent } from "./mcplib";
 import { fetchNative } from "../../globalApi.svelte";
 import { alertInput } from "../../alert";
-import { getDatabase, setDatabaseLite } from "../../storage/database.svelte";
+import { getDatabase } from "../../storage/database.svelte";
 
 interface WebSearchArgs {
     query: string;
@@ -67,11 +67,8 @@ export class GoogleSearchClient extends MCPClientLike {
 
         this.API_KEY = apiKey.trim();
         this.SEARCH_ENGINE_ID = searchEngineId.trim();
-        setDatabaseLite({
-            ...getDatabase(),
-            risunestGoogleSearchApiKey: this.API_KEY,
-            risunestGoogleSearchEngineId: this.SEARCH_ENGINE_ID,
-        });
+        database.risunestGoogleSearchApiKey = this.API_KEY;
+        database.risunestGoogleSearchEngineId = this.SEARCH_ENGINE_ID;
     }
 
     async getToolList(): Promise<MCPTool[]> {
