@@ -2078,7 +2078,20 @@ mod tests {
             );
             assert_ne!(mine.fingerprint, theirs.fingerprint);
 
-            for (completed, marker) in [(&mine, "mine"), (&theirs, "theirs")] {
+            for (completed, writer, marker) in
+                [(&mine, "writer-a", "mine"), (&theirs, "writer-b", "theirs")]
+            {
+                let document = snapshot_restore::download_snapshot(
+                    &completed.reference,
+                    &root.path().join(format!("read-{marker}")),
+                    &key,
+                    &provider,
+                    &repository,
+                    &Cancellation::default(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(document.captured_by_device.as_deref(), Some(writer));
                 let received = snapshot_restore::download_sections(
                     &completed.reference,
                     &BTreeSet::from(["local-plugins".to_owned()]),

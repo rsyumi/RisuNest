@@ -71,6 +71,8 @@ pub(crate) struct PreparedRemoteSnapshot {
     pub staging_root: PathBuf,
     pub records: Vec<PreparedRecord>,
     pub objects: Vec<PreparedObject>,
+    /// The device whose own values the sections are, when there is one.
+    pub captured_by_device: Option<String>,
 }
 
 fn ensure_directory(path: &Path) -> Result<()> {
@@ -790,5 +792,6 @@ pub(crate) async fn download_snapshot(
         staging_root: staging_root.to_path_buf(),
         records: records.into_values().collect(),
         objects: objects.into_values().collect(),
+        captured_by_device: document.captured_by_device,
     })
 }

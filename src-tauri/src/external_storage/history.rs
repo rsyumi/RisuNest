@@ -10,7 +10,7 @@ use risunest_external_storage_format::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, io::Cursor};
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 const PAGE: u16 = 30;
 const MAX_CIPHERTEXT: u64 = 16 * 1024 * 1024;
@@ -124,13 +124,20 @@ async fn open_snapshot(
         document,
     ))
 }
+/// `includedSections` is what a restore may choose from, and `sameDevice` says
+/// whether the values are this device's own. Both come from the authenticated
+/// document, so the screen never guesses the coverage from the connection.
 fn item(
     document: &control::SnapshotView,
     reference: &RemoteObject,
     kind: &str,
     pinned: bool,
+    store_id: &str,
 ) -> Value {
+    let same_device =
+        !store_id.is_empty() && document.captured_by_device.as_deref() == Some(store_id);
     json!({"id":document.snapshot_id,"kind":kind,"createdAtMs":document.created_at_ms.to_string(),"logicalRevision":document.revision,"storedBytes":reference.receipt.byte_length.to_string(),"pinned":pinned,"complete":true,"verified":true,
+        "includedSections":document.sections.keys().collect::<Vec<_>>(),"sameDevice":same_device,
         "warning":"Snapshot metadata is authenticated. All referenced data is verified before restore."})
 }
 fn remember_item(items: &mut BTreeMap<String, Value>, id: String, mut next: Value) {
@@ -157,6 +164,11 @@ pub(crate) async fn external_storage_list_history(
         super::connection_commands::open_connected(&app, &request.connection_id).await?;
     let cancel = Cancellation::default();
     let cache = ConnectionStore::open(&runtime::root(&app)?)?;
+    let store_id = crate::persistent_store::commands::with_store_mut(app.state(), |store| {
+        store.external_identity()
+    })
+    .map_err(runtime::local_error)?
+    .store_id;
     let mut items = BTreeMap::new();
     let next = if state.phase == "points" {
         let page = control::list_connected_backup_points_page(
@@ -184,7 +196,7 @@ pub(crate) async fn external_storage_list_history(
                 remember_item(
                     &mut items,
                     document.snapshot_id.clone(),
-                    item(&document, &reference, kind, pinned),
+                    item(&document, &reference, kind, pinned, &store_id),
                 );
             }
         }
@@ -217,7 +229,7 @@ pub(crate) async fn external_storage_list_history(
             remember_item(
                 &mut items,
                 document.snapshot_id.clone(),
-                item(&document, &reference, "recovery-candidate", false),
+                item(&document, &reference, "recovery-candidate", false, &store_id),
             );
         }
         page.next_cursor.map(|provider| CursorState {

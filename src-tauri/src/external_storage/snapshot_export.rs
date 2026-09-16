@@ -202,6 +202,7 @@ mod tests {
             library_fingerprint: "not-a-hash".into(),
             logical_revision: 1,
             staging_root: staging,
+            captured_by_device: None,
             records: Vec::new(),
             objects: Vec::new(),
         };
@@ -243,6 +244,7 @@ mod tests {
             library_fingerprint: hex::encode(fingerprint(&scope_id, &hashes)),
             logical_revision: 1,
             staging_root: staging,
+            captured_by_device: None,
             records: vec![super::super::snapshot_restore::PreparedRecord {
                 key,
                 content_hash: encoded.hash,

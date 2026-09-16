@@ -232,6 +232,7 @@ mod tests {
             library_id: "library".into(),
             created_at_ms: 1,
             revision: "1".into(),
+            captured_by_device: None,
             library: risunest_external_storage_format::snapshot::LibrarySnapshotRef {
                 record_catalog: records,
                 asset_catalog: assets,
