@@ -108,6 +108,25 @@ fn version(db: &Connection, domain: Domain, key: &str) -> Result<RecordVersion> 
         .map(|v| v.unwrap_or(RecordVersion::Absent))
 }
 
+/// Whether two heads of one lineage carry an identical state for every listed
+/// section. State identity, last change and collection floor all count: a floor
+/// that moved is a real change even when no value did.
+fn carries_the_same_sections(
+    previous: &RemoteHead,
+    observed: &RemoteHead,
+    domains: &[Domain],
+) -> bool {
+    previous.library_id == observed.library_id
+        && previous.epoch == observed.epoch
+        && previous.seq <= observed.seq
+        && domains.iter().all(|domain| {
+            matches!(
+                (previous.section(*domain), observed.section(*domain)),
+                (Ok(before), Ok(after)) if before == after
+            )
+        })
+}
+
 /// The library plus whichever device sections this device takes part in, in
 /// wire order. A section left out is unreceived, not emptied.
 pub(crate) fn refresh(
@@ -180,6 +199,16 @@ fn refresh_once(
             .map(|(h, _, _, _)| decode::<RemoteHead>(h))
             .transpose()?;
         if previous.as_ref().is_some_and(|h| h.same_revision(observed)) {
+            return Ok(observed.clone());
+        }
+        // The commit sequence also moves for sections this device leaves out.
+        // When every requested section is untouched the mirror already holds
+        // this head, so adopt it without reading a single record.
+        if previous
+            .as_ref()
+            .is_some_and(|h| carries_the_same_sections(h, observed, domains))
+        {
+            db.execute("INSERT INTO server_sync_remote_cursor VALUES(1,?1,?2,NULL,1) ON CONFLICT(singleton) DO UPDATE SET head=excluded.head,domains=excluded.domains,cursor=NULL,complete=1",params![json(observed)?,json(&domains)?])?;
             return Ok(observed.clone());
         }
         if previous

@@ -58,6 +58,7 @@ fn section_clock(store: &PersistentStore, section: Section) -> Sequence {
 struct Fleet {
     server: Arc<Store>,
     endpoint: String,
+    paths: Arc<std::sync::Mutex<Vec<String>>>,
     _runtime: tokio::runtime::Runtime,
     task: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
@@ -76,12 +77,25 @@ fn fleet() -> Fleet {
         .unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let serving = server.clone();
+    let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = paths.clone();
     let task = runtime.spawn(async move {
-        axum::serve(listener, http::router(serving)).await.unwrap();
+        let router = http::router(serving).layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let recorded = recorded.clone();
+                let path = request.uri().path().to_owned();
+                async move {
+                    recorded.lock().unwrap().push(path);
+                    next.run(request).await
+                }
+            },
+        ));
+        axum::serve(listener, router).await.unwrap();
     });
     Fleet {
         server,
         endpoint,
+        paths,
         _runtime: runtime,
         task,
         _dir: dir,
@@ -89,6 +103,12 @@ fn fleet() -> Fleet {
 }
 
 impl Fleet {
+    fn requests(&self) -> usize {
+        self.paths.lock().unwrap().len()
+    }
+    fn requests_since(&self, mark: usize) -> Vec<String> {
+        self.paths.lock().unwrap()[mark..].to_vec()
+    }
     fn bind(&self, store: &mut PersistentStore) {
         let device = self.server.add_device().unwrap();
         store
@@ -576,4 +596,57 @@ fn a_rebound_replica_proposes_the_section_values_it_already_holds() {
     assert_eq!(read_vector(&reader, 9), Some(vec![0x88; 16]));
     first.task.abort();
     second.task.abort();
+}
+
+/// A head confirmation decides which sections moved. When only a section this
+/// device left out changed, the cycle reads no record from the server.
+#[test]
+fn a_head_change_in_a_section_this_device_left_out_reads_no_record() {
+    let fleet = fleet();
+    let (_author_dir, mut author) = prepared();
+    let (_reader_dir, mut reader) = prepared();
+    fleet.bind(&mut author);
+    fleet.bind(&mut reader);
+    reader
+        .device_store_mut()
+        .unwrap()
+        .set_section_participating(Section::Hypa, false)
+        .unwrap();
+    assert_eq!(settle(&mut author).phase, "idle");
+    assert_eq!(settle(&mut reader).phase, "idle");
+
+    let before = fleet.server.head().unwrap();
+    author
+        .device_store_mut()
+        .unwrap()
+        .write_hypa_embeddings(&[embedding(11, 4, 0x99)])
+        .unwrap();
+    assert_eq!(settle(&mut author).phase, "idle");
+    assert_eq!(settle(&mut author).phase, "idle");
+    let after = fleet.server.head().unwrap();
+    assert_ne!(after.head_id, before.head_id);
+    assert_ne!(
+        after.section(Domain::Hypa).unwrap(),
+        before.section(Domain::Hypa).unwrap()
+    );
+    assert_eq!(
+        after.section(Domain::Library).unwrap(),
+        before.section(Domain::Library).unwrap()
+    );
+
+    let mark = fleet.requests();
+    assert_eq!(settle(&mut reader).phase, "idle");
+    let records = fleet
+        .requests_since(mark)
+        .into_iter()
+        .filter(|path| {
+            path.starts_with("/checkpoints")
+                || path.starts_with("/read-pins")
+                || path.starts_with("/changes")
+                || path.starts_with("/objects")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(records, Vec::<String>::new());
+    assert_eq!(read_vector(&reader, 11), None);
+    fleet.task.abort();
 }
