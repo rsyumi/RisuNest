@@ -1100,10 +1100,15 @@ fn is_spool_cleanup_race_loss(error: &std::io::Error, path: &Path) -> bool {
     if !cfg!(windows) || error.kind() != std::io::ErrorKind::PermissionDenied {
         return false;
     }
-    for _ in 0..16 {
+    // Windows answers a removal of a directory another thread is already
+    // deleting with a permission error, and the name survives until that
+    // deletion completes. Yielding alone loses the race whenever the winner is
+    // descheduled, so the wait falls back to short sleeps before giving up.
+    for attempt in 0..128 {
         match fs::symlink_metadata(path) {
             Err(probe) if probe.kind() == std::io::ErrorKind::NotFound => return true,
-            _ => std::thread::yield_now(),
+            _ if attempt < 16 => std::thread::yield_now(),
+            _ => std::thread::sleep(std::time::Duration::from_millis(1)),
         }
     }
     matches!(
