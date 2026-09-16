@@ -46,6 +46,9 @@ const MAX_RETRY_AT_MS: u64 = 24 * HOUR_MS;
 /// single deterministic tag. Every other role is grouped per job.
 pub(super) const DESCRIPTOR_BATCH: &str = "d";
 pub(super) const JOB_BATCH_PREFIX: &str = "j";
+/// Leases live in their own releases. A job-derived tag would let an observer
+/// who can only enumerate the repository count the devices writing to it.
+pub(super) const LEASE_BATCH: &str = "l";
 
 fn refused() -> ProviderError {
     ProviderError::new(ErrorKind::Unsupported)
@@ -187,6 +190,7 @@ impl Context {
             Collection::Snapshots | Collection::BackupPoints => {
                 tag.starts_with(&format!("{}-{JOB_BATCH_PREFIX}", self.tag_prefix))
             }
+            Collection::Leases => tag.starts_with(&format!("{}-{LEASE_BATCH}-", self.tag_prefix)),
         }
     }
 
@@ -255,6 +259,7 @@ pub(super) fn role_prefix(role: ObjectRole) -> &'static str {
         ObjectRole::SyncState => "state",
         ObjectRole::BackupBundle => "bundle",
         ObjectRole::BackupPoint => "point",
+        ObjectRole::Lease => "lease",
     }
 }
 
@@ -265,6 +270,7 @@ pub(super) fn collection_roles(collection: Collection) -> &'static [ObjectRole] 
         Collection::Snapshots => &[ObjectRole::SyncState, ObjectRole::BackupBundle],
         Collection::BackupPoints => &[ObjectRole::BackupPoint],
         Collection::Descriptors => &[ObjectRole::Descriptor],
+        Collection::Leases => &[ObjectRole::Lease],
     }
 }
 
@@ -284,6 +290,7 @@ pub(super) fn removable_asset(name: &str) -> bool {
         ObjectRole::SyncState,
         ObjectRole::BackupBundle,
         ObjectRole::BackupPoint,
+        ObjectRole::Lease,
     ]
     .iter()
     .any(|role| holds_role(*role, name))
@@ -301,6 +308,9 @@ pub(super) fn asset_name(role: ObjectRole, object_id: &str) -> String {
 pub(super) fn batch_key(role: ObjectRole, job_id: &str) -> String {
     if role == ObjectRole::Descriptor {
         return DESCRIPTOR_BATCH.to_owned();
+    }
+    if role == ObjectRole::Lease {
+        return LEASE_BATCH.to_owned();
     }
     use sha2::Digest;
     let digest = sha2::Sha256::digest(job_id.as_bytes());

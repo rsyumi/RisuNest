@@ -10,10 +10,12 @@ pub(super) const BACKUPS: &str = "backups";
 pub(super) const CATALOGS: &str = "catalogs";
 pub(super) const DESCRIPTORS: &str = "descriptors";
 pub(super) const HEADS: &str = "heads";
+pub(super) const LEASES: &str = "leases";
 pub(super) const PACKS: &str = "packs";
 pub(super) const SNAPSHOTS: &str = "snapshots";
 /// Sorted so the repository root listing can be compared against it directly.
-pub(super) const FOLDERS: [&str; 6] = [BACKUPS, CATALOGS, DESCRIPTORS, HEADS, PACKS, SNAPSHOTS];
+pub(super) const FOLDERS: [&str; 7] =
+    [BACKUPS, CATALOGS, DESCRIPTORS, HEADS, LEASES, PACKS, SNAPSHOTS];
 
 /// Remote names stay inside a charset that needs no quoting in a multipart
 /// header and no escaping in a locator. `%` is reserved for the encoding below.
@@ -30,6 +32,7 @@ pub(super) fn role_folder(role: ObjectRole) -> &'static str {
         // authenticated envelope header, not the path, tells them apart.
         ObjectRole::SyncState | ObjectRole::BackupBundle => SNAPSHOTS,
         ObjectRole::BackupPoint => BACKUPS,
+        ObjectRole::Lease => LEASES,
     }
 }
 pub(super) fn collection_folder(collection: Collection) -> &'static str {
@@ -37,6 +40,7 @@ pub(super) fn collection_folder(collection: Collection) -> &'static str {
         Collection::Snapshots => SNAPSHOTS,
         Collection::BackupPoints => BACKUPS,
         Collection::Descriptors => DESCRIPTORS,
+        Collection::Leases => LEASES,
     }
 }
 

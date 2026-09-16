@@ -1802,3 +1802,39 @@ fn capabilities_carry_the_documented_evidence_for_every_preset() {
         );
     }
 }
+
+/// Leases are their own key folder, so an enumeration of them can never return
+/// a snapshot, a pack or the descriptor that proves the root.
+#[test]
+fn the_lease_collection_is_its_own_key_folder_and_is_removable() {
+    runtime().block_on(async {
+        let tag = "0123456789abcdef0123456789abcdef";
+        let name = lease_object_id(LeaseKind::Cleanup, tag).unwrap();
+        let test = dependencies();
+        let server = WireServer::start(vec![
+            one_descriptor(),
+            reply(200, &[], listing("leases", &[&name], None)),
+            reply(204, &[], Vec::new()),
+        ]);
+        let (provider, handle) = opened(&test, "generic", &server).await;
+        let cancel = Cancellation::default();
+        let page = provider
+            .list_objects(&handle, Collection::Leases, None, 10, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.objects
+                .iter()
+                .map(|object| object.locator.object.as_str())
+                .collect::<Vec<_>>(),
+            vec![format!("leases/{name}")]
+        );
+        provider
+            .delete_object(&handle, &page.objects[0].locator, &cancel)
+            .await
+            .unwrap();
+        let records = server.requests.lock().unwrap();
+        assert!(line(&records[1]).contains(&format!("prefix={PREFIX}%2Fleases%2F")));
+        assert!(line(&records[2]).ends_with(&format!("/{PREFIX}/leases/{name} HTTP/1.1")));
+    });
+}

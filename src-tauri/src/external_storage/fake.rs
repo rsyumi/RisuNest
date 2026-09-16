@@ -336,6 +336,7 @@ impl Provider for FakeProvider {
                 Collection::Snapshots => ObjectRole::SyncState,
                 Collection::BackupPoints => ObjectRole::BackupPoint,
                 Collection::Descriptors => ObjectRole::Descriptor,
+                Collection::Leases => ObjectRole::Lease,
             };
             let state = self.state.lock().unwrap();
             let mut matches = state.objects.iter().filter(|(id, _)| {
@@ -471,6 +472,60 @@ mod tests {
                 );
                 assert!(provider.holds(refused));
             }
+        });
+    }
+
+    #[test]
+    fn leases_enumerate_on_their_own_and_page_where_the_caller_asks() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let provider = FakeProvider::new(false);
+            let handle = repository();
+            let cancel = Cancellation::default();
+            let tags = ["11111111111111111111111111111111", "22222222222222222222222222222222"];
+            let work = lease_object_id(LeaseKind::Work, tags[0]).unwrap();
+            let deleting = lease_object_id(LeaseKind::Deleting, tags[1]).unwrap();
+            for name in [&work, &deleting] {
+                provider.seed(name, ObjectRole::Lease, vec![1]);
+            }
+            provider.seed("state-a", ObjectRole::SyncState, vec![2]);
+
+            let first = provider
+                .list_objects(&handle, Collection::Leases, None, 1, &cancel)
+                .await
+                .unwrap();
+            assert_eq!(first.objects.len(), 1);
+            let second = provider
+                .list_objects(&handle, Collection::Leases, first.next_cursor.as_deref(), 10, &cancel)
+                .await
+                .unwrap();
+            let mut seen: Vec<String> = first
+                .objects
+                .iter()
+                .chain(second.objects.iter())
+                .map(|object| object.locator.object.clone())
+                .collect();
+            seen.sort();
+            assert_eq!(seen, vec![deleting.clone(), work.clone()]);
+            assert_eq!(second.next_cursor, None);
+
+            // A lease never shows up in another collection's listing.
+            let snapshots = provider
+                .list_objects(&handle, Collection::Snapshots, None, 10, &cancel)
+                .await
+                .unwrap();
+            assert_eq!(snapshots.objects.len(), 1);
+            assert_eq!(snapshots.objects[0].locator.object, "state-a");
+
+            // Leases are removable; that is the whole point of the collection.
+            provider
+                .delete_object(
+                    &handle,
+                    &object(&work),
+                    &cancel,
+                )
+                .await
+                .unwrap();
+            assert!(!provider.holds(&work));
         });
     }
 

@@ -53,6 +53,7 @@ fn role_token(role: ObjectRole) -> &'static str {
         ObjectRole::SyncState => "state",
         ObjectRole::BackupBundle => "bundle",
         ObjectRole::BackupPoint => "backupPoint",
+        ObjectRole::Lease => "lease",
     }
 }
 /// Only names the container a collection lives in. States and bundles share
@@ -63,6 +64,7 @@ fn collection_role(collection: Collection) -> ObjectRole {
         Collection::Snapshots => ObjectRole::SyncState,
         Collection::BackupPoints => ObjectRole::BackupPoint,
         Collection::Descriptors => ObjectRole::Descriptor,
+        Collection::Leases => ObjectRole::Lease,
     }
 }
 fn collection_token(role: ObjectRole) -> Option<&'static str> {
@@ -70,6 +72,7 @@ fn collection_token(role: ObjectRole) -> Option<&'static str> {
         ObjectRole::SyncState | ObjectRole::BackupBundle => Some("snapshots"),
         ObjectRole::BackupPoint => Some("backupPoints"),
         ObjectRole::Descriptor => Some("descriptors"),
+        ObjectRole::Lease => Some("leases"),
         ObjectRole::Pack | ObjectRole::Catalog => None,
     }
 }
@@ -193,8 +196,6 @@ impl GoogleDrive {
 
     /// Bodyless control request. A rejected access token is refreshed once and
     /// the same request is repeated; no other status is retried here.
-    /// One bodyless control request, retried once after a single 401 so an
-    /// expired access token is refreshed rather than surfaced.
     async fn control_request(
         &self,
         session: Session<'_>,
@@ -661,6 +662,7 @@ fn removable(settings: &Settings, file: &DriveFile) -> bool {
                 ObjectRole::SyncState,
                 ObjectRole::BackupBundle,
                 ObjectRole::BackupPoint,
+                ObjectRole::Lease,
             ]
             .iter()
             .any(|known| role_token(*known) == role)

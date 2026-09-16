@@ -1323,3 +1323,51 @@ fn deleting_an_asset_checks_its_release_tag_and_role_prefix_first() {
         );
     });
 }
+
+/// Leases live in releases of their own. A job derived tag would let anyone who
+/// can enumerate the repository count the devices writing to it.
+#[test]
+fn the_lease_collection_uses_its_own_tag_and_asset_prefix() {
+    runtime().block_on(async {
+        let tag = "0123456789abcdef0123456789abcdef";
+        let work = lease_object_id(LeaseKind::Work, tag).unwrap();
+        let lease_tag = format!("{PREFIX}-{}-0", api::LEASE_BATCH);
+        assert_eq!(api::batch_key(ObjectRole::Lease, "job-1"), api::LEASE_BATCH);
+        assert_eq!(api::asset_name(ObjectRole::Lease, &work), format!("lease-{work}"));
+
+        let server = WireServer::start(vec![
+            repository_reply(true),
+            reply(200, json!([])),
+            reply(
+                200,
+                json!([release(31, &lease_tag), release(32, &job_tag("job-1", 0))]),
+            ),
+            reply(
+                200,
+                json!([
+                    asset(1, &format!("lease-{work}"), 10, None),
+                    asset(2, "pack-object-1", 20, None)
+                ]),
+            ),
+        ]);
+        let test = dependencies();
+        let provider = adapter(test.dependencies.clone());
+        let handle = open(provider.as_ref(), &server, OpenMode::Create)
+            .await
+            .unwrap();
+        let page = provider
+            .list_objects(&handle, Collection::Leases, None, 10, &Cancellation::default())
+            .await
+            .unwrap();
+        // Only the lease release is visited, and only its `lease-` assets.
+        assert_eq!(
+            page.objects
+                .iter()
+                .map(|object| object.locator.object.as_str())
+                .collect::<Vec<_>>(),
+            vec!["31/1"]
+        );
+        assert_eq!(page.objects[0].locator.collection.as_deref(), Some(lease_tag.as_str()));
+        assert_eq!(server.requests.lock().unwrap().len(), 4);
+    });
+}

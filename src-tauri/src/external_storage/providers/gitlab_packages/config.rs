@@ -80,6 +80,7 @@ pub(super) fn role_name(role: ObjectRole) -> &'static str {
         ObjectRole::SyncState => "state",
         ObjectRole::BackupBundle => "bundle",
         ObjectRole::BackupPoint => "point",
+        ObjectRole::Lease => "lease",
     }
 }
 fn role_from_name(name: &str) -> Option<ObjectRole> {
@@ -90,6 +91,7 @@ fn role_from_name(name: &str) -> Option<ObjectRole> {
         "state" => ObjectRole::SyncState,
         "bundle" => ObjectRole::BackupBundle,
         "point" => ObjectRole::BackupPoint,
+        "lease" => ObjectRole::Lease,
         _ => return None,
     })
 }
@@ -102,6 +104,7 @@ pub(super) fn collection_roles(collection: Collection) -> &'static [ObjectRole] 
         Collection::Snapshots => &[ObjectRole::SyncState, ObjectRole::BackupBundle],
         Collection::BackupPoints => &[ObjectRole::BackupPoint],
         Collection::Descriptors => &[ObjectRole::Descriptor],
+        Collection::Leases => &[ObjectRole::Lease],
     }
 }
 

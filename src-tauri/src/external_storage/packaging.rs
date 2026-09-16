@@ -206,6 +206,7 @@ pub(crate) fn wire_role(role: ObjectRole) -> Result<wire::ObjectRole> {
         ObjectRole::BackupBundle => Ok(wire::ObjectRole::BackupBundle),
         ObjectRole::BackupPoint => Ok(wire::ObjectRole::BackupPoint),
         ObjectRole::Descriptor => Ok(wire::ObjectRole::Descriptor),
+        ObjectRole::Lease => Ok(wire::ObjectRole::Lease),
     }
 }
 pub(crate) fn native_role(role: wire::ObjectRole) -> Result<ObjectRole> {
@@ -216,6 +217,7 @@ pub(crate) fn native_role(role: wire::ObjectRole) -> Result<ObjectRole> {
         wire::ObjectRole::BackupBundle => Ok(ObjectRole::BackupBundle),
         wire::ObjectRole::BackupPoint => Ok(ObjectRole::BackupPoint),
         wire::ObjectRole::Descriptor => Ok(ObjectRole::Descriptor),
+        wire::ObjectRole::Lease => Ok(ObjectRole::Lease),
         wire::ObjectRole::Head => Err(corrupt("head is not an immutable snapshot object")),
     }
 }

@@ -398,7 +398,7 @@ fn create_refuses_an_occupied_root_and_otherwise_provisions_the_role_folders() {
             .unwrap();
         assert_eq!(handle.repository_id, ROOT_ID);
         let records = api.requests.lock().unwrap();
-        assert_eq!(records.len(), 9);
+        assert_eq!(records.len(), 3 + config::FOLDERS.len());
         assert!(records[2]
             .headers
             .starts_with("POST /synthetic/drive/folders HTTP/1.1"));

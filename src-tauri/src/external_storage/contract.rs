@@ -125,7 +125,63 @@ pub(crate) enum ObjectRole {
     SyncState,
     BackupBundle,
     BackupPoint,
+    Lease,
 }
+
+/// What a lease in `Collection::Leases` announces. The word is plain so a
+/// publisher can tell a delete marker from ordinary work by enumeration alone.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum LeaseKind {
+    Work,
+    Cleanup,
+    Deleting,
+}
+impl LeaseKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Work => "work",
+            Self::Cleanup => "cleanup",
+            Self::Deleting => "deleting",
+        }
+    }
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "work" => Self::Work,
+            "cleanup" => Self::Cleanup,
+            "deleting" => Self::Deleting,
+            _ => return None,
+        })
+    }
+}
+
+/// 128 random bits, chosen before the object is written so a retry after an
+/// unclear answer names the same object again.
+pub(crate) const LEASE_TAG_HEX: usize = 32;
+
+/// `{kind}-{tag}`. No writer or job identity appears, so an observer who can
+/// only enumerate the repository cannot count the devices using it.
+pub(crate) fn lease_object_id(kind: LeaseKind, tag: &str) -> Result<String> {
+    if tag.len() != LEASE_TAG_HEX
+        || !tag
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ProviderError::new(ErrorKind::Corrupt));
+    }
+    Ok(format!("{}-{tag}", kind.as_str()))
+}
+
+pub(crate) fn parse_lease_object_id(object_id: &str) -> Result<(LeaseKind, String)> {
+    let corrupt = || ProviderError::new(ErrorKind::Corrupt);
+    let (kind, tag) = object_id.split_once('-').ok_or_else(corrupt)?;
+    let kind = LeaseKind::parse(kind).ok_or_else(corrupt)?;
+    if lease_object_id(kind, tag)? != object_id {
+        return Err(corrupt());
+    }
+    Ok((kind, tag.to_owned()))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ObjectIntent {
@@ -252,6 +308,7 @@ pub(crate) enum Collection {
     Snapshots,
     BackupPoints,
     Descriptors,
+    Leases,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -392,5 +449,47 @@ impl HeadBytes {
     }
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_lease_name_carries_its_kind_and_tag_and_nothing_else() {
+        let tag = "0123456789abcdef0123456789abcdef";
+        for (kind, expected) in [
+            (LeaseKind::Work, "work"),
+            (LeaseKind::Cleanup, "cleanup"),
+            (LeaseKind::Deleting, "deleting"),
+        ] {
+            let object_id = lease_object_id(kind, tag).unwrap();
+            assert_eq!(object_id, format!("{expected}-{tag}"));
+            assert_eq!(parse_lease_object_id(&object_id).unwrap(), (kind, tag.into()));
+        }
+        // One kind's name can never be read as another's.
+        assert_ne!(
+            lease_object_id(LeaseKind::Work, tag).unwrap(),
+            lease_object_id(LeaseKind::Cleanup, tag).unwrap()
+        );
+
+        for bad in ["", "0123456789ABCDEF0123456789abcdef", &tag[1..], &format!("{tag}0")] {
+            assert_eq!(
+                lease_object_id(LeaseKind::Work, bad).unwrap_err().kind,
+                ErrorKind::Corrupt
+            );
+        }
+        for bad in [
+            "work",
+            &format!("working-{tag}"),
+            &format!("work-{}", &tag[1..]),
+            &format!("work-{tag}-1"),
+        ] {
+            assert_eq!(
+                parse_lease_object_id(bad).unwrap_err().kind,
+                ErrorKind::Corrupt
+            );
+        }
     }
 }

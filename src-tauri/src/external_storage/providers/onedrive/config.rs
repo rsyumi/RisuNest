@@ -95,6 +95,7 @@ pub(super) fn role_folder(role: ObjectRole) -> &'static str {
         // authenticated envelope header, not the path, tells them apart.
         ObjectRole::SyncState | ObjectRole::BackupBundle => "snapshots",
         ObjectRole::BackupPoint => "points",
+        ObjectRole::Lease => "leases",
     }
 }
 
@@ -103,6 +104,7 @@ pub(super) fn collection_folder(collection: Collection) -> &'static str {
         Collection::Snapshots => role_folder(ObjectRole::SyncState),
         Collection::BackupPoints => role_folder(ObjectRole::BackupPoint),
         Collection::Descriptors => role_folder(ObjectRole::Descriptor),
+        Collection::Leases => role_folder(ObjectRole::Lease),
     }
 }
 
@@ -117,6 +119,7 @@ pub(super) fn removable_path(locator: &RemoteLocator) -> Result<String> {
         ObjectRole::Catalog,
         ObjectRole::SyncState,
         ObjectRole::BackupPoint,
+        ObjectRole::Lease,
     ]
     .iter()
     .any(|role| role_folder(*role) == folder);
@@ -135,7 +138,7 @@ pub(super) fn removable_path(locator: &RemoteLocator) -> Result<String> {
 
 /// Every folder a freshly created repository owns.
 pub(super) const REPOSITORY_FOLDERS: &[&str] =
-    &["descriptors", "packs", "catalogs", "snapshots", "points"];
+    &["descriptors", "packs", "catalogs", "snapshots", "points", "leases"];
 
 pub(super) struct Settings {
     pub endpoint: url::Url,

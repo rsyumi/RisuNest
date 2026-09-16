@@ -1492,3 +1492,43 @@ fn a_deploy_token_connection_cannot_delete() {
         assert_eq!(harness.lines().len(), 2);
     });
 }
+
+/// Leases are their own package, listed and removed under the same rules as
+/// every other role of this adapter.
+#[test]
+fn the_lease_collection_is_its_own_package() {
+    runtime().block_on(async {
+        let tag = "0123456789abcdef0123456789abcdef";
+        let name = lease_object_id(LeaseKind::Deleting, tag).unwrap();
+        let token = encoded(&name);
+        let leases = format!("{PACKAGE}.lease");
+        let harness = fixture(
+            vec![
+                marker_present(),
+                json(200, "[]"),
+                headed(
+                    200,
+                    &[("x-next-page", "")],
+                    &format!("[{}]", package_json(4, &leases, &format!("v0-{token}"))),
+                ),
+                json(
+                    200,
+                    &format!("[{}]", file_json(&format!("lease-{token}"), 30, None)),
+                ),
+            ],
+            "personalAccessToken",
+        );
+        let (repository, _) = harness.open(OpenMode::Existing).await.unwrap();
+        let page = harness
+            .provider
+            .list_objects(&repository, Collection::Leases, None, 10, &harness.cancel)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.objects[0].locator.object,
+            format!("{leases}/v0-{token}/lease-{token}")
+        );
+        assert_eq!(page.next_cursor, None);
+        assert!(harness.lines()[2].contains(&format!("package_name={leases}&")));
+    });
+}
