@@ -1,3 +1,4 @@
+import { UNOWNED_PLUGIN_OWNER } from '../plugins/pluginOwner'
 import { describe, expect, it, vi } from 'vitest'
 import type { Chat, Database, character } from './database.svelte'
 import type { PersistentDataStore } from './persistentDataStore'
@@ -54,7 +55,7 @@ describe('SaveCoordinator', () => {
         await coordinator.flushPendingData('changed')
         expect(store.commit).toHaveBeenCalledWith(
             expect.objectContaining({
-                pluginStorage: [{ type: 'set', key: 'nested', value: { count: 2 } }],
+                pluginStorage: [{ type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'nested', value: { count: 2 } }],
             }),
         )
         expect(database.pluginCustomStorage.payload).toBe(payload)
@@ -2583,7 +2584,7 @@ describe('SaveCoordinator', () => {
         expect(commit).toHaveBeenCalledWith({
             expectedRevision: 7,
             rootMutations: [{ type: 'set', key: 'username', value: 'Edited root' }],
-            pluginStorage: [{ type: 'set', key: '__proto__', value: 0 }],
+            pluginStorage: [{ type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: '__proto__', value: 0 }],
             replacePresets: [{ name: 'Adopted preset', mainPrompt: 'After preset edit' }],
             conversations: [
                 {
@@ -3088,7 +3089,7 @@ describe('SaveCoordinator', () => {
 
         expect(commit).toHaveBeenCalledWith({
             expectedRevision: 6,
-            pluginStorage: [{ type: 'set', key: '__proto__', value: 'later' }],
+            pluginStorage: [{ type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: '__proto__', value: 'later' }],
         })
     })
 

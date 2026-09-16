@@ -1,3 +1,4 @@
+const PLUGIN_ACCESS_OWNER = 'test-plugin'
 import { describe, expect, it, vi } from 'vitest'
 import type { Database } from '../storage/database.svelte'
 import type {
@@ -191,12 +192,16 @@ function createHarness() {
             },
             queryPluginStorage: async () => ({
                 revision,
-                items: Object.keys(pluginStorage).map((key) => ({ key, byteSize: 0 })),
+                items: Object.keys(pluginStorage).map((key) => ({
+                    owner: PLUGIN_ACCESS_OWNER,
+                    key,
+                    byteSize: 0,
+                })),
             }),
-            readPluginStorage: async (key: string) => Object.prototype.hasOwnProperty.call(
-                pluginStorage,
-                key,
-            ) ? { revision, value: pluginStorage[key] } : null,
+            readPluginStorage: async (_owner: string, key: string) =>
+                Object.prototype.hasOwnProperty.call(pluginStorage, key)
+                    ? { revision, value: pluginStorage[key] }
+                    : null,
             release,
         } as unknown as PersistentRevisionLease
     })
@@ -264,6 +269,7 @@ function createHarness() {
     const replacePersistentConversation = vi.fn(async () => true)
     const reportIdentityReplacementRejected = vi.fn()
     const access = createPluginDatabaseAccess({
+        owner: PLUGIN_ACCESS_OWNER,
         store,
         flushPendingData,
         getCompatibilityDatabase: () => compatibilityDatabase,
@@ -977,6 +983,7 @@ describe('plugin database access', () => {
             },
         })
         const access = createProductionPluginDatabaseAccess({
+        owner: PLUGIN_ACCESS_OWNER,
             flushPendingData: harness.flushPendingData,
             getCompatibilityDatabase: () => harness.compatibilityDatabase,
             getSelectedCharacterId: harness.getSelectedCharacterId,
@@ -1788,9 +1795,13 @@ describe('plugin database access', () => {
             })
             const character = harness.compatibilityDatabase.characters[0]
             harness.applyCompatibilityDatabaseLite.mockImplementation((update) => {
-                applyPluginDatabaseUpdate(harness.compatibilityDatabase as Database, update, [
-                    'username',
-                ])
+                applyPluginDatabaseUpdate(
+                    harness.compatibilityDatabase as Database,
+                    update,
+                    ['username'],
+                    PLUGIN_ACCESS_OWNER,
+                    () => PLUGIN_ACCESS_OWNER,
+                )
             })
             harness.flushPendingData.mockImplementation(async () => {
                 character.name = 'Concurrent edit'

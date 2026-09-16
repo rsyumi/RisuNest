@@ -768,7 +768,7 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
             expectedRevision: harness.imported.revision,
             root: { ...root, username: 'Later local user' },
             pluginStorage: [
-                { type: 'set', key: 'fixture', value: { value: 'later' } },
+                { type: 'set', owner: 'test-plugin', key: 'fixture', value: { value: 'later' } },
             ],
         })
         const commit = vi.spyOn(harness.store, 'commit')
@@ -781,7 +781,7 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
         expect(published.username).toBe('Snapshot User')
         expect(published.pluginCustomStorage).toEqual({ fixture: { value: 'stored' } })
         expect((await harness.store.readRoot()).value.username).toBe('Later local user')
-        expect((await harness.store.readPluginStorage('fixture'))?.value).toEqual({
+        expect((await harness.store.readPluginStorage('test-plugin', 'fixture'))?.value).toEqual({
             value: 'later',
         })
         expect(harness.markPublished).toHaveBeenCalledWith(harness.imported.revision)
@@ -820,6 +820,7 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
             root: { ...root, username: 'Later local user' },
             pluginStorage: [{
                 type: 'set',
+                owner: 'test-plugin',
                 key: 'plugin',
                 value: { nested: [{ asset: laterAssetKey }] },
             }],
@@ -840,7 +841,7 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
             rejectedNested: rejectedNestedKey,
             prose: 'prefix assets/not-a-reference.bin',
         })
-        expect((await harness.store.readPluginStorage('plugin'))?.value).toEqual({
+        expect((await harness.store.readPluginStorage('test-plugin', 'plugin'))?.value).toEqual({
             nested: [{ asset: laterAssetKey }],
         })
     })

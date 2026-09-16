@@ -9,6 +9,7 @@ import {
     acquireCurrentRevisionWithRetry,
     withPersistentRevisionLease,
 } from '../storage/persistentRecordIterator'
+import { UNOWNED_PLUGIN_OWNER } from './pluginOwner'
 
 export const PLUGIN_STORAGE_CACHE_BYTE_BUDGET = 64 * 1024 * 1024
 
@@ -17,7 +18,8 @@ interface PluginStorageStoreDependencies {
     mutate(mutations: PluginStorageMutation[]): Promise<void>
 }
 
-export interface PluginStorageStore {
+/** What a plugin sees. Every call is confined to the plugin that made it. */
+export interface PluginOwnerStorage {
     getItem(key: string): Promise<unknown | null>
     setItem(key: string, value: unknown): Promise<void>
     removeItem(key: string): Promise<void>
@@ -26,11 +28,21 @@ export interface PluginStorageStore {
     keys(): Promise<string[]>
     length(): Promise<number>
     snapshot(): Promise<Record<string, unknown>>
-    mutate(mutations: readonly PluginStorageMutation[]): Promise<void>
+    mutate(mutations: readonly OwnerScopedStorageMutation[]): Promise<void>
+}
+
+export type OwnerScopedStorageMutation =
+    | { type: 'set'; key: string; value: unknown }
+    | { type: 'delete'; key: string }
+    | { type: 'clear' }
+
+export interface PluginStorageStore {
+    forOwner(owner: string): PluginOwnerStorage
+    /** The single plugin holding a key, or the sentinel when that is unclear. */
+    ownerOf(key: string): string
     invalidate(): void
-    synchronizeCompatibilityStorage(storage: Record<string, unknown>): void
-    synchronizeCompatibilityMutation(mutation: PluginStorageMutation): void
-    synchronizeCompatibilityOrder(keys: readonly string[]): void
+    invalidateOwner(owner: string): void
+    synchronizeCommittedMutation(mutation: PluginStorageMutation): void
 }
 
 let lifecycleStore: PluginStorageStore | null = null
@@ -42,23 +54,24 @@ export function registerPluginStorageLifecycle(store: PluginStorageStore): () =>
     }
 }
 
-export function notifyPluginStorageAuthorityReplacement(
-    compatibilityStorage: Record<string, unknown> | null,
-): void {
-    if (compatibilityStorage === null) lifecycleStore?.invalidate()
-    else lifecycleStore?.synchronizeCompatibilityStorage(compatibilityStorage)
+/**
+ * The flat working set cannot carry ownership, so an authority replacement drops
+ * the caches instead of seeding them. Each plugin reloads its own rows on the
+ * next call.
+ */
+export function notifyPluginStorageAuthorityReplacement(): void {
+    lifecycleStore?.invalidate()
 }
 
 export function notifyPluginStorageCompatibilityMutation(
     mutation: PluginStorageMutation,
 ): void {
-    lifecycleStore?.synchronizeCompatibilityMutation(mutation)
+    lifecycleStore?.synchronizeCommittedMutation(mutation)
 }
 
-export function notifyPluginStorageCompatibilityOrder(
-    keys: readonly string[],
-): void {
-    lifecycleStore?.synchronizeCompatibilityOrder(keys)
+/** The owner of a key as the loaded index sees it. */
+export function resolveLifecyclePluginStorageOwner(key: string): string {
+    return lifecycleStore?.ownerOf(key) ?? UNOWNED_PLUGIN_OWNER
 }
 
 export function observePluginStorageValue<T>(value: T, onMutation: (value: T) => void): T {
@@ -179,11 +192,13 @@ function clonePluginStorageValue<T>(value: T): T {
     return detachReactiveValue(value) as T
 }
 
+
 export function createPluginStorageStore(
     dependencies: PluginStorageStoreDependencies,
     byteBudget = PLUGIN_STORAGE_CACHE_BYTE_BUDGET,
 ): PluginStorageStore {
-    const index = new Map<string, PluginStorageSummary>()
+    /** Owner to its own keys, in the order the store reports them. */
+    const index = new Map<string, Map<string, PluginStorageSummary>>()
     const cache = new ByteBudgetLru<string, CacheEntry>(
         byteBudget,
         (_key, entry) => entry.byteSize,
@@ -194,6 +209,11 @@ export function createPluginStorageStore(
     let initializePromise: Promise<void> | null = null
     let lifecycleGeneration = 0
     let authorityGeneration = 0
+
+    // Length prefixed so no owner or key pair can collide, and cheap enough to
+    // run on every read of a large value.
+    const cacheKey = (owner: string, key: string): string =>
+        `${owner.length}:${owner}${key}`
 
     const getStore = (): PersistentDataStore =>
         typeof dependencies.store === 'function'
@@ -220,7 +240,14 @@ export function createPluginStorageStore(
                     const catalog = await store.queryPluginStorage()
                     if (expectedGeneration !== lifecycleGeneration) return
                     index.clear()
-                    for (const item of catalog.items) index.set(item.key, item)
+                    for (const item of catalog.items) {
+                        let owned = index.get(item.owner)
+                        if (!owned) {
+                            owned = new Map()
+                            index.set(item.owner, owned)
+                        }
+                        owned.set(item.key, item)
+                    }
                     initialized = true
                 })()
                 const finalPromise = loading.finally(() => {
@@ -233,29 +260,15 @@ export function createPluginStorageStore(
         }
     }
 
-    const putCached = (key: string, value: unknown, byteSize: number) => {
-        cache.set(key, { value: clonePluginStorageValue(value), byteSize })
+    const putCached = (owner: string, key: string, value: unknown, byteSize: number) => {
+        cache.set(cacheKey(owner, key), { value: clonePluginStorageValue(value), byteSize })
     }
 
-    const replaceCachedStorage = (storage: Record<string, unknown>) => {
-        authorityGeneration++
-        lifecycleGeneration++
-        pendingReads.clear()
-        keyGenerations.clear()
-        initialized = true
-        index.clear()
-        cache.clear()
-        for (const [key, value] of Object.entries(storage)) {
-            const byteSize = serializedByteSize(value)
-            index.set(key, { key, byteSize })
-            putCached(key, value, byteSize)
-        }
-    }
-
-    const bumpKeyGeneration = (key: string): number => {
-        const generation = (keyGenerations.get(key) ?? 0) + 1
-        keyGenerations.set(key, generation)
-        pendingReads.delete(key)
+    const bumpKeyGeneration = (owner: string, key: string): number => {
+        const identity = cacheKey(owner, key)
+        const generation = (keyGenerations.get(identity) ?? 0) + 1
+        keyGenerations.set(identity, generation)
+        pendingReads.delete(identity)
         return generation
     }
 
@@ -274,62 +287,101 @@ export function createPluginStorageStore(
         resetCachedState()
     }
 
-    const read = async (key: string): Promise<unknown | null> => {
+    const invalidateOwner = (owner: string) => {
+        authorityGeneration++
+        const owned = index.get(owner)
+        if (owned) {
+            for (const key of owned.keys()) {
+                const identity = cacheKey(owner, key)
+                cache.delete(identity)
+                pendingReads.delete(identity)
+                keyGenerations.set(identity, (keyGenerations.get(identity) ?? 0) + 1)
+            }
+        }
+        index.delete(owner)
+        initialized = false
+        initializePromise = null
+        lifecycleGeneration++
+    }
+
+    const read = async (owner: string, key: string): Promise<unknown | null> => {
         await initialize()
-        const cached = cache.get(key)
+        const identity = cacheKey(owner, key)
+        const cached = cache.get(identity)
         if (cached) {
             return structuredClone(cached.value)
         }
-        if (!index.has(key)) return null
-        const keyGeneration = keyGenerations.get(key) ?? 0
-        const pending = pendingReads.get(key)
+        const owned = index.get(owner)
+        if (!owned?.has(key)) return null
+        const keyGeneration = keyGenerations.get(identity) ?? 0
+        const pending = pendingReads.get(identity)
         if (pending?.generation === keyGeneration) return pending.promise
         const readLifecycleGeneration = lifecycleGeneration
-        const reading = getStore().readPluginStorage(key).then((record) => {
+        const reading = getStore().readPluginStorage(owner, key).then((record) => {
             const isCurrent =
                 readLifecycleGeneration === lifecycleGeneration &&
-                keyGeneration === (keyGenerations.get(key) ?? 0)
+                keyGeneration === (keyGenerations.get(identity) ?? 0)
             if (!record) {
-                if (isCurrent) index.delete(key)
+                if (isCurrent) index.get(owner)?.delete(key)
                 return null
             }
-            const byteSize = index.get(key)?.byteSize ?? serializedByteSize(record.value)
+            const byteSize = index.get(owner)?.get(key)?.byteSize
+                ?? serializedByteSize(record.value)
             if (isCurrent) {
-                putCached(key, record.value, byteSize)
+                putCached(owner, key, record.value, byteSize)
             }
             return structuredClone(record.value)
         }).finally(() => {
-            const pending = pendingReads.get(key)
-            if (pending?.promise === reading) pendingReads.delete(key)
+            const pending = pendingReads.get(identity)
+            if (pending?.promise === reading) pendingReads.delete(identity)
         })
-        pendingReads.set(key, { generation: keyGeneration, promise: reading })
+        pendingReads.set(identity, { generation: keyGeneration, promise: reading })
         return reading
     }
 
     const applyCommittedMutation = (mutation: PluginStorageMutation) => {
+        const owner = mutation.owner
         if (mutation.type === 'clear') {
-            resetCachedState()
-            initialized = true
+            const owned = index.get(owner)
+            if (owned) {
+                for (const key of owned.keys()) {
+                    const identity = cacheKey(owner, key)
+                    cache.delete(identity)
+                    pendingReads.delete(identity)
+                    keyGenerations.set(identity, (keyGenerations.get(identity) ?? 0) + 1)
+                }
+            }
+            index.set(owner, new Map())
             return
         }
-        bumpKeyGeneration(mutation.key)
+        bumpKeyGeneration(owner, mutation.key)
+        let owned = index.get(owner)
+        if (!owned) {
+            owned = new Map()
+            index.set(owner, owned)
+        }
         if (mutation.type === 'delete') {
-            index.delete(mutation.key)
-            cache.delete(mutation.key)
+            owned.delete(mutation.key)
+            cache.delete(cacheKey(owner, mutation.key))
             return
         }
         const byteSize = serializedByteSize(mutation.value)
-        index.set(mutation.key, { key: mutation.key, byteSize })
-        putCached(mutation.key, mutation.value, byteSize)
+        owned.set(mutation.key, { owner, key: mutation.key, byteSize })
+        putCached(owner, mutation.key, mutation.value, byteSize)
     }
 
-    const mutate = async (mutations: readonly PluginStorageMutation[]) => {
+    const mutate = async (
+        owner: string,
+        mutations: readonly OwnerScopedStorageMutation[],
+    ) => {
         await initialize()
         if (mutations.length === 0) return
         const normalized = mutations.map((mutation): PluginStorageMutation =>
-            mutation.type === 'set' && mutation.value === undefined
-                ? { type: 'delete', key: mutation.key }
-                : mutation,
+            mutation.type === 'clear'
+                ? { type: 'clear', owner }
+                : mutation.type === 'delete' || mutation.value === undefined
+                  ? { type: 'delete', owner, key: mutation.key }
+                  : { type: 'set', owner, key: mutation.key, value: mutation.value },
         )
         const expectedAuthorityGeneration = authorityGeneration
         await dependencies.mutate(normalized)
@@ -337,32 +389,34 @@ export function createPluginStorageStore(
         for (const mutation of normalized) applyCommittedMutation(mutation)
     }
 
-    const orderedKeys = (): string[] => Object.keys(
-        Object.fromEntries([...index.keys()].map((key) => [key, true])),
+    // Object.keys supplies JavaScript's integer-key ordering, which legacy
+    // plugin storage reproduces.
+    const orderedKeys = (owner: string): string[] => Object.keys(
+        Object.fromEntries([...(index.get(owner)?.keys() ?? [])].map((key) => [key, true])),
     )
 
-    return {
-        getItem: read,
+    const forOwner = (owner: string): PluginOwnerStorage => ({
+        getItem: (key) => read(owner, key),
         async setItem(key, value) {
-            await mutate([{ type: 'set', key, value }])
+            await mutate(owner, [{ type: 'set', key, value }])
         },
         async removeItem(key) {
-            await mutate([{ type: 'delete', key }])
+            await mutate(owner, [{ type: 'delete', key }])
         },
         async clear() {
-            await mutate([{ type: 'clear' }])
+            await mutate(owner, [{ type: 'clear' }])
         },
         async key(position) {
             await initialize()
-            return orderedKeys()[position] ?? null
+            return orderedKeys(owner)[position] ?? null
         },
         async keys() {
             await initialize()
-            return orderedKeys()
+            return orderedKeys(owner)
         },
         async length() {
             await initialize()
-            return index.size
+            return index.get(owner)?.size ?? 0
         },
         async snapshot() {
             const lease = await acquirePinnedPluginStorageLease()
@@ -370,7 +424,8 @@ export function createPluginStorageStore(
                 const pinnedCatalog = await reader.queryPluginStorage()
                 const storage: Record<string, unknown> = {}
                 for (const item of pinnedCatalog.items) {
-                    const record = await reader.readPluginStorage(item.key)
+                    if (item.owner !== owner) continue
+                    const record = await reader.readPluginStorage(owner, item.key)
                     if (record) {
                         defineOwnEnumerableProperty(
                             storage,
@@ -382,22 +437,27 @@ export function createPluginStorageStore(
                 return storage
             })
         },
-        mutate,
+        mutate: (mutations) => mutate(owner, mutations),
+    })
+
+    return {
+        forOwner,
+        ownerOf(key) {
+            let found: string | null = null
+            for (const [owner, owned] of index) {
+                if (!owned.has(key)) continue
+                if (found !== null) return UNOWNED_PLUGIN_OWNER
+                found = owner
+            }
+            return found ?? UNOWNED_PLUGIN_OWNER
+        },
         invalidate,
-        synchronizeCompatibilityStorage(storage) {
-            replaceCachedStorage(storage)
-        },
-        synchronizeCompatibilityMutation(mutation) {
+        invalidateOwner,
+        synchronizeCommittedMutation(mutation) {
             authorityGeneration++
-            applyCommittedMutation(mutation)
-        },
-        synchronizeCompatibilityOrder(keys) {
-            const entries = keys.flatMap((key) => {
-                const entry = index.get(key)
-                return entry ? [entry] : []
-            })
-            index.clear()
-            for (const entry of entries) index.set(entry.key, entry)
+            // Before the index is loaded there is nothing to keep in step, and
+            // the first read takes the store's own answer.
+            if (initialized) applyCommittedMutation(mutation)
         },
     }
 }

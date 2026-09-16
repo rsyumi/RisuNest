@@ -130,7 +130,7 @@ describe('RisuSave persistent store adapter', () => {
             expectedRevision: imported.revision,
             root: { ...root, username: 'Later User' },
             pluginStorage: [
-                { type: 'set', key: 'fixture', value: { value: 'later' } },
+                { type: 'set', owner: 'test-plugin', key: 'fixture', value: { value: 'later' } },
             ],
         })
         const remaining = await concatenate({
@@ -144,7 +144,7 @@ describe('RisuSave persistent store adapter', () => {
         expect(decoded.username).toBe('Snapshot User')
         expect(decoded.pluginCustomStorage).toEqual({ fixture: { value: 'stored' } })
         expect((await store.readRoot()).value.username).toBe('Later User')
-        expect((await store.readPluginStorage('fixture'))?.value).toEqual({ value: 'later' })
+        expect((await store.readPluginStorage('test-plugin', 'fixture'))?.value).toEqual({ value: 'later' })
         expect(materialize).not.toHaveBeenCalled()
     })
 

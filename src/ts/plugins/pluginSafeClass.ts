@@ -1,23 +1,53 @@
-import { pluginDeviceStorage as pluginStorage } from "./pluginDeviceStorage";
+import { pluginDeviceStorage as pluginStorage, pluginDevicePrefix } from "./pluginDeviceStorage";
+
+// Structured so an owner or key holding the separator cannot reach another
+// plugin's keyspace.
+function deviceKey(owner: string, space: 'string' | 'json', key: string): string {
+    return `${pluginDevicePrefix}${JSON.stringify([owner, space, key])}`;
+}
+
+function deviceKeyOwnerSpace(
+    stored: string,
+    owner: string,
+    space: 'string' | 'json',
+): string | null {
+    if (!stored.startsWith(pluginDevicePrefix)) return null;
+    try {
+        const parsed = JSON.parse(stored.substring(pluginDevicePrefix.length));
+        if (!Array.isArray(parsed) || parsed.length !== 3) return null;
+        const [storedOwner, storedSpace, key] = parsed as unknown[];
+        if (storedOwner !== owner || storedSpace !== space) return null;
+        return typeof key === 'string' ? key : null;
+    } catch {
+        return null;
+    }
+}
 
 export class SafeLocalStorage {
+    readonly #owner: string;
+
+    constructor(owner: string) {
+        this.#owner = owner;
+    }
+
     getItem(key: string): string | null {
-        return localStorage.getItem(`safe_plugin_${key}`);
+        return localStorage.getItem(deviceKey(this.#owner, 'string', key));
     }
     setItem(key: string, value: string): void {
-        localStorage.setItem(`safe_plugin_${key}`, value);
+        localStorage.setItem(deviceKey(this.#owner, 'string', key), value);
     }
     removeItem(key: string): void {
-        localStorage.removeItem(`safe_plugin_${key}`);
+        localStorage.removeItem(deviceKey(this.#owner, 'string', key));
     }
     //not a standard localStorage method, but useful
     keys(): string[] {
         const keys: string[] = [];
         for (let i = 0; i < localStorage.length; i++) {
-            const key = localStorage.key(i);
-            if (key && key.startsWith('safe_plugin_')) {
-                keys.push(key.substring('safe_plugin_'.length));
-            }
+            const stored = localStorage.key(i);
+            const key = stored === null
+                ? null
+                : deviceKeyOwnerSpace(stored, this.#owner, 'string');
+            if (key !== null) keys.push(key);
         }
         return keys;
     }
@@ -44,21 +74,27 @@ export class SafeLocalStorage {
 
 export class SafeLocalPluginStorage {
     __classType = 'REMOTE_REQUIRED' as const;
+    readonly #owner: string;
+
+    constructor(owner: string) {
+        this.#owner = owner;
+    }
+
     async getItem<T>(key: string): Promise<T | null> {
-        return await pluginStorage.getItem<T>(`safe_plugin_${key}`);
+        return await pluginStorage.getItem<T>(deviceKey(this.#owner, 'json', key));
     }
     async setItem<T>(key: string, value: T): Promise<void> {
-        await pluginStorage.setItem(`safe_plugin_${key}`, value);
+        await pluginStorage.setItem(deviceKey(this.#owner, 'json', key), value);
     }
     async removeItem(key: string): Promise<void> {
-        await pluginStorage.removeItem(`safe_plugin_${key}`);
+        await pluginStorage.removeItem(deviceKey(this.#owner, 'json', key));
     }
     async keys(): Promise<string[]> {
         const keys: string[] = [];
-        await pluginStorage.iterate((value, key) => {
-            if (key.startsWith('safe_plugin_')) {
-                keys.push(key.substring('safe_plugin_'.length));
-            }
+        const owner = this.#owner;
+        await pluginStorage.iterate((value, stored) => {
+            const key = deviceKeyOwnerSpace(stored, owner, 'json');
+            if (key !== null) keys.push(key);
         });
         return keys;
     }

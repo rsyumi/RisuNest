@@ -61,7 +61,7 @@ import {
 import {
     notifyPluginStorageAuthorityReplacement,
     notifyPluginStorageCompatibilityMutation,
-    notifyPluginStorageCompatibilityOrder,
+    resolveLifecyclePluginStorageOwner,
 } from '../plugins/pluginStorageStore'
 import {
     applyPluginStorageMutationsInPlace,
@@ -105,17 +105,20 @@ export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapte
         },
         publishPluginStorageWorkingSet(storage) {
             getDatabase().pluginCustomStorage = storage
-            notifyPluginStorageAuthorityReplacement(storage)
+            notifyPluginStorageAuthorityReplacement()
         },
         publishPluginStorageMutations(mutations, keys) {
             const storage = (getDatabase().pluginCustomStorage ??= {})
-            applyPluginStorageMutationsInPlace(storage, mutations)
+            applyPluginStorageMutationsInPlace(
+                storage,
+                mutations,
+                resolveLifecyclePluginStorageOwner,
+            )
             const ordered = orderPluginStorageKeys(storage, keys)
             if (ordered !== storage) getDatabase().pluginCustomStorage = ordered
             for (const mutation of mutations) {
                 notifyPluginStorageCompatibilityMutation(mutation)
             }
-            notifyPluginStorageCompatibilityOrder(keys)
         },
         capturePresets() {
             return capturePersistentPresets(getDatabase())
@@ -148,11 +151,7 @@ export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapte
                 forceScalableProjection,
             ) ?? database
             setDatabase(replacement)
-            notifyPluginStorageAuthorityReplacement(
-                forceScalableProjection || isCatalogPresetWorkingSet(replacement.botPresets)
-                    ? null
-                    : replacement.pluginCustomStorage ?? {},
-            )
+            notifyPluginStorageAuthorityReplacement()
             restoreStableWorkingSetSelection(
                 replacement,
                 selectedCharacterId,
@@ -203,7 +202,7 @@ export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapte
         installCompleteDatabase(database) {
             workingSetResidency.clear()
             setDatabase(database)
-            notifyPluginStorageAuthorityReplacement(database.pluginCustomStorage ?? {})
+            notifyPluginStorageAuthorityReplacement()
         },
         restoreSelection(characterId, conversationId) {
             restoreStableWorkingSetSelection(

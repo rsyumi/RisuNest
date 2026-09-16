@@ -308,7 +308,7 @@ async function readPinnedPluginStorage(
     assertPinnedRevision(reader.revision, catalog.revision, 'Plugin storage catalog')
     const values: Database['pluginCustomStorage'] = {}
     for (const summary of catalog.items) {
-        const value = await reader.readPluginStorage(summary.key)
+        const value = await reader.readPluginStorage(summary.owner, summary.key)
         if (!value) throw new Error(`Missing plugin storage value for ${summary.key}`)
         assertPinnedRevision(
             reader.revision,

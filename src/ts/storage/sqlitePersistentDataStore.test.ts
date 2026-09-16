@@ -75,7 +75,7 @@ describe('SqlitePersistentDataStore', () => {
         await store.readConversationMetadata('char-a', 'conv-long')
         await store.readConversationWindow(windowQuery)
         await store.queryPluginStorage()
-        await store.readPluginStorage('memory')
+        await store.readPluginStorage('test-plugin', 'memory')
         await store.readAssetAlias({ kind: alias.kind, key: alias.key })
         await store.listAssetAliases({ kind: 'asset', limit: 2, cursor: 'alias-cursor' })
         await store.readAssetRepositoryAuthority()
@@ -108,7 +108,7 @@ describe('SqlitePersistentDataStore', () => {
             ],
             ['pds_read_conversation_window', { query: windowQuery }],
             ['pds_query_plugin_storage', {}],
-            ['pds_read_plugin_storage', { key: 'memory' }],
+            ['pds_read_plugin_storage', { owner: 'test-plugin', key: 'memory' }],
             ['pds_read_asset_alias', { kind: 'asset', key: alias.key }],
             [
                 'pds_list_asset_aliases',
@@ -499,7 +499,7 @@ describe('SqlitePersistentDataStore', () => {
             limit: 10,
         })
         await lease.queryPluginStorage()
-        await lease.readPluginStorage('memory')
+        await lease.readPluginStorage('test-plugin', 'memory')
         await lease.readAssetAlias({ kind: 'asset', key: 'assets/pinned.bin' })
         await lease.listAssetAliases({ kind: 'asset', limit: 2 })
         await lease.readAssetRepositoryAuthority()
@@ -543,7 +543,7 @@ describe('SqlitePersistentDataStore', () => {
                 },
             ],
             ['pds_query_plugin_storage', { lease: 'lease-7' }],
-            ['pds_read_plugin_storage', { key: 'memory', lease: 'lease-7' }],
+            ['pds_read_plugin_storage', { owner: 'test-plugin', key: 'memory', lease: 'lease-7' }],
             [
                 'pds_read_asset_alias',
                 { kind: 'asset', key: 'assets/pinned.bin', lease: 'lease-7' },

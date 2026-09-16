@@ -9,7 +9,7 @@ import {
 
 describe('logical record key codec', () => {
     it('preserves a leading U+FEFF as part of a logical identifier', () => {
-        const locator = { kind: 'plugin', storageKey: '\uFEFFplugin-key' } as const
+        const locator = { kind: 'plugin', owner: 'test-plugin', storageKey: '\uFEFFplugin-key' } as const
         const encoded = encodeLogicalRecordKey(locator)
 
         expect(encoded).not.toBe(encodeLogicalRecordKey({ ...locator, storageKey: 'plugin-key' }))

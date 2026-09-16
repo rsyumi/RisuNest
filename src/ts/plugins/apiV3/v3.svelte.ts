@@ -2,7 +2,7 @@ import { allowedDbKeys, applyPreparedPluginDatabaseUpdate, customProviderStore, 
 import { SandboxHost } from "./factory";
 import { getDatabase } from "src/ts/storage/database.svelte";
 import { isArchivedCharacter } from "src/ts/storage/workingSetCatalog";
-import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
+import { SafeLocalPluginStorage, SafeLocalStorage, tagWhitelist } from "../pluginSafeClass";
 import DOMPurify from 'dompurify';
 import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburgerMenu, additionalSettingsMenu, bodyIntercepterStore, chatPanelStore, DBState, selectedCharID, type MenuDef } from "src/ts/stores.svelte";
 import { v4 } from "uuid";
@@ -92,10 +92,15 @@ const documentEventListeners: Array<{
     listener: EventListenerOrEventListenerObject
     options: boolean | AddEventListenerOptions
 }> = [];
-let pluginDatabaseAccess: PluginDatabaseAccess | undefined
+// One access object per plugin. The owner is fixed here, so no call a plugin
+// makes can widen past its own rows.
+const pluginDatabaseAccessByOwner = new Map<string, PluginDatabaseAccess>()
 
-function getPluginDatabaseAccess(): PluginDatabaseAccess {
-    return (pluginDatabaseAccess ??= createProductionPluginDatabaseAccess({
+function getPluginDatabaseAccess(owner: string): PluginDatabaseAccess {
+    const existing = pluginDatabaseAccessByOwner.get(owner)
+    if (existing) return existing
+    const access = createProductionPluginDatabaseAccess({
+        owner,
         flushPendingData,
         getCompatibilityDatabase: () => DBState.db,
         getSelectedCharacterId: () =>
@@ -112,9 +117,10 @@ function getPluginDatabaseAccess(): PluginDatabaseAccess {
         getNavigationGeneration: getPersistentNavigationGeneration,
         applyCompatibilityDatabaseLite: (database) =>
             applyPreparedPluginDatabaseUpdate(database, true),
-        readPluginStorageSnapshot: () => pluginStorageStore.snapshot(),
-        mutatePluginStorage: (mutations) => pluginStorageStore.mutate(mutations),
-        invalidatePluginStorage: () => pluginStorageStore.invalidate(),
+        readPluginStorageSnapshot: () => pluginStorageStore.forOwner(owner).snapshot(),
+        mutatePluginStorage: (mutations) =>
+            pluginStorageStore.forOwner(owner).mutate(mutations),
+        invalidatePluginStorage: () => pluginStorageStore.invalidateOwner(owner),
         materializeDatabaseSnapshot: materializePersistentDatabaseSnapshotWithRevision,
         replacePersistentDatabase,
         prepareAuthoritativeDatabaseUpdate: async (database) => {
@@ -125,7 +131,9 @@ function getPluginDatabaseAccess(): PluginDatabaseAccess {
             }
         },
         snapshot: <T>(value: T) => $state.snapshot(value) as T,
-    }))
+    })
+    pluginDatabaseAccessByOwner.set(owner, access)
+    return access
 }
 
 class SafeElement {
@@ -741,15 +749,19 @@ function throwIfPluginReadAborted(signal: AbortSignal): void {
 const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
 
     const oldApis = getV2PluginAPIs();
+    // Every storage entry point below is bound to this plugin's name, which the
+    // host reads from the installed banner. The guest cannot reach the binding.
+    const ownedPluginStorage = pluginStorageStore.forOwner(plugin.name)
+    const ownedSafeLocalStorage = new SafeLocalStorage(plugin.name)
     const pluginLifetime = new AbortController()
     const fullObjectContext = (): PluginFullObjectCallContext => ({
         pluginName: plugin.name,
         signal: pluginLifetime.signal,
     })
     const getCompleteCurrentCharacter = () =>
-        getPluginDatabaseAccess().getCurrentCharacter(fullObjectContext())
+        getPluginDatabaseAccess(plugin.name).getCurrentCharacter(fullObjectContext())
     const setCompleteCurrentCharacter = (character: unknown) =>
-        getPluginDatabaseAccess().setCurrentCharacter(
+        getPluginDatabaseAccess(plugin.name).setCurrentCharacter(
             character as any,
             fullObjectContext(),
         )
@@ -853,9 +865,9 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             removeChatOutputListener(pluginV2.chatOutput, func as ChatOutputListener)
         },
         setDatabaseLite: (database: Record<string, unknown>) =>
-            getPluginDatabaseAccess().setDatabaseLite(database, allowedDbKeys),
+            getPluginDatabaseAccess(plugin.name).setDatabaseLite(database, allowedDbKeys),
         setDatabase: (database: Record<string, unknown>) =>
-            getPluginDatabaseAccess().setDatabase(database, allowedDbKeys),
+            getPluginDatabaseAccess(plugin.name).setDatabase(database, allowedDbKeys),
         loadPlugins: oldApis.loadPlugins,
         readImage: oldApis.readImage,
         readInlay: async (id: string) => {
@@ -872,15 +884,15 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             if(!conf){
                 return null;
             }
-            return getPluginDatabaseAccess().getDatabaseSnapshot(includeOnly, allowedDbKeys)
+            return getPluginDatabaseAccess(plugin.name).getDatabaseSnapshot(includeOnly, allowedDbKeys)
         },
         queryCharacters: async (input?: PluginCharacterQuery) => {
             const allowed = await getPluginPermission(plugin.name, 'db', 'periodically')
-            return allowed ? getPluginDatabaseAccess().queryCharacters(input) : null
+            return allowed ? getPluginDatabaseAccess(plugin.name).queryCharacters(input) : null
         },
         queryConversations: async (input: PluginConversationQuery) => {
             const allowed = await getPluginPermission(plugin.name, 'db', 'periodically')
-            return allowed ? getPluginDatabaseAccess().queryConversations(input) : null
+            return allowed ? getPluginDatabaseAccess(plugin.name).queryConversations(input) : null
         },
         queryConversationMessages: async (input: PluginConversationMessageQuery) => {
             const linked = linkPluginQueryAbortSignals(input.signal, pluginLifetime.signal)
@@ -889,7 +901,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                 const allowed = await getPluginPermission(plugin.name, 'db', 'periodically')
                 throwIfPluginReadAborted(linked.signal)
                 if (!allowed) return null
-                const result = await getPluginDatabaseAccess().queryConversationMessages({
+                const result = await getPluginDatabaseAccess(plugin.name).queryConversationMessages({
                     ...input,
                     signal: linked.signal,
                 })
@@ -989,24 +1001,24 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             }
         },
         getCharacterFromIndex: (index:number) => {
-            return getPluginDatabaseAccess().getCharacterFromIndex(index, fullObjectContext())
+            return getPluginDatabaseAccess(plugin.name).getCharacterFromIndex(index, fullObjectContext())
         },
         setCharacterToIndex: (index:number, char:any) => {
-            return getPluginDatabaseAccess().setCharacterToIndex(
+            return getPluginDatabaseAccess(plugin.name).setCharacterToIndex(
                 index,
                 char,
                 fullObjectContext(),
             )
         },
         getChatFromIndex: (characterIndex:number, chatIndex:number) => {
-            return getPluginDatabaseAccess().getChatFromIndex(
+            return getPluginDatabaseAccess(plugin.name).getChatFromIndex(
                 characterIndex,
                 chatIndex,
                 fullObjectContext(),
             )
         },
         setChatToIndex: (characterIndex:number, chatIndex:number, chat:any) => {
-            return getPluginDatabaseAccess().setChatToIndex(
+            return getPluginDatabaseAccess(plugin.name).setChatToIndex(
                 characterIndex,
                 chatIndex,
                 chat,
@@ -1332,7 +1344,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             }
         },
         getLocalPluginStorage: () => {
-            return new SafeLocalPluginStorage()
+            return new SafeLocalPluginStorage(plugin.name)
         },
         checkCharOrder: checkCharOrder,
         requestPluginPermission: (permission:string) => {
@@ -1379,20 +1391,22 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             
             return v;
         },
-        _getPluginStorage: pluginStorageStore.getItem,
-        _setPluginStorage: pluginStorageStore.setItem,
-        _removePluginStorage: pluginStorageStore.removeItem,
-        _clearPluginStorage: pluginStorageStore.clear,
-        _keyPluginStorage: pluginStorageStore.key,
-        _keysPluginStorage: pluginStorageStore.keys,
-        _lengthPluginStorage: pluginStorageStore.length,
-        _getSafeLocalStorage: oldApis.safeLocalStorage.getItem,
-        _setSafeLocalStorage: oldApis.safeLocalStorage.setItem,
-        _removeSafeLocalStorage: oldApis.safeLocalStorage.removeItem,
-        _clearSafeLocalStorage: oldApis.safeLocalStorage.clear,
-        _keySafeLocalStorage: oldApis.safeLocalStorage.key,
-        _keysSafeLocalStorage: oldApis.safeLocalStorage.keys,
-        _lengthSafeLocalStorage: () => oldApis.safeLocalStorage.length,
+        _getPluginStorage: (key: string) => ownedPluginStorage.getItem(key),
+        _setPluginStorage: (key: string, value: unknown) =>
+            ownedPluginStorage.setItem(key, value),
+        _removePluginStorage: (key: string) => ownedPluginStorage.removeItem(key),
+        _clearPluginStorage: () => ownedPluginStorage.clear(),
+        _keyPluginStorage: (index: number) => ownedPluginStorage.key(index),
+        _keysPluginStorage: () => ownedPluginStorage.keys(),
+        _lengthPluginStorage: () => ownedPluginStorage.length(),
+        _getSafeLocalStorage: (key: string) => ownedSafeLocalStorage.getItem(key),
+        _setSafeLocalStorage: (key: string, value: string) =>
+            ownedSafeLocalStorage.setItem(key, value),
+        _removeSafeLocalStorage: (key: string) => ownedSafeLocalStorage.removeItem(key),
+        _clearSafeLocalStorage: () => ownedSafeLocalStorage.clear(),
+        _keySafeLocalStorage: (index: number) => ownedSafeLocalStorage.key(index),
+        _keysSafeLocalStorage: () => ownedSafeLocalStorage.keys(),
+        _lengthSafeLocalStorage: () => ownedSafeLocalStorage.length,
         searchTranslationCache: async (partialKey: string) => {
             return searchLLMCache(partialKey)
         },

@@ -32,7 +32,7 @@ describe('PluginStorageCaptureCache', () => {
         storage.nested.count = 2
         expect(baseline.matches(cache.capture(storage))).toBe(false)
         expect(baseline.matches(capture)).toBe(true)
-        baseline.apply([{ type: 'set', key: 'nested', value: { count: 2 } }])
+        baseline.apply([{ type: 'set', owner: 'test-plugin', key: 'nested', value: { count: 2 } }])
         expect(baseline.matches(cache.capture(storage))).toBe(true)
         expect(baseline.json).toBe(pluginStorageJson(storage))
     })
@@ -239,7 +239,7 @@ describe('PluginStorageCaptureCache', () => {
         const matches: boolean[] = []
         for (let count = 1; count <= 10; count++) {
             storage.count = count
-            baseline.apply([{ type: 'set', key: 'count', value: count }])
+            baseline.apply([{ type: 'set', owner: 'test-plugin', key: 'count', value: count }])
             const capture = cache.capture(storage)
             matches.push(
                 baseline.matches({
@@ -275,11 +275,11 @@ describe('PluginStorageCaptureCache', () => {
         storage.z = { count: 1 }
         expect(baseline.matches(cache.capture(storage))).toBe(false)
         baseline.apply([
-            { type: 'delete', key: 'z' },
-            { type: 'set', key: 'z', value: { count: 1 } },
+            { type: 'delete', owner: 'test-plugin', key: 'z' },
+            { type: 'set', owner: 'test-plugin', key: 'z', value: { count: 1 } },
         ])
         expect(baseline.matches(cache.capture(storage))).toBe(true)
-        baseline.apply([{ type: 'set', key: '1', value: 'one' }])
+        baseline.apply([{ type: 'set', owner: 'test-plugin', key: '1', value: 'one' }])
         storage['1'] = 'one'
         expect(baseline.matches(cache.capture(storage))).toBe(true)
     })
@@ -290,12 +290,12 @@ describe('PluginStorageCaptureCache', () => {
         const original = cache.capture(storage)
         const baseline = new PluginStorageBaseline(original.json)
         expect(baseline.matches(original)).toBe(true)
-        baseline.apply([{ type: 'set', key: 'count', value: 2 }])
+        baseline.apply([{ type: 'set', owner: 'test-plugin', key: 'count', value: 2 }])
         expect(baseline.matches(original)).toBe(false)
         storage.count = 2
         const changed = cache.capture(storage)
         expect(baseline.matches(changed)).toBe(true)
-        baseline.apply([{ type: 'set', key: 'count', value: 1 }])
+        baseline.apply([{ type: 'set', owner: 'test-plugin', key: 'count', value: 1 }])
         expect(baseline.matches(changed)).toBe(false)
         expect(baseline.matches(original)).toBe(true)
         expect(baseline.json).toBe(original.json)

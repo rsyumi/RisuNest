@@ -1,3 +1,4 @@
+import { UNOWNED_PLUGIN_OWNER } from '../plugins/pluginOwner'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 
@@ -121,7 +122,7 @@ describe('authoritative restore plugin initialization', () => {
         expect(isCatalogCharacterStub(getDatabase().characters[0])).toBe(true)
         let observed: unknown
         vi.mocked(loadV3Plugins).mockImplementationOnce(async () => {
-            observed = await pluginStorageStore.getItem('pm_store')
+            observed = await pluginStorageStore.forOwner(UNOWNED_PLUGIN_OWNER).getItem('pm_store')
         })
         await loadPluginsAfterAuthoritativeRestore()
         expect(observed).toEqual({
@@ -129,7 +130,7 @@ describe('authoritative restore plugin initialization', () => {
             models: [{ id: 'restored' }],
             keys: [],
         })
-        expect((await store.readPluginStorage('pm_store'))?.value).toEqual(
+        expect((await store.readPluginStorage(UNOWNED_PLUGIN_OWNER, 'pm_store'))?.value).toEqual(
             restored.pluginCustomStorage.pm_store,
         )
         expect(materialize).not.toHaveBeenCalled()

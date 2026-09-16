@@ -19,8 +19,21 @@ export interface PersistentConversationMetadata {
 export type PersistentRoot = Omit<Database, 'characters' | 'botPresets' | 'pluginCustomStorage'>
 
 export interface PluginStorageSummary {
+    owner: string
     key: string
     byteSize: number
+}
+
+/** What the plugin data screen lists. Values are fetched one at a time. */
+export interface PluginStorageListItem {
+    owner: string
+    key: string
+    space?: 'string' | 'json'
+    valueType: 'string' | 'json'
+    byteSize: number
+    claimedFrom?: string
+    importBatchId?: string
+    assignedAt?: number
 }
 
 export interface PluginStorageCatalog {
@@ -285,9 +298,9 @@ export function validateAssetAliasKeyBatch(kind: AssetAliasKind, keys: string[])
 }
 
 export type PluginStorageMutation =
-    | { type: 'set'; key: string; value: unknown }
-    | { type: 'delete'; key: string }
-    | { type: 'clear' }
+    | { type: 'set'; owner: string; key: string; value: unknown }
+    | { type: 'delete'; owner: string; key: string }
+    | { type: 'clear'; owner: string }
 
 /// What the list needs about an archived character. The stored object and the
 /// asset hashes it holds stay inside the store.
@@ -507,7 +520,7 @@ export interface PersistentRevisionReader {
         input: ConversationWindowQuery,
     ): Promise<Versioned<ConversationWindow> | null>
     queryPluginStorage(): Promise<PluginStorageCatalog>
-    readPluginStorage(key: string): Promise<Versioned<unknown> | null>
+    readPluginStorage(owner: string, key: string): Promise<Versioned<unknown> | null>
     readAssetAlias(identity: AssetAliasIdentity): Promise<Versioned<AssetAlias> | null>
     readAssetAliasesByKeys(kind: AssetAliasKind, keys: string[]): Promise<Versioned<AssetAlias[]>>
     listAssetAliases(query: AssetAliasListQuery): Promise<AssetAliasPage>
@@ -539,7 +552,9 @@ export interface PersistentDataStore {
         input: ConversationWindowQuery,
     ): Promise<Versioned<ConversationWindow> | null>
     queryPluginStorage(): Promise<PluginStorageCatalog>
-    readPluginStorage(key: string): Promise<Versioned<unknown> | null>
+    readPluginStorage(owner: string, key: string): Promise<Versioned<unknown> | null>
+    /** Sizes and ownership only. Values stay in the store until one is opened. */
+    listPluginStorage(): Promise<PluginStorageListItem[]>
     readAssetAlias(identity: AssetAliasIdentity): Promise<Versioned<AssetAlias> | null>
     readAssetAliasesByKeys(kind: AssetAliasKind, keys: string[]): Promise<Versioned<AssetAlias[]>>
     listAssetAliases(query: AssetAliasListQuery): Promise<AssetAliasPage>

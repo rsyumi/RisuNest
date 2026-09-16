@@ -475,7 +475,7 @@ export async function scanPinnedBackupRecords(
         const pluginStorage = await reader.queryPluginStorage()
         assertPinnedRevision(reader.revision, pluginStorage.revision, 'Plugin storage catalog')
         for (const summary of pluginStorage.items) {
-            const value = await reader.readPluginStorage(summary.key)
+            const value = await reader.readPluginStorage(summary.owner, summary.key)
             if (!value) throw new Error(`Missing plugin storage value for ${summary.key}`)
             assertPinnedRevision(
                 reader.revision,

@@ -56,7 +56,11 @@ export function rebasePluginMutationPublication(
         rebased,
     ).flatMap((mutation): PluginStorageMutation[] =>
         mutation.type === 'clear'
-            ? Object.keys(candidate).map((key) => ({ type: 'delete', key }))
+            ? Object.keys(candidate).map((key): PluginStorageMutation => ({
+              type: 'delete',
+              owner: mutation.owner,
+              key,
+          }))
             : [mutation],
     )
     const publication = [...mutations, ...laterChanges]

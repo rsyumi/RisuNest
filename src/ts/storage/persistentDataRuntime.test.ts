@@ -1,3 +1,4 @@
+import { UNOWNED_PLUGIN_OWNER } from '../plugins/pluginOwner'
 import { describe, expect, it, vi } from 'vitest'
 import type { Database } from './database.svelte'
 import {
@@ -189,9 +190,13 @@ function makeDatabaseLease(database: Database, revision: number): PersistentRevi
         readConversationWindow: vi.fn(async () => null),
         queryPluginStorage: vi.fn(async () => ({
             revision,
-            items: Object.keys(pluginCustomStorage).map((key) => ({ key, byteSize: 0 })),
+            items: Object.keys(pluginCustomStorage).map((key) => ({
+                owner: UNOWNED_PLUGIN_OWNER,
+                key,
+                byteSize: 0,
+            })),
         })),
-        readPluginStorage: vi.fn(async (key) => Object.hasOwn(pluginCustomStorage, key)
+        readPluginStorage: vi.fn(async (_owner, key) => Object.hasOwn(pluginCustomStorage, key)
             ? { revision, value: structuredClone(pluginCustomStorage[key]) }
             : null),
         readAssetAlias: vi.fn(async () => null),
@@ -1545,6 +1550,7 @@ describe('native replacement working-set refresh', () => {
                 rootMutations: [
                     {
                         type: 'set',
+                       
                         key: 'username',
                         value: 'Edit landed while the fence was flushing',
                     },

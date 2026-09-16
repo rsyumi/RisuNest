@@ -1353,12 +1353,13 @@ export class SaveCoordinator {
             const revision = this.revision
             const baseline = this.pluginStorageBaselineEntries
             const committedMutations = mutations.map((mutation): PluginStorageMutation => {
-                if (mutation.type === 'clear') return { type: 'clear' }
+                if (mutation.type === 'clear') return { type: 'clear', owner: mutation.owner }
                 if (mutation.type === 'delete' || mutation.value === undefined) {
-                    return { type: 'delete', key: mutation.key }
+                    return { type: 'delete', owner: mutation.owner, key: mutation.key }
                 }
                 return {
                     type: 'set',
+                    owner: mutation.owner,
                     key: mutation.key,
                     value: canonicalClone(mutation.value),
                 }

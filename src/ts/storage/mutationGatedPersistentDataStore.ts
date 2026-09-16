@@ -46,7 +46,8 @@ export function createMutationGatedPersistentDataStore(
             input: ConversationWindowQuery,
         ): Promise<Versioned<ConversationWindow> | null> => store.readConversationWindow(input),
         queryPluginStorage: () => store.queryPluginStorage(),
-        readPluginStorage: (key: string) => store.readPluginStorage(key),
+        readPluginStorage: (owner: string, key: string) => store.readPluginStorage(owner, key),
+        listPluginStorage: () => store.listPluginStorage(),
         readAssetAlias: (identity: AssetAliasIdentity) => store.readAssetAlias(identity),
         readAssetAliasesByKeys: (kind: AssetAliasKind, keys: string[]) =>
             store.readAssetAliasesByKeys(kind, keys),

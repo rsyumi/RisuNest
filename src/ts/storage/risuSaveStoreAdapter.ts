@@ -19,6 +19,8 @@ import {
     releasePersistentRevisionLease,
 } from './persistentRecordIterator'
 import { defineOwnEnumerableProperty } from './ownEnumerableProperty'
+import type { PluginStorageMeta } from '../plugins/pluginOwner'
+import { isUnownedPluginOwner } from '../plugins/pluginOwner'
 import {
     replaceCharacterResources,
     replaceDatabaseRootResources,
@@ -79,14 +81,27 @@ async function presetValues(reader: PersistentRevisionReader): Promise<Database[
     return presets
 }
 
+/**
+ * Upstream saves hold one value per key. A key two plugins both hold cannot be
+ * written without handing one plugin the other's value, so neither side goes
+ * out. The sidecar carries ownership back when RisuNest reads the file again.
+ */
 async function pluginStorageValues(
     reader: PersistentRevisionReader,
-): Promise<Database['pluginCustomStorage']> {
+): Promise<{ storage: Database['pluginCustomStorage']; meta: PluginStorageMeta }> {
     const storage: Database['pluginCustomStorage'] = {}
+    const meta: PluginStorageMeta = {}
     const catalog = await reader.queryPluginStorage()
     assertPinnedRevision(reader.revision, catalog.revision, 'Plugin storage catalog')
+    const owners = new Map<string, Set<string>>()
     for (const summary of catalog.items) {
-        const value = await reader.readPluginStorage(summary.key)
+        const holders = owners.get(summary.key) ?? new Set<string>()
+        holders.add(summary.owner)
+        owners.set(summary.key, holders)
+    }
+    for (const summary of catalog.items) {
+        if ((owners.get(summary.key)?.size ?? 0) > 1) continue
+        const value = await reader.readPluginStorage(summary.owner, summary.key)
         if (!value) throw new Error(`Missing plugin storage value for ${summary.key}`)
         assertPinnedRevision(
             reader.revision,
@@ -94,8 +109,11 @@ async function pluginStorageValues(
             `Plugin storage value ${summary.key}`,
         )
         defineOwnEnumerableProperty(storage, summary.key, value.value)
+        if (!isUnownedPluginOwner(summary.owner)) {
+            meta[summary.key] = { plugin: summary.owner, updatedAt: 0 }
+        }
     }
-    return storage
+    return { storage, meta }
 }
 
 export async function* streamRisuSaveFromLease(
@@ -110,7 +128,10 @@ export async function* streamRisuSaveFromLease(
     const rootWithPresets = {
         ...storedRoot,
         botPresets: storedPresets,
-        pluginCustomStorage: storedPluginStorage,
+        pluginCustomStorage: storedPluginStorage.storage,
+        ...(Object.keys(storedPluginStorage.meta).length > 0
+            ? { pluginStorageMeta: storedPluginStorage.meta }
+            : {}),
     } as Database
     const root = options?.replaceResources
         ? replaceDatabaseRootResources(rootWithPresets, options.replaceResources)
@@ -211,7 +232,7 @@ async function materializeDatabaseFromLease(
     assertPinnedRevision(reader.revision, rootRecord.revision, 'Root')
     const root = rootRecord.value
     const botPresets = await presetValues(reader)
-    const pluginCustomStorage = await pluginStorageValues(reader)
+    const { storage: pluginCustomStorage } = await pluginStorageValues(reader)
     const characters: Database['characters'] = []
     for await (const character of characterValues(reader)) {
         characters.push(character)
