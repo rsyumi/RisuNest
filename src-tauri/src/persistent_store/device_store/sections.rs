@@ -82,7 +82,7 @@ impl SectionValueRow {
             _ => self == other,
         }
     }
-    fn first_published(&self) -> Option<&TombstonePublication> {
+    pub(crate) fn first_published(&self) -> Option<&TombstonePublication> {
         match self {
             Self::Tombstone { first_published } => first_published.as_ref(),
             _ => None,
@@ -444,11 +444,42 @@ impl DeviceStore {
         published: &[(SectionKey, Sequence)],
         stamped: &[(SectionKey, Sequence)],
         first_published: &TombstonePublication,
+        reclaimed: &BTreeSet<SectionKey>,
+        gc_floor: &Sequence,
     ) -> StoreResult<()> {
-        if published.is_empty() && stamped.is_empty() {
+        if published.is_empty() && stamped.is_empty() && reclaimed.is_empty() {
             return Ok(());
         }
         let transaction = self.transaction()?;
+        // The removals this publication stopped carrying go with the floor it
+        // published, in the transaction that records the publication, so a
+        // publication that never finished reclaims nothing.
+        for (key1, key2, key3) in reclaimed {
+            match section {
+                Section::Hypa => {
+                    transaction
+                        .execute("DELETE FROM hypa_embeddings WHERE cache_key=?1", [key1])?;
+                }
+                Section::LocalPlugins => {
+                    transaction.execute(
+                        "DELETE FROM plugin_device_storage
+                            WHERE owner=?1 AND space=?2 AND key=?3",
+                        params![key1, key2, key3],
+                    )?;
+                }
+            }
+        }
+        let current = sequence(&transaction.query_row(
+            "SELECT gc_floor FROM device_sections WHERE section=?1",
+            [section.as_str()],
+            |row| row.get::<_, String>(0),
+        )?)?;
+        if *gc_floor > current {
+            transaction.execute(
+                "UPDATE device_sections SET gc_floor=?1 WHERE section=?2",
+                params![gc_floor.as_str(), section.as_str()],
+            )?;
+        }
         // A removal takes the marker the publication carried, so the device
         // file and every remote that read it name the same commit. A removal
         // rewritten since the capture is not the one that went out.
@@ -768,6 +799,22 @@ impl DeviceStore {
                 merged.applied_gc_floor.as_str(),
                 merged.observed_max_write_clock.as_str()
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets how far one lineage has been applied, so the section goes back
+    /// through the rejoin path before this device publishes over it again.
+    pub(crate) fn forget_section_cursor(
+        &mut self,
+        connection_id: &str,
+        library_lineage: &str,
+        section: Section,
+    ) -> StoreResult<()> {
+        self.connection.execute(
+            "DELETE FROM device_remote_cursors
+                WHERE connection_id=?1 AND library_lineage=?2 AND section=?3",
+            params![connection_id, library_lineage, section.as_str()],
         )?;
         Ok(())
     }

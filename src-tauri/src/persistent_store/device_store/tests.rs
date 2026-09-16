@@ -1090,6 +1090,7 @@ mod section_exchange {
         SectionCursor, SectionKey, SectionRow, SectionValueRow, TombstonePublication,
         LOCAL_SETTING_KEYS,
     };
+    use std::collections::BTreeSet;
     use super::super::{plugin_values::PluginDeviceMutation, DeviceStore, Section};
     use super::open;
     use risunest_sync_wire::Sequence;
@@ -1704,7 +1705,14 @@ mod section_exchange {
             .collect();
         set(&mut store, "late", "after the capture");
         store
-            .note_section_published(Section::LocalPlugins, &captured, &[], &marker(7, 1_760_000_000_000))
+            .note_section_published(
+                Section::LocalPlugins,
+                &captured,
+                &[],
+                &marker(7, 1_760_000_000_000),
+                &BTreeSet::new(),
+                &Sequence::from(0u64),
+            )
             .expect("record the confirmed publication");
         assert!(store
             .sections_await_publication("connection", "library")
@@ -1717,7 +1725,14 @@ mod section_exchange {
             .map(|row| (row.key(), row.write_clock))
             .collect();
         store
-            .note_section_published(Section::LocalPlugins, &captured, &[], &marker(7, 1_760_000_000_000))
+            .note_section_published(
+                Section::LocalPlugins,
+                &captured,
+                &[],
+                &marker(7, 1_760_000_000_000),
+                &BTreeSet::new(),
+                &Sequence::from(0u64),
+            )
             .expect("record the second publication");
         assert!(!store
             .sections_await_publication("connection", "library")
@@ -1745,7 +1760,14 @@ mod section_exchange {
             .map(|row| (row.key(), row.write_clock))
             .collect();
         store
-            .note_section_published(Section::LocalPlugins, &captured, &[], &marker(7, 1_760_000_000_000))
+            .note_section_published(
+                Section::LocalPlugins,
+                &captured,
+                &[],
+                &marker(7, 1_760_000_000_000),
+                &BTreeSet::new(),
+                &Sequence::from(0u64),
+            )
             .unwrap();
         store
             .write_section_cursor(

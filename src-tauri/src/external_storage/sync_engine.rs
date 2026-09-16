@@ -435,11 +435,23 @@ async fn package_capture(
         let worker_spool = directory.join("sections");
         let worker_generation = generation.clone();
         let worker_cancel = cancel.clone();
+        // The sections the observed state carries say which removals the remote
+        // still holds and how far it has reclaimed, which is what decides both
+        // whether this device may publish an increment and what it may drop.
+        let worker_parent = parent
+            .as_ref()
+            .map(|view| view.sections.clone())
+            .unwrap_or_default();
+        let worker_connection = job.request.connection_id.clone();
+        let worker_lineage = identity.library_epoch.clone();
         tokio::task::spawn_blocking(move || -> Result<_> {
             let mut store = pds(&worker_app)?;
             super::sections::capture_state_sections(
                 &mut store,
                 &worker_generation,
+                &worker_parent,
+                &worker_connection,
+                &worker_lineage,
                 &worker_spool,
                 &worker_cancel,
             )
@@ -618,6 +630,8 @@ fn note_sections_published(
                 &publication.published,
                 &publication.stamped,
                 &publication.first_published,
+                &publication.reclaimed,
+                &publication.gc_floor,
             )
             .map_err(local_error)?;
     }
