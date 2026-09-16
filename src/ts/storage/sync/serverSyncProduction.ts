@@ -67,7 +67,10 @@ let activeScheduler: ReturnType<typeof createServerSyncScheduler> | undefined;
  * scheduler when it settles; restoring a library deliberately does not do this. */
 export function resumeServerSyncAfterBackup(): void {
   activeScheduler?.resume();
-  if (activeScheduler) cleanupDeletedBackups();
+  if (activeScheduler) {
+    cleanupDeletedBackups();
+    void invoke("server_sync_events_start").catch(() => {});
+  }
 }
 export interface ServerSyncBackup {
   id: string;
@@ -154,6 +157,14 @@ export async function restoreServerSyncBackup(
     if (lease) await invoke<void>("server_sync_backup_release", { lease });
   }
 }
+/** Notifications and polling stop together: neither runs while the app is not
+ * in a state to act on them. */
+function suspendServerSync(
+  scheduler: ReturnType<typeof createServerSyncScheduler>,
+): void {
+  scheduler.suspend();
+  void invoke("server_sync_events_stop").catch(() => {});
+}
 export function startServerSync(): void {
   if (started || !isTauri) return;
   started = true;
@@ -174,14 +185,15 @@ export function startServerSync(): void {
         controller.invalidateCompletion();
         scheduler.localCommit();
       },
+      remoteHint: () => scheduler.remoteHint(),
     },
     (event, handler) => listen(event, handler),
   );
   void controller.initialize().then(() => resumeServerSyncAfterBackup());
   window.addEventListener("online", () => resumeServerSyncAfterBackup());
-  window.addEventListener("offline", () => scheduler.suspend());
+  window.addEventListener("offline", () => suspendServerSync(scheduler));
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") scheduler.suspend();
+    if (document.visibilityState === "hidden") suspendServerSync(scheduler);
     else resumeServerSyncAfterBackup();
   });
 }

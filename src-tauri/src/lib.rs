@@ -659,6 +659,7 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         .manage(persistent_store::PersistentStoreState::default())
         .manage(persistent_store::commands::data_health::DataHealthState::default())
         .manage(server_sync::commands::ServerSyncCommandState::default())
+        .manage(server_sync::events::ServerSyncEventsState::default())
         .manage(external_storage::connection_commands::ConnectionCommandState::default())
         .manage(external_storage::job_store::JobCommandState::default())
         .manage(external_storage::runtime_restore::RuntimeRestoreState::default())
@@ -935,6 +936,8 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         persistent_store::commands::pds_working_set_change_window,
         persistent_store::commands::pds_working_set_change_page,
         persistent_store::commands::pds_commit_working_set_change_cursor,
+        server_sync::events::server_sync_events_start,
+        server_sync::events::server_sync_events_stop,
     ]
 }
 

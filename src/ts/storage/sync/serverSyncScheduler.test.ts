@@ -142,6 +142,45 @@ describe("server sync scheduler", () => {
     expect(f.cycle).toHaveBeenCalledTimes(6);
     f.scheduler.stop();
   });
+  it("reaches the same state from polling alone when no notification arrives", async () => {
+    const hinted = fixture();
+    const silent = fixture();
+    await hinted.controller.initialize();
+    await silent.controller.initialize();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(hinted.cycle).toHaveBeenCalledTimes(1);
+    expect(silent.cycle).toHaveBeenCalledTimes(1);
+    // One side is told the remote moved; the other is told nothing at all.
+    hinted.scheduler.remoteHint();
+    await vi.advanceTimersByTimeAsync(250);
+    expect(hinted.cycle).toHaveBeenCalledTimes(2);
+    expect(silent.cycle).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(silent.cycle).toHaveBeenCalledTimes(2);
+    expect(hinted.controller.snapshot().result).toEqual(
+      silent.controller.snapshot().result,
+    );
+    hinted.scheduler.stop();
+    silent.scheduler.stop();
+  });
+  it("coalesces repeated notifications and keeps a failing connection backed off", async () => {
+    const f = fixture();
+    await f.controller.initialize();
+    await vi.advanceTimersByTimeAsync(0);
+    for (let i = 0; i < 10; i += 1) f.scheduler.remoteHint();
+    await vi.advanceTimersByTimeAsync(250);
+    expect(f.cycle).toHaveBeenCalledTimes(2);
+    f.cycle.mockRejectedValue({ code: "server-unreachable" });
+    f.scheduler.remoteHint();
+    await vi.advanceTimersByTimeAsync(250);
+    expect(f.cycle).toHaveBeenCalledTimes(3);
+    f.scheduler.remoteHint();
+    await vi.advanceTimersByTimeAsync(999);
+    expect(f.cycle).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(f.cycle).toHaveBeenCalledTimes(4);
+    f.scheduler.stop();
+  });
   it("does no background work and resumes immediately while preserving manual pause", async () => {
     const f = fixture();
     await f.controller.initialize();
