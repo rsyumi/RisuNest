@@ -1676,8 +1676,12 @@ mod tests {
             journal::JobIdentity,
             snapshot_restore,
         },
-        persistent_store::{content_capture::ContentCaptureSink, sync_selection::CaptureIdentity},
+        persistent_store::{
+            content_capture::ContentCaptureSink, device_store::sections::SectionRow,
+            sync_selection::CaptureIdentity,
+        },
     };
+    use risunest_external_storage_format::section::SectionKind;
 
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
@@ -1844,6 +1848,279 @@ mod tests {
             sdk_overhead_bytes: 0,
             target_plaintext_bytes: max,
         }
+    }
+
+    fn section_rows(kind: SectionKind, marker: &str) -> Vec<SectionRow> {
+        use crate::persistent_store::device_store::sections::SectionValueRow;
+        match kind {
+            SectionKind::Hypa => vec![SectionRow {
+                key1: "a".repeat(64),
+                key2: String::new(),
+                key3: String::new(),
+                value: SectionValueRow::Hypa {
+                    producer: "hypa-v2".into(),
+                    model: marker.into(),
+                    endpoint: None,
+                    preprocess_version: 1,
+                    dimensions: 4,
+                    vector: vec![1u8; 16],
+                    metadata: None,
+                },
+                write_clock: risunest_sync_wire::head::Sequence::from(5u64),
+                writer_id: "writer-a".into(),
+            }],
+            _ => vec![SectionRow {
+                key1: "plugin-a".into(),
+                key2: "string".into(),
+                key3: "token".into(),
+                value: SectionValueRow::Plugin {
+                    space: "string".into(),
+                    value: marker.into(),
+                },
+                write_clock: risunest_sync_wire::head::Sequence::from(6u64),
+                writer_id: "writer-a".into(),
+            }],
+        }
+    }
+
+    fn section(
+        spool: &Path,
+        kind: SectionKind,
+        marker: &str,
+        generation: u64,
+    ) -> CapturedSection {
+        crate::external_storage::sections::capture_section(
+            kind,
+            &section_rows(kind, marker),
+            true,
+            risunest_sync_wire::head::Sequence::from(generation),
+            risunest_sync_wire::head::Sequence::from(0u64),
+            risunest_sync_wire::head::Sequence::from(6u64),
+            &spool.join(format!("{}-{marker}", kind.id())),
+            &Cancellation::default(),
+        )
+        .unwrap()
+    }
+
+    /// Invariants 17, 30 and 33. A publication that does not carry a section
+    /// keeps the reference the observed state had, including the commit number
+    /// that named the publication which last changed it, and that inherited
+    /// catalog is still readable from the newest state.
+    #[test]
+    fn a_section_this_publication_did_not_capture_keeps_the_reference_it_inherited() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let cache = root.path().join("package-cache");
+            let spool = root.path().join("section-spool");
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [9; 32];
+            let publish = |id: &'static str,
+                           revision: i64,
+                           generation: u64,
+                           carried: Vec<CapturedSection>,
+                           inherited: BTreeMap<String, wire::SectionSnapshotRef>| {
+                let cache = cache.clone();
+                let provider = &provider;
+                let repository = &repository;
+                let root = root.path().to_path_buf();
+                async move {
+                    let (capture, _) =
+                        captured(&root, &format!("capture-{id}"), revision, b"record", b"asset");
+                    let mut snapshot_metadata = metadata(id, &capture);
+                    snapshot_metadata.purpose = SnapshotPurpose::SyncState {
+                        epoch: "epoch".into(),
+                        generation: risunest_sync_wire::head::Sequence::from(generation),
+                        parent_sections: inherited,
+                    };
+                    let mut transfer = journal(&root.join(id), id, &capture);
+                    package_and_upload(
+                        capture,
+                        carried,
+                        &root,
+                        &cache,
+                        snapshot_metadata,
+                        &key,
+                        limits(256 * 1024),
+                        &mut transfer,
+                        provider,
+                        repository,
+                        &Cancellation::default(),
+                    )
+                    .await
+                    .unwrap()
+                }
+            };
+            let first = publish(
+                "state-1",
+                1,
+                1,
+                vec![
+                    section(&spool, SectionKind::Hypa, "first", 1),
+                    section(&spool, SectionKind::LocalPlugins, "first", 1),
+                ],
+                BTreeMap::new(),
+            )
+            .await;
+            assert_eq!(first.sections.len(), 2);
+
+            // Only the embeddings changed, so the plugin reference has to come
+            // through untouched, commit number included.
+            let second = publish(
+                "state-2",
+                2,
+                2,
+                vec![section(&spool, SectionKind::Hypa, "second", 2)],
+                first.sections.clone(),
+            )
+            .await;
+            assert_eq!(
+                second.sections["local-plugins"],
+                first.sections["local-plugins"]
+            );
+            assert_ne!(second.sections["hypa"], first.sections["hypa"]);
+            assert_eq!(
+                second.sections["hypa"].generation,
+                risunest_sync_wire::head::Sequence::from(2u64)
+            );
+
+            // Republishing the same embeddings keeps the earlier commit number,
+            // because nothing about that section changed.
+            let third = publish(
+                "state-3",
+                3,
+                3,
+                vec![section(&spool, SectionKind::Hypa, "second", 3)],
+                second.sections.clone(),
+            )
+            .await;
+            assert_eq!(third.sections, second.sections);
+
+            // A library-only publication leaves both references in place and
+            // the inherited catalogs still read back.
+            let fourth = publish("state-4", 4, 4, Vec::new(), third.sections.clone()).await;
+            assert_eq!(fourth.sections, third.sections);
+            let staging = root.path().join("receive");
+            let received = snapshot_restore::download_sections(
+                &fourth.reference,
+                &BTreeSet::from(["local-plugins".to_owned()]),
+                &staging,
+                &key,
+                &provider,
+                &repository,
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(received.len(), 1);
+            let rows = crate::external_storage::sections::decode_section(
+                SectionKind::LocalPlugins,
+                &received[0].entries,
+                &received[0].content_fingerprint,
+            )
+            .unwrap();
+            assert_eq!(rows, section_rows(SectionKind::LocalPlugins, "first"));
+        });
+    }
+
+    /// Invariant 32. Two devices produce separate bundles. Neither carries the
+    /// other's section material and nothing is merged between them.
+    #[test]
+    fn two_devices_keep_separate_backup_bundles() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let cache = root.path().join("package-cache");
+            let spool = root.path().join("section-spool");
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [11; 32];
+            let bundle = |id: &'static str, writer: &'static str, marker: &'static str| {
+                let cache = cache.clone();
+                let spool = spool.clone();
+                let provider = &provider;
+                let repository = &repository;
+                let root = root.path().to_path_buf();
+                async move {
+                    let (capture, _) =
+                        captured(&root, &format!("capture-{id}"), 1, b"record", b"asset");
+                    let mut snapshot_metadata = metadata(id, &capture);
+                    snapshot_metadata.purpose = SnapshotPurpose::BackupBundle {
+                        source: wire_control::BundleSource::Device {
+                            writer_id: writer.into(),
+                        },
+                        remote_generation: None,
+                    };
+                    let mut transfer = journal(&root.join(id), id, &capture);
+                    package_and_upload(
+                        capture,
+                        vec![section(&spool, SectionKind::LocalPlugins, marker, 0)],
+                        &root,
+                        &cache,
+                        snapshot_metadata,
+                        &key,
+                        limits(256 * 1024),
+                        &mut transfer,
+                        provider,
+                        repository,
+                        &Cancellation::default(),
+                    )
+                    .await
+                    .unwrap()
+                }
+            };
+            let mine = bundle("bundle-1", "writer-a", "mine").await;
+            let theirs = bundle("bundle-2", "writer-b", "theirs").await;
+            assert_eq!(mine.sections.keys().collect::<Vec<_>>(), ["local-plugins"]);
+            assert_eq!(theirs.sections.keys().collect::<Vec<_>>(), ["local-plugins"]);
+            assert_ne!(
+                mine.sections["local-plugins"].content_fingerprint,
+                theirs.sections["local-plugins"].content_fingerprint
+            );
+            assert_ne!(mine.fingerprint, theirs.fingerprint);
+
+            for (completed, marker) in [(&mine, "mine"), (&theirs, "theirs")] {
+                let received = snapshot_restore::download_sections(
+                    &completed.reference,
+                    &BTreeSet::from(["local-plugins".to_owned()]),
+                    &root.path().join(format!("receive-{marker}")),
+                    &key,
+                    &provider,
+                    &repository,
+                    &Cancellation::default(),
+                )
+                .await
+                .unwrap();
+                let rows = crate::external_storage::sections::decode_section(
+                    SectionKind::LocalPlugins,
+                    &received[0].entries,
+                    &received[0].content_fingerprint,
+                )
+                .unwrap();
+                assert_eq!(rows, section_rows(SectionKind::LocalPlugins, marker));
+            }
+        });
+    }
+
+    /// Invariant 36. A cancelled capture stops where it is and publishes
+    /// nothing, so no half-written section reaches a repository.
+    #[test]
+    fn a_cancelled_section_capture_publishes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let cancel = Cancellation::default();
+        cancel.cancel();
+        let spool = root.path().join("cancelled");
+        assert!(crate::external_storage::sections::capture_section(
+            SectionKind::Hypa,
+            &section_rows(SectionKind::Hypa, "stopped"),
+            true,
+            risunest_sync_wire::head::Sequence::from(1u64),
+            risunest_sync_wire::head::Sequence::from(0u64),
+            risunest_sync_wire::head::Sequence::from(5u64),
+            &spool,
+            &cancel,
+        )
+        .is_err());
+        assert!(!spool.exists());
     }
 
     #[test]

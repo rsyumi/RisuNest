@@ -1084,3 +1084,297 @@ fn a_committed_device_value_survives_reopening_the_device_file() {
     );
 }
 
+
+mod section_exchange {
+    use super::super::sections::{SectionCursor, SectionRow, SectionValueRow, LOCAL_SETTING_KEYS};
+    use super::super::{plugin_values::PluginDeviceMutation, DeviceStore, Section};
+    use super::open;
+    use risunest_sync_wire::Sequence;
+
+    fn plugin_row(key: &str, value: &str, clock: u64, writer: &str) -> SectionRow {
+        SectionRow {
+            key1: "plugin-a".into(),
+            key2: "string".into(),
+            key3: key.into(),
+            value: SectionValueRow::Plugin {
+                space: "string".into(),
+                value: value.into(),
+            },
+            write_clock: Sequence::from(clock),
+            writer_id: writer.into(),
+        }
+    }
+
+    fn plugin_tombstone(key: &str, clock: u64, writer: &str) -> SectionRow {
+        SectionRow {
+            value: SectionValueRow::Tombstone,
+            ..plugin_row(key, "", clock, writer)
+        }
+    }
+
+    fn set(store: &mut DeviceStore, key: &str, value: &str) {
+        store
+            .write_plugin_device_values(
+                "plugin-a",
+                &[PluginDeviceMutation::Set {
+                    space: "string".to_owned(),
+                    key: key.to_owned(),
+                    value: value.to_owned(),
+                }],
+            )
+            .expect("write plugin value");
+    }
+
+    fn live(store: &mut DeviceStore) -> Vec<(String, Option<String>)> {
+        store
+            .read_section_rows(Section::LocalPlugins)
+            .expect("read section rows")
+            .into_iter()
+            .map(|row| {
+                (
+                    row.key3,
+                    match row.value {
+                        SectionValueRow::Plugin { value, .. } => Some(value),
+                        _ => None,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Invariant 2. A received row is remote material: it keeps the version it
+    /// arrived with, counts as published, and a section this device does not
+    /// take part in offers nothing for publication.
+    #[test]
+    fn a_received_row_stays_remote_material_and_a_non_participating_section_is_not_offered() {
+        let (_directory, mut store) = open();
+        set(&mut store, "mine", "local");
+        store
+            .apply_section_rows(
+                Section::LocalPlugins,
+                &[plugin_row("theirs", "remote", 40, "writer-b")],
+            )
+            .expect("apply remote rows");
+
+        let (clock, writer, published): (String, String, Option<String>) = store
+            .connection()
+            .query_row(
+                "SELECT write_clock,writer_id,published_clock FROM plugin_device_storage
+                    WHERE owner='plugin-a' AND space='string' AND key='theirs'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read received row");
+        assert_eq!((clock.as_str(), writer.as_str()), ("40", "writer-b"));
+        assert_eq!(published.as_deref(), Some("40"));
+        let (own_writer, own_published): (String, Option<String>) = store
+            .connection()
+            .query_row(
+                "SELECT writer_id,published_clock FROM plugin_device_storage
+                    WHERE owner='plugin-a' AND space='string' AND key='mine'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read own row");
+        assert_ne!(own_writer, "writer-b");
+        assert!(own_published.is_none());
+
+        store
+            .set_section_participating(Section::LocalPlugins, true)
+            .unwrap();
+        assert!(store
+            .sections_await_publication("connection", "library")
+            .unwrap());
+        store
+            .set_section_participating(Section::LocalPlugins, false)
+            .unwrap();
+        assert!(!store
+            .sections_await_publication("connection", "library")
+            .unwrap());
+    }
+
+    /// Invariant 15. A deletion travels as a tombstone and the value it removed
+    /// does not come back, while a clear touches only the observed keys of the
+    /// owner and space it names.
+    #[test]
+    fn a_received_deletion_does_not_come_back_as_a_live_value() {
+        let (_directory, mut store) = open();
+        set(&mut store, "gone", "value");
+        store
+            .apply_section_rows(
+                Section::LocalPlugins,
+                &[plugin_tombstone("gone", 90, "writer-b")],
+            )
+            .expect("apply remote tombstone");
+        assert_eq!(live(&mut store), vec![("gone".to_owned(), None)]);
+
+        store
+            .apply_section_rows(
+                Section::LocalPlugins,
+                &[plugin_row("gone", "value", 2, "writer-b")],
+            )
+            .expect("apply stale remote value");
+        assert_eq!(live(&mut store), vec![("gone".to_owned(), None)]);
+
+        set(&mut store, "kept", "still here");
+        store
+            .write_plugin_device_values(
+                "plugin-a",
+                &[PluginDeviceMutation::Clear {
+                    space: "json".to_owned(),
+                }],
+            )
+            .expect("clear another space");
+        assert_eq!(
+            live(&mut store)
+                .into_iter()
+                .filter(|(_, value)| value.is_some())
+                .collect::<Vec<_>>(),
+            vec![("kept".to_owned(), Some("still here".to_owned()))]
+        );
+    }
+
+    /// Invariant 16. The same values and tombstones in either order leave the
+    /// same user state behind.
+    #[test]
+    fn sections_converge_no_matter_which_order_two_devices_arrive_in() {
+        let first = [
+            plugin_row("alpha", "from-b", 30, "writer-b"),
+            plugin_tombstone("beta", 31, "writer-b"),
+        ];
+        let second = [
+            plugin_row("alpha", "from-c", 29, "writer-c"),
+            plugin_row("beta", "from-c", 12, "writer-c"),
+            plugin_row("gamma", "from-c", 33, "writer-c"),
+        ];
+        let settle = |batches: [&[SectionRow]; 2]| {
+            let (directory, mut store) = open();
+            set(&mut store, "alpha", "local");
+            for batch in batches {
+                store
+                    .apply_section_rows(Section::LocalPlugins, batch)
+                    .expect("apply section batch");
+            }
+            let state = live(&mut store);
+            let clock = store
+                .section_state(Section::LocalPlugins)
+                .unwrap()
+                .max_write_clock;
+            drop(directory);
+            (state, clock)
+        };
+        let forward = settle([&first, &second]);
+        let backward = settle([&second, &first]);
+        assert_eq!(forward, backward);
+        assert_eq!(
+            forward.0,
+            vec![
+                ("alpha".to_owned(), Some("from-b".to_owned())),
+                ("beta".to_owned(), None),
+                ("gamma".to_owned(), Some("from-c".to_owned())),
+            ]
+        );
+        assert_eq!(forward.1, Sequence::from(33u64));
+    }
+
+    /// The same key at the same version with different content is a real
+    /// disagreement, so it is reported instead of resolved by guesswork.
+    #[test]
+    fn a_section_row_that_differs_at_the_same_version_is_refused() {
+        let (_directory, mut store) = open();
+        store
+            .apply_section_rows(
+                Section::LocalPlugins,
+                &[plugin_row("alpha", "one", 20, "writer-b")],
+            )
+            .expect("apply first value");
+        assert!(store
+            .apply_section_rows(
+                Section::LocalPlugins,
+                &[plugin_row("alpha", "two", 20, "writer-b")],
+            )
+            .is_err());
+        assert!(store
+            .apply_section_rows(Section::LocalPlugins, &[plugin_row("alpha", "one", 20, "")])
+            .is_err());
+        assert_eq!(
+            live(&mut store),
+            vec![("alpha".to_owned(), Some("one".to_owned()))]
+        );
+    }
+
+    /// Invariant 32 on the device side. Restored backup material is this
+    /// device's own write, so it installs no other writer and no counters, and
+    /// coordination settings never enter a bundle in the first place.
+    #[test]
+    fn restored_backup_material_becomes_this_device_own_write() {
+        let (_directory, mut store) = open();
+        store
+            .restore_section_rows(
+                Section::LocalPlugins,
+                &[plugin_row("alpha", "from-backup", 0, "")],
+            )
+            .expect("restore plugin value");
+        let (clock, writer, published): (String, String, Option<String>) = store
+            .connection()
+            .query_row(
+                "SELECT write_clock,writer_id,published_clock FROM plugin_device_storage
+                    WHERE owner='plugin-a' AND space='string' AND key='alpha'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read restored row");
+        assert_eq!(clock, "1");
+        assert_eq!(writer, store.writer_id().unwrap());
+        assert!(published.is_none());
+
+        for key in [
+            "official-account.association.v1",
+            "official-account.asset-ledger.v1",
+            "sync-conflict-backups.index.v1",
+            "risuNestServerSyncRestoreHold",
+            "risu_lastsaved",
+        ] {
+            assert!(!LOCAL_SETTING_KEYS.contains(&key));
+            store
+                .write_setting(key, &serde_json::json!("control"))
+                .expect("write control setting");
+        }
+        store
+            .write_setting("risuNestDeviceSettings", &serde_json::json!({ "a": 1 }))
+            .expect("write device setting");
+        let rows = store.read_local_setting_rows().expect("read setting rows");
+        assert_eq!(
+            rows.iter().map(|row| row.key2.as_str()).collect::<Vec<_>>(),
+            vec!["risuNestDeviceSettings"]
+        );
+    }
+
+    /// A cursor only moves forward, so a replayed apply cannot lose ground and
+    /// a published section does not offer the same values again.
+    #[test]
+    fn a_section_cursor_never_moves_backwards() {
+        let (_directory, mut store) = open();
+        let cursor = |generation: u64, observed: u64| SectionCursor {
+            applied_generation: Sequence::from(generation),
+            applied_gc_floor: Sequence::from(0u64),
+            observed_max_write_clock: Sequence::from(observed),
+        };
+        store
+            .write_section_cursor("connection", "library", Section::Hypa, &cursor(9, 40))
+            .unwrap();
+        store
+            .write_section_cursor("connection", "library", Section::Hypa, &cursor(3, 12))
+            .unwrap();
+        assert_eq!(
+            store
+                .read_section_cursor("connection", "library", Section::Hypa)
+                .unwrap(),
+            Some(cursor(9, 40))
+        );
+        assert!(store
+            .read_section_cursor("other", "library", Section::Hypa)
+            .unwrap()
+            .is_none());
+    }
+}

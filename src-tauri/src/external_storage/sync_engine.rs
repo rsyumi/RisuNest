@@ -128,6 +128,9 @@ pub(crate) struct SyncInputs<'a> {
     pub local_pristine: bool,
     /// Required once the local side is known to differ from its base.
     pub local_fingerprint: Option<&'a str>,
+    /// A participating section holds a write this remote has not seen. Device
+    /// values move without the library moving, so they need their own signal.
+    pub local_sections_changed: bool,
     pub base: Option<&'a ExternalBase>,
     pub remote: Option<&'a ObservedHead>,
 }
@@ -205,6 +208,9 @@ pub(crate) fn decide_sync(input: SyncInputs<'_>) -> Result<SyncAction> {
     let remote_version_changed = stored.version != remote.observation.version;
 
     match (local_changed, remote_content_changed) {
+        (false, false) if input.local_sections_changed => Ok(SyncAction::PublishLocal {
+            expected: Some(remote.clone()),
+        }),
         (false, false) if remote_version_changed => Ok(SyncAction::AcceptEquivalent {
             remote: remote.clone(),
         }),
@@ -571,6 +577,42 @@ fn participating_sections(app: &AppHandle) -> Result<std::collections::BTreeSet<
     Ok(wanted)
 }
 
+/// Records what a confirmed publication put on the remote, so the next cycle
+/// does not offer the same values again.
+fn note_sections_published(
+    app: &AppHandle,
+    connection_id: &str,
+    library_lineage: &str,
+    sections: &std::collections::BTreeMap<
+        String,
+        risunest_external_storage_format::snapshot::SectionSnapshotRef,
+    >,
+) -> Result<()> {
+    if sections.is_empty() {
+        return Ok(());
+    }
+    let mut store = pds(app)?;
+    let device = store.device_store_mut().map_err(local_error)?;
+    for reference in sections.values() {
+        let Some(section) = super::sections::section_of(reference.kind) else {
+            continue;
+        };
+        device
+            .write_section_cursor(
+                connection_id,
+                library_lineage,
+                section,
+                &crate::persistent_store::device_store::sections::SectionCursor {
+                    applied_generation: reference.generation.clone(),
+                    applied_gc_floor: reference.gc_floor.clone(),
+                    observed_max_write_clock: reference.max_write_clock.clone(),
+                },
+            )
+            .map_err(local_error)?;
+    }
+    Ok(())
+}
+
 /// Merges received sections into the device file. Each section is its own
 /// transaction, so an interrupted apply resumes from the same remote state
 /// instead of reporting the whole receive as done.
@@ -758,7 +800,7 @@ async fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Resu
     apply_received_sections(
         app,
         &job.request.connection_id,
-        &remote.document.library_id,
+        &authoritative.identity.library_epoch,
         received_sections,
     )?;
     let result = json!({"snapshotId":prepared.snapshot_id,"receivedRevision":revision.to_string()});
@@ -1476,9 +1518,23 @@ pub(crate) async fn run_sync(
         identity.revision != base.identity.revision
             || !same_local_lineage(&identity, &base.identity)
     });
+    let sections_changed = match (&base, &remote) {
+        (Some(base), Some(_)) => {
+            let mut store = pds(app)?;
+            let device = store.device_store_mut().map_err(local_error)?;
+            device
+                .sections_await_publication(
+                    &job.request.connection_id,
+                    &base.identity.library_epoch,
+                )
+                .map_err(local_error)?
+        }
+        _ => false,
+    };
     let mut captured = None;
     let mut fingerprint = None;
-    if local_changed && !(base.is_none() && remote.is_some() && local_pristine) {
+    if (local_changed || sections_changed) && !(base.is_none() && remote.is_some() && local_pristine)
+    {
         let value = capture_for_publication(app, connected, job, remote.as_ref(), cancel).await?;
         fingerprint = Some(hex::encode(value.1));
         captured = Some(value);
@@ -1497,6 +1553,7 @@ pub(crate) async fn run_sync(
         current_identity: decision_identity,
         local_pristine,
         local_fingerprint: fingerprint.as_deref(),
+        local_sections_changed: sections_changed,
         base: base.as_ref(),
         remote: remote.as_ref(),
     })?;
@@ -1663,6 +1720,12 @@ pub(crate) async fn run_sync(
                     let _ = journal
                         .release_completed_sessions(connected.dependencies.vault.as_ref())
                         .await;
+                    note_sections_published(
+                        app,
+                        &job.request.connection_id,
+                        &published_identity.library_epoch,
+                        &completed.sections,
+                    )?;
                     Ok(
                         json!({"snapshotId":completed.snapshot_id,"publishedRevision":published_identity.revision.to_string()}),
                     )
@@ -1814,6 +1877,7 @@ mod tests {
                 current_identity: &identity(1),
                 local_pristine: false,
                 local_fingerprint: None,
+                local_sections_changed: false,
                 base: None,
                 remote: Some(&remote)
             })
@@ -1827,6 +1891,7 @@ mod tests {
                 current_identity: &identity(1),
                 local_pristine: false,
                 local_fingerprint: None,
+                local_sections_changed: false,
                 base: None,
                 remote: None
             })
@@ -1840,6 +1905,7 @@ mod tests {
                 current_identity: &identity(0),
                 local_pristine: true,
                 local_fingerprint: None,
+                local_sections_changed: false,
                 base: None,
                 remote: Some(&remote)
             })
@@ -1858,6 +1924,7 @@ mod tests {
                 current_identity: &identity(2),
                 local_pristine: false,
                 local_fingerprint: Some(&"55".repeat(32)),
+                local_sections_changed: false,
                 base: Some(&base),
                 remote: Some(&old)
             })
@@ -1874,6 +1941,7 @@ mod tests {
                 current_identity: &identity(1),
                 local_pristine: false,
                 local_fingerprint: None,
+                local_sections_changed: false,
                 base: Some(&base),
                 remote: Some(&new)
             })
@@ -1889,6 +1957,7 @@ mod tests {
                 current_identity: &identity(2),
                 local_pristine: false,
                 local_fingerprint: Some(&"66".repeat(32)),
+                local_sections_changed: false,
                 base: Some(&base),
                 remote: Some(&new)
             })
@@ -1904,6 +1973,7 @@ mod tests {
                 current_identity: &identity(2),
                 local_pristine: false,
                 local_fingerprint: Some(&"44".repeat(32)),
+                local_sections_changed: false,
                 base: Some(&base),
                 remote: Some(&new)
             })
@@ -1922,6 +1992,7 @@ mod tests {
                 current_identity: &identity(1),
                 local_pristine: false,
                 local_fingerprint: None,
+                local_sections_changed: false,
                 base: Some(&base),
                 remote: None
             })
@@ -1937,6 +2008,7 @@ mod tests {
                 current_identity: &replaced,
                 local_pristine: false,
                 local_fingerprint: None,
+                local_sections_changed: false,
                 base: Some(&base),
                 remote: Some(&old)
             })

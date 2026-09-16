@@ -184,6 +184,7 @@ impl DeviceStore {
 
     /// Turning a section on or off changes what this device exchanges from the
     /// next publication onward. The stored values are left alone either way.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_section_participating(
         &mut self,
         section: Section,
@@ -284,6 +285,35 @@ impl DeviceStore {
         Ok(rows)
     }
 
+    /// Whether a participating section holds a write this remote lineage has
+    /// not seen. A device value can change without the library changing, so
+    /// this is what makes a section-only edit reach the remote at all.
+    pub(crate) fn sections_await_publication(
+        &self,
+        connection_id: &str,
+        library_lineage: &str,
+    ) -> StoreResult<bool> {
+        for section in [Section::Hypa, Section::LocalPlugins] {
+            let state = self.section_state(section)?;
+            if !state.participating {
+                continue;
+            }
+            match self.read_section_cursor(connection_id, library_lineage, section)? {
+                Some(cursor) => {
+                    if state.max_write_clock > cursor.observed_max_write_clock {
+                        return Ok(true);
+                    }
+                }
+                None => {
+                    if state.max_write_clock > Sequence::from(0u64) {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Merges a received section. The higher `(write_clock, writer_id)` wins,
     /// the same version with different content is refused, and a received row
     /// keeps the version it arrived with instead of becoming a local write.
@@ -329,45 +359,6 @@ impl DeviceStore {
         observe_remote_clock(&transaction, section, &highest)?;
         transaction.commit()?;
         Ok(outcome)
-    }
-
-    /// Marks the rows a publication carried. An unpublished row is still this
-    /// device's own contribution and never counts as remote material.
-    pub(crate) fn note_section_published(
-        &mut self,
-        section: Section,
-        rows: &[SectionRow],
-    ) -> StoreResult<()> {
-        let transaction = self.transaction()?;
-        {
-            let mut statement = match section {
-                Section::Hypa => transaction.prepare(
-                    "UPDATE hypa_embeddings SET published_clock=?2
-                        WHERE cache_key=?1 AND write_clock=?2",
-                )?,
-                Section::LocalPlugins => transaction.prepare(
-                    "UPDATE plugin_device_storage SET published_clock=?4
-                        WHERE owner=?1 AND space=?2 AND key=?3 AND write_clock=?4",
-                )?,
-            };
-            for row in rows {
-                match section {
-                    Section::Hypa => {
-                        statement.execute(params![row.key1, row.write_clock.as_str()])?;
-                    }
-                    Section::LocalPlugins => {
-                        statement.execute(params![
-                            row.key1,
-                            row.key2,
-                            row.key3,
-                            row.write_clock.as_str()
-                        ])?;
-                    }
-                }
-            }
-        }
-        transaction.commit()?;
-        Ok(())
     }
 
     pub(crate) fn read_section_cursor(
