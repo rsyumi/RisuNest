@@ -212,12 +212,19 @@ mod tests {
         }
     }
 
+    /// Invariant 33. Every section the head still names counts as reachable,
+    /// including one a library-only publication merely carried forward.
     #[test]
     fn direct_reachable_is_an_explicit_incomplete_lower_bound() {
+        use risunest_external_storage_format::{
+            section::{SectionKind, SECTION_CODEC},
+            snapshot::SectionSnapshotRef,
+        };
         let repository = fake::repository();
         let snapshot = object(&repository, "snapshot-root", ObjectRole::SyncState);
         let records_object = object(&repository, "records", ObjectRole::Catalog);
         let assets_object = object(&repository, "assets", ObjectRole::Catalog);
+        let section_object = object(&repository, "section-hypa", ObjectRole::Catalog);
         let records = records_object.stored(&repository).unwrap();
         let assets = assets_object.stored(&repository).unwrap();
         let document = control::SnapshotView {
@@ -230,17 +237,29 @@ mod tests {
                 asset_catalog: assets,
                 content_fingerprint: [2; 32],
             },
-            sections: std::collections::BTreeMap::new(),
+            sections: std::collections::BTreeMap::from([(
+                SectionKind::Hypa.id().to_owned(),
+                SectionSnapshotRef {
+                    kind: SectionKind::Hypa,
+                    codec: SECTION_CODEC.into(),
+                    generation: risunest_sync_wire::head::Sequence::from(3u64),
+                    gc_floor: risunest_sync_wire::head::Sequence::from(0u64),
+                    max_write_clock: risunest_sync_wire::head::Sequence::from(9u64),
+                    entries_root: section_object.stored(&repository).unwrap(),
+                    content_fingerprint: [4; 32],
+                },
+            )]),
             is_state: true,
         };
         let usage = direct_reachable(&snapshot, &document).unwrap();
         assert!(!usage.complete);
-        assert_eq!(usage.known_direct_objects, 3);
+        assert_eq!(usage.known_direct_objects, 4);
         assert_eq!(
             usage.known_direct_bytes,
             snapshot.receipt.byte_length
                 + records_object.receipt.byte_length
                 + assets_object.receipt.byte_length
+                + section_object.receipt.byte_length
         );
     }
 }
