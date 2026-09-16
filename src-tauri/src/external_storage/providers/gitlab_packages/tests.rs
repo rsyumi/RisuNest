@@ -1396,3 +1396,99 @@ fn cancelling_an_in_flight_download_stops_the_transfer() {
         assert_eq!(harness.lines().len(), 3);
     });
 }
+
+/// A passing exchange here proves the adapter's request shape and status
+/// handling. It is no evidence of the service's own deletion guarantees, which
+/// only the provider documentation behind `Capabilities` can supply.
+#[test]
+fn deleting_resolves_the_numeric_package_file_and_refuses_descriptors() {
+    runtime().block_on(async {
+        let token = encoded("pack-1");
+        let packs = format!("{PACKAGE}.pack");
+        let harness = fixture(
+            vec![
+                marker_present(),
+                json(200, "[]"),
+                json(200, &format!("[{}]", package_json(1, &packs, &format!("v0-{token}")))),
+                json(200, &format!("[{}]", file_json(&format!("pack-{token}"), 20, None))),
+                raw(204, b""),
+                // Nothing under that version any more.
+                json(200, "[]"),
+            ],
+            "personalAccessToken",
+        );
+        let (repository, _) = harness.open(OpenMode::Existing).await.unwrap();
+        let object = |package: &str, role: &str| RemoteLocator {
+            connection_identity: repository.connection_identity.clone(),
+            collection: None,
+            object: format!("{PACKAGE}.{package}/v0-{token}/{role}-{token}"),
+        };
+
+        harness
+            .provider
+            .delete_object(&repository, &object("pack", "pack"), &harness.cancel)
+            .await
+            .unwrap();
+        // A package the listing no longer reports is already in that state.
+        harness
+            .provider
+            .delete_object(&repository, &object("pack", "pack"), &harness.cancel)
+            .await
+            .unwrap();
+        assert_eq!(
+            harness
+                .provider
+                .delete_object(
+                    &repository,
+                    &object("descriptor", "descriptor"),
+                    &harness.cancel
+                )
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::Unsupported
+        );
+
+        let lines = harness.lines();
+        assert_eq!(lines.len(), 6, "the descriptor refusal sends nothing");
+        assert!(lines[2].contains(&format!("package_name={PACKAGE}.pack&package_version=v0-{token}")));
+        assert!(lines[3].contains("/packages/1/package_files"));
+        assert_eq!(
+            lines[4],
+            format!("DELETE {PROJECT_PATH}/packages/1/package_files/7 HTTP/1.1")
+        );
+        let costs = harness.deps.budget.reservations.lock().unwrap()[4].0.clone();
+        assert_eq!(
+            costs.iter().map(|cost| cost.bucket.clone()).collect::<Vec<_>>(),
+            ["apiRequests"],
+            "removal is a project API path, not the package registry"
+        );
+    });
+}
+
+/// Deploy tokens cannot reach the API that resolves a package file id, so the
+/// adapter reports the operation as unavailable rather than attempting it.
+#[test]
+fn a_deploy_token_connection_cannot_delete() {
+    runtime().block_on(async {
+        let token = encoded("pack-1");
+        let harness = fixture(vec![marker_present(), raw(401, b"")], "deployToken");
+        let (repository, capabilities) = harness.open(OpenMode::Existing).await.unwrap();
+        assert!(capabilities.require_cleanup().is_err());
+        let locator = RemoteLocator {
+            connection_identity: repository.connection_identity.clone(),
+            collection: None,
+            object: format!("{PACKAGE}.pack/v0-{token}/pack-{token}"),
+        };
+        assert_eq!(
+            harness
+                .provider
+                .delete_object(&repository, &locator, &harness.cancel)
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::Unsupported
+        );
+        assert_eq!(harness.lines().len(), 2);
+    });
+}

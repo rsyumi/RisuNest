@@ -1680,3 +1680,71 @@ fn request_costs_separate_reads_writes_and_the_identity_platform() {
     let costs = provider.costs(ProviderOperation::List, "onedrive:9:consumers|9:account-1|");
     assert_eq!(costs[0].shared_account, "onedrive:9:consumers|9:account-1|");
 }
+
+/// A passing exchange here proves the adapter's request shape and status
+/// handling. It is no evidence of the service's own deletion guarantees, which
+/// only the provider documentation behind `Capabilities` can supply.
+#[test]
+fn deleting_addresses_one_member_path_and_refuses_the_head_and_descriptors() {
+    runtime().block_on(async {
+        let mut replies = existing_open();
+        replies.push(empty(204, Vec::new()));
+        replies.push(empty(404, Vec::new()));
+        let server = WireServer::start(replies);
+        let test = harness(NOW_MS);
+        let provider = super::create(test.dependencies.clone()).unwrap();
+        let cancel = Cancellation::default();
+        let (repository, capabilities) =
+            open(&provider, &config_for(&server, "personal"), OpenMode::Existing, &cancel)
+                .await
+                .unwrap();
+        // Nothing here raises the cleanup evidence; a wire exchange cannot.
+        assert!(capabilities.require_cleanup().is_err());
+
+        let target = locator_for(&repository, "packs/pack-1");
+        provider
+            .delete_object(&repository, &target, &cancel)
+            .await
+            .unwrap();
+        // An item that is not there is already in the state the caller wanted.
+        provider
+            .delete_object(&repository, &target, &cancel)
+            .await
+            .unwrap();
+
+        for refused in [
+            provider.head_locator(&repository).unwrap(),
+            locator_for(&repository, "descriptors/root.rnd"),
+            locator_for(&repository, "elsewhere/pack-1"),
+            locator_for(&repository, "packs/"),
+        ] {
+            assert_eq!(
+                provider
+                    .delete_object(&repository, &refused, &cancel)
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::Unsupported
+            );
+        }
+
+        let records = server.requests.lock().unwrap();
+        assert_eq!(records.len(), 4);
+        assert!(line(&records[2]).starts_with("DELETE "));
+        assert!(
+            line(&records[2]).contains(":/packs/pack-1 "),
+            "{}",
+            line(&records[2])
+        );
+        drop(records);
+        let reservations = test.budget.reservations.lock().unwrap();
+        assert_eq!(
+            reservations[2]
+                .0
+                .iter()
+                .map(|cost| cost.bucket.clone())
+                .collect::<Vec<_>>(),
+            ["requests", "writes"]
+        );
+    });
+}

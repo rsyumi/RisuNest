@@ -1358,3 +1358,68 @@ fn only_a_strong_entity_tag_becomes_a_version_token() {
         ErrorKind::Corrupt
     );
 }
+
+/// A passing exchange here proves the adapter's request shape and status
+/// handling. It is no evidence of the service's own deletion guarantees, which
+/// only the provider documentation behind `Capabilities` can supply.
+#[test]
+fn deleting_one_member_folds_404_leaves_202_unresolved_and_refuses_the_head() {
+    runtime().block_on(async {
+        let harness = Harness::start(vec![
+            established_root(),
+            reply(204, &[], b""),
+            reply(404, &[], b""),
+            reply(202, &[], b""),
+        ]);
+        let repository = harness.opened().await;
+        let cancel = Cancellation::default();
+        let target = locator(&repository, Some("packs"), "packs/pack-1");
+        harness
+            .provider
+            .delete_object(&repository, &target, &cancel)
+            .await
+            .unwrap();
+        // A member that is not there is already in the state the caller wanted.
+        harness
+            .provider
+            .delete_object(&repository, &target, &cancel)
+            .await
+            .unwrap();
+        // 202 is an accepted request, not an enacted deletion.
+        let accepted = harness
+            .provider
+            .delete_object(&repository, &target, &cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(accepted.kind, ErrorKind::Transient);
+        assert_eq!(accepted.http_status, Some(202));
+
+        for refused in [
+            harness.provider.head_locator(&repository).unwrap(),
+            locator(&repository, None, "descriptors/descriptor-1"),
+            locator(&repository, None, "elsewhere/pack-1"),
+            locator(&repository, None, "packs/nested/pack-1"),
+            locator(&repository, Some("snapshots"), "packs/pack-1"),
+        ] {
+            assert_eq!(
+                harness
+                    .provider
+                    .delete_object(&repository, &refused, &cancel)
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::Unsupported
+            );
+        }
+
+        assert_eq!(harness.count(), 4);
+        assert_eq!(
+            harness.line(1),
+            format!("DELETE {}/packs/pack-1 HTTP/1.1", encoded_root())
+        );
+        let reservations = harness.reservations();
+        assert_eq!(reservations.len(), 4);
+        assert_eq!(reservations[1][0].bucket, REQUEST_BUCKET);
+        assert_eq!(reservations[1][0].shared_account, harness.account());
+    });
+}

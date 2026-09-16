@@ -1611,6 +1611,85 @@ fn a_body_shorter_than_its_declared_length_is_corrupt() {
     });
 }
 
+/// A passing exchange here proves the adapter's request shape and status
+/// handling. It is no evidence of the service's own deletion guarantees, which
+/// only the provider documentation behind `Capabilities` can supply.
+#[test]
+fn deleting_addresses_one_key_folds_404_and_refuses_the_head_and_descriptors() {
+    runtime().block_on(async {
+        let test = dependencies();
+        let server = WireServer::start(vec![
+            one_descriptor(),
+            reply(204, &[], Vec::new()),
+            reply(404, &[], Vec::new()),
+        ]);
+        let (provider, handle) = opened(&test, "generic", &server).await;
+        let cancel = Cancellation::default();
+        let target = RemoteLocator {
+            connection_identity: handle.connection_identity.clone(),
+            collection: Some("packs".into()),
+            object: "packs/pack-1".into(),
+        };
+        provider
+            .delete_object(&handle, &target, &cancel)
+            .await
+            .unwrap();
+        // A key that is not there is already in the state the caller wanted.
+        provider
+            .delete_object(&handle, &target, &cancel)
+            .await
+            .unwrap();
+
+        let refused = |object: &str, collection: Option<&str>| RemoteLocator {
+            connection_identity: handle.connection_identity.clone(),
+            collection: collection.map(str::to_owned),
+            object: object.to_owned(),
+        };
+        for locator in [
+            provider.head_locator(&handle).unwrap(),
+            refused("descriptors/descriptor-1", None),
+            refused("packs/pack-1", Some("snapshots")),
+            refused("elsewhere/pack-1", None),
+            refused("packs/", None),
+        ] {
+            assert_eq!(
+                provider
+                    .delete_object(&handle, &locator, &cancel)
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::Unsupported
+            );
+        }
+        let foreign = RemoteLocator {
+            connection_identity: "s3/generic/https://other.invalid/other/root".into(),
+            collection: Some("packs".into()),
+            object: "packs/pack-1".into(),
+        };
+        assert_eq!(
+            provider
+                .delete_object(&handle, &foreign, &cancel)
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::Corrupt
+        );
+
+        let records = server.requests.lock().unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(line(&records[1]).starts_with("DELETE "));
+        assert!(line(&records[1]).ends_with(&format!("/{BUCKET}/{PREFIX}/packs/pack-1 HTTP/1.1")));
+        assert_eq!(
+            header(&records[1], "x-amz-content-sha256").as_deref(),
+            Some(EMPTY_HASH)
+        );
+        drop(records);
+        let reservations = test.budget.reservations.lock().unwrap();
+        assert_eq!(reservations.len(), 3);
+        assert_eq!(reservations[1].0[0].bucket, "requests");
+    });
+}
+
 #[test]
 fn request_costs_follow_the_preset_buckets_and_are_reserved_per_request() {
     runtime().block_on(async {
@@ -1646,6 +1725,8 @@ fn request_costs_follow_the_preset_buckets_and_are_reserved_per_request() {
         );
         assert!(cost(&r2, ProviderOperation::DownloadUrl).is_empty());
         assert!(cost(&r2, ProviderOperation::Authenticate).is_empty());
+        // Cloudflare lists `DeleteObject` outside both classes, as free.
+        assert!(cost(&r2, ProviderOperation::Delete).is_empty());
 
         let reservations = test.budget.reservations.lock().unwrap();
         assert_eq!(reservations.len(), 1);
@@ -1660,6 +1741,10 @@ fn request_costs_follow_the_preset_buckets_and_are_reserved_per_request() {
             ["transactions", "requests_per_second"]
         );
         assert_eq!(names(&cost(&b2, ProviderOperation::List)), ["transactions"]);
+        assert_eq!(
+            names(&cost(&b2, ProviderOperation::Delete)),
+            ["transactions", "requests_per_second"]
+        );
         let hugging = WireServer::start(vec![one_descriptor()]);
         let (_, hugging) = opened(&dependencies(), "hf", &hugging).await;
         let flat = cost(&hugging, ProviderOperation::Get);

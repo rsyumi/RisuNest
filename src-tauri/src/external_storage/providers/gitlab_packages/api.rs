@@ -140,6 +140,29 @@ pub(super) fn package_files_url(
     )
 }
 
+/// One stored file of a package. Removal addresses the numeric file id, which
+/// only the package file listing reports.
+pub(super) fn package_file_url(
+    settings: &Settings,
+    package_id: u64,
+    file_id: u64,
+) -> Result<url::Url> {
+    url(
+        settings,
+        &[
+            "api",
+            "v4",
+            "projects",
+            &settings.project,
+            "packages",
+            &package_id.to_string(),
+            "package_files",
+            &file_id.to_string(),
+        ],
+        &[],
+    )
+}
+
 pub(super) struct Outgoing<'a> {
     pub(super) method: reqwest::Method,
     pub(super) url: url::Url,
@@ -219,6 +242,7 @@ pub(super) struct PackageJson {
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) struct PackageFileJson {
+    pub(super) id: u64,
     pub(super) file_name: String,
     pub(super) size: u64,
     pub(super) file_sha256: Option<String>,

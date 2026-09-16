@@ -74,6 +74,12 @@ pub(super) fn locator(identity: &str, folder: &str, name: &str) -> RemoteLocator
         object: format!("{folder}/{name}"),
     }
 }
+/// Role folders a cleanup may remove from. Descriptors identify the repository
+/// and the head folder holds the one mutable object, so neither is a target.
+pub(super) fn removable_folder(folder: &str) -> bool {
+    !matches!(folder, DESCRIPTORS | HEADS) && FOLDERS.contains(&folder)
+}
+
 /// `<role folder>/<file name>` relative to the repository root. The optional
 /// collection is a redundant hint and must agree when it is present.
 pub(super) fn parse_locator(locator: &RemoteLocator) -> Result<(&'static str, &str)> {

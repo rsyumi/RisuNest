@@ -13,6 +13,9 @@ pub(super) const MINUTE_LIST: &str = "mybox-list-minute";
 pub(super) const MINUTE_FOLDER: &str = "mybox-folder-minute";
 pub(super) const MINUTE_UPLOAD_URL: &str = "mybox-upload-url-minute";
 pub(super) const MINUTE_DOWNLOAD_URL: &str = "mybox-download-url-minute";
+/// Deletion is a documented allowance of its own, listed apart from the
+/// remaining APIs even where the two numbers agree.
+pub(super) const MINUTE_DELETE: &str = "mybox-delete-minute";
 
 const MINUTE_MS: u64 = 60 * 1000;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
@@ -50,6 +53,7 @@ pub(super) fn costs(account: &str, operation: ProviderOperation, now_ms: u64) ->
     };
     match operation {
         ProviderOperation::Metadata => vec![minute(MINUTE_METADATA)],
+        ProviderOperation::Delete => vec![minute(MINUTE_DELETE)],
         ProviderOperation::List => vec![minute(MINUTE_LIST)],
         ProviderOperation::Create => vec![minute(MINUTE_FOLDER)],
         ProviderOperation::UploadSession | ProviderOperation::ReconcileUpload => {

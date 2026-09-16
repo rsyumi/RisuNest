@@ -268,6 +268,7 @@ pub(crate) enum ProviderOperation {
     ReconcileUpload,
     CompareExchangeHead,
     ReplaceHead,
+    Delete,
     Authenticate,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -349,6 +350,16 @@ pub(crate) trait Provider: Send + Sync {
         limit: u16,
         cancel: &'a Cancellation,
     ) -> ProviderFuture<'a, ObjectPage>;
+    /// Removes one object this repository owns. Idempotent: a target that is
+    /// already gone answers `Ok`. The head locator and descriptor objects are
+    /// refused with `Unsupported`. A success answer means the remote deletion
+    /// finished; an accepted but still pending deletion is not a success.
+    fn delete_object<'a>(
+        &'a self,
+        repository: &'a RepositoryHandle,
+        locator: &'a RemoteLocator,
+        cancel: &'a Cancellation,
+    ) -> ProviderFuture<'a, ()>;
     fn reconcile_upload<'a>(
         &'a self,
         repository: &'a RepositoryHandle,

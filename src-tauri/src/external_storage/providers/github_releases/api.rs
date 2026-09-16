@@ -145,6 +145,10 @@ impl Context {
         self.repository_url(&["releases", "assets", &asset.to_string()])
     }
 
+    pub(super) fn release_url(&self, release: u64) -> Result<url::Url> {
+        self.repository_url(&["releases", &release.to_string()])
+    }
+
     /// Built from the configured upload host rather than the `upload_url`
     /// template of the release, so an authenticated body never follows an
     /// origin chosen by a response.
@@ -269,6 +273,20 @@ pub(super) fn collection_holds(collection: Collection, name: &str) -> bool {
     collection_roles(collection)
         .iter()
         .any(|role| holds_role(*role, name))
+}
+
+/// True when the name carries a role prefix a cleanup may remove. Descriptors
+/// identify the repository and are refused.
+pub(super) fn removable_asset(name: &str) -> bool {
+    [
+        ObjectRole::Pack,
+        ObjectRole::Catalog,
+        ObjectRole::SyncState,
+        ObjectRole::BackupBundle,
+        ObjectRole::BackupPoint,
+    ]
+    .iter()
+    .any(|role| holds_role(*role, name))
 }
 
 fn holds_role(role: ObjectRole, name: &str) -> bool {
@@ -454,5 +472,11 @@ pub(super) fn costs(operation: ProviderOperation, account: &str) -> Vec<RequestC
         | ProviderOperation::CompareExchangeHead
         | ProviderOperation::ReplaceHead
         | ProviderOperation::Authenticate => Vec::new(),
+        // A write costs five endpoint points and is not a content creating
+        // request, so the two content buckets stay out of it.
+        ProviderOperation::Delete => vec![
+            cost(PRIMARY_BUCKET, account, 1, &hour),
+            cost(POINT_BUCKET, account, 5, &minute),
+        ],
     }
 }

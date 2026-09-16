@@ -578,6 +578,10 @@ fn capabilities(settings: &Settings, can_list: bool) -> Capabilities {
         } else {
             Evidence::Unverified
         },
+        // No cleanup evidence has been recorded for this service yet.
+        delete_objects: Evidence::Unverified,
+        gc_control_consistency: Evidence::Unverified,
+        delete_completion: Evidence::Unverified,
         discovery_extra_requests: u32::from(can_list),
         conditional_get: false,
         range: false,
@@ -858,6 +862,61 @@ impl Provider for GitlabPackages {
             self.context(repository)?;
             locator.validate_for(repository)?;
             Err(unsupported())
+        })
+    }
+
+    /// Removal addresses a numeric package file id, so the package and its file
+    /// listing are resolved first. A deploy token cannot reach the API that
+    /// carries either, and answers `Unsupported`.
+    fn delete_object<'a>(
+        &'a self,
+        repository: &'a RepositoryHandle,
+        locator: &'a RemoteLocator,
+        cancel: &'a Cancellation,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            cancel.check()?;
+            let context = self.context(repository)?;
+            locator.validate_for(repository)?;
+            let settings = &context.settings;
+            let (role, placement) = settings.parse_object(&locator.object)?;
+            if role == ObjectRole::Descriptor {
+                return Err(unsupported());
+            }
+            let credential = self.credential(&context.secret).await?;
+            if credential.kind == config::TokenKind::DeployToken || !context.can_list {
+                return Err(unsupported());
+            }
+            let Some(package_id) = self
+                .locate_package(settings, &credential, &placement.package, &placement.version, cancel)
+                .await?
+            else {
+                return Ok(());
+            };
+            let files = self
+                .package_files(settings, &credential, package_id, cancel)
+                .await?;
+            let Some(file) = files.iter().find(|file| file.file_name == placement.file) else {
+                return Ok(());
+            };
+            let response = self
+                .send(
+                    settings,
+                    Outgoing {
+                        method: reqwest::Method::DELETE,
+                        url: api::package_file_url(settings, package_id, file.id)?,
+                        operation: ProviderOperation::Delete,
+                        credential: Some(&credential),
+                        body: None,
+                        content_length: None,
+                    },
+                    cancel,
+                )
+                .await?;
+            match response.status {
+                200 | 204 | 404 => Ok(()),
+                status => Err(api::classify(status, &response.headers, self.now())),
+            }
         })
     }
 

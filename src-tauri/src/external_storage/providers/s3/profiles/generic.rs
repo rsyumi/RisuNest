@@ -25,6 +25,7 @@ pub(crate) const PROFILE: Profile = Profile {
     service_max_object_bytes: Some(5 * GIB * MAX_PARTS),
     multipart_lifetime_ms: None,
     cas_evidence: Evidence::Unverified,
+    cleanup_evidence: Evidence::Unverified,
     cost_model: CostModel::Flat,
     documented_at: DOCUMENTED_AT,
     evidence_urls: &["https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html"],

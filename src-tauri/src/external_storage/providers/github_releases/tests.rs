@@ -1230,3 +1230,96 @@ fn descriptor_listing_reads_only_the_descriptor_release() {
         assert_eq!(server.requests.lock().unwrap().len(), 5);
     });
 }
+
+/// A passing exchange here proves the adapter's request shape and status
+/// handling. It is no evidence of the service's own deletion guarantees, which
+/// only the provider documentation behind `Capabilities` can supply.
+#[test]
+fn deleting_an_asset_checks_its_release_tag_and_role_prefix_first() {
+    runtime().block_on(async {
+        let tag = job_tag("job-1", 0);
+        let server = WireServer::start(vec![
+            repository_reply(true),
+            reply(200, json!([])),
+            // The removable asset: its release is tagged by this root.
+            reply(200, release(20, &tag)),
+            reply(200, json!([asset(88, "pack-object-1", 10, None)])),
+            reply(204, json!(null)),
+            // A release this root never tagged.
+            reply(200, release(21, "someone-elses-tag-0")),
+            // An asset of ours whose name carries no removable role prefix.
+            reply(200, release(20, &tag)),
+            reply(200, json!([asset(89, "descriptor-object-1", 10, None)])),
+            // An asset that is no longer in the release.
+            reply(200, release(20, &tag)),
+            reply(200, json!([])),
+            // A release that is gone entirely.
+            reply(404, json!({})),
+        ]);
+        let test = dependencies();
+        let provider = adapter(test.dependencies.clone());
+        let handle = open(provider.as_ref(), &server, OpenMode::Create)
+            .await
+            .unwrap();
+        let cancel = Cancellation::default();
+        let locator = |collection: Option<&str>, object: &str| RemoteLocator {
+            connection_identity: handle.connection_identity.clone(),
+            collection: collection.map(str::to_owned),
+            object: object.to_owned(),
+        };
+
+        provider
+            .delete_object(&handle, &locator(Some(&tag), "20/88"), &cancel)
+            .await
+            .unwrap();
+        for refused in [
+            locator(Some("someone-elses-tag-0"), "21/90"),
+            locator(Some(&tag), "20/89"),
+        ] {
+            assert_eq!(
+                provider
+                    .delete_object(&handle, &refused, &cancel)
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::Unsupported
+            );
+        }
+        // Both shapes of "already gone" answer the same as a removal.
+        for absent in [locator(Some(&tag), "20/88"), locator(Some(&tag), "22/91")] {
+            provider
+                .delete_object(&handle, &absent, &cancel)
+                .await
+                .unwrap();
+        }
+        // The head does not exist on this service and no locator can name one.
+        assert_eq!(
+            provider.head_locator(&handle).unwrap_err().kind,
+            ErrorKind::Unsupported
+        );
+
+        let records = server.requests.lock().unwrap();
+        assert_eq!(records.len(), 11);
+        assert!(head_line(&records[2]).starts_with("GET ") && head_line(&records[2]).contains("/releases/20 "));
+        assert_eq!(
+            method_of(&records[4]),
+            "DELETE",
+            "only the checked asset id is removed"
+        );
+        assert!(head_line(&records[4]).contains("/releases/assets/88 "));
+        drop(records);
+        let reservations = test.budget.reservations.lock().unwrap();
+        let removal = &reservations[4].0;
+        assert_eq!(
+            removal
+                .iter()
+                .map(|cost| (cost.bucket.clone(), cost.units))
+                .collect::<Vec<_>>(),
+            vec![
+                (api::PRIMARY_BUCKET.to_owned(), 1),
+                (api::POINT_BUCKET.to_owned(), 5)
+            ],
+            "a delete is not a content creating request"
+        );
+    });
+}

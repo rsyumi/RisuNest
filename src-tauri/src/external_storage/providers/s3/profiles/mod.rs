@@ -70,6 +70,9 @@ pub(crate) struct Profile {
     pub multipart_lifetime_ms: Option<u64>,
     /// Evidence class for the two conditional head capabilities.
     pub cas_evidence: Evidence,
+    /// Whether this service documents that a delete finishes with the answer
+    /// and that a listing started afterwards reflects it.
+    pub cleanup_evidence: Evidence,
     pub cost_model: CostModel,
     pub documented_at: &'static str,
     pub evidence_urls: &'static [&'static str],
@@ -108,6 +111,9 @@ impl Profile {
             ProviderOperation::Metadata | ProviderOperation::Get | ProviderOperation::Range
         );
         let mut costs = match self.cost_model {
+            // Cloudflare lists `DeleteObject` as a free operation, in neither
+            // class, so the two-class split does not cover it.
+            CostModel::ClassAb if operation == ProviderOperation::Delete => Vec::new(),
             CostModel::ClassAb if reads => vec![unit("class_b", QuotaReset::Unknown)],
             CostModel::ClassAb => vec![unit("class_a", QuotaReset::Unknown)],
             CostModel::Transactions => {

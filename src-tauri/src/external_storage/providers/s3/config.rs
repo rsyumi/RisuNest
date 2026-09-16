@@ -93,6 +93,19 @@ pub(crate) fn role_folder(role: ObjectRole) -> &'static str {
     }
 }
 
+/// Role folders a cleanup may remove from. Descriptors identify the repository
+/// and the head is not a member of any folder, so neither is a target.
+pub(crate) fn removable_folder(folder: &str) -> bool {
+    [
+        ObjectRole::Pack,
+        ObjectRole::Catalog,
+        ObjectRole::SyncState,
+        ObjectRole::BackupPoint,
+    ]
+    .iter()
+    .any(|role| role_folder(*role) == folder)
+}
+
 pub(crate) fn collection_folder(collection: Collection) -> &'static str {
     match collection {
         Collection::Snapshots => role_folder(ObjectRole::SyncState),

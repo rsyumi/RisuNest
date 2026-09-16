@@ -29,6 +29,7 @@ pub(crate) const PROFILE: Profile = Profile {
     service_max_object_bytes: None,
     multipart_lifetime_ms: Some(SEVEN_DAYS_MS),
     cas_evidence: Evidence::Synthetic,
+    cleanup_evidence: Evidence::Unverified,
     cost_model: CostModel::Flat,
     documented_at: DOCUMENTED_AT,
     evidence_urls: &[

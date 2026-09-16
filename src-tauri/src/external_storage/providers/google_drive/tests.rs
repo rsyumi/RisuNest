@@ -1759,3 +1759,85 @@ fn a_code_exchange_returns_a_storable_refresh_payload() {
         );
     });
 }
+
+/// A passing exchange here proves the adapter's request shape and status
+/// handling. It is no evidence of the service's own deletion guarantees; the
+/// documentation behind `Capabilities` in fact states the opposite for
+/// listings, which is why the cleanup evidence stays unverified.
+#[test]
+fn deleting_checks_the_parent_and_role_of_the_file_before_removing_it() {
+    runtime().block_on(async {
+        let member = |role: &str, parent: &str| {
+            json!({
+                "id": "pack-file",
+                "parents": [parent],
+                "appProperties": { "risunestRole": role, "risunestObjectId": "p1" }
+            })
+        };
+        let mut replies = open_existing_replies();
+        replies.push(json_reply(200, member("pack", FOLDER)));
+        replies.push(Reply::Http {
+            status: 204,
+            headers: vec![],
+            body: Vec::new(),
+        });
+        replies.push(error_reply(404, "notFound"));
+        replies.push(json_reply(200, member("descriptor", FOLDER)));
+        replies.push(json_reply(200, member("pack", "another-folder")));
+        let server = WireServer::start(replies);
+        let test = deps_with(Some(stored_secret(NOW_MS + 3_600_000)));
+        let cancel = Cancellation::default();
+        let (provider, repository) = opened(&server, &test, &cancel).await;
+        let locator = |object: &str| RemoteLocator {
+            connection_identity: repository.connection_identity.clone(),
+            collection: None,
+            object: object.to_owned(),
+        };
+
+        provider
+            .delete_object(&repository, &locator("pack-file"), &cancel)
+            .await
+            .unwrap();
+        // A file that is not there is already in the state the caller wanted.
+        provider
+            .delete_object(&repository, &locator("pack-file"), &cancel)
+            .await
+            .unwrap();
+        // A descriptor, and a file of another folder, are never removed here.
+        for _ in 0..2 {
+            assert_eq!(
+                provider
+                    .delete_object(&repository, &locator("pack-file"), &cancel)
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::Unsupported
+            );
+        }
+        for refused in [
+            provider.head_locator(&repository).unwrap(),
+            locator("not/a/file/id"),
+        ] {
+            assert_eq!(
+                provider
+                    .delete_object(&repository, &refused, &cancel)
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::Unsupported
+            );
+        }
+
+        let lines = request_lines(&server);
+        assert_eq!(lines.len(), 8);
+        assert!(lines[3].contains("fields=id%2Cparents%2CappProperties"));
+        assert_eq!(
+            lines[4],
+            "DELETE /synthetic/drive/v3/files/pack-file HTTP/1.1"
+        );
+        let reservations = test.budget.reservations.lock().unwrap();
+        let removal = &reservations[4].0;
+        assert_eq!(removal.len(), 1);
+        assert_eq!(removal[0].units, 50);
+    });
+}
