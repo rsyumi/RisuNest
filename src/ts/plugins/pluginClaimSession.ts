@@ -18,6 +18,21 @@ export interface PluginClaimSession {
 /** A safety bound on the window, not a promise about how long a plugin needs. */
 export const PLUGIN_CLAIM_SESSION_LIMIT_MS = 30_000
 
+/**
+ * Plugins reload while the replacement that brought the values in still holds
+ * the write fence, so a claim made right then waits for it instead of missing.
+ */
+const FENCE_WAIT_LIMIT_MS = 5_000
+const FENCE_RETRY_DELAY_MS = 50
+
+function isFenced(error: unknown): boolean {
+    return error instanceof Error && error.name === 'PersistentMutationFencedError'
+}
+
+function delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 async function codeHash(script: string): Promise<string> {
     const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(script))
     return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('')
@@ -39,6 +54,7 @@ export async function beginPluginClaimSession(plugin: {
     if (!sessionId) return null
 
     let closed = false
+    let reportedFailure = false
     const close = async (): Promise<void> => {
         if (closed) return
         closed = true
@@ -57,23 +73,44 @@ export async function beginPluginClaimSession(plugin: {
             const { getPersistentDataRuntime } = await import(
                 '../storage/persistentDataRuntime.svelte'
             )
-            await getPersistentDataRuntime().runStorageOnlyMutation(
-                async (expectedRevision) => {
-                    const answer = await invoke<{ value: unknown | null; revision: number }>(
-                        'pds_claim_plugin_storage_value',
-                        {
-                            sessionId,
-                            owner,
-                            codeHash: hash,
-                            runtimeInstance,
-                            key,
-                            expectedRevision,
+            const fenceDeadline = Date.now() + FENCE_WAIT_LIMIT_MS
+            for (;;) {
+                try {
+                    await getPersistentDataRuntime().runStorageOnlyMutation(
+                        async (expectedRevision) => {
+                            const answer = await invoke<{
+                                value: unknown | null
+                                revision: number
+                            }>('pds_claim_plugin_storage_value', {
+                                sessionId,
+                                owner,
+                                codeHash: hash,
+                                runtimeInstance,
+                                key,
+                                expectedRevision,
+                            })
+                            claimed = answer.value ?? null
+                            return answer.revision
                         },
                     )
-                    claimed = answer.value ?? null
-                    return answer.revision
-                },
-            )
+                    break
+                } catch (error) {
+                    if (isFenced(error) && !closed && Date.now() < fenceDeadline) {
+                        await delay(FENCE_RETRY_DELAY_MS)
+                        continue
+                    }
+                    // A read answers a key it cannot take with a miss, because
+                    // the plugin API has no other answer for one.
+                    if (!reportedFailure) {
+                        reportedFailure = true
+                        console.warn(
+                            `[RisuAI Plugin: ${owner}] Could not take an unassigned value.`,
+                            error,
+                        )
+                    }
+                    return null
+                }
+            }
             if (claimed === null) return null
             pluginStorageStore.invalidateOwner(owner)
             return claimed
