@@ -49,6 +49,7 @@ pub struct Store {
     download_job_gate: Mutex<()>,
     connection_gate: Mutex<()>,
     media_signer: risunest_sync_connect::media::MediaSigner,
+    heads: tokio::sync::watch::Sender<u64>,
     _owner: File,
 }
 
@@ -227,6 +228,7 @@ impl Store {
             download_job_gate: Mutex::new(()),
             connection_gate: Mutex::new(()),
             media_signer,
+            heads: tokio::sync::watch::Sender::new(0),
             _owner: owner,
         };
         store
@@ -247,6 +249,14 @@ impl Store {
     }
     pub fn head(&self) -> Result<RemoteHead> {
         Self::read_head(&*self.reader()?)
+    }
+    /// Observes announcements that the head may have moved. A reader still
+    /// confirms the head itself: an announcement is never the state.
+    pub fn head_announcements(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.heads.subscribe()
+    }
+    pub(super) fn announce_head(&self) {
+        self.heads.send_modify(|value| *value = value.wrapping_add(1));
     }
     pub fn device_session(&self, device: &Device) -> Result<DeviceSession> {
         let mut connection = self.reader()?;
