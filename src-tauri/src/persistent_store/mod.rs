@@ -32,6 +32,7 @@ pub(crate) mod server_sync_engine;
 pub(crate) mod server_sync_journal;
 pub(crate) mod server_sync_outbox;
 pub(crate) mod server_sync_projection;
+pub(crate) mod server_sync_sections;
 mod repair;
 mod snapshot;
 mod snapshot_archive;

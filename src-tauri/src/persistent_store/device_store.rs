@@ -392,6 +392,7 @@ impl DeviceStore {
         Ok(())
     }
 
+
     pub(crate) fn asset_residency_policy(&self) -> StoreResult<AssetPolicy> {
         let value: String = self.connection.query_row(
             "SELECT policy FROM asset_residency_policy WHERE singleton=1",
@@ -422,7 +423,6 @@ impl DeviceStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?)
     }
 
-    #[cfg(test)]
     pub(crate) fn connection(&self) -> &Connection {
         &self.connection
     }

@@ -154,7 +154,9 @@ impl PersistentStore {
         })();
         if outcome.is_err() {
             let _ = stored.remove(&root);
+            return outcome;
         }
+        super::server_sync_sections::forget_publications(self.device_store_mut()?)?;
         outcome
     }
     /// Disconnect keeps PDS and cached immutable bytes. An unresolved operation
@@ -205,6 +207,7 @@ impl PersistentStore {
             tx.execute(&format!("DELETE FROM {table}"), [])?;
         }
         tx.commit()?;
+        super::server_sync_sections::forget_publications(self.device_store_mut()?)?;
         if let Some(stored) = stored {
             let _ = stored.remove(self.repository_root());
         }
@@ -341,6 +344,9 @@ impl PersistentStore {
         } else if let Some(replacement) = replacement {
             let _ = replacement.remove(&root);
         }
+        if outcome.is_ok() {
+            super::server_sync_sections::forget_publications(self.device_store_mut()?)?;
+        }
         outcome
     }
     /// Sections whose received changes this device has applied locally. A section
@@ -351,9 +357,10 @@ impl PersistentStore {
             .query_row(
                 "SELECT head FROM server_sync_state WHERE singleton=1",
                 [],
-                |r| r.get(0),
+                |r| r.get::<_, Option<String>>(0),
             )
-            .optional()?;
+            .optional()?
+            .flatten();
         let stored: Option<RemoteHead> = stored
             .map(|value| serde_json::from_str(&value))
             .transpose()
@@ -546,12 +553,16 @@ impl PersistentStore {
         tx.commit()?;
         Ok(committed)
     }
-    pub(crate) fn server_base(&self, key: &str) -> Result<(RecordVersion, Option<String>)> {
+    pub(crate) fn server_base(
+        &self,
+        domain: Domain,
+        key: &str,
+    ) -> Result<(RecordVersion, Option<String>)> {
         let row = self
             .connection
             .query_row(
-                "SELECT version,local_hash FROM server_sync_base WHERE key=?1",
-                [key],
+                "SELECT version,local_hash FROM server_sync_base WHERE domain=?1 AND key=?2",
+                params![domain.as_str(), key],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
             )
             .optional()?;
@@ -565,12 +576,13 @@ impl PersistentStore {
     }
     pub(crate) fn server_record_prepared(
         &self,
+        domain: Domain,
         key: &str,
         version: &RecordVersion,
         local_hash: Option<&str>,
         dirty: &ServerDirtyKey,
     ) -> Result<()> {
-        self.connection.execute("INSERT INTO server_sync_operation_records VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(key) DO UPDATE SET version=excluded.version,local_hash=excluded.local_hash,revision=excluded.revision",params![key,String::from_utf8(canonical::encode(version)?).map_err(|_|SyncError::new("invalid-version",400))?,local_hash,dirty.kind,dirty.key1,dirty.key2,dirty.revision])?;
+        self.connection.execute("INSERT INTO server_sync_operation_records VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(domain,key) DO UPDATE SET version=excluded.version,local_hash=excluded.local_hash,revision=excluded.revision",params![domain.as_str(),key,String::from_utf8(canonical::encode(version)?).map_err(|_|SyncError::new("invalid-version",400))?,local_hash,dirty.kind,dirty.key1,dirty.key2,dirty.revision])?;
         Ok(())
     }
 }

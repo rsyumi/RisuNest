@@ -8,9 +8,14 @@ use risunest_sync_wire::{
     canonical, Domain, RecordChange, RecordVersion, RemoteHead, Sequence, MAX_METADATA_BYTES,
 };
 
-/// The library is the only section this replica applies today. Hypa and local
-/// plugin sections are requested by the section-aware paths added later.
-const SECTIONS: [Domain; 1] = [Domain::Library];
+/// Builds a SQL list from schema-owned wire identifiers, never from input.
+fn domain_filter(domains: &[Domain]) -> String {
+    domains
+        .iter()
+        .map(|domain| format!("'{}'", domain.as_str()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -90,13 +95,10 @@ fn json<T: Serialize>(value: &T) -> Result<String> {
         .map_err(|_| SyncError::new("invalid-remote-metadata", 502))
 }
 fn version(db: &Connection, domain: Domain, key: &str) -> Result<RecordVersion> {
-    if domain != Domain::Library {
-        return Err(SyncError::new("unsupported-remote-section", 502));
-    }
     let value: Option<String> = db
         .query_row(
-            "SELECT version FROM server_sync_remote WHERE key=?1",
-            [key],
+            "SELECT version FROM server_sync_remote WHERE domain=?1 AND key=?2",
+            params![domain.as_str(), key],
             |r| r.get(0),
         )
         .optional()?;
@@ -106,12 +108,21 @@ fn version(db: &Connection, domain: Domain, key: &str) -> Result<RecordVersion> 
         .map(|v| v.unwrap_or(RecordVersion::Absent))
 }
 
+/// The library plus whichever device sections this device takes part in, in
+/// wire order. A section left out is unreceived, not emptied.
 pub(crate) fn refresh(
     db: &mut Connection,
     client: &ServerClient,
     observed: &RemoteHead,
+    domains: &[Domain],
 ) -> Result<RemoteHead> {
-    match refresh_once(db, client, observed) {
+    if domains.first() != Some(&Domain::Library) && !domains.contains(&Domain::Library) {
+        return Err(SyncError::new("invalid-remote-sections", 409));
+    }
+    if domains.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(SyncError::new("invalid-remote-sections", 409));
+    }
+    match refresh_once(db, client, observed, domains) {
         Err(error)
             if error.status == 410
                 || (error.status == 404
@@ -123,7 +134,7 @@ pub(crate) fn refresh(
             // An expired metadata lease invalidates only the staging cursor.
             // Rebuild a fixed checkpoint while preserving PDS, bases and outbox.
             db.execute("DELETE FROM server_sync_remote_cursor", [])?;
-            refresh_once(db, client, observed)
+            refresh_once(db, client, observed, domains)
         }
         result => result,
     }
@@ -132,18 +143,28 @@ fn refresh_once(
     db: &mut Connection,
     client: &ServerClient,
     observed: &RemoteHead,
+    domains: &[Domain],
 ) -> Result<RemoteHead> {
     observed.validate()?;
-    let saved: Option<(String, Option<String>, bool)> = db
+    let saved: Option<(String, Option<String>, bool, String)> = db
         .query_row(
-            "SELECT head,cursor,complete FROM server_sync_remote_cursor WHERE singleton=1",
+            "SELECT head,cursor,complete,domains FROM server_sync_remote_cursor WHERE singleton=1",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
+    // A changed participation choice invalidates the mirror's coverage rather
+    // than its contents, so the next fetch starts from a checkpoint.
+    let saved = match saved {
+        Some((_, _, _, ref stored)) if decode::<Vec<Domain>>(stored)? != domains => {
+            db.execute("DELETE FROM server_sync_remote_cursor", [])?;
+            None
+        }
+        other => other,
+    };
     let through;
     let mut fetch;
-    if let Some((head, cursor, false)) = &saved {
+    if let Some((head, cursor, false, _)) = &saved {
         through = decode::<RemoteHead>(head)?;
         if through.epoch != observed.epoch {
             return Err(SyncError::new("epoch-reconciliation-required", 409));
@@ -156,7 +177,7 @@ fn refresh_once(
     } else {
         let previous = saved
             .as_ref()
-            .map(|(h, _, _)| decode::<RemoteHead>(h))
+            .map(|(h, _, _, _)| decode::<RemoteHead>(h))
             .transpose()?;
         if previous.as_ref().is_some_and(|h| h.same_revision(observed)) {
             return Ok(observed.clone());
@@ -173,13 +194,13 @@ fn refresh_once(
                 "read-pins",
                 &[],
                 Some(
-                    &serde_json::json!({"epoch":previous.epoch,"afterSeq":previous.seq,"domains":SECTIONS}),
+                    &serde_json::json!({"epoch":previous.epoch,"afterSeq":previous.seq,"domains":domains}),
                 ),
                 &[],
             )?;
             if pin.after_seq != previous.seq
                 || pin.through.epoch != previous.epoch
-                || pin.domains != SECTIONS
+                || pin.domains != domains
             {
                 return Err(SyncError::new("invalid-read-pin", 502));
             }
@@ -197,11 +218,11 @@ fn refresh_once(
                 Method::POST,
                 "checkpoints",
                 &[],
-                Some(&serde_json::json!({"domains":SECTIONS})),
+                Some(&serde_json::json!({"domains":domains})),
                 &[],
             )?;
             risunest_sync_wire::validate_id(&checkpoint.checkpoint_id)?;
-            if checkpoint.domains != SECTIONS {
+            if checkpoint.domains != domains {
                 return Err(SyncError::new("checkpoint-identity-mismatch", 502));
             }
             through = checkpoint.head;
@@ -217,13 +238,19 @@ fn refresh_once(
         let tx = db.transaction()?;
         if matches!(fetch, Fetch::Checkpoint { .. }) {
             // Preserve removals from the previous remote snapshot in the work set.
+            // Only the sections this checkpoint covers are rebuilt; the rest keep
+            // the mirror they already had.
+            let scope = domain_filter(domains);
             tx.execute(
-                "INSERT OR IGNORE INTO server_sync_remote_dirty SELECT key FROM server_sync_remote",
+                &format!("INSERT OR IGNORE INTO server_sync_remote_dirty SELECT domain,key FROM server_sync_remote WHERE domain IN ({scope})"),
                 [],
             )?;
-            tx.execute("DELETE FROM server_sync_remote", [])?;
+            tx.execute(
+                &format!("DELETE FROM server_sync_remote WHERE domain IN ({scope})"),
+                [],
+            )?;
         }
-        tx.execute("INSERT INTO server_sync_remote_cursor VALUES(1,?1,?2,?3,0) ON CONFLICT(singleton) DO UPDATE SET head=excluded.head,domains=excluded.domains,cursor=excluded.cursor,complete=0",params![json(&through)?,json(&SECTIONS)?,json(&fetch)?])?;
+        tx.execute("INSERT INTO server_sync_remote_cursor VALUES(1,?1,?2,?3,0) ON CONFLICT(singleton) DO UPDATE SET head=excluded.head,domains=excluded.domains,cursor=excluded.cursor,complete=0",params![json(&through)?,json(&domains)?,json(&fetch)?])?;
         tx.commit()?;
     }
     loop {
@@ -243,7 +270,7 @@ fn refresh_once(
                 )?;
                 if page.checkpoint.checkpoint_id != *id
                     || !page.checkpoint.head.same_revision(&through)
-                    || page.checkpoint.domains != SECTIONS
+                    || page.checkpoint.domains != domains
                     || page.records.len() > 1024
                 {
                     return Err(SyncError::new("checkpoint-identity-mismatch", 502));
@@ -281,7 +308,7 @@ fn refresh_once(
                     &[],
                 )?;
                 if !page.through.same_revision(&through)
-                    || page.domains != SECTIONS
+                    || page.domains != domains
                     || page.entries.len() > 1024
                 {
                     return Err(SyncError::new("journal-identity-mismatch", 502));
@@ -329,16 +356,16 @@ fn refresh_once(
         for entry in entries {
             if entry.key.is_empty()
                 || entry.key.len() > risunest_sync_wire::MAX_KEY_BYTES
-                || !SECTIONS.contains(&entry.domain)
+                || !domains.contains(&entry.domain)
                 || matches!(entry.version, RecordVersion::Absent)
             {
                 return Err(SyncError::new("invalid-remote-record", 502));
             }
             entry.version.validate()?;
-            tx.execute("INSERT INTO server_sync_remote VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET version=excluded.version",params![entry.key,json(&entry.version)?])?;
+            tx.execute("INSERT INTO server_sync_remote VALUES(?1,?2,?3) ON CONFLICT(domain,key) DO UPDATE SET version=excluded.version",params![entry.domain.as_str(),entry.key,json(&entry.version)?])?;
             tx.execute(
-                "INSERT OR IGNORE INTO server_sync_remote_dirty VALUES(?1)",
-                [entry.key],
+                "INSERT OR IGNORE INTO server_sync_remote_dirty VALUES(?1,?2)",
+                params![entry.domain.as_str(), entry.key],
             )?;
         }
         tx.execute(

@@ -66,9 +66,20 @@ impl Cache {
     ) -> Result<ProjectedRecord> {
         let bytes =
             serde_json::to_vec(payload).map_err(|_| SyncError::new("projection-encoding", 409))?;
-        let local_hash = risunest_sync_wire::hash(&bytes);
+        self.project_bytes(&bytes, dependencies, relations, scopes)
+    }
+    /// The same record container for a body the library projection does not own,
+    /// such as a device section entry.
+    pub fn project_bytes(
+        &self,
+        bytes: &[u8],
+        dependencies: &[String],
+        relations: &[String],
+        scopes: Vec<String>,
+    ) -> Result<ProjectedRecord> {
+        let local_hash = risunest_sync_wire::hash(bytes);
         let mut objects = BTreeSet::new();
-        let segmented = payload::build(&mut Cursor::new(&bytes), |bytes| {
+        let segmented = payload::build(&mut Cursor::new(bytes), |bytes| {
             let hash = self
                 .put(bytes)
                 .map_err(|_| WireError("cache-write-failed"))?;
@@ -112,11 +123,14 @@ impl Cache {
     pub fn restore(&self, version: &RecordVersion) -> Result<(ServerPayload, String)> {
         self.restore_with(version, |hash, limit| self.read(hash, limit))
     }
-    pub fn restore_with(
+    pub fn restore_bytes(&self, version: &RecordVersion) -> Result<(Vec<u8>, String)> {
+        self.restore_bytes_with(version, |hash, limit| self.read(hash, limit))
+    }
+    fn restore_bytes_with(
         &self,
         version: &RecordVersion,
         mut read: impl FnMut(&str, usize) -> Result<Vec<u8>>,
-    ) -> Result<(ServerPayload, String)> {
+    ) -> Result<(Vec<u8>, String)> {
         let RecordVersion::Live { object_hash, .. } = version else {
             return Err(SyncError::new("record-is-not-live", 409));
         };
@@ -133,6 +147,14 @@ impl Cache {
             |hash| read(hash, payload::MAX_CHUNK).map_err(|_| WireError("cached-payload-invalid")),
             &mut bytes,
         )?;
+        Ok((bytes, object.payload.content_hash))
+    }
+    pub fn restore_with(
+        &self,
+        version: &RecordVersion,
+        read: impl FnMut(&str, usize) -> Result<Vec<u8>>,
+    ) -> Result<(ServerPayload, String)> {
+        let (bytes, content_hash) = self.restore_bytes_with(version, read)?;
         let payload: ServerPayload = serde_json::from_slice(&bytes)
             .map_err(|_| SyncError::new("invalid-server-payload", 409))?;
         if serde_json::to_vec(&payload)
@@ -141,7 +163,7 @@ impl Cache {
         {
             return Err(SyncError::new("noncanonical-server-payload", 409));
         }
-        Ok((payload, object.payload.content_hash))
+        Ok((payload, content_hash))
     }
     pub fn closure(&self, version: &RecordVersion) -> Result<Vec<String>> {
         let RecordVersion::Live {
