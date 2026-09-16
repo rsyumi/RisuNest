@@ -33,6 +33,15 @@ pub(crate) fn section_from_id(id: &str) -> Option<Section> {
         .find(|section| section.as_str() == id)
 }
 
+/// The commit a removal first reached a remote in, and when that happened. A
+/// removal this device has not published yet carries none, and the marker only
+/// means anything inside the remote lineage that issued the commit number.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TombstonePublication {
+    pub generation: Sequence,
+    pub at_ms: u64,
+}
+
 /// Every section value a device can publish, plus the removal of one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SectionValueRow {
@@ -55,7 +64,30 @@ pub(crate) enum SectionValueRow {
     PluginPermission {
         granted: bool,
     },
-    Tombstone,
+    Tombstone {
+        first_published: Option<TombstonePublication>,
+    },
+}
+
+impl SectionValueRow {
+    pub(crate) fn is_tombstone(&self) -> bool {
+        matches!(self, Self::Tombstone { .. })
+    }
+    /// Whether two rows hold the same thing. A removal's first publication
+    /// marker is bookkeeping about the removal, not part of what the key holds,
+    /// so two removals of the same key are the same content either way.
+    pub(crate) fn same_content(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Tombstone { .. }, Self::Tombstone { .. }) => true,
+            _ => self == other,
+        }
+    }
+    fn first_published(&self) -> Option<&TombstonePublication> {
+        match self {
+            Self::Tombstone { first_published } => first_published.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 /// The triple a section row is named by, in the order the change index holds.
@@ -144,13 +176,45 @@ fn unpublished_keys(
     Ok(keys)
 }
 
+/// The stored marker pair. The schema keeps the two columns set or unset
+/// together, so a half-written pair is a broken device file rather than a
+/// removal this device may publish.
+fn first_published(
+    generation: Option<String>,
+    at_ms: Option<i64>,
+) -> StoreResult<Option<TombstonePublication>> {
+    match (generation, at_ms) {
+        (Some(generation), Some(at_ms)) => Ok(Some(TombstonePublication {
+            generation: sequence(&generation)?,
+            at_ms: u64::try_from(at_ms)
+                .map_err(|_| invalid("device removal marker time is out of range"))?,
+        })),
+        (None, None) => Ok(None),
+        _ => Err(invalid("device removal marker is incomplete")),
+    }
+}
+
+/// Whether `candidate` names an earlier first publication than `current`. A
+/// removal this device has not published yet takes whichever marker a remote
+/// carries for the same version.
+fn earlier_marker(candidate: &SectionValueRow, current: &SectionValueRow) -> bool {
+    match (candidate.first_published(), current.first_published()) {
+        (Some(candidate), Some(current)) => {
+            (&candidate.generation, candidate.at_ms) < (&current.generation, current.at_ms)
+        }
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
 fn read_rows(tx: &Transaction<'_>, section: Section) -> StoreResult<Vec<SectionRow>> {
     let mut rows = Vec::new();
     match section {
         Section::Hypa => {
             let mut statement = tx.prepare(
                 "SELECT cache_key,producer,model,endpoint,preprocess_version,dimensions,vector,
-                        metadata,tombstone,write_clock,writer_id
+                        metadata,tombstone,write_clock,writer_id,first_published_generation,
+                        first_published_at_ms
                     FROM hypa_embeddings ORDER BY cache_key",
             )?;
             let mut query = statement.query([])?;
@@ -158,7 +222,9 @@ fn read_rows(tx: &Transaction<'_>, section: Section) -> StoreResult<Vec<SectionR
                 let tombstone: i64 = row.get(8)?;
                 let vector: Option<Vec<u8>> = row.get(6)?;
                 let value = if tombstone == 1 || vector.is_none() {
-                    SectionValueRow::Tombstone
+                    SectionValueRow::Tombstone {
+                        first_published: first_published(row.get(11)?, row.get(12)?)?,
+                    }
                 } else {
                     SectionValueRow::Hypa {
                         producer: row.get(1)?,
@@ -182,7 +248,8 @@ fn read_rows(tx: &Transaction<'_>, section: Section) -> StoreResult<Vec<SectionR
         }
         Section::LocalPlugins => {
             let mut statement = tx.prepare(
-                "SELECT owner,space,key,value,tombstone,write_clock,writer_id
+                "SELECT owner,space,key,value,tombstone,write_clock,writer_id,
+                        first_published_generation,first_published_at_ms
                     FROM plugin_device_storage ORDER BY owner,space,key",
             )?;
             let mut query = statement.query([])?;
@@ -194,7 +261,9 @@ fn read_rows(tx: &Transaction<'_>, section: Section) -> StoreResult<Vec<SectionR
                         space: row.get(1)?,
                         value,
                     },
-                    _ => SectionValueRow::Tombstone,
+                    _ => SectionValueRow::Tombstone {
+                        first_published: first_published(row.get(7)?, row.get(8)?)?,
+                    },
                 };
                 rows.push(SectionRow {
                     key1: row.get(0)?,
@@ -284,7 +353,7 @@ impl DeviceStore {
         Ok(self
             .read_section_rows(section)?
             .into_iter()
-            .filter(|row| row.value != SectionValueRow::Tombstone)
+            .filter(|row| !row.value.is_tombstone())
             .collect())
     }
 
@@ -373,11 +442,52 @@ impl DeviceStore {
         &mut self,
         section: Section,
         published: &[(SectionKey, Sequence)],
+        stamped: &[(SectionKey, Sequence)],
+        first_published: &TombstonePublication,
     ) -> StoreResult<()> {
-        if published.is_empty() {
+        if published.is_empty() && stamped.is_empty() {
             return Ok(());
         }
         let transaction = self.transaction()?;
+        // A removal takes the marker the publication carried, so the device
+        // file and every remote that read it name the same commit. A removal
+        // rewritten since the capture is not the one that went out.
+        {
+            let mut statement = match section {
+                Section::Hypa => transaction.prepare(
+                    "UPDATE hypa_embeddings
+                        SET first_published_generation=?3,first_published_at_ms=?4
+                        WHERE cache_key=?1 AND write_clock=?2 AND tombstone=1
+                          AND first_published_generation IS NULL",
+                )?,
+                Section::LocalPlugins => transaction.prepare(
+                    "UPDATE plugin_device_storage
+                        SET first_published_generation=?5,first_published_at_ms=?6
+                        WHERE owner=?1 AND space=?2 AND key=?3 AND write_clock=?4
+                          AND tombstone=1 AND first_published_generation IS NULL",
+                )?,
+            };
+            let generation = first_published.generation.as_str();
+            let at_ms = i64::try_from(first_published.at_ms)
+                .map_err(|_| invalid("device removal marker time is out of range"))?;
+            for ((key1, key2, key3), clock) in stamped {
+                match section {
+                    Section::Hypa => {
+                        statement.execute(params![key1, clock.as_str(), generation, at_ms])?;
+                    }
+                    Section::LocalPlugins => {
+                        statement.execute(params![
+                            key1,
+                            key2,
+                            key3,
+                            clock.as_str(),
+                            generation,
+                            at_ms
+                        ])?;
+                    }
+                }
+            }
+        }
         {
             let mut statement = match section {
                 Section::Hypa => transaction.prepare(
@@ -434,7 +544,9 @@ impl DeviceStore {
                     && unpublished.contains(&row.key());
                 let settled = carried
                     .get(&row.key())
-                    .is_some_and(|other| row.same_version(other) && row.value == other.value);
+                    .is_some_and(|other| {
+                        row.same_version(other) && row.value.same_content(&other.value)
+                    });
                 !held && !settled
             })
             .collect();
@@ -449,6 +561,16 @@ impl DeviceStore {
                     &transaction,
                     section,
                     &SectionRow {
+                        // A reissued removal is a new write for whichever
+                        // lineage receives it, and commit numbers mean nothing
+                        // across lineages, so it drops the marker it carried
+                        // and takes one from the publication that carries it.
+                        value: match &row.value {
+                            SectionValueRow::Tombstone { .. } => SectionValueRow::Tombstone {
+                                first_published: None,
+                            },
+                            value => value.clone(),
+                        },
                         write_clock: clock.clone(),
                         writer_id: writer_id.clone(),
                         ..row.clone()
@@ -478,6 +600,7 @@ impl DeviceStore {
             .collect();
         let mut highest = Sequence::from(0u64);
         let mut applied = Vec::new();
+        let mut adopted = Vec::new();
         for row in rows {
             if row.writer_id.is_empty() {
                 return Err(invalid("received section row has no writer"));
@@ -487,10 +610,18 @@ impl DeviceStore {
             }
             match local.get(&row.key()) {
                 Some(current) if current.same_version(row) => {
-                    if current.value != row.value {
+                    if !current.value.same_content(&row.value) {
                         return Err(invalid(
                             "received section row differs at the same version",
                         ));
+                    }
+                    // Two devices can hold different first publication markers
+                    // for one removal when a confirmed publication did not
+                    // finish its local bookkeeping. The earliest marker is the
+                    // one that happened, and taking it whichever way the rows
+                    // arrive keeps the devices from publishing over each other.
+                    if earlier_marker(&row.value, &current.value) {
+                        adopted.push(row);
                     }
                     outcome.kept += 1;
                 }
@@ -503,6 +634,9 @@ impl DeviceStore {
         for row in &applied {
             write_row(&transaction, section, row, true)?;
             outcome.applied += 1;
+        }
+        for row in &adopted {
+            write_row(&transaction, section, row, true)?;
         }
         observe_remote_clock(&transaction, section, &highest)?;
         transaction.commit()?;
@@ -614,11 +748,11 @@ impl DeviceStore {
             .collect();
         super::begin_mutation(&transaction)?;
         for row in rows {
-            if row.value == SectionValueRow::Tombstone {
+            if row.value.is_tombstone() {
                 return Err(invalid("restored section row has no value"));
             }
             let settled = held.get(&row.key()).is_some_and(|current| {
-                current.value == row.value
+                current.value.same_content(&row.value)
                     && current.writer_id == writer_id
                     && unpublished.contains(&row.key())
             });
@@ -638,7 +772,7 @@ impl DeviceStore {
             )?;
         }
         for (key, current) in &held {
-            if restored.contains(key) || current.value == SectionValueRow::Tombstone {
+            if restored.contains(key) || current.value.is_tombstone() {
                 continue;
             }
             let clock = super::issue_write_clock(&transaction, section)?;
@@ -646,7 +780,9 @@ impl DeviceStore {
                 &transaction,
                 section,
                 &SectionRow {
-                    value: SectionValueRow::Tombstone,
+                    value: SectionValueRow::Tombstone {
+                        first_published: None,
+                    },
                     write_clock: clock,
                     writer_id: writer_id.clone(),
                     ..current.clone()
@@ -738,22 +874,30 @@ fn write_row(
     published: bool,
 ) -> StoreResult<()> {
     let published_clock = published.then(|| row.write_clock.as_str().to_owned());
+    let marker = row.value.first_published();
+    let generation = marker.map(|marker| marker.generation.as_str().to_owned());
+    let at_ms = marker.map(|marker| marker.at_ms as i64);
     match (section, &row.value) {
-        (Section::Hypa, SectionValueRow::Tombstone) => {
+        (Section::Hypa, SectionValueRow::Tombstone { .. }) => {
             tx.execute(
                 "INSERT INTO hypa_embeddings
                     (cache_key,producer,model,endpoint,preprocess_version,dimensions,vector,
-                     metadata,tombstone,write_clock,writer_id,published_clock)
-                    VALUES (?1,'','',NULL,0,1,NULL,NULL,1,?2,?3,?4)
+                     metadata,tombstone,write_clock,writer_id,published_clock,
+                     first_published_generation,first_published_at_ms)
+                    VALUES (?1,'','',NULL,0,1,NULL,NULL,1,?2,?3,?4,?5,?6)
                     ON CONFLICT(cache_key) DO UPDATE SET
                         vector=NULL,metadata=NULL,tombstone=1,
                         write_clock=excluded.write_clock,writer_id=excluded.writer_id,
-                        published_clock=excluded.published_clock",
+                        published_clock=excluded.published_clock,
+                        first_published_generation=excluded.first_published_generation,
+                        first_published_at_ms=excluded.first_published_at_ms",
                 params![
                     row.key1,
                     row.write_clock.as_str(),
                     row.writer_id,
-                    published_clock
+                    published_clock,
+                    generation,
+                    at_ms
                 ],
             )?;
         }
@@ -772,8 +916,9 @@ fn write_row(
             tx.execute(
                 "INSERT INTO hypa_embeddings
                     (cache_key,producer,model,endpoint,preprocess_version,dimensions,vector,
-                     metadata,tombstone,write_clock,writer_id,published_clock)
-                    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,?9,?10,?11)
+                     metadata,tombstone,write_clock,writer_id,published_clock,
+                     first_published_generation,first_published_at_ms)
+                    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,?9,?10,?11,NULL,NULL)
                     ON CONFLICT(cache_key) DO UPDATE SET
                         producer=excluded.producer,model=excluded.model,
                         endpoint=excluded.endpoint,
@@ -781,7 +926,8 @@ fn write_row(
                         dimensions=excluded.dimensions,vector=excluded.vector,
                         metadata=excluded.metadata,tombstone=0,
                         write_clock=excluded.write_clock,writer_id=excluded.writer_id,
-                        published_clock=excluded.published_clock",
+                        published_clock=excluded.published_clock,
+                        first_published_generation=NULL,first_published_at_ms=NULL",
                 params![
                     row.key1,
                     producer,
@@ -797,23 +943,27 @@ fn write_row(
                 ],
             )?;
         }
-        (Section::LocalPlugins, SectionValueRow::Tombstone) => {
+        (Section::LocalPlugins, SectionValueRow::Tombstone { .. }) => {
             tx.execute(
                 "INSERT INTO plugin_device_storage
                     (owner,space,key,value,byte_size,tombstone,write_clock,writer_id,
-                     published_clock)
-                    VALUES (?1,?2,?3,NULL,0,1,?4,?5,?6)
+                     published_clock,first_published_generation,first_published_at_ms)
+                    VALUES (?1,?2,?3,NULL,0,1,?4,?5,?6,?7,?8)
                     ON CONFLICT(owner,space,key) DO UPDATE SET
                         value=NULL,byte_size=0,tombstone=1,
                         write_clock=excluded.write_clock,writer_id=excluded.writer_id,
-                        published_clock=excluded.published_clock",
+                        published_clock=excluded.published_clock,
+                        first_published_generation=excluded.first_published_generation,
+                        first_published_at_ms=excluded.first_published_at_ms",
                 params![
                     row.key1,
                     row.key2,
                     row.key3,
                     row.write_clock.as_str(),
                     row.writer_id,
-                    published_clock
+                    published_clock,
+                    generation,
+                    at_ms
                 ],
             )?;
         }
@@ -826,12 +976,13 @@ fn write_row(
             tx.execute(
                 "INSERT INTO plugin_device_storage
                     (owner,space,key,value,byte_size,tombstone,write_clock,writer_id,
-                     published_clock)
-                    VALUES (?1,?2,?3,?4,?5,0,?6,?7,?8)
+                     published_clock,first_published_generation,first_published_at_ms)
+                    VALUES (?1,?2,?3,?4,?5,0,?6,?7,?8,NULL,NULL)
                     ON CONFLICT(owner,space,key) DO UPDATE SET
                         value=excluded.value,byte_size=excluded.byte_size,tombstone=0,
                         write_clock=excluded.write_clock,writer_id=excluded.writer_id,
-                        published_clock=excluded.published_clock",
+                        published_clock=excluded.published_clock,
+                        first_published_generation=NULL,first_published_at_ms=NULL",
                 params![
                     row.key1,
                     row.key2,

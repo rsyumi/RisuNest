@@ -613,7 +613,12 @@ fn note_sections_published(
     let device = store.device_store_mut().map_err(local_error)?;
     for publication in publications {
         device
-            .note_section_published(publication.section, &publication.published)
+            .note_section_published(
+                publication.section,
+                &publication.published,
+                &publication.stamped,
+                &publication.first_published,
+            )
             .map_err(local_error)?;
     }
     for reference in sections.values() {

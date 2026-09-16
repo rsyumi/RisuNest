@@ -3,7 +3,7 @@
 //! change without changing what the repository holds.
 use super::contract::{Cancellation, ErrorKind, ProviderError, Result};
 use crate::persistent_store::device_store::{
-    sections::{SectionCursor, SectionKey, SectionRow, SectionValueRow},
+    sections::{SectionCursor, SectionKey, SectionRow, SectionValueRow, TombstonePublication},
     Section,
 };
 use risunest_external_storage_format::{
@@ -59,6 +59,35 @@ pub(crate) struct CapturedSection {
 pub(crate) struct SectionPublication {
     pub section: Section,
     pub published: Vec<(SectionKey, Sequence)>,
+    /// Removals this capture is publishing for the first time, with the marker
+    /// the entries carry.
+    pub stamped: Vec<(SectionKey, Sequence)>,
+    pub first_published: TombstonePublication,
+}
+
+/// Stamps the removals this capture is publishing for the first time. A marker
+/// a removal already carries is what every other device has, so it is kept.
+fn stamp_removals(
+    rows: Vec<SectionRow>,
+    marker: &TombstonePublication,
+) -> (Vec<SectionRow>, Vec<(SectionKey, Sequence)>) {
+    let mut stamped = Vec::new();
+    let rows = rows
+        .into_iter()
+        .map(|row| match &row.value {
+            SectionValueRow::Tombstone { first_published: None } => {
+                stamped.push((row.key(), row.write_clock.clone()));
+                SectionRow {
+                    value: SectionValueRow::Tombstone {
+                        first_published: Some(marker.clone()),
+                    },
+                    ..row
+                }
+            }
+            _ => row,
+        })
+        .collect();
+    (rows, stamped)
 }
 
 pub(crate) fn section_of(kind: SectionKind) -> Option<Section> {
@@ -144,7 +173,15 @@ fn section_value(
     sources: &mut Vec<SectionSource>,
 ) -> Result<SectionValue> {
     match (&row.value, kind) {
-        (SectionValueRow::Tombstone, _) => Ok(SectionValue::Tombstone),
+        (SectionValueRow::Tombstone { first_published }, _) => {
+            let marker = first_published
+                .as_ref()
+                .ok_or_else(|| corrupt("removal has no first publication marker"))?;
+            Ok(SectionValue::tombstone(
+                marker.generation.clone(),
+                marker.at_ms,
+            ))
+        }
         (
             SectionValueRow::Hypa {
                 producer,
@@ -305,6 +342,10 @@ pub(crate) fn capture_state_sections(
     spool: &Path,
     cancel: &Cancellation,
 ) -> Result<(Vec<CapturedSection>, Vec<SectionPublication>)> {
+    let at_ms = u64::try_from(
+        crate::persistent_store::device_store::now_ms().map_err(device_error)?,
+    )
+    .map_err(corrupt)?;
     let device = store.device_store_mut().map_err(device_error)?;
     let mut captured = Vec::new();
     let mut publications = Vec::new();
@@ -314,7 +355,14 @@ pub(crate) fn capture_state_sections(
         if !state.participating {
             continue;
         }
-        let rows = device.read_section_rows(section).map_err(device_error)?;
+        let marker = TombstonePublication {
+            generation: generation.clone(),
+            at_ms,
+        };
+        let (rows, stamped) = stamp_removals(
+            device.read_section_rows(section).map_err(device_error)?,
+            &marker,
+        );
         captured.push(capture_section(
             kind,
             &rows,
@@ -331,6 +379,8 @@ pub(crate) fn capture_state_sections(
                 .iter()
                 .map(|row| (row.key(), row.write_clock.clone()))
                 .collect(),
+            stamped,
+            first_published: marker,
         });
     }
     Ok((captured, publications))
@@ -459,7 +509,15 @@ fn row_of(
         SectionKind::LocalSettings => decode_setting_entry_key(&entry.key)?,
     };
     let value = match &entry.value {
-        SectionValue::Tombstone => SectionValueRow::Tombstone,
+        SectionValue::Tombstone {
+            first_published_generation,
+            first_published_at_ms,
+        } => SectionValueRow::Tombstone {
+            first_published: Some(TombstonePublication {
+                generation: first_published_generation.clone(),
+                at_ms: *first_published_at_ms,
+            }),
+        },
         SectionValue::Hypa(value) => {
             let vector = match &value.vector {
                 InlineOrObject::Inline(_) => value.vector.decode_inline().map_err(corrupt)?,
@@ -939,7 +997,12 @@ mod tests {
             .expect("read awaiting publication"));
         for publication in &publications {
             device
-                .note_section_published(publication.section, &publication.published)
+                .note_section_published(
+                    publication.section,
+                    &publication.published,
+                    &publication.stamped,
+                    &publication.first_published,
+                )
                 .expect("record the confirmed publication");
         }
         assert!(!device
@@ -959,6 +1022,125 @@ mod tests {
         assert!(device
             .sections_await_publication("connection", "library")
             .expect("read awaiting publication"));
+    }
+
+    fn removal_marker(store: &mut PersistentStore, key: &str) -> Option<TombstonePublication> {
+        store
+            .device_store_mut()
+            .expect("open device store")
+            .read_section_rows(Section::LocalPlugins)
+            .expect("read section rows")
+            .into_iter()
+            .find(|row| row.key3 == key)
+            .and_then(|row| match row.value {
+                SectionValueRow::Tombstone { first_published } => first_published,
+                _ => None,
+            })
+    }
+
+    /// A removal this device has not published yet takes the commit number and
+    /// the time of the publication that carries it, and the device file records
+    /// the same marker once that publication is confirmed. A removal that
+    /// already carries one keeps it, so every device judges its age alike.
+    #[test]
+    fn a_removal_takes_the_marker_of_the_publication_that_carries_it() {
+        let spool = tempfile::tempdir().expect("create spool");
+        let root = tempfile::tempdir().expect("create store root");
+        let mut store = PersistentStore::open(root.path()).expect("open persistent store");
+        {
+            let device = store.device_store_mut().expect("open device store");
+            device
+                .set_section_participating(Section::LocalPlugins, true)
+                .expect("take part in the plugin section");
+            device
+                .set_section_participating(Section::Hypa, false)
+                .expect("leave the embedding section out");
+            device
+                .write_plugin_device_values(
+                    "plugin-a",
+                    &[PluginDeviceMutation::Set {
+                        space: "string".into(),
+                        key: "gone".into(),
+                        value: "value".into(),
+                    }],
+                )
+                .expect("write a local plugin value");
+            device
+                .write_plugin_device_values(
+                    "plugin-a",
+                    &[PluginDeviceMutation::Delete {
+                        space: "string".into(),
+                        key: "gone".into(),
+                    }],
+                )
+                .expect("remove the local plugin value");
+        }
+        assert!(removal_marker(&mut store, "gone").is_none());
+
+        let (captured, publications) = capture_state_sections(
+            &mut store,
+            &Sequence::from(4u64),
+            &spool.path().join("published"),
+            &Cancellation::default(),
+        )
+        .expect("capture the state sections");
+        let plugins = captured
+            .iter()
+            .find(|section| section.kind == SectionKind::LocalPlugins)
+            .expect("published plugin section");
+        let decoded = decode_section(
+            SectionKind::LocalPlugins,
+            &carried(plugins),
+            &plugins.content_fingerprint,
+        )
+        .expect("decode the published section");
+        let SectionValueRow::Tombstone { first_published } = &decoded[0].value else {
+            panic!("the removal did not travel as one");
+        };
+        let carried_marker = first_published.clone().expect("a published marker");
+        assert_eq!(carried_marker.generation, Sequence::from(4u64));
+        assert!(carried_marker.at_ms > 0);
+        // Nothing is recorded before the remote holds the capture.
+        assert!(removal_marker(&mut store, "gone").is_none());
+
+        for publication in &publications {
+            store
+                .device_store_mut()
+                .expect("open device store")
+                .note_section_published(
+                    publication.section,
+                    &publication.published,
+                    &publication.stamped,
+                    &publication.first_published,
+                )
+                .expect("record the confirmed publication");
+        }
+        assert_eq!(removal_marker(&mut store, "gone"), Some(carried_marker));
+
+        let (republished, _) = capture_state_sections(
+            &mut store,
+            &Sequence::from(5u64),
+            &spool.path().join("republished"),
+            &Cancellation::default(),
+        )
+        .expect("capture the state sections again");
+        let plugins = republished
+            .iter()
+            .find(|section| section.kind == SectionKind::LocalPlugins)
+            .expect("published plugin section");
+        let decoded = decode_section(
+            SectionKind::LocalPlugins,
+            &carried(plugins),
+            &plugins.content_fingerprint,
+        )
+        .expect("decode the republished section");
+        assert_eq!(decoded[0].value, removal_marker_row(&mut store, "gone"));
+    }
+
+    fn removal_marker_row(store: &mut PersistentStore, key: &str) -> SectionValueRow {
+        SectionValueRow::Tombstone {
+            first_published: removal_marker(store, key),
+        }
     }
 
     #[test]

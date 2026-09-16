@@ -1087,7 +1087,8 @@ fn a_committed_device_value_survives_reopening_the_device_file() {
 
 mod section_exchange {
     use super::super::sections::{
-        SectionCursor, SectionKey, SectionRow, SectionValueRow, LOCAL_SETTING_KEYS,
+        SectionCursor, SectionKey, SectionRow, SectionValueRow, TombstonePublication,
+        LOCAL_SETTING_KEYS,
     };
     use super::super::{plugin_values::PluginDeviceMutation, DeviceStore, Section};
     use super::open;
@@ -1107,9 +1108,30 @@ mod section_exchange {
         }
     }
 
+    fn marker(generation: u64, at_ms: u64) -> TombstonePublication {
+        TombstonePublication {
+            generation: Sequence::from(generation),
+            at_ms,
+        }
+    }
+
     fn plugin_tombstone(key: &str, clock: u64, writer: &str) -> SectionRow {
+        marked_plugin_tombstone(key, clock, writer, None)
+    }
+
+    fn marked_plugin_tombstone(
+        key: &str,
+        clock: u64,
+        writer: &str,
+        marker: Option<(u64, u64)>,
+    ) -> SectionRow {
         SectionRow {
-            value: SectionValueRow::Tombstone,
+            value: SectionValueRow::Tombstone {
+                first_published: marker.map(|(generation, at_ms)| TombstonePublication {
+                    generation: Sequence::from(generation),
+                    at_ms,
+                }),
+            },
             ..plugin_row(key, "", clock, writer)
         }
     }
@@ -1682,7 +1704,7 @@ mod section_exchange {
             .collect();
         set(&mut store, "late", "after the capture");
         store
-            .note_section_published(Section::LocalPlugins, &captured)
+            .note_section_published(Section::LocalPlugins, &captured, &[], &marker(7, 1_760_000_000_000))
             .expect("record the confirmed publication");
         assert!(store
             .sections_await_publication("connection", "library")
@@ -1695,7 +1717,7 @@ mod section_exchange {
             .map(|row| (row.key(), row.write_clock))
             .collect();
         store
-            .note_section_published(Section::LocalPlugins, &captured)
+            .note_section_published(Section::LocalPlugins, &captured, &[], &marker(7, 1_760_000_000_000))
             .expect("record the second publication");
         assert!(!store
             .sections_await_publication("connection", "library")
@@ -1723,7 +1745,7 @@ mod section_exchange {
             .map(|row| (row.key(), row.write_clock))
             .collect();
         store
-            .note_section_published(Section::LocalPlugins, &captured)
+            .note_section_published(Section::LocalPlugins, &captured, &[], &marker(7, 1_760_000_000_000))
             .unwrap();
         store
             .write_section_cursor(

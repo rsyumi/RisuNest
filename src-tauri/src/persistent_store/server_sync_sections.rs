@@ -64,6 +64,45 @@ pub(crate) fn participation(device: &DeviceStore) -> StoreResult<Vec<(Domain, St
     Ok(chosen)
 }
 
+/// The commit a removal first reached a remote in. A removal this device has
+/// not published yet is stamped as its entry is first projected, so every later
+/// projection of the same version encodes the same bytes.
+pub(crate) fn stamp_unpublished_removal(
+    device: &DeviceStore,
+    domain: Domain,
+    key: &str,
+    generation: &Sequence,
+    now_ms: u64,
+) -> StoreResult<()> {
+    let at_ms = i64::try_from(now_ms).map_err(|_| StoreError::Validation {
+        message: "Device removal marker time is out of range".into(),
+    })?;
+    let db = device.connection();
+    match domain {
+        Domain::Hypa => {
+            db.execute(
+                "UPDATE hypa_embeddings
+                    SET first_published_generation=?2,first_published_at_ms=?3
+                    WHERE cache_key=?1 AND tombstone=1
+                      AND first_published_generation IS NULL",
+                params![key, generation.as_str(), at_ms],
+            )?;
+        }
+        Domain::LocalPlugins => {
+            let (owner, space, name) = decode_local_plugin_entry_key(key).map_err(format_error)?;
+            db.execute(
+                "UPDATE plugin_device_storage
+                    SET first_published_generation=?4,first_published_at_ms=?5
+                    WHERE owner=?1 AND space=?2 AND key=?3 AND tombstone=1
+                      AND first_published_generation IS NULL",
+                params![owner, space, name, generation.as_str(), at_ms],
+            )?;
+        }
+        Domain::Library => return invalid("The library is not a device section"),
+    }
+    Ok(())
+}
+
 /// The identity of a row as the merge rule sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LocalEntry {
@@ -123,6 +162,27 @@ pub(crate) fn resolve(local: Option<&LocalEntry>, received: &SectionEntry) -> St
     Ok(Outcome::Settled)
 }
 
+/// A stored removal as the exchange format carries it. A removal this device
+/// has not published yet has no marker to publish, so projecting one is a
+/// mistake the caller has to fix by stamping it first.
+fn removal(generation: Option<String>, at_ms: Option<i64>) -> StoreResult<SectionValue> {
+    let (Some(generation), Some(at_ms)) = (generation, at_ms) else {
+        return invalid("Device removal carries no first publication marker");
+    };
+    Ok(SectionValue::tombstone(
+        sequence(&generation)?,
+        u64::try_from(at_ms).map_err(|_| StoreError::Validation {
+            message: "Device removal marker time is out of range".into(),
+        })?,
+    ))
+}
+
+fn marker_time(at_ms: u64) -> StoreResult<i64> {
+    i64::try_from(at_ms).map_err(|_| StoreError::Validation {
+        message: "Device removal marker time is out of range".into(),
+    })
+}
+
 fn vector_value(bytes: &[u8]) -> StoreResult<(InlineOrObject, Option<Vec<u8>>)> {
     if bytes.len() <= MAX_INLINE_VALUE_BYTES {
         return Ok((InlineOrObject::inline(bytes).map_err(format_error)?, None));
@@ -154,10 +214,13 @@ fn read_hypa(db: &Connection, key: &str) -> StoreResult<Option<LocalEntry>> {
         String,
         String,
         Option<String>,
+        Option<String>,
+        Option<i64>,
     )> = db
         .query_row(
             "SELECT producer,model,endpoint,preprocess_version,dimensions,vector,metadata,
-                    tombstone,write_clock,writer_id,published_clock
+                    tombstone,write_clock,writer_id,published_clock,
+                    first_published_generation,first_published_at_ms
                 FROM hypa_embeddings WHERE cache_key=?1",
             [key],
             |row| {
@@ -173,6 +236,8 @@ fn read_hypa(db: &Connection, key: &str) -> StoreResult<Option<LocalEntry>> {
                     row.get(8)?,
                     row.get(9)?,
                     row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
                 ))
             },
         )
@@ -189,6 +254,8 @@ fn read_hypa(db: &Connection, key: &str) -> StoreResult<Option<LocalEntry>> {
         write_clock,
         writer_id,
         published_clock,
+        first_published_generation,
+        first_published_at_ms,
     )) = row
     else {
         return Ok(None);
@@ -198,7 +265,10 @@ fn read_hypa(db: &Connection, key: &str) -> StoreResult<Option<LocalEntry>> {
         writer_id,
     };
     let (value, object) = if tombstone {
-        (SectionValue::Tombstone, None)
+        (
+            removal(first_published_generation, first_published_at_ms)?,
+            None,
+        )
     } else {
         let Some(vector) = vector else {
             return invalid("Embedding row carries no vector");
@@ -241,9 +311,18 @@ fn read_hypa(db: &Connection, key: &str) -> StoreResult<Option<LocalEntry>> {
 
 fn read_plugin(db: &Connection, key: &str) -> StoreResult<Option<LocalEntry>> {
     let (owner, space, name) = decode_local_plugin_entry_key(key).map_err(format_error)?;
-    let row: Option<(Option<String>, bool, String, String, Option<String>)> = db
+    let row: Option<(
+        Option<String>,
+        bool,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+    )> = db
         .query_row(
-            "SELECT value,tombstone,write_clock,writer_id,published_clock
+            "SELECT value,tombstone,write_clock,writer_id,published_clock,
+                    first_published_generation,first_published_at_ms
                 FROM plugin_device_storage WHERE owner=?1 AND space=?2 AND key=?3",
             params![owner, space, name],
             |row| {
@@ -253,11 +332,22 @@ fn read_plugin(db: &Connection, key: &str) -> StoreResult<Option<LocalEntry>> {
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
                 ))
             },
         )
         .optional()?;
-    let Some((value, tombstone, write_clock, writer_id, published_clock)) = row else {
+    let Some((
+        value,
+        tombstone,
+        write_clock,
+        writer_id,
+        published_clock,
+        first_published_generation,
+        first_published_at_ms,
+    )) = row
+    else {
         return Ok(None);
     };
     let version = SectionEntryVersion {
@@ -265,7 +355,7 @@ fn read_plugin(db: &Connection, key: &str) -> StoreResult<Option<LocalEntry>> {
         writer_id,
     };
     let value = if tombstone {
-        SectionValue::Tombstone
+        removal(first_published_generation, first_published_at_ms)?
     } else {
         let Some(text) = value else {
             return invalid("Plugin device row carries no value");
@@ -448,7 +538,9 @@ fn apply_row(
                             tombstone=0,
                             write_clock=excluded.write_clock,
                             writer_id=excluded.writer_id,
-                            published_clock=excluded.published_clock",
+                            published_clock=excluded.published_clock,
+                            first_published_generation=NULL,
+                            first_published_at_ms=NULL",
                     params![
                         entry.key,
                         value.producer,
@@ -469,20 +561,32 @@ fn apply_row(
             }
             // A deletion is kept as a row even for a key this device never
             // held, so a later delivery of an older value cannot revive it.
-            SectionValue::Tombstone => {
+            SectionValue::Tombstone {
+                first_published_generation,
+                first_published_at_ms,
+            } => {
                 tx.execute(
                     "INSERT INTO hypa_embeddings
                         (cache_key,producer,model,endpoint,preprocess_version,dimensions,vector,
-                         metadata,tombstone,write_clock,writer_id,published_clock)
-                        VALUES (?1,'','',NULL,0,1,NULL,NULL,1,?2,?3,?2)
+                         metadata,tombstone,write_clock,writer_id,published_clock,
+                         first_published_generation,first_published_at_ms)
+                        VALUES (?1,'','',NULL,0,1,NULL,NULL,1,?2,?3,?2,?4,?5)
                         ON CONFLICT(cache_key) DO UPDATE SET
                             vector=NULL,
                             metadata=NULL,
                             tombstone=1,
                             write_clock=excluded.write_clock,
                             writer_id=excluded.writer_id,
-                            published_clock=excluded.published_clock",
-                    params![entry.key, version.write_clock.as_str(), version.writer_id],
+                            published_clock=excluded.published_clock,
+                            first_published_generation=excluded.first_published_generation,
+                            first_published_at_ms=excluded.first_published_at_ms",
+                    params![
+                        entry.key,
+                        version.write_clock.as_str(),
+                        version.writer_id,
+                        first_published_generation.as_str(),
+                        marker_time(*first_published_at_ms)?
+                    ],
                 )?;
             }
             _ => return invalid("Section entry belongs to another section"),
@@ -517,7 +621,9 @@ fn apply_row(
                                 tombstone=0,
                                 write_clock=excluded.write_clock,
                                 writer_id=excluded.writer_id,
-                                published_clock=excluded.published_clock",
+                                published_clock=excluded.published_clock,
+                                first_published_generation=NULL,
+                                first_published_at_ms=NULL",
                         params![
                             owner,
                             space,
@@ -531,25 +637,32 @@ fn apply_row(
                 }
                 // A deletion is kept as a row even for a key this device never
                 // held, so a later delivery of an older value cannot revive it.
-                SectionValue::Tombstone => {
+                SectionValue::Tombstone {
+                    first_published_generation,
+                    first_published_at_ms,
+                } => {
                     tx.execute(
                         "INSERT INTO plugin_device_storage
                             (owner,space,key,value,byte_size,tombstone,write_clock,writer_id,
-                             published_clock)
-                            VALUES (?1,?2,?3,NULL,0,1,?4,?5,?4)
+                             published_clock,first_published_generation,first_published_at_ms)
+                            VALUES (?1,?2,?3,NULL,0,1,?4,?5,?4,?6,?7)
                             ON CONFLICT(owner,space,key) DO UPDATE SET
                                 value=NULL,
                                 byte_size=0,
                                 tombstone=1,
                                 write_clock=excluded.write_clock,
                                 writer_id=excluded.writer_id,
-                                published_clock=excluded.published_clock",
+                                published_clock=excluded.published_clock,
+                                first_published_generation=excluded.first_published_generation,
+                                first_published_at_ms=excluded.first_published_at_ms",
                         params![
                             owner,
                             space,
                             name,
                             version.write_clock.as_str(),
-                            version.writer_id
+                            version.writer_id,
+                            first_published_generation.as_str(),
+                            marker_time(*first_published_at_ms)?
                         ],
                     )?;
                 }

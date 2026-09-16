@@ -1,7 +1,7 @@
 use super::super::super::device_store::{
     hypa::HypaEmbeddingWrite,
     plugin_values::PluginDeviceMutation,
-    sections::{SectionRow, SectionValueRow},
+    sections::{SectionRow, SectionValueRow, TombstonePublication},
     Section,
 };
 use super::super::super::server_sync_sections as sections;
@@ -272,6 +272,96 @@ fn an_applied_hypa_section_does_not_advance_the_plugin_section_floor() {
     fleet.task.abort();
 }
 
+fn removal_marker(store: &PersistentStore, key: &str) -> Option<(String, i64)> {
+    use rusqlite::OptionalExtension;
+    store
+        .device_store()
+        .unwrap()
+        .connection()
+        .query_row(
+            "SELECT first_published_generation,first_published_at_ms
+                FROM plugin_device_storage
+                WHERE owner='synthetic-plugin' AND space='json' AND key=?1 AND tombstone=1",
+            [key],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                ))
+            },
+        )
+        .optional()
+        .unwrap()
+        .and_then(|(generation, at_ms)| Some((generation?, at_ms?)))
+}
+
+/// A removal names the commit it first reached a remote in. The device that
+/// published it stamps it once and every later projection encodes the same
+/// bytes, so the replica settles instead of proposing it again, and the device
+/// that receives it keeps the marker it arrived with.
+#[test]
+fn a_removal_carries_one_first_publication_marker_to_every_device() {
+    let fleet = fleet();
+    let (_author_dir, mut author) = prepared();
+    let (_reader_dir, mut reader) = prepared();
+    for store in [&mut author, &mut reader] {
+        store
+            .device_store_mut()
+            .unwrap()
+            .set_section_participating(Section::LocalPlugins, true)
+            .unwrap();
+    }
+    fleet.bind(&mut author);
+    fleet.bind(&mut reader);
+    author
+        .device_store_mut()
+        .unwrap()
+        .write_plugin_device_values(
+            "synthetic-plugin",
+            &[PluginDeviceMutation::Set {
+                space: "json".into(),
+                key: "settings".into(),
+                value: json!({"enabled":true}).to_string(),
+            }],
+        )
+        .unwrap();
+    assert_eq!(settle(&mut author).phase, "idle");
+    assert_eq!(settle(&mut reader).phase, "idle");
+    assert!(removal_marker(&author, "settings").is_none());
+
+    author
+        .device_store_mut()
+        .unwrap()
+        .write_plugin_device_values(
+            "synthetic-plugin",
+            &[PluginDeviceMutation::Delete {
+                space: "json".into(),
+                key: "settings".into(),
+            }],
+        )
+        .unwrap();
+    assert_eq!(settle(&mut author).phase, "idle");
+    assert_eq!(settle(&mut author).phase, "idle");
+    let marker = removal_marker(&author, "settings").expect("the author stamped its removal");
+
+    // Further cycles neither restamp the removal nor propose it again.
+    assert_eq!(settle(&mut author).phase, "idle");
+    assert_eq!(removal_marker(&author, "settings"), Some(marker.clone()));
+
+    assert_eq!(settle(&mut reader).phase, "idle");
+    assert_eq!(settle(&mut reader).phase, "idle");
+    assert_eq!(
+        reader
+            .device_store()
+            .unwrap()
+            .read_plugin_device_value("synthetic-plugin", "json", "settings")
+            .unwrap(),
+        None
+    );
+    assert_eq!(removal_marker(&reader, "settings"), Some(marker));
+    fleet.task.abort();
+}
+
 /// Invariant 18. A choice made after a cycle was planned cancels that cycle's
 /// section work instead of carrying out the previous choice.
 #[test]
@@ -451,7 +541,7 @@ fn plugin_entry(key: &str, clock: u64, writer: &str, value: Option<&str>) -> Sec
                 space: PluginSpace::String,
                 value: json!(value),
             }),
-            None => SectionValue::Tombstone,
+            None => SectionValue::tombstone(Sequence::from(3u64), 1_760_000_000_000),
         },
         Some(SectionEntryVersion {
             write_clock: Sequence::from(clock),
@@ -512,7 +602,12 @@ fn apply_over_external_storage(
                     other => serde_json::to_string(other)?,
                 },
             },
-            _ => SectionValueRow::Tombstone,
+            _ => SectionValueRow::Tombstone {
+                first_published: Some(TombstonePublication {
+                    generation: Sequence::from(3u64),
+                    at_ms: 1_760_000_000_000,
+                }),
+            },
         },
         write_clock: version.write_clock.clone(),
         writer_id: version.writer_id.clone(),

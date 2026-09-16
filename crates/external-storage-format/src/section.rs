@@ -182,8 +182,11 @@ pub struct LocalSettingValue {
     pub value: serde_json::Value,
 }
 
+/// A removal carries the commit it first reached a remote in and when that
+/// happened, so every device judges its age the same way. The marker means
+/// nothing outside the remote lineage that issued the commit number.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum SectionValue {
     #[serde(rename = "hypa")]
     Hypa(HypaValue),
@@ -192,7 +195,10 @@ pub enum SectionValue {
     #[serde(rename = "localSetting")]
     LocalSetting(LocalSettingValue),
     #[serde(rename = "tombstone")]
-    Tombstone,
+    Tombstone {
+        first_published_generation: Sequence,
+        first_published_at_ms: u64,
+    },
 }
 
 impl SectionValue {
@@ -201,7 +207,13 @@ impl SectionValue {
             Self::Hypa(_) => Some(SectionKind::Hypa),
             Self::LocalPlugin(_) => Some(SectionKind::LocalPlugins),
             Self::LocalSetting(_) => Some(SectionKind::LocalSettings),
-            Self::Tombstone => None,
+            Self::Tombstone { .. } => None,
+        }
+    }
+    pub fn tombstone(first_published_generation: Sequence, first_published_at_ms: u64) -> Self {
+        Self::Tombstone {
+            first_published_generation,
+            first_published_at_ms,
         }
     }
 }
@@ -285,7 +297,20 @@ impl SectionEntry {
                     return Err(FormatError("invalid-section-value"));
                 }
             }
-            SectionValue::LocalSetting(_) | SectionValue::Tombstone => {}
+            // A removal is only ever published as part of a commit, so a
+            // marker naming no commit or no time is not a removal this format
+            // can carry.
+            SectionValue::Tombstone {
+                first_published_generation,
+                first_published_at_ms,
+            } => {
+                if *first_published_generation == Sequence::from(0u64)
+                    || *first_published_at_ms == 0
+                {
+                    return Err(FormatError("invalid-section-value"));
+                }
+            }
+            SectionValue::LocalSetting(_) => {}
         }
         if self
             .version
@@ -376,7 +401,7 @@ mod tests {
             SectionEntry::new(
                 SectionKind::Hypa,
                 hypa_entry_key(&"b".repeat(64)).unwrap(),
-                SectionValue::Tombstone,
+                SectionValue::tombstone(Sequence::from(3u64), 1_760_000_000_000),
                 version(10),
             )
             .unwrap(),
@@ -491,11 +516,59 @@ mod tests {
             "codec": SECTION_CODEC,
             "kind": "hypa",
             "key": "e".repeat(64),
-            "value": "tombstone",
+            "value": { "tombstone": {
+                "firstPublishedGeneration": "3",
+                "firstPublishedAtMs": 1_760_000_000_000u64,
+            } },
             "version": null,
             "extra": 1,
         });
         assert!(SectionEntry::decode(&serde_json::to_vec(&smuggled).unwrap()).is_err());
+    }
+
+    /// A removal always names the commit it first reached a remote in. A
+    /// marker naming none is not a shape this format accepts, in either
+    /// direction.
+    #[test]
+    fn a_removal_carries_the_commit_it_was_first_published_in() {
+        let entry = SectionEntry::new(
+            SectionKind::Hypa,
+            hypa_entry_key(&"1".repeat(64)).unwrap(),
+            SectionValue::tombstone(Sequence::from(12u64), 1_760_000_000_000),
+            version(10),
+        )
+        .unwrap();
+        let encoded = entry.encode().unwrap();
+        assert!(String::from_utf8_lossy(&encoded).contains(
+            "\"value\":{\"tombstone\":{\"firstPublishedGeneration\":\"12\",\"firstPublishedAtMs\":1760000000000}}"
+        ));
+        assert_eq!(SectionEntry::decode(&encoded).unwrap(), entry);
+        assert_eq!(
+            SectionEntry::new(
+                SectionKind::Hypa,
+                hypa_entry_key(&"2".repeat(64)).unwrap(),
+                SectionValue::tombstone(Sequence::from(0u64), 1_760_000_000_000),
+                version(10),
+            ),
+            Err(FormatError("invalid-section-value"))
+        );
+        assert_eq!(
+            SectionEntry::new(
+                SectionKind::Hypa,
+                hypa_entry_key(&"3".repeat(64)).unwrap(),
+                SectionValue::tombstone(Sequence::from(12u64), 0),
+                version(10),
+            ),
+            Err(FormatError("invalid-section-value"))
+        );
+        let unmarked = serde_json::json!({
+            "codec": SECTION_CODEC,
+            "kind": "hypa",
+            "key": "4".repeat(64),
+            "value": { "tombstone": {} },
+            "version": null,
+        });
+        assert!(SectionEntry::decode(&serde_json::to_vec(&unmarked).unwrap()).is_err());
     }
 
     #[test]
