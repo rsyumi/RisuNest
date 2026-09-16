@@ -627,6 +627,7 @@ fn removable_key(context: &RepositoryContext, locator: &RemoteLocator) -> Result
     let unsupported = || ProviderError::new(ErrorKind::Unsupported);
     let (folder, name) = locator.object.split_once('/').ok_or_else(unsupported)?;
     if name.is_empty()
+        || name.contains('/')
         || !config::removable_folder(folder)
         || locator
             .collection

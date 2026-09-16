@@ -332,15 +332,17 @@ impl Provider for FakeProvider {
             if limit == 0 || limit > 1000 {
                 return Err(ProviderError::new(ErrorKind::Unsupported));
             }
-            let role = match collection {
-                Collection::Snapshots => ObjectRole::SyncState,
-                Collection::BackupPoints => ObjectRole::BackupPoint,
-                Collection::Descriptors => ObjectRole::Descriptor,
-                Collection::Leases => ObjectRole::Lease,
+            // A published state and a backup bundle share the snapshot listing,
+            // which is what every adapter answers.
+            let roles: &[ObjectRole] = match collection {
+                Collection::Snapshots => &[ObjectRole::SyncState, ObjectRole::BackupBundle],
+                Collection::BackupPoints => &[ObjectRole::BackupPoint],
+                Collection::Descriptors => &[ObjectRole::Descriptor],
+                Collection::Leases => &[ObjectRole::Lease],
             };
             let state = self.state.lock().unwrap();
             let mut matches = state.objects.iter().filter(|(id, _)| {
-                state.roles.get(*id) == Some(&role)
+                state.roles.get(*id).is_some_and(|role| roles.contains(role))
                     && cursor.is_none_or(|cursor| id.as_str() > cursor)
             });
             let objects: Vec<_> = matches

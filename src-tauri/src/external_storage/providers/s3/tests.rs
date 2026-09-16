@@ -1651,6 +1651,7 @@ fn deleting_addresses_one_key_folds_404_and_refuses_the_head_and_descriptors() {
             refused("packs/pack-1", Some("snapshots")),
             refused("elsewhere/pack-1", None),
             refused("packs/", None),
+            refused("packs/nested/pack-1", None),
         ] {
             assert_eq!(
                 provider
@@ -1727,6 +1728,16 @@ fn request_costs_follow_the_preset_buckets_and_are_reserved_per_request() {
         assert!(cost(&r2, ProviderOperation::Authenticate).is_empty());
         // Cloudflare lists `DeleteObject` outside both classes, as free.
         assert!(cost(&r2, ProviderOperation::Delete).is_empty());
+        // Only the preset whose own documentation states the delete and listing
+        // guarantees carries the cleanup evidence.
+        assert!(reported_capabilities(&profiles::r2::PROFILE)
+            .require_cleanup()
+            .is_ok());
+        for preset in ["generic", "b2", "hf"] {
+            assert!(reported_capabilities(profiles::lookup(preset).unwrap())
+                .require_cleanup()
+                .is_err());
+        }
 
         let reservations = test.budget.reservations.lock().unwrap();
         assert_eq!(reservations.len(), 1);

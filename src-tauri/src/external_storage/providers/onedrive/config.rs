@@ -124,6 +124,7 @@ pub(super) fn removable_path(locator: &RemoteLocator) -> Result<String> {
     .iter()
     .any(|role| role_folder(*role) == folder);
     if name.is_empty()
+        || name.contains('/')
         || !known
         || locator
             .collection
