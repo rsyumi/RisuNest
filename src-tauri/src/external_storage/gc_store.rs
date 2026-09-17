@@ -4,7 +4,6 @@
 //! reads instead of walking the repository again.
 // The run that writes these tables is wired with the removal path; the usage
 // summary is the only reader until then.
-#![cfg_attr(not(test), allow(dead_code))]
 use super::contract::{ErrorKind, LeaseKind, ObjectRole, ProviderError, RemoteLocator, Result};
 use rusqlite::{Connection, OptionalExtension};
 use std::{
@@ -361,6 +360,41 @@ impl GcStore {
                 "INSERT INTO cleanup_state(connection_id,last_reachable_bytes) VALUES(?1,?2)
                  ON CONFLICT(connection_id) DO UPDATE SET last_reachable_bytes=excluded.last_reachable_bytes",
                 rusqlite::params![connection_id, count(bytes)?],
+            )
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    /// What the last run did and why it stopped. The automatic schedule reads
+    /// this to tell a run that yielded from one that stopped at a bound, and
+    /// `publishes_since` starts again from zero whenever a run ends.
+    pub(crate) fn record_cleanup_run(
+        &self,
+        connection_id: &str,
+        now_ms: u64,
+        stopped_reason: &str,
+        removed_count: u64,
+        removed_bytes: u64,
+    ) -> Result<()> {
+        self.0
+            .execute(
+                "INSERT INTO cleanup_state(connection_id,last_run_ms,publishes_since,policy_changed,
+                     stopped_reason,last_removed_count,last_removed_bytes)
+                 VALUES(?1,?2,0,0,?3,?4,?5)
+                 ON CONFLICT(connection_id) DO UPDATE SET
+                     last_run_ms=excluded.last_run_ms,
+                     publishes_since=0,
+                     policy_changed=0,
+                     stopped_reason=excluded.stopped_reason,
+                     last_removed_count=excluded.last_removed_count,
+                     last_removed_bytes=excluded.last_removed_bytes",
+                rusqlite::params![
+                    connection_id,
+                    count(now_ms)?,
+                    stopped_reason,
+                    count(removed_count)?,
+                    count(removed_bytes)?
+                ],
             )
             .map_err(storage)?;
         Ok(())

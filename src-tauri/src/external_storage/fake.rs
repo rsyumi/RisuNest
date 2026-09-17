@@ -35,7 +35,22 @@ pub(super) fn capabilities(cas: bool) -> Capabilities {
         head_read_after_write: Evidence::Synthetic,
         head_retry_control: Evidence::Synthetic,
         snapshot_discovery: Evidence::Synthetic,
+        delete_objects: Evidence::Synthetic,
+        gc_control_consistency: Evidence::Synthetic,
+        delete_completion: Evidence::Synthetic,
         ..Default::default()
+    }
+}
+
+/// The same repository without the evidence a removal needs. Everything else
+/// stays available, which is what a connection that cannot be cleaned looks
+/// like.
+pub(super) fn capabilities_without_cleanup(cas: bool) -> Capabilities {
+    Capabilities {
+        delete_objects: Evidence::Unverified,
+        gc_control_consistency: Evidence::Unverified,
+        delete_completion: Evidence::Unverified,
+        ..capabilities(cas)
     }
 }
 

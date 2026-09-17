@@ -3,7 +3,6 @@
 //! are still in use; a delete marker says that a removal attempt is running.
 //! Nothing here expires: age is never evidence that a request ended.
 // Delete markers are placed by the removal path, which is wired next.
-#![cfg_attr(not(test), allow(dead_code))]
 use super::{
     contract::{
         lease_object_id, parse_lease_object_id, Cancellation, Collection, ErrorKind, LeaseKind,
@@ -406,16 +405,54 @@ pub(crate) async fn survey(ctx: &LeaseContext<'_>, cancel: &Cancellation) -> Res
     Ok(LeaseSurvey { leases })
 }
 
+/// The same reading for a removal, which needs more than "this page is what
+/// the repository answered". No provider documents that a cursor walk keeps
+/// every object visible across pages, so a collection that does not fit one
+/// page answers `None` and the removal defers instead of trusting the walk.
+/// One lease per device and job means the second page is the rare case.
+pub(crate) async fn survey_single_page(
+    ctx: &LeaseContext<'_>,
+    cancel: &Cancellation,
+) -> Result<Option<LeaseSurvey>> {
+    let mine = ctx
+        .store()?
+        .lease_intents(ctx.connection_id)?
+        .iter()
+        .map(|row| locator_key(&row.locator))
+        .collect::<Result<BTreeSet<String>>>()?;
+    cancel.check()?;
+    let page = ctx
+        .provider
+        .list_objects(ctx.repository, Collection::Leases, None, LEASE_PAGE, cancel)
+        .await?;
+    if page.next_cursor.is_some() {
+        return Ok(None);
+    }
+    let mut leases = Vec::new();
+    for receipt in page.objects {
+        receipt.locator.validate_for(ctx.repository)?;
+        let (kind, _) = parse_lease_object_id(lease_name(&receipt.locator))?;
+        let mine = mine.contains(&locator_key(&receipt.locator)?);
+        leases.push(ObservedLease {
+            locator: receipt.locator,
+            kind,
+            mine,
+        });
+    }
+    Ok(Some(LeaseSurvey { leases }))
+}
+
 /// What a publisher or a reader does before it asks for any data: confirm its
 /// own lease, then read the whole collection and stop while anyone is removing.
 /// The lease stays in place while this device waits.
 pub(crate) async fn admit(
     ctx: &LeaseContext<'_>,
     job_id: &str,
+    kind: LeaseKind,
     now_ms: u64,
     cancel: &Cancellation,
 ) -> Result<LeaseHandle> {
-    let handle = register(ctx, job_id, LeaseKind::Work, now_ms, cancel).await?;
+    let handle = register(ctx, job_id, kind, now_ms, cancel).await?;
     if !survey(ctx, cancel).await?.blocking_markers(None).is_empty() {
         return Err(transient());
     }
@@ -719,13 +756,13 @@ mod tests {
         runtime().block_on(async {
             let context = harness.context();
             let marker = harness.foreign(LeaseKind::Deleting, &tag(1));
-            let yielded = admit(&context, "job", NOW, &cancel).await.unwrap_err();
+            let yielded = admit(&context, "job", LeaseKind::Work, NOW, &cancel).await.unwrap_err();
             assert_eq!(yielded.kind, ErrorKind::Transient);
             assert_eq!(harness.rows().len(), 1, "the lease is kept while waiting");
 
             for later in [NOW + 2 * 60 * 1000, NOW + 7 * DAY, NOW + 400 * DAY] {
                 assert_eq!(
-                    admit(&context, "job", later, &cancel)
+                    admit(&context, "job", LeaseKind::Work, later, &cancel)
                         .await
                         .unwrap_err()
                         .kind,
@@ -735,7 +772,7 @@ mod tests {
             }
 
             harness.remove(&marker).await;
-            let admitted = admit(&context, "job", NOW + 401 * DAY, &cancel)
+            let admitted = admit(&context, "job", LeaseKind::Work, NOW + 401 * DAY, &cancel)
                 .await
                 .unwrap();
             assert_eq!(admitted.kind, LeaseKind::Work);
@@ -853,7 +890,7 @@ mod tests {
                 ErrorKind::PreconditionFailed
             );
             assert_eq!(
-                admit(&context, "publisher", NOW + 7 * DAY, &Cancellation::default())
+                admit(&context, "publisher", LeaseKind::Work, NOW + 7 * DAY, &Cancellation::default())
                     .await
                     .unwrap_err()
                     .kind,
@@ -878,7 +915,7 @@ mod tests {
                 .unfinished_delete_requests(CONNECTION, None)
                 .unwrap()
                 .is_empty());
-            admit(&context, "publisher", NOW + 8 * DAY, &Cancellation::default())
+            admit(&context, "publisher", LeaseKind::Work, NOW + 8 * DAY, &Cancellation::default())
                 .await
                 .unwrap();
         });
@@ -927,7 +964,7 @@ mod tests {
                 ErrorKind::Corrupt
             );
             assert_eq!(
-                admit(&context, "job", NOW, &Cancellation::default())
+                admit(&context, "job", LeaseKind::Work, NOW, &Cancellation::default())
                     .await
                     .unwrap_err()
                     .kind,
@@ -944,7 +981,7 @@ mod tests {
         let cancel = Cancellation::default();
         runtime().block_on(async {
             let context = harness.context();
-            let work = admit(&context, "job", NOW, &cancel).await.unwrap();
+            let work = admit(&context, "job", LeaseKind::Work, NOW, &cancel).await.unwrap();
             let marker = place_marker(&context, "job", NOW, &cancel).await.unwrap();
             release(&context, "job").await.unwrap();
             assert!(!harness.provider.holds(&work.locator.object));
@@ -961,7 +998,7 @@ mod tests {
         runtime().block_on(async {
             let context = harness.context();
             let cancel = Cancellation::default();
-            let work = admit(&context, "job", NOW, &cancel).await.unwrap();
+            let work = admit(&context, "job", LeaseKind::Work, NOW, &cancel).await.unwrap();
             cancel.cancel();
             release(&context, "job").await.unwrap();
             assert!(!harness.provider.holds(&work.locator.object));

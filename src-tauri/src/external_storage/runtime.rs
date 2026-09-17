@@ -402,7 +402,7 @@ fn same_requested_operation(existing: &StartJobRequest, incoming: &StartJobReque
         JobKind::ResolveConflict => {
             existing.conflict_id == incoming.conflict_id && existing.choice == incoming.choice
         }
-        JobKind::Sync | JobKind::Backup => true,
+        JobKind::Sync | JobKind::Backup | JobKind::Cleanup => true,
     }
 }
 async fn wait_for_job_release(app: &AppHandle, id: &str) -> Result<()> {
@@ -551,19 +551,45 @@ fn lease_context<'a>(
     }
 }
 
-/// What every job does before it asks the repository for data: resolve what an
-/// interrupted run left, confirm this job's lease, and stop while another
-/// device is removing objects. A repository that cannot remove anything has
-/// nothing to announce and nothing to wait for.
+/// Resolves what an interrupted run left, confirms this job's lease and stops
+/// while another device is removing objects. A repository that cannot remove
+/// anything has nothing to announce and nothing to wait for.
+pub(crate) async fn admit_repository(
+    root: &std::path::Path,
+    connected: &ConnectedRepository,
+    writer_id: &str,
+    job_id: &str,
+    kind: LeaseKind,
+    live: &BTreeSet<String>,
+    cancel: &Cancellation,
+) -> Result<()> {
+    if connected.stored.capabilities.require_cleanup().is_err() {
+        return Ok(());
+    }
+    let context = lease_context(root, connected, writer_id);
+    leases::resume(&context, live, cancel).await?;
+    leases::admit(&context, job_id, kind, now_ms(), cancel).await?;
+    Ok(())
+}
+
+/// Hands back the leases of one job. A removal marker is not one of them: it
+/// outlives the job until every request it stands for is known to have ended.
+pub(crate) async fn release_repository(
+    root: &std::path::Path,
+    connected: &ConnectedRepository,
+    writer_id: &str,
+    job_id: &str,
+) -> Result<()> {
+    leases::release(&lease_context(root, connected, writer_id), job_id).await
+}
+
+/// What every job does before it asks the repository for data.
 pub(crate) async fn enter_repository(
     app: &AppHandle,
     connected: &ConnectedRepository,
     job: &DurableJob,
     cancel: &Cancellation,
 ) -> Result<()> {
-    if connected.stored.capabilities.require_cleanup().is_err() {
-        return Ok(());
-    }
     let root = root(app)?;
     let writer_id = native_store(app)?
         .external_identity()
@@ -575,10 +601,14 @@ pub(crate) async fn enter_repository(
         .filter(|item| item.request.connection_id == job.request.connection_id)
         .map(|item| item.id)
         .collect();
-    let context = lease_context(&root, connected, &writer_id);
-    leases::resume(&context, &live, cancel).await?;
-    leases::admit(&context, &job.id, now_ms(), cancel).await?;
-    Ok(())
+    let kind = match job.request.kind {
+        JobKind::Cleanup => LeaseKind::Cleanup,
+        _ => LeaseKind::Work,
+    };
+    admit_repository(
+        &root, connected, &writer_id, &job.id, kind, &live, cancel,
+    )
+    .await
 }
 
 /// Hands back the leases of a job that reached an end. A job that is waiting,
@@ -598,7 +628,7 @@ async fn leave_repository(app: &AppHandle, connection_id: &str, job_id: &str) ->
         .external_identity()
         .map_err(local_error)?
         .store_id;
-    leases::release(&lease_context(&root, &connected, &writer_id), job_id).await
+    release_repository(&root, &connected, &writer_id, job_id).await
 }
 
 /// The release for the sites that end a job without an asynchronous context.
@@ -653,10 +683,16 @@ pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
                 Ok(result) => {
                     let maintenance = result.get("maintenanceSessionId").is_some();
                     let receive = result.get("receiveReady").and_then(Value::as_bool) == Some(true);
+                    // A removal that left a request whose end is unknown keeps
+                    // its marker, so the job stays open until that is resolved.
+                    let unresolved =
+                        result.get("stopReason").and_then(Value::as_str) == Some("uncertain");
                     job.summary["state"] = json!(if maintenance || receive {
                         "waiting"
                     } else if result.get("conflictId").is_some() {
                         "conflict"
+                    } else if unresolved {
+                        "uncertain"
                     } else {
                         "succeeded"
                     });
@@ -664,6 +700,8 @@ pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
                         "device-restore-maintenance"
                     } else if receive {
                         "remote-apply"
+                    } else if unresolved {
+                        "removal-unknown"
                     } else {
                         "complete"
                     });
@@ -867,7 +905,58 @@ async fn run_job(app: &AppHandle, id: &str, cancel: &Cancellation) -> Result<Val
         JobKind::PinHistory => {
             super::history_jobs::run_pin_history(app, &connected, &job, cancel).await
         }
+        JobKind::Cleanup => run_cleanup(app, &connected, &job, cancel).await,
     }
+}
+
+/// Removes what the current roots no longer reach. The result is a summary
+/// rather than progress: a cleanup writes no transfer journal, so the four
+/// progress fields would be recomputed as zero on every read.
+async fn run_cleanup(
+    app: &AppHandle,
+    connected: &ConnectedRepository,
+    job: &DurableJob,
+    cancel: &Cancellation,
+) -> Result<Value> {
+    let root = root(app)?;
+    let writer_id = native_store(app)?
+        .external_identity()
+        .map_err(local_error)?
+        .store_id;
+    let unfinished = JobStore::open(&root)?
+        .list_pending()?
+        .into_iter()
+        .filter(|item| item.request.connection_id == job.request.connection_id && item.id != job.id)
+        .map(|item| {
+            let directory = job_directory(&root, &item.request.connection_id, &item.id);
+            (item.id, directory)
+        })
+        .collect();
+    let view = super::cleanup::ConnectedRepositoryView {
+        connected,
+        writer_id: &writer_id,
+        policy: connected
+            .stored
+            .retention_policy
+            .unwrap_or(super::connection::RetentionPolicy::DEFAULT),
+        now_ms: now_ms(),
+        unfinished,
+    };
+    let documents = super::cleanup::ConnectedDocuments { connected, cancel };
+    let outcome = super::cleanup::run(
+        &lease_context(&root, connected, &writer_id),
+        &super::cleanup::CleanupRequest {
+            job_id: &job.id,
+            capabilities: &connected.stored.capabilities,
+            limits: super::cleanup::CleanupLimits::default(),
+            now_ms: now_ms(),
+        },
+        &view,
+        &documents,
+        cancel,
+    )
+    .await?;
+    Ok(outcome.summary())
 }
 async fn run_backup(
     app: &AppHandle,

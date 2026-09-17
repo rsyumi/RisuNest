@@ -233,6 +233,7 @@ mod tests {
         let assets = assets_object.stored(&repository).unwrap();
         let document = control::SnapshotView {
             snapshot_id: "snapshot".into(),
+            parent_snapshot_id: None,
             library_id: "library".into(),
             created_at_ms: 1,
             revision: "1".into(),

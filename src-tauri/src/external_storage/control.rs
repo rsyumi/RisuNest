@@ -867,6 +867,104 @@ pub(crate) async fn list_backup_points_page(
     })
 }
 
+/// Opens one enumerated state or bundle. Its identity comes from the
+/// authenticated envelope, because a listing only carries routing hints.
+pub(crate) async fn open_listed_snapshot(
+    connected: &super::connection_commands::ConnectedRepository,
+    receipt: ObjectReceipt,
+    cancel: &Cancellation,
+) -> Result<(RemoteObject, SnapshotView)> {
+    if !receipt.complete || receipt.byte_length == 0 || receipt.byte_length > MAX_SNAPSHOT_CIPHERTEXT
+    {
+        return Err(corrupt("invalid listed snapshot object"));
+    }
+    let (_, bytes) = download_control(
+        connected.provider.as_ref(),
+        &connected.handle,
+        &receipt.locator,
+        None,
+        MAX_SNAPSHOT_CIPHERTEXT,
+        cancel,
+    )
+    .await?;
+    let bytes = bytes.ok_or_else(|| corrupt("listed snapshot was not downloaded"))?;
+    let repository_id = &connected.stored.descriptor.repository_id;
+    let key = derive_key(&connected.root_key, repository_id, "metadata").map_err(corrupt)?;
+    let mut plaintext = Vec::new();
+    let header = wire::open_envelope(
+        &mut Cursor::new(&bytes),
+        &mut plaintext,
+        &key,
+        wire::MAX_METADATA_BYTES as u64,
+    )
+    .map_err(corrupt)?;
+    if header.repository_id != *repository_id {
+        return Err(corrupt("snapshot discovery envelope differs"));
+    }
+    let view = SnapshotView::read(&plaintext, header.role, repository_id)?;
+    if header.object_id != format!("snapshot-{}", view.snapshot_id) {
+        return Err(corrupt("snapshot discovery document differs"));
+    }
+    Ok((
+        RemoteObject {
+            repository_id: repository_id.clone(),
+            object_id: header.object_id,
+            role: native_role(header.role)?,
+            receipt,
+            ciphertext_sha256: hex::encode(hash(&bytes)),
+            plaintext_length: header.plaintext_length,
+            plaintext_sha256: hex::encode(hash(&plaintext)),
+        },
+        view,
+    ))
+}
+
+/// Everything one catalog node names: the nodes below it and the packs it
+/// holds. A restore only needs the packs, but nothing enumerates an
+/// intermediate node, so a cleanup has to see both.
+pub(crate) async fn read_catalog_children(
+    connected: &super::connection_commands::ConnectedRepository,
+    node: &RemoteObject,
+    cancel: &Cancellation,
+) -> Result<Vec<RemoteObject>> {
+    let repository_id = &connected.stored.descriptor.repository_id;
+    if node.role != ObjectRole::Catalog || node.repository_id != *repository_id {
+        return Err(corrupt("invalid catalog node"));
+    }
+    node.stored(&connected.handle)?;
+    let (_, bytes) = download_control(
+        connected.provider.as_ref(),
+        &connected.handle,
+        &node.receipt.locator,
+        None,
+        MAX_SNAPSHOT_CIPHERTEXT,
+        cancel,
+    )
+    .await?;
+    let bytes = bytes.ok_or_else(|| corrupt("catalog node was not downloaded"))?;
+    let (plaintext, _, plaintext_sha256, ciphertext_sha256) = open(
+        &connected.stored.descriptor,
+        &connected.root_key,
+        Some(&node.object_id),
+        wire::ObjectRole::Catalog,
+        &bytes,
+        wire::MAX_METADATA_BYTES,
+    )?;
+    if plaintext_sha256 != node.plaintext_sha256 || ciphertext_sha256 != node.ciphertext_sha256 {
+        return Err(corrupt("catalog node differs"));
+    }
+    let document = wire::CatalogDocument::decode(&plaintext, wire::MAX_METADATA_BYTES)
+        .map_err(corrupt)?;
+    let mut objects = Vec::new();
+    for child in &document.children {
+        objects.push(RemoteObject::from_stored(&child.object, &connected.handle)?);
+    }
+    for pack in &document.packs {
+        objects.push(RemoteObject::from_stored(pack, &connected.handle)?);
+    }
+    Ok(objects)
+}
+
 /// Explicit history/restore discovery. Normal sync follows the snapshot locator
 /// in the authenticated head and never scans this collection.
 pub(crate) async fn find_snapshot(
@@ -893,60 +991,12 @@ pub(crate) async fn find_snapshot(
             )
             .await?;
         for receipt in page.objects {
-            if !receipt.complete
-                || receipt.byte_length == 0
-                || receipt.byte_length > MAX_SNAPSHOT_CIPHERTEXT
-            {
-                return Err(corrupt("invalid listed snapshot object"));
-            }
-            let (_, bytes) = download_control(
-                connected.provider.as_ref(),
-                &connected.handle,
-                &receipt.locator,
-                None,
-                MAX_SNAPSHOT_CIPHERTEXT,
-                cancel,
-            )
-            .await?;
-            let bytes = bytes.ok_or_else(|| corrupt("listed snapshot was not downloaded"))?;
-            let key = derive_key(
-                &connected.root_key,
-                &connected.stored.descriptor.repository_id,
-                "metadata",
-            )
-            .map_err(corrupt)?;
-            let mut plaintext = Vec::new();
-            let header = wire::open_envelope(
-                &mut Cursor::new(&bytes),
-                &mut plaintext,
-                &key,
-                wire::MAX_METADATA_BYTES as u64,
-            )
-            .map_err(corrupt)?;
-            if header.repository_id != connected.stored.descriptor.repository_id {
-                return Err(corrupt("snapshot discovery envelope differs"));
-            }
-            let view = SnapshotView::read(
-                &plaintext,
-                header.role,
-                &connected.stored.descriptor.repository_id,
-            )?;
-            if header.object_id != format!("snapshot-{}", view.snapshot_id) {
-                return Err(corrupt("snapshot discovery document differs"));
-            }
+            let (object, view) = open_listed_snapshot(connected, receipt, cancel).await?;
             if view.snapshot_id == snapshot_id {
-                if header.object_id != expected_object_id {
+                if object.object_id != expected_object_id {
                     return Err(corrupt("snapshot selection identity differs"));
                 }
-                return Ok(RemoteObject {
-                    repository_id: connected.stored.descriptor.repository_id.clone(),
-                    object_id: header.object_id,
-                    role: native_role(header.role)?,
-                    receipt,
-                    ciphertext_sha256: hex::encode(hash(&bytes)),
-                    plaintext_length: header.plaintext_length,
-                    plaintext_sha256: hex::encode(hash(&plaintext)),
-                });
+                return Ok(object);
             }
         }
         let Some(next) = page.next_cursor else {
@@ -966,6 +1016,9 @@ pub(crate) async fn find_snapshot(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SnapshotView {
     pub snapshot_id: String,
+    /// The state this one replaced, when the document names one. A bundle
+    /// wrapped around a capture has no lineage of its own.
+    pub parent_snapshot_id: Option<String>,
     pub library_id: String,
     pub created_at_ms: u64,
     /// The local library revision for a bundle, or the remote commit order for
@@ -988,6 +1041,7 @@ impl SnapshotView {
                     .map_err(corrupt)?;
                 Self {
                     snapshot_id: document.state_id,
+                    parent_snapshot_id: document.parent_state_id,
                     library_id: document.library_id,
                     created_at_ms: document.created_at_ms,
                     revision: document.generation.as_str().to_owned(),
@@ -1003,6 +1057,7 @@ impl SnapshotView {
                         .map_err(corrupt)?;
                 Self {
                     snapshot_id: document.bundle_id,
+                    parent_snapshot_id: None,
                     library_id: repository_id.to_owned(),
                     created_at_ms: document.captured_at_ms,
                     revision: document

@@ -14,6 +14,7 @@ pub(crate) enum JobKind {
     Restore,
     PinHistory,
     ResolveConflict,
+    Cleanup,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -39,6 +40,16 @@ impl StartJobRequest {
                     .is_some_and(|byte| (b'1'..=b'9').contains(byte))
                     && s.as_bytes()[1..].iter().all(u8::is_ascii_digit)
         };
+        // A removal is described entirely by the connection it runs on.
+        if self.kind == JobKind::Cleanup
+            && (self.snapshot_id.is_some()
+                || self.conflict_id.is_some()
+                || self.choice.is_some()
+                || self.restore_areas.is_some()
+                || self.target_revision.is_some())
+        {
+            return Err(ProviderError::new(ErrorKind::Corrupt));
+        }
         if !valid(&self.connection_id)
             || [&self.snapshot_id, &self.conflict_id, &self.session_id]
                 .into_iter()

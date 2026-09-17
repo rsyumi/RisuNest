@@ -85,6 +85,40 @@ impl TransferJournal {
     pub(crate) fn job_id(&self) -> &str {
         &self.identity.job_id
     }
+
+    /// What one job has already put in the repository, read without taking the
+    /// journal over. A cleanup needs this because an unfinished job's fragments
+    /// are named by nothing else.
+    pub(crate) fn uploaded(directory: &Path, job_id: &str) -> Result<Vec<ObjectReceipt>> {
+        let path = directory.join("transfers.sqlite");
+        crate::trust_boundary::open_regular_source(&path).map_err(storage)?;
+        let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(storage)?;
+        let encoded: String = db
+            .query_row("SELECT value FROM identity WHERE singleton=1", [], |row| {
+                row.get(0)
+            })
+            .map_err(storage)?;
+        let identity: JobIdentity = serde_json::from_str(&encoded).map_err(|_| corrupt())?;
+        if identity.job_id != job_id {
+            return Err(corrupt());
+        }
+        let mut query = db
+            .prepare("SELECT receipt FROM objects WHERE receipt IS NOT NULL")
+            .map_err(storage)?;
+        let rows = query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(storage)?;
+        let mut receipts = Vec::new();
+        for row in rows {
+            let encoded = row.map_err(storage)?;
+            if encoded.len() > 64 * 1024 {
+                return Err(corrupt());
+            }
+            receipts.push(serde_json::from_str(&encoded).map_err(|_| corrupt())?);
+        }
+        Ok(receipts)
+    }
     pub fn open(directory: &Path, identity: JobIdentity) -> Result<Self> {
         if [
             &identity.job_id,
