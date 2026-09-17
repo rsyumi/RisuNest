@@ -14,7 +14,7 @@ use axum::{
     Extension, Json, Router,
 };
 use risunest_sync_wire::{
-    batch, canonical, ChangeSet, CommitIntent, Domain, Receipt, Sequence, TerminalStatus,
+    canonical, transfer, ChangeSet, CommitIntent, Domain, Receipt, Sequence, TerminalStatus,
     MAX_METADATA_BYTES,
 };
 use serde::Deserialize;
@@ -179,9 +179,7 @@ pub fn router_with_workload(store: Arc<Store>, workload: Workload) -> Router {
         .route("/media/access", post(media_access))
         .route("/scopes", get(scope))
         .route("/objects/missing", post(missing))
-        .route("/objects/batch", post(download_batch))
         .route("/objects/{hash}", get(object))
-        .route("/uploads/batch", post(upload_batch))
         .route("/uploads/frames", post(upload_frames))
         .route("/objects/transfer", post(transfer_objects))
         .route("/uploads", post(begin_upload))
@@ -205,7 +203,7 @@ pub fn router_with_workload(store: Arc<Store>, workload: Workload) -> Router {
         .route("/commits", post(commit))
         .route("/operations/{id}", get(receipt))
         .route("/acks", post(ack))
-        .layer(DefaultBodyLimit::max(batch::MAX_BATCH_BYTES))
+        .layer(DefaultBodyLimit::max(transfer::MAX_BATCH_BYTES))
         .route_layer(middleware::from_fn_with_state(app.clone(), authorize))
         // A held notification stream must not occupy an admission slot or a
         // device slot for its whole life, so it authenticates on its own.
@@ -256,12 +254,12 @@ async fn authorize(State(app): State<App>, request: Request, next: Next) -> Resp
             let length = header(request.headers(), "content-length")
                 .and_then(|v| v.parse::<u64>().ok())
                 .ok_or(Error::new("invalid-content-length", 400))?;
-            let limit = if ["/uploads/batch", "/uploads/frames"].contains(&request.uri().path())
+            let limit = if request.uri().path() == "/uploads/frames"
                 || request.uri().path().contains("/chunks/")
                 || (request.uri().path().starts_with("/uploads/")
                     && request.uri().path().ends_with("/delta"))
             {
-                batch::MAX_BATCH_BYTES
+                transfer::MAX_BATCH_BYTES
             } else {
                 MAX_METADATA_BYTES
             };
@@ -299,7 +297,7 @@ async fn authorize(State(app): State<App>, request: Request, next: Next) -> Resp
         let path = request.uri().path();
         let buffered = if matches!(
             path,
-            "/uploads/frames" | "/uploads/batch" | "/objects/transfer" | "/objects/batch"
+            "/uploads/frames" | "/objects/transfer"
         ) || path.contains("/chunks/")
             || (path.starts_with("/uploads/") && path.ends_with("/delta"))
         {
@@ -319,7 +317,7 @@ async fn authorize(State(app): State<App>, request: Request, next: Next) -> Resp
         if let Some(buffered) = &buffered {
             request.extensions_mut().insert(buffered.clone());
         }
-        let deadline = if matches!(request.uri().path(), "/uploads/frames" | "/uploads/batch")
+        let deadline = if request.uri().path() == "/uploads/frames"
             || (request.uri().path().starts_with("/uploads/")
                 && request.uri().path().ends_with("/delta"))
         {
@@ -480,25 +478,6 @@ async fn changes(State(app): State<App>, Query(query): Query<ChangesQuery>) -> R
     })
     .await
 }
-async fn upload_batch(
-    State(app): State<App>,
-    Extension(device): Extension<Device>,
-    Extension(buffer): Extension<BufferedRequest>,
-    body: Bytes,
-) -> Result<Response> {
-    blocking(move || {
-        let _buffer = buffer;
-        // Decode and validate the entire batch before publishing any frame.
-        let frames = batch::decode(&body)?;
-        let mut hashes = Vec::new();
-        for frame in frames {
-            app.store.put_object(&device, &frame.hash, frame.bytes)?;
-            hashes.push(frame.hash);
-        }
-        Ok(Json(serde_json::json!({"verified":hashes})).into_response())
-    })
-    .await
-}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ObjectRequest {
@@ -522,41 +501,6 @@ async fn missing(State(app): State<App>, body: Bytes) -> Result<Response> {
             }
         }
         Ok(Json(serde_json::json!({"missing":absent})).into_response())
-    })
-    .await
-}
-async fn download_batch(
-    State(app): State<App>,
-    Extension(buffer): Extension<BufferedRequest>,
-    body: Bytes,
-) -> Result<Response> {
-    let hashes: Vec<String> = canonical::decode(&body, MAX_METADATA_BYTES)?;
-    if hashes.len() > batch::MAX_BATCH_OBJECTS {
-        return Err(Error::new("too-many-candidates", 400));
-    }
-    blocking(move || {
-        let _buffer = buffer;
-        let mut budget = 8u64;
-        // Preflight without allocating payloads.
-        for digest in &hashes {
-            let size = app
-                .store
-                .object_size(digest)?
-                .ok_or(Error::new("object-not-found", 404))?;
-            budget = budget
-                .checked_add(size)
-                .and_then(|v| v.checked_add(41))
-                .ok_or(Error::new("batch-too-large", 413))?;
-            if budget > batch::MAX_BATCH_BYTES as u64 {
-                return Err(Error::new("batch-too-large", 413));
-            }
-        }
-        let objects: Vec<Vec<u8>> = hashes
-            .iter()
-            .map(|h| app.store.get_object(h))
-            .collect::<Result<_>>()?;
-        let bytes = batch::encode(&objects.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
-        Ok(([("content-type", "application/octet-stream")], bytes).into_response())
     })
     .await
 }

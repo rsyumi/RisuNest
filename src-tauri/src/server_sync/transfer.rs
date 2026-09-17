@@ -457,7 +457,7 @@ impl<'a> Transfer<'a> {
                 &[],
                 Some(canonical::encode(&requests)?),
                 &[],
-                risunest_sync_wire::batch::MAX_BATCH_BYTES,
+                risunest_sync_wire::transfer::MAX_BATCH_BYTES,
             )?;
             if reply.status != 200 {
                 return Err(response_error(reply));
@@ -647,7 +647,7 @@ impl<'a> Transfer<'a> {
                 &[("wait", "true".into())],
                 None,
                 &[],
-                risunest_sync_wire::batch::MAX_BATCH_BYTES,
+                risunest_sync_wire::transfer::MAX_BATCH_BYTES,
             )?;
             self.ensure_active()?;
             match reply.status {

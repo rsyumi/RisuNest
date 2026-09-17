@@ -5,9 +5,21 @@ use risunest_sync_server::{
     http,
     store::{DeviceCredential, Store},
 };
-use risunest_sync_wire::{batch, hash, CommitIntent, Receipt, RemoteHead, TerminalStatus};
+use risunest_sync_wire::{
+    hash,
+    transfer::{self, Frame},
+    CommitIntent, Receipt, RemoteHead, TerminalStatus,
+};
 use std::{sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+fn full_frames(objects: &[&[u8]]) -> Vec<u8> {
+    let frames = objects
+        .iter()
+        .map(|bytes| Frame::Full(bytes.to_vec()))
+        .collect::<Vec<_>>();
+    transfer::encode(&frames).expect("synthetic full frames must fit")
+}
 
 struct Server {
     base: String,
@@ -338,14 +350,52 @@ impl Server {
     async fn upload(&self, device: &DeviceCredential, body: &[u8]) {
         let response = self
             .auth(
-                self.client.post(format!("{}/uploads/batch", self.base)),
+                self.client.post(format!("{}/uploads/frames", self.base)),
                 device,
             )
-            .body(batch::encode(&[body]).unwrap())
+            .body(full_frames(&[body]))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+    async fn download_full(&self, device: &DeviceCredential, expected: &[u8]) -> bool {
+        let digest = hash(expected);
+        let response = self
+            .auth(
+                self.client.post(format!("{}/objects/transfer", self.base)),
+                device,
+            )
+            .json(&serde_json::json!([{"target":digest,"bases":[]}]))
             .send()
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let encoded = response.bytes().await.unwrap();
+        let mut frames = transfer::decode(&encoded).unwrap();
+        assert_eq!(frames.len(), 1);
+        let (bytes, fallback) = match frames.pop().unwrap() {
+            Frame::Full(bytes) => (bytes, false),
+            Frame::FullRequired { hash, size } => {
+                assert_eq!(hash, digest);
+                assert_eq!(size, expected.len() as u64);
+                let response = self
+                    .auth(
+                        self.client.get(format!("{}/objects/{hash}", self.base)),
+                        device,
+                    )
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                (response.bytes().await.unwrap().to_vec(), true)
+            }
+            Frame::Delta(_) => panic!("empty bases must not return a delta"),
+        };
+        assert_eq!(bytes.len(), expected.len());
+        assert_eq!(hash(&bytes), digest);
+        assert_eq!(bytes, expected);
+        fallback
     }
     async fn stage(
         &self,
@@ -500,7 +550,7 @@ async fn unauthorized_large_unfinished_body_is_rejected_before_reading_it() {
         .await
         .unwrap();
     tcp.write_all(
-        b"POST /uploads/batch HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8388608\r\n\r\n",
+        b"POST /uploads/frames HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8388608\r\nExpect: 100-continue\r\n\r\n",
     )
     .await
     .unwrap();
@@ -533,8 +583,8 @@ async fn stalled_upload_does_not_hold_library_writer_or_another_device_slot() {
     let mut tcp = tokio::net::TcpStream::connect(s.base.strip_prefix("http://").unwrap())
         .await
         .unwrap();
-    let frame = batch::encode(&[b"partial synthetic bytes"]).unwrap();
-    let headers=format!("POST /uploads/batch HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nX-Risu-Library: {}\r\nContent-Length: {}\r\n\r\n",s.a.token,s.a.library_id,frame.len());
+    let frame = full_frames(&[b"partial synthetic bytes"]);
+    let headers=format!("POST /uploads/frames HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nX-Risu-Library: {}\r\nContent-Length: {}\r\n\r\n",s.a.token,s.a.library_id,frame.len());
     tcp.write_all(headers.as_bytes()).await.unwrap();
     tcp.write_all(&frame[..10]).await.unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -553,9 +603,16 @@ async fn stalled_upload_does_not_hold_library_writer_or_another_device_slot() {
         .object_size(&hash(b"partial synthetic bytes"))
         .unwrap()
         .is_none());
+    for _ in 0..2 {
+        s.upload(&s.a, b"partial synthetic bytes").await;
+    }
+    assert_eq!(
+        s.store.get_object(&hash(b"partial synthetic bytes")).unwrap(),
+        b"partial synthetic bytes"
+    );
 }
 #[tokio::test]
-async fn identity_range_and_batch_retries_use_verified_target_bytes() {
+async fn identity_range_and_transfer_retries_use_verified_target_bytes() {
     let s = Server::start().await;
     s.upload(&s.a, b"0123456789").await;
     let digest = hash(b"0123456789");
@@ -614,14 +671,7 @@ async fn identity_range_and_batch_retries_use_verified_target_bytes() {
         response.json::<serde_json::Value>().await.unwrap(),
         serde_json::json!({"missing":[hash(b"missing-a"),hash(b"missing-b")]})
     );
-    let response = s
-        .auth(s.client.post(format!("{}/objects/batch", s.base)), &s.b)
-        .json(&[digest])
-        .send()
-        .await
-        .unwrap();
-    let bytes = response.bytes().await.unwrap();
-    assert_eq!(batch::decode(&bytes).unwrap()[0].bytes, b"0123456789");
+    assert!(!s.download_full(&s.b, b"0123456789").await);
 }
 #[tokio::test]
 async fn malformed_metadata_and_frame_fail_without_mutation() {
@@ -637,7 +687,7 @@ async fn malformed_metadata_and_frame_fail_without_mutation() {
     let mut oversized = tokio::net::TcpStream::connect(s.base.strip_prefix("http://").unwrap())
         .await
         .unwrap();
-    let headers=format!("POST /uploads/batch HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nX-Risu-Library: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",s.a.token,s.a.library_id,batch::MAX_BATCH_BYTES+1);
+    let headers=format!("POST /uploads/frames HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nX-Risu-Library: {}\r\nContent-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",s.a.token,s.a.library_id,transfer::MAX_BATCH_BYTES+1);
     oversized.write_all(headers.as_bytes()).await.unwrap();
     let mut response = [0; 1024];
     let length = tokio::time::timeout(Duration::from_secs(2), oversized.read(&mut response))
@@ -646,17 +696,147 @@ async fn malformed_metadata_and_frame_fail_without_mutation() {
         .unwrap();
     assert!(String::from_utf8_lossy(&response[..length]).starts_with("HTTP/1.1 413"));
     drop(oversized);
-    let mut corrupt = batch::encode(&[b"good", b"bad"]).unwrap();
-    *corrupt.last_mut().unwrap() ^= 1;
+    let mut corrupt = full_frames(&[b"good", b"bad"]);
+    let second_hash = 8 + (45 + b"good".len()) + 5;
+    corrupt[second_hash] ^= 1;
     let response = s
-        .auth(s.client.post(format!("{}/uploads/batch", s.base)), &s.a)
+        .auth(s.client.post(format!("{}/uploads/frames", s.base)), &s.a)
         .body(corrupt)
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(s.store.object_size(&hash(b"good")).unwrap().is_none());
+    assert!(s.store.object_size(&hash(b"bad")).unwrap().is_none());
     assert_eq!(s.head(&s.a).await, head);
+}
+
+#[tokio::test]
+async fn removed_batch_endpoints_have_no_post_alias() {
+    let s = Server::start().await;
+    let head = s.head(&s.a).await;
+    let object = b"synthetic obsolete upload";
+    for (path, body) in [
+        ("/uploads/batch", full_frames(&[object])),
+        ("/objects/batch", serde_json::to_vec(&[hash(object)]).unwrap()),
+    ] {
+        let response = s
+            .auth(s.client.post(format!("{}{path}", s.base)), &s.a)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+    assert!(s.store.object_size(&hash(object)).unwrap().is_none());
+    assert_eq!(s.head(&s.a).await, head);
+}
+
+#[tokio::test]
+async fn truncated_frames_never_publish_objects_or_allow_a_commit() {
+    let s = Server::start().await;
+    let head = s.head(&s.a).await;
+    let first = b"synthetic complete first object";
+    let second = b"synthetic truncated second object";
+    let encoded = full_frames(&[first, second]);
+    for end in 0..encoded.len() {
+        let response = s
+            .auth(s.client.post(format!("{}/uploads/frames", s.base)), &s.a)
+            .body(encoded[..end].to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "prefix {end}");
+        assert!(s.store.object_size(&hash(first)).unwrap().is_none());
+        assert!(s.store.object_size(&hash(second)).unwrap().is_none());
+    }
+    let invalid_upload = transfer::encode(&[
+        Frame::Full(first.to_vec()),
+        Frame::FullRequired { hash: hash(second), size: second.len() as u64 },
+    ]).unwrap();
+    let response = s
+        .auth(s.client.post(format!("{}/uploads/frames", s.base)), &s.a)
+        .body(invalid_upload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.json::<serde_json::Value>().await.unwrap()["error"], "invalid-upload-frame");
+    assert!(s.store.object_size(&hash(first)).unwrap().is_none());
+    let intent = s.stage(&s.a, head.clone(), 1, "incomplete", first).await;
+    let response = s
+        .auth(s.client.post(format!("{}/commits", s.base)), &s.a)
+        .header("if-match", head.etag())
+        .json(&intent)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(response.json::<serde_json::Value>().await.unwrap()["error"], "missing-dependency");
+    assert_eq!(s.head(&s.a).await, head);
+}
+
+#[tokio::test]
+async fn streamed_frame_body_limit_rejects_before_publishing() {
+    let s = Server::start().await;
+    let head = s.head(&s.a).await;
+    let object = b"synthetic streamed prefix";
+    let prefix = full_frames(&[object]);
+    let padding = vec![0; transfer::MAX_BATCH_BYTES + 1 - prefix.len()];
+    let body = reqwest::Body::wrap_stream(futures_util::stream::iter([
+        Ok::<_, std::io::Error>(prefix),
+        Ok(padding),
+    ]));
+    let request = s
+        .auth(s.client.post(format!("{}/uploads/frames", s.base)), &s.a)
+        .body(body)
+        .build()
+        .unwrap();
+    assert!(!request.headers().contains_key("content-length"));
+    let response = s.client.execute(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(s.store.object_size(&hash(object)).unwrap().is_none());
+    assert_eq!(s.head(&s.a).await, head);
+}
+
+#[tokio::test]
+async fn transfer_and_full_required_get_reject_other_libraries_and_revoked_devices() {
+    let s = Server::start().await;
+    let foreign = Server::start().await;
+    let bytes = vec![b'x'; transfer::PREFERRED_BATCH_BYTES];
+    s.upload(&s.a, &bytes).await;
+    assert!(s.download_full(&s.b, &bytes).await);
+    let digest = hash(&bytes);
+    for credential in [None, Some(&foreign.a)] {
+        let requests = [
+            s.client.post(format!("{}/objects/transfer", s.base))
+                .json(&serde_json::json!([{"target":digest,"bases":[]}])),
+            s.client.get(format!("{}/objects/{digest}", s.base)),
+        ];
+        for request in requests {
+            let request = match credential {
+                Some(credential) => s.auth(request, credential),
+                None => request,
+            };
+            assert_eq!(request.send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+    let denied = b"synthetic foreign upload";
+    let response = s.client.post(format!("{}/uploads/frames", s.base))
+        .bearer_auth(&s.a.token)
+        .header("x-risu-library", &foreign.a.library_id)
+        .body(full_frames(&[denied]))
+        .send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(s.store.object_size(&hash(denied)).unwrap().is_none());
+    s.store.revoke_device(&s.b.device_id).unwrap();
+    for request in [
+        s.client.post(format!("{}/objects/transfer", s.base))
+            .json(&serde_json::json!([{"target":digest,"bases":[]}])),
+        s.client.get(format!("{}/objects/{digest}", s.base)),
+    ] {
+        assert_eq!(s.auth(request, &s.b).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -735,18 +915,7 @@ async fn chunk_upload_delta_download_checkpoint_and_durable_job_over_tcp() {
         Frame::Delta(recipe) => assert_eq!(recipe.apply(&[&base]).unwrap(), target),
         _ => panic!("warm download must use delta"),
     }
-    let response = s
-        .auth(s.client.post(format!("{}/objects/transfer", s.base)), &s.b)
-        .json(&serde_json::json!([{"target":hash(&target),"bases":[]}]))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
-    assert!(matches!(
-        transfer::decode(&response.bytes().await.unwrap()).unwrap()[0],
-        Frame::FullRequired { .. }
-    ));
+    assert!(s.download_full(&s.b, &target).await);
     let response = s
         .auth(
             s.client

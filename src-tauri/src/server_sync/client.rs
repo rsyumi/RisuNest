@@ -646,9 +646,7 @@ fn replay_safe(method: &Method, path: &str) -> bool {
         && (matches!(
             path,
             "objects/missing"
-                | "objects/batch"
                 | "objects/transfer"
-                | "uploads/batch"
                 | "uploads/frames"
                 | "objects/pins"
                 | "objects/retention/release"
@@ -765,6 +763,9 @@ mod tests {
         assert!(replay_safe(&Method::PUT, "staged-changes/stage/pages/0"));
         assert!(replay_safe(&Method::POST, "uploads/id/complete"));
         assert!(replay_safe(&Method::POST, "uploads/frames"));
+        assert!(replay_safe(&Method::POST, "objects/transfer"));
+        assert!(!replay_safe(&Method::POST, "uploads/batch"));
+        assert!(!replay_safe(&Method::POST, "objects/batch"));
         assert!(!replay_safe(&Method::POST, "commits"));
         assert!(!replay_safe(&Method::POST, "uploads"));
         assert!(!replay_safe(&Method::POST, "staged-changes/start"));

@@ -200,7 +200,7 @@ async fn proxy(State(state): State<Arc<Faults>>, request: Request, next: Next) -
                     // which is a separate transport failure.
                     axum::body::to_bytes(
                         request.into_body(),
-                        risunest_sync_wire::batch::MAX_BATCH_BYTES,
+                        risunest_sync_wire::transfer::MAX_BATCH_BYTES,
                     )
                     .await
                     .unwrap();

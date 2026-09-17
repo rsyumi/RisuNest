@@ -184,7 +184,6 @@ compression is rejected with 415; object Range offsets address identity bytes.
 | `GET /scopes?scope=NAME`                     | Scope version, last clear identity and head in one snapshot; distinguishes independent edits from a clear               |
 | `GET /head`                                  | Small stored head, ETag, bodyless conditional 304                                                                       |
 | `POST /objects/missing`                      | Candidate `{hash,size}` array, decimal string sizes; response lists missing hashes                                      |
-| `POST /uploads/batch`, `POST /objects/batch` | Bounded full object batches                                                                                             |
 | `POST /uploads/frames`                       | Full/delta transfer batch, exact target verification; successful whole batch returns bodyless 204                       |
 | `POST /objects/transfer`                     | Array of `{target,bases}`; delta, full, or full-required frames                                                         |
 | `GET /objects/{hash}`                        | Bounded-memory stream, single Range/If-Range, ETag                                                                      |
@@ -267,12 +266,16 @@ control rules. Rust/ECMAScript tests share exact UTF-8 golden vectors.
 - Staging: 16 sets per device, 256 MiB total metadata per set, 500,000 changes.
 - Record descriptors: immutable bounded reference trees, up to 1,000,000
   references, depth 8, generic dependency/relation roots and up to 16 scopes.
-- Full `RNSF` batches: at most 8 MiB including framing, 1024 frames.
 - Native full batches prefer 1 MiB. Upload and resumed Range chunks are 1 MiB,
   with at most two concurrent chunk requests per direction;
   larger useful delta frames retain the 8 MiB wire ceiling. Native recipe/frame
   requests have a 120-second deadline, ordinary requests 30 seconds.
-- Mixed `RNSB` batches: full, `RNSD` delta, or download-only full-required frames.
+- `RNSB` batches: full, `RNSD` delta, or download-only full-required frames;
+  at most 8 MiB including framing, 1024 frames, and 32 MiB aggregate
+  materialized full/delta bytes. Full-required carries the exact target hash
+  and size; fetch the object through the authenticated `GET /objects/{hash}`
+  path and verify its hash and length. Empty-base requests can return full or
+  full-required, not a delta.
 - `RNSD` is a custom exact COPY/INSERT profile, not VCDIFF: ordered base IDs,
   checked offsets, exact base/target hashes and lengths, no output-copy chains.
   Current encoder/materializer limits: 4 bases, 32 MiB aggregate base bytes,

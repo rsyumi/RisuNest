@@ -1,5 +1,5 @@
 use risunest_sync_wire::{
-    batch, canonical, change_digest::ChangeDigest, hash, operation_id, ChangeSet, CommitIntent,
+    canonical, change_digest::ChangeDigest, hash, operation_id, transfer::{self, Frame}, ChangeSet, CommitIntent,
     Domain, ReadFence, RecordChange, RecordVersion, RemoteHead, Sequence,
 };
 use serde_json::{json, Value};
@@ -130,35 +130,106 @@ fn change_schema_rejects_duplicate_keys_absent_targets_unknown_fields_and_bad_ha
     .is_err());
 }
 #[test]
-fn full_batch_preserves_opaque_bytes_including_empty_and_noncanonical_json() {
+fn full_frames_preserve_opaque_bytes_including_empty_and_noncanonical_json() {
     let raw = br#"{ "b":1.0, "a":9007199254740993 }"#;
-    let encoded = batch::encode(&[b"", raw, &[0xff, 0, 7]]).unwrap();
-    let decoded = batch::decode(&encoded).unwrap();
-    assert_eq!(decoded[0].bytes, b"");
-    assert_eq!(decoded[1].bytes, raw);
-    assert_eq!(decoded[2].bytes, &[0xff, 0, 7]);
-    assert_eq!(decoded[1].hash, hash(raw));
+    let objects: &[&[u8]] = &[b"", raw, &[0xff, 0, 7]];
+    let frames = objects.iter().map(|bytes| Frame::Full(bytes.to_vec())).collect::<Vec<_>>();
+    let encoded = transfer::encode(&frames).unwrap();
+    let decoded = transfer::decode(&encoded).unwrap();
+    assert_eq!(decoded.len(), objects.len());
+    for (frame, expected) in decoded.iter().zip(objects) {
+        let Frame::Full(bytes) = frame else { panic!("expected full frame") };
+        assert_eq!(bytes, expected);
+        assert_eq!(hash(bytes), hash(expected));
+    }
 }
 #[test]
-fn batch_rejects_every_truncated_prefix_trailing_bytes_corruption_and_unknown_codec() {
-    let encoded = batch::encode(&[b"data"]).unwrap();
+fn frames_reject_every_truncated_prefix_trailing_bytes_corruption_and_unknown_codec() {
+    let encoded = transfer::encode(&[Frame::Full(b"data".to_vec())]).unwrap();
     for end in 0..encoded.len() {
-        assert!(batch::decode(&encoded[..end]).is_err(), "prefix {end}");
+        assert!(transfer::decode(&encoded[..end]).is_err(), "prefix {end}");
     }
     let mut bad = encoded.clone();
     bad.push(0);
-    assert!(batch::decode(&bad).is_err());
+    assert!(transfer::decode(&bad).is_err());
     let mut bad = encoded.clone();
     *bad.last_mut().unwrap() ^= 1;
-    assert!(batch::decode(&bad).is_err());
+    assert!(transfer::decode(&bad).is_err());
     let mut bad = encoded.clone();
-    bad[8] = 1;
-    assert!(batch::decode(&bad).is_err());
+    bad[12] = 255;
+    assert!(transfer::decode(&bad).is_err());
     let mut bad = encoded.clone();
-    bad[41..49].fill(255);
-    assert!(batch::decode(&bad).is_err());
-    assert!(batch::encode(&[&vec![0; batch::MAX_BATCH_BYTES]]).is_err());
-    assert!(batch::encode(&vec![b"".as_slice(); 1025]).is_err());
+    bad[45..53].fill(255);
+    assert!(transfer::decode(&bad).is_err());
+    for length in [0u32, 40, 44, 46, u32::MAX] {
+        let mut bad = encoded.clone();
+        bad[8..12].copy_from_slice(&length.to_be_bytes());
+        assert!(transfer::decode(&bad).is_err(), "payload length {length}");
+    }
+    let mut bad = encoded.clone();
+    bad[8..12].copy_from_slice(&46u32.to_be_bytes());
+    bad.push(0);
+    assert!(transfer::decode(&bad).is_err());
+    let mut bad = encoded;
+    bad[..4].copy_from_slice(b"RNSF");
+    assert!(transfer::decode(&bad).is_err());
+}
+#[test]
+fn full_frame_limits_include_count_and_framing() {
+    let full = Frame::Full(vec![0; transfer::MAX_BATCH_BYTES - 53]);
+    let encoded = transfer::encode(&[full]).unwrap();
+    assert_eq!(encoded.len(), transfer::MAX_BATCH_BYTES);
+    assert!(matches!(transfer::decode(&encoded).unwrap().as_slice(), [Frame::Full(_)]));
+    let mut oversized = encoded;
+    oversized.push(0);
+    assert!(transfer::decode(&oversized).is_err());
+    assert!(transfer::encode(&[Frame::Full(vec![0; transfer::MAX_BATCH_BYTES - 52])]).is_err());
+    let mut frames = (0..transfer::MAX_BATCH_OBJECTS)
+        .map(|_| Frame::Full(Vec::new()))
+        .collect::<Vec<_>>();
+    let mut encoded = transfer::encode(&frames).unwrap();
+    assert_eq!(transfer::decode(&encoded).unwrap().len(), transfer::MAX_BATCH_OBJECTS);
+    frames.push(Frame::Full(Vec::new()));
+    assert!(transfer::encode(&frames).is_err());
+    encoded[4..8].copy_from_slice(&((transfer::MAX_BATCH_OBJECTS + 1) as u32).to_be_bytes());
+    assert!(transfer::decode(&encoded).is_err());
+}
+#[test]
+fn full_required_preserves_exact_hash_and_u64_size_without_materializing() {
+    let digest = hash(b"synthetic large object");
+    let encoded = transfer::encode(&[Frame::FullRequired { hash: digest.clone(), size: u64::MAX }]).unwrap();
+    assert_eq!(encoded.len(), 53);
+    let decoded = transfer::decode(&encoded).unwrap();
+    assert!(matches!(&decoded[0], Frame::FullRequired { hash, size } if hash == &digest && *size == u64::MAX));
+    for end in 0..encoded.len() {
+        assert!(transfer::decode(&encoded[..end]).is_err(), "prefix {end}");
+    }
+    let mut trailing = encoded;
+    trailing[8..12].copy_from_slice(&42u32.to_be_bytes());
+    trailing.push(0);
+    assert!(transfer::decode(&trailing).is_err());
+}
+#[test]
+fn full_frame_goldens_match_the_javascript_harness() {
+    #[derive(serde::Deserialize)]
+    struct Golden {
+        name: String,
+        objects: Vec<String>,
+        encoded: String,
+    }
+    let vectors: Vec<Golden> = serde_json::from_str(include_str!("transfer-golden.json")).unwrap();
+    assert_eq!(vectors.len(), 3);
+    for vector in vectors {
+        let frames = vector.objects.iter().map(|hex| {
+            assert_eq!(hex.len() % 2, 0);
+            Frame::Full((0..hex.len()).step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect())
+        }).collect::<Vec<_>>();
+        let encoded = transfer::encode(&frames).unwrap();
+        let hex = encoded.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        assert_eq!(hex, vector.encoded, "{}", vector.name);
+        assert_eq!(transfer::decode(&encoded).unwrap().len(), frames.len());
+    }
 }
 
 #[test]

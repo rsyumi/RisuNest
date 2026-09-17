@@ -84,6 +84,7 @@ the measurement harness, not the server. These scripts create synthetic data and
 count TCP bytes without logging request bodies or credentials:
 
 ```powershell
+$env:CARGO_TARGET_DIR = 'E:/Programming/Github/RisuNest/src-tauri/target'
 cargo build --manifest-path server/sync/Cargo.toml --release --locked
 node benchmarks/sync-server/transfer-comparison.mjs
 $env:OPENSSL_EXE = 'C:/Program Files/Git/usr/bin/openssl.exe'
@@ -92,14 +93,44 @@ node benchmarks/sync-server/tls-head.mjs
 
 `transfer-comparison.mjs` compares 1,000 individual object requests against four
 250-object full batches, in both directions, using loopback ports 19424/19425.
-The batch cases run with two or four workers and separate device credentials.
-Four workers do not override the daemon's two-request limit for a single device.
-Every returned object is checked exactly. A subsequent missing query must return
-no missing objects and send no object bodies. It still sends 89,467 HTTP bytes of
-candidate metadata in this deliberately complete 1,000-object baseline; normal
-native warm cycles send only candidates from the changed closure.
+Uploads use RNSB Full frames on `POST /uploads/frames` and require a bodyless
+success response. Individual downloads use authenticated `GET /objects/{hash}`;
+batch downloads use `POST /objects/transfer` with `{target,bases:[]}` entries.
+A FullRequired response is checked against the exact requested hash and size
+before an authenticated object GET. That GET uses the same counted request path:
+its request, response bytes and elapsed time are included, not hidden as one
+transfer request. Every returned object's length, hash and bytes are checked.
+The decoder rejects malformed framing, oversized batches, hash mismatches,
+trailing bytes, unknown codecs and unexpected deltas without bases.
 
-Representative 2026-09-12 text-fixture results (887,000 raw payload bytes):
+The fixtures remain 1,000 deterministic text, random or precompressed objects;
+the existing seed strings, byte contents and grouping are unchanged. The batch
+cases run with two or four workers and separate device credentials. Four workers
+do not override the daemon's two-request limit for a single device. A subsequent
+missing query must return no missing objects and send no object bodies. Its
+candidate metadata still counts as HTTP traffic; normal native warm cycles send
+only candidates from the changed closure. The comparison does not replace native
+chunk/resume, warm-delta or metadata-only transfer tests.
+
+The codec and fallback-accounting tests need only Node and do not start a daemon:
+
+```powershell
+node --test benchmarks/sync-server/transfer-comparison.test.mjs
+cargo test --manifest-path crates/sync-wire/Cargo.toml --test golden --locked
+```
+
+Both use `crates/sync-wire/tests/transfer-golden.json`, checking empty, single and
+mixed opaque Full frames against Rust `transfer::encode`. Limits remain 8 MiB
+including framing and 1,024 frames. Native chunk/preferred batch sizes remain
+1 MiB, and the native full/delta materialization defense remains 32 MiB.
+To check behavior with a specific already-built local daemon, set
+`RISUNEST_SYNC_SERVER_BINARY` to its absolute executable path. A debug-daemon run
+checks correctness only; do not compare its timings with release measurements.
+The harness does not download, install or build a server. It creates only new
+synthetic directories under `.local` and stops only the processes it spawned.
+
+The following 2026-09-12 results predate the RNSB migration and are historical,
+not measurements of the current harness. Text fixture: 887,000 raw payload bytes.
 
 | Mode                          | Upload HTTP bytes / requests / ms | Download HTTP bytes / requests / ms |
 | ----------------------------- | --------------------------------- | ----------------------------------- |
@@ -107,8 +138,8 @@ Representative 2026-09-12 text-fixture results (887,000 raw payload bytes):
 | Full batches, 2 workers       | 996,904 / 4 / 3,590               | 996,884 / 4 / 437                   |
 | Full batches, 4 workers       | 996,904 / 4 / 3,069               | 996,884 / 4 / 291                   |
 
-The same runs include deterministic random bytes and already-gzipped random
-objects. Offline gzip is measured separately from HTTP framing: text frames shrink
+Those historical runs also included deterministic random bytes and already-gzipped
+random objects. Offline gzip was measured separately from HTTP framing: text frames shrink
 from 928,008 to 42,281 bytes (about 4 ms compression), random frames from 553,008
 to 548,875 bytes (about 12 ms), and precompressed frames from 576,008 to 554,604
 bytes (about 11 ms). This shows potential text savings, not shipped gzip support.

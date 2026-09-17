@@ -1,5 +1,4 @@
 //! Format-independent sync protocol. Content bytes are never JSON-normalized.
-pub mod batch;
 pub mod canonical;
 pub mod change_digest;
 pub mod changes;

@@ -6,7 +6,7 @@ use risunest_sync_server::{
     store::{DeviceCredential, Store},
     workload::Workload,
 };
-use risunest_sync_wire::{batch, canonical, RemoteHead};
+use risunest_sync_wire::{canonical, transfer::{self, Frame}, RemoteHead};
 use std::{sync::Arc, time::Duration};
 
 struct Server {
@@ -65,12 +65,12 @@ impl Server {
     /// One small library change, committed through the ordinary endpoints.
     async fn commit(&self, key: &str, body: &[u8]) {
         let response = self
-            .auth(self.client.post(format!("{}/uploads/batch", self.base)))
-            .body(batch::encode(&[body]).unwrap())
+            .auth(self.client.post(format!("{}/uploads/frames", self.base)))
+            .body(transfer::encode(&[Frame::Full(body.to_vec())]).unwrap())
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let head = self.head().await;
         let device = self
             .store
