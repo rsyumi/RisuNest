@@ -66,7 +66,9 @@ impl PackageLimits {
         let max_stored_bytes = capabilities
             .max_stored_bytes
             .unwrap_or(DEFAULT_MAX_STORED_BYTES);
-        if max_stored_bytes <= capabilities.sdk_overhead_bytes + MIN_OBJECT_BYTES {
+        if capabilities.sdk_overhead_bytes.checked_add(MIN_OBJECT_BYTES)
+            .is_none_or(|minimum| max_stored_bytes <= minimum)
+        {
             return Err(ProviderError::new(ErrorKind::FileTooLarge));
         }
         Ok(Self {
@@ -289,6 +291,32 @@ impl PackageCache {
         }
         Ok(Some(value))
     }
+    fn forget_object(
+        &self,
+        format_repository_id: &str,
+        repository: &RepositoryHandle,
+        object_id: &str,
+    ) -> Result<()> {
+        let transaction = self.db.unchecked_transaction().map_err(transient)?;
+        transaction.execute(
+            "DELETE FROM remote_objects WHERE repository_id=?1 AND connection_identity=?2 AND object_id=?3",
+            params![format_repository_id, repository.connection_identity, object_id],
+        ).map_err(transient)?;
+        transaction.execute(
+            "DELETE FROM entries WHERE repository_id=?1 AND connection_identity=?2
+             AND EXISTS(SELECT 1 FROM json_each(entries.value,'$.packs') AS pack
+               WHERE json_extract(pack.value,'$.objectId')=?3)",
+            params![format_repository_id, repository.connection_identity, object_id],
+        ).map_err(transient)?;
+        // A changed child can change every parent hash. These roots are only
+        // an optimization; their source entries and sealed uploads stay intact.
+        transaction.execute(
+            "DELETE FROM catalogs WHERE repository_id=?1 AND connection_identity=?2",
+            params![format_repository_id, repository.connection_identity],
+        ).map_err(transient)?;
+        transaction.commit().map_err(transient)
+    }
+
     fn put_object(&self, repository: &RepositoryHandle, value: &RemoteObject) -> Result<()> {
         value.stored(repository)?;
         self.db.execute(
@@ -381,6 +409,157 @@ impl PackageCache {
         Ok(())
     }
 }
+/// Reopening a cache never proves that its old object still exists. A journal
+/// can repair a missing object from the original ciphertext; a cache without
+/// that source must let its caller rebuild from the pinned capture.
+async fn revalidate_cached_object(
+    value: &RemoteObject,
+    cache: &mut PackageCache,
+    journal: &mut TransferJournal,
+    provider: &dyn Provider,
+    repository: &RepositoryHandle,
+    cancel: &Cancellation,
+) -> Result<Option<RemoteObject>> {
+    cancel.check()?;
+    value.stored(repository)?;
+    let mut verified = value.clone();
+    if let Some(record) = journal.record(&value.object_id)? {
+        if record.intent.sha256 != value.ciphertext_sha256
+            || record.intent.byte_length != value.receipt.byte_length
+            || record.intent.role != value.role
+        {
+            return Err(corrupt("cached object differs from its sealed source"));
+        }
+        verified.receipt = transfer_job::upload(
+            journal, &value.object_id, provider, repository, cancel,
+        ).await?;
+    } else {
+        let intent = ObjectIntent {
+            repository_id: repository.repository_id.clone(),
+            job_id: journal.job_id().to_owned(),
+            object_id: value.object_id.clone(),
+            role: value.role,
+            byte_length: value.receipt.byte_length,
+            sha256: value.ciphertext_sha256.clone(),
+        };
+        let mut historical = value.receipt.clone();
+        // A checksum from an old receipt is not a fresh metadata response.
+        historical.checksum = None;
+        let Some(receipt) = transfer_job::verify_remote_receipt(
+            journal.directory(), &intent, provider, repository, historical, cancel,
+        ).await? else {
+            cache.forget_object(&value.repository_id, repository, &value.object_id)?;
+            return Ok(None);
+        };
+        verified.receipt = receipt;
+    }
+    // Inherited remote references are not this device's upload inventory.
+    if journal.record(&value.object_id)?.is_some()
+        || cache.object(&value.repository_id, repository, &value.object_id, &value.plaintext_sha256)?.is_some()
+    {
+        cache.put_object(repository, &verified)?;
+    }
+    Ok(Some(verified))
+}
+
+/// A catalog cache hit is useful only when its entire authenticated closure
+/// still exists. Checking the root alone misses missing shared packs and leaves.
+async fn revalidate_cached_catalog(
+    root: &RemoteObject,
+    cache: &mut PackageCache,
+    journal: &mut TransferJournal,
+    root_key: &[u8; 32],
+    provider: &dyn Provider,
+    repository: &RepositoryHandle,
+    cancel: &Cancellation,
+) -> Result<Option<Vec<RemoteObject>>> {
+    let metadata_key = derive_key(root_key, &root.repository_id, "metadata").map_err(corrupt)?;
+    let mut pending = vec![root.clone()];
+    let mut seen = BTreeMap::new();
+    let mut verified = Vec::new();
+    while let Some(object) = pending.pop() {
+        cancel.check()?;
+        let identity = super::gc_store::locator_key(&object.receipt.locator)?;
+        let stored = object.stored(repository)?;
+        if let Some(previous) = seen.insert(identity, stored.clone()) {
+            if previous != stored {
+                return Err(corrupt("conflicting catalog references"));
+            }
+            continue;
+        }
+        if object.repository_id != root.repository_id
+            || !matches!(object.role, ObjectRole::Catalog | ObjectRole::Pack)
+        {
+            return Err(corrupt("invalid cached catalog child"));
+        }
+        let previous_locator = object.receipt.locator.clone();
+        let Some(object) = revalidate_cached_object(
+            &object, cache, journal, provider, repository, cancel,
+        ).await? else {
+            return Ok(None);
+        };
+        // Recreating an object on an ID-based provider can change its locator.
+        // The existing parent still names the old one and must be rebuilt.
+        if object.object_id != root.object_id && object.receipt.locator != previous_locator {
+            cache.forget_object(&root.repository_id, repository, &root.object_id)?;
+            return Ok(None);
+        }
+        if object.role == ObjectRole::Catalog {
+            let stored = object.stored(repository)?;
+            if object.plaintext_length > wire::MAX_METADATA_BYTES as u64 {
+                return Err(ProviderError::new(ErrorKind::FileTooLarge));
+            }
+            let temporary = tempfile::tempdir_in(journal.directory()).map_err(transient)?;
+            let path = temporary.path().join("catalog");
+            let mut sink = SpoolSink::create(&path, object.receipt.byte_length)?;
+            let receipt = match provider.read_object(
+                repository, &object.receipt.locator, None, &mut sink, cancel,
+            ).await {
+                Ok(ReadReceipt::Body(receipt)) => receipt,
+                Ok(ReadReceipt::NotModified(_)) => return Err(corrupt("unexpected cached response")),
+                Err(error) if error.kind == ErrorKind::NotFound => {
+                    cache.forget_object(&object.repository_id, repository, &object.object_id)?;
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            if receipt.locator != object.receipt.locator
+                || receipt.byte_length != object.receipt.byte_length
+                || !receipt.complete || !sink.is_verified()
+            {
+                return Err(corrupt("catalog receipt differs"));
+            }
+            let mut input = crate::trust_boundary::open_regular_source(&path).map_err(transient)?;
+            if hex::encode(hash_reader(&mut input, object.receipt.byte_length).map_err(corrupt)?)
+                != object.ciphertext_sha256
+            {
+                return Err(corrupt("catalog ciphertext differs"));
+            }
+            input.seek(SeekFrom::Start(0)).map_err(transient)?;
+            let mut plaintext = Vec::new();
+            let header = wire::open_envelope(
+                &mut input, &mut plaintext, &metadata_key, wire::MAX_METADATA_BYTES as u64,
+            ).map_err(corrupt)?;
+            if header != stored.header
+                || hex::encode(hash(&plaintext)) != object.plaintext_sha256
+                || plaintext.len() as u64 != object.plaintext_length
+            {
+                return Err(corrupt("catalog plaintext differs"));
+            }
+            let document = wire::CatalogDocument::decode(&plaintext, wire::MAX_METADATA_BYTES)
+                .map_err(corrupt)?;
+            for child in document.children {
+                pending.push(RemoteObject::from_stored(&child.object, repository)?);
+            }
+            for pack in document.packs {
+                pending.push(RemoteObject::from_stored(&pack, repository)?);
+            }
+        }
+        verified.push(object);
+    }
+    Ok(Some(verified))
+}
+
 fn kind_name(kind: wire::CatalogKind) -> &'static str {
     match kind {
         wire::CatalogKind::Records => "records",
@@ -475,7 +654,8 @@ fn max_plaintext(
     let mut low = 0u64;
     let mut high = available;
     while low < high {
-        let middle = low + (high - low + 1) / 2;
+        let distance = high - low;
+        let middle = low + distance / 2 + distance % 2;
         let header =
             wire::PublicObjectHeader::new(repository_id.into(), object_id.into(), role, middle)
                 .map_err(corrupt)?;
@@ -647,7 +827,7 @@ async fn build_entries(
     let mut uncached = Vec::new();
     for source in sources {
         cancel.check()?;
-        if let Some(cached) = cache.entry(
+        if let Some(mut cached) = cache.entry(
             format_repository_id,
             repository,
             kind,
@@ -655,8 +835,17 @@ async fn build_entries(
             &source.content_sha256,
             source.byte_length,
         )? {
-            ready.push(cached);
-            continue;
+            let mut exists = true;
+            for pack in &mut cached.packs {
+                match revalidate_cached_object(pack, cache, journal, provider, repository, cancel).await? {
+                    Some(current) => *pack = current,
+                    None => { exists = false; break; }
+                }
+            }
+            if exists {
+                ready.push(cached);
+                continue;
+            }
         }
         uncached.push(source);
     }
@@ -746,7 +935,13 @@ async fn build_entries(
     cache.put_entries(format_repository_id, repository, kind, &new_entries)?;
     ready.extend(new_entries);
     ready.sort_by(|a, b| a.key.cmp(&b.key));
-    Ok((ready, uploaded_packs))
+    let mut referenced = BTreeMap::new();
+    for entry in &ready {
+        for pack in &entry.packs {
+            referenced.insert(pack.object_id.clone(), pack.clone());
+        }
+    }
+    Ok((ready, referenced.into_values().collect()))
 }
 
 // Named separately so the CPU producer and all capture file I/O run on the
@@ -887,7 +1082,17 @@ async fn upload_plain_object(
         &object_id,
         &plaintext_sha256,
     )? {
-        return Ok(value);
+        if value.object_id != object_id || value.role != role
+            || value.plaintext_length != plaintext_length
+            || value.plaintext_sha256 != plaintext_sha256
+        {
+            return Err(corrupt("cached plaintext identity differs"));
+        }
+        if let Some(current) = revalidate_cached_object(
+            &value, cache, journal, provider, repository, cancel,
+        ).await? {
+            return Ok(current);
+        }
     }
     let wire_role = wire_role(role)?;
     let header = wire::PublicObjectHeader::new(
@@ -996,7 +1201,6 @@ async fn upload_plain_object(
             plaintext_sha256,
         };
         cache.put_object(repository, &value)?;
-        remove_completed_spool(journal, &value.object_id)?;
         return Ok(value);
     }
     let spool = journal.spool_path(&object_id);
@@ -1053,19 +1257,7 @@ async fn upload_plain_object(
         plaintext_sha256,
     };
     cache.put_object(repository, &value)?;
-    remove_completed_spool(journal, &value.object_id)?;
     Ok(value)
-}
-
-fn remove_completed_spool(journal: &TransferJournal, object_id: &str) -> Result<()> {
-    let path = journal.spool_path(object_id);
-    match fs::remove_file(&path) {
-        Ok(()) => crate::trust_boundary::sync_directory(path.parent().unwrap())
-            .map_err(transient)
-            .map(|_| ()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(transient(error)),
-    }
 }
 
 fn unique_packs(
@@ -1116,8 +1308,13 @@ async fn build_catalog(
     referenced: &mut Vec<RemoteObject>,
 ) -> Result<RemoteObject> {
     if let Some(root) = cache.catalog(format_repository_id, repository, kind, fingerprint)? {
-        referenced.push(root.clone());
-        return Ok(root);
+        if let Some(objects) = revalidate_cached_catalog(
+            &root, cache, journal, root_key, provider, repository, cancel,
+        ).await? {
+            let current = objects.first().cloned().ok_or_else(|| corrupt("empty catalog closure"))?;
+            referenced.extend(objects);
+            return Ok(current);
+        }
     }
     let max_plain = usize::try_from(
         max_plaintext(
@@ -1159,11 +1356,7 @@ async fn build_catalog(
                 fragment_count: 1,
                 chunks: last.clone(),
             };
-            let packs = unique_packs(std::slice::from_ref(&probe), &available_packs)?;
-            if wire::CatalogDocument::leaf(kind, vec![probe], packs)
-                .and_then(|doc| doc.encode(max_plain))
-                .is_err()
-            {
+            if !catalog_leaf_fits(kind, std::slice::from_ref(&probe), &available_packs, max_plain)? {
                 let chunk = last.pop().unwrap();
                 if last.is_empty() {
                     return Err(ProviderError::new(ErrorKind::FileTooLarge));
@@ -1454,13 +1647,20 @@ pub(crate) async fn package_and_upload(
         &mut referenced,
     )
     .await?;
-    let asset_catalog = if let Some(root) = cache.catalog(
+    let cached_assets = match cache.catalog(
         &metadata.repository_id,
         repository,
         wire::CatalogKind::Assets,
         &asset_fingerprint,
     )? {
-        referenced.push(root.clone());
+        Some(root) => revalidate_cached_catalog(
+            &root, &mut cache, journal, root_key, provider, repository, cancel,
+        ).await?,
+        None => None,
+    };
+    let asset_catalog = if let Some(objects) = cached_assets {
+        let root = objects.first().cloned().ok_or_else(|| corrupt("empty asset catalog closure"))?;
+        referenced.extend(objects);
         root
     } else {
         let (asset_entries, uploaded) = build_entries(
@@ -1579,6 +1779,15 @@ pub(crate) async fn package_and_upload(
                 content_fingerprint: captured.content_fingerprint,
             },
         );
+    }
+    // Carried, unselected sections are publication references too. Never
+    // silently drop them, and never publish a cached reference with a hole.
+    for section in published_sections.values() {
+        let root = RemoteObject::from_stored(&section.entries_root, repository)?;
+        let objects = revalidate_cached_catalog(
+            &root, &mut cache, journal, root_key, provider, repository, cancel,
+        ).await?.ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
+        referenced.extend(objects);
     }
     let (bytes, fingerprint, sections, role) = match metadata.purpose {
         SnapshotPurpose::SyncState {
@@ -2298,7 +2507,105 @@ mod tests {
     }
 
     #[test]
-    fn stable_job_object_id_rejects_changed_plaintext_after_completed_spool_cleanup() {
+    fn c_cached_asset_tree_is_rebuilt_when_a_pack_or_catalog_disappears() {
+        runtime().block_on(async {
+            for missing_role in [ObjectRole::Pack, ObjectRole::Catalog] {
+                let root = tempfile::tempdir().unwrap();
+                let cache = root.path().join("cache");
+                let provider = FakeProvider::new(false);
+                let repository = fake::repository();
+                let key = [7; 32];
+                let cancel = Cancellation::default();
+                let (capture, _) = captured(root.path(), "first", 1, b"record", b"asset");
+                let meta = metadata("first", &capture);
+                let mut first_journal = journal(&root.path().join("first-job"), "first-job", &capture);
+                let first = package_and_upload(capture, Vec::new(), root.path(), &cache, meta, &key,
+                    limits(128 * 1024), &mut first_journal, &provider, &repository, &cancel).await.unwrap();
+                let bytes = provider.state.lock().unwrap().objects[&first.asset_catalog.receipt.locator.object].0.clone();
+                let metadata_key = derive_key(&key, &first.repository_id, "metadata").unwrap();
+                let mut plaintext = Vec::new();
+                wire::open_envelope(&mut std::io::Cursor::new(bytes), &mut plaintext, &metadata_key,
+                    wire::MAX_METADATA_BYTES as u64).unwrap();
+                let catalog = wire::CatalogDocument::decode(&plaintext, wire::MAX_METADATA_BYTES).unwrap();
+                let asset_pack = &catalog.packs[0];
+                let missing = if missing_role == ObjectRole::Pack {
+                    asset_pack.locator.object.clone()
+                } else { first.asset_catalog.receipt.locator.object.clone() };
+                provider.forget(&missing);
+                let retained = first.referenced_objects.iter().find(|object| {
+                    object.role == ObjectRole::Pack && object.object_id != asset_pack.header.object_id
+                }).unwrap();
+                let (capture, _) = captured(root.path(), "second", 2, b"record", b"asset");
+                let meta = metadata("second", &capture);
+                let mut second_journal = journal(&root.path().join("second-job"), "second-job", &capture);
+                let second = package_and_upload(capture, Vec::new(), root.path(), &cache, meta, &key,
+                    limits(128 * 1024), &mut second_journal, &provider, &repository, &cancel).await.unwrap();
+                let restored = snapshot_restore::download_snapshot(&second.reference, &root.path().join("restored"),
+                    &key, &provider, &repository, &cancel).await.unwrap();
+                assert_eq!(fs::read(&restored.records[0].path).unwrap(), b"record");
+                assert!(restored.objects.iter().any(|object| fs::read(&object.path).unwrap() == b"asset"));
+                assert_eq!(provider.upload_attempts(&retained.object_id), 1);
+                assert!(first_journal.spool_path(&first.reference.object_id).exists());
+                assert!(second_journal.spool_path(&second.reference.object_id).exists());
+                if missing_role == ObjectRole::Pack {
+                    assert_ne!(first.asset_catalog.object_id, second.asset_catalog.object_id);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn c_catalog_reuse_surfaces_authorization_errors_without_publishing() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let cache = root.path().join("cache");
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let key = [7; 32];
+            let cancel = Cancellation::default();
+            let (capture, _) = captured(root.path(), "first", 1, b"record", b"asset");
+            let meta = metadata("first", &capture);
+            let mut first_journal = journal(&root.path().join("first-job"), "first-job", &capture);
+            let first = package_and_upload(capture, Vec::new(), root.path(), &cache, meta, &key,
+                limits(128 * 1024), &mut first_journal, &provider, &repository, &cancel).await.unwrap();
+            provider.fail_read(&first.asset_catalog.receipt.locator.object, ErrorKind::Unauthorized);
+            let (capture, _) = captured(root.path(), "second", 2, b"record", b"asset");
+            let meta = metadata("second", &capture);
+            let mut second_journal = journal(&root.path().join("second-job"), "second-job", &capture);
+            let error = package_and_upload(capture, Vec::new(), root.path(), &cache, meta, &key,
+                limits(128 * 1024), &mut second_journal, &provider, &repository, &cancel).await.unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Unauthorized);
+            assert!(!provider.holds("snapshot-second"));
+            assert!(provider.holds(&first.asset_catalog.object_id));
+            assert!(first_journal.spool_path(&first.reference.object_id).exists());
+        });
+    }
+
+    #[test]
+    fn c_actual_catalog_and_envelope_lengths_enforce_exact_boundaries() {
+        let kind = wire::CatalogKind::Assets;
+        let length = wire::CatalogDocument::leaf(kind, Vec::new(), Vec::new()).unwrap()
+            .encode(wire::MAX_METADATA_BYTES).unwrap().len();
+        for (maximum, fits) in [(length - 1, false), (length, true), (length + 1, true)] {
+            assert_eq!(catalog_leaf_fits(kind, &[], &BTreeMap::new(), maximum).unwrap(), fits);
+        }
+        for maximum in [8191, 8192, 8193] {
+            let mut bound = limits(maximum);
+            bound.sdk_overhead_bytes = 137;
+            let plain = max_plaintext(bound, "repository", "pack-object", wire::ObjectRole::Pack).unwrap();
+            let at = wire::PublicObjectHeader::new("repository".into(), "pack-object".into(), wire::ObjectRole::Pack, plain).unwrap();
+            let over = wire::PublicObjectHeader::new("repository".into(), "pack-object".into(), wire::ObjectRole::Pack, plain + 1).unwrap();
+            assert!(wire::envelope_length(&at).unwrap() + 137 <= maximum);
+            assert!(wire::envelope_length(&over).unwrap() + 137 > maximum);
+        }
+        let mut capabilities = fake::capabilities(false);
+        capabilities.max_stored_bytes = Some(u64::MAX);
+        capabilities.sdk_overhead_bytes = u64::MAX;
+        assert_eq!(PackageLimits::from_capabilities(&capabilities).unwrap_err().kind, ErrorKind::FileTooLarge);
+    }
+
+    #[test]
+    fn stable_job_object_id_rejects_changed_plaintext_while_retaining_completed_spool() {
         runtime().block_on(async {
             let root = tempfile::tempdir().unwrap();
             let provider = FakeProvider::new(false);
@@ -2330,7 +2637,7 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(!journal.spool_path(&first.object_id).exists());
+            assert!(journal.spool_path(&first.object_id).exists());
             let before = provider.state.lock().unwrap().objects.len();
             assert!(upload_plain_object(
                 &second_path,

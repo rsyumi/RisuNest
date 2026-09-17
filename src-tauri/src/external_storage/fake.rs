@@ -81,6 +81,9 @@ pub(crate) enum DeleteFault {
     AppliedThenLost,
     /// The service answered that its request budget is exhausted.
     RateLimited,
+    Accepted,
+    NotFound,
+    Unauthorized,
 }
 
 #[derive(Default)]
@@ -95,6 +98,11 @@ pub(super) struct FakeState {
     listings: usize,
     scheduled: Vec<(usize, String, ObjectRole, Vec<u8>)>,
     after_listing: Vec<(usize, String, ObjectRole, Vec<u8>)>,
+    reads: BTreeMap<String, ProviderError>,
+    read_attempts: Vec<String>,
+    upload_attempts: Vec<String>,
+    reconcile_attempts: Vec<String>,
+    scripted_pages: Vec<(Collection, Result<ObjectPage>)>,
 }
 pub(crate) struct FakeProvider {
     pub(super) state: Mutex<FakeState>,
@@ -165,7 +173,22 @@ impl FakeProvider {
             .filter(|attempt| attempt.as_str() == object)
             .count()
     }
-    fn forget(&self, object: &str) {
+    pub(crate) fn fail_read(&self, object: &str, kind: ErrorKind) {
+        self.state.lock().unwrap().reads.insert(object.into(), ProviderError::new(kind));
+    }
+    pub(crate) fn read_attempts(&self, object: &str) -> usize {
+        self.state.lock().unwrap().read_attempts.iter().filter(|id| id.as_str() == object).count()
+    }
+    pub(crate) fn upload_attempts(&self, object: &str) -> usize {
+        self.state.lock().unwrap().upload_attempts.iter().filter(|id| id.as_str() == object).count()
+    }
+    pub(crate) fn reconcile_attempts(&self, object: &str) -> usize {
+        self.state.lock().unwrap().reconcile_attempts.iter().filter(|id| id.as_str() == object).count()
+    }
+    pub(crate) fn script_page(&self, collection: Collection, page: Result<ObjectPage>) {
+        self.state.lock().unwrap().scripted_pages.push((collection, page));
+    }
+    pub(crate) fn forget(&self, object: &str) {
         let mut state = self.state.lock().unwrap();
         state.objects.remove(object);
         state.roles.remove(object);
@@ -254,6 +277,13 @@ impl Provider for FakeProvider {
             use tokio::io::AsyncWriteExt;
             c.check()?;
             l.validate_for(r)?;
+            {
+                let mut state = self.state.lock().unwrap();
+                state.read_attempts.push(l.object.clone());
+                if let Some(error) = state.reads.remove(&l.object) {
+                    return Err(error);
+                }
+            }
             let (bytes, version) = self
                 .state
                 .lock()
@@ -311,6 +341,7 @@ impl Provider for FakeProvider {
             use tokio::io::AsyncReadExt;
             c.check()?;
             intent.validate(r)?;
+            self.state.lock().unwrap().upload_attempts.push(intent.object_id.clone());
             if intent.byte_length > 1024 * 1024 || source.byte_length() != intent.byte_length {
                 return Err(ProviderError::new(ErrorKind::FileTooLarge));
             }
@@ -420,6 +451,16 @@ impl Provider for FakeProvider {
                     http_status: Some(429),
                     retry_at_ms: None,
                 }),
+                Some(DeleteFault::Accepted) => Err(ProviderError {
+                    kind: ErrorKind::Unsupported, http_status: Some(202), retry_at_ms: None,
+                }),
+                Some(DeleteFault::NotFound) => {
+                    self.forget(&l.object);
+                    Err(ProviderError { kind: ErrorKind::NotFound, http_status: Some(404), retry_at_ms: None })
+                }
+                Some(DeleteFault::Unauthorized) => Err(ProviderError {
+                    kind: ErrorKind::Unauthorized, http_status: Some(401), retry_at_ms: None,
+                }),
                 // A target that is already gone answers the same as one removed now.
                 None => {
                     self.forget(&l.object);
@@ -441,6 +482,15 @@ impl Provider for FakeProvider {
             cancel.check()?;
             if limit == 0 || limit > 1000 {
                 return Err(ProviderError::new(ErrorKind::Unsupported));
+            }
+            let scripted = {
+                let mut state = self.state.lock().unwrap();
+                state.scripted_pages.iter().position(|(kind, _)| *kind == collection)
+                    .map(|index| state.scripted_pages.remove(index).1)
+            };
+            if let Some(page) = scripted {
+                self.listed();
+                return page;
             }
             // A published state and a backup bundle share the snapshot listing,
             // which is what every adapter answers.
@@ -493,7 +543,8 @@ impl Provider for FakeProvider {
         Box::pin(async move {
             cancel.check()?;
             intent.validate(repository)?;
-            let state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap();
+            state.reconcile_attempts.push(intent.object_id.clone());
             let Some((bytes, version)) = state.objects.get(&intent.object_id) else {
                 return Ok(UploadResolution::RestartRequired);
             };

@@ -86,6 +86,21 @@ impl TransferJournal {
         &self.identity.job_id
     }
 
+    pub(crate) fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    /// A previous receipt is historical once a fresh remote observation says
+    /// the object is missing. Keep its immutable source and upload session.
+    pub(crate) fn reopen_object(&mut self, object: &str) -> Result<()> {
+        if self.db.execute("UPDATE objects SET receipt=NULL WHERE id=?1", [object])
+            .map_err(storage)? != 1
+        {
+            return Err(corrupt());
+        }
+        Ok(())
+    }
+
     /// What one job has already put in the repository, read without taking the
     /// journal over. A cleanup needs this because an unfinished job's fragments
     /// are named by nothing else.
