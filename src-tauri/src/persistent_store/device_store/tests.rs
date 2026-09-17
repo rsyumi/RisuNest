@@ -1087,8 +1087,8 @@ fn a_committed_device_value_survives_reopening_the_device_file() {
 
 mod section_exchange {
     use super::super::sections::{
-        PublishedRows, SectionCursor, SectionRow, SectionValueRow, TombstonePublication,
-        LOCAL_SETTING_KEYS,
+        PublishedRows, SectionApplyOutcome, SectionCursor, SectionRow, SectionSpoolBuilder,
+        SectionValueRow, TombstonePublication, LOCAL_SETTING_KEYS,
     };
     use std::collections::BTreeMap;
     use super::super::{plugin_values::PluginDeviceMutation, DeviceStore, Section};
@@ -1107,6 +1107,25 @@ mod section_exchange {
             write_clock: Sequence::from(clock),
             writer_id: writer.into(),
         }
+    }
+
+    fn rejoin(store: &mut DeviceStore, observed: u64, remote: &[SectionRow]) -> SectionApplyOutcome {
+        use risunest_external_storage_format::{content_identity::hash, format::fingerprint, section::SectionKind};
+        store.set_section_participating(Section::LocalPlugins, true).unwrap();
+        let token = store.section_state(Section::LocalPlugins).unwrap().participation_generation;
+        let mut spool = SectionSpoolBuilder::new(Section::LocalPlugins).unwrap();
+        let mut fingerprints = BTreeMap::new();
+        for row in remote {
+            let entry = row.to_entry(SectionKind::LocalPlugins, true).unwrap();
+            let digest = hash(&entry.encode().unwrap());
+            spool.push(row.clone(), &entry.key, &digest).unwrap();
+            fingerprints.insert(entry.key, digest);
+        }
+        let prepared = spool.finish(&fingerprint(&SectionKind::LocalPlugins.fingerprint_domain(), &fingerprints)).unwrap();
+        store.apply_prepared_section_rows("connection", "library", &token, &prepared, &SectionCursor {
+            applied_generation: Sequence::from(1u64), applied_gc_floor: Sequence::from(0u64),
+            observed_max_write_clock: Sequence::from(observed),
+        }, true).unwrap()
     }
 
     fn marker(generation: u64, at_ms: u64) -> TombstonePublication {
@@ -1314,15 +1333,7 @@ mod section_exchange {
             plugin_row("gone", "from-b", 41, "writer-b"),
             plugin_row("theirs", "from-b", 42, "writer-b"),
         ];
-        assert_eq!(
-            store
-                .reissue_section_rows(Section::LocalPlugins, &Sequence::from(42u64), &remote)
-                .expect("reissue the local rows"),
-            2
-        );
-        store
-            .apply_section_rows(Section::LocalPlugins, &remote)
-            .expect("merge the remote rows");
+        assert_eq!(rejoin(&mut store, 42, &remote).applied, 1);
         assert_eq!(
             live(&mut store),
             vec![
@@ -1337,12 +1348,7 @@ mod section_exchange {
             .expect("read section state")
             .max_write_clock;
         assert!(settled > Sequence::from(42u64));
-        assert_eq!(
-            store
-                .reissue_section_rows(Section::LocalPlugins, &Sequence::from(42u64), &remote)
-                .expect("reissue after the merge"),
-            0
-        );
+        assert_eq!(rejoin(&mut store, 42, &remote).applied, 0);
         assert_eq!(
             store
                 .section_state(Section::LocalPlugins)
@@ -1785,9 +1791,10 @@ mod section_exchange {
             .sections_await_publication("connection", "library")
             .unwrap());
 
-        store
-            .reissue_section_rows(Section::LocalPlugins, &Sequence::from(42u64), &[])
-            .expect("reissue the local rows above the remote");
+        // Rebinding makes previously published rows local proposals again.
+        store.forget_section_publications().unwrap();
+        rejoin(&mut store, 42, &[]);
+        assert!(store.read_section_rows(Section::LocalPlugins).unwrap()[0].write_clock > Sequence::from(42u64));
         assert!(store
             .sections_await_publication("connection", "library")
             .unwrap());

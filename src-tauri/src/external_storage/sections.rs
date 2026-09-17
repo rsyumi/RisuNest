@@ -3,17 +3,15 @@
 //! change without changing what the repository holds.
 use super::contract::{Cancellation, ErrorKind, ProviderError, Result};
 use crate::persistent_store::device_store::{
-    sections::{PublishedRows, ReclaimedRows, ReclaimedRowVersion, SectionCursor, SectionRow,
-        SectionValueRow, TombstonePublication},
+    sections::{PreparedSectionRows, PublishedRows, ReclaimedRows, ReclaimedRowVersion,
+        SectionCursor, SectionRow, SectionSpoolBuilder, SectionValueRow, TombstonePublication},
     Section,
 };
 use risunest_external_storage_format::{
     content_identity::hash,
     format::fingerprint,
     section::{
-        decode_local_plugin_entry_key, hypa_entry_key, local_plugin_entry_key, HypaValue,
-        InlineOrObject, LocalPluginValue, LocalSettingValue, ObjectReference, PluginSpace,
-        SectionEntry, SectionEntryVersion, SectionKind, SectionValue, MAX_INLINE_VALUE_BYTES,
+        InlineOrObject, SectionEntry, SectionKind, SectionValue, MAX_SECTION_ENTRY_BYTES,
     },
     snapshot as wire,
 };
@@ -21,7 +19,7 @@ use risunest_sync_wire::head::Sequence;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -153,33 +151,6 @@ pub(crate) fn section_of(kind: SectionKind) -> Option<Section> {
     }
 }
 
-fn setting_entry_key(row: &SectionRow) -> Result<String> {
-    serde_json::to_string(&[
-        row.key1.as_str(),
-        row.key2.as_str(),
-        row.key3.as_str(),
-    ])
-    .map_err(corrupt)
-}
-
-fn decode_setting_entry_key(encoded: &str) -> Result<(String, String, String)> {
-    let parts: Vec<String> = serde_json::from_str(encoded).map_err(corrupt)?;
-    let [key1, key2, key3]: [String; 3] = parts
-        .try_into()
-        .map_err(|_| corrupt("device setting key is not a triple"))?;
-    Ok((key1, key2, key3))
-}
-
-fn entry_key(kind: SectionKind, row: &SectionRow) -> Result<String> {
-    match kind {
-        SectionKind::Hypa => hypa_entry_key(&row.key1).map_err(corrupt),
-        SectionKind::LocalPlugins => {
-            local_plugin_entry_key(&row.key1, &row.key2, &row.key3).map_err(corrupt)
-        }
-        SectionKind::LocalSettings => setting_entry_key(row),
-    }
-}
-
 fn write_spool_object(spool: &Path, bytes: &[u8]) -> Result<(String, PathBuf)> {
     let digest = hex::encode(hash(bytes));
     let path = spool.join(&digest);
@@ -207,95 +178,6 @@ fn write_spool_object(spool: &Path, bytes: &[u8]) -> Result<(String, PathBuf)> {
     Ok((digest, path))
 }
 
-fn plugin_value(space: &str, stored: &str) -> Result<LocalPluginValue> {
-    match space {
-        "string" => Ok(LocalPluginValue {
-            space: PluginSpace::String,
-            value: serde_json::Value::String(stored.into()),
-        }),
-        "json" => Ok(LocalPluginValue {
-            space: PluginSpace::Json,
-            value: serde_json::from_str(stored).map_err(corrupt)?,
-        }),
-        _ => Err(corrupt("plugin value names an unknown space")),
-    }
-}
-
-fn section_value(
-    kind: SectionKind,
-    row: &SectionRow,
-    spool: &Path,
-    sources: &mut Vec<SectionSource>,
-) -> Result<SectionValue> {
-    match (&row.value, kind) {
-        (SectionValueRow::Tombstone { first_published }, _) => {
-            let marker = first_published
-                .as_ref()
-                .ok_or_else(|| corrupt("removal has no first publication marker"))?;
-            Ok(SectionValue::tombstone(
-                marker.generation.clone(),
-                marker.at_ms,
-            ))
-        }
-        (
-            SectionValueRow::Hypa {
-                producer,
-                model,
-                endpoint,
-                preprocess_version,
-                dimensions,
-                vector,
-                metadata,
-            },
-            SectionKind::Hypa,
-        ) => {
-            let carried = if vector.len() > MAX_INLINE_VALUE_BYTES {
-                let (digest, path) = write_spool_object(spool, vector)?;
-                sources.push(SectionSource {
-                    kind: wire::CatalogEntryKind::SectionObject,
-                    key: format!("object/{digest}"),
-                    content_sha256: digest.clone(),
-                    byte_length: vector.len() as u64,
-                    path,
-                });
-                InlineOrObject::Object(ObjectReference {
-                    content_sha256: hash(vector),
-                    byte_length: vector.len() as u64,
-                })
-            } else {
-                InlineOrObject::inline(vector).map_err(corrupt)?
-            };
-            Ok(SectionValue::Hypa(HypaValue {
-                producer: producer.clone(),
-                model: model.clone(),
-                endpoint: endpoint.clone(),
-                preprocess_version: u32::try_from(*preprocess_version).map_err(corrupt)?,
-                dimensions: u32::try_from(*dimensions).map_err(corrupt)?,
-                vector: carried,
-                metadata: metadata
-                    .as_deref()
-                    .map(serde_json::from_str)
-                    .transpose()
-                    .map_err(corrupt)?,
-            }))
-        }
-        (SectionValueRow::Plugin { space, value }, SectionKind::LocalPlugins) => Ok(
-            SectionValue::LocalPlugin(plugin_value(space, value)?),
-        ),
-        (SectionValueRow::Setting { value }, SectionKind::LocalSettings) => {
-            Ok(SectionValue::LocalSetting(LocalSettingValue {
-                value: serde_json::from_str(value).map_err(corrupt)?,
-            }))
-        }
-        (SectionValueRow::PluginPermission { granted }, SectionKind::LocalSettings) => {
-            Ok(SectionValue::LocalSetting(LocalSettingValue {
-                value: serde_json::Value::Bool(*granted),
-            }))
-        }
-        _ => Err(corrupt("device row belongs to another section")),
-    }
-}
-
 /// Encodes one section into spool files. `versioned` is false for a backup
 /// bundle, which carries user values without the counters behind them.
 pub(crate) fn capture_section(
@@ -317,13 +199,18 @@ pub(crate) fn capture_section(
     let mut fingerprints: BTreeMap<String, [u8; 32]> = BTreeMap::new();
     for row in rows {
         cancel.check()?;
-        let key = entry_key(kind, row)?;
-        let value = section_value(kind, row, spool, &mut sources)?;
-        let version = versioned.then(|| SectionEntryVersion {
-            write_clock: row.write_clock.clone(),
-            writer_id: row.writer_id.clone(),
-        });
-        let entry = SectionEntry::new(kind, key.clone(), value, version).map_err(corrupt)?;
+        let entry = row.to_entry(kind, versioned).map_err(corrupt)?;
+        let key = entry.key.clone();
+        if let (SectionValueRow::Hypa { vector, .. }, SectionValue::Hypa(value)) = (&row.value, &entry.value) {
+            if matches!(value.vector, InlineOrObject::Object(_)) {
+                let (digest, path) = write_spool_object(spool, vector)?;
+                sources.push(SectionSource {
+                    kind: wire::CatalogEntryKind::SectionObject,
+                    key: format!("object/{digest}"), content_sha256: digest,
+                    byte_length: vector.len() as u64, path,
+                });
+            }
+        }
         let bytes = entry.encode().map_err(corrupt)?;
         let (digest, path) = write_spool_object(spool, &bytes)?;
         if fingerprints.insert(key.clone(), hash(&bytes)).is_some() {
@@ -351,6 +238,13 @@ pub(crate) fn capture_section(
 
 fn device_error(_: crate::persistent_store::StoreError) -> ProviderError {
     ProviderError::new(ErrorKind::Transient)
+}
+
+fn preparation_error(error: crate::persistent_store::StoreError) -> ProviderError {
+    match error {
+        crate::persistent_store::StoreError::Validation { .. } => corrupt(error),
+        _ => transient(error),
+    }
 }
 
 /// What a backup connection keeps beside the library. Selected sections are
@@ -432,11 +326,15 @@ pub(crate) fn capture_state_sections(
             return Err(transient("this device is behind the remote section floor"));
         }
         let held = device.read_section_rows(section).map_err(device_error)?;
+        // Commit numbers belong to one remote lineage. Preserve that remote's
+        // floor, not device-wide bookkeeping from an unrelated publication.
+        let inherited_floor = reference.map(|reference| reference.gc_floor.clone())
+            .unwrap_or_else(|| Sequence::from(0u64));
         let (reclaimed, gc_floor) = reclaimable_removals(
             &held,
             reference,
             cursor.as_ref(),
-            &state.gc_floor,
+            &inherited_floor,
             at_ms,
         );
         let marker = TombstonePublication {
@@ -509,72 +407,174 @@ pub(crate) enum SectionArrival {
     Rejoining,
 }
 
-/// Merges one received section into the device file and records how far this
-/// remote lineage has been applied. The cursor is written last, so an
-/// interrupted apply runs again from the same remote state instead of
-/// reporting the section as done.
+/// A native capability, not a renderer-supplied path. Its private read-only
+/// spool contains validated rows; the identity and participation token are
+/// captured before preparation and cannot be substituted during application.
+pub(crate) struct PreparedSectionInput {
+    connection_id: String,
+    library_lineage: String,
+    participation_generation: Sequence,
+    cursor: SectionCursor,
+    arrival: SectionArrival,
+    rows: PreparedSectionRows,
+}
+
+fn read_source_bytes(source: &SectionSource, cancel: &Cancellation) -> Result<Vec<u8>> {
+    cancel.check()?;
+    if source.byte_length > i64::MAX as u64
+        || (source.kind == wire::CatalogEntryKind::SectionEntry
+            && source.byte_length > MAX_SECTION_ENTRY_BYTES as u64) {
+        return Err(corrupt("section source exceeds its codec limit"));
+    }
+    let metadata = fs::symlink_metadata(&source.path).map_err(transient)?;
+    if !metadata.is_file() || crate::trust_boundary::is_link_like(&metadata)
+        || metadata.len() != source.byte_length {
+        return Err(corrupt("section source is not the declared file"));
+    }
+    let file = crate::trust_boundary::open_regular_source(&source.path).map_err(transient)?;
+    if file.metadata().map_err(transient)?.len() != source.byte_length {
+        return Err(corrupt("section source length changed"));
+    }
+    let mut bytes = Vec::new();
+    file.take(source.byte_length + 1).read_to_end(&mut bytes).map_err(transient)?;
+    cancel.check()?;
+    if bytes.len() as u64 != source.byte_length {
+        return Err(corrupt("section source length changed"));
+    }
+    Ok(bytes)
+}
+
+/// Preparation only reads downloaded local files. It validates the codec,
+/// keys, object bodies and fingerprint before sealing a bounded disk spool.
+/// No persistent or device database is opened by this function.
+pub(crate) fn prepare_received_section(
+    connection_id: &str,
+    library_lineage: &str,
+    arrival: SectionArrival,
+    participation_generation: &Sequence,
+    source: &CapturedSection,
+    cancel: &Cancellation,
+) -> Result<PreparedSectionInput> {
+    cancel.check()?;
+    let section = section_of(source.kind).ok_or_else(|| corrupt("device-fixed section in a synchronized state"))?;
+    if connection_id.is_empty() || library_lineage.is_empty()
+        || source.generation == Sequence::from(0u64) || source.gc_floor > source.generation {
+        return Err(corrupt("received section identity or bounds are invalid"));
+    }
+    let mut objects = BTreeMap::new();
+    for file in &source.sources {
+        if !crate::trust_boundary::is_lower_hex_256(&file.content_sha256) {
+            return Err(corrupt("section source hash is not canonical"));
+        }
+        match file.kind {
+            wire::CatalogEntryKind::SectionEntry => {}
+            wire::CatalogEntryKind::SectionObject => {
+                if file.key != format!("object/{}", file.content_sha256)
+                    || file.content_sha256.len() != 64
+                    || objects.insert(file.content_sha256.clone(), file).is_some() {
+                    return Err(corrupt("section object key is invalid or duplicated"));
+                }
+            }
+            _ => return Err(corrupt("section source has another catalog kind")),
+        }
+    }
+    let mut spool = SectionSpoolBuilder::new(section).map_err(transient)?;
+    let mut used_objects = BTreeSet::new();
+    for file in &source.sources {
+        if file.kind != wire::CatalogEntryKind::SectionEntry { continue; }
+        let bytes = read_source_bytes(file, cancel)?;
+        let digest = hash(&bytes);
+        if hex::encode(digest) != file.content_sha256 {
+            return Err(corrupt("section entry hash differs"));
+        }
+        let entry = SectionEntry::decode(&bytes).map_err(corrupt)?;
+        if entry.kind != source.kind || entry.key != file.key {
+            return Err(corrupt("section entry names another section or key"));
+        }
+        let mut object = match &entry.value {
+            SectionValue::Hypa(value) => match &value.vector {
+                InlineOrObject::Object(reference) => {
+                    let digest = hex::encode(reference.content_sha256);
+                    let file = objects.get(&digest).ok_or_else(|| corrupt("section object is missing"))?;
+                    if file.byte_length != reference.byte_length {
+                        return Err(corrupt("section object length differs"));
+                    }
+                    used_objects.insert(digest);
+                    Some(read_source_bytes(file, cancel)?)
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let row = SectionRow::from_entry(entry, true, |_| {
+            object.take().ok_or_else(|| crate::persistent_store::StoreError::Validation {
+                message: "Section object is missing".into(),
+            })
+        }).map_err(corrupt)?;
+        spool.push(row, &file.key, &digest).map_err(preparation_error)?;
+    }
+    // Extra catalog objects are not installed, but corrupt ones must not be
+    // hidden merely because this section has no entry that references them.
+    for (digest, file) in &objects {
+        if !used_objects.contains(digest) && hex::encode(hash(&read_source_bytes(file, cancel)?)) != *digest {
+            return Err(corrupt("section object hash differs"));
+        }
+    }
+    let rows = spool.finish(&source.content_fingerprint).map_err(preparation_error)?;
+    if rows.max_write_clock() > &source.max_write_clock {
+        return Err(corrupt("section row clock exceeds its reference"));
+    }
+    cancel.check()?;
+    Ok(PreparedSectionInput {
+        connection_id: connection_id.to_owned(), library_lineage: library_lineage.to_owned(),
+        participation_generation: participation_generation.clone(), arrival,
+        cursor: SectionCursor {
+            applied_generation: source.generation.clone(), applied_gc_floor: source.gc_floor.clone(),
+            observed_max_write_clock: source.max_write_clock.clone(),
+        },
+        rows,
+    })
+}
+
+pub(crate) fn apply_prepared_section(
+    store: &mut crate::persistent_store::PersistentStore,
+    prepared: &PreparedSectionInput,
+) -> Result<()> {
+    store.device_store_mut().map_err(device_error)?.apply_prepared_section_rows(
+        &prepared.connection_id, &prepared.library_lineage, &prepared.participation_generation,
+        &prepared.rows, &prepared.cursor, prepared.arrival == SectionArrival::Rejoining,
+    ).map(|_| ()).map_err(device_error)
+}
+
+/// The buffered snapshot receiver uses the same preparation and application
+/// APIs. File-based receivers pass their existing local sources directly to
+/// preparation, then keep only the returned capability for activation.
 pub(crate) fn apply_received_section(
     store: &mut crate::persistent_store::PersistentStore,
     connection_id: &str,
     library_lineage: &str,
     arrival: SectionArrival,
-    prepared: &super::snapshot_restore::PreparedSection,
+    received: &super::snapshot_restore::PreparedSection,
 ) -> Result<()> {
-    let Some(section) = section_of(prepared.kind) else {
-        return Err(corrupt("device-fixed section in a synchronized state"));
-    };
-    let rows = decode_section(
-        prepared.kind,
-        &prepared.entries,
-        &prepared.content_fingerprint,
+    let section = section_of(received.kind).ok_or_else(|| corrupt("device-fixed section in a synchronized state"))?;
+    let state = store.device_store_mut().map_err(device_error)?.section_state(section).map_err(device_error)?;
+    if !state.participating { return Ok(()); }
+    let directory = tempfile::tempdir().map_err(transient)?;
+    let mut sources = Vec::new();
+    for (kind, key, bytes) in &received.entries {
+        let (content_sha256, path) = write_spool_object(directory.path(), bytes)?;
+        sources.push(SectionSource { kind: *kind, key: key.clone(), content_sha256,
+            byte_length: bytes.len() as u64, path });
+    }
+    let prepared = prepare_received_section(
+        connection_id, library_lineage, arrival, &state.participation_generation,
+        &CapturedSection {
+            kind: received.kind, generation: received.generation.clone(), gc_floor: received.gc_floor.clone(),
+            max_write_clock: received.max_write_clock.clone(), content_fingerprint: received.content_fingerprint, sources,
+        },
+        &Cancellation::default(),
     )?;
-    let device = store.device_store_mut().map_err(device_error)?;
-    if !device.section_state(section).map_err(device_error)?.participating {
-        return Ok(());
-    }
-    let cursor = device
-        .read_section_cursor(connection_id, library_lineage, section)
-        .map_err(device_error)?;
-    // A floor above what this device has applied means the removals between
-    // them were reclaimed before this device ever saw them, so the section
-    // cannot be carried forward as an increment.
-    let arrival = match &cursor {
-        Some(cursor) if prepared.gc_floor > cursor.applied_generation => SectionArrival::Rejoining,
-        _ => arrival,
-    };
-    // Markers name commits of one lineage only, so a section from a lineage
-    // this device holds no cursor for decides nothing about them.
-    let reclaim_floor = cursor
-        .map(|_| prepared.gc_floor.clone())
-        .unwrap_or_else(|| Sequence::from(0u64));
-    if arrival == SectionArrival::Rejoining {
-        // Reissuing rewrites this device's rows as new writes, so a removal the
-        // remote reclaimed has to go before it can come back with a new version.
-        device
-            .reclaim_section_tombstones(section, &reclaim_floor, &rows)
-            .map_err(device_error)?;
-        device
-            .reissue_section_rows(section, &prepared.max_write_clock, &rows)
-            .map_err(device_error)?;
-    }
-    device.apply_section_rows(section, &rows).map_err(device_error)?;
-    if arrival == SectionArrival::Continuing {
-        device
-            .reclaim_section_tombstones(section, &reclaim_floor, &rows)
-            .map_err(device_error)?;
-    }
-    device
-        .write_section_cursor(
-            connection_id,
-            library_lineage,
-            section,
-            &SectionCursor {
-                applied_generation: prepared.generation.clone(),
-                applied_gc_floor: prepared.gc_floor.clone(),
-                observed_max_write_clock: prepared.max_write_clock.clone(),
-            },
-        )
-        .map_err(device_error)
+    apply_prepared_section(store, &prepared)
 }
 
 /// A decoded section as it arrived. Object bodies are resolved by content hash
@@ -603,7 +603,13 @@ pub(crate) fn decode_section(
         if fingerprints.insert(key.clone(), hash(bytes)).is_some() {
             return Err(corrupt("section key appears twice"));
         }
-        rows.push(row_of(kind, &entry, &objects)?);
+        rows.push(SectionRow::from_entry(entry, false, |reference| {
+            objects.get(&reference.content_sha256)
+                .map(|bytes| (*bytes).clone())
+                .ok_or_else(|| crate::persistent_store::StoreError::Validation {
+                    message: "Section object is missing".into(),
+                })
+        }).map_err(corrupt)?);
     }
     if fingerprint(&kind.fingerprint_domain(), &fingerprints) != *expected_fingerprint {
         return Err(corrupt("section content differs from its reference"));
@@ -611,90 +617,9 @@ pub(crate) fn decode_section(
     Ok(rows)
 }
 
-fn row_of(
-    kind: SectionKind,
-    entry: &SectionEntry,
-    objects: &BTreeMap<[u8; 32], &Vec<u8>>,
-) -> Result<SectionRow> {
-    let (key1, key2, key3) = match kind {
-        SectionKind::Hypa => (entry.key.clone(), String::new(), String::new()),
-        SectionKind::LocalPlugins => decode_local_plugin_entry_key(&entry.key).map_err(corrupt)?,
-        SectionKind::LocalSettings => decode_setting_entry_key(&entry.key)?,
-    };
-    let value = match &entry.value {
-        SectionValue::Tombstone {
-            first_published_generation,
-            first_published_at_ms,
-        } => SectionValueRow::Tombstone {
-            first_published: Some(TombstonePublication {
-                generation: first_published_generation.clone(),
-                at_ms: *first_published_at_ms,
-            }),
-        },
-        SectionValue::Hypa(value) => {
-            let vector = match &value.vector {
-                InlineOrObject::Inline(_) => value.vector.decode_inline().map_err(corrupt)?,
-                InlineOrObject::Object(reference) => {
-                    let bytes = objects
-                        .get(&reference.content_sha256)
-                        .ok_or_else(|| corrupt("section object is missing"))?;
-                    if bytes.len() as u64 != reference.byte_length {
-                        return Err(corrupt("section object length differs"));
-                    }
-                    (*bytes).clone()
-                }
-            };
-            SectionValueRow::Hypa {
-                producer: value.producer.clone(),
-                model: value.model.clone(),
-                endpoint: value.endpoint.clone(),
-                preprocess_version: i64::from(value.preprocess_version),
-                dimensions: i64::from(value.dimensions),
-                vector,
-                metadata: value
-                    .metadata
-                    .as_ref()
-                    .map(serde_json::to_string)
-                    .transpose()
-                    .map_err(corrupt)?,
-            }
-        }
-        SectionValue::LocalPlugin(value) => SectionValueRow::Plugin {
-            space: match value.space {
-                PluginSpace::String => "string".into(),
-                PluginSpace::Json => "json".into(),
-            },
-            value: match (&value.space, &value.value) {
-                (PluginSpace::String, serde_json::Value::String(text)) => text.clone(),
-                (PluginSpace::String, _) => return Err(corrupt("plugin string value is not text")),
-                (PluginSpace::Json, value) => serde_json::to_string(value).map_err(corrupt)?,
-            },
-        },
-        SectionValue::LocalSetting(value) => match key1.as_str() {
-            "pluginPermission" => SectionValueRow::PluginPermission {
-                granted: value
-                    .value
-                    .as_bool()
-                    .ok_or_else(|| corrupt("plugin permission is not a decision"))?,
-            },
-            _ => SectionValueRow::Setting {
-                value: serde_json::to_string(&value.value).map_err(corrupt)?,
-            },
-        },
-    };
-    let (write_clock, writer_id) = match &entry.version {
-        Some(version) => (version.write_clock.clone(), version.writer_id.clone()),
-        None => (Sequence::from(0u64), String::new()),
-    };
-    Ok(SectionRow {
-        key1,
-        key2,
-        key3,
-        value,
-        write_clock,
-        writer_id,
-    })
-}
+#[cfg(test)]
+#[path = "section_preparation_tests.rs"]
+mod preparation_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1572,6 +1497,27 @@ mod tests {
     /// moves up to the commit it was first published in. Neither happens until
     /// the publication is confirmed, and a removal still inside the period or
     /// published above what the remote carries is left alone.
+    #[test]
+    fn a_capture_preserves_the_remote_floor_without_borrowing_another_lineages_floor() {
+        for local_floor in [0u64, 90] {
+            let root = tempfile::tempdir().unwrap();
+            let spool = tempfile::tempdir().unwrap();
+            let mut store = participating_plugin_store(root.path());
+            let device = store.device_store_mut().unwrap();
+            device.note_section_published(Section::LocalPlugins, &[], &[],
+                &TombstonePublication { generation: Sequence::from(90u64), at_ms: now_ms() },
+                &BTreeMap::new(), &Sequence::from(local_floor)).unwrap();
+            device.write_section_cursor("connection", "library", Section::LocalPlugins, &SectionCursor {
+                applied_generation: Sequence::from(10u64), applied_gc_floor: Sequence::from(7u64),
+                observed_max_write_clock: Sequence::from(0u64),
+            }).unwrap();
+            let (captured, publications) = capture_state_sections(&mut store, &Sequence::from(11u64),
+                &parent_sections(10, 7), "connection", "library", spool.path(), &Cancellation::default()).unwrap();
+            assert_eq!(captured.iter().find(|source| source.kind == SectionKind::LocalPlugins).unwrap().gc_floor, Sequence::from(7u64));
+            assert_eq!(publications.iter().find(|publication| publication.section == Section::LocalPlugins).unwrap().gc_floor, Sequence::from(7u64));
+        }
+    }
+
     #[test]
     fn e1_reclamation_ack_preserves_rewritten_rows() {
         for kind in [SectionKind::Hypa, SectionKind::LocalPlugins] {

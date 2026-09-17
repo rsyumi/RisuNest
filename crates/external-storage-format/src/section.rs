@@ -291,8 +291,23 @@ impl SectionEntry {
                     return Err(FormatError("invalid-section-value"));
                 }
                 value.vector.validate()?;
+                let byte_length = match &value.vector {
+                    InlineOrObject::Inline(_) => value.vector.decode_inline()?.len() as u64,
+                    InlineOrObject::Object(reference) => reference.byte_length,
+                };
+                if byte_length != u64::from(value.dimensions) * 4 {
+                    return Err(FormatError("invalid-section-vector-length"));
+                }
             }
             SectionValue::LocalPlugin(value) => {
+                let (_, space, _) = decode_local_plugin_entry_key(&self.key)?;
+                let declared = match value.space {
+                    PluginSpace::String => "string",
+                    PluginSpace::Json => "json",
+                };
+                if space != declared {
+                    return Err(FormatError("section-plugin-space-mismatch"));
+                }
                 if matches!(value.space, PluginSpace::String) && !value.value.is_string() {
                     return Err(FormatError("invalid-section-value"));
                 }
@@ -306,6 +321,7 @@ impl SectionEntry {
             } => {
                 if *first_published_generation == Sequence::from(0u64)
                     || *first_published_at_ms == 0
+                    || *first_published_at_ms > i64::MAX as u64
                 {
                     return Err(FormatError("invalid-section-value"));
                 }
@@ -477,7 +493,7 @@ mod tests {
         );
         let reference = InlineOrObject::Object(ObjectReference {
             content_sha256: [3; 32],
-            byte_length: 40_000,
+            byte_length: 1536 * 4,
         });
         assert!(reference.decode_inline().is_err());
         let entry = SectionEntry::new(
@@ -499,6 +515,30 @@ mod tests {
             SectionEntry::decode(&entry.encode().unwrap()).unwrap(),
             entry
         );
+    }
+
+    #[test]
+    fn vector_lengths_plugin_spaces_and_removal_times_are_checked_before_apply() {
+        let mut entry = hypa_entry(&"a".repeat(64));
+        let SectionValue::Hypa(value) = &mut entry.value else { unreachable!() };
+        value.dimensions += 1;
+        assert_eq!(entry.validate(), Err(FormatError("invalid-section-vector-length")));
+        let SectionValue::Hypa(value) = &mut entry.value else { unreachable!() };
+        value.vector = InlineOrObject::Object(ObjectReference { content_sha256: [1; 32], byte_length: 16 });
+        assert_eq!(entry.validate(), Err(FormatError("invalid-section-vector-length")));
+
+        assert_eq!(SectionEntry::new(
+            SectionKind::LocalPlugins,
+            local_plugin_entry_key("owner", "json", "key").unwrap(),
+            SectionValue::LocalPlugin(LocalPluginValue {
+                space: PluginSpace::String, value: serde_json::Value::String("value".into()),
+            }),
+            version(1),
+        ), Err(FormatError("section-plugin-space-mismatch")));
+        assert_eq!(SectionEntry::new(
+            SectionKind::Hypa, hypa_entry_key(&"a".repeat(64)).unwrap(),
+            SectionValue::tombstone(super::Sequence::from(1u64), i64::MAX as u64 + 1), version(1),
+        ), Err(FormatError("invalid-section-value")));
     }
 
     #[test]
