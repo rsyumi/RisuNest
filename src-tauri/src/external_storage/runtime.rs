@@ -927,9 +927,15 @@ async fn run_cleanup(
         .list_pending()?
         .into_iter()
         .filter(|item| item.request.connection_id == job.request.connection_id && item.id != job.id)
-        .map(|item| {
-            let directory = job_directory(&root, &item.request.connection_id, &item.id);
-            (item.id, directory)
+        .map(|item| super::cleanup::UnfinishedJob {
+            directory: job_directory(&root, &item.request.connection_id, &item.id),
+            // A job publishes under its own snapshot identifier and may also
+            // name one it reads, and neither is the job identifier.
+            snapshot_ids: [Some(item.snapshot_id.clone()), item.request.snapshot_id.clone()]
+                .into_iter()
+                .flatten()
+                .collect(),
+            job_id: item.id,
         })
         .collect();
     // One reading of the clock: the retention decision and the grace window

@@ -319,13 +319,11 @@ pub(crate) async fn run(
                 // No answer arrived, so this device cannot tell a request that
                 // never left from one the repository is still running. It stops
                 // and keeps the marker until the end of that request is known.
-                Err(error) => {
-                    outcome.stop_reason = match error.kind {
-                        ErrorKind::RateLimited | ErrorKind::DailyQuotaExhausted => {
-                            StopReason::Budget
-                        }
-                        _ => StopReason::Uncertain,
-                    };
+                // Nothing here can tell a request the budget refused to send
+                // from one the repository is still running, so every failure
+                // settles the same way.
+                Err(_) => {
+                    outcome.stop_reason = StopReason::Uncertain;
                     break 'run;
                 }
             }
@@ -355,8 +353,30 @@ pub(crate) struct ConnectedRepositoryView<'a> {
     pub writer_id: &'a str,
     pub policy: RetentionPolicy,
     pub now_ms: u64,
-    /// The job directory of every unfinished job on this connection.
-    pub unfinished: Vec<(String, std::path::PathBuf)>,
+    pub unfinished: Vec<UnfinishedJob>,
+}
+
+/// One job on this connection that has not reached an end. What it publishes
+/// under and what it has already uploaded are both roots of this run.
+pub(crate) struct UnfinishedJob {
+    pub job_id: String,
+    pub directory: std::path::PathBuf,
+    /// The states and bundles it writes or reads, which is not its own
+    /// identifier: a job publishes under a separate snapshot identifier.
+    pub snapshot_ids: BTreeSet<String>,
+}
+
+fn job_roots_of(unfinished: &[UnfinishedJob]) -> JobRoots {
+    let mut roots = JobRoots::default();
+    for job in unfinished {
+        roots.snapshot_ids.extend(job.snapshot_ids.iter().cloned());
+        // A job that never reached its first upload has no journal, which is
+        // not a reason to refuse the run.
+        if let Ok(receipts) = TransferJournal::uploaded(&job.directory, &job.job_id) {
+            roots.objects.extend(receipts);
+        }
+    }
+    roots
 }
 
 impl ConnectedRepositoryView<'_> {
@@ -496,16 +516,7 @@ impl RepositoryView for ConnectedRepositoryView<'_> {
     }
 
     fn job_roots(&self) -> Result<JobRoots> {
-        let mut roots = JobRoots::default();
-        for (job_id, directory) in &self.unfinished {
-            roots.snapshot_ids.insert(job_id.clone());
-            // A job that never reached its first upload has no journal, which
-            // is not a reason to refuse the run.
-            if let Ok(receipts) = TransferJournal::uploaded(directory, job_id) {
-                roots.objects.extend(receipts);
-            }
-        }
-        Ok(roots)
+        Ok(job_roots_of(&self.unfinished))
     }
 }
 
@@ -1285,6 +1296,52 @@ mod tests {
             outstanding
         );
         assert!(harness.provider.holds(&library.stale_pack.object_id));
+    }
+
+    /// Invariant GC2. An unfinished job protects what it publishes under, which
+    /// is not its own identifier, and the fragments it already uploaded are
+    /// protected even before any document names them.
+    #[test]
+    fn an_unfinished_job_protects_its_snapshot_and_not_its_own_identifier() {
+        let directory = tempfile::tempdir().unwrap();
+        let roots = job_roots_of(&[UnfinishedJob {
+            job_id: "job".into(),
+            directory: directory.path().join("missing"),
+            snapshot_ids: BTreeSet::from(["published".to_owned(), "read".to_owned()]),
+        }]);
+        assert_eq!(
+            roots.snapshot_ids,
+            BTreeSet::from(["published".to_owned(), "read".to_owned()])
+        );
+        assert!(!roots.snapshot_ids.contains("job"));
+        // A job that never reached its first upload has no journal to read.
+        assert!(roots.objects.is_empty());
+    }
+
+    /// Invariant GC2. A protected fragment is kept as it is: the run neither
+    /// removes it nor follows it, because the journal that named one names
+    /// everything that job put below it.
+    #[test]
+    fn a_fragment_an_unfinished_job_uploaded_is_never_a_candidate() {
+        let harness = Harness::new();
+        let (library, mut scripted) = Library::install(&harness);
+        scripted.jobs = JobRoots {
+            objects: vec![library.stale_pack.receipt.clone()],
+            snapshot_ids: BTreeSet::new(),
+        };
+        let outcome = runtime()
+            .block_on(run(
+                &harness.context(),
+                &harness.request("job", CleanupLimits::default()),
+                &scripted,
+                &scripted,
+                &Cancellation::default(),
+            ))
+            .unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::Complete);
+        assert_eq!(outcome.deleted_objects, 2);
+        assert!(harness.provider.holds(&library.stale_pack.object_id));
+        assert!(!harness.provider.holds(&library.stale.object_id));
     }
 
     /// Invariant GC17. Without every evidence the removal path needs, no marker
