@@ -60,6 +60,8 @@ function durablePluginStore(entries: Record<string, unknown>) {
     } as never
     return createPluginStorageStore({
         store: backing,
+        getStorageAuthorityEpoch: () => 0,
+        assertPersistentMutationAllowed: vi.fn(),
         mutate: async (mutations) => {
             for (const mutation of mutations) {
                 if (mutation.type === 'clear') {

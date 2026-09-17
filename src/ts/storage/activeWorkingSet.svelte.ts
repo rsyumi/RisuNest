@@ -1,4 +1,5 @@
 import type { Chat, Database, character, groupChat } from './database.svelte'
+import type { CommittedApplyOutcome } from './persistentDataRuntime'
 import { safeStructuredClone } from '../polyfill'
 import {
     ActiveConversationSession,
@@ -48,7 +49,7 @@ export interface WorkingSetCoordinator {
     readonly mutationGeneration: number
     initialize(revision: DataRevision, database: Database): void
     flushPendingData(reason: string): Promise<void>
-    replacePersistentDatabase(database: Database, reason: string): Promise<void>
+    replacePersistentDatabase(database: Database, reason: string): Promise<CommittedApplyOutcome>
     adoptHydratedCharacter(
         revision: DataRevision,
         mutationGeneration: number,
@@ -810,11 +811,12 @@ export class ActiveWorkingSet {
                 this.dependencies.canActivateWorkingSet?.() === false
             ) return false
             if (!prepared) return false
-            await this.dependencies.coordinator.replacePersistentDatabase(
+            const outcome = await this.dependencies.coordinator.replacePersistentDatabase(
                 prepared.database,
                 prepared.reason,
             )
             if (
+                outcome.projection === 'refresh-required' ||
                 generation !== this.navigationGeneration ||
                 this.dependencies.canActivateWorkingSet?.() === false
             ) return false

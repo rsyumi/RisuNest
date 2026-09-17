@@ -1,4 +1,5 @@
 import type { Chat, Database } from '../storage/database.svelte'
+import type { CommittedApplyOutcome } from '../storage/persistentDataRuntime'
 import type {
     PersistentCompleteCharacterMutation,
     PersistentReplacementOptions,
@@ -169,6 +170,8 @@ export interface PluginDatabaseAccessDependencies {
         diagnostic: PluginIdentityReplacementDiagnostic,
     ): void
     getNavigationGeneration(): number
+    getStorageAuthorityEpoch(): number
+    assertPersistentMutationAllowed(expectedAuthorityEpoch?: number): void
     applyCompatibilityDatabaseLite(database: Record<string, unknown>): void
     readPluginStorageSnapshot(): Promise<Record<string, unknown>>
     mutatePluginStorage(mutations: readonly OwnerScopedStorageMutation[]): Promise<void>
@@ -182,7 +185,7 @@ export interface PluginDatabaseAccessDependencies {
         database: Database,
         reason: string,
         options: PersistentReplacementOptions,
-    ): Promise<void>
+    ): Promise<CommittedApplyOutcome>
     prepareAuthoritativeDatabaseUpdate?(
         database: Record<string, unknown>,
     ): Promise<Record<string, unknown>>
@@ -599,14 +602,20 @@ export function createPluginDatabaseAccess(
             selectedTarget,
         )
     }
-    const captureSelectedCallBoundary = () => ({
-        characterId: dependencies.getSelectedCharacterId(),
-        navigationGeneration: dependencies.getNavigationGeneration(),
-        target: dependencies.captureSelectedConversationTarget(),
-    })
+    const captureSelectedCallBoundary = () => {
+        const authorityEpoch = dependencies.getStorageAuthorityEpoch()
+        dependencies.assertPersistentMutationAllowed(authorityEpoch)
+        return {
+            authorityEpoch,
+            characterId: dependencies.getSelectedCharacterId(),
+            navigationGeneration: dependencies.getNavigationGeneration(),
+            target: dependencies.captureSelectedConversationTarget(),
+        }
+    }
     const recaptureSelectedTarget = (boundary: ReturnType<
         typeof captureSelectedCallBoundary
     >): SelectedConversationTarget | null => {
+        dependencies.assertPersistentMutationAllowed(boundary.authorityEpoch)
         const target = dependencies.captureSelectedConversationTarget()
         if (
             !boundary.target ||
@@ -709,6 +718,7 @@ export function createPluginDatabaseAccess(
             throwIfFullObjectCallAborted(context.signal)
             await dependencies.flushPendingData('plugin-full-object-write')
             throwIfFullObjectCallAborted(context.signal)
+            dependencies.assertPersistentMutationAllowed(selectedBoundary.authorityEpoch)
             const characterId = selectedBoundary.characterId
             if (characterId === null) return
             await openStore()
@@ -736,6 +746,7 @@ export function createPluginDatabaseAccess(
                     target.characterId,
                 )
                 throwIfFullObjectCallAborted(context.signal)
+                dependencies.assertPersistentMutationAllowed(selectedBoundary.authorityEpoch)
                 const replaced = await dependencies.replacePersistentCompleteCharacter(
                     target.characterId,
                     'plugin-setCharacter',
@@ -762,6 +773,7 @@ export function createPluginDatabaseAccess(
             throwIfFullObjectCallAborted(context.signal)
             await dependencies.flushPendingData('plugin-full-object-write')
             throwIfFullObjectCallAborted(context.signal)
+            dependencies.assertPersistentMutationAllowed(selectedBoundary.authorityEpoch)
             await openStore()
             const lease = await acquireCurrentRevisionReader()
             const target = await withPersistentRevisionLease(lease, async (reader) =>
@@ -783,6 +795,7 @@ export function createPluginDatabaseAccess(
                     target.characterId,
                 )
                 throwIfFullObjectCallAborted(context.signal)
+                dependencies.assertPersistentMutationAllowed(selectedBoundary.authorityEpoch)
                 const replaced = await dependencies.replacePersistentCompleteCharacter(
                     target.characterId,
                     'plugin-setCharacterToIndex',
@@ -809,6 +822,7 @@ export function createPluginDatabaseAccess(
             throwIfFullObjectCallAborted(context.signal)
             await dependencies.flushPendingData('plugin-full-object-write')
             throwIfFullObjectCallAborted(context.signal)
+            dependencies.assertPersistentMutationAllowed(selectedBoundary.authorityEpoch)
             await openStore()
             const lease = await acquireCurrentRevisionReader()
             const target = await withPersistentRevisionLease(lease, async (reader) =>
@@ -831,6 +845,7 @@ export function createPluginDatabaseAccess(
                     target.conversationId,
                 )
                 throwIfFullObjectCallAborted(context.signal)
+                dependencies.assertPersistentMutationAllowed(selectedBoundary.authorityEpoch)
                 const replaced = await dependencies.replacePersistentConversation(
                     target.characterId,
                     target.conversationId,
@@ -1076,6 +1091,7 @@ export function createPluginDatabaseAccess(
         },
 
         setDatabaseLite(database, allowedKeys) {
+            dependencies.assertPersistentMutationAllowed()
             validatePluginDatabaseUpdate(database)
             if (hasCharacterUpdate(database)) {
                 throw new Error(SYNCHRONOUS_CHARACTER_SET_ERROR)
@@ -1090,7 +1106,10 @@ export function createPluginDatabaseAccess(
         },
 
         async setDatabase(database, allowedKeys) {
+            const authorityEpoch = dependencies.getStorageAuthorityEpoch()
+            dependencies.assertPersistentMutationAllowed(authorityEpoch)
             validatePluginDatabaseUpdate(database)
+            allowedKeys = [...allowedKeys]
             const initialNavigationGeneration = dependencies.getNavigationGeneration()
             if (hasCharacterUpdate(database)) {
                 validateCompleteCharacters(database.characters)
@@ -1099,6 +1118,7 @@ export function createPluginDatabaseAccess(
             const preparedUpdate = dependencies.prepareAuthoritativeDatabaseUpdate
                 ? await dependencies.prepareAuthoritativeDatabaseUpdate(detachedUpdate)
                 : detachedUpdate
+            dependencies.assertPersistentMutationAllowed(authorityEpoch)
             validatePluginDatabaseUpdate(preparedUpdate)
             if (dependencies.getNavigationGeneration() !== initialNavigationGeneration) {
                 throw new Error(STALE_DATABASE_SET_ERROR)
@@ -1116,12 +1136,14 @@ export function createPluginDatabaseAccess(
                 dependencies.applyCompatibilityDatabaseLite(compatibilityUpdate)
                 if (storageMutations.length > 0)
                     await dependencies.mutatePluginStorage(storageMutations)
+                dependencies.assertPersistentMutationAllowed(authorityEpoch)
                 await dependencies.flushPendingData('plugin-root-update')
                 return
             }
             const materialized = await dependencies.materializeDatabaseSnapshot(
                 'plugin-database-set',
             )
+            dependencies.assertPersistentMutationAllowed(authorityEpoch)
             if (dependencies.getNavigationGeneration() !== initialNavigationGeneration) {
                 throw new Error(STALE_DATABASE_SET_ERROR)
             }

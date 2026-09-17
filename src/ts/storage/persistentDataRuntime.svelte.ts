@@ -1,5 +1,5 @@
 import { createPersistenceCanonicalCapture } from './reactivePersistenceCapture.svelte'
-import { get } from 'svelte/store'
+import { get, readonly, writable } from 'svelte/store'
 import { doingChat } from '../process/generationState'
 import { ReloadGUIPointer, selectedCharID } from '../stores.svelte'
 import type { ActiveConversationSession } from './activeConversationSession'
@@ -21,7 +21,6 @@ import type {
 } from './persistentDataStore'
 import type {
     CharacterAdditionRequest,
-    DestructiveReplacementFenceOptions,
     PersistentCharacterDetailMutation,
     PersistentCompleteCharacterMutation,
     PersistentCompleteCharacterUpsert,
@@ -43,6 +42,7 @@ import {
     publishPersistentCharacterMutationToWorkingSet,
     publishPersistentConversationReplacementToWorkingSet,
     restoreStableWorkingSetSelection,
+    type CommittedApplyOutcome,
     type PersistentDestructiveReplacementFence,
     type PersistentDataRuntime,
     type PersistentDataRuntimeStateAdapter,
@@ -76,6 +76,8 @@ import {
 } from './persistentConversationRead'
 
 export type {
+    CommittedApplyOutcome,
+    ReplacementChangeSet,
     PersistentDestructiveReplacementFence,
     PersistentDataRuntime,
     PersistentDataRuntimeStateAdapter,
@@ -401,6 +403,8 @@ const productionConfiguration: ProductionRuntimeConfiguration = {
     officialPublisher: null,
 }
 let productionRuntime: PersistentDataRuntime | null = null
+const workingSetRefreshRevision = writable<DataRevision | null>(null)
+export const persistentWorkingSetRefreshRevision = readonly(workingSetRefreshRevision)
 
 export function configurePersistentDataRuntime(
     configuration: Partial<ProductionRuntimeConfiguration>,
@@ -420,6 +424,7 @@ export function getPersistentDataRuntime(): PersistentDataRuntime {
             },
             onFlushPromise: (promise) => productionConfiguration.onFlushPromise?.(promise),
             onBackgroundError: (error) => productionConfiguration.onBackgroundError?.(error),
+            onWorkingSetRefreshRequired: (revision) => workingSetRefreshRevision.set(revision),
             prepareDatabase: prepareDatabaseForPersistence,
         })
     }
@@ -428,17 +433,25 @@ export function getPersistentDataRuntime(): PersistentDataRuntime {
 
 export const initializeActiveWorkingSet = (database: Database): Promise<void> =>
     getPersistentDataRuntime().initializeActiveWorkingSet(database)
-export const refreshActiveWorkingSetFromStore = (revision: DataRevision): Promise<void> =>
+export const refreshActiveWorkingSetFromStore = (revision: DataRevision): Promise<CommittedApplyOutcome> =>
     getPersistentDataRuntime().refreshActiveWorkingSetFromStore(revision)
+export const retryCommittedWorkingSetRefresh = (): Promise<CommittedApplyOutcome | null> =>
+    getPersistentDataRuntime().retryCommittedWorkingSetRefresh()
+export const assertPersistentMutationAllowed = (expectedAuthorityEpoch?: number): void =>
+    getPersistentDataRuntime().assertPersistentMutationAllowed(expectedAuthorityEpoch)
+export const getPersistentStorageAuthorityEpoch = (): number =>
+    getPersistentDataRuntime().getStorageAuthorityEpoch()
 export const markPersistentDataDirty = (estimatedBytes: number): void =>
     getPersistentDataRuntime().markPersistentDataDirty(estimatedBytes)
 export const flushPendingData = (reason: string): Promise<void> =>
     getPersistentDataRuntime().flushPendingData(reason)
 export const flushPendingDataLocally = (reason: string): Promise<void> =>
     getPersistentDataRuntime().flushPendingDataLocally(reason)
-export const acknowledgeGenerationCompletion = async (): Promise<void> => {
+export const acknowledgeGenerationCompletion = async (expectedAuthorityEpoch?: number): Promise<void> => {
     const runtime = getPersistentDataRuntime()
-    await runtime.acknowledgeGenerationCompletion()
+    const authorityEpoch = expectedAuthorityEpoch ?? runtime.getStorageAuthorityEpoch()
+    await runtime.acknowledgeGenerationCompletion(authorityEpoch)
+    runtime.assertPersistentMutationAllowed(authorityEpoch)
     notifyLocalPersistentRevision(runtime.revision, 'generation-complete')
 }
 export const commitCharacterAddition = (
@@ -530,7 +543,7 @@ export const replacePersistentDatabase = (
     database: Database,
     reason: string,
     options?: PersistentReplacementOptions,
-): Promise<void> => getPersistentDataRuntime().replacePersistentDatabase(database, reason, options)
+): Promise<CommittedApplyOutcome> => getPersistentDataRuntime().replacePersistentDatabase(database, reason, options)
 export const mutatePersistentPluginStorage = (
     reason: string,
     mutations: readonly PluginStorageMutation[],
@@ -657,13 +670,13 @@ export const readPersistentSelectedConversationWindow = (
 }
 export const capturePersistentMutationToken = (
     reason: string,
+    options?: { publishOfficial?: boolean },
 ): Promise<PersistentMutationToken> =>
-    getPersistentDataRuntime().capturePersistentMutationToken(reason)
+    getPersistentDataRuntime().capturePersistentMutationToken(reason, options)
 export const acquireDestructiveReplacementFence = (
     expected: PersistentMutationToken,
-    options?: DestructiveReplacementFenceOptions,
 ): Promise<PersistentDestructiveReplacementFence> =>
-    getPersistentDataRuntime().acquireDestructiveReplacementFence(expected, options)
+    getPersistentDataRuntime().acquireDestructiveReplacementFence(expected)
 export const acquireCommittedWorkingSetRefreshFence =
 (): Promise<PersistentDestructiveReplacementFence> =>
     getPersistentDataRuntime().acquireCommittedWorkingSetRefreshFence()

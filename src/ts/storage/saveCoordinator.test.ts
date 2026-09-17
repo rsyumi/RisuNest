@@ -1766,7 +1766,7 @@ describe('SaveCoordinator', () => {
         expect(database.characters.map((item) => item.chaId)).toContain('char-other')
     })
 
-    it('runs an earlier replacement before installing an addition', async () => {
+    it('rejects an old-authority queued addition and accepts a fresh request after replacement', async () => {
         let database = makeDatabase()
         const replacement = makeDatabase()
         replacement.username = 'Replacement'
@@ -1797,11 +1797,17 @@ describe('SaveCoordinator', () => {
             estimatedBytes: 1,
             install,
         }, 'new-character')
+        const rejected = expect(adding).rejects.toThrow(/replacement is active/i)
         expect(install).not.toHaveBeenCalled()
         replacementGate.resolve({ revision: 2 })
         await replacing
-        await adding
+        await rejected
+        expect(install).not.toHaveBeenCalled()
+        expect(commit).not.toHaveBeenCalled()
 
+        await coordinator.commitCharacterAddition({
+            characterId: 'char-added', estimatedBytes: 1, install,
+        }, 'fresh-addition-after-replacement')
         expect(install).toHaveBeenCalledOnce()
         expect(database.username).toBe('Replacement')
         expect(commit.mock.calls[0][0]).toMatchObject({

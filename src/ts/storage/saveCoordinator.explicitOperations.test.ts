@@ -441,6 +441,10 @@ describe('SaveCoordinator', () => {
             { ...structuredClone(database.characters[0].chats[0]), name: 'After' },
         )
 
+        expect(pin).not.toHaveBeenCalled()
+        expect(coordinator.revision).toBe(8)
+        expect(coordinator.hasPendingOfficialPublication).toBe(true)
+        await coordinator.publishCurrentOfficialRevision()
         expect(pin).toHaveBeenCalledWith(8)
         expect(publication.publish).toHaveBeenCalledOnce()
         expect(publication.dispose).toHaveBeenCalledOnce()
@@ -1642,6 +1646,8 @@ describe('SaveCoordinator', () => {
         coordinator.initialize(3, database)
         v3Storage = createPluginStorageStore({
             store,
+            getStorageAuthorityEpoch: () => coordinator.storageAuthorityEpoch,
+            assertPersistentMutationAllowed: (epoch) => coordinator.assertPersistentMutationAllowed(epoch),
             mutate: (mutations) => coordinator.mutatePersistentPluginStorage(
                 'overlapping-v3-v2',
                 mutations,
@@ -3276,7 +3282,8 @@ describe('SaveCoordinator', () => {
             'continuous-generation-edit',
             (current) => ({ ...current, name: 'Explicit replacement' }),
         )).rejects.toThrow('Resident character changed')
-        expect(publishedRevisions).toEqual([14])
+        expect(publishedRevisions).toEqual([])
+        expect(coordinator.hasPendingOfficialPublication).toBe(true)
 
         const result = await Promise.race([
             coordinator.flushPendingDataLocally('generation-completion').then(() => 'committed'),
@@ -3298,13 +3305,13 @@ describe('SaveCoordinator', () => {
         })
         expect(coordinator.revision).toBe(15)
         expect(coordinator.hasPendingOfficialPublication).toBe(true)
-        expect(pin).toHaveBeenCalledOnce()
+        expect(pin).not.toHaveBeenCalled()
 
         const publishing = coordinator.publishCurrentOfficialRevision()
         await vi.waitFor(() => expect(pin).toHaveBeenLastCalledWith(15))
         laterPublication.resolve(undefined)
         await publishing
-        expect(publishedRevisions).toEqual([14, 15])
+        expect(publishedRevisions).toEqual([15])
     })
 
     it('publishes a deferred target compensation when a tokened replacement then rejects', async () => {
@@ -3357,7 +3364,8 @@ describe('SaveCoordinator', () => {
                 'continuous-inactive-resident-edits',
                 (current) => ({ ...current, name: 'Explicit replacement' }),
             )).rejects.toThrow('Resident character changed')
-            expect(publishedRevisions).toEqual([14])
+            expect(publishedRevisions).toEqual([])
+            expect(coordinator.hasPendingOfficialPublication).toBe(true)
 
             await expect(coordinator.replacePersistentDatabase(
                 makeDatabase(),
@@ -3368,12 +3376,12 @@ describe('SaveCoordinator', () => {
             expect(commit).toHaveBeenCalledTimes(5)
             expect(coordinator.revision).toBe(15)
             expect(store.replaceFromDatabase).not.toHaveBeenCalled()
-            expect(publishedRevisions).toEqual([14])
+            expect(publishedRevisions).toEqual([])
 
             await vi.advanceTimersByTimeAsync(3_000)
 
             expect(pin).toHaveBeenLastCalledWith(15)
-            expect(publishedRevisions).toEqual([14, 15])
+            expect(publishedRevisions).toEqual([15])
         } finally {
             vi.useRealTimers()
         }
@@ -3458,10 +3466,7 @@ describe('SaveCoordinator', () => {
             'normal-exit-fence',
             { publishOfficial: false },
         )
-        const fence = await coordinator.acquireDestructiveReplacementFence(token, {
-            allowRevisionAdvance: true,
-            publishOfficial: false,
-        })
+        const fence = await coordinator.acquireDestructiveReplacementFence(token)
 
         expect(token.revision).toBe(13)
         expect(coordinator.revision).toBe(13)
@@ -3548,7 +3553,7 @@ describe('SaveCoordinator', () => {
         )
     })
 
-    it('admits an already-applied edit while the exact fence is still acquiring', async () => {
+    it('blocks mutation entry synchronously while the exact fence is still acquiring', async () => {
         const database = makeDatabase()
         const store = makeStore(vi.fn(async ({ expectedRevision }) => ({
             revision: expectedRevision + 1,
@@ -3569,12 +3574,18 @@ describe('SaveCoordinator', () => {
             'queued-preset-mutation',
             () => undefined,
         )).toThrow(/replacement is active/i)
-        database.username = 'Edit completed during final handshake'
-        expect(() => coordinator.markPersistentDataDirty(2 * 1024 * 1024)).not.toThrow()
+        expect(() => {
+            coordinator.assertPersistentMutationAllowed()
+            database.username = 'Must not be applied'
+        }).toThrow(/replacement is active/i)
+        expect(() => coordinator.markPersistentDataDirty(2 * 1024 * 1024)).toThrow(/replacement is active/i)
 
-        await expect(acquiring).rejects.toThrow(/revision|mutation generation/i)
-        expect(coordinator.revision).toBe(13)
-        expect(database.username).toBe('Edit completed during final handshake')
+        const owner = await acquiring
+        expect(coordinator.revision).toBe(12)
+        expect(database.username).toBe('Fixture')
+        expect(store.commit).not.toHaveBeenCalled()
+        coordinator.releaseDestructiveReplacementFence(owner)
+        expect(() => coordinator.assertPersistentMutationAllowed()).not.toThrow()
     })
 
     it('returns the snapshot revision atomically before a queued replacement advances it', async () => {

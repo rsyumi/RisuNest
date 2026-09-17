@@ -15,7 +15,11 @@ import {
     createPluginLoadReentrancyGuard,
     runPluginUnloadCallbacks,
 } from "./pluginCompatibility";
-import { mutatePersistentPluginStorage } from "../storage/persistentDataRuntime.svelte";
+import {
+    assertPersistentMutationAllowed,
+    getPersistentStorageAuthorityEpoch,
+    mutatePersistentPluginStorage,
+} from "../storage/persistentDataRuntime.svelte";
 import { getPersistentDataStore } from "../storage/persistentDataStoreFactory";
 import {
     createPluginStorageStore,
@@ -121,12 +125,16 @@ export const checkPluginUpdate = async (plugin: RisuPlugin) => {
 
 export async function updatePlugin(plugin: RisuPlugin) {
     try {
+        const authorityEpoch = getPersistentStorageAuthorityEpoch()
+        assertPersistentMutationAllowed(authorityEpoch)
+        plugin = safeStructuredClone(plugin)
         if(!plugin.updateURL){
             return false
         }
         const response = await fetch(plugin.updateURL)
         if(response.status >= 200 && response.status < 300){
             const jsFile = await response.text()
+            assertPersistentMutationAllowed(authorityEpoch)
             await importPlugin(jsFile, {
                 isUpdate: true,
                 originalPluginName: plugin.name
@@ -146,6 +154,9 @@ export async function importPlugin(code:string|null = null, argu:{
     isTypescript?: boolean
 } = {}) {
     try {
+        const authorityEpoch = getPersistentStorageAuthorityEpoch()
+        assertPersistentMutationAllowed(authorityEpoch)
+        argu = { ...argu }
         let jsFile = ''
         let db = getDatabase()
         let isUpdate = argu.isUpdate || false
@@ -373,9 +384,11 @@ export async function importPlugin(code:string|null = null, argu:{
             enabled: true
         }
 
+        assertPersistentMutationAllowed(authorityEpoch)
+        db = getDatabase()
         db.plugins ??= []
 
-        const oldPluginIndex = db.plugins.findIndex((p: RisuPlugin) => p.name === pluginData.name);
+        let oldPluginIndex = db.plugins.findIndex((p: RisuPlugin) => p.name === pluginData.name);
 
         if(originalPluginName && originalPluginName !== pluginData.name){
             showError(`When updating plugin "${originalPluginName}", the plugin name cannot be changed to "${pluginData.name}". Please keep the original name to update.`)
@@ -390,6 +403,9 @@ export async function importPlugin(code:string|null = null, argu:{
             }
         }
 
+        assertPersistentMutationAllowed(authorityEpoch)
+        db = getDatabase()
+        oldPluginIndex = db.plugins.findIndex((p: RisuPlugin) => p.name === pluginData.name)
         if(oldPluginIndex !== -1){
             db.plugins[oldPluginIndex] = pluginData;
         }
@@ -416,6 +432,8 @@ let pluginTranslator = false
 
 export const pluginStorageStore = createPluginStorageStore({
     store: getPersistentDataStore,
+    getStorageAuthorityEpoch: () => getPersistentStorageAuthorityEpoch(),
+    assertPersistentMutationAllowed: (epoch) => assertPersistentMutationAllowed(epoch),
     mutate: (mutations) => mutatePersistentPluginStorage('plugin-v3-storage', mutations),
 })
 registerPluginStorageLifecycle(pluginStorageStore)
@@ -528,6 +546,7 @@ export function applyPreparedPluginDatabaseUpdate(
     database: Record<string, unknown>,
     lite: boolean,
 ): void {
+    assertPersistentMutationAllowed()
     const db = getDatabase()
     // The compatibility path has no calling plugin, so nothing it writes gains
     // an owner it did not already have.
@@ -598,6 +617,7 @@ export const getV2PluginAPIs = () => {
             }
         },
         setArg: (arg: string, value: string | number) => {
+            assertPersistentMutationAllowed()
             const db = getDatabase();
             const [name, realArg] = arg.split("::");
             for (const plugin of db.plugins) {

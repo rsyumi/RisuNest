@@ -2,7 +2,17 @@ import { describe, expect, it, vi } from 'vitest'
 import type { Database } from './database.svelte'
 import { createMutationGatedPersistentDataStore } from './mutationGatedPersistentDataStore'
 import type { PersistentDataStore, WorkingSetCommit } from './persistentDataStore'
-import type { StorageMutationGate } from './storageMutationGate'
+import {
+    createInRealmStorageLockManager,
+    createStorageMutationGate,
+    type StorageMutationGate,
+} from './storageMutationGate'
+
+function deferred<T = void>() {
+    let resolve!: (value: T | PromiseLike<T>) => void
+    const promise = new Promise<T>((complete) => { resolve = complete })
+    return { promise, resolve }
+}
 
 function makeStore() {
     return {
@@ -68,6 +78,73 @@ describe('createMutationGatedPersistentDataStore', () => {
         expect(calls).toEqual(['write-gate', 'commit', 'transition-gate', 'replace'])
         expect(gate.runWrite).toHaveBeenCalledOnce()
         expect(gate.runTransition).toHaveBeenCalledOnce()
+    })
+
+    it('transition_does_not_reenter_shared_gate', async () => {
+        const store = makeStore()
+        const gate = createStorageMutationGate({ locks: createInRealmStorageLockManager() })
+        const shared = vi.spyOn(gate, 'runWrite')
+        const exclusive = vi.spyOn(gate, 'runTransition')
+        const started = deferred()
+        const finishFirstWrite = deferred()
+        const calls: string[] = []
+        vi.mocked(store.commit).mockImplementation(async ({ expectedRevision }) => {
+            calls.push(`write:${expectedRevision}`)
+            if (expectedRevision === 0) {
+                started.resolve()
+                await finishFirstWrite.promise
+            }
+            calls.push(`written:${expectedRevision + 1}`)
+            return { revision: expectedRevision + 1 }
+        })
+        vi.mocked(store.replaceFromDatabase).mockImplementation(async (_database, revision) => {
+            calls.push('transition')
+            // The replacement owns the exclusive permit and uses its internal store.
+            const result = await store.commit({ expectedRevision: revision! })
+            calls.push('replaced')
+            return result
+        })
+        const gated = createMutationGatedPersistentDataStore(store, gate)
+        const first = gated.commit({ expectedRevision: 0 })
+        await started.promise
+        const replacement = gated.replaceFromDatabase({ characters: [] } as unknown as Database, 1)
+        const last = gated.commit({ expectedRevision: 2 })
+
+        expect(calls).toEqual(['write:0'])
+        finishFirstWrite.resolve()
+        await expect(Promise.all([first, replacement, last])).resolves.toEqual([
+            { revision: 1 }, { revision: 2 }, { revision: 3 },
+        ])
+        expect(calls).toEqual([
+            'write:0', 'written:1', 'transition', 'write:1', 'written:2',
+            'replaced', 'write:2', 'written:3',
+        ])
+        expect(shared).toHaveBeenCalledTimes(2)
+        expect(exclusive).toHaveBeenCalledOnce()
+    })
+
+    it('releases a failed exclusive transition before the next shared writer', async () => {
+        const store = makeStore()
+        const gate = createStorageMutationGate({ locks: createInRealmStorageLockManager() })
+        const started = deferred()
+        const finishReplacement = deferred()
+        const failure = new Error('replacement failed')
+        vi.mocked(store.replaceFromDatabase).mockImplementation(async () => {
+            started.resolve()
+            await finishReplacement.promise
+            throw failure
+        })
+        vi.mocked(store.commit).mockResolvedValue({ revision: 2 })
+        const gated = createMutationGatedPersistentDataStore(store, gate)
+        const replacement = gated.replaceFromDatabase({ characters: [] } as unknown as Database, 1)
+        const rejected = expect(replacement).rejects.toBe(failure)
+        await started.promise
+        const write = gated.commit({ expectedRevision: 1 })
+        expect(store.commit).not.toHaveBeenCalled()
+        finishReplacement.resolve()
+        await rejected
+        await expect(write).resolves.toEqual({ revision: 2 })
+        expect(store.commit).toHaveBeenCalledOnce()
     })
 
     it('reads and exports without acquiring the write gate', async () => {

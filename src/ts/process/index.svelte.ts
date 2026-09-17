@@ -42,12 +42,16 @@ import {
 } from './generationState'
 import {
     acknowledgeGenerationCompletion,
+    assertPersistentMutationAllowed,
+    getPersistentStorageAuthorityEpoch,
+    getPersistentNavigationGeneration,
     acquireCompleteConversation,
     captureSelectedConversationTarget,
     getActiveConversationSession,
     invalidateActiveConversationSession,
 } from '../storage/persistentDataRuntime.svelte'
 import { ensureCurrentConversationMessageIds } from '../conversationMutations'
+import { PersistentMutationFencedError } from '../storage/saveCoordinator'
 import { requireCurrentConversationSession } from '../storage/activeConversationSession'
 import {
     beginPinnedConversationHistoryOperation,
@@ -155,6 +159,8 @@ function hasMismatchedActiveConversationSession(): boolean {
 }
 
 interface GenerationCompletionLifecycle {
+    authorityEpoch: number
+    isTargetCurrent(): boolean
     onProgress?(completed: number): void
     responseCompleted: boolean
     reroll: boolean
@@ -186,11 +192,40 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     preview?:boolean
     previewPrompt?:boolean
 } = {}, inheritedReservation?: GenerationReservation):Promise<boolean> {
+    const authorityEpoch = getPersistentStorageAuthorityEpoch()
+    try {
+        assertPersistentMutationAllowed(authorityEpoch)
+    } catch (error) {
+        if (error instanceof PersistentMutationFencedError) return false
+        throw error
+    }
+    const initialCharacter = DBState.db.characters[get(selectedCharID)]
+    const initialConversation = initialCharacter?.chats[initialCharacter.chatPage]
+    const characterId = initialCharacter?.chaId
+    const conversationId = initialConversation?.id
+    const navigationGeneration = getPersistentNavigationGeneration()
+    const isTargetCurrent = () => {
+        try {
+            assertPersistentMutationAllowed(authorityEpoch)
+        } catch (error) {
+            if (error instanceof PersistentMutationFencedError) return false
+            throw error
+        }
+        const currentCharacter = DBState.db.characters[get(selectedCharID)]
+        const currentConversation = currentCharacter?.chats[currentCharacter.chatPage]
+        return currentCharacter?.chaId === characterId &&
+            getPersistentNavigationGeneration() === navigationGeneration &&
+            (conversationId
+                ? currentConversation?.id === conversationId
+                : currentConversation === initialConversation)
+    }
     const ownedReservation = inheritedReservation ? null : reserveGeneration()
     const reservation = inheritedReservation ?? ownedReservation
     if (!reservation?.isCurrent()) return false
     let completeLease: CompleteConversationLease | null = null
     const lifecycle: GenerationCompletionLifecycle = {
+        authorityEpoch,
+        isTargetCurrent,
         responseCompleted: false,
         reroll: !!DBState.db.characters[get(selectedCharID)]?.chats[
             DBState.db.characters[get(selectedCharID)]?.chatPage
@@ -214,6 +249,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 throw error
             }
         }
+        if (!lifecycle.isTargetCurrent()) return false
         enteredGeneration = true
         generationKeepAliveAcquired = beginAndroidGenerationKeepAlive()
         iosGeneration = await beginIOSGeneration(arg.signal)
@@ -225,18 +261,23 @@ export async function sendChat(chatProcessIndex = -1,arg:{
           reservation,
         );
         generationReturned = true
-        return result
+        return lifecycle.isTargetCurrent() && result
     } catch (error) {
+        if (!arg.preview && (error instanceof PersistentMutationFencedError || !lifecycle.isTargetCurrent())) {
+            generationReturned = true
+            return false
+        }
         if (lifecycle.reroll && lifecycle.responseCompleted && !arg.signal?.aborted) {
             alertError(error)
             return true
         }
         throw error
     } finally {
-        if (!lifecycle.reroll && lifecycle.responseApplied && !lifecycle.acknowledgementAttempted) {
+        if (!lifecycle.reroll && lifecycle.responseApplied && !lifecycle.acknowledgementAttempted &&
+            lifecycle.isTargetCurrent()) {
             lifecycle.acknowledgementAttempted = true
             try {
-                await acknowledgeGenerationCompletion()
+                await acknowledgeGenerationCompletion(lifecycle.authorityEpoch)
                 lifecycle.onProgress?.(3)
             } catch (acknowledgeError) {
                 console.error(acknowledgeError)
@@ -264,6 +305,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
     previewPrompt?:boolean
 }, lifecycle: GenerationCompletionLifecycle, reservation: GenerationReservation):Promise<boolean> {
 
+    if (!lifecycle.isTargetCurrent()) return false
     chatProcessStage.set(0)
     const abortSignal = arg.signal ?? (new AbortController()).signal
     
@@ -301,6 +343,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
 
 
     function runCurrentChatFunction(chat:Chat){
+        if (!lifecycle.isTargetCurrent()) throw new PersistentMutationFencedError()
         return runCurrentChatParserPass({
             chat,
             database: DBState.db,
@@ -319,7 +362,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
     }
 
     function throwError(error:string){
-        if(!DBState?.db?.inlayErrorResponse){
+        if(!lifecycle.isTargetCurrent() || !DBState?.db?.inlayErrorResponse){
             alertError(error)
             return
         }
@@ -404,7 +447,8 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
     }
 
     if (
-        (generationSetupSession && getActiveConversationSession() !== generationSetupSession)
+        !lifecycle.isTargetCurrent()
+        || (generationSetupSession && getActiveConversationSession() !== generationSetupSession)
         || hasMismatchedActiveConversationSession()
     ) return false
 
@@ -1783,6 +1827,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
     const requestSourceSession = getActiveConversationSession()
     const requestSourceSessionVersion = requestSourceSession?.version
     const isRequestSourceCurrent = () =>
+        lifecycle.isTargetCurrent() &&
         get(selectedCharID) === requestSourceCharacterIndex &&
         DBState.db.characters[requestSourceCharacterIndex]?.chaId === requestSourceCharacterId &&
         DBState.db.characters[requestSourceCharacterIndex]?.chatPage === requestSourceChatPage &&
@@ -1831,14 +1876,16 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
     async function completeGeneration(): Promise<true> {
         if (lifecycle.reroll) return true
         await acknowledgeCompletedGeneration()
+        if (!lifecycle.isTargetCurrent()) throw new PersistentMutationFencedError()
         await notifyGenerationCompletion(result)
         return true
     }
 
     async function acknowledgeCompletedGeneration(): Promise<void> {
         if (lifecycle.reroll) return
+        if (!lifecycle.isTargetCurrent()) throw new PersistentMutationFencedError()
         lifecycle.acknowledgementAttempted = true
-        await acknowledgeGenerationCompletion()
+        await acknowledgeGenerationCompletion(lifecycle.authorityEpoch)
         lifecycle.onProgress?.(3)
     }
     
@@ -1858,14 +1905,17 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
             getCurrentSession: getActiveConversationSession,
             getTargetChat: () => DBState.db.characters[selectedChar]?.chats[selectedChat],
             isOwnerCurrent: () =>
+                lifecycle.isTargetCurrent() &&
                 get(selectedCharID) === selectedChar &&
                 DBState.db.characters[selectedChar]?.chaId === requestSourceCharacterId &&
                 DBState.db.characters[selectedChar]?.chatPage === selectedChat,
             publishTargetChat: (chat) => {
+                if (!lifecycle.isTargetCurrent()) throw new PersistentMutationFencedError()
                 DBState.db.characters[selectedChar].chats[selectedChat] = chat
             },
             invalidateSession: invalidateActiveConversationSession,
             incrementReloadKeys: () => {
+                if (!lifecycle.isTargetCurrent()) throw new PersistentMutationFencedError()
                 DBState.db.characters[selectedChar].reloadKeys += 1
             },
         },

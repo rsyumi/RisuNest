@@ -298,6 +298,8 @@ describe('selected conversation eviction correctness corpus', () => {
             ),
             reportIdentityReplacementRejected: vi.fn(),
             getNavigationGeneration: () => runtime.getNavigationGeneration(),
+            getStorageAuthorityEpoch: () => runtime.getStorageAuthorityEpoch(),
+            assertPersistentMutationAllowed: (epoch) => runtime.assertPersistentMutationAllowed(epoch),
             applyCompatibilityDatabaseLite: vi.fn(),
             readPluginStorageSnapshot: vi.fn(async () => ({})),
             mutatePluginStorage: vi.fn(),

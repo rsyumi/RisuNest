@@ -48,6 +48,9 @@ vi.mock('../parser/parser.svelte', () => ({
 }))
 
 vi.mock('../storage/persistentDataRuntime.svelte', () => ({
+    assertPersistentMutationAllowed: vi.fn(),
+    getPersistentStorageAuthorityEpoch: () => 0,
+    getPersistentNavigationGeneration: () => 0,
     acknowledgeGenerationCompletion: vi.fn(async () => undefined),
     acquireCompleteConversation: testState.unexpectedNativeRuntimeAccess,
     acquireDestructiveReplacementFence: testState.unexpectedNativeRuntimeAccess,

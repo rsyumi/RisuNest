@@ -231,6 +231,11 @@ function createHarness() {
     const prepareAuthoritativeDatabaseUpdate = vi.fn(async (
         database: Record<string, unknown>,
     ) => database)
+    let authorityEpoch = 0
+    let mutationFenced = false
+    const assertPersistentMutationAllowed = (expected = authorityEpoch) => {
+        if (mutationFenced || expected !== authorityEpoch) throw new Error('Persistent mutation fenced')
+    }
     const replacePersistentDatabase = vi.fn(async (
         _database: Database,
         _reason: string,
@@ -240,7 +245,7 @@ function createHarness() {
             expectedRevision?: number
             expectedMutationGeneration?: number
         },
-    ) => undefined)
+    ) => ({ kind: 'committed' as const, revision: 5, projection: 'applied' as const }))
     const readPluginStorageSnapshot = vi.fn(async () => ({
         '2': 0,
         memory: { retained: true },
@@ -283,6 +288,8 @@ function createHarness() {
         replacePersistentConversation,
         reportIdentityReplacementRejected,
         getNavigationGeneration: () => navigationGeneration,
+        getStorageAuthorityEpoch: () => authorityEpoch,
+        assertPersistentMutationAllowed,
         applyCompatibilityDatabaseLite,
         materializeDatabaseSnapshot,
         replacePersistentDatabase,
@@ -327,6 +334,8 @@ function createHarness() {
         setNavigationGeneration(generation: number) {
             navigationGeneration = generation
         },
+        advanceAuthorityEpoch() { authorityEpoch++ },
+        setMutationFenced(value: boolean) { mutationFenced = value },
         snapshot,
         store,
     }
@@ -360,6 +369,42 @@ function callContext(): PluginFullObjectCallContext {
 }
 
 describe('plugin database access', () => {
+    it('late_plugin_result_cannot_cross_replacement during database preparation', async () => {
+        const harness = createHarness()
+        const prepared = deferred<Record<string, unknown>>()
+        harness.prepareAuthoritativeDatabaseUpdate.mockReturnValueOnce(prepared.promise)
+        const writing = harness.access.setDatabase({ temperature: 0.5 }, ['temperature'])
+        const rejected = expect(writing).rejects.toThrow('Persistent mutation fenced')
+        harness.advanceAuthorityEpoch()
+        prepared.resolve({ temperature: 0.5 })
+        await rejected
+        expect(harness.applyCompatibilityDatabaseLite).not.toHaveBeenCalled()
+        expect(harness.mutatePluginStorage).not.toHaveBeenCalled()
+        expect(harness.replacePersistentDatabase).not.toHaveBeenCalled()
+    })
+
+    it('rejects a late selected-character write even when the new library retains the same IDs', async () => {
+        const harness = createHarness()
+        const flushed = deferred<void>()
+        harness.flushPendingData.mockReturnValueOnce(flushed.promise)
+        const writing = harness.access.setCurrentCharacter(makeCharacter('active'), callContext())
+        const rejected = expect(writing).rejects.toThrow('Persistent mutation fenced')
+        harness.advanceAuthorityEpoch()
+        flushed.resolve()
+        await rejected
+        expect(harness.replacePersistentCompleteCharacter).not.toHaveBeenCalled()
+        expect(harness.replacePersistentConversation).not.toHaveBeenCalled()
+    })
+
+    it('blocks synchronous plugin settings before mutating the working set during refresh', () => {
+        const harness = createHarness()
+        harness.setMutationFenced(true)
+        expect(() => harness.access.setDatabaseLite({ temperature: 0.5 }, ['temperature']))
+            .toThrow('Persistent mutation fenced')
+        expect(harness.applyCompatibilityDatabaseLite).not.toHaveBeenCalled()
+        expect(harness.mutatePluginStorage).not.toHaveBeenCalled()
+    })
+
     it('projector overlays durable, dirty resident, and exact live output without flushing', async () => {
         const harness = createHarness()
         const durable = makeCharacter('active')
@@ -994,6 +1039,8 @@ describe('plugin database access', () => {
             replacePersistentConversation: vi.fn(),
             reportIdentityReplacementRejected: vi.fn(),
             getNavigationGeneration: () => 0,
+            getStorageAuthorityEpoch: () => 0,
+            assertPersistentMutationAllowed: vi.fn(),
             applyCompatibilityDatabaseLite: harness.applyCompatibilityDatabaseLite,
             readPluginStorageSnapshot: harness.readPluginStorageSnapshot,
             mutatePluginStorage: harness.mutatePluginStorage,
@@ -1890,6 +1937,7 @@ describe('plugin database access', () => {
                 throw new Error('revision-conflict')
             }
             currentRevision++
+            return { kind: 'committed', revision: currentRevision, projection: 'applied' }
         })
 
         const outcomes = await Promise.allSettled([
@@ -2003,6 +2051,7 @@ describe('plugin database access', () => {
             if (options.expectedMutationGeneration !== currentMutationGeneration) {
                 throw new Error('mutation-generation-conflict')
             }
+            return { kind: 'committed', revision: 61, projection: 'applied' }
         })
 
         await expect(
