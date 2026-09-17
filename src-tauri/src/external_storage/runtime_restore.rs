@@ -600,6 +600,13 @@ async fn resume_task(app: AppHandle, original: DurableJob, session_id: String) {
         if let Ok(mut active) = app.state::<JobCommandState>().active.lock() {
             active.remove(&original.id);
         }
+        // The outcome above may have failed the job, which the caller's copy
+        // does not show.
+        if let Ok(settled) = JobStore::open(app.state::<DeviceBackupState>().repository_root())
+            .and_then(|store| store.read(&original.id))
+        {
+            runtime::release_leases(&app, &settled);
+        }
     }
 }
 
@@ -863,10 +870,13 @@ pub(crate) fn settle_device_restore(
     if job.request.kind != JobKind::Restore {
         return Err(device_command_error());
     }
-    if !job.terminal() {
-        let mut job = job.clone();
-        finalize_maintenance_outcome(&store, &mut job).map_err(|_| device_command_error())?;
-    }
+    let job = if job.terminal() {
+        job
+    } else {
+        let mut settled = job;
+        finalize_maintenance_outcome(&store, &mut settled).map_err(|_| device_command_error())?;
+        settled
+    };
     if session.phase != "committed" {
         if let Some(stage) = session.new_generation.as_deref() {
             let cleanup = app
@@ -890,6 +900,7 @@ pub(crate) fn settle_device_restore(
     if let Ok(mut active) = app.state::<JobCommandState>().active.lock() {
         active.remove(&job.id);
     }
+    runtime::release_leases(&app, &job);
     let staging =
         runtime::job_directory(&root, &job.request.connection_id, &job.id).join("restore-snapshot");
     cleanup_staging(&staging);
@@ -942,6 +953,7 @@ pub(crate) fn reconcile_device_restore_settlements(app: &AppHandle) -> Result<()
             if let Ok(mut active) = app.state::<JobCommandState>().active.lock() {
                 active.remove(&job.id);
             }
+            runtime::release_leases(app, &job);
         }
     }
     Ok(())

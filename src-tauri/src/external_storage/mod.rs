@@ -23,6 +23,7 @@ pub(crate) mod http;
 mod http_tests;
 pub(crate) mod job_store;
 pub(crate) mod journal;
+pub(crate) mod leases;
 pub(crate) mod oauth;
 pub(crate) mod packaging;
 pub(crate) mod providers;

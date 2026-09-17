@@ -1,8 +1,11 @@
 //! Native job admission and bounded renderer DTOs. Network stages own no PDS mutex.
 use super::{
+    connection_commands::ConnectedRepository,
     connection_store::ConnectionStore,
     contract::*,
+    gc_store::GcStore,
     job_store::{DurableJob, JobCommandState, JobKind, JobStore, Session, StartJobRequest},
+    leases,
     publication::ExecutionSession,
 };
 use crate::persistent_store::{
@@ -13,7 +16,7 @@ use crate::persistent_store::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::{collections::BTreeSet, path::PathBuf};
 use tauri::{AppHandle, Manager};
 
 pub(crate) fn now_ms() -> u64 {
@@ -532,6 +535,90 @@ fn settle_interrupted(job: &mut DurableJob, complete: Option<Value>, uncertain: 
     }
     job.summary["updatedAtMs"] = json!(now_ms().to_string());
 }
+fn lease_context<'a>(
+    root: &'a std::path::Path,
+    connected: &'a ConnectedRepository,
+    writer_id: &'a str,
+) -> leases::LeaseContext<'a> {
+    leases::LeaseContext {
+        root,
+        connection_id: &connected.stored.id,
+        writer_id,
+        descriptor: &connected.stored.descriptor,
+        root_key: &connected.root_key,
+        provider: connected.provider.as_ref(),
+        repository: &connected.handle,
+    }
+}
+
+/// What every job does before it asks the repository for data: resolve what an
+/// interrupted run left, confirm this job's lease, and stop while another
+/// device is removing objects. A repository that cannot remove anything has
+/// nothing to announce and nothing to wait for.
+pub(crate) async fn enter_repository(
+    app: &AppHandle,
+    connected: &ConnectedRepository,
+    job: &DurableJob,
+    cancel: &Cancellation,
+) -> Result<()> {
+    if connected.stored.capabilities.require_cleanup().is_err() {
+        return Ok(());
+    }
+    let root = root(app)?;
+    let writer_id = native_store(app)?
+        .external_identity()
+        .map_err(local_error)?
+        .store_id;
+    let live: BTreeSet<String> = JobStore::open(&root)?
+        .list_pending()?
+        .into_iter()
+        .filter(|item| item.request.connection_id == job.request.connection_id)
+        .map(|item| item.id)
+        .collect();
+    let context = lease_context(&root, connected, &writer_id);
+    leases::resume(&context, &live, cancel).await?;
+    leases::admit(&context, &job.id, now_ms(), cancel).await?;
+    Ok(())
+}
+
+/// Hands back the leases of a job that reached an end. A job that is waiting,
+/// uncertain or still running keeps them, and so does a cancelled one whose
+/// remote requests have not been seen to end.
+async fn leave_repository(app: &AppHandle, connection_id: &str, job_id: &str) -> Result<()> {
+    let root = root(app)?;
+    if GcStore::open(&root)?
+        .lease_intents(connection_id)?
+        .iter()
+        .all(|row| row.job_id != job_id)
+    {
+        return Ok(());
+    }
+    let connected = super::connection_commands::open_connected(app, connection_id).await?;
+    let writer_id = native_store(app)?
+        .external_identity()
+        .map_err(local_error)?
+        .store_id;
+    leases::release(&lease_context(&root, &connected, &writer_id), job_id).await
+}
+
+/// The release for the sites that end a job without an asynchronous context.
+/// A failure leaves the lease for the next run on this connection to resolve.
+pub(crate) fn release_leases(app: &AppHandle, job: &DurableJob) {
+    if !job.terminal() {
+        return;
+    }
+    let app = app.clone();
+    let connection_id = job.request.connection_id.clone();
+    let job_id = job.id.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = leave_repository(&app, &connection_id, &job_id).await {
+            crate::nlog!(
+                "error",
+                "External storage lease could not be released: {error}"
+            );
+        }
+    });
+}
 pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
     let job = JobStore::open(&root(&app)?)?.read(&id)?;
     if job.terminal() {
@@ -556,9 +643,10 @@ pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
             (job.request.connection_id.clone(), cancel.clone()),
         );
     }
+    let connection_id = job.request.connection_id.clone();
     tauri::async_runtime::spawn(async move {
         let result = run_job(&app, &id, &cancel).await;
-        let persisted = (|| -> Result<()> {
+        let persisted = (|| -> Result<bool> {
             let store = JobStore::open(&root(&app)?)?;
             let mut job = store.read(&id)?;
             match result {
@@ -655,10 +743,22 @@ pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
                 }
             }
             job.summary["updatedAtMs"] = json!(now_ms().to_string());
-            store.put(&job)
+            store.put(&job)?;
+            Ok(job.terminal())
         })();
-        if persisted.is_err() {
-            crate::nlog!("error", "External job outcome could not be persisted");
+        match persisted {
+            // The outcome is durable before the lease goes, so a loss here
+            // leaves a lease the next run on this connection resolves.
+            Ok(true) => {
+                if let Err(error) = leave_repository(&app, &connection_id, &id).await {
+                    crate::nlog!(
+                        "error",
+                        "External storage lease could not be released: {error}"
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(_) => crate::nlog!("error", "External job outcome could not be persisted"),
         }
         if let Ok(mut active) = app.state::<JobCommandState>().active.lock() {
             active.remove(&id);
@@ -755,6 +855,7 @@ async fn run_job(app: &AppHandle, id: &str, cancel: &Cancellation) -> Result<Val
     let connected =
         super::connection_commands::open_connected(app, &job.request.connection_id).await?;
     cancel.check()?;
+    enter_repository(app, &connected, &job, cancel).await?;
     match job.request.kind {
         JobKind::Backup => run_backup(app, &connected, &job, cancel).await,
         JobKind::Sync | JobKind::ResolveConflict => {
