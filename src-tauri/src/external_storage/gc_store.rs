@@ -5,7 +5,7 @@
 // The run that writes these tables is wired with the removal path; the usage
 // summary is the only reader until then.
 #![cfg_attr(not(test), allow(dead_code))]
-use super::contract::{ErrorKind, ObjectRole, ProviderError, RemoteLocator, Result};
+use super::contract::{ErrorKind, LeaseKind, ObjectRole, ProviderError, RemoteLocator, Result};
 use rusqlite::{Connection, OptionalExtension};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -37,6 +37,9 @@ fn role_name(role: ObjectRole) -> Result<String> {
 fn decode_role(value: &str) -> Result<ObjectRole> {
     serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(|_| corrupt())
 }
+fn decode_lease_kind(value: &str) -> Result<LeaseKind> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(|_| corrupt())
+}
 fn count(value: u64) -> Result<i64> {
     i64::try_from(value).map_err(|_| corrupt())
 }
@@ -53,6 +56,58 @@ pub(crate) struct CommittedDeletion {
     pub byte_length: u64,
     pub decided_at_ms: u64,
     pub done: bool,
+}
+
+/// How far one lease got. A `Pending` row names bytes that may or may not have
+/// reached the repository; a `Releasing` row names an object this device has
+/// decided to remove but has not seen removed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LeaseState {
+    Pending,
+    Confirmed,
+    Releasing,
+}
+impl LeaseState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Confirmed => "confirmed",
+            Self::Releasing => "releasing",
+        }
+    }
+    fn parse(value: &str) -> Result<Self> {
+        Ok(match value {
+            "pending" => Self::Pending,
+            "confirmed" => Self::Confirmed,
+            "releasing" => Self::Releasing,
+            _ => return Err(corrupt()),
+        })
+    }
+}
+
+/// One lease this device decided to place, written before the request that
+/// places it. `bytes` is the sealed object exactly as it was first sent, so a
+/// retry after an unclear answer writes the same name with the same content.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LeaseIntent {
+    pub locator: RemoteLocator,
+    pub kind: LeaseKind,
+    pub job_id: String,
+    pub seq: u64,
+    pub bytes: Vec<u8>,
+    pub state: LeaseState,
+    pub created_at_ms: u64,
+}
+
+/// One removal request this device sent. The row outlives the request: it is
+/// only marked finished once the remote end is known, never after a local
+/// timeout, a cancellation or a restart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeleteRequest {
+    pub locator: RemoteLocator,
+    pub attempt_id: String,
+    pub sent_at_ms: u64,
+    pub finished: bool,
 }
 
 pub(crate) struct GcStore(Connection);
@@ -311,6 +366,221 @@ impl GcStore {
         Ok(())
     }
 
+    /// Writes the intent of a lease this device is about to place. The row has
+    /// to exist before the request leaves, or a lost answer would leave an
+    /// object this device can neither name nor remove.
+    pub(crate) fn put_lease_intent(&self, connection_id: &str, intent: &LeaseIntent) -> Result<()> {
+        self.0
+            .execute(
+                "INSERT INTO lease_intents(connection_id,locator,kind,job_id,seq,bytes,state,created_at_ms)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                rusqlite::params![
+                    connection_id,
+                    locator_key(&intent.locator)?,
+                    intent.kind.as_str(),
+                    intent.job_id,
+                    count(intent.seq)?,
+                    intent.bytes,
+                    intent.state.as_str(),
+                    count(intent.created_at_ms)?,
+                ],
+            )
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    /// Moves a placed lease to the locator the repository answered with and
+    /// records that it exists. The two happen together: a confirmed row is the
+    /// one an enumeration can be matched against.
+    pub(crate) fn confirm_lease_intent(
+        &self,
+        connection_id: &str,
+        placed: &RemoteLocator,
+        confirmed: &RemoteLocator,
+    ) -> Result<()> {
+        let transaction = self.0.unchecked_transaction().map_err(storage)?;
+        let moved = transaction
+            .execute(
+                "UPDATE lease_intents SET locator=?3, state='confirmed'
+                 WHERE connection_id=?1 AND locator=?2",
+                rusqlite::params![
+                    connection_id,
+                    locator_key(placed)?,
+                    locator_key(confirmed)?
+                ],
+            )
+            .map_err(storage)?;
+        if moved != 1 {
+            return Err(corrupt());
+        }
+        transaction.commit().map_err(storage)
+    }
+
+    pub(crate) fn set_lease_state(
+        &self,
+        connection_id: &str,
+        locator: &RemoteLocator,
+        state: LeaseState,
+    ) -> Result<()> {
+        self.0
+            .execute(
+                "UPDATE lease_intents SET state=?3 WHERE connection_id=?1 AND locator=?2",
+                rusqlite::params![connection_id, locator_key(locator)?, state.as_str()],
+            )
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    /// Forgets a lease this device has seen removed from the repository.
+    pub(crate) fn remove_lease_intent(
+        &self,
+        connection_id: &str,
+        locator: &RemoteLocator,
+    ) -> Result<()> {
+        self.0
+            .execute(
+                "DELETE FROM lease_intents WHERE connection_id=?1 AND locator=?2",
+                rusqlite::params![connection_id, locator_key(locator)?],
+            )
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    /// Every lease this device placed on this connection. What is not in here
+    /// belongs to another device, whatever its name says.
+    pub(crate) fn lease_intents(&self, connection_id: &str) -> Result<Vec<LeaseIntent>> {
+        let mut query = self
+            .0
+            .prepare(
+                "SELECT locator,kind,job_id,seq,bytes,state,created_at_ms FROM lease_intents
+                 WHERE connection_id=?1 ORDER BY job_id,seq,locator",
+            )
+            .map_err(storage)?;
+        let rows = query
+            .query_map([connection_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .map_err(storage)?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (locator, kind, job_id, seq, bytes, state, created_at_ms) = row.map_err(storage)?;
+            result.push(LeaseIntent {
+                locator: decode_locator(&locator)?,
+                kind: decode_lease_kind(&kind)?,
+                job_id,
+                seq: amount(seq)?,
+                bytes,
+                state: LeaseState::parse(&state)?,
+                created_at_ms: amount(created_at_ms)?,
+            });
+        }
+        Ok(result)
+    }
+
+    /// Records a removal request before it is sent. The row is what tells a
+    /// later run that a request may still be running somewhere.
+    pub(crate) fn record_delete_request(
+        &self,
+        connection_id: &str,
+        locator: &RemoteLocator,
+        attempt_id: &str,
+        sent_at_ms: u64,
+    ) -> Result<()> {
+        self.0
+            .execute(
+                "INSERT OR IGNORE INTO delete_requests(connection_id,locator,attempt_id,sent_at_ms,finished)
+                 VALUES(?1,?2,?3,?4,0)",
+                rusqlite::params![
+                    connection_id,
+                    locator_key(locator)?,
+                    attempt_id,
+                    count(sent_at_ms)?
+                ],
+            )
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    /// Records that the repository answered for one request. Only an answer
+    /// does this; a local timeout, a cancellation or a restart does not.
+    pub(crate) fn finish_delete_request(
+        &self,
+        connection_id: &str,
+        locator: &RemoteLocator,
+        attempt_id: &str,
+    ) -> Result<()> {
+        self.0
+            .execute(
+                "UPDATE delete_requests SET finished=1
+                 WHERE connection_id=?1 AND locator=?2 AND attempt_id=?3",
+                rusqlite::params![connection_id, locator_key(locator)?, attempt_id],
+            )
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    /// The requests whose remote end is still unknown. `attempt` narrows the
+    /// answer to one removal attempt, which is what a marker is held for.
+    pub(crate) fn unfinished_delete_requests(
+        &self,
+        connection_id: &str,
+        attempt: Option<&str>,
+    ) -> Result<Vec<DeleteRequest>> {
+        let mut query = self
+            .0
+            .prepare(
+                "SELECT locator,attempt_id,sent_at_ms FROM delete_requests
+                 WHERE connection_id=?1 AND finished=0 AND (?2 IS NULL OR attempt_id=?2)
+                 ORDER BY attempt_id,locator",
+            )
+            .map_err(storage)?;
+        let rows = query
+            .query_map(rusqlite::params![connection_id, attempt], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(storage)?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (locator, attempt_id, sent_at_ms) = row.map_err(storage)?;
+            result.push(DeleteRequest {
+                locator: decode_locator(&locator)?,
+                attempt_id,
+                sent_at_ms: amount(sent_at_ms)?,
+                finished: false,
+            });
+        }
+        Ok(result)
+    }
+
+    /// Drops the answered requests of one finished attempt. A request whose
+    /// remote end is still unknown stays, so the marker above it stays too.
+    pub(crate) fn forget_finished_delete_requests(
+        &self,
+        connection_id: &str,
+        attempt_id: &str,
+    ) -> Result<()> {
+        self.0
+            .execute(
+                "DELETE FROM delete_requests
+                 WHERE connection_id=?1 AND attempt_id=?2 AND finished=1",
+                rusqlite::params![connection_id, attempt_id],
+            )
+            .map_err(storage)?;
+        Ok(())
+    }
+
     /// Removes everything this connection owns. A removed connection keeps no
     /// observation, no committed target and no outstanding request.
     pub(crate) fn forget_connection(&self, connection_id: &str) -> Result<()> {
@@ -491,6 +761,112 @@ mod tests {
                 .unwrap();
             assert_eq!(rows, 0, "{table} kept a row");
         }
+    }
+
+    fn intent(object: &str, kind: LeaseKind, seq: u64) -> LeaseIntent {
+        LeaseIntent {
+            locator: locator(None, object),
+            kind,
+            job_id: "job".into(),
+            seq,
+            bytes: vec![1, 2, 3],
+            state: LeaseState::Pending,
+            created_at_ms: 1_000,
+        }
+    }
+
+    /// GC27: the bytes a retry resends come back from the row, not from a
+    /// document built again, and confirming moves the row to the locator the
+    /// repository answered with.
+    #[test]
+    fn a_lease_intent_keeps_its_bytes_and_moves_to_the_confirmed_locator() {
+        let (_root, store) = store();
+        let placed = intent("work-a", LeaseKind::Work, 1);
+        store.put_lease_intent("connection", &placed).unwrap();
+        assert_eq!(store.lease_intents("connection").unwrap(), vec![placed.clone()]);
+        let confirmed = locator(Some("leases"), "leases/work-a");
+        store
+            .confirm_lease_intent("connection", &placed.locator, &confirmed)
+            .unwrap();
+        let rows = store.lease_intents("connection").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].locator, confirmed);
+        assert_eq!(rows[0].state, LeaseState::Confirmed);
+        assert_eq!(rows[0].bytes, placed.bytes);
+        // Confirming a row that was never written is a fault, not a new row.
+        assert_eq!(
+            store
+                .confirm_lease_intent("connection", &locator(None, "work-b"), &confirmed)
+                .unwrap_err()
+                .kind,
+            ErrorKind::Corrupt
+        );
+    }
+
+    /// GC27: one job's renewal and its predecessor coexist, and the same tag
+    /// under two kinds does not collide.
+    #[test]
+    fn two_lease_rows_of_one_job_and_two_kinds_of_one_tag_coexist() {
+        let (_root, store) = store();
+        store
+            .put_lease_intent("connection", &intent("work-a", LeaseKind::Work, 1))
+            .unwrap();
+        store
+            .put_lease_intent("connection", &intent("work-b", LeaseKind::Work, 2))
+            .unwrap();
+        store
+            .put_lease_intent("connection", &intent("deleting-a", LeaseKind::Deleting, 1))
+            .unwrap();
+        assert_eq!(store.lease_intents("connection").unwrap().len(), 3);
+        store
+            .set_lease_state("connection", &locator(None, "work-a"), LeaseState::Releasing)
+            .unwrap();
+        store
+            .remove_lease_intent("connection", &locator(None, "work-a"))
+            .unwrap();
+        let rows = store.lease_intents("connection").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.locator.object != "work-a"));
+    }
+
+    /// GC31: the row of a request whose answer never arrived stays unfinished,
+    /// and a different attempt's answered request does not clear it.
+    #[test]
+    fn a_delete_request_stays_unfinished_until_its_own_answer_arrives() {
+        let (_root, store) = store();
+        let pack = locator(None, "pack-a");
+        let catalog = locator(None, "catalog-a");
+        store
+            .record_delete_request("connection", &pack, "attempt-1", 10)
+            .unwrap();
+        store
+            .record_delete_request("connection", &catalog, "attempt-2", 20)
+            .unwrap();
+        // Sending the same request again keeps the first record.
+        store
+            .record_delete_request("connection", &pack, "attempt-1", 99)
+            .unwrap();
+        store
+            .finish_delete_request("connection", &catalog, "attempt-2")
+            .unwrap();
+        let outstanding = store.unfinished_delete_requests("connection", None).unwrap();
+        assert_eq!(outstanding.len(), 1);
+        assert_eq!(outstanding[0].locator, pack);
+        assert_eq!(outstanding[0].sent_at_ms, 10);
+        assert!(store
+            .unfinished_delete_requests("connection", Some("attempt-2"))
+            .unwrap()
+            .is_empty());
+        store
+            .forget_finished_delete_requests("connection", "attempt-1")
+            .unwrap();
+        assert_eq!(
+            store
+                .unfinished_delete_requests("connection", Some("attempt-1"))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
