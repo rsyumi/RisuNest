@@ -25,7 +25,6 @@ fn all_live_tables_have_an_explicit_preservation_owner() {
         "content_changes",
         "content_change_consumers",
         "content_change_floor",
-        "content_capture_reservations",
         "library_sync_selection",
         "local_library_identity",
         "external_storage_jobs",
@@ -36,7 +35,6 @@ fn all_live_tables_have_an_explicit_preservation_owner() {
         "external_storage_captures",
         "external_storage_capture_refs",
         "external_storage_capture_files",
-        "external_storage_content_cache",
     ];
     let server_operations = [
         "server_sync_state",
@@ -83,4 +81,41 @@ fn all_live_tables_have_an_explicit_preservation_owner() {
     );
     assert!(!portable.contains(&"asset_alias_replacement_candidates"));
     assert!(!portable.contains(&"server_sync_operation"));
+}
+
+#[test]
+fn content_change_schema_retains_live_protections_without_write_only_tables() {
+    let mut db = rusqlite::Connection::open_in_memory().unwrap();
+    super::schema::initialize(&mut db).unwrap();
+    for name in ["content_capture_reservations", "external_storage_content_cache"] {
+        let exists: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [name],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(!exists, "retired table remains: {name}");
+    }
+    for name in [
+        "content_changes", "content_change_context", "content_change_floor",
+        "content_change_consumers", "external_storage_captures",
+        "external_storage_capture_files", "external_storage_capture_refs", "server_sync_dirty",
+    ] {
+        let exists: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [name],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(exists, "live protection table missing: {name}");
+    }
+    let primary_key = db.prepare(
+        "SELECT name FROM pragma_table_info('content_changes') WHERE pk>0 ORDER BY pk",
+    ).unwrap().query_map([], |row| row.get::<_, String>(0)).unwrap()
+        .collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(primary_key, ["generation", "kind", "key1", "key2"]);
+    assert!(db.execute("UPDATE content_change_floor SET revision=-1", []).is_err());
+    assert!(db.execute("INSERT INTO content_change_consumers VALUES('negative','revision-0',-1,0)", []).is_err());
+    assert!(db.execute("INSERT INTO content_change_consumers VALUES('invalid-rebuild','revision-0',0,2)", []).is_err());
+    assert!(db.execute("INSERT INTO content_change_context VALUES(1,'revision-0',0,'unknown')", []).is_err());
+    let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+    assert_eq!(version, super::schema::SCHEMA_VERSION);
 }

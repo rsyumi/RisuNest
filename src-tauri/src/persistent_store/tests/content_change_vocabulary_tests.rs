@@ -2,6 +2,9 @@
 use super::super::content_change_index as changes;
 use super::*;
 
+#[path = "content_change_index_tests.rs"]
+mod content_change_index_tests;
+
 fn recorded(store: &PersistentStore, after_revision: i64) -> Vec<(String, String, String)> {
     let generation = active_generation(&store.connection).expect("active generation");
     let mut statement = store
