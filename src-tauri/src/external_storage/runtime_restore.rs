@@ -600,6 +600,13 @@ async fn resume_task(app: AppHandle, original: DurableJob, session_id: String) {
         if let Ok(mut active) = app.state::<JobCommandState>().active.lock() {
             active.remove(&original.id);
         }
+        // The outcome above may have failed the job, which the caller's copy
+        // does not show.
+        if let Ok(settled) = JobStore::open(app.state::<DeviceBackupState>().repository_root())
+            .and_then(|store| store.read(&original.id))
+        {
+            runtime::release_leases(&app, &settled);
+        }
     }
 }
 
