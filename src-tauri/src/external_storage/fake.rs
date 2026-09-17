@@ -101,6 +101,7 @@ pub(super) struct FakeState {
     reads: BTreeMap<String, ProviderError>,
     read_attempts: Vec<String>,
     upload_attempts: Vec<String>,
+    upload_locators: BTreeMap<String, String>,
     reconcile_attempts: Vec<String>,
     scripted_pages: Vec<(Collection, Result<ObjectPage>)>,
 }
@@ -181,6 +182,18 @@ impl FakeProvider {
     }
     pub(crate) fn upload_attempts(&self, object: &str) -> usize {
         self.state.lock().unwrap().upload_attempts.iter().filter(|id| id.as_str() == object).count()
+    }
+    pub(crate) fn set_upload_locator(&self, object_id: &str, locator: &str) {
+        self.state.lock().unwrap().upload_locators.insert(object_id.into(), locator.into());
+    }
+    pub(crate) fn uploaded_ids(&self) -> Vec<String> {
+        self.state.lock().unwrap().upload_attempts.clone()
+    }
+    pub(crate) fn listing_count(&self) -> usize {
+        self.state.lock().unwrap().listings
+    }
+    pub(crate) fn deletion_order(&self) -> Vec<String> {
+        self.state.lock().unwrap().delete_attempts.clone()
     }
     pub(crate) fn reconcile_attempts(&self, object: &str) -> usize {
         self.state.lock().unwrap().reconcile_attempts.iter().filter(|id| id.as_str() == object).count()
@@ -358,26 +371,25 @@ impl Provider for FakeProvider {
             {
                 return Err(ProviderError::new(ErrorKind::Corrupt));
             }
-            let locator = RemoteLocator {
-                connection_identity: r.connection_identity.clone(),
-                collection: None,
-                object: intent.object_id.clone(),
-            };
             let receipt = {
                 let mut state = self.state.lock().unwrap();
-                if let Some((old, _)) = state.objects.get(&intent.object_id) {
-                    if old != &bytes || state.roles.get(&intent.object_id) != Some(&intent.role) {
+                let remote_id = state.upload_locators.get(&intent.object_id)
+                    .cloned().unwrap_or_else(|| intent.object_id.clone());
+                if let Some((old, _)) = state.objects.get(&remote_id) {
+                    if old != &bytes || state.roles.get(&remote_id) != Some(&intent.role) {
                         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
                     }
                 } else {
                     state.next_version += 1;
                     let v = state.next_version;
-                    state.objects.insert(intent.object_id.clone(), (bytes, v));
-                    state.roles.insert(intent.object_id.clone(), intent.role);
+                    state.objects.insert(remote_id.clone(), (bytes, v));
+                    state.roles.insert(remote_id.clone(), intent.role);
                 }
-                let (_, v) = state.objects.get(&intent.object_id).unwrap();
+                let (_, v) = state.objects.get(&remote_id).unwrap();
                 ObjectReceipt {
-                    locator,
+                    locator: RemoteLocator {
+                        connection_identity: r.connection_identity.clone(), collection: None, object: remote_id,
+                    },
                     byte_length: intent.byte_length,
                     version: Some(VersionToken(v.to_string())),
                     checksum: None,
@@ -545,12 +557,13 @@ impl Provider for FakeProvider {
             intent.validate(repository)?;
             let mut state = self.state.lock().unwrap();
             state.reconcile_attempts.push(intent.object_id.clone());
-            let Some((bytes, version)) = state.objects.get(&intent.object_id) else {
+            let remote_id = state.upload_locators.get(&intent.object_id).unwrap_or(&intent.object_id);
+            let Some((bytes, version)) = state.objects.get(remote_id) else {
                 return Ok(UploadResolution::RestartRequired);
             };
             if bytes.len() as u64 != intent.byte_length
                 || risunest_sync_wire::hash(bytes) != intent.sha256
-                || state.roles.get(&intent.object_id) != Some(&intent.role)
+                || state.roles.get(remote_id) != Some(&intent.role)
             {
                 return Ok(UploadResolution::Conflict);
             }
@@ -558,7 +571,7 @@ impl Provider for FakeProvider {
                 locator: RemoteLocator {
                     connection_identity: repository.connection_identity.clone(),
                     collection: None,
-                    object: intent.object_id.clone(),
+                    object: remote_id.clone(),
                 },
                 byte_length: intent.byte_length,
                 version: Some(VersionToken(version.to_string())),
@@ -826,6 +839,38 @@ impl SecretVault for MemoryVault {
             self.secrets.lock().unwrap().remove(&reference.0);
             Ok(())
         })
+    }
+}
+
+/// Wall time, elapsed time and lifecycle can advance independently without sleeps.
+pub(crate) struct FakeLeaseClock(Mutex<super::leases::ClockReading>);
+impl FakeLeaseClock {
+    pub(crate) fn new(wall_ms: u64) -> Self {
+        Self(Mutex::new(super::leases::ClockReading {
+            wall_ms, monotonic_ms: 0, epoch: 0, foreground: true, trusted: true,
+        }))
+    }
+    pub(crate) fn advance(&self, milliseconds: u64) {
+        let mut now = self.0.lock().unwrap();
+        now.wall_ms = now.wall_ms.checked_add(milliseconds).unwrap();
+        now.monotonic_ms = now.monotonic_ms.checked_add(milliseconds).unwrap();
+    }
+    pub(crate) fn set_trusted(&self, trusted: bool) {
+        self.0.lock().unwrap().trusted = trusted;
+    }
+    pub(crate) fn suspend(&self) {
+        let mut now = self.0.lock().unwrap();
+        now.epoch += 1;
+        now.foreground = false;
+        now.trusted = false;
+    }
+    pub(crate) fn foreground(&self) {
+        self.0.lock().unwrap().foreground = true;
+    }
+}
+impl super::leases::LeaseClock for FakeLeaseClock {
+    fn reading(&self) -> super::leases::ClockReading {
+        *self.0.lock().unwrap()
     }
 }
 

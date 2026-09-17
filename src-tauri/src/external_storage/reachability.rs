@@ -1,1109 +1,620 @@
-//! What the current roots still reach, and which enumerated states and bundles
-//! a cleanup may remove. This stage reads documents and decides; it never
-//! deletes. A root this device cannot read ends the run with nothing to remove.
-// The run that consumes a mark is wired with the removal path; the usage
-// summary is the only reader until then.
+//! Fresh reachability over authenticated roots and a bounded ownership universe.
+//! Snapshot discovery is not permission to collect another writer's objects.
 use super::{
     contract::{
-        Cancellation, ErrorKind, ObjectReceipt, ObjectRole, ProviderError, ProviderFuture, Result,
+        Cancellation, ErrorKind, ObjectReceipt, ObjectRole, ProviderError, ProviderFuture,
+        RepositoryHandle, Result,
     },
-    control,
-    gc_store::{locator_key, CommittedDeletion, GcStore},
+    gc_store::{locator_key, GcStore},
+    leases::UNREACHABLE_GRACE_MS,
     packaging::RemoteObject,
 };
-use risunest_external_storage_format::snapshot as wire;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::Path,
 };
-
-/// How long a state or bundle stays protected after this device first saw it,
-/// and how long an ancestor stays protected after its successor appeared.
-pub(crate) const GRACE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 fn corrupt() -> ProviderError {
     ProviderError::new(ErrorKind::Corrupt)
 }
-fn missing() -> ProviderError {
-    ProviderError::new(ErrorKind::NotFound)
-}
 
-/// Every object a state or bundle document names directly: both library
-/// catalogs and one entries root per published section. A publication that
-/// only changed the library still names the sections it carried forward.
-pub(crate) fn document_references(view: &control::SnapshotView) -> Vec<&wire::StoredObject> {
-    [&view.library.record_catalog, &view.library.asset_catalog]
-        .into_iter()
+/// Every published section is included, even if this device no longer selects it.
+pub(crate) fn document_references(
+    view: &super::control::SnapshotView,
+) -> Vec<&risunest_external_storage_format::snapshot::StoredObject> {
+    std::iter::once(&view.library.record_catalog)
+        .chain(std::iter::once(&view.library.asset_catalog))
         .chain(view.sections.values().map(|section| &section.entries_root))
         .collect()
 }
 
-/// One state or bundle document reduced to what a mark follows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DocumentNode {
     pub snapshot_id: String,
-    /// The state this one replaced, when the document names one. A bundle
-    /// wrapped around a capture has no lineage of its own.
     pub parent_snapshot_id: Option<String>,
     pub references: Vec<RemoteObject>,
 }
 
-/// Reads the immutable documents a mark follows. Where a failed read leaves the
-/// run is decided by the caller, not here: under a root it ends the run, under
-/// a candidate it only drops that candidate.
 pub(crate) trait DocumentSource: Sync {
-    /// A state or bundle this device already holds an authenticated reference
-    /// to, such as the one the head names.
     fn document<'a>(&'a self, object: &'a RemoteObject) -> ProviderFuture<'a, DocumentNode>;
-    /// An enumerated state or bundle, whose identity comes from its envelope.
     fn listed<'a>(
-        &'a self,
-        receipt: &'a ObjectReceipt,
+        &'a self, receipt: &'a ObjectReceipt,
     ) -> ProviderFuture<'a, (RemoteObject, DocumentNode)>;
-    /// The catalog nodes and packs one catalog node names.
     fn catalog<'a>(&'a self, object: &'a RemoteObject) -> ProviderFuture<'a, Vec<RemoteObject>>;
+    /// Verify current identity and bytes. Only a confirmed missing object is None.
+    fn probe<'a>(&'a self, object: &'a RemoteObject) -> ProviderFuture<'a, Option<ObjectReceipt>>;
 }
 
-/// What this run must not remove, gathered before the mark starts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Roots {
-    /// The state the current head names. A backup-only repository has none.
     pub head: Option<RemoteObject>,
-    /// Backup point documents the retention decision keeps.
     pub kept_points: Vec<RemoteObject>,
-    /// The bundles those points name. A conflict point names two.
     pub kept_bundles: Vec<RemoteObject>,
-    /// Fragments an unfinished job on this device uploaded before any document
-    /// could name them. They are protected as they are and never followed: the
-    /// journal that named one names everything that job put below it, and a
-    /// fragment carries no authenticated reference this device could check.
     pub job_objects: Vec<ObjectReceipt>,
-    /// States and bundles an unfinished job on this device targets.
+    /// Authenticated source references also protect reused catalog children.
+    pub job_references: Vec<RemoteObject>,
     pub job_snapshot_ids: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RetiredPoint {
+    pub point: RemoteObject,
+    pub bundles: Vec<RemoteObject>,
 }
 
 pub(crate) struct MarkRequest<'a> {
     pub connection_id: &'a str,
+    pub repository: &'a RepositoryHandle,
+    pub format_repository_id: &'a str,
     pub now_ms: u64,
     pub roots: Roots,
-    /// Everything the snapshot collection answered, read to the end.
     pub listed: Vec<ObjectReceipt>,
-    /// Backup point documents the retention decision dropped. The bundles they
-    /// named come back from the snapshot enumeration on their own.
-    pub dropped_points: Vec<RemoteObject>,
-}
-
-/// The ledger target that carries when this device first saw one state take the
-/// position that displaces its parent. A state identifier never holds a slash,
-/// so this can never collide with the state's own row.
-fn displacement_of(snapshot_id: &str) -> String {
-    format!("head/{snapshot_id}")
+    /// Objects recorded by this device's existing packaging/transfer inventory.
+    pub known_objects: Vec<RemoteObject>,
+    pub retired_points: Vec<RetiredPoint>,
 }
 
 pub(crate) struct Mark {
-    /// Every object the roots reach, keyed the way the cleanup tables key one.
     pub reachable: BTreeSet<String>,
     pub reachable_bytes: u64,
-    /// The committed list this run left behind, each parent ahead of the
-    /// objects below it. It is already stored when the mark answers.
-    pub candidates: Vec<CommittedDeletion>,
-    /// Enumerated documents this run could not read. It removes neither them
-    /// nor anything under them.
-    pub skipped: usize,
-    /// The stored list could not be read, so this run started a new one and
-    /// whatever the old one named is no longer nameable.
-    pub list_recomputed: bool,
+    /// Parents precede children; all entries passed this run's seven-day check.
+    pub candidates: Vec<RemoteObject>,
+    pub deferred: usize,
 }
 
-fn candidate_of(object: &RemoteObject, now_ms: u64) -> CommittedDeletion {
-    CommittedDeletion {
-        locator: object.receipt.locator.clone(),
-        role: object.role,
-        byte_length: object.receipt.byte_length,
-        decided_at_ms: now_ms,
-        done: false,
+pub(crate) fn object_identity(object: &RemoteObject, repository: &RepositoryHandle) -> Result<String> {
+    let encoded = serde_json::to_vec(&object.stored(repository)?).map_err(|_| corrupt())?;
+    Ok(risunest_sync_wire::hash(&encoded))
+}
+fn validate_object(
+    object: &RemoteObject, repository: &RepositoryHandle, format_repository_id: &str,
+) -> Result<()> {
+    object.stored(repository)?;
+    if object.repository_id != format_repository_id
+        || matches!(object.role, ObjectRole::Descriptor | ObjectRole::Lease)
+    {
+        return Err(corrupt());
     }
+    Ok(())
 }
 
-type Listed = BTreeMap<String, (RemoteObject, DocumentNode)>;
-
-/// The objects one already visited object names.
-async fn expand(
-    object: &RemoteObject,
-    source: &dyn DocumentSource,
-    listed: &Listed,
-) -> Result<Vec<RemoteObject>> {
-    match object.role {
-        ObjectRole::SyncState | ObjectRole::BackupBundle => {
-            let key = locator_key(&object.receipt.locator)?;
-            match listed.get(&key) {
-                Some((_, node)) => Ok(node.references.clone()),
-                None => Ok(source.document(object).await?.references),
+#[derive(Clone)]
+struct Node {
+    object: RemoteObject,
+    children: BTreeSet<String>,
+}
+#[derive(Default)]
+struct Graph {
+    nodes: BTreeMap<String, Node>,
+    missing: BTreeSet<String>,
+    identities: BTreeMap<String, String>,
+}
+impl Graph {
+    fn check_acyclic(&self) -> Result<()> {
+        let mut incoming: BTreeMap<_, usize> = self.nodes.keys().map(|key| (key.clone(), 0)).collect();
+        for node in self.nodes.values() {
+            for child in &node.children {
+                if let Some(count) = incoming.get_mut(child) {
+                    *count = count.checked_add(1).ok_or_else(corrupt)?;
+                } else if !self.missing.contains(child) {
+                    return Err(corrupt());
+                }
             }
         }
-        ObjectRole::Catalog => source.catalog(object).await,
-        ObjectRole::Pack
-        | ObjectRole::BackupPoint
-        | ObjectRole::Descriptor
-        | ObjectRole::Lease => Ok(Vec::new()),
+        let mut ready: VecDeque<_> = incoming.iter().filter(|(_, count)| **count == 0)
+            .map(|(key, _)| key.clone()).collect();
+        let mut visited = 0;
+        while let Some(key) = ready.pop_front() {
+            visited += 1;
+            for child in &self.nodes[&key].children {
+                if let Some(count) = incoming.get_mut(child) {
+                    *count = count.checked_sub(1).ok_or_else(corrupt)?;
+                    if *count == 0 { ready.push_back(child.clone()); }
+                }
+            }
+        }
+        if visited != self.nodes.len() { return Err(corrupt()); }
+        Ok(())
     }
 }
 
-/// Walks outward from one starting object. Parents are answered before the
-/// objects below them, which is the order a removal has to follow.
 async fn walk(
-    start: Vec<RemoteObject>,
     source: &dyn DocumentSource,
-    listed: &Listed,
-    visited: &mut BTreeSet<String>,
+    objects: Vec<RemoteObject>,
+    repository: &RepositoryHandle,
+    format_repository_id: &str,
+    tolerate_missing: bool,
     cancel: &Cancellation,
-) -> Result<Vec<RemoteObject>> {
-    let mut queue = std::collections::VecDeque::from(start);
-    let mut reached = Vec::new();
-    while let Some(object) = queue.pop_front() {
+) -> Result<Graph> {
+    let mut graph = Graph::default();
+    let mut pending: VecDeque<_> = objects.into();
+    while let Some(object) = pending.pop_front() {
         cancel.check()?;
+        validate_object(&object, repository, format_repository_id)?;
         let key = locator_key(&object.receipt.locator)?;
-        if !visited.insert(key) {
+        let identity = object_identity(&object, repository)?;
+        if let Some(previous) = graph.identities.insert(key.clone(), identity.clone()) {
+            if previous != identity { return Err(corrupt()); }
             continue;
         }
-        for next in expand(&object, source, listed).await? {
-            queue.push_back(next);
+        let Some(current) = source.probe(&object).await? else {
+            if !tolerate_missing { return Err(ProviderError::new(ErrorKind::NotFound)); }
+            graph.missing.insert(key);
+            continue;
+        };
+        if !current.complete || current.locator != object.receipt.locator
+            || current.byte_length != object.receipt.byte_length
+        {
+            return Err(corrupt());
         }
-        reached.push(object);
+        let children = match object.role {
+            ObjectRole::SyncState | ObjectRole::BackupBundle => {
+                source.document(&object).await.map(|node| node.references)
+            }
+            ObjectRole::Catalog => source.catalog(&object).await,
+            ObjectRole::Pack | ObjectRole::BackupPoint => Ok(Vec::new()),
+            ObjectRole::Descriptor | ObjectRole::Lease => return Err(corrupt()),
+        };
+        // A disappearing metadata object changes the survey even when an earlier
+        // direct probe found it. Do not hide a partially walked closure.
+        let children = children?;
+        let keys = children.iter().map(|child| locator_key(&child.receipt.locator))
+            .collect::<Result<BTreeSet<_>>>()?;
+        graph.nodes.insert(key, Node { object, children: keys });
+        pending.extend(children);
     }
-    Ok(reached)
+    graph.check_acyclic()?;
+    Ok(graph)
 }
 
-/// Decides what the repository still reaches and what this run may remove.
-///
-/// A root that cannot be read, an ancestor the enumeration no longer holds or a
-/// catalog under a root that cannot be opened all end the run with an error and
-/// leave the ledger untouched. An enumerated document that cannot be read only
-/// takes itself and everything under it out of this run.
+fn merge(target: &mut Graph, other: Graph) -> Result<()> {
+    for (key, identity) in other.identities {
+        if target.identities.insert(key, identity.clone()).is_some_and(|previous| previous != identity) {
+            return Err(corrupt());
+        }
+    }
+    for (key, node) in other.nodes {
+        if let Some(previous) = target.nodes.get(&key) {
+            if previous.children != node.children { return Err(corrupt()); }
+        } else {
+            target.nodes.insert(key, node);
+        }
+    }
+    target.missing.extend(other.missing);
+    if target.missing.iter().any(|key| target.nodes.contains_key(key)) { return Err(corrupt()); }
+    target.check_acyclic()
+}
+
+/// The caller invalidates its observation before any remote read and confirms
+/// it only after checking the roots and repository protection again.
 pub(crate) async fn mark(
-    request: MarkRequest<'_>,
-    source: &dyn DocumentSource,
     root: &Path,
+    source: &dyn DocumentSource,
+    request: MarkRequest<'_>,
     cancel: &Cancellation,
 ) -> Result<Mark> {
-    let mut listed: Listed = BTreeMap::new();
-    let mut by_snapshot: BTreeMap<String, String> = BTreeMap::new();
-    let mut skipped = 0usize;
+    cancel.check()?;
+    let mut by_snapshot = BTreeMap::new();
+    let mut listed_locators = BTreeSet::new();
     for receipt in &request.listed {
-        cancel.check()?;
-        let key = locator_key(&receipt.locator)?;
-        match source.listed(receipt).await {
-            Ok((object, node)) => {
-                by_snapshot.insert(node.snapshot_id.clone(), key.clone());
-                listed.insert(key, (object, node));
+        receipt.locator.validate_for(request.repository)?;
+        if !receipt.complete || receipt.byte_length == 0
+            || !listed_locators.insert(locator_key(&receipt.locator)?)
+        {
+            return Err(corrupt());
+        }
+        let (object, document) = source.listed(receipt).await?;
+        validate_object(&object, request.repository, request.format_repository_id)?;
+        if !matches!(object.role, ObjectRole::SyncState | ObjectRole::BackupBundle)
+            || object.receipt.locator != receipt.locator || object.receipt.byte_length != receipt.byte_length
+            || document.snapshot_id.is_empty()
+            || by_snapshot.insert(document.snapshot_id, object).is_some()
+        {
+            return Err(corrupt());
+        }
+    }
+
+    let mut authorized = BTreeSet::new();
+    let mut known_by_locator = BTreeMap::new();
+    for object in &request.known_objects {
+        validate_object(object, request.repository, request.format_repository_id)?;
+        let key = locator_key(&object.receipt.locator)?;
+        authorized.insert(key.clone());
+        if let Some(previous) = known_by_locator.insert(key, object.clone()) {
+            if object_identity(&previous, request.repository)? != object_identity(object, request.repository)? {
+                return Err(corrupt());
             }
-            Err(_) => skipped += 1,
         }
     }
 
-    // The head is a root, so failing to read it ends the run here.
-    let head_node = match &request.roots.head {
-        Some(head) => {
-            let key = locator_key(&head.receipt.locator)?;
-            Some(match listed.get(&key) {
-                Some((_, node)) => node.clone(),
-                None => {
-                    let node = source.document(head).await?;
-                    listed.insert(key, (head.clone(), node.clone()));
-                    node
-                }
-            })
-        }
-        None => None,
-    };
-
-    let mut observed: BTreeSet<String> = by_snapshot.keys().cloned().collect();
-    if let Some(node) = &head_node {
-        observed.insert(node.snapshot_id.clone());
-    }
-    let first_seen = {
-        let store = GcStore::open(root)?;
-        store.record_observations(request.connection_id, &observed, request.now_ms)?
-    };
-    let inside_grace = |id: &str| -> bool {
-        first_seen
-            .get(id)
-            .is_some_and(|seen| request.now_ms.saturating_sub(*seen) < GRACE_MS)
-    };
-
-    let mut roots: Vec<RemoteObject> = Vec::new();
-    roots.extend(request.roots.head.iter().cloned());
-    roots.extend(request.roots.kept_points.iter().cloned());
-    roots.extend(request.roots.kept_bundles.iter().cloned());
+    let mut protected = Vec::new();
+    protected.extend(request.roots.head.clone());
+    protected.extend(request.roots.kept_points.iter().cloned());
+    protected.extend(request.roots.kept_bundles.iter().cloned());
+    protected.extend(request.roots.job_references.iter().cloned());
     for id in &request.roots.job_snapshot_ids {
-        if let Some(key) = by_snapshot.get(id) {
-            roots.push(listed[key].0.clone());
-        }
-    }
-    // Anything this device saw for the first time recently, including whatever
-    // it has never seen before, stays protected for the grace window.
-    for (id, key) in &by_snapshot {
-        if inside_grace(id) {
-            roots.push(listed[key].0.clone());
-        }
-    }
-    // An ancestor is protected from the moment this device saw the state that
-    // displaced it, which is not the moment that state was uploaded: a job can
-    // spend longer than the grace window between its upload and its head write.
-    // The walk stops at the first child whose window has closed, so a long
-    // chain of old states is never followed to its beginning.
-    let mut displaced = BTreeSet::new();
-    if let Some(node) = head_node {
-        let mut child = node;
-        let mut ancestors = BTreeSet::new();
-        while let Some(parent) = child.parent_snapshot_id.clone() {
-            let target = displacement_of(&child.snapshot_id);
-            match first_seen.get(&target) {
-                Some(seen) if request.now_ms.saturating_sub(*seen) >= GRACE_MS => break,
-                Some(_) => {}
-                None => {
-                    displaced.insert(target);
-                }
-            }
-            if !ancestors.insert(parent.clone()) {
-                break;
-            }
-            let key = by_snapshot.get(&parent).ok_or_else(missing)?;
-            let (object, ancestor) = listed.get(key).ok_or_else(corrupt)?;
-            roots.push(object.clone());
-            child = ancestor.clone();
-        }
-    }
-    if !displaced.is_empty() {
-        GcStore::open(root)?.record_observations(
-            request.connection_id,
-            &displaced,
-            request.now_ms,
-        )?;
-    }
-
-    let mut reachable = BTreeSet::new();
-    let reached = walk(roots, source, &listed, &mut reachable, cancel).await?;
-    let mut reachable_bytes = 0u64;
-    for object in &reached {
-        reachable_bytes = reachable_bytes
-            .checked_add(object.receipt.byte_length)
-            .ok_or_else(corrupt)?;
+        if let Some(object) = by_snapshot.get(id) { protected.push(object.clone()); }
     }
     for receipt in &request.roots.job_objects {
-        if reachable.insert(locator_key(&receipt.locator)?) {
-            reachable_bytes = reachable_bytes
-                .checked_add(receipt.byte_length)
-                .ok_or_else(corrupt)?;
+        receipt.locator.validate_for(request.repository)?;
+        if !receipt.complete || receipt.byte_length == 0 { return Err(corrupt()); }
+        if let Some(object) = known_by_locator.get(&locator_key(&receipt.locator)?) {
+            if object.receipt.byte_length != receipt.byte_length { return Err(corrupt()); }
+            protected.push(object.clone());
+        }
+    }
+    let live = walk(
+        source, protected, request.repository, request.format_repository_id, false, cancel,
+    ).await?;
+    let mut reachable = live.nodes.keys().cloned().collect::<BTreeSet<_>>();
+    let mut reachable_bytes = live.nodes.values().try_fold(0u64, |sum, node| {
+        sum.checked_add(node.object.receipt.byte_length).ok_or_else(corrupt)
+    })?;
+    for object in &request.roots.job_objects {
+        if reachable.insert(locator_key(&object.locator)?) {
+            reachable_bytes = reachable_bytes.checked_add(object.byte_length).ok_or_else(corrupt)?;
         }
     }
 
-    // A dropped point goes before the documents it named, so an interrupted run
-    // leaves fragments nothing points at rather than a point pointing at
-    // nothing.
-    let mut documents: Vec<CommittedDeletion> = request
-        .dropped_points
-        .iter()
-        .map(|object| candidate_of(object, request.now_ms))
-        .collect();
-    let mut below = Vec::new();
-    let mut visited = reachable.clone();
-    for (id, key) in &by_snapshot {
-        cancel.check()?;
-        if reachable.contains(key) || inside_grace(id) {
-            continue;
-        }
-        let (object, node) = &listed[key];
-        let mut subtree = visited.clone();
-        subtree.insert(key.clone());
-        match walk(
-            node.references.clone(),
-            source,
-            &listed,
-            &mut subtree,
-            cancel,
-        )
-        .await
+    // Only retention-authorized points expand the ownership universe. Merely
+    // discovering an unheaded snapshot never claims its packs for this device.
+    let expired_roots = request.retired_points.iter().flat_map(|point| {
+        std::iter::once(point.point.clone()).chain(point.bundles.iter().cloned())
+    }).collect();
+    let mut expired = walk(
+        source, expired_roots, request.repository, request.format_repository_id, true, cancel,
+    ).await?;
+    for point in &request.retired_points {
+        if point.point.role != ObjectRole::BackupPoint
+            || point.bundles.iter().any(|bundle| bundle.role != ObjectRole::BackupBundle)
         {
-            Ok(reached) => {
-                documents.push(candidate_of(object, request.now_ms));
-                below.extend(
-                    reached
-                        .iter()
-                        .map(|object| candidate_of(object, request.now_ms)),
-                );
-                visited = subtree;
-            }
-            // Removing a document whose fragments cannot be listed would leave
-            // pieces nothing can name again.
-            Err(_) => skipped += 1,
+            return Err(corrupt());
+        }
+        if let Some(node) = expired.nodes.get_mut(&locator_key(&point.point.receipt.locator)?) {
+            node.children.extend(point.bundles.iter().map(|bundle| locator_key(&bundle.receipt.locator))
+                .collect::<Result<BTreeSet<_>>>()?);
         }
     }
-    documents.extend(below);
-
-    // Once a parent document is gone nothing enumerates the fragments under it
-    // again, so what an interrupted run still owes is written down rather than
-    // rediscovered. A list this device can no longer read costs it those
-    // fragments and the run says so.
+    authorized.extend(expired.nodes.keys().cloned());
+    let mut candidates = walk(
+        source, request.known_objects, request.repository, request.format_repository_id, true, cancel,
+    ).await?;
+    for point in &request.retired_points {
+        if let Some(node) = candidates.nodes.get_mut(&locator_key(&point.point.receipt.locator)?) {
+            node.children.extend(point.bundles.iter().map(|bundle| locator_key(&bundle.receipt.locator))
+                .collect::<Result<BTreeSet<_>>>()?);
+        }
+    }
+    merge(&mut candidates, expired)?;
+    for (key, identity) in &live.identities {
+        if candidates.identities.get(key).is_some_and(|other| other != identity)
+            || candidates.missing.contains(key)
+        {
+            return Err(corrupt());
+        }
+    }
+    let unreachable = authorized.into_iter().filter(|key| {
+        !reachable.contains(key) && !candidates.missing.contains(key) && candidates.nodes.contains_key(key)
+    }).collect::<BTreeSet<_>>();
+    let identities = unreachable.iter().map(|key| (
+        key.clone(), candidates.identities[key].clone(),
+    )).collect();
     let store = GcStore::open(root)?;
-    let (carried, list_recomputed) = match store.committed_deletions(request.connection_id) {
-        Ok(rows) => (rows, false),
-        Err(_) => (Vec::new(), true),
-    };
-    let mut committed = Vec::new();
-    let mut named = BTreeSet::new();
-    for entry in carried
-        .into_iter()
-        .filter(|entry| !entry.done)
-        .chain(documents)
-    {
-        let key = locator_key(&entry.locator)?;
-        // A target the current roots reach again leaves the list instead of
-        // being removed.
-        if reachable.contains(&key) || !named.insert(key) {
-            continue;
+    let observed = store.record_observations(request.connection_id, &identities, request.now_ms)?;
+
+    // Walk dependencies through inherited catalogs without claiming ownership of
+    // them. A young owned ancestor also delays an old owned indirect descendant.
+    let inactive: BTreeSet<_> = candidates.nodes.keys().filter(|key| !reachable.contains(*key))
+        .cloned().collect();
+    let mut incoming: BTreeMap<_, usize> = inactive.iter().map(|key| (key.clone(), 0)).collect();
+    for key in &inactive {
+        for child in &candidates.nodes[key].children {
+            if let Some(count) = incoming.get_mut(child) {
+                *count = count.checked_add(1).ok_or_else(corrupt)?;
+            }
         }
-        committed.push(entry);
     }
-    store.replace_deletions(request.connection_id, &committed)?;
-    let mut keep = observed.clone();
-    keep.extend(
-        observed
-            .iter()
-            .map(|id| displacement_of(id))
-            .collect::<Vec<_>>(),
-    );
-    store.prune_observations(request.connection_id, &keep)?;
-    store.set_last_reachable_bytes(request.connection_id, reachable_bytes)?;
+    let mut ready: BTreeSet<_> = incoming.iter().filter(|(_, count)| **count == 0)
+        .map(|(key, _)| key.clone()).collect();
+    let mut blocked = BTreeSet::new();
+    let mut eligible = Vec::new();
+    let mut visited = 0;
+    while let Some(key) = ready.pop_first() {
+        cancel.check()?;
+        visited += 1;
+        let node = &candidates.nodes[&key];
+        let old_enough = observed.get(&key).and_then(|first| first.checked_add(UNREACHABLE_GRACE_MS))
+            .is_some_and(|expiry| request.now_ms >= expiry);
+        let managed = unreachable.contains(&key);
+        let collect = managed && old_enough && !blocked.contains(&key);
+        let delays_children = blocked.contains(&key) || (managed && !old_enough);
+        if collect { eligible.push(node.object.clone()); }
+        for child in &node.children {
+            if let Some(count) = incoming.get_mut(child) {
+                if delays_children { blocked.insert(child.clone()); }
+                *count = count.checked_sub(1).ok_or_else(corrupt)?;
+                if *count == 0 { ready.insert(child.clone()); }
+            }
+        }
+    }
+    if visited != inactive.len() { return Err(corrupt()); }
     Ok(Mark {
-        reachable,
-        reachable_bytes,
-        candidates: committed,
-        skipped,
-        list_recomputed,
+        reachable, reachable_bytes,
+        deferred: unreachable.len().saturating_sub(eligible.len()), candidates: eligible,
     })
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::external_storage::contract::{ObjectReceipt, RemoteLocator};
+    use crate::external_storage::{contract::RemoteLocator, fake};
+    use risunest_external_storage_format::snapshot as wire;
     use std::sync::Mutex;
 
-    const DAY: u64 = 24 * 60 * 60 * 1000;
-    const NOW: u64 = 1_000 * DAY;
-
-    fn runtime() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-    }
-
-    fn object(id: &str, role: ObjectRole, byte_length: u64) -> RemoteObject {
+    pub(crate) fn object(id: &str, role: ObjectRole) -> RemoteObject {
+        let header = wire::PublicObjectHeader::new(
+            "format-repository".into(), id.into(), super::super::packaging::wire_role(role).unwrap(), 1,
+        ).unwrap();
         RemoteObject {
-            repository_id: "synthetic-repository".into(),
-            object_id: id.into(),
-            role,
+            repository_id: "format-repository".into(), object_id: id.into(), role,
             receipt: ObjectReceipt {
                 locator: RemoteLocator {
-                    connection_identity: "synthetic-account/root".into(),
-                    collection: match role {
-                        ObjectRole::SyncState | ObjectRole::BackupBundle => Some("snapshots".into()),
-                        ObjectRole::Catalog => Some("catalogs".into()),
-                        _ => None,
-                    },
-                    object: id.into(),
+                    connection_identity: fake::repository().connection_identity,
+                    collection: None, object: id.into(),
                 },
-                byte_length,
-                version: None,
-                checksum: None,
-                complete: true,
+                byte_length: wire::envelope_length(&header).unwrap(),
+                version: None, checksum: None, complete: true,
             },
-            ciphertext_sha256: "11".repeat(32),
-            plaintext_length: byte_length,
-            plaintext_sha256: "22".repeat(32),
+            ciphertext_sha256: risunest_sync_wire::hash(id.as_bytes()), plaintext_length: 1,
+            plaintext_sha256: risunest_sync_wire::hash(id.as_bytes()),
         }
     }
-    fn key(object: &RemoteObject) -> String {
-        locator_key(&object.receipt.locator).unwrap()
+    pub(crate) struct Source {
+        pub(crate) objects: BTreeMap<String, RemoteObject>,
+        pub(crate) children: BTreeMap<String, Vec<RemoteObject>>,
+        pub(crate) fail: Mutex<Option<ErrorKind>>,
+        pub(crate) absent: Mutex<BTreeSet<String>>,
     }
-
-    enum Entry {
-        Document(DocumentNode),
-        Catalog(Vec<RemoteObject>),
-    }
-
-    #[derive(Default)]
-    struct Repository {
-        entries: BTreeMap<String, Entry>,
-        broken: BTreeSet<String>,
-        reads: Mutex<Vec<String>>,
-    }
-    impl Repository {
-        fn with_document(
-            &mut self,
-            object: &RemoteObject,
-            parent: Option<&str>,
-            references: Vec<RemoteObject>,
-        ) {
-            self.entries.insert(
-                key(object),
-                Entry::Document(DocumentNode {
-                    snapshot_id: object
-                        .object_id
-                        .strip_prefix("snapshot-")
-                        .unwrap_or(&object.object_id)
-                        .to_owned(),
-                    parent_snapshot_id: parent.map(str::to_owned),
-                    references,
-                }),
-            );
-        }
-        fn with_catalog(&mut self, object: &RemoteObject, children: Vec<RemoteObject>) {
-            self.entries.insert(key(object), Entry::Catalog(children));
-        }
-        fn read(&self, locator: &RemoteLocator) -> Result<&Entry> {
-            let key = locator_key(locator)?;
-            self.reads.lock().unwrap().push(key.clone());
-            if self.broken.contains(&key) {
-                return Err(ProviderError::new(ErrorKind::Transient));
+    impl Source {
+        fn node(&self, object: &RemoteObject) -> Result<DocumentNode> {
+            if !self.objects.contains_key(&object.object_id) {
+                return Err(ProviderError::new(ErrorKind::NotFound));
             }
-            self.entries.get(&key).ok_or_else(missing)
-        }
-        fn requested(&self, object: &RemoteObject) -> bool {
-            self.reads.lock().unwrap().contains(&key(object))
-        }
-    }
-    impl DocumentSource for Repository {
-        fn document<'a>(&'a self, object: &'a RemoteObject) -> ProviderFuture<'a, DocumentNode> {
-            Box::pin(async move {
-                match self.read(&object.receipt.locator)? {
-                    Entry::Document(node) => Ok(node.clone()),
-                    Entry::Catalog(_) => Err(corrupt()),
-                }
+            Ok(DocumentNode {
+                snapshot_id: object.object_id.clone(), parent_snapshot_id: None,
+                references: self.children.get(&object.object_id).cloned().unwrap_or_default(),
             })
         }
-        fn listed<'a>(
-            &'a self,
-            receipt: &'a ObjectReceipt,
-        ) -> ProviderFuture<'a, (RemoteObject, DocumentNode)> {
+    }
+    impl DocumentSource for Source {
+        fn document<'a>(&'a self, object: &'a RemoteObject) -> ProviderFuture<'a, DocumentNode> {
+            Box::pin(async move { self.node(object) })
+        }
+        fn listed<'a>(&'a self, receipt: &'a ObjectReceipt) -> ProviderFuture<'a, (RemoteObject, DocumentNode)> {
             Box::pin(async move {
-                let node = match self.read(&receipt.locator)? {
-                    Entry::Document(node) => node.clone(),
-                    Entry::Catalog(_) => return Err(corrupt()),
-                };
-                let mut object = object(
-                    &format!("snapshot-{}", node.snapshot_id),
-                    ObjectRole::SyncState,
-                    receipt.byte_length,
-                );
-                object.receipt = receipt.clone();
-                Ok((object, node))
+                let object = self.objects.get(&receipt.locator.object)
+                    .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
+                Ok((object.clone(), self.node(object)?))
             })
         }
         fn catalog<'a>(&'a self, object: &'a RemoteObject) -> ProviderFuture<'a, Vec<RemoteObject>> {
+            Box::pin(async move { Ok(self.node(object)?.references) })
+        }
+        fn probe<'a>(&'a self, object: &'a RemoteObject) -> ProviderFuture<'a, Option<ObjectReceipt>> {
             Box::pin(async move {
-                match self.read(&object.receipt.locator)? {
-                    Entry::Catalog(children) => Ok(children.clone()),
-                    Entry::Document(_) => Err(corrupt()),
-                }
+                if let Some(kind) = self.fail.lock().unwrap().take() { return Err(ProviderError::new(kind)); }
+                if self.absent.lock().unwrap().contains(&object.object_id) { return Ok(None); }
+                Ok(self.objects.get(&object.object_id).map(|object| object.receipt.clone()))
             })
         }
     }
-
-    fn store() -> (tempfile::TempDir, GcStore) {
-        let root = tempfile::tempdir().unwrap();
-        let store = GcStore::open(root.path()).unwrap();
-        (root, store)
-    }
-    /// The directory the store the harness holds was opened on, which is what
-    /// a mark is handed so it can open its own.
-    fn at(directory: &tempfile::TempDir) -> &std::path::Path {
-        directory.path()
-    }
-    fn receipts(objects: &[&RemoteObject]) -> Vec<ObjectReceipt> {
-        objects
-            .iter()
-            .map(|object| object.receipt.clone())
-            .collect()
-    }
-    fn roots(head: Option<&RemoteObject>) -> Roots {
-        Roots {
-            head: head.cloned(),
-            kept_points: Vec::new(),
-            kept_bundles: Vec::new(),
-            job_objects: Vec::new(),
-            job_snapshot_ids: BTreeSet::new(),
+    pub(crate) fn source(objects: &[RemoteObject], edges: &[(&RemoteObject, Vec<RemoteObject>)]) -> Source {
+        Source {
+            objects: objects.iter().map(|object| (object.object_id.clone(), object.clone())).collect(),
+            children: edges.iter().map(|(object, children)| (object.object_id.clone(), children.clone())).collect(),
+            fail: Mutex::new(None), absent: Mutex::new(BTreeSet::new()),
         }
     }
-    fn names(mark: &Mark) -> Vec<String> {
-        mark.candidates
-            .iter()
-            .map(|candidate| candidate.locator.object.clone())
-            .collect()
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
     }
-
-    /// A library, a section and one pack under each, shared by the tests that
-    /// need a published state to look like a real one.
-    struct Library {
-        records: RemoteObject,
-        assets: RemoteObject,
-        section: RemoteObject,
-        section_pack: RemoteObject,
-        record_pack: RemoteObject,
-    }
-    impl Library {
-        fn new(tag: &str) -> Self {
-            Self {
-                records: object(&format!("records-{tag}"), ObjectRole::Catalog, 10),
-                assets: object(&format!("assets-{tag}"), ObjectRole::Catalog, 20),
-                section: object(&format!("hypa-{tag}"), ObjectRole::Catalog, 30),
-                section_pack: object(&format!("hypa-pack-{tag}"), ObjectRole::Pack, 400),
-                record_pack: object(&format!("record-pack-{tag}"), ObjectRole::Pack, 500),
-            }
-        }
-        fn install(&self, repository: &mut Repository) {
-            repository.with_catalog(&self.records, vec![self.record_pack.clone()]);
-            repository.with_catalog(&self.assets, Vec::new());
-            repository.with_catalog(&self.section, vec![self.section_pack.clone()]);
-        }
-        fn references(&self) -> Vec<RemoteObject> {
-            vec![
-                self.records.clone(),
-                self.assets.clone(),
-                self.section.clone(),
-            ]
-        }
-    }
-
-    /// Invariant GC1. A publication that only changed the library still names
-    /// the section it inherited, so that section's catalog and packs stay
-    /// reachable even once the state that introduced them is removable.
-    #[test]
-    fn an_inherited_section_survives_a_library_only_publication() {
-        let (_root, store) = store();
-        let mut repository = Repository::default();
-        let old_library = Library::new("old");
-        let new_library = Library::new("new");
-        old_library.install(&mut repository);
-        repository.with_catalog(&new_library.records, vec![new_library.record_pack.clone()]);
-        repository.with_catalog(&new_library.assets, Vec::new());
-        let parent = object("snapshot-parent", ObjectRole::SyncState, 1);
-        let head = object("snapshot-head", ObjectRole::SyncState, 2);
-        repository.with_document(&parent, None, old_library.references());
-        repository.with_document(
-            &head,
-            Some("parent"),
-            vec![
-                new_library.records.clone(),
-                new_library.assets.clone(),
-                // The section reference the new state carried forward.
-                old_library.section.clone(),
-            ],
-        );
-        // Both states were seen long ago, so only the head is a root.
-        store
-            .record_observations(
-                "connection",
-                &["head".to_owned(), "parent".to_owned(), "head/head".to_owned()]
-                    .into_iter()
-                    .collect(),
-                NOW - 60 * DAY,
-            )
-            .unwrap();
-        let mark = runtime()
-            .block_on(mark(
-                MarkRequest {
-                    connection_id: "connection",
-                    now_ms: NOW,
-                    roots: roots(Some(&head)),
-                    listed: receipts(&[&head, &parent]),
-                    dropped_points: Vec::new(),
-                },
-                &repository,
-                at(&_root),
-                &Cancellation::default(),
-            ))
-            .unwrap();
-        assert_eq!(mark.skipped, 0);
-        for kept in [
-            &old_library.section,
-            &old_library.section_pack,
-            &new_library.records,
-            &new_library.record_pack,
-        ] {
-            assert!(mark.reachable.contains(&key(kept)), "{}", kept.object_id);
-        }
-        assert_eq!(
-            names(&mark),
-            vec![
-                "snapshot-parent",
-                "records-old",
-                "assets-old",
-                "record-pack-old"
-            ]
-        );
-    }
-
-    /// Invariant GC3. One unreadable root ends the run: no candidate, no
-    /// recorded total, and an observation ledger that still holds the target
-    /// that left the enumeration.
-    #[test]
-    fn an_unreadable_root_leaves_the_run_with_nothing_to_remove() {
-        let (_root, store) = store();
-        let mut repository = Repository::default();
-        let library = Library::new("head");
-        library.install(&mut repository);
-        let head = object("snapshot-head", ObjectRole::SyncState, 2);
-        let stale = object("snapshot-stale", ObjectRole::SyncState, 3);
-        repository.with_document(&head, None, library.references());
-        repository.with_document(&stale, None, Vec::new());
-        repository.broken.insert(key(&library.records));
-        let carried = leftover(&object("orphan-pack", ObjectRole::Pack, 11), false);
-        store
-            .replace_deletions("connection", &[carried.clone()])
-            .unwrap();
-        store
-            .record_observations(
-                "connection",
-                &["stale".to_owned(), "gone".to_owned()].into_iter().collect(),
-                NOW - 60 * DAY,
-            )
-            .unwrap();
-        let error = runtime().block_on(mark(
-            MarkRequest {
-                connection_id: "connection",
-                now_ms: NOW,
-                roots: roots(Some(&head)),
-                listed: receipts(&[&head, &stale]),
-                dropped_points: Vec::new(),
-            },
-            &repository,
-            at(&_root),
-            &Cancellation::default(),
-        ));
-        assert!(error.is_err());
-        assert_eq!(store.last_reachable_bytes("connection").unwrap(), None);
-        // The run added nothing to the list and took nothing off it.
-        assert_eq!(
-            store.committed_deletions("connection").unwrap(),
-            vec![carried]
-        );
-        let ledger = store
-            .record_observations(
-                "connection",
-                &["gone".to_owned()].into_iter().collect(),
-                NOW,
-            )
-            .unwrap();
-        assert_eq!(ledger.get("gone"), Some(&(NOW - 60 * DAY)));
-    }
-
-    /// Invariant GC15. A head made long ago and displaced a moment ago keeps
-    /// its own objects, and the walk stops at the first ancestor whose grace
-    /// window closed instead of following the lineage to its beginning.
-    #[test]
-    fn a_head_displaced_a_moment_ago_is_not_a_candidate() {
-        let (_root, store) = store();
-        let mut repository = Repository::default();
-        let displaced_library = Library::new("displaced");
-        let older_library = Library::new("older");
-        displaced_library.install(&mut repository);
-        older_library.install(&mut repository);
-        let head = object("snapshot-head", ObjectRole::SyncState, 2);
-        let displaced = object("snapshot-displaced", ObjectRole::SyncState, 3);
-        let older = object("snapshot-older", ObjectRole::SyncState, 4);
-        repository.with_document(&head, Some("displaced"), Vec::new());
-        repository.with_document(&displaced, Some("older"), displaced_library.references());
-        repository.with_document(&older, None, older_library.references());
-        store
-            .record_observations(
-                "connection",
-                &[
-                    "displaced".to_owned(),
-                    "older".to_owned(),
-                    "head/displaced".to_owned(),
-                ]
-                .into_iter()
-                .collect(),
-                NOW - 40 * DAY,
-            )
-            .unwrap();
-        let mark = runtime()
-            .block_on(mark(
-                MarkRequest {
-                    connection_id: "connection",
-                    now_ms: NOW,
-                    roots: roots(Some(&head)),
-                    listed: receipts(&[&head, &displaced, &older]),
-                    dropped_points: Vec::new(),
-                },
-                &repository,
-                at(&_root),
-                &Cancellation::default(),
-            ))
-            .unwrap();
-        assert!(mark.reachable.contains(&key(&displaced)));
-        assert!(mark.reachable.contains(&key(&displaced_library.section_pack)));
-        // The walk stopped at the displaced state, so its own parent was never
-        // taken as a root and is removable.
-        assert!(names(&mark).contains(&"snapshot-older".to_owned()));
-        assert!(!names(&mark).contains(&"snapshot-displaced".to_owned()));
-    }
-
-    /// Invariant GC22. A target with no ledger row is recorded and left alone,
-    /// however old the remote document says it is.
-    #[test]
-    fn a_target_seen_for_the_first_time_is_only_recorded() {
-        let (_root, _) = store();
-        let mut repository = Repository::default();
-        let library = Library::new("head");
-        library.install(&mut repository);
-        let head = object("snapshot-head", ObjectRole::SyncState, 2);
-        let slow = object("snapshot-slow", ObjectRole::SyncState, 3);
-        repository.with_document(&head, None, library.references());
-        repository.with_document(&slow, None, Vec::new());
-        let request = |now: u64| MarkRequest {
-            connection_id: "connection",
-            now_ms: now,
-            roots: roots(Some(&head)),
-            listed: receipts(&[&head, &slow]),
-            dropped_points: Vec::new(),
-        };
-        let first = runtime()
-            .block_on(mark(
-                request(NOW),
-                &repository,
-                at(&_root),
-                &Cancellation::default(),
-            ))
-            .unwrap();
-        assert!(first.candidates.is_empty());
-        let later = runtime()
-            .block_on(mark(
-                request(NOW + 8 * DAY),
-                &repository,
-                at(&_root),
-                &Cancellation::default(),
-            ))
-            .unwrap();
-        assert_eq!(names(&later), vec!["snapshot-slow"]);
-    }
-
-    /// Invariant GC15, second half. An ancestor past the grace window is never
-    /// requested as a root, so the lineage read stops there.
-    #[test]
-    fn the_lineage_read_stops_at_the_first_closed_grace_window() {
-        let (_root, store) = store();
-        let mut repository = Repository::default();
-        let head = object("snapshot-head", ObjectRole::SyncState, 2);
-        let ancient = object("snapshot-ancient", ObjectRole::SyncState, 3);
-        repository.with_document(&head, Some("ancient"), Vec::new());
-        store
-            .record_observations(
-                "connection",
-                &["head".to_owned(), "head/head".to_owned()]
-                    .into_iter()
-                    .collect(),
-                NOW - 40 * DAY,
-            )
-            .unwrap();
-        let mark = runtime()
-            .block_on(mark(
-                MarkRequest {
-                    connection_id: "connection",
-                    now_ms: NOW,
-                    roots: roots(Some(&head)),
-                    listed: receipts(&[&head]),
-                    dropped_points: Vec::new(),
-                },
-                &repository,
-                at(&_root),
-                &Cancellation::default(),
-            ))
-            .unwrap();
-        assert!(mark.candidates.is_empty());
-        assert!(!repository.requested(&ancient));
+    async fn observe(
+        root: &Path, source: &Source, now: u64, roots: Roots,
+        known: Vec<RemoteObject>, retired: Vec<RetiredPoint>,
+    ) -> Result<Mark> {
+        let store = GcStore::open(root)?;
+        store.begin_observation("connection")?;
+        let listed = source.objects.values()
+            .filter(|object| matches!(object.role, ObjectRole::SyncState | ObjectRole::BackupBundle))
+            .map(|object| object.receipt.clone()).collect();
+        let marked = mark(root, source, MarkRequest {
+            connection_id: "connection", repository: &fake::repository(), format_repository_id: "format-repository",
+            now_ms: now, roots, listed, known_objects: known, retired_points: retired,
+        }, &Cancellation::default()).await?;
+        store.finish_observation("connection")?;
+        Ok(marked)
     }
 
     #[test]
-    fn an_unreadable_candidate_takes_only_itself_out_of_the_run() {
-        let (_root, store) = store();
-        let mut repository = Repository::default();
-        let library = Library::new("head");
-        let stale_library = Library::new("stale");
-        library.install(&mut repository);
-        stale_library.install(&mut repository);
-        let head = object("snapshot-head", ObjectRole::SyncState, 2);
-        let stale = object("snapshot-stale", ObjectRole::SyncState, 3);
-        let broken = object("snapshot-broken", ObjectRole::SyncState, 4);
-        repository.with_document(&head, None, library.references());
-        repository.with_document(&stale, None, stale_library.references());
-        repository.with_document(&broken, None, Vec::new());
-        repository.broken.insert(key(&broken));
-        store
-            .record_observations(
-                "connection",
-                &["stale".to_owned()].into_iter().collect(),
-                NOW - 40 * DAY,
-            )
-            .unwrap();
-        let mark = runtime()
-            .block_on(mark(
-                MarkRequest {
-                    connection_id: "connection",
-                    now_ms: NOW,
-                    roots: roots(Some(&head)),
-                    listed: receipts(&[&head, &stale, &broken]),
-                    dropped_points: Vec::new(),
-                },
-                &repository,
-                at(&_root),
-                &Cancellation::default(),
-            ))
-            .unwrap();
-        assert_eq!(mark.skipped, 1);
-        assert!(names(&mark).contains(&"snapshot-stale".to_owned()));
-        assert!(!names(&mark).contains(&"snapshot-broken".to_owned()));
+    fn c_shared_pack_and_unselected_section_stay_live_as_a_whole() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let shared = object("shared-pack", ObjectRole::Pack);
+            let dead_pack = object("dead-pack", ObjectRole::Pack);
+            let section = object("unselected-section", ObjectRole::Catalog);
+            let head = object("head-state", ObjectRole::SyncState);
+            let retired = object("old-state", ObjectRole::BackupBundle);
+            let point = object("expired-point", ObjectRole::BackupPoint);
+            let all = vec![shared.clone(), dead_pack.clone(), section.clone(), head.clone(), retired.clone(), point.clone()];
+            let source = source(&all, &[
+                (&head, vec![section.clone()]), (&section, vec![shared.clone()]),
+                (&retired, vec![shared.clone(), dead_pack.clone()]),
+            ]);
+            let roots = Roots { head: Some(head), ..Roots::default() };
+            let expired = vec![RetiredPoint { point: point.clone(), bundles: vec![retired.clone()] }];
+            assert!(observe(root.path(), &source, 1000, roots.clone(), all.clone(), expired.clone()).await.unwrap().candidates.is_empty());
+            let marked = observe(root.path(), &source, 1000 + UNREACHABLE_GRACE_MS, roots, all, expired).await.unwrap();
+            let ids: Vec<_> = marked.candidates.iter().map(|object| object.object_id.as_str()).collect();
+            assert!(!ids.contains(&shared.object_id.as_str()));
+            assert!(!ids.contains(&section.object_id.as_str()));
+            assert!(ids.iter().position(|id| *id == point.object_id).unwrap() < ids.iter().position(|id| *id == retired.object_id).unwrap());
+            assert!(ids.iter().position(|id| *id == retired.object_id).unwrap() < ids.iter().position(|id| *id == dead_pack.object_id).unwrap());
+        });
     }
 
     #[test]
-    fn an_unfinished_job_keeps_its_own_fragments() {
-        let (_root, store) = store();
-        let mut repository = Repository::default();
-        let library = Library::new("head");
-        library.install(&mut repository);
-        let head = object("snapshot-head", ObjectRole::SyncState, 2);
-        let orphan = object("job-pack", ObjectRole::Pack, 700);
-        repository.with_document(&head, None, library.references());
-        let mut roots = roots(Some(&head));
-        roots.job_objects = vec![orphan.receipt.clone()];
-        let mark = runtime()
-            .block_on(mark(
-                MarkRequest {
-                    connection_id: "connection",
-                    now_ms: NOW,
-                    roots,
-                    listed: receipts(&[&head]),
-                    dropped_points: Vec::new(),
-                },
-                &repository,
-                at(&_root),
-                &Cancellation::default(),
-            ))
-            .unwrap();
-        assert!(mark.reachable.contains(&key(&orphan)));
-        assert_eq!(
-            store.last_reachable_bytes("connection").unwrap(),
-            Some(mark.reachable_bytes)
-        );
-        assert_eq!(
-            mark.reachable_bytes,
-            head.receipt.byte_length + 10 + 20 + 30 + 400 + 500 + 700
-        );
-    }
-
-    /// Invariant GC22. A job that spends longer than the grace window between
-    /// uploading its state and writing the head does not make the state it
-    /// replaced removable the moment that publication lands. The remote
-    /// document's own times never enter the decision.
-    #[test]
-    fn a_state_published_long_after_it_was_uploaded_still_protects_its_parent() {
-        let (_root, _) = store();
-        let mut repository = Repository::default();
-        let library = Library::new("parent");
-        library.install(&mut repository);
-        let parent = object("snapshot-s0", ObjectRole::SyncState, 2);
-        let published = object("snapshot-s1", ObjectRole::SyncState, 3);
-        repository.with_document(&parent, None, library.references());
-        repository.with_document(&published, Some("s0"), Vec::new());
-        let run = |now: u64, head: &RemoteObject, job: &[&str]| {
-            runtime()
-                .block_on(mark(
-                    MarkRequest {
-                        connection_id: "connection",
-                        now_ms: now,
-                        roots: Roots {
-                            head: Some(head.clone()),
-                            job_snapshot_ids: job
-                                .iter()
-                                .map(|id| (*id).to_owned())
-                                .collect(),
-                            ..roots(None)
-                        },
-                        listed: receipts(&[&parent, &published]),
-                        dropped_points: Vec::new(),
-                    },
-                    &repository,
-                    at(&_root),
-                    &Cancellation::default(),
-                ))
-                .unwrap()
-        };
-        // The state is uploaded and enumerated while its job waits on budget.
-        assert!(run(NOW, &parent, &["s1"]).candidates.is_empty());
-        // The head write lands past the window the upload opened.
-        let landed = run(NOW + 8 * DAY, &published, &[]);
-        assert!(landed.candidates.is_empty());
-        assert!(landed.reachable.contains(&key(&library.section_pack)));
-        // The parent's own window runs from the publication this device saw,
-        // so it becomes removable a window after that, not before.
-        let later = run(NOW + 16 * DAY, &published, &[]);
-        assert!(names(&later).contains(&"snapshot-s0".to_owned()));
-    }
-
-    /// A point the retention decision dropped leads the list, ahead of the
-    /// documents it named.
-    #[test]
-    fn a_dropped_backup_point_is_removed_before_what_it_named() {
-        let (_root, store) = store();
-        let mut repository = Repository::default();
-        let head = object("snapshot-head", ObjectRole::SyncState, 2);
-        let bundle = object("snapshot-bundle", ObjectRole::BackupBundle, 3);
-        let point = object("point-old", ObjectRole::BackupPoint, 4);
-        repository.with_document(&head, None, Vec::new());
-        repository.with_document(&bundle, None, Vec::new());
-        store
-            .record_observations(
-                "connection",
-                &["bundle".to_owned()].into_iter().collect(),
-                NOW - 40 * DAY,
-            )
-            .unwrap();
-        let mark = runtime()
-            .block_on(mark(
-                MarkRequest {
-                    connection_id: "connection",
-                    now_ms: NOW,
-                    roots: roots(Some(&head)),
-                    listed: receipts(&[&head, &bundle]),
-                    dropped_points: vec![point.clone()],
-                },
-                &repository,
-                at(&_root),
-                &Cancellation::default(),
-            ))
-            .unwrap();
-        assert_eq!(names(&mark), vec!["point-old", "snapshot-bundle"]);
-    }
-
-    fn leftover(object: &RemoteObject, done: bool) -> CommittedDeletion {
-        CommittedDeletion {
-            locator: object.receipt.locator.clone(),
-            role: object.role,
-            byte_length: object.receipt.byte_length,
-            decided_at_ms: NOW - DAY,
-            done,
-        }
-    }
-
-    /// What an earlier run committed to but never finished joins this run, and
-    /// what it did finish leaves the list once this mark is over. The list this
-    /// run answers with is the one it stored.
-    #[test]
-    fn an_unfinished_target_rejoins_the_run_and_a_finished_one_leaves() {
-        let (_root, store) = store();
-        let mut repository = Repository::default();
-        let head = object("snapshot-head", ObjectRole::SyncState, 2);
-        repository.with_document(&head, None, Vec::new());
-        let unfinished = object("orphan-pack", ObjectRole::Pack, 11);
-        let finished = object("removed-pack", ObjectRole::Pack, 22);
-        store
-            .replace_deletions(
-                "connection",
-                &[leftover(&unfinished, false), leftover(&finished, true)],
-            )
-            .unwrap();
-        let mark = runtime()
-            .block_on(mark(
-                MarkRequest {
-                    connection_id: "connection",
-                    now_ms: NOW,
-                    roots: roots(Some(&head)),
-                    listed: receipts(&[&head]),
-                    dropped_points: Vec::new(),
-                },
-                &repository,
-                at(&_root),
-                &Cancellation::default(),
-            ))
-            .unwrap();
-        assert!(!mark.list_recomputed);
-        assert_eq!(names(&mark), vec!["orphan-pack"]);
-        // The decision time of a carried target is the one it was given.
-        assert_eq!(mark.candidates[0].decided_at_ms, NOW - DAY);
-        assert_eq!(store.committed_deletions("connection").unwrap(), mark.candidates);
-    }
-
-    /// Invariant GC25. A target on the list that the current roots reach again
-    /// is dropped from the list instead of being removed.
-    #[test]
-    fn a_target_that_is_reachable_again_leaves_the_list() {
-        let (_root, store) = store();
-        let mut repository = Repository::default();
-        let library = Library::new("head");
-        library.install(&mut repository);
-        let head = object("snapshot-head", ObjectRole::SyncState, 2);
-        repository.with_document(&head, None, library.references());
-        store
-            .replace_deletions(
-                "connection",
-                &[
-                    leftover(&library.record_pack, false),
-                    leftover(&object("orphan-pack", ObjectRole::Pack, 11), false),
-                ],
-            )
-            .unwrap();
-        let mark = runtime()
-            .block_on(mark(
-                MarkRequest {
-                    connection_id: "connection",
-                    now_ms: NOW,
-                    roots: roots(Some(&head)),
-                    listed: receipts(&[&head]),
-                    dropped_points: Vec::new(),
-                },
-                &repository,
-                at(&_root),
-                &Cancellation::default(),
-            ))
-            .unwrap();
-        assert!(mark.reachable.contains(&key(&library.record_pack)));
-        assert_eq!(names(&mark), vec!["orphan-pack"]);
-        assert_eq!(store.committed_deletions("connection").unwrap(), mark.candidates);
+    fn c_discovered_foreign_snapshots_do_not_expand_collection_ownership() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let foreign = object("foreign-state", ObjectRole::SyncState);
+            let pack = object("foreign-pack", ObjectRole::Pack);
+            let source = source(&[foreign.clone(), pack.clone()], &[(&foreign, vec![pack])]);
+            observe(root.path(), &source, 1000, Roots::default(), vec![], vec![]).await.unwrap();
+            assert!(observe(root.path(), &source, 1000 + UNREACHABLE_GRACE_MS, Roots::default(), vec![], vec![]).await.unwrap().candidates.is_empty());
+        });
     }
 
     #[test]
-    fn a_list_this_device_cannot_read_is_replaced_and_reported() {
-        let (_root, store) = store();
-        let root = &_root;
-        let mut repository = Repository::default();
-        let head = object("snapshot-head", ObjectRole::SyncState, 2);
-        repository.with_document(&head, None, Vec::new());
-        rusqlite::Connection::open(root.path().join("external-gc.sqlite"))
-            .unwrap()
-            .execute(
-                "INSERT INTO deletions(connection_id,locator,role,byte_length,decided_at_ms,done)
-                 VALUES('connection','not-a-locator','pack',1,1,0)",
-                [],
-            )
-            .unwrap();
-        let mark = runtime()
-            .block_on(mark(
-                MarkRequest {
-                    connection_id: "connection",
-                    now_ms: NOW,
-                    roots: roots(Some(&head)),
-                    listed: receipts(&[&head]),
-                    dropped_points: Vec::new(),
-                },
-                &repository,
-                at(&_root),
-                &Cancellation::default(),
-            ))
-            .unwrap();
-        assert!(mark.list_recomputed);
-        assert!(mark.candidates.is_empty());
-        assert!(store.committed_deletions("connection").unwrap().is_empty());
+    fn c_job_catalog_protects_reused_children_and_reachability_resets_age() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let catalog = object("job-catalog", ObjectRole::Catalog);
+            let pack = object("old-pack", ObjectRole::Pack);
+            let known = vec![catalog.clone(), pack.clone()];
+            let source = source(&known, &[(&catalog, vec![pack.clone()])]);
+            observe(root.path(), &source, 1000, Roots::default(), known.clone(), vec![]).await.unwrap();
+            let roots = Roots { job_objects: vec![catalog.receipt.clone()], ..Roots::default() };
+            let live = observe(root.path(), &source, 1000 + UNREACHABLE_GRACE_MS, roots, known.clone(), vec![]).await.unwrap();
+            assert!(live.candidates.is_empty());
+            assert!(live.reachable.contains(&locator_key(&pack.receipt.locator).unwrap()));
+            assert!(observe(root.path(), &source, 1001 + UNREACHABLE_GRACE_MS, Roots::default(), known, vec![]).await.unwrap().candidates.is_empty());
+        });
+    }
+
+    #[test]
+    fn c_pinned_conflict_and_explicit_capture_roots_keep_shared_payloads() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let pack = object("shared", ObjectRole::Pack);
+            let local = object("local-bundle", ObjectRole::BackupBundle);
+            let remote = object("remote-bundle", ObjectRole::BackupBundle);
+            let point = object("conflict-point", ObjectRole::BackupPoint);
+            let all = vec![pack.clone(), local.clone(), remote.clone(), point.clone()];
+            let source = source(&all, &[(&local, vec![pack.clone()]), (&remote, vec![pack.clone()])]);
+            let roots = Roots {
+                kept_points: vec![point], kept_bundles: vec![remote], job_references: vec![local],
+                ..Roots::default()
+            };
+            observe(root.path(), &source, 1000, roots.clone(), all.clone(), vec![]).await.unwrap();
+            let marked = observe(root.path(), &source, 1000 + UNREACHABLE_GRACE_MS, roots, all, vec![]).await.unwrap();
+            assert!(marked.candidates.is_empty());
+            assert_eq!(marked.reachable.len(), 4);
+        });
+    }
+
+    #[test]
+    fn c_incomplete_or_cyclic_graphs_cannot_extend_an_unreachable_interval() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let catalog = object("catalog", ObjectRole::Catalog);
+            let source = source(&[catalog.clone()], &[]);
+            observe(root.path(), &source, 1000, Roots::default(), vec![catalog.clone()], vec![]).await.unwrap();
+            *source.fail.lock().unwrap() = Some(ErrorKind::Transient);
+            assert!(observe(root.path(), &source, 1000 + UNREACHABLE_GRACE_MS, Roots::default(), vec![catalog.clone()], vec![]).await.is_err());
+            assert!(observe(root.path(), &source, 1001 + UNREACHABLE_GRACE_MS, Roots::default(), vec![catalog.clone()], vec![]).await.unwrap().candidates.is_empty());
+            let cyclic = self::source(&[catalog.clone()], &[(&catalog, vec![catalog.clone()])]);
+            assert!(matches!(observe(root.path(), &cyclic, 2000 + UNREACHABLE_GRACE_MS, Roots::default(), vec![catalog], vec![]).await, Err(error) if error.kind == ErrorKind::Corrupt));
+        });
+    }
+
+    #[test]
+    fn c_a_younger_parent_defers_an_old_shared_child() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let pack = object("old-pack", ObjectRole::Pack);
+            let parent = object("new-catalog", ObjectRole::Catalog);
+            let source = source(&[pack.clone(), parent.clone()], &[(&parent, vec![pack.clone()])]);
+            observe(root.path(), &source, 1000, Roots::default(), vec![pack.clone()], vec![]).await.unwrap();
+            let marked = observe(root.path(), &source, 1000 + UNREACHABLE_GRACE_MS, Roots::default(), vec![pack, parent], vec![]).await.unwrap();
+            assert!(marked.candidates.is_empty());
+        });
+    }
+
+    #[test]
+    fn c_parent_age_propagates_through_inherited_catalogs_without_claiming_them() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let pack = object("owned-pack", ObjectRole::Pack);
+            let inherited = object("inherited-catalog", ObjectRole::Catalog);
+            let parent = object("owned-parent", ObjectRole::Catalog);
+            let source = source(&[pack.clone(), inherited.clone(), parent.clone()], &[
+                (&parent, vec![inherited.clone()]), (&inherited, vec![pack.clone()]),
+            ]);
+            observe(root.path(), &source, 1000, Roots::default(), vec![pack.clone()], vec![]).await.unwrap();
+            let marked = observe(root.path(), &source, 1000 + UNREACHABLE_GRACE_MS,
+                Roots::default(), vec![pack.clone(), parent.clone()], vec![]).await.unwrap();
+            assert!(marked.candidates.is_empty());
+            let marked = observe(root.path(), &source, 1000 + 2 * UNREACHABLE_GRACE_MS,
+                Roots::default(), vec![pack, parent], vec![]).await.unwrap();
+            assert_eq!(marked.candidates.iter().map(|object| object.object_id.as_str()).collect::<Vec<_>>(),
+                ["owned-parent", "owned-pack"]);
+            assert!(!marked.candidates.iter().any(|object| object.object_id == inherited.object_id));
+        });
+    }
+
+    #[test]
+    fn c_missing_and_recreated_objects_receive_a_new_unreachable_age() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let pack = object("pack", ObjectRole::Pack);
+            let source = source(&[pack.clone()], &[]);
+            observe(root.path(), &source, 1000, Roots::default(), vec![pack.clone()], vec![]).await.unwrap();
+            source.absent.lock().unwrap().insert(pack.object_id.clone());
+            assert!(observe(root.path(), &source, 1000 + UNREACHABLE_GRACE_MS, Roots::default(), vec![pack.clone()], vec![]).await.unwrap().candidates.is_empty());
+            source.absent.lock().unwrap().clear();
+            assert!(observe(root.path(), &source, 1001 + UNREACHABLE_GRACE_MS, Roots::default(), vec![pack], vec![]).await.unwrap().candidates.is_empty());
+        });
+    }
+
+    #[test]
+    fn c_unreadable_live_roots_and_wrong_scope_or_identity_never_produce_candidates() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let pack = object("pack", ObjectRole::Pack);
+            let source = source(&[pack.clone()], &[]);
+            let roots = Roots { job_references: vec![pack.clone()], ..Roots::default() };
+            source.absent.lock().unwrap().insert(pack.object_id.clone());
+            assert!(matches!(observe(root.path(), &source, 1000, roots, vec![pack.clone()], vec![]).await, Err(error) if error.kind == ErrorKind::NotFound));
+            source.absent.lock().unwrap().clear();
+            let mut wrong = pack.clone();
+            wrong.repository_id = "other-format-repository".into();
+            assert!(observe(root.path(), &source, 1000, Roots::default(), vec![wrong], vec![]).await.is_err());
+            let mut wrong = pack.clone();
+            wrong.receipt.locator.connection_identity = "other-account".into();
+            assert!(observe(root.path(), &source, 1000, Roots::default(), vec![wrong], vec![]).await.is_err());
+            let mut changed = pack.clone();
+            changed.ciphertext_sha256 = "ab".repeat(32);
+            assert!(observe(root.path(), &source, 1000, Roots::default(), vec![pack, changed], vec![]).await.is_err());
+        });
     }
 }
