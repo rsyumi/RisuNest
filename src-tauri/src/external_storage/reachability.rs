@@ -3,7 +3,6 @@
 //! deletes. A root this device cannot read ends the run with nothing to remove.
 // The run that consumes a mark is wired with the removal path; the usage
 // summary is the only reader until then.
-#![cfg_attr(not(test), allow(dead_code))]
 use super::{
     contract::{
         Cancellation, ErrorKind, ObjectReceipt, ObjectRole, ProviderError, ProviderFuture, Result,
@@ -13,7 +12,10 @@ use super::{
     packaging::RemoteObject,
 };
 use risunest_external_storage_format::snapshot as wire;
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 /// How long a state or bundle stays protected after this device first saw it,
 /// and how long an ancestor stays protected after its successor appeared.
@@ -70,9 +72,11 @@ pub(crate) struct Roots {
     pub kept_points: Vec<RemoteObject>,
     /// The bundles those points name. A conflict point names two.
     pub kept_bundles: Vec<RemoteObject>,
-    /// Objects an unfinished job on this device reads or writes, including
-    /// fragments it uploaded before any document could name them.
-    pub job_objects: Vec<RemoteObject>,
+    /// Fragments an unfinished job on this device uploaded before any document
+    /// could name them. They are protected as they are and never followed: the
+    /// journal that named one names everything that job put below it, and a
+    /// fragment carries no authenticated reference this device could check.
+    pub job_objects: Vec<ObjectReceipt>,
     /// States and bundles an unfinished job on this device targets.
     pub job_snapshot_ids: BTreeSet<String>,
 }
@@ -178,7 +182,7 @@ async fn walk(
 pub(crate) async fn mark(
     request: MarkRequest<'_>,
     source: &dyn DocumentSource,
-    store: &GcStore,
+    root: &Path,
     cancel: &Cancellation,
 ) -> Result<Mark> {
     let mut listed: Listed = BTreeMap::new();
@@ -216,7 +220,10 @@ pub(crate) async fn mark(
     if let Some(node) = &head_node {
         observed.insert(node.snapshot_id.clone());
     }
-    let first_seen = store.record_observations(request.connection_id, &observed, request.now_ms)?;
+    let first_seen = {
+        let store = GcStore::open(root)?;
+        store.record_observations(request.connection_id, &observed, request.now_ms)?
+    };
     let inside_grace = |id: &str| -> bool {
         first_seen
             .get(id)
@@ -227,7 +234,6 @@ pub(crate) async fn mark(
     roots.extend(request.roots.head.iter().cloned());
     roots.extend(request.roots.kept_points.iter().cloned());
     roots.extend(request.roots.kept_bundles.iter().cloned());
-    roots.extend(request.roots.job_objects.iter().cloned());
     for id in &request.roots.job_snapshot_ids {
         if let Some(key) = by_snapshot.get(id) {
             roots.push(listed[key].0.clone());
@@ -268,7 +274,11 @@ pub(crate) async fn mark(
         }
     }
     if !displaced.is_empty() {
-        store.record_observations(request.connection_id, &displaced, request.now_ms)?;
+        GcStore::open(root)?.record_observations(
+            request.connection_id,
+            &displaced,
+            request.now_ms,
+        )?;
     }
 
     let mut reachable = BTreeSet::new();
@@ -278,6 +288,13 @@ pub(crate) async fn mark(
         reachable_bytes = reachable_bytes
             .checked_add(object.receipt.byte_length)
             .ok_or_else(corrupt)?;
+    }
+    for receipt in &request.roots.job_objects {
+        if reachable.insert(locator_key(&receipt.locator)?) {
+            reachable_bytes = reachable_bytes
+                .checked_add(receipt.byte_length)
+                .ok_or_else(corrupt)?;
+        }
     }
 
     // A dropped point goes before the documents it named, so an interrupted run
@@ -327,6 +344,7 @@ pub(crate) async fn mark(
     // again, so what an interrupted run still owes is written down rather than
     // rediscovered. A list this device can no longer read costs it those
     // fragments and the run says so.
+    let store = GcStore::open(root)?;
     let (carried, list_recomputed) = match store.committed_deletions(request.connection_id) {
         Ok(rows) => (rows, false),
         Err(_) => (Vec::new(), true),
@@ -498,6 +516,11 @@ mod tests {
         let store = GcStore::open(root.path()).unwrap();
         (root, store)
     }
+    /// The directory the store the harness holds was opened on, which is what
+    /// a mark is handed so it can open its own.
+    fn at(directory: &tempfile::TempDir) -> &std::path::Path {
+        directory.path()
+    }
     fn receipts(objects: &[&RemoteObject]) -> Vec<ObjectReceipt> {
         objects
             .iter()
@@ -598,7 +621,7 @@ mod tests {
                     dropped_points: Vec::new(),
                 },
                 &repository,
-                &store,
+                at(&_root),
                 &Cancellation::default(),
             ))
             .unwrap();
@@ -656,7 +679,7 @@ mod tests {
                 dropped_points: Vec::new(),
             },
             &repository,
-            &store,
+            at(&_root),
             &Cancellation::default(),
         ));
         assert!(error.is_err());
@@ -716,7 +739,7 @@ mod tests {
                     dropped_points: Vec::new(),
                 },
                 &repository,
-                &store,
+                at(&_root),
                 &Cancellation::default(),
             ))
             .unwrap();
@@ -732,7 +755,7 @@ mod tests {
     /// however old the remote document says it is.
     #[test]
     fn a_target_seen_for_the_first_time_is_only_recorded() {
-        let (_root, store) = store();
+        let (_root, _) = store();
         let mut repository = Repository::default();
         let library = Library::new("head");
         library.install(&mut repository);
@@ -751,7 +774,7 @@ mod tests {
             .block_on(mark(
                 request(NOW),
                 &repository,
-                &store,
+                at(&_root),
                 &Cancellation::default(),
             ))
             .unwrap();
@@ -760,7 +783,7 @@ mod tests {
             .block_on(mark(
                 request(NOW + 8 * DAY),
                 &repository,
-                &store,
+                at(&_root),
                 &Cancellation::default(),
             ))
             .unwrap();
@@ -795,7 +818,7 @@ mod tests {
                     dropped_points: Vec::new(),
                 },
                 &repository,
-                &store,
+                at(&_root),
                 &Cancellation::default(),
             ))
             .unwrap();
@@ -835,7 +858,7 @@ mod tests {
                     dropped_points: Vec::new(),
                 },
                 &repository,
-                &store,
+                at(&_root),
                 &Cancellation::default(),
             ))
             .unwrap();
@@ -854,7 +877,7 @@ mod tests {
         let orphan = object("job-pack", ObjectRole::Pack, 700);
         repository.with_document(&head, None, library.references());
         let mut roots = roots(Some(&head));
-        roots.job_objects = vec![orphan.clone()];
+        roots.job_objects = vec![orphan.receipt.clone()];
         let mark = runtime()
             .block_on(mark(
                 MarkRequest {
@@ -865,7 +888,7 @@ mod tests {
                     dropped_points: Vec::new(),
                 },
                 &repository,
-                &store,
+                at(&_root),
                 &Cancellation::default(),
             ))
             .unwrap();
@@ -886,7 +909,7 @@ mod tests {
     /// document's own times never enter the decision.
     #[test]
     fn a_state_published_long_after_it_was_uploaded_still_protects_its_parent() {
-        let (_root, store) = store();
+        let (_root, _) = store();
         let mut repository = Repository::default();
         let library = Library::new("parent");
         library.install(&mut repository);
@@ -912,7 +935,7 @@ mod tests {
                         dropped_points: Vec::new(),
                     },
                     &repository,
-                    &store,
+                    at(&_root),
                     &Cancellation::default(),
                 ))
                 .unwrap()
@@ -957,7 +980,7 @@ mod tests {
                     dropped_points: vec![point.clone()],
                 },
                 &repository,
-                &store,
+                at(&_root),
                 &Cancellation::default(),
             ))
             .unwrap();
@@ -1001,7 +1024,7 @@ mod tests {
                     dropped_points: Vec::new(),
                 },
                 &repository,
-                &store,
+                at(&_root),
                 &Cancellation::default(),
             ))
             .unwrap();
@@ -1041,7 +1064,7 @@ mod tests {
                     dropped_points: Vec::new(),
                 },
                 &repository,
-                &store,
+                at(&_root),
                 &Cancellation::default(),
             ))
             .unwrap();
@@ -1052,7 +1075,8 @@ mod tests {
 
     #[test]
     fn a_list_this_device_cannot_read_is_replaced_and_reported() {
-        let (root, store) = store();
+        let (_root, store) = store();
+        let root = &_root;
         let mut repository = Repository::default();
         let head = object("snapshot-head", ObjectRole::SyncState, 2);
         repository.with_document(&head, None, Vec::new());
@@ -1074,7 +1098,7 @@ mod tests {
                     dropped_points: Vec::new(),
                 },
                 &repository,
-                &store,
+                at(&_root),
                 &Cancellation::default(),
             ))
             .unwrap();

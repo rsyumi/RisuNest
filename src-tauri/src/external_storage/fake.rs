@@ -35,8 +35,38 @@ pub(super) fn capabilities(cas: bool) -> Capabilities {
         head_read_after_write: Evidence::Synthetic,
         head_retry_control: Evidence::Synthetic,
         snapshot_discovery: Evidence::Synthetic,
+        delete_objects: Evidence::Synthetic,
+        gc_control_consistency: Evidence::Synthetic,
+        delete_completion: Evidence::Synthetic,
         ..Default::default()
     }
+}
+
+/// The same repository without the evidence a removal needs. Everything else
+/// stays available, which is what a connection that cannot be cleaned looks
+/// like.
+pub(super) fn capabilities_without_cleanup(cas: bool) -> Capabilities {
+    Capabilities {
+        delete_objects: Evidence::Unverified,
+        gc_control_consistency: Evidence::Unverified,
+        delete_completion: Evidence::Unverified,
+        ..capabilities(cas)
+    }
+}
+
+fn take_scheduled(
+    scheduled: &mut Vec<(usize, String, ObjectRole, Vec<u8>)>,
+    reached: usize,
+) -> Vec<(String, ObjectRole, Vec<u8>)> {
+    let mut taken = Vec::new();
+    scheduled.retain(|(at, object, role, bytes)| {
+        if *at == reached {
+            taken.push((object.clone(), *role, bytes.clone()));
+            return false;
+        }
+        true
+    });
+    taken
 }
 
 /// What a delete of one named target does instead of removing it. Ambiguous
@@ -58,6 +88,10 @@ pub(super) struct FakeState {
     pub(super) lose_response: bool,
     roles: BTreeMap<String, ObjectRole>,
     deletes: BTreeMap<String, DeleteFault>,
+    answered_deletes: usize,
+    listings: usize,
+    scheduled: Vec<(usize, String, ObjectRole, Vec<u8>)>,
+    after_listing: Vec<(usize, String, ObjectRole, Vec<u8>)>,
 }
 pub(crate) struct FakeProvider {
     pub(super) state: Mutex<FakeState>,
@@ -79,6 +113,36 @@ impl FakeProvider {
         state.objects.insert(object.to_owned(), (bytes, version));
         state.roles.insert(object.to_owned(), role);
     }
+    /// Places an object once a given number of removals have been answered,
+    /// which is how another device arrives in the middle of a removal.
+    pub(crate) fn seed_after_delete(
+        &self,
+        answered: usize,
+        object: &str,
+        role: ObjectRole,
+        bytes: Vec<u8>,
+    ) {
+        self.state
+            .lock()
+            .unwrap()
+            .scheduled
+            .push((answered, object.to_owned(), role, bytes));
+    }
+    /// Places an object once a given number of enumerations have answered,
+    /// which is how another device arrives between two readings.
+    pub(crate) fn seed_after_list(
+        &self,
+        listings: usize,
+        object: &str,
+        role: ObjectRole,
+        bytes: Vec<u8>,
+    ) {
+        self.state
+            .lock()
+            .unwrap()
+            .after_listing
+            .push((listings, object.to_owned(), role, bytes));
+    }
     pub(crate) fn fail_delete(&self, object: &str, fault: DeleteFault) {
         self.state
             .lock()
@@ -93,6 +157,30 @@ impl FakeProvider {
         let mut state = self.state.lock().unwrap();
         state.objects.remove(object);
         state.roles.remove(object);
+    }
+    /// Counts one answered removal and places whatever was scheduled for that
+    /// point.
+    fn answered(&self) {
+        let pending = {
+            let mut state = self.state.lock().unwrap();
+            state.answered_deletes += 1;
+            let reached = state.answered_deletes;
+            take_scheduled(&mut state.scheduled, reached)
+        };
+        for (object, role, bytes) in pending {
+            self.seed(&object, role, bytes);
+        }
+    }
+    fn listed(&self) {
+        let pending = {
+            let mut state = self.state.lock().unwrap();
+            state.listings += 1;
+            let reached = state.listings;
+            take_scheduled(&mut state.after_listing, reached)
+        };
+        for (object, role, bytes) in pending {
+            self.seed(&object, role, bytes);
+        }
     }
     pub(super) fn write(
         &self,
@@ -314,6 +402,7 @@ impl Provider for FakeProvider {
                 // A target that is already gone answers the same as one removed now.
                 None => {
                     self.forget(&l.object);
+                    self.answered();
                     Ok(())
                 }
             }
@@ -365,6 +454,8 @@ impl Provider for FakeProvider {
             } else {
                 None
             };
+            drop(state);
+            self.listed();
             Ok(ObjectPage {
                 objects,
                 next_cursor,
