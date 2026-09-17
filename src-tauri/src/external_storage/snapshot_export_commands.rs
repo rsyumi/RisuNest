@@ -3,7 +3,7 @@
 use super::{
     capabilities::Capabilities,
     connection_commands,
-    contract::{Cancellation, ErrorKind, ProviderError, Result},
+    contract::{Cancellation, ErrorKind, LeaseKind, ProviderError, Result},
     control, leases, runtime, snapshot_export, snapshot_restore,
 };
 use serde::{Deserialize, Serialize};
@@ -133,7 +133,7 @@ async fn with_export_lease<T>(
         return body.await;
     }
     let lease_id = uuid::Uuid::new_v4().to_string();
-    let outcome = match leases::admit(context, &lease_id, now_ms, cancel).await {
+    let outcome = match leases::admit(context, &lease_id, LeaseKind::Work, now_ms, cancel).await {
         Ok(_) => body.await,
         Err(error) => Err(error),
     };
@@ -420,7 +420,8 @@ mod tests {
         let started = AtomicBool::new(false);
         block_on(async {
             let context = harness.context();
-            with_export_lease(&context, &fake::capabilities(true), NOW, &cancel, async {
+            let unavailable = fake::capabilities_without_cleanup(true);
+            with_export_lease(&context, &unavailable, NOW, &cancel, async {
                 started.store(true, Ordering::SeqCst);
                 Ok(())
             })
