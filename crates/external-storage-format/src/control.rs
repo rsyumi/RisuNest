@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 const HEAD_SCHEMA: &str = "risunest.external-head/v2";
 const POINT_SCHEMA: &str = "risunest.external-backup-point/v2";
 const BUNDLE_SCHEMA: &str = "risunest.external-backup-bundle/v1";
+const LEASE_SCHEMA: &str = "risunest.external-lease/v1";
 pub const MAX_CONTROL_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -332,6 +333,74 @@ impl BackupBundleDocument {
     }
 }
 
+/// What a lease announces. `Deleting` marks one removal attempt; the other two
+/// announce that a device is reading or writing the repository.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum LeaseKind {
+    Work,
+    Cleanup,
+    Deleting,
+}
+
+/// The body of one lease object. The identity of the object is its name; this
+/// says who placed it and which renewal it is, which only a diagnostic read
+/// needs. `seq` counts renewals of one job's lease and never leaves this
+/// device's storage as a clock.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LeaseDocument {
+    pub schema: String,
+    pub writer_id: String,
+    pub job_id: String,
+    pub kind: LeaseKind,
+    pub seq: u64,
+    pub created_at_ms: u64,
+}
+
+impl LeaseDocument {
+    pub fn new(
+        writer_id: String,
+        job_id: String,
+        kind: LeaseKind,
+        seq: u64,
+        created_at_ms: u64,
+    ) -> Result<Self> {
+        let value = Self {
+            schema: LEASE_SCHEMA.into(),
+            writer_id,
+            job_id,
+            kind,
+            seq,
+            created_at_ms,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != LEASE_SCHEMA
+            || self.writer_id.is_empty()
+            || self.writer_id.len() > 1024
+            || self.job_id.is_empty()
+            || self.job_id.len() > 1024
+        {
+            return Err(FormatError("invalid-lease"));
+        }
+        Ok(())
+    }
+    pub fn encode(&self, max_bytes: usize) -> Result<Vec<u8>> {
+        encode(self, max_bytes, "invalid-lease")
+    }
+    pub fn decode(bytes: &[u8], max_bytes: usize) -> Result<Self> {
+        let value: Self = decode(bytes, max_bytes, "invalid-lease")?;
+        value.validate()?;
+        if value.encode(max_bytes)? != bytes {
+            return Err(FormatError("non-canonical-lease"));
+        }
+        Ok(value)
+    }
+}
+
 fn encode(value: &impl Serialize, max_bytes: usize, error: &'static str) -> Result<Vec<u8>> {
     let bytes = serde_json::to_vec(value).map_err(|_| FormatError(error))?;
     if bytes.is_empty() || bytes.len() > max_bytes.min(MAX_CONTROL_BYTES) {
@@ -472,6 +541,28 @@ mod tests {
         let mut emptied = single;
         emptied.bundle = None;
         assert!(emptied.validate().is_err());
+    }
+
+    /// GC27: a lease body survives the round trip unchanged, so a retry after a
+    /// lost answer can resend the same bytes it stored.
+    #[test]
+    fn a_lease_roundtrips_and_refuses_an_unnamed_writer_or_job() {
+        let lease = LeaseDocument::new(
+            "writer".into(),
+            "job".into(),
+            LeaseKind::Deleting,
+            4,
+            1_700_000_000_000,
+        )
+        .unwrap();
+        let encoded = lease.encode(4096).unwrap();
+        assert_eq!(LeaseDocument::decode(&encoded, 4096).unwrap(), lease);
+        assert!(std::str::from_utf8(&encoded).unwrap().contains("\"deleting\""));
+        assert!(LeaseDocument::new("".into(), "job".into(), LeaseKind::Work, 0, 1).is_err());
+        assert!(LeaseDocument::new("writer".into(), "".into(), LeaseKind::Work, 0, 1).is_err());
+        let mut reordered: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        reordered["schema"] = serde_json::json!("risunest.external-lease/v2");
+        assert!(LeaseDocument::decode(&serde_json::to_vec(&reordered).unwrap(), 4096).is_err());
     }
 
     #[test]
