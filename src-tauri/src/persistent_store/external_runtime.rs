@@ -411,6 +411,7 @@ impl PersistentStore {
         if selection.target == sync_selection::SyncTarget::External(connection.into()) {
             sync_selection::select(&tx, &selection.epoch, &sync_selection::SyncTarget::None)?;
         }
+        super::content_change_index::remove_connection_consumer(&tx, connection)?;
         tx.commit()?;
         Ok(())
     }

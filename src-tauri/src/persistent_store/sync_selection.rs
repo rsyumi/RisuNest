@@ -206,7 +206,6 @@ pub(super) fn restored_copy(tx: &Transaction<'_>) -> StoreResult<()> {
     tx.execute("UPDATE library_sync_selection SET selection_epoch=?1,decision_required=1 WHERE singleton=1",[uuid::Uuid::new_v4().to_string()])?;
     tx.execute("UPDATE external_storage_jobs SET phase='stale' WHERE phase NOT IN ('complete','cancelled')",[])?;
     tx.execute("UPDATE content_change_consumers SET rebuild_required=1", [])?;
-    tx.execute("DELETE FROM content_capture_reservations", [])?;
     tx.execute("DELETE FROM content_change_context", [])?;
     Ok(())
 }
