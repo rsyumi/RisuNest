@@ -1227,6 +1227,238 @@ pub(crate) async fn external_storage_get_quota(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::external_storage::capabilities::Capabilities;
+
+    /// A repository this device can reach without an application handle, which
+    /// is what the admission and release steps actually need.
+    fn connected(
+        provider: std::sync::Arc<super::super::fake::FakeProvider>,
+        capabilities: Capabilities,
+    ) -> ConnectedRepository {
+        let test = super::super::fake::loopback_dependencies(
+            super::super::fake::MemoryVault::default(),
+            1_000,
+        );
+        ConnectedRepository {
+            stored: super::super::connection_store::StoredConnection {
+                id: "connection".into(),
+                config: ConnectionConfig {
+                    provider: "synthetic".into(),
+                    profile: None,
+                    endpoint: "https://synthetic.invalid".into(),
+                    account_id: "account".into(),
+                    location: std::collections::BTreeMap::new(),
+                    oauth_profile: None,
+                },
+                descriptor: risunest_external_storage_format::format::Descriptor::new(
+                    "synthetic-descriptor".into(),
+                    Some(PublicationStrategy::Cas),
+                )
+                .unwrap(),
+                descriptor_locator: RemoteLocator {
+                    connection_identity: super::super::fake::repository().connection_identity,
+                    collection: None,
+                    object: "descriptor".into(),
+                },
+                provider_repository_id: super::super::fake::repository().repository_id,
+                credential_ref: "credential".into(),
+                root_key_ref: "key".into(),
+                capture_policy: None,
+                retention_policy: None,
+                capabilities,
+                created_at_ms: 1_000,
+            },
+            provider,
+            handle: super::super::fake::repository(),
+            dependencies: test.dependencies,
+            root_key: zeroize::Zeroizing::new([7; 32]),
+        }
+    }
+
+    fn lease_names(provider: &super::super::fake::FakeProvider) -> Vec<String> {
+        provider
+            .state
+            .lock()
+            .unwrap()
+            .objects
+            .keys()
+            .filter(|name| {
+                super::super::contract::parse_lease_object_id(name).is_ok()
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Invariants GC19 and GC29. Every job announces itself before it asks for
+    /// data, waits while another device is removing, and hands the lease back
+    /// when it ends. A repository without the removal evidence announces
+    /// nothing and waits for nothing.
+    #[test]
+    fn admission_places_a_lease_waits_for_a_marker_and_gives_the_lease_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let provider = std::sync::Arc::new(super::super::fake::FakeProvider::new(true));
+        let connected = connected(provider.clone(), super::super::fake::capabilities(true));
+        let cancel = Cancellation::default();
+        let live = BTreeSet::from(["job".to_owned()]);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                admit_repository(
+                    root,
+                    &connected,
+                    "writer",
+                    "job",
+                    LeaseKind::Work,
+                    &live,
+                    &cancel,
+                )
+                .await
+                .unwrap();
+                let placed = lease_names(&provider);
+                assert_eq!(placed.len(), 1);
+                assert!(placed[0].starts_with("work-"));
+
+                // Another device's removal marker keeps this job out until it
+                // goes, and this job's own lease stays in place while it waits.
+                provider.seed(
+                    &super::super::contract::lease_object_id(
+                        LeaseKind::Deleting,
+                        &"a".repeat(32),
+                    )
+                    .unwrap(),
+                    ObjectRole::Lease,
+                    b"foreign".to_vec(),
+                );
+                let waiting = admit_repository(
+                    root,
+                    &connected,
+                    "writer",
+                    "job",
+                    LeaseKind::Work,
+                    &live,
+                    &cancel,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(waiting.kind, ErrorKind::Transient);
+                assert_eq!(
+                    lease_names(&provider)
+                        .iter()
+                        .filter(|name| name.starts_with("work-"))
+                        .count(),
+                    1
+                );
+
+                release_repository(root, &connected, "writer", "job")
+                    .await
+                    .unwrap();
+                assert!(lease_names(&provider)
+                    .iter()
+                    .all(|name| name.starts_with("deleting-")));
+            });
+    }
+
+    /// A cleanup announces itself as one, so another device can tell it from a
+    /// publication.
+    #[test]
+    fn a_cleanup_announces_itself_with_its_own_lease_kind() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = std::sync::Arc::new(super::super::fake::FakeProvider::new(true));
+        let connected = connected(provider.clone(), super::super::fake::capabilities(true));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                admit_repository(
+                    directory.path(),
+                    &connected,
+                    "writer",
+                    "cleanup-job",
+                    LeaseKind::Cleanup,
+                    &BTreeSet::from(["cleanup-job".to_owned()]),
+                    &Cancellation::default(),
+                )
+                .await
+                .unwrap();
+            });
+        let placed = lease_names(&provider);
+        assert_eq!(placed.len(), 1);
+        assert!(placed[0].starts_with("cleanup-"));
+    }
+
+    /// Invariant GC17. A repository without the removal evidence announces
+    /// nothing, so no lease is placed and nothing waits.
+    #[test]
+    fn a_repository_without_removal_evidence_announces_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = std::sync::Arc::new(super::super::fake::FakeProvider::new(true));
+        let connected = connected(
+            provider.clone(),
+            super::super::fake::capabilities_without_cleanup(true),
+        );
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                admit_repository(
+                    directory.path(),
+                    &connected,
+                    "writer",
+                    "job",
+                    LeaseKind::Work,
+                    &BTreeSet::new(),
+                    &Cancellation::default(),
+                )
+                .await
+                .unwrap();
+            });
+        assert!(lease_names(&provider).is_empty());
+    }
+
+    /// The lease of a job an interrupted run left behind is given back before
+    /// this device announces anything new.
+    #[test]
+    fn admission_gives_back_the_lease_of_a_job_that_is_no_longer_live() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let provider = std::sync::Arc::new(super::super::fake::FakeProvider::new(true));
+        let connected = connected(provider.clone(), super::super::fake::capabilities(true));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                admit_repository(
+                    root,
+                    &connected,
+                    "writer",
+                    "interrupted",
+                    LeaseKind::Work,
+                    &BTreeSet::from(["interrupted".to_owned()]),
+                    &Cancellation::default(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(lease_names(&provider).len(), 1);
+                admit_repository(
+                    root,
+                    &connected,
+                    "writer",
+                    "next",
+                    LeaseKind::Work,
+                    &BTreeSet::from(["next".to_owned()]),
+                    &Cancellation::default(),
+                )
+                .await
+                .unwrap();
+            });
+        assert_eq!(lease_names(&provider).len(), 1);
+    }
     #[test]
     fn a_new_restore_or_conflict_choice_never_resumes_a_different_pending_request() {
         let existing: StartJobRequest = serde_json::from_value(json!({"connectionId":"x", "kind":"restore", "snapshotId":"a", "restoreAreas":["library"]})).unwrap();

@@ -297,6 +297,30 @@ mod tests {
         input.reason = Some("hidden-retry".into());
         assert!(input.validate().is_err());
     }
+    /// A removal is described by the connection it runs on and nothing else,
+    /// and the name it goes out under is the one the renderer already reads.
+    #[test]
+    fn a_cleanup_request_carries_nothing_but_its_connection() {
+        let mut input: StartJobRequest =
+            serde_json::from_value(json!({"connectionId":"synthetic","kind":"cleanup"})).unwrap();
+        assert!(input.validate().is_ok());
+        assert_eq!(serde_json::to_value(input.kind).unwrap(), json!("cleanup"));
+        input.snapshot_id = Some("snapshot".into());
+        assert!(input.validate().is_err());
+        input.snapshot_id = None;
+        input.restore_areas = Some(vec!["library".into()]);
+        assert!(input.validate().is_err());
+        input.restore_areas = None;
+        input.choice = Some("local".into());
+        assert!(input.validate().is_err());
+        input.choice = None;
+        // The session a job runs under is set by the start path for every kind.
+        input.session = Some("foreground".into());
+        input.session_id = Some("session".into());
+        input.reason = Some("automatic".into());
+        assert!(input.validate().is_ok());
+    }
+
     #[test]
     fn durable_admission_identity_is_required_and_validated() {
         let root = tempfile::tempdir().unwrap();
