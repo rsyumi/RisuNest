@@ -343,10 +343,10 @@ pub enum LeaseKind {
     Deleting,
 }
 
-/// The body of one lease object. The identity of the object is its name; this
-/// says who placed it and which renewal it is, which only a diagnostic read
-/// needs. `seq` counts renewals of one job's lease and never leaves this
-/// device's storage as a clock.
+pub const LEASE_TTL_MS: u64 = 60 * 60_000;
+
+/// Authenticated, finite protection for one execution. `seq` orders renewals
+/// of that execution; it is not a distributed clock.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LeaseDocument {
@@ -356,6 +356,7 @@ pub struct LeaseDocument {
     pub kind: LeaseKind,
     pub seq: u64,
     pub created_at_ms: u64,
+    pub expires_at_ms: u64,
 }
 
 impl LeaseDocument {
@@ -373,6 +374,9 @@ impl LeaseDocument {
             kind,
             seq,
             created_at_ms,
+            expires_at_ms: created_at_ms
+                .checked_add(LEASE_TTL_MS)
+                .ok_or(FormatError("invalid-lease-expiry"))?,
         };
         value.validate()?;
         Ok(value)
@@ -383,12 +387,14 @@ impl LeaseDocument {
             || self.writer_id.len() > 1024
             || self.job_id.is_empty()
             || self.job_id.len() > 1024
+            || self.expires_at_ms.checked_sub(self.created_at_ms) != Some(LEASE_TTL_MS)
         {
             return Err(FormatError("invalid-lease"));
         }
         Ok(())
     }
     pub fn encode(&self, max_bytes: usize) -> Result<Vec<u8>> {
+        self.validate()?;
         encode(self, max_bytes, "invalid-lease")
     }
     pub fn decode(bytes: &[u8], max_bytes: usize) -> Result<Self> {
@@ -543,8 +549,47 @@ mod tests {
         assert!(emptied.validate().is_err());
     }
 
-    /// GC27: a lease body survives the round trip unchanged, so a retry after a
-    /// lost answer can resend the same bytes it stored.
+    #[test]
+    fn c_lease_has_an_exact_one_hour_expiry_without_a_schema_bump() {
+        let lease = LeaseDocument::new("writer".into(), "job".into(), LeaseKind::Work, 0, 42)
+            .unwrap();
+        let encoded = lease.encode(4096).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(value["expiresAtMs"], 42 + 60 * 60_000u64);
+        assert_eq!(value["schema"], LEASE_SCHEMA);
+        assert_eq!(LeaseDocument::decode(&encoded, 4096).unwrap(), lease);
+    }
+
+    #[test]
+    fn c_lease_rejects_expiry_overflow_and_a_body_without_expiry() {
+        assert!(LeaseDocument::new(
+            "writer".into(), "job".into(), LeaseKind::Work, 0, u64::MAX - 60 * 60_000 + 1,
+        ).is_err());
+        let lease = LeaseDocument::new("writer".into(), "job".into(), LeaseKind::Work, 0, 0)
+            .unwrap();
+        let encoded = String::from_utf8(lease.encode(4096).unwrap()).unwrap();
+        let without_expiry = encoded.replace(",\"expiresAtMs\":3600000", "");
+        assert!(LeaseDocument::decode(without_expiry.as_bytes(), 4096).is_err());
+    }
+
+    #[test]
+    fn c_lease_refuses_reversed_or_inexact_expiry_and_accepts_future_issuance() {
+        let valid = LeaseDocument::new(
+            "writer".into(), "job".into(), LeaseKind::Deleting, u64::MAX,
+            u64::MAX - LEASE_TTL_MS,
+        ).unwrap();
+        assert_eq!(valid.expires_at_ms, u64::MAX);
+        assert_eq!(LeaseDocument::decode(&valid.encode(4096).unwrap(), 4096).unwrap(), valid);
+        for expiry in [0, valid.created_at_ms, u64::MAX - 1] {
+            let mut invalid = valid.clone();
+            invalid.expires_at_ms = expiry;
+            assert!(invalid.validate().is_err());
+            assert!(invalid.encode(4096).is_err());
+            let bytes = serde_json::to_vec(&invalid).unwrap();
+            assert!(LeaseDocument::decode(&bytes, 4096).is_err());
+        }
+    }
+
     #[test]
     fn a_lease_roundtrips_and_refuses_an_unnamed_writer_or_job() {
         let lease = LeaseDocument::new(
