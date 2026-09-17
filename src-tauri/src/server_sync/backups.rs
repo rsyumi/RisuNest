@@ -1,3 +1,6 @@
+#[path = "backup_references.rs"]
+pub(crate) mod references;
+
 use super::{Result, SyncError};
 use risunest_sync_wire::RemoteHead;
 use serde::{Deserialize, Serialize};

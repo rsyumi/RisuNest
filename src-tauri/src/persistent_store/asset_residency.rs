@@ -148,6 +148,13 @@ impl PersistentStore {
             )?
             .object_hashes,
         );
+        crate::server_sync::backups::references::visit_roots(&self.repository_root, |object| {
+            referenced.insert(object.hash.clone());
+            if object.metadata || object.local_required {
+                local.insert(object.hash);
+            }
+            Ok(())
+        })?;
         let jobs = if guarded {
             crate::asset_repository::job_pins::collect_durable_cas_job_roots_already_guarded(
                 &self.repository_root,

@@ -2087,6 +2087,195 @@ impl PersistentStore {
         }
         Ok(groups)
     }
+    pub(crate) fn server_conflict_references(
+        &mut self,
+        cache: &Cache,
+        transfer: &Transfer<'_>,
+        client: &ServerClient,
+        revision: i64,
+        head: &RemoteHead,
+    ) -> Result<crate::server_sync::backups::references::Receipt> {
+        use crate::server_sync::backups::{references::{Capture, RemoteRead, PAGE}, Side};
+        use crate::server_sync::residency::Residency;
+        let config = self.server_stored_config()?
+            .ok_or_else(|| SyncError::new("server-not-bound", 409))?;
+        let remote = RemoteRead::begin(client, head)?;
+        let lease = self.acquire_revision(revision)?;
+        let result = (|| {
+            let (_, target) = self.read_view(Some(&lease.lease))?;
+            let mut capture = Capture::begin_or_resume(&self.repository_root, revision, &target.generation, head)?;
+            let mut residency = Residency::open(&self.repository_root)?;
+            let context = Residency::context_id(&config, &head.epoch);
+            let cas = PayloadCas::new(&self.repository_root)?;
+            let (db, target) = self.read_view(Some(&lease.lease))?;
+            if !capture.side_complete(Side::Local)? {
+                let mut after = None;
+                loop {
+                    client.ensure_active()?;
+                    let page = projection::all_keys_page(
+                        db, &target.generation,
+                        after.as_ref().map(|key: &outbox::ServerDirtyKey|
+                            (key.kind.as_str(), key.key1.as_str(), key.key2.as_str())),
+                        PAGE, revision,
+                    )?;
+                    if page.is_empty() { break; }
+                    after = page.last().cloned();
+                    for key in page {
+                        client.ensure_active()?;
+                        let Some(payload) = projection::project(db, &cas, &target.generation, &key)? else { continue; };
+                        for bytes in payload.derived_objects.values() { cache.put(bytes)?; }
+                        let dependencies = projection::dependencies(&payload, &cas)?;
+                        let projected = cache.project(&payload, &dependencies, &relations(&key)?, scopes(&key))?;
+                        self.capture_server_reference_record(
+                            &mut capture, Side::Local, cache, &residency, &context,
+                            &projection::wire_key(&key)?, &projected.version,
+                            &payload, &dependencies, &projected.objects, client,
+                        )?;
+                    }
+                }
+                let mut after = String::new();
+                loop {
+                    let page = {
+                        let mut statement = db.prepare("SELECT key,version FROM server_sync_base
+                            WHERE domain='library' AND key>?1 ORDER BY key LIMIT 256")?;
+                        let rows = statement.query_map([&after], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                            .collect::<std::result::Result<Vec<_>, _>>()?;
+                        rows
+                    };
+                    if page.is_empty() { break; }
+                    for (key, base) in page {
+                        client.ensure_active()?;
+                        after = key.clone();
+                        if !capture.has_record(Side::Local, &key)? {
+                            capture.record(Side::Local, &key, &delete_version(&parse(&base)?), None)?;
+                        }
+                    }
+                }
+                capture.complete_side(Side::Local)?;
+            }
+            if !capture.side_complete(Side::Remote)? {
+                remote.visit(|record| {
+                    if !matches!(record.version, RecordVersion::Live { .. }) {
+                        return capture.record(Side::Remote, &record.key, &record.version, None);
+                    }
+                    transfer.download_record_metadata(&record.version, &[], &RecordVersion::Absent)?;
+                    let (payload, _) = cache.restore(&record.version)?;
+                    let key = key_parts(&record.key, revision)?;
+                    let dependencies = projection::dependencies(&payload, &cache.cas)?;
+                    let projected = cache.project(&payload, &dependencies, &relations(&key)?, scopes(&key))?;
+                    if projected.version != record.version {
+                        return Err(SyncError::new("server-descriptor-semantics-mismatch", 409));
+                    }
+                    self.capture_server_reference_record(
+                        &mut capture, Side::Remote, cache, &residency, &context,
+                        &record.key, &record.version, &payload, &dependencies, &projected.objects, client,
+                    )
+                })?;
+                capture.complete_side(Side::Remote)?;
+            }
+            capture.retain(client, &config, &mut residency)?;
+            capture.visit_records(|record| {
+                client.ensure_active()?;
+                let payload = if let Some(hash) = &record.body_hash {
+                    let bytes = cas.read_object(hash)?
+                        .ok_or_else(|| SyncError::new("conflict-metadata-missing", 409))?;
+                    if risunest_sync_wire::hash(&bytes) != *hash {
+                        return Err(SyncError::new("conflict-object-hash-mismatch", 409));
+                    }
+                    let payload: projection::ServerPayload = serde_json::from_slice(&bytes)
+                        .map_err(|_| SyncError::new("invalid-server-payload", 409))?;
+                    let key = key_parts(&record.key, revision)?;
+                    let dependencies = projection::dependencies(&payload, &cas)?;
+                    if cache.project(&payload, &dependencies, &relations(&key)?, scopes(&key))?.version != record.version {
+                        return Err(SyncError::new("server-descriptor-semantics-mismatch", 409));
+                    }
+                    Some(payload)
+                } else { None };
+                validate_remote_with_residency(RemoteRecord { key: record.key, version: record.version,
+                    payload, local_hash: record.body_hash }, &cas, |hash, size| {
+                    capture.confirms(&residency, record.side, hash, size)
+                        .map_err(|_| super::StoreError::Validation { message: "Conflict custody unavailable".into() })
+                })?;
+                Ok(())
+            })?;
+            client.ensure_active()?;
+            if self.revision()? != revision {
+                return Err(SyncError::new("local-revision-changed", 409));
+            }
+            capture.finish(self, &|| client.ensure_active())
+        })();
+        let released = self.release_revision(&lease.lease);
+        match result {
+            Ok(receipt) => {
+                // An expired/rejected release cannot undo the durable receipt.
+                let _ = remote.release();
+                released?;
+                Ok(receipt)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn capture_server_reference_record(
+        &self,
+        capture: &mut crate::server_sync::backups::references::Capture,
+        side: crate::server_sync::backups::Side,
+        cache: &Cache,
+        residency: &crate::server_sync::residency::Residency,
+        context: &str,
+        key: &str,
+        version: &RecordVersion,
+        payload: &projection::ServerPayload,
+        dependencies: &[String],
+        objects: &[String],
+        client: &ServerClient,
+    ) -> Result<()> {
+        use crate::server_sync::backups::{references::Object, Side};
+        use crate::logical_records::LogicalRecordEnvelope as Envelope;
+        let manifests: BTreeSet<&str> = match &payload.record {
+            Envelope::Root { owner_heads, .. } | Envelope::Character { owner_heads, .. } =>
+                owner_heads.iter().filter_map(|head| head.manifest_hash.as_deref()).collect(),
+            _ => BTreeSet::new(),
+        };
+        let payload_hashes: BTreeSet<&str> = dependencies.iter().map(String::as_str)
+            .filter(|hash| !manifests.contains(hash)).collect();
+        let expected = match &payload.record {
+            Envelope::Asset { object_hash: Some(hash), size, .. }
+            | Envelope::Inlay { object_hash: Some(hash), size, .. } => Some((hash.as_str(), *size)),
+            _ => None,
+        };
+        let bytes = serde_json::to_vec(payload).map_err(|_| SyncError::new("invalid-local-payload", 409))?;
+        let body = capture.metadata(side, &bytes)?;
+        for hash in objects {
+            client.ensure_active()?;
+            if !payload_hashes.contains(hash.as_str()) {
+                capture.cached_metadata(side, cache, hash)?;
+                continue;
+            }
+            let size = expected.filter(|(candidate, _)| *candidate == hash).map(|(_, size)| size);
+            if matches!(side, Side::Local) {
+                if let Some(proof) = residency.object(hash, Some(context))?.or(residency.object(hash, None)?) {
+                    if size.is_some_and(|size| size != proof.size) {
+                        return Err(SyncError::new("conflict-object-size-mismatch", 409));
+                    }
+                    capture.object(side, &Object { hash: hash.clone(), byte_size: Some(proof.size),
+                        metadata: false, context_id: Some(proof.context), local_required: false })?;
+                } else {
+                    let actual = PayloadCas::new(&self.repository_root)?.stat_object(hash)?
+                        .ok_or_else(|| SyncError::new("conflict-local-payload-unavailable", 409))?;
+                    if size.is_some_and(|size| size != actual) {
+                        return Err(SyncError::new("conflict-object-size-mismatch", 409));
+                    }
+                    capture.local_payload(hash, actual, &|| client.ensure_active())?;
+                }
+            } else {
+                capture.object(side, &Object { hash: hash.clone(), byte_size: size,
+                    metadata: false, context_id: Some(context.into()), local_required: false })?;
+            }
+        }
+        capture.record(side, key, version, Some((&body, bytes.len() as u64)))
+    }
+
     fn server_conflict_backups(
         &mut self,
         cache: &Cache,
@@ -2095,6 +2284,9 @@ impl PersistentStore {
         revision: i64,
         head: &RemoteHead,
     ) -> Result<()> {
+        self.server_conflict_references(cache, transfer, client, revision, head)?;
+        // Keep the existing portable recovery gate until the reference source
+        // consumer and GC ownership handoff are connected.
         // Both library-only packages must pass the portable archive verifier before
         // any live activation or server publication. A partial directory is not
         // a completed backup; only the final receipt makes it discoverable.

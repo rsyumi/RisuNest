@@ -377,6 +377,17 @@ fn two_native_replicas_seed_publish_pull_and_preserve_same_key_conflicts() {
         .unwrap()
         .collect::<std::io::Result<Vec<_>>>()
         .unwrap();
+    let references = backups.iter().filter(|entry| entry.path().join("index.sqlite").is_file())
+        .collect::<Vec<_>>();
+    assert_eq!(references.len(), 1);
+    let reference_id = references[0].file_name().into_string().unwrap();
+    let reference_index = crate::server_sync::backups::references::open(
+        &second.repository_root, &reference_id, &|| Ok(())).unwrap();
+    let reference_sides: i64 = reference_index.query_row(
+        "SELECT count(DISTINCT side) FROM records", [], |r| r.get(0)).unwrap();
+    assert_eq!(reference_sides, 2);
+    let backups = backups.iter().filter(|entry| entry.path().join("local.risunest").is_file())
+        .collect::<Vec<_>>();
     assert_eq!(backups.len(), 1);
     for name in ["local.risunest", "remote.risunest", "complete.json"] {
         assert!(backups[0].path().join(name).is_file());

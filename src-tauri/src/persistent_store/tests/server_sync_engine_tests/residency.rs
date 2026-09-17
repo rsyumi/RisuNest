@@ -3,6 +3,7 @@ use crate::asset_repository::PayloadCas;
 use crate::server_sync::residency::{open_or_hydrate, AssetPolicy, Residency};
 
 mod regressions;
+mod references;
 
 struct Fixture {
     _server_root: tempfile::TempDir,
