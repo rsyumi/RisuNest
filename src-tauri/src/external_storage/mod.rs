@@ -15,6 +15,7 @@ pub(crate) mod descriptor;
 pub(crate) mod durable_quota;
 #[cfg(test)]
 pub(crate) mod fake;
+pub(crate) mod gc_store;
 pub(crate) mod history;
 pub(crate) mod history_jobs;
 pub(crate) mod http;
@@ -28,6 +29,7 @@ pub(crate) mod providers;
 pub(crate) mod publication;
 pub(crate) mod quota;
 pub(crate) mod quota_profiles;
+pub(crate) mod reachability;
 pub(crate) mod recovery;
 #[cfg(test)]
 mod recovery_integration_tests;
