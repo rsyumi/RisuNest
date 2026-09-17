@@ -314,6 +314,7 @@ export interface PersistentDataRuntimeDependencies {
     onLocalRevision?(revision: DataRevision): void
     onFlushPromise?(promise: Promise<void> | null): void
     onBackgroundError?(error: unknown): void
+    /** Detaches the input synchronously before any asynchronous preparation. */
     prepareDatabase(database: Database): Promise<Database>
 }
 
@@ -389,7 +390,7 @@ export interface PersistentDataRuntime {
         characterId: string,
         conversationId: string,
         patch: import('./conversationBinding').ConversationBindingPatch,
-        publish: () => void,
+        publish: (committedPatch: import('./conversationBinding').ConversationBindingPatch) => void,
     ): Promise<void>
     mutatePersistentCharacterDetail(
         characterId: string,

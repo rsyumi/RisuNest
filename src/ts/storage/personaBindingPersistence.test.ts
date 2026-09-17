@@ -1,5 +1,6 @@
 import { expect, it, vi } from 'vitest'
-import { captureRoot, makeDatabase, SaveCoordinator } from './saveCoordinator.testSupport'
+import { captureRoot, deferred, makeDatabase, SaveCoordinator } from './saveCoordinator.testSupport'
+import { applyConversationBindingPatch, type ConversationBindingPatch } from './conversationBinding'
 import type { PersistentDataStore } from './persistentDataStore'
 import { createConversationSummaryStub } from './conversationResidency'
 
@@ -40,8 +41,68 @@ function setup() {
         replaceDatabase: () => undefined,
     })
     coordinator.initialize(1)
-    return { character, other, readConversation, commit, coordinator }
+    return { character, other, readConversation, commit, coordinator, store }
 }
+
+it('freezes binding values and explicit deletions through reads, commit and publication', async () => {
+    const { character, other, readConversation, commit, coordinator, store } = setup()
+    const readStarted = deferred<void>()
+    const readFinished = deferred<void>()
+    vi.mocked(store.readConversationMetadata).mockImplementationOnce(async () => {
+        readStarted.resolve()
+        await readFinished.promise
+        return {
+            revision: 1,
+            value: {
+                characterId: character.chaId, conversationId: 'other', totalMessages: 10_000,
+                conversation: {
+                    id: 'other', name: 'Synthetic', note: '', localLore: [], bindedPersona: 'old',
+                    savedToggleValues: { old: 'value' },
+                },
+            },
+        }
+    })
+    const commitStarted = deferred<void>()
+    const commitFinished = deferred<{ revision: number }>()
+    commit.mockImplementationOnce(() => {
+        commitStarted.resolve()
+        return commitFinished.promise
+    })
+    const patch: ConversationBindingPatch = {
+        bindedPersona: undefined,
+        savedToggleValues: { toggle_a: 'captured' },
+    }
+    const captured = structuredClone(patch)
+    const publish = vi.fn((committedPatch: ConversationBindingPatch) => {
+        if (committedPatch) applyConversationBindingPatch(other, committedPatch)
+    })
+    const binding = coordinator.mutateConversationBinding(character.chaId, 'other', patch, publish)
+    patch.bindedPersona = 'Changed while queued'
+    await readStarted.promise
+    patch.savedToggleValues!.toggle_a = 'Changed during read'
+    readFinished.resolve()
+    await commitStarted.promise
+    patch.savedToggleValues!.extra = 'Changed during commit'
+    commitFinished.resolve({ revision: 2 })
+    await binding
+
+    const written = vi.mocked(store.commit).mock.calls[0][0].conversations![0]
+    expect(written).toMatchObject({
+        start: 10_000, deleteCount: 0, messages: [],
+        conversation: { savedToggleValues: captured.savedToggleValues },
+    })
+    expect('conversation' in written && written.conversation).not.toHaveProperty('bindedPersona')
+    expect(publish).toHaveBeenCalledExactlyOnceWith(captured)
+    expect(other.savedToggleValues).toEqual({ toggle_a: 'captured' })
+    expect(other).not.toHaveProperty('bindedPersona')
+    await coordinator.flushPendingDataLocally('clean-frozen-binding')
+    expect(commit).toHaveBeenCalledOnce()
+    expect(readConversation).not.toHaveBeenCalled()
+    other.savedToggleValues!.toggle_a = 'Later UI edit'
+    expect(written).toMatchObject({
+        conversation: { savedToggleValues: { toggle_a: 'captured' } },
+    })
+})
 
 it('writes an inactive persona binding using only metadata and advances the matching baseline', async () => {
     const { character, other, readConversation, commit, coordinator } = setup()

@@ -1027,6 +1027,7 @@ export class SaveCoordinator {
     ): Promise<void> {
         this.assertInitialized()
         this.assertPersistentMutationAllowed()
+        options = { ...options }
         const expectationError = this.replacementExpectationError(options)
         if (expectationError) return Promise.reject(expectationError)
         if (!options.authoritative && this.dependencies.isIncompleteWorkingSet?.(database)) {
@@ -1068,6 +1069,7 @@ export class SaveCoordinator {
     ): Promise<void> {
         this.assertInitialized()
         this.assertPersistentMutationAllowed()
+        options = { ...options }
         const expectationError = this.replacementExpectationError(options)
         if (expectationError) return Promise.reject(expectationError)
         const before = this.capture()
@@ -1076,29 +1078,28 @@ export class SaveCoordinator {
             (this.pendingCharacterAddition ?? this.reservedCharacterAddition)?.token ?? null
         const hadPendingDebounce = this.debounceHandle !== undefined
         this.cancelDebounce()
-        const preparation = Promise.resolve().then(prepare)
+        // Preparation detaches its input synchronously, before the caller can edit it again.
+        const preparation = (async () => {
+            const prepared = await prepare()
+            if (!options.authoritative && this.dependencies.isIncompleteWorkingSet?.(prepared)) {
+                throw new Error(
+                    'Cannot replace persistent data from an incomplete persistent working set',
+                )
+            }
+            return canonicalDatabaseClone(prepared)
+        })().then(
+            (candidate) => ({ ok: true, candidate } as const),
+            (error: unknown) => ({ ok: false, error } as const),
+        )
         const replacement = this.enqueue(async () => {
             const queuedExpectationError = this.replacementExpectationError(options)
             if (queuedExpectationError) throw queuedExpectationError
-            let candidate: Database
-            try {
-                const prepared = await preparation
-                const preparedExpectationError = this.replacementExpectationError(options)
-                if (preparedExpectationError) throw preparedExpectationError
-                if (
-                    !options.authoritative &&
-                    this.dependencies.isIncompleteWorkingSet?.(prepared)
-                ) {
-                    throw new Error(
-                        'Cannot replace persistent data from an incomplete persistent working set',
-                    )
-                }
-                candidate = canonicalDatabaseClone(prepared)
-            } catch (error) {
-                throw error
-            }
+            const prepared = await preparation
+            if (prepared.ok === false) throw prepared.error
+            const preparedExpectationError = this.replacementExpectationError(options)
+            if (preparedExpectationError) throw preparedExpectationError
             await this.runReplacement(
-                candidate,
+                prepared.candidate,
                 before,
                 capturedGeneration,
                 supersededAdditionToken,
@@ -1201,6 +1202,7 @@ export class SaveCoordinator {
         try {
             this.assertInitialized()
             this.assertPersistentMutationAllowed()
+            input = canonicalClone(input)
         } catch (error) {
             throw persistentRootModuleAppendRejected(error)
         }
@@ -1294,10 +1296,10 @@ export class SaveCoordinator {
             }
             const modules = Array.isArray(snapshot.root.modules) ? snapshot.root.modules : []
             const moduleIndex = modules.length
-            snapshot.root.modules = [...modules, canonicalClone(input.module)]
+            snapshot.root.modules = [...modules, input.module]
             const ownerHead: AssetOwnerHead = {
                 owner: { kind: 'root-module-assets', index: moduleIndex },
-                ...canonicalClone(input.ownerHead),
+                ...input.ownerHead,
             } as AssetOwnerHead
             const liveBeforeCommit = this.capture()
             signal?.throwIfAborted()
@@ -1346,24 +1348,24 @@ export class SaveCoordinator {
     ): Promise<void> {
         this.assertInitialized()
         this.assertPersistentMutationAllowed()
+        const committedMutations = mutations.map((mutation): PluginStorageMutation => {
+            if (mutation.type === 'clear') return { type: 'clear', owner: mutation.owner }
+            if (mutation.type === 'delete' || mutation.value === undefined) {
+                return { type: 'delete', owner: mutation.owner, key: mutation.key }
+            }
+            return {
+                type: 'set',
+                owner: mutation.owner,
+                key: mutation.key,
+                value: canonicalClone(mutation.value),
+            }
+        })
         this.cancelDebounce()
         return this.enqueue(async () => {
             await this.flushIterations(reason, true)
-            if (mutations.length === 0) return
+            if (committedMutations.length === 0) return
             const revision = this.revision
             const baseline = this.pluginStorageBaselineEntries
-            const committedMutations = mutations.map((mutation): PluginStorageMutation => {
-                if (mutation.type === 'clear') return { type: 'clear', owner: mutation.owner }
-                if (mutation.type === 'delete' || mutation.value === undefined) {
-                    return { type: 'delete', owner: mutation.owner, key: mutation.key }
-                }
-                return {
-                    type: 'set',
-                    owner: mutation.owner,
-                    key: mutation.key,
-                    value: canonicalClone(mutation.value),
-                }
-            })
             const readLiveStorage = () =>
                 this.dependencies.capturePluginStorage
                     ? this.dependencies.capturePluginStorage()
@@ -1423,10 +1425,15 @@ export class SaveCoordinator {
         characterId: string,
         conversationId: string,
         patch: ConversationBindingPatch,
-        publish: () => void,
+        publish: (committedPatch: ConversationBindingPatch) => void,
     ): Promise<void> {
         this.assertInitialized()
         this.assertPersistentMutationAllowed()
+        const clonePatch = (): ConversationBindingPatch =>
+            Object.fromEntries(Object.entries(patch).map(([key, value]) => [
+                key, value === undefined ? undefined : canonicalClone(value),
+            ]))
+        patch = clonePatch()
         return this.enqueue(async () => {
             await this.flushIterations('chat-binding', true)
             const metadata = await this.dependencies.store.readConversationMetadata(
@@ -1465,7 +1472,8 @@ export class SaveCoordinator {
                 if (conversation) applyConversationBindingPatch(conversation, patch)
                 this.characterBaseline = canonicalJson(baseline)
             }
-            publish()
+            // The UI must not share nested values with the persisted windowed baseline.
+            publish(clonePatch())
             this.dependencies.onStorageOnlyRevision?.(committed.revision)
             this.dependencies.onLocalRevision?.(committed.revision)
             await this.finishExplicitCommit(committed.revision)
@@ -1509,18 +1517,19 @@ export class SaveCoordinator {
                 liveBeforeCommit.root,
             )
             const rootChanged = canonicalJson(committedRoot) !== canonicalJson(rootValue.value)
+            const committedDetail = deleting ? null : canonicalClone(state.character)
             const commit: WorkingSetCommit = { expectedRevision: revision }
             if (rootChanged) commit.root = committedRoot
             if (deleting) commit.deleteCharacterId = characterId
-            else commit.character = canonicalClone(state.character)
+            else commit.character = committedDetail!
 
             const committed = await this.dependencies.store.commit(commit)
             const residentAfterCommit = this.captureResidentCharacter(characterId)
             if (!this.residentCharactersMatch(residentBefore, residentAfterCommit)) {
-                const committedCharacter = deleting
+                const committedCharacter = committedDetail === null
                     ? null
                     : this.mergeCommittedDetailWithResident(
-                          state.character,
+                          committedDetail,
                           residentBefore?.character ?? null,
                       )
                 return this.compensateConcurrentResidentCharacter({
@@ -1544,7 +1553,7 @@ export class SaveCoordinator {
                     ),
                     characterId,
                     kind: deleting ? 'delete' : 'detail',
-                    character: deleting ? null : canonicalClone(state.character),
+                    character: committedDetail,
                 },
                 committedRoot,
             )
@@ -1704,14 +1713,12 @@ export class SaveCoordinator {
     ): Promise<boolean> {
         this.assertInitialized()
         this.assertPersistentMutationAllowed()
+        const { expectedRevision } = options
         this.cancelDebounce()
         return this.enqueue(async () => {
             await this.flushIterations(reason, true)
-            if (
-                options.expectedRevision !== undefined &&
-                options.expectedRevision !== this.revision
-            )
-                throw new RevisionConflictError(options.expectedRevision, this.revision)
+            if (expectedRevision !== undefined && expectedRevision !== this.revision)
+                throw new RevisionConflictError(expectedRevision, this.revision)
             const residentBefore = this.captureResidentCharacter(characterId)
             const revision = this.revision
             const [rootValue, characterValue] = await Promise.all([
@@ -1775,14 +1782,13 @@ export class SaveCoordinator {
     ): Promise<boolean> {
         this.assertInitialized()
         this.assertPersistentMutationAllowed()
+        const candidate = canonicalClone(replacement)
+        const { expectedRevision } = options
         this.cancelDebounce()
         return this.enqueue(async () => {
             await this.flushIterations(reason, true)
-            if (
-                options.expectedRevision !== undefined &&
-                options.expectedRevision !== this.revision
-            )
-                throw new RevisionConflictError(options.expectedRevision, this.revision)
+            if (expectedRevision !== undefined && expectedRevision !== this.revision)
+                throw new RevisionConflictError(expectedRevision, this.revision)
 
             const authority = this.dependencies.captureSelectedConversationAuthority?.() ?? null
             if (
@@ -1805,7 +1811,6 @@ export class SaveCoordinator {
             )
             if (!current) return false
             this.assertReadRevision(this.revision, current.revision)
-            const candidate = canonicalClone(replacement)
             if (candidate.id !== conversationId) {
                 throw new Error(`Replacement conversation ID must remain ${conversationId}`)
             }
@@ -1866,6 +1871,13 @@ export class SaveCoordinator {
     ): Promise<boolean> {
         this.assertInitialized()
         this.assertPersistentMutationAllowed()
+        const { includeInCharacterOrder } = options
+        const assetAliases = options.assetAliases === undefined
+            ? undefined
+            : [...canonicalClone(options.assetAliases)]
+        const assetOwnerHeads = options.assetOwnerHeads === undefined
+            ? undefined
+            : [...canonicalClone(options.assetOwnerHeads)]
         this.cancelDebounce()
         return this.enqueue(async () => {
             await this.flushIterations(reason, true)
@@ -1892,15 +1904,13 @@ export class SaveCoordinator {
             }
 
             const commit: WorkingSetCommit = { expectedRevision: revision }
-            if (options.assetAliases !== undefined) {
-                const assetAliases = [...canonicalClone(options.assetAliases)]
+            if (assetAliases !== undefined) {
                 if (assetAliases.some((alias) => alias.kind !== 'asset')) {
                     throw new TypeError('Prepared character aliases must be ordinary assets')
                 }
                 commit.assetAliases = assetAliases
             }
-            if (options.assetOwnerHeads !== undefined) {
-                const assetOwnerHeads = [...canonicalClone(options.assetOwnerHeads)]
+            if (assetOwnerHeads !== undefined) {
                 if (
                     assetOwnerHeads.some(
                         (head) =>
@@ -1919,7 +1929,7 @@ export class SaveCoordinator {
             if (current) {
                 commit.replaceCharacter = replacement
             } else {
-                if (options.includeInCharacterOrder !== false) {
+                if (includeInCharacterOrder !== false) {
                     appendCharacterIdToOrder(mutatedRoot, characterId)
                     committedRoot = rebaseRootMutation(
                         rootValue.value,
@@ -1947,7 +1957,7 @@ export class SaveCoordinator {
                 {
                     revision: committed.revision,
                     root:
-                        current || options.includeInCharacterOrder === false
+                        current || includeInCharacterOrder === false
                             ? this.capture().root
                             : rebaseRootMutation(rootValue.value, mutatedRoot, this.capture().root),
                     characterId,

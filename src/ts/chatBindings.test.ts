@@ -1,11 +1,13 @@
 import { beforeEach, expect, it, vi } from 'vitest'
 import { writable } from 'svelte/store'
 import type { Chat } from './storage/database.svelte'
+import type { ConversationBindingPatch } from './storage/conversationBinding'
 import { createMetadataOnlySelectedConversation } from './storage/selectedConversationLifecycle'
 const state = vi.hoisted(() => ({
     db: null as any,
     navigation: 0,
     bindings: [] as { characterId: string; conversationId: string; patch: unknown }[],
+    bindingGate: null as Promise<void> | null,
 }))
 vi.mock('./stores.svelte', () => ({ DBState: state, selectedCharID: writable(0) }))
 vi.mock('./storage/persistentDataRuntime.svelte', () => ({
@@ -16,11 +18,13 @@ vi.mock('./storage/persistentDataRuntime.svelte', () => ({
         mutateConversationBinding: async (
             characterId: string,
             conversationId: string,
-            patch: unknown,
-            publish: () => void,
+            patch: ConversationBindingPatch,
+            publish: (committedPatch: ConversationBindingPatch) => void,
         ) => {
-            state.bindings.push({ characterId, conversationId, patch })
-            publish()
+            const committedPatch = structuredClone(patch)
+            state.bindings.push({ characterId, conversationId, patch: committedPatch })
+            if (state.bindingGate) await state.bindingGate
+            publish(committedPatch)
         },
     }),
 }))
@@ -28,6 +32,7 @@ import { bindPersona, captureChatBindingTarget, updateChatBinding } from './chat
 beforeEach(() => {
     state.navigation = 0
     state.bindings = []
+    state.bindingGate = null
     state.db = {
         selectedPersona: 0,
         username: 'Global persona',
@@ -68,6 +73,43 @@ it('commits persona and toggle metadata through the coordinator without reading 
     expect(target.conversation.bindedPersona).toBe('')
     await updateChatBinding(target.conversation, { savedToggleValues: undefined })
     expect('savedToggleValues' in target.conversation).toBe(false)
+})
+it('publishes the committed binding patch instead of the caller value changed during saving', async () => {
+    let finish!: () => void
+    state.bindingGate = new Promise<void>((resolve) => { finish = resolve })
+    const target = captureChatBindingTarget()!
+    const patch: ConversationBindingPatch = {
+        bindedPersona: undefined, savedToggleValues: { toggle_a: 'captured' },
+    }
+    const updating = updateChatBinding(target.conversation, patch)
+    patch.bindedPersona = 'Uncommitted persona'
+    patch.savedToggleValues!.toggle_a = 'Uncommitted toggle'
+    finish()
+    await updating
+
+    expect('bindedPersona' in target.conversation).toBe(false)
+    expect(target.conversation.savedToggleValues).toEqual({ toggle_a: 'captured' })
+})
+it('uses the captured binding target when the original working-set records are replaced', async () => {
+    let finish!: () => void
+    state.bindingGate = new Promise<void>((resolve) => { finish = resolve })
+    const owner = state.db.characters[0]
+    const original = owner.chats[0]
+    const updating = updateChatBinding(original, { bindedPersona: 'captured-persona' })
+    owner.chaId = 'detached-owner'
+    original.id = 'detached-chat'
+    const replacement = createMetadataOnlySelectedConversation({
+        id: 'chat', name: 'Synthetic', note: '', localLore: [],
+    })
+    state.db.characters[0] = { chaId: 'character', chatPage: 0, chats: [replacement] }
+    finish()
+    await updating
+
+    expect(replacement.bindedPersona).toBe('captured-persona')
+    expect(original.bindedPersona).toBeUndefined()
+    expect(state.bindings).toEqual([{
+        characterId: 'character', conversationId: 'chat', patch: { bindedPersona: 'captured-persona' },
+    }])
 })
 it('invalidates the captured picker target even after A to B to A navigation', () => {
     const target = captureChatBindingTarget()!

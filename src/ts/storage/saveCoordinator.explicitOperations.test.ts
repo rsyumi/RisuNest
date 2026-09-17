@@ -4,6 +4,8 @@ import {
     PersistentRootModuleAppendRejectedError,
     canonicalJson,
     type PersistentConversationReplacementResult,
+    type PersistentCharacterMutationState,
+    type PersistentRootModuleAppend,
 } from './saveCoordinator'
 import type { Chat, Database, character, groupChat } from './database.svelte'
 import type { PersistentDataStore, WorkingSetCommit } from './persistentDataStore'
@@ -129,6 +131,59 @@ describe('SaveCoordinator', () => {
             store,
         }
     }
+
+    it('captures conversation input before queueing and before asynchronous reads', async () => {
+        const { coordinator, store, database, publishConversationReplacement } =
+            makeConversationReplacementHarness()
+        const replacement = structuredClone(database.characters[0].chats[1])
+        replacement.name = 'Captured conversation'
+        const captured = structuredClone(replacement)
+        const readStarted = deferred<void>()
+        const readFinished = deferred<void>()
+        vi.mocked(store.readConversation).mockImplementationOnce(async () => {
+            readStarted.resolve()
+            await readFinished.promise
+            return { revision: 7, value: structuredClone(database.characters[0].chats[1]) }
+        })
+
+        const replacing = coordinator.replacePersistentConversation(
+            'char-a', 'chat-b', 'captured-conversation', replacement, { expectedRevision: 7 },
+        )
+        replacement.name = 'Changed while queued'
+        replacement.message[0].data = 'Changed while queued'
+        await readStarted.promise
+        replacement.message.push({ role: 'user', data: 'Changed during read' })
+        readFinished.resolve()
+        await expect(replacing).resolves.toBe(true)
+
+        expect(store.commit).toHaveBeenCalledOnce()
+        expect(store.commit).toHaveBeenCalledWith({
+            expectedRevision: 7,
+            conversations: [expect.objectContaining({
+                messages: captured.message,
+                conversation: expect.objectContaining({ name: captured.name }),
+            })],
+        })
+        expect(publishConversationReplacement).toHaveBeenCalledWith({
+            revision: 8, characterId: 'char-a', conversationId: 'chat-b', conversation: captured,
+        })
+        await coordinator.flushPendingDataLocally('after-captured-conversation')
+        expect(store.commit).toHaveBeenCalledOnce()
+    })
+
+    it('does not let a caller promote a queued conversation expected revision', async () => {
+        const { coordinator, store, database } = makeConversationReplacementHarness()
+        const options = { expectedRevision: 6 }
+        const replacing = coordinator.replacePersistentConversation(
+            'char-a', 'chat-b', 'captured-conversation-revision',
+            structuredClone(database.characters[0].chats[1]), options,
+        )
+        options.expectedRevision = 7
+
+        await expect(replacing).rejects.toBeInstanceOf(RevisionConflictError)
+        expect(store.commit).not.toHaveBeenCalled()
+        expect(store.readConversation).not.toHaveBeenCalled()
+    })
 
     it('replaces one existing conversation without assigning configuredIndex', async () => {
         const { coordinator, store, database, publishConversationReplacement, onLocalRevision } =
@@ -441,6 +496,36 @@ describe('SaveCoordinator', () => {
         expect(coordinator.hasPendingPersistenceWork).toBe(false)
     })
 
+    it('does not let a caller promote a queued complete-character expected revision', async () => {
+        const database = makeDatabase()
+        const store = {
+            readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
+            readCharacter: vi.fn(async () => ({
+                revision: 7, value: { type: 'character', chaId: 'char-a', name: 'Alpha' },
+            })),
+            queryConversations: vi.fn(async () => ({ revision: 7, items: [] })),
+            commit: vi.fn(async () => ({ revision: 8 })),
+        } as unknown as PersistentDataStore
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: vi.fn(),
+        })
+        coordinator.initialize(7)
+        const mutate = vi.fn((current) => current)
+        const options = { expectedRevision: 6 }
+        const replacing = coordinator.replacePersistentCompleteCharacter(
+            'char-a', 'captured-character-revision', mutate, options,
+        )
+        options.expectedRevision = 7
+
+        await expect(replacing).rejects.toBeInstanceOf(RevisionConflictError)
+        expect(store.commit).not.toHaveBeenCalled()
+        expect(store.readCharacter).not.toHaveBeenCalled()
+        expect(mutate).not.toHaveBeenCalled()
+    })
+
     it('fences complete character replacement with an expected revision', async () => {
         const database = makeDatabase()
         const store = {
@@ -480,6 +565,68 @@ describe('SaveCoordinator', () => {
             expectedRevision: 7,
             replaceCharacter: expect.objectContaining({ chaId: 'char-a', name: 'Updated' }),
         })
+    })
+
+    it('captures a root module and its asset identities before queueing and alias reads', async () => {
+        const database = makeDatabase()
+        database.modules = []
+        const readStarted = deferred<void>()
+        const readFinished = deferred<void>()
+        const release = vi.fn(async () => undefined)
+        const store = {
+            commit: vi.fn(async (_input: WorkingSetCommit) => ({ revision: 8 })),
+            acquireRevision: vi.fn(async () => ({
+                revision: 7,
+                readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
+                readAssetAliasesByKeys: vi.fn(async () => {
+                    readStarted.resolve()
+                    await readFinished.promise
+                    return { revision: 7, value: [] }
+                }),
+                release,
+            })),
+        } as unknown as PersistentDataStore
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: vi.fn(),
+            publishRootWorkingSet: (root) => Object.assign(database, root),
+        })
+        coordinator.initialize(7)
+        const input: PersistentRootModuleAppend = {
+            module: {
+                id: 'captured-module', name: 'Captured module', description: '',
+                assets: [['portrait', 'assets/captured.png', 'png']],
+            },
+            assetAliases: [{
+                kind: 'asset', key: 'assets/captured.png', objectHash: 'a'.repeat(64),
+                size: 4, mime: 'image/png', name: 'captured.png', ext: 'png',
+            }],
+            ownerHead: { present: true, manifestHash: 'b'.repeat(64), entryCount: 1 },
+        }
+        const captured = structuredClone(input)
+        const appending = coordinator.appendPersistentRootModule('captured-module', input)
+        input.module.name = 'Changed while queued'
+        input.assetAliases[0].objectHash = 'c'.repeat(64)
+        await readStarted.promise
+        input.module.assets![0][1] = 'assets/changed.png'
+        input.ownerHead.manifestHash = 'd'.repeat(64)
+        readFinished.resolve()
+        await appending
+
+        expect(store.commit).toHaveBeenCalledExactlyOnceWith({
+            expectedRevision: 7,
+            root: expect.objectContaining({ modules: [captured.module] }),
+            assetAliases: captured.assetAliases,
+            assetOwnerHeads: [{
+                owner: { kind: 'root-module-assets', index: 0 }, ...captured.ownerHead,
+            }],
+        })
+        expect(database.modules).toEqual([captured.module])
+        expect(release).toHaveBeenCalledOnce()
+        await coordinator.flushPendingDataLocally('clean-captured-module')
+        expect(store.commit).toHaveBeenCalledOnce()
     })
 
     it('atomically appends a root module while carrying every occurrence owner head', async () => {
@@ -1230,6 +1377,50 @@ describe('SaveCoordinator', () => {
         })
     })
 
+    it('captures plugin mutations before queueing and preserves the queued revision order', async () => {
+        const database = makeDatabase()
+        const firstStarted = deferred<void>()
+        const firstFinished = deferred<{ revision: number }>()
+        const commit = vi.fn(async ({ expectedRevision }: WorkingSetCommit) => ({
+            revision: expectedRevision + 1,
+        })).mockImplementationOnce(() => {
+            firstStarted.resolve()
+            return firstFinished.promise
+        })
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            capturePluginStorage: () => null,
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(7)
+        const first = coordinator.mutatePersistentPluginStorage('first-plugin-write', [
+            { type: 'set', owner: 'plugin-first', key: 'first', value: true },
+        ])
+        await firstStarted.promise
+        const mutations = [
+            { type: 'set' as const, owner: 'plugin-second', key: 'second', value: { nested: ['captured'] } },
+        ]
+        const captured = structuredClone(mutations)
+        const second = coordinator.mutatePersistentPluginStorage('second-plugin-write', mutations)
+        mutations[0].owner = 'changed-owner'
+        mutations[0].key = 'changed-key'
+        mutations[0].value.nested[0] = 'changed-value'
+        mutations.push({ type: 'set', owner: 'extra-owner', key: 'extra', value: { nested: [] } })
+        firstFinished.resolve({ revision: 8 })
+        await Promise.all([first, second])
+
+        expect(commit).toHaveBeenCalledTimes(2)
+        expect(commit).toHaveBeenNthCalledWith(2, {
+            expectedRevision: 8,
+            pluginStorage: captured,
+        })
+        expect(coordinator.revision).toBe(9)
+        await coordinator.flushPendingDataLocally('after-captured-plugin-write')
+        expect(commit).toHaveBeenCalledTimes(2)
+    })
+
     it('serializes explicit plugin mutations through revision CAS', async () => {
         const database = makeDatabase()
         const committed = deferred<{ revision: number }>()
@@ -1686,6 +1877,153 @@ describe('SaveCoordinator', () => {
         expect(coordinator.revision).toBe(22)
     })
 
+    it('freezes a prepared database as soon as preparation settles while the queue is occupied', async () => {
+        let database = makeDatabase()
+        const store = makeStore(vi.fn())
+        vi.mocked(store.replaceFromDatabase).mockResolvedValue({ revision: 8 })
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: (value) => { database = structuredClone(value) },
+        })
+        coordinator.initialize(7)
+        const blocked = deferred<number>()
+        const blockingStarted = deferred<void>()
+        const blocking = coordinator.runStorageOnlyMutation(() => {
+            blockingStarted.resolve()
+            return blocked.promise
+        })
+        await blockingStarted.promise
+        const preparation = deferred<Database>()
+        const prepareStarted = deferred<void>()
+        const prepared = makeDatabase()
+        prepared.username = 'Prepared snapshot'
+        const captured = structuredClone(prepared)
+        const replacing = coordinator.replacePreparedPersistentDatabase(() => {
+            prepareStarted.resolve()
+            return preparation.promise
+        }, 'freeze-settled-preparation')
+        await prepareStarted.promise
+        preparation.resolve(prepared)
+        await preparation.promise
+        prepared.username = 'Mutated after preparation'
+        prepared.characters[0].name = 'Mutated nested result'
+        blocked.resolve(7)
+        await Promise.all([blocking, replacing])
+
+        expect(store.replaceFromDatabase).toHaveBeenCalledExactlyOnceWith(captured, 7)
+        expect(database).toEqual(captured)
+        expect(store.commit).not.toHaveBeenCalled()
+    })
+
+    it.each(['direct', 'prepared'] as const)(
+        'keeps %s replacement options fixed while an earlier write advances the revision',
+        async (kind) => {
+            const database = makeDatabase()
+            const store = makeStore(vi.fn())
+            vi.mocked(store.replaceFromDatabase).mockResolvedValue({ revision: 9 })
+            const coordinator = new SaveCoordinator({
+                store,
+                captureRoot: () => captureRoot(database),
+                captureSelectedCharacter: () => database.characters[0],
+                replaceDatabase: vi.fn(),
+            })
+            coordinator.initialize(7)
+            const blocked = deferred<number>()
+            const blockingStarted = deferred<void>()
+            const blocking = coordinator.runStorageOnlyMutation(() => {
+                blockingStarted.resolve()
+                return blocked.promise
+            })
+            await blockingStarted.promise
+            const options = { expectedRevision: 7 }
+            const replacing = kind === 'direct'
+                ? coordinator.replacePersistentDatabase(makeDatabase(), 'fixed-options', options)
+                : coordinator.replacePreparedPersistentDatabase(
+                    async () => makeDatabase(), 'fixed-options', options,
+                )
+            const rejected = expect(replacing).rejects.toBeInstanceOf(RevisionConflictError)
+            options.expectedRevision = 8
+            blocked.resolve(8)
+            await Promise.all([blocking, rejected])
+
+            expect(coordinator.revision).toBe(8)
+            expect(store.replaceFromDatabase).not.toHaveBeenCalled()
+            expect(store.commit).not.toHaveBeenCalled()
+        },
+    )
+
+    it.each(['throw', 'reject'] as const)(
+        'preserves pending edits and the original error when preparation fails by %s',
+        async (kind) => {
+            const database = makeDatabase()
+            const commit = vi.fn(async ({ expectedRevision }: WorkingSetCommit) => ({
+                revision: expectedRevision + 1,
+            }))
+            const store = makeStore(commit)
+            const coordinator = new SaveCoordinator({
+                store,
+                captureRoot: () => captureRoot(database),
+                captureSelectedCharacter: () => database.characters[0],
+                replaceDatabase: vi.fn(),
+            })
+            coordinator.initialize(7)
+            database.username = 'Pending local edit'
+            coordinator.markPersistentDataDirty(25)
+            const error = new Error('preparation failed')
+            const prepare = () => {
+                if (kind === 'throw') throw error
+                return Promise.reject(error)
+            }
+
+            await expect(coordinator.replacePreparedPersistentDatabase(
+                prepare, 'failed-preparation',
+            )).rejects.toBe(error)
+            expect(coordinator.revision).toBe(7)
+            expect(coordinator.pendingBytes).toBe(25)
+            expect(store.replaceFromDatabase).not.toHaveBeenCalled()
+            expect(commit).not.toHaveBeenCalled()
+            await coordinator.flushPendingDataLocally('preserved-after-preparation-failure')
+            expect(commit).toHaveBeenCalledExactlyOnceWith({
+                expectedRevision: 7,
+                rootMutations: [{ type: 'set', key: 'username', value: 'Pending local edit' }],
+            })
+        },
+    )
+
+    it('observes preparation rejection even when a stale queued replacement never consumes it', async () => {
+        const database = makeDatabase()
+        const store = makeStore(vi.fn())
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: vi.fn(),
+        })
+        coordinator.initialize(7)
+        const blocked = deferred<number>()
+        const blockingStarted = deferred<void>()
+        const blocking = coordinator.runStorageOnlyMutation(() => {
+            blockingStarted.resolve()
+            return blocked.promise
+        })
+        await blockingStarted.promise
+        const preparation = deferred<Database>()
+        const replacing = coordinator.replacePreparedPersistentDatabase(
+            () => preparation.promise, 'stale-failed-preparation', { expectedRevision: 7 },
+        )
+        const rejected = expect(replacing).rejects.toBeInstanceOf(RevisionConflictError)
+        preparation.reject(new Error('preparation failed before the queue became available'))
+        // Let unhandled-rejection reporting run while the replacement is still queued.
+        await new Promise<void>((resolve) => setTimeout(resolve, 0))
+        expect(store.replaceFromDatabase).not.toHaveBeenCalled()
+        blocked.resolve(8)
+        await Promise.all([blocking, rejected])
+        expect(coordinator.revision).toBe(8)
+        expect(store.commit).not.toHaveBeenCalled()
+    })
+
     it('rejects an incomplete live replacement before cloning or capturing state', async () => {
         const database = makeDatabase()
         const candidate = makeDatabase() as Database & { cloneTrap?: unknown }
@@ -1883,6 +2221,65 @@ describe('SaveCoordinator', () => {
         } finally {
             vi.useRealTimers()
         }
+    })
+
+    it('publishes the frozen character detail rather than a retained mutation callback value', async () => {
+        const database = makeDatabase()
+        const commitStarted = deferred<void>()
+        const commitFinished = deferred<{ revision: number }>()
+        const store = {
+            commit: vi.fn(() => {
+                commitStarted.resolve()
+                return commitFinished.promise
+            }),
+            readRoot: vi.fn(async () => ({ revision: 4, value: captureRoot(database) })),
+            readCharacter: vi.fn(async () => ({
+                revision: 4,
+                value: { type: 'character', chaId: 'char-a', name: 'Alpha' },
+            })),
+            readConversation: vi.fn(),
+        } as unknown as PersistentDataStore
+        const publishCharacterMutation = vi.fn((result) => {
+            Object.assign(database, result.root)
+            Object.assign(database.characters[0], structuredClone(result.character))
+        })
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: vi.fn(),
+            publishCharacterMutation,
+        })
+        coordinator.initialize(4)
+        let retained: PersistentCharacterMutationState | undefined
+        const mutating = coordinator.mutatePersistentCharacterDetail(
+            'char-a', 'frozen-character-detail', (state) => {
+                state.character.name = 'Committed name'
+                state.root.username = 'Committed root'
+                retained = state
+            },
+        )
+        await commitStarted.promise
+        retained!.character.name = 'Uncommitted callback edit'
+        retained!.root.username = 'Uncommitted callback root'
+        expect(store.commit).toHaveBeenCalledWith({
+            expectedRevision: 4,
+            root: expect.objectContaining({ username: 'Committed root' }),
+            character: expect.objectContaining({ name: 'Committed name' }),
+        })
+        commitFinished.resolve({ revision: 5 })
+        await expect(mutating).resolves.toBe(true)
+
+        expect(publishCharacterMutation).toHaveBeenCalledWith(expect.objectContaining({
+            revision: 5,
+            root: expect.objectContaining({ username: 'Committed root' }),
+            character: expect.objectContaining({ name: 'Committed name' }),
+        }))
+        expect(database.characters[0].name).toBe('Committed name')
+        expect(database.username).toBe('Committed root')
+        await coordinator.flushPendingDataLocally('after-frozen-character-detail')
+        expect(store.commit).toHaveBeenCalledOnce()
+        expect(store.readConversation).not.toHaveBeenCalled()
     })
 
     it('commits a stable-ID character detail mutation without replacing its conversations', async () => {
@@ -3524,6 +3921,69 @@ describe('SaveCoordinator', () => {
             kind: 'add',
             character: added,
         }))
+    })
+
+    it('captures character insertion and asset options before asynchronous creation', async () => {
+        const database = makeDatabase()
+        database.characterOrder = ['char-a']
+        const store = {
+            readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
+            readCharacter: vi.fn(async () => null),
+            commit: vi.fn(async (_input: WorkingSetCommit) => ({ revision: 8 })),
+        } as unknown as PersistentDataStore
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            captureCharacter: (id) => database.characters.find((item) => item.chaId === id) ?? null,
+            replaceDatabase: vi.fn(),
+            publishCharacterMutation: (state) => {
+                database.characters.push(state.character as Database['characters'][number])
+                Object.assign(database, state.root)
+            },
+        })
+        coordinator.initialize(7)
+        const options = {
+            includeInCharacterOrder: true,
+            assetAliases: [{
+                kind: 'asset' as const, key: 'assets/captured.png', objectHash: 'a'.repeat(64),
+                size: 4, mime: 'image/png', name: 'captured.png', ext: 'png',
+            }],
+            assetOwnerHeads: [{
+                owner: { kind: 'character-additional-assets' as const, characterId: 'captured-char' },
+                present: true as const, manifestHash: 'b'.repeat(64), entryCount: 1,
+            }],
+        }
+        const captured = structuredClone(options)
+        const creationStarted = deferred<void>()
+        const creationFinished = deferred<void>()
+        const creating = coordinator.upsertPersistentCompleteCharacter(
+            'captured-char', 'captured-character-assets', async () => {
+                creationStarted.resolve()
+                await creationFinished.promise
+                return {
+                    type: 'character', chaId: 'captured-char', name: 'Captured', chats: [],
+                } as Database['characters'][number]
+            }, options,
+        )
+        options.includeInCharacterOrder = false
+        options.assetAliases[0].objectHash = 'c'.repeat(64)
+        await creationStarted.promise
+        options.assetOwnerHeads[0].manifestHash = 'd'.repeat(64)
+        options.assetAliases.push({ ...options.assetAliases[0], key: 'assets/unrequested.png' })
+        creationFinished.resolve()
+        await expect(creating).resolves.toBe(true)
+
+        expect(store.commit).toHaveBeenCalledExactlyOnceWith({
+            expectedRevision: 7,
+            root: expect.objectContaining({ characterOrder: ['char-a', 'captured-char'] }),
+            addCharacter: expect.objectContaining({ chaId: 'captured-char' }),
+            assetAliases: captured.assetAliases,
+            assetOwnerHeads: captured.assetOwnerHeads,
+        })
+        expect(database.characterOrder).toEqual(['char-a', 'captured-char'])
+        await coordinator.flushPendingDataLocally('clean-captured-assets')
+        expect(store.commit).toHaveBeenCalledOnce()
     })
 
     it('commits prepared character assets and their owner head before publishing the character', async () => {

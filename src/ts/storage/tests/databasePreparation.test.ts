@@ -70,6 +70,22 @@ function deterministicIds(...ids: string[]): () => string {
 }
 
 describe('prepareDatabaseForPersistence', () => {
+    it('detaches nested replacement input synchronously with one existing canonical capture', async () => {
+        const options = { now: 1_700_000_000_000 }
+        const input = await prepareDatabaseForPersistence(fixtureDatabase, options)
+        const expected = structuredClone(input)
+        vi.mocked(canonicalJson).mockClear()
+        const preparing = prepareDatabaseForPersistence(input, options)
+        input.username = 'Changed after preparation started'
+        input.characters[0].name = 'Changed nested input'
+        const prepared = await preparing
+
+        expect(prepared).toEqual(expected)
+        expect(canonicalJson).toHaveBeenCalledOnce()
+        expect(prepared).not.toBe(input)
+        expect(prepared.characters[0]).not.toBe(input.characters[0])
+    })
+
     it('reports real normalization changes and becomes unchanged after preparation', async () => {
         const input = await prepareDatabaseForPersistence(fixtureDatabase, {
             now: 1_700_000_000_000,

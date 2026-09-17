@@ -66,15 +66,17 @@ export async function updateChatBinding(
         applyConversationBindingPatch(conversation, patch)
         return
     }
+    const characterId = owner.chaId
+    const conversationId = conversation.id
     await getPersistentDataRuntime().mutateConversationBinding(
-        owner.chaId,
-        conversation.id,
+        characterId,
+        conversationId,
         patch,
-        () => {
+        (committedPatch) => {
             const current = DBState.db.characters
-                .find((character) => character.chaId === owner.chaId)
-                ?.chats.find((chat) => chat.id === conversation.id)
-            if (current) applyConversationBindingPatch(current, patch)
+                .find((character) => character.chaId === characterId)
+                ?.chats.find((chat) => chat.id === conversationId)
+            if (current) applyConversationBindingPatch(current, committedPatch)
         },
     )
 }

@@ -1936,6 +1936,87 @@ describe('SaveCoordinator', () => {
         expect(revisions).toEqual([8])
     })
 
+    it('ordinary_flush_keeps_later_edits_dirty across a failed trailing batch', async () => {
+        const database = makeDatabase()
+        database.botPresets = [{ name: 'Initial preset' }] as Database['botPresets']
+        database.pluginCustomStorage = { payload: { value: 'initial' } }
+        database.characters[0].chats = [{
+            id: 'chat-a', name: 'Chat', message: [{ role: 'user', data: 'initial' }],
+        }] as Chat[]
+        const firstStarted = deferred<void>()
+        const firstFinished = deferred<{ revision: number }>()
+        const failure = new Error('trailing batch failed')
+        const commit = vi.fn()
+            .mockImplementationOnce(() => {
+                firstStarted.resolve()
+                return firstFinished.promise
+            })
+            .mockRejectedValueOnce(failure)
+            .mockResolvedValueOnce({ revision: 3 })
+        const store = makeStore(commit)
+        store.readCharacter = vi.fn()
+        store.readConversation = vi.fn()
+        const captureCharacter = vi.fn(() => null)
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            capturePluginStorage: () => database.pluginCustomStorage,
+            capturePresets: () => database.botPresets,
+            captureSelectedCharacter: () => database.characters[0],
+            captureCharacter,
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(1)
+        const edit = (value: string) => {
+            database.username = value
+            database.botPresets[0].name = value
+            database.pluginCustomStorage.payload = { value }
+            database.characters[0].chats[0].message[0].data = value
+            coordinator.markPersistentDataDirty(25)
+        }
+        edit('first')
+        const flushing = coordinator.flushPendingDataLocally('frozen-batches')
+        const rejected = expect(flushing).rejects.toBe(failure)
+        await firstStarted.promise
+        const firstBatch = structuredClone(commit.mock.calls[0][0])
+        edit('second')
+        expect(commit.mock.calls[0][0]).toEqual(firstBatch)
+        firstFinished.resolve({ revision: 2 })
+        await rejected
+
+        expect(coordinator.revision).toBe(2)
+        expect(coordinator.pendingBytes).toBe(25)
+        expect(commit).toHaveBeenCalledTimes(2)
+        expect(commit.mock.calls[0][0]).toEqual(firstBatch)
+        expect(firstBatch.rootMutations).toEqual([
+            { type: 'set', key: 'username', value: 'first' },
+        ])
+        const secondBatch = structuredClone(commit.mock.calls[1][0])
+        expect(secondBatch).toMatchObject({
+            expectedRevision: 2,
+            rootMutations: [{ type: 'set', key: 'username', value: 'second' }],
+            replacePresets: [{ name: 'second' }],
+            pluginStorage: [{
+                type: 'set', owner: UNOWNED_PLUGIN_OWNER, key: 'payload', value: { value: 'second' },
+            }],
+            conversations: [expect.objectContaining({
+                characterId: 'char-a', conversationId: 'chat-a',
+                messages: [{ role: 'user', data: 'second' }],
+            })],
+        })
+
+        await coordinator.flushPendingDataLocally('retry-trailing-batch')
+        expect(commit).toHaveBeenNthCalledWith(3, secondBatch)
+        expect(coordinator.revision).toBe(3)
+        expect(coordinator.pendingBytes).toBe(0)
+        await coordinator.flushPendingDataLocally('clean-frozen-batches')
+        expect(commit).toHaveBeenCalledTimes(3)
+        expect(store.replaceFromDatabase).not.toHaveBeenCalled()
+        expect(store.readCharacter).not.toHaveBeenCalled()
+        expect(store.readConversation).not.toHaveBeenCalled()
+        expect(captureCharacter).not.toHaveBeenCalled()
+    })
+
     it('runs trailing commits for mutations made during every deferred commit', async () => {
         const database = makeDatabase()
         const first = deferred<{ revision: number }>()

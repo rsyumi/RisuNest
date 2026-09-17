@@ -60,7 +60,9 @@ function makeConversationDatabase(username: string): Database {
     return database
 }
 
-async function createActiveSessionRuntimeHarness() {
+async function createActiveSessionRuntimeHarness(
+    prepareDatabase: (value: Database) => Promise<Database> = async (value) => value,
+) {
     let database = makeConversationDatabase('Initial')
     let revision = 1
     const store = {
@@ -105,7 +107,7 @@ async function createActiveSessionRuntimeHarness() {
                 publishPersistentConversationReplacementToWorkingSet(database, result)
             },
         },
-        prepareDatabase: async (value) => value,
+        prepareDatabase,
     })
     await runtime.initializeActiveWorkingSet(database)
     return {
@@ -791,6 +793,28 @@ describe('stable working-set selection', () => {
 })
 
 describe('prepared persistent replacement', () => {
+    it('starts detached preparation before the caller can change the replacement input', async () => {
+        const ready = deferred<void>()
+        const prepareDatabase = vi.fn(async (value: Database) => {
+            const captured = structuredClone(value)
+            await ready.promise
+            return captured
+        })
+        const harness = await createActiveSessionRuntimeHarness(prepareDatabase)
+        const input = makeConversationDatabase('Requested replacement')
+        const captured = structuredClone(input)
+        const replacing = harness.runtime.replacePersistentDatabase(input, 'capture-before-prepare')
+        input.username = 'Changed after request'
+        input.characters[0].chats[0].message[0].data = 'Changed nested input'
+        ready.resolve()
+        await replacing
+
+        expect(prepareDatabase).toHaveBeenCalledOnce()
+        expect(harness.store.replaceFromDatabase).toHaveBeenCalledWith(captured, 1)
+        expect(harness.database).toEqual(captured)
+        expect(harness.store.commit).not.toHaveBeenCalled()
+    })
+
     it('invalidates a resident session before publishing a cloned conversation', async () => {
         const harness = await createActiveSessionRuntimeHarness()
         const session = harness.runtime.getActiveConversationSession()!
