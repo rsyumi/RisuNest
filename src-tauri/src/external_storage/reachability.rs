@@ -137,7 +137,10 @@ async fn expand(
             }
         }
         ObjectRole::Catalog => source.catalog(object).await,
-        ObjectRole::Pack | ObjectRole::BackupPoint | ObjectRole::Descriptor => Ok(Vec::new()),
+        ObjectRole::Pack
+        | ObjectRole::BackupPoint
+        | ObjectRole::Descriptor
+        | ObjectRole::Lease => Ok(Vec::new()),
     }
 }
 
