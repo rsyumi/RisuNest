@@ -554,3 +554,758 @@ impl DocumentSource for ConnectedDocuments<'_> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::external_storage::{
+        contract::{
+            lease_object_id, LeaseKind, ObjectRole, Provider, RemoteLocator, RepositoryHandle,
+        },
+        fake::{self, DeleteFault, FakeProvider},
+        gc_store::{CommittedDeletion, LeaseIntent, LeaseState},
+    };
+    use risunest_external_storage_format::format::{Descriptor, Strategy};
+    use std::{
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex,
+        },
+    };
+
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+    const NOW: u64 = 1_000 * DAY;
+    const CONNECTION: &str = "connection";
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn object(id: &str, role: ObjectRole, byte_length: u64) -> RemoteObject {
+        RemoteObject {
+            repository_id: "synthetic-repository".into(),
+            object_id: id.into(),
+            role,
+            receipt: ObjectReceipt {
+                locator: RemoteLocator {
+                    connection_identity: "synthetic-account/root".into(),
+                    collection: None,
+                    object: id.into(),
+                },
+                byte_length,
+                version: None,
+                checksum: None,
+                complete: true,
+            },
+            ciphertext_sha256: "11".repeat(32),
+            plaintext_length: byte_length,
+            plaintext_sha256: "22".repeat(32),
+        }
+    }
+
+    /// A repository this test drives directly: every reading is arranged, and
+    /// the readings a run takes twice can differ between the two.
+    #[derive(Default)]
+    struct Scripted {
+        readings: Vec<ObservedRoots>,
+        snapshots: Vec<ObjectReceipt>,
+        jobs: JobRoots,
+        documents: BTreeMap<String, DocumentNode>,
+        catalogs: BTreeMap<String, Vec<RemoteObject>>,
+        failing: BTreeSet<String>,
+        taken: AtomicUsize,
+        opened: Mutex<Vec<String>>,
+    }
+    impl Scripted {
+        fn read(&self, id: &str) -> Result<()> {
+            self.opened.lock().unwrap().push(id.to_owned());
+            if self.failing.contains(id) {
+                return Err(ProviderError::new(ErrorKind::Transient));
+            }
+            Ok(())
+        }
+        fn node(&self, id: &str) -> Result<DocumentNode> {
+            self.read(id)?;
+            self.documents
+                .get(id)
+                .cloned()
+                .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))
+        }
+        fn documents_read(&self) -> usize {
+            self.opened.lock().unwrap().len()
+        }
+    }
+    impl RepositoryView for Scripted {
+        fn roots<'a>(&'a self, _: &'a Cancellation) -> ProviderFuture<'a, ObservedRoots> {
+            Box::pin(async move {
+                let index = self.taken.fetch_add(1, Ordering::SeqCst);
+                self.readings
+                    .get(index)
+                    .or_else(|| self.readings.last())
+                    .cloned()
+                    .ok_or_else(|| ProviderError::new(ErrorKind::Transient))
+            })
+        }
+        fn snapshots<'a>(&'a self, _: &'a Cancellation) -> ProviderFuture<'a, Vec<ObjectReceipt>> {
+            Box::pin(async move { Ok(self.snapshots.clone()) })
+        }
+        fn job_roots(&self) -> Result<JobRoots> {
+            Ok(self.jobs.clone())
+        }
+    }
+    impl DocumentSource for Scripted {
+        fn document<'a>(&'a self, object: &'a RemoteObject) -> ProviderFuture<'a, DocumentNode> {
+            Box::pin(async move { self.node(&object.object_id) })
+        }
+        fn listed<'a>(
+            &'a self,
+            receipt: &'a ObjectReceipt,
+        ) -> ProviderFuture<'a, (RemoteObject, DocumentNode)> {
+            Box::pin(async move {
+                let node = self.node(&receipt.locator.object)?;
+                let mut object = object(
+                    &receipt.locator.object,
+                    ObjectRole::SyncState,
+                    receipt.byte_length,
+                );
+                object.receipt = receipt.clone();
+                Ok((object, node))
+            })
+        }
+        fn catalog<'a>(&'a self, object: &'a RemoteObject) -> ProviderFuture<'a, Vec<RemoteObject>> {
+            Box::pin(async move {
+                self.read(&object.object_id)?;
+                self.catalogs
+                    .get(&object.object_id)
+                    .cloned()
+                    .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))
+            })
+        }
+    }
+
+    struct Harness {
+        _directory: tempfile::TempDir,
+        root: PathBuf,
+        provider: FakeProvider,
+        repository: RepositoryHandle,
+        descriptor: Descriptor,
+        root_key: [u8; 32],
+        capabilities: Capabilities,
+    }
+    impl Harness {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().to_path_buf();
+            Self {
+                _directory: directory,
+                root,
+                provider: FakeProvider::new(true),
+                repository: fake::repository(),
+                descriptor: Descriptor::new("synthetic-descriptor".into(), Some(Strategy::Cas))
+                    .unwrap(),
+                root_key: [7; 32],
+                capabilities: fake::capabilities(true),
+            }
+        }
+        fn context(&self) -> LeaseContext<'_> {
+            LeaseContext {
+                root: &self.root,
+                connection_id: CONNECTION,
+                writer_id: "writer",
+                descriptor: &self.descriptor,
+                root_key: &self.root_key,
+                provider: &self.provider,
+                repository: &self.repository,
+            }
+        }
+        fn request<'a>(&'a self, job_id: &'a str, limits: CleanupLimits) -> CleanupRequest<'a> {
+            CleanupRequest {
+                job_id,
+                capabilities: &self.capabilities,
+                limits,
+                now_ms: NOW,
+            }
+        }
+        fn store(&self) -> GcStore {
+            GcStore::open(&self.root).unwrap()
+        }
+        /// Puts one object in the repository so a removal has something to
+        /// answer for.
+        fn place(&self, object: &RemoteObject) {
+            self.provider.seed(
+                &object.object_id,
+                object.role,
+                vec![0; object.receipt.byte_length as usize],
+            );
+        }
+        /// A lease another device left behind. Only its name is readable from
+        /// here, which is all a survey uses.
+        fn foreign(&self, kind: LeaseKind, tag: &str) -> String {
+            let object = lease_object_id(kind, tag).unwrap();
+            self.provider
+                .seed(&object, ObjectRole::Lease, b"foreign".to_vec());
+            object
+        }
+        /// A lease this device placed, recorded the way a confirmed
+        /// registration records one. A survey answers `mine` for it, so only
+        /// the page count can make it matter.
+        fn own_lease(&self, tag: &str) {
+            let object = lease_object_id(LeaseKind::Work, tag).unwrap();
+            self.provider
+                .seed(&object, ObjectRole::Lease, b"mine".to_vec());
+            self.store()
+                .put_lease_intent(
+                    CONNECTION,
+                    &LeaseIntent {
+                        locator: RemoteLocator {
+                            connection_identity: self.repository.connection_identity.clone(),
+                            collection: None,
+                            object,
+                        },
+                        kind: LeaseKind::Work,
+                        job_id: "other".into(),
+                        seq: 0,
+                        bytes: b"mine".to_vec(),
+                        state: LeaseState::Confirmed,
+                        created_at_ms: NOW,
+                    },
+                )
+                .unwrap();
+        }
+        fn markers(&self) -> Vec<String> {
+            self.provider
+                .state
+                .lock()
+                .unwrap()
+                .objects
+                .keys()
+                .filter(|name| name.starts_with("deleting-"))
+                .cloned()
+                .collect()
+        }
+        fn committed(&self) -> Vec<CommittedDeletion> {
+            self.store().committed_deletions(CONNECTION).unwrap()
+        }
+        fn remaining(&self) -> Vec<String> {
+            self.committed()
+                .into_iter()
+                .filter(|entry| !entry.done)
+                .map(|entry| entry.locator.object)
+                .collect()
+        }
+    }
+
+    fn tag(index: u8) -> String {
+        format!("{index:x}").repeat(32)
+    }
+
+    /// One head with a live subtree and one displaced state past the grace
+    /// window with a subtree of its own.
+    struct Library {
+        head: RemoteObject,
+        live_catalog: RemoteObject,
+        live_pack: RemoteObject,
+        stale: RemoteObject,
+        stale_catalog: RemoteObject,
+        stale_pack: RemoteObject,
+    }
+    impl Library {
+        fn install(harness: &Harness) -> (Self, Scripted) {
+            let head = object("snapshot-head", ObjectRole::SyncState, 10);
+            let live_catalog = object("catalog-live", ObjectRole::Catalog, 20);
+            let live_pack = object("pack-live", ObjectRole::Pack, 30);
+            let stale = object("snapshot-stale", ObjectRole::SyncState, 40);
+            let stale_catalog = object("catalog-stale", ObjectRole::Catalog, 50);
+            let stale_pack = object("pack-stale", ObjectRole::Pack, 60);
+            for item in [
+                &head,
+                &live_catalog,
+                &live_pack,
+                &stale,
+                &stale_catalog,
+                &stale_pack,
+            ] {
+                harness.place(item);
+            }
+            // The displaced state has been visible to this device for longer
+            // than the grace window, which is the only thing that makes it a
+            // candidate.
+            harness
+                .store()
+                .record_observations(
+                    CONNECTION,
+                    &BTreeSet::from(["snapshot-stale".to_owned()]),
+                    NOW - 8 * DAY,
+                )
+                .unwrap();
+            let library = Self {
+                head,
+                live_catalog,
+                live_pack,
+                stale,
+                stale_catalog,
+                stale_pack,
+            };
+            let scripted = library.script();
+            (library, scripted)
+        }
+
+        /// The same repository as an arrangement, without placing anything.
+        /// A later run reads it again after an earlier one removed objects.
+        fn script(&self) -> Scripted {
+            Scripted {
+                readings: vec![ObservedRoots {
+                    head: Some(self.head.clone()),
+                    ..ObservedRoots::default()
+                }],
+                snapshots: vec![self.head.receipt.clone(), self.stale.receipt.clone()],
+                documents: BTreeMap::from([
+                    (
+                        "snapshot-head".to_owned(),
+                        DocumentNode {
+                            snapshot_id: "snapshot-head".into(),
+                            parent_snapshot_id: None,
+                            references: vec![self.live_catalog.clone()],
+                        },
+                    ),
+                    (
+                        "snapshot-stale".to_owned(),
+                        DocumentNode {
+                            snapshot_id: "snapshot-stale".into(),
+                            parent_snapshot_id: None,
+                            references: vec![self.stale_catalog.clone()],
+                        },
+                    ),
+                ]),
+                catalogs: BTreeMap::from([
+                    ("catalog-live".to_owned(), vec![self.live_pack.clone()]),
+                    ("catalog-stale".to_owned(), vec![self.stale_pack.clone()]),
+                ]),
+                ..Scripted::default()
+            }
+        }
+    }
+
+    fn removed(harness: &Harness, library: &Library) -> Vec<bool> {
+        [&library.stale, &library.stale_catalog, &library.stale_pack]
+            .iter()
+            .map(|object| !harness.provider.holds(&object.object_id))
+            .collect()
+    }
+
+    /// The publication the current head names is never a candidate, whatever
+    /// else this run removes.
+    fn live_material_survived(harness: &Harness, library: &Library) {
+        assert!(harness.provider.holds(&library.head.object_id));
+        assert!(harness.provider.holds("catalog-live"));
+        assert!(harness.provider.holds(&library.live_pack.object_id));
+    }
+
+    /// Invariants GC30 and GC19. Another device's lease stops the run before
+    /// any document is read, so nothing is decided and no marker is placed.
+    #[test]
+    fn another_device_s_lease_stops_the_run_before_the_mark_starts() {
+        let harness = Harness::new();
+        let (_library, scripted) = Library::install(&harness);
+        harness.foreign(LeaseKind::Work, &tag(1));
+        let outcome = runtime()
+            .block_on(run(
+                &harness.context(),
+                &harness.request("job", CleanupLimits::default()),
+                &scripted,
+                &scripted,
+                &Cancellation::default(),
+            ))
+            .unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::Lease);
+        assert_eq!(outcome.deleted_objects, 0);
+        assert_eq!(scripted.documents_read(), 0);
+        assert!(harness.markers().is_empty());
+        assert!(harness.committed().is_empty());
+    }
+
+    /// Invariant GC19. Another device's cleanup counts the same as its work.
+    #[test]
+    fn another_device_s_cleanup_lease_also_stops_the_run() {
+        let harness = Harness::new();
+        let (_library, scripted) = Library::install(&harness);
+        harness.foreign(LeaseKind::Cleanup, &tag(2));
+        let outcome = runtime()
+            .block_on(run(
+                &harness.context(),
+                &harness.request("job", CleanupLimits::default()),
+                &scripted,
+                &scripted,
+                &Cancellation::default(),
+            ))
+            .unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::Lease);
+        assert_eq!(scripted.documents_read(), 0);
+    }
+
+    /// Invariants GC3 and GC19. A lease collection that does not fit one page
+    /// cannot show that nobody is removing, because no provider documents that
+    /// a cursor walk keeps every object visible. The leases here are this
+    /// device's own, so only the page count can stop the run.
+    #[test]
+    fn a_lease_collection_that_needs_a_second_page_defers_the_run() {
+        for (count, expected, reads) in [
+            (99usize, StopReason::Complete, true),
+            (101, StopReason::Lease, false),
+        ] {
+            let harness = Harness::new();
+            let (_library, scripted) = Library::install(&harness);
+            for index in 0..count {
+                harness.own_lease(&format!("{index:032x}"));
+            }
+            let outcome = runtime()
+                .block_on(run(
+                    &harness.context(),
+                    &harness.request("job", CleanupLimits::default()),
+                    &scripted,
+                    &scripted,
+                    &Cancellation::default(),
+                ))
+                .unwrap();
+            assert_eq!(outcome.stop_reason, expected);
+            assert_eq!(scripted.documents_read() > 0, reads);
+        }
+    }
+
+    /// Invariant GC6. A run that stops at its bound has removed the document
+    /// before the fragments under it, a later run finishes the list, and a
+    /// target that is already gone answers the same as one removed now.
+    #[test]
+    fn a_run_removes_parents_first_and_a_later_run_finishes_the_list() {
+        let harness = Harness::new();
+        let (library, scripted) = Library::install(&harness);
+        let single = CleanupLimits {
+            batch: 25,
+            per_run: 1,
+        };
+        let first = runtime()
+            .block_on(run(
+                &harness.context(),
+                &harness.request("first", single),
+                &scripted,
+                &scripted,
+                &Cancellation::default(),
+            ))
+            .unwrap();
+        assert_eq!(first.stop_reason, StopReason::Limit);
+        assert_eq!(first.deleted_objects, 1);
+        assert_eq!(first.deleted_bytes, library.stale.receipt.byte_length);
+        assert_eq!(removed(&harness, &library), [true, false, false]);
+        assert_eq!(
+            harness.remaining(),
+            ["catalog-stale".to_owned(), "pack-stale".to_owned()]
+        );
+        assert!(harness.markers().is_empty());
+        live_material_survived(&harness, &library);
+
+        // The document is gone, so the enumeration no longer answers with it
+        // and only the committed list can still name what it hid.
+        let mut resumed = library.script();
+        resumed.snapshots = vec![library.head.receipt.clone()];
+        let second = runtime()
+            .block_on(run(
+                &harness.context(),
+                &harness.request("second", CleanupLimits::default()),
+                &resumed,
+                &resumed,
+                &Cancellation::default(),
+            ))
+            .unwrap();
+        assert_eq!(second.stop_reason, StopReason::Complete);
+        assert_eq!(second.deleted_objects, 2);
+        assert_eq!(removed(&harness, &library), [true, true, true]);
+        assert!(harness.remaining().is_empty());
+        live_material_survived(&harness, &library);
+
+        // Removing the same target twice succeeds, which is what lets an
+        // interrupted run be restarted as it is.
+        harness
+            .store()
+            .replace_deletions(
+                CONNECTION,
+                &[CommittedDeletion {
+                    locator: library.stale_pack.receipt.locator.clone(),
+                    role: ObjectRole::Pack,
+                    byte_length: library.stale_pack.receipt.byte_length,
+                    decided_at_ms: NOW,
+                    done: false,
+                }],
+            )
+            .unwrap();
+        let again = runtime()
+            .block_on(run(
+                &harness.context(),
+                &harness.request("third", CleanupLimits::default()),
+                &resumed,
+                &resumed,
+                &Cancellation::default(),
+            ))
+            .unwrap();
+        assert_eq!(again.stop_reason, StopReason::Complete);
+        assert_eq!(again.deleted_objects, 1);
+    }
+
+    /// Invariants GC18 and GC32. A publication that finished between the mark
+    /// and the marker left no lease behind, and the reading taken after the
+    /// marker is what catches it.
+    #[test]
+    fn a_publication_that_finished_before_the_marker_is_caught_by_the_final_reading() {
+        let harness = Harness::new();
+        let (library, mut scripted) = Library::install(&harness);
+        let next = object("snapshot-next", ObjectRole::SyncState, 11);
+        scripted.readings = vec![
+            ObservedRoots {
+                head: Some(library.head.clone()),
+                ..ObservedRoots::default()
+            },
+            ObservedRoots {
+                head: Some(next),
+                ..ObservedRoots::default()
+            },
+        ];
+        let outcome = runtime()
+            .block_on(run(
+                &harness.context(),
+                &harness.request("job", CleanupLimits::default()),
+                &scripted,
+                &scripted,
+                &Cancellation::default(),
+            ))
+            .unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::Lease);
+        assert_eq!(outcome.deleted_objects, 0);
+        assert_eq!(removed(&harness, &library), [false, false, false]);
+        assert!(harness.markers().is_empty());
+    }
+
+    /// Invariants GC18 and GC32. A backup-only repository has no head, so the
+    /// point identifiers are the whole comparison, and a point that appeared
+    /// and one that went both count.
+    #[test]
+    fn a_backup_only_repository_compares_the_point_identifiers_exactly() {
+        for (before, after) in [
+            (["point-a"].as_slice(), ["point-a", "point-b"].as_slice()),
+            (["point-a", "point-b"].as_slice(), ["point-a"].as_slice()),
+        ] {
+            let harness = Harness::new();
+            let (library, mut scripted) = Library::install(&harness);
+            let reading = |ids: &[&str]| ObservedRoots {
+                head: None,
+                point_ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+                ..ObservedRoots::default()
+            };
+            scripted.readings = vec![reading(before), reading(after)];
+            let outcome = runtime()
+                .block_on(run(
+                    &harness.context(),
+                    &harness.request("job", CleanupLimits::default()),
+                    &scripted,
+                    &scripted,
+                    &Cancellation::default(),
+                ))
+                .unwrap();
+            assert_eq!(outcome.stop_reason, StopReason::Lease);
+            assert_eq!(outcome.deleted_objects, 0);
+            assert_eq!(removed(&harness, &library), [false, false, false]);
+            assert!(harness.markers().is_empty());
+        }
+    }
+
+    /// Invariant GC33. A publisher that took its lease after the marker was
+    /// confirmed is seen by the final reading, and nothing is removed.
+    #[test]
+    fn a_lease_taken_after_the_marker_stops_the_run_before_the_first_removal() {
+        let harness = Harness::new();
+        let (library, scripted) = Library::install(&harness);
+        harness.provider.seed_after_list(
+            1,
+            &lease_object_id(LeaseKind::Work, &tag(4)).unwrap(),
+            ObjectRole::Lease,
+            b"foreign".to_vec(),
+        );
+        let outcome = runtime()
+            .block_on(run(
+                &harness.context(),
+                &harness.request("job", CleanupLimits::default()),
+                &scripted,
+                &scripted,
+                &Cancellation::default(),
+            ))
+            .unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::Lease);
+        assert_eq!(outcome.deleted_objects, 0);
+        assert_eq!(removed(&harness, &library), [false, false, false]);
+        assert!(harness.markers().is_empty());
+        // The decision itself is kept: the next run starts from it.
+        assert_eq!(harness.remaining().len(), 3);
+    }
+
+    /// Invariant GC19. A lease that appears once removals have started stops
+    /// the next batch, and the marker goes only because every request sent had
+    /// already answered.
+    #[test]
+    fn a_lease_that_appears_between_batches_stops_the_next_one() {
+        let harness = Harness::new();
+        let (library, scripted) = Library::install(&harness);
+        harness.provider.seed_after_delete(
+            1,
+            &lease_object_id(LeaseKind::Work, &tag(5)).unwrap(),
+            ObjectRole::Lease,
+            b"foreign".to_vec(),
+        );
+        let outcome = runtime()
+            .block_on(run(
+                &harness.context(),
+                &harness.request(
+                    "job",
+                    CleanupLimits {
+                        batch: 1,
+                        per_run: 200,
+                    },
+                ),
+                &scripted,
+                &scripted,
+                &Cancellation::default(),
+            ))
+            .unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::Lease);
+        assert_eq!(outcome.deleted_objects, 1);
+        assert_eq!(removed(&harness, &library), [true, false, false]);
+        assert!(harness.markers().is_empty());
+        assert_eq!(
+            harness.remaining(),
+            ["catalog-stale".to_owned(), "pack-stale".to_owned()]
+        );
+    }
+
+    /// Invariant GC34. An answer that never arrives leaves a request this
+    /// device cannot call finished, so the marker stays and a later run is the
+    /// one that waits, not the one that guesses.
+    #[test]
+    fn an_answer_that_never_arrives_keeps_the_marker_in_place() {
+        let harness = Harness::new();
+        let (library, scripted) = Library::install(&harness);
+        harness
+            .provider
+            .fail_delete(&library.stale.object_id, DeleteFault::Unanswered);
+        let cancel = Cancellation::default();
+        let outcome = runtime().block_on(async {
+            let stop = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                stop.cancel();
+            });
+            run(
+                &harness.context(),
+                &harness.request("job", CleanupLimits::default()),
+                &scripted,
+                &scripted,
+                &cancel,
+            )
+            .await
+        });
+        let outcome = outcome.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::Uncertain);
+        assert_eq!(outcome.deleted_objects, 0);
+        assert_eq!(harness.markers().len(), 1);
+        assert_eq!(
+            harness
+                .store()
+                .unfinished_delete_requests(CONNECTION, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(harness.remaining().len(), 3);
+    }
+
+    /// Invariant GC34. A removal the repository applied but never answered for
+    /// is not finished, and the run that follows waits on the marker instead of
+    /// reading its own success as the end of the earlier request.
+    #[test]
+    fn an_applied_removal_with_a_lost_answer_is_not_treated_as_finished() {
+        let harness = Harness::new();
+        let (library, scripted) = Library::install(&harness);
+        harness
+            .provider
+            .fail_delete(&library.stale.object_id, DeleteFault::AppliedThenLost);
+        let first = runtime()
+            .block_on(run(
+                &harness.context(),
+                &harness.request("first", CleanupLimits::default()),
+                &scripted,
+                &scripted,
+                &Cancellation::default(),
+            ))
+            .unwrap();
+        assert_eq!(first.stop_reason, StopReason::Uncertain);
+        assert_eq!(first.deleted_objects, 0);
+        // The object is gone remotely, which this device has no way to know.
+        assert!(!harness.provider.holds(&library.stale.object_id));
+        assert_eq!(harness.markers().len(), 1);
+        let outstanding = harness
+            .store()
+            .unfinished_delete_requests(CONNECTION, None)
+            .unwrap();
+        assert_eq!(outstanding.len(), 1);
+        assert!(harness
+            .committed()
+            .iter()
+            .all(|entry| !entry.done || entry.locator.object != library.stale.object_id));
+
+        let mut resumed = library.script();
+        resumed.snapshots = vec![library.head.receipt.clone()];
+        let second = runtime()
+            .block_on(run(
+                &harness.context(),
+                &harness.request("second", CleanupLimits::default()),
+                &resumed,
+                &resumed,
+                &Cancellation::default(),
+            ))
+            .unwrap();
+        assert_eq!(second.stop_reason, StopReason::Lease);
+        assert_eq!(second.deleted_objects, 0);
+        assert_eq!(resumed.documents_read(), 0);
+        assert_eq!(harness.markers().len(), 1);
+        assert_eq!(
+            harness
+                .store()
+                .unfinished_delete_requests(CONNECTION, None)
+                .unwrap(),
+            outstanding
+        );
+        assert!(harness.provider.holds(&library.stale_pack.object_id));
+    }
+
+    /// Invariant GC17. Without every evidence the removal path needs, no marker
+    /// and no removal request is made.
+    #[test]
+    fn a_repository_without_the_evidence_removes_nothing() {
+        let mut harness = Harness::new();
+        harness.capabilities = fake::capabilities_without_cleanup(true);
+        let (library, scripted) = Library::install(&harness);
+        let error = runtime()
+            .block_on(run(
+                &harness.context(),
+                &harness.request("job", CleanupLimits::default()),
+                &scripted,
+                &scripted,
+                &Cancellation::default(),
+            ))
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Unsupported);
+        assert_eq!(removed(&harness, &library), [false, false, false]);
+        assert!(harness.markers().is_empty());
+        assert_eq!(scripted.documents_read(), 0);
+    }
+}
