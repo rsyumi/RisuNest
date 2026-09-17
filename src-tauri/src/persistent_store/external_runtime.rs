@@ -26,6 +26,12 @@ pub(crate) struct ExternalJob {
     pub commit_id: String,
     pub phase: String,
 }
+pub(crate) struct ExternalReceiveCompletion {
+    pub snapshot_id: String,
+    pub expected_revision: i64,
+    pub revision: i64,
+}
+
 fn invalid(message: &str) -> StoreError {
     StoreError::Validation {
         message: message.into(),
@@ -141,6 +147,48 @@ impl PersistentStore {
         row.map(|(snapshot, identity)| Ok((snapshot, serde_json::from_str(&identity)?)))
             .transpose()
     }
+    pub(crate) fn external_receive_completion(
+        &self,
+        job: &str,
+        connection: &str,
+    ) -> StoreResult<Option<ExternalReceiveCompletion>> {
+        let Some(completed) = self.external_job(job)?.filter(|item| {
+            item.connection_id == connection && item.role == "restore" && item.phase == "complete"
+        }) else {
+            return Ok(None);
+        };
+        // The receive marker and the single revision increment share one transaction.
+        // A later cycle may have replaced the connection's base already.
+        let revision = completed.identity.revision.checked_add(1)
+            .filter(|_| completed.identity.revision >= 0)
+            .ok_or_else(|| invalid("Invalid completed receive revision"))?;
+        Ok(Some(ExternalReceiveCompletion {
+            snapshot_id: completed.capture_id,
+            expected_revision: completed.identity.revision,
+            revision,
+        }))
+    }
+
+    pub(crate) fn external_validate_receive(
+        &self,
+        job: &str,
+        connection: &str,
+        expected: &sync_selection::CaptureIdentity,
+        authenticated_head: &str,
+    ) -> StoreResult<()> {
+        let intent = self.external_job(job)?
+            .ok_or_else(|| invalid("Missing prepared receive intent"))?;
+        if intent.role != "restore" || intent.phase != "ready"
+            || intent.connection_id != connection || intent.identity != *expected
+            || intent.expected_head.as_deref() != Some(authenticated_head)
+            || self.external_identity()? != *expected
+        {
+            return Err(invalid("Prepared receive identity changed"));
+        }
+        sync_selection::require_publish(&self.connection, expected, connection)?;
+        sync_selection::require_no_pending_publication(&self.connection)
+    }
+
     pub(crate) fn external_identity(&self) -> StoreResult<sync_selection::CaptureIdentity> {
         sync_selection::identity(&self.connection)
     }

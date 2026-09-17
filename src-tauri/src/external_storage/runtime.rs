@@ -85,10 +85,6 @@ pub(crate) async fn require_connection_idle(app: &AppHandle, connection: &str) -
         .map_err(local_error)?
         .values()
         .any(|(id, _)| id == connection)
-        || JobStore::open(&root(app)?)?
-            .list_pending()?
-            .iter()
-            .any(|job| job.request.connection_id == connection && !job.terminal())
     {
         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
     }
@@ -122,6 +118,7 @@ pub(crate) fn external_storage_set_execution_session(
         id: request.id,
     };
     if hidden {
+        state.automatic_targets.lock().map_err(local_error)?.clear();
         for (_, cancel) in state.active.lock().map_err(local_error)?.values() {
             cancel.cancel();
         }
@@ -148,7 +145,10 @@ pub(crate) fn external_storage_get_state(app: AppHandle) -> Result<Value> {
     let jobs = JobStore::open(&root)?
         .list_for_state()?
         .into_iter()
-        .map(|job| reconcile_job(&app, job).map(|job| job_summary(&root, job)))
+        .map(|job| reconcile_job(&app, job).map(|job| {
+            continue_observed_automatic(&app, &job);
+            job_summary(&root, job)
+        }))
         .collect::<Result<Vec<_>>>()?;
     Ok(
         json!({"supported":true,"selection":selection_dto(native_store(&app)?.external_selection().map_err(local_error)?),"connections":connections,"jobs":jobs}),
@@ -194,16 +194,25 @@ pub(crate) async fn external_storage_set_sync_target(
     let selected = native_store(&app)?
         .external_select(&request.expected_selection_epoch, &target)
         .map_err(local_error)?;
+    let state = app.state::<JobCommandState>();
+    state.automatic_targets.lock().map_err(local_error)?.clear();
+    let prepared: Vec<_> = state.prepared_receives.lock().map_err(local_error)?
+        .keys().cloned().collect();
+    drop(_permit);
+    for job in prepared {
+        if super::sync_engine::discard_receive_preparation(&app, &job).is_err() {
+            crate::nlog!("error", "Reselected external receive stage could not be discarded");
+        }
+    }
     Ok(selection_dto(selected))
 }
 #[tauri::command]
 pub(crate) fn external_storage_get_job(app: AppHandle, job_id: String) -> Result<Value> {
     super::runtime_restore::reconcile_device_restore_settlements(&app)?;
     let directory = root(&app)?;
-    Ok(job_summary(
-        &directory,
-        reconcile_job(&app, JobStore::open(&directory)?.read(&job_id)?)?,
-    ))
+    let job = reconcile_job(&app, JobStore::open(&directory)?.read(&job_id)?)?;
+    continue_observed_automatic(&app, &job);
+    Ok(job_summary(&directory, job))
 }
 fn job_summary(root: &std::path::Path, mut job: DurableJob) -> Value {
     if let Ok((done, total, items, count)) = super::journal::TransferJournal::progress(
@@ -221,12 +230,14 @@ fn job_summary(root: &std::path::Path, mut job: DurableJob) -> Value {
 pub(crate) async fn external_storage_cancel_job(app: AppHandle, job_id: String) -> Result<Value> {
     let store = JobStore::open(&root(&app)?)?;
     let state = app.state::<JobCommandState>();
+    state.cancel_automatic_target(&store.read(&job_id)?)?;
     {
         if let Some((_, cancel)) = state.active.lock().map_err(local_error)?.get(&job_id) {
             cancel.cancel();
         }
     }
     wait_for_job_release(&app, &job_id).await?;
+    super::sync_engine::discard_receive_preparation(&app, &job_id)?;
     let mut job = reconcile_job(&app, store.read(&job_id)?)?;
     if job.summary["state"] != "succeeded" {
         let mut pds = native_store(&app)?;
@@ -326,11 +337,11 @@ pub(crate) async fn external_storage_start_job(
         }
     }
     let store = JobStore::open(&root)?;
-    if let Some(mut pending) = store
-        .list_pending()?
-        .into_iter()
-        .find(|job| job.request.connection_id == request.connection_id && !job.terminal())
-    {
+    let pending = store.list_pending()?.into_iter()
+        .find(|job| job.request.connection_id == request.connection_id)
+        .map(|job| reconcile_job(&app, job))
+        .transpose()?;
+    if let Some(mut pending) = pending.filter(|job| !job.terminal()) {
         let cancelled_worker = command_state
             .active
             .lock()
@@ -356,8 +367,14 @@ pub(crate) async fn external_storage_start_job(
             return Err(ProviderError::new(ErrorKind::PreconditionFailed));
         }
         if pending.terminal() {
-            return Ok(pending.summary);
+            let identity = native_store(&app)?.external_identity().map_err(local_error)?;
+            let next = DurableJob::new(request, false, now_ms(), identity);
+            store.put(&next)?;
+            wake_job(app, next.id.clone())?;
+            return Ok(next.summary);
         }
+        let current_identity = native_store(&app)?.external_identity().map_err(local_error)?;
+        command_state.coalesce_automatic(&pending, &request, &current_identity)?;
         if !command_state
             .active
             .lock()
@@ -372,7 +389,9 @@ pub(crate) async fn external_storage_start_job(
             pending.request.session = request.session;
             pending.request.session_id = request.session_id;
             store.put(&pending)?;
-            wake_job(app.clone(), pending.id.clone())?;
+            if super::sync_engine::prepared_receive_result(&app, &pending.id)?.is_none() {
+                wake_job(app.clone(), pending.id.clone())?;
+            }
         }
         return Ok(pending.summary);
     }
@@ -402,10 +421,14 @@ fn same_requested_operation(existing: &StartJobRequest, incoming: &StartJobReque
         JobKind::ResolveConflict => {
             existing.conflict_id == incoming.conflict_id && existing.choice == incoming.choice
         }
-        JobKind::Sync | JobKind::Backup | JobKind::Cleanup => true,
+        JobKind::Sync => {
+            (existing.reason.as_deref() == Some("automatic"))
+                == (incoming.reason.as_deref() == Some("automatic"))
+        }
+        JobKind::Backup | JobKind::Cleanup => true,
     }
 }
-async fn wait_for_job_release(app: &AppHandle, id: &str) -> Result<()> {
+pub(crate) async fn wait_for_job_release(app: &AppHandle, id: &str) -> Result<()> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         if !app
@@ -446,7 +469,18 @@ fn completed_job_result(pds: &mut PersistentStore, job: &DurableJob) -> Result<O
                 )
             })
     {
-        pds.external_finish_conflict(&job.id).map_err(local_error)?;
+        if pds.external_finish_conflict(&job.id).is_err() {
+            crate::nlog!("error", "External job completed but conflict bookkeeping did not finish");
+        }
+    }
+    if matches!(job.request.kind, JobKind::Sync | JobKind::ResolveConflict)
+        && completed.role == "restore"
+    {
+        let received = pds.external_receive_completion(&job.id, &job.request.connection_id)
+            .map_err(local_error)?
+            .ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))?;
+        return Ok(Some(json!({"snapshotId":received.snapshot_id,
+            "receivedRevision":received.revision.to_string()})));
     }
     if job.request.kind == JobKind::Backup {
         let (snapshot, identity) = pds
@@ -495,27 +529,81 @@ pub(crate) fn require_admitted_library(
 fn reconcile_job(app: &AppHandle, mut job: DurableJob) -> Result<DurableJob> {
     let state = app.state::<JobCommandState>();
     let active = state.active.lock().map_err(local_error)?;
-    if (job.terminal() && job.request.kind != JobKind::ResolveConflict)
-        || job.summary["phase"] == "device-restore-maintenance"
-        || active.contains_key(&job.id)
-    {
+    if active.contains_key(&job.id) {
         return Ok(job);
     }
     let mut pds = native_store(app)?;
-    let complete = completed_job_result(&mut pds, &job)?;
-    if complete.is_none() && job.summary["state"] != "running" {
-        return Ok(job);
+    let complete = if job.request.kind == JobKind::Restore {
+        super::runtime_restore::completed_restore(app, &job)?
+    } else {
+        completed_job_result(&mut pds, &job)?
+    };
+    let authoritative = pds.external_job(&job.id).map_err(local_error)?;
+    if complete.is_none() {
+        if let Some(intent) = authoritative.as_ref().filter(|item| matches!(item.phase.as_str(), "stale" | "cancelled")) {
+            let preserving = pds.external_conflict(&job.id).map_err(local_error)?
+                .is_some_and(|record| record.phase == ConflictPhase::Pending
+                    && record.preservation == ConflictPreservation::RemoteComplete);
+            settle_invalidated(&mut job, &intent.phase, preserving);
+            if super::sync_engine::discard_receive_preparation(app, &job.id).is_ok() {
+                job.receive_staging_id = None;
+            }
+            let _ = JobStore::open(&root(app)?).and_then(|store| store.put(&job));
+            return Ok(job);
+        }
+        let prepared = if authoritative.as_ref().is_some_and(|item| item.role == "restore" && item.phase == "ready") {
+            super::sync_engine::prepared_receive_result(app, &job.id)?
+        } else { None };
+        if settle_receive_preparation(&mut job, prepared) {
+            let _ = JobStore::open(&root(app)?).and_then(|store| store.put(&job));
+            return Ok(job);
+        }
+        if job.terminal() || job.summary["phase"] == "device-restore-maintenance"
+            || job.summary["state"] != "running"
+        {
+            return Ok(job);
+        }
     }
-    let uncertain = pds
-        .external_job(&job.id)
-        .map_err(local_error)?
-        .is_some_and(|item| {
-            ["publishing", "publicationUnknown", "applying"].contains(&item.phase.as_str())
-        });
+    let uncertain = authoritative.as_ref().is_some_and(|item| {
+        ["publishing", "publicationUnknown"].contains(&item.phase.as_str())
+    });
+    if complete.is_none() && authoritative.as_ref().is_some_and(|item| item.phase == "publishing") {
+        pds.external_publication_unknown(&job.id).map_err(local_error)?;
+    }
     settle_interrupted(&mut job, complete, uncertain);
     // The renderer still receives a settled result if its auxiliary cache is unwritable.
     let _ = JobStore::open(&root(app)?).and_then(|store| store.put(&job));
     Ok(job)
+}
+
+fn settle_invalidated(job: &mut DurableJob, phase: &str, preserving: bool) {
+    job.summary["state"] = json!(if preserving { "conflict" } else if phase == "cancelled" { "cancelled" } else { "failed" });
+    job.summary["phase"] = json!(if preserving { "conflict-choice" } else { "paused" });
+    job.summary.as_object_mut().unwrap().remove("result");
+    if preserving {
+        job.summary["result"] = json!({"conflictId":job.id});
+    }
+    let kind = if phase == "cancelled" { ErrorKind::Cancelled } else { ErrorKind::PreconditionFailed };
+    job.summary["error"] = error_dto(&ProviderError::new(kind));
+    job.summary["updatedAtMs"] = json!(now_ms().to_string());
+}
+
+fn settle_receive_preparation(job: &mut DurableJob, prepared: Option<Value>) -> bool {
+    if let Some(result) = prepared {
+        job.summary["state"] = json!("waiting");
+        job.summary["phase"] = json!("remote-apply");
+        job.summary["result"] = result;
+        job.summary.as_object_mut().unwrap().remove("error");
+    } else if job.summary["phase"] == "remote-apply" {
+        job.summary["state"] = json!("waiting");
+        job.summary["phase"] = json!("paused");
+        job.summary.as_object_mut().unwrap().remove("result");
+        job.summary["error"] = error_dto(&ProviderError::new(ErrorKind::Transient));
+    } else {
+        return false;
+    }
+    job.summary["updatedAtMs"] = json!(now_ms().to_string());
+    true
 }
 
 fn settle_interrupted(job: &mut DurableJob, complete: Option<Value>, uncertain: bool) {
@@ -639,6 +727,9 @@ pub(crate) fn release_leases(app: &AppHandle, job: &DurableJob) {
     if !job.terminal() {
         return;
     }
+    let Ok((_, claim)) = app.state::<JobCommandState>().claim(job) else {
+        return;
+    };
     let app = app.clone();
     let connection_id = job.request.connection_id.clone();
     let job_id = job.id.clone();
@@ -649,6 +740,7 @@ pub(crate) fn release_leases(app: &AppHandle, job: &DurableJob) {
                 "External storage lease could not be released: {error}"
             );
         }
+        drop(claim);
     });
 }
 pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
@@ -657,27 +749,25 @@ pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
     }
     read_job_session(&app, &id)?;
-    let cancel = Cancellation::default();
-    {
-        let state = app.state::<JobCommandState>();
-        let mut active = state.active.lock().map_err(local_error)?;
-        if active.contains_key(&id) {
-            return Ok(());
-        }
-        if active
-            .values()
-            .any(|(connection, _)| connection == &job.request.connection_id)
-        {
-            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
-        }
-        active.insert(
-            id.clone(),
-            (job.request.connection_id.clone(), cancel.clone()),
-        );
-    }
+    let (cancel, claim) = app.state::<JobCommandState>().claim(&job)?;
     let connection_id = job.request.connection_id.clone();
     tauri::async_runtime::spawn(async move {
-        let result = run_job(&app, &id, &cancel).await;
+        let result = match run_job(&app, &id, &cancel).await {
+            Err(error) => {
+                let completed = if job.request.kind == JobKind::Restore {
+                    super::runtime_restore::completed_restore(&app, &job)
+                } else {
+                    native_store(&app).and_then(|mut pds| completed_job_result(&mut pds, &job))
+                };
+                match completed {
+                    Ok(Some(result)) => Ok(result),
+                    _ => Err(error),
+                }
+            }
+            outcome => outcome,
+        };
+        let confirmed = result.as_ref().ok().and_then(completed_revision);
+        let cancelled = cancel.check().is_err();
         let persisted = (|| -> Result<bool> {
             let store = JobStore::open(&root(&app)?)?;
             let mut job = store.read(&id)?;
@@ -737,6 +827,11 @@ pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
                             | ErrorKind::StorageFull
                     );
                     if !pending && !retryable && !preserving {
+                        if super::sync_engine::discard_receive_preparation(&app, &job.id).is_ok() {
+                            job.receive_staging_id = None;
+                        } else {
+                            crate::nlog!("error", "Rejected external receive stage could not be discarded");
+                        }
                         if let Some(item) = authoritative.iter().find(|item| {
                             item.id == id
                                 && ["preparing", "ready", "stale"].contains(&item.phase.as_str())
@@ -800,12 +895,84 @@ pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
             Ok(false) => {}
             Err(_) => crate::nlog!("error", "External job outcome could not be persisted"),
         }
-        if let Ok(mut active) = app.state::<JobCommandState>().active.lock() {
-            active.remove(&id);
+        drop(claim);
+        if let Some(revision) = confirmed.filter(|_| !cancelled) {
+            if let Err(error) = start_queued_automatic(&app, &job, revision) {
+                crate::nlog!("error", "External follow-up sync could not start: {error}");
+            }
         }
     });
     Ok(())
 }
+
+fn completed_revision(result: &Value) -> Option<i64> {
+    result.get("publishedRevision").or_else(|| result.get("receivedRevision"))
+        .and_then(Value::as_str).and_then(|value| value.parse().ok())
+}
+
+fn continue_observed_automatic(app: &AppHandle, job: &DurableJob) {
+    if job.summary["state"] == "succeeded" {
+        if let Some(revision) = completed_revision(&job.summary["result"]) {
+            if let Err(error) = start_queued_automatic(app, job, revision) {
+                crate::nlog!("error", "External follow-up sync could not start: {error}");
+            }
+        }
+    }
+}
+
+fn start_queued_automatic(app: &AppHandle, completed: &DurableJob, revision: i64) -> Result<()> {
+    if completed.request.kind != JobKind::Sync
+        || completed.request.reason.as_deref() != Some("automatic")
+    {
+        return Ok(());
+    }
+    let state = app.state::<JobCommandState>();
+    if state.active.lock().map_err(local_error)?.values()
+        .any(|(connection, _)| connection == &completed.request.connection_id)
+    {
+        return Ok(());
+    }
+    let target = state.automatic_targets.lock().map_err(local_error)?
+        .get(&completed.request.connection_id).cloned();
+    let Some(target) = target else { return Ok(()) };
+    if target.owner_job_id != completed.id {
+        return Ok(());
+    }
+    let target_revision = super::job_store::requested_revision(&target.request, target.identity.revision)?;
+    if target_revision <= revision {
+        forget_automatic_target(&state, &completed.request.connection_id, &completed.id, revision)?;
+        return Ok(());
+    }
+    {
+        let session = state.session.lock().map_err(local_error)?;
+        require_session(&target.request, &session)?;
+    }
+    let pds = native_store(app)?;
+    let selection = pds.external_selection().map_err(local_error)?;
+    if selection.paused || selection.target != SyncTarget::External(target.request.connection_id.clone()) {
+        return Ok(());
+    }
+    let current = pds.external_identity().map_err(local_error)?;
+    let mut next = DurableJob::new(target.request, false, now_ms(), target.identity);
+    require_admitted_library(&next, &current)?;
+    next.admission_identity = current;
+    let jobs = JobStore::open(&root(app)?)?;
+    jobs.put(&next)?;
+    wake_job(app.clone(), next.id)?;
+    forget_automatic_target(&state, &completed.request.connection_id, &completed.id, target_revision)
+}
+
+fn forget_automatic_target(state: &JobCommandState, connection: &str, owner: &str, through: i64) -> Result<()> {
+    let mut queued = state.automatic_targets.lock().map_err(local_error)?;
+    if queued.get(connection).is_some_and(|target| {
+        target.owner_job_id == owner && super::job_store::requested_revision(&target.request, target.identity.revision)
+            .is_ok_and(|revision| revision <= through)
+    }) {
+        queued.remove(connection);
+    }
+    Ok(())
+}
+
 pub(crate) fn error_dto(error: &ProviderError) -> Value {
     let (message, action, retry) = match error.kind {
         ErrorKind::ReauthRequired | ErrorKind::Unauthorized => (
@@ -1485,6 +1652,75 @@ mod tests {
         incoming.choice = Some("local".into());
         assert!(!same_requested_operation(&existing, &incoming));
     }
+    fn automatic_job() -> DurableJob {
+        let request = serde_json::from_value(json!({
+            "connectionId":"x", "kind":"sync", "reason":"automatic", "targetRevision":"1"
+        })).unwrap();
+        DurableJob::new(request, false, 1, persistent_store::sync_selection::CaptureIdentity {
+            store_id: "store".into(), library_epoch: "library".into(), generation: "generation".into(),
+            selection_epoch: "selection".into(), revision: 1,
+        })
+    }
+
+    #[test]
+    fn a_cached_ready_summary_requires_a_live_prepared_handle_after_restart() {
+        let mut job = automatic_job();
+        job.summary["state"] = json!("running");
+        assert!(settle_receive_preparation(&mut job, Some(json!({
+            "receiveReady":true, "snapshotId":"snapshot", "expectedRevision":"1"
+        }))));
+        assert_eq!(job.summary["phase"], "remote-apply");
+        assert_eq!(job.summary["state"], "waiting");
+        assert!(settle_receive_preparation(&mut job, None));
+        assert_eq!(job.summary["phase"], "paused");
+        assert!(job.summary.get("result").is_none());
+        assert_eq!(job.summary["error"]["action"], "retry");
+        assert_eq!(job.admission_identity.revision, 1);
+    }
+
+    #[test]
+    fn invalidated_waiting_jobs_settle_without_losing_preserved_conflicts() {
+        for cached in ["queued", "waiting", "running", "failed"] {
+            let mut job = automatic_job();
+            job.summary["state"] = json!(cached);
+            settle_invalidated(&mut job, "stale", false);
+            assert!(job.terminal());
+            assert_eq!(job.summary["state"], "failed");
+            settle_invalidated(&mut job, "cancelled", true);
+            assert!(!job.terminal());
+            assert_eq!(job.summary["state"], "conflict");
+            assert_eq!(job.summary["result"]["conflictId"], job.id);
+        }
+    }
+
+    #[test]
+    fn older_completion_or_cancellation_cannot_discard_a_newer_jobs_automatic_target() {
+        let state = JobCommandState::default();
+        let old = automatic_job();
+        let new = automatic_job();
+        let mut current = new.admission_identity.clone();
+        current.revision = 3;
+        let mut request = new.request.clone();
+        request.target_revision = Some("3".into());
+        state.coalesce_automatic(&new, &request, &current).unwrap();
+        state.cancel_automatic_target(&old).unwrap();
+        forget_automatic_target(&state, "x", &old.id, 100).unwrap();
+        assert_eq!(state.automatic_targets.lock().unwrap().len(), 1);
+        forget_automatic_target(&state, "x", &new.id, 2).unwrap();
+        assert_eq!(state.automatic_targets.lock().unwrap().len(), 1);
+        forget_automatic_target(&state, "x", &new.id, 3).unwrap();
+        assert!(state.automatic_targets.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn automatic_sync_does_not_absorb_a_manual_sync_request() {
+        let automatic = automatic_job().request;
+        let mut manual = automatic.clone();
+        manual.reason = Some("manual".into());
+        assert!(!same_requested_operation(&automatic, &manual));
+        assert!(!same_requested_operation(&manual, &automatic));
+    }
+
     #[test]
     fn interrupted_outcome_recovers_only_authoritative_completion() {
         let request = serde_json::from_value(json!({"connectionId":"x","kind":"sync"})).unwrap();
@@ -1503,6 +1739,7 @@ mod tests {
         settle_interrupted(&mut job, None, false);
         assert_eq!(job.summary["state"], "waiting");
         assert_eq!(job.summary["error"]["action"], "retry");
+        job.summary["state"] = json!("failed");
         settle_interrupted(
             &mut job,
             Some(json!({"snapshotId":"snapshot", "receivedRevision":"5"})),

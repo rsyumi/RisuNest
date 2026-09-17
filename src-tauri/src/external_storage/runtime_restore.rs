@@ -3,7 +3,7 @@
 use super::{
     connection_commands::ConnectedRepository,
     contract::{Cancellation, ErrorKind, ProviderError, Result},
-    job_store::{DurableJob, JobCommandState, JobKind, JobStore},
+    job_store::{DurableJob, JobClaim, JobCommandState, JobKind, JobStore},
     runtime,
     snapshot_restore::{self, PreparedRemoteSnapshot},
 };
@@ -99,8 +99,14 @@ pub(crate) fn completed_restore(app: &AppHandle, job: &DurableJob) -> Result<Opt
     completed_restore_in_store(&runtime::native_store(app)?, job)
 }
 
+struct RetainedRestore {
+    job_id: String,
+    store: PersistentStore,
+    claim: Option<JobClaim>,
+}
+
 #[derive(Default)]
-pub(crate) struct RuntimeRestoreState(Mutex<Option<(String, PersistentStore)>>);
+pub(crate) struct RuntimeRestoreState(Mutex<Option<RetainedRestore>>);
 
 impl RuntimeRestoreState {
     fn retain(&self, job: &str, store: PersistentStore) -> Result<()> {
@@ -108,7 +114,7 @@ impl RuntimeRestoreState {
         if slot.is_some() {
             return Err(ProviderError::new(ErrorKind::PreconditionFailed));
         }
-        *slot = Some((job.to_owned(), store));
+        *slot = Some(RetainedRestore { job_id: job.to_owned(), store, claim: None });
         Ok(())
     }
 
@@ -118,16 +124,34 @@ impl RuntimeRestoreState {
         operation: impl FnOnce(&mut PersistentStore) -> Result<T>,
     ) -> Result<T> {
         let mut slot = self.0.lock().map_err(runtime::local_error)?;
-        let (owner, store) = slot.as_mut().ok_or_else(corrupt)?;
-        if owner != job {
+        let retained = slot.as_mut().ok_or_else(corrupt)?;
+        if retained.job_id != job {
             return Err(ProviderError::new(ErrorKind::PreconditionFailed));
         }
-        operation(store)
+        operation(&mut retained.store)
+    }
+
+    fn retain_claim(&self, job: &str, claim: JobClaim) -> Result<()> {
+        let mut slot = self.0.lock().map_err(runtime::local_error)?;
+        let retained = slot.as_mut().ok_or_else(corrupt)?;
+        if retained.job_id != job || retained.claim.is_some() {
+            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+        }
+        retained.claim = Some(claim);
+        Ok(())
+    }
+
+    fn release_claim(&self, job: &str) {
+        if let Ok(mut slot) = self.0.lock() {
+            if let Some(retained) = slot.as_mut().filter(|retained| retained.job_id == job) {
+                retained.claim.take();
+            }
+        }
     }
 
     fn release(&self, job: &str) {
         if let Ok(mut slot) = self.0.lock() {
-            if slot.as_ref().is_some_and(|(owner, _)| owner == job) {
+            if slot.as_ref().is_some_and(|retained| retained.job_id == job) {
                 slot.take();
             }
         }
@@ -546,36 +570,27 @@ pub(crate) fn resume_prepared_device_restore(
     Ok(())
 }
 
-async fn claim_continuation(app: &AppHandle, job: &DurableJob) -> Result<Cancellation> {
-    loop {
-        {
-            let state = app.state::<JobCommandState>();
-            let mut active = state.active.lock().map_err(runtime::local_error)?;
-            if active.contains_key(&job.id) {
-                drop(active);
-            } else {
-                if active
-                    .values()
-                    .any(|(connection, _)| connection == &job.request.connection_id)
-                {
-                    return Err(ProviderError::new(ErrorKind::PreconditionFailed));
-                }
-                let cancel = Cancellation::default();
-                active.insert(
-                    job.id.clone(),
-                    (job.request.connection_id.clone(), cancel.clone()),
-                );
-                return Ok(cancel);
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+async fn claim_continuation(app: &AppHandle, job: &DurableJob) -> Result<(Cancellation, JobClaim)> {
+    runtime::wait_for_job_release(app, &job.id).await?;
+    app.state::<JobCommandState>().claim(job)
 }
 
 async fn resume_task(app: AppHandle, original: DurableJob, session_id: String) {
     let claimed = claim_continuation(&app, &original).await;
+    let mut worker_claim = None;
+    let mut retained = false;
     let result = match claimed {
-        Ok(cancel) => continue_device_restore(&app, &original, &session_id, &cancel).await,
+        Ok((cancel, claim)) => {
+            let keep = app.state::<RuntimeRestoreState>().retain_claim(&original.id, claim.clone());
+            worker_claim = Some(claim);
+            match keep {
+                Ok(()) => {
+                    retained = true;
+                    continue_device_restore(&app, &original, &session_id, &cancel).await
+                }
+                Err(error) => Err(error),
+            }
+        }
         Err(error) => Err(error),
     };
     let committed = result.is_ok();
@@ -597,9 +612,10 @@ async fn resume_task(app: AppHandle, original: DurableJob, session_id: String) {
         );
     }
     if !committed {
-        if let Ok(mut active) = app.state::<JobCommandState>().active.lock() {
-            active.remove(&original.id);
+        if retained {
+            app.state::<RuntimeRestoreState>().release_claim(&original.id);
         }
+        drop(worker_claim);
         // The outcome above may have failed the job, which the caller's copy
         // does not show.
         if let Ok(settled) = JobStore::open(app.state::<DeviceBackupState>().repository_root())
@@ -897,9 +913,6 @@ pub(crate) fn settle_device_restore(
         }
     }
     app.state::<RuntimeRestoreState>().release(&job.id);
-    if let Ok(mut active) = app.state::<JobCommandState>().active.lock() {
-        active.remove(&job.id);
-    }
     runtime::release_leases(&app, &job);
     let staging =
         runtime::job_directory(&root, &job.request.connection_id, &job.id).join("restore-snapshot");
@@ -950,9 +963,6 @@ pub(crate) fn reconcile_device_restore_settlements(app: &AppHandle) -> Result<()
             .join("restore-snapshot");
             cleanup_staging(&staging);
             app.state::<RuntimeRestoreState>().release(&job.id);
-            if let Ok(mut active) = app.state::<JobCommandState>().active.lock() {
-                active.remove(&job.id);
-            }
             runtime::release_leases(app, &job);
         }
     }
@@ -972,6 +982,28 @@ mod tests {
             selection_epoch: "selection".into(),
             revision: 0,
         }
+    }
+
+    #[test]
+    fn settlement_cannot_release_a_restore_worker_that_has_not_returned() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = PersistentStore::open(directory.path()).unwrap();
+        let request = serde_json::from_value(json!({
+            "connectionId":"connection", "kind":"restore", "snapshotId":"snapshot",
+            "targetRevision":"0", "restoreAreas":["library"]
+        })).unwrap();
+        let job = DurableJob::new(request, false, 1, identity());
+        let commands = JobCommandState::default();
+        let (cancel, worker) = commands.claim(&job).unwrap();
+        let retained = RuntimeRestoreState::default();
+        retained.retain(&job.id, store).unwrap();
+        retained.retain_claim(&job.id, worker.clone()).unwrap();
+        retained.release(&job.id);
+        cancel.cancel();
+        assert!(commands.claim(&job).is_err());
+        drop(worker);
+        assert!(commands.active.lock().unwrap().is_empty());
+        assert!(commands.claim(&job).is_ok());
     }
 
     #[test]
