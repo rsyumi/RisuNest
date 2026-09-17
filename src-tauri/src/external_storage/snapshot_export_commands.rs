@@ -133,6 +133,10 @@ async fn with_export_lease<T>(
         return body.await;
     }
     let lease_id = uuid::Uuid::new_v4().to_string();
+    // A job starting beside this export resumes the connection's leases, and a
+    // command's identifier is in no pending job list. Holding it keeps that
+    // resume from taking this lease back while the download is still running.
+    let _held = leases::hold(&lease_id);
     let outcome = match leases::admit(context, &lease_id, LeaseKind::Work, now_ms, cancel).await {
         Ok(_) => body.await,
         Err(error) => Err(error),

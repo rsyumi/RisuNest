@@ -23,7 +23,39 @@ use std::{
     collections::BTreeSet,
     io::Write,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
+
+/// Lease identifiers a command in this process is holding right now. A command
+/// answers no durable job, so a job starting beside it reads the command's lease
+/// as abandoned and takes it back while its owner is still reading.
+static HELD: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+
+fn held() -> &'static Mutex<BTreeSet<String>> {
+    HELD.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+/// A poisoned set still holds valid identifiers: the thread that panicked is
+/// gone, and its own entry going away is exactly what should happen.
+fn held_ids() -> std::sync::MutexGuard<'static, BTreeSet<String>> {
+    held().lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// Keeps one identifier out of a concurrent `resume`'s reclaim set. Dropping it
+/// makes the lease reclaimable again, which is what an owner that has gone away
+/// should leave behind.
+pub(crate) struct Held(String);
+
+pub(crate) fn hold(id: &str) -> Held {
+    held_ids().insert(id.to_owned());
+    Held(id.to_owned())
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        held_ids().remove(&self.0);
+    }
+}
 
 const MAX_LEASE_PLAINTEXT: usize = 4 * 1024;
 const MAX_LEASE_CIPHERTEXT: u64 = 8 * 1024;
@@ -547,7 +579,7 @@ pub(crate) async fn resume(
         }
     }
     for row in ctx.store()?.lease_intents(ctx.connection_id)? {
-        if live_jobs.contains(&row.job_id) {
+        if live_jobs.contains(&row.job_id) || held_ids().contains(&row.job_id) {
             continue;
         }
         if row.kind == LeaseKind::Deleting {
@@ -942,6 +974,31 @@ mod tests {
             note_delete_finished(&context, &marker, &target).unwrap();
             resume(&context, &live, &cancel).await.unwrap();
             assert!(!harness.provider.holds(&marker.locator.object));
+            assert!(harness.rows().is_empty());
+        });
+    }
+
+    /// GC29: a command answers no durable job, so a job starting beside it must
+    /// not read the command's lease as abandoned while it is still reading.
+    #[test]
+    fn a_lease_a_command_is_holding_survives_a_job_that_starts_beside_it() {
+        let harness = Harness::new();
+        let cancel = Cancellation::default();
+        runtime().block_on(async {
+            let context = harness.context();
+            let handle = admit(&context, "export", LeaseKind::Work, NOW, &cancel)
+                .await
+                .unwrap();
+            let held = hold("export");
+
+            // The job list names only the job that just started.
+            let live = BTreeSet::from(["job".to_owned()]);
+            resume(&context, &live, &cancel).await.unwrap();
+            assert!(harness.provider.holds(&handle.locator.object));
+
+            drop(held);
+            resume(&context, &live, &cancel).await.unwrap();
+            assert!(!harness.provider.holds(&handle.locator.object));
             assert!(harness.rows().is_empty());
         });
     }
