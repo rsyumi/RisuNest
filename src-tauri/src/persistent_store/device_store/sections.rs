@@ -3,6 +3,7 @@
 //! remote carried it.
 use super::{invalid, observe_remote_clock, sequence, DeviceStore, Section};
 use crate::persistent_store::StoreResult;
+use risunest_external_storage_format::section::SectionEntryVersion;
 use risunest_sync_wire::Sequence;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
@@ -92,6 +93,16 @@ impl SectionValueRow {
 
 /// The triple a section row is named by, in the order the change index holds.
 pub(crate) type SectionKey = (String, String, String);
+pub(crate) type PublishedRows = Vec<(SectionKey, SectionEntryVersion)>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReclaimedRowVersion {
+    pub write_clock: Sequence,
+    pub writer_id: String,
+    pub first_published: TombstonePublication,
+}
+
+pub(crate) type ReclaimedRows = BTreeMap<SectionKey, ReclaimedRowVersion>;
 
 /// The key triple matches the change index, so a row and its change entry name
 /// the same thing without a second encoding.
@@ -108,6 +119,12 @@ pub(crate) struct SectionRow {
 impl SectionRow {
     pub(crate) fn key(&self) -> (String, String, String) {
         (self.key1.clone(), self.key2.clone(), self.key3.clone())
+    }
+    pub(crate) fn version(&self) -> SectionEntryVersion {
+        SectionEntryVersion {
+            write_clock: self.write_clock.clone(),
+            writer_id: self.writer_id.clone(),
+        }
     }
     fn version_after(&self, other: &Self) -> bool {
         (&self.write_clock, &self.writer_id) > (&other.write_clock, &other.writer_id)
@@ -453,30 +470,37 @@ impl DeviceStore {
     pub(crate) fn note_section_published(
         &mut self,
         section: Section,
-        published: &[(SectionKey, Sequence)],
-        stamped: &[(SectionKey, Sequence)],
+        published: &[(SectionKey, SectionEntryVersion)],
+        stamped: &[(SectionKey, SectionEntryVersion)],
         first_published: &TombstonePublication,
-        reclaimed: &BTreeSet<SectionKey>,
+        reclaimed: &ReclaimedRows,
         gc_floor: &Sequence,
     ) -> StoreResult<()> {
-        if published.is_empty() && stamped.is_empty() && reclaimed.is_empty() {
-            return Ok(());
-        }
         let transaction = self.transaction()?;
         // The removals this publication stopped carrying go with the floor it
         // published, in the transaction that records the publication, so a
         // publication that never finished reclaims nothing.
-        for (key1, key2, key3) in reclaimed {
+        for ((key1, key2, key3), version) in reclaimed {
+            let at_ms = i64::try_from(version.first_published.at_ms)
+                .map_err(|_| invalid("device removal marker time is out of range"))?;
             match section {
                 Section::Hypa => {
-                    transaction
-                        .execute("DELETE FROM hypa_embeddings WHERE cache_key=?1", [key1])?;
+                    transaction.execute(
+                        "DELETE FROM hypa_embeddings WHERE cache_key=?1 AND tombstone=1
+                            AND write_clock=?2 AND writer_id=?3
+                            AND first_published_generation=?4 AND first_published_at_ms=?5",
+                        params![key1, version.write_clock.as_str(), version.writer_id,
+                            version.first_published.generation.as_str(), at_ms],
+                    )?;
                 }
                 Section::LocalPlugins => {
                     transaction.execute(
                         "DELETE FROM plugin_device_storage
-                            WHERE owner=?1 AND space=?2 AND key=?3",
-                        params![key1, key2, key3],
+                            WHERE owner=?1 AND space=?2 AND key=?3 AND tombstone=1
+                              AND write_clock=?4 AND writer_id=?5
+                              AND first_published_generation=?6 AND first_published_at_ms=?7",
+                        params![key1, key2, key3, version.write_clock.as_str(), version.writer_id,
+                            version.first_published.generation.as_str(), at_ms],
                     )?;
                 }
             }
@@ -499,34 +523,29 @@ impl DeviceStore {
             let mut statement = match section {
                 Section::Hypa => transaction.prepare(
                     "UPDATE hypa_embeddings
-                        SET first_published_generation=?3,first_published_at_ms=?4
-                        WHERE cache_key=?1 AND write_clock=?2 AND tombstone=1
+                        SET first_published_generation=?4,first_published_at_ms=?5
+                        WHERE cache_key=?1 AND write_clock=?2 AND writer_id=?3 AND tombstone=1
                           AND first_published_generation IS NULL",
                 )?,
                 Section::LocalPlugins => transaction.prepare(
                     "UPDATE plugin_device_storage
-                        SET first_published_generation=?5,first_published_at_ms=?6
-                        WHERE owner=?1 AND space=?2 AND key=?3 AND write_clock=?4
+                        SET first_published_generation=?6,first_published_at_ms=?7
+                        WHERE owner=?1 AND space=?2 AND key=?3 AND write_clock=?4 AND writer_id=?5
                           AND tombstone=1 AND first_published_generation IS NULL",
                 )?,
             };
             let generation = first_published.generation.as_str();
             let at_ms = i64::try_from(first_published.at_ms)
                 .map_err(|_| invalid("device removal marker time is out of range"))?;
-            for ((key1, key2, key3), clock) in stamped {
+            for ((key1, key2, key3), version) in stamped {
                 match section {
                     Section::Hypa => {
-                        statement.execute(params![key1, clock.as_str(), generation, at_ms])?;
+                        statement.execute(params![key1, version.write_clock.as_str(),
+                            version.writer_id, generation, at_ms])?;
                     }
                     Section::LocalPlugins => {
-                        statement.execute(params![
-                            key1,
-                            key2,
-                            key3,
-                            clock.as_str(),
-                            generation,
-                            at_ms
-                        ])?;
+                        statement.execute(params![key1, key2, key3, version.write_clock.as_str(),
+                            version.writer_id, generation, at_ms])?;
                     }
                 }
             }
@@ -535,20 +554,20 @@ impl DeviceStore {
             let mut statement = match section {
                 Section::Hypa => transaction.prepare(
                     "UPDATE hypa_embeddings SET published_clock=?2
-                        WHERE cache_key=?1 AND write_clock=?2",
+                        WHERE cache_key=?1 AND write_clock=?2 AND writer_id=?3",
                 )?,
                 Section::LocalPlugins => transaction.prepare(
                     "UPDATE plugin_device_storage SET published_clock=?4
-                        WHERE owner=?1 AND space=?2 AND key=?3 AND write_clock=?4",
+                        WHERE owner=?1 AND space=?2 AND key=?3 AND write_clock=?4 AND writer_id=?5",
                 )?,
             };
-            for ((key1, key2, key3), clock) in published {
+            for ((key1, key2, key3), version) in published {
                 match section {
                     Section::Hypa => {
-                        statement.execute(params![key1, clock.as_str()])?;
+                        statement.execute(params![key1, version.write_clock.as_str(), version.writer_id])?;
                     }
                     Section::LocalPlugins => {
-                        statement.execute(params![key1, key2, key3, clock.as_str()])?;
+                        statement.execute(params![key1, key2, key3, version.write_clock.as_str(), version.writer_id])?;
                     }
                 }
             }

@@ -3,7 +3,8 @@
 //! change without changing what the repository holds.
 use super::contract::{Cancellation, ErrorKind, ProviderError, Result};
 use crate::persistent_store::device_store::{
-    sections::{SectionCursor, SectionKey, SectionRow, SectionValueRow, TombstonePublication},
+    sections::{PublishedRows, ReclaimedRows, ReclaimedRowVersion, SectionCursor, SectionRow,
+        SectionValueRow, TombstonePublication},
     Section,
 };
 use risunest_external_storage_format::{
@@ -58,13 +59,13 @@ pub(crate) struct CapturedSection {
 #[derive(Clone, Debug)]
 pub(crate) struct SectionPublication {
     pub section: Section,
-    pub published: Vec<(SectionKey, Sequence)>,
+    pub published: PublishedRows,
     /// Removals this capture is publishing for the first time, with the marker
     /// the entries carry.
-    pub stamped: Vec<(SectionKey, Sequence)>,
+    pub stamped: PublishedRows,
     pub first_published: TombstonePublication,
     /// Removals this capture stopped carrying, and the floor it published.
-    pub reclaimed: BTreeSet<SectionKey>,
+    pub reclaimed: ReclaimedRows,
     pub gc_floor: Sequence,
 }
 
@@ -78,7 +79,7 @@ pub(crate) const TOMBSTONE_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 fn stamp_removals(
     rows: Vec<SectionRow>,
     marker: &TombstonePublication,
-) -> (Vec<SectionRow>, Vec<(SectionKey, Sequence)>) {
+) -> (Vec<SectionRow>, PublishedRows) {
     let publishing = marker.generation > Sequence::from(0u64);
     let mut stamped = Vec::new();
     let rows = rows
@@ -90,7 +91,7 @@ fn stamp_removals(
                 if !publishing {
                     return None;
                 }
-                stamped.push((row.key(), row.write_clock.clone()));
+                stamped.push((row.key(), row.version()));
                 Some(SectionRow {
                     value: SectionValueRow::Tombstone {
                         first_published: Some(marker.clone()),
@@ -114,16 +115,16 @@ fn reclaimable_removals(
     cursor: Option<&SectionCursor>,
     gc_floor: &Sequence,
     now_ms: u64,
-) -> (BTreeSet<SectionKey>, Sequence) {
+) -> (ReclaimedRows, Sequence) {
     let (Some(reference), Some(cursor)) = (reference, cursor) else {
-        return (BTreeSet::new(), gc_floor.clone());
+        return (BTreeMap::new(), gc_floor.clone());
     };
     // A device that has not applied the section the remote holds cannot tell
     // which removals are still carried there.
     if cursor.applied_generation < reference.generation {
-        return (BTreeSet::new(), gc_floor.clone());
+        return (BTreeMap::new(), gc_floor.clone());
     }
-    let mut reclaimed = BTreeSet::new();
+    let mut reclaimed = BTreeMap::new();
     let mut floor = gc_floor.clone();
     for row in rows {
         let Some(marker) = row.value.first_published() else {
@@ -134,7 +135,11 @@ fn reclaimable_removals(
         {
             continue;
         }
-        reclaimed.insert(row.key());
+        reclaimed.insert(row.key(), ReclaimedRowVersion {
+            write_clock: row.write_clock.clone(),
+            writer_id: row.writer_id.clone(),
+            first_published: marker.clone(),
+        });
         floor = floor.max(marker.generation.clone());
     }
     (reclaimed, floor)
@@ -440,7 +445,7 @@ pub(crate) fn capture_state_sections(
         };
         let (rows, stamped) = stamp_removals(
             held.into_iter()
-                .filter(|row| !reclaimed.contains(&row.key()))
+                .filter(|row| !reclaimed.contains_key(&row.key()))
                 .collect(),
             &marker,
         );
@@ -458,7 +463,7 @@ pub(crate) fn capture_state_sections(
             section,
             published: rows
                 .iter()
-                .map(|row| (row.key(), row.write_clock.clone()))
+                .map(|row| (row.key(), row.version()))
                 .collect(),
             stamped,
             first_published: marker,
@@ -1568,6 +1573,114 @@ mod tests {
     /// the publication is confirmed, and a removal still inside the period or
     /// published above what the remote carries is left alone.
     #[test]
+    fn e1_reclamation_ack_preserves_rewritten_rows() {
+        for kind in [SectionKind::Hypa, SectionKind::LocalPlugins] {
+            for replacement in 0..4 {
+                let root = tempfile::tempdir().unwrap();
+                let spool = tempfile::tempdir().unwrap();
+                let mut store = PersistentStore::open(root.path()).unwrap();
+                let section = section_of(kind).unwrap();
+                let value = match kind {
+                    SectionKind::Hypa => hypa_row(&"a".repeat(64), 10, "writer-a", 4),
+                    _ => plugin_row("key", "new value", 10, "writer-a"),
+                };
+                let expired = now_ms() - TOMBSTONE_RETENTION_MS - 1;
+                let old = SectionRow {
+                    value: SectionValueRow::Tombstone {
+                        first_published: Some(TombstonePublication {
+                            generation: Sequence::from(5u64),
+                            at_ms: expired,
+                        }),
+                    },
+                    ..value.clone()
+                };
+                let device = store.device_store_mut().unwrap();
+                for chosen in [Section::Hypa, Section::LocalPlugins] {
+                    device.set_section_participating(chosen, chosen == section).unwrap();
+                }
+                device.apply_section_rows(section, &[old.clone()]).unwrap();
+                device.write_section_cursor("connection", "library", section, &SectionCursor {
+                    applied_generation: Sequence::from(6u64),
+                    applied_gc_floor: Sequence::from(0u64),
+                    observed_max_write_clock: Sequence::from(10u64),
+                }).unwrap();
+                let mut reference = section_reference(6, 0);
+                reference.kind = kind;
+                let (_, publications) = capture_state_sections(
+                    &mut store, &Sequence::from(7u64),
+                    &BTreeMap::from([(kind.id().to_owned(), reference)]),
+                    "connection", "library", spool.path(), &Cancellation::default(),
+                ).unwrap();
+                let publication = &publications[0];
+                assert_eq!(publication.reclaimed.len(), 1);
+                let newer = match replacement {
+                    0 => SectionRow { write_clock: Sequence::from(11u64), ..value.clone() },
+                    1 => SectionRow { write_clock: Sequence::from(11u64), ..old.clone() },
+                    2 => SectionRow { writer_id: "writer-b".into(), ..old.clone() },
+                    _ => SectionRow {
+                        value: SectionValueRow::Tombstone {
+                            first_published: Some(TombstonePublication {
+                                generation: Sequence::from(4u64), at_ms: expired,
+                            }),
+                        },
+                        ..old.clone()
+                    },
+                };
+                let device = store.device_store_mut().unwrap();
+                device.apply_section_rows(section, &[newer.clone()]).unwrap();
+                let table = if section == Section::Hypa { "hypa_embeddings" } else { "plugin_device_storage" };
+                device.connection().execute(&format!("UPDATE {table} SET published_clock=NULL"), []).unwrap();
+                device.note_section_published(
+                    section, &publication.published, &publication.stamped,
+                    &publication.first_published, &publication.reclaimed, &publication.gc_floor,
+                ).unwrap();
+                assert_eq!(device.read_section_rows(section).unwrap(), vec![newer], "{kind:?}, replacement {replacement}");
+                assert!(device.sections_await_publication("connection", "library").unwrap());
+                assert_eq!(device.section_state(section).unwrap().gc_floor, Sequence::from(5u64));
+            }
+        }
+    }
+
+    #[test]
+    fn e1_publication_ack_does_not_stamp_or_publish_another_writer() {
+        for kind in [SectionKind::Hypa, SectionKind::LocalPlugins] {
+            let root = tempfile::tempdir().unwrap();
+            let spool = tempfile::tempdir().unwrap();
+            let mut store = PersistentStore::open(root.path()).unwrap();
+            let section = section_of(kind).unwrap();
+            let mut row = match kind {
+                SectionKind::Hypa => hypa_row(&"a".repeat(64), 10, "writer-a", 4),
+                _ => plugin_row("key", "value", 10, "writer-a"),
+            };
+            row.value = SectionValueRow::Tombstone { first_published: None };
+            let device = store.device_store_mut().unwrap();
+            for chosen in [Section::Hypa, Section::LocalPlugins] {
+                device.set_section_participating(chosen, chosen == section).unwrap();
+            }
+            device.apply_section_rows(section, &[row.clone()]).unwrap();
+            let (_, publications) = capture_state_sections(
+                &mut store, &Sequence::from(7u64), &BTreeMap::new(),
+                "connection", "library", spool.path(), &Cancellation::default(),
+            ).unwrap();
+            row.writer_id = "writer-b".into();
+            let device = store.device_store_mut().unwrap();
+            device.apply_section_rows(section, &[row.clone()]).unwrap();
+            let table = if section == Section::Hypa { "hypa_embeddings" } else { "plugin_device_storage" };
+            device.connection().execute(&format!("UPDATE {table} SET published_clock=NULL"), []).unwrap();
+            let publication = &publications[0];
+            device.note_section_published(
+                section, &publication.published, &publication.stamped,
+                &publication.first_published, &publication.reclaimed, &publication.gc_floor,
+            ).unwrap();
+            assert_eq!(device.read_section_rows(section).unwrap(), vec![row]);
+            let pending: bool = device.connection().query_row(
+                &format!("SELECT published_clock IS NULL FROM {table}"), [], |row| row.get(0),
+            ).unwrap();
+            assert!(pending);
+        }
+    }
+
+    #[test]
     fn a_confirmed_publication_reclaims_the_removals_it_stopped_carrying() {
         let spool = tempfile::tempdir().expect("create spool");
         let root = tempfile::tempdir().expect("create store root");
@@ -1605,11 +1718,18 @@ mod tests {
             .expect("a plugin publication");
         assert_eq!(
             publication.reclaimed,
-            BTreeSet::from([(
+            BTreeMap::from([((
                 "plugin-a".to_owned(),
                 "string".to_owned(),
                 "old".to_owned()
-            )])
+            ), ReclaimedRowVersion {
+                write_clock: Sequence::from(10u64),
+                writer_id: "writer-a".to_owned(),
+                first_published: TombstonePublication {
+                    generation: Sequence::from(5u64),
+                    at_ms: expired,
+                },
+            })])
         );
         assert_eq!(publication.gc_floor, Sequence::from(5u64));
         let plugins = captured

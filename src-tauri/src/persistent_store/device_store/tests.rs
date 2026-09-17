@@ -1087,10 +1087,10 @@ fn a_committed_device_value_survives_reopening_the_device_file() {
 
 mod section_exchange {
     use super::super::sections::{
-        SectionCursor, SectionKey, SectionRow, SectionValueRow, TombstonePublication,
+        PublishedRows, SectionCursor, SectionRow, SectionValueRow, TombstonePublication,
         LOCAL_SETTING_KEYS,
     };
-    use std::collections::BTreeSet;
+    use std::collections::BTreeMap;
     use super::super::{plugin_values::PluginDeviceMutation, DeviceStore, Section};
     use super::open;
     use risunest_sync_wire::Sequence;
@@ -1697,11 +1697,11 @@ mod section_exchange {
             .sections_await_publication("connection", "library")
             .unwrap());
 
-        let captured: Vec<(SectionKey, Sequence)> = store
+        let captured: PublishedRows = store
             .read_section_rows(Section::LocalPlugins)
             .unwrap()
             .into_iter()
-            .map(|row| (row.key(), row.write_clock))
+            .map(|row| (row.key(), row.version()))
             .collect();
         set(&mut store, "late", "after the capture");
         store
@@ -1710,7 +1710,7 @@ mod section_exchange {
                 &captured,
                 &[],
                 &marker(7, 1_760_000_000_000),
-                &BTreeSet::new(),
+                &BTreeMap::new(),
                 &Sequence::from(0u64),
             )
             .expect("record the confirmed publication");
@@ -1718,11 +1718,11 @@ mod section_exchange {
             .sections_await_publication("connection", "library")
             .unwrap());
 
-        let captured: Vec<(SectionKey, Sequence)> = store
+        let captured: PublishedRows = store
             .read_section_rows(Section::LocalPlugins)
             .unwrap()
             .into_iter()
-            .map(|row| (row.key(), row.write_clock))
+            .map(|row| (row.key(), row.version()))
             .collect();
         store
             .note_section_published(
@@ -1730,7 +1730,7 @@ mod section_exchange {
                 &captured,
                 &[],
                 &marker(7, 1_760_000_000_000),
-                &BTreeSet::new(),
+                &BTreeMap::new(),
                 &Sequence::from(0u64),
             )
             .expect("record the second publication");
@@ -1753,11 +1753,11 @@ mod section_exchange {
             .set_section_participating(Section::LocalPlugins, true)
             .unwrap();
         set(&mut store, "mine", "local");
-        let captured: Vec<(SectionKey, Sequence)> = store
+        let captured: PublishedRows = store
             .read_section_rows(Section::LocalPlugins)
             .unwrap()
             .into_iter()
-            .map(|row| (row.key(), row.write_clock))
+            .map(|row| (row.key(), row.version()))
             .collect();
         store
             .note_section_published(
@@ -1765,7 +1765,7 @@ mod section_exchange {
                 &captured,
                 &[],
                 &marker(7, 1_760_000_000_000),
-                &BTreeSet::new(),
+                &BTreeMap::new(),
                 &Sequence::from(0u64),
             )
             .unwrap();
