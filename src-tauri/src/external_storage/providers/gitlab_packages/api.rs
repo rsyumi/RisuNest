@@ -140,6 +140,29 @@ pub(super) fn package_files_url(
     )
 }
 
+/// One stored file of a package. Removal addresses the numeric file id, which
+/// only the package file listing reports.
+pub(super) fn package_file_url(
+    settings: &Settings,
+    package_id: u64,
+    file_id: u64,
+) -> Result<url::Url> {
+    url(
+        settings,
+        &[
+            "api",
+            "v4",
+            "projects",
+            &settings.project,
+            "packages",
+            &package_id.to_string(),
+            "package_files",
+            &file_id.to_string(),
+        ],
+        &[],
+    )
+}
+
 pub(super) struct Outgoing<'a> {
     pub(super) method: reqwest::Method,
     pub(super) url: url::Url,
@@ -219,6 +242,7 @@ pub(super) struct PackageJson {
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) struct PackageFileJson {
+    pub(super) id: u64,
     pub(super) file_name: String,
     pub(super) size: u64,
     pub(super) file_sha256: Option<String>,
@@ -232,14 +256,19 @@ pub(super) fn next_page(headers: &BTreeMap<String, String>) -> Option<String> {
     (page > 0).then(|| page.to_string())
 }
 
-pub(super) fn page_cursor(cursor: Option<&str>) -> Result<Option<String>> {
+/// `<package index>:<page>`. A collection is spread over several packages, so
+/// resuming has to name which one the offset page belongs to. The first page of
+/// a package sends no `page` parameter, which is what the service expects.
+pub(super) fn list_cursor(cursor: Option<&str>, packages: usize) -> Result<(usize, Option<String>)> {
     let Some(cursor) = cursor else {
-        return Ok(None);
+        return Ok((0, None));
     };
-    let page = cursor
-        .parse::<u32>()
-        .ok()
-        .filter(|page| (1..=100_000).contains(page))
-        .ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))?;
-    Ok(Some(page.to_string()))
+    let corrupt = || ProviderError::new(ErrorKind::Corrupt);
+    let (index, page) = cursor.split_once(':').ok_or_else(corrupt)?;
+    let index = index.parse::<usize>().map_err(|_| corrupt())?;
+    let page = page.parse::<u32>().map_err(|_| corrupt())?;
+    if index >= packages || !(1..=100_000).contains(&page) {
+        return Err(corrupt());
+    }
+    Ok((index, (page > 1).then(|| page.to_string())))
 }

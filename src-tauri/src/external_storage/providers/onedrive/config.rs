@@ -3,7 +3,7 @@
 //! under the repository root folder.
 
 use crate::external_storage::contract::{
-    Collection, ConnectionConfig, ErrorKind, ObjectRole, ProviderError, Result,
+    Collection, ConnectionConfig, ErrorKind, ObjectRole, ProviderError, RemoteLocator, Result,
 };
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 
@@ -95,6 +95,7 @@ pub(super) fn role_folder(role: ObjectRole) -> &'static str {
         // authenticated envelope header, not the path, tells them apart.
         ObjectRole::SyncState | ObjectRole::BackupBundle => "snapshots",
         ObjectRole::BackupPoint => "points",
+        ObjectRole::Lease => "leases",
     }
 }
 
@@ -103,12 +104,42 @@ pub(super) fn collection_folder(collection: Collection) -> &'static str {
         Collection::Snapshots => role_folder(ObjectRole::SyncState),
         Collection::BackupPoints => role_folder(ObjectRole::BackupPoint),
         Collection::Descriptors => role_folder(ObjectRole::Descriptor),
+        Collection::Leases => role_folder(ObjectRole::Lease),
     }
+}
+
+/// The relative path of a locator a cleanup may remove. The head is a root
+/// member with no role folder, and descriptors identify the repository, so
+/// neither is a target.
+pub(super) fn removable_path(locator: &RemoteLocator) -> Result<String> {
+    let unsupported = || ProviderError::new(ErrorKind::Unsupported);
+    let (folder, name) = locator.object.split_once('/').ok_or_else(unsupported)?;
+    let known = [
+        ObjectRole::Pack,
+        ObjectRole::Catalog,
+        ObjectRole::SyncState,
+        ObjectRole::BackupPoint,
+        ObjectRole::Lease,
+    ]
+    .iter()
+    .any(|role| role_folder(*role) == folder);
+    if name.is_empty()
+        || name.contains('/')
+        || !known
+        || locator
+            .collection
+            .as_deref()
+            .is_some_and(|hint| hint != folder)
+    {
+        return Err(unsupported());
+    }
+    validate_relative_path(&locator.object).map_err(|_| unsupported())?;
+    Ok(locator.object.clone())
 }
 
 /// Every folder a freshly created repository owns.
 pub(super) const REPOSITORY_FOLDERS: &[&str] =
-    &["descriptors", "packs", "catalogs", "snapshots", "points"];
+    &["descriptors", "packs", "catalogs", "snapshots", "points", "leases"];
 
 pub(super) struct Settings {
     pub endpoint: url::Url,

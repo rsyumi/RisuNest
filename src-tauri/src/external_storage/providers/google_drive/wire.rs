@@ -22,6 +22,7 @@ pub(super) struct DriveFile {
     pub sha256_checksum: Option<String>,
     pub mime_type: Option<String>,
     pub trashed: Option<bool>,
+    pub parents: Option<Vec<String>>,
     pub app_properties: Option<BTreeMap<String, String>>,
 }
 impl DriveFile {
@@ -220,6 +221,9 @@ pub(super) fn costs(
         ProviderOperation::UploadChunk => vec![upload()],
         ProviderOperation::ReplaceHead => vec![queries(50), upload()],
         ProviderOperation::ReconcileUpload => vec![queries(5)],
+        // The per-method table does not name `files.delete`; the editing weight
+        // is the closest documented family.
+        ProviderOperation::Delete => vec![queries(50)],
         // No download URL is issued, the final chunk completes an upload, this
         // service has no head compare-and-exchange primitive, and the token
         // endpoint has no documented Drive quota weight.

@@ -675,6 +675,10 @@ impl Provider for Mybox {
                 head_read_after_write: Evidence::Synthetic,
                 head_retry_control: Evidence::Synthetic,
                 snapshot_discovery: Evidence::Synthetic,
+                // No cleanup evidence has been recorded for this service yet.
+                delete_objects: Evidence::Unverified,
+                gc_control_consistency: Evidence::Unverified,
+                delete_completion: Evidence::Unverified,
                 discovery_extra_requests: 1,
                 conditional_get: false,
                 range: false,
@@ -994,6 +998,51 @@ impl Provider for Mybox {
                 version: None,
                 complete: true,
             })
+        })
+    }
+
+    /// The service resolves a member by resource id, so the name is looked up
+    /// in the role folder first. A folder whose cached entry is already gone
+    /// answers 404, which is reported as a finished deletion.
+    fn delete_object<'a>(
+        &'a self,
+        repository: &'a RepositoryHandle,
+        locator: &'a RemoteLocator,
+        cancel: &'a Cancellation,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            cancel.check()?;
+            let context = self.context(repository)?;
+            locator.validate_for(repository)?;
+            let (folder, name) = config::parse_locator(locator)?;
+            if !config::removable_folder(folder) {
+                return Err(ProviderError::new(ErrorKind::Unsupported));
+            }
+            let Some(entry) = self.lookup(context, folder, name, cancel).await? else {
+                return Ok(());
+            };
+            let response = self
+                .call(
+                    context,
+                    ProviderOperation::Delete,
+                    Method::DELETE,
+                    config::endpoint(
+                        &context.base,
+                        &["drive", "resources", entry.id.as_str()],
+                    )?,
+                    None,
+                    cancel,
+                )
+                .await?;
+            context.forget(folder);
+            match response.status {
+                200 | 204 | 404 => Ok(()),
+                status => Err(api::classify(
+                    status,
+                    &response.headers,
+                    self.deps.clock.now_ms(),
+                )),
+            }
         })
     }
 

@@ -439,15 +439,15 @@ fn create_refuses_an_occupied_root_and_existing_requires_the_descriptor_collecti
 fn create_builds_the_root_and_every_role_collection_without_touching_ancestors() {
     runtime().block_on(async {
         let mut replies = vec![reply(404, &[], b"")];
-        replies.extend((0..6).map(|_| reply(201, &[], b"")));
+        replies.extend((0..7).map(|_| reply(201, &[], b"")));
         let harness = Harness::start(replies);
         harness.open(OpenMode::Create).await.unwrap();
-        assert_eq!(harness.count(), 7);
+        assert_eq!(harness.count(), 8);
         assert_eq!(
             harness.line(1),
             format!("MKCOL {}/ HTTP/1.1", encoded_root())
         );
-        let created: Vec<String> = (2..7).map(|index| harness.line(index)).collect();
+        let created: Vec<String> = (2..8).map(|index| harness.line(index)).collect();
         for folder in ROLE_FOLDERS {
             assert!(
                 created.contains(&format!("MKCOL {}/{folder}/ HTTP/1.1", encoded_root())),
@@ -457,10 +457,10 @@ fn create_builds_the_root_and_every_role_collection_without_touching_ancestors()
 
         // An empty root that already exists is reused; only its contents decide.
         let mut existing = vec![root_listing(Vec::new())];
-        existing.extend((0..5).map(|_| reply(405, &[], b"")));
+        existing.extend((0..6).map(|_| reply(405, &[], b"")));
         let reuse = Harness::start(existing);
         reuse.open(OpenMode::Create).await.unwrap();
-        assert_eq!(reuse.count(), 6);
+        assert_eq!(reuse.count(), 7);
         assert!(reuse.line(1).starts_with("MKCOL "));
     });
 }
@@ -1357,4 +1357,116 @@ fn only_a_strong_entity_tag_becomes_a_version_token() {
             .kind,
         ErrorKind::Corrupt
     );
+}
+
+/// A passing exchange here proves the adapter's request shape and status
+/// handling. It is no evidence of the service's own deletion guarantees, which
+/// only the provider documentation behind `Capabilities` can supply.
+#[test]
+fn deleting_one_member_folds_404_leaves_202_unresolved_and_refuses_the_head() {
+    runtime().block_on(async {
+        let harness = Harness::start(vec![
+            established_root(),
+            reply(204, &[], b""),
+            reply(404, &[], b""),
+            reply(202, &[], b""),
+        ]);
+        let repository = harness.opened().await;
+        let cancel = Cancellation::default();
+        let target = locator(&repository, Some("packs"), "packs/pack-1");
+        harness
+            .provider
+            .delete_object(&repository, &target, &cancel)
+            .await
+            .unwrap();
+        // A member that is not there is already in the state the caller wanted.
+        harness
+            .provider
+            .delete_object(&repository, &target, &cancel)
+            .await
+            .unwrap();
+        // 202 is an accepted request, not an enacted deletion.
+        let accepted = harness
+            .provider
+            .delete_object(&repository, &target, &cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(accepted.kind, ErrorKind::Transient);
+        assert_eq!(accepted.http_status, Some(202));
+
+        for refused in [
+            harness.provider.head_locator(&repository).unwrap(),
+            locator(&repository, None, "descriptors/descriptor-1"),
+            locator(&repository, None, "elsewhere/pack-1"),
+            locator(&repository, None, "packs/nested/pack-1"),
+            locator(&repository, Some("snapshots"), "packs/pack-1"),
+        ] {
+            assert_eq!(
+                harness
+                    .provider
+                    .delete_object(&repository, &refused, &cancel)
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::Unsupported
+            );
+        }
+
+        assert_eq!(harness.count(), 4);
+        assert_eq!(
+            harness.line(1),
+            format!("DELETE {}/packs/pack-1 HTTP/1.1", encoded_root())
+        );
+        let reservations = harness.reservations();
+        assert_eq!(reservations.len(), 4);
+        assert_eq!(reservations[1][0].bucket, REQUEST_BUCKET);
+        assert_eq!(reservations[1][0].shared_account, harness.account());
+    });
+}
+
+/// Leases are their own collection below the root, created with the other role
+/// collections and enumerated on their own.
+#[test]
+fn the_lease_collection_is_its_own_member_of_the_root() {
+    runtime().block_on(async {
+        let tag = "0123456789abcdef0123456789abcdef";
+        let name = lease_object_id(LeaseKind::Work, tag).unwrap();
+        assert!(ROLE_FOLDERS.contains(&"leases"));
+        let harness = Harness::start(vec![
+            established_root(),
+            multistatus_reply(&[
+                collection_response(&format!("{}/leases/", encoded_root())),
+                object_response(&format!("{}/leases/{name}", encoded_root()), 30, None),
+            ]),
+            reply(204, &[], b""),
+        ]);
+        let repository = harness.opened().await;
+        let page = harness
+            .provider
+            .list_objects(
+                &repository,
+                Collection::Leases,
+                None,
+                10,
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.objects
+                .iter()
+                .map(|object| object.locator.object.clone())
+                .collect::<Vec<_>>(),
+            vec![format!("leases/{name}")]
+        );
+        harness
+            .provider
+            .delete_object(&repository, &page.objects[0].locator, &Cancellation::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            harness.line(2),
+            format!("DELETE {}/leases/{name} HTTP/1.1", encoded_root())
+        );
+    });
 }

@@ -99,7 +99,8 @@ fn cost_model(operation: ProviderOperation, account: &str) -> Vec<RequestCost> {
         | ProviderOperation::UploadChunk
         | ProviderOperation::CompleteUpload
         | ProviderOperation::CompareExchangeHead
-        | ProviderOperation::ReplaceHead => vec![bucket("requests"), bucket("writes")],
+        | ProviderOperation::ReplaceHead
+        | ProviderOperation::Delete => vec![bucket("requests"), bucket("writes")],
     }
 }
 
@@ -173,6 +174,10 @@ fn capabilities(account_type: config::AccountType) -> Capabilities {
         head_read_after_write: Evidence::Synthetic,
         head_retry_control: Evidence::Synthetic,
         snapshot_discovery: Evidence::Synthetic,
+        // No cleanup evidence has been recorded for this service yet.
+        delete_objects: Evidence::Unverified,
+        gc_control_consistency: Evidence::Unverified,
+        delete_completion: Evidence::Unverified,
         discovery_extra_requests: 0,
         conditional_get: true,
         range: true,
@@ -904,6 +909,43 @@ impl Provider for OneDrive {
             cancel.check()?;
             self.write_head(repository, locator, None, head, cancel)
                 .await
+        })
+    }
+
+    /// Graph moves a deleted item to the recycle bin and answers 204 once the
+    /// item is gone from the drive. That is the service's own behaviour and the
+    /// adapter does not ask for a permanent removal on top of it.
+    fn delete_object<'a>(
+        &'a self,
+        repository: &'a RepositoryHandle,
+        locator: &'a RemoteLocator,
+        cancel: &'a Cancellation,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            cancel.check()?;
+            let context = self.context(repository)?;
+            locator.validate_for(repository)?;
+            let path = config::removable_path(locator)?;
+            let token = self.access_token(context, cancel).await?;
+            let url = graph::item_url(
+                &context.settings,
+                &context.root_item_id,
+                &path,
+                "",
+                None,
+            )?;
+            let request = self.request(
+                reqwest::Method::DELETE,
+                url,
+                ProviderOperation::Delete,
+                &context.quota_account,
+                Some(token.as_str()),
+            );
+            let response = self.send(request, cancel).await?;
+            match response.status {
+                200 | 204 | 404 => Ok(()),
+                status => Err(graph::classify(status, &response.headers, self.now())),
+            }
         })
     }
 

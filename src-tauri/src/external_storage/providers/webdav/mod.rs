@@ -21,7 +21,8 @@
 //! credentials from `account_id` and those bytes.
 //!
 //! Below the root, each object role owns a collection (`descriptors`, `packs`,
-//! `catalogs`, `snapshots`, `points`) and the head is the root member `head`.
+//! `catalogs`, `snapshots`, `points`, `leases`) and the head is the root member
+//! `head`.
 //! A `RemoteLocator.object` is the slash-joined raw path of an object relative
 //! to the root, which any device can resolve on its own.
 mod multistatus;
@@ -54,9 +55,10 @@ const KOOFR_HOST: &str = "app.koofr.net";
 const KOOFR_DAV_PREFIX: &str = "/dav/";
 const ROOT_KEY: &str = "root";
 const DESCRIPTOR_FOLDER: &str = "descriptors";
-const ROLE_FOLDERS: [&str; 5] = [
+const ROLE_FOLDERS: [&str; 6] = [
     "catalogs",
     DESCRIPTOR_FOLDER,
+    "leases",
     "packs",
     "points",
     "snapshots",
@@ -82,6 +84,7 @@ fn role_folder(role: ObjectRole) -> &'static str {
         // authenticated envelope header, not the path, tells them apart.
         ObjectRole::SyncState | ObjectRole::BackupBundle => "snapshots",
         ObjectRole::BackupPoint => "points",
+        ObjectRole::Lease => "leases",
     }
 }
 fn collection_folder(collection: Collection) -> &'static str {
@@ -89,6 +92,7 @@ fn collection_folder(collection: Collection) -> &'static str {
         Collection::Snapshots => role_folder(ObjectRole::SyncState),
         Collection::BackupPoints => role_folder(ObjectRole::BackupPoint),
         Collection::Descriptors => role_folder(ObjectRole::Descriptor),
+        Collection::Leases => role_folder(ObjectRole::Lease),
     }
 }
 fn dav_method(name: &str) -> reqwest::Method {
@@ -290,6 +294,19 @@ fn object_path(locator: &RemoteLocator) -> Result<Vec<String>> {
     }
     Ok(segments)
 }
+/// The member path of a locator a cleanup may remove. The head is a root
+/// member with no role folder, so it never parses here.
+fn removable_path(locator: &RemoteLocator) -> Result<Vec<String>> {
+    let unsupported = || ProviderError::new(ErrorKind::Unsupported);
+    let segments = object_path(locator).map_err(|_| unsupported())?;
+    if segments.len() != 2
+        || segments[0] == DESCRIPTOR_FOLDER
+        || !ROLE_FOLDERS.contains(&segments[0].as_str())
+    {
+        return Err(unsupported());
+    }
+    Ok(segments)
+}
 fn intent_path(intent: &ObjectIntent) -> Result<Vec<String>> {
     if !paths::valid_segment(&intent.object_id) {
         return Err(paths::corrupt());
@@ -343,6 +360,10 @@ fn capabilities(profile: Profile) -> Capabilities {
         head_read_after_write: Evidence::Synthetic,
         head_retry_control: Evidence::Synthetic,
         snapshot_discovery: Evidence::Synthetic,
+        // No cleanup evidence has been recorded for this service yet.
+        delete_objects: Evidence::Unverified,
+        gc_control_consistency: Evidence::Unverified,
+        delete_completion: Evidence::Unverified,
         // One `PROPFIND Depth: 1` per listing page; DAV has no server paging.
         discovery_extra_requests: 1,
         conditional_get: true,
@@ -543,12 +564,7 @@ impl WebdavProvider {
         url: Url,
         cancel: &Cancellation,
     ) -> Result<()> {
-        let request = self.request(
-            context,
-            dav_method("DELETE"),
-            url,
-            ProviderOperation::Metadata,
-        );
+        let request = self.request(context, dav_method("DELETE"), url, ProviderOperation::Delete);
         let response = self.send(request, cancel).await?;
         if response.status == 404 {
             return Ok(());
@@ -943,6 +959,36 @@ impl Provider for WebdavProvider {
                 ProviderOperation::ReplaceHead,
             );
             self.write_head(request, head, cancel).await
+        })
+    }
+
+    /// 202 is an accepted request, not a finished deletion, so it is reported
+    /// as transient rather than as a success.
+    fn delete_object<'a>(
+        &'a self,
+        repository: &'a RepositoryHandle,
+        locator: &'a RemoteLocator,
+        cancel: &'a Cancellation,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            cancel.check()?;
+            let context = context_of(repository)?;
+            locator.validate_for(repository)?;
+            let path = removable_path(locator)?;
+            let request = self.request(
+                context,
+                dav_method("DELETE"),
+                paths::object_url(&context.base, &path),
+                ProviderOperation::Delete,
+            );
+            let response = self.send(request, cancel).await?;
+            if response.status == 404 {
+                return Ok(());
+            }
+            if response.status == 202 {
+                return Err(common::error(ErrorKind::Transient, 202));
+            }
+            self.require(&response, &[200, 204])
         })
     }
 

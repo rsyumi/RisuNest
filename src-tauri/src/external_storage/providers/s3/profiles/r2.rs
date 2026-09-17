@@ -23,10 +23,13 @@ pub(crate) const PROFILE: Profile = Profile {
     service_max_object_bytes: Some(5 * TIB),
     multipart_lifetime_ms: None,
     cas_evidence: Evidence::Synthetic,
+    cleanup_evidence: Evidence::Synthetic,
     cost_model: CostModel::ClassAb,
     documented_at: DOCUMENTED_AT,
     evidence_urls: &[
         "https://developers.cloudflare.com/r2/api/s3/api/",
         "https://developers.cloudflare.com/r2/platform/limits/",
+        "https://developers.cloudflare.com/r2/reference/consistency/",
+        "https://developers.cloudflare.com/r2/pricing/",
     ],
 };

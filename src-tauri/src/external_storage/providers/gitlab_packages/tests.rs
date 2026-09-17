@@ -730,6 +730,7 @@ fn listing_pages_through_the_next_page_header_and_bounds_its_limit() {
                         file_json(&format!("state-{}", encoded("c")), 33, Some(hash(b"c")))
                     ),
                 ),
+                headed(200, &[("x-next-page", "")], "[]"),
             ],
             "personalAccessToken",
         );
@@ -740,7 +741,7 @@ fn listing_pages_through_the_next_page_header_and_bounds_its_limit() {
             .await
             .unwrap();
         assert_eq!(page.objects.len(), 2);
-        assert_eq!(page.next_cursor.as_deref(), Some("2"));
+        assert_eq!(page.next_cursor.as_deref(), Some("0:2"));
         assert_eq!(
             page.objects[0].locator.object,
             format!(
@@ -766,7 +767,22 @@ fn listing_pages_through_the_next_page_header_and_bounds_its_limit() {
             .await
             .unwrap();
         assert_eq!(last.objects.len(), 1);
-        assert_eq!(last.next_cursor, None);
+        // The state package is exhausted, so the cursor moves to the bundle one.
+        assert_eq!(last.next_cursor.as_deref(), Some("1:1"));
+
+        let bundles = harness
+            .provider
+            .list_objects(
+                &repository,
+                Collection::Snapshots,
+                last.next_cursor.as_deref(),
+                2,
+                &harness.cancel,
+            )
+            .await
+            .unwrap();
+        assert!(bundles.objects.is_empty());
+        assert_eq!(bundles.next_cursor, None);
 
         for limit in [0u16, 1001] {
             assert_eq!(
@@ -801,7 +817,7 @@ fn listing_pages_through_the_next_page_header_and_bounds_its_limit() {
             ErrorKind::Corrupt
         );
         let lines = harness.lines();
-        assert_eq!(lines.len(), 7);
+        assert_eq!(lines.len(), 8);
         assert_eq!(
             lines[2],
             format!(
@@ -809,6 +825,66 @@ fn listing_pages_through_the_next_page_header_and_bounds_its_limit() {
             )
         );
         assert!(lines[5].contains("&per_page=2&page=2 "));
+        assert!(lines[7].contains(&format!("package_name={PACKAGE}.bundle&")));
+    });
+}
+
+/// A backup only connection publishes no state at all, so the whole snapshot
+/// listing used to come back empty. Both packages are read in one call.
+#[test]
+fn a_snapshot_listing_reads_the_bundle_package_when_the_state_one_is_empty() {
+    runtime().block_on(async {
+        let bundles = format!("{PACKAGE}.bundle");
+        let harness = fixture(
+            vec![
+                marker_present(),
+                json(200, "[]"),
+                headed(200, &[("x-next-page", "")], "[]"),
+                headed(
+                    200,
+                    &[("x-next-page", "")],
+                    &format!(
+                        "[{}]",
+                        package_json(9, &bundles, &format!("v0-{}", encoded("e")))
+                    ),
+                ),
+                json(
+                    200,
+                    &format!(
+                        "[{}]",
+                        file_json(&format!("bundle-{}", encoded("e")), 44, None)
+                    ),
+                ),
+            ],
+            "personalAccessToken",
+        );
+        let (repository, _) = harness.open(OpenMode::Existing).await.unwrap();
+        let page = harness
+            .provider
+            .list_objects(
+                &repository,
+                Collection::Snapshots,
+                None,
+                10,
+                &harness.cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.objects.len(), 1);
+        assert_eq!(
+            page.objects[0].locator.object,
+            format!(
+                "{PACKAGE}.bundle/v0-{}/bundle-{}",
+                encoded("e"),
+                encoded("e")
+            )
+        );
+        assert_eq!(page.objects[0].byte_length, 44);
+        assert_eq!(page.next_cursor, None);
+        let lines = harness.lines();
+        assert_eq!(lines.len(), 5);
+        assert!(lines[2].contains(&format!("package_name={PACKAGE}.state&")));
+        assert!(lines[3].contains(&format!("package_name={PACKAGE}.bundle&")));
     });
 }
 
@@ -1318,5 +1394,141 @@ fn cancelling_an_in_flight_download_stops_the_transfer() {
             ErrorKind::Cancelled
         );
         assert_eq!(harness.lines().len(), 3);
+    });
+}
+
+/// A passing exchange here proves the adapter's request shape and status
+/// handling. It is no evidence of the service's own deletion guarantees, which
+/// only the provider documentation behind `Capabilities` can supply.
+#[test]
+fn deleting_resolves_the_numeric_package_file_and_refuses_descriptors() {
+    runtime().block_on(async {
+        let token = encoded("pack-1");
+        let packs = format!("{PACKAGE}.pack");
+        let harness = fixture(
+            vec![
+                marker_present(),
+                json(200, "[]"),
+                json(200, &format!("[{}]", package_json(1, &packs, &format!("v0-{token}")))),
+                json(200, &format!("[{}]", file_json(&format!("pack-{token}"), 20, None))),
+                raw(204, b""),
+                // Nothing under that version any more.
+                json(200, "[]"),
+            ],
+            "personalAccessToken",
+        );
+        let (repository, _) = harness.open(OpenMode::Existing).await.unwrap();
+        let object = |package: &str, role: &str| RemoteLocator {
+            connection_identity: repository.connection_identity.clone(),
+            collection: None,
+            object: format!("{PACKAGE}.{package}/v0-{token}/{role}-{token}"),
+        };
+
+        harness
+            .provider
+            .delete_object(&repository, &object("pack", "pack"), &harness.cancel)
+            .await
+            .unwrap();
+        // A package the listing no longer reports is already in that state.
+        harness
+            .provider
+            .delete_object(&repository, &object("pack", "pack"), &harness.cancel)
+            .await
+            .unwrap();
+        assert_eq!(
+            harness
+                .provider
+                .delete_object(
+                    &repository,
+                    &object("descriptor", "descriptor"),
+                    &harness.cancel
+                )
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::Unsupported
+        );
+
+        let lines = harness.lines();
+        assert_eq!(lines.len(), 6, "the descriptor refusal sends nothing");
+        assert!(lines[2].contains(&format!("package_name={PACKAGE}.pack&package_version=v0-{token}")));
+        assert!(lines[3].contains("/packages/1/package_files"));
+        assert_eq!(
+            lines[4],
+            format!("DELETE {PROJECT_PATH}/packages/1/package_files/7 HTTP/1.1")
+        );
+        let costs = harness.deps.budget.reservations.lock().unwrap()[4].0.clone();
+        assert_eq!(
+            costs.iter().map(|cost| cost.bucket.clone()).collect::<Vec<_>>(),
+            ["apiRequests"],
+            "removal is a project API path, not the package registry"
+        );
+    });
+}
+
+/// Deploy tokens cannot reach the API that resolves a package file id, so the
+/// adapter reports the operation as unavailable rather than attempting it.
+#[test]
+fn a_deploy_token_connection_cannot_delete() {
+    runtime().block_on(async {
+        let token = encoded("pack-1");
+        let harness = fixture(vec![marker_present(), raw(401, b"")], "deployToken");
+        let (repository, capabilities) = harness.open(OpenMode::Existing).await.unwrap();
+        assert!(capabilities.require_cleanup().is_err());
+        let locator = RemoteLocator {
+            connection_identity: repository.connection_identity.clone(),
+            collection: None,
+            object: format!("{PACKAGE}.pack/v0-{token}/pack-{token}"),
+        };
+        assert_eq!(
+            harness
+                .provider
+                .delete_object(&repository, &locator, &harness.cancel)
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::Unsupported
+        );
+        assert_eq!(harness.lines().len(), 2);
+    });
+}
+
+/// Leases are their own package, listed and removed under the same rules as
+/// every other role of this adapter.
+#[test]
+fn the_lease_collection_is_its_own_package() {
+    runtime().block_on(async {
+        let tag = "0123456789abcdef0123456789abcdef";
+        let name = lease_object_id(LeaseKind::Deleting, tag).unwrap();
+        let token = encoded(&name);
+        let leases = format!("{PACKAGE}.lease");
+        let harness = fixture(
+            vec![
+                marker_present(),
+                json(200, "[]"),
+                headed(
+                    200,
+                    &[("x-next-page", "")],
+                    &format!("[{}]", package_json(4, &leases, &format!("v0-{token}"))),
+                ),
+                json(
+                    200,
+                    &format!("[{}]", file_json(&format!("lease-{token}"), 30, None)),
+                ),
+            ],
+            "personalAccessToken",
+        );
+        let (repository, _) = harness.open(OpenMode::Existing).await.unwrap();
+        let page = harness
+            .provider
+            .list_objects(&repository, Collection::Leases, None, 10, &harness.cancel)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.objects[0].locator.object,
+            format!("{leases}/v0-{token}/lease-{token}")
+        );
+        assert_eq!(page.next_cursor, None);
+        assert!(harness.lines()[2].contains(&format!("package_name={leases}&")));
     });
 }

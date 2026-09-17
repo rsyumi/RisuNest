@@ -254,6 +254,7 @@ async fn open_object(
             ObjectRole::SyncState => wire::ObjectRole::SyncState,
             ObjectRole::BackupBundle => wire::ObjectRole::BackupBundle,
             ObjectRole::BackupPoint => wire::ObjectRole::BackupPoint,
+            ObjectRole::Lease => wire::ObjectRole::Lease,
         };
         let expected = wire::PublicObjectHeader::new(
             repository_id,

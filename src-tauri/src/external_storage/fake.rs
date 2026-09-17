@@ -14,6 +14,9 @@ use std::{
         Arc, Mutex,
     },
 };
+/// The one mutable head, refused by every delete.
+const HEAD_OBJECT: &str = "head";
+
 pub(super) fn capabilities(cas: bool) -> Capabilities {
     Capabilities {
         immutable_create: Evidence::Synthetic,
@@ -36,12 +39,25 @@ pub(super) fn capabilities(cas: bool) -> Capabilities {
     }
 }
 
+/// What a delete of one named target does instead of removing it. Ambiguous
+/// outcomes are reachable because a cleanup has to survive them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeleteFault {
+    /// The request never reached the service.
+    Transient,
+    /// No answer arrives at all; only cancellation ends the wait.
+    Unanswered,
+    /// The remote object is gone, but the answer was lost on the way back.
+    AppliedThenLost,
+}
+
 #[derive(Default)]
 pub(super) struct FakeState {
     pub(super) objects: BTreeMap<String, (Vec<u8>, u64)>,
     pub(super) next_version: u64,
     pub(super) lose_response: bool,
     roles: BTreeMap<String, ObjectRole>,
+    deletes: BTreeMap<String, DeleteFault>,
 }
 pub(crate) struct FakeProvider {
     pub(super) state: Mutex<FakeState>,
@@ -53,6 +69,30 @@ impl FakeProvider {
             state: Mutex::new(FakeState::default()),
             cas,
         }
+    }
+    /// Places an object of a role directly, so a listing of any collection can
+    /// be arranged without going through an upload.
+    pub(crate) fn seed(&self, object: &str, role: ObjectRole, bytes: Vec<u8>) {
+        let mut state = self.state.lock().unwrap();
+        state.next_version += 1;
+        let version = state.next_version;
+        state.objects.insert(object.to_owned(), (bytes, version));
+        state.roles.insert(object.to_owned(), role);
+    }
+    pub(crate) fn fail_delete(&self, object: &str, fault: DeleteFault) {
+        self.state
+            .lock()
+            .unwrap()
+            .deletes
+            .insert(object.to_owned(), fault);
+    }
+    pub(crate) fn holds(&self, object: &str) -> bool {
+        self.state.lock().unwrap().objects.contains_key(object)
+    }
+    fn forget(&self, object: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.objects.remove(object);
+        state.roles.remove(object);
     }
     pub(super) fn write(
         &self,
@@ -246,6 +286,39 @@ impl Provider for FakeProvider {
             self.write(l, None, h.as_bytes())
         })
     }
+    fn delete_object<'a>(
+        &'a self,
+        r: &'a RepositoryHandle,
+        l: &'a RemoteLocator,
+        c: &'a Cancellation,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            c.check()?;
+            l.validate_for(r)?;
+            let refused = l.object == HEAD_OBJECT
+                || self.state.lock().unwrap().roles.get(&l.object) == Some(&ObjectRole::Descriptor);
+            if refused {
+                return Err(ProviderError::new(ErrorKind::Unsupported));
+            }
+            let injected = self.state.lock().unwrap().deletes.remove(&l.object);
+            match injected {
+                Some(DeleteFault::Transient) => Err(ProviderError::new(ErrorKind::Transient)),
+                Some(DeleteFault::Unanswered) => {
+                    c.cancelled().await;
+                    Err(ProviderError::new(ErrorKind::Cancelled))
+                }
+                Some(DeleteFault::AppliedThenLost) => {
+                    self.forget(&l.object);
+                    Err(ProviderError::new(ErrorKind::Transient))
+                }
+                // A target that is already gone answers the same as one removed now.
+                None => {
+                    self.forget(&l.object);
+                    Ok(())
+                }
+            }
+        })
+    }
     fn list_objects<'a>(
         &'a self,
         repository: &'a RepositoryHandle,
@@ -259,14 +332,17 @@ impl Provider for FakeProvider {
             if limit == 0 || limit > 1000 {
                 return Err(ProviderError::new(ErrorKind::Unsupported));
             }
-            let role = match collection {
-                Collection::Snapshots => ObjectRole::SyncState,
-                Collection::BackupPoints => ObjectRole::BackupPoint,
-                Collection::Descriptors => ObjectRole::Descriptor,
+            // A published state and a backup bundle share the snapshot listing,
+            // which is what every adapter answers.
+            let roles: &[ObjectRole] = match collection {
+                Collection::Snapshots => &[ObjectRole::SyncState, ObjectRole::BackupBundle],
+                Collection::BackupPoints => &[ObjectRole::BackupPoint],
+                Collection::Descriptors => &[ObjectRole::Descriptor],
+                Collection::Leases => &[ObjectRole::Lease],
             };
             let state = self.state.lock().unwrap();
             let mut matches = state.objects.iter().filter(|(id, _)| {
-                state.roles.get(*id) == Some(&role)
+                state.roles.get(*id).is_some_and(|role| roles.contains(role))
                     && cursor.is_none_or(|cursor| id.as_str() > cursor)
             });
             let objects: Vec<_> = matches
@@ -332,7 +408,7 @@ impl Provider for FakeProvider {
         Ok(RemoteLocator {
             connection_identity: repository.connection_identity.clone(),
             collection: None,
-            object: "head".into(),
+            object: HEAD_OBJECT.into(),
         })
     }
     fn request_cost(&self, _: &RepositoryHandle, _: ProviderOperation) -> Result<Vec<RequestCost>> {
@@ -350,7 +426,169 @@ pub(crate) fn locator() -> RemoteLocator {
     RemoteLocator {
         connection_identity: repository().connection_identity,
         collection: None,
-        object: "head".into(),
+        object: HEAD_OBJECT.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn object(name: &str) -> RemoteLocator {
+        RemoteLocator {
+            connection_identity: repository().connection_identity,
+            collection: None,
+            object: name.into(),
+        }
+    }
+
+    #[test]
+    fn deleting_is_idempotent_and_refuses_the_head_and_a_descriptor() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let provider = FakeProvider::new(false);
+            let handle = repository();
+            let cancel = Cancellation::default();
+            provider.seed("pack-a", ObjectRole::Pack, vec![1, 2, 3]);
+            provider.seed("descriptor-a", ObjectRole::Descriptor, vec![4]);
+            provider.seed(HEAD_OBJECT, ObjectRole::SyncState, vec![5]);
+
+            provider
+                .delete_object(&handle, &object("pack-a"), &cancel)
+                .await
+                .unwrap();
+            assert!(!provider.holds("pack-a"));
+            // A second attempt at the same target still succeeds.
+            provider
+                .delete_object(&handle, &object("pack-a"), &cancel)
+                .await
+                .unwrap();
+
+            for refused in [HEAD_OBJECT, "descriptor-a"] {
+                assert_eq!(
+                    provider
+                        .delete_object(&handle, &object(refused), &cancel)
+                        .await
+                        .unwrap_err()
+                        .kind,
+                    ErrorKind::Unsupported
+                );
+                assert!(provider.holds(refused));
+            }
+        });
+    }
+
+    #[test]
+    fn leases_enumerate_on_their_own_and_page_where_the_caller_asks() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let provider = FakeProvider::new(false);
+            let handle = repository();
+            let cancel = Cancellation::default();
+            let tags = ["11111111111111111111111111111111", "22222222222222222222222222222222"];
+            let work = lease_object_id(LeaseKind::Work, tags[0]).unwrap();
+            let deleting = lease_object_id(LeaseKind::Deleting, tags[1]).unwrap();
+            for name in [&work, &deleting] {
+                provider.seed(name, ObjectRole::Lease, vec![1]);
+            }
+            provider.seed("state-a", ObjectRole::SyncState, vec![2]);
+
+            let first = provider
+                .list_objects(&handle, Collection::Leases, None, 1, &cancel)
+                .await
+                .unwrap();
+            assert_eq!(first.objects.len(), 1);
+            let second = provider
+                .list_objects(&handle, Collection::Leases, first.next_cursor.as_deref(), 10, &cancel)
+                .await
+                .unwrap();
+            let mut seen: Vec<String> = first
+                .objects
+                .iter()
+                .chain(second.objects.iter())
+                .map(|object| object.locator.object.clone())
+                .collect();
+            seen.sort();
+            assert_eq!(seen, vec![deleting.clone(), work.clone()]);
+            assert_eq!(second.next_cursor, None);
+
+            // A lease never shows up in another collection's listing.
+            let snapshots = provider
+                .list_objects(&handle, Collection::Snapshots, None, 10, &cancel)
+                .await
+                .unwrap();
+            assert_eq!(snapshots.objects.len(), 1);
+            assert_eq!(snapshots.objects[0].locator.object, "state-a");
+
+            // Leases are removable; that is the whole point of the collection.
+            provider
+                .delete_object(
+                    &handle,
+                    &object(&work),
+                    &cancel,
+                )
+                .await
+                .unwrap();
+            assert!(!provider.holds(&work));
+        });
+    }
+
+    #[test]
+    fn injected_delete_faults_cover_a_refusal_a_silent_request_and_a_lost_answer() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let provider = FakeProvider::new(false);
+            let handle = repository();
+            let cancel = Cancellation::default();
+            for name in ["pack-a", "pack-b", "pack-c"] {
+                provider.seed(name, ObjectRole::Pack, vec![7]);
+            }
+
+            provider.fail_delete("pack-a", DeleteFault::Transient);
+            assert_eq!(
+                provider
+                    .delete_object(&handle, &object("pack-a"), &cancel)
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::Transient
+            );
+            assert!(provider.holds("pack-a"));
+
+            provider.fail_delete("pack-b", DeleteFault::AppliedThenLost);
+            assert_eq!(
+                provider
+                    .delete_object(&handle, &object("pack-b"), &cancel)
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::Transient
+            );
+            assert!(!provider.holds("pack-b"));
+
+            provider.fail_delete("pack-c", DeleteFault::Unanswered);
+            let pending = Cancellation::default();
+            let signal = pending.clone();
+            let stopper = tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                signal.cancel();
+            });
+            assert_eq!(
+                provider
+                    .delete_object(&handle, &object("pack-c"), &pending)
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::Cancelled
+            );
+            stopper.await.unwrap();
+            // Cancelling the local request is no evidence the remote end ran.
+            assert!(provider.holds("pack-c"));
+
+            // Only the injected attempt is affected; the retry behaves normally.
+            provider
+                .delete_object(&handle, &object("pack-a"), &cancel)
+                .await
+                .unwrap();
+            assert!(!provider.holds("pack-a"));
+        });
     }
 }
 

@@ -12,7 +12,7 @@ use super::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-const OPERATIONS: [ProviderOperation; 13] = [
+const OPERATIONS: [ProviderOperation; 14] = [
     ProviderOperation::Metadata,
     ProviderOperation::List,
     ProviderOperation::DownloadUrl,
@@ -25,6 +25,7 @@ const OPERATIONS: [ProviderOperation; 13] = [
     ProviderOperation::ReconcileUpload,
     ProviderOperation::CompareExchangeHead,
     ProviderOperation::ReplaceHead,
+    ProviderOperation::Delete,
     ProviderOperation::Authenticate,
 ];
 
@@ -206,10 +207,13 @@ fn mybox_limit(profile: &str, bucket: &str) -> Option<u64> {
     match bucket {
         "mybox-download-day" => Some(downloads),
         "mybox-list-minute" => Some(search),
+        // Deletion is documented as its own per-minute allowance; on every plan
+        // it happens to carry the same number as the remaining APIs.
         "mybox-metadata-minute"
         | "mybox-folder-minute"
         | "mybox-upload-url-minute"
-        | "mybox-download-url-minute" => Some(general),
+        | "mybox-download-url-minute"
+        | "mybox-delete-minute" => Some(general),
         _ => None,
     }
 }

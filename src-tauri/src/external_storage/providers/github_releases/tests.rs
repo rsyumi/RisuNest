@@ -575,14 +575,15 @@ fn snapshot_discovery_pages_across_releases_with_a_resumable_cursor() {
             reply(
                 200,
                 json!([
-                    asset(1, "snapshot-a", 10, None),
+                    asset(1, "state-a", 10, None),
                     asset(2, "pack-a", 20, None),
-                    asset(3, "snapshot-b", 30, None)
+                    asset(3, "bundle-b", 30, None),
+                    asset(5, "point-a", 50, None)
                 ]),
             ),
-            reply(200, json!([asset(4, "snapshot-c", 40, None)])),
+            reply(200, json!([asset(4, "state-c", 40, None)])),
             reply(200, releases.clone()),
-            reply(200, json!([asset(4, "snapshot-c", 40, None)])),
+            reply(200, json!([asset(4, "state-c", 40, None)])),
         ]);
         let test = dependencies();
         let provider = adapter(test.dependencies.clone());
@@ -1227,5 +1228,146 @@ fn descriptor_listing_reads_only_the_descriptor_release() {
         );
         assert_eq!(page.next_cursor, None);
         assert_eq!(server.requests.lock().unwrap().len(), 5);
+    });
+}
+
+/// A passing exchange here proves the adapter's request shape and status
+/// handling. It is no evidence of the service's own deletion guarantees, which
+/// only the provider documentation behind `Capabilities` can supply.
+#[test]
+fn deleting_an_asset_checks_its_release_tag_and_role_prefix_first() {
+    runtime().block_on(async {
+        let tag = job_tag("job-1", 0);
+        let server = WireServer::start(vec![
+            repository_reply(true),
+            reply(200, json!([])),
+            // The removable asset: its release is tagged by this root.
+            reply(200, release(20, &tag)),
+            reply(200, json!([asset(88, "pack-object-1", 10, None)])),
+            reply(204, json!(null)),
+            // A release this root never tagged.
+            reply(200, release(21, "someone-elses-tag-0")),
+            // An asset of ours whose name carries no removable role prefix.
+            reply(200, release(20, &tag)),
+            reply(200, json!([asset(89, "descriptor-object-1", 10, None)])),
+            // An asset that is no longer in the release.
+            reply(200, release(20, &tag)),
+            reply(200, json!([])),
+            // A release that is gone entirely.
+            reply(404, json!({})),
+        ]);
+        let test = dependencies();
+        let provider = adapter(test.dependencies.clone());
+        let handle = open(provider.as_ref(), &server, OpenMode::Create)
+            .await
+            .unwrap();
+        let cancel = Cancellation::default();
+        let locator = |collection: Option<&str>, object: &str| RemoteLocator {
+            connection_identity: handle.connection_identity.clone(),
+            collection: collection.map(str::to_owned),
+            object: object.to_owned(),
+        };
+
+        provider
+            .delete_object(&handle, &locator(Some(&tag), "20/88"), &cancel)
+            .await
+            .unwrap();
+        for refused in [
+            locator(Some("someone-elses-tag-0"), "21/90"),
+            locator(Some(&tag), "20/89"),
+        ] {
+            assert_eq!(
+                provider
+                    .delete_object(&handle, &refused, &cancel)
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::Unsupported
+            );
+        }
+        // Both shapes of "already gone" answer the same as a removal.
+        for absent in [locator(Some(&tag), "20/88"), locator(Some(&tag), "22/91")] {
+            provider
+                .delete_object(&handle, &absent, &cancel)
+                .await
+                .unwrap();
+        }
+        // The head does not exist on this service and no locator can name one.
+        assert_eq!(
+            provider.head_locator(&handle).unwrap_err().kind,
+            ErrorKind::Unsupported
+        );
+
+        let records = server.requests.lock().unwrap();
+        assert_eq!(records.len(), 11);
+        assert!(head_line(&records[2]).starts_with("GET ") && head_line(&records[2]).contains("/releases/20 "));
+        assert_eq!(
+            method_of(&records[4]),
+            "DELETE",
+            "only the checked asset id is removed"
+        );
+        assert!(head_line(&records[4]).contains("/releases/assets/88 "));
+        drop(records);
+        let reservations = test.budget.reservations.lock().unwrap();
+        let removal = &reservations[4].0;
+        assert_eq!(
+            removal
+                .iter()
+                .map(|cost| (cost.bucket.clone(), cost.units))
+                .collect::<Vec<_>>(),
+            vec![
+                (api::PRIMARY_BUCKET.to_owned(), 1),
+                (api::POINT_BUCKET.to_owned(), 5)
+            ],
+            "a delete is not a content creating request"
+        );
+    });
+}
+
+/// Leases live in releases of their own. A job derived tag would let anyone who
+/// can enumerate the repository count the devices writing to it.
+#[test]
+fn the_lease_collection_uses_its_own_tag_and_asset_prefix() {
+    runtime().block_on(async {
+        let tag = "0123456789abcdef0123456789abcdef";
+        let work = lease_object_id(LeaseKind::Work, tag).unwrap();
+        let lease_tag = format!("{PREFIX}-{}-0", api::LEASE_BATCH);
+        assert_eq!(api::batch_key(ObjectRole::Lease, "job-1"), api::LEASE_BATCH);
+        assert_eq!(api::asset_name(ObjectRole::Lease, &work), format!("lease-{work}"));
+
+        let server = WireServer::start(vec![
+            repository_reply(true),
+            reply(200, json!([])),
+            reply(
+                200,
+                json!([release(31, &lease_tag), release(32, &job_tag("job-1", 0))]),
+            ),
+            reply(
+                200,
+                json!([
+                    asset(1, &format!("lease-{work}"), 10, None),
+                    asset(2, "pack-object-1", 20, None)
+                ]),
+            ),
+        ]);
+        let test = dependencies();
+        let provider = adapter(test.dependencies.clone());
+        let handle = open(provider.as_ref(), &server, OpenMode::Create)
+            .await
+            .unwrap();
+        let page = provider
+            .list_objects(&handle, Collection::Leases, None, 10, &Cancellation::default())
+            .await
+            .unwrap();
+        // Only the lease release is visited, and only its `lease-` assets.
+        assert_eq!(
+            page.objects
+                .iter()
+                .map(|object| object.locator.object.as_str())
+                .collect::<Vec<_>>(),
+            vec!["31/1"]
+        );
+        assert_eq!(page.objects[0].locator.collection.as_deref(), Some(lease_tag.as_str()));
+        assert_eq!(server.requests.lock().unwrap().len(), 4);
     });
 }

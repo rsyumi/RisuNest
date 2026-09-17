@@ -90,7 +90,22 @@ pub(crate) fn role_folder(role: ObjectRole) -> &'static str {
         // authenticated envelope header, not the path, tells them apart.
         ObjectRole::SyncState | ObjectRole::BackupBundle => "snapshots",
         ObjectRole::BackupPoint => "backup-points",
+        ObjectRole::Lease => "leases",
     }
+}
+
+/// Role folders a cleanup may remove from. Descriptors identify the repository
+/// and the head is not a member of any folder, so neither is a target.
+pub(crate) fn removable_folder(folder: &str) -> bool {
+    [
+        ObjectRole::Pack,
+        ObjectRole::Catalog,
+        ObjectRole::SyncState,
+        ObjectRole::BackupPoint,
+        ObjectRole::Lease,
+    ]
+    .iter()
+    .any(|role| role_folder(*role) == folder)
 }
 
 pub(crate) fn collection_folder(collection: Collection) -> &'static str {
@@ -98,6 +113,7 @@ pub(crate) fn collection_folder(collection: Collection) -> &'static str {
         Collection::Snapshots => role_folder(ObjectRole::SyncState),
         Collection::BackupPoints => role_folder(ObjectRole::BackupPoint),
         Collection::Descriptors => role_folder(ObjectRole::Descriptor),
+        Collection::Leases => role_folder(ObjectRole::Lease),
     }
 }
 

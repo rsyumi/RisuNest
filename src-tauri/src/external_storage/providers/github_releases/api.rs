@@ -46,6 +46,9 @@ const MAX_RETRY_AT_MS: u64 = 24 * HOUR_MS;
 /// single deterministic tag. Every other role is grouped per job.
 pub(super) const DESCRIPTOR_BATCH: &str = "d";
 pub(super) const JOB_BATCH_PREFIX: &str = "j";
+/// Leases live in their own releases. A job-derived tag would let an observer
+/// who can only enumerate the repository count the devices writing to it.
+pub(super) const LEASE_BATCH: &str = "l";
 
 fn refused() -> ProviderError {
     ProviderError::new(ErrorKind::Unsupported)
@@ -145,6 +148,10 @@ impl Context {
         self.repository_url(&["releases", "assets", &asset.to_string()])
     }
 
+    pub(super) fn release_url(&self, release: u64) -> Result<url::Url> {
+        self.repository_url(&["releases", &release.to_string()])
+    }
+
     /// Built from the configured upload host rather than the `upload_url`
     /// template of the release, so an authenticated body never follows an
     /// origin chosen by a response.
@@ -183,6 +190,7 @@ impl Context {
             Collection::Snapshots | Collection::BackupPoints => {
                 tag.starts_with(&format!("{}-{JOB_BATCH_PREFIX}", self.tag_prefix))
             }
+            Collection::Leases => tag.starts_with(&format!("{}-{LEASE_BATCH}-", self.tag_prefix)),
         }
     }
 
@@ -251,15 +259,46 @@ pub(super) fn role_prefix(role: ObjectRole) -> &'static str {
         ObjectRole::SyncState => "state",
         ObjectRole::BackupBundle => "bundle",
         ObjectRole::BackupPoint => "point",
+        ObjectRole::Lease => "lease",
     }
 }
 
-pub(super) fn collection_prefix(collection: Collection) -> &'static str {
+/// Every role a collection holds. A published state and a backup bundle share
+/// the snapshot listing, and each role keeps its own asset name prefix.
+pub(super) fn collection_roles(collection: Collection) -> &'static [ObjectRole] {
     match collection {
-        Collection::Snapshots => "snapshot",
-        Collection::BackupPoints => "point",
-        Collection::Descriptors => "descriptor",
+        Collection::Snapshots => &[ObjectRole::SyncState, ObjectRole::BackupBundle],
+        Collection::BackupPoints => &[ObjectRole::BackupPoint],
+        Collection::Descriptors => &[ObjectRole::Descriptor],
+        Collection::Leases => &[ObjectRole::Lease],
     }
+}
+
+/// True when `asset_name` produced this name for a role the collection holds.
+pub(super) fn collection_holds(collection: Collection, name: &str) -> bool {
+    collection_roles(collection)
+        .iter()
+        .any(|role| holds_role(*role, name))
+}
+
+/// True when the name carries a role prefix a cleanup may remove. Descriptors
+/// identify the repository and are refused.
+pub(super) fn removable_asset(name: &str) -> bool {
+    [
+        ObjectRole::Pack,
+        ObjectRole::Catalog,
+        ObjectRole::SyncState,
+        ObjectRole::BackupBundle,
+        ObjectRole::BackupPoint,
+        ObjectRole::Lease,
+    ]
+    .iter()
+    .any(|role| holds_role(*role, name))
+}
+
+fn holds_role(role: ObjectRole, name: &str) -> bool {
+    name.strip_prefix(role_prefix(role))
+        .is_some_and(|rest| rest.starts_with('-'))
 }
 
 pub(super) fn asset_name(role: ObjectRole, object_id: &str) -> String {
@@ -269,6 +308,9 @@ pub(super) fn asset_name(role: ObjectRole, object_id: &str) -> String {
 pub(super) fn batch_key(role: ObjectRole, job_id: &str) -> String {
     if role == ObjectRole::Descriptor {
         return DESCRIPTOR_BATCH.to_owned();
+    }
+    if role == ObjectRole::Lease {
+        return LEASE_BATCH.to_owned();
     }
     use sha2::Digest;
     let digest = sha2::Sha256::digest(job_id.as_bytes());
@@ -440,5 +482,11 @@ pub(super) fn costs(operation: ProviderOperation, account: &str) -> Vec<RequestC
         | ProviderOperation::CompareExchangeHead
         | ProviderOperation::ReplaceHead
         | ProviderOperation::Authenticate => Vec::new(),
+        // A write costs five endpoint points and is not a content creating
+        // request, so the two content buckets stay out of it.
+        ProviderOperation::Delete => vec![
+            cost(PRIMARY_BUCKET, account, 1, &hour),
+            cost(POINT_BUCKET, account, 5, &minute),
+        ],
     }
 }

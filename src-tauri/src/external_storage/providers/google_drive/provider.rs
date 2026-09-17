@@ -53,6 +53,7 @@ fn role_token(role: ObjectRole) -> &'static str {
         ObjectRole::SyncState => "state",
         ObjectRole::BackupBundle => "bundle",
         ObjectRole::BackupPoint => "backupPoint",
+        ObjectRole::Lease => "lease",
     }
 }
 /// Only names the container a collection lives in. States and bundles share
@@ -63,6 +64,7 @@ fn collection_role(collection: Collection) -> ObjectRole {
         Collection::Snapshots => ObjectRole::SyncState,
         Collection::BackupPoints => ObjectRole::BackupPoint,
         Collection::Descriptors => ObjectRole::Descriptor,
+        Collection::Leases => ObjectRole::Lease,
     }
 }
 fn collection_token(role: ObjectRole) -> Option<&'static str> {
@@ -70,6 +72,7 @@ fn collection_token(role: ObjectRole) -> Option<&'static str> {
         ObjectRole::SyncState | ObjectRole::BackupBundle => Some("snapshots"),
         ObjectRole::BackupPoint => Some("backupPoints"),
         ObjectRole::Descriptor => Some("descriptors"),
+        ObjectRole::Lease => Some("leases"),
         ObjectRole::Pack | ObjectRole::Catalog => None,
     }
 }
@@ -193,18 +196,20 @@ impl GoogleDrive {
 
     /// Bodyless control request. A rejected access token is refreshed once and
     /// the same request is repeated; no other status is retried here.
-    async fn control<T: serde::de::DeserializeOwned>(
+    async fn control_request(
         &self,
         session: Session<'_>,
+        method: reqwest::Method,
         url: &url::Url,
         operation: ProviderOperation,
+        allowed: &[u16],
         cancel: &Cancellation,
-    ) -> Result<T> {
+    ) -> Result<HttpResponse> {
         let mut refreshed = false;
         loop {
             let token = self.token(session, refreshed, cancel).await?;
             let request = HttpRequest {
-                method: reqwest::Method::GET,
+                method: method.clone(),
                 url: url.clone(),
                 headers: authorized_headers(&token),
                 body: None,
@@ -217,9 +222,29 @@ impl GoogleDrive {
                 refreshed = true;
                 continue;
             }
-            wire::require_status(&mut response, &[200], self.now_ms(), cancel).await?;
-            return wire::json(&mut response, cancel).await;
+            wire::require_status(&mut response, allowed, self.now_ms(), cancel).await?;
+            return Ok(response);
         }
+    }
+
+    async fn control<T: serde::de::DeserializeOwned>(
+        &self,
+        session: Session<'_>,
+        url: &url::Url,
+        operation: ProviderOperation,
+        cancel: &Cancellation,
+    ) -> Result<T> {
+        let mut response = self
+            .control_request(
+                session,
+                reqwest::Method::GET,
+                url,
+                operation,
+                &[200],
+                cancel,
+            )
+            .await?;
+        wire::json(&mut response, cancel).await
     }
 
     fn role_query(&self, settings: &Settings, role: &str) -> String {
@@ -622,6 +647,28 @@ fn resolve_file_id(context: &Context, locator: &RemoteLocator) -> Result<String>
     Ok(locator.object.clone())
 }
 
+/// A member of this repository folder whose role is a cleanup target. The head
+/// and the descriptor role are never removed here.
+fn removable(settings: &Settings, file: &DriveFile) -> bool {
+    let parented = file
+        .parents
+        .as_ref()
+        .is_some_and(|parents| parents.iter().any(|id| *id == settings.folder_id));
+    parented
+        && file.property(ROLE_KEY).is_some_and(|role| {
+            [
+                ObjectRole::Pack,
+                ObjectRole::Catalog,
+                ObjectRole::SyncState,
+                ObjectRole::BackupBundle,
+                ObjectRole::BackupPoint,
+                ObjectRole::Lease,
+            ]
+            .iter()
+            .any(|known| role_token(*known) == role)
+        })
+}
+
 fn capabilities() -> Capabilities {
     Capabilities {
         immutable_create: Evidence::Synthetic,
@@ -634,6 +681,10 @@ fn capabilities() -> Capabilities {
         head_read_after_write: Evidence::Synthetic,
         head_retry_control: Evidence::Synthetic,
         snapshot_discovery: Evidence::Synthetic,
+        // No cleanup evidence has been recorded for this service yet.
+        delete_objects: Evidence::Unverified,
+        gc_control_consistency: Evidence::Unverified,
+        delete_completion: Evidence::Unverified,
         discovery_extra_requests: 0,
         conditional_get: false,
         range: true,
@@ -1032,6 +1083,56 @@ impl Provider for GoogleDrive {
                 version: file.version_token(),
                 complete: true,
             })
+        })
+    }
+
+    /// `files.delete` removes the file outright rather than trashing it, so the
+    /// target is confirmed to be a removable member of this repository folder
+    /// before the request goes out.
+    fn delete_object<'a>(
+        &'a self,
+        repository: &'a RepositoryHandle,
+        locator: &'a RemoteLocator,
+        cancel: &'a Cancellation,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            cancel.check()?;
+            let context = context(repository)?;
+            locator.validate_for(repository)?;
+            if locator.object == HEAD_OBJECT || !config::is_drive_id(&locator.object) {
+                return Err(ProviderError::new(ErrorKind::Unsupported));
+            }
+            let file_id = &locator.object;
+            let session = context.session();
+            let metadata: DriveFile = match self
+                .control(
+                    session,
+                    &with_query(
+                        context.settings.api(&format!("/files/{file_id}"))?,
+                        &[("fields", "id,parents,appProperties")],
+                    ),
+                    ProviderOperation::Metadata,
+                    cancel,
+                )
+                .await
+            {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind == ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            if !removable(&context.settings, &metadata) {
+                return Err(ProviderError::new(ErrorKind::Unsupported));
+            }
+            self.control_request(
+                session,
+                reqwest::Method::DELETE,
+                &context.settings.api(&format!("/files/{file_id}"))?,
+                ProviderOperation::Delete,
+                &[200, 204, 404],
+                cancel,
+            )
+            .await
+            .map(|_| ())
         })
     }
 

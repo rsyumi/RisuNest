@@ -398,7 +398,7 @@ fn create_refuses_an_occupied_root_and_otherwise_provisions_the_role_folders() {
             .unwrap();
         assert_eq!(handle.repository_id, ROOT_ID);
         let records = api.requests.lock().unwrap();
-        assert_eq!(records.len(), 9);
+        assert_eq!(records.len(), 3 + config::FOLDERS.len());
         assert!(records[2]
             .headers
             .starts_with("POST /synthetic/drive/folders HTTP/1.1"));
@@ -1020,5 +1020,72 @@ fn cancellation_during_a_download_body_stops_the_transfer() {
         .await
         .unwrap();
         assert!(!sink.is_verified());
+    });
+}
+
+/// A passing exchange here proves the adapter's request shape and status
+/// handling. It is no evidence of the service's own deletion guarantees, which
+/// only the provider documentation behind `Capabilities` can supply.
+#[test]
+fn deleting_resolves_the_resource_id_and_refuses_the_head_and_descriptor_folders() {
+    runtime().block_on(async {
+        let mut replies = open_replies(1_000, 10_000, 0);
+        // The pack folder listing that resolves the name to a resource id.
+        replies.push(json(
+            200,
+            &listing(&[resource("pack-1.bin", "file-p", "file", 8)], None),
+        ));
+        replies.push(json(200, "{}"));
+        // The folder is re-read after the cache was dropped and is now empty.
+        replies.push(json(200, &listing(&[], None)));
+        let api = WireServer::start(replies);
+        let test = fixture();
+        let provider = super::create(test.dependencies.clone()).unwrap();
+        let cancel = Cancellation::default();
+        let (repository, _) = open(&provider, &api, OpenMode::Existing, &cancel)
+            .await
+            .unwrap();
+        let locator = |folder: &str, name: &str| {
+            config::locator(&repository.connection_identity, folder, name)
+        };
+
+        provider
+            .delete_object(&repository, &locator(config::PACKS, "pack-1.bin"), &cancel)
+            .await
+            .unwrap();
+        // A name the folder no longer holds is already in that state.
+        provider
+            .delete_object(&repository, &locator(config::PACKS, "pack-1.bin"), &cancel)
+            .await
+            .unwrap();
+
+        for refused in [
+            provider.head_locator(&repository).unwrap(),
+            locator(config::DESCRIPTORS, "descriptor.bin"),
+        ] {
+            assert_eq!(
+                provider
+                    .delete_object(&repository, &refused, &cancel)
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::Unsupported
+            );
+        }
+
+        let records = api.requests.lock().unwrap();
+        assert_eq!(records.len(), 7);
+        assert!(
+            records[5]
+                .headers
+                .starts_with("DELETE /synthetic/drive/resources/file-p HTTP/1.1"),
+            "{}",
+            records[5].headers
+        );
+        drop(records);
+        let reservations = test.budget.reservations.lock().unwrap();
+        let removal = &reservations[5].0;
+        assert_eq!(removal.len(), 1);
+        assert_eq!(removal[0].bucket, api::MINUTE_DELETE);
     });
 }

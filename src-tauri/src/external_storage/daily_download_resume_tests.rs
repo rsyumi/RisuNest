@@ -160,6 +160,15 @@ impl Provider for QuotaProvider {
         self.inner.replace_head(repository, locator, head, cancel)
     }
 
+    fn delete_object<'a>(
+        &'a self,
+        repository: &'a RepositoryHandle,
+        locator: &'a RemoteLocator,
+        cancel: &'a Cancellation,
+    ) -> ProviderFuture<'a, ()> {
+        self.inner.delete_object(repository, locator, cancel)
+    }
+
     fn list_objects<'a>(
         &'a self,
         repository: &'a RepositoryHandle,

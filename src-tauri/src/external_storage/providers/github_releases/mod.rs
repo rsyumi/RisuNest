@@ -74,6 +74,10 @@ fn capabilities() -> Capabilities {
         head_read_after_write: Evidence::Unverified,
         head_retry_control: Evidence::Unverified,
         snapshot_discovery: Evidence::Synthetic,
+        // No cleanup evidence has been recorded for this service yet.
+        delete_objects: Evidence::Unverified,
+        gc_control_consistency: Evidence::Unverified,
+        delete_completion: Evidence::Unverified,
         // One release listing request accompanies each page of assets read.
         discovery_extra_requests: 1,
         conditional_get: false,
@@ -228,6 +232,26 @@ impl GithubReleases {
             let assets = self.assets_page(context, release, page, cancel).await?;
             let exhausted = assets.len() < api::ASSET_PAGE_SIZE;
             if let Some(found) = assets.into_iter().find(|asset| asset.name == name) {
+                return Ok(Some(found));
+            }
+            if exhausted {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
+    async fn find_asset_by_id(
+        &self,
+        context: &Context,
+        release: u64,
+        asset: u64,
+        cancel: &Cancellation,
+    ) -> Result<Option<AssetView>> {
+        for page in 1..=api::MAX_ASSET_SCAN_PAGES {
+            let assets = self.assets_page(context, release, page, cancel).await?;
+            let exhausted = assets.len() < api::ASSET_PAGE_SIZE;
+            if let Some(found) = assets.into_iter().find(|found| found.id == asset) {
                 return Ok(Some(found));
             }
             if exhausted {
@@ -645,6 +669,57 @@ impl Provider for GithubReleases {
         })
     }
 
+    /// An asset id names no tag of its own, so the release it belongs to is
+    /// read first: only a release this root tagged, holding an asset whose
+    /// name carries a removable role prefix, is a target.
+    fn delete_object<'a>(
+        &'a self,
+        repository: &'a RepositoryHandle,
+        locator: &'a RemoteLocator,
+        cancel: &'a Cancellation,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            cancel.check()?;
+            let context = self.context(repository)?;
+            locator.validate_for(repository)?;
+            let (release, asset) = api::parse_locator(&locator.object)?;
+            let unsupported = || ProviderError::new(ErrorKind::Unsupported);
+            let url = context.release_url(release)?;
+            let request = self.request(context, Method::GET, url, ProviderOperation::Metadata);
+            let response = self.send(request, cancel).await?;
+            if response.status == 404 {
+                return Ok(());
+            }
+            let view: ReleaseView = self.decode(response, cancel).await?;
+            if !context.owns_tag(&view.tag_name)
+                || view.tag_name == context.descriptor_tag()
+                || locator
+                    .collection
+                    .as_deref()
+                    .is_some_and(|hint| hint != view.tag_name)
+            {
+                return Err(unsupported());
+            }
+            let Some(found) = self.find_asset_by_id(context, release, asset, cancel).await? else {
+                return Ok(());
+            };
+            if !api::removable_asset(&found.name) {
+                return Err(unsupported());
+            }
+            let request = self.request(
+                context,
+                Method::DELETE,
+                context.asset_url(asset)?,
+                ProviderOperation::Delete,
+            );
+            let response = self.send(request, cancel).await?;
+            match response.status {
+                204 | 404 => Ok(()),
+                status => Err(api::classify(status, &response.headers, self.now())),
+            }
+        })
+    }
+
     fn list_objects<'a>(
         &'a self,
         repository: &'a RepositoryHandle,
@@ -661,7 +736,6 @@ impl Provider for GithubReleases {
             }
             let (mut release_page, mut release_index, mut asset_page, mut asset_index) =
                 parse_cursor(cursor)?;
-            let prefix = format!("{}-", api::collection_prefix(collection));
             let mut objects = Vec::new();
             let mut next_cursor = None;
             let mut releases: Option<Vec<ReleaseView>> = None;
@@ -695,7 +769,7 @@ impl Provider for GithubReleases {
                 let exhausted = assets.len() < api::ASSET_PAGE_SIZE;
                 let matching: Vec<&AssetView> = assets
                     .iter()
-                    .filter(|asset| asset.name.starts_with(&prefix))
+                    .filter(|asset| api::collection_holds(collection, &asset.name))
                     .collect();
                 let mut stopped = false;
                 for (index, asset) in matching.iter().enumerate().skip(asset_index) {

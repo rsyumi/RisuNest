@@ -160,6 +160,9 @@ pub(crate) fn capabilities(profile: &Profile) -> Capabilities {
         head_read_after_write: Evidence::Synthetic,
         head_retry_control: Evidence::Synthetic,
         snapshot_discovery: Evidence::Synthetic,
+        delete_objects: profile.cleanup_evidence,
+        gc_control_consistency: profile.cleanup_evidence,
+        delete_completion: profile.cleanup_evidence,
         // Snapshot roots are their own listing; no extra index object exists.
         discovery_extra_requests: 0,
         conditional_get: profile.conditional_get,
@@ -618,6 +621,24 @@ fn intent_locator(
     ))
 }
 
+/// The key of a locator a cleanup may remove. The head object is a root member
+/// with no folder, so it never parses here.
+fn removable_key(context: &RepositoryContext, locator: &RemoteLocator) -> Result<String> {
+    let unsupported = || ProviderError::new(ErrorKind::Unsupported);
+    let (folder, name) = locator.object.split_once('/').ok_or_else(unsupported)?;
+    if name.is_empty()
+        || name.contains('/')
+        || !config::removable_folder(folder)
+        || locator
+            .collection
+            .as_deref()
+            .is_some_and(|hint| hint != folder)
+    {
+        return Err(unsupported());
+    }
+    context.key(&locator.object)
+}
+
 impl Provider for S3Provider {
     fn open_repository<'a>(
         &'a self,
@@ -886,6 +907,35 @@ impl Provider for S3Provider {
                 version: version_of(&response.headers),
                 complete: true,
             })
+        })
+    }
+
+    /// `DeleteObject` reports 204 for a key that was removed and for one that
+    /// was never there, which is the idempotence the contract asks for.
+    fn delete_object<'a>(
+        &'a self,
+        repository: &'a RepositoryHandle,
+        locator: &'a RemoteLocator,
+        cancel: &'a Cancellation,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            cancel.check()?;
+            let context = context_of(repository)?;
+            locator.validate_for(repository)?;
+            let key = removable_key(context, locator)?;
+            let credentials = self.credentials(context).await?;
+            let response = self
+                .dispatch(
+                    context,
+                    &credentials,
+                    Call::object(reqwest::Method::DELETE, &key, ProviderOperation::Delete),
+                    cancel,
+                )
+                .await?;
+            if response.status == 404 {
+                return Ok(());
+            }
+            self.require(context.profile, &response, &[200, 204])
         })
     }
 
