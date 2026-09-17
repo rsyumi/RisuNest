@@ -932,6 +932,9 @@ async fn run_cleanup(
             (item.id, directory)
         })
         .collect();
+    // One reading of the clock: the retention decision and the grace window
+    // are measured against the same moment.
+    let started = now_ms();
     let view = super::cleanup::ConnectedRepositoryView {
         connected,
         writer_id: &writer_id,
@@ -939,7 +942,7 @@ async fn run_cleanup(
             .stored
             .retention_policy
             .unwrap_or(super::connection::RetentionPolicy::DEFAULT),
-        now_ms: now_ms(),
+        now_ms: started,
         unfinished,
     };
     let documents = super::cleanup::ConnectedDocuments { connected, cancel };
@@ -949,7 +952,7 @@ async fn run_cleanup(
             job_id: &job.id,
             capabilities: &connected.stored.capabilities,
             limits: super::cleanup::CleanupLimits::default(),
-            now_ms: now_ms(),
+            now_ms: started,
         },
         &view,
         &documents,
