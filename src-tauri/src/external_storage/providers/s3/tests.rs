@@ -421,6 +421,14 @@ fn addressing_and_endpoint_paths_build_the_documented_urls() {
             .as_str(),
         "https://synthetic-bucket.synthetic-account.r2.cloudflarestorage.com/risunest/head"
     );
+    let aws = context("aws", "https://s3.us-east-1.amazonaws.com", None);
+    assert_eq!(aws.addressing, Addressing::Virtual);
+    assert_eq!(
+        aws.url(config::Target::Object("risunest/head"), &[])
+            .unwrap()
+            .as_str(),
+        "https://synthetic-bucket.s3.us-east-1.amazonaws.com/risunest/head"
+    );
     let b2 = context("b2", "https://s3.us-west-004.backblazeb2.com", None);
     assert_eq!(
         b2.url(config::Target::Object("risunest/packs/pack-1"), &[])
@@ -1728,11 +1736,13 @@ fn request_costs_follow_the_preset_buckets_and_are_reserved_per_request() {
         assert!(cost(&r2, ProviderOperation::Authenticate).is_empty());
         // Cloudflare lists `DeleteObject` outside both classes, as free.
         assert!(cost(&r2, ProviderOperation::Delete).is_empty());
-        // Only the preset whose own documentation states the delete and listing
+        // Only a preset whose own documentation states the delete and listing
         // guarantees carries the cleanup evidence.
-        assert!(reported_capabilities(&profiles::r2::PROFILE)
-            .require_cleanup()
-            .is_ok());
+        for preset in ["r2", "aws"] {
+            assert!(reported_capabilities(profiles::lookup(preset).unwrap())
+                .require_cleanup()
+                .is_ok());
+        }
         for preset in ["generic", "b2", "hf"] {
             assert!(reported_capabilities(profiles::lookup(preset).unwrap())
                 .require_cleanup()
@@ -1767,7 +1777,8 @@ fn request_costs_follow_the_preset_buckets_and_are_reserved_per_request() {
 
 #[test]
 fn capabilities_carry_the_documented_evidence_for_every_preset() {
-    let presets: [(&str, &Profile); 4] = [
+    let presets: [(&str, &Profile); 5] = [
+        ("aws", &profiles::aws::PROFILE),
         ("r2", &profiles::r2::PROFILE),
         ("b2", &profiles::b2::PROFILE),
         ("hf", &profiles::hf::PROFILE),
@@ -1808,7 +1819,7 @@ fn capabilities_carry_the_documented_evidence_for_every_preset() {
         );
         assert_eq!(
             reported.conditional_get,
-            matches!(id, "r2" | "generic"),
+            matches!(id, "r2" | "generic" | "aws"),
             "{id}"
         );
     }

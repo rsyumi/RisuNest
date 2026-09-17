@@ -6,6 +6,7 @@ use crate::external_storage::{
     contract::{ErrorKind, ProviderError, ProviderOperation, QuotaReset, RequestCost, Result},
 };
 
+pub(crate) mod aws;
 pub(crate) mod b2;
 pub(crate) mod generic;
 pub(crate) mod hf;
@@ -142,6 +143,7 @@ impl Profile {
 
 pub(crate) fn lookup(id: &str) -> Result<&'static Profile> {
     match id {
+        "aws" => Ok(&aws::PROFILE),
         "r2" => Ok(&r2::PROFILE),
         "b2" => Ok(&b2::PROFILE),
         "hf" => Ok(&hf::PROFILE),

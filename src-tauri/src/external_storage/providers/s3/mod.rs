@@ -5,9 +5,10 @@
 //!
 //! - `provider` is `s3` and `oauth_profile` must be absent; the service
 //!   authenticates with static access keys, not an authorization code flow.
-//! - `profile` is `r2`, `b2`, `hf` or `generic` and selects the preset.
-//! - `endpoint` is `https://<host>` with an optional base path. Cloudflare R2
-//!   uses `https://<account>.r2.cloudflarestorage.com`, Backblaze B2
+//! - `profile` is `aws`, `r2`, `b2`, `hf` or `generic` and selects the preset.
+//! - `endpoint` is `https://<host>` with an optional base path. Amazon S3 uses
+//!   `https://s3.<region>.amazonaws.com`, Cloudflare R2
+//!   `https://<account>.r2.cloudflarestorage.com`, Backblaze B2
 //!   `https://s3.<region>.backblazeb2.com`, Hugging Face Storage Buckets
 //!   `https://s3.hf.co/<namespace>`, where the single path segment is required.
 //!   Plain `http` is accepted only for `127.0.0.1`, which is the loopback wire

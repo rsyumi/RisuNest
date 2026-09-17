@@ -101,7 +101,7 @@ const english = {
     },
     providers: {
         webdav: { name: 'WebDAV / Koofr', description: 'Connects to an HTTPS WebDAV folder with an application password.', strategyNote: 'Concurrent-use protection keeps two devices from uploading to the synchronization server at the same time and corrupting the data. The server has to support it, and support is checked when the connection is attempted.' },
-        s3: { name: 'S3-compatible storage', description: 'Uses an S3-compatible bucket such as Cloudflare R2, Backblaze B2 or Hugging Face.' },
+        s3: { name: 'S3-compatible storage', description: 'Uses an S3-compatible bucket such as Amazon S3, Cloudflare R2, Backblaze B2 or Hugging Face.' },
         google_drive: { name: 'Google Drive', description: 'Signs in with a Google account and uses a Drive folder or the hidden app data space.', warningTitle: 'Take care with the hidden app data space', warning: 'If you choose the hidden app data space, deleting the app data in Drive also deletes the backups.' },
         onedrive: { name: 'OneDrive', description: 'Signs in with a Microsoft account and uses a personal, work or app-only folder.' },
         mybox: { name: 'NAVER MYBOX', description: 'Uses a MYBOX personal access token and a dedicated folder.' },
@@ -130,7 +130,7 @@ const english = {
         'gitlab_packages.tokenKind.personalAccessToken': 'Personal access token', 'gitlab_packages.tokenKind.projectAccessToken': 'Project access token', 'gitlab_packages.tokenKind.deployToken': 'Deploy token',
     },
     profiles: {
-        'webdav.': 'Generic WebDAV', 's3.generic': 'Other S3-compatible', 'gitlab_packages.': 'Automatic', 'gitlab_packages.selfManaged': 'Self-managed', 'mybox.plan': '{0} plan',
+        'webdav.': 'Generic WebDAV', 's3.aws': 'Amazon S3', 's3.generic': 'Other S3-compatible', 'gitlab_packages.': 'Automatic', 'gitlab_packages.selfManaged': 'Self-managed', 'mybox.plan': '{0} plan',
     },
 }
 
@@ -231,7 +231,7 @@ const korean: typeof english = {
     },
     providers: {
         webdav: { name: 'WebDAV / Koofr', description: 'HTTPS WebDAV 폴더에 앱 비밀번호로 연결합니다.', strategyNote: '동시 사용 보호는 두 기기가 동시에 동기화 서버에 업로드를 해 데이터가 손상되는 것을 예방합니다. 서버가 지원해야 동작하며, 연결을 시도할 때 지원 여부를 검사합니다.' },
-        s3: { name: 'S3 호환 저장소', description: 'Cloudflare R2, Backblaze B2, Hugging Face 같은 S3 호환 버킷을 씁니다.' },
+        s3: { name: 'S3 호환 저장소', description: 'Amazon S3, Cloudflare R2, Backblaze B2, Hugging Face 같은 S3 호환 버킷을 씁니다.' },
         google_drive: { name: 'Google Drive', description: 'Google 계정으로 로그인해 Drive 폴더나 숨겨진 앱 데이터 공간을 씁니다.', warningTitle: '숨겨진 앱 데이터 공간에 주의하세요', warning: '숨겨진 앱 데이터 공간을 고른 경우, Drive에서 앱 데이터를 삭제하면 백업도 함께 지워집니다.' },
         onedrive: { name: 'OneDrive', description: 'Microsoft 계정으로 로그인해 개인·회사·앱 전용 폴더를 씁니다.' },
         mybox: { name: '네이버 MYBOX', description: 'MYBOX 개인 액세스 토큰과 전용 폴더를 씁니다.' },
@@ -260,7 +260,7 @@ const korean: typeof english = {
         'gitlab_packages.tokenKind.personalAccessToken': '개인 액세스 토큰', 'gitlab_packages.tokenKind.projectAccessToken': '프로젝트 액세스 토큰', 'gitlab_packages.tokenKind.deployToken': '배포 토큰',
     },
     profiles: {
-        'webdav.': '일반 WebDAV', 's3.generic': '기타 S3 호환', 'gitlab_packages.': '자동', 'gitlab_packages.selfManaged': '직접 운영', 'mybox.plan': '{0} 요금제',
+        'webdav.': '일반 WebDAV', 's3.aws': 'Amazon S3', 's3.generic': '기타 S3 호환', 'gitlab_packages.': '자동', 'gitlab_packages.selfManaged': '직접 운영', 'mybox.plan': '{0} 요금제',
     },
 }
 

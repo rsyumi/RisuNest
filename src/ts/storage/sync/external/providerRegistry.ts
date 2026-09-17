@@ -34,6 +34,7 @@ const s3Profiles = [
     { value: 'r2', label: 'Cloudflare R2' },
     { value: 'b2', label: 'Backblaze B2' },
     { value: 'hf', label: 'Hugging Face Storage Buckets' },
+    { value: 'aws', label: '' },
     { value: 'generic', label: '' },
 ]
 
