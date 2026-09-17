@@ -23,6 +23,27 @@ use std::{
 pub(crate) const PAGE: usize = 256;
 const FORMAT: &str = "risunest-server-conflict-reference";
 
+fn reference_parent(root: &Path, create: bool) -> Result<Option<PathBuf>> {
+    let mut path = root.to_path_buf();
+    for name in ["server-sync", "backups"] {
+        path.push(name);
+        if create {
+            match std::fs::create_dir(&path) {
+                Ok(()) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() && !crate::trust_boundary::is_link_like(&metadata) => (),
+            Ok(_) => return Err(SyncError::new("invalid-backup-path", 409)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(Some(path))
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Receipt {
@@ -75,23 +96,18 @@ pub(crate) struct Capture {
 
 impl Capture {
     pub(crate) fn begin_or_resume(root: &Path, revision: i64, generation: &str, head: &RemoteHead) -> Result<Self> {
-        let parent = root.join("server-sync/backups");
-        match std::fs::read_dir(&parent) {
-            Ok(entries) => {
-                for entry in entries {
-                    let entry = entry?;
-                    let Some(id) = entry.file_name().to_str().map(str::to_owned) else { continue; };
-                    if entry.path().join("complete.json").try_exists()? { continue; }
-                    if !entry.path().join("index.sqlite").try_exists()? { continue; }
-                    if let Ok(capture) = Self::resume(root, &id, revision, generation, head) {
-                        return Ok(capture);
-                    }
-                    // A mismatched or damaged preparation remains protected,
-                    // but cannot become a snapshot of a different revision.
+        if let Some(parent) = reference_parent(root, false)? {
+            for entry in std::fs::read_dir(parent)? {
+                let entry = entry?;
+                let Some(id) = entry.file_name().to_str().map(str::to_owned) else { continue; };
+                if entry.path().join("complete.json").try_exists()? { continue; }
+                if !entry.path().join("index.sqlite").try_exists()? { continue; }
+                if let Ok(capture) = Self::resume(root, &id, revision, generation, head) {
+                    return Ok(capture);
                 }
+                // A mismatched or damaged preparation remains protected,
+                // but cannot become a snapshot of a different revision.
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-            Err(error) => return Err(error.into()),
         }
         Self::begin(root, revision, generation, head)
     }
@@ -102,14 +118,8 @@ impl Capture {
             return Err(SyncError::new("invalid-conflict-revision", 409));
         }
         let id = uuid::Uuid::new_v4().to_string();
-        let parent = root.join("server-sync/backups");
-        std::fs::create_dir_all(&parent)?;
-        for path in [root.join("server-sync"), parent.clone()] {
-            let metadata = std::fs::symlink_metadata(path)?;
-            if !metadata.is_dir() || crate::trust_boundary::is_link_like(&metadata) {
-                return Err(SyncError::new("invalid-backup-path", 409));
-            }
-        }
+        let parent = reference_parent(root, true)?
+            .ok_or_else(|| SyncError::new("invalid-backup-path", 409))?;
         std::fs::create_dir(parent.join(&id))?;
         let path = directory(root, &id)?;
         let created_at_ms = SystemTime::now().duration_since(UNIX_EPOCH)
@@ -399,8 +409,15 @@ impl Capture {
         marker.write_all(&bytes)?;
         marker.as_file().sync_all()?;
         check()?;
-        // This is a new destination, never replacement of an existing marker.
-        marker.persist_noclobber(self.path.join("complete.json")).map_err(|error| error.error)?;
+        // Close the writable handle before publication. Android forbids hard
+        // links, and Windows volumes need not support them.
+        let marker = marker.into_temp_path();
+        let destination = self.path.join("complete.json");
+        #[cfg(any(target_os = "android", windows))]
+        crate::trust_boundary::rename_without_replace(&marker, &destination)?;
+        #[cfg(not(any(target_os = "android", windows)))]
+        std::fs::hard_link(&marker, &destination)?;
+        drop(marker);
         crate::trust_boundary::sync_directory(&self.path)?;
         Ok(receipt)
     }
@@ -500,11 +517,8 @@ pub(crate) fn visit_objects(db: &Connection, mut visit: impl FnMut(Object) -> Re
 }
 
 pub(crate) fn visit_roots(root: &Path, mut visit: impl FnMut(Object) -> Result<()>) -> Result<()> {
-    let entries = match std::fs::read_dir(root.join("server-sync/backups")) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
+    let Some(parent) = reference_parent(root, false)? else { return Ok(()); };
+    let entries = std::fs::read_dir(parent)?;
     for entry in entries {
         let entry = entry?;
         let Some(id) = entry.file_name().to_str().map(str::to_owned) else { continue; };

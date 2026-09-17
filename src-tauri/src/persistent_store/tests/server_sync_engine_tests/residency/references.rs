@@ -3,16 +3,22 @@ use crate::asset_repository::job_pins::DurableCasJob;
 use crate::server_sync::{backups::references, cache::Cache, client::ServerClient, transfer::Transfer};
 use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Mutex};
 
+#[path = "reference_boundaries.rs"]
+mod boundaries;
+
 #[derive(Debug)]
 struct Request {
     method: String,
     path: String,
+    query: Option<String>,
     body: Value,
 }
 #[derive(Default)]
 struct Trace {
     armed: AtomicBool,
     corrupt_retention: AtomicBool,
+    retention_pages: AtomicU64,
+    fail_retention_page: AtomicU64,
     expire_checkpoint: AtomicBool,
     released_before_marker: AtomicBool,
     root: Mutex<Option<std::path::PathBuf>>,
@@ -27,12 +33,13 @@ async fn observe(
     use axum::{body::{to_bytes, Body}, response::IntoResponse};
     let method = request.method().to_string();
     let path = request.uri().path().to_owned();
+    let query = request.uri().query().map(str::to_owned);
     let (parts, body) = request.into_parts();
     let bytes = to_bytes(body, 16 * 1024 * 1024).await.unwrap();
     let armed = trace.armed.load(Ordering::SeqCst);
     if armed {
         trace.requests.lock().unwrap().push(Request {
-            method: method.clone(), path: path.clone(),
+            method: method.clone(), path: path.clone(), query,
             body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         });
         if method == "DELETE" && path.starts_with("/checkpoints/") {
@@ -40,6 +47,13 @@ async fn observe(
             let complete = fs::read_dir(root.join("server-sync/backups")).ok().is_some_and(|entries|
                 entries.filter_map(std::result::Result::ok).any(|entry| entry.path().join("complete.json").is_file()));
             if !complete { trace.released_before_marker.store(true, Ordering::SeqCst); }
+        }
+        if method == "POST" && path == "/objects/retention" {
+            let page = trace.retention_pages.fetch_add(1, Ordering::SeqCst) + 1;
+            if trace.fail_retention_page.load(Ordering::SeqCst) == page {
+                return (axum::http::StatusCode::BAD_REQUEST,
+                    axum::Json(json!({"error":"synthetic-retention-failure"}))).into_response();
+            }
         }
         if method == "GET" && path.starts_with("/checkpoints/") && trace.expire_checkpoint.load(Ordering::SeqCst) {
             return (axum::http::StatusCode::GONE, axum::Json(json!({"error":"checkpoint-expired"}))).into_response();

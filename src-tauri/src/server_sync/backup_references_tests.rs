@@ -126,6 +126,55 @@ fn cancellation_before_marker_keeps_pins_and_never_exposes_completion() {
 }
 
 #[test]
+fn marker_publication_never_replaces_an_existing_completion_file() {
+    let (root, mut store, mut capture) = fixture();
+    capture.metadata(Side::Local, b"protected").unwrap();
+    scanned(&capture);
+    let path = capture.path.clone();
+    let id = capture.id.clone();
+    let collided = std::cell::Cell::new(false);
+    let check = || {
+        let prepared = std::fs::read_dir(&path)?.any(|entry| entry.is_ok_and(|entry|
+            entry.file_name().to_string_lossy().starts_with("complete-")));
+        if prepared && !collided.replace(true) {
+            std::fs::write(path.join("complete.json"), b"existing completion")?;
+        }
+        Ok(())
+    };
+    assert!(capture.finish(&mut store, &check).is_err());
+    assert!(collided.get());
+    assert_eq!(std::fs::read(path.join("complete.json")).unwrap(), b"existing completion");
+    let pins = DurableCasJob::open(root.path(), &id).unwrap();
+    assert!(pins.is_sealed());
+    assert!(!pins.is_released());
+    assert!(!std::fs::read_dir(path).unwrap().any(|entry|
+        entry.unwrap().file_name().to_string_lossy().starts_with("complete-")));
+}
+
+#[test]
+fn reference_operations_reject_non_directory_parents() {
+    let root = tempfile::tempdir().unwrap();
+    let parent = root.path().join("server-sync");
+    std::fs::write(&parent, b"not a directory").unwrap();
+    assert!(Capture::begin(root.path(), 0, "generation", &head()).is_err());
+    assert!(Capture::begin_or_resume(root.path(), 0, "generation", &head()).is_err());
+    assert!(visit_roots(root.path(), |_| panic!("unsafe roots must not be visited")).is_err());
+    assert_eq!(std::fs::read(parent).unwrap(), b"not a directory");
+}
+
+#[cfg(unix)]
+#[test]
+fn reference_operations_do_not_create_or_scan_through_a_linked_parent() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.path().join("server-sync")).unwrap();
+    assert!(Capture::begin(root.path(), 0, "generation", &head()).is_err());
+    assert!(Capture::begin_or_resume(root.path(), 0, "generation", &head()).is_err());
+    assert!(visit_roots(root.path(), |_| panic!("linked roots must not be visited")).is_err());
+    assert!(!outside.path().join("backups").exists());
+}
+
+#[test]
 fn remote_payload_requires_exact_durable_custody_but_not_local_bytes() {
     let (root, mut store, capture) = fixture();
     let digest = hash(b"remote-only");
