@@ -291,6 +291,22 @@ describe('Android Google authorization lifecycle', () => {
     })
 })
 
+describe('service presets', () => {
+    it('offers Amazon S3 under its own name without becoming the preselected preset', async () => {
+        component = mount(ConnectionForm, {
+            target,
+            props: { strings, onconnected: vi.fn(), oncancel: vi.fn() },
+        })
+        await settle()
+        await selectProvider('s3')
+
+        const presets = labelControl<HTMLSelectElement>(strings.profile)
+        expect([...presets.options].map(option => [option.value, option.textContent?.trim()]))
+            .toContainEqual(['aws', 'Amazon S3'])
+        expect(presets.value).toBe('r2')
+    })
+})
+
 describe('synchronization mode defaults', () => {
     it('prefers concurrent-use protection and falls back to one device at a time', async () => {
         component = mount(ConnectionForm, {

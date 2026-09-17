@@ -23,7 +23,8 @@ pub(crate) const PROFILE: Profile = Profile {
     // 10,000 parts of at most 5 GiB, as the multipart limits table states.
     service_max_object_bytes: Some(5 * GIB * MAX_PARTS),
     multipart_lifetime_ms: None,
-    // Conditional writes are left unverified until that documentation is read.
+    // The conditional-write documentation has not been read, so the two
+    // conditional head capabilities stay unverified.
     cas_evidence: Evidence::Unverified,
     // `DeleteObject` answers 204 and is permanent while versioning is off, and
     // the consistency model covers a listing started after a write finished.
