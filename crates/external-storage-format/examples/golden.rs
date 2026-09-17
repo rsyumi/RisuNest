@@ -99,7 +99,7 @@ fn section_entries() -> Vec<Vec<u8>> {
         SectionEntry::new(
             SectionKind::Hypa,
             hypa_entry_key(&"0".repeat(64)).unwrap(),
-            SectionValue::Tombstone,
+            SectionValue::tombstone(Sequence::from(9u64), 1_760_000_000_000),
             version(18_446_744_073_709_551_615, "writer-b"),
         )
         .unwrap(),

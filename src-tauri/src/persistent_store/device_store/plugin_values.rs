@@ -221,15 +221,17 @@ impl DeviceStore {
                     transaction.execute(
                         "INSERT INTO plugin_device_storage
                             (owner,space,key,value,byte_size,tombstone,write_clock,writer_id,
-                             published_clock)
-                            VALUES (?1,?2,?3,?4,?5,0,?6,?7,NULL)
+                             published_clock,first_published_generation,first_published_at_ms)
+                            VALUES (?1,?2,?3,?4,?5,0,?6,?7,NULL,NULL,NULL)
                             ON CONFLICT(owner,space,key) DO UPDATE SET
                                 value=excluded.value,
                                 byte_size=excluded.byte_size,
                                 tombstone=0,
                                 write_clock=excluded.write_clock,
                                 writer_id=excluded.writer_id,
-                                published_clock=NULL",
+                                published_clock=NULL,
+                                first_published_generation=NULL,
+                                first_published_at_ms=NULL",
                         params![
                             owner,
                             space,
@@ -246,7 +248,8 @@ impl DeviceStore {
                     transaction.execute(
                         "UPDATE plugin_device_storage
                             SET value=NULL,byte_size=0,tombstone=1,write_clock=?4,writer_id=?5,
-                                published_clock=NULL
+                                published_clock=NULL,first_published_generation=NULL,
+                                first_published_at_ms=NULL
                             WHERE owner=?1 AND space=?2 AND key=?3 AND tombstone=0",
                         params![owner, space, key, clock.as_str(), writer_id],
                     )?;
@@ -267,7 +270,8 @@ impl DeviceStore {
                         transaction.execute(
                             "UPDATE plugin_device_storage
                                 SET value=NULL,byte_size=0,tombstone=1,write_clock=?4,writer_id=?5,
-                                    published_clock=NULL
+                                    published_clock=NULL,first_published_generation=NULL,
+                                    first_published_at_ms=NULL
                                 WHERE owner=?1 AND space=?2 AND key=?3",
                             params![owner, space, key, clock.as_str(), writer_id],
                         )?;

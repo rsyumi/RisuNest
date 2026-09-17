@@ -32,7 +32,7 @@ use reqwest::Method;
 use risunest_external_storage_format::section::{InlineOrObject, SectionEntry, SectionValue};
 use risunest_sync_wire::{
     canonical, change_digest::ChangeDigest, ChangeSet, CommitIntent, Domain, ReadFence, Receipt,
-    RecordChange, RecordVersion, RemoteHead, ScopeFence, MAX_METADATA_BYTES,
+    RecordChange, RecordVersion, RemoteHead, ScopeFence, Sequence, MAX_METADATA_BYTES,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -1534,6 +1534,28 @@ impl PersistentStore {
             .project_bytes(&bytes, &dependencies, &[], Vec::new())?
             .version)
     }
+    /// The commit a section publication started now would land in. A removal
+    /// this device has not published yet is stamped with it as its entry is
+    /// first projected, so the entry encodes the same bytes on every later
+    /// cycle and the replica can settle it.
+    fn section_publication_generation(&self, domain: Domain) -> Result<Sequence> {
+        let applied: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT applied_seq FROM server_sync_remote_sections WHERE domain=?1",
+                params![domain.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let applied = match applied {
+            Some(value) => Sequence::try_from(value)
+                .map_err(|_| SyncError::new("invalid-remote-section-sequence", 502))?,
+            None => Sequence::from(0u64),
+        };
+        applied
+            .next()
+            .map_err(|_| SyncError::new("invalid-remote-section-sequence", 502))
+    }
     /// Decides every section key this cycle touches. A section settles on the
     /// entry's own write clock, so there is always one winner and no conflict
     /// for the caller to resolve.
@@ -1549,6 +1571,11 @@ impl PersistentStore {
         if participation.is_empty() {
             return Ok((0, 0));
         }
+        let now_ms = u64::try_from(
+            crate::persistent_store::device_store::now_ms()
+                .map_err(|_| SyncError::new("invalid-device-clock", 500))?,
+        )
+        .map_err(|_| SyncError::new("invalid-device-clock", 500))?;
         for (domain, _) in participation {
             let mut after = String::new();
             loop {
@@ -1594,6 +1621,14 @@ impl PersistentStore {
                     .map_err(|_| SyncError::new("invalid-local-section", 409))?;
                 let remote = remote_version(&self.connection, domain, &key)?;
                 let (base, _) = self.effective_server_base(domain, &key, committed)?;
+                let generation = self.section_publication_generation(domain)?;
+                sections::stamp_unpublished_removal(
+                    self.device_store()?,
+                    domain,
+                    &key,
+                    &generation,
+                    now_ms,
+                )?;
                 let local = sections::read_local(self.device_store()?, domain, &key)?;
                 let (action, version) = if remote == base {
                     match &local {

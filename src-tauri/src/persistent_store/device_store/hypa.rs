@@ -120,8 +120,9 @@ impl DeviceStore {
             let mut statement = transaction.prepare(
                 "INSERT INTO hypa_embeddings
                     (cache_key,producer,model,endpoint,preprocess_version,dimensions,vector,
-                     metadata,tombstone,write_clock,writer_id,published_clock)
-                    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,?9,?10,NULL)
+                     metadata,tombstone,write_clock,writer_id,published_clock,
+                     first_published_generation,first_published_at_ms)
+                    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,?9,?10,NULL,NULL,NULL)
                     ON CONFLICT(cache_key) DO UPDATE SET
                         producer=excluded.producer,
                         model=excluded.model,
@@ -133,7 +134,9 @@ impl DeviceStore {
                         tombstone=0,
                         write_clock=excluded.write_clock,
                         writer_id=excluded.writer_id,
-                        published_clock=NULL",
+                        published_clock=NULL,
+                        first_published_generation=NULL,
+                        first_published_at_ms=NULL",
             )?;
             for entry in entries {
                 let clock = issue_write_clock(&transaction, Section::Hypa)?;

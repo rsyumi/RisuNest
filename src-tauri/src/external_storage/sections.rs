@@ -3,7 +3,7 @@
 //! change without changing what the repository holds.
 use super::contract::{Cancellation, ErrorKind, ProviderError, Result};
 use crate::persistent_store::device_store::{
-    sections::{SectionCursor, SectionRow, SectionValueRow},
+    sections::{SectionCursor, SectionKey, SectionRow, SectionValueRow, TombstonePublication},
     Section,
 };
 use risunest_external_storage_format::{
@@ -50,6 +50,94 @@ pub(crate) struct CapturedSection {
     pub max_write_clock: Sequence,
     pub content_fingerprint: [u8; 32],
     pub sources: Vec<SectionSource>,
+}
+
+/// What a confirmed publication has to record locally for one section. Nothing
+/// here is written before the remote holds the captured content, so a failed
+/// publication leaves the device file as it was.
+#[derive(Clone, Debug)]
+pub(crate) struct SectionPublication {
+    pub section: Section,
+    pub published: Vec<(SectionKey, Sequence)>,
+    /// Removals this capture is publishing for the first time, with the marker
+    /// the entries carry.
+    pub stamped: Vec<(SectionKey, Sequence)>,
+    pub first_published: TombstonePublication,
+    /// Removals this capture stopped carrying, and the floor it published.
+    pub reclaimed: BTreeSet<SectionKey>,
+    pub gc_floor: Sequence,
+}
+
+/// How long a removal stays after the commit that first published it.
+pub(crate) const TOMBSTONE_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+
+/// Stamps the removals this capture is publishing for the first time. A marker
+/// a removal already carries is what every other device has, so it is kept. A
+/// capture with no commit number of its own has none to give, so a removal it
+/// has never published is left out of it entirely.
+fn stamp_removals(
+    rows: Vec<SectionRow>,
+    marker: &TombstonePublication,
+) -> (Vec<SectionRow>, Vec<(SectionKey, Sequence)>) {
+    let publishing = marker.generation > Sequence::from(0u64);
+    let mut stamped = Vec::new();
+    let rows = rows
+        .into_iter()
+        .filter_map(|row| match &row.value {
+            SectionValueRow::Tombstone {
+                first_published: None,
+            } => {
+                if !publishing {
+                    return None;
+                }
+                stamped.push((row.key(), row.write_clock.clone()));
+                Some(SectionRow {
+                    value: SectionValueRow::Tombstone {
+                        first_published: Some(marker.clone()),
+                    },
+                    ..row
+                })
+            }
+            _ => Some(row),
+        })
+        .collect();
+    (rows, stamped)
+}
+
+/// The removals this publication can stop carrying: past the retention period,
+/// first published in a commit the remote section has already reached, and
+/// still carried by the state this device has applied. The floor the section
+/// publishes moves up to the highest commit they were first published in.
+fn reclaimable_removals(
+    rows: &[SectionRow],
+    reference: Option<&wire::SectionSnapshotRef>,
+    cursor: Option<&SectionCursor>,
+    gc_floor: &Sequence,
+    now_ms: u64,
+) -> (BTreeSet<SectionKey>, Sequence) {
+    let (Some(reference), Some(cursor)) = (reference, cursor) else {
+        return (BTreeSet::new(), gc_floor.clone());
+    };
+    // A device that has not applied the section the remote holds cannot tell
+    // which removals are still carried there.
+    if cursor.applied_generation < reference.generation {
+        return (BTreeSet::new(), gc_floor.clone());
+    }
+    let mut reclaimed = BTreeSet::new();
+    let mut floor = gc_floor.clone();
+    for row in rows {
+        let Some(marker) = row.value.first_published() else {
+            continue;
+        };
+        if marker.generation > reference.generation
+            || now_ms.saturating_sub(marker.at_ms) < TOMBSTONE_RETENTION_MS
+        {
+            continue;
+        }
+        reclaimed.insert(row.key());
+        floor = floor.max(marker.generation.clone());
+    }
+    (reclaimed, floor)
 }
 
 pub(crate) fn section_of(kind: SectionKind) -> Option<Section> {
@@ -135,7 +223,15 @@ fn section_value(
     sources: &mut Vec<SectionSource>,
 ) -> Result<SectionValue> {
     match (&row.value, kind) {
-        (SectionValueRow::Tombstone, _) => Ok(SectionValue::Tombstone),
+        (SectionValueRow::Tombstone { first_published }, _) => {
+            let marker = first_published
+                .as_ref()
+                .ok_or_else(|| corrupt("removal has no first publication marker"))?;
+            Ok(SectionValue::tombstone(
+                marker.generation.clone(),
+                marker.at_ms,
+            ))
+        }
         (
             SectionValueRow::Hypa {
                 producer,
@@ -293,30 +389,84 @@ pub(crate) fn capture_backup_sections(
 pub(crate) fn capture_state_sections(
     store: &mut crate::persistent_store::PersistentStore,
     generation: &Sequence,
+    parent: &BTreeMap<String, wire::SectionSnapshotRef>,
+    connection_id: &str,
+    library_lineage: &str,
     spool: &Path,
     cancel: &Cancellation,
-) -> Result<Vec<CapturedSection>> {
+) -> Result<(Vec<CapturedSection>, Vec<SectionPublication>)> {
+    let at_ms = u64::try_from(
+        crate::persistent_store::device_store::now_ms().map_err(device_error)?,
+    )
+    .map_err(corrupt)?;
     let device = store.device_store_mut().map_err(device_error)?;
     let mut captured = Vec::new();
+    let mut publications = Vec::new();
     for kind in [SectionKind::Hypa, SectionKind::LocalPlugins] {
         let section = section_of(kind).expect("synchronizable section");
         let state = device.section_state(section).map_err(device_error)?;
         if !state.participating {
             continue;
         }
-        let rows = device.read_section_rows(section).map_err(device_error)?;
+        let reference = parent.get(kind.id());
+        let cursor = device
+            .read_section_cursor(connection_id, library_lineage, section)
+            .map_err(device_error)?;
+        // A remote whose floor stands above what this device applied has
+        // reclaimed removals this device never saw, so publishing over it as an
+        // increment would bring their values back. Dropping the cursor sends the
+        // section through the rejoin path on the next cycle instead.
+        let applied = cursor
+            .as_ref()
+            .map(|cursor| cursor.applied_generation.clone())
+            .unwrap_or_else(|| Sequence::from(0u64));
+        if reference.is_some_and(|reference| reference.gc_floor > applied) {
+            device
+                .forget_section_cursor(connection_id, library_lineage, section)
+                .map_err(device_error)?;
+            return Err(transient("this device is behind the remote section floor"));
+        }
+        let held = device.read_section_rows(section).map_err(device_error)?;
+        let (reclaimed, gc_floor) = reclaimable_removals(
+            &held,
+            reference,
+            cursor.as_ref(),
+            &state.gc_floor,
+            at_ms,
+        );
+        let marker = TombstonePublication {
+            generation: generation.clone(),
+            at_ms,
+        };
+        let (rows, stamped) = stamp_removals(
+            held.into_iter()
+                .filter(|row| !reclaimed.contains(&row.key()))
+                .collect(),
+            &marker,
+        );
         captured.push(capture_section(
             kind,
             &rows,
             true,
             generation.clone(),
-            state.gc_floor.clone(),
+            gc_floor.clone(),
             state.max_write_clock.clone(),
             &spool.join(kind.id()),
             cancel,
         )?);
+        publications.push(SectionPublication {
+            section,
+            published: rows
+                .iter()
+                .map(|row| (row.key(), row.write_clock.clone()))
+                .collect(),
+            stamped,
+            first_published: marker,
+            reclaimed,
+            gc_floor,
+        });
     }
-    Ok(captured)
+    Ok((captured, publications))
 }
 
 /// The sections this device takes part in that this remote lineage holds no
@@ -337,7 +487,7 @@ pub(crate) fn rejoining_sections(
         if device
             .read_section_cursor(connection_id, library_lineage, section)
             .map_err(device_error)?
-            .is_none()
+            .is_none_or(|cursor| !cursor.joined())
         {
             wanted.insert(kind.id().to_owned());
         }
@@ -377,12 +527,37 @@ pub(crate) fn apply_received_section(
     if !device.section_state(section).map_err(device_error)?.participating {
         return Ok(());
     }
+    let cursor = device
+        .read_section_cursor(connection_id, library_lineage, section)
+        .map_err(device_error)?;
+    // A floor above what this device has applied means the removals between
+    // them were reclaimed before this device ever saw them, so the section
+    // cannot be carried forward as an increment.
+    let arrival = match &cursor {
+        Some(cursor) if prepared.gc_floor > cursor.applied_generation => SectionArrival::Rejoining,
+        _ => arrival,
+    };
+    // Markers name commits of one lineage only, so a section from a lineage
+    // this device holds no cursor for decides nothing about them.
+    let reclaim_floor = cursor
+        .map(|_| prepared.gc_floor.clone())
+        .unwrap_or_else(|| Sequence::from(0u64));
     if arrival == SectionArrival::Rejoining {
+        // Reissuing rewrites this device's rows as new writes, so a removal the
+        // remote reclaimed has to go before it can come back with a new version.
+        device
+            .reclaim_section_tombstones(section, &reclaim_floor, &rows)
+            .map_err(device_error)?;
         device
             .reissue_section_rows(section, &prepared.max_write_clock, &rows)
             .map_err(device_error)?;
     }
     device.apply_section_rows(section, &rows).map_err(device_error)?;
+    if arrival == SectionArrival::Continuing {
+        device
+            .reclaim_section_tombstones(section, &reclaim_floor, &rows)
+            .map_err(device_error)?;
+    }
     device
         .write_section_cursor(
             connection_id,
@@ -442,7 +617,15 @@ fn row_of(
         SectionKind::LocalSettings => decode_setting_entry_key(&entry.key)?,
     };
     let value = match &entry.value {
-        SectionValue::Tombstone => SectionValueRow::Tombstone,
+        SectionValue::Tombstone {
+            first_published_generation,
+            first_published_at_ms,
+        } => SectionValueRow::Tombstone {
+            first_published: Some(TombstonePublication {
+                generation: first_published_generation.clone(),
+                at_ms: *first_published_at_ms,
+            }),
+        },
         SectionValue::Hypa(value) => {
             let vector = match &value.vector {
                 InlineOrObject::Inline(_) => value.vector.decode_inline().map_err(corrupt)?,
@@ -527,6 +710,84 @@ mod tests {
             write_clock: Sequence::from(clock),
             writer_id: writer.into(),
         }
+    }
+
+    fn plugin_tombstone(
+        key: &str,
+        clock: u64,
+        writer: &str,
+        marker: Option<(u64, u64)>,
+    ) -> SectionRow {
+        SectionRow {
+            value: SectionValueRow::Tombstone {
+                first_published: marker.map(|(generation, at_ms)| TombstonePublication {
+                    generation: Sequence::from(generation),
+                    at_ms,
+                }),
+            },
+            ..plugin_row(key, "", clock, writer)
+        }
+    }
+
+    /// Every plugin key the device file still holds, with the removals marked.
+    fn held_plugin_keys(store: &mut PersistentStore) -> Vec<(String, bool)> {
+        store
+            .device_store_mut()
+            .expect("open device store")
+            .read_section_rows(Section::LocalPlugins)
+            .expect("read section rows")
+            .into_iter()
+            .map(|row| (row.key3, row.value.is_tombstone()))
+            .collect()
+    }
+
+    fn remote_section(
+        rows: &[SectionRow],
+        generation: u64,
+        gc_floor: u64,
+        max_write_clock: u64,
+        spool: &Path,
+    ) -> CapturedSection {
+        capture_section(
+            SectionKind::LocalPlugins,
+            rows,
+            true,
+            Sequence::from(generation),
+            Sequence::from(gc_floor),
+            Sequence::from(max_write_clock),
+            spool,
+            &Cancellation::default(),
+        )
+        .expect("capture a remote plugin section")
+    }
+
+    fn joined(store: &mut PersistentStore, generation: u64, observed: u64) {
+        store
+            .device_store_mut()
+            .expect("open device store")
+            .write_section_cursor(
+                "connection",
+                "library",
+                Section::LocalPlugins,
+                &SectionCursor {
+                    applied_generation: Sequence::from(generation),
+                    applied_gc_floor: Sequence::from(0u64),
+                    observed_max_write_clock: Sequence::from(observed),
+                },
+            )
+            .expect("record what this lineage carried");
+    }
+
+    fn participating_plugin_store(root: &Path) -> PersistentStore {
+        let mut store = PersistentStore::open(root).expect("open persistent store");
+        let device = store.device_store_mut().expect("open device store");
+        device
+            .set_section_participating(Section::LocalPlugins, true)
+            .expect("take part in the plugin section");
+        device
+            .set_section_participating(Section::Hypa, false)
+            .expect("leave the embedding section out");
+        store
     }
 
     fn hypa_row(key: &str, clock: u64, writer: &str, dimensions: i64) -> SectionRow {
@@ -795,9 +1056,12 @@ mod tests {
         )
         .expect("rejoin the plugin section");
 
-        let published = capture_state_sections(
+        let (published, _) = capture_state_sections(
             &mut store,
             &Sequence::from(4u64),
+            &BTreeMap::new(),
+            "connection",
+            "library",
             &spool.path().join("published"),
             &Cancellation::default(),
         )
@@ -850,9 +1114,12 @@ mod tests {
                 .max_write_clock,
             settled
         );
-        let republished = capture_state_sections(
+        let (republished, _) = capture_state_sections(
             &mut store,
             &Sequence::from(5u64),
+            &BTreeMap::new(),
+            "connection",
+            "library",
             &spool.path().join("republished"),
             &Cancellation::default(),
         )
@@ -865,6 +1132,664 @@ mod tests {
                     .expect("published plugin section")
             ),
             published_plugin_values(plugins)
+        );
+    }
+
+    /// A confirmed publication records the versions it carried, so the next
+    /// cycle stops offering the same section. A write that landed after the
+    /// capture is outside that record and still owes a publication.
+    #[test]
+    fn a_recorded_publication_does_not_make_every_cycle_capture_again() {
+        let spool = tempfile::tempdir().expect("create spool");
+        let root = tempfile::tempdir().expect("create store root");
+        let mut store = PersistentStore::open(root.path()).expect("open persistent store");
+        {
+            let device = store.device_store_mut().expect("open device store");
+            device
+                .set_section_participating(Section::LocalPlugins, true)
+                .expect("take part in the plugin section");
+            device
+                .set_section_participating(Section::Hypa, false)
+                .expect("leave the embedding section out");
+            device
+                .write_plugin_device_values(
+                    "plugin-a",
+                    &[PluginDeviceMutation::Set {
+                        space: "string".into(),
+                        key: "mine".into(),
+                        value: "local".into(),
+                    }],
+                )
+                .expect("write a local plugin value");
+            device
+                .write_section_cursor(
+                    "connection",
+                    "library",
+                    Section::LocalPlugins,
+                    &SectionCursor {
+                        applied_generation: Sequence::from(3u64),
+                        applied_gc_floor: Sequence::from(0u64),
+                        observed_max_write_clock: Sequence::from(1u64),
+                    },
+                )
+                .expect("record what this lineage carried");
+        }
+        let (_, publications) = capture_state_sections(
+            &mut store,
+            &Sequence::from(4u64),
+            &BTreeMap::new(),
+            "connection",
+            "library",
+            &spool.path().join("published"),
+            &Cancellation::default(),
+        )
+        .expect("capture the state sections");
+        assert_eq!(publications.len(), 1);
+
+        let device = store.device_store_mut().expect("open device store");
+        assert!(device
+            .sections_await_publication("connection", "library")
+            .expect("read awaiting publication"));
+        for publication in &publications {
+            device
+                .note_section_published(
+                    publication.section,
+                    &publication.published,
+                    &publication.stamped,
+                    &publication.first_published,
+                    &publication.reclaimed,
+                    &publication.gc_floor,
+                )
+                .expect("record the confirmed publication");
+        }
+        assert!(!device
+            .sections_await_publication("connection", "library")
+            .expect("read awaiting publication"));
+
+        device
+            .write_plugin_device_values(
+                "plugin-a",
+                &[PluginDeviceMutation::Set {
+                    space: "string".into(),
+                    key: "mine".into(),
+                    value: "changed".into(),
+                }],
+            )
+            .expect("write over the published value");
+        assert!(device
+            .sections_await_publication("connection", "library")
+            .expect("read awaiting publication"));
+    }
+
+    fn removal_marker(store: &mut PersistentStore, key: &str) -> Option<TombstonePublication> {
+        store
+            .device_store_mut()
+            .expect("open device store")
+            .read_section_rows(Section::LocalPlugins)
+            .expect("read section rows")
+            .into_iter()
+            .find(|row| row.key3 == key)
+            .and_then(|row| match row.value {
+                SectionValueRow::Tombstone { first_published } => first_published,
+                _ => None,
+            })
+    }
+
+    /// A removal this device has not published yet takes the commit number and
+    /// the time of the publication that carries it, and the device file records
+    /// the same marker once that publication is confirmed. A removal that
+    /// already carries one keeps it, so every device judges its age alike.
+    #[test]
+    fn a_removal_takes_the_marker_of_the_publication_that_carries_it() {
+        let spool = tempfile::tempdir().expect("create spool");
+        let root = tempfile::tempdir().expect("create store root");
+        let mut store = PersistentStore::open(root.path()).expect("open persistent store");
+        {
+            let device = store.device_store_mut().expect("open device store");
+            device
+                .set_section_participating(Section::LocalPlugins, true)
+                .expect("take part in the plugin section");
+            device
+                .set_section_participating(Section::Hypa, false)
+                .expect("leave the embedding section out");
+            device
+                .write_plugin_device_values(
+                    "plugin-a",
+                    &[PluginDeviceMutation::Set {
+                        space: "string".into(),
+                        key: "gone".into(),
+                        value: "value".into(),
+                    }],
+                )
+                .expect("write a local plugin value");
+            device
+                .write_plugin_device_values(
+                    "plugin-a",
+                    &[PluginDeviceMutation::Delete {
+                        space: "string".into(),
+                        key: "gone".into(),
+                    }],
+                )
+                .expect("remove the local plugin value");
+        }
+        assert!(removal_marker(&mut store, "gone").is_none());
+
+        let (captured, publications) = capture_state_sections(
+            &mut store,
+            &Sequence::from(4u64),
+            &BTreeMap::new(),
+            "connection",
+            "library",
+            &spool.path().join("published"),
+            &Cancellation::default(),
+        )
+        .expect("capture the state sections");
+        let plugins = captured
+            .iter()
+            .find(|section| section.kind == SectionKind::LocalPlugins)
+            .expect("published plugin section");
+        let decoded = decode_section(
+            SectionKind::LocalPlugins,
+            &carried(plugins),
+            &plugins.content_fingerprint,
+        )
+        .expect("decode the published section");
+        let SectionValueRow::Tombstone { first_published } = &decoded[0].value else {
+            panic!("the removal did not travel as one");
+        };
+        let carried_marker = first_published.clone().expect("a published marker");
+        assert_eq!(carried_marker.generation, Sequence::from(4u64));
+        assert!(carried_marker.at_ms > 0);
+        // Nothing is recorded before the remote holds the capture.
+        assert!(removal_marker(&mut store, "gone").is_none());
+
+        for publication in &publications {
+            store
+                .device_store_mut()
+                .expect("open device store")
+                .note_section_published(
+                    publication.section,
+                    &publication.published,
+                    &publication.stamped,
+                    &publication.first_published,
+                    &publication.reclaimed,
+                    &publication.gc_floor,
+                )
+                .expect("record the confirmed publication");
+        }
+        assert_eq!(removal_marker(&mut store, "gone"), Some(carried_marker));
+
+        let (republished, _) = capture_state_sections(
+            &mut store,
+            &Sequence::from(5u64),
+            &BTreeMap::new(),
+            "connection",
+            "library",
+            &spool.path().join("republished"),
+            &Cancellation::default(),
+        )
+        .expect("capture the state sections again");
+        let plugins = republished
+            .iter()
+            .find(|section| section.kind == SectionKind::LocalPlugins)
+            .expect("published plugin section");
+        let decoded = decode_section(
+            SectionKind::LocalPlugins,
+            &carried(plugins),
+            &plugins.content_fingerprint,
+        )
+        .expect("decode the republished section");
+        assert_eq!(decoded[0].value, removal_marker_row(&mut store, "gone"));
+    }
+
+    fn removal_marker_row(store: &mut PersistentStore, key: &str) -> SectionValueRow {
+        SectionValueRow::Tombstone {
+            first_published: removal_marker(store, key),
+        }
+    }
+
+    /// A removal the remote reclaimed goes, and one it still carries stays even
+    /// when the floor stands above it: a floor is the boundary for rejoining,
+    /// not a verdict on every removal below it. A removal this device has not
+    /// published is its own new one and is never judged by a remote's floor,
+    /// and a section from a lineage this device never exchanged with decides
+    /// nothing, because commit numbers mean nothing across lineages.
+    #[test]
+    fn only_the_removals_a_remote_reclaimed_leave_this_device() {
+        let spool = tempfile::tempdir().expect("create spool");
+        let root = tempfile::tempdir().expect("create store root");
+        let mut store = participating_plugin_store(root.path());
+        {
+            let device = store.device_store_mut().expect("open device store");
+            device
+                .apply_section_rows(
+                    Section::LocalPlugins,
+                    &[
+                        plugin_tombstone("reclaimed", 10, "writer-a", Some((10, 1))),
+                        plugin_tombstone("held", 11, "writer-a", Some((10, 2))),
+                        plugin_row("kept", "from-a", 12, "writer-a"),
+                    ],
+                )
+                .expect("take the remote removals");
+            device
+                .write_plugin_device_values(
+                    "plugin-a",
+                    &[PluginDeviceMutation::Set {
+                        space: "string".into(),
+                        key: "fresh".into(),
+                        value: "value".into(),
+                    }],
+                )
+                .expect("write a local plugin value");
+            device
+                .write_plugin_device_values(
+                    "plugin-a",
+                    &[PluginDeviceMutation::Delete {
+                        space: "string".into(),
+                        key: "fresh".into(),
+                    }],
+                )
+                .expect("remove the local plugin value");
+        }
+        joined(&mut store, 11, 13);
+        // The remote reclaimed the removal at commit 10 and kept the other,
+        // so its floor stands at 11 while it still carries the held one.
+        let remote = remote_section(
+            &[
+                plugin_tombstone("held", 11, "writer-a", Some((10, 2))),
+                plugin_row("kept", "from-a", 12, "writer-a"),
+            ],
+            12,
+            11,
+            13,
+            &spool.path().join("remote"),
+        );
+
+        // Another lineage numbers its commits differently, so its floor says
+        // nothing about markers this lineage issued.
+        apply_received_section(
+            &mut store,
+            "connection",
+            "other-library",
+            SectionArrival::Continuing,
+            &prepared(&remote),
+        )
+        .expect("apply the section of another lineage");
+        assert!(held_plugin_keys(&mut store).contains(&("reclaimed".to_owned(), true)));
+
+        apply_received_section(
+            &mut store,
+            "connection",
+            "library",
+            SectionArrival::Continuing,
+            &prepared(&remote),
+        )
+        .expect("apply the received section");
+        assert_eq!(
+            held_plugin_keys(&mut store),
+            vec![
+                ("fresh".to_owned(), true),
+                ("held".to_owned(), true),
+                ("kept".to_owned(), false),
+            ]
+        );
+
+        // The next full capture carries exactly what is left: the removal the
+        // remote still holds, this device's own unpublished removal, and the
+        // value. The reclaimed key does not come back in any form.
+        let (captured, _) = capture_state_sections(
+            &mut store,
+            &Sequence::from(13u64),
+            &BTreeMap::new(),
+            "connection",
+            "library",
+            &spool.path().join("published"),
+            &Cancellation::default(),
+        )
+        .expect("capture the state sections");
+        let plugins = captured
+            .iter()
+            .find(|section| section.kind == SectionKind::LocalPlugins)
+            .expect("published plugin section");
+        assert_eq!(
+            published_plugin_values(plugins),
+            vec![
+                ("fresh".to_owned(), None),
+                ("held".to_owned(), None),
+                ("kept".to_owned(), Some("from-a".to_owned())),
+            ]
+        );
+    }
+
+    /// A device behind a remote's floor has never seen the removals the floor
+    /// covers, so the section arrives as a rejoin however it was offered. Its
+    /// own rows are reissued above everything the remote carries rather than
+    /// published as an increment over a state it never applied.
+    #[test]
+    fn a_floor_above_what_this_device_applied_turns_the_section_into_a_rejoin() {
+        let spool = tempfile::tempdir().expect("create spool");
+        let root = tempfile::tempdir().expect("create store root");
+        let mut store = participating_plugin_store(root.path());
+        {
+            let device = store.device_store_mut().expect("open device store");
+            device
+                .write_plugin_device_values(
+                    "plugin-a",
+                    &[PluginDeviceMutation::Set {
+                        space: "string".into(),
+                        key: "mine".into(),
+                        value: "local".into(),
+                    }],
+                )
+                .expect("write a local plugin value");
+            device
+                .apply_section_rows(
+                    Section::LocalPlugins,
+                    &[plugin_tombstone("reclaimed", 10, "writer-a", Some((10, 1)))],
+                )
+                .expect("take the remote removal");
+        }
+        joined(&mut store, 5, 1);
+        let remote = remote_section(
+            &[plugin_row("theirs", "from-a", 50, "writer-a")],
+            12,
+            11,
+            50,
+            &spool.path().join("remote"),
+        );
+
+        apply_received_section(
+            &mut store,
+            "connection",
+            "library",
+            SectionArrival::Continuing,
+            &prepared(&remote),
+        )
+        .expect("apply the received section");
+        let held = store
+            .device_store_mut()
+            .expect("open device store")
+            .read_section_rows(Section::LocalPlugins)
+            .expect("read section rows");
+        let mine = held
+            .iter()
+            .find(|row| row.key3 == "mine")
+            .expect("this device keeps its own value");
+        assert!(mine.write_clock > Sequence::from(50u64));
+        // Reissuing turns this device's rows into its own newest writes, so a
+        // removal the remote reclaimed has to be gone before that happens or it
+        // returns to the remote under a new version.
+        assert!(held.iter().all(|row| row.key3 != "reclaimed"));
+    }
+
+    fn section_reference(generation: u64, gc_floor: u64) -> wire::SectionSnapshotRef {
+        wire::SectionSnapshotRef {
+            kind: SectionKind::LocalPlugins,
+            codec: risunest_external_storage_format::section::SECTION_CODEC.into(),
+            generation: Sequence::from(generation),
+            gc_floor: Sequence::from(gc_floor),
+            max_write_clock: Sequence::from(0u64),
+            entries_root: wire::StoredObject {
+                header: wire::PublicObjectHeader::new(
+                    "repository".into(),
+                    "catalog-synthetic".into(),
+                    wire::ObjectRole::Catalog,
+                    1,
+                )
+                .expect("a synthetic object header"),
+                locator: wire::WireLocator {
+                    connection_identity: "connection".into(),
+                    collection: None,
+                    object: "catalog-synthetic".into(),
+                },
+                ciphertext_length: 1,
+                ciphertext_sha256: [0; 32],
+                plaintext_length: 1,
+                plaintext_sha256: [0; 32],
+            },
+            content_fingerprint: [0; 32],
+        }
+    }
+
+    fn parent_sections(generation: u64, gc_floor: u64) -> BTreeMap<String, wire::SectionSnapshotRef> {
+        BTreeMap::from([(
+            SectionKind::LocalPlugins.id().to_owned(),
+            section_reference(generation, gc_floor),
+        )])
+    }
+
+    fn now_ms() -> u64 {
+        u64::try_from(crate::persistent_store::device_store::now_ms().expect("read the device clock"))
+            .expect("a time after the epoch")
+    }
+
+    /// A removal past the retention period stops being carried, and the floor
+    /// moves up to the commit it was first published in. Neither happens until
+    /// the publication is confirmed, and a removal still inside the period or
+    /// published above what the remote carries is left alone.
+    #[test]
+    fn a_confirmed_publication_reclaims_the_removals_it_stopped_carrying() {
+        let spool = tempfile::tempdir().expect("create spool");
+        let root = tempfile::tempdir().expect("create store root");
+        let mut store = participating_plugin_store(root.path());
+        let now = now_ms();
+        let expired = now - TOMBSTONE_RETENTION_MS - 1;
+        store
+            .device_store_mut()
+            .expect("open device store")
+            .apply_section_rows(
+                Section::LocalPlugins,
+                &[
+                    plugin_tombstone("old", 10, "writer-a", Some((5, expired))),
+                    plugin_tombstone("recent", 11, "writer-a", Some((5, now))),
+                    plugin_tombstone("unreached", 12, "writer-a", Some((9, expired))),
+                    plugin_row("kept", "from-a", 13, "writer-a"),
+                ],
+            )
+            .expect("take the remote rows");
+        joined(&mut store, 6, 13);
+
+        let (captured, publications) = capture_state_sections(
+            &mut store,
+            &Sequence::from(7u64),
+            &parent_sections(6, 0),
+            "connection",
+            "library",
+            &spool.path().join("published"),
+            &Cancellation::default(),
+        )
+        .expect("capture the state sections");
+        let publication = publications
+            .iter()
+            .find(|publication| publication.section == Section::LocalPlugins)
+            .expect("a plugin publication");
+        assert_eq!(
+            publication.reclaimed,
+            BTreeSet::from([(
+                "plugin-a".to_owned(),
+                "string".to_owned(),
+                "old".to_owned()
+            )])
+        );
+        assert_eq!(publication.gc_floor, Sequence::from(5u64));
+        let plugins = captured
+            .iter()
+            .find(|section| section.kind == SectionKind::LocalPlugins)
+            .expect("a published plugin section");
+        assert_eq!(plugins.gc_floor, Sequence::from(5u64));
+        assert_eq!(
+            published_plugin_values(plugins)
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            vec![
+                "kept".to_owned(),
+                "recent".to_owned(),
+                "unreached".to_owned()
+            ]
+        );
+
+        // A publication that never finished reclaims nothing.
+        assert!(held_plugin_keys(&mut store).contains(&("old".to_owned(), true)));
+        assert_eq!(
+            store
+                .device_store_mut()
+                .expect("open device store")
+                .section_state(Section::LocalPlugins)
+                .expect("read section state")
+                .gc_floor,
+            Sequence::from(0u64)
+        );
+
+        for publication in &publications {
+            store
+                .device_store_mut()
+                .expect("open device store")
+                .note_section_published(
+                    publication.section,
+                    &publication.published,
+                    &publication.stamped,
+                    &publication.first_published,
+                    &publication.reclaimed,
+                    &publication.gc_floor,
+                )
+                .expect("record the confirmed publication");
+        }
+        assert_eq!(
+            held_plugin_keys(&mut store),
+            vec![
+                ("kept".to_owned(), false),
+                ("recent".to_owned(), true),
+                ("unreached".to_owned(), true),
+            ]
+        );
+        assert_eq!(
+            store
+                .device_store_mut()
+                .expect("open device store")
+                .section_state(Section::LocalPlugins)
+                .expect("read section state")
+                .gc_floor,
+            Sequence::from(5u64)
+        );
+    }
+
+    /// A device whose cursor is below the remote floor has not seen the
+    /// removals the floor covers, so it may not publish an increment over them.
+    /// Forgetting how far it applied sends the section through the rejoin path.
+    #[test]
+    fn a_device_behind_the_remote_floor_does_not_publish_an_increment() {
+        let spool = tempfile::tempdir().expect("create spool");
+        let root = tempfile::tempdir().expect("create store root");
+        let mut store = participating_plugin_store(root.path());
+        {
+            let device = store.device_store_mut().expect("open device store");
+            device
+                .write_plugin_device_values(
+                    "plugin-a",
+                    &[PluginDeviceMutation::Set {
+                        space: "string".into(),
+                        key: "mine".into(),
+                        value: "local".into(),
+                    }],
+                )
+                .expect("write a local plugin value");
+            device
+                .apply_section_rows(
+                    Section::LocalPlugins,
+                    &[plugin_tombstone("reclaimed", 10, "writer-a", Some((10, 1)))],
+                )
+                .expect("take the remote removal");
+            device
+                .write_plugin_device_values(
+                    "plugin-a",
+                    &[
+                        PluginDeviceMutation::Set {
+                            space: "string".into(),
+                            key: "fresh".into(),
+                            value: "value".into(),
+                        },
+                        PluginDeviceMutation::Delete {
+                            space: "string".into(),
+                            key: "fresh".into(),
+                        },
+                    ],
+                )
+                .expect("remove a value this device never published");
+        }
+        joined(&mut store, 5, 1);
+
+        assert!(capture_state_sections(
+            &mut store,
+            &Sequence::from(13u64),
+            &parent_sections(12, 11),
+            "connection",
+            "library",
+            &spool.path().join("published"),
+            &Cancellation::default(),
+        )
+        .is_err());
+        assert_eq!(
+            rejoining_sections(&mut store, "connection", "library").expect("read rejoining"),
+            BTreeSet::from(["local-plugins".to_owned()])
+        );
+        assert!(store
+            .device_store_mut()
+            .expect("open device store")
+            .sections_await_publication("connection", "library")
+            .expect("read awaiting publication"));
+
+        // The rejoin that follows still knows these markers came from this
+        // lineage, so it drops what the remote reclaimed before reissuing.
+        // Reissuing first would put the removal back under a new version and
+        // bury whatever another device wrote for that key since.
+        let remote = remote_section(
+            &[plugin_row("theirs", "from-a", 50, "writer-a")],
+            12,
+            11,
+            50,
+            &spool.path().join("remote"),
+        );
+        apply_received_section(
+            &mut store,
+            "connection",
+            "library",
+            SectionArrival::Rejoining,
+            &prepared(&remote),
+        )
+        .expect("rejoin the plugin section");
+        assert_eq!(
+            held_plugin_keys(&mut store),
+            vec![
+                ("fresh".to_owned(), true),
+                ("mine".to_owned(), false),
+                ("theirs".to_owned(), false),
+            ]
+        );
+        let (captured, _) = capture_state_sections(
+            &mut store,
+            &Sequence::from(13u64),
+            &parent_sections(12, 11),
+            "connection",
+            "library",
+            &spool.path().join("republished"),
+            &Cancellation::default(),
+        )
+        .expect("capture the state sections after the rejoin");
+        assert_eq!(
+            published_plugin_values(
+                captured
+                    .iter()
+                    .find(|section| section.kind == SectionKind::LocalPlugins)
+                    .expect("a published plugin section")
+            )
+            .into_iter()
+            .collect::<Vec<_>>(),
+            vec![
+                ("fresh".to_owned(), None),
+                ("mine".to_owned(), Some("local".to_owned())),
+                ("theirs".to_owned(), Some("from-a".to_owned())),
+            ]
         );
     }
 

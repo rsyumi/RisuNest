@@ -89,7 +89,10 @@ CREATE TABLE plugin_device_storage(
   write_clock TEXT NOT NULL,
   writer_id TEXT NOT NULL,
   published_clock TEXT,
-  PRIMARY KEY (owner, space, key)
+  first_published_generation TEXT,
+  first_published_at_ms INTEGER,
+  PRIMARY KEY (owner, space, key),
+  CHECK((first_published_generation IS NULL)=(first_published_at_ms IS NULL))
 );
 CREATE INDEX plugin_device_storage_clock ON plugin_device_storage(write_clock);
 
@@ -105,7 +108,10 @@ CREATE TABLE hypa_embeddings(
   tombstone INTEGER NOT NULL CHECK(tombstone IN (0,1)),
   write_clock TEXT NOT NULL,
   writer_id TEXT NOT NULL,
-  published_clock TEXT
+  published_clock TEXT,
+  first_published_generation TEXT,
+  first_published_at_ms INTEGER,
+  CHECK((first_published_generation IS NULL)=(first_published_at_ms IS NULL))
 );
 CREATE INDEX hypa_embeddings_clock ON hypa_embeddings(write_clock);
 

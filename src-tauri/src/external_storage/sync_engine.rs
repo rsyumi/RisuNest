@@ -393,7 +393,11 @@ async fn package_capture(
     expected: Option<&ObservedHead>,
     produce: PackageAs,
     cancel: &Cancellation,
-) -> Result<(CompletedSnapshot, TransferJournal)> {
+) -> Result<(
+    CompletedSnapshot,
+    TransferJournal,
+    Vec<super::sections::SectionPublication>,
+)> {
     let root = super::runtime::root(app)?;
     let directory = super::runtime::job_directory(&root, &job.request.connection_id, &job.id);
     let identity = capture.identity.clone();
@@ -426,16 +430,28 @@ async fn package_capture(
         (PackageAs::State, None) => Sequence::from(1u64),
         (PackageAs::Bundle, _) => Sequence::from(0u64),
     };
-    let sections = {
+    let (sections, publications) = {
         let worker_app = app.clone();
         let worker_spool = directory.join("sections");
         let worker_generation = generation.clone();
         let worker_cancel = cancel.clone();
+        // The sections the observed state carries say which removals the remote
+        // still holds and how far it has reclaimed, which is what decides both
+        // whether this device may publish an increment and what it may drop.
+        let worker_parent = parent
+            .as_ref()
+            .map(|view| view.sections.clone())
+            .unwrap_or_default();
+        let worker_connection = job.request.connection_id.clone();
+        let worker_lineage = identity.library_epoch.clone();
         tokio::task::spawn_blocking(move || -> Result<_> {
             let mut store = pds(&worker_app)?;
             super::sections::capture_state_sections(
                 &mut store,
                 &worker_generation,
+                &worker_parent,
+                &worker_connection,
+                &worker_lineage,
                 &worker_spool,
                 &worker_cancel,
             )
@@ -488,7 +504,7 @@ async fn package_capture(
         cancel,
     )
     .await?;
-    Ok((completed, journal))
+    Ok((completed, journal, publications))
 }
 
 async fn receive_remote(
@@ -600,12 +616,25 @@ fn note_sections_published(
         String,
         risunest_external_storage_format::snapshot::SectionSnapshotRef,
     >,
+    publications: &[super::sections::SectionPublication],
 ) -> Result<()> {
-    if sections.is_empty() {
+    if sections.is_empty() && publications.is_empty() {
         return Ok(());
     }
     let mut store = pds(app)?;
     let device = store.device_store_mut().map_err(local_error)?;
+    for publication in publications {
+        device
+            .note_section_published(
+                publication.section,
+                &publication.published,
+                &publication.stamped,
+                &publication.first_published,
+                &publication.reclaimed,
+                &publication.gc_floor,
+            )
+            .map_err(local_error)?;
+    }
     for reference in sections.values() {
         let Some(section) = super::sections::section_of(reference.kind) else {
             continue;
@@ -1003,7 +1032,9 @@ async fn preserve_conflict(
         Some(&remote),
         false,
     )?;
-    let (local, journal) = package_capture(
+    // A bundle keeps this device's own material instead of joining the
+    // synchronized commit order, so it publishes nothing to mark.
+    let (local, journal, _) = package_capture(
         app,
         connected,
         job,
@@ -1129,7 +1160,9 @@ async fn resume_conflict_preservation(
         .catalog
         .content_fingerprint(&library_fingerprint_domain())
         .map_err(local_error)?;
-    let (local, journal) = package_capture(
+    // A bundle keeps this device's own material instead of joining the
+    // synchronized commit order, so it publishes nothing to mark.
+    let (local, journal, _) = package_capture(
         app,
         connected,
         job,
@@ -1699,7 +1732,7 @@ pub(crate) async fn run_sync(
                 .ok_or_else(|| corrupt("missing publication capture"))?;
             let published_identity = capture.identity.clone();
             let local_capture_id = capture.id.clone();
-            let (completed, mut journal) = package_capture(
+            let (completed, mut journal, publications) = package_capture(
                 app,
                 connected,
                 job,
@@ -1798,6 +1831,7 @@ pub(crate) async fn run_sync(
                         &job.request.connection_id,
                         &published_identity.library_epoch,
                         &completed.sections,
+                        &publications,
                     )?;
                     Ok(
                         json!({"snapshotId":completed.snapshot_id,"publishedRevision":published_identity.revision.to_string()}),
