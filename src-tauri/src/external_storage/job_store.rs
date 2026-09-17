@@ -269,6 +269,14 @@ type ActiveJobs = Arc<Mutex<HashMap<String, (String, Cancellation)>>>;
 pub(crate) struct JobClaim {
     _owner: Arc<JobClaimOwner>,
 }
+impl JobClaim {
+    pub(super) fn require_job(&self, state: &JobCommandState, job: &DurableJob) -> Result<()> {
+        if self._owner.id != job.id || !Arc::ptr_eq(&self._owner.active, &state.active) {
+            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+        }
+        Ok(())
+    }
+}
 
 struct JobClaimOwner {
     id: String,
@@ -480,6 +488,42 @@ mod tests {
         drop(retained);
         assert!(state.active.lock().unwrap().is_empty());
         assert!(state.claim(&other).is_ok());
+    }
+
+    #[test]
+    fn cleanup_claim_excludes_restart_until_settlement_finishes() {
+        let state = Arc::new(JobCommandState::default());
+        let job = DurableJob::new(request(), false, 1, identity());
+        let (cancel, worker) = state.claim(&job).unwrap();
+        cancel.cancel();
+        drop(worker);
+        let (_, cleanup) = state.claim(&job).unwrap();
+        let contender_state = state.clone();
+        let contender_job = job.clone();
+        std::thread::spawn(move || {
+            assert!(contender_state.claim(&contender_job).is_err());
+            let mut other = contender_job;
+            other.id = "different-job".into();
+            assert!(contender_state.claim(&other).is_err());
+            other.request.connection_id = "different-connection".into();
+            assert!(contender_state.claim(&other).is_ok());
+        }).join().unwrap();
+        assert_eq!(state.active.lock().unwrap().len(), 1);
+        drop(cleanup);
+        assert!(state.claim(&job).is_ok());
+    }
+
+    #[test]
+    fn a_claim_is_bound_to_its_job_and_runtime_instance() {
+        let state = JobCommandState::default();
+        let other_state = JobCommandState::default();
+        let job = DurableJob::new(request(), false, 1, identity());
+        let (_, claim) = state.claim(&job).unwrap();
+        assert!(claim.require_job(&state, &job).is_ok());
+        assert!(claim.require_job(&other_state, &job).is_err());
+        let mut other_job = job.clone();
+        other_job.id = "different-job".into();
+        assert!(claim.require_job(&state, &other_job).is_err());
     }
 
     #[test]

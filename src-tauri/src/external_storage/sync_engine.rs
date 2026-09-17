@@ -635,11 +635,21 @@ async fn receive_remote(
     cancel.check()?;
     let _admission = app.state::<crate::native_file_jobs::NativeFileJobState>()
         .admission.file(false).map_err(local_error)?;
-    let observation = observation_json(&remote.observation)?;
-    let participation = {
+    let (observation, participation) = {
         let mut store = pds(app)?;
         require_exact_receive_identity(expected, &store.external_identity().map_err(local_error)?)?;
         super::runtime::require_admitted_library(job, expected)?;
+        let existing = store.external_job(&job.id).map_err(local_error)?;
+        let observation = if let Some(pending) = existing.as_ref()
+            .filter(|item| item.role == "restore" && item.phase == "ready")
+        {
+            let original = pending.expected_head.as_deref()
+                .ok_or_else(|| corrupt("missing received head observation"))?;
+            require_received_head(original, Some(&remote.observation))?;
+            original.to_owned()
+        } else {
+            observation_json(&remote.observation)?
+        };
         let intent = crate::persistent_store::external_storage_state::ReceiveIntent {
             job_id: &job.id,
             connection_id: &job.request.connection_id,
@@ -649,7 +659,6 @@ async fn receive_remote(
             authenticated_head: &observation,
             identity: expected,
         };
-        let existing = store.external_job(&job.id).map_err(local_error)?;
         if job.request.kind == JobKind::ResolveConflict {
             if existing.as_ref().is_some_and(|item| matches!(item.phase.as_str(), "stale" | "cancelled")) {
                 store.external_prepare_conflict_receive(&intent).map_err(local_error)?;
@@ -659,7 +668,7 @@ async fn receive_remote(
         }
         store.external_validate_receive(&job.id, &job.request.connection_id, expected, &observation)
             .map_err(|_| ProviderError::new(ErrorKind::PreconditionFailed))?;
-        receive_participation(&mut store)?
+        (observation, receive_participation(&mut store)?)
     };
     // A process restart loses the native commit handle. Only this worker may
     // revalidate the downloaded files and build another inactive generation.
@@ -705,9 +714,8 @@ async fn receive_remote(
             connected.provider.as_ref(), &connected.handle, &connected.stored.descriptor,
             &connected.root_key, None, cancel,
         ).await?;
-        if current.as_ref().map(|head| &head.observation) != Some(&remote.observation) {
-            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
-        }
+        require_received_head(&prepared.authenticated_head,
+            current.as_ref().map(|head| &head.observation))?;
         super::runtime::enter_repository(app, connected, job, cancel).await?;
         {
             let mut store = pds(app)?;
@@ -741,6 +749,17 @@ async fn receive_remote(
         }
     }
     checked
+}
+
+fn require_received_head(expected: &str, observed: Option<&HeadObservation>) -> Result<()> {
+    let expected = parse_observation(expected)?;
+    if !observed.is_some_and(|current| {
+        current.commit_id == expected.commit_id
+            && current.authenticated_body_hash == expected.authenticated_body_hash
+    }) {
+        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -916,9 +935,11 @@ fn completed_receive_result(store: &PersistentStore, job: &DurableJob, expected:
 
 fn take_prepared_receive(
     state: &super::job_store::JobCommandState,
+    claim: &super::job_store::JobClaim,
     job: &DurableJob,
     expected: i64,
 ) -> Result<PreparedReceive> {
+    claim.require_job(state, job)?;
     let active = state.active.lock().map_err(local_error)?;
     let (connection, cancel) = active.get(&job.id)
         .ok_or_else(|| ProviderError::new(ErrorKind::PreconditionFailed))?;
@@ -948,7 +969,7 @@ fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Result<Val
         return Ok(result);
     }
     let state = app.state::<super::job_store::JobCommandState>();
-    let (cancel, _claim) = state.claim(&job)?;
+    let (cancel, claim) = state.claim(&job)?;
     super::runtime::read_job_session(app, &job.id)?;
     let permit = app.state::<crate::native_file_jobs::NativeFileJobState>()
         .admission.file(true).map_err(local_error)?;
@@ -960,7 +981,7 @@ fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Result<Val
     let current = store.external_identity().map_err(local_error)?;
     cancel.check()?;
     super::runtime::read_job_session(app, &job.id)?;
-    let prepared = take_prepared_receive(&state, &job, expected)?;
+    let prepared = take_prepared_receive(&state, &claim, &job, expected)?;
     let snapshot_id = prepared.snapshot_id.clone();
     let outcome = activate_prepared_receive(&mut store, prepared, &current);
     drop(store);
@@ -2190,12 +2211,14 @@ mod receive_tests {
         let prepared = prepare(&mut store, &job, downloaded);
         let state = super::super::job_store::JobCommandState::default();
         state.prepared_receives.lock().unwrap().insert(job.id.clone(), prepared);
-        assert!(take_prepared_receive(&state, &job, 0).is_err());
+        let other_state = super::super::job_store::JobCommandState::default();
+        let (_, unrelated) = other_state.claim(&job).unwrap();
+        assert!(take_prepared_receive(&state, &unrelated, &job, 0).is_err());
         let (_, claim) = state.claim(&job).unwrap();
-        assert!(take_prepared_receive(&state, &job, 1).is_err());
+        assert!(take_prepared_receive(&state, &claim, &job, 1).is_err());
         assert_eq!(state.prepared_receives.lock().unwrap().len(), 1);
-        let prepared = take_prepared_receive(&state, &job, 0).unwrap();
-        assert!(take_prepared_receive(&state, &job, 0).is_err());
+        let prepared = take_prepared_receive(&state, &claim, &job, 0).unwrap();
+        assert!(take_prepared_receive(&state, &claim, &job, 0).is_err());
         activate_prepared_receive(&mut store, prepared, &job.admission_identity).unwrap();
         drop(claim);
         assert_eq!(completed_receive_result(&store, &job, 0).unwrap().unwrap()["receivedRevision"], "1");
@@ -2210,7 +2233,7 @@ mod receive_tests {
         state.prepared_receives.lock().unwrap().insert(job.id.clone(), prepared);
         let (cancel, claim) = state.claim(&job).unwrap();
         cancel.cancel();
-        assert_eq!(take_prepared_receive(&state, &job, 0).err().unwrap().kind, ErrorKind::Cancelled);
+        assert_eq!(take_prepared_receive(&state, &claim, &job, 0).err().unwrap().kind, ErrorKind::Cancelled);
         assert_eq!(state.prepared_receives.lock().unwrap().len(), 1);
         assert!(state.claim(&job).is_err());
         assert_eq!(store.revision().unwrap(), 0);
@@ -2309,12 +2332,38 @@ mod receive_tests {
         drop(store);
         let mut store = PersistentStore::open(directory.path()).unwrap();
         let state = super::super::job_store::JobCommandState::default();
-        let (_, _claim) = state.claim(&job).unwrap();
-        assert!(take_prepared_receive(&state, &job, 0).is_err());
+        let (_, claim) = state.claim(&job).unwrap();
+        assert!(take_prepared_receive(&state, &claim, &job, 0).is_err());
         let prepared = prepare(&mut store, &job, downloaded);
         activate_prepared_receive(&mut store, prepared, &job.admission_identity).unwrap();
         assert_eq!(rows(&mut store), first);
         assert_eq!(store.revision().unwrap(), 1);
+    }
+
+    #[test]
+    fn receive_head_checks_content_without_binding_to_an_old_provider_token() {
+        let original = HeadObservation {
+            commit_id: "received-commit".into(),
+            authenticated_body_hash: "12".repeat(32),
+            version: Some(VersionToken("before".into())),
+        };
+        let encoded = observation_json(&original).unwrap();
+        let mut current = original.clone();
+        for version in [Some(VersionToken("after".into())), None] {
+            current.version = version;
+            assert!(require_received_head(&encoded, Some(&current)).is_ok());
+        }
+        current.commit_id = "different-commit".into();
+        assert_eq!(require_received_head(&encoded, Some(&current)).unwrap_err().kind,
+            ErrorKind::PreconditionFailed);
+        current.commit_id = original.commit_id;
+        current.authenticated_body_hash = "34".repeat(32);
+        assert_eq!(require_received_head(&encoded, Some(&current)).unwrap_err().kind,
+            ErrorKind::PreconditionFailed);
+        assert_eq!(require_received_head(&encoded, None).unwrap_err().kind,
+            ErrorKind::PreconditionFailed);
+        assert_eq!(require_received_head("invalid", Some(&current)).unwrap_err().kind,
+            ErrorKind::Corrupt);
     }
 
     #[test]

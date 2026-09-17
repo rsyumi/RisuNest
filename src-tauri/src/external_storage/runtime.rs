@@ -177,13 +177,9 @@ pub(crate) async fn external_storage_set_sync_target(
         }
         None => SyncTarget::None,
     };
-    if !app
-        .state::<JobCommandState>()
-        .active
-        .lock()
-        .map_err(local_error)?
-        .is_empty()
-    {
+    let state = app.state::<JobCommandState>();
+    let active = state.active.lock().map_err(local_error)?;
+    if !active.is_empty() {
         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
     }
     let admission = app
@@ -194,7 +190,6 @@ pub(crate) async fn external_storage_set_sync_target(
     let selected = native_store(&app)?
         .external_select(&request.expected_selection_epoch, &target)
         .map_err(local_error)?;
-    let state = app.state::<JobCommandState>();
     state.automatic_targets.lock().map_err(local_error)?.clear();
     let prepared: Vec<_> = state.prepared_receives.lock().map_err(local_error)?
         .keys().cloned().collect();
@@ -204,6 +199,7 @@ pub(crate) async fn external_storage_set_sync_target(
             crate::nlog!("error", "Reselected external receive stage could not be discarded");
         }
     }
+    drop(active);
     Ok(selection_dto(selected))
 }
 #[tauri::command]
@@ -237,8 +233,14 @@ pub(crate) async fn external_storage_cancel_job(app: AppHandle, job_id: String) 
         }
     }
     wait_for_job_release(&app, &job_id).await?;
+    // Keep a new worker from claiming the job while cancellation settles it.
+    let (_, _claim) = state.claim(&store.read(&job_id)?)?;
+    let _permit = app.state::<crate::native_file_jobs::NativeFileJobState>()
+        .admission.file(false).map_err(local_error)?;
+    let mut job = reconcile_stopped_job(&app, store.read(&job_id)?)?;
+    state.cancel_automatic_target(&job)?;
     super::sync_engine::discard_receive_preparation(&app, &job_id)?;
-    let mut job = reconcile_job(&app, store.read(&job_id)?)?;
+    job.receive_staging_id = None;
     if job.summary["state"] != "succeeded" {
         let mut pds = native_store(&app)?;
         let authoritative = pds.external_job(&job_id).map_err(local_error)?;
@@ -458,18 +460,16 @@ fn completed_job_result(pds: &mut PersistentStore, job: &DurableJob) -> Result<O
     else {
         return Ok(None);
     };
-    if job.request.kind == JobKind::ResolveConflict
-        && pds
-            .external_conflict(&job.id)
-            .map_err(local_error)?
-            .is_some_and(|record| {
-                matches!(
-                    record.phase,
-                    ConflictPhase::Resolving | ConflictPhase::PublicationUnknown
-                )
-            })
-    {
-        if pds.external_finish_conflict(&job.id).is_err() {
+    if job.request.kind == JobKind::ResolveConflict {
+        let bookkeeping = (|| -> Result<()> {
+            if pds.external_conflict(&job.id).map_err(local_error)?.is_some_and(|record| {
+                matches!(record.phase, ConflictPhase::Resolving | ConflictPhase::PublicationUnknown)
+            }) {
+                pds.external_finish_conflict(&job.id).map_err(local_error)?;
+            }
+            Ok(())
+        })();
+        if bookkeeping.is_err() {
             crate::nlog!("error", "External job completed but conflict bookkeeping did not finish");
         }
     }
@@ -526,20 +526,34 @@ pub(crate) fn require_admitted_library(
     Ok(())
 }
 
-fn reconcile_job(app: &AppHandle, mut job: DurableJob) -> Result<DurableJob> {
+fn reconcile_job(app: &AppHandle, job: DurableJob) -> Result<DurableJob> {
     let state = app.state::<JobCommandState>();
     let active = state.active.lock().map_err(local_error)?;
     if active.contains_key(&job.id) {
         return Ok(job);
     }
+    reconcile_stopped_job(app, job)
+}
+
+// The caller either holds the active-jobs mutex or owns the cleanup claim.
+fn reconcile_stopped_job(app: &AppHandle, mut job: DurableJob) -> Result<DurableJob> {
     let mut pds = native_store(app)?;
     let complete = if job.request.kind == JobKind::Restore {
         super::runtime_restore::completed_restore(app, &job)?
     } else {
         completed_job_result(&mut pds, &job)?
     };
+    if let Some(result) = complete {
+        settle_interrupted(&mut job, Some(result), false);
+        let _ = JobStore::open(&root(app)?).and_then(|store| store.put(&job));
+        return Ok(job);
+    }
     let authoritative = pds.external_job(&job.id).map_err(local_error)?;
-    if complete.is_none() {
+    if settle_unowned_publication(&mut pds, &mut job, authoritative.as_ref())? {
+        let _ = JobStore::open(&root(app)?).and_then(|store| store.put(&job));
+        return Ok(job);
+    }
+    {
         if let Some(intent) = authoritative.as_ref().filter(|item| matches!(item.phase.as_str(), "stale" | "cancelled")) {
             let preserving = pds.external_conflict(&job.id).map_err(local_error)?
                 .is_some_and(|record| record.phase == ConflictPhase::Pending
@@ -564,16 +578,28 @@ fn reconcile_job(app: &AppHandle, mut job: DurableJob) -> Result<DurableJob> {
             return Ok(job);
         }
     }
-    let uncertain = authoritative.as_ref().is_some_and(|item| {
-        ["publishing", "publicationUnknown"].contains(&item.phase.as_str())
-    });
-    if complete.is_none() && authoritative.as_ref().is_some_and(|item| item.phase == "publishing") {
-        pds.external_publication_unknown(&job.id).map_err(local_error)?;
-    }
-    settle_interrupted(&mut job, complete, uncertain);
+    settle_interrupted(&mut job, None, false);
     // The renderer still receives a settled result if its auxiliary cache is unwritable.
     let _ = JobStore::open(&root(app)?).and_then(|store| store.put(&job));
     Ok(job)
+}
+
+fn settle_unowned_publication(
+    store: &mut PersistentStore,
+    job: &mut DurableJob,
+    authoritative: Option<&persistent_store::external_runtime::ExternalJob>,
+) -> Result<bool> {
+    let Some(intent) = authoritative.filter(|item| {
+        item.id == job.id && item.connection_id == job.request.connection_id
+            && matches!(item.phase.as_str(), "publishing" | "publicationUnknown")
+    }) else {
+        return Ok(false);
+    };
+    if intent.phase == "publishing" {
+        store.external_publication_unknown(&job.id).map_err(local_error)?;
+    }
+    settle_interrupted(job, None, true);
+    Ok(true)
 }
 
 fn settle_invalidated(job: &mut DurableJob, phase: &str, preserving: bool) {
@@ -619,6 +645,7 @@ fn settle_interrupted(job: &mut DurableJob, complete: Option<Value>, uncertain: 
         } else {
             "paused"
         });
+        job.summary.as_object_mut().unwrap().remove("result");
         job.summary["error"] = error_dto(&ProviderError::new(ErrorKind::Transient));
     }
     job.summary["updatedAtMs"] = json!(now_ms().to_string());
@@ -1660,6 +1687,69 @@ mod tests {
             store_id: "store".into(), library_epoch: "library".into(), generation: "generation".into(),
             selection_epoch: "selection".into(), revision: 1,
         })
+    }
+
+    fn receive_job_fixture() -> (tempfile::TempDir, PersistentStore, DurableJob) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let epoch = store.external_selection().unwrap().epoch;
+        store.external_select(&epoch, &SyncTarget::External("x".into())).unwrap();
+        let mut job = automatic_job();
+        job.admission_identity = store.external_identity().unwrap();
+        store.external_prepare_receive(&persistent_store::external_storage_state::ReceiveIntent {
+            job_id: &job.id, connection_id: "x", repository_id: "synthetic-repository",
+            snapshot_id: &job.snapshot_id, commit_id: "synthetic-commit",
+            authenticated_head: "authenticated-head", identity: &job.admission_identity,
+        }).unwrap();
+        (directory, store, job)
+    }
+
+    #[test]
+    fn committed_receive_survives_failure_to_read_conflict_bookkeeping() {
+        let (directory, mut store, mut job) = receive_job_fixture();
+        let stage = store.replace_begin().unwrap();
+        store.replace_put_root(&stage.staging_id, &json!({"marker":"synthetic-remote"})).unwrap();
+        let prepared = store.prepare_replace_commit(&stage.staging_id, Some(0)).unwrap();
+        store.finish_external_receive(prepared, &job.id).unwrap();
+        job.request.kind = JobKind::ResolveConflict;
+        let injector = rusqlite::Connection::open(directory.path().join("persistent.sqlite")).unwrap();
+        injector.execute_batch(
+            "ALTER TABLE external_storage_conflicts RENAME TO synthetic_unavailable_conflicts"
+        ).unwrap();
+        assert!(store.external_conflict(&job.id).is_err());
+        for _ in 0..2 {
+            let result = completed_job_result(&mut store, &job).unwrap().unwrap();
+            assert_eq!(result["receivedRevision"], "1");
+            assert_eq!(result["snapshotId"], job.snapshot_id);
+        }
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(store.materialize(None).unwrap()["marker"], "synthetic-remote");
+    }
+
+    #[test]
+    fn stopped_publication_is_unknown_regardless_of_cached_summary() {
+        let (directory, mut store, original) = receive_job_fixture();
+        let injector = rusqlite::Connection::open(directory.path().join("persistent.sqlite")).unwrap();
+        for cached in ["queued", "running", "waiting", "succeeded", "failed", "cancelled"] {
+            injector.execute(
+                "UPDATE external_storage_jobs SET role='sync',strategy='cas',phase='publishing' WHERE id=?1",
+                [&original.id],
+            ).unwrap();
+            let mut job = original.clone();
+            job.summary["state"] = json!(cached);
+            job.summary["result"] = json!({"publishedRevision":"1"});
+            let intent = store.external_job(&job.id).unwrap().unwrap();
+            assert!(settle_unowned_publication(&mut store, &mut job, Some(&intent)).unwrap());
+            assert_eq!(job.summary["state"], "uncertain", "{cached}");
+            assert_eq!(job.summary["phase"], "publication-unknown", "{cached}");
+            assert!(job.summary.get("result").is_none(), "{cached}");
+            let retained = store.external_job(&job.id).unwrap().unwrap();
+            assert_eq!(retained.phase, "publicationUnknown");
+            assert_eq!(retained.commit_id, intent.commit_id);
+            assert_eq!(retained.identity, intent.identity);
+            assert!(settle_unowned_publication(&mut store, &mut job, Some(&retained)).unwrap());
+        }
+        assert_eq!(store.revision().unwrap(), 0);
     }
 
     #[test]
