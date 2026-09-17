@@ -13,6 +13,7 @@ import type {
     ExternalProviderSecretInput,
     ExternalQuotaSummary,
     ExternalRecoveryMaterial,
+    ExternalRetentionPolicy,
     ExternalStorageState,
     ExternalSnapshotExportResult,
     LibrarySyncSelection,
@@ -127,6 +128,10 @@ export class ExternalStorageBridge {
 
     setCapturePolicy(connectionId: string, policy: ExternalCapturePolicy): Promise<void> {
         return this.native('external_storage_set_capture_policy', { connectionId, policy })
+    }
+
+    setRetentionPolicy(connectionId: string, policy: ExternalRetentionPolicy): Promise<void> {
+        return this.native('external_storage_set_retention_policy', { connectionId, policy })
     }
 
     removeConnection(connectionId: string): Promise<void> {

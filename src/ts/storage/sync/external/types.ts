@@ -38,6 +38,16 @@ export interface ExternalCapturePolicy {
     localSettings: boolean
 }
 
+/**
+ * How much of what this device backed up a connection keeps. An automatic
+ * backup point is removed only once it is past both limits; kept, conflict and
+ * recovery-candidate points stay whatever the limits are.
+ */
+export interface ExternalRetentionPolicy {
+    keepCount: number
+    keepDays: number
+}
+
 export interface ExternalCapabilities {
     cas: boolean
     sequential: boolean
@@ -113,6 +123,8 @@ export interface ExternalConnectionSummary {
     displayName: string
     endpoint: ExternalEndpointConfirmation
     capturePolicy?: ExternalCapturePolicy
+    /** The policy in force, which is the default until the user changes it. */
+    retentionPolicy: ExternalRetentionPolicy
     capabilities: ExternalCapabilities
     status: 'ready' | 'paused' | 'reauth-required' | 'key-locked' | 'error'
     lastVerifiedAtMs?: DecimalString

@@ -22,6 +22,7 @@
         ExternalJobSummary,
         ExternalQuotaSummary,
         ExternalRecoveryMaterial,
+        ExternalRetentionPolicy,
         ExternalRestoreArea,
         ExternalRestoreSection,
         ExternalStorageState,
@@ -33,6 +34,8 @@
     const bridge = getExternalStorageBridge()
     /** How many empty history pages one request reads past before stopping. */
     const EMPTY_HISTORY_STEPS = 4
+    /** What a repository accepts for each retention limit. */
+    const RETENTION_LIMITS = { keepCount: [1, 1000], keepDays: [7, 3650] } as const
     const strings = $derived(externalStorageStrings(DBState.db.language))
     let storageState = $state<ExternalStorageState | null>(null)
     let adding = $state(false)
@@ -263,6 +266,37 @@
         } finally {
             busy = false
         }
+    }
+
+    async function changeRetentionPolicy(
+        connection: ExternalConnectionSummary,
+        policy: ExternalRetentionPolicy,
+    ): Promise<void> {
+        busy = true
+        try {
+            await bridge.setRetentionPolicy(connection.id, policy)
+            await refresh(true)
+        } catch (failure) {
+            error = externalErrorMessage(strings, failure)
+        } finally {
+            busy = false
+        }
+    }
+
+    /** A value outside what the repository accepts goes back to the stored one. */
+    function commitRetentionLimit(
+        connection: ExternalConnectionSummary,
+        limit: keyof ExternalRetentionPolicy,
+        input: HTMLInputElement,
+    ): void {
+        const policy = connection.retentionPolicy
+        const [lowest, highest] = RETENTION_LIMITS[limit]
+        const value = Number(input.value)
+        if (!Number.isInteger(value) || value < lowest || value > highest) {
+            input.value = String(policy[limit])
+            return
+        }
+        if (value !== policy[limit]) void changeRetentionPolicy(connection, { ...policy, [limit]: value })
     }
 
     async function removeConnection(connection: ExternalConnectionSummary): Promise<void> {
@@ -554,19 +588,37 @@
                             </div>
                         {/each}
                     </div>
-                {:else if expanded[connection.id] === 'quota' && quota[connection.id]}
+                {:else if expanded[connection.id] === 'quota'}
                     {@const usage = quota[connection.id]}
-                    <div role="tabpanel"><dl class="kv">
-                        <dt>{strings.usedByService}</dt>
-                        <dd>{#if usage.storage.providerPhysicalKnown && usage.storage.providerPhysicalBytes !== null}{bytes(usage.storage.providerPhysicalBytes ?? undefined)}{:else}{strings.unknownUsage} <span class="text-textcolor2">({strings.unknownUsageHelp})</span>{/if}</dd>
-                        <dt>{strings.uploadedLowerBound}</dt>
-                        <dd>{atLeast(usage.storage.locallyUploadedBytesLowerBound)} · {strings.files.replace('{0}', usage.storage.locallyUploadedObjectCountLowerBound)}</dd>
-                        {#if usage.storage.latestReachable}
-                            <dt>{strings.latestReachable}</dt>
-                            <dd>{atLeast(usage.storage.latestReachable.knownDirectBytes)}</dd>
+                    {@const retention = connection.retentionPolicy}
+                    <div class="usage" role="tabpanel">
+                        {#if usage}
+                            <dl class="kv">
+                                <dt>{strings.usedByService}</dt>
+                                <dd>{#if usage.storage.providerPhysicalKnown && usage.storage.providerPhysicalBytes !== null}{bytes(usage.storage.providerPhysicalBytes ?? undefined)}{:else}{strings.unknownUsage} <span class="text-textcolor2">({strings.unknownUsageHelp})</span>{/if}</dd>
+                                <dt>{strings.uploadedLowerBound}</dt>
+                                <dd>{atLeast(usage.storage.locallyUploadedBytesLowerBound)} · {strings.files.replace('{0}', usage.storage.locallyUploadedObjectCountLowerBound)}</dd>
+                                {#if usage.storage.latestReachable}
+                                    <dt>{strings.latestReachable}</dt>
+                                    <dd>{atLeast(usage.storage.latestReachable.knownDirectBytes)}</dd>
+                                {/if}
+                                {#each usage.buckets as bucket (bucket.id)}<dt>{bucket.id}</dt><dd>{bucket.used}{bucket.limit ? ` / ${bucket.limit}` : ''} {bucket.unit}</dd>{/each}
+                            </dl>
                         {/if}
-                        {#each usage.buckets as bucket (bucket.id)}<dt>{bucket.id}</dt><dd>{bucket.used}{bucket.limit ? ` / ${bucket.limit}` : ''} {bucket.unit}</dd>{/each}
-                    </dl></div>
+                        <label class="policy-row fixed">
+                            <span>{strings.retentionCount}</span>
+                            <span class="amount">
+                                <input type="number" class="number" disabled={busy} inputmode="numeric" min={RETENTION_LIMITS.keepCount[0]} max={RETENTION_LIMITS.keepCount[1]} value={retention.keepCount} onchange={event => commitRetentionLimit(connection, 'keepCount', event.currentTarget)} />
+                            </span>
+                        </label>
+                        <label class="policy-row fixed">
+                            <span>{strings.retentionDays}</span>
+                            <span class="amount">
+                                <input type="number" class="number" disabled={busy} inputmode="numeric" min={RETENTION_LIMITS.keepDays[0]} max={RETENTION_LIMITS.keepDays[1]} value={retention.keepDays} onchange={event => commitRetentionLimit(connection, 'keepDays', event.currentTarget)} />
+                                <span class="value">{strings.retentionDaysUnit}</span>
+                            </span>
+                        </label>
+                    </div>
                 {/if}
 
                 <div class="foot">
@@ -687,6 +739,29 @@
         background: var(--risu-theme-primary-500);
         opacity: 1;
         animation: pulse 1.5s ease-in-out infinite;
+    }
+    .usage {
+        display: grid;
+        gap: 0.4rem;
+    }
+    .amount {
+        display: flex;
+        align-items: center;
+        gap: 0.35rem;
+    }
+    .number {
+        width: 5rem;
+        padding: 0.25rem 0.4rem;
+        border: 1px solid var(--risu-theme-darkborderc);
+        border-radius: 0.375rem;
+        background: var(--risu-theme-darkbg);
+        color: var(--risu-theme-textcolor);
+        font-size: 0.875rem;
+        font-variant-numeric: tabular-nums;
+        text-align: right;
+    }
+    .number:disabled {
+        opacity: 0.6;
     }
     .kv {
         display: grid;

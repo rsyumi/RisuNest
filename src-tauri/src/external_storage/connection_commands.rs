@@ -117,6 +117,30 @@ pub(crate) enum CompleteAuthorizationResult {
     },
 }
 
+/// A connect command's failure. A repository this device already holds is
+/// refused with its own kind so the form can name it; everything else is the
+/// provider failure as it happened.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub(crate) enum ConnectionFailure {
+    Refused { kind: &'static str },
+    Provider(ProviderError),
+}
+
+impl ConnectionFailure {
+    const ALREADY_CONNECTED: Self = Self::Refused {
+        kind: "alreadyConnected",
+    };
+}
+
+impl From<ProviderError> for ConnectionFailure {
+    fn from(value: ProviderError) -> Self {
+        Self::Provider(value)
+    }
+}
+
+type ConnectResult<T> = std::result::Result<T, ConnectionFailure>;
+
 #[tauri::command]
 pub(crate) fn external_storage_cancel_authorization(
     state: State<'_, ConnectionCommandState>,
@@ -346,16 +370,16 @@ pub(crate) async fn external_storage_commit_connection(
     app: AppHandle,
     state: State<'_, ConnectionCommandState>,
     request: CommitConnectionRequest,
-) -> Result<ConnectionResult> {
+) -> ConnectResult<ConnectionResult> {
     let preparation_id = request.preparation_id;
     let pending = take_preparation(&state, &preparation_id)?;
     if pending.request.mode == ConnectionOpenMode::Existing && pending.recovery.is_none() {
         restore_preparation(&state, preparation_id, pending);
-        return Err(ProviderError::new(ErrorKind::ReauthRequired));
+        return Err(ProviderError::new(ErrorKind::ReauthRequired).into());
     }
     if pending.request.config.oauth_profile.is_some() {
         restore_preparation(&state, preparation_id, pending);
-        return Err(ProviderError::new(ErrorKind::Unsupported));
+        return Err(ProviderError::new(ErrorKind::Unsupported).into());
     }
     let secret = connection::encode_secret(&pending.request.config.provider, request.secret)?;
     match commit_preparation(
@@ -521,20 +545,20 @@ pub(crate) async fn external_storage_complete_authorization(
     app: AppHandle,
     state: State<'_, ConnectionCommandState>,
     request: CompleteAuthorizationRequest,
-) -> Result<CompleteAuthorizationResult> {
+) -> ConnectResult<CompleteAuthorizationResult> {
     let client_secret = request.client_secret.map(Zeroizing::new);
     if client_secret.is_some() {
-        return Err(ProviderError::new(ErrorKind::Unsupported));
+        return Err(ProviderError::new(ErrorKind::Unsupported).into());
     }
     if let Some(mut redirect_url) = request.redirect_url {
         redirect_url.zeroize();
-        return Err(ProviderError::new(ErrorKind::Unsupported));
+        return Err(ProviderError::new(ErrorKind::Unsupported).into());
     }
     let authorization = lock(&state.authorizations)?
         .remove(&request.authorization_id)
         .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
     if authorization.expires_at_ms <= now_ms() {
-        return Err(ProviderError::new(ErrorKind::Cancelled));
+        return Err(ProviderError::new(ErrorKind::Cancelled).into());
     }
     let pending = take_preparation(&state, &authorization.preparation_id)?;
     let credential_result: Result<(SecretRef, Option<String>)> = async {
@@ -575,7 +599,7 @@ pub(crate) async fn external_storage_complete_authorization(
         Ok(value) => value,
         Err(error) => {
             restore_preparation(&state, authorization.preparation_id, pending);
-            return Err(error);
+            return Err(error.into());
         }
     };
     match commit_preparation(
@@ -603,7 +627,7 @@ pub(crate) async fn external_storage_complete_authorization(
     app: AppHandle,
     state: State<'_, ConnectionCommandState>,
     request: CompleteAuthorizationRequest,
-) -> Result<CompleteAuthorizationResult> {
+) -> ConnectResult<CompleteAuthorizationResult> {
     let redirect_url = request.redirect_url.map(Zeroizing::new);
     let client_secret = request.client_secret.map(Zeroizing::new);
     let (authorization, grant) = {
@@ -623,14 +647,14 @@ pub(crate) async fn external_storage_complete_authorization(
                 ..
             } => {
                 if redirect_url.is_some() || client_secret.is_some() {
-                    return Err(ProviderError::new(ErrorKind::Unsupported));
+                    return Err(ProviderError::new(ErrorKind::Unsupported).into());
                 }
                 (*expires_at_ms, flow)
             }
         };
         if expires_at_ms <= now_ms() {
             authorizations.remove(&request.authorization_id);
-            return Err(ProviderError::new(ErrorKind::Cancelled));
+            return Err(ProviderError::new(ErrorKind::Cancelled).into());
         }
         let grant = match flow.try_complete(redirect_url.as_deref().map(String::as_str)) {
             Ok(Some(grant)) => grant,
@@ -648,7 +672,7 @@ pub(crate) async fn external_storage_complete_authorization(
             }
             Err(error) => {
                 authorizations.remove(&request.authorization_id);
-                return Err(error);
+                return Err(error.into());
             }
         };
         let authorization = authorizations
@@ -697,7 +721,7 @@ pub(crate) async fn external_storage_complete_authorization(
         Ok(value) => value,
         Err(error) => {
             restore_preparation(&state, preparation_id, pending);
-            return Err(error);
+            return Err(error.into());
         }
     };
     match commit_preparation(
@@ -732,7 +756,7 @@ async fn commit_preparation(
     connection_id: &str,
     preparation: &PendingPreparation,
     credential: CredentialInput,
-) -> Result<ConnectionResult> {
+) -> ConnectResult<ConnectionResult> {
     let root = connection_root(app)?;
     let (dependencies, durable_budget) = connection::dependencies(&root)?;
     let provider_vault = dependencies.vault.clone();
@@ -753,7 +777,7 @@ async fn commit_preparation(
                     && account_id != &pending.config.account_id
             }) {
                 let _ = provider_vault.remove(&replacement).await;
-                return Err(ProviderError::new(ErrorKind::ReauthRequired));
+                return Err(ProviderError::new(ErrorKind::ReauthRequired).into());
             }
             let previous = SecretRef(std::mem::replace(
                 &mut pending.credential_ref,
@@ -766,7 +790,7 @@ async fn commit_preparation(
                 let _ = provider_vault
                     .remove(&SecretRef(pending.credential_ref.clone()))
                     .await;
-                return Err(error);
+                return Err(error.into());
             }
             let _ = provider_vault.remove(&previous).await;
             (pending, true)
@@ -801,7 +825,7 @@ async fn commit_preparation(
                     && account_id != &config.account_id
             }) {
                 let _ = provider_vault.remove(&credential_ref).await;
-                return Err(ProviderError::new(ErrorKind::ReauthRequired));
+                return Err(ProviderError::new(ErrorKind::ReauthRequired).into());
             }
             if let Some(account_id) = account_id {
                 config.account_id = account_id;
@@ -813,7 +837,7 @@ async fn commit_preparation(
                 Ok(reference) => reference,
                 Err(error) => {
                     let _ = provider_vault.remove(&credential_ref).await;
-                    return Err(error);
+                    return Err(error.into());
                 }
             };
             let pending = PendingStoredConnection {
@@ -832,11 +856,11 @@ async fn commit_preparation(
             if let Err(error) = store.put_pending(&pending) {
                 let _ = key_vault.remove(&key_ref).await;
                 let _ = provider_vault.remove(&credential_ref).await;
-                return Err(error);
+                return Err(error.into());
             }
             (pending, false)
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.into()),
     };
     config = pending.config.clone();
     let credential_ref = SecretRef(pending.credential_ref.clone());
@@ -867,14 +891,27 @@ async fn commit_preparation(
                 )
                 .await?
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.into()),
     };
     if pending
         .provider_repository_id
         .as_ref()
         .is_some_and(|expected| expected != &handle.repository_id)
     {
-        return Err(ProviderError::new(ErrorKind::Corrupt));
+        return Err(ProviderError::new(ErrorKind::Corrupt).into());
+    }
+    // Nothing this attempt left behind can be promoted later, so it goes with
+    // the refusal.
+    if store
+        .identity_holder(&handle.connection_identity)?
+        .is_some_and(|held| held != connection_id)
+    {
+        let _ = store.remove_pending(connection_id);
+        let _ = key_vault
+            .remove(&SecretRef(pending.root_key_ref.clone()))
+            .await;
+        let _ = provider_vault.remove(&credential_ref).await;
+        return Err(ConnectionFailure::ALREADY_CONNECTED);
     }
     let mut updated = pending.clone();
     updated.provider_repository_id = Some(handle.repository_id.clone());
@@ -900,7 +937,7 @@ async fn commit_preparation(
         Some(strategy) => capabilities.require(strategy)?,
         None if capabilities.immutable_create != Evidence::Unverified
             && capabilities.direct_complete_read != Evidence::Unverified => {}
-        None => return Err(ProviderError::new(ErrorKind::Unsupported)),
+        None => return Err(ProviderError::new(ErrorKind::Unsupported).into()),
     }
     quota_profiles::configure_connection_budget(
         &durable_budget,
@@ -1049,6 +1086,20 @@ pub(crate) fn external_storage_set_capture_policy(
     let root = connection_root(&app)?;
     let mut store = ConnectionStore::open(&root)?;
     store.set_capture_policy(&connection_id, policy)?;
+    Ok(())
+}
+
+/// Changes how much of what this device backed up a connection keeps. The new
+/// policy applies to cleanups started afterwards.
+#[tauri::command]
+pub(crate) fn external_storage_set_retention_policy(
+    app: AppHandle,
+    connection_id: String,
+    policy: super::connection::RetentionPolicy,
+) -> Result<()> {
+    let root = connection_root(&app)?;
+    let mut store = ConnectionStore::open(&root)?;
+    store.set_retention_policy(&connection_id, policy)?;
     Ok(())
 }
 
@@ -1255,6 +1306,23 @@ fn platform_key() -> &'static str {
 mod tests {
     use super::*;
 
+    /// The form reads the kind to tell a repository this device already holds
+    /// from a provider failure, and a provider failure keeps its own shape.
+    #[test]
+    fn a_refused_connection_reports_its_own_kind() {
+        assert_eq!(
+            serde_json::to_value(ConnectionFailure::ALREADY_CONNECTED).unwrap(),
+            serde_json::json!({"kind":"alreadyConnected"})
+        );
+        assert_eq!(
+            serde_json::to_value(ConnectionFailure::from(ProviderError::new(
+                ErrorKind::Transient
+            )))
+            .unwrap(),
+            serde_json::to_value(ProviderError::new(ErrorKind::Transient)).unwrap()
+        );
+    }
+
     #[test]
     fn incomplete_authorization_is_not_a_connection_or_consumed_error() {
         let pending = CompleteAuthorizationResult::Pending {
@@ -1319,6 +1387,7 @@ mod tests {
             credential_ref: "not-exported".into(),
             root_key_ref: "not-exported".into(),
             capture_policy: None,
+            retention_policy: None,
             capabilities: super::super::fake::capabilities(false),
             created_at_ms: 1,
         };
