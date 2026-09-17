@@ -59,7 +59,6 @@ const PAGE: i64 = 128;
 const GC_SCAN_LIMIT: i64 = 128;
 const GC_DELETE_LIMIT: usize = 16;
 const GC_REFERENCE_LIMIT: i64 = 32;
-const GC_CONTENT_LIMIT: i64 = 128;
 
 fn invalid(message: &str) -> StoreError {
     StoreError::Validation {
@@ -187,10 +186,6 @@ impl PersistentStore {
             return Err(invalid("Referenced capture cache is unavailable"));
         }
         tx.execute(
-            "DELETE FROM external_storage_content_cache WHERE consumer_id IN (SELECT id FROM content_change_consumers WHERE generation=?1 AND revision=?2)",
-            params![candidate.identity.generation, candidate.identity.revision],
-        )?;
-        tx.execute(
             "UPDATE content_change_consumers SET rebuild_required=1 WHERE generation=?1 AND revision=?2",
             params![candidate.identity.generation, candidate.identity.revision],
         )?;
@@ -277,10 +272,6 @@ impl PersistentStore {
         let mut paths = Vec::new();
         {
             let tx = self.connection.transaction()?;
-            tx.execute(
-                "DELETE FROM external_storage_content_cache WHERE rowid IN (SELECT cache.rowid FROM external_storage_content_cache cache LEFT JOIN content_change_consumers consumer ON consumer.id=cache.consumer_id WHERE consumer.id IS NULL OR consumer.generation!=cache.generation OR consumer.rebuild_required=1 LIMIT ?1)",
-                [GC_CONTENT_LIMIT],
-            )?;
             let candidates = {
                 let mut query = tx.prepare(
                     "SELECT c.id,c.identity,f.catalog_path FROM external_storage_captures c LEFT JOIN external_storage_capture_files f ON f.capture_id=c.id WHERE c.id!=?1 AND NOT EXISTS(SELECT 1 FROM external_storage_capture_refs r WHERE r.capture_id=c.id) ORDER BY c.rowid LIMIT ?2",
@@ -647,6 +638,7 @@ impl PersistentStore {
                 &identity.generation,
                 identity.revision,
             )?;
+            content_change_index::prune(&tx)?;
             tx.commit()?;
             self.cleanup_capture_cache(&candidate.id)?;
             return Ok(CapturedSnapshot {
@@ -716,22 +708,16 @@ impl PersistentStore {
             });
         let mut catalog = CaptureCatalog::create(&directory, &objects, prior)?;
         let prepared = self.prepare_content_capture(&id, consumer, identity.revision)?;
-        let result = (|| {
-            let projected_records = prepared.project(&mut catalog, probe)?;
-            let capture_id = prepared.register(self, &catalog, &scope_id, CODEC)?;
-            self.cleanup_capture_cache(&capture_id)?;
-            Ok(CapturedSnapshot {
-                id: capture_id,
-                identity,
-                catalog,
-                projected_records,
-                shared: false,
-            })
-        })();
-        if result.is_err() {
-            self.abandon_content_capture(&id)?;
-        }
-        result
+        let projected_records = prepared.project(&mut catalog, probe)?;
+        let capture_id = prepared.register(self, &catalog, &scope_id, CODEC)?;
+        self.cleanup_capture_cache(&capture_id)?;
+        Ok(CapturedSnapshot {
+            id: capture_id,
+            identity,
+            catalog,
+            projected_records,
+            shared: false,
+        })
     }
 
     pub(crate) fn retain_external_capture(
