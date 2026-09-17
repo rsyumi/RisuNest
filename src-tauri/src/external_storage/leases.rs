@@ -67,6 +67,12 @@ fn corrupt() -> ProviderError {
 fn transient() -> ProviderError {
     ProviderError::new(ErrorKind::Transient)
 }
+/// An HTTP response, including a refusal, ends a synchronous removal request.
+/// Only a request that left without any answer remains outstanding.
+pub(crate) fn delete_answered(error: &ProviderError) -> bool {
+    error.http_status.is_some_and(|status| status != 202)
+        || !matches!(error.kind, ErrorKind::Transient | ErrorKind::Cancelled)
+}
 fn local(_: impl std::fmt::Display) -> ProviderError {
     ProviderError::new(ErrorKind::Transient)
 }
@@ -141,10 +147,18 @@ pub(crate) struct LeaseHandle {
     pub locator: RemoteLocator,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObservedKind {
+    Work,
+    Cleanup,
+    Deleting,
+    Unknown,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ObservedLease {
     pub locator: RemoteLocator,
-    pub kind: LeaseKind,
+    pub kind: ObservedKind,
     /// True when this device holds the intent row that placed it. Everything
     /// else belongs to another device, whatever its name reads like.
     pub mine: bool,
@@ -165,7 +179,7 @@ impl LeaseSurvey {
         self.leases
             .iter()
             .filter(|lease| {
-                lease.kind == LeaseKind::Deleting && own != Some(&lease.locator)
+                lease.kind == ObservedKind::Deleting && own != Some(&lease.locator)
             })
             .collect()
     }
@@ -174,8 +188,31 @@ impl LeaseSurvey {
     pub(crate) fn foreign_work(&self) -> Vec<&ObservedLease> {
         self.leases
             .iter()
-            .filter(|lease| !lease.mine && lease.kind != LeaseKind::Deleting)
+            .filter(|lease| {
+                !lease.mine
+                    && matches!(
+                        lease.kind,
+                        ObservedKind::Work | ObservedKind::Cleanup | ObservedKind::Unknown
+                    )
+            })
             .collect()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Admission {
+    Admitted(LeaseHandle),
+    /// A removal marker is in place. `foreign` is false only when every
+    /// blocking marker belongs to this device.
+    Blocked { foreign: bool },
+}
+
+fn observed_kind(locator: &RemoteLocator) -> ObservedKind {
+    match parse_lease_object_id(lease_name(locator)).map(|(kind, _)| kind) {
+        Ok(LeaseKind::Work) => ObservedKind::Work,
+        Ok(LeaseKind::Cleanup) => ObservedKind::Cleanup,
+        Ok(LeaseKind::Deleting) => ObservedKind::Deleting,
+        Err(_) => ObservedKind::Unknown,
     }
 }
 
@@ -395,9 +432,8 @@ pub(crate) async fn register(
     Ok(handle)
 }
 
-/// Reads the whole lease collection. A page this device cannot read or a name
-/// it cannot classify ends the call, because a partial view cannot show that
-/// no one is removing anything.
+/// Reads the whole lease collection for diagnostics. Admission and removal use
+/// the stricter single-page view below.
 pub(crate) async fn survey(ctx: &LeaseContext<'_>, cancel: &Cancellation) -> Result<LeaseSurvey> {
     let mine = ctx
         .store()?
@@ -421,7 +457,7 @@ pub(crate) async fn survey(ctx: &LeaseContext<'_>, cancel: &Cancellation) -> Res
             .await?;
         for receipt in page.objects {
             receipt.locator.validate_for(ctx.repository)?;
-            let (kind, _) = parse_lease_object_id(lease_name(&receipt.locator))?;
+            let kind = observed_kind(&receipt.locator);
             let mine = mine.contains(&locator_key(&receipt.locator)?);
             leases.push(ObservedLease {
                 locator: receipt.locator,
@@ -463,7 +499,7 @@ pub(crate) async fn survey_single_page(
     let mut leases = Vec::new();
     for receipt in page.objects {
         receipt.locator.validate_for(ctx.repository)?;
-        let (kind, _) = parse_lease_object_id(lease_name(&receipt.locator))?;
+        let kind = observed_kind(&receipt.locator);
         let mine = mine.contains(&locator_key(&receipt.locator)?);
         leases.push(ObservedLease {
             locator: receipt.locator,
@@ -483,12 +519,21 @@ pub(crate) async fn admit(
     kind: LeaseKind,
     now_ms: u64,
     cancel: &Cancellation,
-) -> Result<LeaseHandle> {
+) -> Result<Admission> {
     let handle = register(ctx, job_id, kind, now_ms, cancel).await?;
-    if !survey(ctx, cancel).await?.blocking_markers(None).is_empty() {
+    let Some(survey) = survey_single_page(ctx, cancel).await? else {
         return Err(transient());
+    };
+    if survey.leases.iter().any(|lease| lease.kind == ObservedKind::Unknown) {
+        return Err(corrupt());
     }
-    Ok(handle)
+    let blockers = survey.blocking_markers(None);
+    if !blockers.is_empty() {
+        return Ok(Admission::Blocked {
+            foreign: blockers.iter().any(|lease| !lease.mine),
+        });
+    }
+    Ok(Admission::Admitted(handle))
 }
 
 /// Gives back the work leases of a job whose remote requests have ended. The
@@ -560,6 +605,72 @@ pub(crate) async fn clear_marker(ctx: &LeaseContext<'_>, marker: &LeaseHandle) -
         .forget_finished_delete_requests(ctx.connection_id, &marker.tag)
 }
 
+/// Forgets an attempt after its marker disappeared remotely. Requests from the
+/// old decision must never be replayed without that marker protecting their
+/// addresses.
+pub(crate) fn abandon_marker(ctx: &LeaseContext<'_>, marker: &LeaseHandle) -> Result<()> {
+    let store = ctx.store()?;
+    store.forget_delete_requests(ctx.connection_id, &marker.tag)?;
+    store.remove_lease_intent(ctx.connection_id, &marker.locator)
+}
+
+fn marker_handle(row: &LeaseIntent, locator: RemoteLocator) -> Result<LeaseHandle> {
+    let (kind, tag) = parse_lease_object_id(lease_name(&locator))?;
+    if kind != LeaseKind::Deleting || row.kind != LeaseKind::Deleting {
+        return Err(corrupt());
+    }
+    Ok(LeaseHandle {
+        job_id: row.job_id.clone(),
+        kind,
+        seq: row.seq,
+        tag,
+        locator,
+    })
+}
+
+async fn resume_delete_markers(ctx: &LeaseContext<'_>, cancel: &Cancellation) -> Result<()> {
+    for row in ctx
+        .store()?
+        .lease_intents(ctx.connection_id)?
+        .into_iter()
+        .filter(|row| row.kind == LeaseKind::Deleting)
+    {
+        let locator = settle(ctx, &row, cancel).await?;
+        let marker = marker_handle(&row, locator)?;
+        let Some(survey) = survey_single_page(ctx, cancel).await? else {
+            return Err(transient());
+        };
+        if !survey
+            .leases
+            .iter()
+            .any(|lease| lease.locator == marker.locator)
+        {
+            abandon_marker(ctx, &marker)?;
+            continue;
+        }
+
+        for request in ctx
+            .store()?
+            .unfinished_delete_requests(ctx.connection_id, Some(&marker.tag))?
+        {
+            let retry = Cancellation::default();
+            match ctx
+                .provider
+                .delete_object(ctx.repository, &request.locator, &retry)
+                .await
+            {
+                Ok(()) => note_delete_finished(ctx, &marker, &request.locator)?,
+                Err(error) if delete_answered(&error) => {
+                    note_delete_finished(ctx, &marker, &request.locator)?
+                }
+                Err(_) => return Err(transient()),
+            }
+        }
+        clear_marker(ctx, &marker).await?;
+    }
+    Ok(())
+}
+
 /// Resolves what an interrupted run left behind, before this device places
 /// anything new. `live_jobs` names the jobs that have not reached an end; a
 /// lease of any other job is given back, and one whose removal attempt still
@@ -569,7 +680,11 @@ pub(crate) async fn resume(
     live_jobs: &BTreeSet<String>,
     cancel: &Cancellation,
 ) -> Result<()> {
+    resume_delete_markers(ctx, cancel).await?;
     for row in ctx.store()?.lease_intents(ctx.connection_id)? {
+        if row.kind == LeaseKind::Deleting {
+            continue;
+        }
         match row.state {
             LeaseState::Pending => {
                 settle(ctx, &row, cancel).await?;
@@ -579,24 +694,13 @@ pub(crate) async fn resume(
         }
     }
     for row in ctx.store()?.lease_intents(ctx.connection_id)? {
+        if row.kind == LeaseKind::Deleting {
+            continue;
+        }
         if live_jobs.contains(&row.job_id) || held_ids().contains(&row.job_id) {
             continue;
         }
-        if row.kind == LeaseKind::Deleting {
-            let (_, tag) = parse_lease_object_id(lease_name(&row.locator))?;
-            if !ctx
-                .store()?
-                .unfinished_delete_requests(ctx.connection_id, Some(&tag))?
-                .is_empty()
-            {
-                continue;
-            }
-            drop_lease(ctx, &row, cancel).await?;
-            ctx.store()?
-                .forget_finished_delete_requests(ctx.connection_id, &tag)?;
-        } else {
-            drop_lease(ctx, &row, cancel).await?;
-        }
+        drop_lease(ctx, &row, cancel).await?;
     }
     Ok(())
 }
@@ -620,6 +724,15 @@ mod tests {
 
     fn tag(index: u8) -> String {
         format!("{index:x}").repeat(32)
+    }
+
+    fn admitted(value: Admission) -> LeaseHandle {
+        match value {
+            Admission::Admitted(handle) => handle,
+            Admission::Blocked { foreign } => {
+                panic!("expected admission, got blocked; foreign={foreign}")
+            }
+        }
     }
 
     struct Harness {
@@ -788,27 +901,30 @@ mod tests {
         runtime().block_on(async {
             let context = harness.context();
             let marker = harness.foreign(LeaseKind::Deleting, &tag(1));
-            let yielded = admit(&context, "job", LeaseKind::Work, NOW, &cancel).await.unwrap_err();
-            assert_eq!(yielded.kind, ErrorKind::Transient);
+            assert!(matches!(
+                admit(&context, "job", LeaseKind::Work, NOW, &cancel).await.unwrap(),
+                Admission::Blocked { foreign: true }
+            ));
             assert_eq!(harness.rows().len(), 1, "the lease is kept while waiting");
 
             for later in [NOW + 2 * 60 * 1000, NOW + 7 * DAY, NOW + 400 * DAY] {
-                assert_eq!(
+                assert!(matches!(
                     admit(&context, "job", LeaseKind::Work, later, &cancel)
                         .await
-                        .unwrap_err()
-                        .kind,
-                    ErrorKind::Transient
-                );
+                        .unwrap(),
+                    Admission::Blocked { foreign: true }
+                ));
                 assert!(harness.provider.holds(&marker), "the wait removed a marker");
             }
 
             harness.remove(&marker).await;
-            let admitted = admit(&context, "job", LeaseKind::Work, NOW + 401 * DAY, &cancel)
-                .await
-                .unwrap();
-            assert_eq!(admitted.kind, LeaseKind::Work);
-            assert!(harness.provider.holds(&admitted.locator.object));
+            let handle = admitted(
+                admit(&context, "job", LeaseKind::Work, NOW + 401 * DAY, &cancel)
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(handle.kind, LeaseKind::Work);
+            assert!(harness.provider.holds(&handle.locator.object));
         });
     }
 
@@ -921,35 +1037,48 @@ mod tests {
                 clear_marker(&context, &marker).await.unwrap_err().kind,
                 ErrorKind::PreconditionFailed
             );
-            assert_eq!(
+            assert!(matches!(
                 admit(&context, "publisher", LeaseKind::Work, NOW + 7 * DAY, &Cancellation::default())
+                    .await
+                    .unwrap(),
+                Admission::Blocked { foreign: false }
+            ));
+            let live = BTreeSet::from(["publisher".to_owned()]);
+            harness.provider.fail_delete("pack-a", DeleteFault::Transient);
+            assert_eq!(
+                resume(&context, &live, &Cancellation::default())
                     .await
                     .unwrap_err()
                     .kind,
                 ErrorKind::Transient
             );
-            let live = BTreeSet::from(["publisher".to_owned()]);
-            resume(&context, &live, &Cancellation::default())
-                .await
-                .unwrap();
             assert!(harness.provider.holds(&marker.locator.object));
+            assert!(harness.provider.holds("pack-a"));
+            assert_eq!(harness.provider.delete_attempts("pack-a"), 2);
+            assert_eq!(harness.provider.delete_attempts("pack-b"), 1);
+            assert_eq!(
+                harness.store.unfinished_delete_requests(CONNECTION, Some(&marker.tag))
+                    .unwrap().len(),
+                2
+            );
 
-            // Only an answer ends a request. Removal is idempotent, so the
-            // applied one answers the same way the outstanding one does.
-            for pack in ["pack-a", "pack-b"] {
-                harness.remove(pack).await;
-                note_delete_finished(&context, &marker, &harness.target(pack)).unwrap();
-            }
-            clear_marker(&context, &marker).await.unwrap();
+            // A later resume observes answers for both requests, including the
+            // one that removed its object before losing the original answer.
+            resume(&context, &live, &Cancellation::default()).await.unwrap();
+            assert!(!harness.provider.holds("pack-a"));
+            assert_eq!(harness.provider.delete_attempts("pack-a"), 3);
+            assert_eq!(harness.provider.delete_attempts("pack-b"), 2);
             assert!(!harness.provider.holds(&marker.locator.object));
             assert!(harness
                 .store
                 .unfinished_delete_requests(CONNECTION, None)
                 .unwrap()
                 .is_empty());
-            admit(&context, "publisher", LeaseKind::Work, NOW + 8 * DAY, &Cancellation::default())
-                .await
-                .unwrap();
+            admitted(
+                admit(&context, "publisher", LeaseKind::Work, NOW + 8 * DAY, &Cancellation::default())
+                    .await
+                    .unwrap(),
+            );
         });
     }
 
@@ -965,16 +1094,46 @@ mod tests {
                 .await
                 .unwrap();
             let target = harness.target("pack-a");
+            harness.provider.seed("pack-a", ObjectRole::Pack, b"pack".to_vec());
             note_delete_sent(&context, &marker, &target, NOW).unwrap();
 
             let live = BTreeSet::new();
-            resume(&context, &live, &cancel).await.unwrap();
+            harness.provider.fail_delete("pack-a", DeleteFault::Transient);
+            assert_eq!(resume(&context, &live, &cancel).await.unwrap_err().kind, ErrorKind::Transient);
             assert!(harness.provider.holds(&marker.locator.object));
+            assert_eq!(harness.provider.delete_attempts("pack-a"), 1);
 
-            note_delete_finished(&context, &marker, &target).unwrap();
+            harness.provider.fail_delete("pack-a", DeleteFault::RateLimited);
             resume(&context, &live, &cancel).await.unwrap();
             assert!(!harness.provider.holds(&marker.locator.object));
+            assert!(harness.provider.holds("pack-a"));
+            assert_eq!(harness.provider.delete_attempts("pack-a"), 2);
+            assert!(harness.store.unfinished_delete_requests(CONNECTION, None).unwrap().is_empty());
             assert!(harness.rows().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_missing_marker_never_replays_its_old_delete_requests() {
+        let harness = Harness::new();
+        let cancel = Cancellation::default();
+        runtime().block_on(async {
+            let context = harness.context();
+            let marker = place_marker(&context, "cleanup", NOW, &cancel).await.unwrap();
+            let target = harness.target("pack-a");
+            note_delete_sent(&context, &marker, &target, NOW).unwrap();
+            harness.remove(&marker.locator.object).await;
+            harness.provider.seed("pack-a", ObjectRole::Pack, b"new-owner".to_vec());
+
+            resume(&context, &BTreeSet::new(), &cancel).await.unwrap();
+            assert_eq!(harness.provider.delete_attempts("pack-a"), 0);
+            assert_eq!(harness.stored_bytes("pack-a"), b"new-owner");
+            assert!(!harness.provider.holds(&marker.locator.object));
+            assert!(harness.store.unfinished_delete_requests(CONNECTION, None).unwrap().is_empty());
+            assert!(harness.rows().is_empty());
+
+            resume(&context, &BTreeSet::new(), &cancel).await.unwrap();
+            assert_eq!(harness.provider.delete_attempts("pack-a"), 0);
         });
     }
 
@@ -986,9 +1145,11 @@ mod tests {
         let cancel = Cancellation::default();
         runtime().block_on(async {
             let context = harness.context();
-            let handle = admit(&context, "export", LeaseKind::Work, NOW, &cancel)
-                .await
-                .unwrap();
+            let handle = admitted(
+                admit(&context, "export", LeaseKind::Work, NOW, &cancel)
+                    .await
+                    .unwrap(),
+            );
             let held = hold("export");
 
             // The job list names only the job that just started.
@@ -1003,23 +1164,21 @@ mod tests {
         });
     }
 
-    /// A name this device cannot classify ends the survey. A view it cannot
-    /// read in full never shows that no one is removing anything.
+    /// Diagnostics retain an unknown lease, but it cannot prove that no one
+    /// is removing objects and must not allow admission.
     #[test]
-    fn a_lease_name_that_cannot_be_classified_ends_the_survey() {
+    fn an_unclassified_lease_is_reported_but_never_allows_admission() {
         let harness = Harness::new();
         runtime().block_on(async {
             let context = harness.context();
             harness
                 .provider
                 .seed("not-a-lease", ObjectRole::Lease, b"x".to_vec());
-            assert_eq!(
-                survey(&context, &Cancellation::default())
-                    .await
-                    .unwrap_err()
-                    .kind,
-                ErrorKind::Corrupt
-            );
+            let observed = survey(&context, &Cancellation::default()).await.unwrap();
+            assert_eq!(observed.leases.len(), 1);
+            assert_eq!(observed.leases[0].kind, ObservedKind::Unknown);
+            assert_eq!(observed.foreign_work().len(), 1);
+            assert_eq!(observed.leases[0].locator.object, "not-a-lease");
             assert_eq!(
                 admit(&context, "job", LeaseKind::Work, NOW, &Cancellation::default())
                     .await
@@ -1038,7 +1197,7 @@ mod tests {
         let cancel = Cancellation::default();
         runtime().block_on(async {
             let context = harness.context();
-            let work = admit(&context, "job", LeaseKind::Work, NOW, &cancel).await.unwrap();
+            let work = admitted(admit(&context, "job", LeaseKind::Work, NOW, &cancel).await.unwrap());
             let marker = place_marker(&context, "job", NOW, &cancel).await.unwrap();
             release(&context, "job").await.unwrap();
             assert!(!harness.provider.holds(&work.locator.object));
@@ -1055,7 +1214,7 @@ mod tests {
         runtime().block_on(async {
             let context = harness.context();
             let cancel = Cancellation::default();
-            let work = admit(&context, "job", LeaseKind::Work, NOW, &cancel).await.unwrap();
+            let work = admitted(admit(&context, "job", LeaseKind::Work, NOW, &cancel).await.unwrap());
             cancel.cancel();
             release(&context, "job").await.unwrap();
             assert!(!harness.provider.holds(&work.locator.object));

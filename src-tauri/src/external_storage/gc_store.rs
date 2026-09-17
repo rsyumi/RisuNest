@@ -615,6 +615,24 @@ impl GcStore {
         Ok(())
     }
 
+    /// Forgets every request of an attempt after its marker was removed by the
+    /// user. Replaying those requests without the marker could remove an object
+    /// that another device has since placed at the same address.
+    pub(crate) fn forget_delete_requests(
+        &self,
+        connection_id: &str,
+        attempt_id: &str,
+    ) -> Result<()> {
+        self.0
+            .execute(
+                "DELETE FROM delete_requests
+                 WHERE connection_id=?1 AND attempt_id=?2",
+                rusqlite::params![connection_id, attempt_id],
+            )
+            .map_err(storage)?;
+        Ok(())
+    }
+
     /// Removes everything this connection owns. A removed connection keeps no
     /// observation, no committed target and no outstanding request.
     pub(crate) fn forget_connection(&self, connection_id: &str) -> Result<()> {
@@ -901,6 +919,22 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn forgetting_an_attempt_drops_its_unanswered_requests() {
+        let (_root, store) = store();
+        let pack = locator(None, "pack-a");
+        store
+            .record_delete_request("connection", &pack, "attempt", 10)
+            .unwrap();
+        store
+            .forget_delete_requests("connection", "attempt")
+            .unwrap();
+        assert!(store
+            .unfinished_delete_requests("connection", Some("attempt"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

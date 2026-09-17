@@ -79,6 +79,8 @@ pub(crate) enum DeleteFault {
     Unanswered,
     /// The remote object is gone, but the answer was lost on the way back.
     AppliedThenLost,
+    /// The service answered that its request budget is exhausted.
+    RateLimited,
 }
 
 #[derive(Default)]
@@ -88,6 +90,7 @@ pub(super) struct FakeState {
     pub(super) lose_response: bool,
     roles: BTreeMap<String, ObjectRole>,
     deletes: BTreeMap<String, DeleteFault>,
+    delete_attempts: Vec<String>,
     answered_deletes: usize,
     listings: usize,
     scheduled: Vec<(usize, String, ObjectRole, Vec<u8>)>,
@@ -152,6 +155,15 @@ impl FakeProvider {
     }
     pub(crate) fn holds(&self, object: &str) -> bool {
         self.state.lock().unwrap().objects.contains_key(object)
+    }
+    pub(crate) fn delete_attempts(&self, object: &str) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .delete_attempts
+            .iter()
+            .filter(|attempt| attempt.as_str() == object)
+            .count()
     }
     fn forget(&self, object: &str) {
         let mut state = self.state.lock().unwrap();
@@ -388,7 +400,11 @@ impl Provider for FakeProvider {
             if refused {
                 return Err(ProviderError::new(ErrorKind::Unsupported));
             }
-            let injected = self.state.lock().unwrap().deletes.remove(&l.object);
+            let injected = {
+                let mut state = self.state.lock().unwrap();
+                state.delete_attempts.push(l.object.clone());
+                state.deletes.remove(&l.object)
+            };
             match injected {
                 Some(DeleteFault::Transient) => Err(ProviderError::new(ErrorKind::Transient)),
                 Some(DeleteFault::Unanswered) => {
@@ -399,6 +415,11 @@ impl Provider for FakeProvider {
                     self.forget(&l.object);
                     Err(ProviderError::new(ErrorKind::Transient))
                 }
+                Some(DeleteFault::RateLimited) => Err(ProviderError {
+                    kind: ErrorKind::RateLimited,
+                    http_status: Some(429),
+                    retry_at_ms: None,
+                }),
                 // A target that is already gone answers the same as one removed now.
                 None => {
                     self.forget(&l.object);
@@ -623,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn injected_delete_faults_cover_a_refusal_a_silent_request_and_a_lost_answer() {
+    fn injected_delete_faults_cover_answers_silence_and_a_lost_answer() {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let provider = FakeProvider::new(false);
             let handle = repository();
@@ -672,6 +693,16 @@ mod tests {
             stopper.await.unwrap();
             // Cancelling the local request is no evidence the remote end ran.
             assert!(provider.holds("pack-c"));
+
+            provider.seed("pack-d", ObjectRole::Pack, vec![7]);
+            provider.fail_delete("pack-d", DeleteFault::RateLimited);
+            let answered = provider
+                .delete_object(&handle, &object("pack-d"), &cancel)
+                .await
+                .unwrap_err();
+            assert_eq!(answered.kind, ErrorKind::RateLimited);
+            assert_eq!(answered.http_status, Some(429));
+            assert_eq!(provider.delete_attempts("pack-d"), 1);
 
             // Only the injected attempt is affected; the retry behaves normally.
             provider

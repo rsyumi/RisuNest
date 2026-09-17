@@ -568,8 +568,10 @@ pub(crate) async fn admit_repository(
     }
     let context = lease_context(root, connected, writer_id);
     leases::resume(&context, live, cancel).await?;
-    leases::admit(&context, job_id, kind, now_ms(), cancel).await?;
-    Ok(())
+    match leases::admit(&context, job_id, kind, now_ms(), cancel).await? {
+        leases::Admission::Admitted(_) => Ok(()),
+        leases::Admission::Blocked { .. } => Err(ProviderError::new(ErrorKind::Transient)),
+    }
 }
 
 /// Hands back the leases of one job. A removal marker is not one of them: it

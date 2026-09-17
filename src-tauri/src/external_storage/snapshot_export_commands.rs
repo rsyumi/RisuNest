@@ -138,7 +138,8 @@ async fn with_export_lease<T>(
     // resume from taking this lease back while the download is still running.
     let _held = leases::hold(&lease_id);
     let outcome = match leases::admit(context, &lease_id, LeaseKind::Work, now_ms, cancel).await {
-        Ok(_) => body.await,
+        Ok(leases::Admission::Admitted(_)) => body.await,
+        Ok(leases::Admission::Blocked { .. }) => Err(ProviderError::new(ErrorKind::Transient)),
         Err(error) => Err(error),
     };
     if let Err(error) = leases::release(context, &lease_id).await {
@@ -390,6 +391,29 @@ mod tests {
         // announcement did not outlive the call.
         assert_eq!(harness.creations(), placed + 1);
         assert!(harness.provider.holds(&marker));
+        assert!(harness.rows().is_empty());
+        assert!(harness.work_leases().is_empty());
+    }
+
+    #[test]
+    fn an_export_never_reads_through_an_unclassified_lease() {
+        let harness = Harness::new();
+        let cancel = Cancellation::default();
+        harness.provider.seed("not-a-lease", ObjectRole::Lease, b"unknown".to_vec());
+        let started = AtomicBool::new(false);
+        block_on(async {
+            let context = harness.context();
+            let error = with_export_lease(&context, &cleanup_ready(), NOW, &cancel, async {
+                started.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Corrupt);
+        });
+        assert!(!started.load(Ordering::SeqCst));
+        assert!(harness.provider.holds("not-a-lease"));
+        assert_eq!(harness.provider.delete_attempts("not-a-lease"), 0);
         assert!(harness.rows().is_empty());
         assert!(harness.work_leases().is_empty());
     }
