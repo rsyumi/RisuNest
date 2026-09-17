@@ -81,13 +81,21 @@ fn lease_name(locator: &RemoteLocator) -> &str {
 /// of what it already placed there.
 pub(crate) struct LeaseContext<'a> {
     pub root: &'a Path,
-    pub store: &'a GcStore,
     pub connection_id: &'a str,
     pub writer_id: &'a str,
     pub descriptor: &'a Descriptor,
     pub root_key: &'a [u8; 32],
     pub provider: &'a dyn Provider,
     pub repository: &'a RepositoryHandle,
+}
+
+impl LeaseContext<'_> {
+    /// A bookkeeping handle for one statement. It is opened per call because a
+    /// borrowed database connection cannot cross an await point, and every
+    /// step here sits between two remote requests.
+    fn store(&self) -> Result<GcStore> {
+        GcStore::open(self.root)
+    }
 }
 
 /// A lease this device confirmed. `tag` is also the identity of the removal
@@ -261,7 +269,7 @@ async fn settle(
         UploadResolution::Conflict => return Err(corrupt()),
         UploadResolution::Resumable(_) => return Err(transient()),
     };
-    ctx.store
+    ctx.store()?
         .confirm_lease_intent(ctx.connection_id, &row.locator, &confirmed)?;
     Ok(confirmed)
 }
@@ -302,10 +310,10 @@ async fn place(
         state: LeaseState::Pending,
         created_at_ms: now_ms,
     };
-    ctx.store.put_lease_intent(ctx.connection_id, &row)?;
+    ctx.store()?.put_lease_intent(ctx.connection_id, &row)?;
     let intent = request_for(ctx, &row)?;
     let confirmed = create(ctx, &row, &intent, cancel).await?;
-    ctx.store
+    ctx.store()?
         .confirm_lease_intent(ctx.connection_id, &row.locator, &confirmed)?;
     Ok(LeaseHandle {
         job_id: job_id.to_owned(),
@@ -324,12 +332,12 @@ async fn drop_lease(
     cancel: &Cancellation,
 ) -> Result<()> {
     let locator = settle(ctx, row, cancel).await?;
-    ctx.store
+    ctx.store()?
         .set_lease_state(ctx.connection_id, &locator, LeaseState::Releasing)?;
     ctx.provider
         .delete_object(ctx.repository, &locator, cancel)
         .await?;
-    ctx.store.remove_lease_intent(ctx.connection_id, &locator)
+    ctx.store()?.remove_lease_intent(ctx.connection_id, &locator)
 }
 
 /// Confirms this job's lease of one kind, renewing an existing one. The next
@@ -343,7 +351,7 @@ pub(crate) async fn register(
     cancel: &Cancellation,
 ) -> Result<LeaseHandle> {
     let previous = ctx
-        .store
+        .store()?
         .lease_intents(ctx.connection_id)?
         .into_iter()
         .filter(|row| row.job_id == job_id && row.kind == kind)
@@ -361,7 +369,7 @@ pub(crate) async fn register(
 /// no one is removing anything.
 pub(crate) async fn survey(ctx: &LeaseContext<'_>, cancel: &Cancellation) -> Result<LeaseSurvey> {
     let mine = ctx
-        .store
+        .store()?
         .lease_intents(ctx.connection_id)?
         .iter()
         .map(|row| locator_key(&row.locator))
@@ -420,7 +428,7 @@ pub(crate) async fn admit(
 /// able to hand its lease back.
 pub(crate) async fn release(ctx: &LeaseContext<'_>, job_id: &str) -> Result<()> {
     let cancel = Cancellation::default();
-    for row in ctx.store.lease_intents(ctx.connection_id)? {
+    for row in ctx.store()?.lease_intents(ctx.connection_id)? {
         if row.job_id == job_id && row.kind != LeaseKind::Deleting {
             drop_lease(ctx, &row, &cancel).await?;
         }
@@ -447,7 +455,7 @@ pub(crate) fn note_delete_sent(
     target: &RemoteLocator,
     now_ms: u64,
 ) -> Result<()> {
-    ctx.store
+    ctx.store()?
         .record_delete_request(ctx.connection_id, target, &marker.tag, now_ms)
 }
 
@@ -458,7 +466,7 @@ pub(crate) fn note_delete_finished(
     marker: &LeaseHandle,
     target: &RemoteLocator,
 ) -> Result<()> {
-    ctx.store
+    ctx.store()?
         .finish_delete_request(ctx.connection_id, target, &marker.tag)
 }
 
@@ -467,19 +475,19 @@ pub(crate) fn note_delete_finished(
 /// closed to other work until it is known.
 pub(crate) async fn clear_marker(ctx: &LeaseContext<'_>, marker: &LeaseHandle) -> Result<()> {
     if !ctx
-        .store
+        .store()?
         .unfinished_delete_requests(ctx.connection_id, Some(&marker.tag))?
         .is_empty()
     {
         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
     }
     let cancel = Cancellation::default();
-    for row in ctx.store.lease_intents(ctx.connection_id)? {
+    for row in ctx.store()?.lease_intents(ctx.connection_id)? {
         if row.kind == LeaseKind::Deleting && row.locator == marker.locator {
             drop_lease(ctx, &row, &cancel).await?;
         }
     }
-    ctx.store
+    ctx.store()?
         .forget_finished_delete_requests(ctx.connection_id, &marker.tag)
 }
 
@@ -492,7 +500,7 @@ pub(crate) async fn resume(
     live_jobs: &BTreeSet<String>,
     cancel: &Cancellation,
 ) -> Result<()> {
-    for row in ctx.store.lease_intents(ctx.connection_id)? {
+    for row in ctx.store()?.lease_intents(ctx.connection_id)? {
         match row.state {
             LeaseState::Pending => {
                 settle(ctx, &row, cancel).await?;
@@ -501,21 +509,21 @@ pub(crate) async fn resume(
             LeaseState::Confirmed => {}
         }
     }
-    for row in ctx.store.lease_intents(ctx.connection_id)? {
+    for row in ctx.store()?.lease_intents(ctx.connection_id)? {
         if live_jobs.contains(&row.job_id) {
             continue;
         }
         if row.kind == LeaseKind::Deleting {
             let (_, tag) = parse_lease_object_id(lease_name(&row.locator))?;
             if !ctx
-                .store
+                .store()?
                 .unfinished_delete_requests(ctx.connection_id, Some(&tag))?
                 .is_empty()
             {
                 continue;
             }
             drop_lease(ctx, &row, cancel).await?;
-            ctx.store
+            ctx.store()?
                 .forget_finished_delete_requests(ctx.connection_id, &tag)?;
         } else {
             drop_lease(ctx, &row, cancel).await?;
@@ -573,7 +581,6 @@ mod tests {
         fn context(&self) -> LeaseContext<'_> {
             LeaseContext {
                 root: &self.root,
-                store: &self.store,
                 connection_id: CONNECTION,
                 writer_id: "writer",
                 descriptor: &self.descriptor,

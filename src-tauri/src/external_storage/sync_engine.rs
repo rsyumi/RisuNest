@@ -772,6 +772,9 @@ async fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Resu
     super::runtime::read_job_session(app, &job.id)?;
     let connected =
         super::connection_commands::open_connected(app, &job.request.connection_id).await?;
+    // This staged receive downloads objects without going through `wake_job`,
+    // so it goes through the same admission before it asks for any of them.
+    super::runtime::enter_repository(app, &connected, &job, &cancel).await?;
     let authoritative = pds(app)?
         .external_jobs(&job.request.connection_id)
         .map_err(local_error)?
@@ -910,6 +913,7 @@ async fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Resu
             "External receive committed but its UI summary could not be persisted"
         );
     }
+    super::runtime::release_leases(app, &job);
     Ok(result)
 }
 
