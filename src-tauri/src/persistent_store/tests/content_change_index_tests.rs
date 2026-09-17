@@ -323,7 +323,7 @@ fn catalog(directory: &Path, id: &str) -> crate::external_storage::capture::Capt
 
 #[test]
 fn content_capture_rechecks_the_floor_after_projecting_its_pinned_body() {
-    use crate::logical_records::{decode_logical_record, LogicalRecordEnvelope};
+    use crate::logical_records::{decode_logical_record, encode_logical_record_key, LogicalRecordEnvelope, LogicalRecordLocator};
     let (directory, mut store) = capture_fixture();
     edit_root(&mut store, 2);
     let prepared = store.prepare_content_capture("old", "backup", 2).unwrap();
@@ -331,7 +331,8 @@ fn content_capture_rechecks_the_floor_after_projecting_its_pinned_body() {
     edit_root(&mut store, 3);
     store.commit_working_set_change_cursor(3).unwrap();
     assert!(prepared.project(&mut old, &Never).unwrap() > 1);
-    let root_hash: String = old.db.query_row("SELECT hash FROM records WHERE key='root'", [], |row| row.get(0)).unwrap();
+    let root_key = encode_logical_record_key(&LogicalRecordLocator::Root).unwrap();
+    let root_hash: String = old.db.query_row("SELECT hash FROM records WHERE key=?1", [root_key], |row| row.get(0)).unwrap();
     let bytes = fs::read(directory.path().join("external-storage/objects").join(root_hash)).unwrap();
     let LogicalRecordEnvelope::Root { value, .. } = decode_logical_record(&bytes).unwrap() else { panic!("root record") };
     assert_eq!(value["synthetic"], json!(2));
