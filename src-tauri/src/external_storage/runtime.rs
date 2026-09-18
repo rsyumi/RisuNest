@@ -642,9 +642,6 @@ fn settle_receive_preparation(job: &mut DurableJob, prepared: Option<Value>) -> 
         job.summary["phase"] = json!("paused");
         job.summary.as_object_mut().unwrap().remove("result");
         job.summary["error"] = error_dto(&ProviderError::new(ErrorKind::Transient));
-        if uncertain {
-            job.summary["error"]["reason"] = json!("publication-unknown");
-        }
     } else {
         return false;
     }
@@ -667,6 +664,9 @@ fn settle_interrupted(job: &mut DurableJob, complete: Option<Value>, uncertain: 
         });
         job.summary.as_object_mut().unwrap().remove("result");
         job.summary["error"] = error_dto(&ProviderError::new(ErrorKind::Transient));
+        if uncertain {
+            job.summary["error"]["reason"] = json!("publication-unknown");
+        }
     }
     job.summary["updatedAtMs"] = json!(now_ms().to_string());
 }
