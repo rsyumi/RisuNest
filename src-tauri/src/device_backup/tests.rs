@@ -1844,6 +1844,15 @@ fn native_library_stage_survives_reopen_and_marker_prevents_second_activation() 
     let source = capture_prepared_native_sections(&mut store, &selected, &NeverCancelled).unwrap();
     let rollback =
         capture_prepared_native_sections(&mut store, &selected, &NeverCancelled).unwrap();
+    let mut pins = crate::asset_repository::job_pins::DurableCasJob::begin(
+        root.path(),
+        "library-recovery-job",
+        crate::asset_repository::job_pins::CasJobKind::LocalBackupRestore,
+        0,
+    )
+    .unwrap();
+    pins.seal(&mut store, 0).unwrap();
+    drop(pins);
     let coordinator = state(root.path());
     let id = coordinator
         .create_native_portable_session(
@@ -1917,6 +1926,85 @@ fn native_library_stage_survives_reopen_and_marker_prevents_second_activation() 
     );
     assert!(recovered.is_blocking().unwrap());
     assert!(!recovered.section_list(&id, Spool::Source).unwrap().is_empty());
+    let library_revision = reopened.revision().unwrap();
+    let device_revision = reopened.device_store().unwrap().revision().unwrap();
+
+    let failure = commands::complete_native_recovery_for_test(
+        &recovered,
+        &id,
+        |session, repository_root| {
+            assert_eq!(session.job_id, "library-recovery-job");
+            let mut pins = crate::asset_repository::job_pins::DurableCasJob::open(
+                repository_root,
+                &session.job_id,
+            )
+            .unwrap();
+            pins.leave_release_record_for_cleanup_retry(
+                crate::asset_repository::job_pins::CasReleaseOutcome::Committed,
+            )
+            .unwrap();
+            Err(error(
+                "device-storage-failed",
+                "synthetic durable pin cleanup failure",
+            ))
+        },
+    )
+    .unwrap_err();
+    assert_eq!(failure.code, "device-storage-failed");
+    assert!(recovered.is_blocking().unwrap());
+    assert_eq!(recovered.session(&id).unwrap().phase, "committed");
+    assert!(!recovered.section_list(&id, Spool::Source).unwrap().is_empty());
+    let released = crate::asset_repository::job_pins::DurableCasJob::open(
+        root.path(),
+        "library-recovery-job",
+    )
+    .unwrap();
+    assert!(released.is_released());
+    drop(released);
+    assert_eq!(reopened.revision().unwrap(), library_revision);
+    assert_eq!(
+        reopened.device_store().unwrap().revision().unwrap(),
+        device_revision
+    );
+
+    commands::complete_native_recovery_for_test(
+        &recovered,
+        &id,
+        |session, repository_root| {
+            let mut pins = crate::asset_repository::job_pins::DurableCasJob::open(
+                repository_root,
+                &session.job_id,
+            )
+            .map_err(|_| {
+                error(
+                    "device-storage-failed",
+                    "Native portable recovery could not reopen durable asset pins",
+                )
+            })?;
+            pins.release(crate::asset_repository::job_pins::CasReleaseOutcome::Committed)
+                .map_err(|_| {
+                    error(
+                        "device-storage-failed",
+                        "Native portable recovery could not retry durable asset pin cleanup",
+                    )
+                })
+        },
+    )
+    .unwrap();
+    assert!(!recovered.is_blocking().unwrap());
+    assert_eq!(reopened.revision().unwrap(), library_revision);
+    assert_eq!(
+        reopened.device_store().unwrap().revision().unwrap(),
+        device_revision
+    );
+    let missing = match crate::asset_repository::job_pins::DurableCasJob::open(
+        root.path(),
+        "library-recovery-job",
+    ) {
+        Ok(_) => panic!("released durable pin journal still exists"),
+        Err(error) => error,
+    };
+    assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
 }
 
 #[test]

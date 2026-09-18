@@ -26,6 +26,39 @@ fn release_native_restore_pins(
     }
 }
 
+fn complete_native_recovery_with(
+    state: &DeviceBackupState,
+    session_id: &str,
+    release: impl FnOnce(&Session, &std::path::Path) -> Result<()>,
+) -> Result<()> {
+    let session = state.session(session_id)?;
+    if session.profile == "native-portable" && session.includes_library {
+        if session.phase != "committed" {
+            return Err(error(
+                "device-invalid-state",
+                "Native portable restore pins can only be released after commit",
+            ));
+        }
+        release(&session, state.repository_root())?;
+    }
+    state.recovery_complete(session_id)
+}
+
+fn complete_native_recovery(state: &DeviceBackupState, session_id: &str) -> Result<()> {
+    complete_native_recovery_with(state, session_id, |session, root| {
+        release_native_restore_pins(session, root, CasReleaseOutcome::Committed)
+    })
+}
+
+#[cfg(test)]
+pub(super) fn complete_native_recovery_for_test(
+    state: &DeviceBackupState,
+    session_id: &str,
+    release: impl FnOnce(&Session, &std::path::Path) -> Result<()>,
+) -> Result<()> {
+    complete_native_recovery_with(state, session_id, release)
+}
+
 fn require_renderer_maintenance(state: &DeviceBackupState, session_id: &str) -> Result<()> {
     if !state.maintenance_entered(session_id)? {
         return Err(error(
@@ -279,21 +312,7 @@ pub(crate) fn native_device_backup_recovery_complete(
     session_id: String,
 ) -> Result<()> {
     require_renderer_maintenance(&state, &session_id)?;
-    let session = state.session(&session_id)?;
-    if session.profile == "native-portable" && session.includes_library {
-        if session.phase != "committed" {
-            return Err(error(
-                "device-invalid-state",
-                "Native portable restore pins can only be released after commit",
-            ));
-        }
-        release_native_restore_pins(
-            &session,
-            state.repository_root(),
-            CasReleaseOutcome::Committed,
-        )?;
-    }
-    state.recovery_complete(&session_id)
+    complete_native_recovery(&state, &session_id)
 }
 
 #[tauri::command(async)]
