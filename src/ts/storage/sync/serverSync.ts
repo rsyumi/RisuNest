@@ -184,6 +184,7 @@ export function createServerSyncFacade(options: {
     | {
         revision: number;
         preparationId: string;
+        projected: boolean;
         fence?: PersistentDestructiveReplacementFence;
       }
     | undefined;
@@ -200,20 +201,23 @@ export function createServerSyncFacade(options: {
     if (!pending) throw new ServerSyncError("refresh-not-pending");
     options.onProgress?.("refreshing");
     try {
-      let outcome;
-      if (pending.fence) {
-        const fence = pending.fence;
-        try {
-          outcome = await fence.refreshCommittedWorkingSet(pending.revision);
-        } finally {
-          pending.fence = undefined;
-          fence.release();
+      if (!pending.projected) {
+        let outcome;
+        if (pending.fence) {
+          const fence = pending.fence;
+          try {
+            outcome = await fence.refreshCommittedWorkingSet(pending.revision);
+          } finally {
+            pending.fence = undefined;
+            fence.release();
+          }
+        } else {
+          outcome = await options.runtime.refreshActiveWorkingSetFromStore(pending.revision);
         }
-      } else {
-        outcome = await options.runtime.refreshActiveWorkingSetFromStore(pending.revision);
-      }
-      if (outcome.projection === 'refresh-required') {
-        throw new ServerSyncError('committed-refresh-pending');
+        if (outcome.projection === 'refresh-required') {
+          throw new ServerSyncError('committed-refresh-pending');
+        }
+        pending.projected = true;
       }
       await options.restorePlugins?.();
     } catch {
@@ -252,6 +256,7 @@ export function createServerSyncFacade(options: {
       pendingRefresh = {
         revision,
         preparationId: pending.prepared.preparationId,
+        projected: false,
         fence: pending.fence,
       };
       return refresh();

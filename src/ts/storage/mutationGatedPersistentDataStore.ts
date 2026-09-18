@@ -1,4 +1,3 @@
-import type { Database } from './database.svelte'
 import type {
     AssetAlias,
     AssetAliasIdentity,
@@ -71,12 +70,8 @@ export function createMutationGatedPersistentDataStore(
             gate.runWrite(() => store.archiveCharacter(characterId, expectedRevision)),
         restoreCharacter: (characterId: string, expectedRevision: DataRevision) =>
             gate.runWrite(() => store.restoreCharacter(characterId, expectedRevision)),
-        replaceFromDatabase: (
-            database: Database,
-            expectedRevision?: DataRevision,
-            assetAliases?: AssetAlias[],
-        ) => gate.runTransition(() =>
-            store.replaceFromDatabase(database, expectedRevision, assetAliases)),
+        replaceFromDatabase: (...args: Parameters<PersistentDataStore['replaceFromDatabase']>) =>
+            gate.runTransition(() => store.replaceFromDatabase(...args)),
         materializeDatabase: (revision?: DataRevision) => store.materializeDatabase(revision),
         acquireRevision: (revision: DataRevision): Promise<PersistentRevisionLease> =>
             store.acquireRevision(revision),
