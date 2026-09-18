@@ -203,7 +203,7 @@ fn native_section_archive_roundtrip_keeps_structured_keys_objects_and_local_scop
                 preprocess_version: 1,
                 dimensions: (large_vector.len() / 4) as i64,
                 vector: large_vector.clone(),
-                metadata: Some(r#"{"scope":"synthetic"}"#.into()),
+                metadata: None,
             }])
             .unwrap();
         for (owner, space, value) in [
