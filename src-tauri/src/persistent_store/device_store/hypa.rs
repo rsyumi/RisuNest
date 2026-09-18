@@ -51,6 +51,9 @@ fn validate_write(entry: &HypaEmbeddingWrite) -> StoreResult<()> {
     if entry.vector.len() != entry.dimensions as usize * VECTOR_ELEMENT_BYTES {
         return Err(invalid("embedding vector length does not match dimensions"));
     }
+    if entry.metadata.is_some() {
+        return Err(invalid("embedding metadata is unsupported"));
+    }
     Ok(())
 }
 

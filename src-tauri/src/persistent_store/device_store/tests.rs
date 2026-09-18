@@ -608,6 +608,27 @@ fn an_embedding_batch_is_rejected_whole_when_one_entry_is_malformed() {
 }
 
 #[test]
+fn an_embedding_batch_with_metadata_is_rejected_without_mutation() {
+    let (_directory, mut store) = open();
+    let mut unsupported = embedding("key-b", &[2.0]);
+    unsupported.metadata = Some("{\"scope\":\"synthetic\"}".to_owned());
+    let error = store
+        .write_hypa_embeddings(&[embedding("key-a", &[1.0]), unsupported])
+        .expect_err("reject embedding metadata");
+    assert!(matches!(error, StoreError::Validation { .. }));
+
+    assert_eq!(
+        store
+            .connection()
+            .query_row("SELECT count(*) FROM hypa_embeddings", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(clock(store.connection(), "hypa"), "0");
+}
+
+#[test]
 fn an_embedding_batch_rejects_dimensions_outside_the_supported_range() {
     let (_directory, mut store) = open();
     let mut zero = embedding("key-a", &[]);
