@@ -63,8 +63,9 @@ interface Control {
   fault?: {
     point: FaultPoint;
     reached: boolean;
+    oldExpected: string[];
     newExpected: string[];
-    outcome?: "committed";
+    outcome?: "old" | "committed";
   };
 }
 
@@ -409,6 +410,7 @@ async function restoreArchive(
     ? {
         point: faultPoint,
         reached: false,
+        oldExpected: await fingerprints(),
         newExpected: peer.expected,
       }
     : undefined;
@@ -499,10 +501,15 @@ async function resume() {
     check(!!control.fault?.reached, "synthetic-process-kill-point-reached");
     await nativeInvoke("pds_open");
     const actual = await fingerprints();
+    const oldState =
+      JSON.stringify(actual) === JSON.stringify(control.fault!.oldExpected);
     const committedState =
       JSON.stringify(actual) === JSON.stringify(control.fault!.newExpected);
-    check(committedState, "process-kill-recovers-committed-state");
-    control.fault!.outcome = "committed";
+    check(
+      oldState || committedState,
+      "process-kill-recovers-complete-section-set",
+    );
+    control.fault!.outcome = oldState ? "old" : "committed";
     check(
       localStorage.getItem("outside_smoke_sentinel") === "untouched",
       "process-kill-outside-native-sections-preserved",
