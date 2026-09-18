@@ -97,7 +97,6 @@ fn write_spool_object(spool: &Path, bytes: &[u8]) -> Result<(String, PathBuf)> {
     file.sync_all().map_err(transient)?;
     drop(file);
     fs::rename(&staging, &path).map_err(transient)?;
-    crate::trust_boundary::sync_directory(spool).map_err(transient)?;
     Ok((digest, path))
 }
 
@@ -112,7 +111,7 @@ fn captured_section_fingerprint(
     for source in sources.iter().filter(|source| {
         source.kind == wire::CatalogEntryKind::SectionEntry
     }) {
-        if previous.as_deref() == Some(&source.key) {
+        if previous.as_deref() == Some(source.key.as_str()) {
             return Err(corrupt("section key appears twice"));
         }
         let digest: [u8; 32] = hex::decode(&source.content_sha256).map_err(corrupt)?
@@ -125,7 +124,7 @@ fn captured_section_fingerprint(
 
 fn publication_evidence_fingerprint(connection: &Connection) -> Result<[u8; 32]> {
     let mut fingerprint = risunest_external_storage_format::format::FingerprintBuilder::new(
-        b"risunest-section-publication-evidence-v1",
+        b"risunest-section-evidence-v1____",
     );
     let mut statement = connection.prepare(
         "SELECT key1,key2,key3,write_clock,writer_id,disposition,stamped,
@@ -198,6 +197,7 @@ pub(crate) fn capture_section(
     sources.dedup_by(|a, b| {
         a.kind == wire::CatalogEntryKind::SectionObject && a.kind == b.kind && a.key == b.key
     });
+    crate::trust_boundary::sync_directory(spool).map_err(transient)?;
     let content_fingerprint = captured_section_fingerprint(kind, &sources)?;
     Ok(CapturedSection {
         kind,
@@ -247,6 +247,7 @@ fn capture_prepared_section(
     sources.dedup_by(|a, b| {
         a.kind == wire::CatalogEntryKind::SectionObject && a.kind == b.kind && a.key == b.key
     });
+    crate::trust_boundary::sync_directory(spool).map_err(transient)?;
     let content_fingerprint = captured_section_fingerprint(kind, &sources)?;
     Ok(CapturedSection {
         kind, generation, gc_floor, max_write_clock,
@@ -487,8 +488,8 @@ impl StateSectionCapture {
         } else {
             self.publication_stage.persist(&self.publication_path)
                 .map_err(|error| transient(error.error))?;
-            crate::trust_boundary::sync_directory(&self.spool).map_err(transient)?;
         }
+        crate::trust_boundary::sync_directory(&self.spool).map_err(transient)?;
         Ok((CapturedSection {
             kind: self.kind,
             generation: self.generation,
@@ -1583,6 +1584,93 @@ mod tests {
         assert!(device
             .sections_await_publication("connection", "library")
             .expect("read awaiting publication"));
+    }
+
+    #[test]
+    fn an_identical_remote_section_may_keep_its_earlier_generation() {
+        let spool = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut store = participating_plugin_store(root.path());
+        store.device_store_mut().unwrap().write_plugin_device_values(
+            "plugin-a",
+            &[PluginDeviceMutation::Set {
+                space: "string".into(),
+                key: "same".into(),
+                value: "value".into(),
+            }],
+        ).unwrap();
+        let (captured, publications) = capture_state_sections(
+            &mut store,
+            &Sequence::from(4u64),
+            &BTreeMap::new(),
+            "connection",
+            "library",
+            spool.path(),
+            &Cancellation::default(),
+        ).unwrap();
+        let publication = publications.iter()
+            .find(|publication| publication.section == Section::LocalPlugins).unwrap();
+        let captured = captured_for(&captured, publication);
+        let mut confirmed = section_reference(3, 0);
+        confirmed.kind = captured.kind;
+        confirmed.max_write_clock = captured.max_write_clock.clone();
+        confirmed.content_fingerprint = captured.content_fingerprint;
+        assert!(note_prepared_section_published(
+            store.device_store_mut().unwrap(),
+            publication,
+            "connection",
+            "library",
+            &confirmed,
+        ).unwrap());
+        assert!(!store.device_store_mut().unwrap()
+            .sections_await_publication("connection", "library").unwrap());
+    }
+
+    #[test]
+    fn a_same_job_recapture_reuses_but_never_replaces_publication_evidence() {
+        let spool = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut store = participating_plugin_store(root.path());
+        store.device_store_mut().unwrap().write_plugin_device_values(
+            "plugin-a",
+            &[PluginDeviceMutation::Set {
+                space: "string".into(),
+                key: "same".into(),
+                value: "first".into(),
+            }],
+        ).unwrap();
+        let capture = |store: &mut PersistentStore| capture_state_sections(
+            store,
+            &Sequence::from(4u64),
+            &BTreeMap::new(),
+            "connection",
+            "library",
+            spool.path(),
+            &Cancellation::default(),
+        );
+        let (_, first) = capture(&mut store).unwrap();
+        let index = first.iter().find(|publication| {
+            publication.section == Section::LocalPlugins
+        }).unwrap().publication_index_path.clone();
+        let original = fs::read(&index).unwrap();
+        let mut permissions = fs::metadata(&index).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&index, permissions).unwrap();
+        capture(&mut store).expect("identical recapture reuses immutable evidence");
+
+        store.device_store_mut().unwrap().write_plugin_device_values(
+            "plugin-a",
+            &[PluginDeviceMutation::Set {
+                space: "string".into(),
+                key: "same".into(),
+                value: "changed".into(),
+            }],
+        ).unwrap();
+        assert_eq!(capture(&mut store).unwrap_err().kind, ErrorKind::Corrupt);
+        assert_eq!(fs::read(&index).unwrap(), original);
+        let mut permissions = fs::metadata(&index).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&index, permissions).unwrap();
     }
 
     fn removal_marker(store: &mut PersistentStore, key: &str) -> Option<TombstonePublication> {

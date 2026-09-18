@@ -28,6 +28,7 @@ fn e4_section_capture_scale() {
     let mut store = PersistentStore::open(root.path()).expect("open persistent store");
     {
         let device = store.device_store_mut().expect("open device store");
+        let plugin_owner = "o".repeat(512);
         device.set_section_participating(Section::Hypa, true).unwrap();
         device.set_section_participating(Section::LocalPlugins, true).unwrap();
         device.write_hypa_embeddings(&[HypaEmbeddingWrite {
@@ -60,7 +61,7 @@ fn e4_section_capture_scale() {
                     },
                 }
             }).collect::<Vec<_>>();
-            device.write_plugin_device_values("scale-plugin", &mutations).unwrap();
+            device.write_plugin_device_values(&plugin_owner, &mutations).unwrap();
         }
     }
 
