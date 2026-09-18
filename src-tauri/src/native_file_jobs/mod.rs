@@ -75,6 +75,7 @@ impl std::error::Error for NativeJobError {}
 pub(crate) enum JobSource {
     DesktopPath { path: String },
     AndroidSpool { token: String },
+    ConflictReference { token: String },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -235,7 +236,8 @@ pub(crate) enum NativeFileJobStartRequest {
     },
     ExportPortableBackup {
         destination: Option<String>,
-        expected_revision: i64,
+        expected_revision: Option<i64>,
+        source: Option<JobSource>,
         selection: portable::PortableSelection,
     },
     RestorePortableBackup {
@@ -302,6 +304,44 @@ pub(crate) enum NativeFileJobStartRequest {
         save_date: String,
         credential: OfficialPublicationCredential,
     },
+}
+
+fn portable_export_uses_reference_source(
+    source: &Option<JobSource>,
+    expected_revision: Option<i64>,
+    selection: &portable::PortableSelection,
+) -> Result<bool, NativeJobError> {
+    match (source, expected_revision) {
+        (None, Some(_)) => Ok(false),
+        (Some(JobSource::ConflictReference { .. }), None)
+            if selection.library
+                && selection.device_sections.is_empty()
+                && selection.items.is_none() =>
+        {
+            Ok(true)
+        }
+        (Some(JobSource::ConflictReference { .. }), None) => Err(NativeJobError::new(
+            "invalid-input",
+            "Conflict source export must include the complete library only",
+        )),
+        _ => Err(NativeJobError::new(
+            "invalid-input",
+            "Portable export requires either a revision or a conflict source",
+        )),
+    }
+}
+
+fn validate_portable_restore_selection(
+    source: &JobSource,
+    selection: &Option<portable::PortableSelection>,
+) -> Result<(), NativeJobError> {
+    if matches!(source, JobSource::ConflictReference { .. }) && selection.is_some() {
+        return Err(NativeJobError::new(
+            "invalid-input",
+            "Conflict source restore always replaces the complete library",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -433,6 +473,9 @@ pub(crate) fn open_job_source(
             let path = resolve_spool_source(job_root, token)?;
             open_regular_file_no_follow(&path)
         }
+        JobSource::ConflictReference { .. } => Err(invalid_source_error(
+            "conflict references are not filesystem sources",
+        )),
     }
 }
 
@@ -457,6 +500,9 @@ fn resolve_source(job_root: &Path, source: &JobSource) -> Result<PathBuf, Native
     match source {
         JobSource::DesktopPath { path } => resolve_desktop_source(path),
         JobSource::AndroidSpool { token } => resolve_spool_source(job_root, token),
+        JobSource::ConflictReference { .. } => Err(invalid_source_error(
+            "conflict references are not filesystem sources",
+        )),
     }
 }
 
@@ -1216,6 +1262,11 @@ impl NativeFileJobState {
                         parse_android_spool_token(token)?;
                         None
                     }
+                    JobSource::ConflictReference { .. } => {
+                        return Err(invalid_source_error(
+                            "conflict references require portable restore",
+                        ));
+                    }
                 };
                 NativeFileJobTask::Restore {
                     opened_source,
@@ -1271,6 +1322,11 @@ impl NativeFileJobState {
                         parse_android_spool_token(token)?;
                         None
                     }
+                    JobSource::ConflictReference { .. } => {
+                        return Err(invalid_source_error(
+                            "conflict references require portable restore",
+                        ));
+                    }
                 };
                 let repository_root =
                     crate::persistent_store::commands::with_store_mut(app.state(), |store| {
@@ -1288,21 +1344,34 @@ impl NativeFileJobState {
             NativeFileJobStartRequest::ExportPortableBackup {
                 destination,
                 expected_revision,
+                source,
                 selection,
             } => {
                 let destination = destination.map(PathBuf::from);
                 if let Some(path) = destination.as_deref() {
                     validate_desktop_destination(path)?;
                 }
-                let store =
-                    crate::persistent_store::commands::with_store_mut(app.state(), |store| {
-                        store.open_native_job_store()
-                    })
-                    .map_err(native_store_error)?;
+                let store = if portable_export_uses_reference_source(
+                    &source,
+                    expected_revision,
+                    &selection,
+                )? {
+                    None
+                } else {
+                    Some(
+                        crate::persistent_store::commands::with_store_mut(
+                            app.state(),
+                            |store| store.open_native_job_store(),
+                        )
+                        .map_err(native_store_error)?,
+                    )
+                };
                 NativeFileJobTask::ExportPortable {
                     destination,
                     expected_revision,
                     store,
+                    source,
+                    claimed_source: None,
                     selection,
                     app,
                 }
@@ -1312,12 +1381,14 @@ impl NativeFileJobState {
                 expected_revision,
                 selection,
             } => {
+                validate_portable_restore_selection(&source, &selection)?;
                 let opened_source = match &source {
                     JobSource::DesktopPath { .. } => Some(open_job_source(&self.root, &source)?),
                     JobSource::AndroidSpool { token } => {
                         parse_android_spool_token(token)?;
                         None
                     }
+                    JobSource::ConflictReference { .. } => None,
                 };
                 let store =
                     crate::persistent_store::commands::with_store_mut(app.state(), |store| {
@@ -1330,6 +1401,7 @@ impl NativeFileJobState {
                     expected_revision,
                     store,
                     selection,
+                    claimed_source: None,
                     app,
                 }
             }
@@ -1504,6 +1576,11 @@ impl NativeFileJobState {
                         parse_android_spool_token(token)?;
                         None
                     }
+                    JobSource::ConflictReference { .. } => {
+                        return Err(invalid_source_error(
+                            "conflict references cannot import JPEG assets",
+                        ));
+                    }
                 };
                 let store =
                     crate::persistent_store::commands::with_store_mut(app.state(), |store| {
@@ -1666,6 +1743,9 @@ impl NativeFileJobState {
                 claim_spool_content_source(&self.root, token, &owned_directory, &display_name)
                     .and_then(|path| open_regular_file_no_follow(&path))
             }
+            JobSource::ConflictReference { .. } => Err(invalid_source_error(
+                "conflict references cannot import content",
+            )),
         };
         let opened_source = match opened_source {
             Ok(source) => source,
@@ -1741,6 +1821,11 @@ impl NativeFileJobState {
                 parse_android_spool_token(token)?;
                 None
             }
+            JobSource::ConflictReference { .. } => {
+                return Err(invalid_source_error(
+                    "conflict references require portable restore",
+                ));
+            }
         };
         self.spawn(
             NativeFileJobTask::Restore {
@@ -1797,7 +1882,7 @@ impl NativeFileJobState {
             .registry
             .create_internal(
                 kind,
-                Some(task.expected_revision()),
+                task.expected_revision(),
                 warning_codes.clone(),
                 require_restore_finalization
                     && matches!(
@@ -1819,6 +1904,26 @@ impl NativeFileJobState {
             }
         };
         let source_preparation = (|| -> Result<(), NativeJobError> {
+            match &mut task {
+                NativeFileJobTask::ExportPortable {
+                    source: Some(JobSource::ConflictReference { token }),
+                    claimed_source,
+                    app,
+                    ..
+                }
+                | NativeFileJobTask::RestorePortable {
+                    source: JobSource::ConflictReference { token },
+                    claimed_source,
+                    app,
+                    ..
+                } => {
+                    *claimed_source = Some(reference_source::claim_reference_source(
+                        app, self, token,
+                    )?);
+                    return Ok(());
+                }
+                _ => {}
+            }
             let (opened_source, source, expected_display_name) = match &mut task {
                 NativeFileJobTask::Restore {
                     opened_source,
@@ -1855,6 +1960,10 @@ impl NativeFileJobState {
                     *opened_source = Some(open_regular_file_no_follow(&path)?);
                     Ok(())
                 }
+                JobSource::ConflictReference { .. } => Err(NativeJobError::new(
+                    "store-error",
+                    "conflict source claim was not retained by the native job",
+                )),
                 _ => Err(NativeJobError::new(
                     "store-error",
                     "native job source resolution is inconsistent",
@@ -1874,6 +1983,13 @@ impl NativeFileJobState {
                 )),
             };
         };
+        let terminal_reference_source = match &task {
+            NativeFileJobTask::ExportPortable { claimed_source, .. }
+            | NativeFileJobTask::RestorePortable { claimed_source, .. } => {
+                claimed_source.clone()
+            }
+            _ => None,
+        };
         let root = self.root.clone();
         let registry = Arc::clone(&self.registry);
         std::thread::spawn(move || {
@@ -1885,26 +2001,51 @@ impl NativeFileJobState {
                         destination,
                         expected_revision,
                         store,
+                        claimed_source,
                         selection,
                         app,
-                    } => portable::export_portable(
-                        destination.as_deref(),
-                        expected_revision,
-                        &owned_directory,
-                        &root.join("handoffs"),
-                        store,
-                        &job,
-                        Some((&app, &selection)),
-                    ),
+                        ..
+                    } => match (claimed_source, expected_revision, store) {
+                        (Some(source), None, None) => reference_source::export_reference_source(
+                            source,
+                            destination.as_deref(),
+                            &owned_directory,
+                            &root.join("handoffs"),
+                            &job,
+                            &app,
+                        ),
+                        (None, Some(revision), Some(store)) => portable::export_portable(
+                            destination.as_deref(),
+                            revision,
+                            &owned_directory,
+                            &root.join("handoffs"),
+                            store,
+                            &job,
+                            Some((&app, &selection)),
+                        ),
+                        _ => Err(NativeJobError::new(
+                            "store-error",
+                            "portable export source was not prepared",
+                        )),
+                    },
                     NativeFileJobTask::RestorePortable {
                         opened_source,
                         source,
                         expected_revision,
                         store,
                         selection,
+                        claimed_source,
                         app,
-                    } => match opened_source {
-                        Some(input) => portable::restore_portable(
+                    } => match (claimed_source, opened_source) {
+                        (Some(source), None) => reference_source::restore_reference_source(
+                            source,
+                            expected_revision,
+                            &owned_directory,
+                            store,
+                            &job,
+                            &app,
+                        ),
+                        (None, Some(input)) => portable::restore_portable(
                             input,
                             matches!(source, JobSource::AndroidSpool { .. }),
                             expected_revision,
@@ -1913,7 +2054,7 @@ impl NativeFileJobState {
                             &job,
                             Some((&app, selection.as_ref())),
                         ),
-                        None => Err(NativeJobError::new(
+                        _ => Err(NativeJobError::new(
                             "store-error",
                             "portable input was not prepared",
                         )),
@@ -2152,6 +2293,7 @@ impl NativeFileJobState {
                 }
             }
             let _ = registry.prune();
+            drop(terminal_reference_source);
         });
         Ok(NativeFileJobStarted {
             job_id,
@@ -2403,8 +2545,10 @@ enum RestoreJobSink {
 enum NativeFileJobTask {
     ExportPortable {
         destination: Option<PathBuf>,
-        expected_revision: i64,
-        store: crate::persistent_store::PersistentStore,
+        expected_revision: Option<i64>,
+        store: Option<crate::persistent_store::PersistentStore>,
+        source: Option<JobSource>,
+        claimed_source: Option<reference_source::ClaimedReferenceSource>,
         selection: portable::PortableSelection,
         app: AppHandle,
     },
@@ -2414,6 +2558,7 @@ enum NativeFileJobTask {
         expected_revision: i64,
         store: crate::persistent_store::PersistentStore,
         selection: Option<portable::PortableSelection>,
+        claimed_source: Option<reference_source::ClaimedReferenceSource>,
         app: AppHandle,
     },
     Restore {
@@ -2512,14 +2657,14 @@ impl NativeFileJobTask {
         }
     }
 
-    fn expected_revision(&self) -> i64 {
+    fn expected_revision(&self) -> Option<i64> {
         match self {
             Self::ExportPortable {
                 expected_revision, ..
-            }
-            | Self::RestorePortable {
-                expected_revision, ..
             } => *expected_revision,
+            Self::RestorePortable {
+                expected_revision, ..
+            } => Some(*expected_revision),
             Self::Restore {
                 expected_revision, ..
             }
@@ -2540,14 +2685,14 @@ impl NativeFileJobTask {
             }
             | Self::ImportJpegAsset {
                 expected_revision, ..
-            } => *expected_revision,
+            } => Some(*expected_revision),
             Self::ExportCharacterCharx { prepared, .. }
             | Self::ExportCharacterCard { prepared, .. }
-            | Self::ExportRisuModule { prepared, .. } => prepared.revision,
+            | Self::ExportRisuModule { prepared, .. } => Some(prepared.revision),
             #[cfg(feature = "native-kei-upload-pilot")]
-            Self::KeiBackup { prepared } => prepared.revision(),
+            Self::KeiBackup { prepared } => Some(prepared.revision()),
             #[cfg(feature = "native-official-publication")]
-            Self::OfficialPublication { request, .. } => request.expected_revision,
+            Self::OfficialPublication { request, .. } => Some(request.expected_revision),
         }
     }
 }
@@ -2560,6 +2705,19 @@ fn native_store_error(error: crate::persistent_store::StoreError) -> NativeJobEr
         | crate::persistent_store::StoreError::Store { .. } => "store-error",
     };
     NativeJobError::new(code, error.to_string())
+}
+
+fn job_transition(
+    job: &JobControl,
+    transition: Result<(), String>,
+) -> Result<(), NativeJobError> {
+    transition.map_err(|error| {
+        if job.is_cancel_requested() {
+            NativeJobError::new("cancelled", "Native file job was cancelled")
+        } else {
+            NativeJobError::new("store-error", error)
+        }
+    })
 }
 
 #[derive(Debug)]
@@ -4041,6 +4199,21 @@ impl JobControl {
             return Err("native job phase transition is invalid".to_owned());
         }
         status.phase = phase;
+        Ok(())
+    }
+
+    pub(crate) fn commit_export_publication(&self) -> Result<(), String> {
+        let mut status = self
+            .status
+            .lock()
+            .map_err(|error| format!("native job status mutex poisoned: {error}"))?;
+        if status.phase != JobPhase::PublishingDestination
+            || status.state != JobState::Running
+            || self.cancel_requested.load(Ordering::Acquire)
+        {
+            return Err("native export publication cannot commit from its current state".to_owned());
+        }
+        status.phase = JobPhase::FinalizingExport;
         Ok(())
     }
 
@@ -6588,6 +6761,79 @@ mod tests {
     }
 
     #[test]
+    fn portable_export_requires_exactly_one_active_or_reference_source() {
+        let selection = portable::PortableSelection::default();
+        assert!(!portable_export_uses_reference_source(&None, Some(7), &selection).unwrap());
+
+        let reference = Some(JobSource::ConflictReference {
+            token: "server:00000000-0000-4000-8000-000000000000".into(),
+        });
+        assert!(portable_export_uses_reference_source(&reference, None, &selection).unwrap());
+        assert_eq!(
+            portable_export_uses_reference_source(&reference, Some(7), &selection)
+                .unwrap_err()
+                .code,
+            "invalid-input"
+        );
+        assert_eq!(
+            portable_export_uses_reference_source(&None, None, &selection)
+                .unwrap_err()
+                .code,
+            "invalid-input"
+        );
+
+        let with_device_section = portable::PortableSelection {
+            library: true,
+            device_sections: vec!["hypa".into()],
+            items: None,
+        };
+        assert_eq!(
+            portable_export_uses_reference_source(&reference, None, &with_device_section)
+                .unwrap_err()
+                .code,
+            "invalid-input"
+        );
+
+        let request: NativeFileJobStartRequest = serde_json::from_value(json!({
+            "kind": "export-portable-backup",
+            "source": {
+                "type": "conflictReference",
+                "token": "external:00000000-0000-4000-8000-000000000000"
+            },
+            "selection": {"library": true, "deviceSections": []},
+            "destination": null
+        }))
+        .unwrap();
+        assert!(matches!(
+            request,
+            NativeFileJobStartRequest::ExportPortableBackup {
+                expected_revision: None,
+                source: Some(JobSource::ConflictReference { token }),
+                ..
+            } if token == "external:00000000-0000-4000-8000-000000000000"
+        ));
+    }
+
+    #[test]
+    fn conflict_reference_restore_rejects_partial_or_device_selection() {
+        let source = JobSource::ConflictReference {
+            token: "server:00000000-0000-4000-8000-000000000000".into(),
+        };
+        assert!(validate_portable_restore_selection(&source, &None).is_ok());
+        let selected = Some(portable::PortableSelection {
+            library: true,
+            device_sections: vec!["hypa".into()],
+            items: None,
+        });
+        assert_eq!(
+            validate_portable_restore_selection(&source, &selected)
+                .unwrap_err()
+                .code,
+            "invalid-input"
+        );
+    }
+
+    #[test]
     fn native_content_export_requests_are_descriptor_only_and_recovery_kinds_stay_exact() {
         let plain_shape = json!({
             "kind": "export-character-charx",
@@ -6769,11 +7015,59 @@ mod tests {
 
         job.start(JobPhase::WritingExport).unwrap();
         job.set_phase(JobPhase::PublishingDestination).unwrap();
-        job.set_phase(JobPhase::FinalizingExport).unwrap();
+        job.commit_export_publication().unwrap();
 
         assert_eq!(job.status().phase, JobPhase::FinalizingExport);
         assert_eq!(job.request_cancel().unwrap(), CancelOutcome::TooLate);
         assert!(job.set_phase(JobPhase::StagingDatabase).is_err());
+    }
+
+    #[test]
+    fn accepted_cancel_prevents_destination_publication_commit() {
+        let job = JobRegistry::default()
+            .create(JobKind::ExportPortableBackup)
+            .unwrap();
+        job.start(JobPhase::WritingExport).unwrap();
+        job.set_phase(JobPhase::PublishingDestination).unwrap();
+        assert_eq!(job.request_cancel().unwrap(), CancelOutcome::Requested);
+
+        assert!(job.commit_export_publication().is_err());
+
+        assert_eq!(job.status().state, JobState::Cancelling);
+        assert_eq!(job.status().phase, JobPhase::PublishingDestination);
+        assert!(job.is_cancel_requested());
+    }
+
+    #[test]
+    fn accepted_cancel_maps_queued_and_prepublication_transitions_to_cancelled() {
+        let queued = JobRegistry::default()
+            .create(JobKind::ExportPortableBackup)
+            .unwrap();
+        assert_eq!(queued.request_cancel().unwrap(), CancelOutcome::Requested);
+        assert_eq!(
+            job_transition(&queued, queued.start(JobPhase::WritingExport))
+                .unwrap_err()
+                .code,
+            "cancelled"
+        );
+
+        let preparing = JobRegistry::default()
+            .create(JobKind::ExportPortableBackup)
+            .unwrap();
+        preparing.start(JobPhase::WritingExport).unwrap();
+        assert_eq!(
+            preparing.request_cancel().unwrap(),
+            CancelOutcome::Requested
+        );
+        assert_eq!(
+            job_transition(
+                &preparing,
+                preparing.set_phase(JobPhase::PublishingDestination),
+            )
+            .unwrap_err()
+            .code,
+            "cancelled"
+        );
     }
 
     #[test]

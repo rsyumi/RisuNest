@@ -8,6 +8,7 @@ pub(crate) enum BackupSourceFormat {
     Portable,
     BlockRisuSave,
     LocalBackup,
+    ConflictReference,
 }
 
 fn detect(mut file: File) -> Result<BackupSourceFormat, NativeJobError> {
@@ -69,10 +70,19 @@ fn detect(mut file: File) -> Result<BackupSourceFormat, NativeJobError> {
 
 #[tauri::command]
 pub(crate) fn native_backup_source_format(
+    app: AppHandle,
     state: State<'_, NativeFileJobState>,
     source: JobSource,
 ) -> Result<BackupSourceFormat, NativeJobError> {
-    detect(open_job_source(&state.root, &source)?.file)
+    match source {
+        JobSource::ConflictReference { token } => {
+            drop(super::reference_source::claim_reference_source(
+                &app, &state, &token,
+            )?);
+            Ok(BackupSourceFormat::ConflictReference)
+        }
+        source => detect(open_job_source(&state.root, &source)?.file),
+    }
 }
 
 #[cfg(test)]

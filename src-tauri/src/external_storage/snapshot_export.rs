@@ -242,6 +242,25 @@ pub(crate) fn export_verified_snapshot(
     scratch_parent: &Path,
     cancel: &Cancellation,
 ) -> Result<SnapshotExportReceipt> {
+    export_verified_snapshot_controlled(
+        snapshot,
+        destination,
+        scratch_parent,
+        cancel,
+        || Ok(()),
+    )
+}
+
+pub(crate) fn export_verified_snapshot_controlled(
+    snapshot: PreparedRemoteSnapshot,
+    destination: &Path,
+    scratch_parent: &Path,
+    cancel: &Cancellation,
+    before_replace: impl FnOnce() -> std::result::Result<
+        (),
+        crate::persistent_store::export::destination::DestinationWriteError,
+    >,
+) -> Result<SnapshotExportReceipt> {
     cancel.check()?;
     if destination.extension().and_then(|value| value.to_str()) != Some("risunest")
         || destination.file_name().is_none()
@@ -305,9 +324,14 @@ pub(crate) fn export_verified_snapshot(
         destination,
         || cancel.check().is_err(),
         |_| {},
-        || Ok(()),
+        before_replace,
     )
-    .map_err(|_| transient("snapshot destination publication failed"))?;
+    .map_err(|error| match error {
+        crate::persistent_store::export::destination::DestinationWriteError::Cancelled => {
+            ProviderError::new(ErrorKind::Cancelled)
+        }
+        error => transient(format!("snapshot destination publication failed: {error:?}")),
+    })?;
     Ok(SnapshotExportReceipt {
         destination: destination.to_path_buf(),
         sha256,

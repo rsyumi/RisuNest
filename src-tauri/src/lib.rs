@@ -662,7 +662,6 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         .manage(server_sync::events::ServerSyncEventsState::default())
         .manage(external_storage::connection_commands::ConnectionCommandState::default())
         .manage(external_storage::job_store::JobCommandState::default())
-        .manage(external_storage::runtime_restore::RuntimeRestoreState::default())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_process::init())
@@ -697,6 +696,8 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         external_storage::runtime::external_storage_get_quota,
         external_storage::history::external_storage_list_history,
         external_storage::sync_engine::external_storage_list_conflicts,
+        external_storage::sync_engine::external_storage_delete_conflict,
+        external_storage::sync_engine::external_storage_recheck_conflict,
         native_file_jobs::reference_source::external_storage_open_conflict_source,
         native_file_jobs::reference_source::external_storage_release_conflict_source,
         external_storage::sync_engine::external_storage_apply_received,

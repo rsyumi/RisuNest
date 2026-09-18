@@ -262,7 +262,18 @@ fn publish(
         destination,
         || job.is_cancel_requested(),
         |_| {},
-        || Ok(()),
+        || {
+            job.commit_export_publication().map_err(|message| {
+                if job.is_cancel_requested() {
+                    crate::persistent_store::export::destination::DestinationWriteError::Cancelled
+                } else {
+                    crate::persistent_store::export::destination::DestinationWriteError::Io {
+                        operation: "commit portable export publication",
+                        source: std::io::Error::other(message),
+                    }
+                }
+            })
+        },
     )
     .map_err(|failure| {
         super::error::destination_error_with(
@@ -283,7 +294,7 @@ pub(crate) fn export_portable(
     job: &JobControl,
     device: Option<(&tauri::AppHandle, &PortableSelection)>,
 ) -> Result<JobResultSummary, NativeJobError> {
-    job.start(JobPhase::WritingExport).map_err(error)?;
+    super::job_transition(job, job.start(JobPhase::WritingExport))?;
     let fallback = PortableSelection::default();
     let selection = device.map(|(_, selection)| selection).unwrap_or(&fallback);
     if !selection.library && selection.device_sections.is_empty() {
@@ -344,10 +355,8 @@ pub(crate) fn export_portable(
                 (path.clone(), Some(path.to_string_lossy().into_owned()))
             }
         };
-        job.set_phase(JobPhase::PublishingDestination)
-            .map_err(error)?;
+        super::job_transition(job, job.set_phase(JobPhase::PublishingDestination))?;
         let published = publish(&path, &destination, owned, job)?;
-        job.set_phase(JobPhase::FinalizingExport).map_err(error)?;
         Ok(JobResultSummary {
             revision,
             source_bytes: published.bytes,
