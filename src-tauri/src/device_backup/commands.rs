@@ -73,7 +73,6 @@ pub(super) fn complete_native_recovery_for_test(
 pub(crate) fn native_device_backup_bootstrap(
     app: AppHandle,
     state: State<'_, DeviceBackupState>,
-    fresh_bootstrap: Option<bool>,
 ) -> Result<BootstrapDecision> {
     if state.is_blocking()? {
         require(
@@ -81,7 +80,7 @@ pub(crate) fn native_device_backup_bootstrap(
             "Device maintenance requires one WebView with all previous plugin contexts closed",
         )?;
     }
-    let decision = state.bootstrap_for_entry(fresh_bootstrap.unwrap_or(false))?;
+    let decision = state.bootstrap_for_entry()?;
     let Some(session) = decision.session.as_ref() else {
         return Ok(decision);
     };
@@ -103,7 +102,7 @@ pub(crate) fn native_device_backup_bootstrap(
         )?;
         state.fail(&session.session_id, "interrupted-before-native-apply")?;
         state.recovery_complete(&session.session_id)?;
-        return state.bootstrap_for_entry(false);
+        return state.bootstrap_for_entry();
     }
     if matches!(
         session.phase.as_str(),
@@ -117,7 +116,7 @@ pub(crate) fn native_device_backup_bootstrap(
                 )
             })?;
         resume_journaled_native_restore(&state, &session.session_id, &mut store)?;
-        let decision = state.bootstrap_for_entry(false)?;
+        let decision = state.bootstrap_for_entry()?;
         decision.session.as_ref().ok_or_else(|| {
             error(
                 "device-invalid-state",

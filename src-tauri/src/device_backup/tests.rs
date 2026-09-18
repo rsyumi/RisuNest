@@ -514,7 +514,7 @@ fn native_journal_resumes_before_or_after_an_inflight_section_commit() {
         let recovered = state(root.path());
         assert_eq!(
             recovered
-                .bootstrap_for_entry(false)
+                .bootstrap_for_entry()
                 .unwrap()
                 .session
                 .unwrap()
@@ -629,7 +629,7 @@ fn native_library_stage_survives_reopen_and_marker_prevents_second_activation() 
     drop(coordinator);
 
     let recovered = state(root.path());
-    let decision = recovered.bootstrap_for_entry(false).unwrap();
+    let decision = recovered.bootstrap_for_entry().unwrap();
     let session = decision.session.unwrap();
     assert_eq!(session.phase, "committed");
     assert_eq!(session.action, "native-complete");

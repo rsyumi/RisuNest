@@ -308,7 +308,7 @@ impl DeviceBackupState {
         Ok(active_session(self.lock()?.connection.as_ref().unwrap())?.is_some())
     }
 
-    pub(crate) fn bootstrap_for_entry(&self, _fresh_bootstrap: bool) -> Result<BootstrapDecision> {
+    pub(crate) fn bootstrap_for_entry(&self) -> Result<BootstrapDecision> {
         let mut inner = self.lock()?;
         let restart = !inner.reconciled;
         let connection = inner.connection.as_mut().unwrap();
