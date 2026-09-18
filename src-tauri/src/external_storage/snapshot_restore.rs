@@ -7,6 +7,7 @@ use super::{
         RepositoryHandle, Result,
     },
     packaging::{cpu_permit, RemoteObject},
+    sections::{CapturedSection, SectionSource},
     transfer::SpoolSink,
 };
 use risunest_external_storage_format::{
@@ -561,18 +562,6 @@ fn materialize_entries(
     Ok(())
 }
 
-/// One received section with the control values its reference declared. The
-/// entries stay in memory because applying them needs them there anyway.
-#[derive(Clone, Debug)]
-pub(crate) struct PreparedSection {
-    pub kind: risunest_external_storage_format::section::SectionKind,
-    pub generation: risunest_sync_wire::head::Sequence,
-    pub gc_floor: risunest_sync_wire::head::Sequence,
-    pub max_write_clock: risunest_sync_wire::head::Sequence,
-    pub content_fingerprint: [u8; 32],
-    pub entries: Vec<(wire::CatalogEntryKind, String, Vec<u8>)>,
-}
-
 fn assemble(entry: &CompleteEntry, packs: &BTreeMap<String, PathBuf>) -> Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(usize::try_from(entry.byte_length).map_err(corrupt)?);
     let mut digest = Sha256::new();
@@ -608,6 +597,49 @@ fn assemble(entry: &CompleteEntry, packs: &BTreeMap<String, PathBuf>) -> Result<
     Ok(bytes)
 }
 
+fn materialize_section_entries(
+    entries: Vec<CompleteEntry>,
+    packs: &BTreeMap<String, PathBuf>,
+    staging_root: &Path,
+    cancel: &Cancellation,
+) -> Result<Vec<SectionSource>> {
+    let spool = staging_root.join("section-spool");
+    ensure_directory(&spool)?;
+    let mut sources = Vec::with_capacity(entries.len());
+    for entry in entries {
+        cancel.check()?;
+        let bytes = assemble(&entry, packs)?;
+        let digest = hex::encode(entry.content_sha256);
+        let destination = spool.join(&digest);
+        if !verify(&destination, entry.byte_length, &digest)? {
+            let partial = spool.join(format!(".section-{}.partial", uuid::Uuid::new_v4()));
+            let mut output = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&partial)
+                .map_err(transient)?;
+            output.write_all(&bytes).map_err(transient)?;
+            output.sync_all().map_err(transient)?;
+            drop(output);
+            if !verify(&partial, entry.byte_length, &digest)? {
+                return Err(corrupt("received section spool integrity failed"));
+            }
+            publish_verified(&partial, &destination, entry.byte_length, &digest)?;
+        }
+        drop(bytes);
+        sources.push(SectionSource {
+            kind: entry.kind,
+            key: entry.key,
+            content_sha256: digest,
+            byte_length: entry.byte_length,
+            path: destination,
+        });
+    }
+    sources.sort_by(|a, b| (a.kind as u8, &a.key).cmp(&(b.kind as u8, &b.key)));
+    sources.dedup_by(|a, b| a.kind == b.kind && a.key == b.key);
+    Ok(sources)
+}
+
 /// Downloads only the sections the caller asked for. A section left out of
 /// `wanted` is never read, so its values never reach this device.
 pub(crate) async fn download_sections(
@@ -618,7 +650,7 @@ pub(crate) async fn download_sections(
     provider: &dyn Provider,
     repository: &RepositoryHandle,
     cancel: &Cancellation,
-) -> Result<Vec<PreparedSection>> {
+) -> Result<Vec<CapturedSection>> {
     if wanted.is_empty() {
         return Ok(Vec::new());
     }
@@ -663,24 +695,20 @@ pub(crate) async fn download_sections(
             open_packs(&packs, root_key, staging_root, provider, repository, cancel).await?;
         let cpu = cpu_permit().await?;
         let section_cancel = cancel.clone();
-        let entries = tokio::task::spawn_blocking(move || -> Result<_> {
-            let mut entries = Vec::with_capacity(complete.len());
-            for entry in &complete {
-                section_cancel.check()?;
-                entries.push((entry.kind, entry.key.clone(), assemble(entry, &pack_paths)?));
-            }
-            Ok(entries)
+        let section_staging = staging_root.to_path_buf();
+        let sources = tokio::task::spawn_blocking(move || {
+            materialize_section_entries(complete, &pack_paths, &section_staging, &section_cancel)
         })
         .await
         .map_err(transient)??;
         drop(cpu);
-        prepared.push(PreparedSection {
+        prepared.push(CapturedSection {
             kind: reference.kind,
             generation: reference.generation.clone(),
             gc_floor: reference.gc_floor.clone(),
             max_write_clock: reference.max_write_clock.clone(),
             content_fingerprint: reference.content_fingerprint,
-            entries,
+            sources,
         });
     }
     Ok(prepared)
