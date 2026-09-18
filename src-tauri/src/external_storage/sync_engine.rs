@@ -2278,7 +2278,7 @@ mod receive_tests {
         assert!(rows(&mut store).is_empty());
         assert_eq!(store.materialize_staging(&stage).unwrap()["marker"], "remote");
         // Final apply must need neither the downloaded library nor section sources.
-        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(&source).unwrap();
         // Match the runtime: preparation and activation use separate native handles.
         let mut reopened = store.open_native_job_store().unwrap();
         let state = super::super::job_store::JobCommandState::default();
@@ -2286,7 +2286,7 @@ mod receive_tests {
         let (cancel, claim) = state.claim(&job).unwrap();
         let current = reopened.external_identity().unwrap();
         cancel.check().unwrap();
-        super::super::snapshot_restore::reset_test_read_counts();
+        super::super::snapshot_restore::reset_test_read_counts(&source);
         assert_eq!(
             commit_prepared_receive(&mut reopened, &state, &claim, &job, 1, &current)
                 .unwrap_err().kind,
@@ -2303,7 +2303,10 @@ mod receive_tests {
         .unwrap();
         assert_eq!(snapshot_id, "snapshot");
         assert_eq!(received_revision, 1);
-        assert_eq!(super::super::snapshot_restore::test_read_counts(), (0, 0));
+        assert_eq!(
+            super::super::snapshot_restore::take_test_read_counts(&source),
+            (0, 0)
+        );
         assert_eq!(store.materialize(None).unwrap()["marker"], "remote");
         assert_eq!(rows(&mut store).len(), 1);
         assert!(store.prepare_replace_commit(&stage, Some(1)).is_err());

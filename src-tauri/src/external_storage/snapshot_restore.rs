@@ -22,24 +22,39 @@ use std::{
 };
 
 #[cfg(test)]
-static TEST_NETWORK_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(test)]
-static TEST_PACK_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TEST_READ_COUNTS: std::sync::LazyLock<
+    std::sync::Mutex<BTreeMap<PathBuf, (u64, u64)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
 
 #[cfg(test)]
-pub(super) fn reset_test_read_counts() {
-    use std::sync::atomic::Ordering;
-    TEST_NETWORK_READS.store(0, Ordering::Relaxed);
-    TEST_PACK_READS.store(0, Ordering::Relaxed);
+pub(super) fn reset_test_read_counts(staging_root: &Path) {
+    TEST_READ_COUNTS
+        .lock()
+        .unwrap()
+        .insert(staging_root.to_path_buf(), (0, 0));
 }
 
 #[cfg(test)]
-pub(super) fn test_read_counts() -> (u64, u64) {
-    use std::sync::atomic::Ordering;
-    (
-        TEST_NETWORK_READS.load(Ordering::Relaxed),
-        TEST_PACK_READS.load(Ordering::Relaxed),
-    )
+pub(super) fn take_test_read_counts(staging_root: &Path) -> (u64, u64) {
+    TEST_READ_COUNTS
+        .lock()
+        .unwrap()
+        .remove(staging_root)
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn record_test_read(downloads: &Path, pack: bool) {
+    let staging_root = downloads
+        .parent()
+        .expect("snapshot downloads directory has a staging root");
+    let mut reads = TEST_READ_COUNTS.lock().unwrap();
+    if let Some((network_reads, pack_reads)) = reads.get_mut(staging_root) {
+        *network_reads += 1;
+        if pack {
+            *pack_reads += 1;
+        }
+    }
 }
 
 fn corrupt(_: impl std::fmt::Display) -> ProviderError {
@@ -162,13 +177,7 @@ async fn download_ciphertext(
     }
     let mut sink = SpoolSink::create(&partial, object.receipt.byte_length)?;
     #[cfg(test)]
-    {
-        use std::sync::atomic::Ordering;
-        TEST_NETWORK_READS.fetch_add(1, Ordering::Relaxed);
-        if object.role == ObjectRole::Pack {
-            TEST_PACK_READS.fetch_add(1, Ordering::Relaxed);
-        }
-    }
+    record_test_read(downloads, object.role == ObjectRole::Pack);
     let receipt = provider
         .read_object(repository, &object.receipt.locator, None, &mut sink, cancel)
         .await?;

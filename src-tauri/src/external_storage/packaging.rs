@@ -3014,10 +3014,11 @@ mod tests {
                 )
             };
             let restore_started = std::time::Instant::now();
-            snapshot_restore::reset_test_read_counts();
+            let restore_root = root.path().join("inventory-restore");
+            snapshot_restore::reset_test_read_counts(&restore_root);
             let restored = snapshot_restore::download_snapshot(
                 &completed.reference,
-                &root.path().join("inventory-restore"),
+                &restore_root,
                 &key,
                 &provider,
                 &repository,
@@ -3026,7 +3027,8 @@ mod tests {
             .await
             .unwrap();
             let restore_elapsed = restore_started.elapsed();
-            let (network_reads, pack_reads) = snapshot_restore::test_read_counts();
+            let (network_reads, pack_reads) =
+                snapshot_restore::take_test_read_counts(&restore_root);
             assert_eq!(restored.records.len(), 300);
             assert_eq!(restored.objects.len(), 100_000);
             assert!(provider
@@ -3101,12 +3103,13 @@ mod tests {
             }
             let publication_elapsed = started.elapsed();
             let physical_remote_objects = provider.state.lock().unwrap().objects.len();
-            snapshot_restore::reset_test_read_counts();
+            let restore_root = root.path().join("publication-restore");
+            snapshot_restore::reset_test_read_counts(&restore_root);
             let restore_started = std::time::Instant::now();
             let latest = latest.unwrap();
             let restored = snapshot_restore::download_snapshot(
                 &latest.reference,
-                &root.path().join("publication-restore"),
+                &restore_root,
                 &key,
                 &provider,
                 &repository,
@@ -3115,7 +3118,8 @@ mod tests {
             .await
             .unwrap();
             let restore_elapsed = restore_started.elapsed();
-            let (network_reads, pack_reads) = snapshot_restore::test_read_counts();
+            let (network_reads, pack_reads) =
+                snapshot_restore::take_test_read_counts(&restore_root);
             assert_eq!(restored.records.len(), 1);
             assert_eq!(restored.objects.len(), 1_000);
             assert!(network_reads < 50);
