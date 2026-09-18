@@ -258,7 +258,7 @@
           <span class="font-medium">{text.library}</span>
         </label>
       {/if}
-      {#if sections.some((choice) => choice.sectionId !== "device-settings")}
+      {#if sections.some((choice) => choice.sectionId !== "local-settings")}
         <fieldset class="min-w-0">
           <legend
             class="mb-2 text-xs font-medium tracking-wide text-textcolor2"
@@ -268,7 +268,7 @@
           <div
             class="divide-y divide-darkborderc rounded-lg border border-darkborderc"
           >
-            {#each sections.filter((choice) => choice.sectionId !== "device-settings") as choice (choice.sectionId)}
+            {#each sections.filter((choice) => choice.sectionId !== "local-settings") as choice (choice.sectionId)}
               <label
                 class="flex min-h-12 cursor-pointer items-center gap-3 px-3 py-2 transition-colors hover:bg-darkbutton"
               >
@@ -283,7 +283,7 @@
           </div>
         </fieldset>
       {/if}
-      {#each sections.filter((choice) => choice.sectionId === "device-settings") as choice (choice.sectionId)}
+      {#each sections.filter((choice) => choice.sectionId === "local-settings") as choice (choice.sectionId)}
         <label
           class="mt-4 flex min-h-12 cursor-pointer items-center gap-3 rounded-lg border border-darkborderc px-3 py-2 hover:bg-darkbutton"
         >
