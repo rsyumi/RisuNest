@@ -770,7 +770,8 @@ mod tests {
         .is_ok());
         assert_eq!(
             remote_conflict_source((), "conflict", "connection", "other", valid.clone())
-                .unwrap_err()
+                .err()
+                .unwrap()
                 .kind,
             ErrorKind::Corrupt
         );
@@ -783,7 +784,8 @@ mod tests {
                 "repository",
                 wrong_role,
             )
-            .unwrap_err()
+            .err()
+            .unwrap()
             .kind,
             ErrorKind::Corrupt
         );
@@ -800,7 +802,8 @@ mod tests {
                 "repository",
                 wrong_id,
             )
-            .unwrap_err()
+            .err()
+            .unwrap()
             .kind,
             ErrorKind::Corrupt
         );
@@ -855,7 +858,8 @@ mod tests {
                     catalog_hash: "a".repeat(64),
                 },
             )
-            .unwrap_err()
+            .err()
+            .unwrap()
             .kind,
             ErrorKind::Corrupt
         );
