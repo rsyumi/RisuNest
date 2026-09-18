@@ -6,6 +6,7 @@ import {
   selectPortableBackupExport,
   selectPortableBackupRestore,
 } from "./selectionDialog";
+import type { NativePortableRestorePreview } from "../nativeFileJobs";
 
 beforeEach(() => {
   vi.stubGlobal("indexedDB", new IDBFactory());
@@ -90,7 +91,7 @@ describe("portable backup scope selection", () => {
     expect(document.querySelector("dialog")).toBeNull();
   });
   it("describes a first-run restore as an import instead of an overwrite", async () => {
-    const preview = {
+    const preview: NativePortableRestorePreview = {
       libraryIncluded: true,
       repairRequired: false,
       deviceSections: ["hypa"],

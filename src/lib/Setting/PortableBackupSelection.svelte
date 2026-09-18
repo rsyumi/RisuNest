@@ -1,7 +1,10 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
   import { language } from "../../lang";
-  import type { DeviceSectionChoice } from "../../ts/storage/deviceBackup/selection";
+  import type {
+    DeviceSectionChoice,
+    NativePortableDeviceSection,
+  } from "../../ts/storage/deviceBackup/selection";
   import type {
     NativeArchiveInventory,
     NativePortableSelection,
@@ -20,7 +23,7 @@
     onError,
   }: {
     mode: "export" | "restore";
-    choices: DeviceSectionChoice[];
+    choices: DeviceSectionChoice<NativePortableDeviceSection>[];
     libraryIncluded: boolean;
     repairRequired?: boolean;
     /** What is wrong with the archive, so a refused one can still be looked at. */
