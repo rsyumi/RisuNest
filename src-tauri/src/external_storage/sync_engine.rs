@@ -108,7 +108,7 @@ fn prepare_receive_sections(
     connection_id: &str,
     library_lineage: &str,
     participation: &ReceiveParticipation,
-    sections: Vec<super::snapshot_restore::PreparedSection>,
+    sections: Vec<super::sections::CapturedSection>,
     cancel: &Cancellation,
 ) -> Result<Vec<super::sections::PreparedSectionInput>> {
     let mut seen = std::collections::BTreeSet::new();
@@ -125,35 +125,12 @@ fn prepare_receive_sections(
         if !participating {
             return Err(corrupt("received section is not participating"));
         }
-        let source_directory = tempfile::tempdir().map_err(local_error)?;
-        let mut sources = Vec::with_capacity(section.entries.len());
-        for (index, (kind, key, bytes)) in section.entries.into_iter().enumerate() {
-            cancel.check()?;
-            let path = source_directory.path().join(format!("source-{index}"));
-            std::fs::write(&path, &bytes).map_err(local_error)?;
-            sources.push(super::sections::SectionSource {
-                kind,
-                key,
-                content_sha256: hex::encode(
-                    risunest_external_storage_format::content_identity::hash(&bytes),
-                ),
-                byte_length: bytes.len() as u64,
-                path,
-            });
-        }
         super::sections::prepare_received_section(
             connection_id,
             library_lineage,
             super::sections::SectionArrival::Continuing,
             generation,
-            &super::sections::CapturedSection {
-                kind: section.kind,
-                generation: section.generation,
-                gc_floor: section.gc_floor,
-                max_write_clock: section.max_write_clock,
-                content_fingerprint: section.content_fingerprint,
-                sources,
-            },
+            &section,
             cancel,
         )
     }).collect()
@@ -165,7 +142,7 @@ fn prepare_receive_input(
     expected: CaptureIdentity,
     authenticated_head: String,
     downloaded: super::snapshot_restore::PreparedRemoteSnapshot,
-    sections: Vec<super::snapshot_restore::PreparedSection>,
+    sections: Vec<super::sections::CapturedSection>,
     participation: ReceiveParticipation,
     cancel: &Cancellation,
 ) -> Result<PreparedReceive> {
@@ -2219,7 +2196,7 @@ mod receive_tests {
         (directory, store, job, downloaded)
     }
 
-    fn plugin_section() -> super::super::snapshot_restore::PreparedSection {
+    fn plugin_section(staging_root: &std::path::Path) -> super::super::sections::CapturedSection {
         let kind = SectionKind::LocalPlugins;
         let key = local_plugin_entry_key("owner", "string", "key").unwrap();
         let entry = SectionEntry::new(kind, key.clone(), SectionValue::LocalPlugin(LocalPluginValue {
@@ -2227,11 +2204,19 @@ mod receive_tests {
         }), Some(SectionEntryVersion {
             write_clock: Sequence::from(7u64), writer_id: "remote-writer".into(),
         })).unwrap().encode().unwrap();
-        super::super::snapshot_restore::PreparedSection {
+        let content_sha256 = hex::encode(hash(&entry));
+        let spool = staging_root.join("section-spool");
+        fs::create_dir_all(&spool).unwrap();
+        let path = spool.join(&content_sha256);
+        fs::write(&path, &entry).unwrap();
+        super::super::sections::CapturedSection {
             kind, generation: Sequence::from(7u64), gc_floor: Sequence::from(0u64),
             max_write_clock: Sequence::from(7u64),
             content_fingerprint: fingerprint(&kind.fingerprint_domain(), &BTreeMap::from([(key.clone(), hash(&entry))])),
-            entries: vec![(CatalogEntryKind::SectionEntry, key, entry)],
+            sources: vec![super::super::sections::SectionSource {
+                kind: CatalogEntryKind::SectionEntry, key, content_sha256,
+                byte_length: entry.len() as u64, path,
+            }],
         }
     }
 
@@ -2267,8 +2252,9 @@ mod receive_tests {
         downloaded: super::super::snapshot_restore::PreparedRemoteSnapshot) -> PreparedReceive
     {
         let participation = receive_participation(store).unwrap();
+        let section = plugin_section(&downloaded.staging_root);
         prepare_receive_input(store, job, job.admission_identity.clone(), "authenticated-head".into(),
-            downloaded, vec![plugin_section()], participation, &Cancellation::default()).unwrap()
+            downloaded, vec![section], participation, &Cancellation::default()).unwrap()
     }
 
     fn local_edit(store: &mut PersistentStore, revision: i64) {
@@ -2291,6 +2277,7 @@ mod receive_tests {
         assert_eq!(store.revision().unwrap(), 0);
         assert!(rows(&mut store).is_empty());
         assert_eq!(store.materialize_staging(&stage).unwrap()["marker"], "remote");
+        // Final apply must need neither the downloaded library nor section sources.
         fs::remove_dir_all(source).unwrap();
         // Match the runtime: preparation and activation use separate native handles.
         let mut reopened = store.open_native_job_store().unwrap();
@@ -2450,8 +2437,9 @@ mod receive_tests {
             if before_stage {
                 local_edit(&mut store, 0);
                 let participation = receive_participation(&mut store).unwrap();
+                let section = plugin_section(&downloaded.staging_root);
                 assert!(prepare_receive_input(&mut store, &job, job.admission_identity.clone(),
-                    "authenticated-head".into(), downloaded, vec![plugin_section()], participation,
+                    "authenticated-head".into(), downloaded, vec![section], participation,
                     &Cancellation::default()).is_err());
             } else {
                 let prepared = prepare(&mut store, &job, downloaded);
@@ -2497,9 +2485,9 @@ mod receive_tests {
         for case in ["section", "snapshot", "repository", "record"] {
             let (_directory, mut store, job, mut downloaded) = fixture();
             let participation = receive_participation(&mut store).unwrap();
-            let mut section = plugin_section();
+            let section = plugin_section(&downloaded.staging_root);
             match case {
-                "section" => section.entries[0].2 = b"corrupt".to_vec(),
+                "section" => fs::write(&section.sources[0].path, b"corrupt").unwrap(),
                 "snapshot" => downloaded.snapshot_id = "other-snapshot".into(),
                 "repository" => downloaded.repository_id = "other-repository".into(),
                 "record" => fs::write(&downloaded.records[0].path, b"corrupt").unwrap(),
