@@ -1718,6 +1718,7 @@ mod section_exchange {
                 &marker(7, 1_760_000_000_000),
                 &BTreeMap::new(),
                 &Sequence::from(0u64),
+                None,
             )
             .expect("record the confirmed publication");
         assert!(store
@@ -1738,6 +1739,7 @@ mod section_exchange {
                 &marker(7, 1_760_000_000_000),
                 &BTreeMap::new(),
                 &Sequence::from(0u64),
+                None,
             )
             .expect("record the second publication");
         assert!(!store
@@ -1773,6 +1775,7 @@ mod section_exchange {
                 &marker(7, 1_760_000_000_000),
                 &BTreeMap::new(),
                 &Sequence::from(0u64),
+                None,
             )
             .unwrap();
         store

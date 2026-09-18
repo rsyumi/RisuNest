@@ -10,7 +10,6 @@
     import { isTauriAndroid, isTauriIOS } from 'src/ts/platform'
     import { getExternalStorageBridge } from 'src/ts/storage/sync/external/bridge'
     import {
-        SEQUENTIAL_ACKNOWLEDGEMENT,
         buildPrepareConnectionRequest,
         defaultExternalCapturePolicy,
         requiredConnectionAcknowledgements,
@@ -19,7 +18,6 @@
         buildProviderSecret,
         externalProviderDefinitions,
         getExternalProviderDefinition,
-        type ExternalProviderDefinition,
     } from 'src/ts/storage/sync/external/providerRegistry'
     import type {
         ExternalConnectionResult,
@@ -27,7 +25,6 @@
         ExternalOpenMode,
         ExternalProviderId,
         ExternalProviderDescriptor,
-        ExternalPublicationStrategy,
         PreparedExternalConnection,
     } from 'src/ts/storage/sync/external/types'
     import {
@@ -72,7 +69,6 @@
     // show the purpose this form never asked for.
     let fromRecovery = $state(false)
     let purpose = $state<ExternalConnectionPurpose>('backup')
-    let strategy = $state<ExternalPublicationStrategy>('backup-only')
     let values = $state<Record<string, string>>({
         space: 'drive', accountType: 'personal', tenant: 'common',
         ...(isTauriAndroid ? {
@@ -101,7 +97,7 @@
     let cancellationPromise: Promise<boolean> | null = null
 
     const definition = $derived(getExternalProviderDefinition(providerId))
-    const requiredAcks = $derived(requiredConnectionAcknowledgements(providerId, strategy))
+    const requiredAcks = $derived(requiredConnectionAcknowledgements(providerId))
     const googleAndroid = $derived(isTauriAndroid && providerId === 'google_drive')
     const visibleFields = $derived(definition.fields.filter(field => (
         field.key !== 'oauthRedirectUri' || googleAndroid
@@ -110,8 +106,7 @@
         providerDescriptors.find(provider => provider.id === providerId)?.authorizationAvailable ?? true,
     )
     const providerStrings = $derived(strings.providers[providerId])
-    const syncStrategies = $derived(definition.strategies.filter(item => item !== 'backup-only'))
-    const supportsSync = $derived(syncStrategies.length > 0)
+    const supportsSync = $derived(definition.supportsSync)
     const providerOptions = $derived(externalProviderDefinitions.map(provider => ({
         value: provider.id,
         label: externalProviderName(strings, provider.id),
@@ -121,14 +116,12 @@
         { value: 'backup' as const, label: strings.backup },
         ...(supportsSync ? [{ value: 'sync' as const, label: strings.sync }] : []),
     ])
-    const strategyOptions = $derived(syncStrategies.map(item => ({ value: item, label: strings.strategyLabels[item] })))
     const scopeSummary = $derived([
         strings.library,
         ...(hypa ? [strings.hypa] : []),
         ...(localPlugins ? [strings.devicePlugins] : []),
         ...(localSettings ? [strings.deviceSettings] : []),
     ].join(', '))
-    const providerStrategyNote = $derived('strategyNote' in providerStrings ? providerStrings.strategyNote : undefined)
     const providerWarning = $derived('warningTitle' in providerStrings
         ? { title: providerStrings.warningTitle, body: providerStrings.warning }
         : null)
@@ -201,17 +194,10 @@
         busy = false
     }
 
-    function preferredSyncStrategy(provider: ExternalProviderDefinition): ExternalPublicationStrategy {
-        if (provider.strategies.includes('cas')) return 'cas'
-        if (provider.strategies.includes('sequential')) return 'sequential'
-        return provider.strategies[0]
-    }
-
     function selectProvider(value: string): void {
         providerId = value as ExternalProviderId
         const next = getExternalProviderDefinition(providerId)
-        if (!next.strategies.some(item => item !== 'backup-only')) purpose = 'backup'
-        strategy = purpose === 'backup' ? 'backup-only' : preferredSyncStrategy(next)
+        if (!next.supportsSync) purpose = 'backup'
         values = {
             space: 'drive', accountType: 'personal', tenant: 'common',
             ...(isTauriAndroid ? {
@@ -259,18 +245,7 @@
 
     function selectPurpose(value: ExternalConnectionPurpose): void {
         purpose = value
-        strategy = value === 'backup' ? 'backup-only' : preferredSyncStrategy(definition)
         resetPrepared()
-    }
-
-    function selectStrategy(value: ExternalPublicationStrategy): void {
-        strategy = value
-        resetPrepared()
-    }
-
-    function acknowledgementText(id: string): { title: string; body: string } {
-        if (id === SEQUENTIAL_ACKNOWLEDGEMENT) return { title: strings.sequentialTitle, body: strings.sequentialWarning }
-        return { title: strings.githubWarningTitle, body: strings.githubWarning }
     }
 
     function fieldLabel(key: string): string {
@@ -295,7 +270,7 @@
         let request: ReturnType<typeof buildPrepareConnectionRequest>
         try {
             request = buildPrepareConnectionRequest({
-                providerId, values, platform, mode, purpose, strategy,
+                providerId, values, platform, mode, purpose,
                 capturePolicy: purpose === 'backup'
                     ? { hypa, localPlugins, localSettings }
                     : defaultExternalCapturePolicy(purpose),
@@ -380,7 +355,7 @@
             for (const field of definition.secretFields) values[field.key] = ''
         } catch (reason) {
             await cancelPendingAuthorization()
-            error = externalErrorMessage(strings, reason, strategy)
+            error = externalErrorMessage(strings, reason)
         } finally {
             busy = false
         }
@@ -426,9 +401,7 @@
         </div>
         {#if purpose === 'sync'}
             <div class="field">
-                <span>{strings.strategy}</span>
-                <SegmentedButtons value={strategy} label={strings.strategy} role="radiogroup" onchange={selectStrategy} options={strategyOptions} />
-                {#if providerStrategyNote}<small>{providerStrategyNote}</small>{/if}
+                <small>{strings.sequentialWarning}</small>
             </div>
         {/if}
         {#if providerWarning}
@@ -438,14 +411,13 @@
             </div>
         {/if}
         {#each requiredAcks as acknowledgement (acknowledgement)}
-            {@const text = acknowledgementText(acknowledgement)}
             <div class="warning">
-                <strong>{text.title}</strong>
-                <p>{text.body}</p>
+                <strong>{strings.githubWarningTitle}</strong>
+                <p>{strings.githubWarning}</p>
                 <label class="check">
                     <input type="checkbox" checked={accepted.includes(acknowledgement)} onchange={event => toggleAcknowledgement(acknowledgement, event.currentTarget.checked)} />
                     <span>{strings.acknowledge}</span>
-                    <span class="sr-only">{text.body}</span>
+                    <span class="sr-only">{strings.githubWarning}</span>
                 </label>
             </div>
         {/each}
@@ -508,7 +480,7 @@
                 <dt>{strings.repository}</dt><dd>{prepared.endpoint.repositoryHint}</dd>
                 {#if !fromRecovery}
                     <dt>{strings.purposeReview}</dt>
-                    <dd>{purpose === 'backup' ? `${strings.backup} · ${strings.includes.replace('{0}', scopeSummary)}` : `${strings.sync} · ${strings.strategyLabels[strategy]}`}</dd>
+                    <dd>{purpose === 'backup' ? `${strings.backup} · ${strings.includes.replace('{0}', scopeSummary)}` : strings.sync}</dd>
                 {/if}
                 {#if prepared.requiresPlatformOAuthClient && prepared.oauthProjectHint}<dt>{strings.oauthProjectHint}</dt><dd>{prepared.oauthProjectHint}</dd>{/if}
             </dl>

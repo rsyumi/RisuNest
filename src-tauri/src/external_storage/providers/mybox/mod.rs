@@ -35,9 +35,11 @@ mod tests;
 use super::{common, Dependencies};
 use crate::external_storage::{
     auth::SecretBytes,
-    capabilities::{Capabilities, Evidence},
+    capabilities::Capabilities,
     contract::*,
     http::{self, HttpRequest, HttpResponse},
+    quota::AccountKey,
+    quota_profiles::MyboxPlan,
 };
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
@@ -48,17 +50,6 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-const DOCUMENTED_AT: &str = "2026-09-14";
-const EVIDENCE_URLS: [&str; 8] = [
-    "https://developers.mybox.naver.com/getting-started",
-    "https://developers.mybox.naver.com/docs/dms_storage",
-    "https://developers.mybox.naver.com/docs/dms_root",
-    "https://developers.mybox.naver.com/docs/dms_list",
-    "https://developers.mybox.naver.com/docs/dms_resourceId",
-    "https://developers.mybox.naver.com/docs/files_create_folder",
-    "https://developers.mybox.naver.com/docs/files_upload",
-    "https://developers.mybox.naver.com/docs/files_download",
-];
 /// The listing API pages at most 1,000 entries per request.
 const PAGE_SIZE: u16 = 1000;
 /// The one mutable head, kept inside the heads folder like any other head write.
@@ -88,7 +79,8 @@ struct Listed {
 /// dropped again whenever a write could have changed it.
 struct Context {
     identity: String,
-    account: String,
+    account: AccountKey,
+    plan: MyboxPlan,
     base: url::Url,
     secret: SecretRef,
     folders: BTreeMap<String, String>,
@@ -186,7 +178,7 @@ impl Mybox {
     #[allow(clippy::too_many_arguments)]
     async fn send(
         &self,
-        account: &str,
+        context: &Context,
         operation: ProviderOperation,
         method: Method,
         url: url::Url,
@@ -195,11 +187,12 @@ impl Mybox {
         content_length: Option<u64>,
         cancel: &Cancellation,
     ) -> Result<HttpResponse> {
-        let now = self.deps.clock.now_ms();
-        http::send(
-            self.deps.http.as_ref(),
-            self.deps.budget.as_ref(),
-            self.deps.clock.as_ref(),
+        let mut headers = headers;
+        if http::control_operation(operation) {
+            http::bypass_cache(&mut headers);
+        }
+        let api_request = url.origin() == context.base.origin();
+        let response = self.deps.send(
             HttpRequest {
                 method,
                 url,
@@ -207,11 +200,25 @@ impl Mybox {
                 body,
                 content_length,
                 operation,
-                costs: api::costs(account, operation, now),
+                account: context.account.clone(),
+                api_request,
+                mybox_charge: api::charge(context.plan, operation),
+                control: http::control_operation(operation),
             },
             cancel,
         )
-        .await
+        .await?;
+        if response.status == 423 {
+            let now = self.deps.clock.now_ms();
+            let error = api::classify(response.status, &response.headers, now);
+            self.deps.requests.observe_classified_error(
+                &context.account,
+                &error,
+                &response.headers,
+                now,
+            )?;
+        }
+        Ok(response)
     }
     /// Open API call. The token is read from the vault per request so a revoked
     /// or expired credential stops an already open repository.
@@ -247,7 +254,7 @@ impl Mybox {
             None => (None, None),
         };
         self.send(
-            &context.account,
+            context,
             operation,
             method,
             url,
@@ -323,18 +330,24 @@ impl Mybox {
     ) -> Result<Vec<api::Resource>> {
         let mut collected = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut seen = std::collections::BTreeSet::new();
         for _ in 0..MAX_LIST_PAGES {
             let page = self
                 .list(context, folder_id, cursor.as_deref(), PAGE_SIZE, cancel)
                 .await?;
-            let next = page.cursor().map(str::to_owned);
+            let next = page.cursor()?.map(str::to_owned);
             collected.extend(page.resources);
             match next {
-                Some(value) => cursor = Some(value),
+                Some(value) => {
+                    if !seen.insert(value.clone()) {
+                        return Err(ProviderError::new(ErrorKind::Corrupt));
+                    }
+                    cursor = Some(value);
+                }
                 None => return Ok(collected),
             }
         }
-        Err(ProviderError::new(ErrorKind::Unsupported))
+        Err(ProviderError::new(ErrorKind::Corrupt))
     }
     async fn load(&self, context: &Context, folder: &str, cancel: &Cancellation) -> Result<()> {
         let folder_id = context.folder_id(folder)?.to_owned();
@@ -468,7 +481,7 @@ impl Mybox {
         headers.insert("content-type".to_owned(), form.content_type);
         let response = self
             .send(
-                &context.account,
+                context,
                 operation,
                 Method::POST,
                 url,
@@ -560,14 +573,84 @@ impl Mybox {
             }
             return Ok(Some(resource.resource_id));
         }
-        Ok(self
+        let mut matches = self
             .pages(context, None, cancel)
             .await?
             .into_iter()
-            .find(|resource| {
-                resource.kind == "folder" && resource.name == connection.root_folder_name
-            })
-            .map(|resource| resource.resource_id))
+            .filter(|resource| resource.name == connection.root_folder_name);
+        let found = matches.next();
+        if matches.next().is_some() {
+            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+        }
+        match found {
+            Some(resource) if resource.kind == "folder" => Ok(Some(resource.resource_id)),
+            Some(_) => Err(ProviderError::new(ErrorKind::PreconditionFailed)),
+            None => Ok(None),
+        }
+    }
+
+    async fn resume_folders(
+        &self,
+        context: &mut Context,
+        root_id: &str,
+        children: Vec<api::Resource>,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        for resource in children {
+            let Some(folder) = config::FOLDERS
+                .iter()
+                .find(|folder| **folder == resource.name.as_str())
+            else {
+                return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+            };
+            if resource.kind != "folder"
+                || context
+                    .folders
+                    .insert((*folder).to_owned(), resource.resource_id)
+                    .is_some()
+            {
+                return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+            }
+        }
+        for folder in config::FOLDERS {
+            if !context.folders.contains_key(folder) {
+                let id = self
+                    .create_folder(context, Some(root_id), folder, cancel)
+                    .await?;
+                context.folders.insert(folder.to_owned(), id);
+            }
+        }
+        Ok(())
+    }
+
+    async fn require_initial_contents(
+        &self,
+        context: &Context,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        for folder in config::FOLDERS {
+            let folder_id = context.folder_id(folder)?;
+            let resources = self.pages(context, Some(folder_id), cancel).await?;
+            if folder != config::DESCRIPTORS {
+                if !resources.is_empty() {
+                    return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+                }
+                continue;
+            }
+            if resources.len() > 1 {
+                return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+            }
+            if let Some(resource) = resources.into_iter().next() {
+                if resource.kind != "file"
+                    || resource.size == 0
+                    || !config::valid_name(&resource.name)
+                    || !resource.name.ends_with(".bin")
+                {
+                    return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -584,7 +667,12 @@ impl Provider for Mybox {
             let connection = config::parse(settings)?;
             let mut context = Context {
                 identity: connection.identity.clone(),
-                account: connection.account_scope.clone(),
+                account: AccountKey::new(
+                    config::PROVIDER_ID,
+                    &connection.base,
+                    &connection.account_id,
+                )?,
+                plan: connection.plan,
                 base: connection.base.clone(),
                 secret: secret.clone(),
                 folders: BTreeMap::new(),
@@ -611,7 +699,7 @@ impl Provider for Mybox {
             let discovered = self.discover_root(&context, &connection, cancel).await?;
             let root_id = match (discovered, mode) {
                 (None, OpenMode::Existing) => return Err(ProviderError::new(ErrorKind::NotFound)),
-                (None, OpenMode::Create) => {
+                (None, OpenMode::Create | OpenMode::ResumeCreate) => {
                     self.create_folder(&context, None, &connection.root_folder_name, cancel)
                         .await?
                 }
@@ -640,6 +728,10 @@ impl Provider for Mybox {
                                 }
                             }
                         }
+                        OpenMode::ResumeCreate => {
+                            self.resume_folders(&mut context, &root_id, children, cancel)
+                                .await?;
+                        }
                     }
                     root_id
                 }
@@ -651,6 +743,12 @@ impl Provider for Mybox {
                         .await?;
                     context.folders.insert(folder.into(), id);
                 }
+            } else if mode == OpenMode::ResumeCreate {
+                if context.folders.is_empty() {
+                    self.resume_folders(&mut context, &root_id, Vec::new(), cancel)
+                        .await?;
+                }
+                self.require_initial_contents(&context, cancel).await?;
             } else {
                 // A repository without a descriptor is not one this adapter may
                 // hand back as existing.
@@ -666,33 +764,29 @@ impl Provider for Mybox {
                 }
             }
             let capabilities = Capabilities {
-                immutable_create: Evidence::Synthetic,
-                direct_complete_read: Evidence::Synthetic,
-                // MYBOX documents no conditional write; `isOverwrite` is not one.
-                atomic_create_head: Evidence::Unverified,
-                conditional_head_update: Evidence::Unverified,
-                stable_head_replace: Evidence::Synthetic,
-                head_read_after_write: Evidence::Synthetic,
-                head_retry_control: Evidence::Synthetic,
-                snapshot_discovery: Evidence::Synthetic,
-                // No cleanup evidence has been recorded for this service yet.
-                delete_objects: Evidence::Unverified,
-                gc_control_consistency: Evidence::Unverified,
-                delete_completion: Evidence::Unverified,
-                discovery_extra_requests: 1,
+                immutable_create: true,
+                direct_complete_read: true,
+                // isOverwrite is not a conditional write.
+                atomic_create_head: false,
+                conditional_head_update: false,
+                stable_head_replace: true,
+                head_read_after_write: true,
+                head_retry_control: true,
+                snapshot_discovery: true,
+                lease_operations: true,
+                delete_objects: true,
                 conditional_get: false,
                 range: false,
                 resumable_upload: true,
                 max_stored_bytes: Some(storage.max_file_bytes),
                 sdk_overhead_bytes: 0,
                 upload_alignment: 1,
-                documented_at: Some(DOCUMENTED_AT.into()),
-                evidence_urls: EVIDENCE_URLS.iter().map(|url| (*url).to_owned()).collect(),
             };
             Ok((
                 RepositoryHandle {
                     repository_id: root_id,
                     connection_identity: connection.identity,
+                    account: context.account.clone(),
                     context: Box::new(context),
                 },
                 capabilities,
@@ -738,7 +832,7 @@ impl Provider for Mybox {
             let url = config::transfer_url(&issued.download_url)?;
             let mut response = self
                 .send(
-                    &context.account,
+                    context,
                     ProviderOperation::Get,
                     Method::GET,
                     url,
@@ -1070,7 +1164,7 @@ impl Provider for Mybox {
             let page = self
                 .list(context, Some(&folder_id), cursor, limit, cancel)
                 .await?;
-            let next_cursor = page.cursor().map(str::to_owned);
+            let next_cursor = page.cursor()?.map(str::to_owned);
             let mut objects = Vec::new();
             for resource in page.resources {
                 if resource.kind != "file" || !config::valid_name(&resource.name) {
@@ -1172,18 +1266,6 @@ impl Provider for Mybox {
         Ok(config::locator(&context.identity, config::HEADS, HEAD_NAME))
     }
 
-    fn request_cost(
-        &self,
-        repository: &RepositoryHandle,
-        operation: ProviderOperation,
-    ) -> Result<Vec<RequestCost>> {
-        let context = self.context(repository)?;
-        Ok(api::costs(
-            &context.account,
-            operation,
-            self.deps.clock.now_ms(),
-        ))
-    }
 }
 
 /// Heads are at most 64 KiB and already in memory when they are published.

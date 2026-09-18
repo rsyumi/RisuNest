@@ -1,74 +1,46 @@
-//! Response shapes, status meanings and the documented request cost model.
-use crate::external_storage::{contract::*, providers::common};
+//! Response shapes, status meanings and the documented request limits.
+use crate::external_storage::{
+    contract::*,
+    providers::common,
+    quota_profiles::{MyboxCharge, MyboxCounter, MyboxPlan},
+};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
 /// Daily allowance of the download API. The service documents no remaining
 /// counter, so the owning ledger holds the plan limit and this consumption.
-pub(super) const DAILY_DOWNLOAD: &str = "mybox-download-day";
 /// The per-minute allowance is documented per API, so each endpoint family
 /// reserves its own rolling bucket.
-pub(super) const MINUTE_METADATA: &str = "mybox-metadata-minute";
-pub(super) const MINUTE_LIST: &str = "mybox-list-minute";
-pub(super) const MINUTE_FOLDER: &str = "mybox-folder-minute";
-pub(super) const MINUTE_UPLOAD_URL: &str = "mybox-upload-url-minute";
-pub(super) const MINUTE_DOWNLOAD_URL: &str = "mybox-download-url-minute";
 /// Deletion is a documented allowance of its own, listed apart from the
 /// remaining APIs even where the two numbers agree.
-pub(super) const MINUTE_DELETE: &str = "mybox-delete-minute";
-
-const MINUTE_MS: u64 = 60 * 1000;
-const DAY_MS: u64 = 24 * 60 * 60 * 1000;
-/// Service timestamps and the documented search filters are KST.
-const KST_OFFSET_MS: u64 = 9 * 60 * 60 * 1000;
 /// An issued upload URL is valid for 48 hours and cannot be reused afterwards.
 pub(super) const UPLOAD_URL_LIFETIME_MS: u64 = 48 * 60 * 60 * 1000;
-
-pub(super) fn next_daily_reset_ms(now_ms: u64) -> u64 {
-    let local = now_ms.saturating_add(KST_OFFSET_MS);
-    (local - local % DAY_MS)
-        .saturating_add(DAY_MS)
-        .saturating_sub(KST_OFFSET_MS)
-}
 
 /// One call may charge both the daily download allowance and a per-minute API
 /// allowance. Whether the daily counter follows the URL issuance or the body
 /// transfer is not documented, so both reserve it.
-pub(super) fn costs(account: &str, operation: ProviderOperation, now_ms: u64) -> Vec<RequestCost> {
-    let minute = |bucket: &str| RequestCost {
-        bucket: bucket.into(),
-        shared_account: account.into(),
-        units: 1,
-        reset: QuotaReset::Rolling {
-            window_ms: MINUTE_MS,
-        },
-    };
-    let daily = || RequestCost {
-        bucket: DAILY_DOWNLOAD.into(),
-        shared_account: account.into(),
-        units: 1,
-        reset: QuotaReset::At {
-            unix_ms: next_daily_reset_ms(now_ms),
-        },
-    };
-    match operation {
-        ProviderOperation::Metadata => vec![minute(MINUTE_METADATA)],
-        ProviderOperation::Delete => vec![minute(MINUTE_DELETE)],
-        ProviderOperation::List => vec![minute(MINUTE_LIST)],
-        ProviderOperation::Create => vec![minute(MINUTE_FOLDER)],
+pub(super) fn charge(plan: MyboxPlan, operation: ProviderOperation) -> Option<MyboxCharge> {
+    let counters = match operation {
+        ProviderOperation::Metadata => vec![MyboxCounter::MetadataMinute],
+        ProviderOperation::Delete => vec![MyboxCounter::DeleteMinute],
+        ProviderOperation::List => vec![MyboxCounter::ListMinute],
+        ProviderOperation::Create => vec![MyboxCounter::FolderMinute],
         ProviderOperation::UploadSession | ProviderOperation::ReconcileUpload => {
-            vec![minute(MINUTE_UPLOAD_URL)]
+            vec![MyboxCounter::UploadUrlMinute]
         }
-        ProviderOperation::DownloadUrl => vec![minute(MINUTE_DOWNLOAD_URL), daily()],
-        ProviderOperation::Get | ProviderOperation::Range => vec![daily()],
+        ProviderOperation::DownloadUrl => {
+            vec![MyboxCounter::DownloadUrlMinute, MyboxCounter::DownloadDay]
+        }
+        ProviderOperation::Get | ProviderOperation::Range => vec![MyboxCounter::DownloadDay],
         // Bodies go to an issued storage URL, which is outside the documented
         // Open API allowances.
         ProviderOperation::UploadChunk
         | ProviderOperation::CompleteUpload
         | ProviderOperation::ReplaceHead
         | ProviderOperation::CompareExchangeHead
-        | ProviderOperation::Authenticate => Vec::new(),
-    }
+        | ProviderOperation::Authenticate => return None,
+    };
+    Some(MyboxCharge { plan, counters })
 }
 
 /// 401 is an unusable token the user has to replace, and 423 marks a locked
@@ -133,12 +105,17 @@ pub(super) struct Listing {
     pub response_meta_data: Option<Meta>,
 }
 impl Listing {
-    pub fn cursor(&self) -> Option<&str> {
-        self.response_meta_data
-            .as_ref()?
-            .next_cursor
-            .as_deref()
-            .filter(|cursor| !cursor.is_empty())
+    pub fn cursor(&self) -> Result<Option<&str>> {
+        let metadata = self
+            .response_meta_data
+            .as_ref()
+            .ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))?;
+        match metadata.next_cursor.as_deref() {
+            Some(cursor) if cursor.is_empty() || cursor.len() > 4096 => {
+                Err(ProviderError::new(ErrorKind::Corrupt))
+            }
+            cursor => Ok(cursor),
+        }
     }
 }
 #[derive(Deserialize)]

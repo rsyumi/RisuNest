@@ -2,7 +2,7 @@
 //! response comes from the shared loopback fixture.
 use super::create;
 use crate::external_storage::{
-    capabilities::{Capabilities, Evidence},
+    capabilities::Capabilities,
     contract::*,
     fake::{loopback_dependencies, MemoryVault, TestDependencies},
     transfer::{SpoolSink, SpoolSource},
@@ -12,11 +12,12 @@ use base64::Engine as _;
 use std::{
     collections::BTreeMap,
     path::Path,
-    sync::{atomic::Ordering, Arc},
+    sync::Arc,
     time::Duration,
 };
 
 const NOW: u64 = 1_000;
+const USER_ID: u64 = 4242;
 const PROJECT: &str = "group/synthetic";
 const PACKAGE: &str = "risunest-backup";
 const MARKER_BODY: &str = "gitlab_packages|path:group/synthetic|package:risunest-backup";
@@ -87,6 +88,30 @@ fn marker_created() -> Reply {
         ),
     )
 }
+fn marker_package() -> String {
+    package_json(1, &format!("{PACKAGE}.repository"), "v0")
+}
+fn marker_package_files() -> Reply {
+    json(
+        200,
+        &format!(
+            "[{}]",
+            file_json(
+                "repository",
+                MARKER_BODY.len(),
+                Some(hash(MARKER_BODY.as_bytes()))
+            )
+        ),
+    )
+}
+fn resumable_packages(extra: &[String]) -> Reply {
+    let mut packages = vec![marker_package()];
+    packages.extend_from_slice(extra);
+    json(200, &format!("[{}]", packages.join(",")))
+}
+fn user_reply(id: u64) -> Reply {
+    json(200, &format!("{{\"id\":{id}}}"))
+}
 /// Marker probe answered as present plus the listing probe.
 fn open_existing_replies() -> Vec<Reply> {
     vec![marker_present(), json(200, "[]")]
@@ -105,7 +130,13 @@ struct Harness {
     secret: SecretRef,
     cancel: Cancellation,
 }
-fn fixture(replies: Vec<Reply>, kind: &str) -> Harness {
+fn fixture(mut replies: Vec<Reply>, kind: &str) -> Harness {
+    if matches!(kind, "personalAccessToken" | "projectAccessToken") {
+        replies.insert(0, user_reply(USER_ID));
+    }
+    raw_fixture(replies, kind)
+}
+fn raw_fixture(replies: Vec<Reply>, kind: &str) -> Harness {
     let server = WireServer::start(replies);
     let deps = loopback_dependencies(MemoryVault::with("gitlab", &secret_bytes(kind)), NOW);
     let provider = create(deps.dependencies.clone()).unwrap();
@@ -138,6 +169,12 @@ impl Harness {
             .await
     }
     fn lines(&self) -> Vec<String> {
+        self.all_lines()
+            .into_iter()
+            .filter(|line| !line.contains("/api/v4/user "))
+            .collect()
+    }
+    fn all_lines(&self) -> Vec<String> {
         self.server
             .requests
             .lock()
@@ -155,20 +192,40 @@ impl Harness {
             .collect()
     }
     fn head(&self, index: usize) -> String {
-        self.server.requests.lock().unwrap()[index].headers.clone()
-    }
-    fn sent(&self, index: usize) -> Vec<u8> {
-        self.server.requests.lock().unwrap()[index].body.clone()
-    }
-    fn reservations(&self) -> Vec<Vec<RequestCost>> {
-        self.deps
-            .budget
-            .reservations
+        self.server
+            .requests
             .lock()
             .unwrap()
             .iter()
-            .map(|(costs, _)| costs.clone())
-            .collect()
+            .filter(|request| {
+                !request
+                    .headers
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.contains("/api/v4/user "))
+            })
+            .nth(index)
+            .unwrap()
+            .headers
+            .clone()
+    }
+    fn sent(&self, index: usize) -> Vec<u8> {
+        self.server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                !request
+                    .headers
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.contains("/api/v4/user "))
+            })
+            .nth(index)
+            .unwrap()
+            .body
+            .clone()
     }
 }
 
@@ -298,7 +355,87 @@ fn configuration_and_secret_failures_stop_before_any_request() {
             ErrorKind::ReauthRequired
         );
         assert!(harness.lines().is_empty());
-        assert!(harness.reservations().is_empty());
+    });
+}
+
+#[test]
+fn supported_tokens_share_the_authenticated_numeric_principal_across_renderer_labels() {
+    runtime().block_on(async {
+        for kind in ["personalAccessToken", "projectAccessToken"] {
+            let harness = raw_fixture(
+                vec![
+                    user_reply(USER_ID),
+                    marker_present(),
+                    json(200, "[]"),
+                    user_reply(USER_ID),
+                    marker_present(),
+                    json(200, "[]"),
+                ],
+                kind,
+            );
+            let mut first = harness.default_connection();
+            first.account_id = "renderer-label-one".into();
+            let mut second = harness.default_connection();
+            second.account_id = "renderer-label-two".into();
+            let first = harness
+                .provider
+                .open_repository(&first, &harness.secret, OpenMode::Existing, &harness.cancel)
+                .await
+                .unwrap()
+                .0;
+            let second = harness
+                .provider
+                .open_repository(&second, &harness.secret, OpenMode::Existing, &harness.cancel)
+                .await
+                .unwrap()
+                .0;
+
+            assert_eq!(first.account, second.account, "{kind}");
+            assert_eq!(first.account.provider(), "gitlab_packages");
+            assert_eq!(first.account.principal(), "4242");
+            assert!(!first.account.is_pending());
+            let lines = harness.all_lines();
+            assert_eq!(lines.len(), 6);
+            assert!(lines[0].contains("/api/v4/user "));
+            assert!(lines[3].contains("/api/v4/user "));
+            assert!(harness
+                .server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request.headers.to_lowercase().contains("private-token")));
+        }
+    });
+}
+
+#[test]
+fn invalid_authenticated_identity_fails_before_marker_or_package_requests() {
+    runtime().block_on(async {
+        let cases = [
+            ("missing id", json(200, "{}")),
+            ("text id", json(200, "{\"id\":\"4242\"}")),
+            ("zero id", user_reply(0)),
+        ];
+        for (label, identity) in cases {
+            let harness = raw_fixture(vec![identity], "personalAccessToken");
+            assert_eq!(
+                failure(harness.open(OpenMode::Create).await).kind,
+                ErrorKind::Corrupt,
+                "{label}"
+            );
+            let lines = harness.all_lines();
+            assert_eq!(lines.len(), 1, "{label}");
+            assert!(lines[0].contains("/api/v4/user "), "{label}");
+            assert!(!lines.iter().any(|line| line.starts_with("PUT ")), "{label}");
+        }
+
+        let revoked = raw_fixture(vec![raw(401, b"")], "projectAccessToken");
+        assert_eq!(
+            failure(revoked.open(OpenMode::Create).await).kind,
+            ErrorKind::ReauthRequired
+        );
+        assert_eq!(revoked.all_lines().len(), 1);
     });
 }
 
@@ -306,7 +443,14 @@ fn configuration_and_secret_failures_stop_before_any_request() {
 fn create_writes_the_root_marker_and_refuses_an_occupied_location() {
     runtime().block_on(async {
         let harness = fixture(
-            vec![raw(404, b""), marker_created(), json(200, "[]")],
+            vec![
+                json(200, "[]"),
+                raw(404, b""),
+                marker_created(),
+                marker_present(),
+                resumable_packages(&[]),
+                marker_package_files(),
+            ],
             "personalAccessToken",
         );
         let (repository, capabilities) = harness.open(OpenMode::Create).await.unwrap();
@@ -318,48 +462,60 @@ fn create_writes_the_root_marker_and_refuses_an_occupied_location() {
             )
         );
         assert_eq!(repository.repository_id, repository.connection_identity);
-        assert_eq!(capabilities.immutable_create, Evidence::Synthetic);
-        assert_eq!(capabilities.direct_complete_read, Evidence::Synthetic);
-        assert_eq!(capabilities.snapshot_discovery, Evidence::Synthetic);
-        assert_eq!(capabilities.discovery_extra_requests, 1);
-        assert_eq!(capabilities.atomic_create_head, Evidence::Unverified);
-        assert_eq!(capabilities.conditional_head_update, Evidence::Unverified);
-        assert_eq!(capabilities.stable_head_replace, Evidence::Unverified);
-        assert_eq!(capabilities.head_read_after_write, Evidence::Unverified);
-        assert_eq!(capabilities.head_retry_control, Evidence::Unverified);
+        assert!(capabilities.immutable_create);
+        assert!(capabilities.direct_complete_read);
+        assert!(capabilities.snapshot_discovery);
+        assert!(!capabilities.atomic_create_head);
+        assert!(!capabilities.conditional_head_update);
+        assert!(!capabilities.stable_head_replace);
+        assert!(!capabilities.head_read_after_write);
+        assert!(!capabilities.head_retry_control);
         assert!(!capabilities.conditional_get);
         assert!(!capabilities.range);
         assert!(!capabilities.resumable_upload);
         assert_eq!(capabilities.max_stored_bytes, None);
-        assert_eq!(capabilities.documented_at.as_deref(), Some("2026-09-14"));
-        assert!(capabilities.evidence_urls.len() >= 4);
         assert!(capabilities.require(PublicationStrategy::Cas).is_err());
         assert!(capabilities.require(PublicationStrategy::Sequential).is_err());
 
         let lines = harness.lines();
-        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.len(), 6);
         assert_eq!(
             lines[0],
+            format!("GET {PROJECT_PATH}/packages?package_type=generic&per_page=100 HTTP/1.1")
+        );
+        assert_eq!(
+            lines[1],
             format!(
                 "GET {PROJECT_PATH}/packages/generic/{PACKAGE}.repository/v0/repository HTTP/1.1"
             )
         );
         assert_eq!(
-            lines[1],
+            lines[2],
             format!(
                 "PUT {PROJECT_PATH}/packages/generic/{PACKAGE}.repository/v0/repository?select=package_file HTTP/1.1"
             )
         );
         assert_eq!(
-            lines[2],
+            lines[3],
             format!(
-                "GET {PROJECT_PATH}/packages?package_type=generic&package_name={PACKAGE}&per_page=1 HTTP/1.1"
+                "GET {PROJECT_PATH}/packages/generic/{PACKAGE}.repository/v0/repository HTTP/1.1"
             )
         );
-        assert_eq!(harness.sent(1), MARKER_BODY.as_bytes());
-        assert!(harness.head(1).contains(&format!("private-token: {TOKEN}")));
+        assert_eq!(
+            lines[4],
+            format!("GET {PROJECT_PATH}/packages?package_type=generic&per_page=100 HTTP/1.1")
+        );
+        assert!(lines[5].contains("/package_files?per_page=100"));
+        assert_eq!(harness.sent(2), MARKER_BODY.as_bytes());
+        assert!(harness.head(2).contains(&format!("private-token: {TOKEN}")));
 
-        let occupied = fixture(vec![marker_present()], "personalAccessToken");
+        let occupied = fixture(
+            vec![json(
+                200,
+                &format!("[{}]", package_json(2, &format!("{PACKAGE}.pack"), "v0-foreign")),
+            )],
+            "personalAccessToken",
+        );
         let error = failure(occupied.open(OpenMode::Create).await);
         assert_eq!(error.kind, ErrorKind::PreconditionFailed);
         assert_eq!(occupied.lines().len(), 1);
@@ -410,8 +566,13 @@ fn deploy_token_loses_discovery_but_still_uploads_and_downloads() {
             "deployToken",
         );
         let (repository, capabilities) = harness.open(OpenMode::Existing).await.unwrap();
-        assert_eq!(capabilities.snapshot_discovery, Evidence::Unverified);
-        assert_eq!(capabilities.discovery_extra_requests, 0);
+        assert_eq!(repository.account.principal(), "synthetic-user");
+        assert!(!repository.account.is_pending());
+        assert!(!harness
+            .all_lines()
+            .iter()
+            .any(|line| line.contains("/api/v4/user ")));
+        assert!(!capabilities.snapshot_discovery);
         assert_eq!(
             harness
                 .provider
@@ -1112,8 +1273,6 @@ fn a_download_redirect_is_followed_once_without_carrying_the_token() {
         let storage_request = storage.requests.lock().unwrap()[0].headers.to_lowercase();
         assert!(!storage_request.contains("private-token"));
         assert!(!storage_request.contains("deploy-token"));
-        // Both hops reserve their own budget.
-        assert_eq!(harness.reservations().len(), 4);
     });
 }
 
@@ -1284,65 +1443,6 @@ fn reconciliation_uses_the_stored_object_rather_than_local_progress() {
 }
 
 #[test]
-fn request_costs_name_the_documented_buckets_and_gate_dispatch() {
-    runtime().block_on(async {
-        let harness = fixture(open_existing_replies(), "personalAccessToken");
-        assert!(harness
-            .provider
-            .request_cost(
-                &crate::external_storage::fake::repository(),
-                ProviderOperation::Create
-            )
-            .is_err());
-        let (handle, _) = harness.open(OpenMode::Existing).await.unwrap();
-        let upload = harness
-            .provider
-            .request_cost(&handle, ProviderOperation::Create)
-            .unwrap();
-        assert_eq!(upload.len(), 2);
-        assert_eq!(upload[0].bucket, "apiRequests");
-        assert_eq!(upload[0].shared_account, "gitlab:user:synthetic-user");
-        assert_eq!(upload[0].units, 1);
-        assert_eq!(
-            upload[0].reset,
-            QuotaReset::Rolling {
-                window_ms: 60 * 1000
-            }
-        );
-        assert_eq!(upload[1].bucket, "packageRegistryRequests");
-        assert_eq!(upload[1].shared_account, "gitlab:address:127.0.0.1");
-        assert_eq!(
-            harness
-                .provider
-                .request_cost(&handle, ProviderOperation::List)
-                .unwrap()
-                .len(),
-            1
-        );
-        let reservations = harness.reservations();
-        assert_eq!(reservations.len(), 2);
-        assert_eq!(reservations[0].len(), 2);
-        assert_eq!(
-            reservations[0][0].shared_account,
-            "gitlab:user:synthetic-user"
-        );
-        assert_eq!(
-            reservations[0][1].shared_account,
-            "gitlab:address:127.0.0.1"
-        );
-        assert_eq!(reservations[1].len(), 1);
-
-        let denied = fixture(Vec::new(), "personalAccessToken");
-        denied.deps.budget.deny.store(true, Ordering::SeqCst);
-        assert_eq!(
-            failure(denied.open(OpenMode::Existing).await).kind,
-            ErrorKind::DailyQuotaExhausted
-        );
-        assert!(denied.lines().is_empty());
-    });
-}
-
-#[test]
 fn cancelling_an_in_flight_download_stops_the_transfer() {
     runtime().block_on(async {
         let harness = fixture(
@@ -1371,7 +1471,7 @@ fn cancelling_an_in_flight_download_stops_the_transfer() {
             assert_eq!(error.kind, ErrorKind::Cancelled);
         };
         let trigger = async {
-            while harness.server.requests.lock().unwrap().len() < 3 {
+            while harness.server.requests.lock().unwrap().len() < 4 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1397,9 +1497,6 @@ fn cancelling_an_in_flight_download_stops_the_transfer() {
     });
 }
 
-/// A passing exchange here proves the adapter's request shape and status
-/// handling. It is no evidence of the service's own deletion guarantees, which
-/// only the provider documentation behind `Capabilities` can supply.
 #[test]
 fn deleting_resolves_the_numeric_package_file_and_refuses_descriptors() {
     runtime().block_on(async {
@@ -1457,12 +1554,125 @@ fn deleting_resolves_the_numeric_package_file_and_refuses_descriptors() {
             lines[4],
             format!("DELETE {PROJECT_PATH}/packages/1/package_files/7 HTTP/1.1")
         );
-        let costs = harness.deps.budget.reservations.lock().unwrap()[4].0.clone();
-        assert_eq!(
-            costs.iter().map(|cost| cost.bucket.clone()).collect::<Vec<_>>(),
-            ["apiRequests"],
-            "removal is a project API path, not the package registry"
+    });
+}
+
+#[test]
+fn resume_create_reconciles_only_the_exact_root_marker() {
+    runtime().block_on(async {
+        let existing = fixture(
+            vec![marker_present(), resumable_packages(&[]), marker_package_files()],
+            "personalAccessToken",
         );
+        existing.open(OpenMode::ResumeCreate).await.unwrap();
+        assert_eq!(existing.lines().len(), 3, "an exact marker is not rewritten");
+
+        let token = encoded("d1");
+        let descriptor_package = package_json(
+            2,
+            &format!("{PACKAGE}.descriptor"),
+            &format!("v0-{token}"),
+        );
+        let published = fixture(
+            vec![
+                marker_present(),
+                resumable_packages(&[descriptor_package]),
+                marker_package_files(),
+                json(
+                    200,
+                    &format!("[{}]", file_json(&format!("descriptor-{token}"), 20, None)),
+                ),
+            ],
+            "personalAccessToken",
+        );
+        published.open(OpenMode::ResumeCreate).await.unwrap();
+        assert_eq!(published.lines().len(), 4);
+
+        let foreign = fixture(vec![raw(200, b"another-repository")], "personalAccessToken");
+        assert_eq!(
+            failure(foreign.open(OpenMode::ResumeCreate).await).kind,
+            ErrorKind::PreconditionFailed
+        );
+        assert_eq!(foreign.lines().len(), 1);
+
+        let interrupted = fixture(
+            vec![
+                raw(404, b""),
+                marker_created(),
+                marker_present(),
+                resumable_packages(&[]),
+                marker_package_files(),
+            ],
+            "personalAccessToken",
+        );
+        interrupted.open(OpenMode::ResumeCreate).await.unwrap();
+        let lines = interrupted.lines();
+        assert_eq!(lines.len(), 5);
+        assert!(lines[1].starts_with("PUT "));
+        assert!(lines[2].starts_with("GET "));
+    });
+}
+
+#[test]
+fn resume_create_rejects_hidden_or_ambiguous_package_contents() {
+    runtime().block_on(async {
+        for (label, packages) in [
+            (
+                "payload",
+                vec![package_json(2, &format!("{PACKAGE}.pack"), "v0-cDE")],
+            ),
+            (
+                "foreign adapter package",
+                vec![package_json(2, &format!("{PACKAGE}.foreign"), "v0")],
+            ),
+        ] {
+            let harness = fixture(
+                vec![marker_present(), resumable_packages(&packages), marker_package_files()],
+                "personalAccessToken",
+            );
+            assert_eq!(
+                failure(harness.open(OpenMode::ResumeCreate).await).kind,
+                ErrorKind::PreconditionFailed,
+                "{label}"
+            );
+        }
+
+        let token = encoded("d1");
+        let descriptor = package_json(
+            2,
+            &format!("{PACKAGE}.descriptor"),
+            &format!("v0-{token}"),
+        );
+        let duplicate = fixture(
+            vec![
+                marker_present(),
+                resumable_packages(&[
+                    descriptor.clone(),
+                    package_json(
+                        3,
+                        &format!("{PACKAGE}.descriptor"),
+                        &format!("v0-{token}"),
+                    ),
+                ]),
+                marker_package_files(),
+                json(
+                    200,
+                    &format!("[{}]", file_json(&format!("descriptor-{token}"), 20, None)),
+                ),
+            ],
+            "personalAccessToken",
+        );
+        assert_eq!(
+            failure(duplicate.open(OpenMode::ResumeCreate).await).kind,
+            ErrorKind::PreconditionFailed
+        );
+
+        let deploy = fixture(Vec::new(), "deployToken");
+        assert_eq!(
+            failure(deploy.open(OpenMode::ResumeCreate).await).kind,
+            ErrorKind::Unsupported
+        );
+        assert!(deploy.lines().is_empty());
     });
 }
 

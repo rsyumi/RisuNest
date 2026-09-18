@@ -41,7 +41,7 @@ pub(crate) struct PreparedReceive {
     authenticated_head: String,
     commit: PreparedReplaceCommit,
     participation: ReceiveParticipation,
-    sections: Vec<super::snapshot_restore::PreparedSection>,
+    sections: Vec<super::sections::PreparedSectionInput>,
 }
 impl PreparedReceive {
     fn ready_result(&self) -> Value {
@@ -104,6 +104,61 @@ fn wanted_receive_sections(participation: &ReceiveParticipation) -> std::collect
     }).collect()
 }
 
+fn prepare_receive_sections(
+    connection_id: &str,
+    library_lineage: &str,
+    participation: &ReceiveParticipation,
+    sections: Vec<super::snapshot_restore::PreparedSection>,
+    cancel: &Cancellation,
+) -> Result<Vec<super::sections::PreparedSectionInput>> {
+    let mut seen = std::collections::BTreeSet::new();
+    sections.into_iter().map(|section| {
+        cancel.check()?;
+        if !seen.insert(section.kind.id().to_owned()) {
+            return Err(corrupt("received section is duplicated"));
+        }
+        let device_section = super::sections::section_of(section.kind)
+            .ok_or_else(|| corrupt("device-fixed section in a synchronized state"))?;
+        let (_, participating, generation) = participation.iter()
+            .find(|(candidate, _, _)| *candidate == device_section)
+            .ok_or_else(|| corrupt("received section has no participation identity"))?;
+        if !participating {
+            return Err(corrupt("received section is not participating"));
+        }
+        let source_directory = tempfile::tempdir().map_err(local_error)?;
+        let mut sources = Vec::with_capacity(section.entries.len());
+        for (index, (kind, key, bytes)) in section.entries.into_iter().enumerate() {
+            cancel.check()?;
+            let path = source_directory.path().join(format!("source-{index}"));
+            std::fs::write(&path, &bytes).map_err(local_error)?;
+            sources.push(super::sections::SectionSource {
+                kind,
+                key,
+                content_sha256: hex::encode(
+                    risunest_external_storage_format::content_identity::hash(&bytes),
+                ),
+                byte_length: bytes.len() as u64,
+                path,
+            });
+        }
+        super::sections::prepare_received_section(
+            connection_id,
+            library_lineage,
+            super::sections::SectionArrival::Continuing,
+            generation,
+            &super::sections::CapturedSection {
+                kind: section.kind,
+                generation: section.generation,
+                gc_floor: section.gc_floor,
+                max_write_clock: section.max_write_clock,
+                content_fingerprint: section.content_fingerprint,
+                sources,
+            },
+            cancel,
+        )
+    }).collect()
+}
+
 fn prepare_receive_input(
     store: &mut PersistentStore,
     job: &DurableJob,
@@ -112,6 +167,7 @@ fn prepare_receive_input(
     downloaded: super::snapshot_restore::PreparedRemoteSnapshot,
     sections: Vec<super::snapshot_restore::PreparedSection>,
     participation: ReceiveParticipation,
+    cancel: &Cancellation,
 ) -> Result<PreparedReceive> {
     require_exact_receive_identity(&expected, &store.external_identity().map_err(local_error)?)?;
     store.external_validate_receive(&job.id, &job.request.connection_id, &expected, &authenticated_head)
@@ -126,10 +182,13 @@ fn prepare_receive_input(
     if sections.iter().any(|section| !wanted.contains(section.kind.id())) {
         return Err(corrupt("received section is not participating"));
     }
-    // Reject malformed device rows before exposing an activatable library.
-    for section in &sections {
-        super::sections::decode_section(section.kind, &section.entries, &section.content_fingerprint)?;
-    }
+    let sections = prepare_receive_sections(
+        &job.request.connection_id,
+        &expected.library_epoch,
+        &participation,
+        sections,
+        cancel,
+    )?;
     let scope_id = library_fingerprint_domain();
     let fingerprint = hex::decode(&downloaded.library_fingerprint)
         .ok().and_then(|value| value.try_into().ok())
@@ -169,8 +228,9 @@ fn activate_prepared_receive(
             &prepared.expected, &prepared.authenticated_head)
             .map_err(|_| ProviderError::new(ErrorKind::PreconditionFailed))?;
         require_receive_participation(store, &prepared.participation)?;
-        apply_received_sections(store, &prepared.connection_id,
-            &prepared.expected.library_epoch, &prepared.sections)?;
+        for section in &prepared.sections {
+            super::sections::apply_prepared_section(store, section)?;
+        }
         store.finish_external_receive(prepared.commit, &prepared.job_id)
             .map(|result| result.revision).map_err(local_error)
     })();
@@ -621,6 +681,20 @@ async fn package_capture(
         cancel,
     )
     .await?;
+    match super::packaging::verify_publication(
+        &completed,
+        &cache,
+        &mut journal,
+        &connected.root_key,
+        connected.provider.as_ref(),
+        &connected.handle,
+        cancel,
+    ).await? {
+        super::packaging::PublicationReadiness::Verified => {}
+        super::packaging::PublicationReadiness::Repackage => {
+            return Err(ProviderError::new(ErrorKind::Transient));
+        }
+    }
     Ok((completed, journal, publications))
 }
 
@@ -693,7 +767,7 @@ async fn receive_remote(
         worker_cancel.check()?;
         super::runtime::read_job_session(&worker_app, &worker_job.id)?;
         prepare_receive_input(&mut pds(&worker_app)?, &worker_job, worker_identity,
-            worker_head, downloaded, sections, participation)
+            worker_head, downloaded, sections, participation, &worker_cancel)
     }).await.map_err(local_error)??;
     let recorded = (|| {
         let jobs = JobStore::open(&root)?;
@@ -716,7 +790,6 @@ async fn receive_remote(
         ).await?;
         require_received_head(&prepared.authenticated_head,
             current.as_ref().map(|head| &head.observation))?;
-        super::runtime::enter_repository(app, connected, job, cancel).await?;
         {
             let mut store = pds(app)?;
             require_exact_receive_identity(&prepared.expected, &store.external_identity().map_err(local_error)?)?;
@@ -785,8 +858,40 @@ fn note_sections_published(
         return Ok(());
     }
     let mut store = pds(app)?;
+    note_sections_published_in_store(
+        &mut store,
+        connection_id,
+        library_lineage,
+        sections,
+        publications,
+    )
+}
+
+fn note_sections_published_in_store(
+    store: &mut PersistentStore,
+    connection_id: &str,
+    library_lineage: &str,
+    sections: &std::collections::BTreeMap<
+        String,
+        risunest_external_storage_format::snapshot::SectionSnapshotRef,
+    >,
+    publications: &[super::sections::SectionPublication],
+) -> Result<()> {
     let device = store.device_store_mut().map_err(local_error)?;
     for publication in publications {
+        let mut matching = sections.values().filter(|reference| {
+            super::sections::section_of(reference.kind) == Some(publication.section)
+        });
+        let reference = matching.next()
+            .ok_or_else(|| corrupt("published section is absent from the confirmed state"))?;
+        if matching.next().is_some() {
+            return Err(corrupt("confirmed state repeats a published section"));
+        }
+        let cursor = crate::persistent_store::device_store::sections::SectionCursor {
+            applied_generation: reference.generation.clone(),
+            applied_gc_floor: reference.gc_floor.clone(),
+            observed_max_write_clock: reference.max_write_clock.clone(),
+        };
         device
             .note_section_published(
                 publication.section,
@@ -795,49 +900,14 @@ fn note_sections_published(
                 &publication.first_published,
                 &publication.reclaimed,
                 &publication.gc_floor,
+                Some((
+                    connection_id,
+                    library_lineage,
+                    &publication.participation_generation,
+                    &cursor,
+                )),
             )
             .map_err(local_error)?;
-    }
-    for reference in sections.values() {
-        let Some(section) = super::sections::section_of(reference.kind) else {
-            continue;
-        };
-        device
-            .write_section_cursor(
-                connection_id,
-                library_lineage,
-                section,
-                &crate::persistent_store::device_store::sections::SectionCursor {
-                    applied_generation: reference.generation.clone(),
-                    applied_gc_floor: reference.gc_floor.clone(),
-                    observed_max_write_clock: reference.max_write_clock.clone(),
-                },
-            )
-            .map_err(local_error)?;
-    }
-    Ok(())
-}
-
-/// Merges received sections into the device file. Each section is its own
-/// transaction, so an interrupted apply resumes from the same remote state
-/// instead of reporting the whole receive as done.
-fn apply_received_sections(
-    store: &mut PersistentStore,
-    connection_id: &str,
-    library_lineage: &str,
-    sections: &[super::snapshot_restore::PreparedSection],
-) -> Result<()> {
-    if sections.is_empty() {
-        return Ok(());
-    }
-    for prepared in sections {
-        super::sections::apply_received_section(
-            store,
-            connection_id,
-            library_lineage,
-            super::sections::SectionArrival::Continuing,
-            prepared,
-        )?;
     }
     Ok(())
 }
@@ -1145,6 +1215,7 @@ async fn preserve_conflict(
     remote: ObservedHead,
     capture: crate::persistent_store::external_capture::CapturedSnapshot,
     fingerprint: [u8; 32],
+    protection: Option<&super::runtime::RepositoryProtection<'_>>,
     cancel: &Cancellation,
 ) -> Result<Value> {
     let local_identity = capture.identity.clone();
@@ -1173,7 +1244,9 @@ async fn preserve_conflict(
     )
     .await?;
     let record = bind_local_conflict_snapshot(app, job, record, &local.reference)?;
-    complete_conflict_preservation(app, connected, job, record, Some(remote), journal, cancel)
+    complete_conflict_preservation(
+        app, connected, job, record, Some(remote), journal, protection, cancel,
+    )
         .await
 }
 
@@ -1268,12 +1341,13 @@ async fn resume_conflict_preservation(
     connected: &ConnectedRepository,
     job: &DurableJob,
     record: ConflictRecord,
+    protection: Option<&super::runtime::RepositoryProtection<'_>>,
     cancel: &Cancellation,
 ) -> Result<Value> {
     if record.local_snapshot.is_some() {
         let journal = conflict_journal(app, connected, job, &record)?;
         return complete_conflict_preservation(
-            app, connected, job, record, None, journal, cancel,
+            app, connected, job, record, None, journal, protection, cancel,
         )
         .await;
     }
@@ -1301,7 +1375,9 @@ async fn resume_conflict_preservation(
     )
     .await?;
     let record = bind_local_conflict_snapshot(app, job, record, &local.reference)?;
-    complete_conflict_preservation(app, connected, job, record, None, journal, cancel).await
+    complete_conflict_preservation(
+        app, connected, job, record, None, journal, protection, cancel,
+    ).await
 }
 
 async fn complete_conflict_preservation(
@@ -1311,6 +1387,7 @@ async fn complete_conflict_preservation(
     record: ConflictRecord,
     observed_remote: Option<ObservedHead>,
     mut journal: TransferJournal,
+    protection: Option<&super::runtime::RepositoryProtection<'_>>,
     cancel: &Cancellation,
 ) -> Result<Value> {
     if record.preservation != ConflictPreservation::LocalOnly
@@ -1401,6 +1478,9 @@ async fn complete_conflict_preservation(
         decode_remote(local_snapshot, connected)?,
         remote_bundle,
     )?;
+    if let Some(protection) = protection {
+        protection.recheck(cancel).await?;
+    }
     control::upload_backup_point(
         &connected.stored.descriptor,
         &connected.root_key,
@@ -1445,6 +1525,7 @@ async fn run_resolve_conflict(
     app: &AppHandle,
     connected: &ConnectedRepository,
     job: &DurableJob,
+    protection: Option<&super::runtime::RepositoryProtection<'_>>,
     cancel: &Cancellation,
 ) -> Result<Value> {
     let conflict_id = job
@@ -1603,6 +1684,9 @@ async fn run_resolve_conflict(
         .file(false)
         .map_err(local_error)?;
     let write_session = std::sync::atomic::AtomicU8::new(0);
+    if let Some(protection) = protection {
+        protection.recheck(cancel).await?;
+    }
     let result = match control::publish_head_guarded(
         connected.provider.as_ref(),
         &connected.handle,
@@ -1695,6 +1779,7 @@ pub(crate) async fn run_sync(
     app: &AppHandle,
     connected: &ConnectedRepository,
     job: &DurableJob,
+    protection: Option<&super::runtime::RepositoryProtection<'_>>,
     cancel: &Cancellation,
 ) -> Result<Value> {
     if job.request.kind == JobKind::ResolveConflict {
@@ -1704,7 +1789,7 @@ pub(crate) async fn run_sync(
             }
             return Ok(result);
         }
-        return run_resolve_conflict(app, connected, job, cancel).await;
+        return run_resolve_conflict(app, connected, job, protection, cancel).await;
     }
     if let Some(result) = reconcile_unknown(app, connected, job, cancel).await? {
         return Ok(result);
@@ -1726,7 +1811,7 @@ pub(crate) async fn run_sync(
         .map_err(local_error)?
         .filter(|record| record.preservation == ConflictPreservation::LocalOnly)
     {
-        return resume_conflict_preservation(app, connected, job, record, cancel).await;
+        return resume_conflict_preservation(app, connected, job, record, protection, cancel).await;
     }
     let remote = control::read_head(
         connected.provider.as_ref(),
@@ -1909,6 +1994,9 @@ pub(crate) async fn run_sync(
                 .file(false)
                 .map_err(local_error)?;
             let write_session = std::sync::atomic::AtomicU8::new(0);
+            if let Some(protection) = protection {
+                protection.recheck(cancel).await?;
+            }
             match control::publish_head_guarded(
                 connected.provider.as_ref(),
                 &connected.handle,
@@ -1991,7 +2079,7 @@ pub(crate) async fn run_sync(
                         true,
                     )?;
                     complete_conflict_preservation(
-                        app, connected, job, record, remote, journal, cancel,
+                        app, connected, job, record, remote, journal, protection, cancel,
                     )
                     .await
                 }
@@ -2007,7 +2095,9 @@ pub(crate) async fn run_sync(
             let (capture, fingerprint) = captured
                 .take()
                 .ok_or_else(|| corrupt("missing conflict capture"))?;
-            preserve_conflict(app, connected, job, remote, capture, fingerprint, cancel).await
+            preserve_conflict(
+                app, connected, job, remote, capture, fingerprint, protection, cancel,
+            ).await
         }
         SyncAction::DecisionRequired | SyncAction::RecoveryRequired => {
             Err(ProviderError::new(ErrorKind::PreconditionFailed))
@@ -2042,7 +2132,7 @@ mod receive_tests {
         content_identity::hash,
         format::fingerprint,
         section::{local_plugin_entry_key, LocalPluginValue, PluginSpace, SectionEntry, SectionEntryVersion, SectionValue},
-        snapshot::CatalogEntryKind,
+        snapshot::{self as wire, CatalogEntryKind},
     };
     use std::{collections::BTreeMap, fs};
 
@@ -2105,12 +2195,40 @@ mod receive_tests {
         }
     }
 
+    fn plugin_section_reference(generation: u64) -> wire::SectionSnapshotRef {
+        wire::SectionSnapshotRef {
+            kind: SectionKind::LocalPlugins,
+            codec: risunest_external_storage_format::section::SECTION_CODEC.into(),
+            generation: Sequence::from(generation),
+            gc_floor: Sequence::from(0u64),
+            max_write_clock: Sequence::from(7u64),
+            entries_root: wire::StoredObject {
+                header: wire::PublicObjectHeader::new(
+                    "repository".into(),
+                    "catalog-synthetic".into(),
+                    wire::ObjectRole::Catalog,
+                    1,
+                ).unwrap(),
+                locator: wire::WireLocator {
+                    connection_identity: "connection".into(),
+                    collection: None,
+                    object: "catalog-synthetic".into(),
+                },
+                ciphertext_length: 1,
+                ciphertext_sha256: [0; 32],
+                plaintext_length: 1,
+                plaintext_sha256: [0; 32],
+            },
+            content_fingerprint: [0; 32],
+        }
+    }
+
     fn prepare(store: &mut PersistentStore, job: &DurableJob,
         downloaded: super::super::snapshot_restore::PreparedRemoteSnapshot) -> PreparedReceive
     {
         let participation = receive_participation(store).unwrap();
         prepare_receive_input(store, job, job.admission_identity.clone(), "authenticated-head".into(),
-            downloaded, vec![plugin_section()], participation).unwrap()
+            downloaded, vec![plugin_section()], participation, &Cancellation::default()).unwrap()
     }
 
     fn local_edit(store: &mut PersistentStore, revision: i64) {
@@ -2125,7 +2243,7 @@ mod receive_tests {
     }
 
     #[test]
-    fn preparation_leaves_live_data_untouched_and_activation_needs_no_download_files() {
+    fn final_apply_uses_only_prepared_local_handles() {
         let (_directory, mut store, job, downloaded) = fixture();
         let source = downloaded.staging_root.clone();
         let prepared = prepare(&mut store, &job, downloaded);
@@ -2137,7 +2255,9 @@ mod receive_tests {
         // Match the runtime: preparation and activation use separate native handles.
         let mut reopened = store.open_native_job_store().unwrap();
         let current = reopened.external_identity().unwrap();
+        super::super::snapshot_restore::reset_test_read_counts();
         assert_eq!(activate_prepared_receive(&mut reopened, prepared, &current).unwrap(), 1);
+        assert_eq!(super::super::snapshot_restore::test_read_counts(), (0, 0));
         assert_eq!(store.materialize(None).unwrap()["marker"], "remote");
         assert_eq!(rows(&mut store).len(), 1);
         assert!(store.prepare_replace_commit(&stage, Some(1)).is_err());
@@ -2272,7 +2392,8 @@ mod receive_tests {
                 local_edit(&mut store, 0);
                 let participation = receive_participation(&mut store).unwrap();
                 assert!(prepare_receive_input(&mut store, &job, job.admission_identity.clone(),
-                    "authenticated-head".into(), downloaded, vec![plugin_section()], participation).is_err());
+                    "authenticated-head".into(), downloaded, vec![plugin_section()], participation,
+                    &Cancellation::default()).is_err());
             } else {
                 let prepared = prepare(&mut store, &job, downloaded);
                 local_edit(&mut store, 0);
@@ -2299,6 +2420,48 @@ mod receive_tests {
     }
 
     #[test]
+    fn publication_ack_skips_carried_sections_and_stale_participation_generations() {
+        let (_directory, mut store, _job, _downloaded) = fixture();
+        let sections = BTreeMap::from([(
+            SectionKind::LocalPlugins.id().to_owned(),
+            plugin_section_reference(7),
+        )]);
+        note_sections_published_in_store(&mut store, "connection", "library", &sections, &[])
+            .unwrap();
+        assert!(store.device_store_mut().unwrap()
+            .read_section_cursor("connection", "library", PdsSection::LocalPlugins)
+            .unwrap().is_none());
+
+        let captured_generation = store.device_store_mut().unwrap()
+            .section_state(PdsSection::LocalPlugins).unwrap().participation_generation;
+        let publication = super::super::sections::SectionPublication {
+            section: PdsSection::LocalPlugins,
+            participation_generation: captured_generation,
+            published: Vec::new(),
+            stamped: Vec::new(),
+            first_published: crate::persistent_store::device_store::sections::TombstonePublication {
+                generation: Sequence::from(7u64),
+                at_ms: 1,
+            },
+            reclaimed: BTreeMap::new(),
+            gc_floor: Sequence::from(0u64),
+        };
+        let device = store.device_store_mut().unwrap();
+        device.set_section_participating(PdsSection::LocalPlugins, false).unwrap();
+        device.set_section_participating(PdsSection::LocalPlugins, true).unwrap();
+        note_sections_published_in_store(
+            &mut store,
+            "connection",
+            "library",
+            &sections,
+            &[publication],
+        ).unwrap();
+        assert!(store.device_store_mut().unwrap()
+            .read_section_cursor("connection", "library", PdsSection::LocalPlugins)
+            .unwrap().is_none());
+    }
+
+    #[test]
     fn corrupt_sections_or_snapshot_bindings_never_create_an_applicable_receive() {
         for case in ["section", "snapshot", "repository", "record"] {
             let (_directory, mut store, job, mut downloaded) = fixture();
@@ -2312,7 +2475,8 @@ mod receive_tests {
                 _ => unreachable!(),
             }
             assert!(prepare_receive_input(&mut store, &job, job.admission_identity.clone(),
-                "authenticated-head".into(), downloaded, vec![section], participation).is_err(), "{case}");
+                "authenticated-head".into(), downloaded, vec![section], participation,
+                &Cancellation::default()).is_err(), "{case}");
             assert_eq!(store.revision().unwrap(), 0, "{case}");
             assert!(rows(&mut store).is_empty(), "{case}");
         }
@@ -2322,8 +2486,9 @@ mod receive_tests {
     fn interrupted_section_progress_is_idempotent_after_worker_repreparation() {
         let (directory, mut store, job, downloaded) = fixture();
         let prepared = prepare(&mut store, &job, downloaded.clone());
-        apply_received_sections(&mut store, "connection", &job.admission_identity.library_epoch,
-            &prepared.sections).unwrap();
+        for section in &prepared.sections {
+            super::super::sections::apply_prepared_section(&mut store, section).unwrap();
+        }
         let first = rows(&mut store);
         assert_eq!(first.len(), 1);
         assert_eq!(store.revision().unwrap(), 0);

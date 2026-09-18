@@ -9,12 +9,13 @@ use crate::external_storage::{
     wire_fixture::{Reply, WireServer},
 };
 use serde_json::json;
-use std::{collections::BTreeMap, sync::atomic::Ordering};
+use std::collections::BTreeMap;
 
 const NOW_MS: u64 = 1_000_000;
 const SECRET: &str = "connection-secret";
 const TOKEN: &[u8] = br#"{"token":"synthetic-token"}"#;
 const PREFIX: &str = "risunest";
+const USER_ID: u64 = 4242;
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -32,11 +33,15 @@ fn adapter(dependencies: Dependencies) -> std::sync::Arc<dyn Provider> {
 }
 
 fn config(server: &WireServer) -> ConnectionConfig {
+    config_with_account(server, "synthetic-owner")
+}
+
+fn config_with_account(server: &WireServer, account_id: &str) -> ConnectionConfig {
     ConnectionConfig {
         provider: "github_releases".into(),
         profile: None,
         endpoint: server.url.to_string(),
-        account_id: "synthetic-owner".into(),
+        account_id: account_id.into(),
         location: BTreeMap::from([
             ("owner".to_owned(), "synthetic-owner".to_owned()),
             ("repo".to_owned(), "synthetic-repo".to_owned()),
@@ -66,8 +71,17 @@ fn repository_reply(private: bool) -> Reply {
     )
 }
 
+fn user_reply(id: u64) -> Reply {
+    reply(200, json!({ "id": id, "login": "ignored-login" }))
+}
+
+fn github_server(mut replies: Vec<Reply>) -> WireServer {
+    replies.insert(0, user_reply(USER_ID));
+    WireServer::start(replies)
+}
+
 fn release(id: u64, tag: &str) -> serde_json::Value {
-    json!({ "id": id, "tag_name": tag })
+    json!({ "id": id, "tag_name": tag, "draft": true })
 }
 
 fn asset(id: u64, name: &str, size: u64, digest: Option<String>) -> serde_json::Value {
@@ -182,11 +196,6 @@ fn configuration_and_missing_secrets_are_refused_before_any_request() {
                 config.location.insert("repo".into(), "../escape".into());
                 config
             }),
-            ("empty account", {
-                let mut config = config(&server);
-                config.account_id = String::new();
-                config
-            }),
             ("oauth profile", {
                 let mut config = config(&server);
                 config.oauth_profile = Some(OAuthProfile {
@@ -228,26 +237,307 @@ fn configuration_and_missing_secrets_are_refused_before_any_request() {
 }
 
 #[test]
-fn budget_denial_stops_the_connection_before_dispatch() {
+fn authenticated_numeric_principal_ignores_renderer_labels_and_logins() {
     runtime().block_on(async {
-        let server = WireServer::start(Vec::new());
+        let server = WireServer::start(vec![
+            reply(200, json!({ "id": USER_ID, "login": "first-login" })),
+            repository_reply(true),
+            reply(200, json!([])),
+            reply(200, json!({ "id": USER_ID, "login": "second-login" })),
+            repository_reply(true),
+            reply(200, json!([])),
+        ]);
         let test = dependencies();
-        test.budget.deny.store(true, Ordering::SeqCst);
         let provider = adapter(test.dependencies.clone());
-        let error = open(provider.as_ref(), &server, OpenMode::Existing)
+        let cancel = Cancellation::default();
+        let first = provider
+            .open_repository(
+                &config_with_account(&server, "renderer-label-one"),
+                &secret(),
+                OpenMode::Create,
+                &cancel,
+            )
             .await
-            .err()
+            .unwrap()
+            .0;
+        let second = provider
+            .open_repository(
+                &config_with_account(&server, "renderer-label-two"),
+                &secret(),
+                OpenMode::Create,
+                &cancel,
+            )
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(first.account, second.account);
+        assert_eq!(first.account.provider(), "github_releases");
+        assert_eq!(first.account.principal(), "4242");
+        assert!(!first.account.is_pending());
+        let records = server.requests.lock().unwrap();
+        assert_eq!(records.len(), 6);
+        assert!(head_line(&records[0]).contains("/user "));
+        assert!(head_line(&records[3]).contains("/user "));
+        assert!(records
+            .iter()
+            .all(|record| record.headers.contains("authorization: Bearer synthetic-token")));
+    });
+}
+
+#[test]
+fn mismatched_or_invalid_identity_stops_before_repository_requests() {
+    runtime().block_on(async {
+        let cases = [
+            ("repository-shaped response", repository_reply(true)),
+            ("missing id", reply(200, json!({ "login": "synthetic" }))),
+            ("text id", reply(200, json!({ "id": USER_ID.to_string() }))),
+            ("zero id", user_reply(0)),
+        ];
+        for (label, identity) in cases {
+            let server = WireServer::start(vec![identity]);
+            let test = dependencies();
+            let provider = adapter(test.dependencies.clone());
+            let error = open(provider.as_ref(), &server, OpenMode::Create)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.kind, ErrorKind::Corrupt, "{label}");
+            let records = server.requests.lock().unwrap();
+            assert_eq!(records.len(), 1, "{label}");
+            assert!(head_line(&records[0]).contains("/user "), "{label}");
+            assert!(records[0]
+                .headers
+                .contains("authorization: Bearer synthetic-token"));
+        }
+    });
+}
+
+#[test]
+fn resume_create_accepts_empty_or_one_exact_descriptor_and_converges() {
+    runtime().block_on(async {
+        let empty = github_server(vec![
+            repository_reply(true),
+            reply(200, json!([release(1, "v1.0.0")])),
+        ]);
+        let provider = adapter(dependencies().dependencies);
+        let empty_handle = open(provider.as_ref(), &empty, OpenMode::ResumeCreate)
+            .await
             .unwrap();
-        assert_eq!(error.kind, ErrorKind::DailyQuotaExhausted);
-        assert!(server.requests.lock().unwrap().is_empty());
-        assert_eq!(test.budget.reservations.lock().unwrap().len(), 1);
+        assert_eq!(empty_handle.account.principal(), "4242");
+        let records = empty.requests.lock().unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().all(|record| method_of(record) == "GET"));
+        drop(records);
+
+        let descriptor_tag = format!("{PREFIX}-d-0");
+        let released = github_server(vec![
+            repository_reply(true),
+            reply(200, json!([release(7, &descriptor_tag)])),
+            reply(200, json!([])),
+        ]);
+        let provider = adapter(dependencies().dependencies);
+        open(provider.as_ref(), &released, OpenMode::ResumeCreate)
+            .await
+            .unwrap();
+        let records = released.requests.lock().unwrap();
+        assert_eq!(records.len(), 4);
+        assert!(records.iter().all(|record| method_of(record) == "GET"));
+        drop(records);
+
+        let bytes = b"root".to_vec();
+        let stored = asset(
+            3,
+            "descriptor-root",
+            bytes.len() as u64,
+            Some(digest_of(&bytes)),
+        );
+        let server = github_server(vec![
+            repository_reply(true),
+            reply(200, json!([release(7, &descriptor_tag)])),
+            reply(200, json!([stored.clone()])),
+            reply(422, json!({})),
+            reply(200, json!([stored])),
+            Reply::Http {
+                status: 200,
+                headers: Vec::new(),
+                body: bytes.clone(),
+            },
+        ]);
+        let test = dependencies();
+        let provider = adapter(test.dependencies.clone());
+        let handle = open(provider.as_ref(), &server, OpenMode::ResumeCreate)
+            .await
+            .unwrap();
+        {
+            let records = server.requests.lock().unwrap();
+            assert_eq!(records.len(), 4);
+            assert!(records.iter().all(|record| method_of(record) == "GET"));
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = source(directory.path(), "descriptor", &bytes);
+        let intent = object_intent(&handle, ObjectRole::Descriptor, "root", &bytes);
+        let receipt = provider
+            .create_object(
+                &handle,
+                &intent,
+                &source,
+                None,
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.locator.object, "7/3");
+        let mut sink = SpoolSink::create(&directory.path().join("read"), 16).unwrap();
+        provider
+            .read_object(
+                &handle,
+                &receipt.locator,
+                None,
+                &mut sink,
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+        assert!(sink.is_verified());
+        let records = server.requests.lock().unwrap();
+        assert_eq!(records.len(), 7);
+        assert_eq!(method_of(&records[4]), "POST");
+        assert!(head_line(&records[4]).contains("/releases/7/assets?name=descriptor-root"));
+        assert!(records
+            .iter()
+            .all(|record| method_of(record) != "PATCH" && method_of(record) != "DELETE"));
+    });
+}
+
+#[test]
+fn resume_create_rejects_head_duplicate_malformed_and_foreign_owned_layouts() {
+    runtime().block_on(async {
+        let descriptor_tag = format!("{PREFIX}-d-0");
+        let cases: Vec<(&str, Vec<Reply>)> = vec![
+            (
+                "provider-owned head tag",
+                vec![
+                    repository_reply(true),
+                    reply(200, json!([release(2, &format!("{PREFIX}-head-0"))])),
+                ],
+            ),
+            (
+                "foreign provider-owned tag",
+                vec![
+                    repository_reply(true),
+                    reply(200, json!([release(2, &format!("{PREFIX}-foreign-0"))])),
+                ],
+            ),
+            (
+                "duplicate descriptor releases",
+                vec![
+                    repository_reply(true),
+                    reply(
+                        200,
+                        json!([
+                            release(7, &descriptor_tag),
+                            release(8, &descriptor_tag)
+                        ]),
+                    ),
+                ],
+            ),
+            (
+                "head asset",
+                vec![
+                    repository_reply(true),
+                    reply(200, json!([release(7, &descriptor_tag)])),
+                    reply(200, json!([asset(1, "head", 4, None)])),
+                ],
+            ),
+            (
+                "duplicate descriptor assets",
+                vec![
+                    repository_reply(true),
+                    reply(200, json!([release(7, &descriptor_tag)])),
+                    reply(
+                        200,
+                        json!([
+                            asset(1, "descriptor-one", 4, None),
+                            asset(2, "descriptor-two", 4, None)
+                        ]),
+                    ),
+                ],
+            ),
+            (
+                "malformed descriptor asset",
+                vec![
+                    repository_reply(true),
+                    reply(200, json!([release(7, &descriptor_tag)])),
+                    reply(200, json!([asset(1, "descriptor-../escape", 4, None)])),
+                ],
+            ),
+            (
+                "unfinished descriptor asset",
+                vec![
+                    repository_reply(true),
+                    reply(200, json!([release(7, &descriptor_tag)])),
+                    reply(
+                        200,
+                        json!([{
+                            "id": 1,
+                            "name": "descriptor-root",
+                            "size": 4,
+                            "state": "new"
+                        }]),
+                    ),
+                ],
+            ),
+            (
+                "empty descriptor asset",
+                vec![
+                    repository_reply(true),
+                    reply(200, json!([release(7, &descriptor_tag)])),
+                    reply(200, json!([asset(1, "descriptor-root", 0, None)])),
+                ],
+            ),
+            (
+                "malformed descriptor digest",
+                vec![
+                    repository_reply(true),
+                    reply(200, json!([release(7, &descriptor_tag)])),
+                    reply(
+                        200,
+                        json!([asset(
+                            1,
+                            "descriptor-root",
+                            4,
+                            Some("md5:synthetic".into())
+                        )]),
+                    ),
+                ],
+            ),
+        ];
+
+        for (label, replies) in cases {
+            let server = github_server(replies);
+            let provider = adapter(dependencies().dependencies);
+            let error = open(provider.as_ref(), &server, OpenMode::ResumeCreate)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.kind, ErrorKind::PreconditionFailed, "{label}");
+            assert!(server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|record| method_of(record) == "GET"),
+                "{label}");
+        }
     });
 }
 
 #[test]
 fn a_public_repository_is_refused_and_an_occupied_root_cannot_be_created() {
     runtime().block_on(async {
-        let public = WireServer::start(vec![repository_reply(false)]);
+        let public = github_server(vec![repository_reply(false)]);
         let test = dependencies();
         let provider = adapter(test.dependencies.clone());
         assert_eq!(
@@ -258,9 +548,9 @@ fn a_public_repository_is_refused_and_an_occupied_root_cannot_be_created() {
                 .kind,
             ErrorKind::Unsupported
         );
-        assert_eq!(public.requests.lock().unwrap().len(), 1);
+        assert_eq!(public.requests.lock().unwrap().len(), 2);
 
-        let occupied = WireServer::start(vec![
+        let occupied = github_server(vec![
             repository_reply(true),
             reply(200, json!([release(1, &format!("{PREFIX}-d-0"))])),
         ]);
@@ -273,7 +563,7 @@ fn a_public_repository_is_refused_and_an_occupied_root_cannot_be_created() {
             ErrorKind::PreconditionFailed
         );
 
-        let unrelated = WireServer::start(vec![
+        let unrelated = github_server(vec![
             repository_reply(true),
             reply(200, json!([release(1, "v1.0.0")])),
         ]);
@@ -287,7 +577,7 @@ fn a_public_repository_is_refused_and_an_occupied_root_cannot_be_created() {
             .connection_identity
             .ends_with("|synthetic-owner/synthetic-repo|risunest"));
 
-        let no_push = WireServer::start(vec![reply(
+        let no_push = github_server(vec![reply(
             200,
             json!({ "private": true, "permissions": { "push": false } }),
         )]);
@@ -308,7 +598,7 @@ fn existing_needs_the_descriptor_release_and_one_descriptor_asset() {
         let test = dependencies();
         let provider = adapter(test.dependencies.clone());
 
-        let missing = WireServer::start(vec![
+        let missing = github_server(vec![
             repository_reply(true),
             reply(200, json!([release(1, "v1.0.0")])),
         ]);
@@ -321,7 +611,7 @@ fn existing_needs_the_descriptor_release_and_one_descriptor_asset() {
             ErrorKind::NotFound
         );
 
-        let empty = WireServer::start(vec![
+        let empty = github_server(vec![
             repository_reply(true),
             reply(200, json!([release(7, &format!("{PREFIX}-d-0"))])),
             reply(200, json!([asset(1, "pack-other", 4, None)])),
@@ -335,7 +625,7 @@ fn existing_needs_the_descriptor_release_and_one_descriptor_asset() {
             ErrorKind::NotFound
         );
 
-        let present = WireServer::start(vec![
+        let present = github_server(vec![
             repository_reply(true),
             reply(200, json!([release(7, &format!("{PREFIX}-d-0"))])),
             reply(200, json!([asset(1, "descriptor-root", 4, None)])),
@@ -345,9 +635,10 @@ fn existing_needs_the_descriptor_release_and_one_descriptor_asset() {
             .unwrap();
         assert_eq!(handle.repository_id, handle.connection_identity);
         let records = present.requests.lock().unwrap();
-        assert!(head_line(&records[0]).contains("/repos/synthetic-owner/synthetic-repo "));
-        assert!(head_line(&records[1]).contains("/releases?per_page=30&page=1"));
-        assert!(head_line(&records[2]).contains("/releases/7/assets?per_page=100&page=1"));
+        assert!(head_line(&records[0]).contains("/user "));
+        assert!(head_line(&records[1]).contains("/repos/synthetic-owner/synthetic-repo "));
+        assert!(head_line(&records[2]).contains("/releases?per_page=30&page=1"));
+        assert!(head_line(&records[3]).contains("/releases/7/assets?per_page=100&page=1"));
         assert!(records
             .iter()
             .all(|record| has_header(record, "authorization")));
@@ -358,7 +649,7 @@ fn existing_needs_the_descriptor_release_and_one_descriptor_asset() {
 fn a_created_asset_reports_the_service_digest_and_a_reusable_locator() {
     runtime().block_on(async {
         let bytes = vec![9u8; 3_000];
-        let server = WireServer::start(vec![
+        let server = github_server(vec![
             repository_reply(true),
             reply(200, json!([])),
             reply(201, release(31, &job_tag("job-1", 0))),
@@ -397,31 +688,15 @@ fn a_created_asset_reports_the_service_digest_and_a_reusable_locator() {
         assert!(checksum.provider_verified);
 
         let records = server.requests.lock().unwrap();
-        assert_eq!(records.len(), 4);
-        assert!(head_line(&records[2]).starts_with("POST "));
-        assert!(String::from_utf8_lossy(&records[2].body).contains("\"draft\":true"));
-        assert!(head_line(&records[3]).contains("/releases/31/assets?name=pack-object-1"));
-        assert_eq!(records[3].body, bytes);
-        assert!(records[3]
+        assert_eq!(records.len(), 5);
+        assert!(head_line(&records[3]).starts_with("POST "));
+        assert!(String::from_utf8_lossy(&records[3].body).contains("\"draft\":true"));
+        assert!(head_line(&records[4]).contains("/releases/31/assets?name=pack-object-1"));
+        assert_eq!(records[4].body, bytes);
+        assert!(records[4]
             .headers
             .contains("content-type: application/octet-stream"));
 
-        let reservations = test.budget.reservations.lock().unwrap();
-        let upload = &reservations.last().unwrap().0;
-        let buckets: Vec<&str> = upload.iter().map(|cost| cost.bucket.as_str()).collect();
-        assert_eq!(
-            buckets,
-            vec![
-                api::PRIMARY_BUCKET,
-                api::POINT_BUCKET,
-                api::CONTENT_MINUTE_BUCKET,
-                api::CONTENT_HOUR_BUCKET
-            ]
-        );
-        assert!(upload
-            .iter()
-            .all(|cost| cost.shared_account == "synthetic-owner"));
-        assert_eq!(upload[1].units, 5);
     });
 }
 
@@ -429,7 +704,7 @@ fn a_created_asset_reports_the_service_digest_and_a_reusable_locator() {
 fn a_lost_upload_response_converges_on_the_stored_asset_without_deleting() {
     runtime().block_on(async {
         let bytes = vec![4u8; 512];
-        let server = WireServer::start(vec![
+        let server = github_server(vec![
             repository_reply(true),
             reply(200, json!([])),
             reply(201, release(20, &job_tag("job-1", 0))),
@@ -468,7 +743,7 @@ fn a_lost_upload_response_converges_on_the_stored_asset_without_deleting() {
         assert!(receipt.complete);
         assert!(receipt.checksum.unwrap().provider_verified);
         let records = server.requests.lock().unwrap();
-        assert_eq!(records.len(), 6);
+        assert_eq!(records.len(), 7);
         // The release is reused from the open connection, never recreated.
         assert_eq!(
             records
@@ -487,7 +762,7 @@ fn a_lost_upload_response_converges_on_the_stored_asset_without_deleting() {
 fn a_name_conflict_with_different_bytes_is_refused_and_nothing_is_removed() {
     runtime().block_on(async {
         let bytes = vec![1u8; 64];
-        let server = WireServer::start(vec![
+        let server = github_server(vec![
             repository_reply(true),
             reply(200, json!([])),
             reply(201, release(20, &job_tag("job-1", 0))),
@@ -513,7 +788,7 @@ fn a_name_conflict_with_different_bytes_is_refused_and_nothing_is_removed() {
         assert_eq!(error.kind, ErrorKind::PreconditionFailed);
         assert_eq!(error.http_status, Some(422));
         let records = server.requests.lock().unwrap();
-        assert_eq!(records.len(), 5);
+        assert_eq!(records.len(), 6);
         assert!(records
             .iter()
             .all(|record| method_of(record) != "DELETE" && method_of(record) != "PATCH"));
@@ -527,7 +802,7 @@ fn a_full_release_rolls_the_batch_to_the_next_release() {
         let existing: Vec<serde_json::Value> = (0..api::MAX_ASSETS_PER_RELEASE)
             .map(|index| asset(index as u64 + 1, &format!("pack-old-{index}"), 16, None))
             .collect();
-        let server = WireServer::start(vec![
+        let server = github_server(vec![
             repository_reply(true),
             reply(200, json!([])),
             reply(422, json!({})),
@@ -554,9 +829,9 @@ fn a_full_release_rolls_the_batch_to_the_next_release() {
             Some(job_tag("job-1", 1).as_str())
         );
         let records = server.requests.lock().unwrap();
-        assert!(String::from_utf8_lossy(&records[2].body).contains(&job_tag("job-1", 0)));
-        assert!(String::from_utf8_lossy(&records[5].body).contains(&job_tag("job-1", 1)));
-        assert!(head_line(&records[6]).contains("/releases/41/assets?name=pack-object-1"));
+        assert!(String::from_utf8_lossy(&records[3].body).contains(&job_tag("job-1", 0)));
+        assert!(String::from_utf8_lossy(&records[6].body).contains(&job_tag("job-1", 1)));
+        assert!(head_line(&records[7]).contains("/releases/41/assets?name=pack-object-1"));
     });
 }
 
@@ -568,7 +843,7 @@ fn snapshot_discovery_pages_across_releases_with_a_resumable_cursor() {
             release(52, &job_tag("job-2", 0)),
             release(53, &format!("{PREFIX}-d-0")),
         ]);
-        let server = WireServer::start(vec![
+        let server = github_server(vec![
             repository_reply(true),
             reply(200, json!([])),
             reply(200, releases.clone()),
@@ -640,7 +915,7 @@ fn snapshot_discovery_pages_across_releases_with_a_resumable_cursor() {
                 .kind,
             ErrorKind::Corrupt
         );
-        assert_eq!(server.requests.lock().unwrap().len(), 7);
+        assert_eq!(server.requests.lock().unwrap().len(), 8);
     });
 }
 
@@ -648,7 +923,7 @@ fn snapshot_discovery_pages_across_releases_with_a_resumable_cursor() {
 fn a_download_follows_one_redirect_without_the_token() {
     runtime().block_on(async {
         let bytes = vec![6u8; 4096];
-        let server = WireServer::start(vec![
+        let server = github_server(vec![
             repository_reply(true),
             reply(200, json!([release(9, &format!("{PREFIX}-d-0"))])),
             reply(200, json!([asset(3, "descriptor-root", 4, None)])),
@@ -691,18 +966,14 @@ fn a_download_follows_one_redirect_without_the_token() {
         assert!(sink.is_verified());
 
         let records = server.requests.lock().unwrap();
-        assert!(head_line(&records[3]).contains("/releases/assets/3"));
-        assert!(records[3]
+        assert!(head_line(&records[4]).contains("/releases/assets/3"));
+        assert!(records[4]
             .headers
             .contains("accept: application/octet-stream"));
-        assert!(has_header(&records[3], "authorization"));
-        assert!(head_line(&records[4]).contains("/synthetic/objects/blob"));
-        assert!(!has_header(&records[4], "authorization"));
+        assert!(has_header(&records[4], "authorization"));
+        assert!(head_line(&records[5]).contains("/synthetic/objects/blob"));
+        assert!(!has_header(&records[5], "authorization"));
 
-        let reservations = test.budget.reservations.lock().unwrap();
-        let hop = &reservations.last().unwrap().0;
-        assert_eq!(hop.len(), 1);
-        assert_eq!(hop[0].bucket, api::ASSET_BODY_BUCKET);
     });
 }
 
@@ -712,7 +983,7 @@ fn primary_and_secondary_limits_become_rate_limited_with_a_retry_instant() {
         let test = dependencies();
         let provider = adapter(test.dependencies.clone());
 
-        let primary = WireServer::start(vec![Reply::Http {
+        let primary = github_server(vec![Reply::Http {
             status: 403,
             headers: vec![
                 ("x-ratelimit-remaining".into(), "0".into()),
@@ -728,7 +999,7 @@ fn primary_and_secondary_limits_become_rate_limited_with_a_retry_instant() {
         assert_eq!(error.http_status, Some(403));
         assert_eq!(error.retry_at_ms, Some(1_200_000));
 
-        let secondary = WireServer::start(vec![Reply::Http {
+        let secondary = github_server(vec![Reply::Http {
             status: 403,
             headers: vec![
                 ("retry-after".into(), "60".into()),
@@ -743,7 +1014,7 @@ fn primary_and_secondary_limits_become_rate_limited_with_a_retry_instant() {
         assert_eq!(error.kind, ErrorKind::RateLimited);
         assert_eq!(error.retry_at_ms, Some(NOW_MS + 60_000));
 
-        let forbidden = WireServer::start(vec![Reply::Http {
+        let forbidden = github_server(vec![Reply::Http {
             status: 403,
             headers: Vec::new(),
             body: Vec::new(),
@@ -757,7 +1028,7 @@ fn primary_and_secondary_limits_become_rate_limited_with_a_retry_instant() {
             ErrorKind::Unauthorized
         );
 
-        let expired = WireServer::start(vec![Reply::Http {
+        let expired = github_server(vec![Reply::Http {
             status: 401,
             headers: Vec::new(),
             body: Vec::new(),
@@ -771,7 +1042,7 @@ fn primary_and_secondary_limits_become_rate_limited_with_a_retry_instant() {
             ErrorKind::ReauthRequired
         );
 
-        let absent = WireServer::start(vec![Reply::Http {
+        let absent = github_server(vec![Reply::Http {
             status: 404,
             headers: Vec::new(),
             body: Vec::new(),
@@ -790,7 +1061,7 @@ fn primary_and_secondary_limits_become_rate_limited_with_a_retry_instant() {
 #[test]
 fn head_publication_is_unsupported_and_sends_nothing() {
     runtime().block_on(async {
-        let server = WireServer::start(vec![repository_reply(true), reply(200, json!([]))]);
+        let server = github_server(vec![repository_reply(true), reply(200, json!([]))]);
         let test = dependencies();
         let provider = adapter(test.dependencies.clone());
         let handle = open(provider.as_ref(), &server, OpenMode::Create)
@@ -839,7 +1110,7 @@ fn head_publication_is_unsupported_and_sends_nothing() {
 #[test]
 fn foreign_handles_and_locators_are_rejected_as_corrupt() {
     runtime().block_on(async {
-        let server = WireServer::start(vec![repository_reply(true), reply(200, json!([]))]);
+        let server = github_server(vec![repository_reply(true), reply(200, json!([]))]);
         let test = dependencies();
         let provider = adapter(test.dependencies.clone());
         let handle = open(provider.as_ref(), &server, OpenMode::Create)
@@ -930,14 +1201,14 @@ fn foreign_handles_and_locators_are_rejected_as_corrupt() {
                 .kind,
             ErrorKind::Corrupt
         );
-        assert_eq!(server.requests.lock().unwrap().len(), 2);
+        assert_eq!(server.requests.lock().unwrap().len(), 3);
     });
 }
 
 #[test]
 fn there_is_no_upload_session_and_a_foreign_resume_state_is_refused() {
     runtime().block_on(async {
-        let server = WireServer::start(vec![repository_reply(true), reply(200, json!([]))]);
+        let server = github_server(vec![repository_reply(true), reply(200, json!([]))]);
         let test = dependencies();
         let provider = adapter(test.dependencies.clone());
         let handle = open(provider.as_ref(), &server, OpenMode::Create)
@@ -967,7 +1238,7 @@ fn there_is_no_upload_session_and_a_foreign_resume_state_is_refused() {
                 .kind,
             ErrorKind::Unsupported
         );
-        assert_eq!(server.requests.lock().unwrap().len(), 2);
+        assert_eq!(server.requests.lock().unwrap().len(), 3);
     });
 }
 
@@ -975,7 +1246,7 @@ fn there_is_no_upload_session_and_a_foreign_resume_state_is_refused() {
 fn reconciliation_reports_the_stored_object_or_a_restart() {
     runtime().block_on(async {
         let bytes = vec![8u8; 128];
-        let server = WireServer::start(vec![
+        let server = github_server(vec![
             repository_reply(true),
             reply(200, json!([])),
             reply(200, json!([release(60, &job_tag("job-1", 0))])),
@@ -1021,7 +1292,7 @@ fn reconciliation_reports_the_stored_object_or_a_restart() {
 #[test]
 fn cancelling_during_the_body_stops_the_read() {
     runtime().block_on(async {
-        let server = WireServer::start(vec![
+        let server = github_server(vec![
             repository_reply(true),
             reply(200, json!([release(9, &format!("{PREFIX}-d-0"))])),
             reply(200, json!([asset(3, "descriptor-root", 4, None)])),
@@ -1042,7 +1313,7 @@ fn cancelling_during_the_body_stops_the_read() {
         let cancel = Cancellation::default();
         let read = provider.read_object(&handle, &locator, None, &mut sink, &cancel);
         let trigger = async {
-            while server.requests.lock().unwrap().len() < 4 {
+            while server.requests.lock().unwrap().len() < 5 {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1063,7 +1334,7 @@ fn cancelling_during_the_body_stops_the_read() {
 fn a_create_receipt_locator_reads_the_same_bytes_back() {
     runtime().block_on(async {
         let bytes = vec![7u8; 1_024];
-        let server = WireServer::start(vec![
+        let server = github_server(vec![
             repository_reply(true),
             reply(200, json!([])),
             reply(201, release(31, &job_tag("job-1", 0))),
@@ -1111,74 +1382,7 @@ fn a_create_receipt_locator_reads_the_same_bytes_back() {
         );
         assert!(sink.is_verified());
         let records = server.requests.lock().unwrap();
-        assert!(head_line(&records[4]).contains("/releases/assets/77"));
-    });
-}
-
-#[test]
-fn request_cost_reports_documented_weights_and_nothing_for_unused_operations() {
-    runtime().block_on(async {
-        let server = WireServer::start(vec![
-            repository_reply(true),
-            reply(200, json!([release(9, &format!("{PREFIX}-d-0"))])),
-            reply(200, json!([asset(3, "descriptor-root", 4, None)])),
-        ]);
-        let provider = adapter(dependencies().dependencies);
-        let handle = open(provider.as_ref(), &server, OpenMode::Existing)
-            .await
-            .unwrap();
-        assert!(provider
-            .request_cost(
-                &crate::external_storage::fake::repository(),
-                ProviderOperation::Get
-            )
-            .is_err());
-        for operation in [
-            ProviderOperation::Metadata,
-            ProviderOperation::List,
-            ProviderOperation::DownloadUrl,
-            ProviderOperation::ReconcileUpload,
-        ] {
-            let costs = provider.request_cost(&handle, operation).unwrap();
-            assert_eq!(costs.len(), 2, "{operation:?}");
-            assert_eq!(costs[0].shared_account, "synthetic-owner");
-            assert_eq!(costs[0].bucket, api::PRIMARY_BUCKET);
-            assert_eq!(
-                costs[0].reset,
-                QuotaReset::Rolling {
-                    window_ms: 60 * 60 * 1000
-                }
-            );
-            assert_eq!(costs[1].units, 1);
-        }
-        let create = provider
-            .request_cost(&handle, ProviderOperation::Create)
-            .unwrap();
-        assert_eq!(create.len(), 4);
-        assert_eq!(create[1].units, 5);
-        assert_eq!(create[2].reset, QuotaReset::Rolling { window_ms: 60_000 });
-        let body = provider
-            .request_cost(&handle, ProviderOperation::Get)
-            .unwrap();
-        assert_eq!(body[0].bucket, api::ASSET_BODY_BUCKET);
-        assert_eq!(body[0].reset, QuotaReset::Unknown);
-        for operation in [
-            ProviderOperation::Range,
-            ProviderOperation::UploadSession,
-            ProviderOperation::UploadChunk,
-            ProviderOperation::CompleteUpload,
-            ProviderOperation::CompareExchangeHead,
-            ProviderOperation::ReplaceHead,
-            ProviderOperation::Authenticate,
-        ] {
-            assert!(
-                provider
-                    .request_cost(&handle, operation)
-                    .unwrap()
-                    .is_empty(),
-                "{operation:?} is never dispatched"
-            );
-        }
+        assert!(head_line(&records[5]).contains("/releases/assets/77"));
     });
 }
 
@@ -1186,7 +1390,7 @@ fn request_cost_reports_documented_weights_and_nothing_for_unused_operations() {
 fn descriptor_listing_reads_only_the_descriptor_release() {
     runtime().block_on(async {
         let descriptor_tag = format!("{PREFIX}-d-0");
-        let server = WireServer::start(vec![
+        let server = github_server(vec![
             repository_reply(true),
             reply(200, json!([release(9, &descriptor_tag)])),
             reply(200, json!([asset(3, "descriptor-root", 4, None)])),
@@ -1227,18 +1431,15 @@ fn descriptor_listing_reads_only_the_descriptor_release() {
             Some(descriptor_tag.as_str())
         );
         assert_eq!(page.next_cursor, None);
-        assert_eq!(server.requests.lock().unwrap().len(), 5);
+        assert_eq!(server.requests.lock().unwrap().len(), 6);
     });
 }
 
-/// A passing exchange here proves the adapter's request shape and status
-/// handling. It is no evidence of the service's own deletion guarantees, which
-/// only the provider documentation behind `Capabilities` can supply.
 #[test]
 fn deleting_an_asset_checks_its_release_tag_and_role_prefix_first() {
     runtime().block_on(async {
         let tag = job_tag("job-1", 0);
-        let server = WireServer::start(vec![
+        let server = github_server(vec![
             repository_reply(true),
             reply(200, json!([])),
             // The removable asset: its release is tagged by this root.
@@ -1299,28 +1500,15 @@ fn deleting_an_asset_checks_its_release_tag_and_role_prefix_first() {
         );
 
         let records = server.requests.lock().unwrap();
-        assert_eq!(records.len(), 11);
-        assert!(head_line(&records[2]).starts_with("GET ") && head_line(&records[2]).contains("/releases/20 "));
+        assert_eq!(records.len(), 12);
+        assert!(head_line(&records[3]).starts_with("GET ") && head_line(&records[3]).contains("/releases/20 "));
         assert_eq!(
-            method_of(&records[4]),
+            method_of(&records[5]),
             "DELETE",
             "only the checked asset id is removed"
         );
-        assert!(head_line(&records[4]).contains("/releases/assets/88 "));
+        assert!(head_line(&records[5]).contains("/releases/assets/88 "));
         drop(records);
-        let reservations = test.budget.reservations.lock().unwrap();
-        let removal = &reservations[4].0;
-        assert_eq!(
-            removal
-                .iter()
-                .map(|cost| (cost.bucket.clone(), cost.units))
-                .collect::<Vec<_>>(),
-            vec![
-                (api::PRIMARY_BUCKET.to_owned(), 1),
-                (api::POINT_BUCKET.to_owned(), 5)
-            ],
-            "a delete is not a content creating request"
-        );
     });
 }
 
@@ -1335,7 +1523,7 @@ fn the_lease_collection_uses_its_own_tag_and_asset_prefix() {
         assert_eq!(api::batch_key(ObjectRole::Lease, "job-1"), api::LEASE_BATCH);
         assert_eq!(api::asset_name(ObjectRole::Lease, &work), format!("lease-{work}"));
 
-        let server = WireServer::start(vec![
+        let server = github_server(vec![
             repository_reply(true),
             reply(200, json!([])),
             reply(
@@ -1368,6 +1556,6 @@ fn the_lease_collection_uses_its_own_tag_and_asset_prefix() {
             vec!["31/1"]
         );
         assert_eq!(page.objects[0].locator.collection.as_deref(), Some(lease_tag.as_str()));
-        assert_eq!(server.requests.lock().unwrap().len(), 4);
+        assert_eq!(server.requests.lock().unwrap().len(), 5);
     });
 }

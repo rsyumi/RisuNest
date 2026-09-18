@@ -54,8 +54,11 @@ function connection(keepCount: number, keepDays: number) {
         },
         retentionPolicy: { keepCount, keepDays },
         capabilities: {
-            cas: false, sequential: false, backupOnly: true, resumableUpload: false,
-            rangeDownload: false, snapshotDiscovery: true, evidence: 'synthetic' as const,
+            immutableCreate: true, directCompleteRead: true, atomicCreateHead: false,
+            conditionalHeadUpdate: false, stableHeadReplace: false, headReadAfterWrite: false,
+            headRetryControl: false, leaseOperations: false, deleteObjects: false,
+            conditionalGet: false, resumableUpload: false, range: false,
+            snapshotDiscovery: true, maxStoredBytes: null, sdkOverheadBytes: 0, uploadAlignment: 1,
         },
         status: 'ready' as const,
     }
@@ -114,6 +117,21 @@ describe('the storage usage tab', () => {
         expect(labelled(strings.retentionDays).value).toBe('30')
     })
 
+    it.each(['cas', 'sequential'])('shows the same single-device guidance for %s synchronization', async (strategy) => {
+        if (component) unmount(component)
+        state.getState.mockResolvedValue({
+            supported: true,
+            selection: { kind: 'none', selectionEpoch: '0', paused: false, decisionRequired: false },
+            connections: [{ ...connection(10, 30), purpose: 'sync', strategy }],
+            jobs: [],
+        })
+        component = mount(ExternalStorageSettings, { target })
+        await settle()
+        expect(target.textContent).toContain(strings.sequentialWarning)
+        expect(target.querySelector('.card-sub')?.textContent).toBe('https://synthetic.invalid · RisuNest')
+        expect(target.textContent).not.toContain('Concurrent-use protection')
+    })
+
     it('sends a changed limit and leaves the other one alone', async () => {
         await openStorageUsage()
         const count = labelled(strings.retentionCount)
@@ -124,6 +142,26 @@ describe('the storage usage tab', () => {
             keepCount: 25,
             keepDays: 30,
         })
+    })
+
+    it.each([false, true])('shows local request estimates only when provided (%s)', async (hasCounters) => {
+        state.getQuota.mockResolvedValue({
+            connectionId: 'connection-1',
+            buckets: hasCounters ? [{
+                id: 'mybox-download-day', used: '4', limit: '500',
+                unit: 'requests', localEstimate: true,
+            }] : [],
+            storage: {
+                providerPhysicalBytes: null, providerPhysicalKnown: false,
+                locallyUploadedBytesLowerBound: '0', locallyUploadedObjectCountLowerBound: '0',
+                locallyUploadedCoverage: 'cached-upload-receipts',
+            },
+        })
+        await openStorageUsage()
+        await settle()
+        expect(target.textContent?.includes(strings.requestUsage)).toBe(hasCounters)
+        expect(target.textContent?.includes('4 / 500 requests')).toBe(hasCounters)
+        expect(target.textContent).not.toContain('496')
     })
 
     it('puts back the stored value when the typed one is out of range', async () => {

@@ -24,7 +24,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex,
+        Mutex, OnceLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -193,6 +193,20 @@ impl LeaseClock for SystemLeaseClock {
             }),
         }
     }
+}
+
+static SYSTEM_LEASE_CLOCK: OnceLock<SystemLeaseClock> = OnceLock::new();
+
+pub(crate) fn system_clock() -> &'static SystemLeaseClock {
+    SYSTEM_LEASE_CLOCK.get_or_init(SystemLeaseClock::default)
+}
+
+pub(crate) fn observe_time_sample(sample: TimeSample) {
+    system_clock().observe(sample);
+}
+
+pub(crate) fn set_system_foreground(foreground: bool) {
+    system_clock().set_foreground(foreground);
 }
 
 /// Only small control operations use this deadline. Payload transfers retain

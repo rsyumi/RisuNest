@@ -4,8 +4,10 @@ use super::{
     auth::{SecretBytes, SecretVault},
     capabilities::*,
     contract::*,
-    http::{Clock, HttpTransport, NativeHttpTransport, RequestBudget},
+    http::{Clock, HttpTransport, MyboxRequestBudget, NativeHttpTransport, RequestState},
     providers::Dependencies,
+    quota::AccountKey,
+    quota_profiles::MyboxCharge,
 };
 use std::{
     collections::BTreeMap,
@@ -19,37 +21,25 @@ const HEAD_OBJECT: &str = "head";
 
 pub(super) fn capabilities(cas: bool) -> Capabilities {
     Capabilities {
-        immutable_create: Evidence::Synthetic,
-        direct_complete_read: Evidence::Synthetic,
-        atomic_create_head: if cas {
-            Evidence::Synthetic
-        } else {
-            Evidence::Unverified
-        },
-        conditional_head_update: if cas {
-            Evidence::Synthetic
-        } else {
-            Evidence::Unverified
-        },
-        stable_head_replace: Evidence::Synthetic,
-        head_read_after_write: Evidence::Synthetic,
-        head_retry_control: Evidence::Synthetic,
-        snapshot_discovery: Evidence::Synthetic,
-        delete_objects: Evidence::Synthetic,
-        gc_control_consistency: Evidence::Synthetic,
-        delete_completion: Evidence::Synthetic,
+        immutable_create: true,
+        direct_complete_read: true,
+        atomic_create_head: cas,
+        conditional_head_update: cas,
+        stable_head_replace: true,
+        head_read_after_write: true,
+        head_retry_control: true,
+        snapshot_discovery: true,
+        lease_operations: true,
+        delete_objects: true,
         ..Default::default()
     }
 }
 
-/// The same repository without the evidence a removal needs. Everything else
-/// stays available, which is what a connection that cannot be cleaned looks
-/// like.
+/// The same repository without synchronous removal. Publication and finite
+/// work protection stay available.
 pub(super) fn capabilities_without_cleanup(cas: bool) -> Capabilities {
     Capabilities {
-        delete_objects: Evidence::Unverified,
-        gc_control_consistency: Evidence::Unverified,
-        delete_completion: Evidence::Unverified,
+        delete_objects: false,
         ..capabilities(cas)
     }
 }
@@ -587,14 +577,17 @@ impl Provider for FakeProvider {
             object: HEAD_OBJECT.into(),
         })
     }
-    fn request_cost(&self, _: &RepositoryHandle, _: ProviderOperation) -> Result<Vec<RequestCost>> {
-        Ok(Vec::new())
-    }
 }
 pub(crate) fn repository() -> RepositoryHandle {
     RepositoryHandle {
         repository_id: "synthetic-repository".into(),
         connection_identity: "synthetic-account/root".into(),
+        account: AccountKey::new(
+            "fake",
+            &url::Url::parse("https://synthetic.invalid").expect("valid fake endpoint"),
+            "synthetic-account",
+        )
+        .expect("valid fake account"),
         context: Box::new(()),
     }
 }
@@ -889,20 +882,25 @@ impl Clock for FixedClock {
     }
 }
 
-/// Records every reservation so a wire test can assert per-request costs.
-/// `deny` simulates an exhausted account budget before dispatch.
+/// Records actual MYBOX reservations. Other providers have no synthetic
+/// request-cost ledger.
 #[derive(Default)]
 pub(crate) struct RecordingBudget {
-    pub(crate) reservations: Mutex<Vec<(Vec<RequestCost>, u64)>>,
+    pub(crate) reservations: Mutex<Vec<(AccountKey, MyboxCharge, u64)>>,
     pub(crate) deny: AtomicBool,
 }
-impl RequestBudget for RecordingBudget {
-    fn reserve<'a>(&'a self, costs: &'a [RequestCost], now_ms: u64) -> ProviderFuture<'a, ()> {
+impl MyboxRequestBudget for RecordingBudget {
+    fn reserve_mybox<'a>(
+        &'a self,
+        account: &'a AccountKey,
+        charge: &'a MyboxCharge,
+        now_ms: u64,
+    ) -> ProviderFuture<'a, ()> {
         Box::pin(async move {
             self.reservations
                 .lock()
                 .unwrap()
-                .push((costs.to_vec(), now_ms));
+                .push((account.clone(), charge.clone(), now_ms));
             if self.deny.load(Ordering::SeqCst) {
                 Err(ProviderError::new(ErrorKind::DailyQuotaExhausted))
             } else {
@@ -938,7 +936,8 @@ pub(crate) fn with_transport(
     TestDependencies {
         dependencies: Dependencies {
             http,
-            budget: budget.clone(),
+            mybox_budget: budget.clone(),
+            requests: Arc::new(RequestState::default()),
             clock: clock.clone(),
             vault: vault.clone(),
         },

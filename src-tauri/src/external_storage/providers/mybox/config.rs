@@ -1,5 +1,9 @@
 //! Connection configuration, personal access token payload and remote naming.
-use crate::external_storage::{auth::SecretVault, contract::*};
+use crate::external_storage::{
+    auth::SecretVault,
+    contract::*,
+    quota_profiles::MyboxPlan,
+};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use serde::Deserialize;
 use zeroize::Zeroizing;
@@ -106,25 +110,11 @@ pub(super) fn parse_locator(locator: &RemoteLocator) -> Result<(&'static str, &s
 
 pub(super) struct Connection {
     pub identity: String,
-    pub account_scope: String,
+    pub account_id: String,
+    pub plan: MyboxPlan,
     pub base: url::Url,
     pub root_folder_name: String,
     pub root_folder_id: Option<String>,
-}
-
-/// Documented per-plan allowances. Only used to reject an unknown plan here;
-/// the owning account configures the durable ledger with the same numbers.
-fn plan(profile: Option<&str>) -> Result<(u64, u64)> {
-    match profile.unwrap_or("plan30gb") {
-        "plan30gb" => Ok((500, 60)),
-        "plan80gb" => Ok((1_000, 60)),
-        "plan180gb" => Ok((1_000, 240)),
-        "plan2tb" => Ok((2_000, 240)),
-        "plan5tb" => Ok((5_000, 240)),
-        "plan10tb" => Ok((20_000, 240)),
-        "plan20tb" => Ok((50_000, 240)),
-        _ => Err(ProviderError::new(ErrorKind::Unsupported)),
-    }
 }
 
 pub(super) fn parse(config: &ConnectionConfig) -> Result<Connection> {
@@ -132,7 +122,7 @@ pub(super) fn parse(config: &ConnectionConfig) -> Result<Connection> {
     if config.provider != PROVIDER_ID || config.oauth_profile.is_some() {
         return Err(unsupported());
     }
-    plan(config.profile.as_deref())?;
+    let plan = MyboxPlan::parse(config.profile.as_deref())?;
     let base = base_url(&config.endpoint)?;
     let account = config.account_id.trim();
     if account.is_empty() || account.len() > 256 || account.chars().any(char::is_control) {
@@ -169,7 +159,8 @@ pub(super) fn parse(config: &ConnectionConfig) -> Result<Connection> {
             part(account),
             part(&root_folder_name)
         ),
-        account_scope: format!("{PROVIDER_ID}/{}{}", part(&address), part(account)),
+        account_id: account.to_owned(),
+        plan,
         base,
         root_folder_name,
         root_folder_id,

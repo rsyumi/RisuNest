@@ -2,8 +2,8 @@
 //!
 //! Append-only backup target. Generic packages have no conditional write and no
 //! documented overwrite-and-read path for one file name, so both head methods
-//! answer `Unsupported` and every head capability stays `Unverified`. No Git
-//! protocol is used.
+//! answer `Unsupported` and all head capabilities are false. No Git protocol
+//! is used.
 //!
 //! `ConnectionConfig`:
 //!
@@ -12,7 +12,10 @@
 //!   `https://gitlab.example.com/gitlab`. The API is addressed under `/api/v4`.
 //! * `profile` — absent (inferred from the host), `gitlabCom` or `selfManaged`.
 //!   The GitLab.com profile pins the documented 5 GB generic file limit.
-//! * `account_id` — the token principal the instance rate limit is shared by.
+//! * `account_id` — a renderer label. Personal and project access tokens use
+//!   the authenticated numeric user id as their request-sharing principal.
+//!   Deploy tokens retain the configured label because their package-only
+//!   scope cannot call the public user endpoint.
 //! * `location["projectId"]` — numeric project id or the plain namespace path
 //!   (`group/subgroup/project`); it is percent-encoded per request, so a value
 //!   that is already URL-encoded is rejected.
@@ -55,17 +58,16 @@ mod tests;
 
 use super::{common, Dependencies};
 use crate::external_storage::{
-    capabilities::{Capabilities, Evidence},
+    capabilities::Capabilities,
     contract::*,
-    http::{self, HttpResponse},
+    http::HttpResponse,
 };
-use api::{Outgoing, PackageFileJson, PackageJson};
+use api::{Outgoing, PackageFileJson, PackageJson, UserJson};
 use config::{Credential, Placement, Settings};
 use sha2::Digest;
-use std::{pin::Pin, sync::Arc};
+use std::{collections::BTreeSet, pin::Pin, sync::Arc};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-const DOCUMENTED_AT: &str = "2026-09-14";
 /// Used only when a download answers without a Content-Length.
 const READ_CEILING: u64 = 5 * 1024 * 1024 * 1024;
 /// Object storage backed instances answer a download with one signed redirect.
@@ -77,27 +79,23 @@ fn corrupt() -> ProviderError {
 fn unsupported() -> ProviderError {
     ProviderError::new(ErrorKind::Unsupported)
 }
+fn complete_next_page(
+    headers: &std::collections::BTreeMap<String, String>,
+) -> Result<Option<String>> {
+    let next = api::next_page(headers);
+    if headers
+        .get("x-next-page")
+        .is_some_and(|value| !value.trim().is_empty() && next.is_none())
+    {
+        return Err(corrupt());
+    }
+    Ok(next)
+}
 fn io_error(cancel: &Cancellation) -> ProviderError {
     cancel
         .check()
         .err()
         .unwrap_or_else(|| ProviderError::new(ErrorKind::Transient))
-}
-
-fn evidence_urls() -> Vec<String> {
-    [
-        "https://docs.gitlab.com/user/packages/generic_packages/",
-        "https://docs.gitlab.com/api/packages/",
-        "https://docs.gitlab.com/api/rest/",
-        "https://docs.gitlab.com/user/gitlab_com/",
-        "https://docs.gitlab.com/user/project/deploy_tokens/",
-        "https://docs.gitlab.com/user/storage_usage_quotas/",
-        "https://docs.gitlab.com/administration/object_storage/",
-        "https://docs.gitlab.com/administration/settings/user_and_ip_rate_limits/",
-    ]
-    .iter()
-    .map(|url| (*url).to_owned())
-    .collect()
 }
 
 struct Repository {
@@ -153,14 +151,20 @@ impl GitlabPackages {
         outgoing: Outgoing<'_>,
         cancel: &Cancellation,
     ) -> Result<HttpResponse> {
-        http::send(
-            self.deps.http.as_ref(),
-            self.deps.budget.as_ref(),
-            self.deps.clock.as_ref(),
-            api::request(settings, outgoing),
-            cancel,
-        )
-        .await
+        let request = api::request(settings, outgoing);
+        let account = request.account.clone();
+        let response = self.deps.send(request, cancel).await?;
+        if response.status == 429 {
+            let now = self.now();
+            let error = api::classify(response.status, &response.headers, now);
+            self.deps.requests.observe_classified_error(
+                &account,
+                &error,
+                &response.headers,
+                now,
+            )?;
+        }
+        Ok(response)
     }
     fn context<'a>(&self, repository: &'a RepositoryHandle) -> Result<&'a Repository> {
         let context = repository
@@ -169,6 +173,7 @@ impl GitlabPackages {
             .ok_or_else(corrupt)?;
         if context.settings.connection_identity != repository.connection_identity
             || context.settings.connection_identity != repository.repository_id
+            || context.settings.account != repository.account
         {
             return Err(corrupt());
         }
@@ -305,6 +310,218 @@ impl GitlabPackages {
             status => return Err(api::classify(status, &response.headers, self.now())),
         }
         self.json(&mut response, cancel).await
+    }
+
+    async fn complete_package_files(
+        &self,
+        settings: &Settings,
+        credential: &Credential,
+        package_id: u64,
+        cancel: &Cancellation,
+    ) -> Result<Vec<PackageFileJson>> {
+        let mut files = Vec::new();
+        let mut page = None;
+        let mut seen = BTreeSet::new();
+        loop {
+            let mut query = vec![("per_page", "100")];
+            if let Some(page) = page.as_deref() {
+                query.push(("page", page));
+            }
+            let url = api::package_files_url(settings, package_id, &query)?;
+            let mut response = self
+                .send(
+                    settings,
+                    Outgoing {
+                        method: reqwest::Method::GET,
+                        url,
+                        operation: ProviderOperation::List,
+                        credential: Some(credential),
+                        body: None,
+                        content_length: None,
+                    },
+                    cancel,
+                )
+                .await?;
+            if response.status != 200 {
+                return Err(api::classify(response.status, &response.headers, self.now()));
+            }
+            let next = complete_next_page(&response.headers)?;
+            files.extend(self.json::<Vec<PackageFileJson>>(&mut response, cancel).await?);
+            match next {
+                None => return Ok(files),
+                Some(next) if seen.len() < 10_000 && seen.insert(next.clone()) => {
+                    page = Some(next)
+                }
+                Some(_) => return Err(corrupt()),
+            }
+        }
+    }
+
+    async fn require_resumable_create_layout(
+        &self,
+        settings: &Settings,
+        credential: &Credential,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        let marker = settings.marker();
+        let owned_prefix = format!("{}.", settings.package_base);
+        let mut marker_count = 0usize;
+        let mut descriptor_count = 0usize;
+        let mut page = None;
+        let mut seen = BTreeSet::new();
+        loop {
+            let mut query = vec![
+                ("package_type", "generic"),
+                ("per_page", "100"),
+            ];
+            if let Some(page) = page.as_deref() {
+                query.push(("page", page));
+            }
+            let url = api::packages_url(settings, &query)?;
+            let mut response = self
+                .send(
+                    settings,
+                    Outgoing {
+                        method: reqwest::Method::GET,
+                        url,
+                        operation: ProviderOperation::List,
+                        credential: Some(credential),
+                        body: None,
+                        content_length: None,
+                    },
+                    cancel,
+                )
+                .await?;
+            if response.status != 200 {
+                return Err(api::classify(response.status, &response.headers, self.now()));
+            }
+            let next = complete_next_page(&response.headers)?;
+            let packages: Vec<PackageJson> = self.json(&mut response, cancel).await?;
+            for package in packages {
+                if !package.name.starts_with(&owned_prefix) {
+                    continue;
+                }
+                if package.id == 0 {
+                    return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+                }
+                if package.name == marker.package {
+                    marker_count += 1;
+                    let files = self
+                        .complete_package_files(settings, credential, package.id, cancel)
+                        .await?;
+                    if marker_count > 1
+                        || package.version != marker.version
+                        || files.len() != 1
+                        || files[0].id == 0
+                        || files[0].file_name != marker.file
+                        || files[0].size != settings.marker_body().len() as u64
+                        || files[0].file_sha256.as_deref().is_some_and(|digest| {
+                            !digest.eq_ignore_ascii_case(&hex::encode(sha2::Sha256::digest(
+                                settings.marker_body(),
+                            )))
+                        })
+                    {
+                        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+                    }
+                    continue;
+                }
+                let suffix = package
+                    .name
+                    .strip_prefix(&owned_prefix)
+                    .ok_or_else(corrupt)?;
+                let Some(role) = config::role_from_name(suffix) else {
+                    return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+                };
+                if role != ObjectRole::Descriptor {
+                    return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+                }
+                descriptor_count += 1;
+                if descriptor_count > 1 {
+                    return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+                }
+                let placement = settings
+                    .place_version(role, &package.version)
+                    .map_err(|_| ProviderError::new(ErrorKind::PreconditionFailed))?;
+                let files = self
+                    .complete_package_files(settings, credential, package.id, cancel)
+                    .await?;
+                if files.len() != 1
+                    || files[0].id == 0
+                    || files[0].file_name != placement.file
+                    || files[0].size == 0
+                    || files[0]
+                        .file_sha256
+                        .as_deref()
+                        .is_some_and(|digest| {
+                            digest.len() != 64
+                                || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        })
+                {
+                    return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+                }
+            }
+            match next {
+                None => break,
+                Some(next) if seen.len() < 10_000 && seen.insert(next.clone()) => {
+                    page = Some(next)
+                }
+                Some(_) => return Err(corrupt()),
+            }
+        }
+        if marker_count != 1 {
+            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+        }
+        Ok(())
+    }
+
+    async fn require_empty_create_layout(
+        &self,
+        settings: &Settings,
+        credential: &Credential,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        let owned_prefix = format!("{}.", settings.package_base);
+        let mut page = None;
+        let mut seen = BTreeSet::new();
+        loop {
+            let mut query = vec![("package_type", "generic"), ("per_page", "100")];
+            if let Some(page) = page.as_deref() {
+                query.push(("page", page));
+            }
+            let url = api::packages_url(settings, &query)?;
+            let mut response = self
+                .send(
+                    settings,
+                    Outgoing {
+                        method: reqwest::Method::GET,
+                        url,
+                        operation: ProviderOperation::List,
+                        credential: Some(credential),
+                        body: None,
+                        content_length: None,
+                    },
+                    cancel,
+                )
+                .await?;
+            if response.status != 200 {
+                return Err(api::classify(response.status, &response.headers, self.now()));
+            }
+            let next = complete_next_page(&response.headers)?;
+            let packages: Vec<PackageJson> = self.json(&mut response, cancel).await?;
+            if packages
+                .iter()
+                .any(|package| package.name.starts_with(&owned_prefix))
+            {
+                return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+            }
+            match next {
+                None => return Ok(()),
+                Some(next) if seen.len() < 10_000 && seen.insert(next.clone()) => {
+                    page = Some(next)
+                }
+                Some(_) => return Err(corrupt()),
+            }
+        }
     }
 
     /// One offset page of the package a role lives in, appended to `objects`.
@@ -492,20 +709,48 @@ impl GitlabPackages {
                         .file_sha256
                         .as_deref()
                         .is_none_or(|value| value.eq_ignore_ascii_case(&expected));
-                if agrees {
-                    Ok(())
-                } else {
-                    Err(corrupt())
+                if !agrees {
+                    return Err(corrupt());
                 }
             }
-            201 => Ok(()),
+            201 => {}
             // The instance forbids duplicates and the marker already exists.
-            400 => Err(ProviderError {
-                kind: ErrorKind::PreconditionFailed,
-                http_status: Some(400),
-                retry_at_ms: None,
-            }),
-            status => Err(api::classify(status, &response.headers, self.now())),
+            400 => {
+                return Err(ProviderError {
+                    kind: ErrorKind::PreconditionFailed,
+                    http_status: Some(400),
+                    retry_at_ms: None,
+                })
+            }
+            status => return Err(api::classify(status, &response.headers, self.now())),
+        }
+        let url = api::object_url(settings, &marker, &[])?;
+        let mut verification = self
+            .send(
+                settings,
+                Outgoing {
+                    method: reqwest::Method::GET,
+                    url,
+                    operation: ProviderOperation::Metadata,
+                    credential: Some(credential),
+                    body: None,
+                    content_length: None,
+                },
+                cancel,
+            )
+            .await?;
+        match verification.status {
+            200 => {
+                let stored =
+                    common::read_bounded(&mut verification.body, 64 * 1024, cancel).await?;
+                if stored == settings.marker_body() {
+                    Ok(())
+                } else {
+                    Err(ProviderError::new(ErrorKind::PreconditionFailed))
+                }
+            }
+            404 => Err(ProviderError::new(ErrorKind::Transient)),
+            status => Err(api::classify(status, &verification.headers, self.now())),
         }
     }
 
@@ -566,31 +811,24 @@ fn receipt(
 
 fn capabilities(settings: &Settings, can_list: bool) -> Capabilities {
     Capabilities {
-        immutable_create: Evidence::Synthetic,
-        direct_complete_read: Evidence::Synthetic,
-        atomic_create_head: Evidence::Unverified,
-        conditional_head_update: Evidence::Unverified,
-        stable_head_replace: Evidence::Unverified,
-        head_read_after_write: Evidence::Unverified,
-        head_retry_control: Evidence::Unverified,
-        snapshot_discovery: if can_list {
-            Evidence::Synthetic
-        } else {
-            Evidence::Unverified
-        },
-        // No cleanup evidence has been recorded for this service yet.
-        delete_objects: Evidence::Unverified,
-        gc_control_consistency: Evidence::Unverified,
-        delete_completion: Evidence::Unverified,
-        discovery_extra_requests: u32::from(can_list),
+        immutable_create: true,
+        direct_complete_read: true,
+        atomic_create_head: false,
+        conditional_head_update: false,
+        stable_head_replace: false,
+        head_read_after_write: false,
+        head_retry_control: false,
+        // Deploy tokens may read and create named packages without permission
+        // to enumerate them. That connection can back up but cannot clean up.
+        snapshot_discovery: can_list,
+        lease_operations: can_list,
+        delete_objects: can_list,
         conditional_get: false,
         range: false,
         resumable_upload: false,
         max_stored_bytes: settings.max_stored_bytes,
         sdk_overhead_bytes: 0,
         upload_alignment: 1,
-        documented_at: Some(DOCUMENTED_AT.into()),
-        evidence_urls: evidence_urls(),
     }
 }
 
@@ -604,8 +842,53 @@ impl Provider for GitlabPackages {
     ) -> ProviderFuture<'a, (RepositoryHandle, Capabilities)> {
         Box::pin(async move {
             cancel.check()?;
-            let settings = config::settings(config)?;
+            let mut settings = config::settings(config)?;
             let credential = self.credential(secret).await?;
+            if credential.kind.authenticates_principal() {
+                let pending = crate::external_storage::quota::AccountKey::pending(
+                    config::PROVIDER_ID,
+                    &settings.endpoint,
+                )?;
+                settings.account = pending.clone();
+                let mut response = self
+                    .send(
+                        &settings,
+                        Outgoing {
+                            method: reqwest::Method::GET,
+                            url: api::user_url(&settings)?,
+                            operation: ProviderOperation::Authenticate,
+                            credential: Some(&credential),
+                            body: None,
+                            content_length: None,
+                        },
+                        cancel,
+                    )
+                    .await?;
+                if response.status != 200 {
+                    return Err(api::classify(
+                        response.status,
+                        &response.headers,
+                        self.now(),
+                    ));
+                }
+                let user: UserJson = self.json(&mut response, cancel).await?;
+                let authenticated = crate::external_storage::quota::AccountKey::new(
+                    config::PROVIDER_ID,
+                    &settings.endpoint,
+                    &user.principal()?,
+                )?;
+                self.deps
+                    .requests
+                    .resolve_pending(&pending, &authenticated)?;
+                settings.account = authenticated;
+            }
+            if mode == OpenMode::ResumeCreate && !credential.kind.authenticates_principal() {
+                return Err(ProviderError::new(ErrorKind::Unsupported));
+            }
+            if mode == OpenMode::Create && credential.kind.authenticates_principal() {
+                self.require_empty_create_layout(&settings, &credential, cancel)
+                    .await?;
+            }
             let marker = settings.marker();
             let url = api::object_url(&settings, &marker, &[])?;
             let mut response = self
@@ -630,10 +913,14 @@ impl Provider for GitlabPackages {
                         retry_at_ms: None,
                     })
                 }
-                (200, OpenMode::Existing) => {
+                (200, OpenMode::Existing | OpenMode::ResumeCreate) => {
                     let body = common::read_bounded(&mut response.body, 64 * 1024, cancel).await?;
                     if body != settings.marker_body() {
-                        return Err(corrupt());
+                        return Err(if mode == OpenMode::ResumeCreate {
+                            ProviderError::new(ErrorKind::PreconditionFailed)
+                        } else {
+                            corrupt()
+                        });
                     }
                 }
                 (404, OpenMode::Existing) => {
@@ -643,18 +930,31 @@ impl Provider for GitlabPackages {
                         retry_at_ms: None,
                     })
                 }
-                (404, OpenMode::Create) => {
+                (404, OpenMode::Create | OpenMode::ResumeCreate) => {
                     self.write_marker(&settings, &credential, cancel).await?;
                 }
                 (status, _) => {
                     return Err(api::classify(status, &response.headers, self.now()));
                 }
             }
-            let can_list = self.probe_listing(&settings, &credential, cancel).await?;
+            let can_list = match mode {
+                OpenMode::Create if credential.kind.authenticates_principal() => {
+                    self.require_resumable_create_layout(&settings, &credential, cancel)
+                        .await?;
+                    true
+                }
+                OpenMode::ResumeCreate => {
+                    self.require_resumable_create_layout(&settings, &credential, cancel)
+                        .await?;
+                    true
+                }
+                _ => self.probe_listing(&settings, &credential, cancel).await?,
+            };
             let capabilities = capabilities(&settings, can_list);
             let handle = RepositoryHandle {
                 repository_id: settings.connection_identity.clone(),
                 connection_identity: settings.connection_identity.clone(),
+                account: settings.account.clone(),
                 context: Box::new(Repository {
                     settings,
                     secret: secret.clone(),
@@ -1012,11 +1312,4 @@ impl Provider for GitlabPackages {
         Err(unsupported())
     }
 
-    fn request_cost(
-        &self,
-        repository: &RepositoryHandle,
-        operation: ProviderOperation,
-    ) -> Result<Vec<RequestCost>> {
-        Ok(api::costs(&self.context(repository)?.settings, operation))
-    }
 }

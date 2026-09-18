@@ -1,59 +1,41 @@
 use super::contract::{ErrorKind, ProviderError, PublicationStrategy, Result};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum Evidence {
-    #[default]
-    Unverified,
-    Synthetic,
-    Live,
-}
-impl Evidence {
-    fn verified(self) -> bool {
-        self != Self::Unverified
-    }
-}
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Capabilities {
-    pub immutable_create: Evidence,
-    pub direct_complete_read: Evidence,
-    pub atomic_create_head: Evidence,
-    pub conditional_head_update: Evidence,
-    pub stable_head_replace: Evidence,
-    pub head_read_after_write: Evidence,
-    pub head_retry_control: Evidence,
-    pub snapshot_discovery: Evidence,
-    /// A single object can be removed by name.
-    pub delete_objects: Evidence,
-    /// A full enumeration of `Leases` and `BackupPoints` started after another
-    /// device finished a write contains that object, and paging never skips one.
-    pub gc_control_consistency: Evidence,
-    /// A success answer means that request will not delete the object later.
-    pub delete_completion: Evidence,
-    pub discovery_extra_requests: u32,
+    pub immutable_create: bool,
+    pub direct_complete_read: bool,
+    pub atomic_create_head: bool,
+    pub conditional_head_update: bool,
+    pub stable_head_replace: bool,
+    pub head_read_after_write: bool,
+    pub head_retry_control: bool,
+    pub snapshot_discovery: bool,
+    pub lease_operations: bool,
+    pub delete_objects: bool,
     pub conditional_get: bool,
     pub range: bool,
     pub resumable_upload: bool,
     pub max_stored_bytes: Option<u64>,
     pub sdk_overhead_bytes: u64,
     pub upload_alignment: u64,
-    pub documented_at: Option<String>,
-    pub evidence_urls: Vec<String>,
 }
 impl Capabilities {
+    pub fn automatic_strategy(&self) -> Result<PublicationStrategy> {
+        if self.require(PublicationStrategy::Cas).is_ok() {
+            return Ok(PublicationStrategy::Cas);
+        }
+        self.require(PublicationStrategy::Sequential)?;
+        Ok(PublicationStrategy::Sequential)
+    }
+
     pub fn require(&self, strategy: PublicationStrategy) -> Result<()> {
-        let common = self.immutable_create.verified() && self.direct_complete_read.verified();
+        let common = self.immutable_create && self.direct_complete_read;
         let supported = match strategy {
-            PublicationStrategy::Cas => {
-                self.atomic_create_head.verified() && self.conditional_head_update.verified()
-            }
+            PublicationStrategy::Cas => self.atomic_create_head && self.conditional_head_update,
             PublicationStrategy::Sequential => {
-                self.stable_head_replace.verified()
-                    && self.head_read_after_write.verified()
-                    && self.head_retry_control.verified()
+                self.stable_head_replace && self.head_read_after_write && self.head_retry_control
             }
         };
         if common && supported {
@@ -62,19 +44,19 @@ impl Capabilities {
             Err(ProviderError::new(ErrorKind::Unsupported))
         }
     }
-    /// Every evidence the cleanup path needs. One unverified item disables GC
-    /// for this connection; it never disables backup or synchronization.
+
+    pub fn cleanup_supported(&self) -> bool {
+        self.snapshot_discovery && self.lease_operations && self.delete_objects
+    }
+
     pub fn require_cleanup(&self) -> Result<()> {
-        if self.delete_objects.verified()
-            && self.snapshot_discovery.verified()
-            && self.gc_control_consistency.verified()
-            && self.delete_completion.verified()
-        {
+        if self.cleanup_supported() {
             Ok(())
         } else {
             Err(ProviderError::new(ErrorKind::Unsupported))
         }
     }
+
     pub fn payload_limit(&self, format_overhead: u64) -> Result<Option<u64>> {
         self.max_stored_bytes
             .map(|max| {
@@ -91,38 +73,78 @@ impl Capabilities {
 mod tests {
     use super::*;
 
-    #[test]
-    fn cleanup_needs_all_four_evidences_and_never_gates_publication() {
-        let ready = Capabilities {
-            immutable_create: Evidence::Synthetic,
-            direct_complete_read: Evidence::Synthetic,
-            stable_head_replace: Evidence::Synthetic,
-            head_read_after_write: Evidence::Synthetic,
-            head_retry_control: Evidence::Synthetic,
-            snapshot_discovery: Evidence::Synthetic,
-            delete_objects: Evidence::Synthetic,
-            gc_control_consistency: Evidence::Synthetic,
-            delete_completion: Evidence::Synthetic,
+    fn ready() -> Capabilities {
+        Capabilities {
+            immutable_create: true,
+            direct_complete_read: true,
+            atomic_create_head: true,
+            conditional_head_update: true,
+            stable_head_replace: true,
+            head_read_after_write: true,
+            head_retry_control: true,
+            snapshot_discovery: true,
+            lease_operations: true,
+            delete_objects: true,
             ..Default::default()
-        };
-        assert!(ready.require_cleanup().is_ok());
-        assert!(ready.require(PublicationStrategy::Sequential).is_ok());
-
-        let unverified: [fn(&mut Capabilities); 4] = [
-            |value| value.delete_objects = Evidence::Unverified,
-            |value| value.snapshot_discovery = Evidence::Unverified,
-            |value| value.gc_control_consistency = Evidence::Unverified,
-            |value| value.delete_completion = Evidence::Unverified,
-        ];
-        for clear in unverified {
-            let mut value = ready.clone();
-            clear(&mut value);
-            assert_eq!(
-                value.require_cleanup().unwrap_err().kind,
-                ErrorKind::Unsupported
-            );
-            // Backup and synchronization stay available without cleanup evidence.
-            assert!(value.require(PublicationStrategy::Sequential).is_ok());
         }
+    }
+
+    #[test]
+    fn automatic_strategy_prefers_cas_without_changing_existing_requirements() {
+        let mut value = ready();
+        assert_eq!(value.automatic_strategy().unwrap(), PublicationStrategy::Cas);
+        value.conditional_head_update = false;
+        assert_eq!(value.automatic_strategy().unwrap(), PublicationStrategy::Sequential);
+        assert_eq!(value.require(PublicationStrategy::Cas).unwrap_err().kind, ErrorKind::Unsupported);
+        value.head_retry_control = false;
+        assert_eq!(value.automatic_strategy().unwrap_err().kind, ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn every_publication_strategy_needs_immutable_create_and_complete_reads() {
+        for clear in [
+            (|value: &mut Capabilities| value.immutable_create = false) as fn(&mut Capabilities),
+            |value: &mut Capabilities| value.direct_complete_read = false,
+        ] {
+            let mut value = ready();
+            clear(&mut value);
+            assert_eq!(value.automatic_strategy().unwrap_err().kind, ErrorKind::Unsupported);
+        }
+    }
+
+    #[test]
+    fn cleanup_requires_operations_without_gating_publication() {
+        assert!(ready().cleanup_supported());
+        for clear in [
+            (|value: &mut Capabilities| value.snapshot_discovery = false) as fn(&mut Capabilities),
+            |value: &mut Capabilities| value.lease_operations = false,
+            |value: &mut Capabilities| value.delete_objects = false,
+        ] {
+            let mut value = ready();
+            clear(&mut value);
+            assert!(!value.cleanup_supported());
+            assert_eq!(value.require_cleanup().unwrap_err().kind, ErrorKind::Unsupported);
+            assert!(value.automatic_strategy().is_ok());
+        }
+    }
+
+    #[test]
+    fn actual_size_limits_account_for_both_overheads() {
+        let mut value = ready();
+        value.max_stored_bytes = Some(100);
+        value.sdk_overhead_bytes = 10;
+        assert_eq!(value.payload_limit(20).unwrap(), Some(70));
+        assert_eq!(value.payload_limit(90).unwrap_err().kind, ErrorKind::FileTooLarge);
+        assert_eq!(value.payload_limit(u64::MAX).unwrap_err().kind, ErrorKind::FileTooLarge);
+    }
+
+    #[test]
+    fn capabilities_contain_operations_and_not_documentation_metadata() {
+        let encoded = serde_json::to_value(ready()).unwrap();
+        assert_eq!(encoded["immutableCreate"], true);
+        assert_eq!(encoded["leaseOperations"], true);
+        assert!(encoded.get("evidence").is_none());
+        assert!(encoded.get("evidenceUrls").is_none());
+        assert!(encoded.get("documentedAt").is_none());
     }
 }

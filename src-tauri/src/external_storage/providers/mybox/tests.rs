@@ -1,6 +1,7 @@
 use super::*;
 use crate::external_storage::{
     fake::{loopback_dependencies, MemoryVault, TestDependencies},
+    quota_profiles::{MyboxCounter, MyboxPlan},
     transfer::{SpoolSink, SpoolSource},
     wire_fixture::{Reply, WireServer},
 };
@@ -8,8 +9,6 @@ use std::path::Path;
 
 /// 2027-01-15T08:00:00Z, which is 17:00 in KST.
 const NOW_MS: u64 = 1_800_000_000_000;
-/// 2027-01-16T00:00:00+09:00.
-const NEXT_RESET_MS: u64 = 1_800_025_200_000;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 const SECRET: &str = "mybox-pat";
 const ROOT_ID: &str = "root-1";
@@ -84,8 +83,26 @@ fn role_folders() -> String {
         .collect();
     listing(&items, None)
 }
+fn initial_folder_replies(with_descriptor: bool) -> Vec<Reply> {
+    config::FOLDERS
+        .iter()
+        .map(|folder| {
+            let resources = if with_descriptor && *folder == config::DESCRIPTORS {
+                vec![resource(
+                    "descriptor-id.bin",
+                    "file-descriptor",
+                    "file",
+                    128,
+                )]
+            } else {
+                Vec::new()
+            };
+            json(200, &listing(&resources, None))
+        })
+        .collect()
+}
 /// Storage properties, the drive root, the repository root and the descriptor
-/// evidence an `Existing` open needs.
+/// entry an `Existing` open needs.
 fn open_replies(max_file_bytes: u64, quota_bytes: u64, used_bytes: u64) -> Vec<Reply> {
     vec![
         json(200, &storage_body(max_file_bytes, quota_bytes, used_bytes)),
@@ -149,8 +166,7 @@ fn daily_reservations(deps: &TestDependencies) -> usize {
         .lock()
         .unwrap()
         .iter()
-        .flat_map(|(costs, _)| costs.iter())
-        .filter(|cost| cost.bucket == api::DAILY_DOWNLOAD)
+        .filter(|(_, charge, _)| charge.counters.contains(&MyboxCounter::DownloadDay))
         .count()
 }
 
@@ -286,8 +302,6 @@ fn existing_open_reports_the_account_file_limit_and_refuses_a_foreign_or_bare_ro
                 .kind,
             ErrorKind::Unsupported
         );
-        assert_eq!(capabilities.documented_at.as_deref(), Some(DOCUMENTED_AT));
-        assert_eq!(capabilities.evidence_urls.len(), EVIDENCE_URLS.len());
         assert!(!capabilities.conditional_get && !capabilities.range);
         let records = api.requests.lock().unwrap();
         assert_eq!(records.len(), 4);
@@ -714,7 +728,7 @@ fn every_download_issues_a_fresh_one_time_url_and_charges_both_calls() {
 }
 
 #[test]
-fn the_daily_download_budget_rolls_over_at_the_next_kst_midnight() {
+fn a_mybox_allowance_is_reserved_before_dispatch() {
     runtime().block_on(async {
         let cancel = Cancellation::default();
         let deps = fixture();
@@ -723,40 +737,17 @@ fn the_daily_download_budget_rolls_over_at_the_next_kst_midnight() {
         let (handle, _) = open(&provider, &api, OpenMode::Existing, &cancel)
             .await
             .unwrap();
-        let today = provider
-            .request_cost(&handle, ProviderOperation::Get)
-            .unwrap();
-        assert_eq!(today.len(), 1);
-        assert_eq!(today[0].bucket, api::DAILY_DOWNLOAD);
-        assert_eq!(today[0].units, 1);
-        assert_eq!(
-            today[0].reset,
-            QuotaReset::At {
-                unix_ms: NEXT_RESET_MS
-            }
-        );
-        let issuance = provider
-            .request_cost(&handle, ProviderOperation::DownloadUrl)
-            .unwrap();
-        assert_eq!(issuance.len(), 2);
-        assert_eq!(issuance[0].reset, QuotaReset::Rolling { window_ms: 60_000 });
-        deps.clock.set(NEXT_RESET_MS + 1);
-        assert_eq!(
-            provider
-                .request_cost(&handle, ProviderOperation::Get)
-                .unwrap()[0]
-                .reset,
-            QuotaReset::At {
-                unix_ms: NEXT_RESET_MS + DAY_MS
-            }
-        );
-        // An exhausted ledger stops the adapter before the wire.
+        deps.budget.reservations.lock().unwrap().clear();
         deps.budget
             .deny
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let locator = config::locator(&handle.connection_identity, config::PACKS, "pack-a.bin");
+        let locator = config::locator(
+            &handle.connection_identity,
+            config::DESCRIPTORS,
+            "descriptor.bin",
+        );
         let directory = tempfile::tempdir().unwrap();
-        let mut sink = SpoolSink::create(&directory.path().join("denied"), 16).unwrap();
+        let mut sink = SpoolSink::create(&directory.path().join("denied"), 4).unwrap();
         assert_eq!(
             provider
                 .read_object(&handle, &locator, None, &mut sink, &cancel)
@@ -767,6 +758,206 @@ fn the_daily_download_budget_rolls_over_at_the_next_kst_midnight() {
             ErrorKind::DailyQuotaExhausted
         );
         assert_eq!(api.requests.lock().unwrap().len(), 4);
+        let reservations = deps.budget.reservations.lock().unwrap();
+        assert_eq!(reservations.len(), 1);
+        let (account, charge, now_ms) = &reservations[0];
+        assert_eq!(account.provider(), "mybox");
+        assert_eq!(account.principal(), "synthetic-account");
+        assert_eq!(*now_ms, NOW_MS);
+        assert_eq!(charge.plan, MyboxPlan::Plan30gb);
+        assert_eq!(
+            charge.counters.as_slice(),
+            &[MyboxCounter::DownloadUrlMinute, MyboxCounter::DownloadDay]
+        );
+    });
+}
+
+#[test]
+fn resume_create_reconciles_missing_folders_and_rejects_ambiguous_layouts() {
+    runtime().block_on(async {
+        let cancel = Cancellation::default();
+        let present: Vec<String> = config::FOLDERS[..4]
+            .iter()
+            .map(|folder| resource(folder, &folder_id(folder), "folder", 0))
+            .collect();
+        let mut replies = vec![
+            json(200, &storage_body(1024, 4096, 0)),
+            json(
+                200,
+                &listing(&[resource(ROOT_NAME, ROOT_ID, "folder", 0)], None),
+            ),
+            json(200, &listing(&present, None)),
+        ];
+        for folder in &config::FOLDERS[4..] {
+            replies.push(json(
+                201,
+                &format!(
+                    "{{\"name\":\"{folder}\",\"resourceId\":\"{}\"}}",
+                    folder_id(folder)
+                ),
+            ));
+        }
+        replies.extend(initial_folder_replies(true));
+        let deps = fixture();
+        let provider = create(deps.dependencies.clone()).unwrap();
+        let api = WireServer::start(replies);
+        open(&provider, &api, OpenMode::ResumeCreate, &cancel)
+            .await
+            .unwrap();
+        let requests = api.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            3 + config::FOLDERS.len() - present.len() + config::FOLDERS.len()
+        );
+        let created_end = 3 + config::FOLDERS.len() - present.len();
+        assert!(requests[3..created_end]
+            .iter()
+            .all(|request| request.headers.starts_with("POST ")));
+        assert!(requests[created_end..]
+            .iter()
+            .all(|request| request.headers.starts_with("GET ")));
+        assert!(requests
+            .iter()
+            .all(|request| !request.headers.starts_with("PUT ")));
+        drop(requests);
+
+        let invalid_layouts = [
+            vec![
+                resource(config::DESCRIPTORS, "descriptor-a", "folder", 0),
+                resource(config::DESCRIPTORS, "descriptor-b", "folder", 0),
+            ],
+            vec![resource(config::DESCRIPTORS, "descriptor-file", "file", 1)],
+            vec![
+                resource(config::DESCRIPTORS, "descriptor-folder", "folder", 0),
+                resource("foreign", "foreign-folder", "folder", 0),
+            ],
+        ];
+        for children in invalid_layouts {
+            let deps = fixture();
+            let provider = create(deps.dependencies.clone()).unwrap();
+            let api = WireServer::start(vec![
+                json(200, &storage_body(1024, 4096, 0)),
+                json(
+                    200,
+                    &listing(&[resource(ROOT_NAME, ROOT_ID, "folder", 0)], None),
+                ),
+                json(200, &listing(&children, None)),
+            ]);
+            let failure = open(&provider, &api, OpenMode::ResumeCreate, &cancel)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(failure.kind, ErrorKind::PreconditionFailed);
+            assert_eq!(api.requests.lock().unwrap().len(), 3);
+        }
+
+        let deps = fixture();
+        let provider = create(deps.dependencies.clone()).unwrap();
+        let api = WireServer::start(vec![
+            json(200, &storage_body(1024, 4096, 0)),
+            json(
+                200,
+                &listing(
+                    &[
+                        resource(ROOT_NAME, "root-a", "folder", 0),
+                        resource(ROOT_NAME, "root-b", "folder", 0),
+                    ],
+                    None,
+                ),
+            ),
+        ]);
+        let failure = open(&provider, &api, OpenMode::ResumeCreate, &cancel)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(failure.kind, ErrorKind::PreconditionFailed);
+        assert_eq!(api.requests.lock().unwrap().len(), 2);
+    });
+}
+
+#[test]
+fn resume_create_rejects_foreign_folder_contents_duplicate_descriptors_and_unsafe_cursors() {
+    runtime().block_on(async {
+        let cancel = Cancellation::default();
+        let base = || {
+            vec![
+                json(200, &storage_body(1024, 4096, 0)),
+                json(
+                    200,
+                    &listing(&[resource(ROOT_NAME, ROOT_ID, "folder", 0)], None),
+                ),
+                json(200, &role_folders()),
+            ]
+        };
+
+        let deps = fixture();
+        let provider = create(deps.dependencies.clone()).unwrap();
+        let mut replies = base();
+        replies.push(json(
+            200,
+            &listing(&[resource("foreign.bin", "foreign-file", "file", 4)], None),
+        ));
+        let api = WireServer::start(replies);
+        let failure = open(&provider, &api, OpenMode::ResumeCreate, &cancel)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(failure.kind, ErrorKind::PreconditionFailed);
+        assert_eq!(api.requests.lock().unwrap().len(), 4);
+
+        let deps = fixture();
+        let provider = create(deps.dependencies.clone()).unwrap();
+        let mut replies = base();
+        replies.extend([
+            json(200, &listing(&[], None)),
+            json(200, &listing(&[], None)),
+            json(
+                200,
+                &listing(
+                    &[
+                        resource("descriptor-a.bin", "descriptor-a", "file", 64),
+                        resource("descriptor-b.bin", "descriptor-b", "file", 64),
+                    ],
+                    None,
+                ),
+            ),
+        ]);
+        let api = WireServer::start(replies);
+        let failure = open(&provider, &api, OpenMode::ResumeCreate, &cancel)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(failure.kind, ErrorKind::PreconditionFailed);
+
+        for cursors in [[Some("loop"), Some("loop")], [Some(""), None]] {
+            let deps = fixture();
+            let provider = create(deps.dependencies.clone()).unwrap();
+            let mut replies = base();
+            replies.push(json(200, &listing(&[], cursors[0])));
+            if let Some(cursor) = cursors[1] {
+                replies.push(json(200, &listing(&[], Some(cursor))));
+            }
+            let api = WireServer::start(replies);
+            let failure = open(&provider, &api, OpenMode::ResumeCreate, &cancel)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(failure.kind, ErrorKind::Corrupt);
+        }
+
+        let deps = fixture();
+        let provider = create(deps.dependencies.clone()).unwrap();
+        let mut replies = base();
+        replies.push(json(
+            200,
+            "{\"fileCount\":0,\"subFolderCount\":0,\"resources\":[]}",
+        ));
+        let api = WireServer::start(replies);
+        let failure = open(&provider, &api, OpenMode::ResumeCreate, &cancel)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(failure.kind, ErrorKind::Corrupt);
     });
 }
 
@@ -851,9 +1042,9 @@ fn head_replacement_writes_once_and_compare_exchange_stays_unsupported() {
         let (handle, capabilities) = open(&provider, &api, OpenMode::Existing, &cancel)
             .await
             .unwrap();
-        assert_eq!(capabilities.atomic_create_head, Evidence::Unverified);
-        assert_eq!(capabilities.conditional_head_update, Evidence::Unverified);
-        assert_eq!(capabilities.stable_head_replace, Evidence::Synthetic);
+        assert!(!capabilities.atomic_create_head);
+        assert!(!capabilities.conditional_head_update);
+        assert!(capabilities.stable_head_replace);
         let locator = config::locator(&handle.connection_identity, config::HEADS, "sync-head.bin");
         let head = HeadBytes::new(vec![1, 2, 3, 4]).unwrap();
         assert_eq!(
@@ -1023,9 +1214,6 @@ fn cancellation_during_a_download_body_stops_the_transfer() {
     });
 }
 
-/// A passing exchange here proves the adapter's request shape and status
-/// handling. It is no evidence of the service's own deletion guarantees, which
-/// only the provider documentation behind `Capabilities` can supply.
 #[test]
 fn deleting_resolves_the_resource_id_and_refuses_the_head_and_descriptor_folders() {
     runtime().block_on(async {
@@ -1084,8 +1272,19 @@ fn deleting_resolves_the_resource_id_and_refuses_the_head_and_descriptor_folders
         );
         drop(records);
         let reservations = test.budget.reservations.lock().unwrap();
-        let removal = &reservations[5].0;
-        assert_eq!(removal.len(), 1);
-        assert_eq!(removal[0].bucket, api::MINUTE_DELETE);
+        let counters: Vec<&[MyboxCounter]> = reservations
+            .iter()
+            .rev()
+            .take(3)
+            .map(|(_, charge, _)| charge.counters.as_slice())
+            .collect();
+        assert_eq!(
+            counters,
+            vec![
+                &[MyboxCounter::ListMinute][..],
+                &[MyboxCounter::DeleteMinute][..],
+                &[MyboxCounter::ListMinute][..],
+            ]
+        );
     });
 }

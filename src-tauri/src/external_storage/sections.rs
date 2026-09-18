@@ -57,6 +57,7 @@ pub(crate) struct CapturedSection {
 #[derive(Clone, Debug)]
 pub(crate) struct SectionPublication {
     pub section: Section,
+    pub participation_generation: Sequence,
     pub published: PublishedRows,
     /// Removals this capture is publishing for the first time, with the marker
     /// the entries carry.
@@ -359,6 +360,7 @@ pub(crate) fn capture_state_sections(
         )?);
         publications.push(SectionPublication {
             section,
+            participation_generation: state.participation_generation,
             published: rows
                 .iter()
                 .map(|row| (row.key(), row.version()))
@@ -1129,6 +1131,7 @@ mod tests {
                     &publication.first_published,
                     &publication.reclaimed,
                     &publication.gc_floor,
+                    None,
                 )
                 .expect("record the confirmed publication");
         }
@@ -1244,6 +1247,7 @@ mod tests {
                     &publication.first_published,
                     &publication.reclaimed,
                     &publication.gc_floor,
+                    None,
                 )
                 .expect("record the confirmed publication");
         }
@@ -1506,7 +1510,7 @@ mod tests {
             let device = store.device_store_mut().unwrap();
             device.note_section_published(Section::LocalPlugins, &[], &[],
                 &TombstonePublication { generation: Sequence::from(90u64), at_ms: now_ms() },
-                &BTreeMap::new(), &Sequence::from(local_floor)).unwrap();
+                &BTreeMap::new(), &Sequence::from(local_floor), None).unwrap();
             device.write_section_cursor("connection", "library", Section::LocalPlugins, &SectionCursor {
                 applied_generation: Sequence::from(10u64), applied_gc_floor: Sequence::from(7u64),
                 observed_max_write_clock: Sequence::from(0u64),
@@ -1579,6 +1583,7 @@ mod tests {
                 device.note_section_published(
                     section, &publication.published, &publication.stamped,
                     &publication.first_published, &publication.reclaimed, &publication.gc_floor,
+                    None,
                 ).unwrap();
                 assert_eq!(device.read_section_rows(section).unwrap(), vec![newer], "{kind:?}, replacement {replacement}");
                 assert!(device.sections_await_publication("connection", "library").unwrap());
@@ -1617,6 +1622,7 @@ mod tests {
             device.note_section_published(
                 section, &publication.published, &publication.stamped,
                 &publication.first_published, &publication.reclaimed, &publication.gc_floor,
+                None,
             ).unwrap();
             assert_eq!(device.read_section_rows(section).unwrap(), vec![row]);
             let pending: bool = device.connection().query_row(
@@ -1718,6 +1724,7 @@ mod tests {
                     &publication.first_published,
                     &publication.reclaimed,
                     &publication.gc_floor,
+                    None,
                 )
                 .expect("record the confirmed publication");
         }

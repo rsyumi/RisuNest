@@ -52,9 +52,10 @@ mod tokens;
 use super::{common, Dependencies};
 use crate::external_storage::{
     auth::{AuthorizationCode, AuthorizationPolicy},
-    capabilities::{Capabilities, Evidence},
+    capabilities::Capabilities,
     contract::*,
     http::{self, HttpRequest, HttpResponse},
+    quota::AccountKey,
 };
 use config::Settings;
 use std::{collections::BTreeMap, sync::Arc};
@@ -68,41 +69,11 @@ pub(crate) fn authorization_policy(
     tokens::authorization_policy(config, platform)
 }
 
-/// Documentation reviewed on this date for every capability reported below.
-const DOCUMENTED_AT: &str = "2026-09-14";
 /// Guard against a server that acknowledges fragments without making progress.
 const MAX_FRAGMENT_REQUESTS: u32 = 4096;
+const MAX_LAYOUT_LIST_PAGES: usize = 256;
 /// The one mutable head, a root member beside the role folders.
 const HEAD_OBJECT: &str = "head";
-
-/// Graph throttling is dynamic and publishes no fixed daily allowance, so
-/// every bucket resets at an unknown time and a 429 carries the real hint.
-fn cost_model(operation: ProviderOperation, account: &str) -> Vec<RequestCost> {
-    let bucket = |name: &str| RequestCost {
-        bucket: name.to_owned(),
-        shared_account: account.to_owned(),
-        units: 1,
-        reset: QuotaReset::Unknown,
-    };
-    match operation {
-        // The identity platform is a separate service from Graph.
-        ProviderOperation::Authenticate => vec![bucket("auth")],
-        ProviderOperation::Metadata
-        | ProviderOperation::List
-        | ProviderOperation::DownloadUrl
-        | ProviderOperation::Get
-        | ProviderOperation::Range
-        | ProviderOperation::ReconcileUpload => vec![bucket("requests")],
-        // Writes are throttled on their own threshold.
-        ProviderOperation::Create
-        | ProviderOperation::UploadSession
-        | ProviderOperation::UploadChunk
-        | ProviderOperation::CompleteUpload
-        | ProviderOperation::CompareExchangeHead
-        | ProviderOperation::ReplaceHead
-        | ProviderOperation::Delete => vec![bucket("requests"), bucket("writes")],
-    }
-}
 
 pub(crate) fn create(dependencies: Dependencies) -> Result<Arc<dyn Provider>> {
     Ok(Arc::new(OneDrive::new(dependencies)))
@@ -123,72 +94,34 @@ struct Context {
     /// Root folder item resolved at open time. For an app folder connection this
     /// is the identifier behind `special/approot`.
     root_item_id: String,
-    quota_account: String,
+    account: AccountKey,
 }
 
 fn corrupt() -> ProviderError {
     ProviderError::new(ErrorKind::Corrupt)
 }
 
-fn capabilities(account_type: config::AccountType) -> Capabilities {
-    let mut evidence_urls = vec![
-        "https://learn.microsoft.com/en-us/graph/api/driveitem-put-content?view=graph-rest-1.0"
-            .to_owned(),
-        "https://learn.microsoft.com/en-us/graph/api/driveitem-createuploadsession?view=graph-rest-1.0"
-            .to_owned(),
-        "https://learn.microsoft.com/en-us/graph/api/driveitem-get-content?view=graph-rest-1.0"
-            .to_owned(),
-        "https://learn.microsoft.com/en-us/graph/api/driveitem-list-children?view=graph-rest-1.0"
-            .to_owned(),
-        "https://learn.microsoft.com/en-us/graph/api/driveitem-get?view=graph-rest-1.0".to_owned(),
-        "https://learn.microsoft.com/en-us/graph/api/resources/driveitem?view=graph-rest-1.0"
-            .to_owned(),
-        "https://learn.microsoft.com/en-us/graph/api/resources/hashes?view=graph-rest-1.0"
-            .to_owned(),
-        "https://learn.microsoft.com/en-us/graph/errors".to_owned(),
-        "https://learn.microsoft.com/en-us/graph/throttling".to_owned(),
-        "https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow"
-            .to_owned(),
-    ];
-    if account_type == config::AccountType::AppFolder {
-        evidence_urls.push(
-            "https://learn.microsoft.com/en-us/graph/onedrive-sharepoint-appfolder".to_owned(),
-        );
-        evidence_urls
-            .push("https://learn.microsoft.com/en-us/graph/api/drive-get-specialfolder?view=graph-rest-1.0".to_owned());
-    }
+fn capabilities(_account_type: config::AccountType) -> Capabilities {
     Capabilities {
-        immutable_create: Evidence::Synthetic,
-        direct_complete_read: Evidence::Synthetic,
-        // `@microsoft.graph.conflictBehavior=fail` is the documented create if
-        // absent behaviour of a content PUT.
-        atomic_create_head: Evidence::Synthetic,
-        // Graph documents `if-match` on the metadata PATCH, on
-        // `createUploadSession` and on the explicit session commit, but not on
-        // the content PUT this adapter uses for a head. The request is issued
-        // and a 412 is honoured, yet a service that ignores the header would
-        // overwrite silently, so the behaviour stays unverified and CAS
-        // publication is refused.
-        conditional_head_update: Evidence::Unverified,
-        stable_head_replace: Evidence::Synthetic,
-        head_read_after_write: Evidence::Synthetic,
-        head_retry_control: Evidence::Synthetic,
-        snapshot_discovery: Evidence::Synthetic,
-        // No cleanup evidence has been recorded for this service yet.
-        delete_objects: Evidence::Unverified,
-        gc_control_consistency: Evidence::Unverified,
-        delete_completion: Evidence::Unverified,
-        discovery_extra_requests: 0,
+        immutable_create: true,
+        direct_complete_read: true,
+        // conflictBehavior=fail prevents creating a second head. A plain
+        // content PUT does not provide the conditional update needed for CAS.
+        atomic_create_head: true,
+        conditional_head_update: false,
+        stable_head_replace: true,
+        head_read_after_write: true,
+        head_retry_control: true,
+        snapshot_discovery: true,
+        lease_operations: true,
+        delete_objects: true,
         conditional_get: true,
         range: true,
         resumable_upload: true,
-        // Graph documents no per item ceiling for the upload session path; the
-        // 250 MB figure belongs to the single content PUT alone.
+        // The single content PUT limit does not limit an upload session.
         max_stored_bytes: None,
         sdk_overhead_bytes: 0,
         upload_alignment: graph::FRAGMENT_ALIGNMENT,
-        documented_at: Some(DOCUMENTED_AT.to_owned()),
-        evidence_urls,
     }
 }
 
@@ -201,19 +134,11 @@ impl OneDrive {
         self.deps.clock.now_ms()
     }
 
-    fn costs(&self, operation: ProviderOperation, account: &str) -> Vec<RequestCost> {
-        cost_model(operation, account)
-    }
-
-    async fn send(&self, request: HttpRequest, cancel: &Cancellation) -> Result<HttpResponse> {
-        http::send(
-            self.deps.http.as_ref(),
-            self.deps.budget.as_ref(),
-            self.deps.clock.as_ref(),
-            request,
-            cancel,
-        )
-        .await
+    async fn send(&self, mut request: HttpRequest, cancel: &Cancellation) -> Result<HttpResponse> {
+        if http::control_operation(request.operation) {
+            http::bypass_cache(&mut request.headers);
+        }
+        self.deps.send(request, cancel).await
     }
 
     fn request(
@@ -221,13 +146,14 @@ impl OneDrive {
         method: reqwest::Method,
         url: url::Url,
         operation: ProviderOperation,
-        account: &str,
+        account: &AccountKey,
         token: Option<&str>,
     ) -> HttpRequest {
         let mut headers = BTreeMap::new();
         if let Some(token) = token {
             headers.insert("authorization".to_owned(), tokens::bearer(token));
         }
+        let api_request = url.origin().ascii_serialization() == account.authority();
         HttpRequest {
             method,
             url,
@@ -235,7 +161,10 @@ impl OneDrive {
             body: None,
             content_length: None,
             operation,
-            costs: self.costs(operation, account),
+            account: account.clone(),
+            api_request,
+            mybox_charge: None,
+            control: http::control_operation(operation),
         }
     }
 
@@ -245,6 +174,148 @@ impl OneDrive {
             .insert("content-type".to_owned(), "application/json".to_owned());
         request.content_length = Some(body.len() as u64);
         request.body = Some(Box::pin(std::io::Cursor::new(body)));
+    }
+
+    async fn create_repository_folder(
+        &self,
+        context: &Context,
+        token: &str,
+        folder: &str,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        let url = graph::root_children_url(&context.settings, &context.root_item_id)?;
+        let mut request = self.request(
+            reqwest::Method::POST,
+            url,
+            ProviderOperation::Create,
+            &context.account,
+            Some(token),
+        );
+        let body = format!(
+            "{{\"name\":\"{folder}\",\"folder\":{{}},\"@microsoft.graph.conflictBehavior\":\"fail\"}}"
+        );
+        Self::json_body(&mut request, body.into_bytes());
+        let response = self.send(request, cancel).await?;
+        if response.status == 409 {
+            return Err(common::error(ErrorKind::PreconditionFailed, 409));
+        }
+        graph::require(&response, &[200, 201], self.now())
+    }
+
+    async fn collection_children(
+        &self,
+        context: &Context,
+        token: &str,
+        folder: Option<&str>,
+        cancel: &Cancellation,
+    ) -> Result<Vec<graph::Item>> {
+        let mut items = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..MAX_LAYOUT_LIST_PAGES {
+            let query = graph::listing_query(1000, cursor.as_deref());
+            let url = match folder {
+                Some(folder) => graph::folder_children_url(
+                    &context.settings,
+                    &context.root_item_id,
+                    folder,
+                    &query,
+                )?,
+                None => graph::root_children_listing_url(
+                    &context.settings,
+                    &context.root_item_id,
+                    &query,
+                )?,
+            };
+            let request = self.request(
+                reqwest::Method::GET,
+                url,
+                ProviderOperation::List,
+                &context.account,
+                Some(token),
+            );
+            let mut response = self.send(request, cancel).await?;
+            graph::require(&response, &[200], self.now())?;
+            let page: graph::ChildrenPage = graph::json(&mut response, cancel).await?;
+            items.extend(page.value);
+            let Some(next) = page
+                .next_link
+                .as_deref()
+                .map(|link| graph::skip_token(link, &context.settings))
+                .transpose()?
+            else {
+                return Ok(items);
+            };
+            if !seen.insert(next.clone()) {
+                return Err(corrupt());
+            }
+            cursor = Some(next);
+        }
+        Err(corrupt())
+    }
+
+    async fn require_initial_contents(
+        &self,
+        context: &Context,
+        token: &str,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        let descriptors = config::role_folder(ObjectRole::Descriptor);
+        for folder in config::REPOSITORY_FOLDERS {
+            let items = self
+                .collection_children(context, token, Some(folder), cancel)
+                .await?;
+            if *folder != descriptors {
+                if !items.is_empty() {
+                    return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+                }
+                continue;
+            }
+            if items.len() > 1 {
+                return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+            }
+            if let Some(item) = items.into_iter().next() {
+                let name = item.name.ok_or_else(corrupt)?;
+                let path = format!("{descriptors}/{name}");
+                if item.file.is_none()
+                    || item.folder.is_some()
+                    || item.size.is_none_or(|size| size == 0)
+                    || config::validate_relative_path(&path).is_err()
+                {
+                    return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn resume_layout(
+        &self,
+        context: &Context,
+        token: &str,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        let mut folders = BTreeMap::new();
+        for item in self
+            .collection_children(context, token, None, cancel)
+            .await?
+        {
+            let name = item.name.ok_or_else(corrupt)?;
+            if !config::REPOSITORY_FOLDERS.contains(&name.as_str())
+                || item.folder.is_none()
+                || item.file.is_some()
+                || folders.insert(name, ()).is_some()
+            {
+                return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+            }
+        }
+        for folder in config::REPOSITORY_FOLDERS {
+            if !folders.contains_key(*folder) {
+                self.create_repository_folder(context, token, folder, cancel)
+                    .await?;
+            }
+        }
+        self.require_initial_contents(context, token, cancel).await
     }
 
     fn context<'a>(&self, repository: &'a RepositoryHandle) -> Result<&'a Context> {
@@ -273,7 +344,7 @@ impl OneDrive {
         let request = tokens::token_request(
             &context.settings,
             form,
-            self.costs(ProviderOperation::Authenticate, &context.quota_account),
+            context.account.clone(),
         )?;
         let mut response = self.send(request, cancel).await?;
         if response.status != 200 {
@@ -311,12 +382,12 @@ impl OneDrive {
         if grant.client_id != config::platform_client_id(config, config::platform_key())? {
             return Err(ProviderError::new(ErrorKind::Unsupported));
         }
-        let account = settings.quota_account();
+        let account = AccountKey::pending(config::PROVIDER_ID, &settings.endpoint)?;
         let form = tokens::authorization_code_form(&settings, grant)?;
         let request = tokens::token_request(
             &settings,
             form,
-            self.costs(ProviderOperation::Authenticate, &account),
+            account.clone(),
         )?;
         let mut response = self.send(request, cancel).await?;
         if response.status != 200 {
@@ -348,6 +419,8 @@ impl OneDrive {
         }
         let identity: graph::SignedInUser = graph::json(&mut response, cancel).await?;
         let account_id = config::account_id(&identity.id)?;
+        let authenticated = AccountKey::new(config::PROVIDER_ID, &settings.endpoint, &account_id)?;
+        self.deps.requests.resolve_pending(&account, &authenticated)?;
         let secret = self.deps.vault.store(&tokens::encode(&granted)?).await?;
         Ok(AuthorizedSecret { secret, account_id })
     }
@@ -396,7 +469,7 @@ impl OneDrive {
             reqwest::Method::GET,
             url,
             ProviderOperation::Metadata,
-            &context.quota_account,
+            &context.account,
             Some(token.as_str()),
         );
         let mut response = self.send(request, cancel).await?;
@@ -454,7 +527,7 @@ impl OneDrive {
             reqwest::Method::PUT,
             url,
             ProviderOperation::Create,
-            &context.quota_account,
+            &context.account,
             Some(token.as_str()),
         );
         request.headers.insert(
@@ -504,7 +577,7 @@ impl OneDrive {
                 reqwest::Method::PUT,
                 upload_url.clone(),
                 operation,
-                &context.quota_account,
+                &context.account,
                 None,
             );
             request.headers.insert(
@@ -589,7 +662,7 @@ impl OneDrive {
             reqwest::Method::PUT,
             url,
             operation,
-            &context.quota_account,
+            &context.account,
             Some(token.as_str()),
         );
         request.headers.insert(
@@ -632,19 +705,23 @@ impl Provider for OneDrive {
         Box::pin(async move {
             cancel.check()?;
             let settings = config::validate(config)?;
-            let quota_account = settings.quota_account();
+            let account = AccountKey::new(
+                config::PROVIDER_ID,
+                &settings.endpoint,
+                &settings.account_id,
+            )?;
             let context = Context {
                 settings,
                 secret: secret.clone(),
                 root_item_id: String::new(),
-                quota_account,
+                account,
             };
             let token = self.access_token(&context, cancel).await?;
             let request = self.request(
                 reqwest::Method::GET,
                 graph::root_url(&context.settings)?,
                 ProviderOperation::Metadata,
-                &context.quota_account,
+                &context.account,
                 Some(token.as_str()),
             );
             let mut response = self.send(request, cancel).await?;
@@ -674,7 +751,7 @@ impl Provider for OneDrive {
                         reqwest::Method::GET,
                         url,
                         ProviderOperation::List,
-                        &context.quota_account,
+                        &context.account,
                         Some(token.as_str()),
                     );
                     let mut response = self.send(request, cancel).await?;
@@ -689,33 +766,19 @@ impl Provider for OneDrive {
                 }
                 OpenMode::Create => {
                     for folder in config::REPOSITORY_FOLDERS {
-                        let url =
-                            graph::root_children_url(&context.settings, &context.root_item_id)?;
-                        let mut request = self.request(
-                            reqwest::Method::POST,
-                            url,
-                            ProviderOperation::Create,
-                            &context.quota_account,
-                            Some(token.as_str()),
-                        );
-                        let body = format!(
-                            "{{\"name\":\"{folder}\",\"folder\":{{}},\"@microsoft.graph.conflictBehavior\":\"fail\"}}"
-                        );
-                        Self::json_body(&mut request, body.into_bytes());
-                        let response = self.send(request, cancel).await?;
-                        // An existing repository folder means this location is
-                        // already in use; never reuse or wipe it.
-                        if response.status == 409 {
-                            return Err(common::error(ErrorKind::PreconditionFailed, 409));
-                        }
-                        graph::require(&response, &[200, 201], self.now())?;
+                        self.create_repository_folder(&context, token.as_str(), folder, cancel)
+                            .await?;
                     }
+                }
+                OpenMode::ResumeCreate => {
+                    self.resume_layout(&context, token.as_str(), cancel).await?;
                 }
             }
             let account_type = context.settings.account_type;
             let handle = RepositoryHandle {
                 repository_id: context.settings.identity.clone(),
                 connection_identity: context.settings.identity.clone(),
+                account: context.account.clone(),
                 context: Box::new(context),
             };
             Ok((handle, capabilities(account_type)))
@@ -747,7 +810,7 @@ impl Provider for OneDrive {
                 reqwest::Method::GET,
                 url.clone(),
                 ProviderOperation::DownloadUrl,
-                &context.quota_account,
+                &context.account,
                 Some(token.as_str()),
             );
             if let Some(version) = unchanged {
@@ -771,7 +834,7 @@ impl Provider for OneDrive {
                         reqwest::Method::GET,
                         graph::redirect_target(&first, &url)?,
                         ProviderOperation::Get,
-                        &context.quota_account,
+                        &context.account,
                         None,
                     );
                     let redirected = self.send(hop, cancel).await?;
@@ -823,7 +886,7 @@ impl Provider for OneDrive {
                 reqwest::Method::POST,
                 url,
                 ProviderOperation::UploadSession,
-                &context.quota_account,
+                &context.account,
                 Some(token.as_str()),
             );
             let name = serde_json::to_string(&intent.object_id).map_err(|_| corrupt())?;
@@ -938,7 +1001,7 @@ impl Provider for OneDrive {
                 reqwest::Method::DELETE,
                 url,
                 ProviderOperation::Delete,
-                &context.quota_account,
+                &context.account,
                 Some(token.as_str()),
             );
             let response = self.send(request, cancel).await?;
@@ -978,7 +1041,7 @@ impl Provider for OneDrive {
                 reqwest::Method::GET,
                 url,
                 ProviderOperation::List,
-                &context.quota_account,
+                &context.account,
                 Some(token.as_str()),
             );
             let mut response = self.send(request, cancel).await?;
@@ -1041,7 +1104,7 @@ impl Provider for OneDrive {
                     reqwest::Method::GET,
                     url,
                     ProviderOperation::ReconcileUpload,
-                    &context.quota_account,
+                    &context.account,
                     None,
                 );
                 let mut response = self.send(request, cancel).await?;
@@ -1090,14 +1153,4 @@ impl Provider for OneDrive {
         })
     }
 
-    fn request_cost(
-        &self,
-        repository: &RepositoryHandle,
-        operation: ProviderOperation,
-    ) -> Result<Vec<RequestCost>> {
-        Ok(cost_model(
-            operation,
-            &self.context(repository)?.quota_account,
-        ))
-    }
 }

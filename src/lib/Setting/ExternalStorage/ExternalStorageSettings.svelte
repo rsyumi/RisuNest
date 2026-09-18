@@ -484,7 +484,10 @@
                 <div class="card-head">
                     <div class="min-w-0">
                         <h3 class="card-title">{externalConnectionTitle(strings, connection)}</h3>
-                        <p class="card-sub">{[connection.endpoint.authority, connection.endpoint.repositoryHint, strings.strategyLabels[connection.strategy]].join(' · ')}</p>
+                        <p class="card-sub">{[connection.endpoint.authority, connection.endpoint.repositoryHint].join(' · ')}</p>
+                        {#if connection.purpose === 'sync'}
+                            <p class="card-sub">{strings.sequentialWarning}</p>
+                        {/if}
                     </div>
                     <div class="pills">
                         {#if syncTarget}<span class="status border border-darkborderc">{strings.activeSync}</span>{/if}
@@ -602,8 +605,13 @@
                                     <dt>{strings.latestReachable}</dt>
                                     <dd>{atLeast(usage.storage.latestReachable.knownDirectBytes)}</dd>
                                 {/if}
-                                {#each usage.buckets as bucket (bucket.id)}<dt>{bucket.id}</dt><dd>{bucket.used}{bucket.limit ? ` / ${bucket.limit}` : ''} {bucket.unit}</dd>{/each}
                             </dl>
+                            {#if usage.buckets.length > 0}
+                                <p>{strings.requestUsage}</p>
+                                <dl class="kv">
+                                    {#each usage.buckets as bucket (bucket.id)}<dt>{bucket.id}</dt><dd>{bucket.used} / {bucket.limit} {bucket.unit}</dd>{/each}
+                                </dl>
+                            {/if}
                         {/if}
                         <label class="policy-row fixed">
                             <span>{strings.retentionCount}</span>

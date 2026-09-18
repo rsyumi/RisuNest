@@ -100,6 +100,8 @@ mod tests {
             retention_policy: None,
             capabilities: Capabilities::default(),
             created_at_ms: 1,
+            last_sync_at_ms: None,
+            last_backup_at_ms: None,
         };
         let exported = export(&connection, &[7; 32]).unwrap();
         // Typical connection fits a static QR without serializing ciphertext

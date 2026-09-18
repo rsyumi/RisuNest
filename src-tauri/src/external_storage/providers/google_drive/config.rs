@@ -203,13 +203,6 @@ impl AuthorizationSettings {
         token_info_endpoint(&self.endpoint, self.loopback)
     }
 
-    pub(super) fn quota_scope(&self) -> super::wire::AccountScope {
-        super::wire::AccountScope {
-            queries: format!("google_drive/project+authorization:{}", self.project_id),
-            upload: format!("google_drive/authorization:{}", self.project_id),
-            download: format!("google_drive/project:{}", self.project_id),
-        }
-    }
 }
 
 impl Settings {

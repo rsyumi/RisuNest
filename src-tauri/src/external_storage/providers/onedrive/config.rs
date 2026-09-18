@@ -156,16 +156,6 @@ pub(super) struct Settings {
     pub identity: String,
 }
 
-impl Settings {
-    pub(super) fn quota_account(&self) -> String {
-        format!(
-            "{}:{}",
-            PROVIDER_ID,
-            joined(&[self.tenant.as_str(), self.account_id.as_str()])
-        )
-    }
-}
-
 /// Length prefixed join so that no field boundary can be forged by its content.
 fn joined(parts: &[&str]) -> String {
     let mut out = String::new();

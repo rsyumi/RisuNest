@@ -10,15 +10,26 @@ use super::{
 };
 use crate::external_storage::{
     auth::{AuthorizationCode, SecretBytes},
-    capabilities::Evidence,
+    cleanup::{self, CleanupLimits, CleanupRequest, JobRoots, ObservedRoots, RepositoryView},
     contract::*,
-    fake::{loopback_dependencies, MemoryVault, TestDependencies},
+    fake::{
+        loopback_dependencies, with_transport, FakeLeaseClock, MemoryVault, TestDependencies,
+    },
+    http::{HttpRequest, HttpResponse, HttpTransport, NativeHttpTransport},
+    leases::LeaseContext,
+    packaging::RemoteObject,
     providers::Dependencies,
+    quota::AccountKey,
+    reachability::{DocumentNode, DocumentSource},
     transfer::{SpoolSink, SpoolSource},
     wire_fixture::{Reply, WireServer},
 };
+use risunest_external_storage_format::format::{Descriptor, Strategy};
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, sync::atomic::Ordering};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 const NOW_MS: u64 = 1_700_000_000_000;
 const ACCOUNT: &str = "permission-1";
@@ -80,6 +91,53 @@ fn deps_with(secret: Option<Vec<u8>>) -> TestDependencies {
         None => MemoryVault::default(),
     };
     loopback_dependencies(vault, NOW_MS)
+}
+
+struct RequestIdentity {
+    authorization: Option<String>,
+    account: AccountKey,
+    api_request: bool,
+}
+
+struct InspectingTransport {
+    inner: NativeHttpTransport,
+    requests: Mutex<Vec<RequestIdentity>>,
+}
+
+impl InspectingTransport {
+    fn new() -> Self {
+        Self {
+            inner: NativeHttpTransport::for_loopback_tests(),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl HttpTransport for InspectingTransport {
+    fn send<'a>(
+        &'a self,
+        request: HttpRequest,
+        cancel: &'a Cancellation,
+    ) -> ProviderFuture<'a, HttpResponse> {
+        self.requests.lock().unwrap().push(RequestIdentity {
+            authorization: request.headers.get("authorization").cloned(),
+            account: request.account.clone(),
+            api_request: request.api_request,
+        });
+        self.inner.send(request, cancel)
+    }
+}
+
+fn deps_with_inspection(
+    secret: Vec<u8>,
+) -> (Arc<InspectingTransport>, TestDependencies) {
+    let transport = Arc::new(InspectingTransport::new());
+    let dependencies = with_transport(
+        transport.clone(),
+        MemoryVault::with(SECRET, &secret),
+        NOW_MS,
+    );
+    (transport, dependencies)
 }
 
 fn provider_of(dependencies: &Dependencies) -> std::sync::Arc<dyn Provider> {
@@ -148,7 +206,11 @@ fn descriptor_file(id: &str) -> Value {
         "name": "descriptor-d1",
         "size": "20",
         "version": "3",
-        "appProperties": { "risunestRole": "descriptor", "risunestObjectId": "d1" }
+        "appProperties": {
+            "risunestRole": "descriptor",
+            "risunestObjectId": "d1",
+            "risunestJobId": "d1"
+        }
     })
 }
 
@@ -204,20 +266,45 @@ fn request_lines(server: &WireServer) -> Vec<String> {
         .collect()
 }
 
-fn reserved_units(test: &TestDependencies, bucket: &str) -> Vec<u64> {
-    test.budget
-        .reservations
-        .lock()
-        .unwrap()
-        .iter()
-        .flat_map(|(costs, _)| {
-            costs
-                .iter()
-                .filter(|cost| cost.bucket == bucket)
-                .map(|cost| cost.units)
-                .collect::<Vec<_>>()
-        })
-        .collect()
+struct UnusedCleanupView;
+impl RepositoryView for UnusedCleanupView {
+    fn roots<'a>(&'a self, _: &'a Cancellation) -> ProviderFuture<'a, ObservedRoots> {
+        Box::pin(async { Ok(ObservedRoots::default()) })
+    }
+
+    fn snapshots<'a>(&'a self, _: &'a Cancellation) -> ProviderFuture<'a, Vec<ObjectReceipt>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn job_roots(&self) -> Result<JobRoots> {
+        Ok(JobRoots::default())
+    }
+
+    fn known_objects(&self) -> Result<Vec<RemoteObject>> {
+        Ok(Vec::new())
+    }
+}
+
+struct UnusedCleanupDocuments;
+impl DocumentSource for UnusedCleanupDocuments {
+    fn document<'a>(&'a self, _: &'a RemoteObject) -> ProviderFuture<'a, DocumentNode> {
+        Box::pin(async { Err(ProviderError::new(ErrorKind::Corrupt)) })
+    }
+
+    fn listed<'a>(
+        &'a self,
+        _: &'a ObjectReceipt,
+    ) -> ProviderFuture<'a, (RemoteObject, DocumentNode)> {
+        Box::pin(async { Err(ProviderError::new(ErrorKind::Corrupt)) })
+    }
+
+    fn catalog<'a>(&'a self, _: &'a RemoteObject) -> ProviderFuture<'a, Vec<RemoteObject>> {
+        Box::pin(async { Err(ProviderError::new(ErrorKind::Corrupt)) })
+    }
+
+    fn probe<'a>(&'a self, _: &'a RemoteObject) -> ProviderFuture<'a, Option<ObjectReceipt>> {
+        Box::pin(async { Err(ProviderError::new(ErrorKind::Corrupt)) })
+    }
 }
 
 #[test]
@@ -289,8 +376,6 @@ fn configuration_validation_refuses_foreign_and_incomplete_connections() {
                 ErrorKind::Unsupported
             );
         }
-        assert!(test.budget.reservations.lock().unwrap().is_empty());
-
         // A valid configuration whose secret is gone needs a new authorization.
         let missing = deps_with(None);
         let provider = provider_of(&missing.dependencies);
@@ -308,7 +393,6 @@ fn configuration_validation_refuses_foreign_and_incomplete_connections() {
                 .kind,
             ErrorKind::ReauthRequired
         );
-        assert!(missing.budget.reservations.lock().unwrap().is_empty());
     });
 }
 
@@ -339,13 +423,13 @@ fn open_existing_verifies_identity_folder_and_control_objects() {
             repository.repository_id,
             format!("google_drive:{ACCOUNT}:{FOLDER}")
         );
-        assert_eq!(capabilities.immutable_create, Evidence::Synthetic);
-        assert_eq!(capabilities.stable_head_replace, Evidence::Synthetic);
-        assert_eq!(capabilities.head_read_after_write, Evidence::Synthetic);
-        assert_eq!(capabilities.head_retry_control, Evidence::Synthetic);
-        assert_eq!(capabilities.snapshot_discovery, Evidence::Synthetic);
-        assert_eq!(capabilities.atomic_create_head, Evidence::Unverified);
-        assert_eq!(capabilities.conditional_head_update, Evidence::Unverified);
+        assert!(capabilities.immutable_create);
+        assert!(capabilities.stable_head_replace);
+        assert!(capabilities.head_read_after_write);
+        assert!(capabilities.head_retry_control);
+        assert!(capabilities.snapshot_discovery);
+        assert!(!capabilities.atomic_create_head);
+        assert!(!capabilities.conditional_head_update);
         assert!(capabilities
             .require(PublicationStrategy::Sequential)
             .is_ok());
@@ -360,12 +444,6 @@ fn open_existing_verifies_identity_folder_and_control_objects() {
         assert!(!capabilities.conditional_get);
         assert!(capabilities.range && capabilities.resumable_upload);
         assert_eq!(capabilities.upload_alignment, 256 * 1024);
-        assert_eq!(capabilities.discovery_extra_requests, 0);
-        assert_eq!(capabilities.documented_at.as_deref(), Some("2026-09-14"));
-        assert!(capabilities
-            .evidence_urls
-            .iter()
-            .all(|url| url.starts_with("https://developers.google.com/")));
 
         let lines = request_lines(&server);
         assert_eq!(lines.len(), 3);
@@ -374,12 +452,6 @@ fn open_existing_verifies_identity_folder_and_control_objects() {
         assert!(lines[2].contains("/drive/v3/files?q="));
         assert!(lines[2].contains("risunestRole"));
         assert!(lines[2].contains("pageSize=100"));
-        assert_eq!(reserved_units(&test, "queries"), vec![5, 5, 100]);
-        let reservations = test.budget.reservations.lock().unwrap();
-        assert_eq!(
-            reservations[2].0[0].shared_account,
-            "google_drive/project+user:project-1:permission-1"
-        );
     });
 }
 
@@ -409,6 +481,39 @@ fn create_mode_refuses_a_location_that_already_holds_control_objects() {
             ErrorKind::PreconditionFailed
         );
         // Nothing was written: only the three discovery reads happened.
+        assert_eq!(request_lines(&server).len(), 3);
+
+        let server = WireServer::start(vec![
+            about_reply(),
+            folder_reply(),
+            control_reply(vec![json!({
+                "id": "pack-1",
+                "name": "pack-object-1",
+                "mimeType": "application/octet-stream",
+                "parents": [FOLDER],
+                "size": "4",
+                "appProperties": {
+                    "risunestRole": "pack",
+                    "risunestObjectId": "object-1"
+                }
+            })]),
+        ]);
+        let test = deps_with(Some(stored_secret(NOW_MS + 3_600_000)));
+        let provider = provider_of(&test.dependencies);
+        assert_eq!(
+            provider
+                .open_repository(
+                    &connection(server.url.as_str()),
+                    &secret_ref(),
+                    OpenMode::Create,
+                    &cancel,
+                )
+                .await
+                .err()
+                .unwrap()
+                .kind,
+            ErrorKind::PreconditionFailed
+        );
         assert_eq!(request_lines(&server).len(), 3);
     });
 }
@@ -441,7 +546,172 @@ fn create_mode_reserves_a_head_identifier_in_an_empty_location() {
         let lines = request_lines(&server);
         assert_eq!(lines.len(), 4);
         assert!(lines[3].contains("/drive/v3/files/generateIds?count=1&space=drive"));
-        assert_eq!(reserved_units(&test, "queries"), vec![5, 5, 100, 5]);
+    });
+}
+
+#[test]
+fn resume_create_accepts_only_an_empty_or_single_descriptor_control_layout() {
+    runtime().block_on(async {
+        let test = deps_with(Some(stored_secret(NOW_MS + 3_600_000)));
+        let provider = provider_of(&test.dependencies);
+        let cancel = Cancellation::default();
+
+        let empty = WireServer::start(vec![
+            about_reply(),
+            folder_reply(),
+            control_reply(vec![]),
+            ids_reply("reserved-head"),
+        ]);
+        provider
+            .open_repository(
+                &connection(empty.url.as_str()),
+                &secret_ref(),
+                OpenMode::ResumeCreate,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        let empty_lines = request_lines(&empty);
+        assert_eq!(empty_lines.len(), 4);
+        assert!(!empty_lines[2].contains("risunestRole"));
+
+        let published = WireServer::start(vec![
+            about_reply(),
+            folder_reply(),
+            control_reply(vec![descriptor_file("desc-1")]),
+            ids_reply("reserved-head"),
+            control_reply(vec![descriptor_file("desc-1")]),
+        ]);
+        let (published_repository, _) = provider
+            .open_repository(
+                &connection(published.url.as_str()),
+                &secret_ref(),
+                OpenMode::ResumeCreate,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        let descriptor_intent = ObjectIntent {
+            repository_id: published_repository.repository_id.clone(),
+            job_id: "d1".to_owned(),
+            object_id: "d1".to_owned(),
+            role: ObjectRole::Descriptor,
+            byte_length: 20,
+            sha256: "00".repeat(32),
+        };
+        assert!(provider
+            .begin_upload(&published_repository, &descriptor_intent, &cancel)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(request_lines(&published)
+            .iter()
+            .all(|line| line.starts_with("GET ")));
+
+        let with_head = WireServer::start(vec![
+            about_reply(),
+            folder_reply(),
+            control_reply(vec![head_file("head-file", "7"), descriptor_file("desc-1")]),
+        ]);
+        assert_eq!(
+            provider
+                .open_repository(
+                    &connection(with_head.url.as_str()),
+                    &secret_ref(),
+                    OpenMode::ResumeCreate,
+                    &cancel,
+                )
+                .await
+                .err()
+                .unwrap()
+                .kind,
+            ErrorKind::PreconditionFailed
+        );
+
+        let duplicate = WireServer::start(vec![
+            about_reply(),
+            folder_reply(),
+            control_reply(vec![descriptor_file("desc-1"), descriptor_file("desc-2")]),
+        ]);
+        assert_eq!(
+            provider
+                .open_repository(
+                    &connection(duplicate.url.as_str()),
+                    &secret_ref(),
+                    OpenMode::ResumeCreate,
+                    &cancel,
+                )
+                .await
+                .err()
+                .unwrap()
+                .kind,
+            ErrorKind::PreconditionFailed
+        );
+
+        for (label, hidden) in [
+            (
+                "payload",
+                json!({
+                    "id": "pack-1",
+                    "name": "pack-p1",
+                    "size": "20",
+                    "version": "3",
+                    "appProperties": {
+                        "risunestRole": "pack",
+                        "risunestObjectId": "p1",
+                        "risunestJobId": "p1"
+                    }
+                }),
+            ),
+            (
+                "foreign file",
+                json!({ "id": "foreign-1", "name": "notes.txt", "size": "20", "version": "3" }),
+            ),
+        ] {
+            let server = WireServer::start(vec![
+                about_reply(),
+                folder_reply(),
+                control_reply(vec![hidden]),
+            ]);
+            assert_eq!(
+                provider
+                    .open_repository(
+                        &connection(server.url.as_str()),
+                        &secret_ref(),
+                        OpenMode::ResumeCreate,
+                        &cancel,
+                    )
+                    .await
+                    .err()
+                    .unwrap()
+                    .kind,
+                ErrorKind::PreconditionFailed,
+                "{label}"
+            );
+            assert_eq!(request_lines(&server).len(), 3, "{label}");
+        }
+
+        let mut malformed = descriptor_file("desc-1");
+        malformed["size"] = json!("0");
+        let malformed = WireServer::start(vec![
+            about_reply(),
+            folder_reply(),
+            control_reply(vec![malformed]),
+        ]);
+        assert_eq!(
+            provider
+                .open_repository(
+                    &connection(malformed.url.as_str()),
+                    &secret_ref(),
+                    OpenMode::ResumeCreate,
+                    &cancel,
+                )
+                .await
+                .err()
+                .unwrap()
+                .kind,
+            ErrorKind::Corrupt
+        );
     });
 }
 
@@ -800,11 +1070,6 @@ fn reading_streams_verified_bytes_and_reports_an_unchanged_version() {
         let lines = request_lines(&server);
         assert_eq!(lines.len(), 6);
         assert!(lines[5].contains("/drive/v3/files/pack-file?alt=media"));
-        assert_eq!(reserved_units(&test, "queries"), vec![5, 5, 100, 5, 5, 200]);
-        assert_eq!(
-            reserved_units(&test, "downloadBytes"),
-            vec![payload.len() as u64]
-        );
     });
 }
 
@@ -1033,10 +1298,6 @@ fn a_resumable_session_continues_from_the_offset_the_service_confirmed() {
             .to_lowercase()
             .contains("/synthetic/upload/session/one"));
         drop(records);
-        assert_eq!(
-            reserved_units(&test, "uploadBytes"),
-            vec![1_048_576, 524_288]
-        );
     });
 }
 
@@ -1272,10 +1533,6 @@ fn a_head_replacement_writes_once_and_is_readable_afterwards() {
             .starts_with("PATCH /synthetic/upload/drive/v3/files/head-file?uploadType=media"));
         assert_eq!(records[3].body, head_bytes);
         drop(records);
-        assert_eq!(
-            reserved_units(&test, "queries"),
-            vec![5, 5, 100, 50, 5, 200, 50]
-        );
     });
 }
 
@@ -1347,7 +1604,7 @@ fn compare_and_exchange_is_unsupported_rather_than_emulated() {
 }
 
 #[test]
-fn listing_pages_a_single_role_with_a_cursor_and_bounded_limits() {
+fn listing_accepts_false_and_absent_incomplete_search_with_a_cursor() {
     runtime().block_on(async {
         let mut replies = open_existing_replies();
         replies.push(json_reply(
@@ -1357,6 +1614,7 @@ fn listing_pages_a_single_role_with_a_cursor_and_bounded_limits() {
                     { "id": "snap-1", "size": "10", "version": "2",
                       "appProperties": { "risunestRole": "state", "risunestObjectId": "s1" } }
                 ],
+                "incompleteSearch": false,
                 "nextPageToken": "page-2"
             }),
         ));
@@ -1371,7 +1629,8 @@ fn listing_pages_a_single_role_with_a_cursor_and_bounded_limits() {
             }),
         ));
         let server = WireServer::start(replies);
-        let test = deps_with(Some(stored_secret(NOW_MS + 3_600_000)));
+        let (transport, test) =
+            deps_with_inspection(stored_secret(NOW_MS + 3_600_000));
         let cancel = Cancellation::default();
         let (provider, repository) = opened(&server, &test, &cancel).await;
         for limit in [0u16, 1001] {
@@ -1420,16 +1679,266 @@ fn listing_pages_a_single_role_with_a_cursor_and_bounded_limits() {
         assert!(lines[3].contains("pageSize=1"));
         assert!(lines[3].contains("value%3D%27state%27"));
         assert!(lines[4].contains("pageToken=page-2"));
-        assert_eq!(reserved_units(&test, "queries"), vec![5, 5, 100, 100, 100]);
+        assert!(server.requests.lock().unwrap()[4]
+            .headers
+            .to_lowercase()
+            .contains("authorization: bearer synthetic-access"));
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        let second_page = &requests[4];
+        assert_eq!(
+            second_page.authorization.as_deref(),
+            Some("Bearer synthetic-access")
+        );
+        assert_eq!(second_page.account.provider(), "google_drive");
+        assert_eq!(second_page.account.principal(), ACCOUNT);
+        assert_eq!(
+            second_page.account.authority(),
+            server.url.origin().ascii_serialization()
+        );
+        assert!(!second_page.account.is_pending());
+        assert!(second_page.api_request);
     });
 }
 
 #[test]
-fn a_denied_budget_stops_every_request_before_dispatch() {
+fn second_control_page_authorization_failure_aborts_open_without_a_later_request() {
     runtime().block_on(async {
-        let server = WireServer::start(vec![]);
+        let server = WireServer::start(vec![
+            about_reply(),
+            folder_reply(),
+            json_reply(
+                200,
+                json!({
+                    "files": [descriptor_file("desc-1")],
+                    "nextPageToken": "page-2"
+                }),
+            ),
+            error_reply(403, "insufficientFilePermissions"),
+            control_reply(vec![descriptor_file("must-not-be-requested")]),
+        ]);
+        let (transport, test) =
+            deps_with_inspection(stored_secret(NOW_MS + 3_600_000));
+        let provider = provider_of(&test.dependencies);
+        let cancel = Cancellation::default();
+        let error = provider
+            .open_repository(
+                &connection(server.url.as_str()),
+                &secret_ref(),
+                OpenMode::Existing,
+                &cancel,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind, ErrorKind::Unauthorized);
+
+        let lines = request_lines(&server);
+        assert_eq!(lines.len(), 4);
+        assert!(lines[2].contains("pageSize=100"));
+        assert!(lines[3].contains("pageToken=page-2"));
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        let first_page = &requests[2];
+        let second_page = &requests[3];
+        assert_eq!(first_page.authorization, second_page.authorization);
+        assert_eq!(
+            second_page.authorization.as_deref(),
+            Some("Bearer synthetic-access")
+        );
+        assert_eq!(first_page.account, second_page.account);
+        assert_eq!(second_page.account.provider(), "google_drive");
+        assert_eq!(second_page.account.principal(), ACCOUNT);
+        assert!(!second_page.account.is_pending());
+        assert!(second_page.api_request);
+    });
+}
+
+#[test]
+fn listing_rejects_incomplete_first_and_terminal_pages() {
+    runtime().block_on(async {
+        for body in [
+            json!({
+                "files": [
+                    { "id": "snap-1", "size": "10", "version": "2",
+                      "appProperties": { "risunestRole": "state", "risunestObjectId": "s1" } }
+                ],
+                "incompleteSearch": true,
+                "nextPageToken": "page-2"
+            }),
+            json!({
+                "files": [
+                    { "id": "snap-2", "size": "12", "version": "3",
+                      "appProperties": { "risunestRole": "state", "risunestObjectId": "s2" } }
+                ],
+                "incompleteSearch": true
+            }),
+        ] {
+            let mut replies = open_existing_replies();
+            replies.push(json_reply(200, body));
+            let server = WireServer::start(replies);
+            let test = deps_with(Some(stored_secret(NOW_MS + 3_600_000)));
+            let cancel = Cancellation::default();
+            let (provider, repository) = opened(&server, &test, &cancel).await;
+            assert_eq!(
+                provider
+                    .list_objects(&repository, Collection::Snapshots, None, 1, &cancel)
+                    .await
+                    .err()
+                    .unwrap()
+                    .kind,
+                ErrorKind::Corrupt
+            );
+            let lines = request_lines(&server);
+            assert_eq!(lines.len(), 4);
+            assert!(lines[3].contains("incompleteSearch"));
+        }
+    });
+}
+
+#[test]
+fn incomplete_middle_control_page_exposes_no_cleanup_capable_handle() {
+    runtime().block_on(async {
+        let server = WireServer::start(vec![
+            about_reply(),
+            folder_reply(),
+            json_reply(
+                200,
+                json!({
+                    "files": [descriptor_file("desc-1")],
+                    "incompleteSearch": false,
+                    "nextPageToken": "page-2"
+                }),
+            ),
+            json_reply(
+                200,
+                json!({
+                    "files": [],
+                    "incompleteSearch": true,
+                    "nextPageToken": "page-3"
+                }),
+            ),
+        ]);
         let test = deps_with(Some(stored_secret(NOW_MS + 3_600_000)));
-        test.budget.deny.store(true, Ordering::SeqCst);
+        let provider = provider_of(&test.dependencies);
+        let cancel = Cancellation::default();
+        let error = provider
+            .open_repository(
+                &connection(server.url.as_str()),
+                &secret_ref(),
+                OpenMode::Existing,
+                &cancel,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind, ErrorKind::Corrupt);
+        let lines = request_lines(&server);
+        assert_eq!(lines.len(), 4);
+        assert!(lines[3].contains("pageToken=page-2"));
+    });
+}
+
+#[test]
+fn cleanup_admission_aborts_on_incomplete_drive_listing_without_delete() {
+    runtime().block_on(async {
+        let mut replies = open_existing_replies();
+        replies.push(json_reply(
+            200,
+            json!({
+                "files": [],
+                "incompleteSearch": true,
+                "nextPageToken": "must-not-be-requested"
+            }),
+        ));
+        replies.push(Reply::Http {
+            status: 204,
+            headers: Vec::new(),
+            body: Vec::new(),
+        });
+        let server = WireServer::start(replies);
+        let test = deps_with(Some(stored_secret(NOW_MS + 3_600_000)));
+        let provider = provider_of(&test.dependencies);
+        let cancel = Cancellation::default();
+        let (repository, capabilities) = provider
+            .open_repository(
+                &connection(server.url.as_str()),
+                &secret_ref(),
+                OpenMode::Existing,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert!(capabilities.cleanup_supported());
+
+        let directory = tempfile::tempdir().unwrap();
+        let descriptor =
+            Descriptor::new(repository.repository_id.clone(), Some(Strategy::Sequential)).unwrap();
+        let clock = FakeLeaseClock::new(NOW_MS);
+        let root_key = [7u8; 32];
+        let context = LeaseContext {
+            root: directory.path(),
+            connection_id: "drive-connection",
+            writer_id: "writer",
+            descriptor: &descriptor,
+            root_key: &root_key,
+            provider: provider.as_ref(),
+            repository: &repository,
+            clock: &clock,
+            protection_supported: true,
+        };
+        let available_time = |_: std::time::Instant| -> Result<bool> { Ok(true) };
+        let request = CleanupRequest {
+            job_id: "cleanup",
+            cleanup_supported: capabilities.cleanup_supported(),
+            connection_time: &available_time,
+            limits: CleanupLimits::default(),
+        };
+        let error = cleanup::run(
+            &context,
+            &request,
+            &UnusedCleanupView,
+            &UnusedCleanupDocuments,
+            &cancel,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.kind, ErrorKind::Corrupt);
+
+        let lines = request_lines(&server);
+        assert_eq!(lines.len(), 4);
+        assert!(lines[3].contains("value%3D%27lease%27"));
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("DELETE "))
+                .count(),
+            0
+        );
+    });
+}
+
+#[test]
+fn control_listing_rejects_a_repeated_page_token_cycle() {
+    runtime().block_on(async {
+        let server = WireServer::start(vec![
+            about_reply(),
+            folder_reply(),
+            json_reply(
+                200,
+                json!({ "files": [], "nextPageToken": "page-2" }),
+            ),
+            json_reply(
+                200,
+                json!({ "files": [], "nextPageToken": "page-1" }),
+            ),
+            json_reply(
+                200,
+                json!({ "files": [], "nextPageToken": "page-2" }),
+            ),
+        ]);
+        let test = deps_with(Some(stored_secret(NOW_MS + 3_600_000)));
         let provider = provider_of(&test.dependencies);
         let cancel = Cancellation::default();
         assert_eq!(
@@ -1438,15 +1947,18 @@ fn a_denied_budget_stops_every_request_before_dispatch() {
                     &connection(server.url.as_str()),
                     &secret_ref(),
                     OpenMode::Existing,
-                    &cancel
+                    &cancel,
                 )
                 .await
                 .err()
                 .unwrap()
                 .kind,
-            ErrorKind::DailyQuotaExhausted
+            ErrorKind::Corrupt
         );
-        assert!(server.requests.lock().unwrap().is_empty());
+        let lines = request_lines(&server);
+        assert_eq!(lines.len(), 5);
+        assert!(lines[3].contains("pageToken=page-2"));
+        assert!(lines[4].contains("pageToken=page-1"));
     });
 }
 
@@ -1492,73 +2004,6 @@ fn cancellation_during_a_body_leaves_the_staging_file_unverified() {
         .await
         .unwrap();
         assert!(!sink.is_verified());
-    });
-}
-
-#[test]
-fn quota_costs_use_the_documented_per_method_weights() {
-    runtime().block_on(async {
-        let test = deps_with(Some(stored_secret(NOW_MS + 3_600_000)));
-        let provider = provider_of(&test.dependencies);
-        let server = WireServer::start(open_existing_replies());
-        let cancel = Cancellation::default();
-        let (repository, _) = provider
-            .open_repository(
-                &connection(server.url.as_str()),
-                &secret_ref(),
-                OpenMode::Existing,
-                &cancel,
-            )
-            .await
-            .unwrap();
-        let units = |operation: ProviderOperation, bucket: &str| {
-            provider
-                .request_cost(&repository, operation)
-                .unwrap()
-                .into_iter()
-                .find(|cost| cost.bucket == bucket)
-                .map(|cost| cost.units)
-        };
-        assert_eq!(units(ProviderOperation::Metadata, "queries"), Some(5));
-        assert_eq!(units(ProviderOperation::List, "queries"), Some(100));
-        assert_eq!(units(ProviderOperation::Get, "queries"), Some(200));
-        assert_eq!(units(ProviderOperation::Get, "downloadBytes"), Some(1));
-        assert_eq!(units(ProviderOperation::Create, "queries"), Some(50));
-        assert_eq!(units(ProviderOperation::Create, "uploadBytes"), Some(1));
-        assert_eq!(units(ProviderOperation::ReplaceHead, "queries"), Some(50));
-        assert_eq!(units(ProviderOperation::UploadSession, "queries"), Some(50));
-        assert_eq!(units(ProviderOperation::UploadChunk, "queries"), None);
-        assert_eq!(
-            units(ProviderOperation::UploadChunk, "uploadBytes"),
-            Some(1)
-        );
-        assert_eq!(
-            units(ProviderOperation::ReconcileUpload, "queries"),
-            Some(5)
-        );
-        let list = provider
-            .request_cost(&repository, ProviderOperation::List)
-            .unwrap();
-        assert_eq!(
-            list[0].shared_account,
-            "google_drive/project+user:project-1:permission-1"
-        );
-        assert_eq!(list[0].reset, QuotaReset::Rolling { window_ms: 60_000 });
-        for operation in [
-            ProviderOperation::CompareExchangeHead,
-            ProviderOperation::Authenticate,
-        ] {
-            assert!(provider
-                .request_cost(&repository, operation)
-                .unwrap()
-                .is_empty());
-        }
-        assert!(provider
-            .request_cost(
-                &crate::external_storage::fake::repository(),
-                ProviderOperation::List
-            )
-            .is_err());
     });
 }
 
@@ -1625,11 +2070,16 @@ fn authorization_uses_the_platform_client_and_the_per_file_scope() {
     assert!(android_web_authorization_policy(&custom).is_err());
 }
 
-async fn rejected_android_token_info(reply: Reply) -> (ProviderError, String, Vec<u64>) {
+async fn rejected_android_token_info(reply: Reply) -> (ProviderError, String) {
     let server = WireServer::start(vec![reply, about_reply()]);
     let test = deps_with(None);
     let config = connection(server.url.as_str());
     let settings = AuthorizationSettings::parse(&config, "android").unwrap();
+    let account = AccountKey::pending(
+        super::config::PROVIDER_ID,
+        &settings.api("/").unwrap(),
+    )
+    .unwrap();
     let cancel = Cancellation::default();
     let error = verify_google_grant(
         &test.dependencies,
@@ -1637,7 +2087,7 @@ async fn rejected_android_token_info(reply: Reply) -> (ProviderError, String, Ve
         &settings.client_id,
         &settings.scopes,
         "synthetic-token",
-        &settings.quota_scope(),
+        &account,
         &cancel,
     )
     .await
@@ -1651,14 +2101,14 @@ async fn rejected_android_token_info(reply: Reply) -> (ProviderError, String, Ve
     );
     let request = requests[0].headers.clone();
     drop(requests);
-    (error, request, reserved_units(&test, "queries"))
+    (error, request)
 }
 
 #[test]
 fn android_grant_binding_fails_before_account_lookup() {
     runtime().block_on(async {
         let required_scope = "https://www.googleapis.com/auth/drive.file";
-        let (wrong_client, request, charged) = rejected_android_token_info(json_reply(
+        let (wrong_client, request) = rejected_android_token_info(json_reply(
             200,
             json!({
                 "issued_to": "999999999999-foreign.apps.googleusercontent.com",
@@ -1668,9 +2118,8 @@ fn android_grant_binding_fails_before_account_lookup() {
         .await;
         assert_eq!(wrong_client.kind, ErrorKind::ReauthRequired);
         assert!(request.starts_with("GET /synthetic/tokeninfo?access_token=synthetic-token"));
-        assert_eq!(charged, vec![5]);
 
-        let (missing_scope, _, charged) = rejected_android_token_info(json_reply(
+        let (missing_scope, _) = rejected_android_token_info(json_reply(
             200,
             json!({
                 "issued_to": client_id("android"),
@@ -1679,16 +2128,14 @@ fn android_grant_binding_fails_before_account_lookup() {
         ))
         .await;
         assert_eq!(missing_scope.kind, ErrorKind::ReauthRequired);
-        assert_eq!(charged, vec![5]);
 
-        let (throttled, _, charged) = rejected_android_token_info(json_reply_with(
+        let (throttled, _) = rejected_android_token_info(json_reply_with(
             429,
             &[("Retry-After", "3")],
             json!({ "error": "rate_limit_exceeded" }),
         ))
         .await;
         assert_eq!(throttled.kind, ErrorKind::RateLimited);
-        assert_eq!(charged, vec![5]);
     });
 }
 
@@ -1760,10 +2207,6 @@ fn a_code_exchange_returns_a_storable_refresh_payload() {
     });
 }
 
-/// A passing exchange here proves the adapter's request shape and status
-/// handling. It is no evidence of the service's own deletion guarantees; the
-/// documentation behind `Capabilities` in fact states the opposite for
-/// listings, which is why the cleanup evidence stays unverified.
 #[test]
 fn deleting_checks_the_parent_and_role_of_the_file_before_removing_it() {
     runtime().block_on(async {
@@ -1835,9 +2278,5 @@ fn deleting_checks_the_parent_and_role_of_the_file_before_removing_it() {
             lines[4],
             "DELETE /synthetic/drive/v3/files/pack-file HTTP/1.1"
         );
-        let reservations = test.budget.reservations.lock().unwrap();
-        let removal = &reservations[4].0;
-        assert_eq!(removal.len(), 1);
-        assert_eq!(removal[0].units, 50);
     });
 }

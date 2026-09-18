@@ -2,7 +2,6 @@
 //! Network operations never run while the library PDS mutex is held.
 use super::{
     auth::{SecretBytes, SecretVault},
-    capabilities::Evidence,
     connection::{self, *},
     connection_store::{ConnectionStore, PendingStoredConnection, StoredConnection},
     contract::{
@@ -10,7 +9,6 @@ use super::{
     },
     descriptor,
     providers::{self, Dependencies},
-    quota_profiles,
     recovery::{self, ImportedRecovery},
     runtime, secrets,
 };
@@ -77,6 +75,7 @@ struct PendingRecovery {
 pub(crate) struct ConnectionCommandState {
     preparations: Mutex<HashMap<String, PendingPreparation>>,
     authorizations: Mutex<HashMap<String, PendingAuthorization>>,
+    authorization_cancellations: Mutex<HashMap<String, Cancellation>>,
     recoveries: Mutex<HashMap<String, PendingRecovery>>,
 }
 
@@ -146,7 +145,17 @@ pub(crate) fn external_storage_cancel_authorization(
     state: State<'_, ConnectionCommandState>,
     authorization_id: String,
 ) -> Result<()> {
-    lock(&state.authorizations)?.remove(&authorization_id);
+    cancel_authorization(&state, &authorization_id)
+}
+
+fn cancel_authorization(
+    state: &ConnectionCommandState,
+    authorization_id: &str,
+) -> Result<()> {
+    lock(&state.authorizations)?.remove(authorization_id);
+    if let Some(cancel) = lock(&state.authorization_cancellations)?.remove(authorization_id) {
+        cancel.cancel();
+    }
     Ok(())
 }
 
@@ -237,7 +246,7 @@ fn insert_preparation(
         preparation_id: preparation_id.clone(),
         expires_at_ms: expires_at_ms.to_string(),
         endpoint,
-        capabilities: predicted_capabilities(request.publication_strategy),
+        capabilities: None,
         requires_o_auth: request.config.oauth_profile.is_some(),
         requires_recovery_key: request.mode == ConnectionOpenMode::Existing && recovery.is_none(),
         requires_platform_o_auth_client: missing_platform_client,
@@ -329,8 +338,10 @@ pub(crate) fn connection_root(app: &AppHandle) -> Result<PathBuf> {
     runtime::root(app)
 }
 
-pub(crate) fn budget(app: &AppHandle) -> Result<super::durable_quota::DurableBudget> {
-    super::durable_quota::DurableBudget::open(&connection_root(app)?.join("account-quota.sqlite"))
+pub(crate) fn budget(app: &AppHandle) -> Result<super::durable_quota::MyboxBudget> {
+    Ok(super::durable_quota::MyboxBudget::new(
+        connection_root(app)?.join("account-quota.sqlite"),
+    ))
 }
 
 pub(crate) fn summary(connection: &StoredConnection) -> Result<ConnectionSummary> {
@@ -343,12 +354,7 @@ pub(crate) fn summary(connection: &StoredConnection) -> Result<ConnectionSummary
     if connection.config.oauth_profile.is_some() && connection.config.account_id.is_empty() {
         return Err(ProviderError::new(ErrorKind::Corrupt));
     }
-    match connection.descriptor.publication_strategy {
-        Some(strategy) => connection.capabilities.require(strategy)?,
-        None if connection.capabilities.immutable_create != Evidence::Unverified
-            && connection.capabilities.direct_complete_read != Evidence::Unverified => {}
-        None => return Err(ProviderError::new(ErrorKind::Corrupt)),
-    }
+    require_repository_strategy(&connection.capabilities, connection.descriptor.publication_strategy)?;
     Ok(connection::summary(connection))
 }
 
@@ -382,11 +388,13 @@ pub(crate) async fn external_storage_commit_connection(
         return Err(ProviderError::new(ErrorKind::Unsupported).into());
     }
     let secret = connection::encode_secret(&pending.request.config.provider, request.secret)?;
+    let cancel = Cancellation::default();
     match commit_preparation(
         &app,
         &preparation_id,
         &pending,
         CredentialInput::Bytes(secret),
+        &cancel,
     )
     .await
     {
@@ -457,6 +465,8 @@ pub(crate) async fn external_storage_begin_authorization(
             exchange_config,
         },
     );
+    lock(&state.authorization_cancellations)?
+        .insert(authorization_id.clone(), Cancellation::default());
     Ok(PendingAuthorizationSummary {
         authorization_id,
         authorization_url: Some(authorization_url.to_string()),
@@ -531,6 +541,8 @@ pub(crate) async fn external_storage_begin_authorization(
         _ => return Err(ProviderError::new(ErrorKind::Unsupported)),
     };
     lock(&state.authorizations)?.insert(authorization_id.clone(), authorization);
+    lock(&state.authorization_cancellations)?
+        .insert(authorization_id.clone(), Cancellation::default());
     Ok(PendingAuthorizationSummary {
         authorization_id,
         authorization_url,
@@ -557,14 +569,25 @@ pub(crate) async fn external_storage_complete_authorization(
     let authorization = lock(&state.authorizations)?
         .remove(&request.authorization_id)
         .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
+    let cancel = lock(&state.authorization_cancellations)?
+        .get(&request.authorization_id)
+        .cloned()
+        .ok_or_else(|| ProviderError::new(ErrorKind::Cancelled))?;
     if authorization.expires_at_ms <= now_ms() {
+        lock(&state.authorization_cancellations)?.remove(&request.authorization_id);
         return Err(ProviderError::new(ErrorKind::Cancelled).into());
     }
-    let pending = take_preparation(&state, &authorization.preparation_id)?;
+    let pending = match take_preparation(&state, &authorization.preparation_id) {
+        Ok(pending) => pending,
+        Err(error) => {
+            lock(&state.authorization_cancellations)?.remove(&request.authorization_id);
+            return Err(error.into());
+        }
+    };
     let credential_result: Result<(SecretRef, Option<String>)> = async {
         let root = connection_root(&app)?;
-        let (dependencies, _) = connection::dependencies(&root)?;
-        let grant = authorization.flow.wait(&Cancellation::default()).await?;
+        let dependencies = connection::dependencies(&root)?;
+        let grant = authorization.flow.wait(&cancel).await?;
         match pending.request.config.provider.as_str() {
             "google_drive" => {
                 let authorized = providers::google_drive::auth::exchange_authorization_code(
@@ -572,7 +595,7 @@ pub(crate) async fn external_storage_complete_authorization(
                     &authorization.exchange_config,
                     &grant,
                     None,
-                    &Cancellation::default(),
+                    &cancel,
                 )
                 .await?;
                 Ok((
@@ -586,7 +609,7 @@ pub(crate) async fn external_storage_complete_authorization(
                     .exchange_authorization_code(
                         &authorization.exchange_config,
                         &grant,
-                        &Cancellation::default(),
+                        &cancel,
                     )
                     .await?;
                 Ok((authorized.secret, Some(authorized.account_id)))
@@ -598,11 +621,12 @@ pub(crate) async fn external_storage_complete_authorization(
     let (credential, account_id) = match credential_result {
         Ok(value) => value,
         Err(error) => {
+            lock(&state.authorization_cancellations)?.remove(&request.authorization_id);
             restore_preparation(&state, authorization.preparation_id, pending);
             return Err(error.into());
         }
     };
-    match commit_preparation(
+    let committed = commit_preparation(
         &app,
         &authorization.preparation_id,
         &pending,
@@ -610,9 +634,11 @@ pub(crate) async fn external_storage_complete_authorization(
             reference: credential,
             account_id,
         },
+        &cancel,
     )
-    .await
-    {
+    .await;
+    lock(&state.authorization_cancellations)?.remove(&request.authorization_id);
+    match committed {
         Ok(result) => Ok(CompleteAuthorizationResult::Connected(result)),
         Err(error) => {
             restore_preparation(&state, authorization.preparation_id, pending);
@@ -630,6 +656,10 @@ pub(crate) async fn external_storage_complete_authorization(
 ) -> ConnectResult<CompleteAuthorizationResult> {
     let redirect_url = request.redirect_url.map(Zeroizing::new);
     let client_secret = request.client_secret.map(Zeroizing::new);
+    let cancel = lock(&state.authorization_cancellations)?
+        .get(&request.authorization_id)
+        .cloned()
+        .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
     let (authorization, grant) = {
         let mut authorizations = lock(&state.authorizations)?;
         let authorization = authorizations
@@ -654,6 +684,7 @@ pub(crate) async fn external_storage_complete_authorization(
         };
         if expires_at_ms <= now_ms() {
             authorizations.remove(&request.authorization_id);
+            lock(&state.authorization_cancellations)?.remove(&request.authorization_id);
             return Err(ProviderError::new(ErrorKind::Cancelled).into());
         }
         let grant = match flow.try_complete(redirect_url.as_deref().map(String::as_str)) {
@@ -672,6 +703,7 @@ pub(crate) async fn external_storage_complete_authorization(
             }
             Err(error) => {
                 authorizations.remove(&request.authorization_id);
+                lock(&state.authorization_cancellations)?.remove(&request.authorization_id);
                 return Err(error.into());
             }
         };
@@ -684,10 +716,16 @@ pub(crate) async fn external_storage_complete_authorization(
         PendingAuthorization::Google { preparation_id, .. }
         | PendingAuthorization::OneDrive { preparation_id, .. } => preparation_id.clone(),
     };
-    let pending = take_preparation(&state, &preparation_id)?;
+    let pending = match take_preparation(&state, &preparation_id) {
+        Ok(pending) => pending,
+        Err(error) => {
+            lock(&state.authorization_cancellations)?.remove(&request.authorization_id);
+            return Err(error.into());
+        }
+    };
     let credential_result: Result<(SecretRef, Option<String>)> = async {
         let root = connection_root(&app)?;
-        let (dependencies, _) = connection::dependencies(&root)?;
+        let dependencies = connection::dependencies(&root)?;
         match authorization {
             PendingAuthorization::Google {
                 exchange_config, ..
@@ -697,7 +735,7 @@ pub(crate) async fn external_storage_complete_authorization(
                     &exchange_config,
                     &grant,
                     client_secret,
-                    &Cancellation::default(),
+                    &cancel,
                 )
                 .await?;
                 Ok((
@@ -710,7 +748,7 @@ pub(crate) async fn external_storage_complete_authorization(
             } => {
                 let provider = providers::onedrive::OneDrive::new(dependencies);
                 let authorized = provider
-                    .exchange_authorization_code(&exchange_config, &grant, &Cancellation::default())
+                    .exchange_authorization_code(&exchange_config, &grant, &cancel)
                     .await?;
                 Ok((authorized.secret, Some(authorized.account_id)))
             }
@@ -720,11 +758,12 @@ pub(crate) async fn external_storage_complete_authorization(
     let (credential, account_id) = match credential_result {
         Ok(value) => value,
         Err(error) => {
+            lock(&state.authorization_cancellations)?.remove(&request.authorization_id);
             restore_preparation(&state, preparation_id, pending);
             return Err(error.into());
         }
     };
-    match commit_preparation(
+    let committed = commit_preparation(
         &app,
         &preparation_id,
         &pending,
@@ -732,9 +771,11 @@ pub(crate) async fn external_storage_complete_authorization(
             reference: credential,
             account_id,
         },
+        &cancel,
     )
-    .await
-    {
+    .await;
+    lock(&state.authorization_cancellations)?.remove(&request.authorization_id);
+    match committed {
         Ok(result) => Ok(CompleteAuthorizationResult::Connected(result)),
         Err(error) => {
             restore_preparation(&state, preparation_id, pending);
@@ -751,20 +792,78 @@ enum CredentialInput {
     },
 }
 
+async fn ensure_create_descriptor(
+    root: &std::path::Path,
+    provider: &dyn Provider,
+    handle: &RepositoryHandle,
+    descriptor: &Descriptor,
+    root_key: &[u8; 32],
+    resuming: bool,
+    cancel: &Cancellation,
+) -> Result<super::contract::RemoteLocator> {
+    let resumed = if resuming {
+        descriptor::resume_existing(root, provider, handle, descriptor, root_key, cancel).await?
+    } else {
+        None
+    };
+    let locator = match resumed {
+        Some(locator) => locator,
+        None => descriptor::upload(root, provider, handle, descriptor, root_key, cancel).await?,
+    };
+    descriptor::read(
+        root,
+        provider,
+        handle,
+        &locator,
+        descriptor,
+        root_key,
+        cancel,
+    )
+    .await?;
+    Ok(locator)
+}
+
 async fn commit_preparation(
     app: &AppHandle,
     connection_id: &str,
     preparation: &PendingPreparation,
     credential: CredentialInput,
+    cancel: &Cancellation,
 ) -> ConnectResult<ConnectionResult> {
     let root = connection_root(app)?;
-    let (dependencies, durable_budget) = connection::dependencies(&root)?;
+    let dependencies = connection::dependencies(&root)?;
     let provider_vault = dependencies.vault.clone();
     let key_vault = secrets::repository_key_vault(&root);
     let mut config = preparation.request.config.clone();
     let mut store = ConnectionStore::open(&root)?;
+    let provided_account_id = match &credential {
+        CredentialInput::Bytes(_) => None,
+        CredentialInput::Reference { account_id, .. } => account_id.as_ref(),
+    };
+    if provided_account_id.is_some_and(|account_id| {
+        preparation.request.mode == ConnectionOpenMode::Existing
+            && account_id != &config.account_id
+    }) {
+        return Err(ProviderError::new(ErrorKind::ReauthRequired).into());
+    }
+    if let Some(account_id) = provided_account_id {
+        config.account_id = account_id.clone();
+    }
+    let effective_connection_id = if preparation.request.mode == ConnectionOpenMode::Create
+        && store.pending(connection_id).is_err_and(|error| error.kind == ErrorKind::NotFound)
+    {
+        store
+            .pending_create_for(&config, preparation.request.capture_policy)?
+            .map_or_else(|| connection_id.to_owned(), |pending| pending.id)
+    } else {
+        connection_id.to_owned()
+    };
+    let connection_id = effective_connection_id.as_str();
     let (pending, resuming) = match store.pending(connection_id) {
         Ok(mut pending) => {
+            if pending.create != (preparation.request.mode == ConnectionOpenMode::Create) {
+                return Err(ProviderError::new(ErrorKind::PreconditionFailed).into());
+            }
             let (replacement, account_id) = match credential {
                 CredentialInput::Bytes(bytes) => (provider_vault.store(&bytes).await?, None),
                 CredentialInput::Reference {
@@ -773,8 +872,7 @@ async fn commit_preparation(
                 } => (reference, account_id),
             };
             if account_id.as_ref().is_some_and(|account_id| {
-                preparation.request.mode == ConnectionOpenMode::Existing
-                    && account_id != &pending.config.account_id
+                account_id != &pending.config.account_id
             }) {
                 let _ = provider_vault.remove(&replacement).await;
                 return Err(ProviderError::new(ErrorKind::ReauthRequired).into());
@@ -796,44 +894,35 @@ async fn commit_preparation(
             (pending, true)
         }
         Err(error) if error.kind == ErrorKind::NotFound => {
-            let (descriptor, key) = match preparation.request.mode {
+            let (credential_ref, account_id) = match credential {
+                CredentialInput::Bytes(bytes) => (provider_vault.store(&bytes).await?, None),
+                CredentialInput::Reference { reference, account_id } => (reference, account_id),
+            };
+            cancel.check()?;
+            if let Some(account_id) = account_id {
+                config.account_id = account_id;
+            }
+            let (repository_id, descriptor, key, create) = match preparation.request.mode {
                 ConnectionOpenMode::Create => (
-                    Descriptor::new(
-                        uuid::Uuid::new_v4().to_string(),
-                        preparation.request.publication_strategy.descriptor(),
-                    )
-                    .map_err(|_| ProviderError::new(ErrorKind::Corrupt))?,
+                    uuid::Uuid::new_v4().to_string(),
+                    None,
                     root_key().map_err(|_| ProviderError::new(ErrorKind::Transient))?,
+                    true,
                 ),
                 ConnectionOpenMode::Existing => {
                     let recovery = preparation
                         .recovery
                         .as_ref()
                         .ok_or_else(|| ProviderError::new(ErrorKind::ReauthRequired))?;
-                    (recovery.metadata.descriptor.clone(), recovery.key.clone())
+                    (
+                        recovery.metadata.descriptor.repository_id.clone(),
+                        Some(recovery.metadata.descriptor.clone()),
+                        recovery.key.clone(),
+                        false,
+                    )
                 }
             };
-            let (credential_ref, account_id) = match credential {
-                CredentialInput::Bytes(bytes) => (provider_vault.store(&bytes).await?, None),
-                CredentialInput::Reference {
-                    reference,
-                    account_id,
-                } => (reference, account_id),
-            };
-            if account_id.as_ref().is_some_and(|account_id| {
-                preparation.request.mode == ConnectionOpenMode::Existing
-                    && account_id != &config.account_id
-            }) {
-                let _ = provider_vault.remove(&credential_ref).await;
-                return Err(ProviderError::new(ErrorKind::ReauthRequired).into());
-            }
-            if let Some(account_id) = account_id {
-                config.account_id = account_id;
-            }
-            let key_ref = match key_vault
-                .store(&SecretBytes(Zeroizing::new(key.to_vec())))
-                .await
-            {
+            let key_ref = match key_vault.store(&SecretBytes(Zeroizing::new(key.to_vec()))).await {
                 Ok(reference) => reference,
                 Err(error) => {
                     let _ = provider_vault.remove(&credential_ref).await;
@@ -843,11 +932,10 @@ async fn commit_preparation(
             let pending = PendingStoredConnection {
                 id: connection_id.into(),
                 config,
+                repository_id,
                 descriptor,
-                provider_repository_id: preparation
-                    .recovery
-                    .as_ref()
-                    .map(|recovery| recovery.metadata.provider_repository_id.clone()),
+                create,
+                provider_repository_id: None,
                 credential_ref: credential_ref.0.clone(),
                 root_key_ref: key_ref.0.clone(),
                 capture_policy: preparation.request.capture_policy,
@@ -864,35 +952,28 @@ async fn commit_preparation(
     };
     config = pending.config.clone();
     let credential_ref = SecretRef(pending.credential_ref.clone());
-    let root_key = read_root_key(key_vault.as_ref(), &pending.root_key_ref).await?;
     let provider = connection::provider_for(&config, dependencies.clone())?;
-    let cancel = Cancellation::default();
-    let open_mode = if resuming {
-        super::contract::OpenMode::Existing
-    } else {
-        preparation.request.mode.into()
-    };
-    let opened = provider
-        .open_repository(&config, &credential_ref, open_mode, &cancel)
-        .await;
-    let (handle, mut capabilities) = match opened {
-        Ok(value) => value,
-        Err(error)
-            if resuming
-                && preparation.request.mode == ConnectionOpenMode::Create
-                && error.kind == ErrorKind::NotFound =>
-        {
-            provider
-                .open_repository(
-                    &config,
-                    &credential_ref,
-                    super::contract::OpenMode::Create,
-                    &cancel,
-                )
-                .await?
+    let open_mode = if pending.create {
+        if resuming {
+            super::contract::OpenMode::ResumeCreate
+        } else {
+            super::contract::OpenMode::Create
         }
-        Err(error) => return Err(error.into()),
+    } else {
+        super::contract::OpenMode::Existing
     };
+    let (handle, capabilities) = provider
+        .open_repository(&config, &credential_ref, open_mode, cancel)
+        .await?;
+    if !pending.create {
+        let recovery = preparation
+            .recovery
+            .as_ref()
+            .ok_or_else(|| ProviderError::new(ErrorKind::ReauthRequired))?;
+        if recovery.metadata.provider_repository_id != handle.repository_id {
+            return Err(ProviderError::new(ErrorKind::Corrupt).into());
+        }
+    }
     if pending
         .provider_repository_id
         .as_ref()
@@ -915,61 +996,30 @@ async fn commit_preparation(
     }
     let mut updated = pending.clone();
     updated.provider_repository_id = Some(handle.repository_id.clone());
+    if updated.descriptor.is_none() {
+        let strategy = strategy_for_new_connection(preparation.request.purpose, &capabilities)?;
+        updated.descriptor = Some(
+            Descriptor::new(updated.repository_id.clone(), strategy)
+                .map_err(|_| ProviderError::new(ErrorKind::Corrupt))?,
+        );
+    }
     store.put_pending(&updated)?;
 
-    if config.provider == "webdav"
-        && preparation.request.publication_strategy == ConnectionStrategy::Cas
-    {
-        let probe = providers::webdav::probe_conditional_writes(
-            &dependencies,
-            &config,
-            &credential_ref,
-            &cancel,
-        )
-        .await?;
-        store.remember_discovery(connection_id, "webdav-conditional-write-probe", &probe)?;
-        if probe.create_if_absent && probe.exact_version_update && probe.strong_version_token {
-            capabilities.atomic_create_head = Evidence::Synthetic;
-            capabilities.conditional_head_update = Evidence::Synthetic;
-        }
-    }
-    match preparation.request.publication_strategy.descriptor() {
-        Some(strategy) => capabilities.require(strategy)?,
-        None if capabilities.immutable_create != Evidence::Unverified
-            && capabilities.direct_complete_read != Evidence::Unverified => {}
-        None => return Err(ProviderError::new(ErrorKind::Unsupported).into()),
-    }
-    quota_profiles::configure_connection_budget(
-        &durable_budget,
-        &config.provider,
-        config.profile.as_deref(),
-        provider.as_ref(),
-        &handle,
-        &[],
-        now_ms(),
-    )?;
+    let descriptor = updated.descriptor.as_ref().ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))?;
+    require_repository_strategy(&capabilities, descriptor.publication_strategy)?;
+    let root_key = read_root_key(key_vault.as_ref(), &updated.root_key_ref).await?;
     let descriptor_locator = match preparation.request.mode {
         ConnectionOpenMode::Create => {
-            let locator = descriptor::upload(
+            ensure_create_descriptor(
                 &root,
                 provider.as_ref(),
                 &handle,
-                &updated.descriptor,
+                descriptor,
                 &root_key,
-                &cancel,
+                resuming,
+                cancel,
             )
-            .await?;
-            descriptor::read(
-                &root,
-                provider.as_ref(),
-                &handle,
-                &locator,
-                &updated.descriptor,
-                &root_key,
-                &cancel,
-            )
-            .await?;
-            locator
+            .await?
         }
         ConnectionOpenMode::Existing => {
             let recovery = preparation
@@ -981,22 +1031,29 @@ async fn commit_preparation(
                 provider.as_ref(),
                 &handle,
                 &recovery.metadata.descriptor_locator,
-                &updated.descriptor,
+                descriptor,
                 &root_key,
-                &cancel,
+                cancel,
             )
             .await?;
             recovery.metadata.descriptor_locator.clone()
         }
     };
+    cancel.check()?;
     let stored = store.promote_pending(connection_id, descriptor_locator, capabilities)?;
     let recovery = if preparation.request.mode == ConnectionOpenMode::Create {
-        Some(create_recovery_material(app, &stored, &root_key)?)
+        match create_recovery_material(app, &stored, &root_key) {
+            Ok(material) => Some(material),
+            Err(_) => {
+                crate::nlog!("warn", "External connection recovery material must be exported again");
+                None
+            }
+        }
     } else {
         None
     };
     Ok(ConnectionResult {
-        connection: summary(&stored)?,
+        connection: connection::summary(&stored),
         recovery,
     })
 }
@@ -1017,8 +1074,8 @@ pub(crate) async fn open_connected(
     connection_id: &str,
 ) -> Result<ConnectedRepository> {
     let root = connection_root(app)?;
-    let stored = ConnectionStore::open(&root)?.read(connection_id)?;
-    let (dependencies, durable_budget) = connection::dependencies(&root)?;
+    let mut stored = ConnectionStore::open(&root)?.read(connection_id)?;
+    let dependencies = connection::dependencies(&root)?;
     let root_key = read_root_key(
         secrets::repository_key_vault(&root).as_ref(),
         &stored.root_key_ref,
@@ -1026,7 +1083,7 @@ pub(crate) async fn open_connected(
     .await?;
     let provider = connection::provider_for(&stored.config, dependencies.clone())?;
     let cancel = Cancellation::default();
-    let (handle, _capabilities) = provider
+    let (handle, capabilities) = provider
         .open_repository(
             &stored.config,
             &SecretRef(stored.credential_ref.clone()),
@@ -1041,12 +1098,8 @@ pub(crate) async fn open_connected(
         .descriptor
         .validate()
         .map_err(|_| ProviderError::new(ErrorKind::Corrupt))?;
-    match stored.descriptor.publication_strategy {
-        Some(strategy) => stored.capabilities.require(strategy)?,
-        None if stored.capabilities.immutable_create != Evidence::Unverified
-            && stored.capabilities.direct_complete_read != Evidence::Unverified => {}
-        None => return Err(ProviderError::new(ErrorKind::Unsupported)),
-    }
+    require_repository_strategy(&capabilities, stored.descriptor.publication_strategy)?;
+    stored.capabilities = capabilities;
     descriptor::read(
         &root,
         provider.as_ref(),
@@ -1057,15 +1110,6 @@ pub(crate) async fn open_connected(
         &cancel,
     )
     .await?;
-    quota_profiles::configure_connection_budget(
-        &durable_budget,
-        &stored.config.provider,
-        stored.config.profile.as_deref(),
-        provider.as_ref(),
-        &handle,
-        &[],
-        now_ms(),
-    )?;
     Ok(ConnectedRepository {
         stored,
         provider,
@@ -1261,20 +1305,12 @@ pub(crate) fn external_storage_prepare_recovery_import(
         .map_err(|_| ProviderError::new(ErrorKind::Corrupt))?;
     let code = Zeroizing::new(request.code);
     let imported = recovery::import(&bytes, &code)?;
-    let strategy = match imported.metadata.descriptor.publication_strategy {
-        Some(super::contract::PublicationStrategy::Cas) => ConnectionStrategy::Cas,
-        Some(super::contract::PublicationStrategy::Sequential) => ConnectionStrategy::Sequential,
-        None => ConnectionStrategy::BackupOnly,
-    };
-    let purpose = if strategy == ConnectionStrategy::BackupOnly {
+    let purpose = if imported.metadata.descriptor.publication_strategy.is_none() {
         ConnectionPurpose::Backup
     } else {
         ConnectionPurpose::Sync
     };
     let mut acknowledgements = Vec::new();
-    if strategy == ConnectionStrategy::Sequential {
-        acknowledgements.push(SEQUENTIAL_ACKNOWLEDGEMENT.into());
-    }
     if imported.metadata.config.provider == "github_releases" {
         acknowledgements.push(GITHUB_ACKNOWLEDGEMENT.into());
     }
@@ -1282,7 +1318,6 @@ pub(crate) fn external_storage_prepare_recovery_import(
         config: imported.metadata.config.clone(),
         mode: ConnectionOpenMode::Existing,
         purpose,
-        publication_strategy: strategy,
         capture_policy: (purpose == ConnectionPurpose::Backup)
             .then(super::connection::CapturePolicy::default),
         acknowledgements,
@@ -1342,6 +1377,61 @@ mod tests {
             serde_json::json!({"authorizationPending":true,"callbackRejected":true})
         );
     }
+
+    #[test]
+    fn cancelling_authorization_wakes_completion_after_ownership_is_taken() {
+        let state = ConnectionCommandState::default();
+        let cancel = Cancellation::default();
+        state
+            .authorization_cancellations
+            .lock()
+            .unwrap()
+            .insert("synthetic-authorization".into(), cancel.clone());
+        cancel_authorization(&state, "synthetic-authorization").unwrap();
+        assert_eq!(cancel.check().unwrap_err().kind, ErrorKind::Cancelled);
+        assert!(state.authorization_cancellations.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restarted_create_reuses_the_authenticated_descriptor_without_uploading_again() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let first_root = tempfile::tempdir().unwrap();
+            let restarted_root = tempfile::tempdir().unwrap();
+            let provider = super::super::fake::FakeProvider::new(true);
+            let handle = super::super::fake::repository();
+            let descriptor = Descriptor::new(handle.repository_id.clone(), None).unwrap();
+            let cancel = Cancellation::default();
+
+            let first = ensure_create_descriptor(
+                first_root.path(),
+                &provider,
+                &handle,
+                &descriptor,
+                &[7; 32],
+                false,
+                &cancel,
+            )
+            .await
+            .unwrap();
+            assert_eq!(provider.upload_attempts(&descriptor.repository_id), 1);
+
+            let resumed = ensure_create_descriptor(
+                restarted_root.path(),
+                &provider,
+                &handle,
+                &descriptor,
+                &[7; 32],
+                true,
+                &cancel,
+            )
+            .await
+            .unwrap();
+            assert_eq!(resumed, first);
+            assert_eq!(provider.upload_attempts(&descriptor.repository_id), 1);
+        });
+    }
+
     use std::collections::BTreeMap;
 
     #[test]
@@ -1358,12 +1448,12 @@ mod tests {
             },
             mode: ConnectionOpenMode::Existing,
             purpose: ConnectionPurpose::Backup,
-            publication_strategy: ConnectionStrategy::BackupOnly,
             capture_policy: Some(super::connection::CapturePolicy::default()),
             acknowledgements: Vec::new(),
         };
         let result = insert_preparation(&state, request, None).unwrap();
         assert!(result.requires_recovery_key);
+        assert!(result.capabilities.is_none());
     }
 
     #[test]
@@ -1390,6 +1480,8 @@ mod tests {
             retention_policy: None,
             capabilities: super::super::fake::capabilities(false),
             created_at_ms: 1,
+            last_sync_at_ms: None,
+            last_backup_at_ms: None,
         };
         let exported = recovery::export(&stored, &[7; 32]).unwrap();
         let recovered = recovery::import(&exported.bytes, &exported.code).unwrap();
@@ -1444,9 +1536,8 @@ mod tests {
                 config,
                 mode: ConnectionOpenMode::Existing,
                 purpose: ConnectionPurpose::Sync,
-                publication_strategy: ConnectionStrategy::Sequential,
                 capture_policy: None,
-                acknowledgements: vec![SEQUENTIAL_ACKNOWLEDGEMENT.into()],
+                acknowledgements: Vec::new(),
             },
             expires_at_ms: u64::MAX,
             recovery: Some(imported),

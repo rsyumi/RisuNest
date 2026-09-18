@@ -2,18 +2,18 @@
 //! immutable creates, multipart sessions, head writes and listing.
 use super::{
     config::{self, collection_folder, role_folder, RepositoryContext, Target},
-    profiles::{self, Profile, MAX_PARTS},
+    profiles::{Profile, MAX_PARTS},
     sigv4::{self, hex_sha256, Credentials, EMPTY_PAYLOAD_SHA256, UNSIGNED_PAYLOAD},
     xml,
 };
 use crate::external_storage::{
-    capabilities::{Capabilities, Evidence},
+    capabilities::Capabilities,
     contract::*,
     http::{self, HttpRequest, HttpResponse},
     providers::{common, Dependencies},
 };
 use base64::Engine as _;
-use std::{collections::BTreeMap, pin::Pin, sync::Arc};
+use std::{collections::{BTreeMap, BTreeSet}, pin::Pin, sync::Arc, time::{Duration, Instant}};
 use tokio::io::AsyncRead;
 
 /// Redirects are followed only where the service documents them, and only far
@@ -152,40 +152,35 @@ fn base64_sha256(lower_hex: &str) -> Result<String> {
 
 pub(crate) fn capabilities(profile: &Profile) -> Capabilities {
     Capabilities {
-        immutable_create: Evidence::Synthetic,
-        direct_complete_read: Evidence::Synthetic,
-        atomic_create_head: profile.cas_evidence,
-        conditional_head_update: profile.cas_evidence,
-        stable_head_replace: Evidence::Synthetic,
-        head_read_after_write: Evidence::Synthetic,
-        head_retry_control: Evidence::Synthetic,
-        snapshot_discovery: Evidence::Synthetic,
-        delete_objects: profile.cleanup_evidence,
-        gc_control_consistency: profile.cleanup_evidence,
-        delete_completion: profile.cleanup_evidence,
-        // Snapshot roots are their own listing; no extra index object exists.
-        discovery_extra_requests: 0,
+        immutable_create: true,
+        direct_complete_read: true,
+        atomic_create_head: profile.cas_supported,
+        conditional_head_update: profile.cas_supported,
+        stable_head_replace: true,
+        head_read_after_write: true,
+        head_retry_control: true,
+        snapshot_discovery: true,
+        lease_operations: true,
+        delete_objects: true,
         conditional_get: profile.conditional_get,
-        // Ranged reads are not used: every object is streamed from offset 0.
         range: false,
         resumable_upload: true,
         max_stored_bytes: Some(profile.max_stored_bytes()),
         sdk_overhead_bytes: 0,
         upload_alignment: profile.part_size_bytes,
-        documented_at: Some(profile.documented_at.to_owned()),
-        evidence_urls: profiles::SHARED_EVIDENCE
-            .iter()
-            .chain(profile.evidence_urls.iter())
-            .map(|url| (*url).to_owned())
-            .collect(),
     }
+}
+
+fn control_key(context: &RepositoryContext, key: &str) -> bool {
+    !key.starts_with(&context.folder_prefix("packs"))
 }
 
 fn context_of(repository: &RepositoryHandle) -> Result<&RepositoryContext> {
     repository
         .context
         .downcast_ref::<RepositoryContext>()
-        .filter(|context| context.connection_identity == repository.connection_identity)
+        .filter(|context| context.connection_identity == repository.connection_identity
+            && context.account == repository.account)
         .ok_or_else(corrupt)
 }
 
@@ -212,8 +207,24 @@ impl S3Provider {
             };
             context.url(target, &call.query)?
         };
+        let control = http::control_operation(call.operation)
+            || (call.method == reqwest::Method::GET
+                && call.key.as_deref().is_some_and(|key| control_key(context, key)));
+        let head_interval = if matches!(call.operation,
+            ProviderOperation::CompareExchangeHead | ProviderOperation::ReplaceHead) {
+            context.profile.same_key_write_window_ms
+        } else { None };
+        // SigV4 timestamps are created only after an existing account pause.
+        // The signed dispatch returns without sending if another response
+        // imposed a new pause while these headers were being constructed.
+        let deadline = self.dependencies
+            .wait_until_ready(&context.account, control, cancel)
+            .await?;
         let amz_date = sigv4::amz_date(self.now_ms())?;
         let mut headers = call.headers;
+        if matches!(call.method, reqwest::Method::GET | reqwest::Method::HEAD) {
+            http::bypass_cache(&mut headers);
+        }
         headers.insert("x-amz-content-sha256".into(), call.payload_hash.clone());
         headers.insert("x-amz-date".into(), amz_date.clone());
         let signature = sigv4::sign(
@@ -226,7 +237,7 @@ impl S3Provider {
             &amz_date,
         )?;
         headers.insert("authorization".into(), signature.authorization);
-        self.send(
+        let result = self.dependencies.send_signed(
             HttpRequest {
                 method: call.method,
                 url,
@@ -234,22 +245,21 @@ impl S3Provider {
                 body: call.body,
                 content_length: call.content_length,
                 operation: call.operation,
-                costs: context.profile.costs(&context.account_id, call.operation),
+                account: context.account.clone(),
+                api_request: true,
+                mybox_charge: None,
+                control,
             },
             cancel,
-        )
-        .await
-    }
-
-    async fn send(&self, request: HttpRequest, cancel: &Cancellation) -> Result<HttpResponse> {
-        http::send(
-            self.dependencies.http.as_ref(),
-            self.dependencies.budget.as_ref(),
-            self.dependencies.clock.as_ref(),
-            request,
-            cancel,
-        )
-        .await
+            deadline,
+        ).await;
+        if let Some(interval) = head_interval {
+            if result.is_ok() || result.as_ref().is_err_and(|error| error.kind == ErrorKind::Transient) {
+                self.dependencies.requests.backoff.defer_for(&context.account,
+                    Duration::from_millis(interval), Instant::now())?;
+            }
+        }
+        result
     }
 
     /// Default S3 status meanings with the documented per-service overrides.
@@ -322,7 +332,85 @@ impl S3Provider {
         self.require(context.profile, &response, &[200])?;
         let body =
             common::read_bounded(&mut response.body, common::MAX_CONTROL_BODY, cancel).await?;
-        xml::parse_list_objects(&body)
+        let mut page = xml::parse_list_objects(&body)?;
+        if cursor.is_some() && page.next_continuation_token.as_deref() == cursor {
+            return Err(corrupt());
+        }
+        let prefix = context.folder_prefix(folder);
+        for object in &page.objects {
+            if object.key == prefix {
+                if object.size != 0 { return Err(corrupt()); }
+            } else if context.object_of(folder, &object.key).is_none() {
+                return Err(corrupt());
+            }
+        }
+        page.objects.retain(|object| object.key != prefix);
+        Ok(page)
+    }
+
+    async fn descriptor_exists(&self, context: &RepositoryContext, credentials: &Credentials, cancel: &Cancellation) -> Result<bool> {
+        let mut cursor = None;
+        let mut visited = BTreeSet::new();
+        loop {
+            let page = self.list_page(context, credentials, collection_folder(Collection::Descriptors),
+                cursor.as_deref(), 1, cancel).await?;
+            if !page.objects.is_empty() { return Ok(true); }
+            match page.next_continuation_token {
+                None => return Ok(false),
+                Some(next) if visited.len() < 10_000 && visited.insert(next.clone()) => cursor = Some(next),
+                Some(_) => return Err(corrupt()),
+            }
+        }
+    }
+
+    async fn require_create_layout(
+        &self,
+        context: &RepositoryContext,
+        credentials: &Credentials,
+        allow_descriptor: bool,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        let prefix = if context.prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", context.prefix)
+        };
+        let mut response = self
+            .dispatch(
+                context,
+                credentials,
+                Call::bucket(reqwest::Method::GET, ProviderOperation::List)
+                    .query("list-type", "2")
+                    .query("prefix", prefix.as_str())
+                    .query("max-keys", "2"),
+                cancel,
+            )
+            .await?;
+        self.require(context.profile, &response, &[200])?;
+        let body =
+            common::read_bounded(&mut response.body, common::MAX_CONTROL_BODY, cancel).await?;
+        let page = xml::parse_list_objects(&body)?;
+        if !allow_descriptor {
+            if page.next_continuation_token.is_some() || !page.objects.is_empty() {
+                return Err(precondition(None));
+            }
+            return Ok(());
+        }
+        if page.next_continuation_token.is_some() || page.objects.len() > 1 {
+            return Err(precondition(None));
+        }
+        if let Some(object) = page.objects.first() {
+            if context
+                .object_of(collection_folder(Collection::Descriptors), &object.key)
+                .is_none()
+            {
+                return Err(precondition(None));
+            }
+            if object.size == 0 {
+                return Err(corrupt());
+            }
+        }
+        Ok(())
     }
 
     /// One `GetObject`, plus the documented download redirect where a preset
@@ -356,18 +444,21 @@ impl S3Provider {
             {
                 return Err(corrupt());
             }
-            response = self
+            let mut headers = BTreeMap::new();
+            http::bypass_cache(&mut headers);
+            response = self.dependencies
                 .send(
                     HttpRequest {
                         method: reqwest::Method::GET,
                         url: next.clone(),
-                        headers: BTreeMap::new(),
+                        headers,
                         body: None,
                         content_length: None,
                         operation: ProviderOperation::Get,
-                        costs: context
-                            .profile
-                            .costs(&context.account_id, ProviderOperation::Get),
+                        account: context.account.clone(),
+                        api_request: false,
+                        mybox_charge: None,
+                        control: control_key(context, key),
                     },
                     cancel,
                 )
@@ -651,34 +742,22 @@ impl Provider for S3Provider {
             cancel.check()?;
             let context = config::validate(config, secret)?;
             let credentials = self.credentials(&context).await?;
-            let descriptors = self
-                .list_page(
-                    &context,
-                    &credentials,
-                    collection_folder(Collection::Descriptors),
-                    None,
-                    1,
-                    cancel,
-                )
-                .await?;
             match mode {
                 OpenMode::Create => {
-                    if !descriptors.objects.is_empty() {
-                        return Err(precondition(None));
-                    }
-                    let head = context.key("head")?;
-                    if self
-                        .head_object(&context, &credentials, &head, cancel)
-                        .await?
-                        .is_some()
-                    {
-                        return Err(precondition(None));
-                    }
+                    self.require_create_layout(&context, &credentials, false, cancel)
+                        .await?;
                 }
                 OpenMode::Existing => {
-                    if descriptors.objects.is_empty() {
+                    let descriptor_exists = self
+                        .descriptor_exists(&context, &credentials, cancel)
+                        .await?;
+                    if !descriptor_exists {
                         return Err(ProviderError::new(ErrorKind::NotFound));
                     }
+                }
+                OpenMode::ResumeCreate => {
+                    self.require_create_layout(&context, &credentials, true, cancel)
+                        .await?;
                 }
             }
             let capabilities = capabilities(context.profile);
@@ -687,6 +766,7 @@ impl Provider for S3Provider {
                 RepositoryHandle {
                     repository_id: identity.clone(),
                     connection_identity: identity,
+                    account: context.account.clone(),
                     context: Box::new(context),
                 },
                 capabilities,
@@ -932,8 +1012,12 @@ impl Provider for S3Provider {
                     cancel,
                 )
                 .await?;
+            cancel.check()?;
             if response.status == 404 {
                 return Ok(());
+            }
+            if response.status == 202 {
+                return Err(common::error(ErrorKind::Unsupported, 202));
             }
             self.require(context.profile, &response, &[200, 204])
         })
@@ -1069,14 +1153,6 @@ impl Provider for S3Provider {
         })
     }
 
-    fn request_cost(
-        &self,
-        repository: &RepositoryHandle,
-        operation: ProviderOperation,
-    ) -> Result<Vec<RequestCost>> {
-        let context = context_of(repository)?;
-        Ok(context.profile.costs(&context.account_id, operation))
-    }
 }
 
 fn head_call(key: &str, head: &HeadBytes, operation: ProviderOperation) -> Call {

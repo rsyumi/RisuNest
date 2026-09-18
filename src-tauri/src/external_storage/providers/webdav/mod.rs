@@ -33,13 +33,16 @@ mod tests;
 use super::{common, Dependencies};
 use crate::external_storage::{
     auth::SecretBytes,
-    capabilities::{Capabilities, Evidence},
+    capabilities::Capabilities,
     contract::*,
     http::{self, HttpRequest, HttpResponse},
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 use url::Url;
 use zeroize::Zeroizing;
 
@@ -63,10 +66,8 @@ const ROLE_FOLDERS: [&str; 6] = [
     "points",
     "snapshots",
 ];
-const REQUEST_BUCKET: &str = "requests";
 const MAX_ACCOUNT_BYTES: usize = 255;
 const MAX_PASSWORD_BYTES: usize = 1024;
-const DOCUMENTED_AT: &str = "2026-09-14";
 const OCTET_STREAM: &str = "application/octet-stream";
 const PROPFIND_BODY: &[u8] = br#"<?xml version="1.0" encoding="utf-8"?>
 <propfind xmlns="DAV:"><prop><getetag/><getcontentlength/><resourcetype/></prop></propfind>"#;
@@ -174,8 +175,7 @@ struct RepositoryContext {
     /// Endpoint plus root, the prefix every locator resolves against.
     base: Url,
     identity: String,
-    /// Quota is shared by the account on an endpoint's origin, not by a root.
-    account: String,
+    account: super::super::quota::AccountKey,
     authorization: Zeroizing<String>,
 }
 impl RepositoryContext {
@@ -196,11 +196,11 @@ impl RepositoryContext {
                 &settings.account_id,
                 &settings.root,
             ),
-            account: format!(
-                "webdav:{}:{}",
-                settings.endpoint.origin().ascii_serialization(),
-                settings.account_id
-            ),
+            account: super::super::quota::AccountKey::new(
+                PROVIDER_ID,
+                &settings.endpoint,
+                &settings.account_id,
+            )?,
             authorization: Zeroizing::new(format!(
                 "Basic {}",
                 STANDARD.encode(credentials.as_bytes())
@@ -260,6 +260,45 @@ fn members(request: &Url, entries: &[multistatus::Entry]) -> Result<Vec<Member>>
     }
     members.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(members)
+}
+
+fn strict_members(request: &Url, entries: &[multistatus::Entry]) -> Result<Vec<Member>> {
+    let collection = paths::decoded_segments(request)?;
+    let mut found = Vec::new();
+    for entry in entries {
+        let resolved = paths::resolve_href(request, &entry.href)
+            .ok_or_else(|| ProviderError::new(ErrorKind::PreconditionFailed))?;
+        let target = paths::decoded_segments(&resolved)?;
+        if target == collection {
+            continue;
+        }
+        let name = paths::direct_member(&collection, &target)
+            .ok_or_else(|| ProviderError::new(ErrorKind::PreconditionFailed))?;
+        found.push(member_of(entry, name));
+    }
+    found.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(found)
+}
+
+fn require_exact_collection(request: &Url, entries: &[multistatus::Entry]) -> Result<()> {
+    let target = paths::decoded_segments(request)?;
+    let mut matching = Vec::new();
+    for entry in entries {
+        let Some(resolved) = paths::resolve_href(request, &entry.href) else {
+            continue;
+        };
+        if paths::decoded_segments(&resolved)? == target {
+            matching.push(entry);
+        }
+    }
+    let mut matches = matching.into_iter();
+    let Some(entry) = matches.next() else {
+        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+    };
+    if !entry.collection || matches.next().is_some() {
+        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+    }
+    Ok(())
 }
 
 /// Only a strong entity tag becomes a version token. A weak tag or a missing
@@ -332,68 +371,27 @@ fn declared_checksum(sha256: &str) -> Option<Checksum> {
     })
 }
 
-fn capabilities(profile: Profile) -> Capabilities {
-    let mut evidence_urls = vec![
-        "https://www.rfc-editor.org/rfc/rfc4918.html".to_owned(),
-        "https://www.rfc-editor.org/rfc/rfc9110.html#section-13.1".to_owned(),
-        "https://www.rfc-editor.org/rfc/rfc3986.html#section-2.1".to_owned(),
-    ];
-    if profile == Profile::Koofr {
-        evidence_urls.push(
-            "https://koofr.eu/help/koofr_with_webdav/which-password-to-use-when-connecting-via-webdav/"
-                .to_owned(),
-        );
-        evidence_urls.push(
-            "https://koofr.eu/help/koofr_with_webdav/how-do-i-connect-a-service-to-koofr-through-webdav/"
-                .to_owned(),
-        );
-    }
+fn capabilities(_profile: Profile) -> Capabilities {
     Capabilities {
-        immutable_create: Evidence::Synthetic,
-        direct_complete_read: Evidence::Synthetic,
-        // A deployment that ignores the conditional headers must not get CAS,
-        // and an `ETag` header is no evidence that it honours them. Only
-        // `probe_conditional_writes` can raise these two.
-        atomic_create_head: Evidence::Unverified,
-        conditional_head_update: Evidence::Unverified,
-        stable_head_replace: Evidence::Synthetic,
-        head_read_after_write: Evidence::Synthetic,
-        head_retry_control: Evidence::Synthetic,
-        snapshot_discovery: Evidence::Synthetic,
-        // No cleanup evidence has been recorded for this service yet.
-        delete_objects: Evidence::Unverified,
-        gc_control_consistency: Evidence::Unverified,
-        delete_completion: Evidence::Unverified,
-        // One `PROPFIND Depth: 1` per listing page; DAV has no server paging.
-        discovery_extra_requests: 1,
+        immutable_create: true,
+        direct_complete_read: true,
+        // An ETag alone does not prove that this deployment honours a write
+        // precondition. Only the authenticated conditional-write probe can
+        // enable these operations for the connection.
+        atomic_create_head: false,
+        conditional_head_update: false,
+        stable_head_replace: true,
+        head_read_after_write: true,
+        head_retry_control: true,
+        snapshot_discovery: true,
+        lease_operations: true,
+        delete_objects: true,
         conditional_get: true,
         range: false,
         resumable_upload: false,
         max_stored_bytes: None,
         sdk_overhead_bytes: 0,
         upload_alignment: 1,
-        documented_at: Some(DOCUMENTED_AT.to_owned()),
-        evidence_urls,
-    }
-}
-
-/// No DAV method carries a documented weight, so one request costs one unit of
-/// the account's single bucket and no reset instant is known. Operations this
-/// adapter never issues cost nothing.
-fn request_cost_for(account: &str, operation: ProviderOperation) -> Vec<RequestCost> {
-    match operation {
-        ProviderOperation::DownloadUrl
-        | ProviderOperation::Range
-        | ProviderOperation::UploadSession
-        | ProviderOperation::UploadChunk
-        | ProviderOperation::CompleteUpload
-        | ProviderOperation::Authenticate => Vec::new(),
-        _ => vec![RequestCost {
-            bucket: REQUEST_BUCKET.to_owned(),
-            shared_account: account.to_owned(),
-            units: 1,
-            reset: QuotaReset::Unknown,
-        }],
     }
 }
 
@@ -428,6 +426,9 @@ impl WebdavProvider {
             "authorization".to_owned(),
             context.authorization.to_string(),
         );
+        if http::control_operation(operation) {
+            http::bypass_cache(&mut headers);
+        }
         HttpRequest {
             method,
             url,
@@ -435,18 +436,14 @@ impl WebdavProvider {
             body: None,
             content_length: None,
             operation,
-            costs: request_cost_for(&context.account, operation),
+            account: context.account.clone(),
+            api_request: true,
+            mybox_charge: None,
+            control: http::control_operation(operation),
         }
     }
     async fn send(&self, request: HttpRequest, cancel: &Cancellation) -> Result<HttpResponse> {
-        http::send(
-            self.dependencies.http.as_ref(),
-            self.dependencies.budget.as_ref(),
-            self.dependencies.clock.as_ref(),
-            request,
-            cancel,
-        )
-        .await
+        self.dependencies.send(request, cancel).await
     }
     /// WebDAV gives two statuses a meaning the shared classification does not
     /// carry: 409 is a missing ancestor collection, 423 a write lock another
@@ -535,6 +532,106 @@ impl WebdavProvider {
             return Ok(());
         }
         self.require(&response, &[200, 201])
+    }
+
+    async fn mkcol_new(
+        &self,
+        context: &RepositoryContext,
+        url: Url,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        let request = self.request(context, dav_method("MKCOL"), url, ProviderOperation::Create);
+        let response = self.send(request, cancel).await?;
+        if response.status == 405 {
+            return Err(common::error(ErrorKind::PreconditionFailed, 405));
+        }
+        self.require(&response, &[200, 201])
+    }
+
+    async fn create_missing_root(
+        &self,
+        context: &RepositoryContext,
+        root: &[String],
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        for depth in 1..=root.len() {
+            let url = paths::collection_url(&context.endpoint, &root[..depth]);
+            if depth == root.len() {
+                self.mkcol_new(context, url, cancel).await?;
+                continue;
+            }
+            match self.propfind(context, url.clone(), "0", cancel).await? {
+                Some(entries) => require_exact_collection(&url, &entries)?,
+                None => self.mkcol_new(context, url, cancel).await?,
+            }
+        }
+        Ok(())
+    }
+
+    async fn resume_layout(
+        &self,
+        context: &RepositoryContext,
+        root: &[String],
+        root_url: &Url,
+        listing: Option<Vec<multistatus::Entry>>,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        let mut found = BTreeSet::new();
+        match listing {
+            Some(entries) => {
+                require_exact_collection(root_url, &entries)?;
+                for member in strict_members(root_url, &entries)? {
+                    if !ROLE_FOLDERS.contains(&member.name.as_str())
+                        || !member.collection
+                        || !found.insert(member.name)
+                    {
+                        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+                    }
+                }
+            }
+            None => self.create_missing_root(context, root, cancel).await?,
+        }
+        for folder in ROLE_FOLDERS {
+            if !found.contains(folder) {
+                let url = paths::collection_url(&context.base, &[folder.to_owned()]);
+                self.mkcol_new(context, url, cancel).await?;
+            }
+        }
+        self.require_initial_contents(context, cancel).await
+    }
+
+    async fn require_initial_contents(
+        &self,
+        context: &RepositoryContext,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        for folder in ROLE_FOLDERS {
+            let url = paths::collection_url(&context.base, &[folder.to_owned()]);
+            let entries = self
+                .propfind(context, url.clone(), "1", cancel)
+                .await?
+                .ok_or_else(|| ProviderError::new(ErrorKind::PreconditionFailed))?;
+            require_exact_collection(&url, &entries)?;
+            let contents = strict_members(&url, &entries)?;
+            if folder != DESCRIPTOR_FOLDER {
+                if !contents.is_empty() {
+                    return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+                }
+                continue;
+            }
+            if contents.len() > 1 {
+                return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+            }
+            if let Some(descriptor) = contents.into_iter().next() {
+                if descriptor.collection
+                    || descriptor.content_length.is_none_or(|length| length == 0)
+                    || !paths::valid_segment(&descriptor.name)
+                {
+                    return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+                }
+            }
+        }
+        Ok(())
     }
     async fn create_layout(
         &self,
@@ -765,23 +862,24 @@ impl Provider for WebdavProvider {
                 (OpenMode::Create, listing) => {
                     let occupied = listing
                         .as_deref()
-                        .map(|entries| members(&root, entries))
+                        .map(|entries| strict_members(&root, entries))
                         .transpose()?
-                        .is_some_and(|members| {
-                            members.iter().any(|member| {
-                                member.name == HEAD_OBJECT || member.name == DESCRIPTOR_FOLDER
-                            })
-                        });
+                        .is_some_and(|members| !members.is_empty());
                     if occupied {
                         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
                     }
                     self.create_layout(&context, &settings.root, listing.is_none(), cancel)
                         .await?;
                 }
+                (OpenMode::ResumeCreate, listing) => {
+                    self.resume_layout(&context, &settings.root, &root, listing, cancel)
+                        .await?;
+                }
             }
             let handle = RepositoryHandle {
                 repository_id: repository_id(&context.identity),
                 connection_identity: context.identity.clone(),
+                account: context.account.clone(),
                 context: Box::new(context),
             };
             Ok((handle, capabilities(settings.profile)))
@@ -1084,14 +1182,4 @@ impl Provider for WebdavProvider {
         })
     }
 
-    fn request_cost(
-        &self,
-        repository: &RepositoryHandle,
-        operation: ProviderOperation,
-    ) -> Result<Vec<RequestCost>> {
-        Ok(request_cost_for(
-            &context_of(repository)?.account,
-            operation,
-        ))
-    }
 }

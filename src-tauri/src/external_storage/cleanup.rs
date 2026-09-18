@@ -16,7 +16,7 @@ use super::{
     reachability::{self, DocumentNode, DocumentSource, MarkRequest, RetiredPoint, Roots},
 };
 use risunest_external_storage_format::control::BundleSource;
-use std::{collections::{BTreeMap, BTreeSet}, path::Path};
+use std::{collections::{BTreeMap, BTreeSet}, path::Path, time::{Duration, Instant}};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CleanupLimits {
@@ -135,16 +135,25 @@ pub(crate) struct CleanupRequest<'a> {
     pub job_id: &'a str,
     /// Actual list, lease and synchronous delete support from the provider.
     pub cleanup_supported: bool,
+    /// A fresh, usable HTTP Date observation for this connection, collected no
+    /// earlier than the instant passed here. Another account cannot satisfy it.
+    pub connection_time: &'a (dyn Fn(Instant) -> Result<bool> + Sync),
     pub limits: CleanupLimits,
 }
 
 fn current_limit(
-    context: &LeaseContext<'_>, owner: &LeaseOwner, started: ClockReading, cancel: &Cancellation,
+    context: &LeaseContext<'_>, request: &CleanupRequest<'_>, time_not_before: Instant,
+    owner: &LeaseOwner, started: ClockReading, cancel: &Cancellation,
 ) -> Result<Option<StopReason>> {
     cancel.check()?;
     let now = context.clock.reading();
     if !now.foreground || now.epoch != started.epoch { return Ok(Some(StopReason::Lease)); }
-    if !now.trusted { return Ok(Some(StopReason::Clock)); }
+    let recent = Instant::now()
+        .checked_sub(Duration::from_millis(leases::RENEW_AFTER_MS))
+        .map_or(time_not_before, |recent| recent.max(time_not_before));
+    if !now.trusted || !(request.connection_time)(recent)? {
+        return Ok(Some(StopReason::Clock));
+    }
     if now.monotonic_ms.checked_sub(started.monotonic_ms)
         .is_none_or(|elapsed| elapsed >= leases::CLEANUP_RUN_LIMIT_MS)
     {
@@ -183,13 +192,11 @@ pub(crate) async fn run(
         return Err(ProviderError::new(ErrorKind::Unsupported));
     }
     context.descriptor.validate().map_err(|_| ProviderError::new(ErrorKind::Corrupt))?;
-    let started = context.clock.reading();
+    let initial = context.clock.reading();
     let refused = if !request.cleanup_supported || !context.protection_supported {
         Some(StopReason::Unsupported)
-    } else if !started.foreground {
+    } else if !initial.foreground {
         Some(StopReason::Lease)
-    } else if !started.trusted {
-        Some(StopReason::Clock)
     } else {
         None
     };
@@ -200,6 +207,7 @@ pub(crate) async fn run(
         record(context, &outcome)?;
         return Ok(outcome);
     }
+    let time_not_before = Instant::now();
     let owner = match leases::admit(context, request.job_id, LeaseKind::Cleanup, cancel).await? {
         Admission::Admitted(owner) => owner,
         Admission::Yield { .. } => {
@@ -213,9 +221,23 @@ pub(crate) async fn run(
             return Ok(outcome);
         }
     };
+    let started = context.clock.reading();
+    let connection_time = match (request.connection_time)(time_not_before) {
+        Ok(available) => available,
+        Err(error) => {
+            owner.release_all(context).await;
+            return Err(error);
+        }
+    };
+    if !started.trusted || !connection_time {
+        owner.release_all(context).await;
+        let outcome = CleanupOutcome::stopped(StopReason::Clock);
+        record(context, &outcome)?;
+        return Ok(outcome);
+    }
     let mut outcome = CleanupOutcome::stopped(StopReason::Uncertain);
     let result = owner.run(context, cancel, run_owned(
-        context, request, &owner, started, view, source, cancel, &mut outcome,
+        context, request, time_not_before, &owner, started, view, source, cancel, &mut outcome,
     )).await;
     let bookkeeping = (|| {
         if result.is_err() || !matches!(outcome.stop_reason, StopReason::Complete | StopReason::Limit) {
@@ -231,11 +253,11 @@ pub(crate) async fn run(
 }
 
 async fn run_owned(
-    context: &LeaseContext<'_>, request: &CleanupRequest<'_>, owner: &LeaseOwner,
-    started: ClockReading, view: &dyn RepositoryView, source: &dyn DocumentSource,
+    context: &LeaseContext<'_>, request: &CleanupRequest<'_>, time_not_before: Instant,
+    owner: &LeaseOwner, started: ClockReading, view: &dyn RepositoryView, source: &dyn DocumentSource,
     cancel: &Cancellation, outcome: &mut CleanupOutcome,
 ) -> Result<()> {
-    if let Some(reason) = current_limit(context, owner, started, cancel)? {
+    if let Some(reason) = current_limit(context, request, time_not_before, owner, started, cancel)? {
         outcome.stop_reason = reason;
         return Ok(());
     }
@@ -253,7 +275,7 @@ async fn run_owned(
         },
         listed, known_objects: view.known_objects()?, retired_points: before.retired_points.clone(),
     }, cancel).await?;
-    if let Some(reason) = current_limit(context, owner, started, cancel)? {
+    if let Some(reason) = current_limit(context, request, time_not_before, owner, started, cancel)? {
         outcome.stop_reason = reason;
         return Ok(());
     }
@@ -268,7 +290,7 @@ async fn run_owned(
     outcome.stop_reason = StopReason::Complete;
     let mut sent = 0;
     'batches: for batch in marked.candidates.chunks(request.limits.batch) {
-        if let Some(reason) = current_limit(context, owner, started, cancel)? {
+        if let Some(reason) = current_limit(context, request, time_not_before, owner, started, cancel)? {
             outcome.stop_reason = reason;
             break;
         }
@@ -282,7 +304,7 @@ async fn run_owned(
                 outcome.stop_reason = StopReason::Limit;
                 break 'batches;
             }
-            if let Some(reason) = current_limit(context, owner, started, cancel)? {
+            if let Some(reason) = current_limit(context, request, time_not_before, owner, started, cancel)? {
                 outcome.stop_reason = reason;
                 break 'batches;
             }
@@ -298,7 +320,7 @@ async fn run_owned(
                 return Err(ProviderError::new(ErrorKind::Corrupt));
             }
             // Probing can take time or suspend. Check again at the dispatch boundary.
-            if let Some(reason) = current_limit(context, owner, started, cancel)? {
+            if let Some(reason) = current_limit(context, request, time_not_before, owner, started, cancel)? {
                 outcome.stop_reason = reason;
                 break 'batches;
             }
@@ -337,11 +359,11 @@ async fn run_owned(
         }
     }
     if matches!(outcome.stop_reason, StopReason::Complete | StopReason::Limit) {
-        if let Some(reason) = current_limit(context, owner, started, cancel)? {
+        if let Some(reason) = current_limit(context, request, time_not_before, owner, started, cancel)? {
             outcome.stop_reason = reason;
         } else if let Some(reason) = recheck(context, owner, view, &before, &jobs, cancel).await? {
             outcome.stop_reason = reason;
-        } else if let Some(reason) = current_limit(context, owner, started, cancel)? {
+        } else if let Some(reason) = current_limit(context, request, time_not_before, owner, started, cancel)? {
             outcome.stop_reason = reason;
         } else {
             let store = GcStore::open(context.root)?;
@@ -536,6 +558,14 @@ impl DocumentSource for ConnectedDocuments<'_> {
             if object.repository_id != self.connected.stored.descriptor.repository_id {
                 return Err(ProviderError::new(ErrorKind::Corrupt));
             }
+            std::fs::create_dir_all(self.scratch)
+                .map_err(|_| ProviderError::new(ErrorKind::Transient))?;
+            if crate::trust_boundary::is_link_like(
+                &std::fs::symlink_metadata(self.scratch)
+                    .map_err(|_| ProviderError::new(ErrorKind::Transient))?,
+            ) {
+                return Err(ProviderError::new(ErrorKind::Corrupt));
+            }
             let intent = ObjectIntent {
                 repository_id: self.connected.handle.repository_id.clone(), job_id: "cleanup-probe".into(),
                 object_id: object.object_id.clone(), role: object.role,
@@ -562,6 +592,8 @@ mod tests {
     use std::sync::{atomic::{AtomicUsize, Ordering}, Mutex};
 
     const NOW: u64 = 1000 * 24 * 60 * leases::MINUTE_MS;
+    fn available_time(_: Instant) -> Result<bool> { Ok(true) }
+    fn unavailable_time(_: Instant) -> Result<bool> { Ok(false) }
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
     }
@@ -663,7 +695,8 @@ mod tests {
         }
         async fn run(&self) -> Result<CleanupOutcome> {
             run(&self.context(), &CleanupRequest {
-                job_id: "cleanup", cleanup_supported: true, limits: CleanupLimits { batch: 1, per_run: 200 },
+                job_id: "cleanup", cleanup_supported: true, connection_time: &available_time,
+                limits: CleanupLimits { batch: 1, per_run: 200 },
             }, &self.view, &self.probes(0), &Cancellation::default()).await
         }
         async fn age(&self) {
@@ -687,18 +720,66 @@ mod tests {
         });
     }
     #[test]
-    fn c_unsupported_or_untrusted_cleanup_sends_no_remote_requests() {
+    fn c_unsupported_sends_no_requests_and_untrusted_time_sends_no_delete() {
         runtime().block_on(async {
             let h = Harness::new();
             h.clock.set_trusted(false);
             assert_eq!(h.run().await.unwrap().stop_reason, StopReason::Clock);
-            h.clock.set_trusted(true);
+            assert!(h.payload_deletes().is_empty());
+            let h = Harness::new();
             let result = run(&h.context(), &CleanupRequest {
-                job_id: "cleanup", cleanup_supported: false, limits: CleanupLimits::default(),
+                job_id: "cleanup", cleanup_supported: false, connection_time: &available_time,
+                limits: CleanupLimits::default(),
             }, &h.view, &h.probes(0), &Cancellation::default()).await.unwrap();
             assert_eq!(result.stop_reason, StopReason::Unsupported);
             assert_eq!(h.provider.listing_count(), 0);
             assert!(h.provider.deletion_order().is_empty());
+        });
+    }
+    #[test]
+    fn c_connection_time_cannot_be_borrowed_and_a_later_unusable_sample_blocks_delete() {
+        runtime().block_on(async {
+            // The process clock represents another account's recent usable
+            // response. This connection still has no qualifying observation.
+            let h = Harness::new();
+            let result = run(&h.context(), &CleanupRequest {
+                job_id: "cleanup", cleanup_supported: true,
+                connection_time: &unavailable_time, limits: CleanupLimits::default(),
+            }, &h.view, &h.probes(0), &Cancellation::default()).await.unwrap();
+            assert_eq!(result.stop_reason, StopReason::Clock);
+            assert!(h.payload_deletes().is_empty());
+
+            // A usable observation may age candidates, but an unusable latest
+            // observation for that connection cannot authorize the next run.
+            let h = Harness::new();
+            let usable = AtomicUsize::new(1);
+            let evidence = |_: Instant| Ok(usable.load(Ordering::SeqCst) == 1);
+            let request = CleanupRequest {
+                job_id: "cleanup", cleanup_supported: true,
+                connection_time: &evidence, limits: CleanupLimits::default(),
+            };
+            assert_eq!(run(
+                &h.context(), &request, &h.view, &h.probes(0), &Cancellation::default(),
+            ).await.unwrap().deleted_objects, 0);
+            h.clock.advance(leases::UNREACHABLE_GRACE_MS);
+            usable.store(0, Ordering::SeqCst);
+            assert_eq!(run(
+                &h.context(), &request, &h.view, &h.probes(0), &Cancellation::default(),
+            ).await.unwrap().stop_reason, StopReason::Clock);
+            assert!(h.payload_deletes().is_empty());
+
+            // If a later request replaces the usable sample while the survey
+            // runs, the next safety checkpoint discards the delete decision.
+            let h = Harness::new();
+            h.age().await;
+            let checks = AtomicUsize::new(0);
+            let evidence = |_: Instant| Ok(checks.fetch_add(1, Ordering::SeqCst) < 2);
+            let result = run(&h.context(), &CleanupRequest {
+                job_id: "cleanup", cleanup_supported: true,
+                connection_time: &evidence, limits: CleanupLimits::default(),
+            }, &h.view, &h.probes(0), &Cancellation::default()).await.unwrap();
+            assert_eq!(result.stop_reason, StopReason::Clock);
+            assert!(h.payload_deletes().is_empty());
         });
     }
     #[test]
@@ -719,7 +800,8 @@ mod tests {
             let h = Harness::new();
             h.age().await;
             let result = run(&h.context(), &CleanupRequest {
-                job_id: "cleanup", cleanup_supported: true, limits: CleanupLimits::default(),
+                job_id: "cleanup", cleanup_supported: true, connection_time: &available_time,
+                limits: CleanupLimits::default(),
             }, &h.view, &h.probes(leases::CLEANUP_RUN_LIMIT_MS), &Cancellation::default()).await.unwrap();
             assert_eq!(result.stop_reason, StopReason::Budget);
             assert!(h.payload_deletes().is_empty());
@@ -801,7 +883,8 @@ mod tests {
             let h = Harness::new();
             h.age().await;
             let result = run(&h.context(), &CleanupRequest {
-                job_id: "cleanup", cleanup_supported: true, limits: CleanupLimits { batch: 1, per_run: 1 },
+                job_id: "cleanup", cleanup_supported: true, connection_time: &available_time,
+                limits: CleanupLimits { batch: 1, per_run: 1 },
             }, &h.view, &h.probes(0), &Cancellation::default()).await.unwrap();
             assert_eq!(result.stop_reason, StopReason::Limit);
             assert_eq!(result.deleted_objects, 1);

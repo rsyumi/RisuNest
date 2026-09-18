@@ -3,7 +3,6 @@ use super::{
     connection_commands::ConnectedRepository,
     connection_store::ConnectionStore,
     contract::*,
-    gc_store::GcStore,
     job_store::{DurableJob, JobCommandState, JobKind, JobStore, Session, StartJobRequest},
     leases,
     publication::ExecutionSession,
@@ -16,7 +15,7 @@ use crate::persistent_store::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{collections::BTreeSet, path::PathBuf};
+use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
 pub(crate) fn now_ms() -> u64 {
@@ -117,6 +116,7 @@ pub(crate) fn external_storage_set_execution_session(
         kind: request.kind,
         id: request.id,
     };
+    leases::set_system_foreground(!hidden);
     if hidden {
         state.automatic_targets.lock().map_err(local_error)?.clear();
         for (_, cancel) in state.active.lock().map_err(local_error)?.values() {
@@ -663,112 +663,23 @@ fn lease_context<'a>(
         root_key: &connected.root_key,
         provider: connected.provider.as_ref(),
         repository: &connected.handle,
+        clock: leases::system_clock(),
+        protection_supported: connected.stored.capabilities.lease_operations,
     }
 }
 
-/// Resolves what an interrupted run left, confirms this job's lease and stops
-/// while another device is removing objects. A repository that cannot remove
-/// anything has nothing to announce and nothing to wait for.
-pub(crate) async fn admit_repository(
-    root: &std::path::Path,
-    connected: &ConnectedRepository,
-    writer_id: &str,
-    job_id: &str,
-    kind: LeaseKind,
-    live: &BTreeSet<String>,
-    cancel: &Cancellation,
-) -> Result<()> {
-    if connected.stored.capabilities.require_cleanup().is_err() {
-        return Ok(());
-    }
-    let context = lease_context(root, connected, writer_id);
-    leases::resume(&context, live, cancel).await?;
-    match leases::admit(&context, job_id, kind, now_ms(), cancel).await? {
-        leases::Admission::Admitted(_) => Ok(()),
-        leases::Admission::Blocked { .. } => Err(ProviderError::new(ErrorKind::Transient)),
-    }
+pub(crate) struct RepositoryProtection<'a> {
+    owner: &'a leases::LeaseOwner,
+    context: &'a leases::LeaseContext<'a>,
 }
-
-/// Hands back the leases of one job. A removal marker is not one of them: it
-/// outlives the job until every request it stands for is known to have ended.
-pub(crate) async fn release_repository(
-    root: &std::path::Path,
-    connected: &ConnectedRepository,
-    writer_id: &str,
-    job_id: &str,
-) -> Result<()> {
-    leases::release(&lease_context(root, connected, writer_id), job_id).await
-}
-
-/// What every job does before it asks the repository for data.
-pub(crate) async fn enter_repository(
-    app: &AppHandle,
-    connected: &ConnectedRepository,
-    job: &DurableJob,
-    cancel: &Cancellation,
-) -> Result<()> {
-    let root = root(app)?;
-    let writer_id = native_store(app)?
-        .external_identity()
-        .map_err(local_error)?
-        .store_id;
-    let live: BTreeSet<String> = JobStore::open(&root)?
-        .list_pending()?
-        .into_iter()
-        .filter(|item| item.request.connection_id == job.request.connection_id)
-        .map(|item| item.id)
-        .collect();
-    let kind = match job.request.kind {
-        JobKind::Cleanup => LeaseKind::Cleanup,
-        _ => LeaseKind::Work,
-    };
-    admit_repository(
-        &root, connected, &writer_id, &job.id, kind, &live, cancel,
-    )
-    .await
-}
-
-/// Hands back the leases of a job that reached an end. A job that is waiting,
-/// uncertain or still running keeps them, and so does a cancelled one whose
-/// remote requests have not been seen to end.
-async fn leave_repository(app: &AppHandle, connection_id: &str, job_id: &str) -> Result<()> {
-    let root = root(app)?;
-    if GcStore::open(&root)?
-        .lease_intents(connection_id)?
-        .iter()
-        .all(|row| row.job_id != job_id)
-    {
-        return Ok(());
-    }
-    let connected = super::connection_commands::open_connected(app, connection_id).await?;
-    let writer_id = native_store(app)?
-        .external_identity()
-        .map_err(local_error)?
-        .store_id;
-    release_repository(&root, &connected, &writer_id, job_id).await
-}
-
-/// The release for the sites that end a job without an asynchronous context.
-/// A failure leaves the lease for the next run on this connection to resolve.
-pub(crate) fn release_leases(app: &AppHandle, job: &DurableJob) {
-    if !job.terminal() {
-        return;
-    }
-    let Ok((_, claim)) = app.state::<JobCommandState>().claim(job) else {
-        return;
-    };
-    let app = app.clone();
-    let connection_id = job.request.connection_id.clone();
-    let job_id = job.id.clone();
-    tauri::async_runtime::spawn(async move {
-        if let Err(error) = leave_repository(&app, &connection_id, &job_id).await {
-            crate::nlog!(
-                "error",
-                "External storage lease could not be released: {error}"
-            );
+impl RepositoryProtection<'_> {
+    pub(crate) async fn recheck(&self, cancel: &Cancellation) -> Result<()> {
+        self.owner.check_control(self.context, false)?;
+        if self.owner.recheck(self.context, cancel).await?.is_some() {
+            return Err(ProviderError::new(ErrorKind::Transient));
         }
-        drop(claim);
-    });
+        self.owner.check_control(self.context, false)
+    }
 }
 pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
     let job = JobStore::open(&root(&app)?)?.read(&id)?;
@@ -777,7 +688,6 @@ pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
     }
     read_job_session(&app, &id)?;
     let (cancel, claim) = app.state::<JobCommandState>().claim(&job)?;
-    let connection_id = job.request.connection_id.clone();
     tauri::async_runtime::spawn(async move {
         let result = match run_job(&app, &id, &cancel).await {
             Err(error) => {
@@ -795,7 +705,7 @@ pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
         };
         let confirmed = result.as_ref().ok().and_then(completed_revision);
         let cancelled = cancel.check().is_err();
-        let persisted = (|| -> Result<bool> {
+        let persisted = (|| -> Result<()> {
             let store = JobStore::open(&root(&app)?)?;
             let mut job = store.read(&id)?;
             match result {
@@ -906,23 +816,31 @@ pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
             }
             job.summary["updatedAtMs"] = json!(now_ms().to_string());
             store.put(&job)?;
-            Ok(job.terminal())
+            Ok(())
         })();
-        match persisted {
-            // The outcome is durable before the lease goes, so a loss here
-            // leaves a lease the next run on this connection resolves.
-            Ok(true) => {
-                if let Err(error) = leave_repository(&app, &connection_id, &id).await {
-                    crate::nlog!(
-                        "error",
-                        "External storage lease could not be released: {error}"
-                    );
-                }
-            }
-            Ok(false) => {}
-            Err(_) => crate::nlog!("error", "External job outcome could not be persisted"),
+        let outcome_persisted = persisted.is_ok();
+        if !outcome_persisted {
+            crate::nlog!("error", "External job outcome could not be persisted");
         }
         drop(claim);
+        if outcome_persisted {
+            let cleaned = (|| -> Result<()> {
+                let root = root(&app)?;
+                let connection = ConnectionStore::open(&root)?.read(&job.request.connection_id)?;
+                let directory = job_directory(&root, &job.request.connection_id, &job.id);
+                let mut pds = native_store(&app)?;
+                super::journal::TransferJournal::cleanup_terminal_spools_at(
+                    &directory,
+                    &job.id,
+                    &mut pds,
+                    &connection.descriptor.repository_id,
+                )?;
+                Ok(())
+            })();
+            if let Err(error) = cleaned {
+                crate::nlog!("error", "External terminal spool cleanup failed: {error}");
+            }
+        }
         if let Some(revision) = confirmed.filter(|_| !cancelled) {
             if let Err(error) = start_queued_automatic(&app, &job, revision) {
                 crate::nlog!("error", "External follow-up sync could not start: {error}");
@@ -1089,11 +1007,41 @@ async fn run_job(app: &AppHandle, id: &str, cancel: &Cancellation) -> Result<Val
     let connected =
         super::connection_commands::open_connected(app, &job.request.connection_id).await?;
     cancel.check()?;
-    enter_repository(app, &connected, &job, cancel).await?;
     match job.request.kind {
-        JobKind::Backup => run_backup(app, &connected, &job, cancel).await,
-        JobKind::Sync | JobKind::ResolveConflict => {
-            super::sync_engine::run_sync(app, &connected, &job, cancel).await
+        JobKind::Backup | JobKind::Sync | JobKind::ResolveConflict => {
+            let root = root(app)?;
+            let writer_id = native_store(app)?
+                .external_identity()
+                .map_err(local_error)?
+                .store_id;
+            let context = lease_context(&root, &connected, &writer_id);
+            match leases::admit(&context, &job.id, LeaseKind::Work, cancel).await? {
+                leases::Admission::Admitted(owner) => {
+                    let protection = RepositoryProtection { owner: &owner, context: &context };
+                    owner.run(&context, cancel, async {
+                        match job.request.kind {
+                            JobKind::Backup => {
+                                run_backup(app, &connected, &job, Some(&protection), cancel).await
+                            }
+                            JobKind::Sync | JobKind::ResolveConflict => {
+                                super::sync_engine::run_sync(
+                                    app, &connected, &job, Some(&protection), cancel,
+                                ).await
+                            }
+                            _ => unreachable!(),
+                        }
+                    }).await
+                }
+                leases::Admission::Yield { .. } => {
+                    Err(ProviderError::new(ErrorKind::Transient))
+                }
+                leases::Admission::UnsupportedProtection if job.request.kind == JobKind::Backup => {
+                    run_backup(app, &connected, &job, None, cancel).await
+                }
+                leases::Admission::UnsupportedProtection => {
+                    Err(ProviderError::new(ErrorKind::Unsupported))
+                }
+            }
         }
         JobKind::Restore => {
             super::runtime_restore::run_restore(app, &connected, &job, cancel).await
@@ -1119,7 +1067,7 @@ async fn run_cleanup(
         .external_identity()
         .map_err(local_error)?
         .store_id;
-    let unfinished = JobStore::open(&root)?
+    let mut unfinished = JobStore::open(&root)?
         .list_pending()?
         .into_iter()
         .filter(|item| item.request.connection_id == job.request.connection_id && item.id != job.id)
@@ -1132,11 +1080,50 @@ async fn run_cleanup(
                 .flatten()
                 .collect(),
             job_id: item.id,
+            references: Vec::new(),
         })
-        .collect();
+        .collect::<Vec<_>>();
+    for conflict in native_store(app)?
+        .external_conflicts(&job.request.connection_id)
+        .map_err(local_error)?
+    {
+        let mut references = Vec::new();
+        for encoded in [conflict.local_snapshot, conflict.remote_snapshot]
+            .into_iter()
+            .flatten()
+        {
+            let reference: super::packaging::RemoteObject =
+                serde_json::from_str(&encoded).map_err(local_error)?;
+            if reference.repository_id != connected.stored.descriptor.repository_id {
+                return Err(ProviderError::new(ErrorKind::Corrupt));
+            }
+            reference.stored(&connected.handle)?;
+            references.push(reference);
+        }
+        if references.is_empty() {
+            continue;
+        }
+        if let Some(owner) = unfinished.iter_mut().find(|owner| owner.job_id == conflict.id) {
+            owner.references.extend(references);
+        } else {
+            unfinished.push(super::cleanup::UnfinishedJob {
+                directory: job_directory(&root, &job.request.connection_id, &conflict.id),
+                snapshot_ids: std::collections::BTreeSet::new(),
+                job_id: conflict.id,
+                references,
+            });
+        }
+    }
     // One reading of the clock: the retention decision and the grace window
     // are measured against the same moment.
     let started = now_ms();
+    let cleanup_directory = job_directory(&root, &job.request.connection_id, &job.id);
+    let cache_root = cleanup_directory
+        .parent()
+        .and_then(|path| path.parent())
+        .ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))?
+        .join("package-cache");
+    let scratch = cleanup_directory.join("cleanup-probe");
     let view = super::cleanup::ConnectedRepositoryView {
         connected,
         writer_id: &writer_id,
@@ -1146,15 +1133,21 @@ async fn run_cleanup(
             .unwrap_or(super::connection::RetentionPolicy::DEFAULT),
         now_ms: started,
         unfinished,
+        cache_root: &cache_root,
     };
-    let documents = super::cleanup::ConnectedDocuments { connected, cancel };
+    let documents = super::cleanup::ConnectedDocuments { connected, cancel, scratch: &scratch };
+    let connection_time = |not_before| {
+        Ok(connected.dependencies.requests
+            .clock_sample_after(&connected.handle.account, not_before)?
+            .is_some())
+    };
     let outcome = super::cleanup::run(
         &lease_context(&root, connected, &writer_id),
         &super::cleanup::CleanupRequest {
             job_id: &job.id,
-            capabilities: &connected.stored.capabilities,
+            cleanup_supported: connected.stored.capabilities.cleanup_supported(),
             limits: super::cleanup::CleanupLimits::default(),
-            now_ms: started,
+            connection_time: &connection_time,
         },
         &view,
         &documents,
@@ -1167,6 +1160,7 @@ async fn run_backup(
     app: &AppHandle,
     connected: &super::connection_commands::ConnectedRepository,
     job: &DurableJob,
+    protection: Option<&RepositoryProtection<'_>>,
     cancel: &Cancellation,
 ) -> Result<Value> {
     use super::{
@@ -1315,6 +1309,20 @@ async fn run_backup(
         cancel,
     )
     .await?;
+    match super::packaging::verify_publication(
+        &completed,
+        &cache,
+        &mut journal,
+        &connected.root_key,
+        connected.provider.as_ref(),
+        &connected.handle,
+        cancel,
+    ).await? {
+        super::packaging::PublicationReadiness::Verified => {}
+        super::packaging::PublicationReadiness::Repackage => {
+            return Err(ProviderError::new(ErrorKind::Transient));
+        }
+    }
     let kind = if job.request.reason.as_deref() == Some("automatic") {
         BackupPointKind::Automatic
     } else {
@@ -1330,6 +1338,9 @@ async fn run_backup(
             .ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))?,
         completed.reference.clone(),
     )?;
+    if let Some(protection) = protection {
+        protection.recheck(cancel).await?;
+    }
     let point = super::control::upload_backup_point(
         &connected.stored.descriptor,
         &connected.root_key,
@@ -1376,26 +1387,23 @@ pub(crate) async fn external_storage_get_quota(
     let connected = super::connection_commands::open_connected(&app, &connection_id).await?;
     let root = root(&app)?;
     let budget = super::connection_commands::budget(&app)?;
-    let summaries = super::quota_profiles::configure_connection_budget(
+    let summaries = super::quota_profiles::connection_usage(
         &budget,
-        &connected.stored.config.provider,
-        connected.stored.config.profile.as_deref(),
-        connected.provider.as_ref(),
-        &connected.handle,
-        &[],
+        &connected.stored.config,
         now_ms(),
     )?;
     let buckets = summaries
         .into_iter()
         .map(|bucket| {
-            let mut value =
-                json!({"id":bucket.bucket,"used":bucket.used.to_string(),"unit":"requests"});
-            if let Some(limit) = bucket.limit {
-                value["limit"] = json!(limit.to_string());
-                value["remaining"] = json!(limit.saturating_sub(bucket.used).to_string());
-            }
-            if let QuotaReset::At { unix_ms } = bucket.reset {
-                value["resetAtMs"] = json!(unix_ms.to_string());
+            let mut value = json!({
+                "id":bucket.id,
+                "used":bucket.used.to_string(),
+                "limit":bucket.limit.to_string(),
+                "unit":"requests",
+                "localEstimate":bucket.local_estimate,
+            });
+            if let Some(reset_at_ms) = bucket.reset_at_ms {
+                value["resetAtMs"] = json!(reset_at_ms.to_string());
             }
             value
         })
@@ -1432,238 +1440,6 @@ pub(crate) async fn external_storage_get_quota(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::external_storage::capabilities::Capabilities;
-
-    /// A repository this device can reach without an application handle, which
-    /// is what the admission and release steps actually need.
-    fn connected(
-        provider: std::sync::Arc<super::super::fake::FakeProvider>,
-        capabilities: Capabilities,
-    ) -> ConnectedRepository {
-        let test = super::super::fake::loopback_dependencies(
-            super::super::fake::MemoryVault::default(),
-            1_000,
-        );
-        ConnectedRepository {
-            stored: super::super::connection_store::StoredConnection {
-                id: "connection".into(),
-                config: ConnectionConfig {
-                    provider: "synthetic".into(),
-                    profile: None,
-                    endpoint: "https://synthetic.invalid".into(),
-                    account_id: "account".into(),
-                    location: std::collections::BTreeMap::new(),
-                    oauth_profile: None,
-                },
-                descriptor: risunest_external_storage_format::format::Descriptor::new(
-                    "synthetic-descriptor".into(),
-                    Some(PublicationStrategy::Cas),
-                )
-                .unwrap(),
-                descriptor_locator: RemoteLocator {
-                    connection_identity: super::super::fake::repository().connection_identity,
-                    collection: None,
-                    object: "descriptor".into(),
-                },
-                provider_repository_id: super::super::fake::repository().repository_id,
-                credential_ref: "credential".into(),
-                root_key_ref: "key".into(),
-                capture_policy: None,
-                retention_policy: None,
-                capabilities,
-                created_at_ms: 1_000,
-            },
-            provider,
-            handle: super::super::fake::repository(),
-            dependencies: test.dependencies,
-            root_key: zeroize::Zeroizing::new([7; 32]),
-        }
-    }
-
-    fn lease_names(provider: &super::super::fake::FakeProvider) -> Vec<String> {
-        provider
-            .state
-            .lock()
-            .unwrap()
-            .objects
-            .keys()
-            .filter(|name| {
-                super::super::contract::parse_lease_object_id(name).is_ok()
-            })
-            .cloned()
-            .collect()
-    }
-
-    /// Invariants GC19 and GC29. Every job announces itself before it asks for
-    /// data, waits while another device is removing, and hands the lease back
-    /// when it ends. A repository without the removal evidence announces
-    /// nothing and waits for nothing.
-    #[test]
-    fn admission_places_a_lease_waits_for_a_marker_and_gives_the_lease_back() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        let provider = std::sync::Arc::new(super::super::fake::FakeProvider::new(true));
-        let connected = connected(provider.clone(), super::super::fake::capabilities(true));
-        let cancel = Cancellation::default();
-        let live = BTreeSet::from(["job".to_owned()]);
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                admit_repository(
-                    root,
-                    &connected,
-                    "writer",
-                    "job",
-                    LeaseKind::Work,
-                    &live,
-                    &cancel,
-                )
-                .await
-                .unwrap();
-                let placed = lease_names(&provider);
-                assert_eq!(placed.len(), 1);
-                assert!(placed[0].starts_with("work-"));
-
-                // Another device's removal marker keeps this job out until it
-                // goes, and this job's own lease stays in place while it waits.
-                provider.seed(
-                    &super::super::contract::lease_object_id(
-                        LeaseKind::Deleting,
-                        &"a".repeat(32),
-                    )
-                    .unwrap(),
-                    ObjectRole::Lease,
-                    b"foreign".to_vec(),
-                );
-                let waiting = admit_repository(
-                    root,
-                    &connected,
-                    "writer",
-                    "job",
-                    LeaseKind::Work,
-                    &live,
-                    &cancel,
-                )
-                .await
-                .unwrap_err();
-                assert_eq!(waiting.kind, ErrorKind::Transient);
-                assert_eq!(
-                    lease_names(&provider)
-                        .iter()
-                        .filter(|name| name.starts_with("work-"))
-                        .count(),
-                    1
-                );
-
-                release_repository(root, &connected, "writer", "job")
-                    .await
-                    .unwrap();
-                assert!(lease_names(&provider)
-                    .iter()
-                    .all(|name| name.starts_with("deleting-")));
-            });
-    }
-
-    /// A cleanup announces itself as one, so another device can tell it from a
-    /// publication.
-    #[test]
-    fn a_cleanup_announces_itself_with_its_own_lease_kind() {
-        let directory = tempfile::tempdir().unwrap();
-        let provider = std::sync::Arc::new(super::super::fake::FakeProvider::new(true));
-        let connected = connected(provider.clone(), super::super::fake::capabilities(true));
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                admit_repository(
-                    directory.path(),
-                    &connected,
-                    "writer",
-                    "cleanup-job",
-                    LeaseKind::Cleanup,
-                    &BTreeSet::from(["cleanup-job".to_owned()]),
-                    &Cancellation::default(),
-                )
-                .await
-                .unwrap();
-            });
-        let placed = lease_names(&provider);
-        assert_eq!(placed.len(), 1);
-        assert!(placed[0].starts_with("cleanup-"));
-    }
-
-    /// Invariant GC17. A repository without the removal evidence announces
-    /// nothing, so no lease is placed and nothing waits.
-    #[test]
-    fn a_repository_without_removal_evidence_announces_nothing() {
-        let directory = tempfile::tempdir().unwrap();
-        let provider = std::sync::Arc::new(super::super::fake::FakeProvider::new(true));
-        let connected = connected(
-            provider.clone(),
-            super::super::fake::capabilities_without_cleanup(true),
-        );
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                admit_repository(
-                    directory.path(),
-                    &connected,
-                    "writer",
-                    "job",
-                    LeaseKind::Work,
-                    &BTreeSet::new(),
-                    &Cancellation::default(),
-                )
-                .await
-                .unwrap();
-            });
-        assert!(lease_names(&provider).is_empty());
-    }
-
-    /// The lease of a job an interrupted run left behind is given back before
-    /// this device announces anything new.
-    #[test]
-    fn admission_gives_back_the_lease_of_a_job_that_is_no_longer_live() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        let provider = std::sync::Arc::new(super::super::fake::FakeProvider::new(true));
-        let connected = connected(provider.clone(), super::super::fake::capabilities(true));
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                admit_repository(
-                    root,
-                    &connected,
-                    "writer",
-                    "interrupted",
-                    LeaseKind::Work,
-                    &BTreeSet::from(["interrupted".to_owned()]),
-                    &Cancellation::default(),
-                )
-                .await
-                .unwrap();
-                assert_eq!(lease_names(&provider).len(), 1);
-                admit_repository(
-                    root,
-                    &connected,
-                    "writer",
-                    "next",
-                    LeaseKind::Work,
-                    &BTreeSet::from(["next".to_owned()]),
-                    &Cancellation::default(),
-                )
-                .await
-                .unwrap();
-            });
-        assert_eq!(lease_names(&provider).len(), 1);
-    }
     #[test]
     fn a_new_restore_or_conflict_choice_never_resumes_a_different_pending_request() {
         let existing: StartJobRequest = serde_json::from_value(json!({"connectionId":"x", "kind":"restore", "snapshotId":"a", "restoreAreas":["library"]})).unwrap();
@@ -1712,7 +1488,10 @@ mod tests {
         let prepared = store.prepare_replace_commit(&stage.staging_id, Some(0)).unwrap();
         store.finish_external_receive(prepared, &job.id).unwrap();
         job.request.kind = JobKind::ResolveConflict;
-        let injector = rusqlite::Connection::open(directory.path().join("persistent.sqlite")).unwrap();
+        let injector = rusqlite::Connection::open(
+            directory.path().join("persistent/persistent.sqlite"),
+        )
+        .unwrap();
         injector.execute_batch(
             "ALTER TABLE external_storage_conflicts RENAME TO synthetic_unavailable_conflicts"
         ).unwrap();
@@ -1729,7 +1508,10 @@ mod tests {
     #[test]
     fn stopped_publication_is_unknown_regardless_of_cached_summary() {
         let (directory, mut store, original) = receive_job_fixture();
-        let injector = rusqlite::Connection::open(directory.path().join("persistent.sqlite")).unwrap();
+        let injector = rusqlite::Connection::open(
+            directory.path().join("persistent/persistent.sqlite"),
+        )
+        .unwrap();
         for cached in ["queued", "running", "waiting", "succeeded", "failed", "cancelled"] {
             injector.execute(
                 "UPDATE external_storage_jobs SET role='sync',strategy='cas',phase='publishing' WHERE id=?1",

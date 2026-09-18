@@ -4,17 +4,18 @@
 use super::{
     auth::{self, CachedToken},
     config::{self, Settings, Space},
-    wire::{self, About, AccountScope, DriveFile, FileList, GeneratedIds},
+    wire::{self, About, DriveFile, FileList, GeneratedIds},
 };
 use crate::external_storage::{
     auth::SecretBytes,
-    capabilities::{Capabilities, Evidence},
+    capabilities::Capabilities,
     contract::*,
     http::{self, HttpRequest, HttpResponse},
     providers::{common, Dependencies},
+    quota::AccountKey,
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     pin::Pin,
     sync::{Arc, Mutex},
 };
@@ -31,7 +32,7 @@ const DESCRIPTOR_ROLE: &str = "descriptor";
 const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 const OCTET_STREAM: &str = "application/octet-stream";
 const FILE_FIELDS: &str = "id,size,version,sha256Checksum,appProperties";
-const LIST_FIELDS: &str = "nextPageToken,files(id,size,version,sha256Checksum,appProperties)";
+const LIST_FIELDS: &str = "nextPageToken,incompleteSearch,files(id,size,version,sha256Checksum,appProperties)";
 const UPLOAD_ALIGNMENT: u64 = 256 * 1024;
 const UPLOAD_CHUNK_BYTES: u64 = 32 * UPLOAD_ALIGNMENT;
 /// Documented ceiling of a single multipart or simple upload request.
@@ -39,7 +40,6 @@ const MULTIPART_MAX_BYTES: u64 = 5_000_000;
 const MAX_STORED_BYTES: u64 = 5_000_000_000_000;
 const SESSION_LIFETIME_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const CONTROL_PAGE_SIZE: &str = "100";
-const DOCUMENTED_AT: &str = "2026-09-14";
 
 fn corrupt() -> ProviderError {
     ProviderError::new(ErrorKind::Corrupt)
@@ -85,7 +85,7 @@ struct HeadState {
 pub(super) struct Context {
     settings: Settings,
     secret: SecretRef,
-    scope: AccountScope,
+    account: AccountKey,
     token: Mutex<Option<CachedToken>>,
     head: Mutex<HeadState>,
 }
@@ -94,7 +94,7 @@ impl Context {
         Session {
             settings: &self.settings,
             secret: &self.secret,
-            scope: &self.scope,
+            account: &self.account,
             token: &self.token,
         }
     }
@@ -104,7 +104,7 @@ impl Context {
 struct Session<'a> {
     settings: &'a Settings,
     secret: &'a SecretRef,
-    scope: &'a AccountScope,
+    account: &'a AccountKey,
     token: &'a Mutex<Option<CachedToken>>,
 }
 
@@ -167,14 +167,40 @@ impl GoogleDrive {
         self.dependencies.clock.now_ms()
     }
     async fn dispatch(&self, request: HttpRequest, cancel: &Cancellation) -> Result<HttpResponse> {
-        http::send(
-            self.dependencies.http.as_ref(),
-            self.dependencies.budget.as_ref(),
-            self.dependencies.clock.as_ref(),
-            request,
-            cancel,
-        )
-        .await
+        let mut request = request;
+        if http::control_operation(request.operation) {
+            http::bypass_cache(&mut request.headers);
+        }
+        self.dependencies.send(request, cancel).await
+    }
+    async fn classify_response(
+        &self,
+        response: &mut HttpResponse,
+        account: &AccountKey,
+        cancel: &Cancellation,
+    ) -> Result<ProviderError> {
+        let now = self.now_ms();
+        let error = wire::classify(response, now, cancel).await;
+        self.dependencies.requests.observe_classified_error(
+            account,
+            &error,
+            &response.headers,
+            now,
+        )?;
+        Ok(error)
+    }
+    async fn require_status(
+        &self,
+        response: &mut HttpResponse,
+        allowed: &[u16],
+        account: &AccountKey,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        if allowed.contains(&response.status) {
+            Ok(())
+        } else {
+            Err(self.classify_response(response, account, cancel).await?)
+        }
     }
     async fn token(
         &self,
@@ -186,7 +212,7 @@ impl GoogleDrive {
             &self.dependencies,
             session.settings,
             session.secret,
-            session.scope,
+            session.account,
             session.token,
             force_refresh,
             cancel,
@@ -215,14 +241,17 @@ impl GoogleDrive {
                 body: None,
                 content_length: None,
                 operation,
-                costs: wire::costs(operation, session.scope, 0),
+                account: session.account.clone(),
+                api_request: true,
+                mybox_charge: None,
+                control: http::control_operation(operation),
             };
             let mut response = self.dispatch(request, cancel).await?;
             if response.status == 401 && !refreshed {
                 refreshed = true;
                 continue;
             }
-            wire::require_status(&mut response, allowed, self.now_ms(), cancel).await?;
+            self.require_status(&mut response, allowed, session.account, cancel).await?;
             return Ok(response);
         }
     }
@@ -265,6 +294,37 @@ impl GoogleDrive {
             parameters.push(("spaces", config::APP_DATA_FOLDER));
         }
         Ok(with_query(settings.api("/files")?, &parameters))
+    }
+
+    async fn list_control_files(
+        &self,
+        session: Session<'_>,
+        query: &str,
+        maximum: usize,
+        cancel: &Cancellation,
+    ) -> Result<Vec<DriveFile>> {
+        let mut files = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = BTreeSet::new();
+        loop {
+            cancel.check()?;
+            let mut parameters = vec![("pageSize", CONTROL_PAGE_SIZE), ("orderBy", "name")];
+            if let Some(token) = cursor.as_deref() {
+                parameters.push(("pageToken", token));
+            }
+            let url = self.list_url(session.settings, query, &parameters)?;
+            let page: FileList = self.control(session, &url, ProviderOperation::List, cancel).await?;
+            page.validate_page(cursor.as_deref())?;
+            if files.len().saturating_add(page.files.len()) > maximum {
+                return Err(corrupt());
+            }
+            files.extend(page.files);
+            let Some(next) = page.next_page_token else { return Ok(files); };
+            if !seen.insert(next.clone()) {
+                return Err(corrupt());
+            }
+            cursor = Some(next);
+        }
     }
 
     async fn generate_id(&self, session: Session<'_>, cancel: &Cancellation) -> Result<String> {
@@ -346,10 +406,13 @@ impl GoogleDrive {
             body: Some(Box::pin(std::io::Cursor::new(metadata.into_bytes()))),
             content_length: Some(length),
             operation: ProviderOperation::UploadSession,
-            costs: wire::costs(ProviderOperation::UploadSession, session.scope, 0),
+            account: session.account.clone(),
+            api_request: true,
+            mybox_charge: None,
+            control: true,
         };
         let mut response = self.dispatch(request, cancel).await?;
-        wire::require_status(&mut response, &[200, 201], self.now_ms(), cancel).await?;
+        self.require_status(&mut response, &[200, 201], session.account, cancel).await?;
         let location = response.headers.get("location").ok_or_else(corrupt)?;
         let session_uri = url::Url::options()
             .base_url(Some(&url))
@@ -410,7 +473,10 @@ impl GoogleDrive {
             body: None,
             content_length: Some(0),
             operation: ProviderOperation::ReconcileUpload,
-            costs: wire::costs(ProviderOperation::ReconcileUpload, session.scope, 0),
+            account: session.account.clone(),
+            api_request: true,
+            mybox_charge: None,
+            control: true,
         };
         let mut response = self.dispatch(request, cancel).await?;
         match response.status {
@@ -421,7 +487,7 @@ impl GoogleDrive {
                 &response.headers,
             )?)),
             404 | 410 => Ok(SessionStatus::Gone),
-            _ => Err(wire::classify(&mut response, self.now_ms(), cancel).await),
+            _ => Err(self.classify_response(&mut response, session.account, cancel).await?),
         }
     }
 
@@ -457,7 +523,10 @@ impl GoogleDrive {
                 body: Some(reader),
                 content_length: Some(length),
                 operation: ProviderOperation::UploadChunk,
-                costs: wire::costs(ProviderOperation::UploadChunk, session.scope, length),
+                account: session.account.clone(),
+                api_request: true,
+                mybox_charge: None,
+                control: false,
             };
             let mut response = self.dispatch(request, cancel).await?;
             match response.status {
@@ -480,7 +549,7 @@ impl GoogleDrive {
                 404 | 410 => {
                     return Err(common::error(ErrorKind::NotFound, response.status));
                 }
-                _ => return Err(wire::classify(&mut response, self.now_ms(), cancel).await),
+                _ => return Err(self.classify_response(&mut response, session.account, cancel).await?),
             }
         }
         match self
@@ -544,11 +613,7 @@ impl GoogleDrive {
             session.settings.folder_id,
             config::escape_query_literal(&intent.object_id)?
         );
-        let url = self.list_url(session.settings, &query, &[("pageSize", "2")])?;
-        let page: FileList = self
-            .control(session, &url, ProviderOperation::List, cancel)
-            .await?;
-        let mut files = page.files.into_iter();
+        let mut files = self.list_control_files(session, &query, 2, cancel).await?.into_iter();
         let Some(file) = files.next() else {
             return Ok(None);
         };
@@ -591,10 +656,13 @@ impl GoogleDrive {
             body: Some(body),
             content_length: Some(length),
             operation: ProviderOperation::Create,
-            costs: wire::costs(ProviderOperation::Create, session.scope, intent.byte_length),
+            account: session.account.clone(),
+            api_request: true,
+            mybox_charge: None,
+            control: false,
         };
         let mut response = self.dispatch(request, cancel).await?;
-        wire::require_status(&mut response, &[200, 201], self.now_ms(), cancel).await?;
+        self.require_status(&mut response, &[200, 201], session.account, cancel).await?;
         let file: DriveFile = wire::json(&mut response, cancel).await?;
         self.completed_receipt(session.settings, intent, &file, Some(file_id))
     }
@@ -669,50 +737,46 @@ fn removable(settings: &Settings, file: &DriveFile) -> bool {
         })
 }
 
+fn validate_resumable_descriptor(file: &DriveFile) -> Result<()> {
+    if !config::is_drive_id(file.file_id()?)
+        || file.byte_length()? == 0
+        || file.version_token().is_none()
+    {
+        return Err(corrupt());
+    }
+    let object_id = file.property(OBJECT_KEY).ok_or_else(corrupt)?;
+    if !config::is_drive_id(object_id) || file.property(JOB_KEY) != Some(object_id) {
+        return Err(corrupt());
+    }
+    if file
+        .sha256_checksum
+        .as_deref()
+        .is_some_and(|checksum| !crate::trust_boundary::is_lower_hex_256(checksum))
+    {
+        return Err(corrupt());
+    }
+    Ok(())
+}
+
 fn capabilities() -> Capabilities {
     Capabilities {
-        immutable_create: Evidence::Synthetic,
-        direct_complete_read: Evidence::Synthetic,
-        // v3 documents no precondition parameter on the content update path,
-        // and the read-only change counter is not an exchange token.
-        atomic_create_head: Evidence::Unverified,
-        conditional_head_update: Evidence::Unverified,
-        stable_head_replace: Evidence::Synthetic,
-        head_read_after_write: Evidence::Synthetic,
-        head_retry_control: Evidence::Synthetic,
-        snapshot_discovery: Evidence::Synthetic,
-        // No cleanup evidence has been recorded for this service yet.
-        delete_objects: Evidence::Unverified,
-        gc_control_consistency: Evidence::Unverified,
-        delete_completion: Evidence::Unverified,
-        discovery_extra_requests: 0,
+        immutable_create: true,
+        direct_complete_read: true,
+        // The read-only change counter is not an exchange token.
+        atomic_create_head: false,
+        conditional_head_update: false,
+        stable_head_replace: true,
+        head_read_after_write: true,
+        head_retry_control: true,
+        snapshot_discovery: true,
+        lease_operations: true,
+        delete_objects: true,
         conditional_get: false,
         range: true,
         resumable_upload: true,
         max_stored_bytes: Some(MAX_STORED_BYTES),
         sdk_overhead_bytes: 0,
         upload_alignment: UPLOAD_ALIGNMENT,
-        documented_at: Some(DOCUMENTED_AT.to_owned()),
-        evidence_urls: [
-            "https://developers.google.com/workspace/drive/api/guides/limits",
-            "https://developers.google.com/workspace/drive/api/guides/manage-uploads",
-            "https://developers.google.com/workspace/drive/api/guides/manage-downloads",
-            "https://developers.google.com/workspace/drive/api/guides/create-file",
-            "https://developers.google.com/workspace/drive/api/guides/search-files",
-            "https://developers.google.com/workspace/drive/api/guides/properties",
-            "https://developers.google.com/workspace/drive/api/guides/appdata",
-            "https://developers.google.com/workspace/drive/api/guides/handle-errors",
-            "https://developers.google.com/workspace/drive/api/reference/rest/v3/files",
-            "https://developers.google.com/workspace/drive/api/reference/rest/v3/files/list",
-            "https://developers.google.com/workspace/drive/api/reference/rest/v3/files/update",
-            "https://developers.google.com/workspace/drive/api/reference/rest/v3/files/generateIds",
-            "https://developers.google.com/workspace/drive/api/guides/api-specific-auth",
-            "https://developers.google.com/identity/protocols/oauth2",
-            "https://developers.google.com/identity/protocols/oauth2/native-app",
-        ]
-        .iter()
-        .map(|url| (*url).to_owned())
-        .collect(),
     }
 }
 
@@ -727,12 +791,16 @@ impl Provider for GoogleDrive {
         Box::pin(async move {
             cancel.check()?;
             let settings = Settings::parse(config)?;
-            let scope = AccountScope::of(&settings);
+            let account = AccountKey::new(
+                config::PROVIDER_ID,
+                &settings.api("/")?,
+                &settings.account_id,
+            )?;
             let token = Mutex::new(None);
             let session = Session {
                 settings: &settings,
                 secret,
-                scope: &scope,
+                account: &account,
                 token: &token,
             };
             let about: About = self
@@ -764,41 +832,45 @@ impl Provider for GoogleDrive {
                     return Err(ProviderError::new(ErrorKind::NotFound));
                 }
             }
-            let query = format!(
-                "'{}' in parents and trashed = false and (appProperties has {{ key='{ROLE_KEY}' and value='{HEAD_ROLE}' }} or appProperties has {{ key='{ROLE_KEY}' and value='{DESCRIPTOR_ROLE}' }})",
-                settings.folder_id
-            );
-            let control: FileList = self
-                .control(
-                    session,
-                    &self.list_url(
-                        &settings,
-                        &query,
-                        &[("pageSize", CONTROL_PAGE_SIZE), ("orderBy", "name")],
-                    )?,
-                    ProviderOperation::List,
-                    cancel,
+            let query = if matches!(mode, OpenMode::Create | OpenMode::ResumeCreate) {
+                format!("'{}' in parents and trashed = false", settings.folder_id)
+            } else {
+                format!(
+                    "'{}' in parents and trashed = false and (appProperties has {{ key='{ROLE_KEY}' and value='{HEAD_ROLE}' }} or appProperties has {{ key='{ROLE_KEY}' and value='{DESCRIPTOR_ROLE}' }})",
+                    settings.folder_id
                 )
-                .await?;
+            };
+            let control = self.list_control_files(session, &query, 2, cancel).await?;
             let heads: Vec<&DriveFile> = control
-                .files
                 .iter()
                 .filter(|file| file.property(ROLE_KEY) == Some(HEAD_ROLE))
                 .collect();
-            let descriptors = control
-                .files
+            let descriptors: Vec<&DriveFile> = control
                 .iter()
-                .any(|file| file.property(ROLE_KEY) == Some(DESCRIPTOR_ROLE));
+                .filter(|file| file.property(ROLE_KEY) == Some(DESCRIPTOR_ROLE))
+                .collect();
             if heads.len() > 1 {
                 // Drive names are not unique; two control files are ambiguous
                 // and must never be resolved by picking one of them.
                 return Err(corrupt());
             }
             match mode {
-                OpenMode::Create if !heads.is_empty() || descriptors => {
+                OpenMode::Create if !control.is_empty() => {
                     return Err(ProviderError::new(ErrorKind::PreconditionFailed));
                 }
-                OpenMode::Existing if !descriptors => {
+                OpenMode::ResumeCreate
+                    if !heads.is_empty()
+                        || descriptors.len() > 1
+                        || heads.len() + descriptors.len() != control.len() =>
+                {
+                    return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+                }
+                OpenMode::ResumeCreate => {
+                    if let Some(descriptor) = descriptors.first() {
+                        validate_resumable_descriptor(descriptor)?;
+                    }
+                }
+                OpenMode::Existing if descriptors.is_empty() => {
                     return Err(ProviderError::new(ErrorKind::NotFound));
                 }
                 _ => {}
@@ -821,10 +893,11 @@ impl Provider for GoogleDrive {
                     settings.folder_id
                 ),
                 connection_identity: settings.connection_identity.clone(),
+                account: account.clone(),
                 context: Box::new(Context {
                     settings,
                     secret: secret.clone(),
-                    scope,
+                    account,
                     token,
                     head: Mutex::new(head),
                 }),
@@ -876,10 +949,13 @@ impl Provider for GoogleDrive {
                 body: None,
                 content_length: None,
                 operation: ProviderOperation::Get,
-                costs: wire::costs(ProviderOperation::Get, session.scope, length),
+                account: session.account.clone(),
+                api_request: true,
+                mybox_charge: None,
+                control: false,
             };
             let mut response = self.dispatch(request, cancel).await?;
-            wire::require_status(&mut response, &[200], self.now_ms(), cancel).await?;
+            self.require_status(&mut response, &[200], session.account, cancel).await?;
             let declared = common::content_length(&response.headers)?;
             if declared.is_some_and(|declared| declared != length) {
                 return Err(corrupt());
@@ -917,6 +993,13 @@ impl Provider for GoogleDrive {
             intent.validate(repository)?;
             self.check_intent(intent)?;
             let session = context.session();
+            if intent.role == ObjectRole::Descriptor
+                && self.existing_object(session, intent, cancel).await?.is_some()
+            {
+                // Descriptor retries must converge before opening a new upload
+                // session, otherwise a lost completion can create a duplicate.
+                return Ok(None);
+            }
             let file_id = self.generate_id(session, cancel).await?;
             let session_uri = self.open_session(session, intent, &file_id, cancel).await?;
             let sealed_state = self
@@ -1043,7 +1126,10 @@ impl Provider for GoogleDrive {
                     body: Some(Box::pin(std::io::Cursor::new(bytes))),
                     content_length: Some(length),
                     operation: ProviderOperation::ReplaceHead,
-                    costs: wire::costs(ProviderOperation::ReplaceHead, session.scope, length),
+                    account: session.account.clone(),
+                    api_request: true,
+                    mybox_charge: None,
+                    control: true,
                 }
             } else {
                 let metadata = serde_json::json!({
@@ -1067,13 +1153,16 @@ impl Provider for GoogleDrive {
                     body: Some(body),
                     content_length: Some(total),
                     operation: ProviderOperation::ReplaceHead,
-                    costs: wire::costs(ProviderOperation::ReplaceHead, session.scope, length),
+                    account: session.account.clone(),
+                    api_request: true,
+                    mybox_charge: None,
+                    control: true,
                 }
             };
             // Exactly one write attempt: an ambiguous outcome is reported so the
             // owner re-observes the head instead of writing again.
             let mut response = self.dispatch(request, cancel).await?;
-            wire::require_status(&mut response, &[200, 201], self.now_ms(), cancel).await?;
+            self.require_status(&mut response, &[200, 201], session.account, cancel).await?;
             let file: DriveFile = wire::json(&mut response, cancel).await?;
             if file.file_id()? != file_id {
                 return Err(corrupt());
@@ -1168,6 +1257,7 @@ impl Provider for GoogleDrive {
             let page: FileList = self
                 .control(context.session(), &url, ProviderOperation::List, cancel)
                 .await?;
+            page.validate_page(cursor)?;
             let mut objects = Vec::with_capacity(page.files.len());
             for file in &page.files {
                 objects.push(ObjectReceipt {
@@ -1186,7 +1276,7 @@ impl Provider for GoogleDrive {
             }
             Ok(ObjectPage {
                 objects,
-                next_cursor: page.next_page_token.filter(|token| !token.is_empty()),
+                next_cursor: page.next_page_token,
             })
         })
     }
@@ -1288,15 +1378,6 @@ impl Provider for GoogleDrive {
         })
     }
 
-    /// Documented per-method quota units. The transfer buckets count one unit
-    /// per byte, so an actual request scales them by the bytes it moves.
-    fn request_cost(
-        &self,
-        repository: &RepositoryHandle,
-        operation: ProviderOperation,
-    ) -> Result<Vec<RequestCost>> {
-        Ok(wire::costs(operation, &context(repository)?.scope, 1))
-    }
 }
 
 pub(super) fn provider(dependencies: Dependencies) -> Arc<dyn Provider> {

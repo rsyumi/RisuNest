@@ -10,10 +10,10 @@ use super::{
 use crate::external_storage::{
     auth::{AuthorizationCode, AuthorizationPolicy, SecretBytes},
     contract::{
-        Cancellation, ConnectionConfig, ErrorKind, ProviderError, ProviderOperation, RequestCost,
-        Result,
+        Cancellation, ConnectionConfig, ErrorKind, ProviderError, ProviderOperation, Result,
     },
     http::{HttpRequest, HttpResponse},
+    quota::AccountKey,
 };
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use std::collections::BTreeMap;
@@ -175,7 +175,7 @@ pub(super) fn authorization_code_form(
 pub(super) fn token_request(
     settings: &Settings,
     form: Zeroizing<String>,
-    costs: Vec<RequestCost>,
+    account: AccountKey,
 ) -> Result<HttpRequest> {
     let url = url::Url::parse(&format!(
         "{}/{}/oauth2/v2.0/token",
@@ -196,7 +196,10 @@ pub(super) fn token_request(
         content_length: Some(body.len() as u64),
         body: Some(Box::pin(std::io::Cursor::new(body))),
         operation: ProviderOperation::Authenticate,
-        costs,
+        account,
+        api_request: false,
+        mybox_charge: None,
+        control: true,
     })
 }
 

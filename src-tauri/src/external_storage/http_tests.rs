@@ -1,9 +1,10 @@
 use super::{
     contract::*,
     http::*,
+    quota::AccountKey,
     wire_fixture::{Reply, WireServer},
 };
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, time::{Duration, Instant}};
 use tokio::io::AsyncReadExt;
 fn request(server: &WireServer, body: Option<Vec<u8>>) -> HttpRequest {
     let length = body.as_ref().map(|body| body.len() as u64);
@@ -18,7 +19,10 @@ fn request(server: &WireServer, body: Option<Vec<u8>>) -> HttpRequest {
         body: body.map(|body| Box::pin(std::io::Cursor::new(body)) as _),
         content_length: length,
         operation: ProviderOperation::ReplaceHead,
-        costs: vec![],
+        account: AccountKey::new("webdav", &server.url, "synthetic-account").unwrap(),
+        api_request: true,
+        mybox_charge: None,
+        control: true,
     }
 }
 fn runtime() -> tokio::runtime::Runtime {
@@ -139,8 +143,11 @@ fn cancellation_wakes_header_and_body_waits_and_all_listeners() {
     });
 }
 #[test]
-fn durable_quota_denies_wire_dispatch_after_reopen() {
-    use super::{durable_quota::DurableBudget, quota::Bucket};
+fn mybox_quota_denies_wire_dispatch_after_reopen() {
+    use super::{
+        durable_quota::MyboxBudget,
+        quota_profiles::{MyboxCharge, MyboxCounter, MyboxPlan},
+    };
     struct Time;
     impl Clock for Time {
         fn now_ms(&self) -> u64 {
@@ -150,35 +157,27 @@ fn durable_quota_denies_wire_dispatch_after_reopen() {
     runtime().block_on(async {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("quota.sqlite");
-        let budget = DurableBudget::open(&path).unwrap();
-        budget
-            .configure(
-                "account",
-                "download",
-                Bucket {
-                    limit: 1,
-                    used: 0,
-                    reset: QuotaReset::Unknown,
-                    blocked_until_ms: None,
-                    last_reset_ms: None,
-                },
-            )
-            .unwrap();
+        let budget = MyboxBudget::new(path.clone());
         let server = WireServer::start(vec![Reply::Lost]);
+        let account = AccountKey::new("mybox", &server.url, "synthetic-account").unwrap();
+        let charge = MyboxCharge {
+            plan: MyboxPlan::Plan30gb,
+            counters: vec![MyboxCounter::ListMinute],
+        };
+        for _ in 0..9 {
+            budget.reserve(&account, &charge, 10).unwrap();
+        }
         let transport = NativeHttpTransport::for_loopback_tests();
         let cancel = Cancellation::default();
         let make = || {
             let mut request = request(&server, Some(vec![1]));
-            request.costs.push(RequestCost {
-                bucket: "download".into(),
-                shared_account: "account".into(),
-                units: 1,
-                reset: QuotaReset::Unknown,
-            });
+            request.account = account.clone();
+            request.mybox_charge = Some(charge.clone());
             request
         };
+        let first_state = RequestState::default();
         assert_eq!(
-            send(&transport, &budget, &Time, make(), &cancel)
+            send(&transport, &budget, &Time, &first_state, make(), &cancel)
                 .await
                 .err()
                 .unwrap()
@@ -186,15 +185,55 @@ fn durable_quota_denies_wire_dispatch_after_reopen() {
             ErrorKind::Transient
         );
         drop(budget);
-        let reopened = DurableBudget::open(&path).unwrap();
+        let reopened = MyboxBudget::new(path);
+        let reopened_state = RequestState::default();
         assert_eq!(
-            send(&transport, &reopened, &Time, make(), &cancel)
+            send(&transport, &reopened, &Time, &reopened_state, make(), &cancel)
                 .await
                 .err()
                 .unwrap()
                 .kind,
-            ErrorKind::DailyQuotaExhausted
+            ErrorKind::RateLimited
         );
         assert_eq!(server.requests.lock().unwrap().len(), 1);
+    });
+}
+
+#[test]
+fn account_wait_stops_a_control_request_before_dispatch() {
+    use super::fake::RecordingBudget;
+    struct Time;
+    impl Clock for Time {
+        fn now_ms(&self) -> u64 {
+            10
+        }
+    }
+    runtime().block_on(async {
+        let server = WireServer::start(Vec::new());
+        let transport = NativeHttpTransport::for_loopback_tests();
+        let budget = RecordingBudget::default();
+        let state = RequestState::default();
+        let account = AccountKey::new("s3", &server.url, "synthetic-account").unwrap();
+        state
+            .backoff
+            .failure(
+                &account,
+                ErrorKind::RateLimited,
+                Some(Duration::from_secs(120)),
+                Instant::now(),
+            )
+            .unwrap();
+        let mut blocked = request(&server, None);
+        blocked.account = account;
+        assert_eq!(
+            send(&transport, &budget, &Time, &state, blocked, &Cancellation::default())
+                .await
+                .err()
+                .unwrap()
+                .kind,
+            ErrorKind::RateLimited
+        );
+        assert!(server.requests.lock().unwrap().is_empty());
+        assert!(budget.reservations.lock().unwrap().is_empty());
     });
 }

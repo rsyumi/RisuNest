@@ -1390,10 +1390,16 @@ impl PersistentStore {
                             domain,
                             &parse::<RecordVersion>(&version)?,
                         )?),
-                        "mark" => writes.push(sections::SectionWrite::Mark {
-                            domain,
-                            key: key.clone(),
-                        }),
+                        "mark" => {
+                            if let Some(write) = self.section_mark_write(
+                                &cache,
+                                domain,
+                                &key,
+                                &parse::<RecordVersion>(&version)?,
+                            )? {
+                                writes.push(write);
+                            }
+                        }
                         _ => (),
                     }
                     bases.push((domain, key, parse::<RecordVersion>(&remote)?, None));
@@ -1730,6 +1736,33 @@ impl PersistentStore {
             entry,
             object,
         })
+    }
+    /// Marks only the section row carried by the cursor this cycle prepared.
+    /// A newer local write under the same key must remain unpublished.
+    fn section_mark_write(
+        &self,
+        cache: &Cache,
+        domain: Domain,
+        key: &str,
+        version: &RecordVersion,
+    ) -> Result<Option<sections::SectionWrite>> {
+        if !matches!(version, RecordVersion::Live { .. }) {
+            return Ok(None);
+        }
+        let (bytes, _) = cache.restore_bytes(version)?;
+        let entry = SectionEntry::decode(&bytes)
+            .map_err(|_| SyncError::new("invalid-remote-section-entry", 502))?;
+        if sections::kind_of(domain) != Some(entry.kind) || entry.key != key {
+            return Err(SyncError::new("invalid-remote-section-entry", 502));
+        }
+        let version = entry
+            .version
+            .ok_or_else(|| SyncError::new("invalid-remote-section-entry", 502))?;
+        Ok(Some(sections::SectionWrite::MarkVersion {
+            domain,
+            key: key.to_owned(),
+            version,
+        }))
     }
     fn effective_server_base(
         &self,

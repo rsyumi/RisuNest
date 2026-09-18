@@ -1,5 +1,6 @@
 //! Connection settings, credential payload and the remote naming layout.
 use crate::external_storage::contract::*;
+use crate::external_storage::quota::AccountKey;
 use base64::Engine as _;
 use serde::Deserialize;
 use zeroize::Zeroizing;
@@ -44,6 +45,10 @@ impl TokenKind {
             Self::PersonalAccessToken | Self::ProjectAccessToken => "PRIVATE-TOKEN",
         }
     }
+
+    pub(super) fn authenticates_principal(self) -> bool {
+        matches!(self, Self::PersonalAccessToken | Self::ProjectAccessToken)
+    }
 }
 
 #[derive(Deserialize)]
@@ -83,7 +88,7 @@ pub(super) fn role_name(role: ObjectRole) -> &'static str {
         ObjectRole::Lease => "lease",
     }
 }
-fn role_from_name(name: &str) -> Option<ObjectRole> {
+pub(super) fn role_from_name(name: &str) -> Option<ObjectRole> {
     Some(match name {
         "descriptor" => ObjectRole::Descriptor,
         "pack" => ObjectRole::Pack,
@@ -137,7 +142,7 @@ pub(super) struct Settings {
     /// Numeric project id or the plain namespace path; percent-encoded per request.
     pub(super) project: String,
     pub(super) package_base: String,
-    pub(super) account_id: String,
+    pub(super) account: AccountKey,
     pub(super) max_stored_bytes: Option<u64>,
     /// Project and package identity without the instance address, so the marker
     /// stays byte-identical for every device that opens the same root.
@@ -324,11 +329,12 @@ pub(super) fn settings(config: &ConnectionConfig) -> Result<Settings> {
     };
     let root_binding = format!("{project_key}|package:{package_base}");
     let connection_identity = format!("{PROVIDER_ID}|{origin}|{root_binding}");
+    let account = AccountKey::new(PROVIDER_ID, &endpoint, &config.account_id)?;
     Ok(Settings {
         endpoint,
         project,
         package_base,
-        account_id: config.account_id.clone(),
+        account,
         max_stored_bytes,
         root_binding,
         connection_identity,

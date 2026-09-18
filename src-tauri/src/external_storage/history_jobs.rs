@@ -323,6 +323,8 @@ mod tests {
                 retention_policy: None,
                 capabilities: fake::capabilities(true),
                 created_at_ms: 1_000,
+                last_sync_at_ms: None,
+                last_backup_at_ms: None,
             },
             provider,
             handle: fake::repository(),

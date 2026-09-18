@@ -49,14 +49,22 @@ export interface ExternalRetentionPolicy {
 }
 
 export interface ExternalCapabilities {
-    cas: boolean
-    sequential: boolean
-    backupOnly: boolean
+    immutableCreate: boolean
+    directCompleteRead: boolean
+    atomicCreateHead: boolean
+    conditionalHeadUpdate: boolean
+    stableHeadReplace: boolean
+    headReadAfterWrite: boolean
+    headRetryControl: boolean
+    leaseOperations: boolean
+    deleteObjects: boolean
+    conditionalGet: boolean
     resumableUpload: boolean
-    rangeDownload: boolean
+    range: boolean
     snapshotDiscovery: boolean
-    maxStoredBytes?: DecimalString
-    evidence: 'live' | 'synthetic' | 'unverified'
+    maxStoredBytes: number | null
+    sdkOverheadBytes: number
+    uploadAlignment: number
 }
 
 export interface ExternalEndpointConfirmation {
@@ -72,7 +80,6 @@ export interface PrepareExternalConnectionRequest {
     config: ExternalConnectionConfig
     mode: ExternalOpenMode
     purpose: ExternalConnectionPurpose
-    publicationStrategy: ExternalPublicationStrategy
     capturePolicy?: ExternalCapturePolicy
     acknowledgements: string[]
 }
@@ -256,10 +263,10 @@ export interface ExternalConflictSummary {
 export interface ExternalQuotaBucket {
     id: string
     used: DecimalString
-    limit?: DecimalString
-    remaining?: DecimalString
+    limit: DecimalString
     resetAtMs?: DecimalString
-    unit: 'requests' | 'bytes'
+    localEstimate: true
+    unit: 'requests'
 }
 
 export interface ExternalQuotaSummary {

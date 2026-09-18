@@ -1,7 +1,7 @@
 //! GitHub Releases backup adapter. Append only: it creates unique release
 //! assets and reads them back, and offers no head publication at all, so
 //! `compare_exchange_head` and `replace_head` answer `Unsupported` and the head
-//! capabilities stay unverified. Asset metadata updates rename an asset rather
+//! capabilities are false. Asset metadata updates rename an asset rather
 //! than replacing its bytes, and deleting and recreating an asset changes its
 //! id, so neither is presented as a stable head.
 //!
@@ -19,8 +19,8 @@
 //!   tagged `<tagPrefix>-<batch>-<seq>`, where `<batch>` is `d` for descriptors
 //!   and `j<16 hex>` derived from the job id for every other role, and `<seq>`
 //!   rolls over when a release reaches the adapter's asset bound.
-//! - `account_id` is the GitHub login whose primary REST allowance the
-//!   connection consumes; it is the quota sharing key of every request.
+//! - `account_id` is only the renderer label. The authenticated numeric user id
+//!   from `GET /user` is the request sharing key.
 //! - `profile` is unused and any value is accepted.
 //! - The secret is UTF-8 JSON `{"token":"<pat>"}` with no other field. A fine
 //!   grained personal access token needs `Contents: read and write` on that one
@@ -33,11 +33,11 @@
 //! and never moves or removes an existing ref.
 use super::{common, Dependencies};
 use crate::external_storage::{
-    capabilities::{Capabilities, Evidence},
+    capabilities::Capabilities,
     contract::*,
     http::{HttpRequest, HttpResponse},
 };
-use api::{AssetView, Batch, Context, ReleaseView, RepositoryView};
+use api::{AssetView, Batch, Context, ReleaseView, RepositoryView, UserView};
 use reqwest::Method;
 use std::{collections::BTreeMap, sync::Arc};
 use zeroize::Zeroizing;
@@ -65,37 +65,23 @@ fn corrupt() -> ProviderError {
 
 fn capabilities() -> Capabilities {
     Capabilities {
-        immutable_create: Evidence::Synthetic,
-        direct_complete_read: Evidence::Synthetic,
-        // No conditional or plain head write exists on this service.
-        atomic_create_head: Evidence::Unverified,
-        conditional_head_update: Evidence::Unverified,
-        stable_head_replace: Evidence::Unverified,
-        head_read_after_write: Evidence::Unverified,
-        head_retry_control: Evidence::Unverified,
-        snapshot_discovery: Evidence::Synthetic,
-        // No cleanup evidence has been recorded for this service yet.
-        delete_objects: Evidence::Unverified,
-        gc_control_consistency: Evidence::Unverified,
-        delete_completion: Evidence::Unverified,
-        // One release listing request accompanies each page of assets read.
-        discovery_extra_requests: 1,
+        immutable_create: true,
+        direct_complete_read: true,
+        // Releases support immutable backup objects, not a mutable sync head.
+        atomic_create_head: false,
+        conditional_head_update: false,
+        stable_head_replace: false,
+        head_read_after_write: false,
+        head_retry_control: false,
+        snapshot_discovery: true,
+        lease_operations: true,
+        delete_objects: true,
         conditional_get: false,
         range: false,
         resumable_upload: false,
         max_stored_bytes: Some(api::MAX_ASSET_BYTES),
         sdk_overhead_bytes: 0,
         upload_alignment: 1,
-        documented_at: Some("2026-09-14".into()),
-        evidence_urls: vec![
-            "https://docs.github.com/en/rest/releases/releases?apiVersion=2022-11-28".into(),
-            "https://docs.github.com/en/rest/releases/assets?apiVersion=2022-11-28".into(),
-            "https://docs.github.com/en/rest/repos/repos?apiVersion=2022-11-28".into(),
-            "https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api?apiVersion=2022-11-28".into(),
-            "https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens?apiVersion=2022-11-28".into(),
-            "https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases".into(),
-            "https://github.blog/changelog/2025-06-03-releases-now-expose-digests-for-release-assets/".into(),
-        ],
     }
 }
 
@@ -105,21 +91,29 @@ impl GithubReleases {
     }
 
     async fn send(&self, request: HttpRequest, cancel: &Cancellation) -> Result<HttpResponse> {
-        crate::external_storage::http::send(
-            self.dependencies.http.as_ref(),
-            self.dependencies.budget.as_ref(),
-            self.dependencies.clock.as_ref(),
-            request,
-            cancel,
-        )
-        .await
+        let account = request.account.clone();
+        let response = self.dependencies.send(request, cancel).await?;
+        if matches!(response.status, 403 | 429) {
+            let now = self.now();
+            let error = api::classify(response.status, &response.headers, now);
+            self.dependencies.requests.observe_classified_error(
+                &account,
+                &error,
+                &response.headers,
+                now,
+            )?;
+        }
+        Ok(response)
     }
 
     fn context<'a>(&self, repository: &'a RepositoryHandle) -> Result<&'a Context> {
         repository
             .context
             .downcast_ref::<Context>()
-            .filter(|context| context.identity == repository.connection_identity)
+            .filter(|context| {
+                context.identity == repository.connection_identity
+                    && context.account == repository.account
+            })
             .ok_or_else(corrupt)
     }
 
@@ -141,6 +135,9 @@ impl GithubReleases {
             "authorization".to_owned(),
             context.authorization().to_string(),
         );
+        if crate::external_storage::http::control_operation(operation) {
+            crate::external_storage::http::bypass_cache(&mut headers);
+        }
         HttpRequest {
             method,
             url,
@@ -148,7 +145,10 @@ impl GithubReleases {
             body: None,
             content_length: None,
             operation,
-            costs: api::costs(operation, &context.account),
+            account: context.account.clone(),
+            api_request: true,
+            mybox_charge: None,
+            control: crate::external_storage::http::control_operation(operation),
         }
     }
 
@@ -280,6 +280,73 @@ impl GithubReleases {
         Ok(true)
     }
 
+    async fn resume_create_layout(
+        &self,
+        context: &Context,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        let descriptor_tag = context.descriptor_tag();
+        let mut descriptor_release = None;
+        let mut complete = false;
+        for page in 1..=api::MAX_RELEASE_SCAN_PAGES {
+            let releases = self.releases_page(context, page, cancel).await?;
+            let exhausted = releases.len() < api::RELEASE_PAGE_SIZE;
+            for release in releases {
+                if !context.owns_tag(&release.tag_name) {
+                    continue;
+                }
+                if release.tag_name != descriptor_tag
+                    || !release.draft
+                    || release.id == 0
+                    || descriptor_release.is_some()
+                {
+                    return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+                }
+                descriptor_release = Some(release.id);
+            }
+            if exhausted {
+                complete = true;
+                break;
+            }
+        }
+        if !complete {
+            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+        }
+
+        let Some(release) = descriptor_release else {
+            return Ok(());
+        };
+        let assets = self.assets_page(context, release, 1, cancel).await?;
+        if assets.len() > 1 {
+            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+        }
+        if let Some(asset) = assets.first() {
+            let prefix = format!("{}-", api::role_prefix(ObjectRole::Descriptor));
+            let valid_name = asset
+                .name
+                .strip_prefix(&prefix)
+                .is_some_and(|object_id| api::is_safe_name(object_id, 180));
+            let valid_digest = asset.digest.is_none() || asset.sha256().is_some();
+            if asset.id == 0
+                || !valid_name
+                || !asset.uploaded()
+                || asset.size == 0
+                || !valid_digest
+            {
+                return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+            }
+        }
+        context.batches().insert(
+            api::DESCRIPTOR_BATCH.to_owned(),
+            Batch {
+                seq: 0,
+                release,
+                assets: assets.len(),
+            },
+        );
+        Ok(())
+    }
+
     /// Creates the release of one batch sequence, or adopts the existing one
     /// when the tag is already taken. Existing assets are counted, never removed.
     async fn open_batch(
@@ -405,7 +472,31 @@ impl Provider for GithubReleases {
     ) -> ProviderFuture<'a, (RepositoryHandle, Capabilities)> {
         Box::pin(async move {
             cancel.check()?;
-            let context = Context::new(config, self.token(secret).await?)?;
+            let mut context = Context::new(config, self.token(secret).await?)?;
+            let request = self.request(
+                &context,
+                Method::GET,
+                context.user_url()?,
+                ProviderOperation::Authenticate,
+            );
+            let response = self.send(request, cancel).await?;
+            if response.status != 200 {
+                return Err(api::classify(
+                    response.status,
+                    &response.headers,
+                    self.now(),
+                ));
+            }
+            let user: UserView = self.decode(response, cancel).await?;
+            let account = crate::external_storage::quota::AccountKey::new(
+                api::PROVIDER_ID,
+                &context.api,
+                &user.principal()?,
+            )?;
+            self.dependencies
+                .requests
+                .resolve_pending(&context.account, &account)?;
+            context.account = account;
             let url = context.repository_url(&[])?;
             let request = self.request(&context, Method::GET, url, ProviderOperation::Metadata);
             let response = self.send(request, cancel).await?;
@@ -431,6 +522,9 @@ impl Provider for GithubReleases {
                     if self.root_occupied(&context, cancel).await? {
                         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
                     }
+                }
+                OpenMode::ResumeCreate => {
+                    self.resume_create_layout(&context, cancel).await?;
                 }
                 OpenMode::Existing => {
                     let tag = context.descriptor_tag();
@@ -458,6 +552,7 @@ impl Provider for GithubReleases {
                 RepositoryHandle {
                     repository_id: identity.clone(),
                     connection_identity: identity,
+                    account: context.account.clone(),
                     context: Box::new(context),
                 },
                 capabilities(),
@@ -521,7 +616,10 @@ impl Provider for GithubReleases {
                     body: None,
                     content_length: None,
                     operation: ProviderOperation::Get,
-                    costs: api::costs(ProviderOperation::Get, &context.account),
+                    account: repository.account.clone(),
+                    api_request: false,
+                    mybox_charge: None,
+                    control: false,
                 };
                 response = self.send(hop, cancel).await?;
                 if response.status != 200 {
@@ -855,13 +953,6 @@ impl Provider for GithubReleases {
         Err(ProviderError::new(ErrorKind::Unsupported))
     }
 
-    fn request_cost(
-        &self,
-        repository: &RepositoryHandle,
-        operation: ProviderOperation,
-    ) -> Result<Vec<RequestCost>> {
-        Ok(api::costs(operation, &self.context(repository)?.account))
-    }
 }
 
 /// `<release page>:<release index>:<asset page>:<asset index>`, all positions

@@ -14,21 +14,17 @@ describe('externalErrorMessage', () => {
     it('names a repository this device has already connected', () => {
         expect(externalErrorMessage(strings, { kind: 'alreadyConnected' }))
             .toBe(strings.connectionAlreadyAdded)
-        expect(externalErrorMessage(strings, { kind: 'alreadyConnected' }, 'cas'))
-            .toBe(strings.connectionAlreadyAdded)
     })
 
-    it('names the refused strategy only for a concurrent-use attempt', () => {
+    it('reports unsupported operations without asking users to change the strategy', () => {
         const refused = { kind: 'unsupported', httpStatus: null, retryAtMs: null }
-        expect(externalErrorMessage(strings, refused, 'cas')).toBe(strings.casUnsupported)
-        expect(externalErrorMessage(strings, refused, 'sequential')).toBe(strings.unsupportedOperation)
         expect(externalErrorMessage(strings, refused)).toBe(strings.unsupportedOperation)
     })
 
     it('falls back for a local failure that carries no native kind', () => {
         expect(externalErrorMessage(strings, new Error('offline'))).toBe(strings.errorGeneric)
         expect(externalErrorMessage(strings, undefined)).toBe(strings.errorGeneric)
-        expect(externalErrorMessage(strings, { kind: 'invented' }, 'cas')).toBe(strings.errorGeneric)
+        expect(externalErrorMessage(strings, { kind: 'invented' })).toBe(strings.errorGeneric)
     })
 
     it('keeps both languages complete for every kind it maps', () => {

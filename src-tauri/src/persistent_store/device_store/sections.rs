@@ -1276,8 +1276,20 @@ impl DeviceStore {
         first_published: &TombstonePublication,
         reclaimed: &ReclaimedRows,
         gc_floor: &Sequence,
-    ) -> StoreResult<()> {
+        cursor: Option<(&str, &str, &Sequence, &SectionCursor)>,
+    ) -> StoreResult<bool> {
         let transaction = self.transaction()?;
+        if let Some((_, _, expected_generation, _)) = cursor {
+            let (participating, generation): (bool, String) = transaction.query_row(
+                "SELECT participating,participation_generation FROM device_sections WHERE section=?1",
+                [section.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if !participating || sequence(&generation)? != *expected_generation {
+                transaction.commit()?;
+                return Ok(false);
+            }
+        }
         // The removals this publication stopped carrying go with the floor it
         // published, in the transaction that records the publication, so a
         // publication that never finished reclaims nothing.
@@ -1373,8 +1385,11 @@ impl DeviceStore {
                 }
             }
         }
+        if let Some((connection_id, library_lineage, _, cursor)) = cursor {
+            record_cursor(&transaction, connection_id, library_lineage, section, cursor)?;
+        }
         transaction.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     /// Merges a received section. The higher `(write_clock, writer_id)` wins,

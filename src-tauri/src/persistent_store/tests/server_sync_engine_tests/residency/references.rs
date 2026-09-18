@@ -1,6 +1,11 @@
 use super::*;
 use crate::asset_repository::job_pins::DurableCasJob;
-use crate::server_sync::{backups::references, cache::Cache, client::ServerClient, transfer::Transfer};
+use crate::server_sync::{
+    backups::{references, Side},
+    cache::Cache,
+    client::ServerClient,
+    transfer::Transfer,
+};
 use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Mutex};
 
 #[path = "reference_boundaries.rs"]
@@ -205,6 +210,140 @@ fn reference_preparation_transfers_only_metadata_and_retains_remote_only_local_p
     assert!(Residency::open(scenario.local.repository_root()).unwrap().object(&scenario.remote_payload, None).unwrap().is_some(),
         "a remote object referenced only by the conflict copy must retain custody");
     println!("reference capture: metadata bytes={metadata_bytes}; ordinary payload downloads=0; uploads=0");
+}
+
+#[test]
+fn whole_pds_replacement_preserves_completed_and_interrupted_reference_roots() {
+    for completed in [true, false] {
+        let mut scenario = Scenario::new();
+        let protected_bytes = format!("synthetic conflict root completed={completed}").into_bytes();
+        let protected = put(
+            &mut scenario.local,
+            "assets/replacement-conflict-root.png",
+            &protected_bytes,
+        );
+        let protected_hash = protected.object_hash.clone().unwrap();
+        scenario
+            .local
+            .delete_asset_alias("asset", &protected.key, scenario.local.revision().unwrap())
+            .unwrap();
+        let before_conflict = scenario
+            .local
+            .snapshot_create(if completed {
+                "before-completed-conflict"
+            } else {
+                "before-interrupted-conflict"
+            })
+            .unwrap();
+        scenario
+            .local
+            .commit_asset_alias(&protected, scenario.local.revision().unwrap())
+            .unwrap();
+
+        let repository_root = scenario.local.repository_root().to_path_buf();
+        let revision = scenario.local.revision().unwrap();
+        let generation = active_generation(&scenario.local.connection).unwrap();
+        let head = scenario.fixture.server.head().unwrap();
+        let stored = scenario.local.server_stored_config().unwrap().unwrap();
+        let context = Residency::context_id(&stored, &head.epoch);
+        let client = ServerClient::new(scenario.local.server_config().unwrap().unwrap()).unwrap();
+        let mut capture =
+            references::Capture::begin(&repository_root, revision, &generation, &head).unwrap();
+        let id = capture.id.clone();
+        capture
+            .local_payload(&protected_hash, protected_bytes.len() as u64, &|| Ok(()))
+            .unwrap();
+        capture
+            .object(
+                Side::Remote,
+                &references::Object {
+                    hash: scenario.remote_payload.clone(),
+                    byte_size: Some(128 * 1024 + 3),
+                    metadata: false,
+                    context_id: Some(context.clone()),
+                    local_required: false,
+                },
+            )
+            .unwrap();
+        capture.complete_side(Side::Local).unwrap();
+        capture.complete_side(Side::Remote).unwrap();
+        let mut residency = Residency::open(&repository_root).unwrap();
+        capture.retain(&client, &stored, &mut residency).unwrap();
+        drop(residency);
+
+        if completed {
+            capture.finish(&mut scenario.local, &|| Ok(())).unwrap();
+            references::open(&repository_root, &id, &|| Ok(())).unwrap();
+        } else {
+            let capture_path = repository_root
+                .join("server-sync/backups")
+                .join(&id);
+            let marker = capture_path.join("complete.json");
+            let result = capture.finish(&mut scenario.local, &|| {
+                if fs::read_dir(&capture_path).unwrap().any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("complete-")
+                }) {
+                    Err(crate::server_sync::SyncError::new("cancelled", 409))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(matches!(result, Err(error) if error.code == "cancelled"));
+            assert!(!marker.exists());
+            assert!(DurableCasJob::open(&repository_root, &id)
+                .unwrap()
+                .is_sealed());
+            assert!(references::open(&repository_root, &id, &|| Ok(())).is_err());
+        }
+
+        scenario
+            .local
+            .snapshot_restore_request(&before_conflict.id)
+            .unwrap();
+        drop(scenario.local);
+        let mut local = PersistentStore::open(&repository_root).unwrap();
+        assert_eq!(local.pending_restore_failure(), None);
+        assert!(local
+            .read_asset_alias("asset", &protected.key, None)
+            .unwrap()
+            .is_none());
+        local.snapshot_delete(&before_conflict.id).unwrap();
+
+        let mut roots = std::collections::BTreeSet::new();
+        references::visit_roots(&repository_root, |object| {
+            roots.insert(object.hash);
+            Ok(())
+        })
+        .unwrap();
+        assert!(roots.contains(&protected_hash));
+        assert!(roots.contains(&scenario.remote_payload));
+        if completed {
+            references::open(&repository_root, &id, &|| Ok(())).unwrap();
+        } else {
+            assert!(references::open(&repository_root, &id, &|| Ok(())).is_err());
+        }
+
+        let gc = local
+            .asset_gc_delete_page(4096, None, i64::MAX / 2, 0)
+            .unwrap();
+        assert!(gc.report.marked_hashes.contains(&protected_hash));
+        assert!(!gc.report.deleted_hashes.contains(&protected_hash));
+        assert!(PayloadCas::new(&repository_root)
+            .unwrap()
+            .stat_object(&protected_hash)
+            .unwrap()
+            .is_some());
+        local.asset_residency_release_unused(&|| Ok(())).unwrap();
+        assert!(Residency::open(&repository_root)
+            .unwrap()
+            .object(&scenario.remote_payload, Some(&context))
+            .unwrap()
+            .is_some());
+    }
 }
 
 #[test]

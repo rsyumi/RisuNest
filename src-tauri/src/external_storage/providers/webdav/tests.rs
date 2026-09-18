@@ -5,7 +5,6 @@ use crate::external_storage::{
     wire_fixture::{Reply, WireServer},
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use std::sync::atomic::Ordering;
 
 const ROOT: &str = "백업 폴더";
 const ACCOUNT: &str = "user@synthetic.invalid";
@@ -64,6 +63,31 @@ fn root_listing(members: Vec<String>) -> Reply {
     let mut responses = vec![collection_response(&format!("{}/", encoded_root()))];
     responses.extend(members);
     multistatus_reply(&responses)
+}
+fn folder_listing(folder: &str, members: Vec<String>) -> Reply {
+    let mut responses = vec![collection_response(&format!(
+        "{}/{folder}/",
+        encoded_root()
+    ))];
+    responses.extend(members);
+    multistatus_reply(&responses)
+}
+fn initial_folder_listings(with_descriptor: bool) -> Vec<Reply> {
+    ROLE_FOLDERS
+        .iter()
+        .map(|folder| {
+            let members = if with_descriptor && *folder == DESCRIPTOR_FOLDER {
+                vec![object_response(
+                    &format!("{}/{folder}/descriptor-id", encoded_root()),
+                    128,
+                    Some("\"descriptor-etag\""),
+                )]
+            } else {
+                Vec::new()
+            };
+            folder_listing(folder, members)
+        })
+        .collect()
 }
 fn descriptor_collection() -> String {
     collection_response(&format!("{}/descriptors/", encoded_root()))
@@ -137,22 +161,6 @@ impl Harness {
     fn body(&self, index: usize) -> Vec<u8> {
         self.server.requests.lock().unwrap()[index].body.clone()
     }
-    fn reservations(&self) -> Vec<Vec<RequestCost>> {
-        self.test
-            .budget
-            .reservations
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(costs, _)| costs.clone())
-            .collect()
-    }
-    fn account(&self) -> String {
-        format!(
-            "webdav:{}:{ACCOUNT}",
-            self.server.url.origin().ascii_serialization()
-        )
-    }
 }
 
 fn locator(repository: &RepositoryHandle, collection: Option<&str>, object: &str) -> RemoteLocator {
@@ -195,7 +203,7 @@ fn head() -> HeadBytes {
 }
 
 #[test]
-fn existing_open_proves_credentials_in_one_request_and_reports_documented_capabilities() {
+fn existing_open_proves_credentials_in_one_request_and_reports_capabilities() {
     runtime().block_on(async {
         let harness = Harness::start(vec![established_root()]);
         let (repository, capabilities) = harness.open(OpenMode::Existing).await.unwrap();
@@ -208,28 +216,21 @@ fn existing_open_proves_credentials_in_one_request_and_reports_documented_capabi
         assert!(repository.connection_identity.starts_with("webdav:"));
         assert!(repository.connection_identity.contains(ROOT));
 
-        assert_eq!(capabilities.immutable_create, Evidence::Synthetic);
-        assert_eq!(capabilities.direct_complete_read, Evidence::Synthetic);
-        assert_eq!(capabilities.stable_head_replace, Evidence::Synthetic);
-        assert_eq!(capabilities.head_read_after_write, Evidence::Synthetic);
-        assert_eq!(capabilities.head_retry_control, Evidence::Synthetic);
-        assert_eq!(capabilities.snapshot_discovery, Evidence::Synthetic);
+        assert!(capabilities.immutable_create);
+        assert!(capabilities.direct_complete_read);
+        assert!(capabilities.stable_head_replace);
+        assert!(capabilities.head_read_after_write);
+        assert!(capabilities.head_retry_control);
+        assert!(capabilities.snapshot_discovery);
         // An ETag header is never CAS evidence; only the probe can raise these.
-        assert_eq!(capabilities.atomic_create_head, Evidence::Unverified);
-        assert_eq!(capabilities.conditional_head_update, Evidence::Unverified);
+        assert!(!capabilities.atomic_create_head);
+        assert!(!capabilities.conditional_head_update);
         assert!(capabilities.conditional_get);
         assert!(!capabilities.range);
         assert!(!capabilities.resumable_upload);
         assert_eq!(capabilities.upload_alignment, 1);
         assert_eq!(capabilities.sdk_overhead_bytes, 0);
         assert_eq!(capabilities.max_stored_bytes, None);
-        assert_eq!(capabilities.discovery_extra_requests, 1);
-        assert_eq!(capabilities.documented_at.as_deref(), Some("2026-09-14"));
-        assert_eq!(capabilities.evidence_urls.len(), 3);
-        assert!(capabilities
-            .evidence_urls
-            .iter()
-            .all(|url| url.starts_with("https://")));
         assert!(capabilities
             .require(PublicationStrategy::Sequential)
             .is_ok());
@@ -254,20 +255,11 @@ fn existing_open_proves_credentials_in_one_request_and_reports_documented_capabi
             STANDARD.encode(format!("{ACCOUNT}:{}", String::from_utf8_lossy(PASSWORD)))
         );
         assert_eq!(harness.header(0, "authorization"), Some(expected));
-        assert_eq!(
-            harness.reservations(),
-            vec![vec![RequestCost {
-                bucket: "requests".to_owned(),
-                shared_account: harness.account(),
-                units: 1,
-                reset: QuotaReset::Unknown,
-            }]]
-        );
     });
 }
 
 #[test]
-fn koofr_profile_binds_the_documented_endpoint_and_cites_its_help_pages() {
+fn koofr_profile_binds_the_documented_endpoint() {
     let mut config = ConnectionConfig {
         provider: PROVIDER_ID.to_owned(),
         profile: Some("koofr".to_owned()),
@@ -285,13 +277,6 @@ fn koofr_profile_binds_the_documented_endpoint_and_cites_its_help_pages() {
     config.endpoint = "https://app.koofr.net/other/Koofr".to_owned();
     assert_eq!(kind_of(settings(&config)), ErrorKind::Unsupported);
 
-    let koofr = capabilities(Profile::Koofr);
-    assert_eq!(koofr.evidence_urls.len(), 5);
-    assert!(koofr
-        .evidence_urls
-        .iter()
-        .any(|url| url.contains("koofr.eu/help/koofr_with_webdav")));
-    assert_eq!(capabilities(Profile::Generic).evidence_urls.len(), 3);
 }
 
 #[test]
@@ -883,7 +868,150 @@ fn head_writes_send_one_conditional_request_and_read_back_the_same_bytes() {
         );
         assert!(staging.is_verified());
         assert_eq!(harness.count(), 5);
-        assert_eq!(harness.reservations().len(), 5);
+    });
+}
+
+#[test]
+fn resume_create_recovers_lost_collection_creation_without_overwriting_descriptors() {
+    runtime().block_on(async {
+        let present: Vec<String> = ROLE_FOLDERS[..3]
+            .iter()
+            .map(|folder| collection_response(&format!("{}/{folder}/", encoded_root())))
+            .collect();
+        let mut replies = vec![reply(404, &[], b""), Reply::Lost, root_listing(present)];
+        replies.extend(ROLE_FOLDERS[3..].iter().map(|_| reply(201, &[], b"")));
+        replies.extend(initial_folder_listings(true));
+        let harness = Harness::start(replies);
+        assert!(harness.open(OpenMode::ResumeCreate).await.is_err());
+        harness.open(OpenMode::ResumeCreate).await.unwrap();
+        assert_eq!(
+            harness.count(),
+            3 + ROLE_FOLDERS.len() - ROLE_FOLDERS[..3].len() + ROLE_FOLDERS.len()
+        );
+        assert_eq!(
+            harness.line(1),
+            format!("MKCOL {}/ HTTP/1.1", encoded_root())
+        );
+        let created_end = 3 + ROLE_FOLDERS.len() - ROLE_FOLDERS[..3].len();
+        assert!((3..created_end).all(|index| harness.line(index).starts_with("MKCOL ")));
+        assert!((0..harness.count()).all(|index| !harness.line(index).starts_with("PUT ")));
+    });
+}
+
+#[test]
+fn resume_create_rejects_foreign_role_contents_duplicate_descriptors_and_incomplete_lists() {
+    runtime().block_on(async {
+        let root_members: Vec<String> = ROLE_FOLDERS
+            .iter()
+            .map(|folder| collection_response(&format!("{}/{folder}/", encoded_root())))
+            .collect();
+
+        let harness = Harness::start(vec![
+            root_listing(root_members.clone()),
+            folder_listing(
+                ROLE_FOLDERS[0],
+                vec![object_response(
+                    &format!("{}/{}/foreign", encoded_root(), ROLE_FOLDERS[0]),
+                    4,
+                    None,
+                )],
+            ),
+        ]);
+        assert_eq!(
+            kind_of(harness.open(OpenMode::ResumeCreate).await),
+            ErrorKind::PreconditionFailed
+        );
+
+        let payload = Harness::start(vec![root_listing(vec![collection_response(&format!(
+            "{}/packs/",
+            encoded_root()
+        ))])]);
+        assert_eq!(
+            kind_of(payload.open(OpenMode::Create).await),
+            ErrorKind::PreconditionFailed
+        );
+        assert_eq!(payload.count(), 1);
+        assert_eq!(harness.count(), 2);
+
+        let harness = Harness::start(vec![
+            root_listing(root_members.clone()),
+            folder_listing(ROLE_FOLDERS[0], Vec::new()),
+            folder_listing(
+                DESCRIPTOR_FOLDER,
+                vec![
+                    object_response(
+                        &format!("{}/{DESCRIPTOR_FOLDER}/descriptor-a", encoded_root()),
+                        64,
+                        None,
+                    ),
+                    object_response(
+                        &format!("{}/{DESCRIPTOR_FOLDER}/descriptor-b", encoded_root()),
+                        64,
+                        None,
+                    ),
+                ],
+            ),
+        ]);
+        assert_eq!(
+            kind_of(harness.open(OpenMode::ResumeCreate).await),
+            ErrorKind::PreconditionFailed
+        );
+
+        let harness = Harness::start(vec![
+            root_listing(root_members),
+            multistatus_reply(&[object_response(
+                &format!("{}/{}/foreign", encoded_root(), ROLE_FOLDERS[0]),
+                4,
+                None,
+            )]),
+        ]);
+        assert_eq!(
+            kind_of(harness.open(OpenMode::ResumeCreate).await),
+            ErrorKind::PreconditionFailed
+        );
+        assert_eq!(harness.count(), 2);
+    });
+}
+
+#[test]
+fn resume_create_rejects_duplicates_conflicting_types_unknown_members_and_405() {
+    runtime().block_on(async {
+        let invalid = [
+            multistatus_reply(&[object_response(&encoded_root(), 0, None)]),
+            multistatus_reply(&[
+                collection_response(&format!("{}/", encoded_root())),
+                collection_response(&format!("{}/", encoded_root())),
+            ]),
+            root_listing(vec![descriptor_collection(), descriptor_collection()]),
+            root_listing(vec![object_response(
+                &format!("{}/descriptors", encoded_root()),
+                1,
+                None,
+            )]),
+            root_listing(vec![
+                descriptor_collection(),
+                collection_response(&format!("{}/foreign/", encoded_root())),
+            ]),
+        ];
+        for listing in invalid {
+            let harness = Harness::start(vec![listing]);
+            assert_eq!(
+                kind_of(harness.open(OpenMode::ResumeCreate).await),
+                ErrorKind::PreconditionFailed
+            );
+            assert_eq!(harness.count(), 1);
+        }
+
+        let existing: Vec<String> = ROLE_FOLDERS[1..]
+            .iter()
+            .map(|folder| collection_response(&format!("{}/{folder}/", encoded_root())))
+            .collect();
+        let harness = Harness::start(vec![root_listing(existing), reply(405, &[], b"")]);
+        assert_eq!(
+            kind_of(harness.open(OpenMode::ResumeCreate).await),
+            ErrorKind::PreconditionFailed
+        );
+        assert_eq!(harness.count(), 2);
     });
 }
 
@@ -1119,31 +1247,6 @@ fn documented_statuses_map_to_provider_errors_with_their_retry_hints() {
 }
 
 #[test]
-fn a_denied_budget_stops_the_request_before_it_is_dispatched() {
-    runtime().block_on(async {
-        let harness = Harness::start(vec![established_root()]);
-        let repository = harness.opened().await;
-        harness.test.budget.deny.store(true, Ordering::SeqCst);
-        let directory = tempfile::tempdir().unwrap();
-        let mut staging = sink(&directory, "denied");
-        let error = harness
-            .provider
-            .read_object(
-                &repository,
-                &locator(&repository, None, HEAD_OBJECT),
-                None,
-                &mut staging,
-                &Cancellation::default(),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind, ErrorKind::DailyQuotaExhausted);
-        assert_eq!(harness.count(), 1);
-        assert_eq!(harness.reservations().len(), 2);
-    });
-}
-
-#[test]
 fn cancellation_during_a_body_stops_the_read() {
     runtime().block_on(async {
         let harness = Harness::start(vec![established_root(), Reply::DelayedBody]);
@@ -1286,52 +1389,6 @@ fn the_probe_enables_conditional_writes_only_when_the_server_enforces_them() {
 }
 
 #[test]
-fn every_issued_request_costs_one_unit_of_the_account_bucket() {
-    let issued = [
-        ProviderOperation::Metadata,
-        ProviderOperation::List,
-        ProviderOperation::Get,
-        ProviderOperation::Create,
-        ProviderOperation::ReconcileUpload,
-        ProviderOperation::CompareExchangeHead,
-        ProviderOperation::ReplaceHead,
-    ];
-    for operation in issued {
-        assert_eq!(
-            request_cost_for("account", operation),
-            vec![RequestCost {
-                bucket: "requests".to_owned(),
-                shared_account: "account".to_owned(),
-                units: 1,
-                reset: QuotaReset::Unknown,
-            }],
-            "{operation:?}"
-        );
-    }
-    for operation in [
-        ProviderOperation::DownloadUrl,
-        ProviderOperation::Range,
-        ProviderOperation::UploadSession,
-        ProviderOperation::UploadChunk,
-        ProviderOperation::CompleteUpload,
-        ProviderOperation::Authenticate,
-    ] {
-        assert!(
-            request_cost_for("account", operation).is_empty(),
-            "{operation:?}"
-        );
-    }
-    let test = loopback_dependencies(MemoryVault::default(), NOW_MS);
-    let provider = create(test.dependencies).unwrap();
-    assert!(provider
-        .request_cost(
-            &crate::external_storage::fake::repository(),
-            ProviderOperation::Get
-        )
-        .is_err());
-}
-
-#[test]
 fn only_a_strong_entity_tag_becomes_a_version_token() {
     for accepted in ["\"v1\"", "  \"v1\"  ", "\"\""] {
         assert_eq!(
@@ -1359,9 +1416,6 @@ fn only_a_strong_entity_tag_becomes_a_version_token() {
     );
 }
 
-/// A passing exchange here proves the adapter's request shape and status
-/// handling. It is no evidence of the service's own deletion guarantees, which
-/// only the provider documentation behind `Capabilities` can supply.
 #[test]
 fn deleting_one_member_folds_404_leaves_202_unresolved_and_refuses_the_head() {
     runtime().block_on(async {
@@ -1417,10 +1471,6 @@ fn deleting_one_member_folds_404_leaves_202_unresolved_and_refuses_the_head() {
             harness.line(1),
             format!("DELETE {}/packs/pack-1 HTTP/1.1", encoded_root())
         );
-        let reservations = harness.reservations();
-        assert_eq!(reservations.len(), 4);
-        assert_eq!(reservations[1][0].bucket, REQUEST_BUCKET);
-        assert_eq!(reservations[1][0].shared_account, harness.account());
     });
 }
 

@@ -1,8 +1,8 @@
 //! Device-local connection settings. Only opaque OS-vault references are stored
 //! here; sync bases and job outcomes remain authoritative in the library PDS.
-use super::{capabilities::Capabilities, contract::*};
+use super::{capabilities::Capabilities, contract::*, packaging::RemoteObject};
 use risunest_external_storage_format::format::Descriptor;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
 
@@ -18,6 +18,8 @@ pub(crate) struct StoredConnection {
     pub root_key_ref: String,
     pub capabilities: Capabilities,
     pub created_at_ms: u64,
+    pub last_sync_at_ms: Option<u64>,
+    pub last_backup_at_ms: Option<u64>,
     /// Backup connections only. Changing it applies to work started
     /// afterwards and never rewrites an existing point.
     #[serde(default)]
@@ -32,7 +34,11 @@ pub(crate) struct StoredConnection {
 pub(crate) struct PendingStoredConnection {
     pub id: String,
     pub config: ConnectionConfig,
-    pub descriptor: Descriptor,
+    /// Fixed before any remote mutation. The descriptor is selected exactly
+    /// once after authenticated capabilities are known.
+    pub repository_id: String,
+    pub descriptor: Option<Descriptor>,
+    pub create: bool,
     #[serde(default)]
     pub capture_policy: Option<super::connection::CapturePolicy>,
     pub provider_repository_id: Option<String>,
@@ -40,6 +46,12 @@ pub(crate) struct PendingStoredConnection {
     pub root_key_ref: String,
     pub created_at_ms: u64,
 }
+#[derive(Clone, Copy)]
+pub(crate) enum CompletionKind {
+    Sync,
+    Backup,
+}
+
 pub(crate) struct ConnectionStore(Connection);
 fn corrupt() -> ProviderError {
     ProviderError::new(ErrorKind::Corrupt)
@@ -170,13 +182,45 @@ impl ConnectionStore {
             .map_err(storage)?;
         Ok(connection)
     }
-    pub fn put_pending(&self, connection: &PendingStoredConnection) -> Result<()> {
+    pub fn put_pending(&mut self, connection: &PendingStoredConnection) -> Result<()> {
         validate_pending(connection)?;
         let encoded = serde_json::to_string(connection).map_err(storage)?;
-        self.0.execute(
+        let tx = self.0.transaction_with_behavior(TransactionBehavior::Immediate).map_err(storage)?;
+        let previous: Option<String> = tx.query_row(
+            "SELECT value FROM pending_connections WHERE id=?1", [&connection.id],
+            |row| row.get(0),
+        ).optional().map_err(storage)?;
+        if let Some(previous) = previous {
+            let pinned = decode_pending(&previous)?;
+            let immutable_changed = pinned.id != connection.id
+                || pinned.config != connection.config
+                || pinned.repository_id != connection.repository_id
+                || pinned.create != connection.create
+                || pinned.root_key_ref != connection.root_key_ref
+                || pinned.capture_policy != connection.capture_policy
+                || pinned.created_at_ms != connection.created_at_ms;
+            let descriptor_changed = match (&pinned.descriptor, &connection.descriptor) {
+                (Some(previous), Some(proposed)) => previous != proposed,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            let provider_changed = match (
+                &pinned.provider_repository_id,
+                &connection.provider_repository_id,
+            ) {
+                (Some(previous), Some(proposed)) => previous != proposed,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if immutable_changed || descriptor_changed || provider_changed {
+                return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+            }
+        }
+        tx.execute(
             "INSERT INTO pending_connections VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET value=excluded.value",
             params![connection.id, encoded],
         ).map_err(storage)?;
+        tx.commit().map_err(storage)?;
         Ok(())
     }
     pub fn pending(&self, id: &str) -> Result<PendingStoredConnection> {
@@ -196,6 +240,33 @@ impl ConnectionStore {
         }
         Ok(value)
     }
+    pub fn pending_create_for(
+        &self,
+        config: &ConnectionConfig,
+        capture_policy: Option<super::connection::CapturePolicy>,
+    ) -> Result<Option<PendingStoredConnection>> {
+        let mut query = self
+            .0
+            .prepare("SELECT value FROM pending_connections ORDER BY id")
+            .map_err(storage)?;
+        let rows = query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(storage)?;
+        let mut matched = None;
+        for row in rows {
+            let pending = decode_pending(&row.map_err(storage)?)?;
+            if pending.create
+                && pending.config == *config
+                && pending.capture_policy == capture_policy
+            {
+                if matched.is_some() {
+                    return Err(corrupt());
+                }
+                matched = Some(pending);
+            }
+        }
+        Ok(matched)
+    }
     pub fn promote_pending(
         &mut self,
         id: &str,
@@ -204,10 +275,11 @@ impl ConnectionStore {
     ) -> Result<StoredConnection> {
         let pending = self.pending(id)?;
         let provider_repository_id = pending.provider_repository_id.ok_or_else(corrupt)?;
+        let descriptor = pending.descriptor.ok_or_else(corrupt)?;
         let connection = StoredConnection {
             id: pending.id,
             config: pending.config,
-            descriptor: pending.descriptor,
+            descriptor,
             descriptor_locator,
             provider_repository_id,
             credential_ref: pending.credential_ref,
@@ -216,6 +288,8 @@ impl ConnectionStore {
             root_key_ref: pending.root_key_ref,
             capabilities,
             created_at_ms: pending.created_at_ms,
+            last_sync_at_ms: None,
+            last_backup_at_ms: None,
         };
         connection.descriptor.validate().map_err(|_| corrupt())?;
         self.require_unheld_identity(&connection.descriptor_locator.connection_identity)?;
@@ -252,12 +326,44 @@ impl ConnectionStore {
         tx.commit().map_err(storage)?;
         Ok(connection)
     }
-    pub fn remember_discovery<T: Serialize>(
+    /// Records only a completed operation; starting or preparing work never calls this.
+    pub fn record_completion(
+        &mut self,
+        id: &str,
+        kind: CompletionKind,
+        completed_at_ms: u64,
+    ) -> Result<()> {
+        if completed_at_ms == 0 {
+            return Err(corrupt());
+        }
+        let tx = self.0.transaction_with_behavior(TransactionBehavior::Immediate).map_err(storage)?;
+        let encoded: Option<String> = tx.query_row(
+            "SELECT value FROM connections WHERE id=?1", [id], |row| row.get(0),
+        ).optional().map_err(storage)?;
+        let mut connection = decode(&encoded.ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?)?;
+        if connection.id != id {
+            return Err(corrupt());
+        }
+        let timestamp = match kind {
+            CompletionKind::Sync if connection.descriptor.publication_strategy.is_some() => {
+                &mut connection.last_sync_at_ms
+            }
+            CompletionKind::Sync => return Err(ProviderError::new(ErrorKind::Unsupported)),
+            CompletionKind::Backup => &mut connection.last_backup_at_ms,
+        };
+        *timestamp = Some(timestamp.unwrap_or(0).max(completed_at_ms));
+        let encoded = serde_json::to_string(&connection).map_err(storage)?;
+        tx.execute("UPDATE connections SET value=?2 WHERE id=?1", params![id, encoded]).map_err(storage)?;
+        tx.commit().map_err(storage)
+    }
+
+    pub fn remember_discovery(
         &self,
         connection: &str,
         id: &str,
-        value: &T,
+        value: &RemoteObject,
     ) -> Result<()> {
+        validate_discovery(&self.read(connection)?, id, value)?;
         let encoded = serde_json::to_string(value).map_err(storage)?;
         if encoded.len() > 256 * 1024 {
             return Err(corrupt());
@@ -266,11 +372,14 @@ impl ConnectionStore {
             params![connection, id, encoded]).map_err(storage)?;
         Ok(())
     }
-    pub fn discovery<T: serde::de::DeserializeOwned>(
+    pub fn discovery(
         &self,
         connection: &str,
         id: &str,
-    ) -> Result<T> {
+        role: ObjectRole,
+        expected_ciphertext_sha256: Option<&str>,
+    ) -> Result<RemoteObject> {
+        let current = self.read(connection)?;
         let encoded: Option<String> = self
             .0
             .query_row(
@@ -284,9 +393,34 @@ impl ConnectionStore {
         if encoded.len() > 256 * 1024 {
             return Err(corrupt());
         }
-        serde_json::from_str(&encoded).map_err(|_| corrupt())
+        let value: RemoteObject = serde_json::from_str(&encoded).map_err(|_| corrupt())?;
+        validate_discovery(&current, id, &value)?;
+        if value.role != role || expected_ciphertext_sha256.is_some_and(|hash| {
+            !crate::trust_boundary::is_lower_hex_256(hash) || hash != value.ciphertext_sha256
+        }) {
+            return Err(corrupt());
+        }
+        Ok(value)
     }
 }
+
+fn validate_discovery(connection: &StoredConnection, id: &str, value: &RemoteObject) -> Result<()> {
+    let locator = &value.receipt.locator;
+    if id.is_empty() || id.len() > 256 || id.chars().any(char::is_control)
+        || value.object_id != format!("snapshot-{id}")
+        || value.repository_id != connection.descriptor.repository_id
+        || !matches!(value.role, ObjectRole::SyncState | ObjectRole::BackupBundle)
+        || locator.connection_identity != connection.descriptor_locator.connection_identity
+        || locator.object.is_empty() || locator.object.len() > 8192 || locator.object.contains('\0')
+        || !value.receipt.complete || value.receipt.byte_length == 0 || value.plaintext_length == 0
+        || !crate::trust_boundary::is_lower_hex_256(&value.ciphertext_sha256)
+        || !crate::trust_boundary::is_lower_hex_256(&value.plaintext_sha256)
+    {
+        return Err(corrupt());
+    }
+    Ok(())
+}
+
 fn decode(encoded: &str) -> Result<StoredConnection> {
     if encoded.len() > 128 * 1024 {
         return Err(corrupt());
@@ -307,14 +441,18 @@ fn decode(encoded: &str) -> Result<StoredConnection> {
     Ok(value)
 }
 fn validate_pending(value: &PendingStoredConnection) -> Result<()> {
-    value.descriptor.validate().map_err(|_| corrupt())?;
-    if [&value.id, &value.credential_ref, &value.root_key_ref]
+    if let Some(descriptor) = &value.descriptor {
+        descriptor.validate().map_err(|_| corrupt())?;
+        if descriptor.repository_id != value.repository_id {
+            return Err(corrupt());
+        }
+    } else if !value.create {
+        return Err(corrupt());
+    }
+    if [&value.id, &value.repository_id, &value.credential_ref, &value.root_key_ref]
         .iter()
         .any(|value| value.is_empty())
-        || value
-            .provider_repository_id
-            .as_ref()
-            .is_some_and(String::is_empty)
+        || value.provider_repository_id.as_ref().is_some_and(String::is_empty)
     {
         return Err(corrupt());
     }
@@ -344,9 +482,10 @@ mod tests {
                 location: [("root".into(), "RisuNest".into())].into(),
                 oauth_profile: None,
             },
-            descriptor: Descriptor::new("synthetic-format-repository".into(), None,
-            )
-            .unwrap(),
+            repository_id: "synthetic-format-repository".into(),
+            descriptor: Some(Descriptor::new("synthetic-format-repository".into(), None)
+                .unwrap()),
+            create: true,
             provider_repository_id: Some("synthetic-provider-repository".into()),
             credential_ref: "provider-v1:00000000-0000-4000-8000-000000000001".into(),
             root_key_ref: "repository-key-v1:00000000-0000-4000-8000-000000000002".into(),
@@ -361,6 +500,160 @@ mod tests {
             collection: Some("descriptors".into()),
             object: "descriptor".into(),
         }
+    }
+
+    #[test]
+    fn retry_keeps_the_pending_repository_key_strategy_and_account() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = ConnectionStore::open(root.path()).unwrap();
+        let original = pending();
+        store.put_pending(&original).unwrap();
+        let mutations: [fn(&mut PendingStoredConnection); 7] = [
+            |value| {
+                value.root_key_ref =
+                    "repository-key-v1:00000000-0000-4000-8000-000000000003".into()
+            },
+            |value| {
+                value.repository_id = "different-format-repository".into();
+                value.descriptor = Some(
+                    Descriptor::new("different-format-repository".into(), None).unwrap(),
+                );
+            },
+            |value| value.create = false,
+            |value| value.descriptor.as_mut().unwrap().publication_strategy = Some(PublicationStrategy::Cas),
+            |value| value.provider_repository_id = Some("different-root".into()),
+            |value| value.config.account_id = "another-account".into(),
+            |value| value.config.endpoint = "https://another.invalid".into(),
+        ];
+        for mutate in mutations {
+            let mut retry = original.clone();
+            mutate(&mut retry);
+            assert_eq!(store.put_pending(&retry).unwrap_err().kind, ErrorKind::PreconditionFailed);
+            assert_eq!(serde_json::to_value(store.pending(&original.id).unwrap()).unwrap(),
+                serde_json::to_value(&original).unwrap());
+        }
+        let mut refreshed = original.clone();
+        refreshed.credential_ref = "new-credential-for-the-same-account".into();
+        store.put_pending(&refreshed).unwrap();
+        drop(store);
+        let reopened = ConnectionStore::open(root.path()).unwrap();
+        let restored = reopened.pending(&original.id).unwrap();
+        assert_eq!(restored.credential_ref, refreshed.credential_ref);
+        assert_eq!(restored.root_key_ref, original.root_key_ref);
+        assert_eq!(restored.descriptor, original.descriptor);
+    }
+
+    #[test]
+    fn pending_create_is_durable_before_provider_identity_and_strategy_are_known() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = ConnectionStore::open(root.path()).unwrap();
+        let mut value = pending();
+        value.provider_repository_id = None;
+        value.descriptor = None;
+        store.put_pending(&value).unwrap();
+        let mut initialized = value.clone();
+        initialized.provider_repository_id = Some("synthetic-provider-repository".into());
+        initialized.descriptor = Some(
+            Descriptor::new(value.repository_id.clone(), Some(PublicationStrategy::Sequential))
+                .unwrap(),
+        );
+        store.put_pending(&initialized).unwrap();
+        let restored = store.pending(&value.id).unwrap();
+        assert_eq!(restored.provider_repository_id, initialized.provider_repository_id);
+        assert_eq!(restored.descriptor, initialized.descriptor);
+        assert_eq!(store.put_pending(&value).unwrap_err().kind, ErrorKind::PreconditionFailed);
+    }
+
+    #[test]
+    fn a_restarted_prepare_recovers_the_single_matching_create_intent() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = ConnectionStore::open(root.path()).unwrap();
+        let mut value = pending();
+        value.descriptor = None;
+        value.provider_repository_id = None;
+        store.put_pending(&value).unwrap();
+        let matched = store
+            .pending_create_for(&value.config, value.capture_policy)
+            .unwrap()
+            .unwrap();
+        assert_eq!(matched.id, value.id);
+
+        let mut duplicate = value.clone();
+        duplicate.id = "second-pending-create".into();
+        duplicate.credential_ref = "second-credential".into();
+        duplicate.root_key_ref = "second-key".into();
+        duplicate.repository_id = "second-repository".into();
+        store.put_pending(&duplicate).unwrap();
+        assert_eq!(
+            store
+                .pending_create_for(&value.config, value.capture_policy)
+                .err()
+                .unwrap()
+                .kind,
+            ErrorKind::Corrupt
+        );
+    }
+
+    #[test]
+    fn only_real_completions_set_independent_monotonic_timestamps() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = ConnectionStore::open(root.path()).unwrap();
+        let mut value = pending();
+        value.descriptor.as_mut().unwrap().publication_strategy = Some(PublicationStrategy::Sequential);
+        store.put_pending(&value).unwrap();
+        let connected = store.promote_pending(&value.id, locator("synthetic"), Capabilities::default()).unwrap();
+        assert_eq!(connected.last_sync_at_ms, None);
+        assert_eq!(connected.last_backup_at_ms, None);
+        store.record_completion(&value.id, CompletionKind::Backup, 20).unwrap();
+        assert_eq!(store.read(&value.id).unwrap().last_sync_at_ms, None);
+        store.record_completion(&value.id, CompletionKind::Sync, 30).unwrap();
+        store.record_completion(&value.id, CompletionKind::Sync, 10).unwrap();
+        assert_eq!(store.record_completion(&value.id, CompletionKind::Backup, 0).unwrap_err().kind, ErrorKind::Corrupt);
+        drop(store);
+        let restored = ConnectionStore::open(root.path()).unwrap().read(&value.id).unwrap();
+        assert_eq!(restored.last_sync_at_ms, Some(30));
+        assert_eq!(restored.last_backup_at_ms, Some(20));
+        assert_eq!(restored.descriptor.publication_strategy, Some(PublicationStrategy::Sequential));
+    }
+
+    #[test]
+    fn discovery_checks_the_current_repository_role_id_and_hash() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = ConnectionStore::open(root.path()).unwrap();
+        let value = pending();
+        store.put_pending(&value).unwrap();
+        store.promote_pending(&value.id, locator("synthetic"), Capabilities::default()).unwrap();
+        let reference = RemoteObject {
+            repository_id: value.repository_id.clone(),
+            object_id: "snapshot-a".into(),
+            role: ObjectRole::BackupBundle,
+            receipt: ObjectReceipt {
+                locator: RemoteLocator { connection_identity: "synthetic".into(), collection: None, object: "bundle-a".into() },
+                byte_length: 100, version: None, checksum: None, complete: true,
+            },
+            ciphertext_sha256: "a".repeat(64), plaintext_sha256: "b".repeat(64), plaintext_length: 50,
+        };
+        store.remember_discovery(&value.id, "a", &reference).unwrap();
+        assert_eq!(store.discovery(&value.id, "a", ObjectRole::BackupBundle,
+            Some(&reference.ciphertext_sha256)).unwrap(), reference);
+        assert_eq!(store.discovery(&value.id, "a", ObjectRole::SyncState, None).unwrap_err().kind, ErrorKind::Corrupt);
+        assert_eq!(store.discovery(&value.id, "a", ObjectRole::BackupBundle, Some(&"c".repeat(64)))
+            .unwrap_err().kind, ErrorKind::Corrupt);
+        for mutate in [
+            (|object: &mut RemoteObject| object.repository_id = "other-repository".into()) as fn(&mut RemoteObject),
+            |object| object.object_id = "snapshot-b".into(),
+            |object| object.receipt.locator.connection_identity = "other-connection".into(),
+            |object| object.role = ObjectRole::Pack,
+            |object| object.receipt.complete = false,
+            |object| object.ciphertext_sha256 = "invalid".into(),
+        ] {
+            let mut invalid = reference.clone();
+            mutate(&mut invalid);
+            assert_eq!(store.remember_discovery(&value.id, "a", &invalid).unwrap_err().kind, ErrorKind::Corrupt);
+        }
+        // A cache row is not enough once its connection has been removed.
+        store.remove(&value.id).unwrap();
+        assert_eq!(store.discovery(&value.id, "a", ObjectRole::BackupBundle, None).unwrap_err().kind, ErrorKind::NotFound);
     }
 
     #[test]

@@ -165,6 +165,8 @@ fn recovery_package_opens_and_applies_a_real_snapshot_without_the_source_vault()
                 retention_policy: None,
                 capabilities: Capabilities::default(),
                 created_at_ms: 1,
+                last_sync_at_ms: None,
+                last_backup_at_ms: None,
             };
             let exported = recovery::export(&stored, &root_key).unwrap();
             let unavailable_source_vault = MemoryVault::default();

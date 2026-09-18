@@ -8,8 +8,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 /// JSON/XML pages and heads are read into memory; anything larger is refused.
 pub(crate) const MAX_CONTROL_BODY: usize = 4 * 1024 * 1024;
-/// Retry hints further away than this are clamped; a day-scale hint is a quota.
-const MAX_RETRY_AFTER_MS: u64 = 24 * 60 * 60 * 1000;
 
 pub(crate) fn error(kind: ErrorKind, status: u16) -> ProviderError {
     ProviderError {
@@ -99,7 +97,7 @@ pub(crate) fn content_length(headers: &BTreeMap<String, String>) -> Result<Optio
         .transpose()
 }
 
-/// Delay-seconds or an HTTP-date, clamped to one day from `now_ms`.
+/// Delay-seconds or an HTTP-date, preserving the server's full wait.
 pub(crate) fn retry_after_ms(headers: &BTreeMap<String, String>, now_ms: u64) -> Option<u64> {
     let value = headers.get("retry-after")?.trim();
     let at = if let Ok(seconds) = value.parse::<u64>() {
@@ -109,7 +107,7 @@ pub(crate) fn retry_after_ms(headers: &BTreeMap<String, String>, now_ms: u64) ->
         let unix = date.duration_since(std::time::UNIX_EPOCH).ok()?;
         (unix.as_millis().min(u64::MAX as u128) as u64).max(now_ms)
     };
-    Some(at.min(now_ms.saturating_add(MAX_RETRY_AFTER_MS)))
+    Some(at)
 }
 
 /// Default classification of a non-success status. Redirects and unlisted 4xx
@@ -232,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_accepts_seconds_and_dates_with_a_daily_clamp() {
+    fn retry_after_accepts_seconds_and_dates_without_shortening_server_waits() {
         let mut headers = BTreeMap::new();
         assert_eq!(retry_after_ms(&headers, 1_000), None);
         headers.insert("retry-after".into(), "60".into());
@@ -243,8 +241,14 @@ mod tests {
         headers.insert("retry-after".into(), "999999999".into());
         assert_eq!(
             retry_after_ms(&headers, 1_000),
-            Some(1_000 + MAX_RETRY_AFTER_MS)
+            Some(1_000 + 999_999_999_000)
         );
+        headers.insert("retry-after".into(), "172800".into());
+        assert_eq!(retry_after_ms(&headers, 1_000), Some(172_801_000));
+        headers.insert("retry-after".into(), "Sat, 03 Jan 1970 00:00:00 GMT".into());
+        assert_eq!(retry_after_ms(&headers, 1_000), Some(172_800_000));
+        headers.insert("retry-after".into(), u64::MAX.to_string());
+        assert_eq!(retry_after_ms(&headers, 1_000), Some(u64::MAX));
         headers.insert("retry-after".into(), "soon".into());
         assert_eq!(retry_after_ms(&headers, 1_000), None);
     }

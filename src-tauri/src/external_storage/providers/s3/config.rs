@@ -29,7 +29,7 @@ pub(crate) struct RepositoryContext {
     pub prefix: String,
     pub region: String,
     pub addressing: Addressing,
-    pub account_id: String,
+    pub account: crate::external_storage::quota::AccountKey,
     pub connection_identity: String,
     pub secret: SecretRef,
 }
@@ -149,6 +149,7 @@ pub(crate) fn validate(config: &ConnectionConfig, secret: &SecretRef) -> Result<
         profile.id,
         origin_text = origin_text(&origin)?
     );
+    let account = crate::external_storage::quota::AccountKey::new(PROVIDER_ID, &origin, &config.account_id)?;
     Ok(RepositoryContext {
         profile,
         origin,
@@ -157,7 +158,7 @@ pub(crate) fn validate(config: &ConnectionConfig, secret: &SecretRef) -> Result<
         prefix,
         region,
         addressing,
-        account_id: config.account_id.clone(),
+        account,
         connection_identity,
         secret: secret.clone(),
     })

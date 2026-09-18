@@ -10,8 +10,9 @@ const exclude = [
   '**/.worktrees/**',
   '**/.superpowers/**',
   '**/docs/research/**',
-  // This golden-vector test uses node:test and runs with the Node test runner.
+  // These suites use node:test and run with the Node test runner.
   'crates/sync-wire/tests/golden.test.mjs',
+  'benchmarks/sync-server/transfer-comparison.test.mjs',
 ]
 
 export default defineConfig({

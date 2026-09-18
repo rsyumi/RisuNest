@@ -616,13 +616,6 @@ async fn resume_task(app: AppHandle, original: DurableJob, session_id: String) {
             app.state::<RuntimeRestoreState>().release_claim(&original.id);
         }
         drop(worker_claim);
-        // The outcome above may have failed the job, which the caller's copy
-        // does not show.
-        if let Ok(settled) = JobStore::open(app.state::<DeviceBackupState>().repository_root())
-            .and_then(|store| store.read(&original.id))
-        {
-            runtime::release_leases(&app, &settled);
-        }
     }
 }
 
@@ -913,7 +906,6 @@ pub(crate) fn settle_device_restore(
         }
     }
     app.state::<RuntimeRestoreState>().release(&job.id);
-    runtime::release_leases(&app, &job);
     let staging =
         runtime::job_directory(&root, &job.request.connection_id, &job.id).join("restore-snapshot");
     cleanup_staging(&staging);
@@ -963,7 +955,6 @@ pub(crate) fn reconcile_device_restore_settlements(app: &AppHandle) -> Result<()
             .join("restore-snapshot");
             cleanup_staging(&staging);
             app.state::<RuntimeRestoreState>().release(&job.id);
-            runtime::release_leases(app, &job);
         }
     }
     Ok(())

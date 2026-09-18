@@ -45,7 +45,6 @@ pub(super) struct Item {
 
 #[derive(serde::Deserialize)]
 pub(super) struct ChildrenPage {
-    #[serde(default)]
     pub value: Vec<Item>,
     #[serde(rename = "@odata.nextLink", default)]
     pub next_link: Option<String>,
@@ -204,6 +203,17 @@ pub(super) fn folder_children_url(
 
 pub(super) fn root_children_url(settings: &Settings, root_item_id: &str) -> Result<url::Url> {
     parse(format!("{}/children", root_prefix(settings, root_item_id)))
+}
+
+pub(super) fn root_children_listing_url(
+    settings: &Settings,
+    root_item_id: &str,
+    query: &str,
+) -> Result<url::Url> {
+    parse(format!(
+        "{}/children?{query}",
+        root_prefix(settings, root_item_id)
+    ))
 }
 
 pub(super) fn listing_query(limit: u16, cursor: Option<&str>) -> String {

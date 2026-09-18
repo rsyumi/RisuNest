@@ -432,6 +432,150 @@ fn a_removal_carries_one_first_publication_marker_to_every_device() {
     fleet.task.abort();
 }
 
+/// A cycle acknowledges the row version it observed during preparation. A
+/// value or removal written before activation remains pending for a later cycle.
+#[test]
+fn a_prepared_section_ack_does_not_ack_a_later_value_or_removal() {
+    let fleet = fleet();
+    let (_store_dir, mut store) = prepared();
+    store
+        .device_store_mut()
+        .unwrap()
+        .set_section_participating(Section::LocalPlugins, true)
+        .unwrap();
+    fleet.bind(&mut store);
+    assert_eq!(settle(&mut store).phase, "idle");
+
+    store
+        .device_store_mut()
+        .unwrap()
+        .write_plugin_device_values(
+            "synthetic-plugin",
+            &[
+                PluginDeviceMutation::Set {
+                    space: "json".into(),
+                    key: "changed-after-prepare".into(),
+                    value: json!({"revision":"old"}).to_string(),
+                },
+                PluginDeviceMutation::Set {
+                    space: "json".into(),
+                    key: "deleted-after-prepare".into(),
+                    value: json!({"revision":"old"}).to_string(),
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!(settle(&mut store).phase, "idle");
+    assert_eq!(settle(&mut store).phase, "idle");
+
+    let changed_key =
+        local_plugin_entry_key("synthetic-plugin", "json", "changed-after-prepare").unwrap();
+    let deleted_key =
+        local_plugin_entry_key("synthetic-plugin", "json", "deleted-after-prepare").unwrap();
+    let old_changed = sections::read_local(
+        store.device_store().unwrap(),
+        Domain::LocalPlugins,
+        &changed_key,
+    )
+    .unwrap()
+    .unwrap();
+    let old_deleted = sections::read_local(
+        store.device_store().unwrap(),
+        Domain::LocalPlugins,
+        &deleted_key,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(old_changed.published);
+    assert!(old_deleted.published);
+
+    // Reproduce a confirmed remote publication whose local acknowledgement was
+    // lost. Preparation now chooses `mark` for these exact remote versions.
+    store
+        .device_store_mut()
+        .unwrap()
+        .connection()
+        .execute(
+            "UPDATE plugin_device_storage SET published_clock=NULL
+                WHERE owner='synthetic-plugin' AND space='json'
+                  AND key IN ('changed-after-prepare','deleted-after-prepare')",
+            [],
+        )
+        .unwrap();
+    let crate::persistent_store::server_sync_engine::Preparation::Ready(mut ready) = store
+        .server_prepare_cycle(&CycleOptions::default())
+        .unwrap()
+    else {
+        panic!("expected a prepared cycle")
+    };
+
+    store
+        .device_store_mut()
+        .unwrap()
+        .write_plugin_device_values(
+            "synthetic-plugin",
+            &[
+                PluginDeviceMutation::Set {
+                    space: "json".into(),
+                    key: "changed-after-prepare".into(),
+                    value: json!({"revision":"new"}).to_string(),
+                },
+                PluginDeviceMutation::Delete {
+                    space: "json".into(),
+                    key: "deleted-after-prepare".into(),
+                },
+            ],
+        )
+        .unwrap();
+
+    store.server_activate_cycle(&mut ready).unwrap();
+    assert_eq!(store.server_publish_cycle(&ready).unwrap().phase, "idle");
+
+    let changed = sections::read_local(
+        store.device_store().unwrap(),
+        Domain::LocalPlugins,
+        &changed_key,
+    )
+    .unwrap()
+    .unwrap();
+    let deleted: (String, String, Option<String>, bool, Option<String>) = store
+        .device_store()
+        .unwrap()
+        .connection()
+        .query_row(
+            "SELECT write_clock,writer_id,published_clock,tombstone,first_published_generation
+                FROM plugin_device_storage
+                WHERE owner='synthetic-plugin' AND space='json' AND key='deleted-after-prepare'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    let deleted_version = SectionEntryVersion {
+        write_clock: Sequence::try_from(deleted.0).unwrap(),
+        writer_id: deleted.1,
+    };
+    assert_ne!(changed.version, old_changed.version);
+    assert_ne!(deleted_version, old_deleted.version);
+    assert!(!changed.published);
+    assert_eq!(deleted.2, None);
+    assert!(deleted.3);
+    assert_eq!(deleted.4, None);
+    assert!(matches!(
+        changed.entry.value,
+        SectionValue::LocalPlugin(LocalPluginValue { value, .. })
+            if value == json!({"revision":"new"})
+    ));
+    fleet.task.abort();
+}
+
 /// Invariant 18. A choice made after a cycle was planned cancels that cycle's
 /// section work instead of carrying out the previous choice.
 #[test]

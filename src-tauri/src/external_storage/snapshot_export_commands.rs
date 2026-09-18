@@ -116,39 +116,23 @@ fn publish_uri_destination(
 
 /// Announces this command in the repository, runs its remote work and hands
 /// the announcement back. A command has no durable job to name it, so the
-/// identity is drawn per call and lives only as long as the call does. Every
-/// remote request of `body` is awaited before this returns, which is what makes
-/// the release point the one where nothing of this command is still in flight;
-/// an end this device cannot see, such as a panic, keeps the lease instead. A
-/// repository that cannot remove anything has nothing to announce and nothing
-/// to wait for.
+/// identity is drawn per call and lives only as long as the call does.
+/// An interrupted command leaves only a finite lease behind.
 async fn with_export_lease<T>(
     context: &leases::LeaseContext<'_>,
     capabilities: &Capabilities,
-    now_ms: u64,
     cancel: &Cancellation,
     body: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
-    if capabilities.require_cleanup().is_err() {
+    if !capabilities.lease_operations {
         return body.await;
     }
     let lease_id = uuid::Uuid::new_v4().to_string();
-    // A job starting beside this export resumes the connection's leases, and a
-    // command's identifier is in no pending job list. Holding it keeps that
-    // resume from taking this lease back while the download is still running.
-    let _held = leases::hold(&lease_id);
-    let outcome = match leases::admit(context, &lease_id, LeaseKind::Work, now_ms, cancel).await {
-        Ok(leases::Admission::Admitted(_)) => body.await,
-        Ok(leases::Admission::Blocked { .. }) => Err(ProviderError::new(ErrorKind::Transient)),
-        Err(error) => Err(error),
-    };
-    if let Err(error) = leases::release(context, &lease_id).await {
-        crate::nlog!(
-            "error",
-            "External storage lease could not be released: {error}"
-        );
+    match leases::admit(context, &lease_id, LeaseKind::Work, cancel).await? {
+        leases::Admission::Admitted(owner) => owner.run(context, cancel, body).await,
+        leases::Admission::Yield { .. } => Err(ProviderError::new(ErrorKind::Transient)),
+        leases::Admission::UnsupportedProtection => Err(ProviderError::new(ErrorKind::Unsupported)),
     }
-    outcome
 }
 
 #[tauri::command(async)]
@@ -188,11 +172,12 @@ pub(crate) async fn external_storage_export_snapshot(
         root_key: &connected.root_key,
         provider: connected.provider.as_ref(),
         repository: &connected.handle,
+        clock: leases::system_clock(),
+        protection_supported: connected.stored.capabilities.lease_operations,
     };
     let prepared = with_export_lease(
         &context,
         &connected.stored.capabilities,
-        runtime::now_ms(),
         &cancel,
         async {
             let remote = control::find_snapshot(&connected, &request.snapshot_id, &cancel).await?;
@@ -242,10 +227,8 @@ pub(crate) async fn external_storage_export_snapshot(
 mod tests {
     use super::*;
     use crate::external_storage::{
-        capabilities::Evidence,
         contract::{lease_object_id, LeaseKind, ObjectRole, RepositoryHandle},
-        fake::{self, FakeProvider},
-        gc_store::{GcStore, LeaseIntent, LeaseState},
+        fake::{self, FakeLeaseClock, FakeProvider},
     };
     use risunest_external_storage_format::format::{Descriptor, Strategy};
     use std::{
@@ -266,22 +249,14 @@ mod tests {
             .block_on(future)
     }
 
-    /// Everything a cleanup needs evidence of, on top of what the shared fake
-    /// already states. Without it a repository never announces anything.
     fn cleanup_ready() -> Capabilities {
-        Capabilities {
-            delete_objects: Evidence::Synthetic,
-            snapshot_discovery: Evidence::Synthetic,
-            gc_control_consistency: Evidence::Synthetic,
-            delete_completion: Evidence::Synthetic,
-            ..fake::capabilities(true)
-        }
+        fake::capabilities(true)
     }
 
     struct Harness {
         _directory: tempfile::TempDir,
         root: PathBuf,
-        store: GcStore,
+        clock: FakeLeaseClock,
         provider: FakeProvider,
         repository: RepositoryHandle,
         descriptor: Descriptor,
@@ -293,7 +268,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path().to_path_buf();
             Self {
-                store: GcStore::open(&root).unwrap(),
+                clock: FakeLeaseClock::new(NOW),
                 _directory: directory,
                 root,
                 provider: FakeProvider::new(true),
@@ -312,10 +287,9 @@ mod tests {
                 root_key: &self.root_key,
                 provider: &self.provider,
                 repository: &self.repository,
+                clock: &self.clock,
+                protection_supported: true,
             }
-        }
-        fn rows(&self) -> Vec<LeaseIntent> {
-            self.store.lease_intents(CONNECTION).unwrap()
         }
         /// The work leases the repository shows, whoever placed them.
         fn work_leases(&self) -> Vec<String> {
@@ -345,11 +319,11 @@ mod tests {
         let held = RefCell::new(Vec::new());
         block_on(async {
             let context = harness.context();
-            let value = with_export_lease(&context, &cleanup_ready(), NOW, &cancel, async {
-                let rows = harness.rows();
+            let value = with_export_lease(&context, &cleanup_ready(), &cancel, async {
+                let rows = leases::survey(&context, &cancel).await.unwrap().leases;
                 assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0].kind, LeaseKind::Work);
-                assert_eq!(rows[0].state, LeaseState::Confirmed);
+                assert_eq!(rows[0].document.as_ref().unwrap().kind, risunest_external_storage_format::control::LeaseKind::Work);
+                assert_eq!(rows[0].document.as_ref().unwrap().expires_at_ms, NOW + leases::LEASE_TTL_MS);
                 assert!(harness.provider.holds(&rows[0].locator.object));
                 *held.borrow_mut() = harness.work_leases();
                 Ok(7u8)
@@ -359,14 +333,12 @@ mod tests {
             assert_eq!(value, 7);
         });
         assert_eq!(held.borrow().len(), 1);
-        assert!(harness.rows().is_empty());
         assert!(harness.work_leases().is_empty());
     }
 
-    /// GC29: a delete marker stops the data requests whatever its age is, and
-    /// the lease this command placed to find that out is still handed back.
+    /// An unverifiable delete marker stops data requests before admission.
     #[test]
-    fn an_export_waits_for_a_delete_marker_however_old_it_is() {
+    fn an_export_refuses_an_unverifiable_delete_marker() {
         let harness = Harness::new();
         let cancel = Cancellation::default();
         let marker = lease_object_id(LeaseKind::Deleting, &"a".repeat(32)).unwrap();
@@ -378,7 +350,7 @@ mod tests {
         block_on(async {
             let context = harness.context();
             let error =
-                with_export_lease(&context, &cleanup_ready(), NOW + 8 * DAY, &cancel, async {
+                with_export_lease(&context, &cleanup_ready(), &cancel, async {
                     started.store(true, Ordering::SeqCst);
                     Ok(())
                 })
@@ -387,11 +359,9 @@ mod tests {
             assert_eq!(error.kind, ErrorKind::Transient);
         });
         assert!(!started.load(Ordering::SeqCst));
-        // The wait happened after this command announced itself, and the
-        // announcement did not outlive the call.
-        assert_eq!(harness.creations(), placed + 1);
+        // The initial survey yields before announcing this export.
+        assert_eq!(harness.creations(), placed);
         assert!(harness.provider.holds(&marker));
-        assert!(harness.rows().is_empty());
         assert!(harness.work_leases().is_empty());
     }
 
@@ -403,23 +373,21 @@ mod tests {
         let started = AtomicBool::new(false);
         block_on(async {
             let context = harness.context();
-            let error = with_export_lease(&context, &cleanup_ready(), NOW, &cancel, async {
+            let error = with_export_lease(&context, &cleanup_ready(), &cancel, async {
                 started.store(true, Ordering::SeqCst);
                 Ok(())
             })
             .await
             .unwrap_err();
-            assert_eq!(error.kind, ErrorKind::Corrupt);
+            assert_eq!(error.kind, ErrorKind::Transient);
         });
         assert!(!started.load(Ordering::SeqCst));
         assert!(harness.provider.holds("not-a-lease"));
         assert_eq!(harness.provider.delete_attempts("not-a-lease"), 0);
-        assert!(harness.rows().is_empty());
         assert!(harness.work_leases().is_empty());
     }
 
-    /// GC29: a body that fails or is cancelled ends the same way. Nothing of
-    /// this command is still in flight once it has returned.
+    /// GC29: a body that fails or reports cancellation gives its lease back.
     #[test]
     fn an_export_that_fails_or_is_cancelled_still_returns_its_lease() {
         for kind in [ErrorKind::Cancelled, ErrorKind::Corrupt] {
@@ -427,14 +395,13 @@ mod tests {
             let cancel = Cancellation::default();
             block_on(async {
                 let context = harness.context();
-                let error = with_export_lease(&context, &cleanup_ready(), NOW, &cancel, async {
+                let error = with_export_lease(&context, &cleanup_ready(), &cancel, async {
                     Err::<(), _>(ProviderError::new(kind))
                 })
                 .await
                 .unwrap_err();
                 assert_eq!(error.kind, kind);
             });
-            assert!(harness.rows().is_empty());
             assert!(harness.work_leases().is_empty());
         }
     }
@@ -448,8 +415,8 @@ mod tests {
         let started = AtomicBool::new(false);
         block_on(async {
             let context = harness.context();
-            let unavailable = fake::capabilities_without_cleanup(true);
-            with_export_lease(&context, &unavailable, NOW, &cancel, async {
+            let unavailable = Capabilities { lease_operations: false, ..fake::capabilities_without_cleanup(true) };
+            with_export_lease(&context, &unavailable, &cancel, async {
                 started.store(true, Ordering::SeqCst);
                 Ok(())
             })
@@ -457,7 +424,6 @@ mod tests {
             .unwrap();
         });
         assert!(started.load(Ordering::SeqCst));
-        assert!(harness.rows().is_empty());
         assert_eq!(harness.creations(), 0);
     }
 

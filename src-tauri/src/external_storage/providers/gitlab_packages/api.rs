@@ -1,7 +1,11 @@
-//! URL construction, per-request quota costs, response shapes and the GitLab
+//! URL construction, request metadata, response shapes and the GitLab
 //! specific status classification.
 use super::config::{Credential, Placement, Settings};
-use crate::external_storage::{contract::*, http::HttpRequest, providers::common};
+use crate::external_storage::{
+    contract::*,
+    http::{self, HttpRequest},
+    providers::common,
+};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use serde::Deserialize;
 use std::{collections::BTreeMap, pin::Pin};
@@ -15,64 +19,7 @@ const SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'~');
 
-/// Authenticated API traffic is counted per token principal; package registry
-/// traffic is additionally throttled per client address of one instance.
-const USER_BUCKET: &str = "apiRequests";
-const ADDRESS_BUCKET: &str = "packageRegistryRequests";
-const USER_SCOPE: &str = "gitlab:user";
-const ADDRESS_SCOPE: &str = "gitlab:address";
 const MINUTE_MS: u64 = 60 * 1000;
-
-fn registry_path(operation: ProviderOperation) -> bool {
-    matches!(
-        operation,
-        ProviderOperation::Metadata
-            | ProviderOperation::Get
-            | ProviderOperation::Range
-            | ProviderOperation::Create
-            | ProviderOperation::CompareExchangeHead
-            | ProviderOperation::ReplaceHead
-    )
-}
-
-/// The trait method has no connection, so it reports the bucket model with the
-/// scope prefixes. Dispatched requests carry the resolved account identities.
-pub(super) fn cost_model(operation: ProviderOperation) -> Vec<RequestCost> {
-    let mut costs = vec![RequestCost {
-        bucket: USER_BUCKET.into(),
-        shared_account: USER_SCOPE.into(),
-        units: 1,
-        reset: QuotaReset::Rolling {
-            window_ms: MINUTE_MS,
-        },
-    }];
-    if registry_path(operation) {
-        costs.push(RequestCost {
-            bucket: ADDRESS_BUCKET.into(),
-            shared_account: ADDRESS_SCOPE.into(),
-            units: 1,
-            reset: QuotaReset::Rolling {
-                window_ms: MINUTE_MS,
-            },
-        });
-    }
-    costs
-}
-
-pub(super) fn costs(settings: &Settings, operation: ProviderOperation) -> Vec<RequestCost> {
-    let host = settings.endpoint.host_str().unwrap_or_default();
-    cost_model(operation)
-        .into_iter()
-        .map(|mut cost| {
-            if cost.bucket == ADDRESS_BUCKET {
-                cost.shared_account = format!("{ADDRESS_SCOPE}:{host}");
-            } else {
-                cost.shared_account = format!("{USER_SCOPE}:{}", settings.account_id);
-            }
-            cost
-        })
-        .collect()
-}
 
 fn url(settings: &Settings, segments: &[&str], query: &[(&str, &str)]) -> Result<url::Url> {
     let mut text = settings.endpoint.as_str().trim_end_matches('/').to_owned();
@@ -118,6 +65,10 @@ pub(super) fn packages_url(settings: &Settings, query: &[(&str, &str)]) -> Resul
         &["api", "v4", "projects", &settings.project, "packages"],
         query,
     )
+}
+
+pub(super) fn user_url(settings: &Settings) -> Result<url::Url> {
+    url(settings, &["api", "v4", "user"], &[])
 }
 
 pub(super) fn package_files_url(
@@ -182,6 +133,10 @@ pub(super) fn request(settings: &Settings, outgoing: Outgoing<'_>) -> HttpReques
             credential.token.to_string(),
         );
     }
+    if http::control_operation(outgoing.operation) {
+        http::bypass_cache(&mut headers);
+    }
+    let api_request = outgoing.url.origin() == settings.endpoint.origin();
     HttpRequest {
         method: outgoing.method,
         url: outgoing.url,
@@ -189,7 +144,10 @@ pub(super) fn request(settings: &Settings, outgoing: Outgoing<'_>) -> HttpReques
         body: outgoing.body,
         content_length: outgoing.content_length,
         operation: outgoing.operation,
-        costs: costs(settings, outgoing.operation),
+        account: settings.account.clone(),
+        api_request,
+        mybox_charge: None,
+        control: http::control_operation(outgoing.operation),
     }
 }
 
@@ -237,6 +195,20 @@ pub(super) struct PackageJson {
     pub(super) id: u64,
     pub(super) name: String,
     pub(super) version: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct UserJson {
+    id: u64,
+}
+
+impl UserJson {
+    pub(super) fn principal(&self) -> Result<String> {
+        if self.id == 0 {
+            return Err(ProviderError::new(ErrorKind::Corrupt));
+        }
+        Ok(self.id.to_string())
+    }
 }
 
 #[derive(Deserialize)]

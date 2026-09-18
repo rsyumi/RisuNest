@@ -3,13 +3,14 @@
 //! `Authorization` header value or a sealed vault payload.
 use super::{
     config::{self, AuthorizationSettings, Settings},
-    wire::{self, About, AccountScope},
+    wire::{self, About},
 };
 use crate::external_storage::{
     auth::{AuthorizationCode, AuthorizationPolicy, SecretBytes},
     contract::*,
-    http::{self, HttpRequest},
+    http::HttpRequest,
     providers::Dependencies,
+    quota::AccountKey,
 };
 use serde::Deserialize;
 use std::{collections::BTreeMap, sync::Mutex};
@@ -151,7 +152,7 @@ impl tokio::io::AsyncRead for SecretBody {
 async fn post_token(
     dependencies: &Dependencies,
     token_endpoint: url::Url,
-    scope: &AccountScope,
+    account: &AccountKey,
     body: Zeroizing<Vec<u8>>,
     cancel: &Cancellation,
 ) -> Result<TokenResponse> {
@@ -168,16 +169,12 @@ async fn post_token(
         })),
         content_length: Some(length),
         operation: ProviderOperation::Authenticate,
-        costs: wire::costs(ProviderOperation::Authenticate, scope, 0),
+        account: account.clone(),
+        api_request: true,
+        mybox_charge: None,
+        control: true,
     };
-    let mut response = http::send(
-        dependencies.http.as_ref(),
-        dependencies.budget.as_ref(),
-        dependencies.clock.as_ref(),
-        request,
-        cancel,
-    )
-    .await?;
+    let mut response = dependencies.send(request, cancel).await?;
     if response.status == 200 {
         return wire::json::<TokenResponse>(&mut response, cancel).await;
     }
@@ -199,7 +196,7 @@ pub(super) async fn verify_google_grant(
     expected_client_id: &str,
     required_scopes: &[String],
     access_token: &str,
-    scope: &AccountScope,
+    account: &AccountKey,
     cancel: &Cancellation,
 ) -> Result<()> {
     let mut url = token_info_endpoint;
@@ -215,16 +212,12 @@ pub(super) async fn verify_google_grant(
         body: None,
         content_length: None,
         operation: ProviderOperation::Authenticate,
-        costs: wire::costs(ProviderOperation::Metadata, scope, 0),
+        account: account.clone(),
+        api_request: true,
+        mybox_charge: None,
+        control: true,
     };
-    let mut response = http::send(
-        dependencies.http.as_ref(),
-        dependencies.budget.as_ref(),
-        dependencies.clock.as_ref(),
-        request,
-        cancel,
-    )
-    .await?;
+    let mut response = dependencies.send(request, cancel).await?;
     if matches!(response.status, 400 | 401) {
         return Err(reauth());
     }
@@ -248,6 +241,7 @@ async fn account_id(
     dependencies: &Dependencies,
     settings: &AuthorizationSettings,
     access_token: &str,
+    account: &AccountKey,
     cancel: &Cancellation,
 ) -> Result<String> {
     let mut url = settings.api("/about")?;
@@ -262,16 +256,12 @@ async fn account_id(
         body: None,
         content_length: None,
         operation: ProviderOperation::Metadata,
-        costs: wire::costs(ProviderOperation::Metadata, &settings.quota_scope(), 0),
+        account: account.clone(),
+        api_request: true,
+        mybox_charge: None,
+        control: true,
     };
-    let mut response = http::send(
-        dependencies.http.as_ref(),
-        dependencies.budget.as_ref(),
-        dependencies.clock.as_ref(),
-        request,
-        cancel,
-    )
-    .await?;
+    let mut response = dependencies.send(request, cancel).await?;
     if response.status == 401 {
         return Err(reauth());
     }
@@ -293,7 +283,7 @@ pub(super) async fn access_token(
     dependencies: &Dependencies,
     settings: &Settings,
     secret: &SecretRef,
-    scope: &AccountScope,
+    account: &AccountKey,
     cache: &Mutex<Option<CachedToken>>,
     force_refresh: bool,
     cancel: &Cancellation,
@@ -336,7 +326,7 @@ pub(super) async fn access_token(
     let granted = post_token(
         dependencies,
         settings.token_endpoint()?,
-        scope,
+        account,
         form(&refresh_form),
         cancel,
     )
@@ -357,7 +347,7 @@ pub(super) async fn access_token(
         &settings.client_id,
         &settings.scopes(),
         access.as_str(),
-        scope,
+        account,
         cancel,
     )
     .await?;
@@ -447,7 +437,7 @@ pub(crate) async fn exchange_authorization_code(
     if grant.client_id != settings.client_id {
         return Err(reauth());
     }
-    let scope = settings.quota_scope();
+    let pending = AccountKey::pending(config::PROVIDER_ID, &settings.api("/")?)?;
     let code = std::str::from_utf8(&grant.code.0).map_err(|_| reauth())?;
     let verifier = std::str::from_utf8(&grant.verifier.0).map_err(|_| reauth())?;
     if client_secret.as_ref().is_some_and(|secret| {
@@ -471,7 +461,7 @@ pub(crate) async fn exchange_authorization_code(
     let granted = post_token(
         dependencies,
         settings.token_endpoint()?,
-        &scope,
+        &pending,
         form(&exchange_form),
         cancel,
     )
@@ -497,11 +487,13 @@ pub(crate) async fn exchange_authorization_code(
         &settings.client_id,
         &settings.scopes,
         &access_token,
-        &scope,
+        &pending,
         cancel,
     )
     .await?;
-    let account_id = account_id(dependencies, &settings, &access_token, cancel).await?;
+    let account_id = account_id(dependencies, &settings, &access_token, &pending, cancel).await?;
+    let account = AccountKey::new(config::PROVIDER_ID, &settings.api("/")?, &account_id)?;
+    dependencies.requests.resolve_pending(&pending, &account)?;
     let secret = encode(&SecretPayload {
         refresh_token,
         access_token: Some(access_token),

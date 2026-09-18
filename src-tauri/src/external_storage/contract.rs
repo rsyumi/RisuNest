@@ -57,7 +57,7 @@ impl std::error::Error for ProviderError {}
 /// No Debug/Serialize implementation: provider contexts stay outside UI DTOs.
 #[derive(Clone)]
 pub(crate) struct SecretRef(pub String);
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ConnectionConfig {
     pub provider: String,
@@ -67,7 +67,7 @@ pub(crate) struct ConnectionConfig {
     pub location: BTreeMap<String, String>,
     pub oauth_profile: Option<OAuthProfile>,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct OAuthProfile {
     pub project_id: String,
@@ -76,6 +76,9 @@ pub(crate) struct OAuthProfile {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OpenMode {
     Create,
+    /// Resume the same durable create intent after an earlier attempt may
+    /// have initialized part or all of the provider-owned remote layout.
+    ResumeCreate,
     Existing,
 }
 
@@ -86,6 +89,8 @@ pub(crate) struct RepositoryHandle {
     pub repository_id: String,
     /// Provider/account/endpoint/root identity, checked before reusing a locator.
     pub connection_identity: String,
+    /// Stable authenticated account scope for waits and API clock observations.
+    pub account: super::quota::AccountKey,
     pub context: Box<dyn std::any::Any + Send + Sync>,
 }
 
@@ -328,24 +333,8 @@ pub(crate) enum ProviderOperation {
     Delete,
     Authenticate,
 }
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum QuotaReset {
-    At { unix_ms: u64 },
-    Rolling { window_ms: u64 },
-    Unknown,
-}
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct RequestCost {
-    pub bucket: String,
-    pub shared_account: String,
-    pub units: u64,
-    pub reset: QuotaReset,
-}
-
-/// One call represents one provider operation. SDK subrequests, session control
-/// and retries must individually pass the injected quota/HTTP boundary.
+/// One call represents one provider operation. Each SDK subrequest, session
+/// control call and explicit owner retry passes the one-dispatch HTTP boundary.
 pub(crate) trait Provider: Send + Sync {
     fn open_repository<'a>(
         &'a self,
@@ -428,12 +417,6 @@ pub(crate) trait Provider: Send + Sync {
     /// locator, so an ordinary object can never be replaced by a head write;
     /// a backup-only service answers `Unsupported`.
     fn head_locator(&self, repository: &RepositoryHandle) -> Result<RemoteLocator>;
-    /// Budget one operation reserves on the account buckets of this connection.
-    fn request_cost(
-        &self,
-        repository: &RepositoryHandle,
-        operation: ProviderOperation,
-    ) -> Result<Vec<RequestCost>>;
 }
 
 #[derive(Clone)]

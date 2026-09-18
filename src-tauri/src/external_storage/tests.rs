@@ -1,4 +1,4 @@
-use super::{capabilities::*, contract::*, publication::*, quota::*, registry::Registry};
+use super::{capabilities::*, contract::*, publication::*, registry::Registry};
 use std::sync::Arc;
 
 use super::fake::{capabilities, locator, repository, FakeProvider};
@@ -169,51 +169,6 @@ fn sequential_hidden_and_changed_or_missing_head_cannot_publish() {
 }
 
 #[test]
-fn quota_is_shared_persistent_atomic_and_does_not_reset_on_restore_or_retry() {
-    let mut ledger = QuotaLedger::default();
-    ledger.configure(
-        "account",
-        "download",
-        Bucket {
-            limit: 500,
-            used: 499,
-            reset: QuotaReset::At { unix_ms: 1000 },
-            blocked_until_ms: None,
-            last_reset_ms: None,
-        },
-    );
-    let cost = RequestCost {
-        bucket: "download".into(),
-        shared_account: "account".into(),
-        units: 1,
-        reset: QuotaReset::At { unix_ms: 1000 },
-    };
-    assert!(ledger.reserve(&[cost.clone(), cost.clone()], 500).is_err());
-    assert_eq!(ledger.used("account", "download"), Some(499));
-    ledger.reserve(&[cost.clone()], 500).unwrap();
-    let mut reopened: QuotaLedger =
-        serde_json::from_str(&serde_json::to_string(&ledger).unwrap()).unwrap();
-    assert_eq!(
-        reopened.reserve(&[cost.clone()], 999).unwrap_err().kind,
-        ErrorKind::DailyQuotaExhausted
-    );
-    reopened.reserve(&[cost.clone()], 1000).unwrap();
-    reopened.configure(
-        "account",
-        "download",
-        Bucket {
-            limit: 500,
-            used: 0,
-            reset: QuotaReset::At { unix_ms: 1000 },
-            blocked_until_ms: None,
-            last_reset_ms: None,
-        },
-    );
-    reopened.reserve(&[cost], 1001).unwrap();
-    assert_eq!(reopened.used("account", "download"), Some(2));
-}
-
-#[test]
 fn every_listed_provider_has_a_factory_and_only_registration_exposes_it() {
     use super::{fake::MemoryVault, providers, registry::PROVIDER_IDS};
     let test = super::fake::loopback_dependencies(MemoryVault::default(), 0);
@@ -221,11 +176,8 @@ fn every_listed_provider_has_a_factory_and_only_registration_exposes_it() {
     assert!(providers::create("proton", test.dependencies.clone()).is_err());
     for id in PROVIDER_IDS {
         let provider = providers::create(id, test.dependencies.clone()).unwrap();
-        // A handle from another provider never yields a head or a budget.
+        // A handle from another provider never yields a head.
         assert!(provider.head_locator(&repository()).is_err());
-        assert!(provider
-            .request_cost(&repository(), ProviderOperation::Get)
-            .is_err());
         assert!(registry.get(id).is_err());
         registry.register(id, provider).unwrap();
         assert!(registry.get(id).is_ok());

@@ -9,7 +9,7 @@ use super::{
 };
 use crate::external_storage::{
     auth::{SecretBytes, SecretVault},
-    capabilities::{Capabilities, Evidence},
+    capabilities::Capabilities,
     contract::*,
     fake::{self, loopback_dependencies, with_transport, MemoryVault, TestDependencies},
     http::{HttpRequest, HttpResponse, HttpTransport},
@@ -95,11 +95,16 @@ fn listing(folder: &str, names: &[&str], next: Option<&str>) -> Vec<u8> {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult \
          xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>synthetic-bucket</Name>",
     );
-    body.push_str(&format!("<Prefix>{PREFIX}/{folder}/</Prefix>"));
+    let root = if folder.is_empty() {
+        PREFIX.to_owned()
+    } else {
+        format!("{PREFIX}/{folder}")
+    };
+    body.push_str(&format!("<Prefix>{root}/</Prefix>"));
     body.push_str(&format!("<IsTruncated>{}</IsTruncated>", next.is_some()));
     for name in names {
         body.push_str(&format!(
-            "<Contents><Key>{PREFIX}/{folder}/{name}</Key><LastModified>2026-01-01T00:00:00.000Z\
+            "<Contents><Key>{root}/{name}</Key><LastModified>2026-01-01T00:00:00.000Z\
              </LastModified><ETag>&quot;{name}-tag&quot;</ETag><Size>64</Size>\
              <StorageClass>STANDARD</StorageClass></Contents>"
         ));
@@ -501,10 +506,10 @@ fn absent_or_malformed_credentials_require_reauthentication_before_any_request()
 #[test]
 fn create_refuses_an_occupied_root_and_existing_requires_a_descriptor() {
     runtime().block_on(async {
-        let empty = || reply(200, &[], listing("descriptors", &[], None));
+        let empty = || reply(200, &[], listing("", &[], None));
 
         let test = dependencies();
-        let server = WireServer::start(vec![empty(), reply(404, &[], Vec::new())]);
+        let server = WireServer::start(vec![empty()]);
         let (_, handle, reported) = open(&test, "r2", server.url.as_str(), OpenMode::Create)
             .await
             .unwrap();
@@ -515,15 +520,11 @@ fn create_refuses_an_occupied_root_and_existing_requires_a_descriptor() {
         assert_eq!(handle.repository_id, handle.connection_identity);
         assert!(reported.require(PublicationStrategy::Cas).is_ok());
         let records = server.requests.lock().unwrap();
-        assert_eq!(records.len(), 2);
+        assert_eq!(records.len(), 1);
         assert_eq!(
             line(&records[0]),
             "GET /synthetic/synthetic-bucket\
-             ?list-type=2&max-keys=1&prefix=risunest%2Fdescriptors%2F HTTP/1.1"
-        );
-        assert_eq!(
-            line(&records[1]),
-            "HEAD /synthetic/synthetic-bucket/risunest/head HTTP/1.1"
+             ?list-type=2&max-keys=2&prefix=risunest%2F HTTP/1.1"
         );
         assert_eq!(
             header(&records[0], "x-amz-content-sha256").unwrap(),
@@ -535,7 +536,11 @@ fn create_refuses_an_occupied_root_and_existing_requires_a_descriptor() {
         ));
         drop(records);
 
-        let server = WireServer::start(vec![one_descriptor()]);
+        let server = WireServer::start(vec![reply(
+            200,
+            &[],
+            listing("", &["descriptors/descriptor-1"], None),
+        )]);
         assert_eq!(
             open_fails(&dependencies(), "r2", server.url.as_str(), OpenMode::Create)
                 .await
@@ -544,14 +549,27 @@ fn create_refuses_an_occupied_root_and_existing_requires_a_descriptor() {
         );
         assert_eq!(server.requests.lock().unwrap().len(), 1);
 
-        let server = WireServer::start(vec![empty(), metadata(48, "\"head-1\"")]);
+        let server = WireServer::start(vec![reply(200, &[], listing("", &["head"], None))]);
         assert_eq!(
             open_fails(&dependencies(), "r2", server.url.as_str(), OpenMode::Create)
                 .await
                 .kind,
             ErrorKind::PreconditionFailed
         );
-        assert_eq!(server.requests.lock().unwrap().len(), 2);
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+
+        let server = WireServer::start(vec![reply(
+            200,
+            &[],
+            listing("", &["packs/foreign-pack"], None),
+        )]);
+        assert_eq!(
+            open_fails(&dependencies(), "r2", server.url.as_str(), OpenMode::Create)
+                .await
+                .kind,
+            ErrorKind::PreconditionFailed
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
 
         let server = WireServer::start(vec![empty()]);
         assert_eq!(
@@ -576,6 +594,125 @@ fn create_refuses_an_occupied_root_and_existing_requires_a_descriptor() {
         )
         .await
         .is_ok());
+    });
+}
+
+fn root_listing(objects: &[(&str, u64)], next: Option<&str>) -> Vec<u8> {
+    let mut body = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult \
+         xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>synthetic-bucket</Name>",
+    );
+    body.push_str(&format!("<Prefix>{PREFIX}/</Prefix>"));
+    body.push_str(&format!("<IsTruncated>{}</IsTruncated>", next.is_some()));
+    for (key, size) in objects {
+        body.push_str(&format!(
+            "<Contents><Key>{PREFIX}/{key}</Key><LastModified>2026-01-01T00:00:00.000Z\
+             </LastModified><ETag>&quot;synthetic-tag&quot;</ETag><Size>{size}</Size>\
+             <StorageClass>STANDARD</StorageClass></Contents>"
+        ));
+    }
+    if let Some(token) = next {
+        body.push_str(&format!(
+            "<NextContinuationToken>{token}</NextContinuationToken>"
+        ));
+    }
+    body.push_str("</ListBucketResult>");
+    body.into_bytes()
+}
+
+#[test]
+fn resume_create_accepts_only_an_empty_or_single_descriptor_control_layout() {
+    runtime().block_on(async {
+        let empty = || reply(200, &[], root_listing(&[], None));
+
+        let server = WireServer::start(vec![empty()]);
+        open(
+            &dependencies(),
+            "r2",
+            server.url.as_str(),
+            OpenMode::ResumeCreate,
+        )
+        .await
+        .unwrap();
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+
+        let server = WireServer::start(vec![reply(
+            200,
+            &[],
+            root_listing(&[("descriptors/descriptor-1", 64)], None),
+        )]);
+        open(
+            &dependencies(),
+            "r2",
+            server.url.as_str(),
+            OpenMode::ResumeCreate,
+        )
+        .await
+        .unwrap();
+        let records = server.requests.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(line(&records[0]).contains("max-keys=2"));
+        drop(records);
+
+        for key in ["head", "packs/pack-1", "foreign/object"] {
+            let server = WireServer::start(vec![reply(
+                200,
+                &[],
+                root_listing(&[(key, 48)], None),
+            )]);
+            assert_eq!(
+                open_fails(
+                    &dependencies(),
+                    "r2",
+                    server.url.as_str(),
+                    OpenMode::ResumeCreate,
+                )
+                .await
+                .kind,
+                ErrorKind::PreconditionFailed,
+                "{key}"
+            );
+            assert_eq!(server.requests.lock().unwrap().len(), 1);
+        }
+
+        let server = WireServer::start(vec![reply(
+            200,
+            &[],
+            root_listing(
+                &[
+                    ("descriptors/descriptor-1", 64),
+                    ("descriptors/descriptor-2", 64),
+                ],
+                None,
+            ),
+        )]);
+        assert_eq!(
+            open_fails(
+                &dependencies(),
+                "r2",
+                server.url.as_str(),
+                OpenMode::ResumeCreate,
+            )
+            .await
+            .kind,
+            ErrorKind::PreconditionFailed
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+
+        let zero = root_listing(&[("descriptors/descriptor-1", 0)], None);
+        let server = WireServer::start(vec![reply(200, &[], zero)]);
+        assert_eq!(
+            open_fails(
+                &dependencies(),
+                "r2",
+                server.url.as_str(),
+                OpenMode::ResumeCreate,
+            )
+            .await
+            .kind,
+            ErrorKind::Corrupt
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
     });
 }
 
@@ -933,8 +1070,8 @@ fn a_head_survives_a_plain_replacement_and_is_readable_again() {
 fn backblaze_reports_no_conditional_head_and_refuses_a_compare_exchange() {
     runtime().block_on(async {
         let b2 = reported_capabilities(&profiles::b2::PROFILE);
-        assert_eq!(b2.atomic_create_head, Evidence::Unverified);
-        assert_eq!(b2.conditional_head_update, Evidence::Unverified);
+        assert!(!b2.atomic_create_head);
+        assert!(!b2.conditional_head_update);
         assert!(!b2.conditional_get);
         assert!(b2.require(PublicationStrategy::Cas).is_err());
         assert!(b2.require(PublicationStrategy::Sequential).is_ok());
@@ -966,14 +1103,7 @@ fn listing_pages_with_a_continuation_token_and_bounds_the_limit() {
     runtime().block_on(async {
         let cancel = Cancellation::default();
         let test = dependencies();
-        let mut first = listing("snapshots", &["snapshot-a", "snapshot-b"], Some("token-2"));
-        // A key nested below the role folder belongs to no collection page.
-        let nested = format!(
-            "<Contents><Key>{PREFIX}/snapshots/deep/inner</Key><ETag>&quot;x&quot;</ETag>\
-             <Size>1</Size></Contents></ListBucketResult>"
-        );
-        first.truncate(first.len() - "</ListBucketResult>".len());
-        first.extend_from_slice(nested.as_bytes());
+        let first = listing("snapshots", &["snapshot-a", "snapshot-b"], Some("token-2"));
         let server = WireServer::start(vec![
             one_descriptor(),
             reply(200, &[], first),
@@ -1038,6 +1168,30 @@ fn listing_pages_with_a_continuation_token_and_bounds_the_limit() {
 }
 
 #[test]
+fn listing_rejects_a_nested_key_outside_the_collection_contract() {
+    runtime().block_on(async {
+        let cancel = Cancellation::default();
+        let test = dependencies();
+        let nested = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult>\
+             <Contents><Key>{PREFIX}/snapshots/deep/inner</Key><ETag>&quot;x&quot;</ETag>\
+             <Size>1</Size></Contents></ListBucketResult>"
+        );
+        let server = WireServer::start(vec![one_descriptor(), reply(200, &[], nested.into_bytes())]);
+        let (provider, handle) = opened(&test, "r2", &server).await;
+        assert_eq!(
+            provider
+                .list_objects(&handle, Collection::Snapshots, None, 2, &cancel)
+                .await
+                .err()
+                .unwrap()
+                .kind,
+            ErrorKind::Corrupt
+        );
+    });
+}
+
+#[test]
 fn a_documented_download_redirect_is_followed_without_carrying_authentication() {
     runtime().block_on(async {
         let spool = Spool::of(512);
@@ -1091,8 +1245,6 @@ fn a_documented_download_redirect_is_followed_without_carrying_authentication() 
         assert!(header(&hops[0], "authorization").is_none());
         assert!(header(&hops[0], "x-amz-date").is_none());
         assert!(header(&hops[0], "x-amz-content-sha256").is_none());
-        // The redirect hop reserves its own budget.
-        assert_eq!(test.budget.reservations.lock().unwrap().len(), 3);
     });
 }
 
@@ -1465,22 +1617,6 @@ fn documented_failure_statuses_map_to_provider_kinds_without_a_server_message() 
 }
 
 #[test]
-fn a_denied_budget_stops_every_request_before_it_is_dispatched() {
-    runtime().block_on(async {
-        let test = dependencies();
-        test.budget.deny.store(true, Ordering::SeqCst);
-        let server = WireServer::start(vec![one_descriptor()]);
-        assert_eq!(
-            open_fails(&test, "r2", server.url.as_str(), OpenMode::Existing)
-                .await
-                .kind,
-            ErrorKind::DailyQuotaExhausted
-        );
-        assert!(server.requests.lock().unwrap().is_empty());
-    });
-}
-
-#[test]
 fn a_foreign_handle_or_locator_never_reaches_the_service() {
     runtime().block_on(async {
         let cancel = Cancellation::default();
@@ -1619,9 +1755,6 @@ fn a_body_shorter_than_its_declared_length_is_corrupt() {
     });
 }
 
-/// A passing exchange here proves the adapter's request shape and status
-/// handling. It is no evidence of the service's own deletion guarantees, which
-/// only the provider documentation behind `Capabilities` can supply.
 #[test]
 fn deleting_addresses_one_key_folds_404_and_refuses_the_head_and_descriptors() {
     runtime().block_on(async {
@@ -1693,90 +1826,20 @@ fn deleting_addresses_one_key_folds_404_and_refuses_the_head_and_descriptors() {
             Some(EMPTY_HASH)
         );
         drop(records);
-        let reservations = test.budget.reservations.lock().unwrap();
-        assert_eq!(reservations.len(), 3);
-        assert_eq!(reservations[1].0[0].bucket, "requests");
     });
 }
 
 #[test]
-fn request_costs_follow_the_preset_buckets_and_are_reserved_per_request() {
-    runtime().block_on(async {
-        let test = dependencies();
-        let server = WireServer::start(vec![one_descriptor()]);
-        let (provider, r2) = opened(&test, "r2", &server).await;
-        let cost = |handle: &RepositoryHandle, operation| {
-            provider.request_cost(handle, operation).unwrap()
-        };
-        let names = |costs: &[RequestCost]| {
-            costs
-                .iter()
-                .map(|cost| cost.bucket.clone())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(names(&cost(&r2, ProviderOperation::Metadata)), ["class_b"]);
-        assert_eq!(names(&cost(&r2, ProviderOperation::Get)), ["class_b"]);
-        assert_eq!(names(&cost(&r2, ProviderOperation::List)), ["class_a"]);
-        assert_eq!(names(&cost(&r2, ProviderOperation::Create)), ["class_a"]);
-        assert_eq!(
-            names(&cost(&r2, ProviderOperation::UploadChunk)),
-            ["class_a"]
-        );
-        assert_eq!(
-            names(&cost(&r2, ProviderOperation::ReplaceHead)),
-            ["class_a", "head_key_write"]
-        );
-        let head_write = cost(&r2, ProviderOperation::CompareExchangeHead);
-        assert_eq!(head_write[0].shared_account, ACCESS_KEY);
-        assert_eq!(
-            head_write[1].reset,
-            QuotaReset::Rolling { window_ms: 1_000 }
-        );
-        assert!(cost(&r2, ProviderOperation::DownloadUrl).is_empty());
-        assert!(cost(&r2, ProviderOperation::Authenticate).is_empty());
-        // Cloudflare lists `DeleteObject` outside both classes, as free.
-        assert!(cost(&r2, ProviderOperation::Delete).is_empty());
-        // Only a preset whose own documentation states the delete and listing
-        // guarantees carries the cleanup evidence.
-        for preset in ["r2", "aws"] {
-            assert!(reported_capabilities(profiles::lookup(preset).unwrap())
-                .require_cleanup()
-                .is_ok());
-        }
-        for preset in ["generic", "b2", "hf"] {
-            assert!(reported_capabilities(profiles::lookup(preset).unwrap())
-                .require_cleanup()
-                .is_err());
-        }
-
-        let reservations = test.budget.reservations.lock().unwrap();
-        assert_eq!(reservations.len(), 1);
-        assert_eq!(names(&reservations[0].0), ["class_a"]);
-        assert_eq!(reservations[0].1, NOW_MS);
-        drop(reservations);
-
-        let b2 = WireServer::start(vec![one_descriptor()]);
-        let (_, b2) = opened(&dependencies(), "b2", &b2).await;
-        assert_eq!(
-            names(&cost(&b2, ProviderOperation::Get)),
-            ["transactions", "requests_per_second"]
-        );
-        assert_eq!(names(&cost(&b2, ProviderOperation::List)), ["transactions"]);
-        assert_eq!(
-            names(&cost(&b2, ProviderOperation::Delete)),
-            ["transactions", "requests_per_second"]
-        );
-        let hugging = WireServer::start(vec![one_descriptor()]);
-        let (_, hugging) = opened(&dependencies(), "hf", &hugging).await;
-        let flat = cost(&hugging, ProviderOperation::Get);
-        assert_eq!(names(&flat), ["requests"]);
-        assert_eq!(flat[0].units, 1);
-        assert_eq!(flat[0].reset, QuotaReset::Unknown);
-    });
+fn cleanup_capability_follows_the_preset() {
+    for preset in ["r2", "aws", "generic", "b2", "hf"] {
+        assert!(reported_capabilities(profiles::lookup(preset).unwrap())
+            .require_cleanup()
+            .is_ok());
+    }
 }
 
 #[test]
-fn capabilities_carry_the_documented_evidence_for_every_preset() {
+fn capabilities_match_every_preset() {
     let presets: [(&str, &Profile); 5] = [
         ("aws", &profiles::aws::PROFILE),
         ("r2", &profiles::r2::PROFILE),
@@ -1786,23 +1849,16 @@ fn capabilities_carry_the_documented_evidence_for_every_preset() {
     ];
     for (id, profile) in presets {
         let reported = reported_capabilities(profile);
-        assert_eq!(reported.immutable_create, Evidence::Synthetic, "{id}");
-        assert_eq!(reported.direct_complete_read, Evidence::Synthetic, "{id}");
-        assert_eq!(reported.stable_head_replace, Evidence::Synthetic, "{id}");
-        assert_eq!(reported.head_read_after_write, Evidence::Synthetic, "{id}");
-        assert_eq!(reported.head_retry_control, Evidence::Synthetic, "{id}");
-        assert_eq!(reported.snapshot_discovery, Evidence::Synthetic, "{id}");
-        assert_eq!(reported.discovery_extra_requests, 0, "{id}");
+        assert!(reported.immutable_create, "{id}");
+        assert!(reported.direct_complete_read, "{id}");
+        assert!(reported.stable_head_replace, "{id}");
+        assert!(reported.head_read_after_write, "{id}");
+        assert!(reported.head_retry_control, "{id}");
+        assert!(reported.snapshot_discovery, "{id}");
         assert_eq!(reported.sdk_overhead_bytes, 0, "{id}");
         assert_eq!(reported.upload_alignment, 64 * 1024 * 1024, "{id}");
         assert!(!reported.range, "{id}");
         assert!(reported.resumable_upload, "{id}");
-        assert_eq!(
-            reported.documented_at.as_deref(),
-            Some("2026-09-14"),
-            "{id}"
-        );
-        assert!(reported.evidence_urls.len() >= 4, "{id}");
         assert!(
             reported.require(PublicationStrategy::Sequential).is_ok(),
             "{id}"

@@ -2,7 +2,7 @@
 //! construction, response shapes, naming and the service specific meaning of a
 //! status code. Nothing here performs a request; the provider owns the injected
 //! HTTP boundary so every hop reserves account budget before dispatch.
-use crate::external_storage::{contract::*, providers::common};
+use crate::external_storage::{contract::*, providers::common, quota::AccountKey};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -32,14 +32,7 @@ pub(super) const MAX_LIST_STEPS: u32 = 64;
 /// Each file in a release must stay under 2 GiB.
 pub(super) const MAX_ASSET_BYTES: u64 = 2 * 1024 * 1024 * 1024 - 1;
 
-pub(super) const PRIMARY_BUCKET: &str = "rest-primary";
-pub(super) const POINT_BUCKET: &str = "rest-endpoint-points";
-pub(super) const CONTENT_MINUTE_BUCKET: &str = "content-creation-minute";
-pub(super) const CONTENT_HOUR_BUCKET: &str = "content-creation-hour";
-pub(super) const ASSET_BODY_BUCKET: &str = "asset-body";
-
 const HOUR_MS: u64 = 60 * 60 * 1000;
-const MINUTE_MS: u64 = 60 * 1000;
 const MAX_RETRY_AT_MS: u64 = 24 * HOUR_MS;
 
 /// Descriptors live in one release so an existing root is provable with a
@@ -65,7 +58,7 @@ pub(super) struct Context {
     pub(super) owner: String,
     pub(super) repo: String,
     pub(super) tag_prefix: String,
-    pub(super) account: String,
+    pub(super) account: AccountKey,
     pub(super) identity: String,
     token: Zeroizing<String>,
     batches: Mutex<BTreeMap<String, Batch>>,
@@ -92,20 +85,18 @@ impl Context {
         let owner = location(config, "owner", 100)?;
         let repo = location(config, "repo", 100)?;
         let tag_prefix = location(config, "tagPrefix", 48)?;
-        if !is_safe_name(&config.account_id, 100) {
-            return Err(refused());
-        }
         let identity = format!(
             "{PROVIDER_ID}|{}|{owner}/{repo}|{tag_prefix}",
             api.origin().ascii_serialization()
         );
+        let account = AccountKey::pending(PROVIDER_ID, &api)?;
         Ok(Self {
             api,
             uploads,
             owner,
             repo,
             tag_prefix,
-            account: config.account_id.clone(),
+            account,
             identity,
             token,
             batches: Mutex::new(BTreeMap::new()),
@@ -126,6 +117,10 @@ impl Context {
         let mut segments = vec!["repos", self.owner.as_str(), self.repo.as_str()];
         segments.extend_from_slice(tail);
         extend(&self.api, &segments)
+    }
+
+    pub(super) fn user_url(&self) -> Result<url::Url> {
+        extend(&self.api, &["user"])
     }
 
     pub(super) fn release_page_url(&self, page: u32) -> Result<url::Url> {
@@ -339,6 +334,20 @@ pub(super) struct RepositoryView {
 }
 
 #[derive(Deserialize)]
+pub(super) struct UserView {
+    id: u64,
+}
+
+impl UserView {
+    pub(super) fn principal(&self) -> Result<String> {
+        if self.id == 0 {
+            return Err(corrupt());
+        }
+        Ok(self.id.to_string())
+    }
+}
+
+#[derive(Deserialize)]
 pub(super) struct PermissionsView {
     #[serde(default)]
     pub(super) push: bool,
@@ -349,6 +358,8 @@ pub(super) struct ReleaseView {
     pub(super) id: u64,
     #[serde(default)]
     pub(super) tag_name: String,
+    #[serde(default)]
+    pub(super) draft: bool,
 }
 
 #[derive(Deserialize)]
@@ -438,55 +449,4 @@ fn reset_at_ms(headers: &BTreeMap<String, String>, now_ms: u64) -> Option<u64> {
             .saturating_mul(1000)
             .clamp(now_ms, now_ms.saturating_add(MAX_RETRY_AT_MS)),
     )
-}
-
-fn cost(bucket: &str, account: &str, units: u64, reset: &QuotaReset) -> RequestCost {
-    RequestCost {
-        bucket: bucket.into(),
-        shared_account: account.into(),
-        units,
-        reset: reset.clone(),
-    }
-}
-
-/// Documented weights: 5,000 REST requests per hour for a personal access
-/// token, 900 endpoint points per minute where a read costs one point and a
-/// write five, and 80 per minute / 500 per hour content creating requests.
-/// The redirected asset body is served by a separate host and is metered on its
-/// own bucket rather than folded into the REST limit.
-pub(super) fn costs(operation: ProviderOperation, account: &str) -> Vec<RequestCost> {
-    let hour = QuotaReset::Rolling { window_ms: HOUR_MS };
-    let minute = QuotaReset::Rolling {
-        window_ms: MINUTE_MS,
-    };
-    match operation {
-        ProviderOperation::Metadata
-        | ProviderOperation::List
-        | ProviderOperation::DownloadUrl
-        | ProviderOperation::ReconcileUpload => vec![
-            cost(PRIMARY_BUCKET, account, 1, &hour),
-            cost(POINT_BUCKET, account, 1, &minute),
-        ],
-        ProviderOperation::Create => vec![
-            cost(PRIMARY_BUCKET, account, 1, &hour),
-            cost(POINT_BUCKET, account, 5, &minute),
-            cost(CONTENT_MINUTE_BUCKET, account, 1, &minute),
-            cost(CONTENT_HOUR_BUCKET, account, 1, &hour),
-        ],
-        ProviderOperation::Get => vec![cost(ASSET_BODY_BUCKET, account, 1, &QuotaReset::Unknown)],
-        // Ranges, upload sessions and head writes are never dispatched here.
-        ProviderOperation::Range
-        | ProviderOperation::UploadSession
-        | ProviderOperation::UploadChunk
-        | ProviderOperation::CompleteUpload
-        | ProviderOperation::CompareExchangeHead
-        | ProviderOperation::ReplaceHead
-        | ProviderOperation::Authenticate => Vec::new(),
-        // A write costs five endpoint points and is not a content creating
-        // request, so the two content buckets stay out of it.
-        ProviderOperation::Delete => vec![
-            cost(PRIMARY_BUCKET, account, 1, &hour),
-            cost(POINT_BUCKET, account, 5, &minute),
-        ],
-    }
 }

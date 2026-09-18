@@ -2,11 +2,11 @@
 //! repository keys never implement serialization or debugging in this module.
 use super::{
     auth::SecretBytes,
-    capabilities::{Capabilities, Evidence},
+    capabilities::Capabilities,
     connection_store::StoredConnection,
     contract::{ConnectionConfig, ErrorKind, OpenMode, ProviderError, PublicationStrategy, Result},
     control::BackupPointKind,
-    durable_quota::DurableBudget,
+    durable_quota::MyboxBudget,
     http::{NativeHttpTransport, SystemClock},
     providers::{self, Dependencies},
     secrets,
@@ -21,7 +21,6 @@ use std::{
 use zeroize::{Zeroize, Zeroizing};
 
 pub(crate) const PREPARATION_LIFETIME_MS: u64 = 10 * 60 * 1000;
-pub(crate) const SEQUENTIAL_ACKNOWLEDGEMENT: &str = "sequential-single-device";
 pub(crate) const GITHUB_ACKNOWLEDGEMENT: &str = "github-dedicated-private-repository";
 
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -196,7 +195,6 @@ pub(crate) struct PrepareConnectionRequest {
     pub config: ConnectionConfig,
     pub mode: ConnectionOpenMode,
     pub purpose: ConnectionPurpose,
-    pub publication_strategy: ConnectionStrategy,
     /// Backup connections only.
     #[serde(default)]
     pub capture_policy: Option<CapturePolicy>,
@@ -287,33 +285,11 @@ pub(crate) struct EndpointConfirmation {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ConnectionCapabilities {
-    pub cas: bool,
-    pub sequential: bool,
-    pub backup_only: bool,
-    pub resumable_upload: bool,
-    pub range_download: bool,
-    pub snapshot_discovery: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_stored_bytes: Option<String>,
-    pub evidence: CapabilityEvidence,
-}
-
-#[derive(Clone, Copy, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum CapabilityEvidence {
-    Live,
-    Synthetic,
-    Unverified,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct PreparedConnection {
     pub preparation_id: String,
     pub expires_at_ms: String,
     pub endpoint: EndpointConfirmation,
-    pub capabilities: ConnectionCapabilities,
+    pub capabilities: Option<Capabilities>,
     pub requires_o_auth: bool,
     pub requires_recovery_key: bool,
     pub requires_platform_o_auth_client: bool,
@@ -365,7 +341,7 @@ pub(crate) struct ConnectionSummary {
     pub capture_policy: Option<CapturePolicy>,
     /// The policy in force, which is the default until the user changes it.
     pub retention_policy: RetentionPolicy,
-    pub capabilities: ConnectionCapabilities,
+    pub capabilities: Capabilities,
     pub status: ConnectionStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_verified_at_ms: Option<String>,
@@ -383,7 +359,7 @@ pub(crate) fn provider_descriptors() -> Vec<ProviderDescriptor> {
             "webdav",
             "WebDAV / Koofr",
             false,
-            &["cas", "sequential", "backup-only"],
+            &["sequential", "backup-only"],
             &["koofr"],
         ),
         provider(
@@ -473,24 +449,17 @@ pub(crate) fn validate_preparation(
     }
     // A synchronization connection carries no capture policy: what it
     // exchanges is chosen per device.
-    if request.purpose == ConnectionPurpose::Sync
-        && (request.publication_strategy == ConnectionStrategy::BackupOnly
-            || request.capture_policy.is_some())
-    {
-        return Err(ProviderError::new(ErrorKind::Unsupported));
-    }
-    if request.purpose == ConnectionPurpose::Backup
-        && request.publication_strategy != ConnectionStrategy::BackupOnly
-    {
+    if request.purpose == ConnectionPurpose::Sync && request.capture_policy.is_some() {
         return Err(ProviderError::new(ErrorKind::Unsupported));
     }
     let definition = provider_descriptors()
         .into_iter()
         .find(|provider| provider.id == request.config.provider)
         .ok_or_else(|| ProviderError::new(ErrorKind::Unsupported))?;
-    if !definition
-        .strategies
-        .contains(&request.publication_strategy)
+    if (request.purpose == ConnectionPurpose::Sync
+        && !definition.strategies.iter().any(|strategy| {
+            matches!(strategy, ConnectionStrategy::Cas | ConnectionStrategy::Sequential)
+        }))
         || definition.oauth != request.config.oauth_profile.is_some()
     {
         return Err(ProviderError::new(ErrorKind::Unsupported));
@@ -500,20 +469,10 @@ pub(crate) fn validate_preparation(
         .iter()
         .map(String::as_str)
         .collect();
-    let required = [
-        (
-            request.publication_strategy == ConnectionStrategy::Sequential,
-            SEQUENTIAL_ACKNOWLEDGEMENT,
-        ),
-        (
-            request.config.provider == "github_releases",
-            GITHUB_ACKNOWLEDGEMENT,
-        ),
-    ];
     if request.acknowledgements.len() > 16
-        || required
-            .iter()
-            .any(|(needed, value)| *needed && !unique.contains(value))
+        || unique.iter().any(|value| *value != GITHUB_ACKNOWLEDGEMENT)
+        || (request.config.provider == "github_releases"
+            && !unique.contains(GITHUB_ACKNOWLEDGEMENT))
     {
         return Err(ProviderError::new(ErrorKind::Unsupported));
     }
@@ -750,47 +709,27 @@ pub(crate) fn endpoint_confirmation(
     })
 }
 
-pub(crate) fn predicted_capabilities(strategy: ConnectionStrategy) -> ConnectionCapabilities {
-    ConnectionCapabilities {
-        cas: strategy == ConnectionStrategy::Cas,
-        sequential: strategy == ConnectionStrategy::Sequential,
-        backup_only: strategy == ConnectionStrategy::BackupOnly,
-        resumable_upload: false,
-        range_download: false,
-        snapshot_discovery: false,
-        max_stored_bytes: None,
-        evidence: CapabilityEvidence::Unverified,
+pub(crate) fn strategy_for_new_connection(
+    purpose: ConnectionPurpose,
+    capabilities: &Capabilities,
+) -> Result<Option<PublicationStrategy>> {
+    match purpose {
+        ConnectionPurpose::Sync => capabilities.automatic_strategy().map(Some),
+        ConnectionPurpose::Backup => {
+            require_repository_strategy(capabilities, None)?;
+            Ok(None)
+        }
     }
 }
 
-pub(crate) fn capabilities(value: &Capabilities) -> ConnectionCapabilities {
-    let evidence = [
-        value.immutable_create,
-        value.direct_complete_read,
-        value.atomic_create_head,
-        value.conditional_head_update,
-        value.stable_head_replace,
-        value.head_read_after_write,
-        value.head_retry_control,
-        value.snapshot_discovery,
-    ];
-    let evidence = if evidence.iter().all(|value| *value == Evidence::Live) {
-        CapabilityEvidence::Live
-    } else if evidence.iter().any(|value| *value == Evidence::Synthetic) {
-        CapabilityEvidence::Synthetic
-    } else {
-        CapabilityEvidence::Unverified
-    };
-    ConnectionCapabilities {
-        cas: value.require(PublicationStrategy::Cas).is_ok(),
-        sequential: value.require(PublicationStrategy::Sequential).is_ok(),
-        backup_only: value.immutable_create != Evidence::Unverified
-            && value.direct_complete_read != Evidence::Unverified,
-        resumable_upload: value.resumable_upload,
-        range_download: value.range,
-        snapshot_discovery: value.snapshot_discovery != Evidence::Unverified,
-        max_stored_bytes: value.max_stored_bytes.map(|value| value.to_string()),
-        evidence,
+pub(crate) fn require_repository_strategy(
+    capabilities: &Capabilities,
+    strategy: Option<PublicationStrategy>,
+) -> Result<()> {
+    match strategy {
+        Some(strategy) => capabilities.require(strategy),
+        None if capabilities.immutable_create && capabilities.direct_complete_read => Ok(()),
+        None => Err(ProviderError::new(ErrorKind::Unsupported)),
     }
 }
 
@@ -830,25 +769,24 @@ pub(crate) fn summary(connection: &StoredConnection) -> ConnectionSummary {
         retention_policy: connection
             .retention_policy
             .unwrap_or(RetentionPolicy::DEFAULT),
-        capabilities: capabilities(&connection.capabilities),
+        capabilities: connection.capabilities.clone(),
         status: ConnectionStatus::Ready,
         last_verified_at_ms: Some(connection.created_at_ms.to_string()),
-        last_sync_at_ms: None,
-        last_backup_at_ms: None,
+        last_sync_at_ms: connection.last_sync_at_ms.map(|value| value.to_string()),
+        last_backup_at_ms: connection.last_backup_at_ms.map(|value| value.to_string()),
         last_error: None,
     }
 }
 
-pub(crate) fn dependencies(root: &Path) -> Result<(Dependencies, Arc<DurableBudget>)> {
+pub(crate) fn dependencies(root: &Path) -> Result<Dependencies> {
     std::fs::create_dir_all(root).map_err(|_| ProviderError::new(ErrorKind::Transient))?;
-    let budget = Arc::new(DurableBudget::open(&root.join("account-quota.sqlite"))?);
-    let dependencies = Dependencies {
+    Ok(Dependencies {
         http: Arc::new(NativeHttpTransport::new()?),
-        budget: budget.clone(),
+        mybox_budget: Arc::new(MyboxBudget::new(root.join("account-quota.sqlite"))),
+        requests: super::http::shared_request_state(),
         clock: Arc::new(SystemClock),
         vault: secrets::provider_vault(root),
-    };
-    Ok((dependencies, budget))
+    })
 }
 
 pub(crate) fn encode_secret(provider: &str, input: ProviderSecretInput) -> Result<SecretBytes> {
@@ -957,7 +895,6 @@ mod tests {
     fn request(
         provider: &str,
         purpose: ConnectionPurpose,
-        strategy: ConnectionStrategy,
     ) -> PrepareConnectionRequest {
         PrepareConnectionRequest {
             config: ConnectionConfig {
@@ -970,14 +907,9 @@ mod tests {
             },
             mode: ConnectionOpenMode::Create,
             purpose,
-            publication_strategy: strategy,
             capture_policy: (purpose == ConnectionPurpose::Backup)
                 .then(CapturePolicy::default),
-            acknowledgements: match strategy {
-                ConnectionStrategy::Sequential => vec![SEQUENTIAL_ACKNOWLEDGEMENT.into()],
-                ConnectionStrategy::BackupOnly => Vec::new(),
-                ConnectionStrategy::Cas => Vec::new(),
-            },
+            acknowledgements: Vec::new(),
         }
     }
 
@@ -1190,29 +1122,65 @@ mod tests {
     }
 
     #[test]
-    fn local_prepare_rejects_missing_acknowledgement_and_sync_device_scope() {
-        let mut sequential = request(
-            "webdav",
-            ConnectionPurpose::Sync,
-            ConnectionStrategy::Sequential,
-        );
-        sequential.acknowledgements.clear();
-        assert!(validate_preparation(&sequential).is_err());
-        sequential
-            .acknowledgements
-            .push(SEQUENTIAL_ACKNOWLEDGEMENT.into());
-        // A synchronization connection never carries a capture policy.
-        sequential.capture_policy = Some(CapturePolicy::default());
-        assert!(validate_preparation(&sequential).is_err());
+    fn local_prepare_needs_no_strategy_approval_and_rejects_sync_device_scope() {
+        let mut sync = request("webdav", ConnectionPurpose::Sync);
+        assert!(validate_preparation(&sync).is_ok());
+        sync.acknowledgements.push("sequential-single-device".into());
+        assert!(validate_preparation(&sync).is_err());
+        sync.acknowledgements.clear();
+        sync.capture_policy = Some(CapturePolicy::default());
+        assert!(validate_preparation(&sync).is_err());
+    }
+
+    #[test]
+    fn renderer_cannot_choose_a_publication_strategy() {
+        let config = request("webdav", ConnectionPurpose::Sync).config;
+        let mut encoded = serde_json::json!({
+            "config": config, "mode": "create", "purpose": "sync", "acknowledgements": []
+        });
+        assert!(serde_json::from_value::<PrepareConnectionRequest>(encoded.clone()).is_ok());
+        encoded["publicationStrategy"] = serde_json::json!("sequential");
+        assert!(serde_json::from_value::<PrepareConnectionRequest>(encoded).is_err());
+    }
+
+    #[test]
+    fn a_backup_only_provider_never_silently_changes_a_sync_purpose() {
+        let sync = request("gitlab_packages", ConnectionPurpose::Sync);
+        assert!(matches!(validate_preparation(&sync), Err(ProviderError {
+            kind: ErrorKind::Unsupported, ..
+        })));
+        assert!(matches!(sync.purpose, ConnectionPurpose::Sync));
+    }
+
+    #[test]
+    fn new_sync_strategy_is_automatic_but_an_existing_descriptor_never_downgrades() {
+        let mut capabilities = Capabilities {
+            immutable_create: true,
+            direct_complete_read: true,
+            atomic_create_head: true,
+            conditional_head_update: true,
+            stable_head_replace: true,
+            head_read_after_write: true,
+            head_retry_control: true,
+            ..Default::default()
+        };
+        assert_eq!(strategy_for_new_connection(ConnectionPurpose::Sync, &capabilities).unwrap(),
+            Some(PublicationStrategy::Cas));
+        assert_eq!(strategy_for_new_connection(ConnectionPurpose::Backup, &capabilities).unwrap(), None);
+        capabilities.conditional_head_update = false;
+        assert_eq!(strategy_for_new_connection(ConnectionPurpose::Sync, &capabilities).unwrap(),
+            Some(PublicationStrategy::Sequential));
+        assert_eq!(require_repository_strategy(&capabilities, Some(PublicationStrategy::Cas))
+            .unwrap_err().kind, ErrorKind::Unsupported);
+        capabilities.stable_head_replace = false;
+        assert_eq!(strategy_for_new_connection(ConnectionPurpose::Sync, &capabilities)
+            .unwrap_err().kind, ErrorKind::Unsupported);
+        assert_eq!(strategy_for_new_connection(ConnectionPurpose::Backup, &capabilities).unwrap(), None);
     }
 
     #[test]
     fn local_prepare_rejects_an_incomplete_provider_location() {
-        let mut request = request(
-            "webdav",
-            ConnectionPurpose::Backup,
-            ConnectionStrategy::BackupOnly,
-        );
+        let mut request = request("webdav", ConnectionPurpose::Backup);
         request.config.location.clear();
         assert!(validate_preparation(&request).is_err());
     }

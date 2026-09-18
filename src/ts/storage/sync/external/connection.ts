@@ -6,12 +6,10 @@ import type {
     ExternalOpenMode,
     ExternalCapturePolicy,
     ExternalProviderId,
-    ExternalPublicationStrategy,
     PrepareExternalConnectionRequest,
 } from './types'
 import { buildConnectionConfig, getExternalProviderDefinition } from './providerRegistry'
 
-export const SEQUENTIAL_ACKNOWLEDGEMENT = 'sequential-single-device'
 export const GITHUB_DEDICATED_REPOSITORY_ACKNOWLEDGEMENT = 'github-dedicated-private-repository'
 
 /** Backup connections start with everything the device can contribute. */
@@ -24,10 +22,8 @@ export function defaultExternalCapturePolicy(
 
 export function requiredConnectionAcknowledgements(
     providerId: ExternalProviderId,
-    strategy: ExternalPublicationStrategy,
 ): string[] {
     const acknowledgements: string[] = []
-    if (strategy === 'sequential') acknowledgements.push(SEQUENTIAL_ACKNOWLEDGEMENT)
     if (providerId === 'github_releases')
         acknowledgements.push(GITHUB_DEDICATED_REPOSITORY_ACKNOWLEDGEMENT)
     return acknowledgements
@@ -39,24 +35,18 @@ export function buildPrepareConnectionRequest(options: {
     platform: string
     mode: ExternalOpenMode
     purpose: ExternalConnectionPurpose
-    strategy: ExternalPublicationStrategy
     capturePolicy?: ExternalCapturePolicy
     acknowledgements: string[]
 }): PrepareExternalConnectionRequest {
     const definition = getExternalProviderDefinition(options.providerId)
-    if (!definition.strategies.includes(options.strategy))
-        throw new Error(`${options.providerId} does not support ${options.strategy}.`)
-    if (options.purpose === 'sync' && options.strategy === 'backup-only')
-        throw new Error('A synchronization connection needs a synchronization strategy.')
-    if (options.purpose === 'backup' && options.strategy !== 'backup-only')
-        throw new Error('A backup destination must use the backup-only strategy.')
+    if (options.purpose === 'sync' && !definition.supportsSync)
+        throw new Error('This provider does not support synchronization.')
     if (options.purpose === 'sync' && options.capturePolicy)
         throw new Error('A synchronization connection does not carry a capture policy.')
     if (options.purpose === 'backup' && !options.capturePolicy)
         throw new Error('A backup connection needs a capture policy.')
     const missingAcknowledgement = requiredConnectionAcknowledgements(
         options.providerId,
-        options.strategy,
     ).find(item => !options.acknowledgements.includes(item))
     if (missingAcknowledgement)
         throw new Error(`Required acknowledgement is missing: ${missingAcknowledgement}`)
@@ -64,7 +54,6 @@ export function buildPrepareConnectionRequest(options: {
         config: buildConnectionConfig(options.providerId, options.values, options.platform),
         mode: options.mode,
         purpose: options.purpose,
-        publicationStrategy: options.strategy,
         ...(options.capturePolicy ? { capturePolicy: { ...options.capturePolicy } } : {}),
         acknowledgements: [...options.acknowledgements],
     }

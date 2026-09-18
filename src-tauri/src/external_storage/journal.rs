@@ -66,6 +66,49 @@ pub(crate) struct TransferJournal {
     identity: JobIdentity,
 }
 impl TransferJournal {
+    /// Reopens an existing journal after its worker has exited, then removes
+    /// terminal spools only when the authoritative PDS owner can be released.
+    /// Jobs without a transfer journal have no registered spool to remove.
+    pub(crate) fn cleanup_terminal_spools_at(
+        directory: &Path,
+        job_id: &str,
+        store: &mut crate::persistent_store::PersistentStore,
+        format_repository_id: &str,
+    ) -> Result<SpoolCleanup> {
+        let path = directory.join("transfers.sqlite");
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(SpoolCleanup::Retained);
+            }
+            Err(error) => return Err(storage(error)),
+            Ok(_) => {}
+        }
+        if crate::trust_boundary::is_link_like(
+            &std::fs::symlink_metadata(directory).map_err(storage)?,
+        ) {
+            return Err(corrupt());
+        }
+        crate::trust_boundary::open_regular_source(&path).map_err(storage)?;
+        let db = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(storage)?;
+        db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;")
+            .map_err(storage)?;
+        let encoded: String = db
+            .query_row("SELECT value FROM identity WHERE singleton=1", [], |row| {
+                row.get(0)
+            })
+            .map_err(|_| corrupt())?;
+        if encoded.len() > 16 * 1024 {
+            return Err(corrupt());
+        }
+        let identity: JobIdentity = serde_json::from_str(&encoded).map_err(|_| corrupt())?;
+        if identity.job_id != job_id {
+            return Err(corrupt());
+        }
+        Self { db, directory: directory.into(), identity }
+            .cleanup_terminal_spools(store, format_repository_id)
+    }
+
     pub(crate) fn progress(directory: &Path, job_id: &str) -> Result<(u64, u64, u64, u64)> {
         let path = directory.join("transfers.sqlite");
         crate::trust_boundary::open_regular_source(&path).map_err(storage)?;
@@ -494,14 +537,19 @@ mod tests {
         assert!(store.release_external_capture("capture", "export-owner").unwrap());
         let shared = root.path().join("shared-source.spool");
         std::fs::write(&shared, b"shared source").unwrap();
-        let journal = TransferJournal::open(&directory, identity.clone()).unwrap();
-        assert_eq!(journal.cleanup_terminal_spools(&mut store, "format-repository").unwrap(),
+        assert_eq!(TransferJournal::cleanup_terminal_spools_at(
+            &directory, "job", &mut store, "format-repository",
+        ).unwrap(),
             SpoolCleanup::Removed { objects: 1, bytes: b"synthetic sealed ciphertext".len() as u64 });
         assert!(!spool.exists());
         assert_eq!(std::fs::read(shared).unwrap(), b"shared source");
-        let journal = TransferJournal::open(&directory, identity).unwrap();
-        assert_eq!(journal.cleanup_terminal_spools(&mut store, "format-repository").unwrap(),
+        assert_eq!(TransferJournal::cleanup_terminal_spools_at(
+            &directory, "job", &mut store, "format-repository",
+        ).unwrap(),
             SpoolCleanup::Removed { objects: 0, bytes: 0 });
+        assert_eq!(TransferJournal::cleanup_terminal_spools_at(
+            &root.path().join("no-journal"), "job", &mut store, "format-repository",
+        ).unwrap(), SpoolCleanup::Retained);
     }
 
     #[test]

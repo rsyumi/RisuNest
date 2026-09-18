@@ -2,12 +2,13 @@ use super::{
     capabilities::Capabilities,
     capture::CaptureCatalog,
     contract::*,
-    durable_quota::DurableBudget,
+    durable_quota::MyboxBudget,
     fake::{self, FakeProvider, FixedClock},
-    http::{Clock, RequestBudget},
+    http::Clock,
     journal::{JobIdentity, TransferJournal},
     packaging::{self, CompletedSnapshot, PackageLimits, SnapshotMetadata},
-    quota::Bucket,
+    quota::AccountKey,
+    quota_profiles::{MyboxCharge, MyboxCounter, MyboxPlan},
     snapshot_restore,
 };
 use crate::persistent_store::{
@@ -29,14 +30,14 @@ use std::{
 };
 
 const ACCOUNT: &str = "synthetic-account";
-const BUCKET: &str = "pack-download";
-const FIRST_RESET_MS: u64 = 86_400_000;
+const FIRST_RESET_MS: u64 = 54_000_000;
 const PACKS: usize = 520;
 const INTERRUPT_AFTER: u64 = 300;
 
 struct QuotaProvider {
     inner: Arc<FakeProvider>,
-    budget: DurableBudget,
+    budget: MyboxBudget,
+    account: AccountKey,
     clock: Arc<FixedClock>,
     pack_reads: AtomicU64,
     interrupt_after: Option<u64>,
@@ -46,7 +47,7 @@ struct QuotaProvider {
 impl QuotaProvider {
     fn new(
         inner: Arc<FakeProvider>,
-        budget: DurableBudget,
+        budget: MyboxBudget,
         clock: Arc<FixedClock>,
         interrupt_after: Option<u64>,
         interrupt: Cancellation,
@@ -54,6 +55,12 @@ impl QuotaProvider {
         Self {
             inner,
             budget,
+            account: AccountKey::new(
+                "mybox",
+                &url::Url::parse("https://synthetic.invalid").unwrap(),
+                ACCOUNT,
+            )
+            .unwrap(),
             clock,
             pack_reads: AtomicU64::new(0),
             interrupt_after,
@@ -66,14 +73,10 @@ impl QuotaProvider {
     }
 }
 
-fn download_cost() -> RequestCost {
-    RequestCost {
-        bucket: BUCKET.into(),
-        shared_account: ACCOUNT.into(),
-        units: 1,
-        reset: QuotaReset::At {
-            unix_ms: FIRST_RESET_MS,
-        },
+fn download_charge() -> MyboxCharge {
+    MyboxCharge {
+        plan: MyboxPlan::Plan30gb,
+        counters: vec![MyboxCounter::DownloadDay],
     }
 }
 
@@ -100,8 +103,7 @@ impl Provider for QuotaProvider {
             let pack = locator.object.starts_with("pack-");
             if pack {
                 self.budget
-                    .reserve(&[download_cost()], self.clock.now_ms())
-                    .await?;
+                    .reserve(&self.account, &download_charge(), self.clock.now_ms())?;
             }
             let receipt = self
                 .inner
@@ -196,13 +198,6 @@ impl Provider for QuotaProvider {
         self.inner.head_locator(repository)
     }
 
-    fn request_cost(
-        &self,
-        repository: &RepositoryHandle,
-        operation: ProviderOperation,
-    ) -> Result<Vec<RequestCost>> {
-        self.inner.request_cost(repository, operation)
-    }
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -304,24 +299,27 @@ fn journal(root: &Path, capture: &CapturedSnapshot) -> TransferJournal {
     .unwrap()
 }
 
-fn budget(path: &Path) -> DurableBudget {
-    let budget = DurableBudget::open(path).unwrap();
-    budget
-        .configure(
-            ACCOUNT,
-            BUCKET,
-            Bucket {
-                limit: 500,
-                used: 0,
-                reset: QuotaReset::At {
-                    unix_ms: FIRST_RESET_MS,
-                },
-                blocked_until_ms: None,
-                last_reset_ms: None,
-            },
+fn budget(path: &Path) -> MyboxBudget {
+    MyboxBudget::new(path.to_path_buf())
+}
+
+fn used(path: &Path, now_ms: u64) -> u64 {
+    MyboxBudget::new(path.to_path_buf())
+        .snapshot(
+            &AccountKey::new(
+                "mybox",
+                &url::Url::parse("https://synthetic.invalid").unwrap(),
+                ACCOUNT,
+            )
+            .unwrap(),
+            MyboxPlan::Plan30gb,
+            now_ms,
         )
-        .unwrap();
-    budget
+        .unwrap()
+        .into_iter()
+        .find(|counter| counter.id == MyboxCounter::DownloadDay.id())
+        .unwrap()
+        .used
 }
 
 fn verified_pack_count(completed: &CompletedSnapshot, staging: &Path) -> usize {
@@ -412,12 +410,7 @@ fn daily_download_resume_preserves_verified_packs_and_durable_budget() {
         assert_eq!(first.pack_reads(), INTERRUPT_AFTER);
         assert_eq!(verified_pack_count(&completed, &staging_root), 300);
         assert_eq!(
-            DurableBudget::open(&quota_path)
-                .unwrap()
-                .snapshot(ACCOUNT, BUCKET)
-                .unwrap()
-                .unwrap()
-                .used,
+            used(&quota_path, 1),
             300
         );
 
@@ -443,12 +436,7 @@ fn daily_download_resume_preserves_verified_packs_and_durable_budget() {
         assert_eq!(second.pack_reads(), 200);
         assert_eq!(verified_pack_count(&completed, &staging_root), 500);
         assert_eq!(
-            DurableBudget::open(&quota_path)
-                .unwrap()
-                .snapshot(ACCOUNT, BUCKET)
-                .unwrap()
-                .unwrap()
-                .used,
+            used(&quota_path, 2),
             500
         );
 
@@ -482,12 +470,7 @@ fn daily_download_resume_preserves_verified_packs_and_durable_budget() {
             source_hash
         );
         assert_eq!(
-            DurableBudget::open(&quota_path)
-                .unwrap()
-                .snapshot(ACCOUNT, BUCKET)
-                .unwrap()
-                .unwrap()
-                .used,
+            used(&quota_path, FIRST_RESET_MS),
             20
         );
     });

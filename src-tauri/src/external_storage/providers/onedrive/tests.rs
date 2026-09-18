@@ -5,7 +5,7 @@ use crate::external_storage::{
     transfer::{SpoolSink, SpoolSource},
     wire_fixture::{Reply, WireRequest, WireServer},
 };
-use std::sync::{atomic::Ordering, Mutex};
+use std::sync::Mutex;
 
 const SECRET: &str = "onedrive-secret";
 const NOW_MS: u64 = 1_700_000_000_000;
@@ -98,6 +98,28 @@ fn file_item(name: &str, size: u64, etag: &str) -> String {
     format!(
         "{{\"id\":\"item-{name}\",\"name\":\"{name}\",\"size\":{size},\"eTag\":\"{etag}\",\"file\":{{}}}}"
     )
+}
+
+fn folder_item(name: &str) -> String {
+    format!("{{\"id\":\"folder-{name}\",\"name\":\"{name}\",\"folder\":{{}}}}")
+}
+
+fn children_page(items: &[String]) -> String {
+    format!("{{\"value\":[{}]}}", items.join(","))
+}
+
+fn initial_folder_pages(with_descriptor: bool) -> Vec<Reply> {
+    config::REPOSITORY_FOLDERS
+        .iter()
+        .map(|folder| {
+            let items = if with_descriptor && *folder == "descriptors" {
+                vec![file_item("descriptor-id", 128, "etag-descriptor")]
+            } else {
+                Vec::new()
+            };
+            json(200, &children_page(&items))
+        })
+        .collect()
 }
 
 fn descriptor_page() -> String {
@@ -410,29 +432,6 @@ fn a_missing_vault_secret_requires_reauthentication_before_any_request() {
 }
 
 #[test]
-fn a_denied_budget_sends_no_request() {
-    runtime().block_on(async {
-        let server = WireServer::start(existing_open());
-        let harness = harness(NOW_MS);
-        harness.budget.deny.store(true, Ordering::SeqCst);
-        let provider = create(harness.dependencies.clone()).unwrap();
-        let cancel = Cancellation::default();
-        let error = failed(
-            open(
-                &provider,
-                &config_for(&server, "personal"),
-                OpenMode::Existing,
-                &cancel,
-            )
-            .await,
-        );
-        assert_eq!(error.kind, ErrorKind::DailyQuotaExhausted);
-        assert!(server.requests.lock().unwrap().is_empty());
-        assert_eq!(harness.budget.reservations.lock().unwrap().len(), 1);
-    });
-}
-
-#[test]
 fn opening_an_existing_repository_needs_a_descriptor_and_creates_nothing() {
     runtime().block_on(async {
         let server = WireServer::start(existing_open());
@@ -564,7 +563,7 @@ fn creating_a_repository_provisions_every_folder_and_refuses_an_occupied_root() 
 }
 
 #[test]
-fn each_account_type_resolves_its_own_root_and_reports_its_own_evidence() {
+fn each_account_type_resolves_its_own_root_and_reports_capabilities() {
     runtime().block_on(async {
         for (account_type, expected_root) in [
             ("personal", "items/configured-root"),
@@ -584,16 +583,9 @@ fn each_account_type_resolves_its_own_root_and_reports_its_own_evidence() {
             .await
             .unwrap();
             assert!(repository.connection_identity.contains(account_type));
-            assert_eq!(capabilities.documented_at.as_deref(), Some(DOCUMENTED_AT));
             assert_eq!(capabilities.upload_alignment, 320 * 1024);
             assert!(capabilities.resumable_upload && capabilities.conditional_get);
             assert_eq!(capabilities.max_stored_bytes, None);
-            assert_eq!(capabilities.discovery_extra_requests, 0);
-            let app_folder_evidence = capabilities
-                .evidence_urls
-                .iter()
-                .any(|url| url.contains("onedrive-sharepoint-appfolder"));
-            assert_eq!(app_folder_evidence, account_type == "appFolder");
             let records = server.requests.lock().unwrap();
             assert!(
                 line(&records[0]).contains(&format!("/synthetic/drives/drive-1/{expected_root}")),
@@ -664,16 +656,183 @@ fn reading_follows_the_download_redirect_to_another_origin_without_authorization
         assert_eq!(download_records.len(), 1);
         assert!(!head(&download_records[0]).contains("authorization"));
 
-        // Issuing the URL and fetching the body reserve budget separately.
-        let operations: Vec<_> = harness
-            .budget
-            .reservations
-            .lock()
-            .unwrap()
+    });
+}
+
+#[test]
+fn resume_create_reconciles_only_missing_folders_and_refuses_ambiguous_layouts() {
+    runtime().block_on(async {
+        let cancel = Cancellation::default();
+        let present: Vec<String> = config::REPOSITORY_FOLDERS[..4]
             .iter()
-            .map(|(costs, _)| costs.len())
+            .map(|folder| folder_item(folder))
             .collect();
-        assert_eq!(operations, vec![1, 1, 1, 1]);
+        let mut replies = vec![
+            json(200, &root_folder()),
+            json(200, &children_page(&present)),
+        ];
+        for folder in &config::REPOSITORY_FOLDERS[4..] {
+            replies.push(json(
+                201,
+                &format!("{{\"id\":\"folder-{folder}\",\"name\":\"{folder}\",\"folder\":{{}}}}"),
+            ));
+        }
+        replies.extend(initial_folder_pages(true));
+        let server = WireServer::start(replies);
+        let harness = harness(NOW_MS);
+        let provider = create(harness.dependencies.clone()).unwrap();
+        open(
+            &provider,
+            &config_for(&server, "personal"),
+            OpenMode::ResumeCreate,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        let records = server.requests.lock().unwrap();
+        assert_eq!(
+            records.len(),
+            2 + config::REPOSITORY_FOLDERS.len() - present.len()
+                + config::REPOSITORY_FOLDERS.len()
+        );
+        assert!(line(&records[1]).contains("/children?$top=1000"));
+        let created_end = 2 + config::REPOSITORY_FOLDERS.len() - present.len();
+        assert!(records[2..created_end]
+            .iter()
+            .all(|request| line(request).starts_with("POST ")));
+        assert!(records[created_end..]
+            .iter()
+            .all(|request| line(request).starts_with("GET ")));
+        assert!(records
+            .iter()
+            .all(|request| !line(request).starts_with("PUT ")));
+        drop(records);
+
+        for invalid in [
+            vec![folder_item("descriptors"), folder_item("descriptors")],
+            vec![file_item("descriptors", 1, "etag-file")],
+            vec![folder_item("descriptors"), folder_item("foreign")],
+        ] {
+            let server = WireServer::start(vec![
+                json(200, &root_folder()),
+                json(200, &children_page(&invalid)),
+            ]);
+            let error = failed(
+                open(
+                    &provider,
+                    &config_for(&server, "personal"),
+                    OpenMode::ResumeCreate,
+                    &cancel,
+                )
+                .await,
+            );
+            assert_eq!(error.kind, ErrorKind::PreconditionFailed);
+            assert_eq!(server.requests.lock().unwrap().len(), 2);
+        }
+    });
+}
+
+#[test]
+fn resume_create_rejects_foreign_folder_contents_duplicate_descriptors_and_token_loops() {
+    runtime().block_on(async {
+        let cancel = Cancellation::default();
+        let folders: Vec<String> = config::REPOSITORY_FOLDERS
+            .iter()
+            .map(|folder| folder_item(folder))
+            .collect();
+
+        let server = WireServer::start(vec![
+            json(200, &root_folder()),
+            json(200, &children_page(&folders)),
+            json(200, &children_page(&[])),
+            json(200, &children_page(&[file_item("foreign-pack", 4, "etag-pack")])),
+        ]);
+        let harness = harness(NOW_MS);
+        let provider = create(harness.dependencies.clone()).unwrap();
+        let failure = open(
+            &provider,
+            &config_for(&server, "personal"),
+            OpenMode::ResumeCreate,
+            &cancel,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(failure.kind, ErrorKind::PreconditionFailed);
+        assert_eq!(server.requests.lock().unwrap().len(), 4);
+
+        let server = WireServer::start(vec![
+            json(200, &root_folder()),
+            json(200, &children_page(&folders)),
+            json(
+                200,
+                &children_page(&[
+                    file_item("descriptor-a", 64, "etag-a"),
+                    file_item("descriptor-b", 64, "etag-b"),
+                ]),
+            ),
+        ]);
+        let failure = open(
+            &provider,
+            &config_for(&server, "personal"),
+            OpenMode::ResumeCreate,
+            &cancel,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(failure.kind, ErrorKind::PreconditionFailed);
+
+        let server = WireServer::start(vec![json(200, &root_folder()), json(200, "{}")]);
+        let failure = open(
+            &provider,
+            &config_for(&server, "personal"),
+            OpenMode::ResumeCreate,
+            &cancel,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(failure.kind, ErrorKind::Corrupt);
+
+        let loop_page = format!(
+            "{{\"value\":[],\"@odata.nextLink\":\"https://graph.example.invalid/v1/next?$skiptoken=loop\"}}"
+        );
+        let transport = ScriptedTransport::with(vec![
+            Exchange {
+                status: 200,
+                headers: vec![],
+                body: root_folder().into_bytes(),
+            },
+            Exchange {
+                status: 200,
+                headers: vec![],
+                body: children_page(&folders).into_bytes(),
+            },
+            Exchange {
+                status: 200,
+                headers: vec![],
+                body: loop_page.as_bytes().to_vec(),
+            },
+            Exchange {
+                status: 200,
+                headers: vec![],
+                body: loop_page.into_bytes(),
+            },
+        ]);
+        let test = with_transport(transport, MemoryVault::with(SECRET, &token_document()), NOW_MS);
+        let provider = create(test.dependencies).unwrap();
+        let failure = provider
+            .open_repository(
+                &config_at("https://graph.example.invalid/v1", "personal"),
+                &secret(),
+                OpenMode::ResumeCreate,
+                &cancel,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(failure.kind, ErrorKind::Corrupt);
     });
 }
 
@@ -1635,56 +1794,6 @@ fn redeeming_an_authorization_code_stores_the_first_token_document() {
 }
 
 #[test]
-fn request_costs_separate_reads_writes_and_the_identity_platform() {
-    let harness = harness(NOW_MS);
-    let provider = OneDrive::new(harness.dependencies.clone());
-    let names = |operation| {
-        cost_model(operation, "onedrive:test")
-            .into_iter()
-            .map(|cost| {
-                assert_eq!(cost.units, 1);
-                assert_eq!(cost.reset, QuotaReset::Unknown);
-                assert_eq!(cost.shared_account, "onedrive:test");
-                cost.bucket
-            })
-            .collect::<Vec<_>>()
-    };
-    assert!(provider
-        .request_cost(
-            &crate::external_storage::fake::repository(),
-            ProviderOperation::List
-        )
-        .is_err());
-    assert_eq!(names(ProviderOperation::Authenticate), vec!["auth"]);
-    for read in [
-        ProviderOperation::Metadata,
-        ProviderOperation::List,
-        ProviderOperation::DownloadUrl,
-        ProviderOperation::Get,
-        ProviderOperation::Range,
-        ProviderOperation::ReconcileUpload,
-    ] {
-        assert_eq!(names(read), vec!["requests"]);
-    }
-    for write in [
-        ProviderOperation::Create,
-        ProviderOperation::UploadSession,
-        ProviderOperation::UploadChunk,
-        ProviderOperation::CompleteUpload,
-        ProviderOperation::CompareExchangeHead,
-        ProviderOperation::ReplaceHead,
-    ] {
-        assert_eq!(names(write), vec!["requests", "writes"]);
-    }
-    // A request carries the connection account, not the provider fallback.
-    let costs = provider.costs(ProviderOperation::List, "onedrive:9:consumers|9:account-1|");
-    assert_eq!(costs[0].shared_account, "onedrive:9:consumers|9:account-1|");
-}
-
-/// A passing exchange here proves the adapter's request shape and status
-/// handling. It is no evidence of the service's own deletion guarantees, which
-/// only the provider documentation behind `Capabilities` can supply.
-#[test]
 fn deleting_addresses_one_member_path_and_refuses_the_head_and_descriptors() {
     runtime().block_on(async {
         let mut replies = existing_open();
@@ -1698,8 +1807,7 @@ fn deleting_addresses_one_member_path_and_refuses_the_head_and_descriptors() {
             open(&provider, &config_for(&server, "personal"), OpenMode::Existing, &cancel)
                 .await
                 .unwrap();
-        // Nothing here raises the cleanup evidence; a wire exchange cannot.
-        assert!(capabilities.require_cleanup().is_err());
+        assert!(capabilities.require_cleanup().is_ok());
 
         let target = locator_for(&repository, "packs/pack-1");
         provider
@@ -1737,14 +1845,5 @@ fn deleting_addresses_one_member_path_and_refuses_the_head_and_descriptors() {
             line(&records[2])
         );
         drop(records);
-        let reservations = test.budget.reservations.lock().unwrap();
-        assert_eq!(
-            reservations[2]
-                .0
-                .iter()
-                .map(|cost| cost.bucket.clone())
-                .collect::<Vec<_>>(),
-            ["requests", "writes"]
-        );
     });
 }

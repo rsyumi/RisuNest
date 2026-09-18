@@ -1,7 +1,6 @@
 import type {
     ExternalConnectionSummary,
     ExternalProviderId,
-    ExternalPublicationStrategy,
 } from 'src/ts/storage/sync/external/types'
 
 const english = {
@@ -14,7 +13,8 @@ const english = {
     purpose: 'Purpose', backup: 'Backup only', sync: 'Synchronization',
     purposeHelp: 'Backup only uploads and never downloads; it downloads only when you restore by hand. Synchronization keeps uploading and downloading so that the latest data is everywhere, but there is no real-time synchronization.',
     backupOnlyProvider: 'This service supports backups only.',
-    strategy: 'Synchronization mode', cas: 'Concurrent-use protection', sequential: 'One device at a time', backupOnly: 'Backup only',
+    backupOnly: 'Backup only',
+    requestUsage: 'Estimated requests used on this device',
     connectionInfo: 'Connection details', endpoint: 'Server address', profile: 'Service type', optional: ' (optional)',
     scope: 'Data to store', library: 'Characters, chats and attachments',
     hypa: 'Hypa embedding data', deviceSettings: 'Local settings', devicePlugins: 'Local plugin data',
@@ -29,7 +29,7 @@ const english = {
     prepare: 'Review details',
     pendingVerification: 'The next step reviews what you entered and asks you to sign in or to enter the password or key. Pressing Review details does not connect to the server.',
     sequentialTitle: 'Use one device at a time',
-    sequentialWarning: 'Confirm that synchronization finished on one device and close the app before you use another. Using two devices at once can corrupt or overwrite data, and you may then need to restore by hand.',
+    sequentialWarning: 'Use one device at a time. Confirm that synchronization has finished and close the app before using another device.',
     githubWarningTitle: 'Create a separate private repository for backups',
     githubWarning: 'This connection keeps creating draft releases and tags. Do not connect a repository you use for anything else.',
     acknowledge: 'I understand',
@@ -87,20 +87,18 @@ const english = {
     objectTooLarge: 'A file is larger than this service allows.',
     corrupted: 'The stored data did not pass verification. Choose another backup or connect the repository again.',
     unsupportedOperation: 'This repository cannot do that.',
-    casUnsupported: 'This repository does not support concurrent-use protection. Change the synchronization mode to one device at a time and try again.',
     interrupted: 'This stopped before it finished. Try again.',
     errorGeneric: 'Could not complete this. Try again.',
     oldDriveNote: 'Google Drive backup here uses the official RisuAI account method. To back up to your own Drive folder or another cloud, use External storage in the RisuNest tab.',
     jobKinds: { backup: 'Backup', sync: 'Sync', restore: 'Restore', 'pin-history': 'Keep', 'resolve-conflict': 'Resolve conflict' },
     jobActive: { backup: 'Backing up', sync: 'Syncing', restore: 'Restoring', 'pin-history': 'Keeping', 'resolve-conflict': 'Resolving conflict' },
-    strategyLabels: { cas: 'Concurrent-use protection', sequential: 'One device at a time', 'backup-only': 'Backup only' },
     historyKinds: { snapshot: 'Sync', 'backup-point': 'Backup', conflict: 'Conflict backup', 'recovery-candidate': 'Recovery candidate' },
     endpointWarnings: {
         'github-dedicated-repository': 'Use a separate private repository. This connection is backup only.',
         'gitlab-cleanup-policy': 'GitLab package cleanup policies can delete backups. Keep cleanup policies off for this project. This connection is backup only.',
     },
     providers: {
-        webdav: { name: 'WebDAV / Koofr', description: 'Connects to an HTTPS WebDAV folder with an application password.', strategyNote: 'Concurrent-use protection keeps two devices from uploading to the synchronization server at the same time and corrupting the data. The server has to support it, and support is checked when the connection is attempted.' },
+        webdav: { name: 'WebDAV / Koofr', description: 'Connects to an HTTPS WebDAV folder with an application password.' },
         s3: { name: 'S3-compatible storage', description: 'Uses an S3-compatible bucket such as Amazon S3, Cloudflare R2, Backblaze B2 or Hugging Face.' },
         google_drive: { name: 'Google Drive', description: 'Signs in with a Google account and uses a Drive folder or the hidden app data space.', warningTitle: 'Take care with the hidden app data space', warning: 'If you choose the hidden app data space, deleting the app data in Drive also deletes the backups.' },
         onedrive: { name: 'OneDrive', description: 'Signs in with a Microsoft account and uses a personal, work or app-only folder.' },
@@ -144,7 +142,8 @@ const korean: typeof english = {
     purpose: '용도', backup: '백업만', sync: '동기화',
     purposeHelp: '백업만 하는 경우 데이터를 다운로드 하지 않고 업로드만 하며, 수동으로 복원하는 경우에만 다운로드를 합니다. 동기화를 하는 경우 업로드 다운로드를 반복하여 항상 최신 데이터로 동기화를 시도합니다. 다만 실시간 동기화 기능은 지원되지 않습니다.',
     backupOnlyProvider: '이 서비스는 백업만 지원합니다.',
-    strategy: '동기화 방식', cas: '동시 사용 보호', sequential: '한 기기씩 사용', backupOnly: '백업만',
+    backupOnly: '백업만',
+    requestUsage: '이 기기의 예상 요청 사용량',
     connectionInfo: '연결 정보', endpoint: '서버 주소', profile: '서비스 종류', optional: ' (선택)',
     scope: '저장할 데이터', library: '캐릭터·대화와 첨부 파일',
     hypa: '하이파 임베딩 데이터', deviceSettings: '로컬 설정', devicePlugins: '로컬 플러그인 데이터',
@@ -159,7 +158,7 @@ const korean: typeof english = {
     prepare: '입력 내용 확인',
     pendingVerification: '다음 단계에서 입력한 내용을 검토하고 로그인을 하거나, 비밀번호/키를 입력하게 됩니다. 입력 내용 확인 버튼을 눌러도 서버에 연결되지 않습니다.',
     sequentialTitle: '한 번에 한 기기에서만 사용하세요',
-    sequentialWarning: '한 기기에서 동기화가 끝난 것을 확인하고 앱을 닫은 뒤 다른 기기를 사용해야 합니다. 동시에 사용하면 데이터가 손상되거나 데이터가 덮어씌워질 수 있어 수동 복원이 필요할 수 있습니다.',
+    sequentialWarning: '한 번에 한 기기에서 사용하세요. 다른 기기를 사용하기 전에 동기화 완료를 확인하고 앱을 닫아주세요.',
     githubWarningTitle: '백업 전용 비공개 저장소를 따로 만드세요',
     githubWarning: '이 연결은 초안 릴리스와 태그를 계속 만듭니다. 다른 용도로 쓰는 저장소에는 연결하지 마세요.',
     acknowledge: '확인했습니다',
@@ -217,20 +216,18 @@ const korean: typeof english = {
     objectTooLarge: '이 서비스가 허용하는 크기보다 큰 파일이 있습니다.',
     corrupted: '저장된 데이터가 검증을 통과하지 못했습니다. 다른 백업을 고르거나 저장소를 다시 연결하세요.',
     unsupportedOperation: '이 저장소에서는 할 수 없는 작업입니다.',
-    casUnsupported: '이 저장소는 동시 사용 보호를 지원하지 않습니다. 동기화 방식을 한 기기씩 사용으로 바꾼 뒤 다시 시도하세요.',
     interrupted: '끝나기 전에 멈췄습니다. 다시 시도하세요.',
     errorGeneric: '작업을 마치지 못했습니다. 다시 시도하세요.',
     oldDriveNote: '여기의 Google Drive 백업은 RisuAI 공식 계정 방식입니다. 내 Drive 폴더나 다른 클라우드에 백업하려면 RisuNest 탭의 외부 저장소를 쓰세요.',
     jobKinds: { backup: '백업', sync: '동기화', restore: '복원', 'pin-history': '보관', 'resolve-conflict': '충돌 해결' },
     jobActive: { backup: '백업 중', sync: '동기화 중', restore: '복원 중', 'pin-history': '보관 중', 'resolve-conflict': '충돌 해결 중' },
-    strategyLabels: { cas: '동시 사용 보호', sequential: '한 기기씩 사용', 'backup-only': '백업만' },
     historyKinds: { snapshot: '동기화', 'backup-point': '백업', conflict: '충돌 백업', 'recovery-candidate': '복구 후보' },
     endpointWarnings: {
         'github-dedicated-repository': '백업 전용 비공개 저장소를 따로 쓰세요. 이 연결은 백업만 합니다.',
         'gitlab-cleanup-policy': 'GitLab의 패키지 정리 정책이 백업을 지울 수 있습니다. 이 프로젝트에서는 정리 정책을 꺼 두세요. 이 연결은 백업만 합니다.',
     },
     providers: {
-        webdav: { name: 'WebDAV / Koofr', description: 'HTTPS WebDAV 폴더에 앱 비밀번호로 연결합니다.', strategyNote: '동시 사용 보호는 두 기기가 동시에 동기화 서버에 업로드를 해 데이터가 손상되는 것을 예방합니다. 서버가 지원해야 동작하며, 연결을 시도할 때 지원 여부를 검사합니다.' },
+        webdav: { name: 'WebDAV / Koofr', description: 'HTTPS WebDAV 폴더에 앱 비밀번호로 연결합니다.' },
         s3: { name: 'S3 호환 저장소', description: 'Amazon S3, Cloudflare R2, Backblaze B2, Hugging Face 같은 S3 호환 버킷을 씁니다.' },
         google_drive: { name: 'Google Drive', description: 'Google 계정으로 로그인해 Drive 폴더나 숨겨진 앱 데이터 공간을 씁니다.', warningTitle: '숨겨진 앱 데이터 공간에 주의하세요', warning: '숨겨진 앱 데이터 공간을 고른 경우, Drive에서 앱 데이터를 삭제하면 백업도 함께 지워집니다.' },
         onedrive: { name: 'OneDrive', description: 'Microsoft 계정으로 로그인해 개인·회사·앱 전용 폴더를 씁니다.' },
@@ -306,17 +303,12 @@ function externalErrorKind(value: unknown): string | undefined {
     return typeof kind === 'string' ? kind : undefined
 }
 
-/**
- * Sentence for a failure the native side reported. `strategy` names the publication
- * strategy a connection attempt asked for, so a refused capability says which one.
- */
+/** Sentence for a failure the native side reported. */
 export function externalErrorMessage(
     strings: ExternalStorageStrings,
     value: unknown,
-    strategy?: ExternalPublicationStrategy,
 ): string {
     const kind = externalErrorKind(value)
-    if (kind === 'unsupported' && strategy === 'cas') return strings.casUnsupported
     switch (kind) {
         case 'alreadyConnected': return strings.connectionAlreadyAdded
         case 'unauthorized': return strings.credentialsRejected

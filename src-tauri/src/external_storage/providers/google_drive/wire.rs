@@ -1,7 +1,6 @@
-//! Drive v3 response shapes, documented quota weights and the status/reason
+//! Drive v3 response shapes and the status/reason
 //! classification. Response text is only ever inspected for a documented
 //! machine reason string; nothing from a body reaches an error or a log.
-use super::config::Settings;
 use crate::external_storage::{
     contract::*,
     http::HttpResponse,
@@ -71,6 +70,20 @@ pub(super) struct FileList {
     #[serde(default)]
     pub files: Vec<DriveFile>,
     pub next_page_token: Option<String>,
+    #[serde(default)]
+    pub incomplete_search: bool,
+}
+impl FileList {
+    pub fn validate_page(&self, cursor: Option<&str>) -> Result<()> {
+        if self.incomplete_search
+            || self.next_page_token.as_deref().is_some_and(|token| {
+                token.is_empty() || token.len() > 4096 || Some(token) == cursor
+            })
+        {
+            return Err(ProviderError::new(ErrorKind::Corrupt));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -163,73 +176,5 @@ pub(super) async fn require_status(
         Ok(())
     } else {
         Err(classify(response, now_ms, cancel).await)
-    }
-}
-
-pub(super) const BUCKET_QUERIES: &str = "queries";
-pub(super) const BUCKET_UPLOAD_BYTES: &str = "uploadBytes";
-pub(super) const BUCKET_DOWNLOAD_BYTES: &str = "downloadBytes";
-const MINUTE_MS: u64 = 60 * 1000;
-const DAY_MS: u64 = 24 * 60 * 60 * 1000;
-
-/// Quota units are shared per project and user; transfer volume is shared per
-/// user for uploads and per project for egress.
-#[derive(Clone, PartialEq, Eq)]
-pub(super) struct AccountScope {
-    pub queries: String,
-    pub upload: String,
-    pub download: String,
-}
-impl AccountScope {
-    pub(super) fn of(settings: &Settings) -> Self {
-        Self {
-            queries: format!(
-                "google_drive/project+user:{}:{}",
-                settings.project_id, settings.account_id
-            ),
-            upload: format!("google_drive/user:{}", settings.account_id),
-            download: format!("google_drive/project:{}", settings.project_id),
-        }
-    }
-}
-
-fn unit(bucket: &str, shared_account: &str, units: u64, window_ms: u64) -> RequestCost {
-    RequestCost {
-        bucket: bucket.into(),
-        shared_account: shared_account.into(),
-        units,
-        reset: QuotaReset::Rolling { window_ms },
-    }
-}
-
-/// Documented per-method quota units plus the transfer buckets, which count one
-/// unit per byte and are therefore scaled by the bytes this request moves.
-pub(super) fn costs(
-    operation: ProviderOperation,
-    scope: &AccountScope,
-    bytes: u64,
-) -> Vec<RequestCost> {
-    let queries = |units: u64| unit(BUCKET_QUERIES, &scope.queries, units, MINUTE_MS);
-    let upload = || unit(BUCKET_UPLOAD_BYTES, &scope.upload, bytes, DAY_MS);
-    let download = || unit(BUCKET_DOWNLOAD_BYTES, &scope.download, bytes, DAY_MS);
-    match operation {
-        ProviderOperation::Metadata => vec![queries(5)],
-        ProviderOperation::List => vec![queries(100)],
-        ProviderOperation::Get | ProviderOperation::Range => vec![queries(200), download()],
-        ProviderOperation::Create => vec![queries(50), upload()],
-        ProviderOperation::UploadSession => vec![queries(50)],
-        ProviderOperation::UploadChunk => vec![upload()],
-        ProviderOperation::ReplaceHead => vec![queries(50), upload()],
-        ProviderOperation::ReconcileUpload => vec![queries(5)],
-        // The per-method table does not name `files.delete`; the editing weight
-        // is the closest documented family.
-        ProviderOperation::Delete => vec![queries(50)],
-        // No download URL is issued, the final chunk completes an upload, this
-        // service has no head compare-and-exchange primitive, and the token
-        // endpoint has no documented Drive quota weight.
-        ProviderOperation::DownloadUrl
-        | ProviderOperation::CompleteUpload
-        | ProviderOperation::CompareExchangeHead
-        | ProviderOperation::Authenticate => Vec::new(),
     }
 }

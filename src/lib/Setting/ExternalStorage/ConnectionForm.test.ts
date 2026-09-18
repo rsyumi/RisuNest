@@ -48,13 +48,22 @@ const prepared = {
         remoteVerified: false,
     },
     capabilities: {
-        cas: false,
-        sequential: true,
-        backupOnly: true,
+        immutableCreate: true,
+        directCompleteRead: true,
+        atomicCreateHead: false,
+        conditionalHeadUpdate: false,
+        stableHeadReplace: true,
+        headReadAfterWrite: true,
+        headRetryControl: true,
+        leaseOperations: true,
+        deleteObjects: true,
+        conditionalGet: false,
         resumableUpload: true,
-        rangeDownload: true,
+        range: true,
         snapshotDiscovery: true,
-        evidence: 'live' as const,
+        maxStoredBytes: null,
+        sdkOverheadBytes: 0,
+        uploadAlignment: 1,
     },
     requiresOAuth: true,
     requiresRecoveryKey: false,
@@ -308,7 +317,7 @@ describe('service presets', () => {
 })
 
 describe('synchronization mode defaults', () => {
-    it('prefers concurrent-use protection and falls back to one device at a time', async () => {
+    it('shows common single-device guidance without a strategy selector', async () => {
         component = mount(ConnectionForm, {
             target,
             props: { strings, onconnected: vi.fn(), oncancel: vi.fn() },
@@ -319,15 +328,15 @@ describe('synchronization mode defaults', () => {
         button(strings.sync).click()
         await settle()
 
-        expect(button(strings.strategyLabels.cas).getAttribute('aria-checked')).toBe('true')
-        expect(button(strings.strategyLabels.sequential).getAttribute('aria-checked')).toBe('false')
+        expect(target.textContent).toContain(strings.sequentialWarning)
+        expect(target.textContent).not.toContain('Concurrent-use protection')
 
         await selectProvider('google_drive')
         button(strings.sync).click()
         await settle()
 
-        expect(() => button(strings.strategyLabels.cas)).toThrow()
-        expect(button(strings.strategyLabels.sequential).getAttribute('aria-checked')).toBe('true')
+        expect(target.textContent).toContain(strings.sequentialWarning)
+        expect(target.querySelectorAll('input[type="checkbox"]')).toHaveLength(0)
     })
 })
 
@@ -390,6 +399,7 @@ describe('what a connection stores', () => {
         const request = state.prepareConnection.mock.calls.at(-1)?.[0]
         expect(request.purpose).toBe('sync')
         expect(request.capturePolicy).toBeUndefined()
+        expect(request).not.toHaveProperty('publicationStrategy')
     })
 
     it('says where local data is chosen when reviewing a synchronization connection', async () => {
@@ -410,7 +420,7 @@ describe('what a connection stores', () => {
 })
 
 describe('native failure messages', () => {
-    it('names the refused strategy when a repository cannot do concurrent-use protection', async () => {
+    it('reports unsupported repositories without suggesting a strategy choice', async () => {
         component = mount(ConnectionForm, {
             target,
             props: { strings, onconnected: vi.fn(), oncancel: vi.fn() },
@@ -434,7 +444,7 @@ describe('native failure messages', () => {
         button(strings.connect).click()
         await settle()
 
-        expect(target.textContent).toContain(strings.casUnsupported)
+        expect(target.textContent).toContain(strings.unsupportedOperation)
     })
 
     it('reports a rejected sign-in instead of a bare failure', async () => {
@@ -450,6 +460,6 @@ describe('native failure messages', () => {
         await settle()
 
         await vi.waitFor(() => expect(target.textContent).toContain(strings.credentialsRejected))
-        expect(target.textContent).not.toContain(strings.casUnsupported)
+        expect(target.textContent).not.toContain(strings.unsupportedOperation)
     })
 })

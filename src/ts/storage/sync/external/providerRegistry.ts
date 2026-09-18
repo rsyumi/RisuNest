@@ -2,7 +2,6 @@ import type {
     ExternalConnectionConfig,
     ExternalProviderId,
     ExternalProviderSecretInput,
-    ExternalPublicationStrategy,
 } from './types'
 
 /** Field shape only; labels, help and option names come from the settings strings. */
@@ -27,7 +26,7 @@ export interface ExternalProviderDefinition {
     fields: ExternalProviderField[]
     secretFields: ExternalProviderField[]
     oauth: boolean
-    strategies: ExternalPublicationStrategy[]
+    supportsSync: boolean
 }
 
 const s3Profiles = [
@@ -44,7 +43,7 @@ export const externalProviderDefinitions: ExternalProviderDefinition[] = [
         defaultEndpoint: '', profiles: [{ value: '', label: '' }, { value: 'koofr', label: 'Koofr' }],
         fields: [{ key: 'accountId', required: true }, { key: 'root', required: true, location: true, placeholder: 'RisuNest' }],
         secretFields: [{ key: 'password', required: true, secret: true }],
-        strategies: ['cas', 'sequential', 'backup-only'],
+        supportsSync: true,
     },
     {
         id: 's3', oauth: false, customEndpoint: true,
@@ -57,7 +56,7 @@ export const externalProviderDefinitions: ExternalProviderDefinition[] = [
             { key: 'addressing', location: true, type: 'select', options: ['', 'path', 'virtual'] },
         ],
         secretFields: [{ key: 'accessKeyId', required: true, secret: true }, { key: 'secretAccessKey', required: true, secret: true }],
-        strategies: ['cas', 'sequential', 'backup-only'],
+        supportsSync: true,
     },
     {
         id: 'google_drive', oauth: true, customEndpoint: false,
@@ -69,7 +68,7 @@ export const externalProviderDefinitions: ExternalProviderDefinition[] = [
             { key: 'oauthRedirectUri', required: true, location: true },
             { key: 'projectId', required: true },
             { key: 'clientId', required: true },
-        ], secretFields: [], strategies: ['sequential', 'backup-only'],
+        ], secretFields: [], supportsSync: true,
     },
     {
         // No CAS: Graph has no conditional update on the content PUT used for a head.
@@ -84,7 +83,7 @@ export const externalProviderDefinitions: ExternalProviderDefinition[] = [
             { key: 'redirectUri', required: true, location: true },
             { key: 'projectId', required: true },
             { key: 'clientId', required: true },
-        ], secretFields: [], strategies: ['sequential', 'backup-only'],
+        ], secretFields: [], supportsSync: true,
     },
     {
         id: 'mybox', oauth: false, customEndpoint: false,
@@ -92,21 +91,21 @@ export const externalProviderDefinitions: ExternalProviderDefinition[] = [
         profiles: ['plan30gb', 'plan80gb', 'plan180gb', 'plan2tb', 'plan5tb', 'plan10tb', 'plan20tb'].map(value => ({ value, label: '' })),
         fields: [{ key: 'accountId', required: true }, { key: 'rootFolderName', required: true, location: true }, { key: 'rootFolderId', location: true }],
         secretFields: [{ key: 'pat', required: true, secret: true }, { key: 'expiresAtMs', required: true, type: 'datetime-local' }],
-        strategies: ['sequential', 'backup-only'],
+        supportsSync: true,
     },
     {
         id: 'github_releases', oauth: false, customEndpoint: false,
         defaultEndpoint: 'https://api.github.com', profiles: [],
         fields: [{ key: 'accountId', required: true }, { key: 'uploadEndpoint', required: true, location: true, placeholder: 'https://uploads.github.com' }, { key: 'owner', required: true, location: true }, { key: 'repo', required: true, location: true }, { key: 'tagPrefix', required: true, location: true, placeholder: 'risunest-backup' }],
         secretFields: [{ key: 'token', required: true, secret: true }],
-        strategies: ['backup-only'],
+        supportsSync: false,
     },
     {
         id: 'gitlab_packages', oauth: false, customEndpoint: true,
         defaultEndpoint: 'https://gitlab.com', profiles: [{ value: '', label: '' }, { value: 'gitlabCom', label: 'GitLab.com' }, { value: 'selfManaged', label: '' }],
         fields: [{ key: 'accountId', required: true }, { key: 'projectId', required: true, location: true }, { key: 'packageName', required: true, location: true, placeholder: 'risunest-backup' }, { key: 'maxFileBytes', location: true }],
         secretFields: [{ key: 'token', required: true, secret: true }, { key: 'tokenKind', required: true, type: 'select', options: ['personalAccessToken', 'projectAccessToken', 'deployToken'] }],
-        strategies: ['backup-only'],
+        supportsSync: false,
     },
 ]
 
