@@ -40,7 +40,7 @@ pub(super) fn take_test_read_counts(staging_root: &Path) -> (u64, u64) {
         .lock()
         .unwrap()
         .remove(staging_root)
-        .unwrap_or_default()
+        .expect("test read counter root was registered")
 }
 
 #[cfg(test)]
@@ -831,4 +831,22 @@ pub(crate) async fn download_snapshot(
         objects: objects.into_values().collect(),
         captured_by_device: document.captured_by_device,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_read_counts_are_scoped_to_registered_staging_root() {
+        let root_a = Path::new("snapshot-restore-read-count-root-a");
+        let root_b = Path::new("snapshot-restore-read-count-root-b");
+        reset_test_read_counts(root_a);
+
+        record_test_read(&root_a.join("downloads"), false);
+        record_test_read(&root_a.join("downloads"), true);
+        record_test_read(&root_b.join("downloads"), true);
+
+        assert_eq!(take_test_read_counts(root_a), (2, 1));
+    }
 }
