@@ -11,6 +11,7 @@ pub mod screenshot_output;
 mod backup_source;
 mod legacy_backup;
 mod portable;
+pub(crate) mod reference_source;
 pub(crate) use backup_source::*;
 mod official_snapshot;
 mod risum_export;
@@ -1140,6 +1141,7 @@ pub(crate) struct NativeFileJobState {
     max_concurrent_jobs: usize,
     startup_warnings: Vec<NativeJobError>,
     capability_error: Option<NativeJobError>,
+    external_reference_sources: Arc<reference_source::ExternalReferenceSources>,
 }
 
 impl NativeFileJobState {
@@ -1191,6 +1193,7 @@ impl NativeFileJobState {
             max_concurrent_jobs,
             startup_warnings,
             capability_error,
+            external_reference_sources: Arc::new(reference_source::ExternalReferenceSources::default()),
         }
     }
 

@@ -697,6 +697,8 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         external_storage::runtime::external_storage_get_quota,
         external_storage::history::external_storage_list_history,
         external_storage::sync_engine::external_storage_list_conflicts,
+        native_file_jobs::reference_source::external_storage_open_conflict_source,
+        native_file_jobs::reference_source::external_storage_release_conflict_source,
         external_storage::sync_engine::external_storage_apply_received,
         external_storage::snapshot_export_commands::external_storage_export_snapshot,
         #[cfg(target_os = "ios")]
