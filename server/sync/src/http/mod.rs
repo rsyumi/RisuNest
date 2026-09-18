@@ -340,11 +340,16 @@ async fn authorize(State(app): State<App>, request: Request, next: Next) -> Resp
             .insert("cache-control", "no-store".parse().unwrap());
         // A slow response must retain its slot until the stream is consumed or
         // disconnected, not just until response headers are ready.
-        use futures_util::StreamExt;
+        use futures_util::Stream;
         let (parts, body) = response.into_parts();
-        let stream = body.into_data_stream().map(move |chunk| {
-            let _ = &permits;
-            chunk
+        let mut body = Box::pin(body.into_data_stream());
+        let mut permits = Some(permits);
+        let stream = futures_util::stream::poll_fn(move |context| {
+            let next = body.as_mut().poll_next(context);
+            if matches!(next, std::task::Poll::Ready(None)) {
+                permits.take();
+            }
+            next
         });
         let response = Response::from_parts(parts, axum::body::Body::from_stream(stream));
         Ok::<_, Error>(response)
