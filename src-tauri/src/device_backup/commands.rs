@@ -1,5 +1,30 @@
 use super::*;
+use crate::asset_repository::job_pins::{CasReleaseOutcome, DurableCasJob};
+use std::io::ErrorKind;
 use tauri::{AppHandle, Manager, State};
+
+fn release_native_restore_pins(
+    session: &Session,
+    root: &std::path::Path,
+    outcome: CasReleaseOutcome,
+) -> Result<()> {
+    if !session.includes_library {
+        return Ok(());
+    }
+    match DurableCasJob::open(root, &session.job_id) {
+        Ok(mut pins) => pins.release(outcome).map_err(|_| {
+            error(
+                "device-storage-failed",
+                "Native portable recovery could not release durable asset pins",
+            )
+        }),
+        Err(failure) if failure.kind() == ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(error(
+            "device-storage-failed",
+            "Native portable recovery could not open durable asset pins",
+        )),
+    }
+}
 
 fn require_renderer_maintenance(state: &DeviceBackupState, session_id: &str) -> Result<()> {
     if !state.maintenance_entered(session_id)? {
@@ -23,7 +48,51 @@ pub(crate) fn native_device_backup_bootstrap(
             "Device maintenance requires one WebView with all previous plugin contexts closed",
         )?;
     }
-    state.bootstrap_for_entry(fresh_bootstrap.unwrap_or(false))
+    let decision = state.bootstrap_for_entry(fresh_bootstrap.unwrap_or(false))?;
+    let Some(session) = decision.session.as_ref() else {
+        return Ok(decision);
+    };
+    if session.profile != "native-portable" {
+        return Ok(decision);
+    }
+    if session.phase == "committed" {
+        return Ok(decision);
+    }
+    if matches!(
+        session.phase.as_str(),
+        "loading-source" | "preparing" | "awaiting-native-preparation"
+    ) {
+        release_native_restore_pins(
+            session,
+            state.repository_root(),
+            CasReleaseOutcome::Aborted,
+        )?;
+        state.fail(&session.session_id, "interrupted-before-native-apply")?;
+        state.recovery_complete(&session.session_id)?;
+        return state.bootstrap_for_entry(false);
+    }
+    if matches!(
+        session.phase.as_str(),
+        "prepared" | "applying-device" | "committing-library"
+    ) {
+        let mut store = crate::persistent_store::PersistentStore::open(state.repository_root())
+            .map_err(|_| {
+                error(
+                    "device-storage-failed",
+                    "Native portable recovery could not open persistent storage",
+                )
+            })?;
+        resume_journaled_native_restore(&state, &session.session_id, &mut store)?;
+        let decision = state.bootstrap_for_entry(false)?;
+        decision.session.as_ref().ok_or_else(|| {
+            error(
+                "device-invalid-state",
+                "Native portable recovery lost its committed session",
+            )
+        })?;
+        return Ok(decision);
+    }
+    Ok(decision)
 }
 
 #[tauri::command(async)]
@@ -163,22 +232,13 @@ pub(crate) fn native_device_backup_blob_read(
     state.blob_read(&session_id, spool, &object_id, offset, length)
 }
 
-pub(super) fn native_device_backup_prepared_state(
+#[tauri::command(async)]
+pub(crate) fn native_device_backup_prepared(
     state: State<'_, DeviceBackupState>,
     session_id: String,
 ) -> Result<()> {
     require_renderer_maintenance(&state, &session_id)?;
     state.prepared(&session_id)
-}
-
-#[tauri::command(async)]
-pub(crate) fn native_device_backup_prepared(
-    app: AppHandle,
-    state: State<'_, DeviceBackupState>,
-    session_id: String,
-) -> Result<()> {
-    native_device_backup_prepared_state(state, session_id.clone())?;
-    crate::external_storage::runtime_restore::resume_prepared_device_restore(app, &session_id)
 }
 
 #[tauri::command(async)]
@@ -213,38 +273,27 @@ pub(crate) fn native_device_backup_finish_device(
     state.finish_device(&session_id)
 }
 
-pub(super) fn native_device_backup_recovery_complete_state(
-    state: State<'_, DeviceBackupState>,
-    session_id: String,
-) -> Result<Session> {
-    require_renderer_maintenance(&state, &session_id)?;
-    let session = state.session(&session_id)?;
-    state.recovery_complete(&session_id)?;
-    Ok(session)
-}
-
 #[tauri::command(async)]
 pub(crate) fn native_device_backup_recovery_complete(
-    app: AppHandle,
     state: State<'_, DeviceBackupState>,
     session_id: String,
 ) -> Result<()> {
     require_renderer_maintenance(&state, &session_id)?;
     let session = state.session(&session_id)?;
-    crate::external_storage::runtime_restore::prepare_device_restore_settlement(
-        app.clone(),
-        &session,
-    )?;
-    state.recovery_complete(&session_id)?;
-    if let Err(error) =
-        crate::external_storage::runtime_restore::settle_device_restore(app, &session)
-    {
-        crate::nlog!(
-            "error",
-            "Completed device restore outcome remains queued for settlement: {error}"
-        );
+    if session.profile == "native-portable" && session.includes_library {
+        if session.phase != "committed" {
+            return Err(error(
+                "device-invalid-state",
+                "Native portable restore pins can only be released after commit",
+            ));
+        }
+        release_native_restore_pins(
+            &session,
+            state.repository_root(),
+            CasReleaseOutcome::Committed,
+        )?;
     }
-    Ok(())
+    state.recovery_complete(&session_id)
 }
 
 #[tauri::command(async)]

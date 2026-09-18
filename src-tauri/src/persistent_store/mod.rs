@@ -1306,6 +1306,10 @@ impl PersistentStore {
     }
 
     pub(crate) fn open(app_data_dir: &Path) -> StoreResult<Self> {
+        let retained_stage = crate::device_backup::active_native_portable_stage(app_data_dir)
+            .map_err(|failure| StoreError::Validation {
+                message: failure.to_string(),
+            })?;
         let persistent_dir = app_data_dir.join("persistent");
         let snapshots_dir = persistent_dir.join("snapshots");
         std::fs::create_dir_all(&snapshots_dir)?;
@@ -1338,7 +1342,7 @@ impl PersistentStore {
         export::sweep_abandoned(&snapshots_dir)?;
         #[cfg(feature = "native-kei-upload-pilot")]
         kei::sweep_abandoned(&snapshots_dir);
-        snapshot::sweep_temporary_generations(&mut connection)?;
+        snapshot::sweep_temporary_generations(&mut connection, retained_stage.as_deref())?;
         snapshot::checkpoint(&connection, CheckpointMode::Truncate)?;
 
         let active_readers = Arc::new(snapshot::ActiveReaderRegistry::default());

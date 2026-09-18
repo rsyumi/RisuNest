@@ -5,6 +5,10 @@ import type {
 } from "./maintenance";
 import { checkNativeStartupStatus } from "../../nativeStartup";
 
+export interface DeviceMaintenanceEntryDependencies {
+  reload?: () => void;
+}
+
 function maintenanceView(
   cancel: () => void,
   retry: () => Promise<void>,
@@ -99,7 +103,9 @@ function maintenanceView(
 }
 
 /** Minimal startup entry, intentionally independent of settings, DBState and plugins. */
-export async function deviceMaintenanceBeforeBootstrap(): Promise<void> {
+export async function deviceMaintenanceBeforeBootstrap(
+  dependencies: DeviceMaintenanceEntryDependencies = {},
+): Promise<void> {
   if (
     !(window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__
   )
@@ -113,18 +119,34 @@ export async function deviceMaintenanceBeforeBootstrap(): Promise<void> {
   }
   let view: ReturnType<typeof maintenanceView> | undefined;
   let sessionId: string | undefined;
+  let nativeCompletion = false;
+  const reload = dependencies.reload ?? (() => location.reload());
   const retry = async () => {
-    if (sessionId)
+    if (sessionId && !nativeCompletion)
       await invoke("native_device_backup_retry_recovery", { sessionId });
-    location.reload();
+    reload();
   };
   try {
-    const bootstrap = await invoke<DeviceMaintenanceBootstrap>(
+    let bootstrap = await invoke<DeviceMaintenanceBootstrap>(
       "native_device_backup_bootstrap",
       { freshBootstrap: true },
     );
     if (bootstrap.mode === "normal") return;
     sessionId = bootstrap.session?.sessionId;
+    nativeCompletion = bootstrap.session?.action === "native-complete";
+    if (nativeCompletion) {
+      if (!sessionId)
+        throw new Error("Native device restore completion has no session ID");
+      if (bootstrap.session.includesLibrary)
+        localStorage.setItem("risuNestServerSyncRestoreHold", "true");
+      await invoke("native_device_backup_recovery_complete", { sessionId });
+      bootstrap = await invoke<DeviceMaintenanceBootstrap>(
+        "native_device_backup_bootstrap",
+      );
+      if (bootstrap.mode !== "normal")
+        throw new Error("Native device restore completion is still pending");
+      return;
+    }
     const cancellation = new AbortController();
     view = maintenanceView(() => cancellation.abort(), retry);
     const [

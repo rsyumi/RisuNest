@@ -28,6 +28,8 @@ import type { DeviceNativeInvoke } from "./nativeSpool";
 import {
   defaultDeviceExportChoices,
   defaultDeviceRestoreChoices,
+  defaultNativePortableExportChoices,
+  defaultNativePortableRestoreChoices,
   selectedDeviceSections,
 } from "./selection";
 
@@ -403,6 +405,40 @@ describe("device plugin storage scopes", () => {
         recordCount: 0,
       },
     ]);
+  });
+
+  it("keeps native portable sections separate from browser clone scopes", () => {
+    expect(defaultNativePortableExportChoices()).toEqual([
+      {
+        sectionId: "hypa",
+        label: "",
+        included: true,
+        selected: true,
+      },
+      {
+        sectionId: "local-plugins",
+        label: "",
+        included: true,
+        selected: true,
+      },
+      {
+        sectionId: "local-settings",
+        label: "",
+        included: true,
+        selected: false,
+      },
+    ]);
+    expect(defaultNativePortableRestoreChoices(["local-settings"])).toEqual([
+      {
+        sectionId: "local-settings",
+        label: "",
+        included: true,
+        selected: true,
+      },
+    ]);
+    expect(() =>
+      defaultNativePortableRestoreChoices(["local-storage"]),
+    ).toThrow("Invalid native portable device section");
   });
 
   it("restores original database absence without requiring space for a new database", async () => {

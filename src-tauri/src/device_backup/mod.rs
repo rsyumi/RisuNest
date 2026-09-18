@@ -8,7 +8,11 @@
 mod archive;
 mod commands;
 mod spool;
-pub(crate) use archive::validate_archive_catalog;
+pub(crate) use archive::{
+    apply_prepared_native_sections, capture_native_sections, capture_prepared_native_sections,
+    journal_prepared_native_sections, prepare_journaled_native_sections, prepare_native_sections,
+    resume_journaled_native_restore, validate_archive_catalog, PreparedDeviceSection,
+};
 pub(crate) use commands::*;
 pub(crate) use spool::{BlobManifest, RowPage, SectionManifest};
 
@@ -113,6 +117,9 @@ pub(crate) struct Session {
     pub(crate) selected_sections: Vec<String>,
     pub(crate) old_generation: Option<String>,
     pub(crate) new_generation: Option<String>,
+    pub(crate) profile: String,
+    pub(crate) expected_revision: Option<i64>,
+    pub(crate) stage_id: Option<String>,
     pub(crate) action: String,
     pub(crate) failure_code: Option<String>,
     pub(crate) failure_detail: Option<FailureDetail>,
@@ -270,6 +277,65 @@ impl DeviceBackupState {
         old_generation: Option<String>,
         new_generation: Option<String>,
     ) -> Result<String> {
+        self.create_session_with_profile(
+            job_id,
+            operation,
+            includes_library,
+            selected_sections,
+            old_generation,
+            new_generation,
+            "renderer-clone",
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn create_native_portable_session(
+        &self,
+        job_id: &str,
+        includes_library: bool,
+        selected_sections: &[String],
+        expected_revision: i64,
+        stage_id: Option<String>,
+    ) -> Result<String> {
+        require(expected_revision >= 0, "Invalid native restore revision")?;
+        require(
+            includes_library == stage_id.is_some(),
+            "Native portable library selection and stage do not match",
+        )?;
+        for section in selected_sections {
+            risunest_external_storage_format::section::SectionKind::parse(section)
+                .map_err(|_| error("device-invalid-state", "Invalid native portable section"))?;
+        }
+        if let Some(stage_id) = stage_id.as_deref() {
+            validate_native_stage_id(stage_id)?;
+        }
+        self.create_session_with_profile(
+            job_id,
+            Operation::Restore,
+            includes_library,
+            selected_sections,
+            None,
+            None,
+            "native-portable",
+            Some(expected_revision),
+            stage_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_session_with_profile(
+        &self,
+        job_id: &str,
+        operation: Operation,
+        includes_library: bool,
+        selected_sections: &[String],
+        old_generation: Option<String>,
+        new_generation: Option<String>,
+        profile: &str,
+        expected_revision: Option<i64>,
+        stage_id: Option<String>,
+    ) -> Result<String> {
         self.require_maintenance_guard()?;
         validate_id(job_id)?;
         require(
@@ -291,6 +357,13 @@ impl DeviceBackupState {
                 "Generation identifier is too large",
             )?;
         }
+        require(
+            matches!(profile, "renderer-clone" | "native-portable"),
+            "Invalid device maintenance profile",
+        )?;
+        if let Some(stage_id) = &stage_id {
+            validate_id(stage_id)?;
+        }
         let mut inner = self.lock()?;
         self.require_maintenance_guard()?;
         let connection = inner.connection.as_mut().unwrap();
@@ -300,7 +373,7 @@ impl DeviceBackupState {
         )?;
         let id = Uuid::new_v4().to_string();
         let transaction = connection.transaction()?;
-        transaction.execute("INSERT INTO sessions(id,job_id,operation,phase,includes_library,old_generation,new_generation) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![id,job_id,if operation == Operation::Capture {"capture"} else {"restore"},if operation == Operation::Capture {"capturing"} else {"loading-source"},includes_library,old_generation,new_generation])?;
+        transaction.execute("INSERT INTO sessions(id,job_id,operation,phase,includes_library,old_generation,new_generation,profile,expected_revision,stage_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![id,job_id,if operation == Operation::Capture {"capture"} else {"restore"},if operation == Operation::Capture {"capturing"} else {"loading-source"},includes_library,old_generation,new_generation,profile,expected_revision,stage_id])?;
         for (position, section) in selected_sections.iter().enumerate() {
             transaction.execute(
                 "INSERT INTO selection(session,section,position) VALUES(?1,?2,?3)",
@@ -650,14 +723,48 @@ impl DeviceBackupState {
 
     pub(crate) fn commit_marker(&self, id: &str) -> Result<(String, CommitMarker)> {
         let session = self.session(id)?;
+        let new_generation = if session.profile == "native-portable" {
+            session.stage_id
+        } else {
+            session.new_generation
+        };
         Ok((
             marker_key(&session.job_id),
             CommitMarker {
                 job_id: session.job_id,
                 session_id: session.session_id,
-                new_generation: session.new_generation,
+                new_generation,
             },
         ))
+    }
+
+    pub(crate) fn library_commit_marker_exists(&self, id: &str) -> Result<bool> {
+        let inner = self.lock()?;
+        let connection = inner.connection.as_ref().unwrap();
+        let session = active_session_for(connection, id)?;
+        require(
+            session.operation == Operation::Restore && session.includes_library,
+            "Library marker requires a library restore session",
+        )?;
+        commit_exists(connection, &self.repository_root, &session)
+    }
+
+    pub(crate) fn pending_source_sections(&self, id: &str) -> Result<Vec<String>> {
+        let inner = self.lock()?;
+        let connection = inner.connection.as_ref().unwrap();
+        let session = active_session_for(connection, id)?;
+        require(
+            session.operation == Operation::Restore && native_section_session(&session),
+            "Native source progress requires a native restore session",
+        )?;
+        let mut statement = connection.prepare(
+            "SELECT section FROM selection
+                WHERE session=?1 AND (intent<>'source' OR intent IS NULL OR verified_digest IS NULL)
+                ORDER BY position",
+        )?;
+        Ok(statement
+            .query_map([id], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub(crate) fn fail(&self, id: &str, code: &str) -> Result<Session> {
@@ -846,7 +953,7 @@ fn open(root: &Path) -> Result<Connection> {
     let connection = Connection::open(path)?;
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
     connection.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA foreign_keys=ON; PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA auto_vacuum=INCREMENTAL;
-        CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,job_id TEXT NOT NULL,operation TEXT NOT NULL,phase TEXT NOT NULL,includes_library INTEGER NOT NULL,old_generation TEXT,new_generation TEXT,device_committed INTEGER NOT NULL DEFAULT 0,active INTEGER NOT NULL DEFAULT 1,failure_code TEXT,failure_detail TEXT);
+        CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,job_id TEXT NOT NULL,operation TEXT NOT NULL,phase TEXT NOT NULL,includes_library INTEGER NOT NULL,old_generation TEXT,new_generation TEXT,profile TEXT NOT NULL CHECK(profile IN ('renderer-clone','native-portable')),expected_revision INTEGER,stage_id TEXT,device_committed INTEGER NOT NULL DEFAULT 0,active INTEGER NOT NULL DEFAULT 1,failure_code TEXT,failure_detail TEXT);
         CREATE UNIQUE INDEX IF NOT EXISTS one_active_session ON sessions(active) WHERE active=1;
         CREATE TABLE IF NOT EXISTS selection(session TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,section TEXT NOT NULL,position INTEGER NOT NULL,intent TEXT,verified_digest TEXT,PRIMARY KEY(session,section));
         CREATE TABLE IF NOT EXISTS sections(session TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,spool TEXT NOT NULL,section TEXT NOT NULL,metadata TEXT NOT NULL,sealed INTEGER NOT NULL DEFAULT 0,records INTEGER NOT NULL DEFAULT 0,sha256 TEXT,PRIMARY KEY(session,spool,section));
@@ -855,6 +962,59 @@ fn open(root: &Path) -> Result<Connection> {
         CREATE TABLE IF NOT EXISTS chunks(session TEXT NOT NULL,spool TEXT NOT NULL,object_id TEXT NOT NULL,offset INTEGER NOT NULL,bytes BLOB NOT NULL,PRIMARY KEY(session,spool,object_id,offset),FOREIGN KEY(session,spool,object_id) REFERENCES blobs(session,spool,object_id) ON DELETE CASCADE);")?;
     crate::trust_boundary::sync_directory(root)?;
     Ok(connection)
+}
+
+pub(crate) fn active_native_portable_stage(root: &Path) -> Result<Option<String>> {
+    let path = root.join("device-backup").join("coordinator.sqlite");
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => require(
+            metadata.is_file() && !crate::trust_boundary::is_link_like(&metadata),
+            "Device coordinator path is not a regular file",
+        )?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA query_only=ON;")?;
+    let row: Option<(String, bool, Option<String>)> = connection
+        .query_row(
+            "SELECT phase,includes_library,stage_id FROM sessions
+                WHERE active=1 AND profile='native-portable'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((phase, includes_library, stage_id)) = row else {
+        return Ok(None);
+    };
+    if !matches!(
+        phase.as_str(),
+        "loading-source"
+            | "preparing"
+            | "awaiting-native-preparation"
+            | "prepared"
+            | "applying-device"
+            | "committing-library"
+            | "committed"
+    ) {
+        return Ok(None);
+    }
+    if includes_library {
+        let stage_id = stage_id.ok_or_else(|| {
+            error(
+                "device-invalid-state",
+                "Active native portable restore has no library stage",
+            )
+        })?;
+        validate_native_stage_id(&stage_id)?;
+        Ok(Some(stage_id))
+    } else {
+        require(
+            stage_id.is_none(),
+            "Device-only native portable restore has a library stage",
+        )?;
+        Ok(None)
+    }
 }
 
 fn validate_id(id: &str) -> Result<()> {
@@ -867,6 +1027,23 @@ fn validate_id(id: &str) -> Result<()> {
         "Invalid opaque identifier",
     )
 }
+fn validate_native_stage_id(stage_id: &str) -> Result<()> {
+    validate_id(stage_id)?;
+    let uuid = stage_id.strip_prefix("staging-").ok_or_else(|| {
+        error(
+            "device-invalid-state",
+            "Invalid native portable stage identifier",
+        )
+    })?;
+    Uuid::parse_str(uuid)
+        .map(|_| ())
+        .map_err(|_| {
+            error(
+                "device-invalid-state",
+                "Invalid native portable stage identifier",
+            )
+        })
+}
 fn validate_digest(digest: &str) -> Result<()> {
     require(
         crate::trust_boundary::is_lower_hex_256(digest),
@@ -874,7 +1051,8 @@ fn validate_digest(digest: &str) -> Result<()> {
     )
 }
 fn validate_section(section: &str) -> Result<()> {
-    let valid = matches!(section, "local-storage" | "localforage" | "device-settings")
+    let valid = risunest_external_storage_format::section::SectionKind::parse(section).is_ok()
+        || matches!(section, "local-storage" | "localforage" | "device-settings")
         || section.strip_prefix("indexed-db:").is_some_and(|name| {
             name.starts_with("0073006100660065005f0070006c007500670069006e005f")
                 && name.len() % 4 == 0
@@ -891,7 +1069,7 @@ fn active_session(connection: &Connection) -> Result<Option<Session>> {
 }
 fn session_for(connection: &Connection, id: &str) -> Result<Session> {
     validate_id(id)?;
-    let mut session=connection.query_row("SELECT id,job_id,operation,phase,includes_library,old_generation,new_generation,failure_code,failure_detail FROM sessions WHERE id=?1",[id],|r|Ok(Session {session_id:r.get(0)?,job_id:r.get(1)?,operation:if r.get::<_,String>(2)?=="capture"{Operation::Capture}else{Operation::Restore},phase:r.get(3)?,includes_library:r.get(4)?,old_generation:r.get(5)?,new_generation:r.get(6)?,selected_sections:Vec::new(),action:String::new(),failure_code:r.get(7)?,failure_detail:None})).optional()?.ok_or_else(||error("device-session-missing","Device maintenance session is absent"))?;
+    let mut session=connection.query_row("SELECT id,job_id,operation,phase,includes_library,old_generation,new_generation,profile,expected_revision,stage_id,failure_code,failure_detail FROM sessions WHERE id=?1",[id],|r|Ok(Session {session_id:r.get(0)?,job_id:r.get(1)?,operation:if r.get::<_,String>(2)?=="capture"{Operation::Capture}else{Operation::Restore},phase:r.get(3)?,includes_library:r.get(4)?,old_generation:r.get(5)?,new_generation:r.get(6)?,profile:r.get(7)?,expected_revision:r.get(8)?,stage_id:r.get(9)?,selected_sections:Vec::new(),action:String::new(),failure_code:r.get(10)?,failure_detail:None})).optional()?.ok_or_else(||error("device-session-missing","Device maintenance session is absent"))?;
     let detail: Option<String> = connection.query_row(
         "SELECT failure_detail FROM sessions WHERE id=?1",
         [id],
@@ -911,21 +1089,33 @@ fn session_for(connection: &Connection, id: &str) -> Result<Session> {
     session.selected_sections = statement
         .query_map([id], |r| r.get(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    session.action = match session.phase.as_str() {
-        "capturing" => "capture",
-        "preparing" => "prepare",
-        "loading-source" => "await-source",
-        "rolling-back" => "rollback",
-        "committed" => "reapply-source",
-        "recovery-required" => "recovery-required",
-        "committing-library" => "await-library",
-        "device-captured" => "await-capture",
-        "awaiting-native-preparation" => "await-native-preparation",
-        "capture-complete" | "rolled-back" => "complete",
-        _ => "continue",
+    session.action = if native_section_session(&session) && session.phase == "committed" {
+        "native-complete"
+    } else {
+        match session.phase.as_str() {
+            "capturing" => "capture",
+            "preparing" => "prepare",
+            "loading-source" => "await-source",
+            "rolling-back" => "rollback",
+            "committed" => "reapply-source",
+            "recovery-required" => "recovery-required",
+            "committing-library" => "await-library",
+            "device-captured" => "await-capture",
+            "awaiting-native-preparation" => "await-native-preparation",
+            "capture-complete" | "rolled-back" => "complete",
+            _ => "continue",
+        }
     }
     .into();
     Ok(session)
+}
+
+fn native_section_session(session: &Session) -> bool {
+    session.profile == "native-portable"
+        && !session.selected_sections.is_empty()
+        && session.selected_sections.iter().all(|section| {
+            risunest_external_storage_format::section::SectionKind::parse(section).is_ok()
+        })
 }
 fn verify_completions(connection: &Connection, id: &str, target: Spool) -> Result<()> {
     let missing:i64=connection.query_row("SELECT COUNT(*) FROM selection s LEFT JOIN sections p ON p.session=s.session AND p.section=s.section AND p.spool=?2 WHERE s.session=?1 AND (s.intent IS NULL OR s.intent<>?2 OR s.verified_digest IS NULL OR p.sha256 IS NULL OR s.verified_digest<>p.sha256)",params![id,target.key()],|r|r.get(0))?;
@@ -940,7 +1130,9 @@ fn marker_key(job_id: &str) -> String {
 
 /// Reads the sole commit authority without opening or migrating the PDS.
 fn read_commit_marker(root: &Path, session: &Session) -> Result<Option<CommitMarker>> {
-    let path = root.join("persistent").join(crate::persistent_store::DATABASE_FILE);
+    let path = root
+        .join("persistent")
+        .join(crate::persistent_store::DATABASE_FILE);
     match std::fs::symlink_metadata(&path) {
         Ok(metadata) => require(
             metadata.is_file() && !crate::trust_boundary::is_link_like(&metadata),
@@ -969,7 +1161,12 @@ fn read_commit_marker(root: &Path, session: &Session) -> Result<Option<CommitMar
     require(
         marker.job_id == session.job_id
             && marker.session_id == session.session_id
-            && marker.new_generation == session.new_generation,
+            && marker.new_generation
+                == if session.profile == "native-portable" {
+                    session.stage_id.clone()
+                } else {
+                    session.new_generation.clone()
+                },
         "Library commit marker identity mismatch",
     )?;
     Ok(Some(marker))
@@ -1030,6 +1227,7 @@ fn reconcile(connection: &mut Connection, root: &Path, session: &Session) -> Res
             "capture-complete" => "capture-complete",
             "device-captured" => "device-captured",
             "rolled-back" => "rolled-back",
+            _ if native_section_session(session) => "applying-device",
             _ => "rolling-back",
         }
     };
@@ -1037,7 +1235,7 @@ fn reconcile(connection: &mut Connection, root: &Path, session: &Session) -> Res
         "UPDATE sessions SET phase=?2 WHERE id=?1",
         params![session.session_id, phase],
     )?;
-    if matches!(phase, "committed" | "rolling-back") {
+    if matches!(phase, "committed" | "rolling-back") && !native_section_session(session) {
         transaction.execute(
             "UPDATE selection SET intent=NULL,verified_digest=NULL WHERE session=?1",
             [&session.session_id],

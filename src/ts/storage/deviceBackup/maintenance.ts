@@ -40,7 +40,8 @@ export interface DeviceMaintenanceSession {
     | "await-capture"
     | "await-native-preparation"
     | "await-source"
-    | "await-navigation";
+    | "await-navigation"
+    | "native-complete";
 }
 export interface DeviceMaintenanceBootstrap {
   mode: "normal" | "maintenance";

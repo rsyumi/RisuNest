@@ -2776,7 +2776,6 @@ pub(crate) fn native_portable_select_sections(
     state: State<'_, NativeFileJobState>,
     job_id: String,
     selection: portable::PortableSelection,
-    expected_revision: Option<i64>,
 ) -> Result<(), NativeJobError> {
     let job = state
         .registry
@@ -2785,7 +2784,7 @@ pub(crate) fn native_portable_select_sections(
         .ok_or_else(|| {
             NativeJobError::new("job-not-found", "Portable backup job is unavailable")
         })?;
-    job.select_portable_sections(selection, expected_revision)
+    job.select_portable_sections(selection)
         .map_err(|e| NativeJobError::new("invalid-selection", e))
 }
 
@@ -3547,7 +3546,6 @@ impl JobControl {
     fn select_portable_sections(
         &self,
         selection: portable::PortableSelection,
-        expected_revision: Option<i64>,
     ) -> Result<(), String> {
         let mut status = self
             .status
@@ -3584,11 +3582,6 @@ impl JobControl {
                 .lock()
                 .map_err(|_| "native job wait mutex poisoned".to_owned())?;
             wait.portable_selection = Some(selection);
-            // A renderer that fences the replacement at selection time reports
-            // the revision it flushed to, which supersedes the start request's.
-            if expected_revision.is_some() {
-                wait.activation_expected_revision = expected_revision;
-            }
         }
         status.state = JobState::Running;
         status.phase = JobPhase::ReadingSource;

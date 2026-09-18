@@ -90,6 +90,16 @@ describe("portable export bootstrap recovery", () => {
     mocks.publication.acknowledgeAndroid.mockReturnValue(true);
   });
 
+  it("does not call native recovery commands during web bootstrap", async () => {
+    delete (window as Window & { __TAURI_INTERNALS__?: unknown })
+      .__TAURI_INTERNALS__;
+
+    await resumePortableExportsAfterBootstrap();
+
+    expect(mocks.invoke).not.toHaveBeenCalled();
+    expect(mocks.resume).not.toHaveBeenCalled();
+  });
+
   it("discards a succeeded export and both native receipts when selected", async () => {
     mocks.resume.mockRejectedValueOnce(
       new mocks.NeedsAttention("publication-failed", job.jobId),

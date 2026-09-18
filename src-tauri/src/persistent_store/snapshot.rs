@@ -238,8 +238,23 @@ fn prepare_restore_candidate(persistent_dir: &Path, target: &Path) -> StoreResul
     Ok(candidate)
 }
 
-pub(super) fn sweep_temporary_generations(connection: &mut Connection) -> StoreResult<()> {
+pub(super) fn sweep_temporary_generations(
+    connection: &mut Connection,
+    retained_stage: Option<&str>,
+) -> StoreResult<()> {
     let transaction = connection.transaction()?;
+    if let Some(retained_stage) = retained_stage {
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM root WHERE generation=?1)",
+            [retained_stage],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::Validation {
+                message: "Native portable restore stage is missing".into(),
+            });
+        }
+    }
     let legacy_generations = {
         let mut statement = transaction.prepare("SELECT generation FROM snapshot_leases")?;
         let generations = statement
@@ -262,7 +277,7 @@ pub(super) fn sweep_temporary_generations(connection: &mut Connection) -> StoreR
     stale.sort();
     stale.dedup();
     for generation in stale {
-        if generation != active {
+        if generation != active && retained_stage != Some(generation.as_str()) {
             delete_generation(&transaction, &generation)?;
         }
     }

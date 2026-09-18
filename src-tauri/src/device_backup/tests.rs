@@ -1036,7 +1036,7 @@ fn assert_renderer_mutations_blocked(state: tauri::State<'_, DeviceBackupState>,
         ),
         native_device_backup_blob_finish(state.clone(), id.into(), Spool::Source, "object".into())
             .map(|_| ()),
-        native_device_backup_prepared_state(state.clone(), id.into()),
+        native_device_backup_prepared(state.clone(), id.into()),
         native_device_backup_section_intent(state.clone(), id.into(), SECTION.into(), false),
         native_device_backup_section_complete(
             state.clone(),
@@ -1046,7 +1046,7 @@ fn assert_renderer_mutations_blocked(state: tauri::State<'_, DeviceBackupState>,
             "0".repeat(64),
         ),
         native_device_backup_finish_device(state.clone(), id.into()).map(|_| ()),
-        native_device_backup_recovery_complete_state(state.clone(), id.into()).map(|_| ()),
+        native_device_backup_recovery_complete(state.clone(), id.into()),
         native_device_backup_fail(state.clone(), id.into(), "synthetic-failure".into(), None)
             .map(|_| ()),
         native_device_backup_retry_recovery(state, id.into()).map(|_| ()),
@@ -1147,8 +1147,27 @@ fn renderer_mutations_require_native_completion_and_confirmed_maintenance_entry(
         "device-captured"
     );
     state.confirm_capture(&id).unwrap();
-    native_device_backup_recovery_complete_state(state.clone(), id).unwrap();
+    native_device_backup_recovery_complete(state.clone(), id).unwrap();
     assert!(!state.is_blocking().unwrap());
+}
+
+#[test]
+fn renderer_clone_with_native_section_names_does_not_become_native_portable() {
+    let root = tempfile::tempdir().unwrap();
+    let coordinator = state(root.path());
+    let id = coordinator
+        .create_session(
+            "renderer-restore",
+            Operation::Restore,
+            false,
+            &["hypa".into()],
+            None,
+            None,
+        )
+        .unwrap();
+    let session = coordinator.session(&id).unwrap();
+    assert_eq!(session.profile, "renderer-clone");
+    assert!(!native_section_session(&session));
 }
 
 #[test]
@@ -1184,7 +1203,7 @@ fn native_source_import_remains_available_before_renderer_restore_mutations() {
     .unwrap();
     native_device_backup_section_finish(state.clone(), id.clone(), Spool::Rollback, SECTION.into())
         .unwrap();
-    native_device_backup_prepared_state(state.clone(), id.clone()).unwrap();
+    native_device_backup_prepared(state.clone(), id.clone()).unwrap();
     state.allow_device_apply(&id).unwrap();
     native_device_backup_section_intent(state.clone(), id.clone(), SECTION.into(), false).unwrap();
     native_device_backup_section_complete(
@@ -1431,4 +1450,378 @@ fn excluded_empty_section_is_inspectable_when_its_header_and_digest_are_valid() 
         &Never,
     )
     .unwrap();
+}
+
+#[test]
+fn native_section_archive_roundtrip_keeps_structured_keys_objects_and_local_scope() {
+    use crate::persistent_store::device_store::{
+        hypa::HypaEmbeddingWrite, plugin_values::PluginDeviceMutation,
+    };
+
+    struct Never;
+    impl crate::local_backup::CancellationProbe for Never {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let source_root = root.path().join("source");
+    let target_root = root.path().join("target");
+    let jobs = root.path().join("jobs");
+    std::fs::create_dir(&jobs).unwrap();
+    let mut source = crate::persistent_store::PersistentStore::open(&source_root).unwrap();
+    let large_vector = vec![7u8; 8 * 1024];
+    {
+        let device = source.device_store_mut().unwrap();
+        device
+            .write_hypa_embeddings(&[HypaEmbeddingWrite {
+                cache_key: "ab".repeat(32),
+                producer: "synthetic".into(),
+                model: "portable-roundtrip".into(),
+                endpoint: None,
+                preprocess_version: 1,
+                dimensions: (large_vector.len() / 4) as i64,
+                vector: large_vector.clone(),
+                metadata: Some(r#"{"scope":"synthetic"}"#.into()),
+            }])
+            .unwrap();
+        for (owner, space, value) in [
+            ("owner-a", "string", "first"),
+            ("owner-a", "json", r#"{"value":2}"#),
+            ("owner-b", "string", "third"),
+        ] {
+            device
+                .write_plugin_device_values(
+                    owner,
+                    &[PluginDeviceMutation::Set {
+                        space: space.into(),
+                        key: "shared".into(),
+                        value: value.into(),
+                    }],
+                )
+                .unwrap();
+        }
+        device
+            .write_plugin_device_values(
+                "owner-a",
+                &[
+                    PluginDeviceMutation::Set {
+                        space: "string".into(),
+                        key: "removed".into(),
+                        value: "not exported".into(),
+                    },
+                    PluginDeviceMutation::Delete {
+                        space: "string".into(),
+                        key: "removed".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        device
+            .write_setting("dosync", &serde_json::json!(true))
+            .unwrap();
+        device
+            .write_setting("risu_lastsaved", &serde_json::json!("source-control"))
+            .unwrap();
+        device
+            .write_plugin_permission("plugin-hash", "network", true)
+            .unwrap();
+    }
+
+    let catalog = crate::portable_backup::Catalog::create(&jobs, "synthetic-native", 0).unwrap();
+    catalog
+        .db
+        .execute(
+            "UPDATE backup_info SET value='false' WHERE key='libraryIncluded'",
+            [],
+        )
+        .unwrap();
+    let selected = vec![
+        "hypa".to_owned(),
+        "local-plugins".to_owned(),
+        "local-settings".to_owned(),
+    ];
+    capture_native_sections(&mut source, &selected, &catalog, &Never).unwrap();
+    assert_eq!(
+        catalog
+            .db
+            .query_row::<i64, _, _>("SELECT count(*) FROM objects", [], |row| row.get(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        catalog
+            .db
+            .query_row::<i64, _, _>(
+                "SELECT count(*) FROM device_records WHERE section='local-plugins' AND ordinal>=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        3
+    );
+    let path = root.path().join("native.risunest");
+    catalog.write_candidate(&path, false, &Never).unwrap();
+    let archive = crate::portable_backup::VerifiedArchive::open(
+        std::fs::File::open(path).unwrap(),
+        &jobs,
+        &Never,
+    )
+    .unwrap();
+    let prepared = prepare_native_sections(&archive, &selected, &Never).unwrap();
+
+    let mut target = crate::persistent_store::PersistentStore::open(&target_root).unwrap();
+    {
+        let device = target.device_store_mut().unwrap();
+        device
+            .write_plugin_device_values(
+                "stale-owner",
+                &[PluginDeviceMutation::Set {
+                    space: "string".into(),
+                    key: "stale".into(),
+                    value: "remove me".into(),
+                }],
+            )
+            .unwrap();
+        device
+            .write_setting("dosync", &serde_json::json!(false))
+            .unwrap();
+        device
+            .write_setting("risu_lastsaved", &serde_json::json!("target-control"))
+            .unwrap();
+    }
+    apply_prepared_native_sections(&mut target, &prepared).unwrap();
+    let revision = target.device_store().unwrap().revision().unwrap();
+    apply_prepared_native_sections(&mut target, &prepared).unwrap();
+    let device = target.device_store().unwrap();
+    assert_eq!(device.revision().unwrap(), revision);
+    assert_eq!(
+        device.read_hypa_embeddings(&["ab".repeat(32)]).unwrap()[0]
+            .vector
+            .as_deref(),
+        Some(large_vector.as_slice())
+    );
+    for (owner, space, expected) in [
+        ("owner-a", "string", "first"),
+        ("owner-a", "json", r#"{"value":2}"#),
+        ("owner-b", "string", "third"),
+    ] {
+        assert_eq!(
+            device
+                .read_plugin_device_value(owner, space, "shared")
+                .unwrap()
+                .as_deref(),
+            Some(expected)
+        );
+    }
+    assert_eq!(
+        device
+            .read_plugin_device_value("owner-a", "string", "removed")
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        device
+            .read_plugin_device_value("stale-owner", "string", "stale")
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        device.read_setting("dosync").unwrap(),
+        Some(serde_json::json!(true))
+    );
+    assert_eq!(
+        device.read_setting("risu_lastsaved").unwrap(),
+        Some(serde_json::json!("target-control"))
+    );
+    let permissions = device.read_plugin_permissions().unwrap();
+    assert_eq!(permissions.len(), 1);
+    assert_eq!(permissions[0].code_hash, "plugin-hash");
+    assert_eq!(permissions[0].permission, "network");
+    assert!(permissions[0].granted);
+}
+
+#[test]
+fn selected_empty_native_section_clears_only_that_section() {
+    use crate::persistent_store::device_store::plugin_values::PluginDeviceMutation;
+
+    struct Never;
+    impl crate::local_backup::CancellationProbe for Never {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let jobs = root.path().join("jobs");
+    std::fs::create_dir(&jobs).unwrap();
+    let mut source =
+        crate::persistent_store::PersistentStore::open(root.path().join("source")).unwrap();
+    let catalog = crate::portable_backup::Catalog::create(&jobs, "synthetic-empty", 0).unwrap();
+    catalog
+        .db
+        .execute(
+            "UPDATE backup_info SET value='false' WHERE key='libraryIncluded'",
+            [],
+        )
+        .unwrap();
+    let selected = vec!["local-plugins".to_owned()];
+    capture_native_sections(&mut source, &selected, &catalog, &Never).unwrap();
+    assert_eq!(
+        catalog
+            .db
+            .query_row::<(i64, i64), _, _>(
+                "SELECT present,record_count FROM device_sections WHERE section='local-plugins'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap(),
+        (1, 0)
+    );
+    let path = root.path().join("empty.risunest");
+    catalog.write_candidate(&path, false, &Never).unwrap();
+    let archive = crate::portable_backup::VerifiedArchive::open(
+        std::fs::File::open(path).unwrap(),
+        &jobs,
+        &Never,
+    )
+    .unwrap();
+    let prepared = prepare_native_sections(&archive, &selected, &Never).unwrap();
+    let mut target =
+        crate::persistent_store::PersistentStore::open(root.path().join("target")).unwrap();
+    {
+        let device = target.device_store_mut().unwrap();
+        device
+            .write_plugin_device_values(
+                "owner",
+                &[PluginDeviceMutation::Set {
+                    space: "string".into(),
+                    key: "remove".into(),
+                    value: "value".into(),
+                }],
+            )
+            .unwrap();
+        device
+            .write_setting("dosync", &serde_json::json!(true))
+            .unwrap();
+    }
+    apply_prepared_native_sections(&mut target, &prepared).unwrap();
+    let device = target.device_store().unwrap();
+    assert_eq!(
+        device
+            .read_plugin_device_value("owner", "string", "remove")
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        device.read_setting("dosync").unwrap(),
+        Some(serde_json::json!(true))
+    );
+}
+
+#[test]
+fn native_journal_resumes_before_or_after_an_inflight_section_commit() {
+    use crate::local_backup::NeverCancelled;
+    use crate::persistent_store::device_store::plugin_values::PluginDeviceMutation;
+
+    for committed_before_interrupt in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let selected = vec!["local-plugins".to_owned()];
+        let mut source = crate::persistent_store::PersistentStore::open(
+            root.path().join("synthetic-source"),
+        )
+        .unwrap();
+        source
+            .device_store_mut()
+            .unwrap()
+            .write_plugin_device_values(
+                "owner-a",
+                &[PluginDeviceMutation::Set {
+                    space: "string".into(),
+                    key: "key".into(),
+                    value: "restored".into(),
+                }],
+            )
+            .unwrap();
+        let incoming = capture_prepared_native_sections(&mut source, &selected, &NeverCancelled)
+            .unwrap();
+
+        let mut target = crate::persistent_store::PersistentStore::open(root.path()).unwrap();
+        {
+            let device = target.device_store_mut().unwrap();
+            device
+                .write_plugin_device_values(
+                    "owner-a",
+                    &[PluginDeviceMutation::Set {
+                        space: "string".into(),
+                        key: "key".into(),
+                        value: "old".into(),
+                    }],
+                )
+                .unwrap();
+            device.write_setting("dosync", &serde_json::json!(true)).unwrap();
+        }
+        let rollback =
+            capture_prepared_native_sections(&mut target, &selected, &NeverCancelled).unwrap();
+        let coordinator = state(root.path());
+        let id = coordinator
+            .create_native_portable_session("synthetic-job", false, &selected, 0, None)
+            .unwrap();
+        let source_manifests = journal_prepared_native_sections(
+            &coordinator,
+            &id,
+            Spool::Source,
+            &incoming,
+        )
+        .unwrap();
+        coordinator.source_ready(&id).unwrap();
+        journal_prepared_native_sections(&coordinator, &id, Spool::Rollback, &rollback).unwrap();
+        coordinator.prepared(&id).unwrap();
+        coordinator.allow_device_apply(&id).unwrap();
+        coordinator
+            .section_intent(&id, "local-plugins", false)
+            .unwrap();
+        let revision_after_first_apply = if committed_before_interrupt {
+            apply_prepared_native_sections(&mut target, &incoming).unwrap();
+            Some(target.device_store().unwrap().revision().unwrap())
+        } else {
+            None
+        };
+        drop(target);
+        drop(coordinator);
+
+        let recovered = state(root.path());
+        assert_eq!(
+            recovered
+                .bootstrap_for_entry(false)
+                .unwrap()
+                .session
+                .unwrap()
+                .phase,
+            "applying-device"
+        );
+        let mut target = crate::persistent_store::PersistentStore::open(root.path()).unwrap();
+        resume_journaled_native_restore(&recovered, &id, &mut target).unwrap();
+        let session = recovered.session(&id).unwrap();
+        assert_eq!(session.phase, "committed");
+        assert_eq!(session.action, "native-complete");
+        assert!(recovered.pending_source_sections(&id).unwrap().is_empty());
+        assert_eq!(source_manifests.len(), 1);
+        let device = target.device_store().unwrap();
+        assert_eq!(
+            device
+                .read_plugin_device_value("owner-a", "string", "key")
+                .unwrap()
+                .as_deref(),
+            Some("restored")
+        );
+        assert_eq!(
+            device.read_setting("dosync").unwrap(),
+            Some(serde_json::json!(true))
+        );
+        if let Some(revision) = revision_after_first_apply {
+            assert_eq!(device.revision().unwrap(), revision);
+        }
+    }
 }

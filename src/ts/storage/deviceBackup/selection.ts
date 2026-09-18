@@ -6,12 +6,28 @@ import {
   type DeviceSectionInfo,
 } from "./scopes";
 
-export interface DeviceSectionChoice {
-  sectionId: DeviceSectionId;
+export interface DeviceSectionChoice<TSectionId extends string = string> {
+  sectionId: TSectionId;
   label: string;
   selected: boolean;
   included: boolean;
   recordCount?: number;
+}
+
+export const nativePortableDeviceSections = [
+  "hypa",
+  "local-plugins",
+  "local-settings",
+] as const;
+
+export type NativePortableDeviceSection =
+  (typeof nativePortableDeviceSections)[number];
+
+export function validateNativePortableDeviceSection(
+  value: string,
+): asserts value is NativePortableDeviceSection {
+  if (!(nativePortableDeviceSections as readonly string[]).includes(value))
+    throw new Error(`Invalid native portable device section: ${value}`);
 }
 
 export function deviceSectionLabel(sectionId: DeviceSectionId): string {
@@ -24,7 +40,7 @@ export function deviceSectionLabel(sectionId: DeviceSectionId): string {
 /** Read-only selection preview. Consistent capture starts only after native maintenance. */
 export async function defaultDeviceExportChoices(
   factory: IDBFactory = indexedDB,
-): Promise<DeviceSectionChoice[]> {
+): Promise<DeviceSectionChoice<DeviceSectionId>[]> {
   if (typeof factory.databases !== "function")
     throw new Error("Plugin database enumeration is unavailable");
   const names = (await factory.databases())
@@ -45,7 +61,7 @@ export async function defaultDeviceExportChoices(
 
 export function defaultDeviceRestoreChoices(
   sections: readonly DeviceSectionInfo[],
-): DeviceSectionChoice[] {
+): DeviceSectionChoice<DeviceSectionId>[] {
   const unique = new Set<string>();
   return sections.map((section) => {
     validateDeviceSectionId(section.sectionId);
@@ -63,7 +79,7 @@ export function defaultDeviceRestoreChoices(
 }
 
 export function selectedDeviceSections(
-  choices: readonly DeviceSectionChoice[],
+  choices: readonly DeviceSectionChoice<DeviceSectionId>[],
 ): DeviceSectionId[] {
   const selected = choices
     .filter((choice) => choice.included && choice.selected)
@@ -72,4 +88,31 @@ export function selectedDeviceSections(
   if (new Set(selected).size !== selected.length)
     throw new Error("Duplicate device selection");
   return selected;
+}
+
+export function defaultNativePortableExportChoices(): DeviceSectionChoice<NativePortableDeviceSection>[] {
+  return nativePortableDeviceSections.map((sectionId) => ({
+    sectionId,
+    label: "",
+    included: true,
+    selected: sectionId !== "local-settings",
+  }));
+}
+
+export function defaultNativePortableRestoreChoices(
+  sections: readonly string[],
+): DeviceSectionChoice<NativePortableDeviceSection>[] {
+  const unique = new Set<string>();
+  return sections.map((sectionId) => {
+    validateNativePortableDeviceSection(sectionId);
+    if (unique.has(sectionId))
+      throw new Error("Duplicate native portable device section");
+    unique.add(sectionId);
+    return {
+      sectionId,
+      label: "",
+      included: true,
+      selected: true,
+    };
+  });
 }
