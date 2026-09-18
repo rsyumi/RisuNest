@@ -389,18 +389,8 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             .manage(android_commit_transport::native_state().clone())
             .on_page_load(|webview, payload| {
                 if webview.label() == "main"
-                    && matches!(payload.event(), tauri::webview::PageLoadEvent::Finished)
-                {
-                    if let Some(state) = webview.try_state::<device_backup::DeviceBackupState>() {
-                        state.main_document_finished();
-                    }
-                }
-                if webview.label() == "main"
                     && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
                 {
-                    if let Some(state) = webview.try_state::<device_backup::DeviceBackupState>() {
-                        state.main_document_started();
-                    }
                     if let Some(state) =
                         webview.try_state::<persistent_store::PersistentStoreState>()
                     {
@@ -441,18 +431,8 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
     {
         builder = builder.on_page_load(|webview, payload| {
             if webview.label() == "main"
-                && matches!(payload.event(), tauri::webview::PageLoadEvent::Finished)
-            {
-                if let Some(state) = webview.try_state::<device_backup::DeviceBackupState>() {
-                    state.main_document_finished();
-                }
-            }
-            if webview.label() == "main"
                 && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
             {
-                if let Some(state) = webview.try_state::<device_backup::DeviceBackupState>() {
-                    state.main_document_started();
-                }
                 if let Some(state) = webview.try_state::<persistent_store::PersistentStoreState>() {
                     if let Err(error) = state.reset_renderer_session() {
                         crate::nlog!(
@@ -494,9 +474,6 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
                 ios_lifecycle::main_document_started(webview.app_handle());
                 #[cfg(target_os = "macos")]
                 macos_lifecycle::document_started(webview.app_handle());
-                if let Some(state) = webview.try_state::<device_backup::DeviceBackupState>() {
-                    state.main_document_started();
-                }
                 if let Some(state) = webview.try_state::<persistent_store::PersistentStoreState>() {
                     if let Err(error) = state.reset_renderer_session() {
                         crate::nlog!(
@@ -522,13 +499,6 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
                             "failed to reset native media renderer session: {error}"
                         );
                     }
-                }
-            }
-            if webview.label() == "main"
-                && matches!(payload.event(), tauri::webview::PageLoadEvent::Finished)
-            {
-                if let Some(state) = webview.try_state::<device_backup::DeviceBackupState>() {
-                    state.main_document_finished();
                 }
             }
         });

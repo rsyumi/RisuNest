@@ -423,7 +423,6 @@ fn begin_native_restore(
             .map_err(error)?;
         coordinator.prepared(&id).map_err(error)?;
         coordinator.allow_device_apply(&id).map_err(error)?;
-        job.leave_device_wait(true).map_err(error)?;
         Ok(())
     })();
     if let Err(failure) = prepared {

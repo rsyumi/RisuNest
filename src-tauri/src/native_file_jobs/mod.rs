@@ -3119,7 +3119,6 @@ pub(crate) enum JobState {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum JobPhase {
     AwaitingBackupSelection,
-    AwaitingDeviceMaintenance,
     Queued,
     ReadingSource,
     AwaitingContentMapping,
@@ -3755,26 +3754,6 @@ impl JobControl {
             return Err("device maintenance requires running job".into());
         }
         status.device_session_id = Some(id.into());
-        status.phase = JobPhase::AwaitingDeviceMaintenance;
-        status.state = JobState::WaitingForInput;
-        Ok(())
-    }
-    fn leave_device_wait(&self, activating: bool) -> Result<(), String> {
-        let mut status = self
-            .status
-            .lock()
-            .map_err(|_| "native job mutex poisoned".to_owned())?;
-        if status.state != JobState::WaitingForInput
-            || status.phase != JobPhase::AwaitingDeviceMaintenance
-        {
-            return Err("device maintenance is not waiting".into());
-        }
-        status.state = JobState::Running;
-        status.phase = if activating {
-            JobPhase::ActivatingDatabase
-        } else {
-            JobPhase::WritingExport
-        };
         Ok(())
     }
     pub(crate) fn set_compatibility_report(
@@ -4599,7 +4578,6 @@ impl JobPhase {
             Self::Queued => 0,
             Self::ReadingSource
             | Self::WritingExport
-            | Self::AwaitingDeviceMaintenance
             | Self::AwaitingBackupSelection => 1,
             Self::AwaitingContentMapping
             | Self::StagingDatabase
@@ -7960,6 +7938,25 @@ mod tests {
 
         job.set_device_session("synthetic-device-session").unwrap();
 
+        assert_eq!(
+            job.status().device_session_id.as_deref(),
+            Some("synthetic-device-session")
+        );
+        assert_eq!(job.status().state, JobState::Cancelling);
+        assert_eq!(job.status().phase, JobPhase::WritingExport);
+    }
+
+    #[test]
+    fn native_file_lifecycle_device_session_does_not_enter_renderer_wait() {
+        let job = JobRegistry::default()
+            .create(JobKind::RestorePortableBackup)
+            .unwrap();
+        job.start(JobPhase::ReadingSource).unwrap();
+
+        job.set_device_session("synthetic-device-session").unwrap();
+
+        assert_eq!(job.status().state, JobState::Running);
+        assert_eq!(job.status().phase, JobPhase::ReadingSource);
         assert_eq!(
             job.status().device_session_id.as_deref(),
             Some("synthetic-device-session")

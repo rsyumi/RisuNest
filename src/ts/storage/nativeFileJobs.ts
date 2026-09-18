@@ -364,7 +364,6 @@ export interface NativeFileJobStatus {
         | 'queued'
         | 'reading-source'
         | 'awaiting-content-mapping'
-        | 'awaiting-device-maintenance'
         | 'awaiting-backup-selection'
         | 'staging-database'
         | 'awaiting-activation'
