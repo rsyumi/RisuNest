@@ -11,6 +11,7 @@ import {
     runNativeArchiveReferenceExport,
     runNativeBlockRisuSaveExport,
     runNativeLegacyLocalBackupExport,
+    runNativeRawRecoveryExport,
     runNativeCompatibleLocalBackupExport,
     runNativeLegacyLocalBackupRestore,
     runNativeCharacterCharxExport,
@@ -2053,6 +2054,56 @@ describe('native file jobs', () => {
             'native_file_job_status',
             'native_legacy_backup_handoff_cleanup',
             'native_file_job_forget',
+        ])
+    })
+
+    it('retains a raw recovery handoff when Android publication fails', async () => {
+        const commands: string[] = []
+        const handoffPath =
+            'C:\\app\\native-file-jobs\\handoffs\\risunest-rescue-123e4567-e89b-42d3-a456-426614174003.risunest-rescue.zip'
+        const terminal: NativeFileJobStatus = {
+            jobId: 'raw-recovery-export',
+            kind: 'export-raw-recovery',
+            state: 'succeeded',
+            phase: 'complete',
+            progress: { completedBytes: 4096, completedItems: 1 },
+            result: {
+                revision: 0,
+                sourceBytes: 4096,
+                sourceSha256: 'b'.repeat(64),
+                characterCount: 0,
+                presetCount: 0,
+                warningCodes: [],
+                handoffPath,
+            },
+        }
+
+        await expect(
+            runNativeRawRecoveryExport(
+                {
+                    type: 'androidSaf',
+                    suggestedName: 'original-data.risunest-rescue.zip',
+                },
+                {},
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        commands.push(command)
+                        if (command === 'native_file_job_start')
+                            return { jobId: 'raw-recovery-export' }
+                        if (command === 'native_file_job_status') return terminal
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
+                    copyToAndroidSaf: async () => {
+                        throw new Error('synthetic destination failure')
+                    },
+                },
+            ),
+        ).rejects.toThrow('synthetic destination failure')
+        expect(commands).toEqual([
+            'native_file_job_start',
+            'native_file_job_status',
         ])
     })
 

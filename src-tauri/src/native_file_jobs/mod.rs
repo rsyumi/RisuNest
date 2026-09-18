@@ -11,6 +11,7 @@ pub mod screenshot_output;
 mod backup_source;
 mod legacy_backup;
 mod portable;
+pub(crate) mod raw_recovery;
 pub(crate) mod reference_source;
 pub(crate) use backup_source::*;
 mod official_snapshot;
@@ -239,6 +240,9 @@ pub(crate) enum NativeFileJobStartRequest {
         expected_revision: Option<i64>,
         source: Option<JobSource>,
         selection: portable::PortableSelection,
+    },
+    ExportRawRecovery {
+        destination: Option<String>,
     },
     RestorePortableBackup {
         source: JobSource,
@@ -870,6 +874,7 @@ fn cleanup_legacy_backup_handoff_path(root: &Path, path: &Path) -> Result<bool, 
 
 fn is_owned_handoff_name(path: &Path) -> bool {
     handoff_name(path, "risunest-backup-", ".risunest")
+        || handoff_name(path, "risunest-rescue-", ".risunest-rescue.zip")
         || handoff_name(path, "risu-backup-", ".bin")
         || handoff_name(path, "risu-charx-", ".charx")
         || handoff_name(path, "risu-charx-", ".jpeg")
@@ -1376,6 +1381,25 @@ impl NativeFileJobState {
                     app,
                 }
             }
+            NativeFileJobStartRequest::ExportRawRecovery { destination } => {
+                let destination = destination.map(PathBuf::from);
+                if let Some(path) = destination.as_deref() {
+                    validate_desktop_destination(path)?;
+                }
+                let data_root = self.root.parent().ok_or_else(|| {
+                    NativeJobError::new(
+                        "capability-unavailable",
+                        "Native application data root is unavailable",
+                    )
+                })?.to_path_buf();
+                NativeFileJobTask::ExportRawRecovery {
+                    destination,
+                    data_root,
+                    app_version: app.package_info().version.to_string(),
+                    app,
+                    capture_guard: None,
+                }
+            }
             NativeFileJobStartRequest::RestorePortableBackup {
                 source,
                 expected_revision,
@@ -1846,6 +1870,7 @@ impl NativeFileJobState {
         let exclusive = matches!(
             task.kind(),
             JobKind::ExportPortableBackup
+                | JobKind::ExportRawRecovery
                 | JobKind::RestorePortableBackup
                 | JobKind::RestoreBlockRisuSave
                 | JobKind::RestoreLegacyLocalBackup
@@ -1855,6 +1880,21 @@ impl NativeFileJobState {
             .admission
             .file(exclusive)
             .map_err(|code| NativeJobError::new(code, "Another library operation is running"))?;
+        if let NativeFileJobTask::ExportRawRecovery { app, .. } = &task {
+            app.state::<crate::NativeStartupState>()
+                .ensure_ready()
+                .map_err(|_| NativeJobError::new(
+                    "capability-unavailable",
+                    "Recovery export is unavailable because native setup failed",
+                ))?;
+            let capture_guard = app
+                .state::<crate::persistent_store::commands::PersistentStoreState>()
+                .acquire_raw_capture()
+                .map_err(native_store_error)?;
+            if let NativeFileJobTask::ExportRawRecovery { capture_guard: slot, .. } = &mut task {
+                *slot = Some(capture_guard);
+            }
+        }
         // Admission prevents a new server operation between this check and activation.
         if let NativeFileJobTask::RestorePortable { store, .. } = &task {
             let status = store.server_status().map_err(|_| {
@@ -1993,7 +2033,7 @@ impl NativeFileJobState {
         let root = self.root.clone();
         let registry = Arc::clone(&self.registry);
         std::thread::spawn(move || {
-            let _admission = admission;
+            let mut admission = Some(admission);
             let _worker_permit = worker_permit;
             let outcome = run_worker(
                 || match task {
@@ -2028,6 +2068,31 @@ impl NativeFileJobState {
                             "portable export source was not prepared",
                         )),
                     },
+                    NativeFileJobTask::ExportRawRecovery {
+                        destination,
+                        data_root,
+                        app_version,
+                        capture_guard,
+                        ..
+                    } => {
+                        let captured = raw_recovery::capture(
+                            &data_root,
+                            &owned_directory,
+                            &app_version,
+                            &job,
+                        );
+                        drop(capture_guard);
+                        drop(admission.take());
+                        captured.and_then(|captured| {
+                            raw_recovery::publish(
+                                captured,
+                                &owned_directory,
+                                &root.join("handoffs"),
+                                destination.as_deref(),
+                                &job,
+                            )
+                        })
+                    }
                     NativeFileJobTask::RestorePortable {
                         opened_source,
                         source,
@@ -2517,6 +2582,13 @@ enum NativeFileJobTask {
         selection: portable::PortableSelection,
         app: AppHandle,
     },
+    ExportRawRecovery {
+        destination: Option<PathBuf>,
+        data_root: PathBuf,
+        app_version: String,
+        app: AppHandle,
+        capture_guard: Option<crate::persistent_store::commands::DeviceMaintenanceGuard>,
+    },
     RestorePortable {
         opened_source: Option<OpenedJobSource>,
         source: JobSource,
@@ -2604,6 +2676,7 @@ impl NativeFileJobTask {
     fn kind(&self) -> JobKind {
         match self {
             Self::ExportPortable { .. } => JobKind::ExportPortableBackup,
+            Self::ExportRawRecovery { .. } => JobKind::ExportRawRecovery,
             Self::RestorePortable { .. } => JobKind::RestorePortableBackup,
             Self::Restore { .. } => JobKind::RestoreBlockRisuSave,
             Self::Export { .. } => JobKind::ExportBlockRisuSave,
@@ -2627,6 +2700,7 @@ impl NativeFileJobTask {
             Self::ExportPortable {
                 expected_revision, ..
             } => *expected_revision,
+            Self::ExportRawRecovery { .. } => None,
             Self::RestorePortable {
                 expected_revision, ..
             } => Some(*expected_revision),
@@ -3060,6 +3134,20 @@ pub(crate) fn native_portable_handoff_cleanup(
 }
 
 #[tauri::command(async)]
+pub(crate) fn native_raw_recovery_handoff_cleanup(
+    state: State<'_, NativeFileJobState>,
+    path: String,
+) -> Result<bool, NativeJobError> {
+    cleanup_handoff_path(
+        &state.root,
+        Path::new(&path),
+        "risunest-rescue-",
+        ".risunest-rescue.zip",
+        "raw recovery",
+    )
+}
+
+#[tauri::command(async)]
 pub(crate) fn native_legacy_backup_handoff_cleanup(
     state: State<'_, NativeFileJobState>,
     path: String,
@@ -3095,6 +3183,7 @@ pub(crate) fn native_risu_module_handoff_cleanup(
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum JobKind {
     ExportPortableBackup,
+    ExportRawRecovery,
     RestorePortableBackup,
     RestoreBlockRisuSave,
     RestoreOfficialAccountSnapshot,
@@ -4100,6 +4189,7 @@ impl JobControl {
         let expected = match status.kind {
             JobKind::RestorePortableBackup => JobPhase::ReadingSource,
             JobKind::ExportPortableBackup => JobPhase::WritingExport,
+            JobKind::ExportRawRecovery => JobPhase::ReadingSource,
             JobKind::RestoreBlockRisuSave => JobPhase::ReadingSource,
             JobKind::RestoreOfficialAccountSnapshot => JobPhase::ReadingSource,
             JobKind::RestoreLegacyLocalBackup => JobPhase::ReadingSource,

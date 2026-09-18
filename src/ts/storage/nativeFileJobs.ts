@@ -245,6 +245,7 @@ export type NativeFileOperationFormat =
     | 'library-backup'
     | 'conflict-reference'
     | 'content'
+    | 'raw-recovery'
 
 /**
  * Resolves the stage a status describes. Statuses carrying `detail` name it
@@ -267,6 +268,7 @@ export function resolveNativeFileJobStage(
             // reported job kind, not the admission format, tells an archive apart.
             return status.kind === 'restore-legacy-local-backup' ||
                 format === 'local-backup' ||
+                format === 'raw-recovery' ||
                 format === 'content'
                 ? 'reading-archive'
                 : 'reading-database'
@@ -348,6 +350,7 @@ export interface NativeFileJobStatus {
         | 'export-legacy-local-backup'
         | 'export-compatible-local-backup'
         | 'export-portable-backup'
+        | 'export-raw-recovery'
         | 'restore-portable-backup'
         | 'prepare-content-import'
         | 'import-jpeg-asset'
@@ -1716,6 +1719,7 @@ interface NativeManagedExportSpec {
     handoffCleanupCommand: string
     destination: NativeCharacterCharxExportDestination
     relaySafCopyProgress?: boolean
+    retainHandoffOnPublicationFailure?: boolean
     prepareRequest(): Record<string, unknown> | Promise<Record<string, unknown>>
 }
 
@@ -1854,7 +1858,12 @@ async function runNativeManagedExport(
         outcomeFailed = true
         throw error
     } finally {
-        if (managedSource) {
+        const retainHandoff = Boolean(
+            managedSource &&
+                outcomeFailed &&
+                spec.retainHandoffOnPublicationFailure,
+        )
+        if (managedSource && !retainHandoff) {
             try {
                 await invokeNative(dependencies, spec.handoffCleanupCommand, {
                     path: managedSource,
@@ -1868,7 +1877,7 @@ async function runNativeManagedExport(
                 }
             }
         }
-        if (!handoffCleanupFailed) {
+        if (!handoffCleanupFailed && !retainHandoff) {
             try {
                 await invokeNative(dependencies, 'native_file_job_forget', {
                     jobId: started.jobId,
@@ -1980,6 +1989,31 @@ export function runNativeLegacyLocalBackupExport(
         'native_legacy_backup_handoff_cleanup',
         runtime,
         destination,
+        options,
+        dependencies,
+    )
+}
+
+export function runNativeRawRecoveryExport(
+    destination: NativeBackupDestination,
+    options: NativeFileJobOptions = {},
+    dependencies: NativeBackupExportDependencies = productionBackupExportDependencies,
+): Promise<NativeFileJobResult> {
+    return runNativeManagedExport(
+        {
+            operation: 'Original data export',
+            safLengthMismatchLabel: 'original data archive',
+            handoffCleanupCommand: 'native_raw_recovery_handoff_cleanup',
+            destination,
+            relaySafCopyProgress: true,
+            retainHandoffOnPublicationFailure: true,
+            prepareRequest: () => ({
+                kind: 'export-raw-recovery',
+                ...(destination.type === 'desktopPath'
+                    ? { destination: destination.path }
+                    : {}),
+            }),
+        },
         options,
         dependencies,
     )

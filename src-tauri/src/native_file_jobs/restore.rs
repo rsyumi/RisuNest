@@ -100,11 +100,17 @@ pub(crate) struct RestoreProgressScale {
 }
 
 pub(crate) fn restore_block_risu_save(
-    source: OpenedJobSource,
+    mut source: OpenedJobSource,
     expected_revision: i64,
     job: &JobControl,
     sink: &dyn ReplacementSink,
 ) -> Result<JobResultSummary, NativeJobError> {
+    if super::raw_recovery::is_raw_recovery_archive(&mut source.file)? {
+        return Err(NativeJobError::new(
+            "rescue-format-not-restorable",
+            "RisuNest rescue archives cannot be imported or restored",
+        ));
+    }
     restore_risu_save_reader_controlled(
         source.file,
         source.total_bytes,
@@ -1644,6 +1650,38 @@ mod tests {
     fn valid_save(path: &Path) {
         let bytes = save_bytes(valid_blocks());
         fs::write(path, bytes).unwrap();
+    }
+
+    fn raw_recovery_archive(path: &Path) {
+        let file = fs::File::create(path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        archive
+            .start_file(
+                "manifest.json",
+                zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        archive
+            .write_all(br#"{"format":"risunest-raw-recovery","version":1}"#)
+            .unwrap();
+        archive.finish().unwrap();
+    }
+
+    #[test]
+    fn block_restore_rejects_a_renamed_raw_recovery_archive() {
+        let (directory, sink) = fixture();
+        let source = directory.path().join("renamed.risudat");
+        raw_recovery_archive(&source);
+        let registry = JobRegistry::default();
+        let job = registry.create(JobKind::RestoreBlockRisuSave).unwrap();
+
+        let error = restore_block_risu_save_path(&source, 1, &job, &sink).unwrap_err();
+
+        assert_eq!(error.code, "rescue-format-not-restorable");
+        let store = sink.store.lock().unwrap();
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(store.materialize(Some(1)).unwrap()["username"], "Old");
     }
 
     fn msgpackr_parity_fixture() -> Value {

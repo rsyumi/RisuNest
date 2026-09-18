@@ -56,6 +56,9 @@ private val MANAGED_LEGACY_BACKUP_NAME = Regex(
 private val MANAGED_PORTABLE_BACKUP_NAME = Regex(
   "risunest-backup-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\\.risunest",
 )
+private val MANAGED_RAW_RECOVERY_NAME = Regex(
+  "risunest-rescue-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\\.risunest-rescue\\.zip",
+)
 private val MANAGED_CHARACTER_CHARX_NAME = Regex(
   "risu-charx-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\\.(?:charx|jpeg)",
 )
@@ -519,6 +522,9 @@ private class ManagedHandoffKind(
 )
 
 private val MANAGED_HANDOFF_KINDS = listOf(
+  ManagedHandoffKind(MANAGED_RAW_RECOVERY_NAME, SafDestinationSourceKind.RISU_SAVE) { id ->
+    listOf("risunest-rescue-$id.risunest-rescue.zip")
+  },
   ManagedHandoffKind(MANAGED_PORTABLE_BACKUP_NAME, SafDestinationSourceKind.RISU_SAVE) { id ->
     listOf("risunest-backup-$id.risunest")
   },

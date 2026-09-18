@@ -126,6 +126,13 @@ impl PersistentStoreState {
         Ok(maintenance)
     }
 
+    /// Prevents application writes while raw files are copied without changing
+    /// the lifetime or state of an already-open SQLite connection.
+    pub(crate) fn acquire_raw_capture(&self) -> StoreResult<DeviceMaintenanceGuard> {
+        self.try_acquire_renderer_maintenance()?
+            .ok_or_else(renderer_gate_error)
+    }
+
     fn try_acquire_renderer_maintenance(&self) -> StoreResult<Option<DeviceMaintenanceGuard>> {
         let mut state = self
             .renderer_gate
@@ -1502,6 +1509,31 @@ mod tests {
             .unwrap(),
             Some(json!(3))
         );
+    }
+
+    #[test]
+    fn raw_capture_gate_keeps_the_open_connection_and_source_files_unchanged() {
+        let directory = tempdir().unwrap();
+        let state = PersistentStoreState::default();
+        open_renderer_persistent_store(&state, directory.path()).unwrap();
+        let database = directory.path().join("persistent/persistent.sqlite");
+        let before = fs::read(&database).unwrap();
+        let sidecars_before = ["persistent.sqlite-wal", "persistent.sqlite-shm"]
+            .map(|name| directory.path().join("persistent").join(name).exists());
+
+        let capture = state.acquire_raw_capture().unwrap();
+        assert!(state.store.lock().unwrap().is_some());
+        assert!(state.admit_renderer_operation().is_err());
+        assert_eq!(fs::read(&database).unwrap(), before);
+        assert_eq!(
+            ["persistent.sqlite-wal", "persistent.sqlite-shm"]
+                .map(|name| directory.path().join("persistent").join(name).exists()),
+            sidecars_before,
+        );
+        drop(capture);
+
+        assert!(state.store.lock().unwrap().is_some());
+        drop(state.admit_renderer_operation().unwrap());
     }
 
     #[test]

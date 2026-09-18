@@ -85,6 +85,7 @@ const STAGE_ORDER: DialogStageId[] = [
 
 /** Stages shown as pending from the start; optional stages appear only once observed. */
 const EXPECTED_STAGES: Record<NativeFileOperationFormat, DialogStageId[]> = {
+    'raw-recovery': ['reading-archive'],
     'library-backup': [
         'reading-database',
         'finalizing-staging',
@@ -215,6 +216,8 @@ function titleOf(format: NativeFileOperationFormat | undefined): string {
             return copy.titleBackup
         case 'local-backup':
             return copy.titleLocalBackup
+        case 'raw-recovery':
+            return language.risuNest.recovery.exportTitle
         default:
             return copy.titleImport
     }
