@@ -37,6 +37,13 @@ pub(crate) struct ValidatedRecord {
     record: RemoteRecord,
     locator: LogicalRecordLocator,
 }
+
+impl ValidatedRecord {
+    pub(crate) fn into_parts(self) -> (RemoteRecord, LogicalRecordLocator) {
+        (self.record, self.locator)
+    }
+}
+
 pub(crate) struct ReplicaAdvance {
     pub scope_clears: Vec<(String, String)>,
     pub publish_keys: Vec<ServerDirtyKey>,

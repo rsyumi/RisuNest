@@ -2466,15 +2466,17 @@ impl PersistentStore {
                 "SELECT value FROM root WHERE generation=?1",
                 [&active],
                 |row| row.get::<_, String>(0),
-            ).optional()?.map(|value| serde_json::from_str(&value)).transpose()?;
+            ).optional()?.map(|value| serde_json::from_str(&value)).transpose()
+                .map_err(|_| SyncError::new("invalid-local-root", 409))?;
             let mut saw_root = false;
             records.visit(false, |item| {
                 check().map_err(|_| super::StoreError::Validation {
                     message: "Conflict restore cancelled".into(),
                 })?;
-                let Some(mut payload) = item.record.payload else { return Ok(()); };
+                let (record, locator) = item.into_parts();
+                let Some(mut payload) = record.payload else { return Ok(()); };
                 let raw_character: Option<serde_json::Value> =
-                    if let crate::logical_records::LogicalRecordLocator::Character { character_id } = &item.locator {
+                    if let crate::logical_records::LogicalRecordLocator::Character { character_id } = &locator {
                         tx.query_row(
                             "SELECT detail FROM characters WHERE generation=?1 AND character_id=?2",
                             params![active, character_id],
@@ -2483,7 +2485,7 @@ impl PersistentStore {
                     } else {
                         None
                     };
-                saw_root |= matches!(&item.locator, crate::logical_records::LogicalRecordLocator::Root);
+                saw_root |= matches!(&locator, crate::logical_records::LogicalRecordLocator::Root);
                 projection::preserve_local_view(
                     &mut payload,
                     raw_character.as_ref(),
@@ -2492,7 +2494,7 @@ impl PersistentStore {
                 super::record_apply::apply_materialized_record(
                     &tx,
                     &staging_id,
-                    item.locator,
+                    locator,
                     payload.record,
                     payload.messages.as_deref(),
                 )?;

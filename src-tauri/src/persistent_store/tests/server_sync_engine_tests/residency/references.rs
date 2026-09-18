@@ -335,6 +335,20 @@ fn failed_custody_release_preserves_other_roots_and_the_next_cleanup_recomputes_
     let cas = PayloadCas::new(scenario.local.repository_root()).unwrap();
     assert!(cas.stat_object(&scenario.unique_payload).unwrap().is_some());
 
+    let config = scenario.local.server_config().unwrap().unwrap();
+    let stored = scenario.local.server_stored_config().unwrap().unwrap();
+    let device = scenario.fixture.server.authenticate(&config.library_id, &config.token).unwrap();
+    let unused_bytes = b"synthetic unreferenced custody after conflict deletion";
+    let unused_hash = risunest_sync_wire::hash(unused_bytes);
+    scenario.fixture.server.put_object(&device, &unused_hash, unused_bytes).unwrap();
+    let client = ServerClient::new(config).unwrap();
+    let mut residency = Residency::open(scenario.local.repository_root()).unwrap();
+    residency.retain(&client, &stored, &head,
+        &[(unused_hash.clone(), Some(unused_bytes.len() as u64))]).unwrap();
+    let context = Residency::context_id(&stored, &head.epoch);
+    assert!(residency.release_object(&unused_hash, &context).unwrap().is_some());
+    drop(residency);
+
     scenario.trace.fail_release_once.store(true, Ordering::SeqCst);
     assert!(scenario.local.asset_residency_release_unused(|| Ok(())).is_err());
     assert!(!scenario.trace.fail_release_once.load(Ordering::SeqCst));
@@ -344,8 +358,7 @@ fn failed_custody_release_preserves_other_roots_and_the_next_cleanup_recomputes_
 
     scenario.local.asset_residency_release_unused(|| Ok(())).unwrap();
     assert!(Residency::open(scenario.local.repository_root()).unwrap()
-        .release_object(&scenario.remote_payload, &Residency::context_id(
-            &scenario.local.server_stored_config().unwrap().unwrap(), &head.epoch))
+        .release_object(&unused_hash, &context)
         .unwrap().is_none());
     assert!(scenario.local.read_asset_alias(
         "asset", "assets/reference-local-only.png", None).unwrap().is_some());
