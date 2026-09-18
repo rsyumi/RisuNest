@@ -757,64 +757,6 @@ describe('SaveCoordinator', () => {
             expect(harness.onPersisted).not.toHaveBeenCalled()
         })
 
-        it('checks current windowed authority before retrying resident compensation', async () => {
-            const database = makeDatabase()
-            const { character: projection } = makeWindowedProjection()
-            let selected: character | groupChat = database.characters[0]
-            let authority: TestWindowedAuthority | null = null
-            let coordinator!: SaveCoordinator
-            const commit = vi.fn(async ({ expectedRevision }) => {
-                const call = commit.mock.calls.length
-                if (call <= 4) {
-                    ;(database.characters[0] as character).desc = `Concurrent edit ${call}`
-                    coordinator.markPersistentDataDirty(1)
-                }
-                return { revision: expectedRevision + 1 }
-            })
-            const store = {
-                ...makeStore(commit),
-                readRoot: vi.fn(async () => ({ revision: 10, value: captureRoot(database) })),
-                readCharacter: vi.fn(async () => ({
-                    revision: 10,
-                    value: { type: 'character', chaId: 'char-a', name: 'Alpha' },
-                })),
-                queryConversations: vi.fn(async () => ({ revision: 10, items: [] })),
-            } as unknown as PersistentDataStore
-            coordinator = new SaveCoordinator({
-                store,
-                captureRoot: () => captureRoot(database),
-                captureSelectedCharacter: () => selected,
-                captureSelectedConversationAuthority: () => authority,
-                captureCharacter: (id) =>
-                    database.characters.find((item) => item.chaId === id) ?? null,
-                replaceDatabase: () => undefined,
-            })
-            coordinator.initialize(10, database)
-            await expect(coordinator.replacePersistentCompleteCharacter(
-                'char-a',
-                'seed-pending-compensation',
-                (current) => ({ ...current, name: 'Explicit replacement' }),
-            )).rejects.toThrow('Resident character changed')
-            expect(commit).toHaveBeenCalledTimes(4)
-
-            selected = projection
-            authority = {
-                kind: 'windowed',
-                characterId: 'char-a',
-                conversationId: 'two',
-                sessionToken: 'windowed-after-compensation' as any,
-                storeRevision: 14,
-                persistedSessionVersion: 0,
-                sessionVersion: 0,
-                totalMessages: 10_000,
-            }
-
-            await expect(
-                coordinator.flushPendingData('windowed-before-compensation'),
-            ).rejects.toThrow(/compatibility/i)
-            expect(commit).toHaveBeenCalledTimes(4)
-        })
-
         it('rechecks windowed authority after an awaited complete-character commit', async () => {
             const database = makeDatabase()
             const { character: projection } = makeWindowedProjection()

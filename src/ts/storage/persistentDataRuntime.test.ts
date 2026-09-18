@@ -1637,12 +1637,13 @@ describe('native replacement working-set refresh', () => {
         await fence.refreshCommittedWorkingSet(2)
         expect(harness.database.username).toBe('After native restore')
         expect(runtime.revision).toBe(2)
-        expect(() => runtime.markPersistentDataDirty(1)).not.toThrow()
+        expect(() => runtime.markPersistentDataDirty(1)).toThrow(/replacement is active/i)
 
         harness.username = 'Edit after native commit'
-        expect(() => runtime.markPersistentDataDirty(1)).not.toThrow()
+        expect(() => runtime.markPersistentDataDirty(1)).toThrow(/replacement is active/i)
 
         fence.release()
+        runtime.markPersistentDataDirty(1)
         await runtime.flushPendingData('post-native-commit-edit')
         expect(harness.database.username).toBe('Edit after native commit')
         expect(harness.store.commit).toHaveBeenCalledWith(
@@ -1712,7 +1713,7 @@ describe('native replacement working-set refresh', () => {
         expect(harness.store.commit).not.toHaveBeenCalled()
     })
 
-    it('queues a large post-publication edit without starting a fenced background flush', async () => {
+    it('keeps a large post-publication edit blocked until fence release', async () => {
         const restored = makeConversationDatabase('After native restore')
         const harness = createFenceRuntimeHarness(
             makeConversationDatabase('Before native restore'),
@@ -1725,8 +1726,11 @@ describe('native replacement working-set refresh', () => {
         await fence.refreshCommittedWorkingSet(2)
 
         harness.username = 'Large post-publication edit'
-        expect(() => runtime.markPersistentDataDirty(2 * 1024 * 1024)).not.toThrow()
+        expect(() => runtime.markPersistentDataDirty(2 * 1024 * 1024)).toThrow(
+            /replacement is active/i,
+        )
         fence.release()
+        runtime.markPersistentDataDirty(2 * 1024 * 1024)
         await runtime.flushPendingData('large-post-publication-edit')
 
         expect(harness.store.commit).toHaveBeenCalledWith(
