@@ -6,6 +6,7 @@ import {
     NativeFileJobError,
     runNativeOfficialAccountSnapshotRestore,
     runNativeBlockRisuSaveRestore,
+    runNativeArchiveExport,
     runNativeArchiveRestore,
     runNativeArchiveReferenceExport,
     runNativeBlockRisuSaveExport,
@@ -186,6 +187,83 @@ async function restoreOverPluginValues(options: {
 }
 
 describe('native file jobs', () => {
+    it('flushes a device-section export without acquiring the old renderer replacement fence', async () => {
+        localStorage.removeItem('risuNestPortableExportIntent')
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        let revision = 20
+        const runtime = {
+            ...restoreRuntime(20, {
+                capture: () => {
+                    throw new Error('old mutation token must not be captured')
+                },
+                acquire: () => {
+                    throw new Error('old replacement fence must not be acquired')
+                },
+            }),
+            get revision() {
+                return revision
+            },
+            flushPendingData: async (reason: string) => {
+                calls.push([`flush:${reason}`, undefined])
+                revision = 21
+            },
+        }
+        const result = {
+            revision: 21,
+            sourceBytes: 128,
+            sourceSha256: 'd'.repeat(64),
+            characterCount: 1,
+            presetCount: 0,
+            warningCodes: [],
+        }
+
+        await expect(
+            runNativeArchiveExport(
+                runtime,
+                { type: 'desktopPath', path: 'C:\\chosen\\device.risunest' },
+                { library: true, deviceSections: ['hypa'] },
+                {},
+                {
+                    isTauri: () => true,
+                    invoke: async (command, args) => {
+                        calls.push([command, args])
+                        if (command === 'native_file_job_start')
+                            return { jobId: 'device-export-1' }
+                        if (command === 'native_file_job_status')
+                            return {
+                                ...status('succeeded', result),
+                                jobId: 'device-export-1',
+                                kind: 'export-portable-backup',
+                            }
+                        if (command === 'native_file_job_forget') return true
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
+                    copyToAndroidSaf: async () => ({ bytes: 0, warningCodes: [] }),
+                },
+            ),
+        ).resolves.toEqual(result)
+
+        expect(calls.slice(0, 2)).toEqual([
+            ['flush:native-portable-export', undefined],
+            [
+                'native_file_job_start',
+                {
+                    request: {
+                        kind: 'export-portable-backup',
+                        expectedRevision: 21,
+                        selection: { library: true, deviceSections: ['hypa'] },
+                        destination: 'C:\\chosen\\device.risunest',
+                    },
+                },
+            ],
+        ])
+        expect(calls.map(([command]) => command)).not.toContain(
+            'native_device_backup_bootstrap',
+        )
+        expect(localStorage.getItem('risuNestPortableExportIntent')).toBeNull()
+    })
+
     it('starts a library-only portable export from an opaque conflict source', async () => {
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
         const result = {

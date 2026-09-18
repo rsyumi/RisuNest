@@ -2074,15 +2074,7 @@ export async function runNativeArchiveExport(
     options: NativeFileJobOptions = {},
     dependencies: NativeBackupExportDependencies = productionBackupExportDependencies,
 ): Promise<NativeFileJobResult> {
-    let held = true
     let expectedRevision = runtime.revision
-    let fence:
-        | Awaited<
-              ReturnType<
-                  NativeBlockRestoreRuntime['acquireDestructiveReplacementFence']
-              >
-          >
-        | undefined
     let intent:
         | import('./deviceBackup/job').PortableExportIntentStore
         | undefined
@@ -2106,16 +2098,9 @@ export async function runNativeArchiveExport(
                                 'publication-pending',
                                 'Finish the previous backup save before starting another',
                             )
-                        const token = await runtime.capturePersistentMutationToken(
-                            'native-portable-export', { publishOfficial: false },
-                        )
-                        fence = await runtime.acquireDestructiveReplacementFence(token)
-                        // Export reads exactly the revision accepted by the input guard.
-                        expectedRevision = fence.revision
-                    } else {
-                        await runtime.flushPendingData('native-portable-export')
-                        expectedRevision = runtime.revision
                     }
+                    await runtime.flushPendingData('native-portable-export')
+                    expectedRevision = runtime.revision
                     return {
                         kind: 'export-portable-backup',
                         expectedRevision,
@@ -2142,24 +2127,6 @@ export async function runNativeArchiveExport(
                 },
                 onNativeStatus: async (status) => {
                     await options.onNativeStatus?.(status)
-                    if (hasDevice && status.kind === 'export-portable-backup') {
-                        const module = await import('./deviceBackup/job')
-                        await module.handlePortableDeviceMaintenanceStatus(
-                            { ...status, kind: status.kind },
-                            {
-                                flushedRevision: expectedRevision,
-                                assertHeld() {
-                                    if (!held || !fence)
-                                        throw new Error(
-                                            'Device capture ownership was released',
-                                        )
-                                },
-                            },
-                            {
-                                invoke: dependencies.invoke as import('./deviceBackup/nativeSpool').DeviceNativeInvoke,
-                            },
-                        )
-                    }
                 },
             },
             dependencies,
@@ -2181,8 +2148,6 @@ export async function runNativeArchiveExport(
         }
         throw error
     } finally {
-        held = false
-        fence?.release()
         if (completed && startedId) intent?.clear(startedId)
     }
 }
