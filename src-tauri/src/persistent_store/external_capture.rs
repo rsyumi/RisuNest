@@ -831,7 +831,7 @@ impl PersistentStore {
             let mut query = tx.prepare(
                 "SELECT c.id,c.identity,f.catalog_path,f.file_hash FROM external_storage_capture_files f JOIN external_storage_captures c ON c.id=f.capture_id",
             )?;
-            query
+            let rows = query
                 .query_map([], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -840,7 +840,8 @@ impl PersistentStore {
                         row.get::<_, String>(3)?,
                     ))
                 })?
-                .collect::<Result<Vec<_>, _>>()?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
         };
         rows.retain(|(_, _, candidate, _)| {
             Path::new(candidate)

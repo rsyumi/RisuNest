@@ -662,6 +662,50 @@ pub(crate) async fn upload_backup_bundle(
     .await
 }
 
+pub(crate) async fn ensure_remote_conflict_bundle(
+    connected: &super::connection_commands::ConnectedRepository,
+    conflict_id: &str,
+    remote_commit_id: &str,
+    captured_at_ms: u64,
+    remote_snapshot: &RemoteObject,
+    journal: &mut TransferJournal,
+    cancel: &Cancellation,
+) -> Result<RemoteObject> {
+    if conflict_id.is_empty()
+        || conflict_id.len() > 1024
+        || conflict_id.contains('\0')
+        || remote_commit_id.is_empty()
+        || remote_commit_id.len() > 1024
+        || remote_commit_id.contains('\0')
+        || remote_snapshot.repository_id != connected.stored.descriptor.repository_id
+    {
+        return Err(corrupt("conflict remote state identity differs"));
+    }
+    match remote_snapshot.role {
+        ObjectRole::BackupBundle => Ok(remote_snapshot.clone()),
+        ObjectRole::SyncState => {
+            let view = read_snapshot_document(connected, remote_snapshot, cancel).await?;
+            upload_backup_bundle(
+                &connected.stored.descriptor,
+                &connected.root_key,
+                format!("{conflict_id}-remote"),
+                wire_control::BundleSource::SyncState {
+                    commit_id: remote_commit_id.to_owned(),
+                },
+                captured_at_ms,
+                view.library,
+                view.sections,
+                journal,
+                connected.provider.as_ref(),
+                &connected.handle,
+                cancel,
+            )
+            .await
+        }
+        _ => Err(corrupt("conflict remote state role differs")),
+    }
+}
+
 /// Republishes an already captured library reference as a synchronized state.
 /// Resolving a conflict in favour of this device publishes the preserved
 /// material, and a head can only point at a state.
@@ -763,6 +807,25 @@ async fn upload_control_object(
         .ok_or_else(|| corrupt("missing control journal"))?;
     if record.intent.role != role {
         return Err(corrupt("history journal role differs"));
+    }
+    let mut recorded = crate::trust_boundary::open_regular_source(&spool).map_err(corrupt)?;
+    let mut recorded_bytes = Vec::new();
+    recorded.read_to_end(&mut recorded_bytes).map_err(corrupt)?;
+    if recorded_bytes.len() as u64 != record.intent.byte_length
+        || hex::encode(hash(&recorded_bytes)) != record.intent.sha256
+    {
+        return Err(corrupt("control journal bytes differ"));
+    }
+    let (recorded_plaintext, _, _, _) = open(
+        descriptor,
+        root_key,
+        Some(&object_id),
+        wire_role(role)?,
+        &recorded_bytes,
+        MAX_POINT_PLAINTEXT,
+    )?;
+    if recorded_plaintext != plaintext {
+        return Err(corrupt("control journal content differs"));
     }
     let receipt = transfer_job::upload(journal, &object_id, provider, repository, cancel).await?;
     Ok(RemoteObject {
@@ -1945,6 +2008,101 @@ mod tests {
                 .unwrap(),
                 RemoteConflictPointDeleteOutcome::NotFound
             );
+        });
+    }
+
+    #[test]
+    fn sync_state_conflict_wrapper_uploads_only_small_metadata() {
+        runtime().block_on(async {
+            let provider = Arc::new(fake::FakeProvider::new(false));
+            let connected = connected(provider.clone());
+            let root = tempfile::tempdir().unwrap();
+            let identity = JobIdentity {
+                job_id: "job".into(),
+                connection_id: "connection".into(),
+                repository_id: connected.handle.repository_id.clone(),
+                capture_id: "capture".into(),
+                capture: CaptureIdentity {
+                    store_id: "store".into(),
+                    library_epoch: "epoch".into(),
+                    generation: "generation".into(),
+                    selection_epoch: "selection".into(),
+                    revision: 1,
+                },
+            };
+            let mut journal = TransferJournal::open(root.path(), identity).unwrap();
+            let library = wire::LibrarySnapshotRef {
+                record_catalog: catalog(&connected.handle, "records"),
+                asset_catalog: catalog(&connected.handle, "assets"),
+                content_fingerprint: [3; 32],
+            };
+            let (state, _) = upload_sync_state(
+                &connected.stored.descriptor,
+                &connected.root_key,
+                "remote-state".into(),
+                "library".into(),
+                "epoch".into(),
+                risunest_sync_wire::head::Sequence::from(1u64),
+                None,
+                "writer".into(),
+                1,
+                library,
+                BTreeMap::new(),
+                &mut journal,
+                connected.provider.as_ref(),
+                &connected.handle,
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+
+            let bundle = ensure_remote_conflict_bundle(
+                &connected,
+                "conflict",
+                "remote-commit",
+                2,
+                &state,
+                &mut journal,
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(bundle.role, ObjectRole::BackupBundle);
+            assert_eq!(bundle.object_id, "snapshot-conflict-remote");
+            assert_eq!(provider.upload_attempts("snapshot-remote-state"), 1);
+            assert_eq!(provider.upload_attempts("snapshot-conflict-remote"), 1);
+            assert_eq!(provider.state.lock().unwrap().objects.len(), 2);
+
+            let repeated = ensure_remote_conflict_bundle(
+                &connected,
+                "conflict",
+                "remote-commit",
+                2,
+                &state,
+                &mut journal,
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(repeated.object_id, bundle.object_id);
+            assert_eq!(provider.upload_attempts("snapshot-conflict-remote"), 1);
+            assert_eq!(
+                ensure_remote_conflict_bundle(
+                    &connected,
+                    "conflict",
+                    "different-commit",
+                    2,
+                    &state,
+                    &mut journal,
+                    &Cancellation::default(),
+                )
+                .await
+                .unwrap_err()
+                .kind,
+                ErrorKind::Corrupt
+            );
+            assert_eq!(provider.upload_attempts("snapshot-conflict-remote"), 1);
         });
     }
 }
