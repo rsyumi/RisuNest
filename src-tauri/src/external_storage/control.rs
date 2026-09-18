@@ -583,6 +583,33 @@ pub(crate) async fn upload_backup_point(
     .await
 }
 
+pub(crate) async fn ensure_remote_conflict_point(
+    descriptor: &Descriptor,
+    conflict_id: &str,
+    created_at_ms: u64,
+    remote_bundle: RemoteObject,
+    journal: &mut TransferJournal,
+    connected: &super::connection_commands::ConnectedRepository,
+    cancel: &Cancellation,
+) -> Result<RemoteObject> {
+    let document = BackupPointDocument::conflict(
+        descriptor,
+        conflict_id.to_owned(),
+        created_at_ms,
+        remote_bundle,
+    )?;
+    upload_backup_point(
+        descriptor,
+        &connected.root_key,
+        document,
+        journal,
+        connected.provider.as_ref(),
+        &connected.handle,
+        cancel,
+    )
+    .await
+}
+
 /// Wraps an already published library reference in its own immutable bundle so
 /// a retained point names a bundle rather than a synchronized state. A state is
 /// the merged result of several devices, which is why the source says so. The
@@ -986,6 +1013,17 @@ async fn scan_snapshot(
     Err(corrupt("snapshot discovery page limit"))
 }
 
+fn same_snapshot_identity(left: &RemoteObject, right: &RemoteObject) -> bool {
+    left.repository_id == right.repository_id
+        && left.object_id == right.object_id
+        && left.role == right.role
+        && left.receipt.byte_length == right.receipt.byte_length
+        && left.receipt.complete == right.receipt.complete
+        && left.ciphertext_sha256 == right.ciphertext_sha256
+        && left.plaintext_length == right.plaintext_length
+        && left.plaintext_sha256 == right.plaintext_sha256
+}
+
 /// Reads an authenticated locator first. Only an explicit NotFound means the
 /// provider may be scanned to recover an object's current opaque locator.
 pub(crate) async fn find_snapshot_with_locator(
@@ -1009,7 +1047,11 @@ pub(crate) async fn find_snapshot_with_locator(
             Err(error) => return Err(error),
         }
     }
-    scan_snapshot(connected, snapshot_id, cancel).await
+    let recovered = scan_snapshot(connected, snapshot_id, cancel).await?;
+    if known.is_some_and(|expected| !same_snapshot_identity(expected, &recovered)) {
+        return Err(corrupt("relocated snapshot identity differs"));
+    }
+    Ok(recovered)
 }
 
 /// ID-only recovery for callers that do not yet hold an authenticated object
@@ -1657,6 +1699,31 @@ mod tests {
                 .unwrap_err();
 
             assert_eq!(error.kind, ErrorKind::Corrupt);
+            assert_eq!(provider.listing_count(), 1);
+        });
+    }
+
+    #[test]
+    fn relocated_snapshot_with_the_same_id_but_different_bytes_is_rejected() {
+        runtime().block_on(async {
+            let provider = Arc::new(fake::FakeProvider::new(false));
+            let connected = connected(provider.clone());
+            let (mut known, _) = snapshot_fixture(&connected, "target", "stale-target", 1);
+            let (_, changed) = snapshot_fixture(&connected, "target", "current-target", 2);
+            provider.seed("current-target", ObjectRole::BackupBundle, changed);
+            known.receipt.locator.object = "stale-target".into();
+
+            let error = find_snapshot_with_locator(
+                &connected,
+                "target",
+                Some(&known),
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(error.kind, ErrorKind::Corrupt);
+            assert_eq!(provider.read_attempts("stale-target"), 1);
             assert_eq!(provider.listing_count(), 1);
         });
     }
