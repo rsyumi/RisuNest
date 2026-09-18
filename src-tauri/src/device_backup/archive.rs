@@ -132,24 +132,15 @@ pub(crate) fn validate_archive_catalog(
             spool::validate_section_metadata(&metadata)? == (present == 1),
             "Archive device presence flag differs from section metadata",
         )?;
-        let native = SectionKind::parse(&section).ok();
-        let native_header = native
-            .map(|kind| {
-                require(
-                    included == 1 && complete == 1 && present == 1,
-                    "Native backup sections must be included, complete, and present",
-                )?;
-                parse_native_header(&metadata, kind)
-            })
-            .transpose()?;
-        let mut fingerprint =
-            native.map(|kind| FingerprintBuilder::new(&kind.fingerprint_domain()));
+        let kind = SectionKind::parse(&section).map_err(section_codec_error)?;
+        require(
+            included == 1 && complete == 1 && present == 1,
+            "Native backup sections must be included, complete, and present",
+        )?;
+        let native_header = parse_native_header(&metadata, kind)?;
+        let mut fingerprint = FingerprintBuilder::new(&kind.fingerprint_domain());
         let mut transport_hash = spool::start_section_hash(&metadata);
-        let record_limit = if native.is_some() {
-            MAX_SECTION_ENTRY_BYTES
-        } else {
-            MAX_GRAPH_BYTES
-        };
+        let record_limit = MAX_SECTION_ENTRY_BYTES;
         let mut record_statement=db.prepare("SELECT ordinal,CASE WHEN typeof(metadata)='text' AND length(CAST(metadata AS BLOB))<=?2 THEN CAST(metadata AS BLOB) END FROM device_records WHERE section=?1 AND ordinal>=0 ORDER BY ordinal")?;
         let mut record_rows = record_statement.query(params![&section, record_limit as i64])?;
         let mut observed = 0i64;
@@ -167,26 +158,20 @@ pub(crate) fn validate_archive_catalog(
                     "Archive device graph exceeds its bound",
                 )
             })?;
-            if let Some(kind) = native {
-                let entry = SectionEntry::decode(&payload).map_err(section_codec_error)?;
-                require(
-                    entry.kind == kind && entry.version.is_none(),
-                    "Native backup entry has the wrong section identity",
-                )?;
-                require(
-                    entry.encode().map_err(section_codec_error)? == payload,
-                    "Native backup entry is not canonically encoded",
-                )?;
-                fingerprint
-                    .as_mut()
-                    .expect("native fingerprint")
-                    .push(&entry.key, &content_hash(&payload))
-                    .map_err(section_codec_error)?;
-                if let Some(reference) = object_reference(&entry) {
-                    validate_native_object_reference(db, kind, reference)?;
-                }
-            } else {
-                spool::validate_json(&payload, MAX_GRAPH_BYTES)?;
+            let entry = SectionEntry::decode(&payload).map_err(section_codec_error)?;
+            require(
+                entry.kind == kind && entry.version.is_none(),
+                "Native backup entry has the wrong section identity",
+            )?;
+            require(
+                entry.encode().map_err(section_codec_error)? == payload,
+                "Native backup entry is not canonically encoded",
+            )?;
+            fingerprint
+                .push(&entry.key, &content_hash(&payload))
+                .map_err(section_codec_error)?;
+            if let Some(reference) = object_reference(&entry) {
+                validate_native_object_reference(db, kind, reference)?;
             }
             spool::start_record_hash(&mut transport_hash, ordinal as u64, payload.len() as u64);
             for chunk in payload.chunks(MAX_CHUNK_BYTES) {
@@ -203,12 +188,10 @@ pub(crate) fn validate_archive_catalog(
             hex::encode(transport_hash.finalize()) == expected,
             "Archive device section digest mismatch",
         )?;
-        if let (Some(header), Some(fingerprint)) = (native_header, fingerprint) {
-            require(
-                hex::encode(fingerprint.finish()) == header.content_fingerprint,
-                "Native backup section fingerprint mismatch",
-            )?;
-        }
+        require(
+            hex::encode(fingerprint.finish()) == native_header.content_fingerprint,
+            "Native backup section fingerprint mismatch",
+        )?;
     }
     Ok(())
 }
@@ -926,8 +909,7 @@ pub(crate) fn resume_journaled_native_restore(
 ) -> Result<i64> {
     let session = state.session(id)?;
     require(
-        session.operation == Operation::Restore
-            && session.profile == "native-portable"
+        session.profile == "native-portable"
             && session
                 .selected_sections
                 .iter()
@@ -960,13 +942,13 @@ pub(crate) fn resume_journaled_native_restore(
                         "Native recovery source manifest is absent",
                     )
                 })?;
-                state.section_intent(id, &section_id, false)?;
+                state.section_intent(id, &section_id)?;
                 store
                     .device_store_mut()
                     .map_err(device_store_error)?
                     .restore_prepared_backup_section(section.rows())
                     .map_err(device_store_error)?;
-                state.section_complete(id, &section_id, false, &manifest.sha256)?;
+                state.section_complete(id, &section_id, &manifest.sha256)?;
             }
         }
         if state.session(id)?.phase == "applying-device" {
@@ -1014,61 +996,4 @@ pub(crate) fn resume_journaled_native_restore(
         "Native recovery did not reach its committed state",
     )?;
     store.revision().map_err(device_store_error)
-}
-
-impl DeviceBackupState {
-    pub(crate) fn export_to_catalog(
-        &self,
-        id: &str,
-        spool: Spool,
-        catalog: &Catalog,
-        probe: &dyn CancellationProbe,
-    ) -> Result<()> {
-        require(
-            !probe.is_cancelled(),
-            "Device archive operation was cancelled",
-        )?;
-        self.export_spool(id, spool, &catalog.db, |hash, size, reader| {
-            catalog
-                .add_reader("device", hash, "{}", reader, size, hash, probe)
-                .map_err(archive_error)
-        })?;
-        require(
-            !probe.is_cancelled(),
-            "Device archive operation was cancelled",
-        )
-    }
-
-    pub(crate) fn import_from_archive(
-        &self,
-        id: &str,
-        archive: &VerifiedArchive,
-        probe: &dyn CancellationProbe,
-    ) -> Result<()> {
-        require(
-            !probe.is_cancelled(),
-            "Device archive operation was cancelled",
-        )?;
-        self.import_spool(id, &archive.db, &[], |_, _| Ok(()))?;
-        // Keep only one descriptor and one bounded copy buffer resident. The
-        // archive has already verified object membership, hashes and offsets.
-        let mut statement=archive.db.prepare("SELECT DISTINCT lower(hex(f.object_hash)),o.byte_length FROM files f JOIN objects o ON o.sha256=f.object_hash WHERE f.kind='device' AND f.state='present' ORDER BY f.object_hash")?;
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            require(
-                !probe.is_cancelled(),
-                "Device archive operation was cancelled",
-            )?;
-            let hash: String = row.get(0)?;
-            let size: i64 = row.get(1)?;
-            require(size >= 0, "Device archive object has negative length")?;
-            self.import_object(id, &hash, size as u64, |writer| {
-                archive
-                    .copy_object(&hash, writer, probe)
-                    .map_err(archive_error)?;
-                Ok(())
-            })?;
-        }
-        self.source_ready(id)
-    }
 }

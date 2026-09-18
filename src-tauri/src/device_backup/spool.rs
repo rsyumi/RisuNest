@@ -1,6 +1,6 @@
 use super::*;
 use sha2::{Digest, Sha256};
-use std::io::{Read, Write};
+
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,10 +45,8 @@ fn write_allowed(connection: &Connection, id: &str, spool: Spool) -> Result<Sess
             r.get(0)
         })?;
     let writable = matches!(
-        (session.operation, spool, session.phase.as_str()),
-        (Operation::Capture, Spool::Source, "capturing")
-            | (Operation::Restore, Spool::Source, "loading-source")
-            | (Operation::Restore, Spool::Rollback, "preparing")
+        (spool, session.phase.as_str()),
+        (Spool::Source, "loading-source") | (Spool::Rollback, "preparing")
     );
     require(
         active && writable,
@@ -62,8 +60,7 @@ pub(super) fn validate_json(bytes: &[u8], maximum: usize) -> Result<()> {
         bytes.len() <= maximum,
         "Device metadata exceeds the explicit size limit",
     )?;
-    // The clone profile encodes every UTF-16 string in ASCII. JSON text itself
-    // must be valid UTF-8; no lossy conversion ever touches stored strings.
+    // No lossy conversion ever touches stored JSON strings.
     let _: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| {
         error(
             "device-metadata-invalid",
@@ -258,6 +255,31 @@ fn read_blob_range(
     }
     require(position == end, "Binary object ended early")?;
     Ok(output)
+}
+
+fn append_row(
+    connection: &mut Connection,
+    id: &str,
+    spool: Spool,
+    section: &str,
+    ordinal: u64,
+    payload: &[u8],
+) -> Result<()> {
+    write_allowed(connection, id, spool)?;
+    let manifest = section_manifest(connection, id, spool, section)?;
+    require(
+        !manifest.sealed && ordinal == manifest.records,
+        "Device row append is out of sequence or section is sealed",
+    )?;
+    let hash = hex::encode(Sha256::digest(payload));
+    let transaction = connection.transaction()?;
+    transaction.execute("INSERT INTO records(session,spool,section,ordinal,payload,sha256) VALUES(?1,?2,?3,?4,?5,?6)",params![id,spool.key(),section,sql_integer(ordinal)?,payload,hash])?;
+    transaction.execute(
+        "UPDATE sections SET records=records+1 WHERE session=?1 AND spool=?2 AND section=?3",
+        params![id, spool.key(), section],
+    )?;
+    transaction.commit()?;
+    Ok(())
 }
 
 impl DeviceBackupState {
@@ -616,250 +638,6 @@ impl DeviceBackupState {
         read_blob_range(connection, id, spool, object_id, offset, length)
     }
 
-    /// Native archive boundary. The returned metadata rows include ordinal -1
-    /// for the section header. Value rows remain individually addressable.
-    pub(crate) fn export_spool(
-        &self,
-        id: &str,
-        spool: Spool,
-        destination: &Connection,
-        mut object_sink: impl FnMut(&str, u64, &mut dyn Read) -> Result<()>,
-    ) -> Result<()> {
-        let objects = {
-            let inner = self.lock()?;
-            let connection = inner.connection.as_ref().unwrap();
-            let session = session_for(connection, id)?;
-            for section in &session.selected_sections {
-                let manifest = verify_section(connection, id, spool, section)?;
-                destination.execute("INSERT INTO device_sections(section,schema_version,included,complete,present,record_count,sha256) VALUES(?1,1,1,1,?2,?3,?4)",params![section,manifest.present,sql_integer(manifest.records)?,manifest.sha256])?;
-                destination.execute(
-                    "INSERT INTO device_records(section,ordinal,metadata) VALUES(?1,-1,?2)",
-                    params![section, manifest.metadata_json],
-                )?;
-                let mut statement=connection.prepare("SELECT ordinal,payload FROM records WHERE session=?1 AND spool=?2 AND section=?3 ORDER BY ordinal")?;
-                let mut rows = statement.query(params![id, spool.key(), section])?;
-                while let Some(row) = rows.next()? {
-                    let ordinal: i64 = row.get(0)?;
-                    let payload: Vec<u8> = row.get(1)?;
-                    let text = std::str::from_utf8(&payload).map_err(|_| {
-                        error("device-metadata-invalid", "Device row UTF-8 is invalid")
-                    })?;
-                    destination.execute(
-                        "INSERT INTO device_records(section,ordinal,metadata) VALUES(?1,?2,?3)",
-                        params![section, ordinal, text],
-                    )?;
-                }
-            }
-            let mut statement=connection.prepare("SELECT sha256,MAX(bytes) FROM blobs WHERE session=?1 AND spool=?2 AND sealed=1 AND metadata_only=0 GROUP BY sha256")?;
-            let mut rows = statement.query(params![id, spool.key()])?;
-            let mut objects = Vec::new();
-            while let Some(row) = rows.next()? {
-                objects.push((row.get::<_, String>(0)?, read_unsigned(row, 1)?));
-            }
-            objects
-        };
-        for (hash, bytes) in objects {
-            let mut reader = BlobReader {
-                state: self,
-                id,
-                spool,
-                object: &hash,
-                position: 0,
-                length: bytes,
-            };
-            object_sink(&hash, bytes, &mut reader)?;
-            require(
-                reader.position == bytes,
-                "Archive did not consume complete device binary",
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Source is a native-verified archive connection, never an IPC path. Blob
-    /// hashes are supplied from the verified archive's device object inventory.
-    pub(crate) fn import_spool(
-        &self,
-        id: &str,
-        source: &Connection,
-        objects: &[(String, u64)],
-        mut object_source: impl FnMut(&str, &mut dyn Write) -> Result<()>,
-    ) -> Result<()> {
-        let session = self.session(id)?;
-        require(
-            session.operation == Operation::Restore && session.phase == "loading-source",
-            "Source import has wrong phase",
-        )?;
-        for section in &session.selected_sections {
-            let (version,included,complete,present,count,hash):(i64,bool,bool,bool,u64,String)=source.query_row("SELECT schema_version,included,complete,present,record_count,sha256 FROM device_sections WHERE section=?1",[section],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,read_unsigned(r,4)?,r.get(5)?)))?;
-            require(
-                version == 1 && included && complete,
-                "Archive device section is unsupported or incomplete",
-            )?;
-            validate_digest(&hash)?;
-            let metadata: Option<String> = source.query_row(
-                "SELECT CASE WHEN length(CAST(metadata AS BLOB))<=262144 THEN metadata ELSE NULL END FROM device_records WHERE section=?1 AND ordinal=-1",
-                [section],
-                |r| r.get(0),
-            )?;
-            let metadata = metadata.ok_or_else(|| {
-                error(
-                    "device-metadata-invalid",
-                    "Archive section metadata exceeds size bound",
-                )
-            })?;
-            self.section_begin(id, Spool::Source, section, &metadata)?;
-            let mut statement=source.prepare("SELECT ordinal,CASE WHEN length(CAST(metadata AS BLOB))<=67108864 THEN metadata ELSE NULL END FROM device_records WHERE section=?1 AND ordinal>=0 ORDER BY ordinal")?;
-            let mut rows = statement.query([section])?;
-            let mut found = 0;
-            while let Some(row) = rows.next()? {
-                let ordinal = read_unsigned(row, 0)?;
-                let metadata: Option<String> = row.get(1)?;
-                let metadata = metadata.ok_or_else(|| {
-                    error(
-                        "device-metadata-invalid",
-                        "Archive device graph exceeds size bound",
-                    )
-                })?;
-                validate_json(metadata.as_bytes(), MAX_GRAPH_BYTES)?;
-                let mut inner = self.lock()?;
-                append_row(
-                    inner.connection.as_mut().unwrap(),
-                    id,
-                    Spool::Source,
-                    section,
-                    ordinal,
-                    metadata.as_bytes(),
-                )?;
-                found += 1;
-            }
-            let manifest = self.section_finish(id, Spool::Source, section)?;
-            require(
-                found == count && manifest.sha256 == hash && manifest.present == present,
-                "Archive device section verification failed",
-            )?;
-        }
-        for (hash, length) in objects {
-            self.import_object(id, hash, *length, |writer| object_source(hash, writer))?;
-        }
-        Ok(())
-    }
-
-    pub(super) fn import_object(
-        &self,
-        id: &str,
-        hash: &str,
-        length: u64,
-        source: impl FnOnce(&mut dyn Write) -> Result<()>,
-    ) -> Result<()> {
-        validate_digest(hash)?;
-        self.blob_begin(id, Spool::Source, hash)?;
-        let mut writer = BlobWriter {
-            state: self,
-            id,
-            hash,
-            position: 0,
-            expected: length,
-        };
-        source(&mut writer)?;
-        require(
-            writer.position == length,
-            "Archive device binary length mismatch",
-        )?;
-        let manifest = self.blob_finish(id, Spool::Source, hash)?;
-        require(
-            manifest.sha256 == hash,
-            "Archive device binary digest mismatch",
-        )
-    }
-}
-
-fn append_row(
-    connection: &mut Connection,
-    id: &str,
-    spool: Spool,
-    section: &str,
-    ordinal: u64,
-    payload: &[u8],
-) -> Result<()> {
-    write_allowed(connection, id, spool)?;
-    let manifest = section_manifest(connection, id, spool, section)?;
-    require(
-        !manifest.sealed && ordinal == manifest.records,
-        "Device row append is out of sequence or section is sealed",
-    )?;
-    let hash = hex::encode(Sha256::digest(payload));
-    let transaction = connection.transaction()?;
-    transaction.execute("INSERT INTO records(session,spool,section,ordinal,payload,sha256) VALUES(?1,?2,?3,?4,?5,?6)",params![id,spool.key(),section,sql_integer(ordinal)?,payload,hash])?;
-    transaction.execute(
-        "UPDATE sections SET records=records+1 WHERE session=?1 AND spool=?2 AND section=?3",
-        params![id, spool.key(), section],
-    )?;
-    transaction.commit()?;
-    Ok(())
-}
-
-struct BlobReader<'a> {
-    state: &'a DeviceBackupState,
-    id: &'a str,
-    spool: Spool,
-    object: &'a str,
-    position: u64,
-    length: u64,
-}
-impl Read for BlobReader<'_> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        if self.position == self.length || buffer.is_empty() {
-            return Ok(0);
-        }
-        let bytes = self
-            .state
-            .blob_read(
-                self.id,
-                self.spool,
-                self.object,
-                self.position,
-                buffer.len().min(MAX_CHUNK_BYTES),
-            )
-            .map_err(std::io::Error::other)?;
-        buffer[..bytes.len()].copy_from_slice(&bytes);
-        self.position += bytes.len() as u64;
-        Ok(bytes.len())
-    }
-}
-struct BlobWriter<'a> {
-    state: &'a DeviceBackupState,
-    id: &'a str,
-    hash: &'a str,
-    position: u64,
-    expected: u64,
-}
-impl Write for BlobWriter<'_> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.is_empty() {
-            return Ok(0);
-        }
-        let length = bytes.len().min(MAX_CHUNK_BYTES);
-        if self.position.saturating_add(length as u64) > self.expected {
-            return Err(std::io::Error::other(
-                "Device binary exceeds declared length",
-            ));
-        }
-        self.state
-            .blob_append(
-                self.id,
-                Spool::Source,
-                self.hash,
-                self.position,
-                &bytes[..length],
-            )
-            .map_err(std::io::Error::other)?;
-        self.position += length as u64;
-        Ok(length)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 fn sql_integer(value: u64) -> Result<i64> {
