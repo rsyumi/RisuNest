@@ -22,6 +22,7 @@ import {
     type NativeStagedPluginChoice,
     type NativeStagedPluginPreview,
 } from './nativeFileJobs'
+import { continueCommittedWorkingSetRefresh } from './committedWorkingSetContinuation'
 
 function status(
     state: NativeFileJobStatus['state'],
@@ -48,12 +49,14 @@ function restoreRuntime(
         refresh?: (revision: number) => void | Promise<void>
         acquire?: () => void | Promise<void>
         release?: () => void
+        projection?: 'applied' | 'refresh-required'
         /** Revision captured after explicit restore preparation and user choices. */
         fencedRevision?: number
     } = {},
 ) {
     let captures = 0
     return {
+        getStorageAuthorityEpoch: () => 2,
         capturePersistentMutationToken: async (reason: string) => {
             await options.capture?.(reason)
             return {
@@ -70,7 +73,11 @@ function restoreRuntime(
                     committedRevision: number,
                 ) => {
                     await options.refresh?.(committedRevision)
-                    return { kind: 'committed', revision: committedRevision, projection: 'applied' } as const
+                    return {
+                        kind: 'committed',
+                        revision: committedRevision,
+                        projection: options.projection ?? 'applied',
+                    } as const
                 },
                 release: () => options.release?.(),
             }
@@ -931,8 +938,8 @@ describe('native file jobs', () => {
         expect(events).toEqual([
             'fence-acquired',
             'refreshed',
-            'plugins-reloaded',
             'fence-released',
+            'plugins-reloaded',
         ])
         expect(calls[0]).toEqual([
             'native_file_job_start',
@@ -1442,8 +1449,8 @@ describe('native file jobs', () => {
             'fresh-status',
             'fence-acquired',
             'refreshed',
-            'plugins-reloaded',
             'fence-released',
+            'plugins-reloaded',
         ])
         expect(calls).toEqual([
             [
@@ -2235,7 +2242,7 @@ describe('native file jobs', () => {
         expect(commands).not.toContain('native_file_job_finalize')
     })
 
-    it('holds the replacement fence through refresh, plugin reload, and acknowledgement', async () => {
+    it('releases the replacement fence before plugin reload and acknowledgement', async () => {
         const events: string[] = []
         const observedPhases: string[] = []
         let statusCount = 0
@@ -2302,12 +2309,106 @@ describe('native file jobs', () => {
             'native-finalized',
             'stage:refreshing-app',
             'working-set-refreshed',
+            'fence-released',
             'stage:reloading-plugins',
             'plugins-reloaded',
             'terminal-acknowledged',
-            'fence-released',
         ])
         expect(observedPhases).toContain('activating-database')
+    })
+
+    it('continues a committed restore once after read-only recovery without reactivation', async () => {
+        const events: string[] = []
+        let statusCount = 0
+        const commands: string[] = []
+        const committed = {
+            revision: 9,
+            sourceBytes: 128,
+            sourceSha256: 'e'.repeat(64),
+            characterCount: 1,
+            presetCount: 0,
+            warningCodes: [],
+        }
+
+        const runtime = restoreRuntime(8, {
+            projection: 'refresh-required',
+            release: () => events.push('fence-released'),
+        })
+        await expect(runNativeBlockRisuSaveRestore(
+            runtime,
+            { type: 'desktopPath', path: 'C:\\chosen\\backup.risudat' },
+            { afterRefresh: () => { events.push('plugins-reloaded') } },
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    if (command === 'native_file_job_start') return { jobId: 'job-1' }
+                    if (command === 'native_file_job_status') {
+                        statusCount++
+                        return statusCount === 1
+                            ? { ...status('waitingForInput'), phase: 'awaiting-activation' }
+                            : status('succeeded', committed)
+                    }
+                    if (command === 'native_file_job_finalize') return 'requested'
+                    if (command === 'native_file_job_forget') {
+                        events.push('terminal-acknowledged')
+                        return true
+                    }
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )).rejects.toBeInstanceOf(NativeFileJobActivationCommittedError)
+
+        expect(events).toEqual(['fence-released'])
+        expect(commands.filter(command => command === 'native_file_job_finalize')).toHaveLength(1)
+        await continueCommittedWorkingSetRefresh(9, runtime, 2)
+        await continueCommittedWorkingSetRefresh(9, runtime, 2)
+        expect(events).toEqual([
+            'fence-released',
+            'plugins-reloaded',
+            'terminal-acknowledged',
+        ])
+        expect(commands.filter(command => command === 'native_file_job_finalize')).toHaveLength(1)
+    })
+
+    it('acknowledges a committed native job when plugin reload fails after fence release', async () => {
+        let statusCount = 0
+        const commands: string[] = []
+        const committed = {
+            revision: 9,
+            sourceBytes: 128,
+            sourceSha256: 'd'.repeat(64),
+            characterCount: 1,
+            presetCount: 0,
+            warningCodes: [],
+        }
+
+        await expect(runNativeBlockRisuSaveRestore(
+            restoreRuntime(8),
+            { type: 'desktopPath', path: 'C:\\chosen\\backup.risudat' },
+            { afterRefresh: async () => { throw new Error('plugin reload failed') } },
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    if (command === 'native_file_job_start') return { jobId: 'job-1' }
+                    if (command === 'native_file_job_status') {
+                        statusCount++
+                        return statusCount === 1
+                            ? { ...status('waitingForInput'), phase: 'awaiting-activation' }
+                            : status('succeeded', committed)
+                    }
+                    if (command === 'native_file_job_finalize') return 'requested'
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )).rejects.toBeInstanceOf(NativeFileJobActivationCommittedError)
+
+        expect(commands.filter(command => command === 'native_file_job_finalize')).toHaveLength(1)
+        expect(commands.filter(command => command === 'native_file_job_forget')).toHaveLength(1)
     })
 
     it.each(['refresh', 'native-status', 'ui-status'])(

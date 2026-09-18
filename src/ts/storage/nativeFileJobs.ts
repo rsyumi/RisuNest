@@ -12,6 +12,7 @@ import {
 import type { PreparedImmutablePayload } from './payloadCas'
 import type { DataHealthResult } from './dataHealth'
 import type { PersistentDataRuntime } from './persistentDataRuntime'
+import { registerCommittedWorkingSetContinuation } from './committedWorkingSetContinuation'
 import {
     copyNativeExportToAndroidSaf,
     discardAndroidSafSource,
@@ -432,7 +433,7 @@ export interface NativePortableRestorePreview {
 export type NativeBlockRestoreRuntime = Pick<
     PersistentDataRuntime,
     'capturePersistentMutationToken' | 'acquireDestructiveReplacementFence'
->
+> & Partial<Pick<PersistentDataRuntime, 'getStorageAuthorityEpoch'>>
 
 export interface NativeFileJobOptions {
     onStarted?(jobId: string): void | Promise<void>
@@ -1421,26 +1422,6 @@ async function runNativeReplacementRestore(
                     'Native restore committed without a renderer replacement fence',
                 )
             }
-            try {
-                options.onStatus?.(
-                    syntheticNativeFileJobStatus(terminal, 'refreshing-app'),
-                )
-                const outcome = await replacementFence.refreshCommittedWorkingSet(
-                    terminal.result.revision,
-                )
-                if (outcome.projection === 'refresh-required') {
-                    throw new Error('Committed native restore requires a read-only working-set refresh')
-                }
-                options.onStatus?.(
-                    syntheticNativeFileJobStatus(terminal, 'reloading-plugins'),
-                )
-                await options.afterRefresh?.()
-            } catch (error) {
-                throw new NativeFileJobActivationCommittedError(
-                    terminal.result.revision,
-                    error,
-                )
-            }
             const committedResult = {
                 ...terminal.result,
                 warningCodes: mergeWarningCodes(
@@ -1448,13 +1429,55 @@ async function runNativeReplacementRestore(
                     terminal.result.warningCodes,
                 ),
             }
+            const continueAfterRefresh = async (): Promise<void> => {
+                options.onStatus?.(
+                    syntheticNativeFileJobStatus(terminal, 'reloading-plugins'),
+                )
+                let followupFailed = false
+                let followupError: unknown
+                try {
+                    await options.afterRefresh?.()
+                } catch (error) {
+                    followupFailed = true
+                    followupError = error
+                }
+                try {
+                    await invokeNative(dependencies, 'native_file_job_forget', {
+                        jobId: started.jobId,
+                    })
+                } catch {
+                    committedResult.warningCodes = withCleanupFailedWarning(
+                        committedResult.warningCodes,
+                    )
+                }
+                if (followupFailed) throw followupError
+            }
             try {
-                await invokeNative(dependencies, 'native_file_job_forget', {
-                    jobId: started.jobId,
-                })
-            } catch {
-                committedResult.warningCodes = withCleanupFailedWarning(
-                    committedResult.warningCodes,
+                options.onStatus?.(
+                    syntheticNativeFileJobStatus(terminal, 'refreshing-app'),
+                )
+                const outcome = await replacementFence.refreshCommittedWorkingSet(
+                    terminal.result.revision,
+                )
+                replacementFence.release()
+                replacementFence = undefined
+                if (outcome.projection === 'refresh-required') {
+                    if (!runtime.getStorageAuthorityEpoch) {
+                        throw new Error('Persistent storage authority is unavailable')
+                    }
+                    registerCommittedWorkingSetContinuation(
+                        terminal.result.revision,
+                        runtime,
+                        runtime.getStorageAuthorityEpoch(),
+                        continueAfterRefresh,
+                    )
+                    throw new Error('Committed native restore requires a read-only working-set refresh')
+                }
+                await continueAfterRefresh()
+            } catch (error) {
+                throw new NativeFileJobActivationCommittedError(
+                    terminal.result.revision,
+                    error,
                 )
             }
             return committedResult

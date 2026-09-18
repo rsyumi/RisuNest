@@ -32,6 +32,7 @@ import type {
 } from './saveCoordinator'
 import type { CharacterActivationOptions } from './activeWorkingSet.svelte'
 import { notifyLocalPersistentRevision } from './persistentRevisionEvents'
+import { retryCommittedWorkingSetRefreshWithContinuation } from './committedWorkingSetContinuation'
 import {
     capturePersistentRoot,
     capturePersistentPluginStorage,
@@ -441,8 +442,13 @@ export const initializeActiveWorkingSet = (database: Database): Promise<void> =>
     getPersistentDataRuntime().initializeActiveWorkingSet(database)
 export const refreshActiveWorkingSetFromStore = (revision: DataRevision): Promise<CommittedApplyOutcome> =>
     getPersistentDataRuntime().refreshActiveWorkingSetFromStore(revision)
-export const retryCommittedWorkingSetRefresh = (): Promise<CommittedApplyOutcome | null> =>
-    getPersistentDataRuntime().retryCommittedWorkingSetRefresh()
+export const retryCommittedWorkingSetRefresh = async (): Promise<CommittedApplyOutcome | null> => {
+    const runtime = getPersistentDataRuntime()
+    return retryCommittedWorkingSetRefreshWithContinuation(
+        runtime,
+        productionConfiguration.onBackgroundError,
+    )
+}
 export const assertPersistentMutationAllowed = (expectedAuthorityEpoch?: number): void =>
     getPersistentDataRuntime().assertPersistentMutationAllowed(expectedAuthorityEpoch)
 export const getPersistentStorageAuthorityEpoch = (): number =>

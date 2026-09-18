@@ -9,6 +9,10 @@ import {
 } from './persistentDataRuntime'
 import { PersistentMutationFencedError, type OfficialRevisionPublisher } from './saveCoordinator'
 import { deferred, makeDatabase } from './saveCoordinator.testSupport'
+import {
+    registerCommittedWorkingSetContinuation,
+    retryCommittedWorkingSetRefreshWithContinuation,
+} from './committedWorkingSetContinuation'
 
 async function createHarness(officialPublisher?: OfficialRevisionPublisher) {
     let database = makeDatabase()
@@ -235,6 +239,39 @@ describe('committed apply outcomes', () => {
         expect(store.materializeDatabase).not.toHaveBeenCalled()
         expect(harness.leases[0].release).toHaveBeenCalledOnce()
         expect(harness.onWorkingSetRefreshRequired.mock.calls).toEqual([[2], [null]])
+    })
+
+    it('runs the source continuation after the real recovery install advances authority', async () => {
+        const harness = await createHarness()
+        harness.replaceDatabase.mockImplementationOnce(() => {
+            throw new Error('projection failed')
+        })
+        await expect(
+            harness.runtime.replacePersistentDatabase(replacement(), 'failed-projection'),
+        ).resolves.toEqual({
+            kind: 'committed', revision: 2, projection: 'refresh-required',
+        })
+        const authorityBeforeRecovery = harness.runtime.getStorageAuthorityEpoch()
+        const continuation = vi.fn(async () => {})
+        registerCommittedWorkingSetContinuation(
+            2,
+            harness.runtime,
+            authorityBeforeRecovery,
+            continuation,
+        )
+
+        await expect(
+            retryCommittedWorkingSetRefreshWithContinuation(harness.runtime),
+        ).resolves.toEqual({
+            kind: 'committed', revision: 2, projection: 'applied',
+        })
+
+        expect(harness.runtime.getStorageAuthorityEpoch()).toBe(
+            authorityBeforeRecovery + 1,
+        )
+        expect(continuation).toHaveBeenCalledOnce()
+        expect(harness.store.replaceFromDatabase).toHaveBeenCalledOnce()
+        expect(harness.store.commit).not.toHaveBeenCalled()
     })
 
     it('keeps the guard through another failed refresh without repeating the original replacement', async () => {

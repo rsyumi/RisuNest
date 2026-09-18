@@ -2,9 +2,12 @@ import {
     acquireDestructiveReplacementFence,
     capturePersistentMutationToken,
     flushPendingDataLocally,
+    getPersistentDataRuntime,
+    getPersistentStorageAuthorityEpoch,
 } from '../../persistentDataRuntime.svelte'
 import { subscribeLocalPersistentRevision } from '../../persistentRevisionEvents'
 import type { SyncExitDrainAdapter } from '../../syncExitCoordinator'
+import { registerCommittedWorkingSetContinuation } from '../../committedWorkingSetContinuation'
 import { getExternalStorageBridge } from './bridge'
 import {
     createExternalStorageController,
@@ -86,6 +89,12 @@ async function applyReceivedSync(
         throw new Error('Local data changed while external sync receive was prepared')
     }
     const fence = await acquireDestructiveReplacementFence(token)
+    let fenceReleased = false
+    const releaseFence = (): void => {
+        if (fenceReleased) return
+        fenceReleased = true
+        fence.release()
+    }
     try {
         const result = await getExternalStorageBridge().applyReceived(
             job.id,
@@ -98,23 +107,33 @@ async function applyReceivedSync(
         if (!Number.isSafeInteger(receivedRevision)) {
             throw new RangeError('External sync receive revision exceeds the renderer range')
         }
-        try {
-            const outcome = await fence.refreshCommittedWorkingSet(receivedRevision)
-            if (outcome.projection === 'refresh-required') {
-                throw new Error('Committed external receive requires a read-only working-set refresh')
-            }
+        const continueAfterRefresh = async (): Promise<void> => {
             await (
                 await import('../../../plugins/plugins.svelte')
             ).loadPluginsAfterAuthoritativeRestore()
             const state = await getExternalStorageBridge().getState()
             current.state = state
             current.controller.replaceState(state)
+        }
+        try {
+            const outcome = await fence.refreshCommittedWorkingSet(receivedRevision)
+            releaseFence()
+            if (outcome.projection === 'refresh-required') {
+                registerCommittedWorkingSetContinuation(
+                    receivedRevision,
+                    getPersistentDataRuntime(),
+                    getPersistentStorageAuthorityEpoch(),
+                    continueAfterRefresh,
+                )
+                throw new Error('Committed external receive requires a read-only working-set refresh')
+            }
+            await continueAfterRefresh()
         } catch (error) {
             const { NativeFileJobActivationCommittedError } = await import('../../nativeFileJobs')
             throw new NativeFileJobActivationCommittedError(receivedRevision, error)
         }
     } finally {
-        fence.release()
+        releaseFence()
     }
 }
 
@@ -292,6 +311,12 @@ export async function requestExternalStorageRestore(
         'external-storage-restore', { publishOfficial: false },
     )
     const fence = await acquireDestructiveReplacementFence(token)
+    let fenceReleased = false
+    const releaseFence = (): void => {
+        if (fenceReleased) return
+        fenceReleased = true
+        fence.release()
+    }
     await current.scheduler.suspend(destination => destination.kind === 'sync')
     try {
         let job = await getExternalStorageBridge().startJob({
@@ -327,24 +352,34 @@ export async function requestExternalStorageRestore(
         if (!Number.isSafeInteger(receivedRevision)) {
             throw new RangeError('External restore revision exceeds the renderer range')
         }
-        try {
-            const outcome = await fence.refreshCommittedWorkingSet(receivedRevision)
-            if (outcome.projection === 'refresh-required') {
-                throw new Error('Committed external restore requires a read-only working-set refresh')
-            }
+        const continueAfterRefresh = async (): Promise<void> => {
             await (
                 await import('../../../plugins/plugins.svelte')
             ).loadPluginsAfterAuthoritativeRestore()
             const state = await getExternalStorageBridge().getState()
             current.state = state
             current.controller.replaceState(state)
+        }
+        try {
+            const outcome = await fence.refreshCommittedWorkingSet(receivedRevision)
+            releaseFence()
+            if (outcome.projection === 'refresh-required') {
+                registerCommittedWorkingSetContinuation(
+                    receivedRevision,
+                    getPersistentDataRuntime(),
+                    getPersistentStorageAuthorityEpoch(),
+                    continueAfterRefresh,
+                )
+                throw new Error('Committed external restore requires a read-only working-set refresh')
+            }
+            await continueAfterRefresh()
         } catch (error) {
             const { NativeFileJobActivationCommittedError } = await import('../../nativeFileJobs')
             throw new NativeFileJobActivationCommittedError(receivedRevision, error)
         }
         return job
     } finally {
-        fence.release()
+        releaseFence()
         current.scheduler.resume()
     }
 }
