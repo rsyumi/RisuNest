@@ -232,7 +232,7 @@ async fn trace_request(
     let input = request.body().size_hint().exact();
     if path == "/uploads/frames" {
         let (parts, body) = request.into_parts();
-        let bytes = axum::body::to_bytes(body, risunest_sync_wire::batch::MAX_BATCH_BYTES)
+        let bytes = axum::body::to_bytes(body, risunest_sync_wire::transfer::MAX_BATCH_BYTES)
             .await
             .unwrap();
         for frame in risunest_sync_wire::transfer::decode(&bytes).unwrap() {
