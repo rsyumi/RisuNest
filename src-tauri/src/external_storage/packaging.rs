@@ -1921,8 +1921,9 @@ mod tests {
             snapshot_restore,
         },
         persistent_store::{
-            content_capture::ContentCaptureSink, device_store::sections::SectionRow,
-            sync_selection::CaptureIdentity,
+            content_capture::ContentCaptureSink,
+            device_store::sections::{SectionRow, SectionValueRow},
+            sync_selection::CaptureIdentity, PersistentStore,
         },
     };
     use risunest_external_storage_format::section::SectionKind;
@@ -2127,6 +2128,54 @@ mod tests {
         }
     }
 
+    fn materialized_section_rows(
+        source: &CapturedSection,
+        versioned: bool,
+    ) -> Vec<SectionRow> {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let section = crate::external_storage::sections::section_of(source.kind).unwrap();
+        if versioned {
+            store
+                .device_store_mut()
+                .unwrap()
+                .set_section_participating(section, true)
+                .unwrap();
+            crate::external_storage::sections::apply_received_section(
+                &mut store,
+                "connection",
+                "library",
+                crate::external_storage::sections::SectionArrival::Continuing,
+                source,
+            )
+            .unwrap();
+        } else {
+            let mut prepared = crate::external_storage::sections::prepare_received_backup_sections(
+                std::slice::from_ref(source),
+                &Cancellation::default(),
+            )
+            .unwrap();
+            store
+                .device_store_mut()
+                .unwrap()
+                .restore_prepared_backup_section(&prepared.remove(0))
+                .unwrap();
+        }
+        store
+            .device_store_mut()
+            .unwrap()
+            .read_backup_section_rows(section)
+            .unwrap()
+    }
+
+    fn section_values(
+        rows: Vec<SectionRow>,
+    ) -> Vec<(String, String, String, SectionValueRow)> {
+        rows.into_iter()
+            .map(|row| (row.key1, row.key2, row.key3, row.value))
+            .collect()
+    }
+
     fn section(
         spool: &Path,
         kind: SectionKind,
@@ -2136,7 +2185,7 @@ mod tests {
         crate::external_storage::sections::capture_section(
             kind,
             &section_rows(kind, marker),
-            true,
+            generation != 0,
             risunest_sync_wire::head::Sequence::from(generation),
             risunest_sync_wire::head::Sequence::from(0u64),
             risunest_sync_wire::head::Sequence::from(6u64),
@@ -2257,13 +2306,11 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(received.len(), 1);
-            let rows = crate::external_storage::sections::decode_section(
-                SectionKind::LocalPlugins,
-                &received[0].entries,
-                &received[0].content_fingerprint,
-            )
-            .unwrap();
-            assert_eq!(rows, section_rows(SectionKind::LocalPlugins, "first"));
+            let rows = materialized_section_rows(&received[0], true);
+            assert_eq!(
+                section_values(rows),
+                section_values(section_rows(SectionKind::LocalPlugins, "first"))
+            );
         });
     }
 
@@ -2347,13 +2394,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                let rows = crate::external_storage::sections::decode_section(
-                    SectionKind::LocalPlugins,
-                    &received[0].entries,
-                    &received[0].content_fingerprint,
-                )
-                .unwrap();
-                assert_eq!(rows, section_rows(SectionKind::LocalPlugins, marker));
+                let rows = materialized_section_rows(&received[0], false);
+                assert_eq!(
+                    section_values(rows),
+                    section_values(section_rows(SectionKind::LocalPlugins, marker))
+                );
             }
         });
     }
