@@ -129,6 +129,17 @@ pub(crate) struct ReclaimedRowVersion {
 
 pub(crate) type ReclaimedRows = BTreeMap<SectionKey, ReclaimedRowVersion>;
 
+pub(crate) enum SectionPublicationDisposition {
+    Published { first_published: Option<TombstonePublication> },
+    Reclaimed { first_published: TombstonePublication },
+}
+
+pub(crate) struct SectionPublicationRow {
+    pub key: SectionKey,
+    pub version: SectionEntryVersion,
+    pub disposition: SectionPublicationDisposition,
+}
+
 /// The key triple matches the change index, so a row and its change entry name
 /// the same thing without a second encoding.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -175,6 +186,18 @@ pub(crate) struct SectionCursor {
     pub applied_generation: Sequence,
     pub applied_gc_floor: Sequence,
     pub observed_max_write_clock: Sequence,
+}
+
+pub(crate) enum SectionSnapshotEvent {
+    Section {
+        section: Section,
+        state: SectionState,
+        cursor: Option<SectionCursor>,
+    },
+    Row {
+        section: Section,
+        row: SectionRow,
+    },
 }
 
 impl SectionCursor {
@@ -830,23 +853,31 @@ impl PreparedSectionRows {
 
     pub(crate) fn visit_entries(
         &self,
-        mut visitor: impl FnMut(&SectionEntry, Option<&[u8]>) -> StoreResult<()>,
+        visitor: impl FnMut(&SectionEntry, Option<&[u8]>) -> StoreResult<()>,
     ) -> StoreResult<()> {
+        self.visit_entries_mapped(visitor, |error| error)
+    }
+
+    pub(crate) fn visit_entries_mapped<E>(
+        &self,
+        mut visitor: impl FnMut(&SectionEntry, Option<&[u8]>) -> std::result::Result<(), E>,
+        mut map_error: impl FnMut(crate::persistent_store::StoreError) -> E,
+    ) -> std::result::Result<(), E> {
         let mut after = String::new();
         let mut visited = 0i64;
         loop {
             let page = {
                 let mut statement = self.connection.prepare(
                     "SELECT entry_key FROM row_index WHERE entry_key>?1 ORDER BY entry_key LIMIT 256",
-                )?;
-                let mut rows = statement.query([&after])?;
-                read_text_page(&mut rows)?
+                ).map_err(|error| map_error(error.into()))?;
+                let mut rows = statement.query([&after]).map_err(|error| map_error(error.into()))?;
+                read_text_page(&mut rows).map_err(&mut map_error)?
             };
             if page.is_empty() { break; }
             for key in page {
-                let mut row = self.row_by_entry_key(&key)?
-                    .ok_or_else(|| invalid("Prepared row is missing"))?;
-                let entry = row.to_entry(self.kind, self.versioned)?;
+                let mut row = self.row_by_entry_key(&key).map_err(&mut map_error)?
+                    .ok_or_else(|| map_error(invalid("Prepared row is missing")))?;
+                let entry = row.to_entry(self.kind, self.versioned).map_err(&mut map_error)?;
                 let object = match &mut row.value {
                     SectionValueRow::Hypa { vector, .. } if vector.len() > MAX_INLINE_VALUE_BYTES => {
                         Some(std::mem::take(vector))
@@ -858,7 +889,7 @@ impl PreparedSectionRows {
                 after = key;
             }
         }
-        if visited != self.count { return Err(invalid("Section spool scan is incomplete")); }
+        if visited != self.count { return Err(map_error(invalid("Section spool scan is incomplete"))); }
         Ok(())
     }
 }
@@ -1153,6 +1184,26 @@ fn capture_backup_rows(
     Ok(())
 }
 
+fn read_section_state(db: &Connection, section: Section) -> StoreResult<SectionState> {
+    let (participating, max_write_clock, gc_floor, participation_generation): (
+        i64,
+        String,
+        String,
+        String,
+    ) = db.query_row(
+        "SELECT participating,max_write_clock,gc_floor,participation_generation
+            FROM device_sections WHERE section=?1",
+        [section.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    Ok(SectionState {
+        participating: participating == 1,
+        max_write_clock: sequence(&max_write_clock)?,
+        gc_floor: sequence(&gc_floor)?,
+        participation_generation: sequence(&participation_generation)?,
+    })
+}
+
 impl DeviceStore {
     /// Captures every selected section from one read-only SQLite snapshot and
     /// releases that snapshot after all local spools are complete.
@@ -1181,6 +1232,48 @@ impl DeviceStore {
         for (kind, spool) in &mut spools { capture_backup_rows(&snapshot, *kind, spool)?; }
         snapshot.execute_batch("COMMIT;")?;
         spools.into_iter().map(|(_, spool)| spool.finish_captured()).collect()
+    }
+
+    /// Visits participating synchronized rows from one read-only SQLite
+    /// snapshot. The callback may spool each row before the snapshot closes.
+    pub(crate) fn visit_participating_section_snapshot_mapped<E>(
+        &self,
+        connection_id: &str,
+        library_lineage: &str,
+        mut visitor: impl FnMut(SectionSnapshotEvent) -> std::result::Result<(), E>,
+        mut map_error: impl FnMut(crate::persistent_store::StoreError) -> E,
+    ) -> std::result::Result<(), E> {
+        let path: String = self.connection.query_row(
+            "SELECT file FROM pragma_database_list WHERE name='main'", [], |row| row.get(0),
+        ).map_err(|error| map_error(error.into()))?;
+        if path.is_empty() { return Err(map_error(invalid("Device database path is unavailable"))); }
+        let snapshot = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ).map_err(|error| map_error(error.into()))?;
+        snapshot.execute_batch(
+            "PRAGMA busy_timeout=5000; PRAGMA query_only=ON; PRAGMA mmap_size=0; BEGIN;",
+        ).map_err(|error| map_error(error.into()))?;
+        for section in CHOOSABLE_SECTIONS {
+            let state = read_section_state(&snapshot, section).map_err(&mut map_error)?;
+            if !state.participating { continue; }
+            let cursor = read_cursor(&snapshot, connection_id, library_lineage, section)
+                .map_err(&mut map_error)?;
+            visitor(SectionSnapshotEvent::Section { section, state, cursor })?;
+            let mut statement = snapshot.prepare(match section {
+                Section::Hypa => "SELECT * FROM hypa_embeddings ORDER BY cache_key",
+                Section::LocalPlugins => "SELECT * FROM plugin_device_storage ORDER BY owner,space,key",
+            }).map_err(|error| map_error(error.into()))?;
+            let mut rows = statement.query([]).map_err(|error| map_error(error.into()))?;
+            while let Some(row) = rows.next().map_err(|error| map_error(error.into()))? {
+                visitor(SectionSnapshotEvent::Row {
+                    section,
+                    row: row_from_sql(section, row).map_err(&mut map_error)?,
+                })?;
+            }
+        }
+        snapshot.execute_batch("COMMIT;").map_err(|error| map_error(error.into()))?;
+        Ok(())
     }
 
     /// The input owns a validated read-only spool. No transport or archive
@@ -1324,23 +1417,7 @@ impl DeviceStore {
     }
 
     pub(crate) fn section_state(&self, section: Section) -> StoreResult<SectionState> {
-        let (participating, max_write_clock, gc_floor, participation_generation): (
-            i64,
-            String,
-            String,
-            String,
-        ) = self.connection.query_row(
-            "SELECT participating,max_write_clock,gc_floor,participation_generation
-                FROM device_sections WHERE section=?1",
-            [section.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
-        Ok(SectionState {
-            participating: participating == 1,
-            max_write_clock: sequence(&max_write_clock)?,
-            gc_floor: sequence(&gc_floor)?,
-            participation_generation: sequence(&participation_generation)?,
-        })
+        read_section_state(&self.connection, section)
     }
 
     /// Turning a section on or off changes what this device exchanges from the
@@ -1613,6 +1690,111 @@ impl DeviceStore {
         if let Some((connection_id, library_lineage, _, cursor)) = cursor {
             record_cursor(&transaction, connection_id, library_lineage, section, cursor)?;
         }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Applies immutable publication evidence a row at a time. The evidence
+    /// may come from a durable job spool and is consumed inside one local
+    /// transaction, so a confirmed publication is either fully recorded or
+    /// left for reconciliation to retry.
+    pub(crate) fn note_spooled_section_published(
+        &mut self,
+        section: Section,
+        expected_participation_generation: &Sequence,
+        first_published: &TombstonePublication,
+        gc_floor: &Sequence,
+        cursor: (&str, &str, &SectionCursor),
+        rows: impl Iterator<Item = StoreResult<SectionPublicationRow>>,
+    ) -> StoreResult<bool> {
+        let transaction = self.transaction()?;
+        let (participating, generation): (bool, String) = transaction.query_row(
+            "SELECT participating,participation_generation FROM device_sections WHERE section=?1",
+            [section.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if !participating || sequence(&generation)? != *expected_participation_generation {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let stamp_at_ms = i64::try_from(first_published.at_ms)
+            .map_err(|_| invalid("device removal marker time is out of range"))?;
+        for evidence in rows {
+            let evidence = evidence?;
+            let (key1, key2, key3) = evidence.key;
+            match evidence.disposition {
+                SectionPublicationDisposition::Reclaimed { first_published } => {
+                    let at_ms = i64::try_from(first_published.at_ms)
+                        .map_err(|_| invalid("device removal marker time is out of range"))?;
+                    match section {
+                        Section::Hypa => transaction.execute(
+                            "DELETE FROM hypa_embeddings WHERE cache_key=?1 AND tombstone=1
+                                AND write_clock=?2 AND writer_id=?3
+                                AND first_published_generation=?4 AND first_published_at_ms=?5",
+                            params![key1, evidence.version.write_clock.as_str(), evidence.version.writer_id,
+                                first_published.generation.as_str(), at_ms],
+                        )?,
+                        Section::LocalPlugins => transaction.execute(
+                            "DELETE FROM plugin_device_storage
+                                WHERE owner=?1 AND space=?2 AND key=?3 AND tombstone=1
+                                  AND write_clock=?4 AND writer_id=?5
+                                  AND first_published_generation=?6 AND first_published_at_ms=?7",
+                            params![key1, key2, key3, evidence.version.write_clock.as_str(),
+                                evidence.version.writer_id, first_published.generation.as_str(), at_ms],
+                        )?,
+                    };
+                }
+                SectionPublicationDisposition::Published { first_published: stamp } => {
+                    if let Some(stamp) = stamp {
+                        if stamp != *first_published {
+                            return Err(invalid("Publication removal marker differs from its spool"));
+                        }
+                        match section {
+                            Section::Hypa => transaction.execute(
+                                "UPDATE hypa_embeddings
+                                    SET first_published_generation=?4,first_published_at_ms=?5
+                                    WHERE cache_key=?1 AND write_clock=?2 AND writer_id=?3 AND tombstone=1
+                                      AND first_published_generation IS NULL",
+                                params![key1, evidence.version.write_clock.as_str(), evidence.version.writer_id,
+                                    first_published.generation.as_str(), stamp_at_ms],
+                            )?,
+                            Section::LocalPlugins => transaction.execute(
+                                "UPDATE plugin_device_storage
+                                    SET first_published_generation=?6,first_published_at_ms=?7
+                                    WHERE owner=?1 AND space=?2 AND key=?3 AND write_clock=?4 AND writer_id=?5
+                                      AND tombstone=1 AND first_published_generation IS NULL",
+                                params![key1, key2, key3, evidence.version.write_clock.as_str(),
+                                    evidence.version.writer_id, first_published.generation.as_str(), stamp_at_ms],
+                            )?,
+                        };
+                    }
+                    match section {
+                        Section::Hypa => transaction.execute(
+                            "UPDATE hypa_embeddings SET published_clock=?2
+                                WHERE cache_key=?1 AND write_clock=?2 AND writer_id=?3",
+                            params![key1, evidence.version.write_clock.as_str(), evidence.version.writer_id],
+                        )?,
+                        Section::LocalPlugins => transaction.execute(
+                            "UPDATE plugin_device_storage SET published_clock=?4
+                                WHERE owner=?1 AND space=?2 AND key=?3 AND write_clock=?4 AND writer_id=?5",
+                            params![key1, key2, key3, evidence.version.write_clock.as_str(), evidence.version.writer_id],
+                        )?,
+                    };
+                }
+            }
+        }
+        let current = sequence(&transaction.query_row(
+            "SELECT gc_floor FROM device_sections WHERE section=?1",
+            [section.as_str()],
+            |row| row.get::<_, String>(0),
+        )?)?;
+        if *gc_floor > current {
+            transaction.execute(
+                "UPDATE device_sections SET gc_floor=?1 WHERE section=?2",
+                params![gc_floor.as_str(), section.as_str()],
+            )?;
+        }
+        record_cursor(&transaction, cursor.0, cursor.1, section, cursor.2)?;
         transaction.commit()?;
         Ok(true)
     }

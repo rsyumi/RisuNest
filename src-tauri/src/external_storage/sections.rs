@@ -3,19 +3,22 @@
 //! change without changing what the repository holds.
 use super::contract::{Cancellation, ErrorKind, ProviderError, Result};
 use crate::persistent_store::device_store::{
-    sections::{PreparedSectionRows, PublishedRows, ReclaimedRows, ReclaimedRowVersion,
-        SectionCursor, SectionRow, SectionSpoolBuilder, SectionValueRow, TombstonePublication},
+    sections::{PreparedSectionRows, SectionCursor, SectionPublicationDisposition,
+        SectionPublicationRow, SectionRow, SectionSnapshotEvent, SectionSpoolBuilder,
+        SectionValueRow, TombstonePublication},
     Section,
 };
 use risunest_external_storage_format::{
     content_identity::hash,
     format::fingerprint,
     section::{
-        InlineOrObject, SectionEntry, SectionKind, SectionValue, MAX_SECTION_ENTRY_BYTES,
+        InlineOrObject, SectionEntry, SectionEntryVersion, SectionKind, SectionValue,
+        MAX_SECTION_ENTRY_BYTES,
     },
     snapshot as wire,
 };
 use risunest_sync_wire::head::Sequence;
+use rusqlite::{params, Connection, OpenFlags};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
@@ -54,95 +57,14 @@ pub(crate) struct CapturedSection {
 /// What a confirmed publication has to record locally for one section. Nothing
 /// here is written before the remote holds the captured content, so a failed
 /// publication leaves the device file as it was.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct SectionPublication {
     pub section: Section,
-    pub participation_generation: Sequence,
-    pub published: PublishedRows,
-    /// Removals this capture is publishing for the first time, with the marker
-    /// the entries carry.
-    pub stamped: PublishedRows,
-    pub first_published: TombstonePublication,
-    /// Removals this capture stopped carrying, and the floor it published.
-    pub reclaimed: ReclaimedRows,
-    pub gc_floor: Sequence,
+    pub publication_index_path: PathBuf,
 }
 
 /// How long a removal stays after the commit that first published it.
 pub(crate) const TOMBSTONE_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
-
-/// Stamps the removals this capture is publishing for the first time. A marker
-/// a removal already carries is what every other device has, so it is kept. A
-/// capture with no commit number of its own has none to give, so a removal it
-/// has never published is left out of it entirely.
-fn stamp_removals(
-    rows: Vec<SectionRow>,
-    marker: &TombstonePublication,
-) -> (Vec<SectionRow>, PublishedRows) {
-    let publishing = marker.generation > Sequence::from(0u64);
-    let mut stamped = Vec::new();
-    let rows = rows
-        .into_iter()
-        .filter_map(|row| match &row.value {
-            SectionValueRow::Tombstone {
-                first_published: None,
-            } => {
-                if !publishing {
-                    return None;
-                }
-                stamped.push((row.key(), row.version()));
-                Some(SectionRow {
-                    value: SectionValueRow::Tombstone {
-                        first_published: Some(marker.clone()),
-                    },
-                    ..row
-                })
-            }
-            _ => Some(row),
-        })
-        .collect();
-    (rows, stamped)
-}
-
-/// The removals this publication can stop carrying: past the retention period,
-/// first published in a commit the remote section has already reached, and
-/// still carried by the state this device has applied. The floor the section
-/// publishes moves up to the highest commit they were first published in.
-fn reclaimable_removals(
-    rows: &[SectionRow],
-    reference: Option<&wire::SectionSnapshotRef>,
-    cursor: Option<&SectionCursor>,
-    gc_floor: &Sequence,
-    now_ms: u64,
-) -> (ReclaimedRows, Sequence) {
-    let (Some(reference), Some(cursor)) = (reference, cursor) else {
-        return (BTreeMap::new(), gc_floor.clone());
-    };
-    // A device that has not applied the section the remote holds cannot tell
-    // which removals are still carried there.
-    if cursor.applied_generation < reference.generation {
-        return (BTreeMap::new(), gc_floor.clone());
-    }
-    let mut reclaimed = BTreeMap::new();
-    let mut floor = gc_floor.clone();
-    for row in rows {
-        let Some(marker) = row.value.first_published() else {
-            continue;
-        };
-        if marker.generation > reference.generation
-            || now_ms.saturating_sub(marker.at_ms) < TOMBSTONE_RETENTION_MS
-        {
-            continue;
-        }
-        reclaimed.insert(row.key(), ReclaimedRowVersion {
-            write_clock: row.write_clock.clone(),
-            writer_id: row.writer_id.clone(),
-            first_published: marker.clone(),
-        });
-        floor = floor.max(marker.generation.clone());
-    }
-    (reclaimed, floor)
-}
 
 pub(crate) fn section_of(kind: SectionKind) -> Option<Section> {
     match kind {
@@ -237,6 +159,53 @@ pub(crate) fn capture_section(
     })
 }
 
+fn capture_prepared_section(
+    prepared: &PreparedSectionRows,
+    generation: Sequence,
+    gc_floor: Sequence,
+    max_write_clock: Sequence,
+    spool: &Path,
+    cancel: &Cancellation,
+) -> Result<CapturedSection> {
+    cancel.check()?;
+    fs::create_dir_all(spool).map_err(transient)?;
+    if crate::trust_boundary::is_link_like(&fs::symlink_metadata(spool).map_err(transient)?) {
+        return Err(corrupt("section spool is a link"));
+    }
+    let kind = prepared.kind();
+    let mut sources = Vec::new();
+    let mut fingerprints: BTreeMap<String, [u8; 32]> = BTreeMap::new();
+    prepared.visit_entries_mapped(|entry, object| {
+        cancel.check()?;
+        if let Some(bytes) = object {
+            let (digest, path) = write_spool_object(spool, bytes)?;
+            sources.push(SectionSource {
+                kind: wire::CatalogEntryKind::SectionObject,
+                key: format!("object/{digest}"), content_sha256: digest,
+                byte_length: bytes.len() as u64, path,
+            });
+        }
+        let bytes = entry.encode().map_err(corrupt)?;
+        let (digest, path) = write_spool_object(spool, &bytes)?;
+        if fingerprints.insert(entry.key.clone(), hash(&bytes)).is_some() {
+            return Err(corrupt("section key appears twice"));
+        }
+        sources.push(SectionSource {
+            kind: wire::CatalogEntryKind::SectionEntry,
+            key: entry.key.clone(), content_sha256: digest,
+            byte_length: bytes.len() as u64, path,
+        });
+        Ok(())
+    }, preparation_error)?;
+    sources.sort_by(|a, b| (a.kind as u8, &a.key).cmp(&(b.kind as u8, &b.key)));
+    sources.dedup_by(|a, b| a.kind == b.kind && a.key == b.key);
+    Ok(CapturedSection {
+        kind, generation, gc_floor, max_write_clock,
+        content_fingerprint: fingerprint(&kind.fingerprint_domain(), &fingerprints),
+        sources,
+    })
+}
+
 fn device_error(_: crate::persistent_store::StoreError) -> ProviderError {
     ProviderError::new(ErrorKind::Transient)
 }
@@ -257,31 +226,209 @@ pub(crate) fn capture_backup_sections(
     cancel: &Cancellation,
 ) -> Result<Vec<CapturedSection>> {
     let device = store.device_store_mut().map_err(device_error)?;
-    let mut captured = Vec::new();
-    for (kind, selected) in [
+    let kinds = [
         (SectionKind::Hypa, policy.hypa),
         (SectionKind::LocalPlugins, policy.local_plugins),
         (SectionKind::LocalSettings, policy.local_settings),
-    ] {
-        if !selected {
-            continue;
-        }
-        let rows = match section_of(kind) {
-            Some(section) => device.read_backup_section_rows(section).map_err(device_error)?,
-            None => device.read_local_setting_rows().map_err(device_error)?,
-        };
-        captured.push(capture_section(
-            kind,
-            &rows,
-            false,
+    ].into_iter().filter_map(|(kind, selected)| selected.then_some(kind)).collect::<Vec<_>>();
+    let prepared = device.capture_backup_sections(&kinds).map_err(device_error)?;
+    prepared.iter().map(|section| capture_prepared_section(
+            section,
             Sequence::from(0u64),
             Sequence::from(0u64),
             Sequence::from(0u64),
-            &spool.join(kind.id()),
+            &spool.join(section.kind().id()),
             cancel,
-        )?);
+        )).collect()
+}
+
+struct StateSectionCapture {
+    section: Section,
+    kind: SectionKind,
+    generation: Sequence,
+    gc_floor: Sequence,
+    max_write_clock: Sequence,
+    participation_generation: Sequence,
+    marker: TombstonePublication,
+    reference: Option<wire::SectionSnapshotRef>,
+    cursor: Option<SectionCursor>,
+    sources: Vec<SectionSource>,
+    fingerprints: BTreeMap<String, [u8; 32]>,
+    publication_rows: u64,
+    publication: Option<Connection>,
+    publication_stage: tempfile::NamedTempFile,
+    publication_path: PathBuf,
+    spool: PathBuf,
+}
+
+impl StateSectionCapture {
+    fn new(
+        section: Section,
+        state: crate::persistent_store::device_store::sections::SectionState,
+        cursor: Option<SectionCursor>,
+        generation: Sequence,
+        reference: Option<wire::SectionSnapshotRef>,
+        at_ms: u64,
+        spool: PathBuf,
+    ) -> Result<Self> {
+        fs::create_dir_all(&spool).map_err(transient)?;
+        if crate::trust_boundary::is_link_like(&fs::symlink_metadata(&spool).map_err(transient)?) {
+            return Err(corrupt("section spool is a link"));
+        }
+        let publication_stage = tempfile::NamedTempFile::new_in(&spool).map_err(transient)?;
+        let publication = Connection::open(publication_stage.path()).map_err(transient)?;
+        publication.execute_batch(
+            "PRAGMA journal_mode=DELETE;
+             PRAGMA synchronous=FULL;
+             PRAGMA temp_store=FILE;
+             PRAGMA mmap_size=0;
+             CREATE TABLE publication_meta(
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                section TEXT NOT NULL,
+                participation_generation TEXT NOT NULL,
+                first_published_generation TEXT NOT NULL,
+                first_published_at_ms INTEGER NOT NULL,
+                gc_floor TEXT NOT NULL,
+                max_write_clock TEXT NOT NULL,
+                row_count INTEGER NOT NULL
+             );
+             CREATE TABLE publication_rows(
+                key1 TEXT NOT NULL,key2 TEXT NOT NULL,key3 TEXT NOT NULL,
+                write_clock TEXT NOT NULL,writer_id TEXT NOT NULL,
+                disposition INTEGER NOT NULL CHECK(disposition IN (0,1)),
+                stamped INTEGER NOT NULL CHECK(stamped IN (0,1)),
+                first_published_generation TEXT,
+                first_published_at_ms INTEGER,
+                PRIMARY KEY(key1,key2,key3),
+                CHECK((first_published_generation IS NULL)=(first_published_at_ms IS NULL)),
+                CHECK(disposition=0 OR (stamped=0 AND first_published_generation IS NOT NULL))
+             ) WITHOUT ROWID;
+             BEGIN IMMEDIATE;",
+        ).map_err(transient)?;
+        let kind = match section {
+            Section::Hypa => SectionKind::Hypa,
+            Section::LocalPlugins => SectionKind::LocalPlugins,
+        };
+        let inherited_floor = reference.as_ref().map(|reference| reference.gc_floor.clone())
+            .unwrap_or_else(|| Sequence::from(0u64));
+        Ok(Self {
+            section, kind, generation: generation.clone(), gc_floor: inherited_floor,
+            max_write_clock: state.max_write_clock,
+            participation_generation: state.participation_generation,
+            marker: TombstonePublication { generation, at_ms }, reference, cursor,
+            sources: Vec::new(), fingerprints: BTreeMap::new(), publication_rows: 0,
+            publication: Some(publication), publication_stage,
+            publication_path: spool.join("publication.sqlite"), spool,
+        })
     }
-    Ok(captured)
+
+    fn insert_evidence(
+        &mut self,
+        row: &SectionRow,
+        disposition: i64,
+        stamped: bool,
+        first_published: Option<&TombstonePublication>,
+    ) -> Result<()> {
+        let at_ms = first_published.map(|marker| i64::try_from(marker.at_ms))
+            .transpose().map_err(corrupt)?;
+        self.publication.as_ref().expect("open publication index").execute(
+            "INSERT INTO publication_rows(
+                key1,key2,key3,write_clock,writer_id,disposition,stamped,
+                first_published_generation,first_published_at_ms
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![row.key1, row.key2, row.key3, row.write_clock.as_str(), row.writer_id,
+                disposition, stamped, first_published.map(|marker| marker.generation.as_str()), at_ms],
+        ).map_err(corrupt)?;
+        self.publication_rows = self.publication_rows.checked_add(1)
+            .ok_or_else(|| corrupt("publication row count is exhausted"))?;
+        Ok(())
+    }
+
+    fn push(&mut self, mut row: SectionRow, cancel: &Cancellation) -> Result<()> {
+        cancel.check()?;
+        if let Some(first_published) = row.value.first_published().cloned() {
+            let reclaimable = self.reference.as_ref().zip(self.cursor.as_ref()).is_some_and(
+                |(reference, cursor)| cursor.applied_generation >= reference.generation
+                    && first_published.generation <= reference.generation
+                    && self.marker.at_ms.saturating_sub(first_published.at_ms) >= TOMBSTONE_RETENTION_MS,
+            );
+            if reclaimable {
+                self.gc_floor = self.gc_floor.clone().max(first_published.generation.clone());
+                self.insert_evidence(&row, 1, false, Some(&first_published))?;
+                return Ok(());
+            }
+        }
+        let stamped = matches!(row.value, SectionValueRow::Tombstone { first_published: None });
+        if stamped {
+            if self.marker.generation == Sequence::from(0u64) { return Ok(()); }
+            row.value = SectionValueRow::Tombstone {
+                first_published: Some(self.marker.clone()),
+            };
+        }
+        let entry = row.to_entry(self.kind, true).map_err(corrupt)?;
+        if let (SectionValueRow::Hypa { vector, .. }, SectionValue::Hypa(value)) = (&row.value, &entry.value) {
+            if matches!(value.vector, InlineOrObject::Object(_)) {
+                let (digest, path) = write_spool_object(&self.spool, vector)?;
+                self.sources.push(SectionSource {
+                    kind: wire::CatalogEntryKind::SectionObject,
+                    key: format!("object/{digest}"), content_sha256: digest,
+                    byte_length: vector.len() as u64, path,
+                });
+            }
+        }
+        let bytes = entry.encode().map_err(corrupt)?;
+        let (digest, path) = write_spool_object(&self.spool, &bytes)?;
+        if self.fingerprints.insert(entry.key.clone(), hash(&bytes)).is_some() {
+            return Err(corrupt("section key appears twice"));
+        }
+        self.sources.push(SectionSource {
+            kind: wire::CatalogEntryKind::SectionEntry,
+            key: entry.key, content_sha256: digest, byte_length: bytes.len() as u64, path,
+        });
+        let stamped_marker = stamped.then(|| self.marker.clone());
+        self.insert_evidence(&row, 0, stamped, stamped_marker.as_ref())
+    }
+
+    fn finish(mut self) -> Result<(CapturedSection, SectionPublication)> {
+        let row_count = i64::try_from(self.publication_rows).map_err(corrupt)?;
+        let at_ms = i64::try_from(self.marker.at_ms).map_err(corrupt)?;
+        let publication = self.publication.take().expect("open publication index");
+        publication.execute(
+            "INSERT INTO publication_meta(
+                singleton,section,participation_generation,first_published_generation,
+                first_published_at_ms,gc_floor,max_write_clock,row_count
+             ) VALUES (1,?1,?2,?3,?4,?5,?6,?7)",
+            params![self.section.as_str(), self.participation_generation.as_str(),
+                self.marker.generation.as_str(), at_ms, self.gc_floor.as_str(),
+                self.max_write_clock.as_str(), row_count],
+        ).map_err(transient)?;
+        publication.execute_batch("COMMIT;").map_err(transient)?;
+        drop(publication);
+        self.publication_stage.as_file().sync_all().map_err(transient)?;
+        if self.publication_path.exists() {
+            let metadata = fs::symlink_metadata(&self.publication_path).map_err(transient)?;
+            if !metadata.is_file() || crate::trust_boundary::is_link_like(&metadata) {
+                return Err(corrupt("publication index is not a regular file"));
+            }
+            fs::remove_file(&self.publication_path).map_err(transient)?;
+        }
+        self.publication_stage.persist(&self.publication_path)
+            .map_err(|error| transient(error.error))?;
+        crate::trust_boundary::sync_directory(&self.spool).map_err(transient)?;
+        self.sources.sort_by(|a, b| (a.kind as u8, &a.key).cmp(&(b.kind as u8, &b.key)));
+        self.sources.dedup_by(|a, b| a.kind == b.kind && a.key == b.key);
+        Ok((CapturedSection {
+            kind: self.kind,
+            generation: self.generation,
+            gc_floor: self.gc_floor,
+            max_write_clock: self.max_write_clock,
+            content_fingerprint: fingerprint(&self.kind.fingerprint_domain(), &self.fingerprints),
+            sources: self.sources,
+        }, SectionPublication {
+            section: self.section,
+            publication_index_path: self.publication_path,
+        }))
+    }
 }
 
 /// What a synchronization connection publishes. Only a participating section
@@ -299,79 +446,232 @@ pub(crate) fn capture_state_sections(
         crate::persistent_store::device_store::now_ms().map_err(device_error)?,
     )
     .map_err(corrupt)?;
-    let device = store.device_store_mut().map_err(device_error)?;
     let mut captured = Vec::new();
     let mut publications = Vec::new();
-    for kind in [SectionKind::Hypa, SectionKind::LocalPlugins] {
-        let section = section_of(kind).expect("synchronizable section");
-        let state = device.section_state(section).map_err(device_error)?;
-        if !state.participating {
-            continue;
-        }
-        let reference = parent.get(kind.id());
-        let cursor = device
-            .read_section_cursor(connection_id, library_lineage, section)
+    let mut current: Option<StateSectionCapture> = None;
+    let mut behind_floor = None;
+    let device = store.device_store_mut().map_err(device_error)?;
+    let visit = device.visit_participating_section_snapshot_mapped(
+        connection_id,
+        library_lineage,
+        |event| {
+            match event {
+                SectionSnapshotEvent::Section { section, state, cursor } => {
+                    if let Some(previous) = current.take() {
+                        let (section, publication) = previous.finish()?;
+                        captured.push(section);
+                        publications.push(publication);
+                    }
+                    let kind = match section {
+                        Section::Hypa => SectionKind::Hypa,
+                        Section::LocalPlugins => SectionKind::LocalPlugins,
+                    };
+                    let reference = parent.get(kind.id()).cloned();
+                    let applied = cursor.as_ref().map(|cursor| cursor.applied_generation.clone())
+                        .unwrap_or_else(|| Sequence::from(0u64));
+                    if reference.as_ref().is_some_and(|reference| reference.gc_floor > applied) {
+                        behind_floor = Some(section);
+                        return Err(transient("this device is behind the remote section floor"));
+                    }
+                    current = Some(StateSectionCapture::new(
+                        section, state, cursor, generation.clone(), reference, at_ms,
+                        spool.join(kind.id()),
+                    )?);
+                }
+                SectionSnapshotEvent::Row { section, row } => {
+                    let capture = current.as_mut()
+                        .filter(|capture| capture.section == section)
+                        .ok_or_else(|| corrupt("section snapshot row has no header"))?;
+                    capture.push(row, cancel)?;
+                }
+            }
+            Ok(())
+        },
+        preparation_error,
+    );
+    if let Some(section) = behind_floor {
+        device.forget_section_cursor(connection_id, library_lineage, section)
             .map_err(device_error)?;
-        // A remote whose floor stands above what this device applied has
-        // reclaimed removals this device never saw, so publishing over it as an
-        // increment would bring their values back. Dropping the cursor sends the
-        // section through the rejoin path on the next cycle instead.
-        let applied = cursor
-            .as_ref()
-            .map(|cursor| cursor.applied_generation.clone())
-            .unwrap_or_else(|| Sequence::from(0u64));
-        if reference.is_some_and(|reference| reference.gc_floor > applied) {
-            device
-                .forget_section_cursor(connection_id, library_lineage, section)
-                .map_err(device_error)?;
-            return Err(transient("this device is behind the remote section floor"));
-        }
-        let held = device.read_section_rows(section).map_err(device_error)?;
-        // Commit numbers belong to one remote lineage. Preserve that remote's
-        // floor, not device-wide bookkeeping from an unrelated publication.
-        let inherited_floor = reference.map(|reference| reference.gc_floor.clone())
-            .unwrap_or_else(|| Sequence::from(0u64));
-        let (reclaimed, gc_floor) = reclaimable_removals(
-            &held,
-            reference,
-            cursor.as_ref(),
-            &inherited_floor,
-            at_ms,
-        );
-        let marker = TombstonePublication {
-            generation: generation.clone(),
-            at_ms,
-        };
-        let (rows, stamped) = stamp_removals(
-            held.into_iter()
-                .filter(|row| !reclaimed.contains_key(&row.key()))
-                .collect(),
-            &marker,
-        );
-        captured.push(capture_section(
-            kind,
-            &rows,
-            true,
-            generation.clone(),
-            gc_floor.clone(),
-            state.max_write_clock.clone(),
-            &spool.join(kind.id()),
-            cancel,
-        )?);
-        publications.push(SectionPublication {
-            section,
-            participation_generation: state.participation_generation,
-            published: rows
-                .iter()
-                .map(|row| (row.key(), row.version()))
-                .collect(),
-            stamped,
-            first_published: marker,
-            reclaimed,
-            gc_floor,
-        });
+        return Err(transient("this device is behind the remote section floor"));
+    }
+    visit?;
+    if let Some(previous) = current.take() {
+        let (section, publication) = previous.finish()?;
+        captured.push(section);
+        publications.push(publication);
     }
     Ok((captured, publications))
+}
+
+struct PublicationMeta {
+    section: Section,
+    participation_generation: Sequence,
+    first_published: TombstonePublication,
+    gc_floor: Sequence,
+    max_write_clock: Sequence,
+}
+
+fn stored_sequence(value: String) -> Result<Sequence> {
+    value.try_into().map_err(corrupt)
+}
+
+fn open_publication_index(path: &Path) -> Result<(Connection, PublicationMeta)> {
+    let metadata = fs::symlink_metadata(path).map_err(transient)?;
+    if !metadata.is_file() || crate::trust_boundary::is_link_like(&metadata) {
+        return Err(corrupt("publication index is not a regular file"));
+    }
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ).map_err(corrupt)?;
+    connection.execute_batch("PRAGMA query_only=ON; PRAGMA mmap_size=0; BEGIN;")
+        .map_err(corrupt)?;
+    let (section, participation_generation, first_generation, first_at_ms, gc_floor,
+        max_write_clock, expected_rows): (String, String, String, i64, String, String, i64) =
+        connection.query_row(
+            "SELECT section,participation_generation,first_published_generation,
+                first_published_at_ms,gc_floor,max_write_clock,row_count
+             FROM publication_meta WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                row.get(4)?, row.get(5)?, row.get(6)?)),
+        ).map_err(corrupt)?;
+    let section = crate::persistent_store::device_store::sections::section_from_id(&section)
+        .ok_or_else(|| corrupt("publication index names an unknown section"))?;
+    let actual_rows: i64 = connection.query_row(
+        "SELECT count(*) FROM publication_rows", [], |row| row.get(0),
+    ).map_err(corrupt)?;
+    if expected_rows < 0 || actual_rows != expected_rows {
+        return Err(corrupt("publication index row count differs"));
+    }
+    Ok((connection, PublicationMeta {
+        section,
+        participation_generation: stored_sequence(participation_generation)?,
+        first_published: TombstonePublication {
+            generation: stored_sequence(first_generation)?,
+            at_ms: u64::try_from(first_at_ms).map_err(corrupt)?,
+        },
+        gc_floor: stored_sequence(gc_floor)?,
+        max_write_clock: stored_sequence(max_write_clock)?,
+    }))
+}
+
+pub(crate) fn load_prepared_section_publications(
+    sections_spool: &Path,
+) -> Result<Vec<SectionPublication>> {
+    let mut publications = Vec::new();
+    for (kind, section) in [
+        (SectionKind::Hypa, Section::Hypa),
+        (SectionKind::LocalPlugins, Section::LocalPlugins),
+    ] {
+        let path = sections_spool.join(kind.id()).join("publication.sqlite");
+        if !path.exists() { continue; }
+        let (_, metadata) = open_publication_index(&path)?;
+        if metadata.section != section {
+            return Err(corrupt("publication index is under the wrong section"));
+        }
+        publications.push(SectionPublication { section, publication_index_path: path });
+    }
+    Ok(publications)
+}
+
+fn publication_row(
+    row: &rusqlite::Row<'_>,
+    section: Section,
+) -> crate::persistent_store::StoreResult<SectionPublicationRow> {
+    let key: (String, String, String) = (row.get(0)?, row.get(1)?, row.get(2)?);
+    let valid_key = match section {
+        Section::Hypa => key.1.is_empty() && key.2.is_empty()
+            && risunest_external_storage_format::section::hypa_entry_key(&key.0).is_ok(),
+        Section::LocalPlugins => risunest_external_storage_format::section::local_plugin_entry_key(
+            &key.0, &key.1, &key.2,
+        ).is_ok(),
+    };
+    if !valid_key {
+        return Err(crate::persistent_store::StoreError::Validation {
+            message: "Publication index key is invalid".into(),
+        });
+    }
+    let write_clock: String = row.get(3)?;
+    let writer_id: String = row.get(4)?;
+    let write_clock = write_clock.try_into().map_err(|_| crate::persistent_store::StoreError::Validation {
+        message: "Publication index write clock is invalid".into(),
+    })?;
+    if writer_id.is_empty() || writer_id.len() > 1024 {
+        return Err(crate::persistent_store::StoreError::Validation {
+            message: "Publication index writer is invalid".into(),
+        });
+    }
+    let disposition: i64 = row.get(5)?;
+    let stamped: i64 = row.get(6)?;
+    let first_generation: Option<String> = row.get(7)?;
+    let first_at_ms: Option<i64> = row.get(8)?;
+    let first_published = match (first_generation, first_at_ms) {
+        (Some(generation), Some(at_ms)) => Some(TombstonePublication {
+            generation: generation.try_into().map_err(|_| crate::persistent_store::StoreError::Validation {
+                message: "Publication removal generation is invalid".into(),
+            })?,
+            at_ms: u64::try_from(at_ms).map_err(|_| crate::persistent_store::StoreError::Validation {
+                message: "Publication removal time is invalid".into(),
+            })?,
+        }),
+        (None, None) => None,
+        _ => return Err(crate::persistent_store::StoreError::Validation {
+            message: "Publication removal marker is incomplete".into(),
+        }),
+    };
+    let disposition = match (disposition, stamped, first_published) {
+        (0, 0, None) => SectionPublicationDisposition::Published { first_published: None },
+        (0, 1, Some(marker)) => SectionPublicationDisposition::Published {
+            first_published: Some(marker),
+        },
+        (1, 0, Some(marker)) => SectionPublicationDisposition::Reclaimed {
+            first_published: marker,
+        },
+        _ => return Err(crate::persistent_store::StoreError::Validation {
+            message: "Publication row disposition is invalid".into(),
+        }),
+    };
+    Ok(SectionPublicationRow {
+        key,
+        version: SectionEntryVersion { write_clock, writer_id },
+        disposition,
+    })
+}
+
+pub(crate) fn note_prepared_section_published(
+    device: &mut crate::persistent_store::device_store::DeviceStore,
+    publication: &SectionPublication,
+    connection_id: &str,
+    library_lineage: &str,
+    cursor: &SectionCursor,
+) -> Result<bool> {
+    let (connection, metadata) = open_publication_index(&publication.publication_index_path)?;
+    if metadata.section != publication.section
+        || metadata.gc_floor != cursor.applied_gc_floor
+        || metadata.max_write_clock != cursor.observed_max_write_clock
+    {
+        return Err(corrupt("confirmed section differs from its publication index"));
+    }
+    let mut statement = connection.prepare(
+        "SELECT key1,key2,key3,write_clock,writer_id,disposition,stamped,
+            first_published_generation,first_published_at_ms
+         FROM publication_rows ORDER BY key1,key2,key3",
+    ).map_err(corrupt)?;
+    let mut rows = statement.query([]).map_err(corrupt)?;
+    let evidence = std::iter::from_fn(|| match rows.next() {
+        Ok(Some(row)) => Some(publication_row(row, publication.section)),
+        Ok(None) => None,
+        Err(error) => Some(Err(error.into())),
+    });
+    device.note_spooled_section_published(
+        publication.section,
+        &metadata.participation_generation,
+        &metadata.first_published,
+        &metadata.gc_floor,
+        (connection_id, library_lineage, cursor),
+        evidence,
+    ).map_err(device_error)
 }
 
 /// The sections this device takes part in that this remote lineage holds no
@@ -755,6 +1055,43 @@ mod tests {
             .collect()
     }
 
+    fn confirm_publication(
+        store: &mut PersistentStore,
+        publication: &SectionPublication,
+        captured: &CapturedSection,
+    ) {
+        let cursor = SectionCursor {
+            applied_generation: captured.generation.clone(),
+            applied_gc_floor: captured.gc_floor.clone(),
+            observed_max_write_clock: captured.max_write_clock.clone(),
+        };
+        assert!(note_prepared_section_published(
+            store.device_store_mut().expect("open device store"),
+            publication,
+            "connection",
+            "library",
+            &cursor,
+        ).expect("record the confirmed publication"));
+    }
+
+    fn captured_for<'a>(
+        captured: &'a [CapturedSection],
+        publication: &SectionPublication,
+    ) -> &'a CapturedSection {
+        captured.iter().find(|captured| section_of(captured.kind) == Some(publication.section))
+            .expect("captured publication section")
+    }
+
+    fn publication_evidence_count(publication: &SectionPublication, disposition: i64) -> i64 {
+        let (connection, _) = open_publication_index(&publication.publication_index_path)
+            .expect("open publication index");
+        connection.query_row(
+            "SELECT count(*) FROM publication_rows WHERE disposition=?1",
+            [disposition],
+            |row| row.get(0),
+        ).expect("count publication evidence")
+    }
+
     #[test]
     fn a_large_vector_becomes_an_object_and_returns_byte_identical() {
         let spool = tempfile::tempdir().expect("create spool");
@@ -1106,7 +1443,7 @@ mod tests {
                 )
                 .expect("record what this lineage carried");
         }
-        let (_, publications) = capture_state_sections(
+        let (captured, publications) = capture_state_sections(
             &mut store,
             &Sequence::from(4u64),
             &BTreeMap::new(),
@@ -1118,23 +1455,13 @@ mod tests {
         .expect("capture the state sections");
         assert_eq!(publications.len(), 1);
 
-        let device = store.device_store_mut().expect("open device store");
-        assert!(device
+        assert!(store.device_store_mut().expect("open device store")
             .sections_await_publication("connection", "library")
             .expect("read awaiting publication"));
         for publication in &publications {
-            device
-                .note_section_published(
-                    publication.section,
-                    &publication.published,
-                    &publication.stamped,
-                    &publication.first_published,
-                    &publication.reclaimed,
-                    &publication.gc_floor,
-                    None,
-                )
-                .expect("record the confirmed publication");
+            confirm_publication(&mut store, publication, captured_for(&captured, publication));
         }
+        let device = store.device_store_mut().expect("open device store");
         assert!(!device
             .sections_await_publication("connection", "library")
             .expect("read awaiting publication"));
@@ -1237,19 +1564,7 @@ mod tests {
         assert!(removal_marker(&mut store, "gone").is_none());
 
         for publication in &publications {
-            store
-                .device_store_mut()
-                .expect("open device store")
-                .note_section_published(
-                    publication.section,
-                    &publication.published,
-                    &publication.stamped,
-                    &publication.first_published,
-                    &publication.reclaimed,
-                    &publication.gc_floor,
-                    None,
-                )
-                .expect("record the confirmed publication");
+            confirm_publication(&mut store, publication, captured_for(&captured, publication));
         }
         assert_eq!(removal_marker(&mut store, "gone"), Some(carried_marker));
 
@@ -1556,13 +1871,13 @@ mod tests {
                 }).unwrap();
                 let mut reference = section_reference(6, 0);
                 reference.kind = kind;
-                let (_, publications) = capture_state_sections(
+                let (captured, publications) = capture_state_sections(
                     &mut store, &Sequence::from(7u64),
                     &BTreeMap::from([(kind.id().to_owned(), reference)]),
                     "connection", "library", spool.path(), &Cancellation::default(),
                 ).unwrap();
                 let publication = &publications[0];
-                assert_eq!(publication.reclaimed.len(), 1);
+                assert_eq!(publication_evidence_count(publication, 1), 1);
                 let newer = match replacement {
                     0 => SectionRow { write_clock: Sequence::from(11u64), ..value.clone() },
                     1 => SectionRow { write_clock: Sequence::from(11u64), ..old.clone() },
@@ -1576,15 +1891,12 @@ mod tests {
                         ..old.clone()
                     },
                 };
-                let device = store.device_store_mut().unwrap();
-                device.apply_section_rows(section, &[newer.clone()]).unwrap();
+                store.device_store_mut().unwrap().apply_section_rows(section, &[newer.clone()]).unwrap();
                 let table = if section == Section::Hypa { "hypa_embeddings" } else { "plugin_device_storage" };
-                device.connection().execute(&format!("UPDATE {table} SET published_clock=NULL"), []).unwrap();
-                device.note_section_published(
-                    section, &publication.published, &publication.stamped,
-                    &publication.first_published, &publication.reclaimed, &publication.gc_floor,
-                    None,
-                ).unwrap();
+                store.device_store_mut().unwrap().connection()
+                    .execute(&format!("UPDATE {table} SET published_clock=NULL"), []).unwrap();
+                confirm_publication(&mut store, publication, captured_for(&captured, publication));
+                let device = store.device_store_mut().unwrap();
                 assert_eq!(device.read_section_rows(section).unwrap(), vec![newer], "{kind:?}, replacement {replacement}");
                 assert!(device.sections_await_publication("connection", "library").unwrap());
                 assert_eq!(device.section_state(section).unwrap().gc_floor, Sequence::from(5u64));
@@ -1609,21 +1921,18 @@ mod tests {
                 device.set_section_participating(chosen, chosen == section).unwrap();
             }
             device.apply_section_rows(section, &[row.clone()]).unwrap();
-            let (_, publications) = capture_state_sections(
+            let (captured, publications) = capture_state_sections(
                 &mut store, &Sequence::from(7u64), &BTreeMap::new(),
                 "connection", "library", spool.path(), &Cancellation::default(),
             ).unwrap();
             row.writer_id = "writer-b".into();
-            let device = store.device_store_mut().unwrap();
-            device.apply_section_rows(section, &[row.clone()]).unwrap();
+            store.device_store_mut().unwrap().apply_section_rows(section, &[row.clone()]).unwrap();
             let table = if section == Section::Hypa { "hypa_embeddings" } else { "plugin_device_storage" };
-            device.connection().execute(&format!("UPDATE {table} SET published_clock=NULL"), []).unwrap();
+            store.device_store_mut().unwrap().connection()
+                .execute(&format!("UPDATE {table} SET published_clock=NULL"), []).unwrap();
             let publication = &publications[0];
-            device.note_section_published(
-                section, &publication.published, &publication.stamped,
-                &publication.first_published, &publication.reclaimed, &publication.gc_floor,
-                None,
-            ).unwrap();
+            confirm_publication(&mut store, publication, captured_for(&captured, publication));
+            let device = store.device_store_mut().unwrap();
             assert_eq!(device.read_section_rows(section).unwrap(), vec![row]);
             let pending: bool = device.connection().query_row(
                 &format!("SELECT published_clock IS NULL FROM {table}"), [], |row| row.get(0),
@@ -1668,22 +1977,10 @@ mod tests {
             .iter()
             .find(|publication| publication.section == Section::LocalPlugins)
             .expect("a plugin publication");
-        assert_eq!(
-            publication.reclaimed,
-            BTreeMap::from([((
-                "plugin-a".to_owned(),
-                "string".to_owned(),
-                "old".to_owned()
-            ), ReclaimedRowVersion {
-                write_clock: Sequence::from(10u64),
-                writer_id: "writer-a".to_owned(),
-                first_published: TombstonePublication {
-                    generation: Sequence::from(5u64),
-                    at_ms: expired,
-                },
-            })])
-        );
-        assert_eq!(publication.gc_floor, Sequence::from(5u64));
+        assert_eq!(publication_evidence_count(publication, 1), 1);
+        let (_, publication_meta) = open_publication_index(&publication.publication_index_path)
+            .expect("open publication index");
+        assert_eq!(publication_meta.gc_floor, Sequence::from(5u64));
         let plugins = captured
             .iter()
             .find(|section| section.kind == SectionKind::LocalPlugins)
@@ -1714,19 +2011,7 @@ mod tests {
         );
 
         for publication in &publications {
-            store
-                .device_store_mut()
-                .expect("open device store")
-                .note_section_published(
-                    publication.section,
-                    &publication.published,
-                    &publication.stamped,
-                    &publication.first_published,
-                    &publication.reclaimed,
-                    &publication.gc_floor,
-                    None,
-                )
-                .expect("record the confirmed publication");
+            confirm_publication(&mut store, publication, captured_for(&captured, publication));
         }
         assert_eq!(
             held_plugin_keys(&mut store),
