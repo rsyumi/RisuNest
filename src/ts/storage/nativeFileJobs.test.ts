@@ -311,14 +311,17 @@ describe('native file jobs', () => {
         expect(JSON.stringify(calls[0])).not.toContain('expectedRevision')
     })
 
-    it.each([false, true])(
-        'acknowledges a committed portable device session before refresh (ack fails: %s)',
-        async (ackFails) => {
+    it.each(['none', 'ack', 'open'] as const)(
+        'acknowledges and reopens a committed portable device session before refresh (failure: %s)',
+        async (failure) => {
             const calls: string[] = []
             const events: string[] = []
             let staleWritesBlocked = false
-            let failAck = ackFails
+            let storeOpen = false
+            let failAck = failure === 'ack'
+            let failOpen = failure === 'open'
             const refresh = vi.fn(async () => {
+                if (!storeOpen) throw new Error('persistent store has not been opened')
                 events.push('working-set-refresh')
             })
             const markRefreshRequired = vi.fn((revision: number) => {
@@ -367,6 +370,12 @@ describe('native file jobs', () => {
                     if (failAck) throw new Error('synthetic ack failure')
                     return undefined
                 }
+                if (command === 'pds_open') {
+                    events.push('persistent-store-open')
+                    if (failOpen) throw new Error('synthetic open failure')
+                    storeOpen = true
+                    return { revision: 4 }
+                }
                 if (command === 'native_file_job_forget') return true
                 throw new Error(`Unexpected command: ${command}`)
             }
@@ -374,7 +383,7 @@ describe('native file jobs', () => {
                 refresh,
                 markRefreshRequired,
                 release: () => {
-                    if (ackFails) expect(staleWritesBlocked).toBe(true)
+                    if (failure !== 'none') expect(staleWritesBlocked).toBe(true)
                     events.push('fence-released')
                 },
             })
@@ -397,7 +406,7 @@ describe('native file jobs', () => {
                 },
             )
 
-            if (ackFails) {
+            if (failure !== 'none') {
                 await expect(running).rejects.toBeInstanceOf(
                     NativeFileJobActivationCommittedError,
                 )
@@ -408,13 +417,20 @@ describe('native file jobs', () => {
                 expect(calls.filter(command => command === 'native_file_job_finalize'))
                     .toHaveLength(1)
                 failAck = false
+                failOpen = false
                 await expect(
                     retryCommittedWorkingSetRefreshWithContinuation(runtime),
                 ).resolves.toMatchObject({ revision: 4, projection: 'applied' })
                 expect(calls.filter(command => command === 'native_file_job_finalize'))
                     .toHaveLength(1)
+                expect(calls.filter(command => command === 'native_file_job_start'))
+                    .toHaveLength(1)
                 expect(refresh).toHaveBeenCalledOnce()
                 expect(calls).toContain('native_file_job_forget')
+                expect(calls.filter(command => command === 'native_device_backup_recovery_complete'))
+                    .toHaveLength(failure === 'ack' ? 2 : 1)
+                expect(calls.filter(command => command === 'pds_open'))
+                    .toHaveLength(failure === 'open' ? 2 : 1)
             } else {
                 await expect(running).resolves.toEqual(committed)
                 expect(refresh).toHaveBeenCalledOnce()
@@ -422,18 +438,30 @@ describe('native file jobs', () => {
                 expect(calls).toContain('native_file_job_forget')
             }
             expect(events).toEqual(
-                ackFails
+                failure === 'ack'
                     ? [
                         'library-hold',
                         'device-ack',
                         'refresh-required',
                         'fence-released',
                         'device-ack',
+                        'persistent-store-open',
                         'working-set-refresh',
                     ]
+                    : failure === 'open'
+                      ? [
+                            'library-hold',
+                            'device-ack',
+                            'persistent-store-open',
+                            'refresh-required',
+                            'fence-released',
+                            'persistent-store-open',
+                            'working-set-refresh',
+                        ]
                     : [
                         'library-hold',
                         'device-ack',
+                        'persistent-store-open',
                         'working-set-refresh',
                         'fence-released',
                     ],

@@ -1442,15 +1442,32 @@ async function runNativeReplacementRestore(
             }
             const deviceSessionId = terminal.deviceSessionId
             if (kind === 'restore-portable-backup' && deviceSessionId) {
-                const acknowledgeDeviceRecovery = async (): Promise<void> => {
-                    await invokeNative(
+                let recoveryAcknowledged = false
+                const prepareCommittedRefresh = async (): Promise<void> => {
+                    if (!recoveryAcknowledged) {
+                        await invokeNative(
+                            dependencies,
+                            'native_device_backup_recovery_complete',
+                            { sessionId: deviceSessionId },
+                        )
+                        recoveryAcknowledged = true
+                    }
+                    const opened = (await invokeNative(
                         dependencies,
-                        'native_device_backup_recovery_complete',
-                        { sessionId: deviceSessionId },
-                    )
+                        'pds_open',
+                    )) as { revision?: unknown }
+                    if (
+                        !Number.isSafeInteger(opened?.revision) ||
+                        (opened.revision as number) < terminal.result.revision
+                    ) {
+                        throw new NativeFileJobError(
+                            'revision-conflict',
+                            'Persistent store reopened before the committed native restore revision',
+                        )
+                    }
                 }
                 try {
-                    await acknowledgeDeviceRecovery()
+                    await prepareCommittedRefresh()
                 } catch (error) {
                     const committedError = new NativeFileJobActivationCommittedError(
                         terminal.result.revision,
@@ -1465,7 +1482,7 @@ async function runNativeReplacementRestore(
                         runtime,
                         runtime.getStorageAuthorityEpoch(),
                         continueAfterRefresh,
-                        acknowledgeDeviceRecovery,
+                        prepareCommittedRefresh,
                     )
                     throw committedError
                 }
