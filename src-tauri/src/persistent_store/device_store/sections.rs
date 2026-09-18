@@ -12,6 +12,9 @@ use risunest_sync_wire::Sequence;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 /// Device settings a restored installation wants back, as opposed to the
 /// coordination state it must never inherit from another run.
 pub(crate) const LOCAL_SETTING_KEYS: [&str; 9] = [
@@ -884,6 +887,10 @@ impl PreparedSectionRows {
                     }
                     _ => None,
                 };
+                #[cfg(test)]
+                if let Some(object) = &object {
+                    SECTION_TEST_MAX_VALUE_BYTES.fetch_max(object.len(), Ordering::Relaxed);
+                }
                 visitor(&entry, object.as_deref())?;
                 visited += 1;
                 after = key;
@@ -1016,6 +1023,35 @@ fn merge_validated_row(tx: &Transaction<'_>, section: Section, incoming: &Sectio
 const SECTION_PAGE_ROWS: usize = 256;
 const SECTION_PAGE_BYTES: usize = 4 * 1024 * 1024;
 
+#[cfg(test)]
+static SECTION_TEST_MAX_PAGE_ROWS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static SECTION_TEST_MAX_PAGE_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static SECTION_TEST_MAX_VALUE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+fn observe_section_page(rows: usize, bytes: usize) {
+    SECTION_TEST_MAX_PAGE_ROWS.fetch_max(rows, Ordering::Relaxed);
+    SECTION_TEST_MAX_PAGE_BYTES.fetch_max(bytes, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn reset_section_resource_evidence() {
+    SECTION_TEST_MAX_PAGE_ROWS.store(0, Ordering::Relaxed);
+    SECTION_TEST_MAX_PAGE_BYTES.store(0, Ordering::Relaxed);
+    SECTION_TEST_MAX_VALUE_BYTES.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn section_resource_evidence() -> (usize, usize, usize) {
+    (
+        SECTION_TEST_MAX_PAGE_ROWS.load(Ordering::Relaxed),
+        SECTION_TEST_MAX_PAGE_BYTES.load(Ordering::Relaxed),
+        SECTION_TEST_MAX_VALUE_BYTES.load(Ordering::Relaxed),
+    )
+}
+
 fn read_key_page(rows: &mut rusqlite::Rows<'_>) -> StoreResult<Vec<SectionKey>> {
     let mut page = Vec::new();
     let mut bytes = 0usize;
@@ -1028,6 +1064,8 @@ fn read_key_page(rows: &mut rusqlite::Rows<'_>) -> StoreResult<Vec<SectionKey>> 
         bytes = bytes.saturating_add(size);
         page.push(key);
     }
+    #[cfg(test)]
+    observe_section_page(page.len(), bytes);
     Ok(page)
 }
 
@@ -1042,6 +1080,8 @@ fn read_text_page(rows: &mut rusqlite::Rows<'_>) -> StoreResult<Vec<String>> {
         bytes = bytes.saturating_add(size);
         page.push(key);
     }
+    #[cfg(test)]
+    observe_section_page(page.len(), bytes);
     Ok(page)
 }
 

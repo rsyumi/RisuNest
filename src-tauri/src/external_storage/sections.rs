@@ -101,6 +101,57 @@ fn write_spool_object(spool: &Path, bytes: &[u8]) -> Result<(String, PathBuf)> {
     Ok((digest, path))
 }
 
+fn captured_section_fingerprint(
+    kind: SectionKind,
+    sources: &[SectionSource],
+) -> Result<[u8; 32]> {
+    let mut fingerprint = risunest_external_storage_format::format::FingerprintBuilder::new(
+        &kind.fingerprint_domain(),
+    );
+    let mut previous = None;
+    for source in sources.iter().filter(|source| {
+        source.kind == wire::CatalogEntryKind::SectionEntry
+    }) {
+        if previous.as_deref() == Some(&source.key) {
+            return Err(corrupt("section key appears twice"));
+        }
+        let digest: [u8; 32] = hex::decode(&source.content_sha256).map_err(corrupt)?
+            .try_into().map_err(|_| corrupt("section entry hash is invalid"))?;
+        fingerprint.push(&source.key, &digest).map_err(corrupt)?;
+        previous = Some(source.key.clone());
+    }
+    Ok(fingerprint.finish())
+}
+
+fn publication_evidence_fingerprint(connection: &Connection) -> Result<[u8; 32]> {
+    let mut fingerprint = risunest_external_storage_format::format::FingerprintBuilder::new(
+        b"risunest-section-publication-evidence-v1",
+    );
+    let mut statement = connection.prepare(
+        "SELECT key1,key2,key3,write_clock,writer_id,disposition,stamped,
+            first_published_generation,first_published_at_ms
+         FROM publication_rows ORDER BY key1,key2,key3",
+    ).map_err(corrupt)?;
+    let mut rows = statement.query([]).map_err(corrupt)?;
+    while let Some(row) = rows.next().map_err(corrupt)? {
+        let key = serde_json::to_string(&(
+            row.get::<_, String>(0).map_err(corrupt)?,
+            row.get::<_, String>(1).map_err(corrupt)?,
+            row.get::<_, String>(2).map_err(corrupt)?,
+        )).map_err(corrupt)?;
+        let bytes = serde_json::to_vec(&(
+            row.get::<_, String>(3).map_err(corrupt)?,
+            row.get::<_, String>(4).map_err(corrupt)?,
+            row.get::<_, i64>(5).map_err(corrupt)?,
+            row.get::<_, i64>(6).map_err(corrupt)?,
+            row.get::<_, Option<String>>(7).map_err(corrupt)?,
+            row.get::<_, Option<i64>>(8).map_err(corrupt)?,
+        )).map_err(corrupt)?;
+        fingerprint.push(&key, &hash(&bytes)).map_err(corrupt)?;
+    }
+    Ok(fingerprint.finish())
+}
+
 /// Encodes one section into spool files. `versioned` is false for a backup
 /// bundle, which carries user values without the counters behind them.
 pub(crate) fn capture_section(
@@ -119,7 +170,6 @@ pub(crate) fn capture_section(
         return Err(corrupt("section spool is a link"));
     }
     let mut sources = Vec::new();
-    let mut fingerprints: BTreeMap<String, [u8; 32]> = BTreeMap::new();
     for row in rows {
         cancel.check()?;
         let entry = row.to_entry(kind, versioned).map_err(corrupt)?;
@@ -136,9 +186,6 @@ pub(crate) fn capture_section(
         }
         let bytes = entry.encode().map_err(corrupt)?;
         let (digest, path) = write_spool_object(spool, &bytes)?;
-        if fingerprints.insert(key.clone(), hash(&bytes)).is_some() {
-            return Err(corrupt("section key appears twice"));
-        }
         sources.push(SectionSource {
             kind: wire::CatalogEntryKind::SectionEntry,
             key,
@@ -148,13 +195,16 @@ pub(crate) fn capture_section(
         });
     }
     sources.sort_by(|a, b| (a.kind as u8, &a.key).cmp(&(b.kind as u8, &b.key)));
-    sources.dedup_by(|a, b| a.kind == b.kind && a.key == b.key);
+    sources.dedup_by(|a, b| {
+        a.kind == wire::CatalogEntryKind::SectionObject && a.kind == b.kind && a.key == b.key
+    });
+    let content_fingerprint = captured_section_fingerprint(kind, &sources)?;
     Ok(CapturedSection {
         kind,
         generation,
         gc_floor,
         max_write_clock,
-        content_fingerprint: fingerprint(&kind.fingerprint_domain(), &fingerprints),
+        content_fingerprint,
         sources,
     })
 }
@@ -174,7 +224,6 @@ fn capture_prepared_section(
     }
     let kind = prepared.kind();
     let mut sources = Vec::new();
-    let mut fingerprints: BTreeMap<String, [u8; 32]> = BTreeMap::new();
     prepared.visit_entries_mapped(|entry, object| {
         cancel.check()?;
         if let Some(bytes) = object {
@@ -187,9 +236,6 @@ fn capture_prepared_section(
         }
         let bytes = entry.encode().map_err(corrupt)?;
         let (digest, path) = write_spool_object(spool, &bytes)?;
-        if fingerprints.insert(entry.key.clone(), hash(&bytes)).is_some() {
-            return Err(corrupt("section key appears twice"));
-        }
         sources.push(SectionSource {
             kind: wire::CatalogEntryKind::SectionEntry,
             key: entry.key.clone(), content_sha256: digest,
@@ -198,10 +244,13 @@ fn capture_prepared_section(
         Ok(())
     }, preparation_error)?;
     sources.sort_by(|a, b| (a.kind as u8, &a.key).cmp(&(b.kind as u8, &b.key)));
-    sources.dedup_by(|a, b| a.kind == b.kind && a.key == b.key);
+    sources.dedup_by(|a, b| {
+        a.kind == wire::CatalogEntryKind::SectionObject && a.kind == b.kind && a.key == b.key
+    });
+    let content_fingerprint = captured_section_fingerprint(kind, &sources)?;
     Ok(CapturedSection {
         kind, generation, gc_floor, max_write_clock,
-        content_fingerprint: fingerprint(&kind.fingerprint_domain(), &fingerprints),
+        content_fingerprint,
         sources,
     })
 }
@@ -253,7 +302,6 @@ struct StateSectionCapture {
     reference: Option<wire::SectionSnapshotRef>,
     cursor: Option<SectionCursor>,
     sources: Vec<SectionSource>,
-    fingerprints: BTreeMap<String, [u8; 32]>,
     publication_rows: u64,
     publication: Option<Connection>,
     publication_stage: tempfile::NamedTempFile,
@@ -275,6 +323,16 @@ impl StateSectionCapture {
         if crate::trust_boundary::is_link_like(&fs::symlink_metadata(&spool).map_err(transient)?) {
             return Err(corrupt("section spool is a link"));
         }
+        let publication_path = spool.join("publication.sqlite");
+        let at_ms = if publication_path.exists() {
+            let (_, existing) = open_publication_index(&publication_path)?;
+            if existing.section != section || existing.generation != generation {
+                return Err(corrupt("publication index belongs to another capture"));
+            }
+            existing.first_published_at_ms
+        } else {
+            at_ms
+        };
         let publication_stage = tempfile::NamedTempFile::new_in(&spool).map_err(transient)?;
         let publication = Connection::open(publication_stage.path()).map_err(transient)?;
         publication.execute_batch(
@@ -286,10 +344,12 @@ impl StateSectionCapture {
                 singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 section TEXT NOT NULL,
                 participation_generation TEXT NOT NULL,
-                first_published_generation TEXT NOT NULL,
+                generation TEXT NOT NULL,
                 first_published_at_ms INTEGER NOT NULL,
                 gc_floor TEXT NOT NULL,
                 max_write_clock TEXT NOT NULL,
+                content_fingerprint BLOB NOT NULL,
+                evidence_fingerprint BLOB NOT NULL,
                 row_count INTEGER NOT NULL
              );
              CREATE TABLE publication_rows(
@@ -316,9 +376,9 @@ impl StateSectionCapture {
             max_write_clock: state.max_write_clock,
             participation_generation: state.participation_generation,
             marker: TombstonePublication { generation, at_ms }, reference, cursor,
-            sources: Vec::new(), fingerprints: BTreeMap::new(), publication_rows: 0,
+            sources: Vec::new(), publication_rows: 0,
             publication: Some(publication), publication_stage,
-            publication_path: spool.join("publication.sqlite"), spool,
+            publication_path, spool,
         })
     }
 
@@ -378,9 +438,6 @@ impl StateSectionCapture {
         }
         let bytes = entry.encode().map_err(corrupt)?;
         let (digest, path) = write_spool_object(&self.spool, &bytes)?;
-        if self.fingerprints.insert(entry.key.clone(), hash(&bytes)).is_some() {
-            return Err(corrupt("section key appears twice"));
-        }
         self.sources.push(SectionSource {
             kind: wire::CatalogEntryKind::SectionEntry,
             key: entry.key, content_sha256: digest, byte_length: bytes.len() as u64, path,
@@ -392,37 +449,52 @@ impl StateSectionCapture {
     fn finish(mut self) -> Result<(CapturedSection, SectionPublication)> {
         let row_count = i64::try_from(self.publication_rows).map_err(corrupt)?;
         let at_ms = i64::try_from(self.marker.at_ms).map_err(corrupt)?;
+        self.sources.sort_by(|a, b| (a.kind as u8, &a.key).cmp(&(b.kind as u8, &b.key)));
+        self.sources.dedup_by(|a, b| {
+            a.kind == wire::CatalogEntryKind::SectionObject && a.kind == b.kind && a.key == b.key
+        });
+        let content_fingerprint = captured_section_fingerprint(self.kind, &self.sources)?;
         let publication = self.publication.take().expect("open publication index");
+        let evidence_fingerprint = publication_evidence_fingerprint(&publication)?;
         publication.execute(
             "INSERT INTO publication_meta(
-                singleton,section,participation_generation,first_published_generation,
-                first_published_at_ms,gc_floor,max_write_clock,row_count
-             ) VALUES (1,?1,?2,?3,?4,?5,?6,?7)",
+                singleton,section,participation_generation,generation,first_published_at_ms,
+                gc_floor,max_write_clock,content_fingerprint,evidence_fingerprint,row_count
+             ) VALUES (1,?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![self.section.as_str(), self.participation_generation.as_str(),
                 self.marker.generation.as_str(), at_ms, self.gc_floor.as_str(),
-                self.max_write_clock.as_str(), row_count],
+                self.max_write_clock.as_str(), content_fingerprint.as_slice(),
+                evidence_fingerprint.as_slice(), row_count],
         ).map_err(transient)?;
         publication.execute_batch("COMMIT;").map_err(transient)?;
         drop(publication);
         self.publication_stage.as_file().sync_all().map_err(transient)?;
+        let expected = PublicationMeta {
+            section: self.section,
+            participation_generation: self.participation_generation.clone(),
+            generation: self.generation.clone(),
+            first_published_at_ms: self.marker.at_ms,
+            gc_floor: self.gc_floor.clone(),
+            max_write_clock: self.max_write_clock.clone(),
+            content_fingerprint,
+            evidence_fingerprint,
+        };
         if self.publication_path.exists() {
-            let metadata = fs::symlink_metadata(&self.publication_path).map_err(transient)?;
-            if !metadata.is_file() || crate::trust_boundary::is_link_like(&metadata) {
-                return Err(corrupt("publication index is not a regular file"));
+            let (_, existing) = open_publication_index(&self.publication_path)?;
+            if existing != expected {
+                return Err(corrupt("publication index differs from this capture"));
             }
-            fs::remove_file(&self.publication_path).map_err(transient)?;
+        } else {
+            self.publication_stage.persist(&self.publication_path)
+                .map_err(|error| transient(error.error))?;
+            crate::trust_boundary::sync_directory(&self.spool).map_err(transient)?;
         }
-        self.publication_stage.persist(&self.publication_path)
-            .map_err(|error| transient(error.error))?;
-        crate::trust_boundary::sync_directory(&self.spool).map_err(transient)?;
-        self.sources.sort_by(|a, b| (a.kind as u8, &a.key).cmp(&(b.kind as u8, &b.key)));
-        self.sources.dedup_by(|a, b| a.kind == b.kind && a.key == b.key);
         Ok((CapturedSection {
             kind: self.kind,
             generation: self.generation,
             gc_floor: self.gc_floor,
             max_write_clock: self.max_write_clock,
-            content_fingerprint: fingerprint(&self.kind.fingerprint_domain(), &self.fingerprints),
+            content_fingerprint,
             sources: self.sources,
         }, SectionPublication {
             section: self.section,
@@ -503,12 +575,16 @@ pub(crate) fn capture_state_sections(
     Ok((captured, publications))
 }
 
+#[derive(PartialEq, Eq)]
 struct PublicationMeta {
     section: Section,
     participation_generation: Sequence,
-    first_published: TombstonePublication,
+    generation: Sequence,
+    first_published_at_ms: u64,
     gc_floor: Sequence,
     max_write_clock: Sequence,
+    content_fingerprint: [u8; 32],
+    evidence_fingerprint: [u8; 32],
 }
 
 fn stored_sequence(value: String) -> Result<Sequence> {
@@ -526,15 +602,16 @@ fn open_publication_index(path: &Path) -> Result<(Connection, PublicationMeta)> 
     ).map_err(corrupt)?;
     connection.execute_batch("PRAGMA query_only=ON; PRAGMA mmap_size=0; BEGIN;")
         .map_err(corrupt)?;
-    let (section, participation_generation, first_generation, first_at_ms, gc_floor,
-        max_write_clock, expected_rows): (String, String, String, i64, String, String, i64) =
+    let (section, participation_generation, generation, first_at_ms, gc_floor,
+        max_write_clock, content_fingerprint, evidence_fingerprint, expected_rows):
+        (String, String, String, i64, String, String, Vec<u8>, Vec<u8>, i64) =
         connection.query_row(
-            "SELECT section,participation_generation,first_published_generation,
-                first_published_at_ms,gc_floor,max_write_clock,row_count
+            "SELECT section,participation_generation,generation,first_published_at_ms,
+                gc_floor,max_write_clock,content_fingerprint,evidence_fingerprint,row_count
              FROM publication_meta WHERE singleton=1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
-                row.get(4)?, row.get(5)?, row.get(6)?)),
+                row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)),
         ).map_err(corrupt)?;
     let section = crate::persistent_store::device_store::sections::section_from_id(&section)
         .ok_or_else(|| corrupt("publication index names an unknown section"))?;
@@ -544,15 +621,23 @@ fn open_publication_index(path: &Path) -> Result<(Connection, PublicationMeta)> 
     if expected_rows < 0 || actual_rows != expected_rows {
         return Err(corrupt("publication index row count differs"));
     }
+    let content_fingerprint = content_fingerprint.try_into()
+        .map_err(|_| corrupt("publication content fingerprint is invalid"))?;
+    let stored_evidence_fingerprint: [u8; 32] = evidence_fingerprint.try_into()
+        .map_err(|_| corrupt("publication evidence fingerprint is invalid"))?;
+    let evidence_fingerprint = publication_evidence_fingerprint(&connection)?;
+    if evidence_fingerprint != stored_evidence_fingerprint {
+        return Err(corrupt("publication evidence fingerprint differs"));
+    }
     Ok((connection, PublicationMeta {
         section,
         participation_generation: stored_sequence(participation_generation)?,
-        first_published: TombstonePublication {
-            generation: stored_sequence(first_generation)?,
-            at_ms: u64::try_from(first_at_ms).map_err(corrupt)?,
-        },
+        generation: stored_sequence(generation)?,
+        first_published_at_ms: u64::try_from(first_at_ms).map_err(corrupt)?,
         gc_floor: stored_sequence(gc_floor)?,
         max_write_clock: stored_sequence(max_write_clock)?,
+        content_fingerprint,
+        evidence_fingerprint,
     }))
 }
 
@@ -644,15 +729,23 @@ pub(crate) fn note_prepared_section_published(
     publication: &SectionPublication,
     connection_id: &str,
     library_lineage: &str,
-    cursor: &SectionCursor,
+    confirmed: &wire::SectionSnapshotRef,
 ) -> Result<bool> {
     let (connection, metadata) = open_publication_index(&publication.publication_index_path)?;
     if metadata.section != publication.section
-        || metadata.gc_floor != cursor.applied_gc_floor
-        || metadata.max_write_clock != cursor.observed_max_write_clock
+        || section_of(confirmed.kind) != Some(publication.section)
+        || metadata.generation != confirmed.generation
+        || metadata.gc_floor != confirmed.gc_floor
+        || metadata.max_write_clock != confirmed.max_write_clock
+        || metadata.content_fingerprint != confirmed.content_fingerprint
     {
         return Err(corrupt("confirmed section differs from its publication index"));
     }
+    let cursor = SectionCursor {
+        applied_generation: confirmed.generation.clone(),
+        applied_gc_floor: confirmed.gc_floor.clone(),
+        observed_max_write_clock: confirmed.max_write_clock.clone(),
+    };
     let mut statement = connection.prepare(
         "SELECT key1,key2,key3,write_clock,writer_id,disposition,stamped,
             first_published_generation,first_published_at_ms
@@ -667,9 +760,12 @@ pub(crate) fn note_prepared_section_published(
     device.note_spooled_section_published(
         publication.section,
         &metadata.participation_generation,
-        &metadata.first_published,
+        &TombstonePublication {
+            generation: metadata.generation,
+            at_ms: metadata.first_published_at_ms,
+        },
         &metadata.gc_floor,
-        (connection_id, library_lineage, cursor),
+        (connection_id, library_lineage, &cursor),
         evidence,
     ).map_err(device_error)
 }
@@ -924,6 +1020,10 @@ pub(crate) fn decode_section(
 mod preparation_tests;
 
 #[cfg(test)]
+#[path = "section_scale_tests.rs"]
+mod scale_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::persistent_store::{
@@ -1060,17 +1160,19 @@ mod tests {
         publication: &SectionPublication,
         captured: &CapturedSection,
     ) {
-        let cursor = SectionCursor {
-            applied_generation: captured.generation.clone(),
-            applied_gc_floor: captured.gc_floor.clone(),
-            observed_max_write_clock: captured.max_write_clock.clone(),
-        };
+        let mut confirmed = section_reference(
+            captured.generation.as_str().parse().expect("test generation fits u64"),
+            captured.gc_floor.as_str().parse().expect("test floor fits u64"),
+        );
+        confirmed.kind = captured.kind;
+        confirmed.max_write_clock = captured.max_write_clock.clone();
+        confirmed.content_fingerprint = captured.content_fingerprint;
         assert!(note_prepared_section_published(
             store.device_store_mut().expect("open device store"),
             publication,
             "connection",
             "library",
-            &cursor,
+            &confirmed,
         ).expect("record the confirmed publication"));
     }
 
