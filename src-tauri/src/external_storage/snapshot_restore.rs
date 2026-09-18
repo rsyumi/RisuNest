@@ -636,7 +636,6 @@ fn materialize_section_entries(
         });
     }
     sources.sort_by(|a, b| (a.kind as u8, &a.key).cmp(&(b.kind as u8, &b.key)));
-    sources.dedup_by(|a, b| a.kind == b.kind && a.key == b.key);
     Ok(sources)
 }
 
