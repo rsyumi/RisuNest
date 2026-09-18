@@ -78,6 +78,43 @@ final class NativeUITests: XCTestCase {
     func testLiveCloudTransition() throws { try liveCloud(cancel: false) }
     func testLiveCloudCancellation() throws { try liveCloud(cancel: true) }
 
+    func testOAuthCallbackReturn() throws {
+        continueAfterFailure = false
+        let app = XCUIApplication(bundleIdentifier: "io.github.rsyumi.risunest.ios.bench")
+        app.launchEnvironment["RISUNEST_IOS_PHASE"] = "oauth"
+        app.launch()
+        let start = app.webViews.buttons["Start OAuth callback"]
+        XCTAssertTrue(start.waitForExistence(timeout: 60))
+        start.tap()
+
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let continuations = [
+            app.buttons["Continue"],
+            app.alerts.buttons["Continue"],
+            springboard.buttons["Continue"],
+            springboard.alerts.buttons["Continue"],
+        ]
+        for button in continuations where button.waitForExistence(timeout: 3) {
+            button.tap()
+            break
+        }
+
+        let result = app.webViews.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "oauth-result:")).firstMatch
+        let failure = app.webViews.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "verification-error:")).firstMatch
+        let completed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in result.exists || failure.exists }, object: nil)
+        wait(for: [completed], timeout: 90)
+        if failure.exists {
+            let diagnostic = XCTAttachment(string: failure.label)
+            diagnostic.lifetime = .keepAlways
+            add(diagnostic)
+        }
+        XCTAssertTrue(result.exists)
+        let measurement = XCTAttachment(string: result.label)
+        measurement.lifetime = .keepAlways
+        add(measurement)
+        XCTAssertTrue(app.webViews.staticTexts["passed"].waitForExistence(timeout: 10))
+    }
+
     func testDeviceCore() throws {
         continueAfterFailure = false
         let app = XCUIApplication(bundleIdentifier: "io.github.rsyumi.risunest.ios.bench")

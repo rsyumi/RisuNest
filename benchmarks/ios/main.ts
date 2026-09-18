@@ -27,6 +27,32 @@ async function userStart(label: string) {
     document.getElementById("benchmark")!.append(button);
   });
 }
+async function oauthCallbackContract() {
+  await userStart("Start OAuth callback");
+  const callbackScheme = "risunestoauthtest";
+  const expectedCallback =
+    "risunestoauthtest://oauth?code=synthetic&state=device";
+  const authorizationUrl =
+    "https://httpbin.org/redirect-to?url=" +
+    encodeURIComponent(expectedCallback);
+  const result = await invoke<{
+    status: string;
+    callbackUrl?: string;
+  }>("plugin:ios-native|authenticate", {
+    authorizationUrl,
+    callbackScheme,
+    prefersEphemeral: true,
+  });
+  check(result.status === "succeeded", "OAuth session did not succeed");
+  check(
+    result.callbackUrl === expectedCallback,
+    "OAuth callback URL was not returned unchanged",
+  );
+  const measured = document.createElement("pre");
+  measured.textContent = "oauth-result:" + JSON.stringify(result);
+  document.getElementById("benchmark")!.append(measured);
+  return result;
+}
 async function main() {
   await guard();
   check(isTauriIOS && !isTauriDesktop, "iOS runtime classification");
@@ -55,7 +81,10 @@ async function main() {
   if (phase === "cloud" || phase === "cloud-cancel")
     await userStart("Start live request");
   if (phase === "background-ui") await userStart("Start background work");
-  if (phase === "network") {
+  if (phase === "oauth") {
+    await report("oauth", await oauthCallbackContract());
+    await report("complete", { passed: true });
+  } else if (phase === "network") {
     const before = await invoke("ios_bench_network_probe");
     await userStart("Start network background work");
     const lease = await beginIOSGeneration();
