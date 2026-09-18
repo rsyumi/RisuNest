@@ -192,7 +192,17 @@ async function fingerprints() {
   for (const entryKey of [...hypaKeys, extraHypaKey]) {
     const value = cache.get(entryKey);
     hypaParts.push(entryKey, value ? String(value.dimensions) : "missing");
-    if (value) hypaParts.push(value.vector.buffer);
+    if (value) {
+      const vectorBytes = new Uint8Array(value.vector.byteLength);
+      vectorBytes.set(
+        new Uint8Array(
+          value.vector.buffer,
+          value.vector.byteOffset,
+          value.vector.byteLength,
+        ),
+      );
+      hypaParts.push(vectorBytes);
+    }
   }
   const plugins = pluginKeyspace();
   const pluginParts = await Promise.all(
