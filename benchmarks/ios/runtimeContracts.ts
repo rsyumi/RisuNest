@@ -7,6 +7,7 @@ import {
 } from "../../src/ts/tokenizer/nativeTokenizer";
 import corpus from "../tokenizer/native-tokenizer-corpus.json";
 import { check } from "./contracts";
+import { PersistentBenchmarkMarker } from "./persistentMarker";
 
 export async function streaming() {
   const base = await invoke<string>("ios_bench_stream_url");
@@ -93,21 +94,22 @@ export async function tokenizer() {
 }
 
 export async function snapshotRestore(): Promise<boolean> {
-  await invoke("pds_open");
+  const marker = new PersistentBenchmarkMarker();
+  await marker.open();
   const key = "ios-synthetic-restore";
   if (localStorage.getItem(key)) {
     check(
-      (await invoke("pds_get_app_kv", { key })) === "before",
+      (await marker.read()) === "before",
       "snapshot reopened the native SQLite state",
     );
     localStorage.removeItem(key);
     return true;
   }
-  await invoke("pds_set_app_kv", { key, value: "before" });
+  await marker.write("before");
   const snapshot = await invoke<{ id: string }>("pds_snapshot_create", {
     reason: "ios-synthetic",
   });
-  await invoke("pds_set_app_kv", { key, value: "after" });
+  await marker.write("after");
   await invoke("pds_snapshot_restore_request", { id: snapshot.id });
   localStorage.setItem(key, "pending");
   await invoke("ios_prepare_restart");

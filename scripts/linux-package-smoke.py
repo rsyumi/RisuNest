@@ -100,16 +100,24 @@ try:
         execute('Array.from(document.querySelectorAll("button")).find(x=>x.innerText.trim()==="Create from Scratch").click()')
         wait('return Array.from(document.querySelectorAll("button")).some(x=>x.innerText.trim()==="New Chat")')
         time.sleep(1)
-        native('pds_set_app_kv', {'key':'linux-package-smoke','value':{'marker':'synthetic 한글 🐿️','version':1}})
+        root = native('pds_read_root')
+        marker_value = json.dumps({'marker':'synthetic 한글 🐿️','version':1}, ensure_ascii=False, separators=(',', ':'))
+        native('pds_commit', {
+            'commit': {
+                'expectedRevision': root['revision'],
+                'rootMutations': [{'type':'set','key':'username','value':marker_value}],
+            },
+            'assetAliases': [],
+        })
     else:
         wait('return !document.body.innerText.startsWith("Loading")')
         time.sleep(1)
     catalog = native('pds_query_characters', {'query':{'order':'configured','trash':False,'limit':100}})
     if len(catalog['items']) != 1 or catalog['items'][0]['name'] != '' or catalog['items'][0]['conversationCount'] != 1:
         raise RuntimeError('Created character/conversation was not preserved')
-    sentinel = native('pds_get_app_kv', {'key':'linux-package-smoke'})
+    sentinel = json.loads(native('pds_read_root')['value']['username'])
     if sentinel != {'marker':'synthetic 한글 🐿️','version':1}:
-        raise RuntimeError('Synthetic persistent key/value was not preserved')
+        raise RuntimeError('Synthetic persistent marker was not preserved')
     digest = hashlib.sha256(json.dumps({'items':catalog['items'],'sentinel':sentinel}, sort_keys=True).encode()).hexdigest()
     result = {'passed':True, 'phase':args.phase, 'identifier':identifier, 'coldDeepLink':True, 'catalogHash':digest, 'characters':1, 'conversations':1}
     if args.phase != 'first':

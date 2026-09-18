@@ -11,6 +11,7 @@ import {
 } from "../../src/ts/iosNative";
 import { isTauriIOS, isTauriDesktop } from "../../src/ts/platform";
 import { persistence, reload, regex, guard, check, pause } from "./contracts";
+import { PersistentBenchmarkMarker } from "./persistentMarker";
 
 const report = (stage: string, result: unknown) =>
   invoke("ios_bench_report", { stage, result });
@@ -167,7 +168,8 @@ async function main() {
     });
     await report("complete", { passed: true });
   } else if (phase === "background" || phase === "background-ui") {
-    await invoke("pds_open");
+    const marker = new PersistentBenchmarkMarker();
+    await marker.open();
     const lease = await beginIOSGeneration();
     const initialState = await getIOSNativeState();
     await report("background-ready", { state: initialState });
@@ -180,10 +182,7 @@ async function main() {
       gapsMs.push(performance.now() - previous);
       previous = performance.now();
       lease.progress(Math.min(3, Math.floor(tick / 25) + 1));
-      await invoke("pds_set_app_kv", {
-        key: "ios-synthetic-background",
-        value: ++tick,
-      });
+      await marker.write(String(++tick));
       await pause(250);
     }
     await lease.dispose();

@@ -4,6 +4,7 @@ import { fetchTauriHttpStream } from "../../src/ts/network/tauriHttpStream";
 import { createRequestAbortScope } from "../../src/ts/network/requestAbortScope";
 import { beginIOSGeneration, getIOSNativeState } from "../../src/ts/iosNative";
 import { check } from "./contracts";
+import { PersistentBenchmarkMarker } from "./persistentMarker";
 
 /** Optional live transport check. Never display credentials or provider output. */
 export async function cloudContract(cancelExpected: boolean) {
@@ -58,8 +59,9 @@ export async function cloudContract(cancelExpected: boolean) {
       },
     ),
   });
+  const marker = new PersistentBenchmarkMarker();
   try {
-    await invoke("pds_open");
+    await marker.open();
     const stream = await client.chat({
       model: "deepseek-v4.1-flash",
       stream: true,
@@ -84,10 +86,7 @@ export async function cloudContract(cancelExpected: boolean) {
       finished ||= chunk.done === true;
       lease.progress(2);
       stage = "saving";
-      await invoke("pds_set_app_kv", {
-        key: "ios-synthetic-cloud",
-        value: text,
-      });
+      await marker.write(text);
       stage = "reading";
       if (text.length)
         document.getElementById("status")!.textContent = "cloud-streaming";
@@ -143,9 +142,7 @@ export async function cloudContract(cancelExpected: boolean) {
     client.abort();
   }
   const state = await getIOSNativeState();
-  const saved = await invoke<string>("pds_get_app_kv", {
-    key: "ios-synthetic-cloud",
-  });
+  const saved = await marker.read();
   const result = {
     model: "deepseek-v4.1-flash",
     outcome,
