@@ -1,7 +1,8 @@
 use super::{JobControl, JobPhase, JobResultSummary, NativeJobError, OpenedJobSource};
 use crate::device_backup::{
     capture_native_sections, capture_prepared_native_sections, journal_prepared_native_sections,
-    prepare_native_sections, resume_journaled_native_restore, DeviceBackupState, Spool,
+    prepare_native_sections, resume_journaled_native_restore, DeviceBackupError, DeviceBackupState,
+    Spool,
 };
 use crate::{
     asset_repository::{
@@ -130,6 +131,13 @@ impl CancellationProbe for Probe<'_> {
 }
 fn error(error: impl std::fmt::Display) -> NativeJobError {
     NativeJobError::new("portable-backup-failed", error.to_string())
+}
+fn device_error(failure: DeviceBackupError) -> NativeJobError {
+    if failure.code == "device-cancelled" {
+        NativeJobError::new("cancelled", failure.message)
+    } else {
+        error(failure)
+    }
 }
 fn portable_error(failure: portable_backup::Error) -> NativeJobError {
     match failure {
@@ -290,13 +298,33 @@ pub(crate) fn export_portable(
     revision: i64,
     owned: &Path,
     handoffs: &Path,
-    mut store: PersistentStore,
+    store: PersistentStore,
     job: &JobControl,
     device: Option<(&tauri::AppHandle, &PortableSelection)>,
 ) -> Result<JobResultSummary, NativeJobError> {
     super::job_transition(job, job.start(JobPhase::WritingExport))?;
     let fallback = PortableSelection::default();
     let selection = device.map(|(_, selection)| selection).unwrap_or(&fallback);
+    export_portable_running(
+        destination,
+        revision,
+        owned,
+        handoffs,
+        store,
+        job,
+        selection,
+    )
+}
+
+fn export_portable_running(
+    destination: Option<&Path>,
+    revision: i64,
+    owned: &Path,
+    handoffs: &Path,
+    mut store: PersistentStore,
+    job: &JobControl,
+    selection: &PortableSelection,
+) -> Result<JobResultSummary, NativeJobError> {
     if !selection.library && selection.device_sections.is_empty() {
         return Err(error("Select at least one backup section"));
     }
@@ -333,7 +361,7 @@ pub(crate) fn export_portable(
                 &captured.catalog,
                 &probe,
             )
-            .map_err(error)?;
+            .map_err(device_error)?;
         }
         let path = owned.join("archive.risunest.part");
         let archive = write_verified(
@@ -742,6 +770,75 @@ mod tests {
             .unwrap();
         store.replace_commit(&stage.staging_id, Some(0)).unwrap();
         store
+    }
+
+    #[test]
+    fn cancelled_device_capture_returns_the_canonical_worker_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let owned = directory.path().join("job");
+        fs::create_dir(&owned).unwrap();
+        let store = library(&source);
+        let revision = store.revision().unwrap();
+        let registry = super::super::JobRegistry::default();
+        let job = registry
+            .create_internal(
+                super::super::JobKind::ExportPortableBackup,
+                Some(revision),
+                vec![],
+                false,
+            )
+            .unwrap();
+        job.start(JobPhase::WritingExport).unwrap();
+        assert_eq!(
+            job.request_cancel().unwrap(),
+            super::super::CancelOutcome::Requested
+        );
+
+        let failure = export_portable_running(
+            None,
+            revision,
+            &owned,
+            &directory.path().join("handoffs"),
+            store,
+            &job,
+            &PortableSelection {
+                library: false,
+                device_sections: vec!["hypa".into()],
+                items: None,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(failure.code, "cancelled");
+        assert_eq!(failure.message, "Device catalog verification was cancelled");
+        assert_eq!(job.status().state, super::super::JobState::Cancelling);
+        super::super::finish_worker_outcome(
+            &job,
+            super::super::JobKind::ExportPortableBackup,
+            Err(failure),
+            vec![],
+        );
+        let status = job.status();
+        assert_eq!(status.state, super::super::JobState::Cancelled);
+        assert!(status.error.is_none());
+        assert!(status.result.is_none());
+        assert!(!owned.join("archive.risunest.part").exists());
+        assert!(!directory.path().join("handoffs").exists());
+    }
+
+    #[test]
+    fn non_cancellation_device_errors_keep_the_portable_failure_contract() {
+        let failure = device_error(DeviceBackupError {
+            code: "device-storage-failed".into(),
+            message: "synthetic storage failure".into(),
+        });
+
+        assert_eq!(failure.code, "portable-backup-failed");
+        assert_eq!(
+            failure.message,
+            "device-storage-failed: synthetic storage failure"
+        );
     }
 
     fn add_test_aliases(root: &Path, hash: &str, size: usize, count: usize) {

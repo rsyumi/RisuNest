@@ -2256,42 +2256,7 @@ impl NativeFileJobState {
             {
                 cleanup_errors.push(error);
             }
-            match (outcome, cleanup_errors.is_empty()) {
-                (Ok(result), true) => {
-                    let _ = if kind == JobKind::OfficialPublicationUpload {
-                        job.finish_official_publication_success(result)
-                    } else {
-                        job.finish_success(result)
-                    };
-                }
-                (Ok(mut result), false) => {
-                    if !result
-                        .warning_codes
-                        .iter()
-                        .any(|code| code == "cleanup-failed")
-                    {
-                        result.warning_codes.push("cleanup-failed".to_owned());
-                    }
-                    let _ = if kind == JobKind::OfficialPublicationUpload {
-                        job.finish_official_publication_success(result)
-                    } else {
-                        job.finish_success(result)
-                    };
-                }
-                (Err(error), false) => {
-                    let cleanup = cleanup_errors.join("; ");
-                    let _ = job.finish_failure(
-                        "cleanup-failed",
-                        &format!("{}; cleanup failed: {cleanup}", error.message),
-                    );
-                }
-                (Err(error), true) if error.code == "cancelled" => {
-                    let _ = job.finish_cancelled();
-                }
-                (Err(error), true) => {
-                    let _ = job.finish_failure(&error.code, &error.message);
-                }
-            }
+            finish_worker_outcome(&job, kind, outcome, cleanup_errors);
             let _ = registry.prune();
             drop(terminal_reference_source);
         });
@@ -2788,6 +2753,50 @@ fn create_owned_directory(jobs_root: &Path, job_id: &str) -> Result<PathBuf, Str
                 "{error}; partial native job directory cleanup failed: {cleanup}"
             )),
         },
+    }
+}
+
+fn finish_worker_outcome(
+    job: &JobControl,
+    kind: JobKind,
+    outcome: Result<JobResultSummary, NativeJobError>,
+    cleanup_errors: Vec<String>,
+) {
+    match (outcome, cleanup_errors.is_empty()) {
+        (Ok(result), true) => {
+            let _ = if kind == JobKind::OfficialPublicationUpload {
+                job.finish_official_publication_success(result)
+            } else {
+                job.finish_success(result)
+            };
+        }
+        (Ok(mut result), false) => {
+            if !result
+                .warning_codes
+                .iter()
+                .any(|code| code == "cleanup-failed")
+            {
+                result.warning_codes.push("cleanup-failed".to_owned());
+            }
+            let _ = if kind == JobKind::OfficialPublicationUpload {
+                job.finish_official_publication_success(result)
+            } else {
+                job.finish_success(result)
+            };
+        }
+        (Err(error), false) => {
+            let cleanup = cleanup_errors.join("; ");
+            let _ = job.finish_failure(
+                "cleanup-failed",
+                &format!("{}; cleanup failed: {cleanup}", error.message),
+            );
+        }
+        (Err(error), true) if error.code == "cancelled" => {
+            let _ = job.finish_cancelled();
+        }
+        (Err(error), true) => {
+            let _ = job.finish_failure(&error.code, &error.message);
+        }
     }
 }
 
