@@ -249,6 +249,93 @@ describe('external storage controller', () => {
         expect(bridge.getJob).not.toHaveBeenCalled()
     })
 
+    it.each(['sync', 'backup'] as const)('cancels a late-started %s job after the connection was cancelled', async kind => {
+        const started = deferred<ExternalJobSummary>()
+        const bridge: ExternalStorageJobBridge = {
+            startJob: vi.fn(async () => started.promise),
+            getJob: vi.fn(),
+            cancelJob: vi.fn(async id => ({ ...job(id, 'cancelled'), kind })),
+        }
+        const controller = createExternalStorageController(bridge, state)
+        const pending = controller.request({
+            connectionId: 'sync-1', kind, targetRevision: '12',
+            reason: 'manual', session: { kind: 'foreground', id: 'foreground-1' },
+        })
+        expect(bridge.startJob).toHaveBeenCalledTimes(1)
+        const cancelled = controller.cancel('sync-1')
+        started.resolve({ ...job('late-job', 'running'), kind })
+
+        await cancelled
+        await expect(pending).resolves.toEqual({ kind: 'cancelled' })
+        expect(bridge.cancelJob).toHaveBeenCalledExactlyOnceWith('late-job')
+        expect(bridge.getJob).not.toHaveBeenCalled()
+    })
+
+    it('keeps a replacement request separate until the cancelled native start is settled', async () => {
+        const started = deferred<ExternalJobSummary>()
+        const cancelled = deferred<ExternalJobSummary>()
+        let starts = 0
+        const bridge: ExternalStorageJobBridge = {
+            startJob: vi.fn(async () => ++starts === 1
+                ? started.promise
+                : job('replacement-job', 'succeeded', '20')),
+            getJob: vi.fn(async id => job(id, 'succeeded', '12')),
+            cancelJob: vi.fn(async () => cancelled.promise),
+        }
+        const controller = createExternalStorageController(bridge, state, { wait: async () => {} })
+        const first = controller.request({
+            connectionId: 'sync-1', kind: 'sync', targetRevision: '12',
+            reason: 'manual', session: { kind: 'foreground', id: 'foreground-1' },
+        })
+        const stopping = controller.cancel('sync-1')
+        const replacement = controller.request({
+            connectionId: 'sync-1', kind: 'sync', targetRevision: '20',
+            reason: 'automatic', session: { kind: 'foreground', id: 'foreground-1' },
+        })
+        started.resolve(job('late-job', 'running'))
+
+        await vi.waitFor(() => expect(bridge.cancelJob).toHaveBeenCalledExactlyOnceWith('late-job'))
+        expect(bridge.startJob).toHaveBeenCalledTimes(1)
+        expect(bridge.getJob).not.toHaveBeenCalled()
+        cancelled.resolve(job('late-job', 'cancelled'))
+        await stopping
+        await expect(first).resolves.toEqual({ kind: 'cancelled' })
+        await expect(replacement).resolves.toMatchObject({ kind: 'complete', revision: '20' })
+        expect(bridge.startJob).toHaveBeenCalledTimes(2)
+    })
+
+    it.each(['connection', 'caller'] as const)('does not start a queued replacement cancelled by its %s', async cancellation => {
+        const started = deferred<ExternalJobSummary>()
+        const bridge: ExternalStorageJobBridge = {
+            startJob: vi.fn(async () => started.promise),
+            getJob: vi.fn(),
+            cancelJob: vi.fn(async id => job(id, 'cancelled')),
+        }
+        const controller = createExternalStorageController(bridge, state)
+        const first = controller.request({
+            connectionId: 'sync-1', kind: 'sync', targetRevision: '12',
+            reason: 'manual', session: { kind: 'foreground', id: 'foreground-1' },
+        })
+        const stopping = controller.cancel('sync-1')
+        const abort = new AbortController()
+        const replacement = controller.request({
+            connectionId: 'sync-1', kind: 'sync', targetRevision: '20',
+            reason: 'automatic', session: { kind: 'foreground', id: 'foreground-1' },
+            signal: abort.signal,
+        })
+        const stopReplacement = cancellation === 'connection'
+            ? controller.cancel('sync-1')
+            : Promise.resolve(abort.abort())
+        started.resolve(job('late-job', 'running'))
+
+        await Promise.all([stopping, stopReplacement])
+        await expect(first).resolves.toEqual({ kind: 'cancelled' })
+        await expect(replacement).resolves.toEqual({ kind: 'cancelled' })
+        expect(bridge.startJob).toHaveBeenCalledTimes(1)
+        expect(bridge.cancelJob).toHaveBeenCalledExactlyOnceWith('late-job')
+        expect(bridge.getJob).not.toHaveBeenCalled()
+    })
+
     it('does not apply a remote receive returned after abort and waits for native cancellation', async () => {
         const polled = deferred<ExternalJobSummary>()
         const cancelled = deferred<ExternalJobSummary>()

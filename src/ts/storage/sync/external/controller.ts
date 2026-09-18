@@ -197,6 +197,7 @@ export function createExternalStorageController(
                 await run.cancelling
                 run.cancelling = undefined
             }
+            if (run.cancelled || run.goals.length === 0) break
             const sessionGoal = run.goals.find(candidate => candidate.request.reason === 'exitDrain')
             const selectedGoal = sessionGoal ?? run.goals.reduce((current, candidate) =>
                 candidate.revision > current.revision ? candidate : current)
@@ -217,11 +218,14 @@ export function createExternalStorageController(
                 })
                 run.active = started
                 publish()
-                if (request.signal?.aborted && !terminalStates.has(started.state)) {
-                    run.cancelling = bridge.cancelJob(started.id).then(() => undefined, () => undefined)
+                if (
+                    (run.cancelled || run.abort.signal.aborted || request.signal?.aborted)
+                    && !terminalStates.has(started.state)
+                ) {
+                    run.cancelling ??= bridge.cancelJob(started.id).then(() => undefined, () => undefined)
                     await run.cancelling
                     run.cancelling = undefined
-                    throw request.signal.reason
+                    throw run.abort.signal.reason ?? request.signal?.reason
                 }
                 const completed = await poll(started, run.abort.signal)
                 run.active = completed
@@ -275,18 +279,24 @@ export function createExternalStorageController(
         run.running = runDestination(connectionId, run).finally(() => {
             run.running = undefined
             if (run.goals.length > 0 && !run.cancelled) kick(connectionId, run)
-            else if (run.goals.length === 0 && !run.active) runs.delete(connectionId)
+            else if (run.goals.length === 0 && !run.active && runs.get(connectionId) === run) {
+                runs.delete(connectionId)
+            }
         })
     }
     const request = (requestValue: ExternalControllerRequest): Promise<ExternalControllerResult> => {
         revision(requestValue.targetRevision)
         let run = runs.get(requestValue.connectionId)
-        if (!run) {
-            run = { goals: [], cancelled: false, abort: new AbortController() }
+        if (!run || run.cancelled) {
+            // A cancelled run keeps ownership of its late start and cleanup.
+            // New requests wait for it without reviving or sharing its goals.
+            const previous = run
+            run = {
+                goals: [], cancelled: false, abort: new AbortController(),
+                cancelling: previous?.running?.then(() => undefined, () => undefined),
+            }
             runs.set(requestValue.connectionId, run)
         }
-        if (run.cancelled) run.abort = new AbortController()
-        run.cancelled = false
         const promise = new Promise<ExternalControllerResult>((resolve) => {
             const goal: Goal = {
                 revision: revision(requestValue.targetRevision),
