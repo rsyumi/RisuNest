@@ -198,7 +198,7 @@ impl AuthorizationSettings {
         }
     }
 
-    #[cfg(any(target_os = "android", test))]
+    #[cfg(any(target_os = "android", target_os = "ios", test))]
     pub(super) fn token_info_endpoint(&self) -> Result<url::Url> {
         token_info_endpoint(&self.endpoint, self.loopback)
     }
@@ -303,7 +303,7 @@ impl Settings {
             url::Url::parse(TOKEN_ENDPOINT).map_err(|_| unsupported())
         }
     }
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     pub(super) fn token_info_endpoint(&self) -> Result<url::Url> {
         token_info_endpoint(&self.endpoint, self.loopback)
     }
