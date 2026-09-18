@@ -698,10 +698,13 @@ mod tests {
             .unwrap();
 
         let roots = registered_capture_roots([&reference], root.path()).unwrap();
-        assert!(roots.catalogs.contains(&capture_directory.join("capture.sqlite")));
-        assert!(roots
-            .logical_records
-            .contains(&object_directory.join(&record_hash)));
+        let expected_catalog = capture_directory
+            .join("capture.sqlite")
+            .canonicalize()
+            .unwrap();
+        let expected_record = object_directory.join(&record_hash).canonicalize().unwrap();
+        assert!(roots.catalogs.contains(&expected_catalog));
+        assert!(roots.logical_records.contains(&expected_record));
         assert!(roots.assets.object_hashes.contains(&asset_hash));
 
         let record_path = object_directory.join(&record_hash);

@@ -894,18 +894,19 @@ mod conflict_cleanup_tests {
         PreservedHeadObservation, PreservedRemoteState,
     };
     use risunest_external_storage_format::snapshot::{
-        ObjectRole, PublicObjectHeader, StoredObject, WireLocator,
+        envelope_length, ObjectRole, PublicObjectHeader, StoredObject, WireLocator,
     };
 
     fn stored(repository: &str, id: &str, role: ObjectRole) -> StoredObject {
+        let header = PublicObjectHeader::new(repository.into(), id.into(), role, 1).unwrap();
         StoredObject {
-            header: PublicObjectHeader::new(repository.into(), id.into(), role, 1).unwrap(),
+            ciphertext_length: envelope_length(&header).unwrap(),
+            header,
             locator: WireLocator {
                 connection_identity: "synthetic/root".into(),
                 collection: None,
                 object: id.into(),
             },
-            ciphertext_length: 17,
             ciphertext_sha256: [2; 32],
             plaintext_length: 1,
             plaintext_sha256: [1; 32],

@@ -418,7 +418,9 @@ pub(crate) fn conflict_source_descriptor(db: &Connection, repository_root: &Path
 mod tests {
     use super::*;
     use crate::persistent_store::content_capture::ContentCaptureSink;
-    use risunest_external_storage_format::snapshot::{PublicObjectHeader, WireLocator};
+    use risunest_external_storage_format::snapshot::{
+        envelope_length, PublicObjectHeader, WireLocator,
+    };
 
     fn db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
@@ -428,10 +430,11 @@ mod tests {
     }
 
     fn object(repository: &str, id: &str, role: ObjectRole) -> StoredObject {
+        let header = PublicObjectHeader::new(repository.into(), id.into(), role, 1).unwrap();
         StoredObject {
-            header: PublicObjectHeader::new(repository.into(), id.into(), role, 1).unwrap(),
+            ciphertext_length: envelope_length(&header).unwrap(),
+            header,
             locator: WireLocator { connection_identity: "account/root".into(), collection: None, object: id.into() },
-            ciphertext_length: 17,
             ciphertext_sha256: [2; 32],
             plaintext_length: 1,
             plaintext_sha256: [1; 32],
