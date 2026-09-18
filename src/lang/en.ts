@@ -2598,7 +2598,7 @@ export const languageEnglish = {
                 'Import cancelled. Some attachments that were already saved may remain.',
             resultFailed: 'Import failed. Your existing data is unchanged.',
             resultFailedAfterCommit:
-                'The data was imported, but the screen could not be refreshed. Restart the app before doing anything else.',
+                'The data was imported, but the screen could not be refreshed. Use the refresh prompt before doing anything else.',
             errorDetails: 'Error details',
             copyDetails: 'Copy',
             copied: 'Copied',

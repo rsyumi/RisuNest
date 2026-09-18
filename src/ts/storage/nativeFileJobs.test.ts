@@ -23,7 +23,10 @@ import {
     type NativeStagedPluginChoice,
     type NativeStagedPluginPreview,
 } from './nativeFileJobs'
-import { continueCommittedWorkingSetRefresh } from './committedWorkingSetContinuation'
+import {
+    continueCommittedWorkingSetRefresh,
+    retryCommittedWorkingSetRefreshWithContinuation,
+} from './committedWorkingSetContinuation'
 
 function status(
     state: NativeFileJobStatus['state'],
@@ -59,6 +62,14 @@ function restoreRuntime(
     let captures = 0
     return {
         getStorageAuthorityEpoch: () => 2,
+        retryCommittedWorkingSetRefresh: async () => {
+            await options.refresh?.(revision + 1)
+            return {
+                kind: 'committed' as const,
+                revision: revision + 1,
+                projection: options.projection ?? 'applied' as const,
+            }
+        },
         capturePersistentMutationToken: async (reason: string) => {
             await options.capture?.(reason)
             return {
@@ -229,7 +240,9 @@ describe('native file jobs', () => {
             const events: string[] = []
             let staleWritesBlocked = false
             let failAck = ackFails
-            const refresh = vi.fn(async () => {})
+            const refresh = vi.fn(async () => {
+                events.push('working-set-refresh')
+            })
             const markRefreshRequired = vi.fn((revision: number) => {
                 expect(revision).toBe(4)
                 staleWritesBlocked = true
@@ -279,15 +292,16 @@ describe('native file jobs', () => {
                 if (command === 'native_file_job_forget') return true
                 throw new Error(`Unexpected command: ${command}`)
             }
+            const runtime = restoreRuntime(3, {
+                refresh,
+                markRefreshRequired,
+                release: () => {
+                    if (ackFails) expect(staleWritesBlocked).toBe(true)
+                    events.push('fence-released')
+                },
+            })
             const running = runNativeArchiveRestore(
-                restoreRuntime(3, {
-                    refresh,
-                    markRefreshRequired,
-                    release: () => {
-                        if (ackFails) expect(staleWritesBlocked).toBe(true)
-                        events.push('fence-released')
-                    },
-                }),
+                runtime,
                 { type: 'desktopPath', path: 'C:\\synthetic\\portable.risunest' },
                 {
                     choosePortableSections: async () => ({
@@ -316,11 +330,13 @@ describe('native file jobs', () => {
                 expect(calls.filter(command => command === 'native_file_job_finalize'))
                     .toHaveLength(1)
                 failAck = false
-                await invoke('native_device_backup_recovery_complete')
+                await expect(
+                    retryCommittedWorkingSetRefreshWithContinuation(runtime),
+                ).resolves.toMatchObject({ revision: 4, projection: 'applied' })
                 expect(calls.filter(command => command === 'native_file_job_finalize'))
                     .toHaveLength(1)
-                expect(refresh).not.toHaveBeenCalled()
-                expect(calls).not.toContain('native_file_job_forget')
+                expect(refresh).toHaveBeenCalledOnce()
+                expect(calls).toContain('native_file_job_forget')
             } else {
                 await expect(running).resolves.toEqual(committed)
                 expect(refresh).toHaveBeenCalledOnce()
@@ -335,8 +351,14 @@ describe('native file jobs', () => {
                         'refresh-required',
                         'fence-released',
                         'device-ack',
+                        'working-set-refresh',
                     ]
-                    : ['library-hold', 'device-ack', 'fence-released'],
+                    : [
+                        'library-hold',
+                        'device-ack',
+                        'working-set-refresh',
+                        'fence-released',
+                    ],
             )
         },
     )

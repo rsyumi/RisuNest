@@ -11,6 +11,7 @@ function dependencies(): LegacyLocalBackupFileRouteDependencies {
     return {
         runtime: () => ({
             revision: 7,
+            getStorageAuthorityEpoch: () => 1,
             flushPendingData: vi.fn(async () => undefined),
             capturePersistentMutationToken: vi.fn(async () => ({
                 revision: 7,

@@ -80,6 +80,61 @@ describe('committed working-set continuation', () => {
         expect(continuation).toHaveBeenCalledOnce()
     })
 
+    it('prepares a committed retry once before refreshing and retains it when preparation fails', async () => {
+        const events: string[] = []
+        let preparationFails = true
+        const beforeRefresh = vi.fn(async () => {
+            events.push('before-refresh')
+            if (preparationFails) throw new Error('native acknowledgement failed')
+        })
+        let refreshAttempts = 0
+        const runtime = {
+            retryCommittedWorkingSetRefresh: vi.fn(async () => {
+                events.push('refresh')
+                refreshAttempts++
+                return {
+                    kind: 'committed' as const,
+                    revision: 17,
+                    projection: refreshAttempts === 1
+                        ? 'refresh-required' as const
+                        : 'applied' as const,
+                }
+            }),
+            getStorageAuthorityEpoch: () => 9,
+        }
+        const afterRefresh = vi.fn(async () => {
+            events.push('after-refresh')
+        })
+        registerCommittedWorkingSetContinuation(
+            17,
+            runtime,
+            9,
+            afterRefresh,
+            beforeRefresh,
+        )
+
+        await expect(
+            retryCommittedWorkingSetRefreshWithContinuation(runtime),
+        ).rejects.toThrow('native acknowledgement failed')
+        expect(runtime.retryCommittedWorkingSetRefresh).not.toHaveBeenCalled()
+
+        preparationFails = false
+        await retryCommittedWorkingSetRefreshWithContinuation(runtime)
+        expect(afterRefresh).not.toHaveBeenCalled()
+        await retryCommittedWorkingSetRefreshWithContinuation(runtime)
+
+        expect(events).toEqual([
+            'before-refresh',
+            'before-refresh',
+            'refresh',
+            'refresh',
+            'after-refresh',
+        ])
+        expect(beforeRefresh).toHaveBeenCalledTimes(2)
+        expect(runtime.retryCommittedWorkingSetRefresh).toHaveBeenCalledTimes(2)
+        expect(afterRefresh).toHaveBeenCalledOnce()
+    })
+
     it('keeps a successful read-only retry successful when its continuation fails', async () => {
         const report = vi.fn()
         let authorityEpoch = 7

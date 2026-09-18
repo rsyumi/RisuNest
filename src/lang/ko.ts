@@ -2407,7 +2407,7 @@ export const languageKorean = {
             resultFailed:
                 '가져오기에 실패했습니다. 기존 데이터는 그대로입니다.',
             resultFailedAfterCommit:
-                '데이터는 가져왔지만 화면을 새로 고치지 못했습니다. 다른 작업을 하기 전에 앱을 다시 시작하세요.',
+                '데이터는 가져왔지만 화면을 새로 고치지 못했습니다. 다른 작업을 하기 전에 화면 새로 고침 안내를 따라주세요.',
             errorDetails: '오류 상세',
             copyDetails: '복사',
             copied: '복사됨',

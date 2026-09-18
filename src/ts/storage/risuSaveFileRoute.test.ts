@@ -16,6 +16,7 @@ function dependencies(platform: 'native-desktop' | 'web'): RisuSaveFileRouteDepe
         runtime: () => ({
             store: {} as never,
             revision: 4,
+            getStorageAuthorityEpoch: () => 1,
             flushPendingData: vi.fn(async () => undefined),
             capturePersistentMutationToken: vi.fn(async () => ({
                 revision: 4,

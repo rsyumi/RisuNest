@@ -9,6 +9,7 @@ let pending:
           runtime: object
           authorityEpoch: number
           continueAfterRefresh: CommittedWorkingSetContinuation
+          prepareRefresh?: CommittedWorkingSetContinuation
       }>
     | undefined
 
@@ -17,11 +18,18 @@ export function registerCommittedWorkingSetContinuation(
     runtime: object,
     authorityEpoch: number,
     continueAfterRefresh: CommittedWorkingSetContinuation,
+    prepareRefresh?: CommittedWorkingSetContinuation,
 ): void {
     if (pending?.runtime === runtime && pending.authorityEpoch === authorityEpoch) {
         throw new Error('A committed working-set continuation is already pending')
     }
-    pending = { minimumRevision, runtime, authorityEpoch, continueAfterRefresh }
+    pending = {
+        minimumRevision,
+        runtime,
+        authorityEpoch,
+        continueAfterRefresh,
+        prepareRefresh,
+    }
 }
 
 export async function continueCommittedWorkingSetRefresh(
@@ -40,14 +48,21 @@ export async function continueCommittedWorkingSetRefresh(
     await continuation()
 }
 
-function claimCommittedWorkingSetRetry(
+async function prepareCommittedWorkingSetRetry(
     runtime: object,
     authorityEpoch: number,
-): boolean {
+): Promise<boolean> {
     if (!pending) return false
-    if (pending.runtime === runtime && pending.authorityEpoch === authorityEpoch) return true
-    pending = undefined
-    return false
+    if (pending.runtime !== runtime || pending.authorityEpoch !== authorityEpoch) {
+        pending = undefined
+        return false
+    }
+    const claimed = pending
+    await claimed.prepareRefresh?.()
+    if (pending === claimed && claimed.prepareRefresh) {
+        pending = { ...claimed, prepareRefresh: undefined }
+    }
+    return true
 }
 
 function rebaseCommittedWorkingSetRetry(
@@ -67,7 +82,15 @@ export async function retryCommittedWorkingSetRefreshWithContinuation(
     onContinuationError?: (error: unknown) => void,
 ): Promise<CommittedApplyOutcome | null> {
     const authorityEpoch = runtime.getStorageAuthorityEpoch()
-    const ownsContinuation = claimCommittedWorkingSetRetry(runtime, authorityEpoch)
+    let ownsContinuation: boolean
+    try {
+        ownsContinuation = await prepareCommittedWorkingSetRetry(runtime, authorityEpoch)
+    } catch (error) {
+        try {
+            onContinuationError?.(error)
+        } catch {}
+        throw error
+    }
     const outcome = await runtime.retryCommittedWorkingSetRefresh()
     if (!ownsContinuation) return outcome
     if (outcome?.projection !== 'applied') {

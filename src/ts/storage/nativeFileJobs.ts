@@ -438,7 +438,8 @@ export type NativeBlockRestoreRuntime = Pick<
     | 'capturePersistentMutationToken'
     | 'acquireDestructiveReplacementFence'
     | 'markCommittedWorkingSetRefreshRequired'
-> & Partial<Pick<PersistentDataRuntime, 'getStorageAuthorityEpoch'>>
+    | 'getStorageAuthorityEpoch'
+>
 
 export interface NativeFileJobOptions {
     onStarted?(jobId: string): void | Promise<void>
@@ -1410,28 +1411,6 @@ async function runNativeReplacementRestore(
                     'Native restore committed without a renderer replacement fence',
                 )
             }
-            if (
-                kind === 'restore-portable-backup' &&
-                terminal.deviceSessionId
-            ) {
-                try {
-                    await invokeNative(
-                        dependencies,
-                        'native_device_backup_recovery_complete',
-                        { sessionId: terminal.deviceSessionId },
-                    )
-                } catch (error) {
-                    const committedError = new NativeFileJobActivationCommittedError(
-                        terminal.result.revision,
-                        error,
-                    )
-                    runtime.markCommittedWorkingSetRefreshRequired(
-                        terminal.result.revision,
-                        committedError,
-                    )
-                    throw committedError
-                }
-            }
             const committedResult = {
                 ...terminal.result,
                 warningCodes: mergeWarningCodes(
@@ -1462,6 +1441,36 @@ async function runNativeReplacementRestore(
                 }
                 if (followupFailed) throw followupError
             }
+            const deviceSessionId = terminal.deviceSessionId
+            if (kind === 'restore-portable-backup' && deviceSessionId) {
+                const acknowledgeDeviceRecovery = async (): Promise<void> => {
+                    await invokeNative(
+                        dependencies,
+                        'native_device_backup_recovery_complete',
+                        { sessionId: deviceSessionId },
+                    )
+                }
+                try {
+                    await acknowledgeDeviceRecovery()
+                } catch (error) {
+                    const committedError = new NativeFileJobActivationCommittedError(
+                        terminal.result.revision,
+                        error,
+                    )
+                    runtime.markCommittedWorkingSetRefreshRequired(
+                        terminal.result.revision,
+                        committedError,
+                    )
+                    registerCommittedWorkingSetContinuation(
+                        terminal.result.revision,
+                        runtime,
+                        runtime.getStorageAuthorityEpoch(),
+                        continueAfterRefresh,
+                        acknowledgeDeviceRecovery,
+                    )
+                    throw committedError
+                }
+            }
             try {
                 options.onStatus?.(
                     syntheticNativeFileJobStatus(terminal, 'refreshing-app'),
@@ -1472,9 +1481,6 @@ async function runNativeReplacementRestore(
                 replacementFence.release()
                 replacementFence = undefined
                 if (outcome.projection === 'refresh-required') {
-                    if (!runtime.getStorageAuthorityEpoch) {
-                        throw new Error('Persistent storage authority is unavailable')
-                    }
                     registerCommittedWorkingSetContinuation(
                         terminal.result.revision,
                         runtime,
