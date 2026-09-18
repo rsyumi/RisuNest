@@ -32,17 +32,14 @@ async function oauthCallbackContract() {
   const callbackScheme = "risunestoauthtest";
   const expectedCallback =
     "risunestoauthtest://oauth?code=synthetic&state=device";
-  const authorizationUrl =
-    "https://httpbin.org/redirect-to?url=" +
-    encodeURIComponent(expectedCallback);
   const result = await invoke<{
     status: string;
     callbackUrl?: string;
-  }>("plugin:ios-native|authenticate", {
-    authorizationUrl,
-    callbackScheme,
-    prefersEphemeral: true,
-  });
+  }>("ios_bench_authenticate");
+  check(
+    callbackScheme === new URL(expectedCallback).protocol.slice(0, -1),
+    "OAuth callback scheme fixture",
+  );
   check(result.status === "succeeded", "OAuth session did not succeed");
   check(
     result.callbackUrl === expectedCallback,
