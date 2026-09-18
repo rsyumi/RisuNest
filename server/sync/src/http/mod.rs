@@ -247,7 +247,7 @@ fn retain_guard_until_body_eof<T: Send + 'static>(
     let stream = futures_util::stream::poll_fn(move |context| {
         let next = body.as_mut().poll_next(context);
         if matches!(next, std::task::Poll::Ready(None)) {
-            guard.take();
+            drop(guard.take());
         }
         next
     });
