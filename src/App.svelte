@@ -48,6 +48,8 @@
     import { openDataHealthScreen } from './ts/storage/dataHealthNavigation';
     import LoadingIndicator from './lib/UI/GUI/LoadingIndicator.svelte';
     import SyncExitDialog from './lib/Others/SyncExitDialog.svelte';
+    import PersistentWorkingSetRecovery from './lib/Others/PersistentWorkingSetRecovery.svelte';
+    import { persistentWorkingSetInputBlocked } from './ts/storage/persistentDataRuntime.svelte';
 
     import {
         serverSyncNavigation,
@@ -226,7 +228,7 @@
 
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-<main class="flex bg-bg w-full h-full max-w-100vw text-textcolor" use:keepFocusedInputVisible={isTauriMobile} ondragover={(e) => {
+<main inert={$persistentWorkingSetInputBlocked} class="flex bg-bg w-full h-full max-w-100vw text-textcolor" use:keepFocusedInputVisible={isTauriMobile} ondragover={(e) => {
     const dropEffect = getMainDropEffect(e)
     e.preventDefault()
     e.dataTransfer.dropEffect = dropEffect
@@ -607,6 +609,7 @@
         <CustomSidebarConfig />
     {/if}
     <NativeFileJobDialog />
-    <SyncExitDialog />
     <UpdatePopup />
 </main>
+<SyncExitDialog />
+<PersistentWorkingSetRecovery />

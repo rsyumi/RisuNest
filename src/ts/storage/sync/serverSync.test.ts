@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { createServerSyncFacade, type ServerCycle } from "./serverSync";
+import type { CommittedApplyOutcome } from '../persistentDataRuntime';
 
 const head = {
   libraryId: "library",
@@ -30,9 +31,11 @@ function fixture(
   const trace: string[] = [];
   let fenced = false;
   const fence = {
-    refreshCommittedWorkingSet: vi.fn(async () => {
+    revision: 7,
+    refreshCommittedWorkingSet: vi.fn(async (): Promise<CommittedApplyOutcome> => {
       expect(fenced).toBe(true);
       trace.push("refresh");
+      return { kind: 'committed', revision: 8, projection: 'applied' };
     }),
     release: vi.fn(() => {
       fenced = false;
@@ -43,13 +46,17 @@ function fixture(
     flushPendingData: vi.fn(async () => {
       expect(fenced).toBe(false);
     }),
-    capturePersistentMutationToken: vi.fn(async () => ({ revision: 7 })),
+    capturePersistentMutationToken: vi.fn(async () => ({ revision: 7, mutationGeneration: 1 })),
     acquireDestructiveReplacementFence: vi.fn(async () => {
       fenced = true;
       trace.push("fence");
       return fence;
     }),
-    acquireCommittedWorkingSetRefreshFence: vi.fn(async () => fence),
+    refreshActiveWorkingSetFromStore: vi.fn(async (revision: number): Promise<CommittedApplyOutcome> => {
+      expect(fenced).toBe(false);
+      trace.push('read-only-refresh');
+      return { kind: 'committed', revision, projection: 'applied' };
+    }),
   };
   const native = vi.fn(async (command: string) => {
     trace.push(command);
@@ -74,7 +81,7 @@ function fixture(
     return undefined;
   });
   const facade = createServerSyncFacade({
-    runtime: runtime as never,
+    runtime,
     invoke: native as never,
     onProgress: (phase) => progress.push(phase),
     onVerifiedBytes,
@@ -197,15 +204,20 @@ describe("server sync activation boundary", () => {
     ]);
     expect(fence.refreshCommittedWorkingSet).toHaveBeenCalledWith(8);
   });
-  it("retains the mutation fence after a committed refresh failure and retries without a second activation", async () => {
-    const { facade, native, fence } = fixture();
-    fence.refreshCommittedWorkingSet.mockRejectedValueOnce(
-      new Error("synthetic refresh failure"),
-    );
+  it.each(['returned', 'thrown'] as const)("releases the physical fence after a %s refresh failure and retries read-only", async (failure) => {
+    const { facade, native, fence, runtime } = fixture();
+    if (failure === 'returned') {
+      fence.refreshCommittedWorkingSet.mockResolvedValueOnce({
+        kind: 'committed', revision: 8, projection: 'refresh-required',
+      });
+    } else {
+      fence.refreshCommittedWorkingSet.mockRejectedValueOnce(new Error('synthetic refresh failure'));
+    }
     await expect(facade.cycle()).rejects.toMatchObject({
       code: "committed-refresh-pending",
     });
-    expect(fence.release).not.toHaveBeenCalled();
+    expect(fence.release).toHaveBeenCalledOnce();
+    expect(facade.needsRefresh()).toBe(true);
     await expect(facade.reconcile()).rejects.toMatchObject({
       code: "committed-refresh-pending",
     });
@@ -219,6 +231,8 @@ describe("server sync activation boundary", () => {
       ),
     ).toHaveLength(1);
     expect(fence.release).toHaveBeenCalledTimes(1);
+    expect(runtime.refreshActiveWorkingSetFromStore).toHaveBeenCalledExactlyOnceWith(8);
+    expect(fence.refreshCommittedWorkingSet).toHaveBeenCalledOnce();
   });
   it("releases the fence and discards preparation if local edits invalidate the prepared revision", async () => {
     const { facade, native, fence } = fixture();

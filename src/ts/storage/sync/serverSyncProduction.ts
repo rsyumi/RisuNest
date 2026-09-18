@@ -5,6 +5,7 @@ import {
   flushPendingData,
   capturePersistentMutationToken,
   acquireDestructiveReplacementFence,
+  refreshActiveWorkingSetFromStore,
 } from "../persistentDataRuntime.svelte";
 import { createServerSyncFacade, type ServerHead } from "./serverSync";
 import { createServerSyncController } from "./serverSyncController";
@@ -25,6 +26,7 @@ export function getServerSyncController() {
         flushPendingData,
         capturePersistentMutationToken,
         acquireDestructiveReplacementFence,
+        refreshActiveWorkingSetFromStore,
       },
       restorePlugins: async () => {
         await (

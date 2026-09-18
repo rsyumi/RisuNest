@@ -75,13 +75,15 @@ async function makeRuntime(name: string, database = makeDatabase('Initial')) {
     await store.open()
     await store.replaceFromDatabase(database)
     const state = makeState(database)
+    const onBackgroundError = vi.fn()
     const runtime = createPersistentDataRuntime({
         store,
         state,
+        onBackgroundError,
         prepareDatabase: async (candidate) => structuredClone(candidate),
     })
     await runtime.initializeActiveWorkingSet(database)
-    return { runtime, state, store }
+    return { runtime, state, store, onBackgroundError }
 }
 
 describe('committed working-set refresh fence', () => {
@@ -121,18 +123,21 @@ describe('committed working-set refresh fence', () => {
         expect(state.current().username).toBe('Revision three')
     })
 
-    it('rejects when the authoritative revision has not reached the required minimum', async () => {
-        const { runtime, state } = await makeRuntime(
+    it('retains a refresh guard when the confirmed revision is not yet readable', async () => {
+        const { runtime, state, onBackgroundError } = await makeRuntime(
             `committed-refresh-minimum-${crypto.randomUUID()}`,
         )
         const fence = await runtime.acquireCommittedWorkingSetRefreshFence()
 
-        await expect(fence.refreshCommittedWorkingSet(2)).rejects.toEqual(
-            new RevisionConflictError(2, 1),
-        )
-        expect(runtime.revision).toBe(1)
+        await expect(fence.refreshCommittedWorkingSet(2)).resolves.toEqual({
+            kind: 'committed', revision: 2, projection: 'refresh-required',
+        })
+        expect(onBackgroundError).toHaveBeenCalledWith(new RevisionConflictError(2, 1))
+        expect(runtime.revision).toBe(2)
+        expect(runtime.pendingWorkingSetRefreshRevision).toBe(2)
         expect(state.current().username).toBe('Initial')
         fence.release()
+        expect(() => runtime.markPersistentDataDirty(1)).toThrow(PersistentMutationFencedError)
     })
 
     it('rejects a local-only completion flush while the refresh fence is held', async () => {
@@ -209,14 +214,23 @@ describe('committed working-set refresh fence', () => {
         state.current().username = 'Mutation during projection'
         expect(() => runtime.markPersistentDataDirty(10)).toThrow(PersistentMutationFencedError)
         resumeProjection()
-        await expect(refresh).rejects.toBeInstanceOf(PersistentMutationFencedError)
+        await expect(refresh).resolves.toEqual({
+            kind: 'committed', revision: 2, projection: 'refresh-required',
+        })
         fence.release()
 
-        await expect(runtime.flushPendingData('preserved-after-failed-refresh')).rejects.toEqual(
-            new RevisionConflictError(1, 2),
-        )
+        const commit = vi.spyOn(store, 'commit')
+        expect(() => runtime.flushPendingData('preserved-after-failed-refresh'))
+            .toThrow(PersistentMutationFencedError)
         expect(state.current().username).toBe('Mutation during projection')
-        expect(runtime.revision).toBe(1)
+        expect(runtime.revision).toBe(2)
+        expect(runtime.pendingWorkingSetRefreshRevision).toBe(2)
+        expect(commit).not.toHaveBeenCalled()
+        await expect(runtime.retryCommittedWorkingSetRefresh()).resolves.toEqual({
+            kind: 'committed', revision: 2, projection: 'applied',
+        })
+        expect(state.current().username).toBe('Remote winner')
+        expect(commit).not.toHaveBeenCalled()
     })
 
     it('disposes a stale pinned publication without republishing it after refresh', async () => {

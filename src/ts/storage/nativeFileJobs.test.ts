@@ -44,27 +44,33 @@ function status(
 function restoreRuntime(
     revision: number,
     options: {
-        capture?: () => void | Promise<void>
+        capture?: (reason: string) => void | Promise<void>
         refresh?: (revision: number) => void | Promise<void>
         acquire?: () => void | Promise<void>
         release?: () => void
-        /** Revision the fence reports after its own flush advanced past the token. */
+        /** Revision captured after explicit restore preparation and user choices. */
         fencedRevision?: number
     } = {},
 ) {
+    let captures = 0
     return {
-        capturePersistentMutationToken: async () => {
-            await options.capture?.()
-            return { revision, mutationGeneration: 1 }
-        },
-        acquireDestructiveReplacementFence: async () => {
-            await options.acquire?.()
+        capturePersistentMutationToken: async (reason: string) => {
+            await options.capture?.(reason)
             return {
-                revision: options.fencedRevision ?? revision,
+                revision: captures++ > 0 ? options.fencedRevision ?? revision : revision,
+                mutationGeneration: 1,
+            }
+        },
+        acquireDestructiveReplacementFence: async (token: { revision: number; mutationGeneration: number }) => {
+            await options.acquire?.()
+            expect(token.revision).toBe(options.fencedRevision ?? revision)
+            return {
+                revision: token.revision,
                 refreshCommittedWorkingSet: async (
                     committedRevision: number,
                 ) => {
                     await options.refresh?.(committedRevision)
+                    return { kind: 'committed', revision: committedRevision, projection: 'applied' } as const
                 },
                 release: () => options.release?.(),
             }
@@ -1815,11 +1821,8 @@ describe('native file jobs', () => {
         ]
         const refreshed: number[] = []
         const runtime = restoreRuntime(3, {
-            capture: () => {
-                calls.push([
-                    'capture:native-block-risu-save-restore',
-                    undefined,
-                ])
+            capture: (reason) => {
+                calls.push([`capture:${reason}`, undefined])
             },
             refresh: (revision) => {
                 refreshed.push(revision)
@@ -1871,6 +1874,7 @@ describe('native file jobs', () => {
             ],
             ['native_file_job_status', { jobId: 'job-1' }],
             ['native_file_job_status', { jobId: 'job-1' }],
+            ['capture:native-block-risu-save-restore-activation', undefined],
             [
                 'native_file_job_finalize',
                 { jobId: 'job-1', expectedRevision: 3 },
@@ -1882,7 +1886,7 @@ describe('native file jobs', () => {
         expect(JSON.stringify(calls)).not.toContain('Uint8Array')
     })
 
-    it('activates against the revision its fence flushed to, not the started one', async () => {
+    it('activates against an explicitly recaptured token after restore preparation', async () => {
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
         const statuses = [
             {
@@ -1901,7 +1905,7 @@ describe('native file jobs', () => {
 
         const result = await runNativeBlockRisuSaveRestore(
             // Reading the backup took long enough for the renderer to leave an
-            // edit behind, which the fence acquisition flushes to revision 5.
+            // edit behind, which the explicit activation token capture flushes to revision 5.
             restoreRuntime(4, { fencedRevision: 5 }),
             { type: 'desktopPath', path: 'C:\chosen\backup.risudat' },
             undefined,

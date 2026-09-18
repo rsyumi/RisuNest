@@ -901,7 +901,7 @@ describe('prepared persistent replacement', () => {
         expect(store.replaceFromDatabase).not.toHaveBeenCalled()
     })
 
-    it('rebases live edits made while database preparation is pending', async () => {
+    it('preserves newer local edits and rejects a stale prepared replacement', async () => {
         let database = makeDatabase('Initial')
         const preparation = deferred<Database>()
         const prepareDatabase = vi.fn(() => preparation.promise)
@@ -941,13 +941,12 @@ describe('prepared persistent replacement', () => {
         database.username = 'Edited during preparation'
         runtime.markPersistentDataDirty(1)
         preparation.resolve(makeDatabase('Prepared replacement'))
-        await replacement
+        await expect(replacement).rejects.toBeInstanceOf(RevisionConflictError)
 
         expect(database.username).toBe('Edited during preparation')
-        expect(store.replaceFromDatabase).toHaveBeenCalledWith(
-            expect.objectContaining({ username: 'Prepared replacement' }),
-            1,
-        )
+        expect(store.replaceFromDatabase).not.toHaveBeenCalled()
+        expect(store.commit).toHaveBeenCalledOnce()
+        expect(runtime.revision).toBe(2)
     })
 
     it('returns a detached materialized snapshot without installing it', async () => {
@@ -1229,7 +1228,12 @@ describe('prepared persistent replacement', () => {
                     )
                 },
                 publishCharacter: vi.fn(),
-                publishCharacterSet: vi.fn(),
+                publishCharacterSet: (primary, related) => {
+                    for (const value of [primary, ...related]) {
+                        const resident = database.characters.find((item) => item.chaId === value.chaId)
+                        if (resident) Object.assign(resident, structuredClone(value))
+                    }
+                },
                 publishConversation: vi.fn(),
             },
             prepareDatabase: async (value) => value,
@@ -1259,7 +1263,7 @@ describe('prepared persistent replacement', () => {
         expect(isCatalogCharacterStub(database.characters[4])).toBe(true)
     })
 
-    it('rebases a dirty UI edit before synchronous bounded replacement publication', async () => {
+    it('blocks a stale UI edit and persists fresh edits after bounded replacement publication', async () => {
         const complete = {
             username: 'Initial',
             customBackground: '',
@@ -1342,20 +1346,25 @@ describe('prepared persistent replacement', () => {
 
         const replacing = runtime.replacePersistentDatabase(replacement, 'delayed-replacement')
         await vi.waitFor(() => expect(store.replaceFromDatabase).toHaveBeenCalledOnce())
-        database.customBackground = 'live edit during replacement'
-        runtime.markPersistentDataDirty(1)
+        expect(() => {
+            runtime.assertPersistentMutationAllowed()
+            database.customBackground = 'blocked edit during replacement'
+        }).toThrow(/replacement is active/i)
         replacementWrite.resolve({ revision: 8 })
         await replacing
 
         expect(database.username).toBe('Replacement')
-        expect(database.customBackground).toBe('live edit during replacement')
+        expect(database.customBackground).toBe('')
         expect(database.pluginCustomStorage).toEqual({})
         expect(database.characters[0].personality).toBe('member detail')
         expect(isCatalogCharacterStub(database.characters[2])).toBe(true)
         expect(acquireRevision).not.toHaveBeenCalled()
         expect(materializeDatabase).not.toHaveBeenCalled()
 
-        await runtime.flushPendingData('persist-rebased-live-edit')
+        expect(commit).not.toHaveBeenCalled()
+        database.customBackground = 'live edit during replacement'
+        runtime.markPersistentDataDirty(1)
+        await runtime.flushPendingData('persist-new-live-edit')
         expect(commit).toHaveBeenCalledWith(
             expect.objectContaining({
                 expectedRevision: 8,

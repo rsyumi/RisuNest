@@ -184,7 +184,7 @@ export function createServerSyncFacade(options: {
     | {
         revision: number;
         preparationId: string;
-        fence: PersistentDestructiveReplacementFence;
+        fence?: PersistentDestructiveReplacementFence;
       }
     | undefined;
   let pendingActivation:
@@ -200,13 +200,26 @@ export function createServerSyncFacade(options: {
     if (!pending) throw new ServerSyncError("refresh-not-pending");
     options.onProgress?.("refreshing");
     try {
-      await pending.fence.refreshCommittedWorkingSet(pending.revision);
+      let outcome;
+      if (pending.fence) {
+        const fence = pending.fence;
+        try {
+          outcome = await fence.refreshCommittedWorkingSet(pending.revision);
+        } finally {
+          pending.fence = undefined;
+          fence.release();
+        }
+      } else {
+        outcome = await options.runtime.refreshActiveWorkingSetFromStore(pending.revision);
+      }
+      if (outcome.projection === 'refresh-required') {
+        throw new ServerSyncError('committed-refresh-pending');
+      }
       await options.restorePlugins?.();
     } catch {
       throw new ServerSyncError("committed-refresh-pending");
     }
     pendingRefresh = undefined;
-    pending.fence.release();
     return pending.preparationId;
   };
   const activate = async (): Promise<string> => {

@@ -1,5 +1,5 @@
 import { createPersistenceCanonicalCapture } from './reactivePersistenceCapture.svelte'
-import { get, readonly, writable } from 'svelte/store'
+import { derived, get, readonly, writable } from 'svelte/store'
 import { doingChat } from '../process/generationState'
 import { ReloadGUIPointer, selectedCharID } from '../stores.svelte'
 import type { ActiveConversationSession } from './activeConversationSession'
@@ -404,7 +404,12 @@ const productionConfiguration: ProductionRuntimeConfiguration = {
 }
 let productionRuntime: PersistentDataRuntime | null = null
 const workingSetRefreshRevision = writable<DataRevision | null>(null)
+const destructiveReplacementActive = writable(false)
 export const persistentWorkingSetRefreshRevision = readonly(workingSetRefreshRevision)
+export const persistentWorkingSetInputBlocked = derived(
+    [destructiveReplacementActive, workingSetRefreshRevision],
+    ([active, revision]) => active || revision !== null,
+)
 
 export function configurePersistentDataRuntime(
     configuration: Partial<ProductionRuntimeConfiguration>,
@@ -425,6 +430,7 @@ export function getPersistentDataRuntime(): PersistentDataRuntime {
             onFlushPromise: (promise) => productionConfiguration.onFlushPromise?.(promise),
             onBackgroundError: (error) => productionConfiguration.onBackgroundError?.(error),
             onWorkingSetRefreshRequired: (revision) => workingSetRefreshRevision.set(revision),
+            onDestructiveReplacementFenceChanged: (active) => destructiveReplacementActive.set(active),
             prepareDatabase: prepareDatabaseForPersistence,
         })
     }

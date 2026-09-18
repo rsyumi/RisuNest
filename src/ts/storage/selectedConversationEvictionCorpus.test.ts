@@ -144,8 +144,11 @@ function screenshotRenderContext(owner: character): ChatScreenshotRenderContext 
     }
 }
 
-async function waitForWindowed(runtime: ReturnType<typeof createPersistentDataRuntime>) {
-    await vi.waitFor(() => expect(runtime.getSelectedConversationMode()).toBe('windowed'))
+async function waitForWindowed(
+    runtime: ReturnType<typeof createPersistentDataRuntime>,
+    stage = 'initial activation',
+) {
+    await vi.waitFor(() => expect(runtime.getSelectedConversationMode(), stage).toBe('windowed'))
     expect(runtime.getActiveConversationSession()).toBeNull()
     const source = runtime.getActiveConversationViewportSource()
     expect(source).not.toBeNull()
@@ -208,9 +211,11 @@ describe('selected conversation eviction correctness corpus', () => {
             isConversationOperationActive: () => false,
             conversationViewportRowBudget: VIEWPORT_ROW_BUDGET,
         }
+        const backgroundErrors: unknown[] = []
         const runtime = createPersistentDataRuntime({
             store,
             state,
+            onBackgroundError: (error) => { backgroundErrors.push(error) },
             prepareDatabase: async (candidate) => candidate,
         })
         await runtime.initializeActiveWorkingSet(workingCopy)
@@ -236,7 +241,7 @@ describe('selected conversation eviction correctness corpus', () => {
             conversationId: string,
             expectedConversation: Chat,
         ) => {
-            await waitForWindowed(runtime)
+            await waitForWindowed(runtime, stage)
             expect(() => selectedConversation().message).toThrow('metadata-only')
             expect(Object.keys(selectedConversation()), `${stage}: metadata shell keys`)
                 .not.toContain('message')
@@ -524,8 +529,11 @@ describe('selected conversation eviction correctness corpus', () => {
         await expect(runtime.flushPendingData('revision-conflict-stale'))
             .rejects.toBeInstanceOf(RevisionConflictError)
         expect(runtime.getSelectedConversationMode()).toBe('complete')
-        await runtime.refreshActiveWorkingSetFromStore(competingCommit.revision)
-        await waitForWindowed(runtime)
+        backgroundErrors.length = 0
+        const refresh = await runtime.refreshActiveWorkingSetFromStore(competingCommit.revision)
+        expect(backgroundErrors, 'refresh after competing commit').toEqual([])
+        expect(refresh.projection).toBe('applied')
+        await waitForWindowed(runtime, 'refresh after competing commit')
         const retryLease = await runtime.acquireCompleteConversation('revision-conflict-retry')
         retryLease.session.append(structuredClone(conflictMessage))
         retryLease.release()
@@ -701,7 +709,10 @@ describe('selected conversation eviction correctness corpus', () => {
         }))
         vi.doMock('./persistentDataRuntime.svelte', () => ({
             acquireDestructiveReplacementFence: vi.fn(),
-            acknowledgeGenerationCompletion: () => runtime.acknowledgeGenerationCompletion(),
+            acknowledgeGenerationCompletion: (epoch?: number) => runtime.acknowledgeGenerationCompletion(epoch),
+            assertPersistentMutationAllowed: (epoch?: number) => runtime.assertPersistentMutationAllowed(epoch),
+            getPersistentStorageAuthorityEpoch: () => runtime.getStorageAuthorityEpoch(),
+            getPersistentNavigationGeneration: () => runtime.getNavigationGeneration(),
             capturePersistentMutationToken: vi.fn(),
             captureSelectedConversationTarget: () => runtime.captureSelectedConversationTarget(),
             acquireCompleteConversation: (reason: string, target: never) =>

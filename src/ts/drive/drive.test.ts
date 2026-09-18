@@ -21,7 +21,7 @@ const state = vi.hoisted(() => ({
     forageInit: vi.fn(async () => undefined),
     officialCold: new Map<string, unknown>(),
     publishCurrentOfficialRevision: vi.fn<() => Promise<void>>(),
-    replacePersistentDatabase: vi.fn<(database: Database, reason: string) => Promise<void>>(),
+    replacePersistentDatabase: vi.fn<PersistentDataRuntime['replacePersistentDatabase']>(),
     runtime: null as PersistentDataRuntime | null,
     restoreEvents: [] as string[],
     getUncleanables: vi.fn(async () => ['assets/second-read.png']),
@@ -135,8 +135,8 @@ vi.mock('../process/coldstorage.svelte', () => ({
 vi.mock('../storage/persistentDataRuntime.svelte', () => ({
     getPersistentDataRuntime: () => state.runtime,
     publishCurrentOfficialRevision: () => state.publishCurrentOfficialRevision(),
-    replacePersistentDatabase: (database: Database, reason: string) => (
-        state.replacePersistentDatabase(database, reason)
+    replacePersistentDatabase: (...args: Parameters<PersistentDataRuntime['replacePersistentDatabase']>) => (
+        state.replacePersistentDatabase(...args)
     ),
 }))
 
@@ -338,10 +338,12 @@ describe('Drive restore cold snapshot assets', () => {
             markPublished: vi.fn(),
             ledger: createUnrecordedOfficialAssetLedger(),
         })
-        state.replacePersistentDatabase.mockImplementation(async (candidate, reason) => {
+        state.replacePersistentDatabase.mockImplementation(async (candidate, reason, options) => {
             expect(reason).toBe('drive-restore')
+            expect(options?.publishOfficial).toBe(true)
             state.restoreEvents.push('database')
             revision = (await store.replaceFromDatabase(structuredClone(candidate))).revision
+            return { kind: 'committed', revision, projection: 'applied' }
         })
         state.publishCurrentOfficialRevision.mockImplementation(async () => {
             const publication = await adapter.pin(revision)

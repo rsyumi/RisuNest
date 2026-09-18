@@ -329,6 +329,7 @@ export interface PersistentDataRuntimeDependencies {
     onFlushPromise?(promise: Promise<void> | null): void
     onBackgroundError?(error: unknown): void
     onWorkingSetRefreshRequired?(revision: DataRevision | null): void
+    onDestructiveReplacementFenceChanged?(active: boolean): void
     /** Detaches the input synchronously before any asynchronous preparation. */
     prepareDatabase(database: Database): Promise<Database>
 }
@@ -615,6 +616,12 @@ export function createPersistentDataRuntime(
         onWorkingSetRefreshRequired: (revision) => {
             if (revision === null) pendingRefreshChangeSet = null
             dependencies.onWorkingSetRefreshRequired?.(revision)
+        },
+        onDestructiveReplacementFenceChanged: (active) => {
+            // A projection can request demotion while its input guard still blocks it.
+            // Retry only after the final release, preserving all ordinary demotion checks.
+            if (!active) workingSet.scheduleSelectedConversationDemotion()
+            dependencies.onDestructiveReplacementFenceChanged?.(active)
         },
         isConversationOperationActive: dependencies.state.isConversationOperationActive,
     })

@@ -51,12 +51,17 @@ export async function openSyncConflictBackups(): Promise<void> {
         'sync-conflict-restore',
     )
     await installLocalBackup(decoded, {
-        replaceDatabase: (database, reason) => replacePersistentDatabase(database, reason, {
+        replaceDatabase: (database, reason, options) => replacePersistentDatabase(database, reason, {
+            ...options,
             authoritative: true,
             expectedRevision: current.revision,
             expectedMutationGeneration: current.mutationGeneration,
         }),
         publishAcceptedRevision: publishCurrentOfficialRevision,
+        onPostCommitError: (error) => {
+            console.error('Committed conflict restore follow-up failed', error)
+            alertError(language.risuNest.persistentData.followupFailed)
+        },
         relaunch: () => location.reload(),
     })
 }

@@ -13,6 +13,8 @@ const database = {
     account: { token: 'account-token', useSync: true },
     characters: [],
 } as Database
+const committed = { kind: 'committed', revision: 8, projection: 'applied' } as const
+const refreshRequired = { ...committed, projection: 'refresh-required' } as const
 
 describe.each([
     ['account backup', installAccountBackup, 'account-backup'],
@@ -24,6 +26,7 @@ describe.each([
         await install(database, {
             replaceDatabase: async (_candidate, reason) => {
                 events.push(`replace:${reason}`)
+                return committed
             },
             loadPlugins: async () => {
                 events.push('plugins')
@@ -52,7 +55,7 @@ describe('local backup restore', () => {
         const events: string[] = []
 
         await installLocalBackup(database, {
-            replaceDatabase: async () => { events.push('replace') },
+            replaceDatabase: async () => { events.push('replace'); return committed },
             publishAcceptedRevision: async () => { events.push('publish') },
             relaunch: async () => { events.push('relaunch') },
         })
@@ -75,12 +78,15 @@ describe('local backup restore', () => {
     it('retains publication retry ownership and does not relaunch on publish failure', async () => {
         const relaunch = vi.fn()
 
+        const onPostCommitError = vi.fn()
         await expect(installLocalBackup(database, {
-            replaceDatabase: async () => undefined,
+            replaceDatabase: async () => committed,
             publishAcceptedRevision: async () => { throw new Error('official offline') },
             relaunch,
-        })).rejects.toThrow('official offline')
+            onPostCommitError,
+        })).resolves.toEqual(committed)
 
+        expect(onPostCommitError).toHaveBeenCalledWith(new Error('official offline'))
         expect(relaunch).not.toHaveBeenCalled()
     })
 })
@@ -90,7 +96,7 @@ describe('Drive restore', () => {
         const events: string[] = []
 
         await installDriveRestore(database, {
-            replaceDatabase: async () => { events.push('replace') },
+            replaceDatabase: async () => { events.push('replace'); return committed },
             publishAcceptedRevision: async () => { events.push('publish') },
             relaunch: async () => { events.push('relaunch') },
         })
@@ -113,12 +119,15 @@ describe('Drive restore', () => {
     it('does not relaunch when accepted-revision publication fails', async () => {
         const relaunch = vi.fn()
 
+        const onPostCommitError = vi.fn()
         await expect(installDriveRestore(database, {
-            replaceDatabase: async () => undefined,
+            replaceDatabase: async () => committed,
             publishAcceptedRevision: async () => { throw new Error('official offline') },
             relaunch,
-        })).rejects.toThrow('official offline')
+            onPostCommitError,
+        })).resolves.toEqual(committed)
 
+        expect(onPostCommitError).toHaveBeenCalledWith(new Error('official offline'))
         expect(relaunch).not.toHaveBeenCalled()
     })
 })
@@ -136,6 +145,7 @@ describe('completeAccountUnmigration', () => {
                 expect(reason).toBe('account-unmigration')
                 expect(candidate.account).toBeNull()
                 expect(candidate).not.toBe(live)
+                return committed
             },
             finalize: () => { events.push('finalize') },
         })
@@ -169,6 +179,61 @@ describe('completeAccountUnmigration', () => {
         expect(replaceDatabase).not.toHaveBeenCalled()
         expect(finalize).not.toHaveBeenCalled()
     })
+})
+
+describe.each([
+    ['account', installAccountBackup],
+    ['Risu-Kei', installRisuKeiBackup],
+] as const)('%s committed restore follow-ups', (_name, install) => {
+    it('does not load plugins from a stale projection or repeat the replacement', async () => {
+        const replaceDatabase = vi.fn(async () => refreshRequired)
+        const loadPlugins = vi.fn()
+        await expect(install(database, { replaceDatabase, loadPlugins })).resolves.toEqual(refreshRequired)
+        expect(replaceDatabase).toHaveBeenCalledOnce()
+        expect(loadPlugins).not.toHaveBeenCalled()
+    })
+
+    it('reports plugin failure without rejecting a completed local replacement', async () => {
+        const failure = new Error('plugin startup unavailable')
+        const replaceDatabase = vi.fn(async () => committed)
+        const onPostCommitError = vi.fn()
+        await expect(install(database, {
+            replaceDatabase,
+            loadPlugins: async () => { throw failure },
+            onPostCommitError,
+        })).resolves.toEqual(committed)
+        expect(replaceDatabase).toHaveBeenCalledOnce()
+        expect(onPostCommitError).toHaveBeenCalledExactlyOnceWith(failure)
+    })
+})
+
+describe.each([
+    ['local', installLocalBackup, 'local-backup'],
+    ['Drive', installDriveRestore, 'drive-restore'],
+] as const)('%s committed restore follow-ups', (_name, install, reason) => {
+    it('queues publication without immediately publishing or restarting a stale projection', async () => {
+        const replaceDatabase = vi.fn(async () => refreshRequired)
+        const publishAcceptedRevision = vi.fn()
+        const relaunch = vi.fn()
+        await expect(install(database, {
+            replaceDatabase, publishAcceptedRevision, relaunch,
+        })).resolves.toEqual(refreshRequired)
+        expect(replaceDatabase).toHaveBeenCalledExactlyOnceWith(database, reason, { publishOfficial: true })
+        expect(publishAcceptedRevision).not.toHaveBeenCalled()
+        expect(relaunch).not.toHaveBeenCalled()
+    })
+})
+
+it('awaits account marker finalization even when committed projection needs refresh', async () => {
+    let finished = false
+    const finalize = vi.fn(async () => { await Promise.resolve(); finished = true })
+    await expect(completeAccountUnmigration(database, {
+        prepareResources: async () => undefined,
+        replaceDatabase: async () => refreshRequired,
+        finalize,
+    })).resolves.toEqual(refreshRequired)
+    expect(finished).toBe(true)
+    expect(finalize).toHaveBeenCalledOnce()
 })
 
 describe('account unmigration resource materialization', () => {

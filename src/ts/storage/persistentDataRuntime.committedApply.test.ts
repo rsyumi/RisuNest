@@ -207,14 +207,12 @@ describe('committed apply outcomes', () => {
         replaceDatabase.mockImplementationOnce(() => { throw failure })
         const oldEpoch = runtime.getStorageAuthorityEpoch()
         const replacing = runtime.replacePersistentDatabase(replacement(), 'failed-projection')
-        const staleWriter = vi.fn(async () => 3)
-        const staleResult = expect(runtime.runStorageOnlyMutation(staleWriter))
-            .rejects.toBeInstanceOf(PersistentMutationFencedError)
-
         await expect(replacing).resolves.toEqual({
             kind: 'committed', revision: 2, projection: 'refresh-required',
         })
-        await staleResult
+        const staleWriter = vi.fn(async () => 3)
+        expect(() => runtime.runStorageOnlyMutation(staleWriter))
+            .toThrow(PersistentMutationFencedError)
         expect(staleWriter).not.toHaveBeenCalled()
         expect(harness.durable.username).toBe('Committed replacement')
         expect(harness.database.username).toBe('Fixture')

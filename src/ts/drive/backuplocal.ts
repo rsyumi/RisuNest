@@ -649,6 +649,10 @@ export async function importLegacyBackupWithWebView(
     report('activating')
     await installLocalBackup(dbData, {
         replaceDatabase: replacePersistentDatabase,
+        onPostCommitError: (error) => {
+            console.error('Committed local restore follow-up failed', error)
+            alertError(language.risuNest.persistentData.followupFailed)
+        },
         publishAcceptedRevision: publishCurrentOfficialRevision,
         relaunch: async () => {
             report('restarting-app')

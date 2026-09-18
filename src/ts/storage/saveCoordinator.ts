@@ -122,6 +122,7 @@ export interface SaveCoordinatorDependencies {
     onFlushPromise?(promise: Promise<void> | null): void
     onBackgroundError?(error: unknown): void
     onWorkingSetRefreshRequired?(revision: DataRevision | null): void
+    onDestructiveReplacementFenceChanged?(active: boolean): void
     isConversationOperationActive?(): boolean
 }
 
@@ -407,9 +408,12 @@ function conversationMatchesAfterIdNormalization(
     )
 }
 
-interface ReplacementRebaseResult {
-    database: Database
-    compensation: Omit<WorkingSetCommit, 'expectedRevision'> | null
+interface ReplacementAdmission extends PersistentMutationToken {
+    authorityEpoch: number
+    navigationGeneration: number | undefined
+    baseline: CapturedState
+    hadPendingDebounce: boolean
+    supersededAdditionToken: object | null
 }
 
 export interface PersistentReplacementOptions {
@@ -574,7 +578,7 @@ export class SaveCoordinator {
     private pendingResidentConversationCompensations: PendingResidentConversationCompensation[] = []
     private pendingConversationMutations: PendingConversationMutation[] = []
     private lastBackgroundErrorMessage: string | null = null
-    private destructiveReplacementFence: {
+    private destructiveReplacementFenceState: {
         owner: symbol
         state: 'acquiring' | 'held'
         acceptsPostPublicationDirty: boolean
@@ -582,6 +586,17 @@ export class SaveCoordinator {
         blockedPrePublicationDirty: boolean
         refreshBaseline?: CapturedState
     } | null = null
+    private get destructiveReplacementFence() {
+        return this.destructiveReplacementFenceState
+    }
+    private set destructiveReplacementFence(value: SaveCoordinator['destructiveReplacementFenceState']) {
+        this.destructiveReplacementFenceState = value
+        try {
+            this.dependencies.onDestructiveReplacementFenceChanged?.(value !== null)
+        } catch (error) {
+            this.reportBackgroundError(error)
+        }
+    }
     private selectedConversationTransitionActive = false
     private persistenceWasBusy = false
 
@@ -1077,28 +1092,7 @@ export class SaveCoordinator {
             )
         }
         const candidate = canonicalDatabaseClone(database)
-        const before = this.capture()
-        const capturedGeneration = this.dirtyGeneration
-        const supersededAdditionToken =
-            (this.pendingCharacterAddition ?? this.reservedCharacterAddition)?.token ?? null
-        const hadPendingDebounce = this.debounceHandle !== undefined
-        this.cancelDebounce()
-        const replacement = this.enqueue(() => {
-            const queuedExpectationError = this.replacementExpectationError(options)
-            if (queuedExpectationError) throw queuedExpectationError
-            return this.runReplacement(
-                candidate,
-                before,
-                capturedGeneration,
-                supersededAdditionToken,
-                reason,
-                options,
-            )
-        })
-        return replacement.catch((error) => {
-            this.rearmDebounceAfterReplacementFailure(capturedGeneration, hadPendingDebounce)
-            throw error
-        })
+        return this.enqueueReplacement(candidate, this.captureReplacementAdmission(options), reason, options)
     }
 
     replacePreparedPersistentDatabase(
@@ -1111,43 +1105,92 @@ export class SaveCoordinator {
         options = { ...options }
         const expectationError = this.replacementExpectationError(options)
         if (expectationError) return Promise.reject(expectationError)
-        const before = this.capture()
-        const capturedGeneration = this.dirtyGeneration
-        const supersededAdditionToken =
-            (this.pendingCharacterAddition ?? this.reservedCharacterAddition)?.token ?? null
-        const hadPendingDebounce = this.debounceHandle !== undefined
-        this.cancelDebounce()
-        // Preparation detaches its input synchronously, before the caller can edit it again.
-        const preparation = (async () => {
+        const admission = this.captureReplacementAdmission(options)
+        // Detach immediately, but do not reserve the write queue or pause local autosave.
+        return (async () => {
             const prepared = await prepare()
             if (!options.authoritative && this.dependencies.isIncompleteWorkingSet?.(prepared)) {
                 throw new Error(
                     'Cannot replace persistent data from an incomplete persistent working set',
                 )
             }
-            return canonicalDatabaseClone(prepared)
-        })().then(
-            (candidate) => ({ ok: true, candidate } as const),
-            (error: unknown) => ({ ok: false, error } as const),
-        )
-        const replacement = this.enqueue(async () => {
-            const queuedExpectationError = this.replacementExpectationError(options)
-            if (queuedExpectationError) throw queuedExpectationError
-            const prepared = await preparation
-            if (prepared.ok === false) throw prepared.error
-            const preparedExpectationError = this.replacementExpectationError(options)
-            if (preparedExpectationError) throw preparedExpectationError
-            return this.runReplacement(
-                prepared.candidate,
-                before,
-                capturedGeneration,
-                supersededAdditionToken,
-                reason,
-                options,
+            const candidate = canonicalDatabaseClone(prepared)
+            return this.enqueueReplacement(candidate, admission, reason, options)
+        })()
+    }
+
+    private captureReplacementAdmission(options: PersistentReplacementOptions): ReplacementAdmission {
+        return {
+            revision: options.expectedRevision ?? this.revision,
+            mutationGeneration: options.expectedMutationGeneration ?? this.dirtyGeneration,
+            authorityEpoch: this.authorityEpoch,
+            navigationGeneration: this.dependencies.getNavigationGeneration?.(),
+            baseline: this.capture(),
+            hadPendingDebounce: this.debounceHandle !== undefined,
+            supersededAdditionToken:
+                (this.pendingCharacterAddition ?? this.reservedCharacterAddition)?.token ?? null,
+        }
+    }
+
+    private enqueueReplacement(
+        candidate: Database,
+        admission: ReplacementAdmission,
+        reason: string,
+        options: PersistentReplacementOptions,
+    ): Promise<CommittedApplyOutcome> {
+        this.assertPersistentMutationAllowed(admission.authorityEpoch)
+        if (this.dependencies.isConversationOperationActive?.() || this.publicationInProgress) {
+            return Promise.reject(new PersistentMutationFencedError())
+        }
+        const owner = Symbol('prepared-database-replacement')
+        this.destructiveReplacementFence = {
+            owner,
+            state: 'acquiring',
+            acceptsPostPublicationDirty: false,
+            queuedPostPublicationDirty: false,
+            blockedPrePublicationDirty: false,
+        }
+        this.cancelDebounce()
+        return this.enqueue(async () => {
+            try {
+                // Earlier queued writes and pre-existing dirty state remain durable even
+                // when they make this prepared replacement's exact token stale.
+                await this.flushIterations(reason, false)
+                const expectationError = this.replacementExpectationError({
+                    expectedRevision: admission.revision,
+                    expectedMutationGeneration: admission.mutationGeneration,
+                })
+                if (expectationError) throw expectationError
+                if (
+                    this.authorityEpoch !== admission.authorityEpoch ||
+                    this.dependencies.getNavigationGeneration?.() !== admission.navigationGeneration ||
+                    !this.captureMatchesCapturedState(admission.baseline) ||
+                    this.dependencies.isConversationOperationActive?.()
+                ) {
+                    throw new PersistentMutationFencedError()
+                }
+                if (admission.baseline.windowedCharacter || this.windowedCharacterBaseline) {
+                    throw new WindowedConversationRequiresCompatibilityError(
+                        'database replacement requires complete ownership',
+                    )
+                }
+                if (this.destructiveReplacementFence?.owner !== owner) {
+                    throw new Error('Destructive persistent replacement fence ownership changed')
+                }
+                this.destructiveReplacementFence.state = 'held'
+                return await this.runReplacement(candidate, admission, options)
+            } finally {
+                if (this.destructiveReplacementFence?.owner === owner) {
+                    // A failed admission owns the same input guard as an applied replacement.
+                    this.destructiveReplacementFence.state = 'held'
+                    this.releaseDestructiveReplacementFence(owner)
+                }
+            }
+        }, null).catch((error) => {
+            this.rearmDebounceAfterReplacementFailure(
+                admission.mutationGeneration,
+                admission.hadPendingDebounce,
             )
-        })
-        return replacement.catch((error) => {
-            this.rearmDebounceAfterReplacementFailure(capturedGeneration, hadPendingDebounce)
             throw error
         })
     }
@@ -2729,97 +2772,61 @@ export class SaveCoordinator {
 
     private async runReplacement(
         candidate: Database,
-        before: CapturedState,
-        capturedGeneration: number,
-        supersededAdditionToken: object | null,
-        reason: string,
+        admission: ReplacementAdmission,
         options: PersistentReplacementOptions,
     ): Promise<CommittedApplyOutcome> {
-        await this.retryPendingResidentCompensations(false)
-        const pendingExpectationError = this.replacementExpectationError(options)
-        if (pendingExpectationError) throw pendingExpectationError
-        this.rebaseReplacementPublication(candidate, before, this.capture(), false)
         const candidateCapture = this.captureDatabase(candidate)
         const replaced = await this.dependencies.store.replaceFromDatabase(
             candidate,
-            options.expectedRevision ?? this.revision,
+            admission.revision,
         )
+        // This revision is authoritative even when a later projection or notification fails.
         this.authorityEpoch++
         this.currentRevision = replaced.revision
         const stalePublication = options.publishOfficial ? null : this.pendingPublication
         if (!options.publishOfficial) {
             this.pendingPublication = null
             this.pendingPublicationRevision = null
+            this.deferredPublicationRevision = null
             this.cancelOfficialPublishRetry()
         }
-        if (this.pendingCharacterAddition?.token === supersededAdditionToken) {
+        if (this.pendingCharacterAddition?.token === admission.supersededAdditionToken) {
             this.pendingCharacterAddition = null
         }
-        if (this.reservedCharacterAddition?.token === supersededAdditionToken) {
+        if (this.reservedCharacterAddition?.token === admission.supersededAdditionToken) {
             this.reservedCharacterAddition = null
         }
         this.rootBaseline = candidateCapture.rootCanonical
         this.pluginStorageBaseline = candidateCapture.pluginStorageCanonical
         this.presetsBaseline = candidateCapture.presetsCanonical
         this.setCharacterBaseline(candidateCapture)
+        this.pendingByteCount = 0
+        this.cancelDebounce()
 
-        let rebased: ReplacementRebaseResult
         try {
+            if (
+                this.destructiveReplacementFence?.blockedPrePublicationDirty ||
+                this.dependencies.getNavigationGeneration?.() !== admission.navigationGeneration ||
+                !this.captureMatchesCapturedState(admission.baseline)
+            ) {
+                throw new PersistentMutationFencedError()
+            }
             this.dependencies.onLocalRevision?.(replaced.revision)
-            const live = this.capture()
-            rebased = this.rebaseReplacementPublication(candidate, before, live, true)
-            this.dependencies.replaceDatabase(rebased.database)
+            this.dependencies.replaceDatabase(candidate)
+            // Projection may select a different character when the old selection is absent.
+            // Baseline the committed candidate for that selection, never the mutable live view.
+            this.setCharacterBaseline(this.captureDatabase(candidate))
         } catch (error) {
             this.markCommittedWorkingSetRefreshRequired(replaced.revision, error)
+        }
+        // Cleanup and official publication are queued while the input guard is held.
+        // Neither operation can turn a completed local replacement into a retryable write.
+        try {
             if (stalePublication) await this.disposeOrQueuePublication(stalePublication)
             if (options.publishOfficial) await this.finishExplicitCommit(replaced.revision)
-            return { kind: 'committed', revision: replaced.revision, projection: 'refresh-required' }
+        } catch (error) {
+            this.reportBackgroundError(error)
         }
-        const published = rebased.database
-        const compensation = rebased.compensation ? canonicalClone(rebased.compensation) : null
-
-        if (stalePublication) {
-            await this.disposeOrQueuePublication(stalePublication)
-        }
-        if (compensation) {
-            this.dirtyGeneration++
-            const compensated = await this.dependencies.store.commit({
-                expectedRevision: replaced.revision,
-                ...compensation,
-            })
-            this.currentRevision = compensated.revision
-            if (compensation.root) {
-                this.rootBaseline = canonicalJson(compensation.root)
-            }
-            if (compensation.pluginStorage) {
-                this.pluginStorageBaseline = pluginStorageJson(published.pluginCustomStorage ?? {})
-            }
-            if (compensation.replacePresets) {
-                this.presetsBaseline = canonicalJson(compensation.replacePresets)
-            }
-            if (
-                compensation.replaceCharacter &&
-                this.capture().character?.chaId === compensation.replaceCharacter.chaId
-            ) {
-                this.characterBaseline = canonicalJson(compensation.replaceCharacter)
-                this.characterBaselineId = compensation.replaceCharacter.chaId
-            }
-            this.dependencies.onLocalRevision?.(compensated.revision)
-            if (!this.flushPromise && !this.additionPromise) this.armDebounce()
-            if (options.publishOfficial && this.dependencies.officialPublisher) {
-                await this.stagePublication(compensated.revision)
-                this.armOfficialPublishRetry(this.officialPublishDelayMs())
-            }
-            throw new Error(`Concurrent live changes conflicted with replacement: ${reason}`)
-        }
-
-        if (this.dirtyGeneration === capturedGeneration) {
-            this.cancelDebounce()
-            this.pendingByteCount = 0
-        } else if (!this.flushPromise && !this.additionPromise) {
-            this.armDebounce()
-        }
-        if (options.publishOfficial) await this.finishExplicitCommit(replaced.revision)
         return {
             kind: 'committed',
             revision: replaced.revision,
@@ -4376,106 +4383,6 @@ export class SaveCoordinator {
             !this.additionPromise
         ) {
             this.armDebounce()
-        }
-    }
-
-    private rebaseReplacementPublication(
-        candidate: Database,
-        before: CapturedState,
-        live: CapturedState,
-        preserveConflicts: boolean,
-    ): ReplacementRebaseResult {
-        if (before.windowedCharacter || live.windowedCharacter || this.windowedCharacterBaseline) {
-            throw new WindowedConversationRequiresCompatibilityError(
-                'database replacement requires complete ownership',
-            )
-        }
-        const publishedParts = splitDatabase(canonicalDatabaseClone(candidate))
-        const compensation: Omit<WorkingSetCommit, 'expectedRevision'> = {}
-        let publishedRoot: RootDatabase
-        try {
-            publishedRoot = rebaseConcurrentLiveDelta(before.root, live.root, publishedParts.root)
-        } catch (error) {
-            if (!preserveConflicts) throw error
-            publishedRoot = canonicalClone(live.root)
-            compensation.root = publishedRoot
-        }
-
-        let publishedPresets = publishedParts.presets
-        if (
-            live.presets !== null &&
-            before.presets !== null &&
-            live.presetsCanonical !== before.presetsCanonical
-        ) {
-            try {
-                publishedPresets = rebaseConcurrentLiveDelta(
-                    before.presets,
-                    live.presets,
-                    publishedParts.presets,
-                )
-            } catch (error) {
-                if (!preserveConflicts) throw error
-                publishedPresets = canonicalClone(live.presets)
-                compensation.replacePresets = publishedPresets
-            }
-        }
-
-        let publishedPluginStorage = publishedParts.pluginStorage
-        if (
-            live.pluginStorage !== null &&
-            before.pluginStorage !== null &&
-            live.pluginStorageCanonical !== before.pluginStorageCanonical
-        ) {
-            try {
-                publishedPluginStorage = rebaseConcurrentPluginStorage(
-                    before.pluginStorage,
-                    live.pluginStorage,
-                    publishedParts.pluginStorage,
-                )
-            } catch (error) {
-                if (!preserveConflicts) throw error
-                publishedPluginStorage = applyPluginStorageMutations(live.pluginStorage, [])
-                compensation.pluginStorage = diffPluginStorage(
-                    pluginStorageJson(publishedParts.pluginStorage),
-                    publishedPluginStorage,
-                )
-            }
-        }
-        if (
-            before.character &&
-            live.character?.chaId === before.character.chaId &&
-            live.characterCanonical !== before.characterCanonical
-        ) {
-            const index = publishedParts.characters.findIndex(
-                (characterValue) => characterValue.chaId === live.character!.chaId,
-            )
-            // A character absent from the replacement was removed by it; do not resurrect it.
-            if (index >= 0) {
-                try {
-                    publishedParts.characters[index] = rebaseConcurrentLiveDelta(
-                        before.character,
-                        live.character,
-                        publishedParts.characters[index],
-                    )
-                } catch (error) {
-                    if (!preserveConflicts) throw error
-                    publishedParts.characters[index] = canonicalClone(live.character)
-                    compensation.replaceCharacter = publishedParts.characters[index]
-                }
-            }
-        }
-
-        const includesPluginStorage =
-            Object.prototype.hasOwnProperty.call(candidate, 'pluginCustomStorage') ||
-            live.pluginStorage !== null
-        return {
-            database: {
-                ...publishedRoot,
-                ...(includesPluginStorage ? { pluginCustomStorage: publishedPluginStorage } : {}),
-                characters: publishedParts.characters,
-                botPresets: publishedPresets,
-            } as Database,
-            compensation: Object.keys(compensation).length > 0 ? compensation : null,
         }
     }
 

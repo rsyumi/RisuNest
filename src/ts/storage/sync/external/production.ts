@@ -78,12 +78,14 @@ async function applyReceivedSync(
         throw new Error('External sync receive readiness is incomplete')
     }
     await flushPendingDataLocally('external-storage-sync-receive')
-    const token = await capturePersistentMutationToken('external-storage-sync-receive')
+    const token = await capturePersistentMutationToken(
+        'external-storage-sync-receive', { publishOfficial: false },
+    )
     if (String(token.revision) !== job.result.expectedRevision) {
         await getExternalStorageBridge().cancelJob(job.id)
         throw new Error('Local data changed while external sync receive was prepared')
     }
-    const fence = await acquireDestructiveReplacementFence(token, { allowRevisionAdvance: true })
+    const fence = await acquireDestructiveReplacementFence(token)
     try {
         const result = await getExternalStorageBridge().applyReceived(
             job.id,
@@ -97,7 +99,10 @@ async function applyReceivedSync(
             throw new RangeError('External sync receive revision exceeds the renderer range')
         }
         try {
-            await fence.refreshCommittedWorkingSet(receivedRevision)
+            const outcome = await fence.refreshCommittedWorkingSet(receivedRevision)
+            if (outcome.projection === 'refresh-required') {
+                throw new Error('Committed external receive requires a read-only working-set refresh')
+            }
             await (
                 await import('../../../plugins/plugins.svelte')
             ).loadPluginsAfterAuthoritativeRestore()
@@ -283,8 +288,10 @@ export async function requestExternalStorageRestore(
     const current = runtime
     if (!current) throw new Error('External storage production is not installed')
     await flushPendingDataLocally('external-storage-restore')
-    const token = await capturePersistentMutationToken('external-storage-restore')
-    const fence = await acquireDestructiveReplacementFence(token, { allowRevisionAdvance: true })
+    const token = await capturePersistentMutationToken(
+        'external-storage-restore', { publishOfficial: false },
+    )
+    const fence = await acquireDestructiveReplacementFence(token)
     await current.scheduler.suspend(destination => destination.kind === 'sync')
     try {
         let job = await getExternalStorageBridge().startJob({
@@ -321,7 +328,10 @@ export async function requestExternalStorageRestore(
             throw new RangeError('External restore revision exceeds the renderer range')
         }
         try {
-            await fence.refreshCommittedWorkingSet(receivedRevision)
+            const outcome = await fence.refreshCommittedWorkingSet(receivedRevision)
+            if (outcome.projection === 'refresh-required') {
+                throw new Error('Committed external restore requires a read-only working-set refresh')
+            }
             await (
                 await import('../../../plugins/plugins.svelte')
             ).loadPluginsAfterAuthoritativeRestore()

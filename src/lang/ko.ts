@@ -1719,6 +1719,13 @@ export const languageKorean = {
     nanoGPTManualInput: "수동 입력",
     nanoGPTManualModelSelect: "수동 모델 선택",
     risuNest: {
+        persistentData: {
+            followupFailed: '복원 내용은 저장되었지만 후속 작업을 마치지 못했습니다. 백업을 다시 가져오지 말고 동기화 상태를 확인하거나 앱을 재시작해주세요.',
+            refreshTitle: '저장은 완료되었지만 화면을 새로 고쳐야 합니다',
+            refreshHelp: '변경 사항은 저장되어 있습니다. 저장된 데이터를 화면에 다시 불러올 때까지 편집이 잠시 중단됩니다. 화면 새로 고침은 저장이나 가져오기를 다시 실행하지 않습니다.',
+            refresh: '화면 새로 고침',
+            refreshFailed: '저장된 데이터를 화면에 표시하지 못했습니다. 새로 고침을 다시 시도하거나 앱을 재시작해주세요.',
+        },
         exitSaveFailedWarning:
             '저장에 실패했습니다. 저장하지 않고 종료하려면 예를, 앱을 열어 두고 다시 시도하려면 아니오를 선택하세요.',
         archive: {
