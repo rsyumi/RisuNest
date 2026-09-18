@@ -1657,7 +1657,7 @@ fn selected_empty_native_section_clears_only_that_section() {
     let jobs = root.path().join("jobs");
     std::fs::create_dir(&jobs).unwrap();
     let mut source =
-        crate::persistent_store::PersistentStore::open(root.path().join("source")).unwrap();
+        crate::persistent_store::PersistentStore::open(&root.path().join("source")).unwrap();
     let catalog = crate::portable_backup::Catalog::create(&jobs, "synthetic-empty", 0).unwrap();
     catalog
         .db
@@ -1689,7 +1689,7 @@ fn selected_empty_native_section_clears_only_that_section() {
     .unwrap();
     let prepared = prepare_native_sections(&archive, &selected, &Never).unwrap();
     let mut target =
-        crate::persistent_store::PersistentStore::open(root.path().join("target")).unwrap();
+        crate::persistent_store::PersistentStore::open(&root.path().join("target")).unwrap();
     {
         let device = target.device_store_mut().unwrap();
         device
@@ -1729,7 +1729,7 @@ fn native_journal_resumes_before_or_after_an_inflight_section_commit() {
         let root = tempfile::tempdir().unwrap();
         let selected = vec!["local-plugins".to_owned()];
         let mut source = crate::persistent_store::PersistentStore::open(
-            root.path().join("synthetic-source"),
+            &root.path().join("synthetic-source"),
         )
         .unwrap();
         source

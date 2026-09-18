@@ -10,7 +10,7 @@ mod commands;
 mod spool;
 pub(crate) use archive::{
     apply_prepared_native_sections, capture_native_sections, capture_prepared_native_sections,
-    journal_prepared_native_sections, prepare_journaled_native_sections, prepare_native_sections,
+    journal_prepared_native_sections, prepare_native_sections,
     resume_journaled_native_restore, validate_archive_catalog, PreparedDeviceSection,
 };
 pub(crate) use commands::*;
@@ -762,9 +762,10 @@ impl DeviceBackupState {
                 WHERE session=?1 AND (intent<>'source' OR intent IS NULL OR verified_digest IS NULL)
                 ORDER BY position",
         )?;
-        Ok(statement
+        let pending = statement
             .query_map([id], |row| row.get(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(pending)
     }
 
     pub(crate) fn fail(&self, id: &str, code: &str) -> Result<Session> {
