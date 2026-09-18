@@ -421,6 +421,14 @@ pub(crate) fn kind_of_section(section: Section) -> SectionKind {
     }
 }
 
+fn section_of_kind(kind: SectionKind) -> Option<Section> {
+    match kind {
+        SectionKind::Hypa => Some(Section::Hypa),
+        SectionKind::LocalPlugins => Some(Section::LocalPlugins),
+        SectionKind::LocalSettings => None,
+    }
+}
+
 pub(crate) fn section_entry_key(kind: SectionKind, row: &SectionRow) -> StoreResult<String> {
     match kind {
         SectionKind::Hypa => {
@@ -586,7 +594,8 @@ pub(crate) enum SectionWriteInput<'a> {
 pub(crate) struct SectionSpoolBuilder {
     connection: Connection,
     directory: tempfile::TempDir,
-    section: Section,
+    kind: SectionKind,
+    versioned: bool,
     count: i64,
     max_write_clock: Sequence,
 }
@@ -595,13 +604,22 @@ pub(crate) struct PreparedSectionRows {
     connection: Connection,
     // Declared after the connection so Windows closes the file before cleanup.
     _directory: tempfile::TempDir,
-    section: Section,
+    kind: SectionKind,
+    versioned: bool,
     count: i64,
     max_write_clock: Sequence,
 }
 
 impl SectionSpoolBuilder {
     pub(crate) fn new(section: Section) -> StoreResult<Self> {
+        Self::open(kind_of_section(section), true)
+    }
+
+    pub(crate) fn new_backup(kind: SectionKind) -> StoreResult<Self> {
+        Self::open(kind, false)
+    }
+
+    fn open(kind: SectionKind, versioned: bool) -> StoreResult<Self> {
         let directory = tempfile::tempdir()?;
         let connection = Connection::open(directory.path().join("rows.sqlite"))?;
         connection.execute_batch(
@@ -618,12 +636,44 @@ impl SectionSpoolBuilder {
              ) WITHOUT ROWID;
              BEGIN IMMEDIATE;",
         )?;
-        Ok(Self { connection, directory, section, count: 0, max_write_clock: Sequence::from(0u64) })
+        Ok(Self { connection, directory, kind, versioned, count: 0, max_write_clock: Sequence::from(0u64) })
     }
 
-    pub(crate) fn push(&mut self, mut row: SectionRow, entry_key: &str, entry_hash: &[u8; 32]) -> StoreResult<()> {
-        validate_sync_row(self.section, &row)?;
-        if section_entry_key(kind_of_section(self.section), &row)? != entry_key {
+    pub(crate) fn push(&mut self, row: SectionRow, entry_key: &str, entry_hash: &[u8; 32]) -> StoreResult<()> {
+        let section = section_of_kind(self.kind).ok_or_else(|| invalid("Backup section is not synchronized"))?;
+        if !self.versioned { return Err(invalid("Backup rows must use push_backup_entry")); }
+        validate_sync_row(section, &row)?;
+        self.push_row(row, entry_key, entry_hash)
+    }
+
+    pub(crate) fn push_backup_entry(
+        &mut self,
+        entry: SectionEntry,
+        object: impl FnMut(&ObjectReference) -> StoreResult<Vec<u8>>,
+    ) -> StoreResult<()> {
+        if self.versioned || entry.kind != self.kind || entry.version.is_some() {
+            return Err(invalid("Backup section entry has the wrong identity"));
+        }
+        let encoded = entry.encode().map_err(section_format_error)?;
+        let entry_key = entry.key.clone();
+        let entry_hash = risunest_external_storage_format::content_identity::hash(&encoded);
+        let row = SectionRow::from_entry(entry, false, object)?;
+        if row.value.is_tombstone() { return Err(invalid("Backup section entry is a removal")); }
+        self.push_row(row, &entry_key, &entry_hash)
+    }
+
+    fn push_backup_row(&mut self, row: SectionRow) -> StoreResult<()> {
+        if self.versioned || row.value.is_tombstone() { return Err(invalid("Backup section row is invalid")); }
+        let entry = row.to_entry(self.kind, false)?;
+        let entry_key = entry.key.clone();
+        let entry_hash = risunest_external_storage_format::content_identity::hash(
+            &entry.encode().map_err(section_format_error)?,
+        );
+        self.push_row(row, &entry_key, &entry_hash)
+    }
+
+    fn push_row(&mut self, mut row: SectionRow, entry_key: &str, entry_hash: &[u8; 32]) -> StoreResult<()> {
+        if section_entry_key(self.kind, &row)? != entry_key {
             return Err(invalid("Section spool key differs from its entry"));
         }
         let duplicate: bool = self.connection.query_row(
@@ -659,7 +709,7 @@ impl SectionSpoolBuilder {
 
     pub(crate) fn finish(self, expected_fingerprint: &[u8; 32]) -> StoreResult<PreparedSectionRows> {
         let mut fingerprint = risunest_external_storage_format::format::FingerprintBuilder::new(
-            &kind_of_section(self.section).fingerprint_domain(),
+            &self.kind.fingerprint_domain(),
         );
         {
             let mut statement = self.connection.prepare("SELECT entry_key,entry_hash FROM row_index ORDER BY entry_key")?;
@@ -684,12 +734,40 @@ impl SectionSpoolBuilder {
         let count: i64 = connection.query_row("SELECT count(*) FROM row_index", [], |row| row.get(0))?;
         if count != self.count { return Err(invalid("Section spool is incomplete")); }
         Ok(PreparedSectionRows { connection, _directory: self.directory,
-            section: self.section, count, max_write_clock: self.max_write_clock })
+            kind: self.kind, versioned: self.versioned, count, max_write_clock: self.max_write_clock })
+    }
+
+    fn finish_captured(self) -> StoreResult<PreparedSectionRows> {
+        let mut fingerprint = risunest_external_storage_format::format::FingerprintBuilder::new(
+            &self.kind.fingerprint_domain(),
+        );
+        {
+            let mut statement = self.connection.prepare(
+                "SELECT entry_key,entry_hash FROM row_index ORDER BY entry_key",
+            )?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let key: String = row.get(0)?;
+                let digest: Vec<u8> = row.get(1)?;
+                let digest: [u8; 32] = digest.try_into()
+                    .map_err(|_| invalid("Section entry hash is invalid"))?;
+                fingerprint.push(&key, &digest).map_err(section_format_error)?;
+            }
+        }
+        self.finish(&fingerprint.finish())
     }
 }
 
 impl PreparedSectionRows {
+    pub(crate) fn kind(&self) -> SectionKind { self.kind }
+    pub(crate) fn len(&self) -> u64 { self.count as u64 }
+    pub(crate) fn is_empty(&self) -> bool { self.count == 0 }
     pub(crate) fn max_write_clock(&self) -> &Sequence { &self.max_write_clock }
+
+    fn synchronized_section(&self) -> StoreResult<Section> {
+        if !self.versioned { return Err(invalid("Backup section cannot be merged as synchronized state")); }
+        section_of_kind(self.kind).ok_or_else(|| invalid("Section is not synchronized"))
+    }
 
     fn row(&self, key: &SectionKey) -> StoreResult<Option<SectionRow>> {
         let stored: Option<(String, Option<Vec<u8>>)> = self.connection.query_row(
@@ -697,6 +775,21 @@ impl PreparedSectionRows {
                 LEFT JOIN vector_values b ON b.hash=v.vector_hash
                 WHERE i.key1=?1 AND i.key2=?2 AND i.key3=?3",
             params![key.0, key.1, key.2], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        stored.map(|(metadata, vector)| {
+            let mut row: SectionRow = serde_json::from_str(&metadata)?;
+            if let SectionValueRow::Hypa { vector: target, .. } = &mut row.value {
+                *target = vector.ok_or_else(|| invalid("Prepared vector is missing"))?;
+            }
+            Ok(row)
+        }).transpose()
+    }
+
+    fn row_by_entry_key(&self, entry_key: &str) -> StoreResult<Option<SectionRow>> {
+        let stored: Option<(String, Option<Vec<u8>>)> = self.connection.query_row(
+            "SELECT v.metadata,b.bytes FROM row_index i JOIN row_values v ON v.id=i.body_id
+                LEFT JOIN vector_values b ON b.hash=v.vector_hash WHERE i.entry_key=?1",
+            [entry_key], |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional()?;
         stored.map(|(metadata, vector)| {
             let mut row: SectionRow = serde_json::from_str(&metadata)?;
@@ -727,6 +820,40 @@ impl PreparedSectionRows {
             if page.is_empty() { break; }
             for key in page {
                 visitor(self.row(&key)?.ok_or_else(|| invalid("Prepared row is missing"))?)?;
+                visited += 1;
+                after = key;
+            }
+        }
+        if visited != self.count { return Err(invalid("Section spool scan is incomplete")); }
+        Ok(())
+    }
+
+    pub(crate) fn visit_entries(
+        &self,
+        mut visitor: impl FnMut(&SectionEntry, Option<&[u8]>) -> StoreResult<()>,
+    ) -> StoreResult<()> {
+        let mut after = String::new();
+        let mut visited = 0i64;
+        loop {
+            let page = {
+                let mut statement = self.connection.prepare(
+                    "SELECT entry_key FROM row_index WHERE entry_key>?1 ORDER BY entry_key LIMIT 256",
+                )?;
+                let mut rows = statement.query([&after])?;
+                read_text_page(&mut rows)?
+            };
+            if page.is_empty() { break; }
+            for key in page {
+                let mut row = self.row_by_entry_key(&key)?
+                    .ok_or_else(|| invalid("Prepared row is missing"))?;
+                let entry = row.to_entry(self.kind, self.versioned)?;
+                let object = match &mut row.value {
+                    SectionValueRow::Hypa { vector, .. } if vector.len() > MAX_INLINE_VALUE_BYTES => {
+                        Some(std::mem::take(vector))
+                    }
+                    _ => None,
+                };
+                visitor(&entry, object.as_deref())?;
                 visited += 1;
                 after = key;
             }
@@ -873,6 +1000,20 @@ fn read_key_page(rows: &mut rusqlite::Rows<'_>) -> StoreResult<Vec<SectionKey>> 
     Ok(page)
 }
 
+fn read_text_page(rows: &mut rusqlite::Rows<'_>) -> StoreResult<Vec<String>> {
+    let mut page = Vec::new();
+    let mut bytes = 0usize;
+    while page.len() < SECTION_PAGE_ROWS {
+        let Some(row) = rows.next()? else { break; };
+        let key: String = row.get(0)?;
+        let size = key.len().saturating_add(std::mem::size_of::<String>());
+        if !page.is_empty() && bytes.saturating_add(size) > SECTION_PAGE_BYTES { break; }
+        bytes = bytes.saturating_add(size);
+        page.push(key);
+    }
+    Ok(page)
+}
+
 fn local_key_page(db: &Connection, section: Section, after: &SectionKey, tombstones_only: bool) -> StoreResult<Vec<SectionKey>> {
     let mut statement = db.prepare(match section {
         Section::Hypa => "SELECT cache_key,'','' FROM hypa_embeddings
@@ -881,6 +1022,15 @@ fn local_key_page(db: &Connection, section: Section, after: &SectionKey, tombsto
             WHERE (owner,space,key)>(?1,?2,?3) AND (?4=0 OR tombstone=1) ORDER BY owner,space,key LIMIT 256",
     })?;
     let mut rows = statement.query(params![after.0, after.1, after.2, tombstones_only])?;
+    read_key_page(&mut rows)
+}
+
+fn local_permission_key_page(db: &Connection, after: &SectionKey) -> StoreResult<Vec<SectionKey>> {
+    let mut statement = db.prepare(
+        "SELECT 'pluginPermission',code_hash,permission FROM plugin_permissions
+            WHERE (code_hash,permission)>(?1,?2) ORDER BY code_hash,permission LIMIT 256",
+    )?;
+    let mut rows = statement.query(params![after.1, after.2])?;
     read_key_page(&mut rows)
 }
 
@@ -901,15 +1051,16 @@ fn delete_current_row(tx: &Transaction<'_>, section: Section, row: &SectionRow) 
 
 fn reclaim_prepared(tx: &Transaction<'_>, prepared: &PreparedSectionRows, floor: &Sequence) -> StoreResult<()> {
     if *floor == Sequence::from(0u64) { return Ok(()); }
+    let section = prepared.synchronized_section()?;
     let mut after = (String::new(), String::new(), String::new());
     loop {
-        let page = local_key_page(tx, prepared.section, &after, true)?;
+        let page = local_key_page(tx, section, &after, true)?;
         if page.is_empty() { break; }
         for key in page {
-            let (row, _) = read_row(tx, prepared.section, &key)?.ok_or_else(|| invalid("Section row disappeared"))?;
+            let (row, _) = read_row(tx, section, &key)?.ok_or_else(|| invalid("Section row disappeared"))?;
             if row.value.first_published().is_some_and(|marker| marker.generation <= *floor)
                 && !prepared.contains(&key, true)? {
-                delete_current_row(tx, prepared.section, &row)?;
+                delete_current_row(tx, section, &row)?;
             }
             after = key;
         }
@@ -918,20 +1069,21 @@ fn reclaim_prepared(tx: &Transaction<'_>, prepared: &PreparedSectionRows, floor:
 }
 
 fn rejoin_prepared(tx: &Transaction<'_>, prepared: &PreparedSectionRows, observed: &Sequence, behind_floor: bool) -> StoreResult<()> {
+    let section = prepared.synchronized_section()?;
     let writer_id: String = tx.query_row("SELECT writer_id FROM device_meta WHERE singleton=1", [], |row| row.get(0))?;
     let mut issued: Option<Sequence> = None;
     let mut after = (String::new(), String::new(), String::new());
     loop {
-        let page = local_key_page(tx, prepared.section, &after, false)?;
+        let page = local_key_page(tx, section, &after, false)?;
         if page.is_empty() { break; }
         for key in page {
-            let (mut row, published) = read_row(tx, prepared.section, &key)?.ok_or_else(|| invalid("Section row disappeared"))?;
+            let (mut row, published) = read_row(tx, section, &key)?.ok_or_else(|| invalid("Section row disappeared"))?;
             after = key;
             if published {
                 // A complete snapshot beyond the floor is authoritative for
                 // settled values. Only unpublished edits may be carried back.
                 if behind_floor && !row.value.is_tombstone() && !prepared.contains(&after, false)? {
-                    delete_current_row(tx, prepared.section, &row)?;
+                    delete_current_row(tx, section, &row)?;
                 }
                 continue;
             }
@@ -944,21 +1096,93 @@ fn rejoin_prepared(tx: &Transaction<'_>, prepared: &PreparedSectionRows, observe
             if row.writer_id == writer_id && row.write_clock > *observed { continue; }
             if issued.is_none() {
                 super::begin_mutation(tx)?;
-                issued = Some(super::issue_write_clock(tx, prepared.section)?);
+                issued = Some(super::issue_write_clock(tx, section)?);
             }
             row.write_clock = issued.as_ref().expect("issued write clock").clone();
             row.writer_id = writer_id.clone();
             if row.value.is_tombstone() {
                 row.value = SectionValueRow::Tombstone { first_published: None };
             }
-            write_row(tx, prepared.section, &row, false)?;
+            write_row(tx, section, &row, false)?;
         }
     }
     if issued.is_some() { super::finish_mutation(tx)?; }
     Ok(())
 }
 
+fn capture_backup_rows(
+    snapshot: &Connection,
+    kind: SectionKind,
+    spool: &mut SectionSpoolBuilder,
+) -> StoreResult<()> {
+    let mut push = |row: SectionRow| spool.push_backup_row(row);
+    match section_of_kind(kind) {
+        Some(section) => {
+            let mut statement = snapshot.prepare(match section {
+                Section::Hypa => "SELECT * FROM hypa_embeddings WHERE tombstone=0 ORDER BY cache_key",
+                Section::LocalPlugins => "SELECT * FROM plugin_device_storage WHERE tombstone=0 ORDER BY owner,space,key",
+            })?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? { push(row_from_sql(section, row)?)?; }
+        }
+        None if kind == SectionKind::LocalSettings => {
+            let mut statement = snapshot.prepare("SELECT key,value FROM device_settings ORDER BY key")?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let key: String = row.get(0)?;
+                if setting_is_local(&key) {
+                    push(SectionRow { key1: "setting".into(), key2: key, key3: String::new(),
+                        value: SectionValueRow::Setting { value: row.get(1)? },
+                        write_clock: Sequence::from(0u64), writer_id: String::new() })?;
+                }
+            }
+            drop(rows);
+            drop(statement);
+            let mut statement = snapshot.prepare(
+                "SELECT code_hash,permission,granted FROM plugin_permissions ORDER BY code_hash,permission",
+            )?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                push(SectionRow { key1: "pluginPermission".into(), key2: row.get(0)?, key3: row.get(1)?,
+                    value: SectionValueRow::PluginPermission { granted: row.get::<_, i64>(2)? == 1 },
+                    write_clock: Sequence::from(0u64), writer_id: String::new() })?;
+            }
+        }
+        None => return Err(invalid("Backup section kind is unsupported")),
+    }
+    Ok(())
+}
+
 impl DeviceStore {
+    /// Captures every selected section from one read-only SQLite snapshot and
+    /// releases that snapshot after all local spools are complete.
+    pub(crate) fn capture_backup_sections(
+        &mut self,
+        kinds: &[SectionKind],
+    ) -> StoreResult<Vec<PreparedSectionRows>> {
+        let mut seen = BTreeSet::new();
+        let mut spools = Vec::with_capacity(kinds.len());
+        for kind in kinds {
+            if !seen.insert(kind.id()) { return Err(invalid("Backup section kind is repeated")); }
+            spools.push((*kind, SectionSpoolBuilder::new_backup(*kind)?));
+        }
+        if spools.is_empty() { return Ok(Vec::new()); }
+        let path: String = self.connection.query_row(
+            "SELECT file FROM pragma_database_list WHERE name='main'", [], |row| row.get(0),
+        )?;
+        if path.is_empty() { return Err(invalid("Device database path is unavailable")); }
+        let snapshot = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        snapshot.execute_batch(
+            "PRAGMA busy_timeout=5000; PRAGMA query_only=ON; PRAGMA mmap_size=0; BEGIN;",
+        )?;
+        for (kind, spool) in &mut spools { capture_backup_rows(&snapshot, *kind, spool)?; }
+        snapshot.execute_batch("COMMIT;")?;
+        spools.into_iter().map(|(_, spool)| spool.finish_captured()).collect()
+    }
+
     /// The input owns a validated read-only spool. No transport or archive
     /// decoding takes place inside this single section transaction.
     pub(crate) fn apply_prepared_section_rows(
@@ -970,6 +1194,7 @@ impl DeviceStore {
         cursor: &SectionCursor,
         rejoining: bool,
     ) -> StoreResult<SectionApplyOutcome> {
+        let section = prepared.synchronized_section()?;
         if connection_id.is_empty() || library_lineage.is_empty()
             || cursor.applied_gc_floor > cursor.applied_generation
             || prepared.max_write_clock > cursor.observed_max_write_clock {
@@ -978,12 +1203,12 @@ impl DeviceStore {
         let tx = self.transaction()?;
         let (participating, generation): (bool, String) = tx.query_row(
             "SELECT participating,participation_generation FROM device_sections WHERE section=?1",
-            [prepared.section.as_str()], |row| Ok((row.get(0)?, row.get(1)?)),
+            [section.as_str()], |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         if !participating || sequence(&generation)? != *expected_participation_generation {
             return Err(invalid("Section participation changed during preparation"));
         }
-        let current = read_cursor(&tx, connection_id, library_lineage, prepared.section)?;
+        let current = read_cursor(&tx, connection_id, library_lineage, section)?;
         if current.as_ref().is_some_and(|current| current.applied_generation > cursor.applied_generation
             || current.applied_gc_floor > cursor.applied_gc_floor) {
             return Err(invalid("Prepared section is older than the applied cursor"));
@@ -991,19 +1216,19 @@ impl DeviceStore {
         let behind_floor = current.as_ref().is_some_and(|current| cursor.applied_gc_floor > current.applied_generation);
         let rejoining = rejoining || behind_floor || current.as_ref().is_none_or(|cursor| !cursor.joined());
         let floor = if current.is_some() { cursor.applied_gc_floor.clone() } else { Sequence::from(0u64) };
-        observe_remote_clock(&tx, prepared.section, &cursor.observed_max_write_clock)?;
+        observe_remote_clock(&tx, section, &cursor.observed_max_write_clock)?;
         if rejoining {
             reclaim_prepared(&tx, prepared, &floor)?;
             rejoin_prepared(&tx, prepared, &cursor.observed_max_write_clock, behind_floor)?;
         }
         let mut outcome = SectionApplyOutcome::default();
         prepared.visit(|row| {
-            if merge_validated_row(&tx, prepared.section, &row)? { outcome.applied += 1; }
+            if merge_validated_row(&tx, section, &row)? { outcome.applied += 1; }
             else { outcome.kept += 1; }
             Ok(())
         })?;
         if !rejoining { reclaim_prepared(&tx, prepared, &floor)?; }
-        record_cursor(&tx, connection_id, library_lineage, prepared.section, cursor)?;
+        record_cursor(&tx, connection_id, library_lineage, section, cursor)?;
         tx.commit()?;
         Ok(outcome)
     }
@@ -1459,6 +1684,114 @@ impl DeviceStore {
                 WHERE connection_id=?1 AND library_lineage=?2 AND section=?3",
             params![connection_id, library_lineage, section.as_str()],
         )?;
+        Ok(())
+    }
+
+    /// Replaces exactly one present backup section. An empty spool clears the
+    /// selected scope; callers preserve an absent scope by not invoking this.
+    pub(crate) fn restore_prepared_backup_section(
+        &mut self,
+        prepared: &PreparedSectionRows,
+    ) -> StoreResult<()> {
+        if prepared.versioned { return Err(invalid("Synchronized section input is not backup material")); }
+        match section_of_kind(prepared.kind) {
+            Some(section) => self.restore_prepared_value_section(section, prepared),
+            None if prepared.kind == SectionKind::LocalSettings => self.restore_prepared_local_settings(prepared),
+            None => Err(invalid("Backup section kind is unsupported")),
+        }
+    }
+
+    fn restore_prepared_value_section(
+        &mut self,
+        section: Section,
+        prepared: &PreparedSectionRows,
+    ) -> StoreResult<()> {
+        let transaction = self.transaction()?;
+        let writer_id: String = transaction.query_row(
+            "SELECT writer_id FROM device_meta WHERE singleton=1", [], |row| row.get(0),
+        )?;
+        let mut changed = false;
+        prepared.visit(|mut row| {
+            if row.value.is_tombstone() { return Err(invalid("Restored section row has no value")); }
+            let settled = read_row(&transaction, section, &row.key())?.is_some_and(|(current, published)| {
+                !published && current.writer_id == writer_id && current.value.same_content(&row.value)
+            });
+            if settled { return Ok(()); }
+            if !changed { super::begin_mutation(&transaction)?; changed = true; }
+            row.write_clock = super::issue_write_clock(&transaction, section)?;
+            row.writer_id = writer_id.clone();
+            write_row(&transaction, section, &row, false)
+        })?;
+        let mut after = (String::new(), String::new(), String::new());
+        loop {
+            let page = local_key_page(&transaction, section, &after, false)?;
+            if page.is_empty() { break; }
+            for key in page {
+                let (mut current, _) = read_row(&transaction, section, &key)?
+                    .ok_or_else(|| invalid("Section row disappeared"))?;
+                after = key;
+                if current.value.is_tombstone() || prepared.contains(&after, false)? { continue; }
+                if !changed { super::begin_mutation(&transaction)?; changed = true; }
+                current.value = SectionValueRow::Tombstone { first_published: None };
+                current.write_clock = super::issue_write_clock(&transaction, section)?;
+                current.writer_id = writer_id.clone();
+                write_row(&transaction, section, &current, false)?;
+            }
+        }
+        if changed { super::finish_mutation(&transaction)?; }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn restore_prepared_local_settings(&mut self, prepared: &PreparedSectionRows) -> StoreResult<()> {
+        let transaction = self.transaction()?;
+        prepared.visit(|row| match row.value {
+            SectionValueRow::Setting { value } => {
+                if row.key1 != "setting" || !setting_is_local(&row.key2) || !row.key3.is_empty() {
+                    return Err(invalid("Restored device setting is not a device setting"));
+                }
+                transaction.execute(
+                    "INSERT INTO device_settings (key,value) VALUES (?1,?2)
+                        ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    params![row.key2, value],
+                )?;
+                Ok(())
+            }
+            SectionValueRow::PluginPermission { granted } => {
+                if row.key1 != "pluginPermission" || row.key2.is_empty() || row.key3.is_empty() {
+                    return Err(invalid("Restored plugin permission is incomplete"));
+                }
+                transaction.execute(
+                    "INSERT INTO plugin_permissions (code_hash,permission,granted)
+                        VALUES (?1,?2,?3)
+                        ON CONFLICT(code_hash,permission) DO UPDATE SET granted=excluded.granted",
+                    params![row.key2, row.key3, i64::from(granted)],
+                )?;
+                Ok(())
+            }
+            _ => Err(invalid("Restored device setting has the wrong shape")),
+        })?;
+        for key in LOCAL_SETTING_KEYS {
+            let row_key = ("setting".to_owned(), key.to_owned(), String::new());
+            if !prepared.contains(&row_key, false)? {
+                transaction.execute("DELETE FROM device_settings WHERE key=?1", [key])?;
+            }
+        }
+        let mut after = (String::new(), String::new(), String::new());
+        loop {
+            let page = local_permission_key_page(&transaction, &after)?;
+            if page.is_empty() { break; }
+            for key in page {
+                after = key;
+                if !prepared.contains(&after, false)? {
+                    transaction.execute(
+                        "DELETE FROM plugin_permissions WHERE code_hash=?1 AND permission=?2",
+                        params![after.1, after.2],
+                    )?;
+                }
+            }
+        }
+        transaction.commit()?;
         Ok(())
     }
 

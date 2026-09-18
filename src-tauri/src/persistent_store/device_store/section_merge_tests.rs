@@ -1,4 +1,5 @@
 use super::*;
+use crate::persistent_store::device_store::plugin_values::PluginDeviceMutation;
 use crate::persistent_store::server_sync_sections as server;
 use risunest_sync_wire::Domain;
 
@@ -214,4 +215,104 @@ fn e3_spool_key_pages_limit_bytes_as_well_as_rows() {
     let mut visited = 0;
     prepared.visit(|_| { visited += 1; Ok(()) }).unwrap();
     assert_eq!(visited, 100);
+}
+
+fn set_plugin(store: &mut DeviceStore, key: &str, value: &str) {
+    store.write_plugin_device_values("plugin", &[PluginDeviceMutation::Set {
+        space: "string".into(), key: key.into(), value: value.into(),
+    }]).unwrap();
+}
+
+#[test]
+fn e4_captures_selected_sections_from_one_read_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = DeviceStore::open(directory.path()).unwrap();
+    set_plugin(&mut store, "value", "before");
+    store.write_setting("dosync", &serde_json::json!("before")).unwrap();
+    let snapshot = Connection::open_with_flags(
+        directory.path().join(super::super::DEVICE_DATABASE_FILE),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ).unwrap();
+    snapshot.execute_batch("PRAGMA query_only=ON; BEGIN;").unwrap();
+    let mut plugins = SectionSpoolBuilder::new_backup(SectionKind::LocalPlugins).unwrap();
+    capture_backup_rows(&snapshot, SectionKind::LocalPlugins, &mut plugins).unwrap();
+    set_plugin(&mut store, "value", "after");
+    store.write_setting("dosync", &serde_json::json!("after")).unwrap();
+    let mut settings = SectionSpoolBuilder::new_backup(SectionKind::LocalSettings).unwrap();
+    capture_backup_rows(&snapshot, SectionKind::LocalSettings, &mut settings).unwrap();
+    snapshot.execute_batch("COMMIT;").unwrap();
+    let plugins = plugins.finish_captured().unwrap();
+    let settings = settings.finish_captured().unwrap();
+    let mut plugin_value = None;
+    plugins.visit_entries(|entry, _| {
+        let SectionValue::LocalPlugin(value) = &entry.value else { unreachable!() };
+        plugin_value = value.value.as_str().map(str::to_owned);
+        Ok(())
+    }).unwrap();
+    let mut setting_value = None;
+    settings.visit_entries(|entry, _| {
+        if let SectionValue::LocalSetting(value) = &entry.value {
+            setting_value = value.value.as_str().map(str::to_owned);
+        }
+        Ok(())
+    }).unwrap();
+    assert_eq!(plugin_value.as_deref(), Some("before"));
+    assert_eq!(setting_value.as_deref(), Some("before"));
+}
+
+#[test]
+fn e4_backup_entries_are_visited_in_canonical_key_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = DeviceStore::open(directory.path()).unwrap();
+    store.write_setting("dosync", &serde_json::json!(true)).unwrap();
+    for code_hash in ["a".repeat(64), "f".repeat(64)] {
+        store.write_plugin_permission(&code_hash, "network", true).unwrap();
+    }
+    let prepared = store.capture_backup_sections(&[SectionKind::LocalSettings])
+        .unwrap().pop().unwrap();
+    let mut keys = Vec::new();
+    prepared.visit_entries(|entry, _| { keys.push(entry.key.clone()); Ok(()) }).unwrap();
+    let mut sorted = keys.clone(); sorted.sort(); assert_eq!(keys, sorted);
+
+    let mut plugin_spool = SectionSpoolBuilder::new_backup(SectionKind::LocalPlugins).unwrap();
+    for (owner, key) in [
+        ("owner-z".to_owned(), "short".to_owned()),
+        ("소유자".to_owned(), "인용-\"-키".to_owned()),
+        ("owner-a".to_owned(), "x".repeat(4096)),
+    ] {
+        let mut row = plugin("0", ""); row.key1 = owner; row.key3 = key;
+        plugin_spool.push_backup_row(row).unwrap();
+    }
+    let prepared = plugin_spool.finish_captured().unwrap();
+    let mut keys = Vec::new();
+    prepared.visit_entries(|entry, _| { keys.push(entry.key.clone()); Ok(()) }).unwrap();
+    let mut sorted = keys.clone(); sorted.sort(); assert_eq!(keys, sorted);
+}
+
+#[test]
+fn e4_prepared_restore_is_bounded_empty_aware_and_idempotent() {
+    let source_directory = tempfile::tempdir().unwrap();
+    let mut source = DeviceStore::open(source_directory.path()).unwrap();
+    set_plugin(&mut source, "alpha", "from-backup");
+    let prepared = source.capture_backup_sections(&[SectionKind::LocalPlugins])
+        .unwrap().pop().unwrap();
+    assert_eq!(prepared.kind(), SectionKind::LocalPlugins);
+    assert_eq!(prepared.len(), 1);
+    assert!(!prepared.is_empty());
+    let target_directory = tempfile::tempdir().unwrap();
+    let mut target = DeviceStore::open(target_directory.path()).unwrap();
+    set_plugin(&mut target, "dropped", "before");
+    target.restore_prepared_backup_section(&prepared).unwrap();
+    let first_clock = target.section_state(Section::LocalPlugins).unwrap().max_write_clock;
+    let first_rows = target.read_section_rows(Section::LocalPlugins).unwrap();
+    target.restore_prepared_backup_section(&prepared).unwrap();
+    assert_eq!(target.section_state(Section::LocalPlugins).unwrap().max_write_clock, first_clock);
+    assert_eq!(target.read_section_rows(Section::LocalPlugins).unwrap(), first_rows);
+    let empty_directory = tempfile::tempdir().unwrap();
+    let mut empty = DeviceStore::open(empty_directory.path()).unwrap();
+    let empty = empty.capture_backup_sections(&[SectionKind::LocalPlugins])
+        .unwrap().pop().unwrap();
+    assert!(empty.is_empty());
+    target.restore_prepared_backup_section(&empty).unwrap();
+    assert!(target.read_backup_section_rows(Section::LocalPlugins).unwrap().is_empty());
 }
