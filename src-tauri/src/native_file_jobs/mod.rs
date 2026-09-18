@@ -7129,12 +7129,11 @@ mod tests {
             .unwrap();
         job.start(JobPhase::WritingExport).unwrap();
         let session = device
-            .create_session(
+            .create_native_portable_session(
                 &job.id(),
-                crate::device_backup::Operation::Capture,
                 false,
-                &["local-storage".into()],
-                None,
+                &["hypa".into()],
+                0,
                 None,
             )
             .unwrap();
