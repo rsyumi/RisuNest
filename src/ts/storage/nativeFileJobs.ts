@@ -435,7 +435,9 @@ export interface NativePortableRestorePreview {
 
 export type NativeBlockRestoreRuntime = Pick<
     PersistentDataRuntime,
-    'capturePersistentMutationToken' | 'acquireDestructiveReplacementFence'
+    | 'capturePersistentMutationToken'
+    | 'acquireDestructiveReplacementFence'
+    | 'markCommittedWorkingSetRefreshRequired'
 > & Partial<Pick<PersistentDataRuntime, 'getStorageAuthorityEpoch'>>
 
 export interface NativeFileJobOptions {
@@ -1419,10 +1421,15 @@ async function runNativeReplacementRestore(
                         { sessionId: terminal.deviceSessionId },
                     )
                 } catch (error) {
-                    throw new NativeFileJobActivationCommittedError(
+                    const committedError = new NativeFileJobActivationCommittedError(
                         terminal.result.revision,
                         error,
                     )
+                    runtime.markCommittedWorkingSetRefreshRequired(
+                        terminal.result.revision,
+                        committedError,
+                    )
+                    throw committedError
                 }
             }
             const committedResult = {

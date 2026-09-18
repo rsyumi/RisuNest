@@ -1,6 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
 import { isTauri } from '../../../platform'
-import { requestDeviceMaintenanceRestart as restartForDeviceMaintenance } from '../../deviceBackup/maintenance'
 import type {
     ExternalCapturePolicy,
     DecimalString,
@@ -153,12 +152,6 @@ export class ExternalStorageBridge {
 
     startJob(request: StartExternalJobRequest): Promise<ExternalJobSummary> {
         return this.native<ExternalJobSummary>('external_storage_start_job', { request })
-    }
-
-    requestDeviceMaintenanceRestart(): Promise<never> {
-        return restartForDeviceMaintenance(
-            (command, args) => this.native(command, args),
-        )
     }
 
     cancelJob(jobId: string): Promise<ExternalJobSummary> {

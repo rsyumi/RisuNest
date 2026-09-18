@@ -36,6 +36,7 @@ type FileRouteRuntime = Pick<
     | 'flushPendingData'
     | 'capturePersistentMutationToken'
     | 'acquireDestructiveReplacementFence'
+    | 'markCommittedWorkingSetRefreshRequired'
     | 'replacePersistentDatabase'
 >
 

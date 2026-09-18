@@ -1654,6 +1654,30 @@ describe('native replacement working-set refresh', () => {
         )
     })
 
+    it('keeps a stale working set read-only when native acknowledgement fails after commit', async () => {
+        const harness = createFenceRuntimeHarness(
+            makeConversationDatabase('Before native restore'),
+            makeConversationDatabase('After native restore'),
+        )
+        const { runtime } = harness
+        await runtime.initializeActiveWorkingSet(harness.database)
+        const token = await runtime.capturePersistentMutationToken('native-restore-start')
+        const fence = await runtime.acquireDestructiveReplacementFence(token)
+
+        runtime.markCommittedWorkingSetRefreshRequired(
+            2,
+            new Error('synthetic native acknowledgement failure'),
+        )
+        fence.release()
+
+        expect(runtime.revision).toBe(2)
+        expect(runtime.pendingWorkingSetRefreshRevision).toBe(2)
+        expect(harness.database.username).toBe('Before native restore')
+        expect(() => runtime.assertPersistentMutationAllowed()).toThrow(/replacement is active/i)
+        expect(() => runtime.markPersistentDataDirty(1)).toThrow(/replacement is active/i)
+        expect(harness.store.commit).not.toHaveBeenCalled()
+    })
+
     it('does not overwrite an already-applied edit during committed working-set projection', async () => {
         const restored = makeConversationDatabase('After native restore')
         const harness = createFenceRuntimeHarness(

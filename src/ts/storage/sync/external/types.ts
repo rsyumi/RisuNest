@@ -214,7 +214,6 @@ export interface ExternalJobSummary {
         receivedRevision?: DecimalString
         receiveReady?: boolean
         expectedRevision?: DecimalString
-        maintenanceSessionId?: string
     }
 }
 

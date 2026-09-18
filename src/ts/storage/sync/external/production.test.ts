@@ -16,7 +16,6 @@ const mocks = vi.hoisted(() => ({
         startJob: vi.fn(),
         getJob: vi.fn(),
         cancelJob: vi.fn(),
-        requestDeviceMaintenanceRestart: vi.fn(),
         applyReceived: vi.fn(),
         openConflictSource: vi.fn(),
         releaseConflictSource: vi.fn(),

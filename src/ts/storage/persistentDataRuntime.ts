@@ -339,6 +339,7 @@ export interface PersistentDataRuntime {
     readonly revision: DataRevision
     getStorageAuthorityEpoch(): number
     assertPersistentMutationAllowed(expectedAuthorityEpoch?: number): void
+    markCommittedWorkingSetRefreshRequired(revision: DataRevision, error: unknown): void
     readonly pendingWorkingSetRefreshRevision: DataRevision | null
     initializeActiveWorkingSet(database: Database): Promise<void>
     refreshActiveWorkingSetFromStore(revision: DataRevision): Promise<CommittedApplyOutcome>
@@ -890,6 +891,8 @@ export function createPersistentDataRuntime(
         getStorageAuthorityEpoch: () => coordinator.storageAuthorityEpoch,
         assertPersistentMutationAllowed: (expectedAuthorityEpoch) =>
             coordinator.assertPersistentMutationAllowed(expectedAuthorityEpoch),
+        markCommittedWorkingSetRefreshRequired: (revision, error) =>
+            coordinator.markCommittedWorkingSetRefreshRequired(revision, error),
         get pendingWorkingSetRefreshRevision() {
             return coordinator.pendingWorkingSetRefreshRevision
         },

@@ -377,13 +377,6 @@ export async function requestExternalStorageRestore(
             sessionId: current.session.id,
         })
         while (true) {
-            if (
-                job.state === 'waiting'
-                && job.phase === 'device-restore-maintenance'
-                && job.result?.maintenanceSessionId
-            ) {
-                await getExternalStorageBridge().requestDeviceMaintenanceRestart()
-            }
             if (job.state === 'succeeded') break
             if (['failed', 'cancelled', 'uncertain', 'conflict'].includes(job.state)) {
                 throw restoreFailure(job)

@@ -21,6 +21,7 @@ function dependencies(platform: 'native-desktop' | 'web'): RisuSaveFileRouteDepe
                 revision: 4,
                 mutationGeneration: 1,
             })),
+            markCommittedWorkingSetRefreshRequired: vi.fn(),
             acquireDestructiveReplacementFence: vi.fn(async () => ({
                 revision: 4,
                 refreshCommittedWorkingSet: vi.fn(async () => undefined),

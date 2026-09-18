@@ -48,6 +48,7 @@ function restoreRuntime(
     options: {
         capture?: (reason: string) => void | Promise<void>
         refresh?: (revision: number) => void | Promise<void>
+        markRefreshRequired?: (revision: number, error: unknown) => void
         acquire?: () => void | Promise<void>
         release?: () => void
         projection?: 'applied' | 'refresh-required'
@@ -65,6 +66,10 @@ function restoreRuntime(
                 mutationGeneration: 1,
             }
         },
+        markCommittedWorkingSetRefreshRequired: (
+            committedRevision: number,
+            error: unknown,
+        ) => options.markRefreshRequired?.(committedRevision, error),
         acquireDestructiveReplacementFence: async (token: { revision: number; mutationGeneration: number }) => {
             await options.acquire?.()
             expect(token.revision).toBe(options.fencedRevision ?? revision)
@@ -222,8 +227,14 @@ describe('native file jobs', () => {
         async (ackFails) => {
             const calls: string[] = []
             const events: string[] = []
+            let staleWritesBlocked = false
             let failAck = ackFails
             const refresh = vi.fn(async () => {})
+            const markRefreshRequired = vi.fn((revision: number) => {
+                expect(revision).toBe(4)
+                staleWritesBlocked = true
+                events.push('refresh-required')
+            })
             const committed = {
                 revision: 4,
                 sourceBytes: 128,
@@ -269,7 +280,14 @@ describe('native file jobs', () => {
                 throw new Error(`Unexpected command: ${command}`)
             }
             const running = runNativeArchiveRestore(
-                restoreRuntime(3, { refresh }),
+                restoreRuntime(3, {
+                    refresh,
+                    markRefreshRequired,
+                    release: () => {
+                        if (ackFails) expect(staleWritesBlocked).toBe(true)
+                        events.push('fence-released')
+                    },
+                }),
                 { type: 'desktopPath', path: 'C:\\synthetic\\portable.risunest' },
                 {
                     choosePortableSections: async () => ({
@@ -292,6 +310,8 @@ describe('native file jobs', () => {
                     NativeFileJobActivationCommittedError,
                 )
                 expect(refresh).not.toHaveBeenCalled()
+                expect(markRefreshRequired).toHaveBeenCalledOnce()
+                expect(staleWritesBlocked).toBe(true)
                 expect(calls).not.toContain('native_file_job_forget')
                 expect(calls.filter(command => command === 'native_file_job_finalize'))
                     .toHaveLength(1)
@@ -304,12 +324,19 @@ describe('native file jobs', () => {
             } else {
                 await expect(running).resolves.toEqual(committed)
                 expect(refresh).toHaveBeenCalledOnce()
+                expect(markRefreshRequired).not.toHaveBeenCalled()
                 expect(calls).toContain('native_file_job_forget')
             }
             expect(events).toEqual(
                 ackFails
-                    ? ['library-hold', 'device-ack', 'device-ack']
-                    : ['library-hold', 'device-ack'],
+                    ? [
+                        'library-hold',
+                        'device-ack',
+                        'refresh-required',
+                        'fence-released',
+                        'device-ack',
+                    ]
+                    : ['library-hold', 'device-ack', 'fence-released'],
             )
         },
     )
