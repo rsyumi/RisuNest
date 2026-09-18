@@ -53,8 +53,8 @@ enum ConflictReferenceMode<'a> {
     PortableExport { source_root: &'a Path },
 }
 
-impl ConflictReferenceMode<'_> {
-    fn source_root(self) -> &Path {
+impl<'a> ConflictReferenceMode<'a> {
+    fn source_root(self) -> &'a Path {
         match self {
             Self::DirectRestore { source_root } | Self::PortableExport { source_root } => {
                 source_root
