@@ -159,6 +159,22 @@ impl ExternalReferenceSources {
 }
 
 impl NativeFileJobState {
+    fn external_conflict_source_open_admission(
+        &self,
+    ) -> Result<super::admission::Permit, NativeJobError> {
+        self.admission
+            .file(false)
+            .map_err(|code| NativeJobError::new(code, "Another library operation is running"))
+    }
+
+    pub(crate) fn external_conflict_mutation_admission(
+        &self,
+    ) -> Result<super::admission::Permit, NativeJobError> {
+        self.admission
+            .file(true)
+            .map_err(|code| NativeJobError::new(code, "Another library operation is running"))
+    }
+
     fn register_external_reference_source(
         &self,
         descriptor: ConflictSourceDescriptor,
@@ -200,6 +216,7 @@ pub(crate) fn external_storage_open_conflict_source(
     id: String,
     side: ConflictSide,
 ) -> Result<OpenConflictSourceResponse, NativeJobError> {
+    let _admission = state.external_conflict_source_open_admission()?;
     crate::persistent_store::commands::with_store_mut(app.state(), |store| {
         let root = store.repository_root().to_path_buf();
         let descriptor = external_conflicts::conflict_source_descriptor(
@@ -270,5 +287,30 @@ mod tests {
         drop(guard);
         assert!(!sources.conflict_in_use("conflict").unwrap());
         sources.release(&token).unwrap();
+    }
+
+    #[test]
+    fn conflict_delete_cannot_cross_the_descriptor_read_and_registration_boundary() {
+        let state = NativeFileJobState::initialize_with_max_workers(
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            1,
+        );
+        let open = state.external_conflict_source_open_admission().unwrap();
+        assert_eq!(
+            state
+                .external_conflict_mutation_admission()
+                .unwrap_err()
+                .code,
+            "library-operation-busy"
+        );
+        let token = state
+            .register_external_reference_source(descriptor("conflict"))
+            .unwrap();
+        drop(open);
+
+        let _delete = state.external_conflict_mutation_admission().unwrap();
+        assert!(state.external_conflict_in_use("conflict").unwrap());
+        state.release_external_reference_source(&token).unwrap();
+        assert!(!state.external_conflict_in_use("conflict").unwrap());
     }
 }
