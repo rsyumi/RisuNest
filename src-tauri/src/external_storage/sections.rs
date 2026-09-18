@@ -732,9 +732,11 @@ pub(crate) fn note_prepared_section_published(
     confirmed: &wire::SectionSnapshotRef,
 ) -> Result<bool> {
     let (connection, metadata) = open_publication_index(&publication.publication_index_path)?;
+    // Packaging keeps an older generation when the exact section content was
+    // already remote. Its fingerprint and bounds still have to match.
     if metadata.section != publication.section
         || section_of(confirmed.kind) != Some(publication.section)
-        || metadata.generation != confirmed.generation
+        || confirmed.generation > metadata.generation
         || metadata.gc_floor != confirmed.gc_floor
         || metadata.max_write_clock != confirmed.max_write_clock
         || metadata.content_fingerprint != confirmed.content_fingerprint
