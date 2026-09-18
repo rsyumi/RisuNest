@@ -1825,3 +1825,133 @@ fn native_journal_resumes_before_or_after_an_inflight_section_commit() {
         }
     }
 }
+
+#[test]
+fn native_library_stage_survives_reopen_and_marker_prevents_second_activation() {
+    use crate::local_backup::NeverCancelled;
+
+    let root = tempfile::tempdir().unwrap();
+    let selected = vec!["local-settings".to_owned()];
+    let mut store = crate::persistent_store::PersistentStore::open(root.path()).unwrap();
+    let unrelated = store.replace_begin().unwrap().staging_id;
+    store
+        .replace_put_root(&unrelated, &serde_json::json!({ "username": "unrelated" }))
+        .unwrap();
+    let stage = store.replace_begin().unwrap().staging_id;
+    store
+        .replace_put_root(&stage, &serde_json::json!({ "username": "restored" }))
+        .unwrap();
+    let source = capture_prepared_native_sections(&mut store, &selected, &NeverCancelled).unwrap();
+    let rollback =
+        capture_prepared_native_sections(&mut store, &selected, &NeverCancelled).unwrap();
+    let coordinator = state(root.path());
+    let id = coordinator
+        .create_native_portable_session(
+            "library-recovery-job",
+            true,
+            &selected,
+            0,
+            Some(stage.clone()),
+        )
+        .unwrap();
+    let source_manifest = journal_prepared_native_sections(
+        &coordinator,
+        &id,
+        Spool::Source,
+        &source,
+    )
+    .unwrap()
+    .remove(0);
+    coordinator.source_ready(&id).unwrap();
+    journal_prepared_native_sections(&coordinator, &id, Spool::Rollback, &rollback).unwrap();
+    coordinator.prepared(&id).unwrap();
+    coordinator.allow_device_apply(&id).unwrap();
+    drop(store);
+
+    let mut reopened = crate::persistent_store::PersistentStore::open(root.path()).unwrap();
+    assert!(reopened
+        .prepare_replace_commit(&unrelated, Some(0))
+        .is_err());
+    let prepared = reopened
+        .prepare_replace_commit(&stage, Some(0))
+        .unwrap();
+    coordinator
+        .section_intent(&id, "local-settings", false)
+        .unwrap();
+    apply_prepared_native_sections(&mut reopened, &source).unwrap();
+    coordinator
+        .section_complete(
+            &id,
+            "local-settings",
+            false,
+            &source_manifest.sha256,
+        )
+        .unwrap();
+    coordinator.finish_device(&id).unwrap();
+    let (marker_key, marker) = coordinator.commit_marker(&id).unwrap();
+    let committed = reopened
+        .finish_prepared_replace_with_app_kv(
+            prepared,
+            &marker_key,
+            &serde_json::to_value(marker).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(committed.revision, 1);
+    drop(reopened);
+    drop(coordinator);
+
+    let recovered = state(root.path());
+    let decision = recovered.bootstrap_for_entry(false).unwrap();
+    let session = decision.session.unwrap();
+    assert_eq!(session.phase, "committed");
+    assert_eq!(session.action, "native-complete");
+    let mut reopened = crate::persistent_store::PersistentStore::open(root.path()).unwrap();
+    assert_eq!(
+        resume_journaled_native_restore(&recovered, &id, &mut reopened).unwrap(),
+        1
+    );
+    assert_eq!(reopened.revision().unwrap(), 1);
+    assert_eq!(
+        reopened.read_root(None).unwrap().value["username"],
+        "restored"
+    );
+    assert!(recovered.is_blocking().unwrap());
+    assert!(!recovered.section_list(&id, Spool::Source).unwrap().is_empty());
+}
+
+#[test]
+fn missing_journal_owned_stage_blocks_open_without_discarding_source_spool() {
+    use crate::local_backup::NeverCancelled;
+
+    let root = tempfile::tempdir().unwrap();
+    let selected = vec!["local-settings".to_owned()];
+    let mut store = crate::persistent_store::PersistentStore::open(root.path()).unwrap();
+    let stage = store.replace_begin().unwrap().staging_id;
+    store
+        .replace_put_root(&stage, &serde_json::json!({ "username": "restored" }))
+        .unwrap();
+    let source = capture_prepared_native_sections(&mut store, &selected, &NeverCancelled).unwrap();
+    let rollback =
+        capture_prepared_native_sections(&mut store, &selected, &NeverCancelled).unwrap();
+    let coordinator = state(root.path());
+    let id = coordinator
+        .create_native_portable_session(
+            "missing-stage-job",
+            true,
+            &selected,
+            0,
+            Some(stage.clone()),
+        )
+        .unwrap();
+    journal_prepared_native_sections(&coordinator, &id, Spool::Source, &source).unwrap();
+    coordinator.source_ready(&id).unwrap();
+    journal_prepared_native_sections(&coordinator, &id, Spool::Rollback, &rollback).unwrap();
+    coordinator.prepared(&id).unwrap();
+    coordinator.allow_device_apply(&id).unwrap();
+    store.replace_abort(&stage).unwrap();
+    drop(store);
+
+    assert!(crate::persistent_store::PersistentStore::open(root.path()).is_err());
+    assert!(coordinator.is_blocking().unwrap());
+    assert!(!coordinator.section_list(&id, Spool::Source).unwrap().is_empty());
+}

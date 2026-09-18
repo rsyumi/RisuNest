@@ -996,7 +996,6 @@ pub(crate) fn active_native_portable_stage(root: &Path) -> Result<Option<String>
             | "prepared"
             | "applying-device"
             | "committing-library"
-            | "committed"
     ) {
         return Ok(None);
     }
