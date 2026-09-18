@@ -90,6 +90,7 @@ pub(super) struct FakeState {
     after_listing: Vec<(usize, String, ObjectRole, Vec<u8>)>,
     reads: BTreeMap<String, ProviderError>,
     read_attempts: Vec<String>,
+    cancel_after_reads: BTreeMap<String, (usize, Cancellation)>,
     upload_attempts: Vec<String>,
     upload_locators: BTreeMap<String, String>,
     reconcile_attempts: Vec<String>,
@@ -169,6 +170,17 @@ impl FakeProvider {
     }
     pub(crate) fn read_attempts(&self, object: &str) -> usize {
         self.state.lock().unwrap().read_attempts.iter().filter(|id| id.as_str() == object).count()
+    }
+    pub(crate) fn cancel_after_read(
+        &self,
+        object: &str,
+        attempts: usize,
+        cancellation: &Cancellation,
+    ) {
+        self.state.lock().unwrap().cancel_after_reads.insert(
+            object.into(),
+            (attempts, cancellation.clone()),
+        );
     }
     pub(crate) fn upload_attempts(&self, object: &str) -> usize {
         self.state.lock().unwrap().upload_attempts.iter().filter(|id| id.as_str() == object).count()
@@ -280,12 +292,22 @@ impl Provider for FakeProvider {
             use tokio::io::AsyncWriteExt;
             c.check()?;
             l.validate_for(r)?;
-            {
+            let cancel_after_read = {
                 let mut state = self.state.lock().unwrap();
                 state.read_attempts.push(l.object.clone());
+                let attempts = state.read_attempts.iter()
+                    .filter(|object| *object == &l.object)
+                    .count();
+                let cancel = state.cancel_after_reads.get(&l.object)
+                    .filter(|(after, _)| *after == attempts)
+                    .map(|(_, cancel)| cancel.clone());
                 if let Some(error) = state.reads.remove(&l.object) {
                     return Err(error);
                 }
+                cancel
+            };
+            if let Some(cancel) = cancel_after_read {
+                cancel.cancel();
             }
             let (bytes, version) = self
                 .state

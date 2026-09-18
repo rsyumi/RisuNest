@@ -987,6 +987,20 @@ fn take_prepared_receive(
     Ok(entries.remove(&job.id).expect("prepared receive held under mutex"))
 }
 
+fn commit_prepared_receive(
+    store: &mut PersistentStore,
+    state: &super::job_store::JobCommandState,
+    claim: &super::job_store::JobClaim,
+    job: &DurableJob,
+    expected: i64,
+    current: &CaptureIdentity,
+) -> Result<(String, i64)> {
+    let prepared = take_prepared_receive(state, claim, job, expected)?;
+    let snapshot_id = prepared.snapshot_id.clone();
+    let revision = activate_prepared_receive(store, prepared, current)?;
+    Ok((snapshot_id, revision))
+}
+
 fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Result<Value> {
     let expected = receive_revision(request)?;
     let jobs = JobStore::open(&super::runtime::root(app)?)?;
@@ -1010,14 +1024,12 @@ fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Result<Val
     let current = store.external_identity().map_err(local_error)?;
     cancel.check()?;
     super::runtime::read_job_session(app, &job.id)?;
-    let prepared = take_prepared_receive(&state, &claim, &job, expected)?;
-    let snapshot_id = prepared.snapshot_id.clone();
-    let outcome = activate_prepared_receive(&mut store, prepared, &current);
+    let outcome = commit_prepared_receive(&mut store, &state, &claim, &job, expected, &current);
     drop(store);
     drop(permit);
     job.receive_staging_id = None;
-    let revision = match outcome {
-        Ok(revision) => revision,
+    let (snapshot_id, revision) = match outcome {
+        Ok(result) => result,
         Err(error) => {
             let permanent = matches!(error.kind, ErrorKind::PreconditionFailed | ErrorKind::Corrupt);
             let mut preserving = false;
@@ -1099,13 +1111,87 @@ async fn reconcile_unknown(
             .map_err(local_error)?;
     }
     let intended_state = format!("snapshot-{}", job.snapshot_id);
+    match observe_unknown_publication(
+        connected.provider.as_ref(),
+        &connected.handle,
+        &connected.stored.descriptor,
+        &connected.root_key,
+        &intent.commit_id,
+        &intended_state,
+        cancel,
+    )
+    .await?
+    {
+        Some(observed) => {
+            remember_discovery(
+                app,
+                &job.request.connection_id,
+                &job.snapshot_id,
+                &observed.document.state,
+            );
+            let confirmed = control::read_snapshot_document(
+                connected,
+                &observed.document.state,
+                cancel,
+            )
+            .await?;
+            let observation = observation_json(&observed.observation)?;
+            let permit = super::runtime::publication_permit(app, &job.id)?;
+            let sections_spool = super::runtime::job_directory(
+                &super::runtime::root(app)?,
+                &job.request.connection_id,
+                &job.id,
+            )
+            .join("sections");
+            let publications =
+                super::sections::load_prepared_section_publications(&sections_spool)?;
+            note_sections_published(
+                app,
+                &job.request.connection_id,
+                &intent.identity.library_epoch,
+                &confirmed.sections,
+                &publications,
+            )?;
+            pds(app)?
+                .external_confirm_publication(
+                    &permit,
+                    &intent.commit_id,
+                    &job.snapshot_id,
+                    &observation,
+                )
+                .map_err(local_error)?;
+            super::runtime::record_connection_completion(
+                app,
+                &job.request.connection_id,
+                super::connection_store::CompletionKind::Sync,
+            );
+            return Ok(Some(
+                json!({"snapshotId":job.snapshot_id,"publishedRevision":intent.identity.revision.to_string()}),
+            ));
+        }
+        None => {}
+    }
+    Ok(Some(
+        json!({"stopReason":"uncertain","reason":"publication-unknown"}),
+    ))
+}
+
+async fn observe_unknown_publication(
+    provider: &dyn super::contract::Provider,
+    repository: &super::contract::RepositoryHandle,
+    descriptor: &Descriptor,
+    root_key: &[u8; 32],
+    intended_commit: &str,
+    intended_state: &str,
+    cancel: &Cancellation,
+) -> Result<Option<ObservedHead>> {
     for attempt in 0..2 {
         cancel.check()?;
         match control::read_head(
-            connected.provider.as_ref(),
-            &connected.handle,
-            &connected.stored.descriptor,
-            &connected.root_key,
+            provider,
+            repository,
+            descriptor,
+            root_key,
             None,
             cancel,
         )
@@ -1119,58 +1205,13 @@ async fn reconcile_unknown(
                     )
                 });
                 if super::publication::classify_publication(
-                    &intent.commit_id,
-                    &intended_state,
+                    intended_commit,
+                    intended_state,
                     authenticated_head,
                     false,
                 ) == super::publication::PublicationObservation::Confirmed
                 {
-                    let observed = observed.expect("confirmed publication has a head");
-                    remember_discovery(
-                        app,
-                        &job.request.connection_id,
-                        &job.snapshot_id,
-                        &observed.document.state,
-                    );
-                    let confirmed = control::read_snapshot_document(
-                        connected,
-                        &observed.document.state,
-                        cancel,
-                    )
-                    .await?;
-                    let observation = observation_json(&observed.observation)?;
-                    let permit = super::runtime::publication_permit(app, &job.id)?;
-                    let sections_spool = super::runtime::job_directory(
-                        &super::runtime::root(app)?,
-                        &job.request.connection_id,
-                        &job.id,
-                    )
-                    .join("sections");
-                    let publications =
-                        super::sections::load_prepared_section_publications(&sections_spool)?;
-                    note_sections_published(
-                        app,
-                        &job.request.connection_id,
-                        &intent.identity.library_epoch,
-                        &confirmed.sections,
-                        &publications,
-                    )?;
-                    pds(app)?
-                        .external_confirm_publication(
-                            &permit,
-                            &intent.commit_id,
-                            &job.snapshot_id,
-                            &observation,
-                        )
-                        .map_err(local_error)?;
-                    super::runtime::record_connection_completion(
-                        app,
-                        &job.request.connection_id,
-                        super::connection_store::CompletionKind::Sync,
-                    );
-                    return Ok(Some(
-                        json!({"snapshotId":job.snapshot_id,"publishedRevision":intent.identity.revision.to_string()}),
-                    ));
+                    return Ok(observed);
                 }
             }
             Err(error) => {
@@ -1186,9 +1227,7 @@ async fn reconcile_unknown(
             }
         }
     }
-    Ok(Some(
-        json!({"stopReason":"uncertain","reason":"publication-unknown"}),
-    ))
+    Ok(None)
 }
 
 async fn preserve_conflict(
@@ -1607,6 +1646,9 @@ async fn run_resolve_conflict(
                     &observation,
                 )
                 .map_err(local_error)?;
+            let _ = resolve_journal
+                .release_completed_sessions(connected.dependencies.vault.as_ref())
+                .await;
             if mark_conflict_resolved(app, conflict_id).is_err() {
                 crate::nlog!("error","External conflict publication committed but conflict bookkeeping did not finish");
             }
@@ -1653,7 +1695,7 @@ pub(crate) async fn run_sync(
     if let Some(result) = reconcile_unknown(app, connected, job, cancel).await? {
         return Ok(result);
     }
-    let session = super::runtime::read_job_session(app, &job.id)?;
+    super::runtime::read_job_session(app, &job.id)?;
     let strategy = connected
         .stored
         .descriptor
@@ -1661,11 +1703,7 @@ pub(crate) async fn run_sync(
         .ok_or_else(|| ProviderError::new(ErrorKind::Unsupported))?;
     connected.stored.capabilities.require(strategy)?;
     if let Some(record) = conflict_record(app, &job.id)?.filter(|record| !record.resolved) {
-        return if record.remote_point.is_some() {
-            Ok(json!({"snapshotId":record.local.capture_id,"conflictId":job.id,"preservation":"remote-complete"}))
-        } else {
-            resume_conflict_preservation(app, connected, job, record, protection, cancel).await
-        };
+        return resume_conflict_preservation(app, connected, job, record, protection, cancel).await;
     }
     let remote = control::read_head(
         connected.provider.as_ref(),
@@ -2245,7 +2283,7 @@ mod receive_tests {
     }
 
     #[test]
-    fn final_apply_uses_only_prepared_local_handles() {
+    fn final_apply_dispatcher_uses_only_prepared_local_handles() {
         let (_directory, mut store, job, downloaded) = fixture();
         let source = downloaded.staging_root.clone();
         let prepared = prepare(&mut store, &job, downloaded);
@@ -2256,9 +2294,28 @@ mod receive_tests {
         fs::remove_dir_all(source).unwrap();
         // Match the runtime: preparation and activation use separate native handles.
         let mut reopened = store.open_native_job_store().unwrap();
+        let state = super::super::job_store::JobCommandState::default();
+        state.prepared_receives.lock().unwrap().insert(job.id.clone(), prepared);
+        let (cancel, claim) = state.claim(&job).unwrap();
         let current = reopened.external_identity().unwrap();
+        cancel.check().unwrap();
         super::super::snapshot_restore::reset_test_read_counts();
-        assert_eq!(activate_prepared_receive(&mut reopened, prepared, &current).unwrap(), 1);
+        assert_eq!(
+            commit_prepared_receive(&mut reopened, &state, &claim, &job, 1, &current)
+                .unwrap_err().kind,
+            ErrorKind::PreconditionFailed,
+        );
+        let (snapshot_id, received_revision) = commit_prepared_receive(
+            &mut reopened,
+            &state,
+            &claim,
+            &job,
+            0,
+            &current,
+        )
+        .unwrap();
+        assert_eq!(snapshot_id, "snapshot");
+        assert_eq!(received_revision, 1);
         assert_eq!(super::super::snapshot_restore::test_read_counts(), (0, 0));
         assert_eq!(store.materialize(None).unwrap()["marker"], "remote");
         assert_eq!(rows(&mut store).len(), 1);
@@ -2527,6 +2584,7 @@ mod tests {
     use crate::external_storage::{
         contract::{ObjectReceipt, ObjectRole, RemoteLocator},
         control::HeadDocument,
+        fake,
         packaging::RemoteObject,
     };
     use risunest_external_storage_format::{
@@ -2603,6 +2661,67 @@ mod tests {
             head_observation: observation_json(&head.observation).unwrap(),
             identity,
         }
+    }
+
+    async fn observe(
+        provider: &fake::FakeProvider,
+        cancel: &Cancellation,
+    ) -> Result<Option<ObservedHead>> {
+        observe_unknown_publication(
+            provider,
+            &fake::repository(),
+            &descriptor(),
+            &[7; 32],
+            "intended-commit",
+            "snapshot-intended",
+            cancel,
+        )
+        .await
+    }
+
+    #[test]
+    fn publication_unknown_observation_is_bounded_cancelable_and_read_only() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let missing = fake::FakeProvider::new(false);
+            assert!(observe(&missing, &Cancellation::default()).await.unwrap().is_none());
+            assert_eq!(missing.read_attempts("head"), 2);
+            assert!(!missing.holds("head"));
+            assert!(missing.uploaded_ids().is_empty());
+
+            let transient = fake::FakeProvider::new(false);
+            transient.fail_read("head", ErrorKind::Transient);
+            assert!(observe(&transient, &Cancellation::default()).await.unwrap().is_none());
+            assert_eq!(transient.read_attempts("head"), 2);
+            assert!(!transient.holds("head"));
+            assert!(transient.uploaded_ids().is_empty());
+
+            let cancelled = fake::FakeProvider::new(false);
+            let cancellation = Cancellation::default();
+            cancelled.cancel_after_read("head", 1, &cancellation);
+            assert_eq!(
+                observe(&cancelled, &cancellation).await.unwrap_err().kind,
+                ErrorKind::Cancelled,
+            );
+            assert_eq!(cancelled.read_attempts("head"), 1);
+            assert!(!cancelled.holds("head"));
+            assert!(cancelled.uploaded_ids().is_empty());
+
+            for kind in [ErrorKind::Unauthorized, ErrorKind::ReauthRequired, ErrorKind::Corrupt] {
+                let permanent = fake::FakeProvider::new(false);
+                permanent.fail_read("head", kind);
+                assert_eq!(
+                    observe(&permanent, &Cancellation::default()).await.unwrap_err().kind,
+                    kind,
+                );
+                assert_eq!(permanent.read_attempts("head"), 1, "{kind:?}");
+                assert!(!permanent.holds("head"), "{kind:?}");
+                assert!(permanent.uploaded_ids().is_empty(), "{kind:?}");
+            }
+        });
     }
 
     /// Invariant 30. A device value that moved on its own publishes; it never
