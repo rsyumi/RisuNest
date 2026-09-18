@@ -74,7 +74,7 @@ async fn observe(
         }
         if method == "POST" && path == "/objects/retention/release"
             && trace.fail_release_once.swap(false, Ordering::SeqCst) {
-            return (axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(json!({"error":"synthetic-release-failure"}))).into_response();
         }
         if method == "GET" && path.starts_with("/checkpoints/") && trace.expire_checkpoint.load(Ordering::SeqCst) {
