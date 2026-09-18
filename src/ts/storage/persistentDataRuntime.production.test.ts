@@ -31,7 +31,7 @@ import {
     projectCompleteScalableWorkingSet,
 } from './workingSetCatalog'
 import { workingSetResidency } from './workingSetResidency'
-import { SaveCoordinator } from './saveCoordinator'
+import { canonicalJson, SaveCoordinator } from './saveCoordinator'
 
 afterEach(() => {
     configurePersistentDataRuntime({ projectWorkingSet: undefined })
@@ -41,6 +41,31 @@ afterEach(() => {
 })
 
 describe('production persistent working-set publication', () => {
+    it.each(['character', 'group'])('tracks cold selection and subsequent %s edits in the same canonical capture', (type) => {
+        setDatabaseLite({
+            botPresets: [], plugins: [], pluginCustomStorage: {},
+            characters: ['a', 'b'].map((id) => ({
+                type, chaId: id, name: id, chatPage: 0,
+                ...(type === 'group' ? { characters: [], characterTalks: [] } : {}),
+                chats: [{ id: `chat-${id}`, note: '', message: [] }],
+            })),
+        } as unknown as Database)
+        selectedCharID.set(-1)
+        const adapter = createProductionStateAdapter()
+        const capture = adapter.canonicalCapture!
+        expect(capture.character()).toBeNull()
+        for (const index of [0, 1, 0]) {
+            selectedCharID.set(index)
+            expect(capture.character()).toBe(canonicalJson(adapter.captureSelectedCharacter()))
+            const character = getDatabase().characters[index]
+            character.name = '수정 🙂'
+            character.chats[0].note = 'Synthetic nested edit'
+            expect(capture.character()).toBe(canonicalJson(adapter.captureSelectedCharacter()))
+            character.name = ''
+            expect(capture.character()).toBe(canonicalJson(adapter.captureSelectedCharacter()))
+        }
+    })
+
     it('uses canonical captures for immediate production edits and emits a small delta', async () => {
         setDatabaseLite({
             username: 'Before',

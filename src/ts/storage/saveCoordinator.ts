@@ -2735,6 +2735,14 @@ export class SaveCoordinator {
                     (currentAddition.pending.locallyAdded &&
                         currentAddition.canonical === currentAddition.pending.baseline))
             ) {
+                if (this.pendingConversationMutations.length > 0) {
+                    if (pendingConversationMutations.some((pending) =>
+                        this.pendingConversationMutations.includes(pending),
+                    )) {
+                        throw new Error('Pending conversation mutations could not be persisted')
+                    }
+                    continue
+                }
                 this.pendingByteCount = 0
                 if (publishOfficial && this.pendingPublicationRevision !== null) {
                     const delay = this.officialPublishDelayMs()

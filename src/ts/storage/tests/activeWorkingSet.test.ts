@@ -426,6 +426,22 @@ function makeWindowedHarness(input: {
 }
 
 describe('ActiveWorkingSet', () => {
+    it('propagates a windowed transition failure after restoring the previous selection', async () => {
+        const harness = makeWindowedHarness({
+            characters: [makeCharacter('a', [makeChat('chat-a')]), makeCharacter('b', [makeChat('chat-b')])],
+        })
+        await expect(harness.workingSet.activateCharacter('a')).resolves.toBe(true)
+        const previous = harness.database.characters[0]
+        const error = new Error('Synthetic pending persistence failure')
+        harness.coordinator.runSelectedConversationTransition.mockImplementationOnce(() => { throw error })
+        await expect(harness.workingSet.activateCharacter('b')).rejects.toBe(error)
+        expect(harness.database.characters[0]).toBe(previous)
+        expect(harness.workingSet.captureSelectedConversationTarget()).toMatchObject({
+            characterId: 'a', conversationId: 'chat-a',
+        })
+        await expect(harness.workingSet.activateCharacter('b')).resolves.toBe(true)
+    })
+
     it('directly activates a large selected conversation from metadata', async () => {
         const conversation = {
             ...makeChat('chat-large'),

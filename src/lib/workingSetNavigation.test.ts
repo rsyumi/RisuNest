@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => {
     const events: string[] = []
     const database = { characters: [] as any[] }
     return {
+        alertError: vi.fn(),
         database,
         events,
         selectedCharID: {
@@ -58,6 +59,7 @@ vi.mock('src/ts/stores.svelte', () => ({
     DBState: { db: mocks.database },
     selectedCharID: mocks.selectedCharID,
 }))
+vi.mock('src/ts/alert', () => ({ alertError: mocks.alertError }))
 vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
     deactivateActiveWorkingSet: mocks.deactivateActiveWorkingSet,
     markPersistentDataDirty: mocks.markPersistentDataDirty,
@@ -85,6 +87,16 @@ describe('working-set UI navigation', () => {
     it('deactivates and flushes the working set before clearing selection', async () => {
         await expect(clearCharacterSelection()).resolves.toBe(true)
 
+        expect(mocks.events).toEqual(['deactivate', 'select:-1'])
+    })
+
+    it('reports a persistence failure without clearing selection and permits retry', async () => {
+        const error = new Error('Synthetic storage failure')
+        mocks.deactivateActiveWorkingSet.mockRejectedValueOnce(error)
+        await expect(clearCharacterSelection()).resolves.toBe(false)
+        expect(mocks.alertError).toHaveBeenCalledExactlyOnceWith(error)
+        expect(mocks.events).toEqual([])
+        await expect(clearCharacterSelection()).resolves.toBe(true)
         expect(mocks.events).toEqual(['deactivate', 'select:-1'])
     })
 

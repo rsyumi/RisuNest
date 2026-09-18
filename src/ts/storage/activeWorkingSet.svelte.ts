@@ -1666,6 +1666,7 @@ export class ActiveWorkingSet {
             summary: safeStructuredClone(input.summary),
             viewportSource,
         }
+        const supersededAdoption = new Error('Windowed selected conversation was not adopted')
         try {
             transition.call(this.dependencies.coordinator, () => {
                 this.selectedConversationState = windowedState
@@ -1717,9 +1718,7 @@ export class ActiveWorkingSet {
                     input.activation,
                 )
                 if (!adopted) {
-                    throw new Error(
-                        'Windowed selected conversation was not adopted',
-                    )
+                    throw supersededAdoption
                 }
             })
         } catch (error) {
@@ -1742,7 +1741,8 @@ export class ActiveWorkingSet {
                 this.notifyActiveConversationViewportSource()
                 throw rollbackError
             }
-            return false
+            if (error === supersededAdoption) return false
+            throw error
         }
 
         if (input.previousState && input.previousState !== windowedState) {

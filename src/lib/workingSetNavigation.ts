@@ -36,8 +36,10 @@ export async function clearCharacterSelection(): Promise<boolean> {
         if (!await deactivateActiveWorkingSet()) return reportBlockedNavigation()
         selectedCharID.set(-1)
         return true
-    } catch {
-        return reportBlockedNavigation()
+    } catch (error) {
+        const { alertError } = await import('src/ts/alert')
+        alertError(error instanceof Error ? error : String(error))
+        return false
     }
 }
 
