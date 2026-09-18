@@ -357,7 +357,7 @@ fn prepare_local_restore(
     expected_revision: i64,
     snapshot: PreparedRemoteSnapshot,
     selection: RestoreSelection,
-    sections: Vec<snapshot_restore::PreparedSection>,
+    sections: Vec<super::sections::CapturedSection>,
     cancel: Cancellation,
 ) -> Result<Value> {
     cancel.check()?;
@@ -416,26 +416,14 @@ fn prepare_local_restore(
     };
 
     let prepared = prepared.ok_or_else(corrupt)?;
-    // Decoding every selected section before touching the device file keeps a
+    // Preparing every selected section before touching the device file keeps a
     // bundle with a missing object from installing half of itself.
-    let decoded = sections
-        .into_iter()
-        .map(|section| {
-            let rows = super::sections::decode_section(
-                section.kind,
-                &section.entries,
-                &section.content_fingerprint,
-            )?;
-            Ok((section.kind, rows))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    for (kind, rows) in decoded {
+    let prepared_sections =
+        super::sections::prepare_received_backup_sections(&sections, &cancel)?;
+    let device = store.device_store_mut().map_err(pds_error)?;
+    for rows in &prepared_sections {
         cancel.check()?;
-        let device = store.device_store_mut().map_err(pds_error)?;
-        match super::sections::section_of(kind) {
-            Some(section) => device.restore_section_rows(section, &rows).map_err(pds_error)?,
-            None => device.restore_local_setting_rows(&rows).map_err(pds_error)?,
-        }
+        device.restore_prepared_backup_section(rows).map_err(pds_error)?;
     }
     let marker = restore_marker(job, expected_revision)?;
     let revision = store
