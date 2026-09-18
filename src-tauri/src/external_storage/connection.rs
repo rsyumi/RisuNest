@@ -403,7 +403,7 @@ fn provider(
         id: id.into(),
         display_name: display_name.into(),
         oauth,
-        authorization_available: !oauth || !cfg!(target_os = "ios"),
+        authorization_available: true,
         strategies: strategies
             .iter()
             .map(|value| match *value {
@@ -419,10 +419,6 @@ fn provider(
 pub(crate) fn validate_preparation(
     request: &PrepareConnectionRequest,
 ) -> Result<EndpointConfirmation> {
-    #[cfg(target_os = "ios")]
-    if request.config.oauth_profile.is_some() {
-        return Err(ProviderError::new(ErrorKind::Unsupported));
-    }
     // A synchronization connection carries no capture policy: what it
     // exchanges is chosen per device.
     if request.purpose == ConnectionPurpose::Sync && request.capture_policy.is_some() {
@@ -1220,7 +1216,7 @@ mod tests {
             .iter()
             .find(|provider| provider.id == "webdav")
             .unwrap();
-        assert_eq!(google.authorization_available, !cfg!(target_os = "ios"));
+        assert!(google.authorization_available);
         assert!(webdav.authorization_available);
     }
 

@@ -340,7 +340,7 @@ pub(super) async fn access_token(
         .clock
         .now_ms()
         .saturating_add(granted.expires_in.unwrap_or(0).saturating_mul(1000));
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     verify_google_grant(
         dependencies,
         settings.token_info_endpoint()?,
@@ -380,7 +380,7 @@ pub(crate) fn authorization_policy(
     platform: &str,
     redirect_url: url::Url,
 ) -> Result<AuthorizationPolicy> {
-    if platform == "android" || platform == "ios" {
+    if matches!(platform, "android" | "ios") {
         return Err(config::unsupported());
     }
     let settings = AuthorizationSettings::parse(config, platform)?;
@@ -398,6 +398,35 @@ pub(crate) fn authorization_policy(
         redirect_url,
         scopes: settings.scopes,
     })
+}
+
+#[cfg(any(target_os = "ios", test))]
+pub(crate) fn ios_authorization_policy(
+    config: &ConnectionConfig,
+) -> Result<(AuthorizationPolicy, String)> {
+    const SUFFIX: &str = ".apps.googleusercontent.com";
+    let settings = AuthorizationSettings::parse(config, "ios")?;
+    let prefix = settings
+        .client_id
+        .strip_suffix(SUFFIX)
+        .filter(|prefix| {
+            !prefix.is_empty()
+                && prefix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+        .ok_or_else(config::unsupported)?;
+    let callback_scheme = format!("com.googleusercontent.apps.{prefix}");
+    let redirect_url = url::Url::parse(&format!("{callback_scheme}:/oauth2redirect"))
+        .map_err(|_| config::unsupported())?;
+    let policy = AuthorizationPolicy {
+        authorize_url: url::Url::parse(config::AUTHORIZE_ENDPOINT)
+            .map_err(|_| config::unsupported())?,
+        client_id: settings.client_id,
+        redirect_url,
+        scopes: settings.scopes,
+    };
+    Ok((policy, callback_scheme))
 }
 
 #[cfg(not(target_os = "android"))]
@@ -480,7 +509,7 @@ pub(crate) async fn exchange_authorization_code(
         .clock
         .now_ms()
         .saturating_add(granted.expires_in.unwrap_or(0).saturating_mul(1000));
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     verify_google_grant(
         dependencies,
         settings.token_info_endpoint()?,

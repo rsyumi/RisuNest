@@ -60,6 +60,9 @@ use crate::external_storage::{
 use config::Settings;
 use std::{collections::BTreeMap, sync::Arc};
 
+#[cfg(any(target_os = "ios", test))]
+pub(crate) const IOS_REDIRECT_URI: &str = "msauth.io.github.rsyumi.risunest://auth";
+
 /// External browser policy for a connection: authority, client id for the
 /// platform, registered reply URL and the scopes of its account type.
 pub(crate) fn authorization_policy(

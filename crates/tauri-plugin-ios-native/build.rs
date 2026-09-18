@@ -12,6 +12,8 @@ fn main() {
         "publication",
         "generation_progress",
         "reset_generation",
+        "authenticate",
+        "cancel_authentication",
     ])
     .ios_path("ios")
     .build();

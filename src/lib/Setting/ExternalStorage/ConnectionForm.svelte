@@ -250,6 +250,7 @@
 
     function fieldLabel(key: string): string {
         if (key === 'clientId' && googleAndroid) return strings.webOAuthClientId
+        if (key === 'clientId' && isTauriIOS) return strings.iosOAuthClientId
         if (key === 'oauthRedirectUri') return strings.oauthCallbackUrl
         return externalFieldLabel(strings, providerId, key)
     }
@@ -322,9 +323,14 @@
                         return
                     }
                     pendingAuthorizationId = pending.authorizationId
-                    authorizationStatus = strings.authorizationWaiting
-                    if (pending.authorizationUrl) await openUrl(pending.authorizationUrl)
-                    return
+                    authorizationStatus = pending.state === 'complete'
+                        ? ''
+                        : strings.authorizationWaiting
+                    if (pending.authorizationUrl) {
+                        await openUrl(pending.authorizationUrl)
+                        return
+                    }
+                    if (pending.state !== 'complete') return
                 }
                 authorizationCompletionInFlight = true
                 const result = await bridge.completeAuthorization(
@@ -387,6 +393,8 @@
             {#if !authorizationAvailable}<p class="note danger"><span>{strings.authorizationUnavailable}</span></p>{/if}
             {#if googleAndroid}<p class="note"><span>{strings.googleAndroidSetup}</span></p>{/if}
             {#if isTauriAndroid && providerId === 'onedrive'}<p class="note"><span>{strings.oneDriveAndroidSetup}</span></p>{/if}
+            {#if isTauriIOS && providerId === 'google_drive'}<p class="note"><span>{strings.googleIOSSetup}</span></p>{/if}
+            {#if isTauriIOS && providerId === 'onedrive'}<p class="note"><span>{strings.oneDriveIOSSetup}</span></p>{/if}
         {/if}
     </section>
     {/if}

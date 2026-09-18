@@ -1,4 +1,5 @@
 import Tauri
+import AuthenticationServices
 import UIKit
 import UserNotifications
 import UniformTypeIdentifiers
@@ -10,8 +11,13 @@ private struct ProgressArgs: Decodable { let id: String; let completed: Int64 }
 private struct PathArgs: Decodable { let path: String }
 private struct ExportArgs: Decodable { let sourcePath: String; let suggestedName: String; let requestId: String }
 private struct NotificationArgs: Decodable { let body: String }
+private struct WebAuthenticationArgs: Decodable {
+    let authorizationUrl: String
+    let callbackScheme: String
+    let prefersEphemeral: Bool
+}
 
-final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
+final class IosNativePlugin: Plugin, UIDocumentPickerDelegate, ASWebAuthenticationPresentationContextProviding {
     private weak var webView: WKWebView?
     private var tasks: [String: UIBackgroundTaskIdentifier] = [:]
     private var expired = Set<String>()
@@ -25,6 +31,7 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
     private var progress: [String: Int64] = [:]
     private var continuedRegistered = false
     private var continuedErrorCode: Int?
+    private var authenticationSession: ASWebAuthenticationSession?
     private var taskIdentifier: String { Bundle.main.bundleIdentifier! + ".generation" }
 
     private var dataRoot: URL {
@@ -224,6 +231,76 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate {
                 invoke.resolve(["opened": opened])
             }
         }
+    }
+
+    @objc func authenticate(_ invoke: Invoke) throws {
+        let args = try invoke.parseArgs(WebAuthenticationArgs.self)
+        guard let authorizationUrl = URL(string: args.authorizationUrl),
+              authorizationUrl.scheme == "https",
+              URL(string: "\(args.callbackScheme):/")?.scheme == args.callbackScheme else {
+            invoke.resolve(["status": "failed"])
+            return
+        }
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else {
+                invoke.resolve(["status": "failed"])
+                return
+            }
+            guard self.authenticationSession == nil else {
+                invoke.resolve(["status": "busy"])
+                return
+            }
+            guard self.authenticationPresentationAnchor() != nil else {
+                invoke.resolve(["status": "presentation-unavailable"])
+                return
+            }
+            let session = ASWebAuthenticationSession(
+                url: authorizationUrl,
+                callbackURLScheme: args.callbackScheme
+            ) { [weak self] callbackUrl, error in
+                DispatchQueue.main.async {
+                    self?.authenticationSession = nil
+                    if let callbackUrl = callbackUrl {
+                        invoke.resolve([
+                            "status": "succeeded",
+                            "callbackUrl": callbackUrl.absoluteString
+                        ])
+                    } else if let authenticationError = error as? ASWebAuthenticationSessionError,
+                              authenticationError.code == .canceledLogin {
+                        invoke.resolve(["status": "cancelled"])
+                    } else {
+                        invoke.resolve(["status": "failed"])
+                    }
+                }
+            }
+            session.presentationContextProvider = self
+            session.prefersEphemeralWebBrowserSession = args.prefersEphemeral
+            self.authenticationSession = session
+            if !session.start() {
+                self.authenticationSession = nil
+                invoke.resolve(["status": "failed"])
+            }
+        }
+    }
+
+    @objc func cancelAuthentication(_ invoke: Invoke) {
+        DispatchQueue.main.async { [weak self] in
+            self?.authenticationSession?.cancel()
+            invoke.resolve()
+        }
+    }
+
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        authenticationPresentationAnchor() ?? ASPresentationAnchor()
+    }
+
+    private func authenticationPresentationAnchor() -> ASPresentationAnchor? {
+        if let window = webView?.window { return window }
+        return UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }?
+            .windows
+            .first { $0.isKeyWindow }
     }
 
     private func present(_ picker: UIDocumentPickerViewController, invoke: Invoke) {

@@ -40,11 +40,19 @@ struct PendingPreparation {
     recovery: Option<ImportedRecovery>,
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 struct PendingAuthorization {
     preparation_id: String,
     expires_at_ms: u64,
     flow: super::oauth::LoopbackAuthorization,
+    exchange_config: super::contract::ConnectionConfig,
+}
+
+#[cfg(target_os = "ios")]
+struct PendingAuthorization {
+    preparation_id: String,
+    expires_at_ms: u64,
+    grant: super::auth::AuthorizationCode,
     exchange_config: super::contract::ConnectionConfig,
 }
 
@@ -406,7 +414,7 @@ pub(crate) async fn external_storage_commit_connection(
     }
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[tauri::command]
 pub(crate) async fn external_storage_begin_authorization(
     state: State<'_, ConnectionCommandState>,
@@ -472,6 +480,81 @@ pub(crate) async fn external_storage_begin_authorization(
         authorization_url: Some(authorization_url.to_string()),
         expires_at_ms: expires_at_ms.to_string(),
         state: "browser-required",
+    })
+}
+
+#[cfg(target_os = "ios")]
+#[tauri::command]
+pub(crate) async fn external_storage_begin_authorization(
+    app: AppHandle,
+    state: State<'_, ConnectionCommandState>,
+    request: BeginAuthorizationRequest,
+) -> Result<PendingAuthorizationSummary> {
+    let BeginAuthorizationRequest {
+        preparation_id,
+        current_platform_client_id,
+    } = request;
+    let config = {
+        let mut pending = lock(&state.preparations)?;
+        let preparation = pending
+            .get_mut(&preparation_id)
+            .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
+        if preparation.expires_at_ms <= now_ms() {
+            return Err(ProviderError::new(ErrorKind::Cancelled));
+        }
+        if preparation.request.mode == ConnectionOpenMode::Existing
+            && preparation.recovery.is_none()
+        {
+            return Err(ProviderError::new(ErrorKind::ReauthRequired));
+        }
+        apply_recovery_platform_client(preparation, current_platform_client_id)?;
+        preparation.request.config.clone()
+    };
+    let mut exchange_config = config;
+    let flow = match exchange_config.provider.as_str() {
+        "google_drive" => {
+            let (policy, callback_scheme) =
+                providers::google_drive::auth::ios_authorization_policy(&exchange_config)?;
+            super::oauth::IosWebAuthenticationAuthorization::start(
+                policy,
+                callback_scheme,
+                true,
+            )?
+        }
+        "onedrive" => {
+            exchange_config.location.insert(
+                "redirectUri".into(),
+                providers::onedrive::IOS_REDIRECT_URI.into(),
+            );
+            let policy = providers::onedrive::authorization_policy(&exchange_config, "ios")?;
+            let callback_scheme = policy.redirect_url.scheme().to_owned();
+            super::oauth::IosWebAuthenticationAuthorization::start(
+                policy,
+                callback_scheme,
+                false,
+            )?
+        }
+        _ => return Err(ProviderError::new(ErrorKind::Unsupported)),
+    };
+    let grant = flow.authenticate(&app).await?;
+    let authorization_id = uuid::Uuid::new_v4().to_string();
+    let expires_at_ms = now_ms().saturating_add(PREPARATION_LIFETIME_MS);
+    lock(&state.authorizations)?.insert(
+        authorization_id.clone(),
+        PendingAuthorization {
+            preparation_id,
+            expires_at_ms,
+            grant,
+            exchange_config,
+        },
+    );
+    lock(&state.authorization_cancellations)?
+        .insert(authorization_id.clone(), Cancellation::default());
+    Ok(PendingAuthorizationSummary {
+        authorization_id,
+        authorization_url: None,
+        expires_at_ms: expires_at_ms.to_string(),
+        state: "complete",
     })
 }
 
@@ -551,7 +634,7 @@ pub(crate) async fn external_storage_begin_authorization(
     })
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[tauri::command]
 pub(crate) async fn external_storage_complete_authorization(
     app: AppHandle,
@@ -609,6 +692,96 @@ pub(crate) async fn external_storage_complete_authorization(
                     .exchange_authorization_code(
                         &authorization.exchange_config,
                         &grant,
+                        &cancel,
+                    )
+                    .await?;
+                Ok((authorized.secret, Some(authorized.account_id)))
+            }
+            _ => Err(ProviderError::new(ErrorKind::Unsupported)),
+        }
+    }
+    .await;
+    let (credential, account_id) = match credential_result {
+        Ok(value) => value,
+        Err(error) => {
+            lock(&state.authorization_cancellations)?.remove(&request.authorization_id);
+            restore_preparation(&state, authorization.preparation_id, pending);
+            return Err(error.into());
+        }
+    };
+    let committed = commit_preparation(
+        &app,
+        &authorization.preparation_id,
+        &pending,
+        CredentialInput::Reference {
+            reference: credential,
+            account_id,
+        },
+        &cancel,
+    )
+    .await;
+    lock(&state.authorization_cancellations)?.remove(&request.authorization_id);
+    match committed {
+        Ok(result) => Ok(CompleteAuthorizationResult::Connected(result)),
+        Err(error) => {
+            restore_preparation(&state, authorization.preparation_id, pending);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(target_os = "ios")]
+#[tauri::command]
+pub(crate) async fn external_storage_complete_authorization(
+    app: AppHandle,
+    state: State<'_, ConnectionCommandState>,
+    request: CompleteAuthorizationRequest,
+) -> ConnectResult<CompleteAuthorizationResult> {
+    if request.redirect_url.is_some() || request.client_secret.is_some() {
+        return Err(ProviderError::new(ErrorKind::Unsupported).into());
+    }
+    let authorization = lock(&state.authorizations)?
+        .remove(&request.authorization_id)
+        .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
+    let cancel = lock(&state.authorization_cancellations)?
+        .get(&request.authorization_id)
+        .cloned()
+        .ok_or_else(|| ProviderError::new(ErrorKind::Cancelled))?;
+    if authorization.expires_at_ms <= now_ms() {
+        lock(&state.authorization_cancellations)?.remove(&request.authorization_id);
+        return Err(ProviderError::new(ErrorKind::Cancelled).into());
+    }
+    let pending = match take_preparation(&state, &authorization.preparation_id) {
+        Ok(pending) => pending,
+        Err(error) => {
+            lock(&state.authorization_cancellations)?.remove(&request.authorization_id);
+            return Err(error.into());
+        }
+    };
+    let credential_result: Result<(SecretRef, Option<String>)> = async {
+        let root = connection_root(&app)?;
+        let dependencies = connection::dependencies(&root)?;
+        match authorization.exchange_config.provider.as_str() {
+            "google_drive" => {
+                let authorized = providers::google_drive::auth::exchange_authorization_code(
+                    &dependencies,
+                    &authorization.exchange_config,
+                    &authorization.grant,
+                    None,
+                    &cancel,
+                )
+                .await?;
+                Ok((
+                    dependencies.vault.store(&authorized.secret).await?,
+                    Some(authorized.account_id),
+                ))
+            }
+            "onedrive" => {
+                let provider = providers::onedrive::OneDrive::new(dependencies);
+                let authorized = provider
+                    .exchange_authorization_code(
+                        &authorization.exchange_config,
+                        &authorization.grant,
                         &cancel,
                     )
                     .await?;
