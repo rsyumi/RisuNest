@@ -28,7 +28,8 @@ src-others/
 *.njsproj
 *.sln
 *.sw?
-/src-tauri/target/
+# Cargo build output, including standalone crates and editor checks
+target/
 /src-tauri/target-*/
 /src-tauri/gen/schemas/acl-manifests.json
 /src-tauri/gen/schemas/*-schema.json

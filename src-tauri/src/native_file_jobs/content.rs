@@ -217,6 +217,10 @@ pub(super) fn prepare_content(
                 "invalid-input",
                 "content preparation accepts JSON, PNG, CharX, and RISUM content only",
             )),
+            ContentKind::RescueArchive => Err(NativeJobError::new(
+                "rescue-format-not-restorable",
+                "RisuNest rescue archives cannot be imported or restored",
+            )),
             _ => unreachable!("supported content kinds were handled above"),
         };
     }

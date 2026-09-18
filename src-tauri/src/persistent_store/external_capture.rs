@@ -424,6 +424,12 @@ impl PersistentStore {
             "WITH dependencies(hash,manifest) AS (
                 SELECT object_hash,0 FROM asset_aliases WHERE generation=?1 AND object_hash IS NOT NULL
                 UNION SELECT manifest_hash,1 FROM asset_owner_heads WHERE generation=?1 AND manifest_hash IS NOT NULL
+                UNION SELECT json_extract(archived_object,'$.objectHash'),0
+                      FROM characters WHERE generation=?1 AND archived_object IS NOT NULL
+                UNION SELECT assets.value,0 FROM characters, json_each(
+                    json_extract(characters.archived_object,'$.assetHashes')
+                ) AS assets
+                      WHERE generation=?1 AND archived_object IS NOT NULL
              ) SELECT hash,max(manifest) FROM dependencies WHERE hash>?2 GROUP BY hash ORDER BY hash LIMIT ?3",
         )?;
         let rows = query.query_map(params![generation, after, PAGE], |row| {
@@ -485,7 +491,28 @@ impl PersistentStore {
         match key.kind.as_str() {
             "root" => self.owner_dependencies(generation, None, &mut dependencies)?,
             "character" => {
-                self.owner_dependencies(generation, Some(&key.key1), &mut dependencies)?
+                self.owner_dependencies(generation, Some(&key.key1), &mut dependencies)?;
+                let archived: Option<String> = self
+                    .connection
+                    .query_row(
+                        "SELECT archived_object FROM characters
+                         WHERE generation=?1 AND character_id=?2",
+                        params![generation, key.key1],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                if let Some(archived) = archived {
+                    let archived: super::archive::ArchivedObject = serde_json::from_str(&archived)?;
+                    dependencies.insert(Dependency {
+                        hash: archived.object_hash,
+                        manifest: false,
+                    });
+                    dependencies.extend(archived.asset_hashes.into_iter().map(|hash| Dependency {
+                        hash,
+                        manifest: false,
+                    }));
+                }
             }
             "owner" if key.key1 == "character-additional-assets" => {
                 self.owner_dependencies(generation, Some(&key.key2), &mut dependencies)?

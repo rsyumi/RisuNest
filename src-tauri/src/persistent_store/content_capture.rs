@@ -408,11 +408,17 @@ fn project_record(
         sink.object(hash, bytes)?;
     }
     if !matches!(envelope, LogicalRecordEnvelope::Conversation { .. }) {
+        let owner_manifest_hashes = match &envelope {
+            LogicalRecordEnvelope::Root { owner_heads, .. }
+            | LogicalRecordEnvelope::Character { owner_heads, .. }
+            | LogicalRecordEnvelope::ArchivedCharacter { owner_heads, .. } => owner_heads
+                .iter()
+                .filter_map(|head| head.manifest_hash.as_deref())
+                .collect::<std::collections::BTreeSet<_>>(),
+            _ => std::collections::BTreeSet::new(),
+        };
         for hash in envelope.dependency_hashes() {
-            let bytes = if matches!(
-                envelope,
-                LogicalRecordEnvelope::Root { .. } | LogicalRecordEnvelope::Character { .. }
-            ) {
+            let bytes = if owner_manifest_hashes.contains(hash.as_str()) {
                 Some(match derived.get(&hash) {
                     Some(bytes) => bytes.clone(),
                     None => cas

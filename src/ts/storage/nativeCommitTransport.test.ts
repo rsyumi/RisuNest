@@ -169,12 +169,15 @@ describe('native commit transport', () => {
         expect(h.invoke).not.toHaveBeenCalled()
     })
 
-    it('releases the native producer even when releasing the JS view fails', async () => {
+    it.each(['releaseBuffer', 'removeEventListener'] as const)('preserves the confirmed commit when %s fails', async (cleanup) => {
         const h = harness()
-        vi.mocked(h.webview.releaseBuffer).mockImplementation(() => {
+        const report = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+        vi.mocked(h.webview[cleanup]).mockImplementation(() => {
             throw new Error('Detached')
         })
-        await expect(h.transport.commit(fixture())).rejects.toThrow('Detached')
+        await expect(h.transport.commit(fixture())).resolves.toEqual({ revision: 2 })
+        expect(report).toHaveBeenCalledWith(expect.stringContaining('cleanup failed'), expect.any(Error))
+        report.mockRestore()
         const requestId = h.invoke.mock.calls.find(
             ([command]) => command === 'pds_commit_shared_open',
         )?.[1].requestId

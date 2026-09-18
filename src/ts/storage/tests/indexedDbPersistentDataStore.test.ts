@@ -546,6 +546,38 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         }
     })
 
+    it('preserves same-key values for different plugin owners during replacement', async () => {
+        const indexedDB = new IDBFactory()
+        const store = new IndexedDbPersistentDataStore(
+            `plugin-owner-replacement-${databaseSequence++}`,
+            indexedDB,
+            IDBKeyRange,
+        )
+        await store.open()
+        const values = [
+            { owner: 'plugin-a', key: 'shared', value: { source: 'a' } },
+            { owner: 'plugin-b', key: 'shared', value: { source: 'b' } },
+        ]
+
+        const replaced = await store.replaceFromDatabase(fixtureDatabase, undefined, [], values)
+
+        await expect(store.queryPluginStorage()).resolves.toEqual({
+            revision: replaced.revision,
+            items: [
+                { owner: 'plugin-a', key: 'shared', byteSize: 14 },
+                { owner: 'plugin-b', key: 'shared', byteSize: 14 },
+            ],
+        })
+        await expect(store.readPluginStorage('plugin-a', 'shared')).resolves.toEqual({
+            revision: replaced.revision,
+            value: { source: 'a' },
+        })
+        await expect(store.readPluginStorage('plugin-b', 'shared')).resolves.toEqual({
+            revision: replaced.revision,
+            value: { source: 'b' },
+        })
+    })
+
     it('allocates a new plugin ordinal without scanning existing payload rows', async () => {
         const indexedDB = new IDBFactory()
         const store = new IndexedDbPersistentDataStore(

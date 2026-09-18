@@ -249,6 +249,14 @@ pub(crate) struct PluginStorageSummary {
     pub(crate) byte_size: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PluginStorageValue {
+    pub(crate) owner: String,
+    pub(crate) key: String,
+    pub(crate) value: Value,
+}
+
 /// What the plugin data screen lists. Values stay in the store; the screen asks
 /// for one when the reader opens it.
 /// A claim answers with the value it handed over and the revision it left the
@@ -1779,6 +1787,20 @@ impl PersistentStore {
 
     pub(crate) fn replace_put_root(&mut self, staging_id: &str, root: &Value) -> StoreResult<()> {
         commit::replace_put_root(&mut self.connection, staging_id, root)
+    }
+
+    pub(crate) fn replace_put_root_with_plugin_storage(
+        &mut self,
+        staging_id: &str,
+        root: &Value,
+        plugin_storage: Option<&[PluginStorageValue]>,
+    ) -> StoreResult<()> {
+        commit::replace_put_root_with_plugin_storage(
+            &mut self.connection,
+            staging_id,
+            root,
+            plugin_storage,
+        )
     }
 
     pub(crate) fn staged_plugin_preview(

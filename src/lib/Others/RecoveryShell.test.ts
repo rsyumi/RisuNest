@@ -20,7 +20,11 @@ vi.mock('src/ts/alert', () => ({ alertError: vi.fn(), alertNormal: vi.fn() }))
 vi.mock('src/ts/globalApi.svelte', () => ({ downloadFile: vi.fn() }))
 vi.mock('src/ts/platform', () => ({ isTauri: true }))
 const core = vi.hoisted(() => ({ invoke: vi.fn().mockResolvedValue({ revision: 0 }) }))
+const rawRecovery = vi.hoisted(() => ({
+    exportOriginalData: vi.fn().mockResolvedValue({ warningCodes: [] }),
+}))
 vi.mock('@tauri-apps/api/core', () => core)
+vi.mock('src/ts/storage/rawRecoveryExport', () => rawRecovery)
 vi.mock('src/lang', async () => ({
     language: (await import('src/lang/en')).languageEnglish,
 }))
@@ -135,6 +139,22 @@ describe('RecoveryShell', () => {
         ).toBeLessThan(
             maintenance.getNativeDataHealthResult.mock.invocationCallOrder[0],
         )
+    })
+
+    it('uses the shared runtime-independent route for original data export', async () => {
+        await decideBoot({
+            begin: vi.fn().mockResolvedValue({ consecutiveFailures: 2 }),
+            complete: vi.fn(),
+        })
+        const body = await setup()
+        const exportButton = [...body.querySelectorAll('button')].find(
+            (button) => button.textContent?.trim() === strings.exportAction,
+        )
+        exportButton?.click()
+        await settle()
+        expect(rawRecovery.exportOriginalData).toHaveBeenCalledOnce()
+        expect(body.querySelector('[data-recovery-export]')?.textContent)
+            .toContain(strings.exportComplete)
     })
 
     it('keeps every string it shows in both shipped languages', () => {

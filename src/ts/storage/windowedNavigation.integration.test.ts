@@ -1,5 +1,6 @@
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { flushSync } from 'svelte'
 
 vi.mock('../parser/parser.svelte', () => ({
     assetRegex: /$^/,
@@ -12,13 +13,14 @@ vi.mock('../process/modules', () => ({ moduleUpdate: vi.fn() }))
 vi.mock('../process/scripts', () => ({ resetScriptCache: vi.fn() }))
 
 import { characterFormatUpdate } from '../characters'
-import { selectedCharID } from '../stores.svelte'
+import { selectedCharID, selIdState } from '../stores.svelte'
 import type { Chat, Database, Message, character } from './database.svelte'
 import { getDatabase, setDatabaseLite } from './database.svelte'
 import { IndexedDbPersistentDataStore } from './indexedDbPersistentDataStore'
 import { createPersistentDataRuntime } from './persistentDataRuntime'
 import { createProductionStateAdapter } from './persistentDataRuntime.svelte'
 import { workingSetResidency } from './workingSetResidency'
+import { observePersistentSaveChanges } from './persistentSaveObserver.svelte'
 
 afterEach(() => {
     workingSetResidency.clear()
@@ -84,6 +86,77 @@ function makeLargeLegacyDatabase(): {
 }
 
 describe('windowed navigation integration', () => {
+    it.each(['immediate', 'autosave'])('preserves cold-selection editor changes and a user-only turn through %s navigation', async (timing) => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `cold-selection-${timing}`
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        const { database } = makeLargeLegacyDatabase()
+        const first = database.characters[0] as character
+        first.chats[0].message = [{ role: 'char', data: 'Synthetic existing history' }]
+        const second = structuredClone(first)
+        second.chaId = 'second-character'
+        second.chats[0].id = 'second-chat'
+        database.characters.push(second)
+        await store.replaceFromDatabase(database)
+        setDatabaseLite(structuredClone(database))
+        selectedCharID.set(-1)
+        const state = createProductionStateAdapter()
+        expect(state.canonicalCapture!.character()).toBeNull()
+        const runtime = createPersistentDataRuntime({ store, state, prepareDatabase: async (value) => value })
+        await runtime.initializeActiveWorkingSet(getDatabase())
+        const navigate = async (id: string) => {
+            const expectedGeneration = runtime.getNavigationGeneration() + 1
+            if (await runtime.activateCharacter(id)) return true
+            if (runtime.getNavigationGeneration() !== expectedGeneration) return false
+            // Match changeChar's single retry after observer invalidation.
+            return runtime.activateCharacter(id)
+        }
+        const dispose = observePersistentSaveChanges({
+            readDatabase: getDatabase,
+            readSelectedCharacter: () => getDatabase().characters[selIdState.selId] ?? null,
+            markDirty: (bytes) => runtime.markPersistentDataDirty(bytes),
+        })
+        try {
+            flushSync()
+            expect(await navigate(first.chaId)).toBe(true)
+            const lease = await runtime.acquireCompleteConversation('synthetic-bound-editor')
+            try {
+                const live = getDatabase().characters[selIdState.selId] as character
+                live.name = '수정 🙂'
+                live.desc = 'Synthetic edited description'
+                live.chats[0].note = 'Synthetic edited note'
+                lease.session.append({ role: 'user', data: 'Synthetic user-only turn' })
+                flushSync()
+                if (timing === 'autosave') {
+                    await vi.waitFor(async () => {
+                        expect((await store.readCharacter(first.chaId))?.value.name).toBe('수정 🙂')
+                        expect((await store.readConversation(first.chaId, 'legacy-chat'))?.value.message).toHaveLength(2)
+                    }, { timeout: 3000 })
+                }
+            } finally {
+                lease.release()
+            }
+            expect(await navigate(second.chaId)).toBe(true)
+            expect(await navigate(first.chaId)).toBe(true)
+            expect(getDatabase().characters[selIdState.selId].name).toBe('수정 🙂')
+            const reopened = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+            await reopened.open()
+            expect((await reopened.readCharacter(first.chaId))?.value).toMatchObject({
+                name: '수정 🙂', desc: 'Synthetic edited description',
+            })
+            expect((await reopened.readConversation(first.chaId, 'legacy-chat'))?.value).toMatchObject({
+                note: 'Synthetic edited note',
+                message: [
+                    { role: 'char', data: 'Synthetic existing history' },
+                    { role: 'user', data: 'Synthetic user-only turn' },
+                ],
+            })
+        } finally {
+            dispose()
+        }
+    })
+
     it('normalizes through the production Svelte adapter and survives immediate promotion and restart', async () => {
         const indexedDB = new IDBFactory()
         const databaseName = 'windowed-navigation-normalize-promote-restart'

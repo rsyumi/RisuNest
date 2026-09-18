@@ -20,6 +20,7 @@ import type {
     PersistentDataStore,
     PersistentRevisionLease,
     PluginStorageMutation,
+    PluginStorageValue,
 } from '../storage/persistentDataStore'
 import {
     acquireCurrentRevisionWithRetry,
@@ -176,10 +177,14 @@ export interface PluginDatabaseAccessDependencies {
     readPluginStorageSnapshot(): Promise<Record<string, unknown>>
     mutatePluginStorage(mutations: readonly OwnerScopedStorageMutation[]): Promise<void>
     invalidatePluginStorage(): void
-    materializeDatabaseSnapshot(reason: string): Promise<{
+    materializeDatabaseSnapshot(
+        reason: string,
+        options?: { includePluginStorageValues?: boolean },
+    ): Promise<{
         database: Database
         revision: DataRevision
         mutationGeneration: number
+        pluginStorageValues?: PluginStorageValue[]
     }>
     replacePersistentDatabase(
         database: Database,
@@ -395,6 +400,33 @@ function pluginStorageMutations(
         mutations.push({ type: 'set', key, value: update[key] })
     }
     return mutations
+}
+
+function applyOwnerScopedStorageMutations(
+    values: readonly PluginStorageValue[],
+    owner: string,
+    mutations: readonly OwnerScopedStorageMutation[],
+): PluginStorageValue[] {
+    const result = values.map((value) => ({ ...value }))
+    for (const mutation of mutations) {
+        if (mutation.type === 'clear') {
+            for (let index = result.length - 1; index >= 0; index--) {
+                if (result[index].owner === owner) result.splice(index, 1)
+            }
+            continue
+        }
+        const index = result.findIndex(
+            (value) => value.owner === owner && value.key === mutation.key,
+        )
+        if (mutation.type === 'delete') {
+            if (index >= 0) result.splice(index, 1)
+            continue
+        }
+        const value = { owner, key: mutation.key, value: mutation.value }
+        if (index >= 0) result[index] = value
+        else result.push(value)
+    }
+    return result
 }
 
 function compatibilityOnlyUpdate(
@@ -1142,6 +1174,7 @@ export function createPluginDatabaseAccess(
             }
             const materialized = await dependencies.materializeDatabaseSnapshot(
                 'plugin-database-set',
+                { includePluginStorageValues: true },
             )
             dependencies.assertPersistentMutationAllowed(authorityEpoch)
             if (dependencies.getNavigationGeneration() !== initialNavigationGeneration) {
@@ -1159,6 +1192,15 @@ export function createPluginDatabaseAccess(
                 publishOfficial: true,
                 expectedRevision: materialized.revision,
                 expectedMutationGeneration: materialized.mutationGeneration,
+                ...(materialized.pluginStorageValues
+                    ? {
+                          pluginStorageValues: applyOwnerScopedStorageMutations(
+                              materialized.pluginStorageValues,
+                              dependencies.owner,
+                              storageMutations,
+                          ),
+                      }
+                    : {}),
             })
             dependencies.invalidatePluginStorage()
         },

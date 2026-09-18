@@ -2342,8 +2342,13 @@ export const languageEnglish = {
             excludeAccount: 'Account',
             exportTitle: 'Save your original data',
             exportHelp:
-                'Copies the database and files as they are, so you can keep them even if this device stops working.',
+                'Saves the original database and files without changing them. The archive contains private data and cannot currently be restored in the app.',
             exportAction: 'Save a copy',
+            exportComplete: 'The original files were exported.',
+            exportPartial: 'The available files were exported, but some source files could not be captured completely.',
+            exportCancelled: 'The export was cancelled.',
+            exportFailed: 'The original files could not be exported.',
+            exportUnavailable: 'Original data export is unavailable because native setup did not finish.',
             startNormally: 'Start normally',
             keepTitle: 'Keep these off?',
             keepBody:

@@ -9,6 +9,11 @@
     "handoffDirectory": "native-file-jobs/handoffs",
     "managedHandoffs": [
       {
+        "kind": "raw-recovery",
+        "prefix": "risunest-rescue-",
+        "suffixes": [".risunest-rescue.zip"]
+      },
+      {
         "kind": "portable-backup",
         "prefix": "risunest-backup-",
         "suffixes": [".risunest"]

@@ -124,7 +124,9 @@ impl<'a> Transfer<'a> {
             })?;
             use crate::logical_records::LogicalRecordEnvelope as Envelope;
             let local = match &payload.record {
-                Envelope::Root { owner_heads, .. } | Envelope::Character { owner_heads, .. } => {
+                Envelope::Root { owner_heads, .. }
+                | Envelope::Character { owner_heads, .. }
+                | Envelope::ArchivedCharacter { owner_heads, .. } => {
                     owner_heads
                         .iter()
                         .filter_map(|h| h.manifest_hash.clone())

@@ -1,3 +1,4 @@
+import 'fake-indexeddb/auto'
 import { UNOWNED_PLUGIN_OWNER } from '../plugins/pluginOwner'
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -343,7 +344,7 @@ describe('local backup persistent snapshot', () => {
         })
     })
 
-    it('stops a WebView import at the next chunk after cancellation and flags partial writes', async () => {
+    it('stops a WebView import after cancellation without publishing staged attachments', async () => {
         const assetName = 'partial-asset.png'
         const encodedName = new TextEncoder().encode(assetName)
         const data = new Uint8Array([1, 2, 3])
@@ -354,7 +355,7 @@ describe('local backup persistent snapshot', () => {
         view.setUint32(4 + encodedName.byteLength, data.byteLength, true)
         entry.set(data, 8 + encodedName.byteLength)
         const controller = new AbortController()
-        // The importer yields between entries; cancelling there leaves the asset written.
+        // Cancel after staging the first attachment.
         vi.mocked(sleep).mockImplementationOnce(async () => controller.abort())
         const file = {
             name: 'partial.bin',
@@ -390,12 +391,8 @@ describe('local backup persistent snapshot', () => {
         await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
         createElement.mockRestore()
 
-        expect(state.blobStore?.put).toHaveBeenCalledWith(
-            `assets/${assetName}`,
-            data,
-            expect.objectContaining({ kind: 'asset', name: assetName }),
-        )
-        expect(context.setPartialWritesPossible).toHaveBeenCalledWith(true)
+        expect(state.blobStore?.put).not.toHaveBeenCalled()
+        expect(context.setPartialWritesPossible).not.toHaveBeenCalled()
         expect(state.replacePersistentDatabase).not.toHaveBeenCalled()
     })
 

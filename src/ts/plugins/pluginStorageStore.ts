@@ -465,9 +465,8 @@ export function createPluginStorageStore(
         invalidateOwner,
         synchronizeCommittedMutation(mutation) {
             authorityGeneration++
-            // Before the index is loaded there is nothing to keep in step, and
-            // the first read takes the store's own answer.
             if (initialized) applyCommittedMutation(mutation)
+            else resetCachedState()
         },
     }
 }

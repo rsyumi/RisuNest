@@ -1,5 +1,6 @@
 use super::*;
 use crate::persistent_store::plugin_owner::UNOWNED_OWNER;
+use crate::persistent_store::PluginStorageValue;
 
 fn store_with_rows(rows: &[(&str, &str, Value)]) -> (tempfile::TempDir, PersistentStore) {
     let directory = tempfile::tempdir().expect("create plugin owner directory");
@@ -537,6 +538,49 @@ fn a_later_full_replacement_keeps_the_import_a_waiting_value_arrived_in() {
         .begin_plugin_claim_session("plugin-a", "hash-one", "run-three")
         .expect("reopen attempt after a replacement")
         .is_none());
+}
+
+#[test]
+fn full_replacement_preserves_same_key_values_for_different_owners() {
+    let (_directory, mut store) = store_with_rows(&[
+        ("plugin-a", "shared", json!({ "source": "a" })),
+        ("plugin-b", "shared", json!({ "source": "b" })),
+    ]);
+    let values = vec![
+        PluginStorageValue {
+            owner: "plugin-a".to_owned(),
+            key: "shared".to_owned(),
+            value: json!({ "source": "a" }),
+        },
+        PluginStorageValue {
+            owner: "plugin-b".to_owned(),
+            key: "shared".to_owned(),
+            value: json!({ "source": "b" }),
+        },
+    ];
+    let staging = store.replace_begin().expect("begin replacement");
+    store
+        .replace_put_root_with_plugin_storage(
+            &staging.staging_id,
+            &json!({ "pluginCustomStorage": { "shared": { "source": "a" } } }),
+            Some(&values),
+        )
+        .expect("stage owner-scoped plugin values");
+    let revision = store.revision().expect("read revision");
+    store
+        .replace_commit(&staging.staging_id, Some(revision))
+        .expect("activate replacement");
+
+    for (owner, source) in [("plugin-a", "a"), ("plugin-b", "b")] {
+        assert_eq!(
+            store
+                .read_plugin_storage(owner, "shared", None)
+                .expect("read plugin value")
+                .expect("plugin value exists")
+                .value,
+            json!({ "source": source })
+        );
+    }
 }
 
 #[test]

@@ -176,9 +176,15 @@ export class NativeCommitTransport {
             return await deps.invoke('pds_commit_shared_finish', { id: nativeId })
         } finally {
             if (timer !== undefined) clearTimeout(timer)
-            webview.removeEventListener('sharedbufferreceived', listener)
+            try {
+                webview.removeEventListener('sharedbufferreceived', listener)
+            } catch (cleanupError) {
+                console.error('Persistence shared commit listener cleanup failed', cleanupError)
+            }
             try {
                 if (buffer) webview.releaseBuffer(buffer)
+            } catch (cleanupError) {
+                console.error('Persistence shared commit buffer cleanup failed', cleanupError)
             } finally {
                 try {
                     await deps.invoke('pds_commit_shared_cancel', { requestId })

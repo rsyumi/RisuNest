@@ -17,6 +17,43 @@ import {
 } from './saveCoordinator.testSupport'
 
 describe('SaveCoordinator', () => {
+    it('rejects an uncovered owned append without acknowledging it and allows a later retry', async () => {
+        const database = makeChattyDatabase()
+        let available = false
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const onPersisted = vi.fn()
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => available ? database.characters[0] : null,
+            replaceDatabase: () => undefined,
+            onConversationMutationPersisted: onPersisted,
+        })
+        coordinator.initialize(2)
+        const session = new ActiveConversationSession({
+            characterId: 'char-a', conversationId: 'two',
+            conversation: database.characters[0].chats[1], storeRevision: 2,
+            onMutation: (event) => coordinator.recordActiveConversationMutation(event),
+        })
+        session.transaction((transaction) => transaction.append({ role: 'user', data: 'Unsaved synthetic turn' }))
+        await expect(coordinator.flushPendingData('missing-capture')).rejects.toThrow(
+            'Pending conversation mutations could not be persisted',
+        )
+        expect(commit).not.toHaveBeenCalled()
+        expect(onPersisted).not.toHaveBeenCalled()
+        expect(coordinator.hasPendingPersistenceWork).toBe(true)
+        available = true
+        await coordinator.flushPendingData('restored-capture')
+        expect(commit).toHaveBeenCalledWith(expect.objectContaining({
+            replaceCharacter: expect.objectContaining({
+                chats: expect.arrayContaining([expect.objectContaining({
+                    id: 'two', message: expect.arrayContaining([{ role: 'user', data: 'Unsaved synthetic turn' }]),
+                })]),
+            }),
+        }))
+        expect(coordinator.hasPendingPersistenceWork).toBe(false)
+    })
+
     it('rejects top-level values that JSON cannot serialize', () => {
         expect(() => canonicalJson(undefined)).toThrow(TypeError)
     })
@@ -889,7 +926,9 @@ describe('SaveCoordinator', () => {
         detachedSession.append({ role: 'user', data: 'not in selected capture' })
         database.characters[0].name = 'Committed selected character'
         coordinator.markPersistentDataDirty(1)
-        await coordinator.flushPendingData('other-character')
+        await expect(coordinator.flushPendingData('other-character')).rejects.toThrow(
+            'Pending conversation mutations could not be persisted',
+        )
 
         expect(commit.mock.calls[0][0].replaceCharacter).toMatchObject({
             chaId: 'char-a',
@@ -897,6 +936,7 @@ describe('SaveCoordinator', () => {
         })
         expect(onPersisted).not.toHaveBeenCalled()
         expect(detachedSession.persistedVersion).toBe(0)
+        expect(coordinator.hasPendingPersistenceWork).toBe(true)
     })
 
     it('does not acknowledge same-character evidence omitted from a fallback conversation commit', async () => {
@@ -925,7 +965,9 @@ describe('SaveCoordinator', () => {
         detachedSession.append({ role: 'user', data: 'not in captured conversation' })
         database.characters[0].chats[0].message[0].data = 'captured fallback edit'
         coordinator.markPersistentDataDirty(1)
-        await coordinator.flushPendingData('same-character-fallback')
+        await expect(coordinator.flushPendingData('same-character-fallback')).rejects.toThrow(
+            'Pending conversation mutations could not be persisted',
+        )
 
         expect(commit.mock.calls[0][0].conversations).toEqual([
             expect.objectContaining({
@@ -935,6 +977,7 @@ describe('SaveCoordinator', () => {
         ])
         expect(onPersistenceStarted).not.toHaveBeenCalled()
         expect(onPersisted).not.toHaveBeenCalled()
+        expect(coordinator.hasPendingPersistenceWork).toBe(true)
     })
 
     it('retires unprojectable evidence after persisting that conversation through fallback', async () => {

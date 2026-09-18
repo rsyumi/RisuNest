@@ -17,6 +17,7 @@ const HANDOFF_KIND_TO_JOB_KIND: Record<
     string,
     keyof typeof ANDROID_SAF_HANDOFF_ID_PATTERNS
 > = {
+    'raw-recovery': 'export-raw-recovery',
     'portable-backup': 'export-portable-backup',
     'legacy-backup': 'export-legacy-local-backup',
     'character-charx': 'export-character-charx',

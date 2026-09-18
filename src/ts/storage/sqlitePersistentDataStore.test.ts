@@ -281,6 +281,27 @@ describe('SqlitePersistentDataStore', () => {
         ])
     })
 
+    it('passes owner-scoped plugin values through a staged replacement', async () => {
+        mocks.invoke.mockImplementation(async (command: string) => {
+            if (command === 'pds_replace_begin') return { stagingId: 'staging-plugin-values' }
+            if (command === 'pds_replace_preserve_repositories') return { revision: 4 }
+            if (command === 'pds_replace_commit') return { revision: 5 }
+            return undefined
+        })
+        const pluginStorageValues = [
+            { owner: 'plugin-a', key: 'shared', value: 'a' },
+            { owner: 'plugin-b', key: 'shared', value: 'b' },
+        ]
+        const store = new SqlitePersistentDataStore()
+
+        await store.replaceFromDatabase(fixtureDatabase, 4, [], pluginStorageValues)
+
+        expect(mocks.invoke).toHaveBeenCalledWith('pds_replace_put_root', expect.objectContaining({
+            stagingId: 'staging-plugin-values',
+            pluginStorageValues,
+        }))
+    })
+
     it('preserves active repositories after staging a database replacement', async () => {
         mocks.invoke.mockImplementation(async (command: string) => {
             if (command === 'pds_replace_begin') return { stagingId: 'staging-cold-preserved' }

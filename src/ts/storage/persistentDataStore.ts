@@ -27,6 +27,12 @@ export interface PluginStorageSummary {
     byteSize: number
 }
 
+export interface PluginStorageValue {
+    owner: string
+    key: string
+    value: unknown
+}
+
 /** What the plugin data screen lists. Values are fetched one at a time. */
 export interface PluginStorageListItem {
     owner: string
@@ -552,6 +558,7 @@ export interface PersistentDataStore {
         database: Database,
         expectedRevision?: DataRevision,
         assetAliases?: AssetAlias[],
+        pluginStorageValues?: PluginStorageValue[],
     ): Promise<{ revision: DataRevision }>
     materializeDatabase(revision?: DataRevision): Promise<Database>
     acquireRevision(revision: DataRevision): Promise<PersistentRevisionLease>

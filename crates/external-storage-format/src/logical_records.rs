@@ -244,6 +244,36 @@ pub enum LogicalRecordEnvelope {
         #[serde(rename = "ownerHeads")]
         owner_heads: Vec<LogicalOwnerHead>,
     },
+    #[serde(rename = "archived-character")]
+    ArchivedCharacter {
+        #[serde(rename = "configuredIndex")]
+        configured_index: u64,
+        #[serde(rename = "recentAt")]
+        recent_at: i64,
+        trashed: bool,
+        name: String,
+        image: Option<String>,
+        #[serde(rename = "type")]
+        character_type: String,
+        #[serde(rename = "creatorNotes")]
+        creator_notes: Option<String>,
+        #[serde(rename = "trashTime")]
+        trash_time: Option<i64>,
+        #[serde(rename = "archiveObjectHash")]
+        archive_object_hash: String,
+        #[serde(rename = "archiveObjectSize")]
+        archive_object_size: u64,
+        #[serde(rename = "archivedAt")]
+        archived_at: u64,
+        #[serde(rename = "conversationCount")]
+        conversation_count: u64,
+        #[serde(rename = "messageCount")]
+        message_count: u64,
+        #[serde(rename = "assetHashes")]
+        asset_hashes: Vec<String>,
+        #[serde(rename = "ownerHeads")]
+        owner_heads: Vec<LogicalOwnerHead>,
+    },
     Conversation {
         #[serde(rename = "configuredIndex")]
         configured_index: u64,
@@ -365,12 +395,50 @@ impl LogicalRecordEnvelope {
             | Self::Character {
                 configured_index, ..
             }
+            | Self::ArchivedCharacter {
+                configured_index, ..
+            }
             | Self::Conversation {
                 configured_index, ..
             } => {
                 validate_safe_integer(*configured_index, "configured index")?;
                 if let Self::Character { owner_heads, .. } = self {
                     validate_owner_heads(owner_heads)?;
+                }
+                if let Self::ArchivedCharacter {
+                    archive_object_hash,
+                    archive_object_size,
+                    archived_at,
+                    conversation_count,
+                    message_count,
+                    asset_hashes,
+                    owner_heads,
+                    ..
+                } = self
+                {
+                    validate_object_descriptor(archive_object_hash, *archive_object_size)?;
+                    validate_safe_integer(*archived_at, "archive timestamp")?;
+                    validate_safe_integer(*conversation_count, "archived conversation count")?;
+                    validate_safe_integer(*message_count, "archived message count")?;
+                    let mut previous: Option<&str> = None;
+                    for hash in asset_hashes {
+                        validate_hash(hash, "archived asset hash")?;
+                        if previous.is_some_and(|value| value >= hash.as_str()) {
+                            return Err(invalid("archived asset hashes must be sorted and unique"));
+                        }
+                        previous = Some(hash);
+                    }
+                    for head in owner_heads {
+                        head.validate_identity()?;
+                    }
+                    let mut keys = owner_heads.iter().map(LogicalOwnerHead::storage_key);
+                    let mut previous = keys.next();
+                    for key in keys {
+                        if previous.as_deref().is_some_and(|value| value >= key.as_str()) {
+                            return Err(invalid("logical owner heads must be sorted and unique"));
+                        }
+                        previous = Some(key);
+                    }
                 }
                 if let Self::Conversation {
                     message_page_hashes,
@@ -417,6 +485,15 @@ impl LogicalRecordEnvelope {
             Self::Root { owner_heads, .. } | Self::Character { owner_heads, .. } => owner_heads
                 .iter()
                 .filter_map(|head| head.manifest_hash.clone())
+                .collect(),
+            Self::ArchivedCharacter {
+                archive_object_hash,
+                asset_hashes,
+                owner_heads,
+                ..
+            } => std::iter::once(archive_object_hash.clone())
+                .chain(asset_hashes.iter().cloned())
+                .chain(owner_heads.iter().filter_map(|head| head.manifest_hash.clone()))
                 .collect(),
             Self::Conversation {
                 message_page_hashes,
@@ -758,6 +835,30 @@ mod tests {
                     },
                 )],
             },
+            LogicalRecordEnvelope::ArchivedCharacter {
+                configured_index: 3,
+                recent_at: 41,
+                trashed: false,
+                name: "Archived".to_owned(),
+                image: Some("assets/archived.png".to_owned()),
+                character_type: "character".to_owned(),
+                creator_notes: Some("notes".to_owned()),
+                trash_time: None,
+                archive_object_hash: "4".repeat(64),
+                archive_object_size: 128,
+                archived_at: 43,
+                conversation_count: 2,
+                message_count: 7,
+                asset_hashes: vec!["5".repeat(64)],
+                owner_heads: vec![LogicalOwnerHead::unpositioned_present(
+                    LogicalOwnerLocator::CharacterAdditional {
+                        character_id: "archived-1".to_owned(),
+                    },
+                    manifest_hash.clone(),
+                    2,
+                )
+                .unwrap()],
+            },
             LogicalRecordEnvelope::Conversation {
                 configured_index: 5,
                 recent_at: 42,
@@ -797,6 +898,7 @@ mod tests {
             "preset",
             "plugin",
             "character",
+            "archived-character",
             "conversation",
             "asset",
             "inlay",

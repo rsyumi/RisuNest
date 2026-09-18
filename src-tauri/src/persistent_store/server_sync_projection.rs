@@ -200,6 +200,7 @@ pub(crate) fn project(
                 }
             }
         }
+        LogicalRecordEnvelope::ArchivedCharacter { .. } => (),
         _ => (),
     }
     let messages = if let LogicalRecordLocator::Conversation {
@@ -252,6 +253,34 @@ pub(crate) fn dependencies(payload: &ServerPayload, cas: &PayloadCas) -> StoreRe
                 }
             }
         }
+        LogicalRecordEnvelope::ArchivedCharacter {
+            archive_object_hash,
+            asset_hashes,
+            owner_heads,
+            ..
+        } => {
+            hashes.insert(archive_object_hash.clone());
+            hashes.extend(asset_hashes.iter().cloned());
+            for head in owner_heads {
+                if let Some(hash) = &head.manifest_hash {
+                    hashes.insert(hash.clone());
+                    let bytes = cas
+                        .read_object(hash)?
+                        .ok_or_else(|| StoreError::Validation {
+                            message: "Server source owner object is missing".into(),
+                        })?;
+                    for entry in decode_owner_manifest(&bytes).map_err(|_| {
+                        StoreError::Validation {
+                            message: "Server source owner object is invalid".into(),
+                        }
+                    })? {
+                        if let Some(hash) = entry.payload_hash {
+                            hashes.insert(hex::encode(hash));
+                        }
+                    }
+                }
+            }
+        }
         LogicalRecordEnvelope::Asset { object_hash, .. }
         | LogicalRecordEnvelope::Inlay { object_hash, .. } => {
             if let Some(hash) = object_hash {
@@ -292,6 +321,7 @@ pub(crate) fn preserve_local_view(
                 }
             }
         }
+        LogicalRecordEnvelope::ArchivedCharacter { .. } => (),
         _ => (),
     }
 }

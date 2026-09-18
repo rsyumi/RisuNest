@@ -517,11 +517,24 @@ pub(super) fn replace_put_root(
     staging_id: &str,
     root: &Value,
 ) -> StoreResult<()> {
+    replace_put_root_with_plugin_storage(connection, staging_id, root, None)
+}
+
+pub(super) fn replace_put_root_with_plugin_storage(
+    connection: &mut Connection,
+    staging_id: &str,
+    root: &Value,
+    plugin_storage_values: Option<&[super::PluginStorageValue]>,
+) -> StoreResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     require_staging(&transaction, staging_id)?;
     let mut staged_root = object(root, "Persistent root")?.clone();
     let plugin_storage_meta = staged_root.shift_remove("pluginStorageMeta");
-    if let Some(plugin_storage) = staged_root.shift_remove("pluginCustomStorage") {
+    let plugin_storage = staged_root.shift_remove("pluginCustomStorage");
+    if let Some(plugin_storage_values) = plugin_storage_values {
+        let carried = carried_plugin_import_batches(&transaction)?;
+        replace_plugin_storage_values(&transaction, staging_id, plugin_storage_values, &carried)?;
+    } else if let Some(plugin_storage) = plugin_storage {
         let plugin_storage = plugin_storage
             .as_object()
             .ok_or_else(|| validation("pluginCustomStorage must be a JSON object"))?;
@@ -536,6 +549,36 @@ pub(super) fn replace_put_root(
     }
     put_root(&transaction, staging_id, &Value::Object(staged_root))?;
     transaction.commit()?;
+    Ok(())
+}
+
+fn replace_plugin_storage_values(
+    transaction: &Transaction<'_>,
+    generation: &str,
+    values: &[super::PluginStorageValue],
+    carried: &HashMap<String, String>,
+) -> StoreResult<()> {
+    transaction.execute(
+        "DELETE FROM plugin_storage WHERE generation = ?1",
+        [generation],
+    )?;
+    for (ordinal, entry) in values.iter().enumerate() {
+        let import_batch = plugin_owner::is_unowned(&entry.owner).then(|| {
+            carried
+                .get(entry.key.as_str())
+                .map(String::as_str)
+                .unwrap_or(generation)
+        });
+        put_plugin_storage(
+            transaction,
+            generation,
+            &entry.owner,
+            &entry.key,
+            &entry.value,
+            Some(ordinal as i64),
+            import_batch,
+        )?;
+    }
     Ok(())
 }
 
@@ -741,21 +784,31 @@ fn preserve_archived_characters(
     active: &str,
     staging_id: &str,
 ) -> StoreResult<()> {
-    let archived = super::archive::archived_character_ids(transaction, active)?;
+    let archived = {
+        let mut statement = transaction.prepare(
+            "SELECT character_id, configured_index FROM characters
+             WHERE generation = ?1 AND archived_object IS NOT NULL
+             ORDER BY configured_index ASC",
+        )?;
+        let archived = statement
+            .query_map([active], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        archived
+    };
     if archived.is_empty() {
         return Ok(());
     }
-    let mut configured_index: i64 = transaction.query_row(
-        "SELECT COALESCE(MAX(configured_index) + 1, 0) FROM characters WHERE generation = ?1",
-        [staging_id],
-        |row| row.get(0),
-    )?;
-    for character_id in archived {
+    for (character_id, configured_index) in archived {
         if character_exists(transaction, staging_id, &character_id)? {
             return Err(validation(format!(
                 "Character {character_id} is archived and the replacement carries the same character"
             )));
         }
+        transaction.execute(
+            "UPDATE characters SET configured_index = configured_index + 1
+             WHERE generation = ?1 AND configured_index >= ?2",
+            params![staging_id, configured_index],
+        )?;
         transaction.execute(
             "INSERT INTO characters (
                 generation, character_id, configured_index, recent_at, trashed, name, image,
@@ -766,7 +819,6 @@ fn preserve_archived_characters(
              FROM characters WHERE generation = ?2 AND character_id = ?4",
             params![staging_id, active, configured_index, character_id],
         )?;
-        configured_index += 1;
     }
     Ok(())
 }

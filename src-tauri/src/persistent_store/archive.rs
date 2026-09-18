@@ -125,7 +125,7 @@ pub(super) fn archived_character_ids(
 
 /// The detail an archived row keeps. `detail` is NOT NULL, and readers that only
 /// need identity still work; anything that needs the character fails explicitly.
-fn marker_detail(character_id: &str, name: &str, character_type: &str) -> Value {
+pub(super) fn marker_detail(character_id: &str, name: &str, character_type: &str) -> Value {
     serde_json::json!({
         "chaId": character_id,
         "name": name,

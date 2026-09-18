@@ -10,6 +10,7 @@ import type {
     DataRevision,
     PersistentDataStore,
     PluginStorageMutation,
+    PluginStorageValue,
     PersistentRoot,
     WorkingSetCommit,
 } from './persistentDataStore'
@@ -411,6 +412,7 @@ export interface PersistentReplacementOptions {
     authoritative?: boolean
     expectedRevision?: DataRevision
     expectedMutationGeneration?: number
+    pluginStorageValues?: PluginStorageValue[]
 }
 
 export interface PersistentPresetMutationState {
@@ -454,6 +456,11 @@ export class PersistentMutationFencedError extends Error {
 
 export interface PersistentDatabaseSnapshot extends PersistentMutationToken {
     database: Database
+    pluginStorageValues?: PluginStorageValue[]
+}
+
+export interface PersistentDatabaseMaterializationOptions {
+    includePluginStorageValues?: boolean
 }
 
 export interface PersistentSelectedConversation {
@@ -1053,6 +1060,13 @@ export class SaveCoordinator {
         this.assertInitialized()
         this.assertPersistentMutationAllowed()
         options = { ...options }
+        if (options.pluginStorageValues) {
+            options.pluginStorageValues = options.pluginStorageValues.map((entry) => ({
+                owner: entry.owner,
+                key: entry.key,
+                value: canonicalClone(entry.value),
+            }))
+        }
         const expectationError = this.replacementExpectationError(options)
         if (expectationError) return Promise.reject(expectationError)
         if (!options.authoritative && this.dependencies.isIncompleteWorkingSet?.(database)) {
@@ -2308,6 +2322,7 @@ export class SaveCoordinator {
 
     materializePersistentDatabaseSnapshotWithRevision(
         reason: string,
+        options: PersistentDatabaseMaterializationOptions = {},
     ): Promise<PersistentDatabaseSnapshot> {
         this.assertInitialized()
         this.assertPersistentMutationAllowed()
@@ -2318,6 +2333,9 @@ export class SaveCoordinator {
             const generation = this.dirtyGeneration
             const navigationGeneration = this.dependencies.getNavigationGeneration?.()
             const database = await this.dependencies.store.materializeDatabase(revision)
+            const pluginStorageValues = options.includePluginStorageValues
+                ? await this.materializePluginStorageValues(revision)
+                : undefined
             if (
                 this.revision !== revision ||
                 this.dirtyGeneration !== generation ||
@@ -2329,8 +2347,24 @@ export class SaveCoordinator {
                 database: canonicalDatabaseClone(database),
                 revision,
                 mutationGeneration: generation,
+                ...(pluginStorageValues !== undefined ? { pluginStorageValues } : {}),
             }
         })
+    }
+
+    private async materializePluginStorageValues(
+        revision: DataRevision,
+    ): Promise<PluginStorageValue[]> {
+        const catalog = await this.dependencies.store.queryPluginStorage()
+        this.assertReadRevision(revision, catalog.revision)
+        return Promise.all(
+            catalog.items.map(async ({ owner, key }) => {
+                const stored = await this.dependencies.store.readPluginStorage(owner, key)
+                if (!stored) throw new Error(`Missing plugin storage value for ${key}`)
+                this.assertReadRevision(revision, stored.revision)
+                return { owner, key, value: canonicalClone(stored.value) }
+            }),
+        )
     }
 
     publishCurrentOfficialRevision(): Promise<void> {
@@ -2701,6 +2735,14 @@ export class SaveCoordinator {
                     (currentAddition.pending.locallyAdded &&
                         currentAddition.canonical === currentAddition.pending.baseline))
             ) {
+                if (this.pendingConversationMutations.length > 0) {
+                    if (pendingConversationMutations.some((pending) =>
+                        this.pendingConversationMutations.includes(pending),
+                    )) {
+                        throw new Error('Pending conversation mutations could not be persisted')
+                    }
+                    continue
+                }
                 this.pendingByteCount = 0
                 if (publishOfficial && this.pendingPublicationRevision !== null) {
                     const delay = this.officialPublishDelayMs()
@@ -2758,10 +2800,14 @@ export class SaveCoordinator {
         options: PersistentReplacementOptions,
     ): Promise<CommittedApplyOutcome> {
         const candidateCapture = this.captureDatabase(candidate)
-        const replaced = await this.dependencies.store.replaceFromDatabase(
-            candidate,
-            admission.revision,
-        )
+        const replaced = options.pluginStorageValues
+            ? await this.dependencies.store.replaceFromDatabase(
+                  candidate,
+                  admission.revision,
+                  [],
+                  options.pluginStorageValues,
+              )
+            : await this.dependencies.store.replaceFromDatabase(candidate, admission.revision)
         // This revision is authoritative even when a later projection or notification fails.
         this.authorityEpoch++
         this.currentRevision = replaced.revision

@@ -57,6 +57,8 @@ describe('createMutationGatedPersistentDataStore', () => {
             pluginStorage: [{ type: 'set', owner: 'test-plugin', key: 'plugin', value: true }],
         } as WorkingSetCommit
         const database = { username: 'Fixture', characters: [] } as unknown as Database
+        const aliases: Parameters<PersistentDataStore['replaceFromDatabase']>[2] = []
+        const values = [{ owner: 'test-plugin', key: 'key', value: 'value' }]
         const commitResult = { revision: 4 }
         const replacementResult = { revision: 5 }
         vi.mocked(store.commit).mockImplementation(async (input) => {
@@ -64,16 +66,18 @@ describe('createMutationGatedPersistentDataStore', () => {
             expect(input).toBe(commit)
             return commitResult
         })
-        vi.mocked(store.replaceFromDatabase).mockImplementation(async (input, revision) => {
+        vi.mocked(store.replaceFromDatabase).mockImplementation(async (input, revision, assets, pluginValues) => {
             calls.push('replace')
             expect(input).toBe(database)
             expect(revision).toBe(4)
+            expect(assets).toBe(aliases)
+            expect(pluginValues).toBe(values)
             return replacementResult
         })
         const gated = createMutationGatedPersistentDataStore(store, gate)
 
         await expect(gated.commit(commit)).resolves.toBe(commitResult)
-        await expect(gated.replaceFromDatabase(database, 4)).resolves.toBe(replacementResult)
+        await expect(gated.replaceFromDatabase(database, 4, aliases, values)).resolves.toBe(replacementResult)
 
         expect(calls).toEqual(['write-gate', 'commit', 'transition-gate', 'replace'])
         expect(gate.runWrite).toHaveBeenCalledOnce()

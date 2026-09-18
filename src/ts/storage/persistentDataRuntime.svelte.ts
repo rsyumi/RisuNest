@@ -1,7 +1,7 @@
 import { createPersistenceCanonicalCapture } from './reactivePersistenceCapture.svelte'
 import { derived, get, readonly, writable } from 'svelte/store'
 import { doingChat } from '../process/generationState'
-import { ReloadGUIPointer, selectedCharID } from '../stores.svelte'
+import { ReloadGUIPointer, selectedCharID, selIdState } from '../stores.svelte'
 import type { ActiveConversationSession } from './activeConversationSession'
 import type {
     ActiveConversationViewportSourceListener,
@@ -25,6 +25,7 @@ import type {
     PersistentCompleteCharacterMutation,
     PersistentCompleteCharacterUpsert,
     PersistentCompleteCharacterUpsertOptions,
+    PersistentDatabaseMaterializationOptions,
     PersistentScopedReplacementOptions,
     PersistentDatabaseSnapshot,
     PersistentMutationToken,
@@ -90,7 +91,7 @@ type CompleteCharacter = character | groupChat
 export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapter {
     const readSelectedCharacter = () => {
         const database = getDatabase()
-        const selected = captureSelectedPersistentCharacter(database, get(selectedCharID))
+        const selected = captureSelectedPersistentCharacter(database, selIdState.selId)
         return selected ? captureResidentPersistentCharacter(database, selected.chaId) : null
     }
     const canonicalCapture = createPersistenceCanonicalCapture({
@@ -696,8 +697,9 @@ export const materializePersistentDatabaseSnapshot = (reason: string): Promise<D
     getPersistentDataRuntime().materializePersistentDatabaseSnapshot(reason)
 export const materializePersistentDatabaseSnapshotWithRevision = (
     reason: string,
+    options?: PersistentDatabaseMaterializationOptions,
 ): Promise<PersistentDatabaseSnapshot> =>
-    getPersistentDataRuntime().materializePersistentDatabaseSnapshotWithRevision(reason)
+    getPersistentDataRuntime().materializePersistentDatabaseSnapshotWithRevision(reason, options)
 
 export const releaseInactiveWorkingSet = (
     canRelease?: () => boolean | Promise<boolean>,

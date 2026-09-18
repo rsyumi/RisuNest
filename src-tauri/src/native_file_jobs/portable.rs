@@ -504,6 +504,13 @@ pub(crate) fn restore_portable(
         output.seek(SeekFrom::Start(0)).map_err(error)?;
         (output, hash)
     };
+    let mut input = input;
+    if super::raw_recovery::is_raw_recovery_archive(&mut input)? {
+        return Err(NativeJobError::new(
+            "rescue-format-not-restorable",
+            "RisuNest rescue archives cannot be imported or restored",
+        ));
+    }
     let archive = VerifiedArchive::open(input, owned, &probe).map_err(error)?;
     let fallback = match device {
         Some((_, None)) => job
@@ -738,6 +745,62 @@ mod tests {
     use super::*;
     use crate::local_backup::NeverCancelled;
     use crate::persistent_store::{portable::digest_raw_tables, AssetRepositoryAuthorityState};
+    use std::io::Write;
+
+    fn raw_recovery_archive(path: &Path) -> u64 {
+        let file = File::create(path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        archive
+            .start_file(
+                "manifest.json",
+                zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        archive
+            .write_all(br#"{"format":"risunest-raw-recovery","version":1}"#)
+            .unwrap();
+        archive.finish().unwrap();
+        fs::metadata(path).unwrap().len()
+    }
+
+    #[test]
+    fn portable_restore_rejects_a_renamed_raw_recovery_archive() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("renamed.risunest");
+        let bytes = raw_recovery_archive(&source);
+        let target = directory.path().join("target");
+        let store = library(&target);
+        let owned = directory.path().join("restore-job");
+        fs::create_dir(&owned).unwrap();
+        let job = super::super::JobRegistry::default()
+            .create_internal(
+                super::super::JobKind::RestorePortableBackup,
+                Some(1),
+                vec![],
+                false,
+            )
+            .unwrap();
+
+        let error = restore_portable(
+            OpenedJobSource {
+                file: File::open(source).unwrap(),
+                total_bytes: bytes,
+            },
+            true,
+            1,
+            &owned,
+            store,
+            &job,
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "rescue-format-not-restorable");
+        let store = PersistentStore::open(&target).unwrap();
+        assert_eq!(store.revision().unwrap(), 1);
+    }
+
     pub(super) fn library(root: &Path) -> PersistentStore {
         let mut store = PersistentStore::open(root).unwrap();
         let database: serde_json::Value =

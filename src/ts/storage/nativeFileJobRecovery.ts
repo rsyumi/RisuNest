@@ -32,6 +32,8 @@ const productionDependencies: NativeFileJobRecoveryDependencies = {
 export const ANDROID_SAF_HANDOFF_ID_PATTERNS: Partial<
     Record<NativeFileJobStatus['kind'], RegExp>
 > = {
+    'export-raw-recovery':
+        /(?:^|[\\/])risunest-rescue-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.risunest-rescue\.zip$/,
     'export-portable-backup':
         /(?:^|[\\/])risunest-backup-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.risunest$/,
     'export-legacy-local-backup':
@@ -108,12 +110,16 @@ async function reconcileExportInBackground(
             return
         }
         if (
-            (status.kind === 'export-legacy-local-backup' ||
+            (status.kind === 'export-raw-recovery' ||
+                status.kind === 'export-legacy-local-backup' ||
                 status.kind === 'export-compatible-local-backup') &&
             status.result?.handoffPath
         ) {
             retainNativeJob = true
-            await dependencies.invoke('native_legacy_backup_handoff_cleanup', {
+            await dependencies.invoke(
+                status.kind === 'export-raw-recovery'
+                    ? 'native_raw_recovery_handoff_cleanup'
+                    : 'native_legacy_backup_handoff_cleanup', {
                 path: status.result.handoffPath,
             })
             retainNativeJob = false
@@ -212,6 +218,7 @@ export async function reconcileNativeFileJobsBeforeBootstrap(
                 // maintenance navigation. Never discard its SAF handoff here.
                 break
             case 'export-block-risu-save':
+            case 'export-raw-recovery':
             case 'export-legacy-local-backup':
             case 'export-compatible-local-backup':
             case 'export-character-charx':

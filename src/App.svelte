@@ -45,11 +45,11 @@
         type RecoveryExclusion,
     } from './ts/storage/recoveryMode.svelte';
     import { getDeviceSettings, updateDeviceSettings } from './ts/storage/deviceSettings';
-    import { openDataHealthScreen } from './ts/storage/dataHealthNavigation';
     import LoadingIndicator from './lib/UI/GUI/LoadingIndicator.svelte';
     import SyncExitDialog from './lib/Others/SyncExitDialog.svelte';
     import PersistentWorkingSetRecovery from './lib/Others/PersistentWorkingSetRecovery.svelte';
     import { persistentWorkingSetInputBlocked } from './ts/storage/persistentDataRuntime.svelte';
+    import { exportOriginalData } from './ts/storage/rawRecoveryExport';
 
     import {
         serverSyncNavigation,
@@ -86,6 +86,21 @@
     })
 
     let recoveryExcluded: RecoveryExclusion[] = $state([])
+    let startupExportMessage = $state('')
+    const exportStartupOriginalData = async () => {
+        startupExportMessage = ''
+        try {
+            const result = await exportOriginalData()
+            if (!result) return
+            startupExportMessage = result.warningCodes.includes('source-problems')
+                ? language.risuNest.recovery.exportPartial
+                : language.risuNest.recovery.exportComplete
+        } catch (error) {
+            startupExportMessage = error instanceof DOMException && error.name === 'AbortError'
+                ? language.risuNest.recovery.exportCancelled
+                : language.risuNest.recovery.exportFailed
+        }
+    }
     const exclusionName = (exclusion: RecoveryExclusion): string =>
         ({
             plugins: language.risuNest.recovery.excludePlugins,
@@ -370,7 +385,6 @@
                     recoveryExcluded = [...excluded]
                     start?.()
                 }}
-                onExportSource={() => openDataHealthScreen()}
             />
         {:else if $bootFailure}
             <div class="w-full h-full overflow-y-auto bg-darkbg text-textcolor flex justify-center items-start">
@@ -386,6 +400,22 @@
                     <code class="text-xs font-mono select-text break-all whitespace-pre-wrap border border-darkborderc rounded-md p-3 text-textcolor2">{$bootFailure.message}</code>
                     {#if $bootFailure.stage}
                         <span class="text-xs text-textcolor2 select-text">{language.risuNest.boot.stage}: {$bootFailure.stage}</span>
+                    {/if}
+                    {#if isTauri}
+                        <div class="rounded-md border border-darkborderc p-3">
+                            <p class="text-sm font-bold">{language.risuNest.recovery.exportTitle}</p>
+                            <p class="mt-1 text-xs text-textcolor2">{language.risuNest.recovery.exportHelp}</p>
+                            <button
+                                class="mt-2 bg-darkbutton border border-darkborderc rounded-md px-4 py-2 text-sm hover:bg-selected disabled:opacity-50"
+                                disabled={$bootFailure.stage === 'native-setup'}
+                                onclick={exportStartupOriginalData}
+                            >{language.risuNest.recovery.exportAction}</button>
+                            {#if $bootFailure.stage === 'native-setup'}
+                                <p class="mt-2 text-xs text-textcolor2">{language.risuNest.recovery.exportUnavailable}</p>
+                            {:else if startupExportMessage}
+                                <p class="mt-2 text-xs text-textcolor2" role="status">{startupExportMessage}</p>
+                            {/if}
+                        </div>
                     {/if}
                     <div class="flex flex-wrap gap-2 mt-1">
                         <button class="bg-darkbutton border border-darkborderc rounded-md px-4 py-2 text-sm hover:bg-selected" onclick={() => location.reload()}>

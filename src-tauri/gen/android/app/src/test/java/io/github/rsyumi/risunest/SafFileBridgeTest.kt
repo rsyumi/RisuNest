@@ -876,6 +876,28 @@ class SafFileBridgeTest {
   }
 
   @Test
+  fun `destination source accepts only exact app-owned raw recovery handoffs`() {
+    val appData = temporaryDirectory()
+    val handoffs = appData.resolve("native-file-jobs/handoffs")
+    handoffs.mkdirs()
+    val id = "99999999-9999-4999-8999-999999999999"
+    val source = handoffs.resolve("risunest-rescue-$id.risunest-rescue.zip")
+    source.writeBytes(byteArrayOf(1, 2, 3))
+    val outside = appData.resolve("outside/risunest-rescue-$id.risunest-rescue.zip")
+    outside.parentFile!!.mkdirs()
+    outside.writeBytes(byteArrayOf(9))
+    val unrelated = handoffs.resolve("manual.risunest-rescue.zip").apply {
+      writeBytes(byteArrayOf(8))
+    }
+
+    assertEquals(source.canonicalFile, resolveManagedExportSource(appData, source.path))
+    assertEquals(id, managedExportId(source))
+    assertEquals(source.canonicalFile, resolveManagedExportById(appData, id))
+    assertNull(resolveManagedExportSource(appData, outside.path))
+    assertNull(resolveManagedExportSource(appData, unrelated.path))
+  }
+
+  @Test
   fun `destination source accepts only exact app-owned character CharX handoffs`() {
     val appData = temporaryDirectory()
     val handoffs = appData.resolve("native-file-jobs/handoffs")
