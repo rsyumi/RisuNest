@@ -91,6 +91,38 @@ fn stale_release_cannot_remove_renewed_custody() {
 }
 
 #[test]
+fn latest_release_claim_uses_the_newest_id_and_stale_completion_preserves_a_new_retain() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Residency::open(root.path()).unwrap();
+    store
+        .confirm(&config("device"), &head(), &[object(b"first")])
+        .unwrap();
+    store
+        .confirm(&config("device"), &head(), &[object(b"second")])
+        .unwrap();
+    let context = Residency::context_id(&config("device"), "epoch");
+    let releasing = store
+        .begin_latest_release(&hash(b"payload"), &context)
+        .unwrap()
+        .unwrap();
+    assert_eq!(releasing.retention_id, hash(b"second"));
+
+    let mut concurrent = Residency::open(root.path()).unwrap();
+    concurrent
+        .confirm(&config("device"), &head(), &[object(b"third")])
+        .unwrap();
+    store.finish_release(&releasing).unwrap();
+    assert_eq!(
+        store
+            .object(&hash(b"payload"), Some(&context))
+            .unwrap()
+            .unwrap()
+            .retention_id,
+        hash(b"third")
+    );
+}
+
+#[test]
 fn invalid_confirmation_is_atomic_and_unknown_schema_is_rejected() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Residency::open(root.path()).unwrap();

@@ -23,6 +23,11 @@ struct PreparedJob {
     // Drop after staged stores and cycle resources have settled.
     _admission: crate::native_file_jobs::admission::Permit,
 }
+struct BackupSourceLease {
+    source: super::backups::ReferenceSource,
+    released: bool,
+    guards: usize,
+}
 #[derive(Default)]
 pub(crate) struct ServerSyncCommandState {
     running: AtomicBool,
@@ -31,13 +36,51 @@ pub(crate) struct ServerSyncCommandState {
     verified_bytes: Mutex<Arc<std::sync::atomic::AtomicU64>>,
     cycle_items: Mutex<Arc<CycleItemCounter>>,
     retryable_failure: Arc<Mutex<Option<String>>>,
-    backup_sources: Mutex<BTreeMap<String, String>>,
+    backup_sources: Mutex<BTreeMap<String, BackupSourceLease>>,
+}
+
+pub(crate) struct ReferenceSourceGuard {
+    app: AppHandle,
+    token: String,
+    source: super::backups::ReferenceSource,
+}
+
+impl ReferenceSourceGuard {
+    pub(crate) fn source(&self) -> &super::backups::ReferenceSource { &self.source }
+}
+
+impl Drop for ReferenceSourceGuard {
+    fn drop(&mut self) {
+        self.app.state::<ServerSyncCommandState>().finish_reference_source(&self.token);
+    }
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CycleItemCounts {
     done: u64,
     total: u64,
+}
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum BackupCleanup {
+    Complete,
+    Pending,
+}
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BackupDeleteResult {
+    local_deleted: bool,
+    cleanup: BackupCleanup,
+}
+fn finish_backup_delete(cleanup: impl FnOnce() -> Result<()>) -> BackupDeleteResult {
+    BackupDeleteResult {
+        local_deleted: true,
+        cleanup: if cleanup().is_ok() {
+            BackupCleanup::Complete
+        } else {
+            BackupCleanup::Pending
+        },
+    }
 }
 struct Running<'a>(&'a ServerSyncCommandState);
 impl Drop for Running<'_> {
@@ -74,6 +117,51 @@ impl ServerSyncCommandState {
         }
         Ok(())
     }
+    fn insert_reference_source(&self, token: String, source: super::backups::ReferenceSource) -> Result<()> {
+        let mut sources = self.backup_sources.lock()
+            .map_err(|_| SyncError::new("server-sync-state-unavailable", 503))?;
+        match sources.entry(token) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(BackupSourceLease { source, released: false, guards: 0 });
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {
+                Err(SyncError::new("server-sync-state-unavailable", 503))
+            }
+        }
+    }
+    fn claim_reference_source(&self, token: &str) -> Result<super::backups::ReferenceSource> {
+        let mut sources = self.backup_sources.lock()
+            .map_err(|_| SyncError::new("server-sync-state-unavailable", 503))?;
+        let entry = sources.get_mut(token)
+            .filter(|entry| !entry.released)
+            .ok_or_else(|| SyncError::new("source-unavailable", 409))?;
+        entry.guards = entry.guards.checked_add(1)
+            .ok_or_else(|| SyncError::new("server-sync-state-unavailable", 503))?;
+        Ok(entry.source.clone())
+    }
+    fn finish_reference_source(&self, token: &str) {
+        let Ok(mut sources) = self.backup_sources.lock() else { return; };
+        let remove = if let Some(entry) = sources.get_mut(token) {
+            entry.guards = entry.guards.saturating_sub(1);
+            entry.released && entry.guards == 0
+        } else {
+            false
+        };
+        if remove { sources.remove(token); }
+    }
+    fn release_reference_source(&self, token: &str) -> Result<()> {
+        let mut sources = self.backup_sources.lock()
+            .map_err(|_| SyncError::new("server-sync-state-unavailable", 503))?;
+        let remove = if let Some(entry) = sources.get_mut(token) {
+            entry.released = true;
+            entry.guards == 0
+        } else {
+            false
+        };
+        if remove { sources.remove(token); }
+        Ok(())
+    }
 }
 fn claim_library(app: &AppHandle) -> Result<crate::native_file_jobs::admission::Permit> {
     app.state::<crate::native_file_jobs::NativeFileJobState>()
@@ -100,7 +188,7 @@ fn pinned_backups(state: &ServerSyncCommandState) -> Result<BTreeSet<String>> {
         .lock()
         .map_err(|_| SyncError::new("server-sync-state-unavailable", 503))?
         .values()
-        .cloned()
+        .map(|entry| entry.source.id().to_owned())
         .collect())
 }
 fn management_block(store: &PersistentStore) -> Result<Option<&'static str>> {
@@ -142,16 +230,21 @@ pub(crate) async fn server_sync_backup_cleanup(
         let _running = state.claim()?;
         state.require_no_preparation()?;
         let store = job_store(&app)?;
-        super::management::cleanup_deleted_backups(
+        let cleanup = super::management::cleanup_deleted_backups(
             store.repository_root(),
             management_block(&store)?,
             &pinned_backups(&state)?,
-        )
+        )?;
+        store.asset_residency_release_unused(|| Ok(()))?;
+        Ok(cleanup)
     })
     .await
 }
 #[tauri::command]
-pub(crate) async fn server_sync_backup_delete(app: AppHandle, id: String) -> Result<()> {
+pub(crate) async fn server_sync_backup_delete(
+    app: AppHandle,
+    id: String,
+) -> Result<BackupDeleteResult> {
     blocking(move || {
         let _admission = claim_library(&app)?;
         let state = app.state::<ServerSyncCommandState>();
@@ -163,7 +256,10 @@ pub(crate) async fn server_sync_backup_delete(app: AppHandle, id: String) -> Res
             &id,
             management_block(&store)?,
             &pinned_backups(&state)?,
-        )
+        )?;
+        Ok(finish_backup_delete(|| {
+            store.asset_residency_release_unused(|| Ok(()))
+        }))
     })
     .await
 }
@@ -235,10 +331,13 @@ pub(crate) async fn server_sync_cache_cleanup(
     blocking(move || manage_cache(&app, true)).await
 }
 #[tauri::command]
-pub(crate) async fn server_sync_backups(app: AppHandle) -> Result<Vec<super::backups::Backup>> {
+pub(crate) async fn server_sync_backups(
+    app: AppHandle,
+    before: Option<super::backups::BackupCursor>,
+) -> Result<super::backups::BackupList> {
     blocking(move || {
         let store = job_store(&app)?;
-        super::backups::list(store.repository_root())
+        super::backups::list(store.repository_root(), before.as_ref())
     })
     .await
 }
@@ -256,34 +355,66 @@ pub(crate) async fn server_sync_backup_source(
         if store.server_status()?.operation_pending {
             return Err(SyncError::new("resolve-pending-operation-first", 409));
         }
-        let path = super::backups::source(store.repository_root(), &id, side, || {
-            cancelled.load(Ordering::Acquire)
+        let source = super::backups::source(store.repository_root(), &id, side, &|| {
+            if cancelled.load(Ordering::Acquire) {
+                Err(SyncError::new("cancelled", 409))
+            } else {
+                Ok(())
+            }
         })?;
-        let lease = uuid::Uuid::new_v4().to_string();
-        state
-            .backup_sources
-            .lock()
-            .map_err(|_| SyncError::new("server-sync-state-unavailable", 503))?
-            .insert(lease.clone(), id);
-        Ok(BackupSource { path, lease })
+        let lease = format!("server:{}", uuid::Uuid::new_v4());
+        state.insert_reference_source(lease.clone(), source)?;
+        Ok(BackupSource {
+            source: ConflictReferenceSource::ConflictReference { token: lease.clone() },
+            lease,
+        })
     })
     .await
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct BackupSource {
-    path: String,
+    source: ConflictReferenceSource,
     lease: String,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum ConflictReferenceSource {
+    ConflictReference { token: String },
+}
+
+fn validate_reference_token(token: &str) -> Result<()> {
+    let id = token.strip_prefix("server:")
+        .ok_or_else(|| SyncError::new("source-unavailable", 409))?;
+    let uuid = uuid::Uuid::parse_str(id)
+        .map_err(|_| SyncError::new("source-unavailable", 409))?;
+    if uuid.to_string() != id || uuid.get_version() != Some(uuid::Version::Random) {
+        return Err(SyncError::new("source-unavailable", 409));
+    }
+    Ok(())
+}
+
+pub(crate) fn claim_reference_source(app: &AppHandle, token: &str) -> Result<ReferenceSourceGuard> {
+    validate_reference_token(token)?;
+    let state = app.state::<ServerSyncCommandState>();
+    let source = state.claim_reference_source(token)?;
+    let guard = ReferenceSourceGuard {
+        app: app.clone(),
+        token: token.to_owned(),
+        source,
+    };
+    let store = job_store(app)?;
+    super::backups::validate_reference_source(
+        store.repository_root(), guard.source(), &|| Ok(()),
+    )?;
+    Ok(guard)
 }
 
 #[tauri::command]
 pub(crate) fn server_sync_backup_release(app: AppHandle, lease: String) -> Result<()> {
-    app.state::<ServerSyncCommandState>()
-        .backup_sources
-        .lock()
-        .map_err(|_| SyncError::new("server-sync-state-unavailable", 503))?
-        .remove(&lease);
-    Ok(())
+    app.state::<ServerSyncCommandState>().release_reference_source(&lease)
 }
 
 #[derive(Serialize)]
@@ -590,4 +721,79 @@ pub(crate) fn server_sync_cancel(app: AppHandle) -> Result<()> {
             .take();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod backup_source_tests {
+    use super::*;
+    use crate::server_sync::backups::{references::Capture, Side};
+    use risunest_sync_wire::RemoteHead;
+
+    #[test]
+    fn deleted_backup_reports_remote_cleanup_as_complete_or_pending() {
+        let complete = finish_backup_delete(|| Ok(()));
+        assert_eq!(complete, BackupDeleteResult {
+            local_deleted: true,
+            cleanup: BackupCleanup::Complete,
+        });
+        assert_eq!(serde_json::to_value(complete).unwrap(), serde_json::json!({
+            "localDeleted": true,
+            "cleanup": "complete",
+        }));
+
+        let pending = finish_backup_delete(|| {
+            Err(SyncError::new("synthetic-network-release-failure", 503))
+        });
+        assert_eq!(pending, BackupDeleteResult {
+            local_deleted: true,
+            cleanup: BackupCleanup::Pending,
+        });
+        assert_eq!(serde_json::to_value(pending).unwrap(), serde_json::json!({
+            "localDeleted": true,
+            "cleanup": "pending",
+        }));
+    }
+
+    #[test]
+    fn namespaced_tokens_and_worker_guards_pin_until_release_and_last_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(root.path()).unwrap();
+        let head = RemoteHead::genesis("library".into(), "epoch".into()).unwrap();
+        let capture = Capture::begin(root.path(), 0, "generation", &head).unwrap();
+        capture.complete_side(Side::Local).unwrap();
+        capture.complete_side(Side::Remote).unwrap();
+        let id = capture.finish(&mut store, &|| Ok(())).unwrap().id;
+        let source = super::super::backups::source(root.path(), &id, Side::Local, &|| Ok(())).unwrap();
+        let state = ServerSyncCommandState::default();
+        let token = format!("server:{}", uuid::Uuid::new_v4());
+        validate_reference_token(&token).unwrap();
+        assert_eq!(serde_json::to_value(BackupSource {
+            source: ConflictReferenceSource::ConflictReference { token: token.clone() },
+            lease: token.clone(),
+        }).unwrap(), serde_json::json!({
+            "source": { "type": "conflictReference", "token": token.clone() },
+            "lease": token.clone(),
+        }));
+        for invalid in ["external:00000000-0000-4000-8000-000000000000", "server:INVALID",
+            "server:", "server:00000000-0000-0000-0000-000000000000",
+            "server:00000000-0000-1000-8000-000000000000"] {
+            assert_eq!(validate_reference_token(invalid).unwrap_err().code, "source-unavailable");
+        }
+        state.insert_reference_source(token.clone(), source).unwrap();
+        let first = state.claim_reference_source(&token).unwrap();
+        let second = state.claim_reference_source(&token).unwrap();
+        assert_eq!(first.id(), id);
+        assert_eq!(second.side(), Side::Local);
+        assert_eq!(pinned_backups(&state).unwrap(), BTreeSet::from([id.clone()]));
+
+        state.release_reference_source(&token).unwrap();
+        assert_eq!(state.claim_reference_source(&token).unwrap_err().code, "source-unavailable");
+        assert_eq!(pinned_backups(&state).unwrap(), BTreeSet::from([id.clone()]));
+        state.finish_reference_source(&token);
+        state.release_reference_source(&token).unwrap();
+        assert_eq!(pinned_backups(&state).unwrap(), BTreeSet::from([id]));
+        state.finish_reference_source(&token);
+        assert!(pinned_backups(&state).unwrap().is_empty());
+        state.release_reference_source(&token).unwrap();
+    }
 }

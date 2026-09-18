@@ -24,8 +24,10 @@ struct Trace {
     corrupt_retention: AtomicBool,
     retention_pages: AtomicU64,
     fail_retention_page: AtomicU64,
+    fail_release_once: AtomicBool,
     expire_checkpoint: AtomicBool,
     released_before_marker: AtomicBool,
+    add_active_reference_on_session: AtomicBool,
     root: Mutex<Option<std::path::PathBuf>>,
     requests: Mutex<Vec<Request>>,
 }
@@ -47,6 +49,14 @@ async fn observe(
             method: method.clone(), path: path.clone(), query,
             body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         });
+        if method == "GET" && path == "/session"
+            && trace.add_active_reference_on_session.swap(false, Ordering::SeqCst) {
+            let root = trace.root.lock().unwrap().clone().unwrap();
+            let mut store = PersistentStore::open(&root).unwrap();
+            let active = put(&mut store, "assets/active-conflict-payload.png",
+                &vec![61; 128 * 1024 + 3]);
+            assert!(active.object_hash.is_some());
+        }
         if method == "DELETE" && path.starts_with("/checkpoints/") {
             let root = trace.root.lock().unwrap().clone().unwrap();
             let complete = fs::read_dir(root.join("server-sync/backups")).ok().is_some_and(|entries|
@@ -59,6 +69,11 @@ async fn observe(
                 return (axum::http::StatusCode::BAD_REQUEST,
                     axum::Json(json!({"error":"synthetic-retention-failure"}))).into_response();
             }
+        }
+        if method == "POST" && path == "/objects/retention/release"
+            && trace.fail_release_once.swap(false, Ordering::SeqCst) {
+            return (axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({"error":"synthetic-release-failure"}))).into_response();
         }
         if method == "GET" && path.starts_with("/checkpoints/") && trace.expire_checkpoint.load(Ordering::SeqCst) {
             return (axum::http::StatusCode::GONE, axum::Json(json!({"error":"checkpoint-expired"}))).into_response();
@@ -203,13 +218,142 @@ fn reference_preparation_transfers_only_metadata_and_retains_remote_only_local_p
     let directory = scenario.local.repository_root().join("server-sync/backups").join(&receipt.id);
     assert!(!directory.join("local.risunest").exists());
     assert!(!directory.join("remote.risunest").exists());
-    let pins = DurableCasJob::open(scenario.local.repository_root(), &receipt.id).unwrap();
-    assert!(pins.is_sealed());
-    assert!(pins.root_set().unwrap().object_hashes.contains(&scenario.unique_payload));
+    assert_eq!(DurableCasJob::open(scenario.local.repository_root(), &receipt.id)
+        .unwrap_err().kind(), std::io::ErrorKind::NotFound);
     scenario.local.asset_residency_release_unused(&|| Ok(())).unwrap();
     assert!(Residency::open(scenario.local.repository_root()).unwrap().object(&scenario.remote_payload, None).unwrap().is_some(),
         "a remote object referenced only by the conflict copy must retain custody");
     println!("reference capture: metadata bytes={metadata_bytes}; ordinary payload downloads=0; uploads=0");
+}
+
+#[test]
+fn conflict_roots_replace_released_job_pins_without_forcing_custody_payloads_local() {
+    let mut scenario = Scenario::new();
+    let head = scenario.fixture.server.head().unwrap();
+    let (receipt, _) = scenario.capture(&head).unwrap();
+    let index = references::open(scenario.local.repository_root(), &receipt.id, &|| Ok(())).unwrap();
+    let metadata = index.prepare("SELECT DISTINCT hash FROM objects WHERE role='metadata' ORDER BY hash")
+        .unwrap().query_map([], |row| row.get::<_, String>(0)).unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>().unwrap();
+    assert!(!metadata.is_empty());
+    drop(index);
+
+    assert_eq!(DurableCasJob::open(scenario.local.repository_root(), &receipt.id)
+        .unwrap_err().kind(), std::io::ErrorKind::NotFound);
+    scenario.local.delete_asset_alias("asset", "assets/reference-local-only.png",
+        scenario.local.revision().unwrap()).unwrap();
+    for snapshot in scenario.local.snapshot_list().unwrap() {
+        scenario.local.snapshot_delete(&snapshot.id).unwrap();
+    }
+    let cas = PayloadCas::new(scenario.local.repository_root()).unwrap();
+    assert!(cas.stat_object(&scenario.unique_payload).unwrap().is_some());
+    assert!(metadata.iter().all(|hash| cas.stat_object(hash).unwrap().is_some()));
+
+    use std::io::Read;
+    let mut hydrated = Vec::new();
+    open_or_hydrate(scenario.local.repository_root(), &scenario.remote_payload).unwrap().unwrap()
+        .read_to_end(&mut hydrated).unwrap();
+    assert_eq!(hydrated, vec![61; 128 * 1024 + 3]);
+    scenario.local.asset_residency_evict(|| Ok(())).unwrap();
+
+    assert_eq!(cas.stat_object(&scenario.remote_payload).unwrap(), None);
+    assert!(Residency::open(scenario.local.repository_root()).unwrap()
+        .object(&scenario.remote_payload, None).unwrap().is_some());
+    assert!(cas.stat_object(&scenario.unique_payload).unwrap().is_some());
+    assert!(metadata.iter().all(|hash| cas.stat_object(hash).unwrap().is_some()));
+}
+
+#[test]
+fn custody_release_waits_for_both_conflicts_and_the_active_library() {
+    let mut scenario = Scenario::new();
+    let head = scenario.fixture.server.head().unwrap();
+    let context = Residency::context_id(&scenario.local.server_stored_config().unwrap().unwrap(), &head.epoch);
+    let (first, _) = scenario.capture(&head).unwrap();
+    let first_retention = Residency::open(scenario.local.repository_root()).unwrap()
+        .object(&scenario.remote_payload, Some(&context)).unwrap().unwrap().retention_id;
+
+    put(&mut scenario.local, "assets/second-conflict-divider.png", b"synthetic second conflict divider");
+    let (second, _) = scenario.capture(&head).unwrap();
+    assert_ne!(first.id, second.id);
+    let second_retention = Residency::open(scenario.local.repository_root()).unwrap()
+        .object(&scenario.remote_payload, Some(&context)).unwrap().unwrap().retention_id;
+    assert_ne!(first_retention, second_retention);
+
+    crate::server_sync::management::delete_backup(scenario.local.repository_root(), &first.id,
+        None, &Default::default()).unwrap();
+    scenario.local.asset_residency_release_unused(|| Ok(())).unwrap();
+    assert_eq!(Residency::open(scenario.local.repository_root()).unwrap()
+        .object(&scenario.remote_payload, Some(&context)).unwrap().unwrap().retention_id,
+        second_retention);
+
+    crate::server_sync::management::delete_backup(scenario.local.repository_root(), &second.id,
+        None, &Default::default()).unwrap();
+    scenario.trace.add_active_reference_on_session.store(true, Ordering::SeqCst);
+    scenario.local.asset_residency_release_unused(|| Ok(())).unwrap();
+    assert!(!scenario.trace.add_active_reference_on_session.load(Ordering::SeqCst));
+    let active = scenario.local.read_asset_alias(
+        "asset", "assets/active-conflict-payload.png", None).unwrap().unwrap();
+    assert_eq!(active.value.object_hash.as_deref(), Some(scenario.remote_payload.as_str()));
+    assert_eq!(Residency::open(scenario.local.repository_root()).unwrap()
+        .object(&scenario.remote_payload, Some(&context)).unwrap().unwrap().retention_id,
+        second_retention);
+
+    scenario.local.delete_asset_alias("asset", &active.value.key,
+        scenario.local.revision().unwrap()).unwrap();
+    for snapshot in scenario.local.snapshot_list().unwrap() {
+        scenario.local.snapshot_delete(&snapshot.id).unwrap();
+    }
+    scenario.local.asset_residency_release_unused(|| Ok(())).unwrap();
+    assert!(Residency::open(scenario.local.repository_root()).unwrap()
+        .object(&scenario.remote_payload, Some(&context)).unwrap().is_none());
+    let config = scenario.local.server_config().unwrap().unwrap();
+    let device = scenario.fixture.server.authenticate(&config.library_id, &config.token).unwrap();
+    assert!(scenario.fixture.server.retained_objects(&device, &head.epoch, None).unwrap().objects
+        .iter().all(|object| object.hash != scenario.remote_payload));
+}
+
+#[test]
+fn failed_custody_release_preserves_other_roots_and_the_next_cleanup_recomputes_inventory() {
+    let mut scenario = Scenario::new();
+    let head = scenario.fixture.server.head().unwrap();
+    let (receipt, _) = scenario.capture(&head).unwrap();
+    assert_eq!(DurableCasJob::open(scenario.local.repository_root(), &receipt.id)
+        .unwrap_err().kind(), std::io::ErrorKind::NotFound);
+    crate::server_sync::management::delete_backup(scenario.local.repository_root(), &receipt.id,
+        None, &Default::default()).unwrap();
+    for snapshot in scenario.local.snapshot_list().unwrap() {
+        scenario.local.snapshot_delete(&snapshot.id).unwrap();
+    }
+    let mut conflict_roots = std::collections::BTreeSet::new();
+    references::visit_roots(scenario.local.repository_root(), |object| {
+        conflict_roots.insert(object.hash);
+        Ok(())
+    }).unwrap();
+    assert!(!conflict_roots.contains(&scenario.unique_payload));
+    assert!(scenario.local.read_asset_alias(
+        "asset", "assets/reference-local-only.png", None).unwrap().is_some());
+    let cas = PayloadCas::new(scenario.local.repository_root()).unwrap();
+    assert!(cas.stat_object(&scenario.unique_payload).unwrap().is_some());
+
+    scenario.trace.fail_release_once.store(true, Ordering::SeqCst);
+    assert!(scenario.local.asset_residency_release_unused(|| Ok(())).is_err());
+    assert!(!scenario.trace.fail_release_once.load(Ordering::SeqCst));
+    assert!(scenario.local.read_asset_alias(
+        "asset", "assets/reference-local-only.png", None).unwrap().is_some());
+    assert!(cas.stat_object(&scenario.unique_payload).unwrap().is_some());
+
+    scenario.local.asset_residency_release_unused(|| Ok(())).unwrap();
+    assert!(Residency::open(scenario.local.repository_root()).unwrap()
+        .release_object(&scenario.remote_payload, &Residency::context_id(
+            &scenario.local.server_stored_config().unwrap().unwrap(), &head.epoch))
+        .unwrap().is_none());
+    assert!(scenario.local.read_asset_alias(
+        "asset", "assets/reference-local-only.png", None).unwrap().is_some());
+    assert!(cas.stat_object(&scenario.unique_payload).unwrap().is_some());
+    let release_requests = scenario.trace.requests.lock().unwrap().iter()
+        .filter(|request| request.method == "POST"
+            && request.path == "/objects/retention/release").count();
+    assert_eq!(release_requests, 2);
 }
 
 #[test]
@@ -400,4 +544,210 @@ fn expired_checkpoint_keeps_known_local_roots_without_restarting_the_remote_scan
     assert!(!requests.iter().any(|request| request.method == "DELETE"));
     drop(requests);
     scenario.assert_no_payload_transfers();
+}
+
+#[test]
+fn reference_source_prepares_replacement_without_hydrating_custody_payloads() {
+    let mut scenario = Scenario::new();
+    let head = scenario.fixture.server.head().unwrap();
+    let (receipt, _) = scenario.capture(&head).unwrap();
+    let source = crate::server_sync::backups::source(
+        scenario.local.repository_root(),
+        &receipt.id,
+        Side::Remote,
+        &|| Ok(()),
+    ).unwrap();
+    let revision = scenario.local.revision().unwrap();
+    let cas = PayloadCas::new(scenario.local.repository_root()).unwrap();
+    assert_eq!(cas.stat_object(&scenario.remote_payload).unwrap(), None);
+
+    let prepared = scenario.local.prepare_server_conflict_replacement(
+        &source,
+        revision,
+        &|| Ok(()),
+    ).unwrap();
+    assert_eq!(cas.stat_object(&scenario.remote_payload).unwrap(), None);
+    assert_eq!(scenario.local.finish_prepared_replace(prepared).unwrap().revision, revision + 1);
+    assert_eq!(cas.stat_object(&scenario.remote_payload).unwrap(), None);
+    let alias = scenario.local.read_asset_alias(
+        "asset",
+        "assets/reference-shared.png",
+        None,
+    ).unwrap().unwrap();
+    assert_eq!(alias.value.object_hash.as_deref(), Some(scenario.remote_payload.as_str()));
+}
+
+#[test]
+fn local_reference_source_prepares_replacement_after_server_unbind() {
+    let mut scenario = Scenario::new();
+    scenario.local.delete_asset_alias(
+        "asset",
+        "assets/reference-shared.png",
+        scenario.local.revision().unwrap(),
+    ).unwrap();
+    let head = scenario.fixture.server.head().unwrap();
+    let (receipt, _) = scenario.capture(&head).unwrap();
+    let index = references::open(
+        scenario.local.repository_root(),
+        &receipt.id,
+        &|| Ok(()),
+    ).unwrap();
+    let requirements = references::side_requirements(
+        scenario.local.repository_root(),
+        &index,
+        Side::Local,
+    ).unwrap();
+    assert_eq!(requirements.remote_dependent_bytes, 0);
+    assert!(requirements.local_required_available);
+    drop(index);
+    let source = crate::server_sync::backups::source(
+        scenario.local.repository_root(),
+        &receipt.id,
+        Side::Local,
+        &|| Ok(()),
+    ).unwrap();
+    let revision = scenario.local.revision().unwrap();
+
+    use std::io::Read;
+    let mut hydrated = Vec::new();
+    open_or_hydrate(scenario.local.repository_root(), &scenario.remote_payload)
+        .unwrap()
+        .unwrap()
+        .read_to_end(&mut hydrated)
+        .unwrap();
+    assert_eq!(hydrated, vec![61; 128 * 1024 + 3]);
+    let cas = PayloadCas::new(scenario.local.repository_root()).unwrap();
+    assert_eq!(
+        cas.stat_object(&scenario.remote_payload).unwrap(),
+        Some(hydrated.len() as u64),
+    );
+    scenario.local.server_unbind().unwrap();
+    let prepared = scenario.local.prepare_server_conflict_replacement(
+        &source,
+        revision,
+        &|| Ok(()),
+    ).unwrap();
+    assert_eq!(scenario.local.finish_prepared_replace(prepared).unwrap().revision, revision + 1);
+    assert!(scenario.local.server_config().unwrap().is_none());
+    let alias = scenario.local.read_asset_alias(
+        "asset",
+        "assets/reference-local-only.png",
+        None,
+    ).unwrap().unwrap();
+    assert_eq!(alias.value.object_hash.as_deref(), Some(scenario.unique_payload.as_str()));
+}
+
+#[test]
+fn reference_source_rejects_missing_local_required_and_corrupt_metadata() {
+    {
+        let mut scenario = Scenario::new();
+        let head = scenario.fixture.server.head().unwrap();
+        let (receipt, _) = scenario.capture(&head).unwrap();
+        let source = crate::server_sync::backups::source(
+            scenario.local.repository_root(),
+            &receipt.id,
+            Side::Local,
+            &|| Ok(()),
+        ).unwrap();
+        let cas = PayloadCas::new(scenario.local.repository_root()).unwrap();
+        fs::remove_file(cas.object_path(&scenario.unique_payload).unwrap().unwrap()).unwrap();
+        let revision = scenario.local.revision().unwrap();
+        let error = match scenario.local.prepare_server_conflict_replacement(
+            &source,
+            revision,
+            &|| Ok(()),
+        ) {
+            Ok(_) => panic!("missing local-required payload must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.code,
+            "conflict-local-object-missing",
+        );
+    }
+
+    {
+        let mut scenario = Scenario::new();
+        let head = scenario.fixture.server.head().unwrap();
+        let (receipt, _) = scenario.capture(&head).unwrap();
+        let source = crate::server_sync::backups::source(
+            scenario.local.repository_root(),
+            &receipt.id,
+            Side::Remote,
+            &|| Ok(()),
+        ).unwrap();
+        let index = references::open(
+            scenario.local.repository_root(),
+            &receipt.id,
+            &|| Ok(()),
+        ).unwrap();
+        let (hash, size): (String, i64) = index.query_row(
+            "SELECT hash,byte_size FROM objects WHERE side='remote' AND role='metadata' ORDER BY hash LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        drop(index);
+        let cas = PayloadCas::new(scenario.local.repository_root()).unwrap();
+        fs::write(
+            cas.object_path(&hash).unwrap().unwrap(),
+            vec![0; usize::try_from(size).unwrap()],
+        ).unwrap();
+        let revision = scenario.local.revision().unwrap();
+        assert!(scenario.local.prepare_server_conflict_replacement(
+            &source,
+            revision,
+            &|| Ok(()),
+        ).is_err());
+    }
+}
+
+#[test]
+fn reference_source_rejects_a_record_body_with_mismatched_descriptor_semantics() {
+    let mut scenario = Scenario::new();
+    let head = scenario.fixture.server.head().unwrap();
+    let (receipt, _) = scenario.capture(&head).unwrap();
+    let directory = scenario.local.repository_root()
+        .join("server-sync/backups")
+        .join(&receipt.id);
+    let index_path = directory.join("index.sqlite");
+    {
+        let db = rusqlite::Connection::open(&index_path).unwrap();
+        let records = db.prepare(
+            "SELECT record_key,version_json FROM records
+             WHERE side='local' AND body_hash IS NOT NULL ORDER BY record_key LIMIT 2",
+        ).unwrap().query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }).unwrap().collect::<std::result::Result<Vec<_>, _>>().unwrap();
+        assert_eq!(records.len(), 2);
+        let (first_key, first_version) = &records[0];
+        let (_, second_version) = &records[1];
+        assert_ne!(first_version, second_version);
+        db.execute(
+            "UPDATE records SET version_json=?2 WHERE side='local' AND record_key=?1",
+            rusqlite::params![first_key, second_version],
+        ).unwrap();
+    }
+    let index = fs::read(&index_path).unwrap();
+    let marker_path = directory.join("complete.json");
+    let mut marker: Value = serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+    marker["indexHash"] = json!(risunest_sync_wire::hash(&index));
+    marker["indexBytes"] = json!(index.len() as u64);
+    fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+
+    let source = crate::server_sync::backups::source(
+        scenario.local.repository_root(),
+        &receipt.id,
+        Side::Local,
+        &|| Ok(()),
+    ).unwrap();
+    let revision = scenario.local.revision().unwrap();
+    let error = match scenario.local.prepare_server_conflict_replacement(
+        &source,
+        revision,
+        &|| Ok(()),
+    ) {
+        Ok(_) => panic!("descriptor and body mismatch must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, "server-descriptor-semantics-mismatch");
 }

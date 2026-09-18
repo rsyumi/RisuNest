@@ -233,8 +233,9 @@ fn separate_conversations_keep_local_views_and_alias_conflicts_preserve_both_sid
         "first"
     );
     assert_eq!(
-        crate::server_sync::backups::list(second.repository_root())
+        crate::server_sync::backups::list(second.repository_root(), None)
             .unwrap()
+            .items
             .len(),
         1
     );

@@ -345,7 +345,7 @@ impl PersistentStore {
         &self,
         check: impl Fn() -> Result<()>,
     ) -> Result<()> {
-        let residency = Residency::open(&self.repository_root)?;
+        let mut residency = Residency::open(&self.repository_root)?;
         let cas = PayloadCas::new(&self.repository_root)?;
         let mut after = String::new();
         loop {
@@ -353,51 +353,64 @@ impl PersistentStore {
             if page.is_empty() {
                 break;
             }
-            let mut releases = std::collections::BTreeMap::<
-                String,
-                Vec<crate::server_sync::residency::RemoteObject>,
-            >::new();
-            {
-                let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
-                let inventory = self.residency_inventory(true)?;
-                if inventory.release_blocked {
-                    return Ok(());
-                }
-                for (cursor, hash, _) in page {
-                    check()?;
-                    after = cursor.clone();
-                    let context = cursor
-                        .split_once('/')
-                        .ok_or_else(|| SyncError::new("invalid-custody-cursor", 409))?
-                        .0;
-                    let Some(object) = residency.release_object(&hash, context)? else {
-                        continue;
-                    };
-                    if inventory.referenced.contains(&hash) || inventory.local.contains(&hash) {
-                        continue;
-                    }
-                    if !residency.begin_release(&object)? {
-                        continue;
-                    }
-                    if cas.stat_object(&hash)?.is_none() {
-                        self.connection
-                            .execute("DELETE FROM asset_objects WHERE object_hash=?1", [&hash])?;
-                    }
-                    releases.entry(context.to_owned()).or_default().push(object);
-                }
-            }
-            for objects in releases.values() {
+            let mut candidates = std::collections::BTreeMap::<String, Vec<String>>::new();
+            for (cursor, hash, _) in page {
                 check()?;
-                let client =
-                    ServerClient::new(objects[0].config.resolve(&self.repository_root)?)?;
+                after = cursor.clone();
+                let context = cursor
+                    .split_once('/')
+                    .ok_or_else(|| SyncError::new("invalid-custody-cursor", 409))?
+                    .0;
+                candidates.entry(context.to_owned()).or_default().push(hash);
+            }
+            for (context, hashes) in candidates {
+                check()?;
+                let mut proof = None;
+                for hash in &hashes {
+                    if let Some(object) = residency.release_object(hash, &context)? {
+                        proof = Some(object);
+                        break;
+                    }
+                }
+                let Some(proof) = proof else {
+                    continue;
+                };
+                let client = ServerClient::new(proof.config.resolve(&self.repository_root)?)?;
                 let head = client.resolve_identity(false)?;
                 check()?;
+                let objects = {
+                    let _guard = crate::asset_repository::coordinator::lock_repository_mutation()?;
+                    let inventory = self.residency_inventory(true)?;
+                    if inventory.release_blocked {
+                        return Ok(());
+                    }
+                    let mut objects = Vec::new();
+                    for hash in hashes {
+                        if inventory.referenced.contains(&hash) || inventory.local.contains(&hash) {
+                            continue;
+                        }
+                        let Some(object) = residency.begin_latest_release(&hash, &context)? else {
+                            continue;
+                        };
+                        if cas.stat_object(&hash)?.is_none() {
+                            self.connection.execute(
+                                "DELETE FROM asset_objects WHERE object_hash=?1",
+                                [&hash],
+                            )?;
+                        }
+                        objects.push(object);
+                    }
+                    objects
+                };
+                if objects.is_empty() {
+                    continue;
+                }
                 let reply=client.request(reqwest::Method::POST,"objects/retention/release",&[],
                     Some(risunest_sync_wire::canonical::encode(&serde_json::json!({"epoch":head.epoch,"objects":objects.iter().map(|object|serde_json::json!({"deviceId":object.device_id,"hash":object.hash,"retentionId":object.retention_id})).collect::<Vec<_>>()}))?),&[],risunest_sync_wire::MAX_METADATA_BYTES)?;
                 if reply.status != 204 {
                     return Err(crate::server_sync::client::response_error(reply));
                 }
-                for object in objects {
+                for object in &objects {
                     residency.finish_release(object)?;
                 }
             }

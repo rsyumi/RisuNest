@@ -7,8 +7,7 @@ mod promotion_tests;
 use super::{
     asset_object_catalog::{AssetObjectCatalog, AssetObjectRegistration},
     server_sync_apply::{
-        validate_remote, validate_remote_with_residency, RemoteRecord, ReplicaAdvance,
-        ValidatedRecords,
+        validate_remote_with_residency, RemoteRecord, ReplicaAdvance, ValidatedRecords,
     },
     server_sync_outbox as outbox, server_sync_projection as projection,
     server_sync_sections as sections, PersistentStore,
@@ -34,7 +33,7 @@ use risunest_sync_wire::{
     canonical, change_digest::ChangeDigest, ChangeSet, CommitIntent, Domain, ReadFence, Receipt,
     RecordChange, RecordVersion, RemoteHead, ScopeFence, Sequence, MAX_METADATA_BYTES,
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1153,7 +1152,7 @@ impl PersistentStore {
             {
                 return Err(SyncError::new("conflict-preview-stale", 409));
             }
-            self.server_conflict_backups(&cache, &transfer, &client, revision, &through)?;
+            self.server_conflict_references(&cache, &transfer, &client, revision, &through)?;
         }
         if !scope_fences.is_empty() {
             let mut after = String::new();
@@ -2309,153 +2308,235 @@ impl PersistentStore {
         capture.record(side, key, version, Some((&body, bytes.len() as u64)))
     }
 
-    fn server_conflict_backups(
+    /// Projects a claimed conflict reference into the normal replacement fence.
+    /// The caller must keep its reference-source guard alive until the returned
+    /// preparation is either committed or abandoned.
+    pub(crate) fn prepare_server_conflict_replacement(
         &mut self,
-        cache: &Cache,
-        transfer: &Transfer<'_>,
-        client: &ServerClient,
-        revision: i64,
-        head: &RemoteHead,
-    ) -> Result<()> {
-        self.server_conflict_references(cache, transfer, client, revision, head)?;
-        // Keep the existing portable recovery gate until the reference source
-        // consumer and GC ownership handoff are connected.
-        // Both library-only packages must pass the portable archive verifier before
-        // any live activation or server publication. A partial directory is not
-        // a completed backup; only the final receipt makes it discoverable.
-        struct Cancel<'a>(&'a ServerClient);
-        impl crate::local_backup::CancellationProbe for Cancel<'_> {
-            fn is_cancelled(&self) -> bool {
-                self.0.ensure_active().is_err()
-            }
+        source: &crate::server_sync::backups::ReferenceSource,
+        expected_revision: i64,
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<super::PreparedReplaceCommit> {
+        #[derive(Clone)]
+        struct StoredObject {
+            byte_size: u64,
+            metadata: bool,
+            context_id: Option<String>,
+            local_required: bool,
         }
-        let root = self
-            .repository_root
-            .join("server-sync/backups")
-            .join(uuid::Uuid::new_v4().to_string());
-        std::fs::create_dir_all(&root)?;
-        let scratch = tempfile::Builder::new()
-            .prefix("working-")
-            .tempdir_in(&root)?;
-        std::fs::create_dir_all(scratch.path().join("local-staging"))?;
-        std::fs::create_dir_all(scratch.path().join("remote-staging"))?;
-        let cancel = Cancel(client);
-        let local = crate::portable_backup::create_verified_library_backup(
-            self,
-            revision,
-            &root.join("local.risunest"),
-            &scratch.path().join("local-staging"),
-            &cancel,
-        )
-        .map_err(|_| SyncError::new("complete-local-backup-required", 409))?;
-        let mut remote_store = PersistentStore::open(&scratch.path().join("remote-source"))?;
-        remote_store.server_bind(
-            &self
-                .server_config()?
-                .ok_or_else(|| SyncError::new("server-not-bound", 409))?,
-        )?;
-        let remote_cas = PayloadCas::new(&remote_store.repository_root)?;
-        let mut records = ValidatedRecords::new()?;
-        let mut after = String::new();
-        loop {
-            let page = {
-                let mut stmt=self.connection.prepare("SELECT key,version FROM server_sync_remote WHERE domain='library' AND key>?1 ORDER BY key LIMIT 1024")?;
-                let result = stmt
-                    .query_map([&after], |r| {
-                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                    })?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                result
-            };
-            if page.is_empty() {
-                break;
-            }
-            for (key, version) in page {
-                client.ensure_active()?;
-                after = key.clone();
-                let version: RecordVersion = parse(&version)?;
-                if !matches!(version, RecordVersion::Live { .. }) {
-                    continue;
-                }
-                transfer.download_record(
-                    &version,
-                    &self.server_base_candidates(Domain::Library, &key, cache, false)?,
-                    &self.server_base(Domain::Library, &key)?.0,
-                )?;
-                let (payload, hash) = cache.restore(&version)?;
-                let dependencies = projection::dependencies(&payload, &cache.cas)?;
-                let dirty = key_parts(&key, revision)?;
-                if cache
-                    .project(&payload, &dependencies, &relations(&dirty)?, scopes(&dirty))?
-                    .version
-                    != version
-                {
-                    return Err(SyncError::new("server-descriptor-semantics-mismatch", 409));
-                }
-                remote_store
-                    .promote_server_dependencies(cache, &dependencies, || client.ensure_active())?;
-                records.push(validate_remote(
-                    RemoteRecord {
-                        key,
-                        version,
-                        payload: Some(payload),
-                        local_hash: Some(hash),
-                    },
-                    &remote_cas,
-                )?)?;
-            }
-        }
-        let initial_revision = remote_store.revision()?;
-        let remote_revision = remote_store.server_apply_advance(
-            initial_revision,
-            None,
-            head,
-            &records,
-            &[],
-            &[],
-            ReplicaAdvance::default(),
-        )?;
-        // A complete verified mirror has an authoritative alias inventory, even
-        // for references already missing on the server. No legacy files exist
-        // in this newly created staging repository.
-        let generation = super::active_generation(&remote_store.connection)?;
-        let authority = serde_json::to_string(&super::AssetRepositoryAuthorityState::V2 {
-            migration_id: head.head_id.clone(),
-            compatibility_hash: head.head_id.clone(),
-        })
-        .map_err(|_| SyncError::new("backup-metadata", 409))?;
-        remote_store.connection.execute(
-            "UPDATE asset_repository_authority SET value=?2 WHERE generation=?1",
-            params![generation, authority],
-        )?;
-        let remote = crate::portable_backup::create_verified_library_backup(
-            &mut remote_store,
-            remote_revision,
-            &root.join("remote.risunest"),
-            &scratch.path().join("remote-staging"),
-            &cancel,
-        )
-        .map_err(|_| SyncError::new("complete-remote-backup-required", 409))?;
-        client.ensure_active()?;
-        if self.revision()? != revision {
+
+        check()?;
+        if self.revision()? != expected_revision {
             return Err(SyncError::new("local-revision-changed", 409));
         }
-        let receipt=serde_json::to_vec(&serde_json::json!({"format":"risunest-portable-backup","scope":"library","head":head,"localRevision":revision,"localHash":local,"remoteHash":remote})).map_err(|_|SyncError::new("backup-receipt-encoding",409))?;
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(root.join("complete.json"))?;
-        file.write_all(&receipt)?;
-        file.sync_all()?;
-        // The verified packages now own every byte. Close database handles
-        // before removing the temporary mirror, especially on Windows.
-        remote_store.server_unbind()?;
-        drop(remote_store);
-        drop(records);
-        scratch.close()?;
-        Ok(())
+        let root = self.repository_root.clone();
+        let native = PayloadCas::new(&root)?;
+        let residency = crate::server_sync::residency::Residency::open(&root)?;
+        let mut objects = BTreeMap::new();
+        crate::server_sync::backups::visit_reference_objects(
+            &root,
+            source,
+            check,
+            |object| {
+                check()?;
+                if object.metadata && !object.local_required {
+                    return Err(SyncError::new("invalid-conflict-object", 409));
+                }
+                if objects.contains_key(&object.hash) {
+                    return Err(SyncError::new("duplicate-conflict-object", 409));
+                }
+                if let Some(mut file) = native.open_object(&object.hash)? {
+                    native.prepare_reader_expected(
+                        &mut file,
+                        &object.hash,
+                        object.byte_size,
+                    )?;
+                } else if object.metadata || object.local_required {
+                    return Err(SyncError::new("conflict-local-object-missing", 409));
+                } else {
+                    let context = object.context_id.as_deref()
+                        .ok_or_else(|| SyncError::new("invalid-conflict-object", 409))?;
+                    if !residency.confirms(&object.hash, Some(object.byte_size), context)? {
+                        return Err(SyncError::new("conflict-custody-unavailable", 409));
+                    }
+                }
+                objects.insert(object.hash, StoredObject {
+                    byte_size: object.byte_size,
+                    metadata: object.metadata,
+                    context_id: object.context_id,
+                    local_required: object.local_required,
+                });
+                Ok(())
+            },
+        )?;
+
+        let cache = Cache::open(&root)?;
+        let mut records = ValidatedRecords::new()?;
+        crate::server_sync::backups::visit_reference_records(
+            &root,
+            source,
+            check,
+            |record| {
+                check()?;
+                let dependencies = record.payload.as_ref()
+                    .map(|payload| projection::dependencies(payload, &native))
+                    .transpose()?
+                    .unwrap_or_default();
+                let mut local = Vec::new();
+                let mut remote = BTreeMap::<String, Vec<String>>::new();
+                for hash in &dependencies {
+                    let object = objects.get(hash)
+                        .ok_or_else(|| SyncError::new("conflict-object-missing", 409))?;
+                    if native.stat_object(hash)? == Some(object.byte_size) {
+                        local.push(hash.clone());
+                    } else if object.metadata || object.local_required {
+                        return Err(SyncError::new("conflict-local-object-missing", 409));
+                    } else {
+                        let context = object.context_id.as_ref()
+                            .ok_or_else(|| SyncError::new("invalid-conflict-object", 409))?;
+                        remote.entry(context.clone()).or_default().push(hash.clone());
+                    }
+                }
+                if let Some(payload) = record.payload.as_ref() {
+                    let dirty = key_parts(&record.key, source.local_revision())?;
+                    if cache.project(
+                        payload,
+                        &dependencies,
+                        &relations(&dirty)?,
+                        scopes(&dirty),
+                    )?.version != record.version {
+                        return Err(SyncError::new(
+                            "server-descriptor-semantics-mismatch",
+                            409,
+                        ));
+                    }
+                }
+                if !local.is_empty() {
+                    self.promote_server_dependencies_with_residency(
+                        &cache,
+                        &local,
+                        None,
+                        || check(),
+                    )?;
+                }
+                for (context, hashes) in remote {
+                    self.promote_server_dependencies_with_residency(
+                        &cache,
+                        &hashes,
+                        Some((&residency, &context)),
+                        || check(),
+                    )?;
+                }
+                records.push(validate_remote_with_residency(
+                    RemoteRecord {
+                        key: record.key,
+                        version: record.version,
+                        payload: record.payload,
+                        local_hash: None,
+                    },
+                    &native,
+                    |hash, size| {
+                        let Some(object) = objects.get(hash) else { return Ok(false); };
+                        if size.is_some_and(|size| size != object.byte_size) {
+                            return Ok(false);
+                        }
+                        if native.stat_object(hash)? == Some(object.byte_size) {
+                            return Ok(true);
+                        }
+                        let Some(context) = object.context_id.as_deref() else {
+                            return Ok(false);
+                        };
+                        residency.confirms(hash, Some(object.byte_size), context)
+                            .map_err(|_| super::StoreError::Validation {
+                                message: "Conflict custody unavailable".into(),
+                            })
+                    },
+                )?)?;
+                Ok(())
+            },
+        )?;
+
+        let stage = self.replace_begin()?;
+        let staging_id = stage.staging_id.clone();
+        let prepared = (|| -> Result<super::PreparedReplaceCommit> {
+            check()?;
+            let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let active = super::active_generation(&tx)?;
+            let raw_root: Option<serde_json::Value> = tx.query_row(
+                "SELECT value FROM root WHERE generation=?1",
+                [&active],
+                |row| row.get::<_, String>(0),
+            ).optional()?.map(|value| serde_json::from_str(&value)).transpose()?;
+            let mut saw_root = false;
+            records.visit(false, |item| {
+                check().map_err(|_| super::StoreError::Validation {
+                    message: "Conflict restore cancelled".into(),
+                })?;
+                let Some(mut payload) = item.record.payload else { return Ok(()); };
+                let raw_character: Option<serde_json::Value> =
+                    if let crate::logical_records::LogicalRecordLocator::Character { character_id } = &item.locator {
+                        tx.query_row(
+                            "SELECT detail FROM characters WHERE generation=?1 AND character_id=?2",
+                            params![active, character_id],
+                            |row| row.get::<_, String>(0),
+                        ).optional()?.map(|value| serde_json::from_str(&value)).transpose()?
+                    } else {
+                        None
+                    };
+                saw_root |= matches!(&item.locator, crate::logical_records::LogicalRecordLocator::Root);
+                projection::preserve_local_view(
+                    &mut payload,
+                    raw_character.as_ref(),
+                    raw_root.as_ref(),
+                );
+                super::record_apply::apply_materialized_record(
+                    &tx,
+                    &staging_id,
+                    item.locator,
+                    payload.record,
+                    payload.messages.as_deref(),
+                )?;
+                Ok(())
+            })?;
+            if !saw_root {
+                return Err(SyncError::new("conflict-root-missing", 409));
+            }
+            tx.execute(
+                "UPDATE characters SET conversation_count=(SELECT count(*) FROM conversations
+                    WHERE conversations.generation=?1 AND conversations.character_id=characters.character_id)
+                    WHERE generation=?1",
+                [&staging_id],
+            )?;
+            super::record_apply::validate_configured_index_uniqueness(&tx, &staging_id)?;
+            let duplicate_plugins: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM plugin_storage WHERE generation=?1
+                    GROUP BY ordinal HAVING count(*)>1)",
+                [&staging_id],
+                |row| row.get(0),
+            )?;
+            if duplicate_plugins {
+                return Err(SyncError::new("conflict-plugin-order-invalid", 409));
+            }
+            tx.commit()?;
+            check()?;
+            self.replace_put_asset_repository_authority(
+                &staging_id,
+                &super::AssetRepositoryAuthorityState::V2 {
+                    migration_id: source.id().to_owned(),
+                    compatibility_hash: source.index_hash().to_owned(),
+                },
+            )?;
+            Ok(self.prepare_replace_commit(&staging_id, Some(expected_revision))?)
+        })();
+        match prepared {
+            Ok(prepared) => Ok(prepared),
+            Err(error) => {
+                self.replace_abort(&staging_id)?;
+                Err(error)
+            }
+        }
     }
+
     fn promote_server_dependencies(
         &mut self,
         cache: &Cache,
@@ -2477,15 +2558,18 @@ impl PersistentStore {
             let registrations = batch
                 .iter()
                 .map(|hash| {
-                    let size = match cache.cas.stat_object(hash)? {
+                    let size = match native.stat_object(hash)? {
                         Some(size) => size,
-                        None => remote
-                            .and_then(|(residency, context)| {
-                                residency.object(hash, Some(context)).transpose()
-                            })
-                            .transpose()?
-                            .map(|object| object.size)
-                            .ok_or_else(|| SyncError::new("missing-downloaded-payload", 409))?,
+                        None => match cache.cas.stat_object(hash)? {
+                            Some(size) => size,
+                            None => remote
+                                .and_then(|(residency, context)| {
+                                    residency.object(hash, Some(context)).transpose()
+                                })
+                                .transpose()?
+                                .map(|object| object.size)
+                                .ok_or_else(|| SyncError::new("missing-downloaded-payload", 409))?,
+                        },
                     };
                     Ok(AssetObjectRegistration {
                         object_hash: hash.clone(),

@@ -225,6 +225,44 @@ impl Residency {
     pub fn begin_release(&self, object: &RemoteObject) -> Result<bool> {
         Ok(self.db.execute("UPDATE objects SET state='releasing' WHERE context=?1 AND hash=?2 AND retention_id=?3 AND state IN ('active','releasing')",params![object.context,object.hash,object.retention_id])?==1)
     }
+    pub fn begin_latest_release(
+        &mut self,
+        digest: &str,
+        context: &str,
+    ) -> Result<Option<RemoteObject>> {
+        validate_hash(digest)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let value: Option<(i64, String, String, String)> = tx
+            .query_row(
+                "SELECT o.size,o.retention_id,c.device_id,c.config FROM objects o JOIN contexts c ON c.id=o.context WHERE o.hash=?1 AND o.context=?2 AND o.state!='released'",
+                params![digest, context],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((size, retention_id, device_id, config)) = value else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let updated = tx.execute(
+            "UPDATE objects SET state='releasing' WHERE context=?1 AND hash=?2 AND retention_id=?3 AND state IN ('active','releasing')",
+            params![context, digest, retention_id],
+        )?;
+        tx.commit()?;
+        if updated != 1 {
+            return Ok(None);
+        }
+        Ok(Some(RemoteObject {
+            context: context.to_owned(),
+            hash: digest.to_owned(),
+            size: u64::try_from(size).map_err(|_| SyncError::new("invalid-retention-size", 409))?,
+            retention_id,
+            device_id,
+            config: serde_json::from_str(&config)
+                .map_err(|_| SyncError::new("invalid-retention-config", 409))?,
+        }))
+    }
     pub fn finish_release(&self, object: &RemoteObject) -> Result<()> {
         self.db.execute("UPDATE objects SET state='released' WHERE context=?1 AND hash=?2 AND retention_id=?3 AND state='releasing'",params![object.context,object.hash,object.retention_id])?;
         Ok(())

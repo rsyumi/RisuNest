@@ -3,7 +3,6 @@ use super::*;
 use crate::server_sync::client::ServerConfig;
 use risunest_sync_server::{http, store::Store};
 use risunest_sync_wire::{ChangeSet, Domain, ScopeFence};
-use std::fs::OpenOptions;
 #[path = "server_sync_initial_tests.rs"]
 mod initial;
 #[path = "server_sync_matrix_tests.rs"]
@@ -377,61 +376,42 @@ fn two_native_replicas_seed_publish_pull_and_preserve_same_key_conflicts() {
         .unwrap()
         .collect::<std::io::Result<Vec<_>>>()
         .unwrap();
-    let references = backups.iter().filter(|entry| entry.path().join("index.sqlite").is_file())
-        .collect::<Vec<_>>();
-    assert_eq!(references.len(), 1);
-    let reference_id = references[0].file_name().into_string().unwrap();
+    assert_eq!(backups.len(), 1);
+    let reference = &backups[0];
+    assert!(reference.path().join("index.sqlite").is_file());
+    assert!(reference.path().join("complete.json").is_file());
+    assert!(!reference.path().join("local.risunest").exists());
+    assert!(!reference.path().join("remote.risunest").exists());
+    let reference_id = reference.file_name().into_string().unwrap();
     let reference_index = crate::server_sync::backups::references::open(
         &second.repository_root, &reference_id, &|| Ok(())).unwrap();
     let reference_sides: i64 = reference_index.query_row(
         "SELECT count(DISTINCT side) FROM records", [], |r| r.get(0)).unwrap();
     assert_eq!(reference_sides, 2);
-    let backups = backups.iter().filter(|entry| entry.path().join("local.risunest").is_file())
-        .collect::<Vec<_>>();
-    assert_eq!(backups.len(), 1);
-    for name in ["local.risunest", "remote.risunest", "complete.json"] {
-        assert!(backups[0].path().join(name).is_file());
-    }
-    for name in ["local.risunest", "remote.risunest"] {
-        let archive = crate::portable_backup::VerifiedArchive::open(
-            std::fs::File::open(backups[0].path().join(name)).unwrap(),
-            &backups[0].path(),
-            &crate::local_backup::NeverCancelled,
-        )
-        .unwrap();
-        assert!(archive.manifest.library_included);
-        assert!(!archive.manifest.device_included);
-        assert!(!archive.manifest.repair_required);
-        archive
-            .validate_library(&crate::local_backup::NeverCancelled)
-            .unwrap();
-        let scratch = tempfile::tempdir().unwrap();
-        let mut restored = PersistentStore::open(scratch.path()).unwrap();
-        let stage = restored
-            .stage_portable_records(&archive.db, &crate::local_backup::NeverCancelled)
-            .unwrap();
-        let prepared = restored
-            .prepare_replace_commit(&stage.staging_id, Some(0))
-            .unwrap();
-        let snapshot = prepared;
-        restored.finish_prepared_replace(snapshot).unwrap();
-        assert_eq!(restored.revision().unwrap(), 1);
-    }
-    let listed = crate::server_sync::backups::list(&second.repository_root).unwrap();
+    let listed = crate::server_sync::backups::list(&second.repository_root, None)
+        .unwrap()
+        .items;
     assert_eq!(listed.len(), 1);
     let source = crate::server_sync::backups::source(
         &second.repository_root,
         &listed[0].id,
         crate::server_sync::backups::Side::Remote,
-        || false,
+        &|| Ok(()),
     )
     .unwrap();
-    assert!(Path::new(&source).is_file());
+    assert_eq!(source.id(), listed[0].id);
+    assert_eq!(source.side(), crate::server_sync::backups::Side::Remote);
+    crate::server_sync::backups::validate_reference_source(
+        &second.repository_root,
+        &source,
+        &|| Ok(()),
+    )
+    .unwrap();
     assert!(crate::server_sync::backups::source(
         &second.repository_root,
         "../outside",
         crate::server_sync::backups::Side::Local,
-        || false
+        &|| Ok(())
     )
     .is_err());
     assert_eq!(
@@ -439,31 +419,11 @@ fn two_native_replicas_seed_publish_pull_and_preserve_same_key_conflicts() {
             &second.repository_root,
             &listed[0].id,
             crate::server_sync::backups::Side::Local,
-            || true
+            &|| Err(crate::server_sync::SyncError::new("cancelled", 409))
         )
         .unwrap_err()
         .code,
         "cancelled"
-    );
-    {
-        use std::io::Write;
-        OpenOptions::new()
-            .append(true)
-            .open(&source)
-            .unwrap()
-            .write_all(b"synthetic corruption")
-            .unwrap();
-    }
-    assert_eq!(
-        crate::server_sync::backups::source(
-            &second.repository_root,
-            &listed[0].id,
-            crate::server_sync::backups::Side::Remote,
-            || false
-        )
-        .unwrap_err()
-        .code,
-        "backup-hash-mismatch"
     );
     use super::super::server_sync_engine::Resolution;
     for (index, resolution) in [Resolution::KeepLocal, Resolution::KeepRemote]

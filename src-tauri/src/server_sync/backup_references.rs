@@ -2,7 +2,7 @@
 //! local bytes stay in the repository CAS, never beside the index.
 use super::{directory, Side};
 use crate::asset_repository::{
-    job_pins::{CasJobKind, CasObjectRole, DurableCasJob},
+    job_pins::{CasJobKind, CasObjectRole, CasReleaseOutcome, DurableCasJob},
     PayloadCas,
 };
 use crate::server_sync::{
@@ -79,6 +79,27 @@ pub(crate) struct CapturedRecord {
     pub key: String,
     pub version: RecordVersion,
     pub body_hash: Option<String>,
+    pub body_bytes: Option<u64>,
+}
+
+pub(crate) struct SourceRecord {
+    pub key: String,
+    pub version: RecordVersion,
+    pub payload: Option<crate::persistent_store::server_sync_projection::ServerPayload>,
+}
+
+pub(crate) struct SideRequirements {
+    pub local_required_bytes: u64,
+    pub remote_dependent_bytes: u64,
+    pub local_required_available: bool,
+}
+
+pub(crate) struct SourceObject {
+    pub hash: String,
+    pub byte_size: u64,
+    pub metadata: bool,
+    pub context_id: Option<String>,
+    pub local_required: bool,
 }
 
 pub(crate) struct Capture {
@@ -209,14 +230,15 @@ impl Capture {
     pub(crate) fn visit_records(&self, mut visit: impl FnMut(CapturedRecord) -> Result<()>) -> Result<()> {
         let mut after = (String::new(), String::new());
         loop {
-            let mut statement = self.db.prepare("SELECT side,record_key,version_json,body_hash
+            let mut statement = self.db.prepare("SELECT side,record_key,version_json,body_hash,body_bytes
                 FROM records WHERE (side,record_key)>(?1,?2) ORDER BY side,record_key LIMIT 256")?;
             let page = statement.query_map(params![after.0, after.1], |row|
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?)))?
+                    row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?)))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             if page.is_empty() { return Ok(()); }
-            for (side, key, version, body_hash) in page {
+            for (side, key, version, body_hash, body_bytes) in page {
                 after = (side.clone(), key.clone());
                 let side = match side.as_str() {
                     "local" => Side::Local,
@@ -225,7 +247,8 @@ impl Capture {
                 };
                 let version = serde_json::from_str(&version)
                     .map_err(|_| SyncError::new("invalid-conflict-version", 409))?;
-                visit(CapturedRecord { side, key, version, body_hash })?;
+                visit(CapturedRecord { side, key, version, body_hash,
+                    body_bytes: unsigned_size(body_bytes)? })?;
             }
         }
     }
@@ -384,8 +407,8 @@ impl Capture {
             Ok(())
         })?;
         self.pins.seal(store, self.created_at_ms as i64)?;
-        // The durable pins remain owners until conflict roots and source leases
-        // take over. Failure and cancellation must never release them as aborted.
+        // The sealed job remains the owner until the complete reference root is
+        // durably published. Failure and cancellation must leave its pins active.
         self.db.close().map_err(|(_, error)| error)?;
         let index = self.path.join("index.sqlite");
         // Flush the original writable handle. FlushFileBuffers rejects a
@@ -419,6 +442,9 @@ impl Capture {
         std::fs::hard_link(&marker, &destination)?;
         drop(marker);
         crate::trust_boundary::sync_directory(&self.path)?;
+        // The complete reference root owns these objects now. A failed journal
+        // cleanup is a safe leak recovered by normal durable-job maintenance.
+        let _ = self.pins.release(CasReleaseOutcome::Committed);
         Ok(receipt)
     }
 }
@@ -491,6 +517,11 @@ pub(crate) fn open(root: &Path, id: &str, check: &impl Fn() -> Result<()>) -> Re
     Ok(db)
 }
 
+pub(crate) fn open_for_inspection(root: &Path, id: &str) -> Result<Connection> {
+    inspect(root, id)?;
+    index(&directory(root, id)?)
+}
+
 fn unsigned_size(size: Option<i64>) -> Result<Option<u64>> {
     size.map(u64::try_from).transpose()
         .map_err(|_| SyncError::new("invalid-conflict-object-size", 409))
@@ -514,6 +545,179 @@ pub(crate) fn visit_objects(db: &Connection, mut visit: impl FnMut(Object) -> Re
         }
     }
     Ok(())
+}
+
+pub(crate) fn visit_side_objects(
+    db: &Connection,
+    side: Side,
+    mut visit: impl FnMut(Object) -> Result<()>,
+) -> Result<()> {
+    let mut after = String::new();
+    loop {
+        let mut statement = db.prepare("SELECT hash,byte_size,role='metadata',context_id,local_required
+            FROM objects WHERE side=?1 AND hash>?2 ORDER BY hash LIMIT 256")?;
+        let page = statement.query_map(params![side_name(side), after], |r| Ok((
+            r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, bool>(2)?,
+            r.get::<_, Option<String>>(3)?, r.get::<_, bool>(4)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if page.is_empty() { break; }
+        for (hash, size, metadata, context_id, local_required) in page {
+            risunest_sync_wire::validate_hash(&hash)?;
+            if let Some(context) = &context_id { risunest_sync_wire::validate_hash(context)?; }
+            after = hash.clone();
+            visit(Object { hash, byte_size: unsigned_size(size)?, metadata, context_id, local_required })?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn visit_source_objects(
+    root: &Path,
+    db: &Connection,
+    side: Side,
+    check: &impl Fn() -> Result<()>,
+    mut visit: impl FnMut(SourceObject) -> Result<()>,
+) -> Result<()> {
+    let cas = PayloadCas::new(root)?;
+    visit_side_objects(db, side, |object| {
+        check()?;
+        let byte_size = object.byte_size
+            .ok_or_else(|| SyncError::new("invalid-conflict-object-size", 409))?;
+        if object.metadata || object.local_required {
+            let file = cas.open_object(&object.hash)?
+                .ok_or_else(|| SyncError::new("conflict-local-object-missing", 409))?;
+            verify_file(file, Some((&object.hash, byte_size)), check)?;
+        }
+        visit(SourceObject {
+            hash: object.hash,
+            byte_size,
+            metadata: object.metadata,
+            context_id: object.context_id,
+            local_required: object.local_required,
+        })
+    })
+}
+
+pub(crate) fn side_requirements(root: &Path, db: &Connection, side: Side) -> Result<SideRequirements> {
+    let cas = PayloadCas::new(root)?;
+    let (local, remote, invalid): (i64, i64, bool) = db.query_row(
+        "SELECT coalesce(sum(CASE WHEN role='metadata' OR local_required=1 THEN byte_size ELSE 0 END),0),
+            coalesce(sum(CASE WHEN role='payload' AND local_required=0 THEN byte_size ELSE 0 END),0),
+            EXISTS(SELECT 1 FROM objects WHERE side=?1 AND (byte_size IS NULL
+                OR (role='payload' AND local_required=0 AND context_id IS NULL)))
+            FROM objects WHERE side=?1", params![side_name(side)], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+    if invalid {
+        return Err(SyncError::new("invalid-conflict-object", 409));
+    }
+    let mut result = SideRequirements {
+        local_required_bytes: u64::try_from(local)
+            .map_err(|_| SyncError::new("storage-size-overflow", 409))?,
+        remote_dependent_bytes: u64::try_from(remote)
+            .map_err(|_| SyncError::new("storage-size-overflow", 409))?,
+        local_required_available: true,
+    };
+    let mut after = String::new();
+    loop {
+        let mut statement = db.prepare("SELECT hash,byte_size FROM objects WHERE side=?1
+            AND (role='metadata' OR local_required=1) AND hash>?2 ORDER BY hash LIMIT 256")?;
+        let page = statement.query_map(params![side_name(side), after], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+        if page.is_empty() { break; }
+        for (hash, size) in page {
+            risunest_sync_wire::validate_hash(&hash)?;
+            let size = u64::try_from(size)
+                .map_err(|_| SyncError::new("invalid-conflict-object-size", 409))?;
+            after = hash.clone();
+            result.local_required_available &= cas.stat_object(&hash).ok().flatten() == Some(size);
+        }
+    }
+    Ok(result)
+}
+
+pub(crate) fn visit_source_records(
+    root: &Path,
+    db: &Connection,
+    side: Side,
+    check: &impl Fn() -> Result<()>,
+    mut visit: impl FnMut(SourceRecord) -> Result<()>,
+) -> Result<()> {
+    let cas = PayloadCas::new(root)?;
+    let mut after = String::new();
+    loop {
+        check()?;
+        let mut statement = db.prepare("SELECT record_key,version_json,body_hash,body_bytes
+            FROM records WHERE side=?1 AND record_key>?2 ORDER BY record_key LIMIT 256")?;
+        let page = statement.query_map(params![side_name(side), after], |r| Ok((
+            r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?,
+            r.get::<_, Option<i64>>(3)?)))?.collect::<std::result::Result<Vec<_>, _>>()?;
+        if page.is_empty() { break; }
+        for (key, encoded_version, body_hash, body_bytes) in page {
+            check()?;
+            crate::logical_records::decode_logical_record_key(&key)
+                .map_err(|_| SyncError::new("invalid-conflict-record-key", 409))?;
+            let version: RecordVersion = serde_json::from_str(&encoded_version)
+                .map_err(|_| SyncError::new("invalid-conflict-version", 409))?;
+            version.validate()?;
+            let body_bytes = unsigned_size(body_bytes)?;
+            if matches!(version, RecordVersion::Live { .. }) != body_hash.is_some()
+                || body_hash.is_some() != body_bytes.is_some() {
+                return Err(SyncError::new("invalid-conflict-record-body", 409));
+            }
+            let payload = match (body_hash, body_bytes) {
+                (Some(hash), Some(size)) => {
+                    risunest_sync_wire::validate_hash(&hash)?;
+                    let file = cas.open_object(&hash)?
+                        .ok_or_else(|| SyncError::new("conflict-record-metadata-missing", 409))?;
+                    let bytes = read_verified_file(file, &hash, size, check)?;
+                    let payload = serde_json::from_slice(&bytes)
+                        .map_err(|_| SyncError::new("invalid-server-payload", 409))?;
+                    if serde_json::to_vec(&payload)
+                        .map_err(|_| SyncError::new("invalid-server-payload", 409))? != bytes {
+                        return Err(SyncError::new("noncanonical-server-payload", 409));
+                    }
+                    Some(payload)
+                }
+                (None, None) => None,
+                _ => return Err(SyncError::new("invalid-conflict-record-body", 409)),
+            };
+            after = key.clone();
+            visit(SourceRecord { key, version, payload })?;
+        }
+    }
+    Ok(())
+}
+
+fn read_verified_file(
+    mut file: File,
+    expected_hash: &str,
+    expected_bytes: u64,
+    check: &impl Fn() -> Result<()>,
+) -> Result<Vec<u8>> {
+    if expected_bytes > MAX_METADATA_BYTES as u64 {
+        return Err(SyncError::new("conflict-record-too-large", 409));
+    }
+    let capacity = usize::try_from(expected_bytes)
+        .map_err(|_| SyncError::new("invalid-conflict-object-size", 409))?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity)
+        .map_err(|_| SyncError::new("conflict-record-too-large", 409))?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    while bytes.len() as u64 <= expected_bytes {
+        check()?;
+        let count = file.read(&mut buffer)?;
+        if count == 0 { break; }
+        hash.update(&buffer[..count]);
+        bytes.extend_from_slice(&buffer[..count]);
+        if bytes.len() as u64 > expected_bytes { break; }
+    }
+    if bytes.len() as u64 != expected_bytes || format!("{:x}", hash.finalize()) != expected_hash {
+        return Err(SyncError::new("conflict-object-hash-mismatch", 409));
+    }
+    Ok(bytes)
 }
 
 pub(crate) fn visit_roots(root: &Path, mut visit: impl FnMut(Object) -> Result<()>) -> Result<()> {
