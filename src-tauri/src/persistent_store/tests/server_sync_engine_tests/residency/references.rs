@@ -1,5 +1,7 @@
 use super::*;
-use crate::asset_repository::job_pins::DurableCasJob;
+use crate::asset_repository::job_pins::{
+    CasJobKind, CasObjectRole, CasReleaseOutcome, DurableCasJob,
+};
 use crate::server_sync::{
     backups::{references, Side},
     cache::Cache,
@@ -664,6 +666,17 @@ fn reference_source_rejects_missing_local_required_and_corrupt_metadata() {
         ).unwrap();
         let cas = PayloadCas::new(scenario.local.repository_root()).unwrap();
         fs::remove_file(cas.object_path(&scenario.unique_payload).unwrap().unwrap()).unwrap();
+        let export_scratch = tempfile::tempdir().unwrap();
+        let export_error = match crate::server_sync::backups::prepare_reference_portable_store(
+            scenario.local.repository_root(),
+            &source,
+            export_scratch.path(),
+            &|| Ok(()),
+        ) {
+            Ok(_) => panic!("portable export must not hydrate a local-required payload"),
+            Err(error) => error,
+        };
+        assert_eq!(export_error.code, "conflict-local-object-missing");
         let revision = scenario.local.revision().unwrap();
         let error = match scenario.local.prepare_server_conflict_replacement(
             &source,
@@ -763,4 +776,176 @@ fn reference_source_rejects_a_record_body_with_mismatched_descriptor_semantics()
         Err(error) => error,
     };
     assert_eq!(error.code, "server-descriptor-semantics-mismatch");
+}
+
+#[test]
+fn remote_reference_exports_a_restore_validated_portable_library_with_exact_records() {
+    use crate::local_backup::NeverCancelled;
+    use std::fs::File;
+
+    let mut scenario = Scenario::new();
+    let mut remote = PersistentStore::open(scenario._first_root.path()).unwrap();
+    let generation = active_generation(&remote.connection).unwrap();
+    let mut root = remote.read_root(None).unwrap().value;
+    root["referenceExportRoot"] = json!("exact-root-value");
+    let mut presets = remote.connection.prepare(
+        "SELECT value FROM bot_presets WHERE generation=?1 ORDER BY configured_index",
+    ).unwrap().query_map([&generation], |row| row.get::<_, String>(0)).unwrap()
+        .map(|value| serde_json::from_str::<Value>(&value.unwrap()).unwrap())
+        .collect::<Vec<_>>();
+    assert!(!presets.is_empty());
+    presets[0]["referenceExportPreset"] = json!("exact-preset-value");
+    let (character_id, mut character): (String, Value) = remote.connection.query_row(
+        "SELECT character_id,detail FROM characters WHERE generation=?1 ORDER BY configured_index LIMIT 1",
+        [&generation],
+        |row| Ok((row.get(0)?, serde_json::from_str::<Value>(&row.get::<_, String>(1)?).unwrap())),
+    ).unwrap();
+    character["referenceExportCharacter"] = json!("exact-character-value");
+    let (conversation_id, mut conversation, message_count): (String, Value, i64) = remote.connection.query_row(
+        "SELECT conversation_id,detail,message_count FROM conversations
+         WHERE generation=?1 AND character_id=?2 ORDER BY configured_index LIMIT 1",
+        params![generation, character_id],
+        |row| Ok((row.get(0)?, serde_json::from_str::<Value>(&row.get::<_, String>(1)?).unwrap(), row.get(2)?)),
+    ).unwrap();
+    conversation["referenceExportConversation"] = json!({"nested": true, "rank": 7});
+    let message = json!({
+        "role": "user",
+        "data": "portable conflict exact text",
+        "chatId": "portable-conflict-message",
+        "metadata": {"speaker": "synthetic", "sequence": 7}
+    });
+    let plugin = json!({"text": "exact-plugin-value", "metadata": {"enabled": true}});
+    remote.commit(&WorkingSetCommit {
+        root: Some(root),
+        replace_presets: Some(presets),
+        character_details: Some(vec![character]),
+        conversations: Some(vec![ConversationMutation::ReplaceRange {
+            character_id: character_id.clone(),
+            conversation_id: conversation_id.clone(),
+            start: 0,
+            delete_count: message_count,
+            messages: vec![message.clone()],
+            conversation: Some(conversation.clone()),
+            configured_index: None,
+        }]),
+        plugin_storage: Some(vec![PluginStorageMutation::Set {
+            owner: "reference-export-plugin".into(),
+            key: "exact".into(),
+            value: plugin.clone(),
+        }]),
+        ..empty_working_set_commit(remote.revision().unwrap())
+    }).unwrap();
+    assert_eq!(settle(&mut remote).phase, "idle");
+    drop(remote);
+
+    assert_eq!(PayloadCas::new(scenario.local.repository_root()).unwrap()
+        .stat_object(&scenario.remote_payload).unwrap(), None);
+    let head = scenario.fixture.server.head().unwrap();
+    let (receipt, _) = scenario.capture(&head).unwrap();
+    let source = crate::server_sync::backups::source(
+        scenario.local.repository_root(),
+        &receipt.id,
+        Side::Remote,
+        &|| Ok(()),
+    ).unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let prepared = crate::server_sync::backups::prepare_reference_portable_store(
+        scenario.local.repository_root(),
+        &source,
+        work.path(),
+        &|| Ok(()),
+    ).unwrap();
+    assert_eq!(PayloadCas::new(scenario.local.repository_root()).unwrap()
+        .stat_object(&scenario.remote_payload).unwrap(), Some(128 * 1024 + 3));
+    let (mut export_store, revision, _scratch) = prepared.into_parts();
+    let archive_scratch = work.path().join("archive-scratch");
+    fs::create_dir(&archive_scratch).unwrap();
+    let candidate = work.path().join("reference-export.risunest");
+    crate::portable_backup::create_verified_library_backup(
+        &mut export_store,
+        revision,
+        &candidate,
+        &archive_scratch,
+        &NeverCancelled,
+    ).unwrap();
+    let archive = crate::portable_backup::VerifiedArchive::open(
+        File::open(&candidate).unwrap(),
+        work.path(),
+        &NeverCancelled,
+    ).unwrap();
+    archive.validate_library(&NeverCancelled).unwrap();
+
+    let restored_root = tempfile::tempdir().unwrap();
+    let mut restored = PersistentStore::open(restored_root.path()).unwrap();
+    let inventory = crate::portable_backup::RestoreInventory::build(
+        &archive,
+        work.path(),
+        &NeverCancelled,
+    ).unwrap();
+    let mut pins = DurableCasJob::begin(
+        restored.repository_root(),
+        &uuid::Uuid::new_v4().to_string(),
+        CasJobKind::LocalBackupRestore,
+        0,
+    ).unwrap();
+    let restored_cas = PayloadCas::new(restored.repository_root()).unwrap();
+    let mut statement = inventory.db
+        .prepare("SELECT hash,owner FROM live_objects ORDER BY hash")
+        .unwrap();
+    let mut rows = statement.query([]).unwrap();
+    while let Some(row) = rows.next().unwrap() {
+        let hash: String = row.get(0).unwrap();
+        let owner: bool = row.get(1).unwrap();
+        let (mut input, size) = archive.open_object(&hash).unwrap();
+        pins.prepare_reader_expected(
+            &restored_cas,
+            &mut input,
+            &hash,
+            size,
+            if owner {
+                CasObjectRole::OwnerManifest
+            } else {
+                CasObjectRole::DirectObject
+            },
+        ).unwrap();
+    }
+    drop(rows);
+    drop(statement);
+    pins.seal(&mut restored, 0).unwrap();
+    let stage = restored.stage_portable_records(&archive.db, &NeverCancelled).unwrap();
+    let prepared = restored.prepare_replace_commit(&stage.staging_id, Some(0)).unwrap();
+    restored.finish_prepared_replace(prepared).unwrap();
+    pins.release(CasReleaseOutcome::Committed).unwrap();
+    let restored_generation = active_generation(&restored.connection).unwrap();
+    assert_eq!(restored.read_root(None).unwrap().value["referenceExportRoot"], "exact-root-value");
+    let preset: Value = serde_json::from_str(&restored.connection.query_row::<String, _, _>(
+        "SELECT value FROM bot_presets WHERE generation=?1 ORDER BY configured_index LIMIT 1",
+        [&restored_generation], |row| row.get(0),
+    ).unwrap()).unwrap();
+    assert_eq!(preset["referenceExportPreset"], "exact-preset-value");
+    let restored_character: Value = serde_json::from_str(&restored.connection.query_row::<String, _, _>(
+        "SELECT detail FROM characters WHERE generation=?1 AND character_id=?2",
+        params![restored_generation, character_id], |row| row.get(0),
+    ).unwrap()).unwrap();
+    assert_eq!(restored_character["referenceExportCharacter"], "exact-character-value");
+    let restored_conversation: Value = serde_json::from_str(&restored.connection.query_row::<String, _, _>(
+        "SELECT detail FROM conversations WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",
+        params![restored_generation, character_id, conversation_id], |row| row.get(0),
+    ).unwrap()).unwrap();
+    assert_eq!(restored_conversation["referenceExportConversation"], conversation["referenceExportConversation"]);
+    let restored_message: Value = serde_json::from_str(&restored.connection.query_row::<String, _, _>(
+        "SELECT value FROM messages WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",
+        params![restored_generation, character_id, conversation_id], |row| row.get(0),
+    ).unwrap()).unwrap();
+    assert_eq!(restored_message, message);
+    let restored_plugin: Value = serde_json::from_str(&restored.connection.query_row::<String, _, _>(
+        "SELECT value FROM plugin_storage WHERE generation=?1 AND owner='reference-export-plugin' AND storage_key='exact'",
+        [&restored_generation], |row| row.get(0),
+    ).unwrap()).unwrap();
+    assert_eq!(restored_plugin, plugin);
+    let alias = restored.read_asset_alias("asset", "assets/reference-shared.png", None)
+        .unwrap().unwrap();
+    assert_eq!(alias.value.object_hash.as_deref(), Some(scenario.remote_payload.as_str()));
+    assert_eq!(PayloadCas::new(restored.repository_root()).unwrap()
+        .read_object(&scenario.remote_payload).unwrap().unwrap(), vec![61; 128 * 1024 + 3]);
 }

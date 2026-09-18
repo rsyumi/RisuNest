@@ -35,13 +35,36 @@ use risunest_sync_wire::{
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Resolution {
     KeepLocal,
     KeepRemote,
+}
+
+#[derive(Clone, Copy)]
+enum ConflictReferenceMode<'a> {
+    DirectRestore { source_root: &'a Path },
+    PortableExport { source_root: &'a Path },
+}
+
+impl ConflictReferenceMode<'_> {
+    fn source_root(self) -> &Path {
+        match self {
+            Self::DirectRestore { source_root } | Self::PortableExport { source_root } => {
+                source_root
+            }
+        }
+    }
+
+    fn hydrates_all(self) -> bool {
+        matches!(self, Self::PortableExport { .. })
+    }
 }
 
 #[cfg(test)]
@@ -2317,6 +2340,37 @@ impl PersistentStore {
         expected_revision: i64,
         check: &impl Fn() -> Result<()>,
     ) -> Result<super::PreparedReplaceCommit> {
+        let source_root = self.repository_root.clone();
+        self.prepare_server_conflict_replacement_mode(
+            source,
+            expected_revision,
+            ConflictReferenceMode::DirectRestore { source_root: &source_root },
+            check,
+        )
+    }
+
+    pub(crate) fn prepare_server_conflict_portable_export(
+        &mut self,
+        source_root: &Path,
+        source: &crate::server_sync::backups::ReferenceSource,
+        expected_revision: i64,
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<super::PreparedReplaceCommit> {
+        self.prepare_server_conflict_replacement_mode(
+            source,
+            expected_revision,
+            ConflictReferenceMode::PortableExport { source_root },
+            check,
+        )
+    }
+
+    fn prepare_server_conflict_replacement_mode(
+        &mut self,
+        source: &crate::server_sync::backups::ReferenceSource,
+        expected_revision: i64,
+        mode: ConflictReferenceMode<'_>,
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<super::PreparedReplaceCommit> {
         #[derive(Clone)]
         struct StoredObject {
             byte_size: u64,
@@ -2329,12 +2383,14 @@ impl PersistentStore {
         if self.revision()? != expected_revision {
             return Err(SyncError::new("local-revision-changed", 409));
         }
-        let root = self.repository_root.clone();
-        let native = PayloadCas::new(&root)?;
-        let residency = crate::server_sync::residency::Residency::open(&root)?;
+        let source_root = mode.source_root();
+        let target_root = self.repository_root.clone();
+        let source_native = PayloadCas::new(source_root)?;
+        let target_native = PayloadCas::new(&target_root)?;
+        let residency = crate::server_sync::residency::Residency::open(source_root)?;
         let mut objects = BTreeMap::new();
         crate::server_sync::backups::visit_reference_objects(
-            &root,
+            source_root,
             source,
             check,
             |object| {
@@ -2345,14 +2401,27 @@ impl PersistentStore {
                 if objects.contains_key(&object.hash) {
                     return Err(SyncError::new("duplicate-conflict-object", 409));
                 }
-                if let Some(mut file) = native.open_object(&object.hash)? {
-                    native.prepare_reader_expected(
+                let available = if object.metadata || object.local_required {
+                    source_native.open_object(&object.hash)?
+                } else if mode.hydrates_all() {
+                    crate::server_sync::residency::open_or_hydrate_with_check(
+                        source_root,
+                        &object.hash,
+                        check,
+                    )?
+                } else {
+                    source_native.open_object(&object.hash)?
+                };
+                if let Some(mut file) = available {
+                    target_native.prepare_reader_expected(
                         &mut file,
                         &object.hash,
                         object.byte_size,
                     )?;
                 } else if object.metadata || object.local_required {
                     return Err(SyncError::new("conflict-local-object-missing", 409));
+                } else if mode.hydrates_all() {
+                    return Err(SyncError::new("conflict-custody-unavailable", 409));
                 } else {
                     let context = object.context_id.as_deref()
                         .ok_or_else(|| SyncError::new("invalid-conflict-object", 409))?;
@@ -2370,16 +2439,16 @@ impl PersistentStore {
             },
         )?;
 
-        let cache = Cache::open(&root)?;
+        let cache = Cache::open(&target_root)?;
         let mut records = ValidatedRecords::new()?;
         crate::server_sync::backups::visit_reference_records(
-            &root,
+            source_root,
             source,
             check,
             |record| {
                 check()?;
                 let dependencies = record.payload.as_ref()
-                    .map(|payload| projection::dependencies(payload, &native))
+                    .map(|payload| projection::dependencies(payload, &target_native))
                     .transpose()?
                     .unwrap_or_default();
                 let mut local = Vec::new();
@@ -2387,7 +2456,7 @@ impl PersistentStore {
                 for hash in &dependencies {
                     let object = objects.get(hash)
                         .ok_or_else(|| SyncError::new("conflict-object-missing", 409))?;
-                    if native.stat_object(hash)? == Some(object.byte_size) {
+                    if target_native.stat_object(hash)? == Some(object.byte_size) {
                         local.push(hash.clone());
                     } else if object.metadata || object.local_required {
                         return Err(SyncError::new("conflict-local-object-missing", 409));
@@ -2434,13 +2503,13 @@ impl PersistentStore {
                         payload: record.payload,
                         local_hash: None,
                     },
-                    &native,
+                    &target_native,
                     |hash, size| {
                         let Some(object) = objects.get(hash) else { return Ok(false); };
                         if size.is_some_and(|size| size != object.byte_size) {
                             return Ok(false);
                         }
-                        if native.stat_object(hash)? == Some(object.byte_size) {
+                        if target_native.stat_object(hash)? == Some(object.byte_size) {
                             return Ok(true);
                         }
                         let Some(context) = object.context_id.as_deref() else {
@@ -2486,11 +2555,13 @@ impl PersistentStore {
                         None
                     };
                 saw_root |= matches!(&locator, crate::logical_records::LogicalRecordLocator::Root);
-                projection::preserve_local_view(
-                    &mut payload,
-                    raw_character.as_ref(),
-                    raw_root.as_ref(),
-                );
+                if !mode.hydrates_all() {
+                    projection::preserve_local_view(
+                        &mut payload,
+                        raw_character.as_ref(),
+                        raw_root.as_ref(),
+                    );
+                }
                 super::record_apply::apply_materialized_record(
                     &tx,
                     &staging_id,

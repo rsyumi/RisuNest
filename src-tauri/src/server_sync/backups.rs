@@ -2,6 +2,7 @@
 pub(crate) mod references;
 
 use super::{Result, SyncError};
+use crate::persistent_store::PersistentStore;
 use risunest_sync_wire::RemoteHead;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -227,6 +228,44 @@ pub(crate) fn visit_reference_objects(
 ) -> Result<()> {
     let db = reopen(root, source, check)?;
     references::visit_source_objects(root, &db, source.side, check, visit)
+}
+
+pub(crate) struct PreparedReferencePortableStore {
+    store: PersistentStore,
+    revision: i64,
+    scratch: tempfile::TempDir,
+}
+
+impl PreparedReferencePortableStore {
+    pub(crate) fn into_parts(self) -> (PersistentStore, i64, tempfile::TempDir) {
+        (self.store, self.revision, self.scratch)
+    }
+}
+
+pub(crate) fn prepare_reference_portable_store(
+    source_root: &Path,
+    source: &ReferenceSource,
+    scratch_parent: &Path,
+    check: &impl Fn() -> Result<()>,
+) -> Result<PreparedReferencePortableStore> {
+    check()?;
+    let metadata = std::fs::symlink_metadata(scratch_parent)?;
+    if !metadata.is_dir() || crate::trust_boundary::is_link_like(&metadata) {
+        return Err(SyncError::new("invalid-conflict-export-scratch", 409));
+    }
+    let scratch = tempfile::Builder::new()
+        .prefix("server-conflict-export-")
+        .tempdir_in(scratch_parent)?;
+    let mut store = PersistentStore::open(&scratch.path().join("pds"))?;
+    let prepared = store.prepare_server_conflict_portable_export(
+        source_root,
+        source,
+        0,
+        check,
+    )?;
+    let revision = store.finish_prepared_replace(prepared)?.revision;
+    check()?;
+    Ok(PreparedReferencePortableStore { store, revision, scratch })
 }
 
 #[cfg(test)]
