@@ -145,7 +145,7 @@ async function seed() {
   localStorage.setItem("outside_smoke_sentinel", "untouched");
   await createNativeHypaEmbeddingCache().write(embeddingEntries(1));
   const plugins = pluginKeyspace();
-  await plugins.setItem("string", "text", "synthetic\u0000\ud800🙂");
+  await plugins.setItem("string", "text", "synthetic\u0000🙂");
   await plugins.setItem(
     "json",
     "graph",

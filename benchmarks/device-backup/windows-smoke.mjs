@@ -286,7 +286,7 @@ async function run() {
     reuse?.previous.directory ??
     path.join(root, ".tmp", `device-windows-smoke-${runId}`);
   const identifier = `io.github.rsyumi.risunest.devicebackupsynthetic.s${runId.replaceAll("-", "")}`;
-  if (!reuse) await mkdir(directory, { recursive: false });
+  if (!reuse) await mkdir(directory, { recursive: true });
   const reservation = net.createServer();
   reservation.listen(reuse?.previous.port ?? 0, "127.0.0.1");
   await once(reservation, "listening");
