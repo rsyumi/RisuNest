@@ -15,7 +15,6 @@ const NOW_MS: u64 = 1_000_000;
 const SECRET: &str = "connection-secret";
 const TOKEN: &[u8] = br#"{"token":"synthetic-token"}"#;
 const PREFIX: &str = "risunest";
-const USER_ID: u64 = 4242;
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -33,7 +32,13 @@ fn adapter(dependencies: Dependencies) -> std::sync::Arc<dyn Provider> {
 }
 
 fn config(server: &WireServer) -> ConnectionConfig {
-    config_with_account(server, "synthetic-owner")
+    config_with_account(
+        server,
+        &crate::external_storage::quota::credential_principal(
+            "github_releases",
+            b"synthetic-token",
+        ),
+    )
 }
 
 fn config_with_account(server: &WireServer, account_id: &str) -> ConnectionConfig {
@@ -71,12 +76,7 @@ fn repository_reply(private: bool) -> Reply {
     )
 }
 
-fn user_reply(id: u64) -> Reply {
-    reply(200, json!({ "id": id, "login": "ignored-login" }))
-}
-
-fn github_server(mut replies: Vec<Reply>) -> WireServer {
-    replies.insert(0, user_reply(USER_ID));
+fn github_server(replies: Vec<Reply>) -> WireServer {
     WireServer::start(replies)
 }
 
@@ -237,22 +237,35 @@ fn configuration_and_missing_secrets_are_refused_before_any_request() {
 }
 
 #[test]
-fn authenticated_numeric_principal_ignores_renderer_labels_and_logins() {
+fn credential_principal_shares_only_matching_tokens_at_the_same_authority() {
     runtime().block_on(async {
         let server = WireServer::start(vec![
-            reply(200, json!({ "id": USER_ID, "login": "first-login" })),
             repository_reply(true),
             reply(200, json!([])),
-            reply(200, json!({ "id": USER_ID, "login": "second-login" })),
+            repository_reply(true),
+            reply(200, json!([])),
             repository_reply(true),
             reply(200, json!([])),
         ]);
         let test = dependencies();
         let provider = adapter(test.dependencies.clone());
         let cancel = Cancellation::default();
+        let same = crate::external_storage::quota::credential_principal(
+            "github_releases",
+            b"synthetic-token",
+        );
+        let different = crate::external_storage::quota::credential_principal(
+            "github_releases",
+            b"different-token",
+        );
+        let different_secret = test.dependencies.vault.store(
+            &crate::external_storage::auth::SecretBytes(zeroize::Zeroizing::new(
+                br#"{"token":"different-token"}"#.to_vec(),
+            )),
+        ).await.unwrap();
         let first = provider
             .open_repository(
-                &config_with_account(&server, "renderer-label-one"),
+                &config_with_account(&server, &same),
                 &secret(),
                 OpenMode::Create,
                 &cancel,
@@ -262,8 +275,18 @@ fn authenticated_numeric_principal_ignores_renderer_labels_and_logins() {
             .0;
         let second = provider
             .open_repository(
-                &config_with_account(&server, "renderer-label-two"),
+                &config_with_account(&server, &same),
                 &secret(),
+                OpenMode::Create,
+                &cancel,
+            )
+            .await
+            .unwrap()
+            .0;
+        let third = provider
+            .open_repository(
+                &config_with_account(&server, &different),
+                &different_secret,
                 OpenMode::Create,
                 &cancel,
             )
@@ -272,44 +295,44 @@ fn authenticated_numeric_principal_ignores_renderer_labels_and_logins() {
             .0;
 
         assert_eq!(first.account, second.account);
+        assert_ne!(first.account, third.account);
         assert_eq!(first.account.provider(), "github_releases");
-        assert_eq!(first.account.principal(), "4242");
+        assert_eq!(first.account.principal(), same);
         assert!(!first.account.is_pending());
         let records = server.requests.lock().unwrap();
         assert_eq!(records.len(), 6);
-        assert!(head_line(&records[0]).contains("/user "));
-        assert!(head_line(&records[3]).contains("/user "));
-        assert!(records
+        for pair in records.chunks_exact(2) {
+            assert!(head_line(&pair[0]).contains("/repos/synthetic-owner/synthetic-repo "));
+            assert!(head_line(&pair[1]).contains("/repos/synthetic-owner/synthetic-repo/releases?"));
+        }
+        assert!(records[..4]
             .iter()
             .all(|record| record.headers.contains("authorization: Bearer synthetic-token")));
+        assert!(records[4..]
+            .iter()
+            .all(|record| record.headers.contains("authorization: Bearer different-token")));
     });
 }
 
 #[test]
-fn mismatched_or_invalid_identity_stops_before_repository_requests() {
+fn missing_credential_principal_stops_before_repository_requests() {
     runtime().block_on(async {
-        let cases = [
-            ("repository-shaped response", repository_reply(true)),
-            ("missing id", reply(200, json!({ "login": "synthetic" }))),
-            ("text id", reply(200, json!({ "id": USER_ID.to_string() }))),
-            ("zero id", user_reply(0)),
-        ];
-        for (label, identity) in cases {
-            let server = WireServer::start(vec![identity]);
-            let test = dependencies();
-            let provider = adapter(test.dependencies.clone());
-            let error = open(provider.as_ref(), &server, OpenMode::Create)
-                .await
-                .err()
-                .unwrap();
-            assert_eq!(error.kind, ErrorKind::Corrupt, "{label}");
-            let records = server.requests.lock().unwrap();
-            assert_eq!(records.len(), 1, "{label}");
-            assert!(head_line(&records[0]).contains("/user "), "{label}");
-            assert!(records[0]
-                .headers
-                .contains("authorization: Bearer synthetic-token"));
-        }
+        let server = WireServer::start(Vec::new());
+        let test = dependencies();
+        let provider = adapter(test.dependencies.clone());
+        let cancel = Cancellation::default();
+        let error = provider
+            .open_repository(
+                &config_with_account(&server, ""),
+                &secret(),
+                OpenMode::Create,
+                &cancel,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind, ErrorKind::Unsupported);
+        assert!(server.requests.lock().unwrap().is_empty());
     });
 }
 
@@ -324,9 +347,15 @@ fn resume_create_accepts_empty_or_one_exact_descriptor_and_converges() {
         let empty_handle = open(provider.as_ref(), &empty, OpenMode::ResumeCreate)
             .await
             .unwrap();
-        assert_eq!(empty_handle.account.principal(), "4242");
+        assert_eq!(
+            empty_handle.account.principal(),
+            crate::external_storage::quota::credential_principal(
+                "github_releases",
+                b"synthetic-token",
+            )
+        );
         let records = empty.requests.lock().unwrap();
-        assert_eq!(records.len(), 3);
+        assert_eq!(records.len(), 2);
         assert!(records.iter().all(|record| method_of(record) == "GET"));
         drop(records);
 
@@ -341,7 +370,7 @@ fn resume_create_accepts_empty_or_one_exact_descriptor_and_converges() {
             .await
             .unwrap();
         let records = released.requests.lock().unwrap();
-        assert_eq!(records.len(), 4);
+        assert_eq!(records.len(), 3);
         assert!(records.iter().all(|record| method_of(record) == "GET"));
         drop(records);
 
@@ -371,7 +400,7 @@ fn resume_create_accepts_empty_or_one_exact_descriptor_and_converges() {
             .unwrap();
         {
             let records = server.requests.lock().unwrap();
-            assert_eq!(records.len(), 4);
+            assert_eq!(records.len(), 3);
             assert!(records.iter().all(|record| method_of(record) == "GET"));
         }
 
@@ -402,9 +431,9 @@ fn resume_create_accepts_empty_or_one_exact_descriptor_and_converges() {
             .unwrap();
         assert!(sink.is_verified());
         let records = server.requests.lock().unwrap();
-        assert_eq!(records.len(), 7);
-        assert_eq!(method_of(&records[4]), "POST");
-        assert!(head_line(&records[4]).contains("/releases/7/assets?name=descriptor-root"));
+        assert_eq!(records.len(), 6);
+        assert_eq!(method_of(&records[3]), "POST");
+        assert!(head_line(&records[3]).contains("/releases/7/assets?name=descriptor-root"));
         assert!(records
             .iter()
             .all(|record| method_of(record) != "PATCH" && method_of(record) != "DELETE"));
@@ -548,7 +577,7 @@ fn a_public_repository_is_refused_and_an_occupied_root_cannot_be_created() {
                 .kind,
             ErrorKind::Unsupported
         );
-        assert_eq!(public.requests.lock().unwrap().len(), 2);
+        assert_eq!(public.requests.lock().unwrap().len(), 1);
 
         let occupied = github_server(vec![
             repository_reply(true),
@@ -635,10 +664,9 @@ fn existing_needs_the_descriptor_release_and_one_descriptor_asset() {
             .unwrap();
         assert_eq!(handle.repository_id, handle.connection_identity);
         let records = present.requests.lock().unwrap();
-        assert!(head_line(&records[0]).contains("/user "));
-        assert!(head_line(&records[1]).contains("/repos/synthetic-owner/synthetic-repo "));
-        assert!(head_line(&records[2]).contains("/releases?per_page=30&page=1"));
-        assert!(head_line(&records[3]).contains("/releases/7/assets?per_page=100&page=1"));
+        assert!(head_line(&records[0]).contains("/repos/synthetic-owner/synthetic-repo "));
+        assert!(head_line(&records[1]).contains("/releases?per_page=30&page=1"));
+        assert!(head_line(&records[2]).contains("/releases/7/assets?per_page=100&page=1"));
         assert!(records
             .iter()
             .all(|record| has_header(record, "authorization")));
@@ -688,12 +716,12 @@ fn a_created_asset_reports_the_service_digest_and_a_reusable_locator() {
         assert!(checksum.provider_verified);
 
         let records = server.requests.lock().unwrap();
-        assert_eq!(records.len(), 5);
-        assert!(head_line(&records[3]).starts_with("POST "));
-        assert!(String::from_utf8_lossy(&records[3].body).contains("\"draft\":true"));
-        assert!(head_line(&records[4]).contains("/releases/31/assets?name=pack-object-1"));
-        assert_eq!(records[4].body, bytes);
-        assert!(records[4]
+        assert_eq!(records.len(), 4);
+        assert!(head_line(&records[2]).starts_with("POST "));
+        assert!(String::from_utf8_lossy(&records[2].body).contains("\"draft\":true"));
+        assert!(head_line(&records[3]).contains("/releases/31/assets?name=pack-object-1"));
+        assert_eq!(records[3].body, bytes);
+        assert!(records[3]
             .headers
             .contains("content-type: application/octet-stream"));
 
@@ -743,7 +771,7 @@ fn a_lost_upload_response_converges_on_the_stored_asset_without_deleting() {
         assert!(receipt.complete);
         assert!(receipt.checksum.unwrap().provider_verified);
         let records = server.requests.lock().unwrap();
-        assert_eq!(records.len(), 7);
+        assert_eq!(records.len(), 6);
         // The release is reused from the open connection, never recreated.
         assert_eq!(
             records
@@ -788,7 +816,7 @@ fn a_name_conflict_with_different_bytes_is_refused_and_nothing_is_removed() {
         assert_eq!(error.kind, ErrorKind::PreconditionFailed);
         assert_eq!(error.http_status, Some(422));
         let records = server.requests.lock().unwrap();
-        assert_eq!(records.len(), 6);
+        assert_eq!(records.len(), 5);
         assert!(records
             .iter()
             .all(|record| method_of(record) != "DELETE" && method_of(record) != "PATCH"));
@@ -829,9 +857,9 @@ fn a_full_release_rolls_the_batch_to_the_next_release() {
             Some(job_tag("job-1", 1).as_str())
         );
         let records = server.requests.lock().unwrap();
-        assert!(String::from_utf8_lossy(&records[3].body).contains(&job_tag("job-1", 0)));
-        assert!(String::from_utf8_lossy(&records[6].body).contains(&job_tag("job-1", 1)));
-        assert!(head_line(&records[7]).contains("/releases/41/assets?name=pack-object-1"));
+        assert!(String::from_utf8_lossy(&records[2].body).contains(&job_tag("job-1", 0)));
+        assert!(String::from_utf8_lossy(&records[5].body).contains(&job_tag("job-1", 1)));
+        assert!(head_line(&records[6]).contains("/releases/41/assets?name=pack-object-1"));
     });
 }
 
@@ -915,7 +943,7 @@ fn snapshot_discovery_pages_across_releases_with_a_resumable_cursor() {
                 .kind,
             ErrorKind::Corrupt
         );
-        assert_eq!(server.requests.lock().unwrap().len(), 8);
+        assert_eq!(server.requests.lock().unwrap().len(), 7);
     });
 }
 
@@ -966,13 +994,13 @@ fn a_download_follows_one_redirect_without_the_token() {
         assert!(sink.is_verified());
 
         let records = server.requests.lock().unwrap();
-        assert!(head_line(&records[4]).contains("/releases/assets/3"));
-        assert!(records[4]
+        assert!(head_line(&records[3]).contains("/releases/assets/3"));
+        assert!(records[3]
             .headers
             .contains("accept: application/octet-stream"));
-        assert!(has_header(&records[4], "authorization"));
-        assert!(head_line(&records[5]).contains("/synthetic/objects/blob"));
-        assert!(!has_header(&records[5], "authorization"));
+        assert!(has_header(&records[3], "authorization"));
+        assert!(head_line(&records[4]).contains("/synthetic/objects/blob"));
+        assert!(!has_header(&records[4], "authorization"));
 
     });
 }
@@ -1201,7 +1229,7 @@ fn foreign_handles_and_locators_are_rejected_as_corrupt() {
                 .kind,
             ErrorKind::Corrupt
         );
-        assert_eq!(server.requests.lock().unwrap().len(), 3);
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
     });
 }
 
@@ -1238,7 +1266,7 @@ fn there_is_no_upload_session_and_a_foreign_resume_state_is_refused() {
                 .kind,
             ErrorKind::Unsupported
         );
-        assert_eq!(server.requests.lock().unwrap().len(), 3);
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
     });
 }
 
@@ -1313,7 +1341,7 @@ fn cancelling_during_the_body_stops_the_read() {
         let cancel = Cancellation::default();
         let read = provider.read_object(&handle, &locator, None, &mut sink, &cancel);
         let trigger = async {
-            while server.requests.lock().unwrap().len() < 5 {
+            while server.requests.lock().unwrap().len() < 4 {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1382,7 +1410,7 @@ fn a_create_receipt_locator_reads_the_same_bytes_back() {
         );
         assert!(sink.is_verified());
         let records = server.requests.lock().unwrap();
-        assert!(head_line(&records[5]).contains("/releases/assets/77"));
+        assert!(head_line(&records[4]).contains("/releases/assets/77"));
     });
 }
 
@@ -1431,7 +1459,7 @@ fn descriptor_listing_reads_only_the_descriptor_release() {
             Some(descriptor_tag.as_str())
         );
         assert_eq!(page.next_cursor, None);
-        assert_eq!(server.requests.lock().unwrap().len(), 6);
+        assert_eq!(server.requests.lock().unwrap().len(), 5);
     });
 }
 
@@ -1500,14 +1528,14 @@ fn deleting_an_asset_checks_its_release_tag_and_role_prefix_first() {
         );
 
         let records = server.requests.lock().unwrap();
-        assert_eq!(records.len(), 12);
-        assert!(head_line(&records[3]).starts_with("GET ") && head_line(&records[3]).contains("/releases/20 "));
+        assert_eq!(records.len(), 11);
+        assert!(head_line(&records[2]).starts_with("GET ") && head_line(&records[2]).contains("/releases/20 "));
         assert_eq!(
-            method_of(&records[5]),
+            method_of(&records[4]),
             "DELETE",
             "only the checked asset id is removed"
         );
-        assert!(head_line(&records[5]).contains("/releases/assets/88 "));
+        assert!(head_line(&records[4]).contains("/releases/assets/88 "));
         drop(records);
     });
 }
@@ -1556,6 +1584,6 @@ fn the_lease_collection_uses_its_own_tag_and_asset_prefix() {
             vec!["31/1"]
         );
         assert_eq!(page.objects[0].locator.collection.as_deref(), Some(lease_tag.as_str()));
-        assert_eq!(server.requests.lock().unwrap().len(), 5);
+        assert_eq!(server.requests.lock().unwrap().len(), 4);
     });
 }

@@ -19,8 +19,8 @@
 //!   tagged `<tagPrefix>-<batch>-<seq>`, where `<batch>` is `d` for descriptors
 //!   and `j<16 hex>` derived from the job id for every other role, and `<seq>`
 //!   rolls over when a release reaches the adapter's asset bound.
-//! - `account_id` is only the renderer label. The authenticated numeric user id
-//!   from `GET /user` is the request sharing key.
+//! - `account_id` is an opaque fingerprint derived from the token and is the
+//!   request sharing key.
 //! - `profile` is unused and any value is accepted.
 //! - The secret is UTF-8 JSON `{"token":"<pat>"}` with no other field. A fine
 //!   grained personal access token needs `Contents: read and write` on that one
@@ -37,7 +37,7 @@ use crate::external_storage::{
     contract::*,
     http::{HttpRequest, HttpResponse},
 };
-use api::{AssetView, Batch, Context, ReleaseView, RepositoryView, UserView};
+use api::{AssetView, Batch, Context, ReleaseView, RepositoryView};
 use reqwest::Method;
 use std::{collections::BTreeMap, sync::Arc};
 use zeroize::Zeroizing;
@@ -472,31 +472,7 @@ impl Provider for GithubReleases {
     ) -> ProviderFuture<'a, (RepositoryHandle, Capabilities)> {
         Box::pin(async move {
             cancel.check()?;
-            let mut context = Context::new(config, self.token(secret).await?)?;
-            let request = self.request(
-                &context,
-                Method::GET,
-                context.user_url()?,
-                ProviderOperation::Authenticate,
-            );
-            let response = self.send(request, cancel).await?;
-            if response.status != 200 {
-                return Err(api::classify(
-                    response.status,
-                    &response.headers,
-                    self.now(),
-                ));
-            }
-            let user: UserView = self.decode(response, cancel).await?;
-            let account = crate::external_storage::quota::AccountKey::new(
-                api::PROVIDER_ID,
-                &context.api,
-                &user.principal()?,
-            )?;
-            self.dependencies
-                .requests
-                .resolve_pending(&context.account, &account)?;
-            context.account = account;
+            let context = Context::new(config, self.token(secret).await?)?;
             let url = context.repository_url(&[])?;
             let request = self.request(&context, Method::GET, url, ProviderOperation::Metadata);
             let response = self.send(request, cancel).await?;

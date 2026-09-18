@@ -1,6 +1,7 @@
 //! Process-local waits shared by an account, not by a repository or token.
 //! Actual MYBOX counters live separately in `durable_quota`.
 use super::contract::{Cancellation, ErrorKind, ProviderError, Result};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::Mutex,
@@ -61,6 +62,18 @@ impl AccountKey {
         self.pending && !account.pending
             && self.provider == account.provider && self.authority == account.authority
     }
+}
+
+const CREDENTIAL_PRINCIPAL_PREFIX: &str = "credential-sha256:";
+
+/// Builds a stable opaque principal from an authentication value. Callers
+/// validate the provider and credential before deriving it.
+pub(crate) fn credential_principal(provider: &str, credential: &[u8]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(provider.as_bytes());
+    hash.update(b"\0");
+    hash.update(credential);
+    format!("{CREDENTIAL_PRINCIPAL_PREFIX}{}", hex::encode(hash.finalize()))
 }
 
 #[derive(Default)]
@@ -204,6 +217,34 @@ mod tests {
         assert_ne!(first, AccountKey::new("webdav", &url::Url::parse("https://synthetic.invalid").unwrap(), "a").unwrap());
         assert!(AccountKey::new("s3", &url::Url::parse("https://synthetic.invalid/?token=secret").unwrap(), "a").is_err());
         assert!(!format!("{first:?}").contains("principal"));
+    }
+
+    #[test]
+    fn credential_principals_are_stable_separated_and_opaque() {
+        let first = credential_principal("mybox", b"synthetic-token-a");
+        assert_eq!(first, credential_principal("mybox", b"synthetic-token-a"));
+        assert_ne!(first, credential_principal("mybox", b"synthetic-token-b"));
+        assert_ne!(first, credential_principal("s3", b"synthetic-token-a"));
+        assert!(!first.contains("synthetic-token-a"));
+        assert_eq!(first.len(), CREDENTIAL_PRINCIPAL_PREFIX.len() + 64);
+    }
+
+    #[test]
+    fn credential_accounts_share_only_the_same_provider_authority_and_credential() {
+        let principal = credential_principal("s3", b"synthetic-access-key");
+        let first = account(&principal, "https://synthetic.invalid/root-one");
+        assert_eq!(first, account(&principal, "https://synthetic.invalid/root-two"));
+        assert_ne!(
+            first,
+            account(
+                &credential_principal("s3", b"different-access-key"),
+                "https://synthetic.invalid/root-one",
+            )
+        );
+        assert_ne!(
+            first,
+            account(&principal, "https://other.invalid/root-one")
+        );
     }
 
     #[test]

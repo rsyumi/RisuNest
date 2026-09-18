@@ -785,7 +785,7 @@ pub(crate) async fn external_storage_complete_authorization(
 }
 
 enum CredentialInput {
-    Bytes(SecretBytes),
+    Bytes(EncodedProviderSecret),
     Reference {
         reference: SecretRef,
         account_id: Option<String>,
@@ -837,7 +837,7 @@ async fn commit_preparation(
     let mut config = preparation.request.config.clone();
     let mut store = ConnectionStore::open(&root)?;
     let provided_account_id = match &credential {
-        CredentialInput::Bytes(_) => None,
+        CredentialInput::Bytes(secret) => secret.account_id.as_ref(),
         CredentialInput::Reference { account_id, .. } => account_id.as_ref(),
     };
     if provided_account_id.is_some_and(|account_id| {
@@ -865,7 +865,10 @@ async fn commit_preparation(
                 return Err(ProviderError::new(ErrorKind::PreconditionFailed).into());
             }
             let (replacement, account_id) = match credential {
-                CredentialInput::Bytes(bytes) => (provider_vault.store(&bytes).await?, None),
+                CredentialInput::Bytes(secret) => (
+                    provider_vault.store(&secret.bytes).await?,
+                    secret.account_id,
+                ),
                 CredentialInput::Reference {
                     reference,
                     account_id,
@@ -895,7 +898,10 @@ async fn commit_preparation(
         }
         Err(error) if error.kind == ErrorKind::NotFound => {
             let (credential_ref, account_id) = match credential {
-                CredentialInput::Bytes(bytes) => (provider_vault.store(&bytes).await?, None),
+                CredentialInput::Bytes(secret) => (
+                    provider_vault.store(&secret.bytes).await?,
+                    secret.account_id,
+                ),
                 CredentialInput::Reference { reference, account_id } => (reference, account_id),
             };
             cancel.check()?;

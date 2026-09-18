@@ -171,6 +171,26 @@ fn daily_reservations(deps: &TestDependencies) -> usize {
 }
 
 #[test]
+fn different_credential_accounts_keep_the_same_named_folder_distinct() {
+    let server = WireServer::start(Vec::new());
+    let mut first = settings(&server);
+    first.account_id = crate::external_storage::quota::credential_principal(
+        "mybox",
+        b"synthetic-pat-a",
+    );
+    let mut second = first.clone();
+    second.account_id = crate::external_storage::quota::credential_principal(
+        "mybox",
+        b"synthetic-pat-b",
+    );
+
+    let first = config::parse(&first).unwrap();
+    let second = config::parse(&second).unwrap();
+    assert_eq!(first.root_folder_name, second.root_folder_name);
+    assert_ne!(first.identity, second.identity);
+}
+
+#[test]
 fn configuration_is_refused_before_any_request_is_dispatched() {
     runtime().block_on(async {
         let deps = fixture();

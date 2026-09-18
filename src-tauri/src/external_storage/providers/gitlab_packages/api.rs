@@ -67,10 +67,6 @@ pub(super) fn packages_url(settings: &Settings, query: &[(&str, &str)]) -> Resul
     )
 }
 
-pub(super) fn user_url(settings: &Settings) -> Result<url::Url> {
-    url(settings, &["api", "v4", "user"], &[])
-}
-
 pub(super) fn package_files_url(
     settings: &Settings,
     package_id: u64,
@@ -128,10 +124,7 @@ pub(super) fn request(settings: &Settings, outgoing: Outgoing<'_>) -> HttpReques
     let mut headers = BTreeMap::new();
     headers.insert("accept".into(), "application/json".into());
     if let Some(credential) = outgoing.credential {
-        headers.insert(
-            credential.kind.header().to_owned(),
-            credential.token.to_string(),
-        );
+        headers.insert("PRIVATE-TOKEN".into(), credential.token.to_string());
     }
     if http::control_operation(outgoing.operation) {
         http::bypass_cache(&mut headers);
@@ -195,20 +188,6 @@ pub(super) struct PackageJson {
     pub(super) id: u64,
     pub(super) name: String,
     pub(super) version: String,
-}
-
-#[derive(Deserialize)]
-pub(super) struct UserJson {
-    id: u64,
-}
-
-impl UserJson {
-    pub(super) fn principal(&self) -> Result<String> {
-        if self.id == 0 {
-            return Err(ProviderError::new(ErrorKind::Corrupt));
-        }
-        Ok(self.id.to_string())
-    }
 }
 
 #[derive(Deserialize)]

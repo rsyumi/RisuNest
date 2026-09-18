@@ -31,36 +31,14 @@ pub(super) enum Profile {
     SelfManaged,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(super) enum TokenKind {
-    DeployToken,
-    PersonalAccessToken,
-    ProjectAccessToken,
-}
-impl TokenKind {
-    pub(super) fn header(self) -> &'static str {
-        match self {
-            Self::DeployToken => "DEPLOY-TOKEN",
-            Self::PersonalAccessToken | Self::ProjectAccessToken => "PRIVATE-TOKEN",
-        }
-    }
-
-    pub(super) fn authenticates_principal(self) -> bool {
-        matches!(self, Self::PersonalAccessToken | Self::ProjectAccessToken)
-    }
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CredentialPayload {
     token: String,
-    kind: TokenKind,
 }
 /// No Debug, Serialize or Display. The token never leaves this struct except as
 /// a request header value.
 pub(super) struct Credential {
-    pub(super) kind: TokenKind,
     pub(super) token: Zeroizing<String>,
 }
 
@@ -71,10 +49,7 @@ pub(super) fn credential(bytes: &[u8]) -> Result<Credential> {
     if token.is_empty() || token.len() > 512 || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
         return Err(reauth());
     }
-    Ok(Credential {
-        kind: payload.kind,
-        token,
-    })
+    Ok(Credential { token })
 }
 
 pub(super) fn role_name(role: ObjectRole) -> &'static str {
@@ -154,8 +129,7 @@ impl Settings {
     pub(super) fn package(&self, role: ObjectRole) -> String {
         format!("{}.{}", self.package_base, role_name(role))
     }
-    /// Deterministic control object proving the root exists. Deploy tokens
-    /// cannot enumerate packages, so `Create`/`Existing` probe this instead.
+    /// Deterministic control object proving the root exists.
     pub(super) fn marker(&self) -> Placement {
         Placement {
             package: format!("{}.{MARKER_SUFFIX}", self.package_base),

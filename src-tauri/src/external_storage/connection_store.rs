@@ -595,6 +595,42 @@ mod tests {
     }
 
     #[test]
+    fn pending_create_matching_keeps_credential_accounts_separate() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = ConnectionStore::open(root.path()).unwrap();
+        let mut first = pending();
+        first.config.provider = "mybox".into();
+        first.config.profile = Some("plan30gb".into());
+        first.config.account_id = crate::external_storage::quota::credential_principal(
+            "mybox",
+            b"synthetic-pat-a",
+        );
+        first.config.location = BTreeMap::from([(
+            "rootFolderName".into(),
+            "RisuNest".into(),
+        )]);
+        store.put_pending(&first).unwrap();
+
+        let mut second_config = first.config.clone();
+        second_config.account_id = crate::external_storage::quota::credential_principal(
+            "mybox",
+            b"synthetic-pat-b",
+        );
+        assert!(store
+            .pending_create_for(&second_config, first.capture_policy)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .pending_create_for(&first.config, first.capture_policy)
+                .unwrap()
+                .unwrap()
+                .id,
+            first.id
+        );
+    }
+
+    #[test]
     fn only_real_completions_set_independent_monotonic_timestamps() {
         let root = tempfile::tempdir().unwrap();
         let mut store = ConnectionStore::open(root.path()).unwrap();

@@ -100,11 +100,7 @@ export type ExternalProviderSecretInput =
     | { kind: 's3'; accessKeyId: string; secretAccessKey: string }
     | { kind: 'mybox'; pat: string; expiresAtMs: DecimalString }
     | { kind: 'github'; token: string }
-    | {
-          kind: 'gitlab'
-          token: string
-          tokenKind: 'deployToken' | 'personalAccessToken' | 'projectAccessToken'
-      }
+    | { kind: 'gitlab'; token: string }
 
 export interface ExternalConnectionError {
     code: string

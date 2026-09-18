@@ -77,6 +77,9 @@ impl Context {
         if config.provider != PROVIDER_ID || config.oauth_profile.is_some() {
             return Err(refused());
         }
+        if config.account_id.is_empty() || config.account_id.len() > 256 {
+            return Err(refused());
+        }
         let api = endpoint(&config.endpoint)?;
         let uploads = match config.location.get("uploadEndpoint") {
             Some(value) => endpoint(value)?,
@@ -89,7 +92,7 @@ impl Context {
             "{PROVIDER_ID}|{}|{owner}/{repo}|{tag_prefix}",
             api.origin().ascii_serialization()
         );
-        let account = AccountKey::pending(PROVIDER_ID, &api)?;
+        let account = AccountKey::new(PROVIDER_ID, &api, &config.account_id)?;
         Ok(Self {
             api,
             uploads,
@@ -117,10 +120,6 @@ impl Context {
         let mut segments = vec!["repos", self.owner.as_str(), self.repo.as_str()];
         segments.extend_from_slice(tail);
         extend(&self.api, &segments)
-    }
-
-    pub(super) fn user_url(&self) -> Result<url::Url> {
-        extend(&self.api, &["user"])
     }
 
     pub(super) fn release_page_url(&self, page: u32) -> Result<url::Url> {
@@ -331,20 +330,6 @@ pub(super) struct RepositoryView {
     pub(super) private: bool,
     #[serde(default)]
     pub(super) permissions: Option<PermissionsView>,
-}
-
-#[derive(Deserialize)]
-pub(super) struct UserView {
-    id: u64,
-}
-
-impl UserView {
-    pub(super) fn principal(&self) -> Result<String> {
-        if self.id == 0 {
-            return Err(corrupt());
-        }
-        Ok(self.id.to_string())
-    }
 }
 
 #[derive(Deserialize)]

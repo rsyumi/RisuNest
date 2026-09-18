@@ -203,7 +203,7 @@
             ...(isTauriAndroid ? {
                 oauthRedirectUri: 'https://update.rsyumi.workers.dev/oauth/google-drive-callback.html',
             } : {}),
-            uploadEndpoint: 'https://uploads.github.com', tokenKind: 'personalAccessToken',
+            uploadEndpoint: 'https://uploads.github.com',
             profile: next.profiles[0]?.value ?? '',
         }
         accepted = []
@@ -438,7 +438,6 @@
             {/if}
             {#each visibleFields as field (field.key)}
                 {@const help = externalFieldHelp(strings, providerId, field.key)}
-                {@const helpAsPlaceholder = field.key === 'accountId' && definition.oauth}
                 <label class="field">
                     <span>{fieldLabel(field.key)}{field.required ? '' : strings.optional}</span>
                     {#if field.type === 'select'}
@@ -446,9 +445,9 @@
                             {#each field.options ?? [] as option (option)}<OptionInput value={option}>{externalOptionLabel(strings, providerId, field.key, option)}</OptionInput>{/each}
                         </SelectInput>
                     {:else}
-                        <TextInput fullwidth value={values[field.key] ?? ''} onchange={event => updateValue(field.key, event.currentTarget.value)} placeholder={field.placeholder ?? (helpAsPlaceholder ? help ?? '' : '')} />
+                        <TextInput fullwidth value={values[field.key] ?? ''} onchange={event => updateValue(field.key, event.currentTarget.value)} placeholder={field.placeholder ?? ''} />
                     {/if}
-                    {#if help && !helpAsPlaceholder}<small>{help}</small>{/if}
+                    {#if help}<small>{help}</small>{/if}
                 </label>
             {/each}
         </div>

@@ -205,7 +205,8 @@ pub(crate) struct PrepareConnectionRequest {
 #[serde(
     tag = "kind",
     rename_all = "camelCase",
-    rename_all_fields = "camelCase"
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
 )]
 pub(crate) enum ProviderSecretInput {
     Webdav {
@@ -224,26 +225,7 @@ pub(crate) enum ProviderSecretInput {
     },
     Gitlab {
         token: String,
-        token_kind: GitlabTokenKind,
     },
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum GitlabTokenKind {
-    DeployToken,
-    PersonalAccessToken,
-    ProjectAccessToken,
-}
-
-impl GitlabTokenKind {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::DeployToken => "deployToken",
-            Self::PersonalAccessToken => "personalAccessToken",
-            Self::ProjectAccessToken => "projectAccessToken",
-        }
-    }
 }
 
 #[derive(Serialize)]
@@ -263,12 +245,6 @@ struct MyboxSecretWire<'a> {
 #[derive(Serialize)]
 struct TokenSecretWire<'a> {
     token: &'a str,
-}
-
-#[derive(Serialize)]
-struct GitlabSecretWire<'a> {
-    token: &'a str,
-    kind: &'static str,
 }
 
 #[derive(Clone, Serialize)]
@@ -367,7 +343,7 @@ pub(crate) fn provider_descriptors() -> Vec<ProviderDescriptor> {
             "S3 compatible",
             false,
             &["cas", "sequential", "backup-only"],
-            &["r2", "b2", "hf", "generic"],
+            &["aws", "r2", "b2", "hf", "generic"],
         ),
         provider(
             "google_drive",
@@ -559,8 +535,8 @@ pub(crate) fn validate_config_shape(config: &ConnectionConfig) -> Result<()> {
         "s3" => {
             matches!(
                 config.profile.as_deref(),
-                Some("r2" | "b2" | "hf" | "generic")
-            ) && account()
+                Some("aws" | "r2" | "b2" | "hf" | "generic")
+            )
                 && required(&["bucket"])
                 && only(&["bucket", "prefix", "region", "addressing"])
                 && config
@@ -609,13 +585,12 @@ pub(crate) fn validate_config_shape(config: &ConnectionConfig) -> Result<()> {
                         | "plan10tb"
                         | "plan20tb"
                 )
-            ) && account()
+            )
                 && required(&["rootFolderName"])
                 && only(&["rootFolderName", "rootFolderId"])
         }
         "github_releases" => {
             config.profile.is_none()
-                && account()
                 && required(&["uploadEndpoint", "owner", "repo", "tagPrefix"])
                 && only(&["uploadEndpoint", "owner", "repo", "tagPrefix"])
                 && config
@@ -628,7 +603,7 @@ pub(crate) fn validate_config_shape(config: &ConnectionConfig) -> Result<()> {
             matches!(
                 config.profile.as_deref(),
                 None | Some("gitlabCom" | "selfManaged")
-            ) && account()
+            )
                 && required(&["projectId", "packageName"])
                 && only(&["projectId", "packageName", "maxFileBytes"])
                 && config
@@ -702,7 +677,9 @@ pub(crate) fn endpoint_confirmation(
     Ok(EndpointConfirmation {
         provider_id: config.provider.clone(),
         authority,
-        account_hint: (!config.account_id.is_empty()).then(|| config.account_id.clone()),
+        account_hint: ((config.provider == "webdav" || config.oauth_profile.is_some())
+            && !config.account_id.is_empty())
+        .then(|| config.account_id.clone()),
         repository_hint,
         warnings,
         remote_verified,
@@ -749,13 +726,16 @@ pub(crate) fn summary(connection: &StoredConnection) -> ConnectionSummary {
         },
         strategy,
         mode: ConnectionOpenMode::Existing,
-        display_name: if connection.config.account_id.is_empty() {
-            connection.config.provider.clone()
-        } else {
+        display_name: if (connection.config.provider == "webdav"
+            || connection.config.oauth_profile.is_some())
+            && !connection.config.account_id.is_empty()
+        {
             format!(
                 "{} · {}",
                 connection.config.provider, connection.config.account_id
             )
+        } else {
+            connection.config.provider.clone()
         },
         endpoint: endpoint_confirmation(&connection.config, true).unwrap_or(EndpointConfirmation {
             provider_id: connection.config.provider.clone(),
@@ -789,15 +769,25 @@ pub(crate) fn dependencies(root: &Path) -> Result<Dependencies> {
     })
 }
 
-pub(crate) fn encode_secret(provider: &str, input: ProviderSecretInput) -> Result<SecretBytes> {
+pub(crate) struct EncodedProviderSecret {
+    pub bytes: SecretBytes,
+    /// Opaque identity derived from the identity-bearing credential field.
+    /// This replaces any renderer-provided account label before persistence.
+    pub account_id: Option<String>,
+}
+
+pub(crate) fn encode_secret(
+    provider: &str,
+    input: ProviderSecretInput,
+) -> Result<EncodedProviderSecret> {
     let invalid = || ProviderError::new(ErrorKind::ReauthRequired);
-    let bytes = match (provider, input) {
+    let (bytes, account_id) = match (provider, input) {
         ("webdav", ProviderSecretInput::Webdav { password })
             if !password.is_empty()
                 && password.len() <= 1024
                 && !password.chars().any(char::is_control) =>
         {
-            password.into_bytes()
+            (password.into_bytes(), None)
         }
         (
             "s3",
@@ -808,6 +798,8 @@ pub(crate) fn encode_secret(provider: &str, input: ProviderSecretInput) -> Resul
         ) if valid_printable(&access_key_id, 256, true)
             && valid_printable(&secret_access_key, 1024, true) =>
         {
+            let account_id =
+                super::quota::credential_principal("s3", access_key_id.as_bytes());
             let encoded = serde_json::to_vec(&S3SecretWire {
                 access_key_id: &access_key_id,
                 secret_access_key: &secret_access_key,
@@ -815,7 +807,7 @@ pub(crate) fn encode_secret(provider: &str, input: ProviderSecretInput) -> Resul
             .map_err(|_| invalid())?;
             access_key_id.zeroize();
             secret_access_key.zeroize();
-            encoded
+            (encoded, Some(account_id))
         }
         (
             "mybox",
@@ -835,40 +827,41 @@ pub(crate) fn encode_secret(provider: &str, input: ProviderSecretInput) -> Resul
                 .ok()
                 .filter(|value| *value > now_ms)
                 .ok_or_else(invalid)?;
+            let account_id = super::quota::credential_principal("mybox", pat.as_bytes());
             let encoded = serde_json::to_vec(&MyboxSecretWire {
                 pat: &pat,
                 expires_at_ms,
             })
             .map_err(|_| invalid())?;
             pat.zeroize();
-            encoded
+            (encoded, Some(account_id))
         }
         ("github_releases", ProviderSecretInput::Github { mut token })
             if valid_printable(&token, 512, false) =>
         {
+            let account_id =
+                super::quota::credential_principal("github_releases", token.as_bytes());
             let encoded =
                 serde_json::to_vec(&TokenSecretWire { token: &token }).map_err(|_| invalid())?;
             token.zeroize();
-            encoded
+            (encoded, Some(account_id))
         }
-        (
-            "gitlab_packages",
-            ProviderSecretInput::Gitlab {
-                mut token,
-                token_kind,
-            },
-        ) if valid_printable(&token, 512, false) => {
-            let encoded = serde_json::to_vec(&GitlabSecretWire {
-                token: &token,
-                kind: token_kind.as_str(),
-            })
-            .map_err(|_| invalid())?;
+        ("gitlab_packages", ProviderSecretInput::Gitlab { mut token })
+            if valid_printable(&token, 512, false) =>
+        {
+            let account_id =
+                super::quota::credential_principal("gitlab_packages", token.as_bytes());
+            let encoded =
+                serde_json::to_vec(&TokenSecretWire { token: &token }).map_err(|_| invalid())?;
             token.zeroize();
-            encoded
+            (encoded, Some(account_id))
         }
         _ => return Err(invalid()),
     };
-    Ok(SecretBytes(Zeroizing::new(bytes)))
+    Ok(EncodedProviderSecret {
+        bytes: SecretBytes(Zeroizing::new(bytes)),
+        account_id,
+    })
 }
 
 fn valid_printable(value: &str, max: usize, allow_space: bool) -> bool {
@@ -1186,6 +1179,37 @@ mod tests {
     }
 
     #[test]
+    fn non_webdav_preparation_needs_no_renderer_account_label_and_accepts_aws() {
+        let mut s3 = request("s3", ConnectionPurpose::Backup);
+        s3.config.profile = Some("aws".into());
+        s3.config.account_id.clear();
+        s3.config.location = BTreeMap::from([
+            ("bucket".into(), "synthetic-bucket".into()),
+            ("region".into(), "us-east-1".into()),
+        ]);
+        assert!(validate_preparation(&s3).is_ok());
+
+        let mut mybox = request("mybox", ConnectionPurpose::Backup);
+        mybox.config.account_id.clear();
+        mybox.config.location =
+            BTreeMap::from([("rootFolderName".into(), "RisuNest".into())]);
+        assert!(validate_preparation(&mybox).is_ok());
+
+        let mut github = request("github_releases", ConnectionPurpose::Backup);
+        github.config.account_id.clear();
+        github.config.location = BTreeMap::from([
+            ("uploadEndpoint".into(), "https://uploads.github.com".into()),
+            ("owner".into(), "synthetic-owner".into()),
+            ("repo".into(), "synthetic-repository".into()),
+            ("tagPrefix".into(), "risunest".into()),
+        ]);
+        github
+            .acknowledgements
+            .push(GITHUB_ACKNOWLEDGEMENT.into());
+        assert!(validate_preparation(&github).is_ok());
+    }
+
+    #[test]
     fn provider_registry_reports_current_platform_oauth_availability() {
         let providers = provider_descriptors();
         let google = providers
@@ -1201,6 +1225,48 @@ mod tests {
     }
 
     #[test]
+    fn credential_fingerprints_never_reach_connection_titles() {
+        let account_id = super::super::quota::credential_principal(
+            "mybox",
+            b"synthetic-pat",
+        );
+        let connection = StoredConnection {
+            id: "synthetic-connection".into(),
+            config: ConnectionConfig {
+                provider: "mybox".into(),
+                profile: Some("plan30gb".into()),
+                endpoint: "https://open-api.mybox.naver.com/v1".into(),
+                account_id: account_id.clone(),
+                location: BTreeMap::from([(
+                    "rootFolderName".into(),
+                    "RisuNest".into(),
+                )]),
+                oauth_profile: None,
+            },
+            descriptor: risunest_external_storage_format::format::Descriptor::new(
+                "synthetic-repository".into(),
+                None,
+            )
+            .unwrap(),
+            descriptor_locator: super::super::fake::locator(),
+            provider_repository_id: "synthetic-root".into(),
+            credential_ref: "synthetic-credential-ref".into(),
+            root_key_ref: "synthetic-key-ref".into(),
+            capabilities: Capabilities::default(),
+            created_at_ms: 1,
+            last_sync_at_ms: None,
+            last_backup_at_ms: None,
+            capture_policy: Some(CapturePolicy::default()),
+            retention_policy: None,
+        };
+        let summary = summary(&connection);
+        assert_eq!(summary.display_name, "mybox");
+        assert_eq!(summary.endpoint.account_hint, None);
+        let serialized = serde_json::to_string(&summary).unwrap();
+        assert!(!serialized.contains(&account_id));
+    }
+
+    #[test]
     fn secret_encoding_matches_adapter_owned_payload_shapes_without_debugging_values() {
         let encoded = encode_secret(
             "s3",
@@ -1210,9 +1276,43 @@ mod tests {
             },
         )
         .unwrap();
-        let decoded: serde_json::Value = serde_json::from_slice(&encoded.0).unwrap();
+        let decoded: serde_json::Value = serde_json::from_slice(&encoded.bytes.0).unwrap();
         assert_eq!(decoded["accessKeyId"], "synthetic-id");
         assert_eq!(decoded["secretAccessKey"], "synthetic-key");
+        assert_eq!(
+            encoded.account_id,
+            Some(super::super::quota::credential_principal(
+                "s3",
+                b"synthetic-id"
+            ))
+        );
+
+        let first = encode_secret(
+            "mybox",
+            ProviderSecretInput::Mybox {
+                pat: "synthetic-pat".into(),
+                expires_at_ms: u64::MAX.to_string(),
+            },
+        )
+        .unwrap();
+        let renewed = encode_secret(
+            "mybox",
+            ProviderSecretInput::Mybox {
+                pat: "synthetic-pat".into(),
+                expires_at_ms: (u64::MAX - 1).to_string(),
+            },
+        )
+        .unwrap();
+        let other = encode_secret(
+            "mybox",
+            ProviderSecretInput::Mybox {
+                pat: "different-pat".into(),
+                expires_at_ms: u64::MAX.to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(first.account_id, renewed.account_id);
+        assert_ne!(first.account_id, other.account_id);
         assert!(encode_secret(
             "google_drive",
             ProviderSecretInput::Github {
@@ -1234,16 +1334,15 @@ mod tests {
 
         let parsed: ProviderSecretInput = serde_json::from_value(serde_json::json!({
             "kind": "gitlab",
+            "token": "synthetic-token"
+        }))
+        .unwrap();
+        assert!(matches!(parsed, ProviderSecretInput::Gitlab { .. }));
+        assert!(serde_json::from_value::<ProviderSecretInput>(serde_json::json!({
+            "kind": "gitlab",
             "token": "synthetic-token",
             "tokenKind": "projectAccessToken"
         }))
-        .unwrap();
-        assert!(matches!(
-            parsed,
-            ProviderSecretInput::Gitlab {
-                token_kind: GitlabTokenKind::ProjectAccessToken,
-                ..
-            }
-        ));
+        .is_err());
     }
 }

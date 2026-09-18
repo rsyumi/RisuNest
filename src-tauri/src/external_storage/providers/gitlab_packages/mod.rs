@@ -12,10 +12,7 @@
 //!   `https://gitlab.example.com/gitlab`. The API is addressed under `/api/v4`.
 //! * `profile` — absent (inferred from the host), `gitlabCom` or `selfManaged`.
 //!   The GitLab.com profile pins the documented 5 GB generic file limit.
-//! * `account_id` — a renderer label. Personal and project access tokens use
-//!   the authenticated numeric user id as their request-sharing principal.
-//!   Deploy tokens retain the configured label because their package-only
-//!   scope cannot call the public user endpoint.
+//! * `account_id` — an opaque token fingerprint used for request sharing.
 //! * `location["projectId"]` — numeric project id or the plain namespace path
 //!   (`group/subgroup/project`); it is percent-encoded per request, so a value
 //!   that is already URL-encoded is rejected.
@@ -26,8 +23,9 @@
 //! * `oauth_profile` — must be absent; this service authenticates with a token.
 //!
 //! Secret payload (`vault.read`): UTF-8 JSON
-//! `{"token":"<token>","kind":"deployToken|personalAccessToken|projectAccessToken"}`.
-//! A deploy token is sent as `DEPLOY-TOKEN`, the other kinds as `PRIVATE-TOKEN`.
+//! `{"token":"<personal-or-project-access-token>"}`. The token is sent as
+//! `PRIVATE-TOKEN` and must have the `api` scope plus Maintainer or Owner access
+//! to the project.
 //!
 //! Remote layout under the project, one package name per role and one package
 //! version per object:
@@ -48,9 +46,8 @@
 //!
 //! Creating an object always asks the remote state first, because an instance
 //! that allows duplicate generic packages answers a repeated upload by adding a
-//! second file under the same name instead of rejecting it. A token that can
-//! list resolves that from package metadata, otherwise the stored bytes are
-//! read back; an absent object costs one `404` before the upload.
+//! second file under the same name instead of rejecting it. Package metadata
+//! resolves that before every upload.
 mod api;
 mod config;
 #[cfg(test)]
@@ -62,7 +59,7 @@ use crate::external_storage::{
     contract::*,
     http::HttpResponse,
 };
-use api::{Outgoing, PackageFileJson, PackageJson, UserJson};
+use api::{Outgoing, PackageFileJson, PackageJson};
 use config::{Credential, Placement, Settings};
 use sha2::Digest;
 use std::{collections::BTreeSet, pin::Pin, sync::Arc};
@@ -101,8 +98,6 @@ fn io_error(cancel: &Cancellation) -> ProviderError {
 struct Repository {
     settings: Settings,
     secret: SecretRef,
-    /// Result of the listing probe performed while opening the repository.
-    can_list: bool,
 }
 
 enum Verification {
@@ -615,42 +610,40 @@ impl GitlabPackages {
         cancel: &Cancellation,
     ) -> Result<Verification> {
         let settings = &context.settings;
-        if context.can_list {
-            let Some(package_id) = self
-                .locate_package(
-                    settings,
-                    credential,
-                    &placement.package,
-                    &placement.version,
-                    cancel,
-                )
-                .await?
-            else {
-                return Ok(Verification::Absent);
-            };
-            let files = self
-                .package_files(settings, credential, package_id, cancel)
-                .await?;
-            let mut matching = files.iter().filter(|file| file.file_name == placement.file);
-            let Some(file) = matching.next() else {
-                return Ok(Verification::Absent);
-            };
-            if matching.next().is_some() {
-                return Ok(Verification::Different);
+        let Some(package_id) = self
+            .locate_package(
+                settings,
+                credential,
+                &placement.package,
+                &placement.version,
+                cancel,
+            )
+            .await?
+        else {
+            return Ok(Verification::Absent);
+        };
+        let files = self
+            .package_files(settings, credential, package_id, cancel)
+            .await?;
+        let mut matching = files.iter().filter(|file| file.file_name == placement.file);
+        let Some(file) = matching.next() else {
+            return Ok(Verification::Absent);
+        };
+        if matching.next().is_some() {
+            return Ok(Verification::Different);
+        }
+        if file.size != intent.byte_length {
+            return Ok(Verification::Different);
+        }
+        match file.file_sha256.as_deref() {
+            Some(value) if value.eq_ignore_ascii_case(&intent.sha256) => {
+                return Ok(Verification::Present {
+                    provider_verified: true,
+                })
             }
-            if file.size != intent.byte_length {
-                return Ok(Verification::Different);
-            }
-            match file.file_sha256.as_deref() {
-                Some(value) if value.eq_ignore_ascii_case(&intent.sha256) => {
-                    return Ok(Verification::Present {
-                        provider_verified: true,
-                    })
-                }
-                Some(_) => return Ok(Verification::Different),
-                // An instance that stores no digest still has to prove the bytes.
-                None => {}
-            }
+            Some(_) => return Ok(Verification::Different),
+            // An instance that stores no digest still has to prove the bytes.
+            None => {}
         }
         let Some(mut response) = self.fetch(settings, credential, placement, cancel).await? else {
             return Ok(Verification::Absent);
@@ -754,12 +747,12 @@ impl GitlabPackages {
         }
     }
 
-    async fn probe_listing(
+    async fn require_listing(
         &self,
         settings: &Settings,
         credential: &Credential,
         cancel: &Cancellation,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         let url = api::packages_url(
             settings,
             &[
@@ -783,8 +776,7 @@ impl GitlabPackages {
             )
             .await?;
         match response.status {
-            200 => Ok(true),
-            401 | 403 => Ok(false),
+            200 => Ok(()),
             status => Err(api::classify(status, &response.headers, self.now())),
         }
     }
@@ -809,7 +801,7 @@ fn receipt(
     }
 }
 
-fn capabilities(settings: &Settings, can_list: bool) -> Capabilities {
+fn capabilities(settings: &Settings) -> Capabilities {
     Capabilities {
         immutable_create: true,
         direct_complete_read: true,
@@ -818,11 +810,9 @@ fn capabilities(settings: &Settings, can_list: bool) -> Capabilities {
         stable_head_replace: false,
         head_read_after_write: false,
         head_retry_control: false,
-        // Deploy tokens may read and create named packages without permission
-        // to enumerate them. That connection can back up but cannot clean up.
-        snapshot_discovery: can_list,
-        lease_operations: can_list,
-        delete_objects: can_list,
+        snapshot_discovery: true,
+        lease_operations: true,
+        delete_objects: true,
         conditional_get: false,
         range: false,
         resumable_upload: false,
@@ -842,50 +832,9 @@ impl Provider for GitlabPackages {
     ) -> ProviderFuture<'a, (RepositoryHandle, Capabilities)> {
         Box::pin(async move {
             cancel.check()?;
-            let mut settings = config::settings(config)?;
+            let settings = config::settings(config)?;
             let credential = self.credential(secret).await?;
-            if credential.kind.authenticates_principal() {
-                let pending = crate::external_storage::quota::AccountKey::pending(
-                    config::PROVIDER_ID,
-                    &settings.endpoint,
-                )?;
-                settings.account = pending.clone();
-                let mut response = self
-                    .send(
-                        &settings,
-                        Outgoing {
-                            method: reqwest::Method::GET,
-                            url: api::user_url(&settings)?,
-                            operation: ProviderOperation::Authenticate,
-                            credential: Some(&credential),
-                            body: None,
-                            content_length: None,
-                        },
-                        cancel,
-                    )
-                    .await?;
-                if response.status != 200 {
-                    return Err(api::classify(
-                        response.status,
-                        &response.headers,
-                        self.now(),
-                    ));
-                }
-                let user: UserJson = self.json(&mut response, cancel).await?;
-                let authenticated = crate::external_storage::quota::AccountKey::new(
-                    config::PROVIDER_ID,
-                    &settings.endpoint,
-                    &user.principal()?,
-                )?;
-                self.deps
-                    .requests
-                    .resolve_pending(&pending, &authenticated)?;
-                settings.account = authenticated;
-            }
-            if mode == OpenMode::ResumeCreate && !credential.kind.authenticates_principal() {
-                return Err(ProviderError::new(ErrorKind::Unsupported));
-            }
-            if mode == OpenMode::Create && credential.kind.authenticates_principal() {
+            if mode == OpenMode::Create {
                 self.require_empty_create_layout(&settings, &credential, cancel)
                     .await?;
             }
@@ -937,20 +886,18 @@ impl Provider for GitlabPackages {
                     return Err(api::classify(status, &response.headers, self.now()));
                 }
             }
-            let can_list = match mode {
-                OpenMode::Create if credential.kind.authenticates_principal() => {
+            match mode {
+                OpenMode::Create => {
                     self.require_resumable_create_layout(&settings, &credential, cancel)
                         .await?;
-                    true
                 }
                 OpenMode::ResumeCreate => {
                     self.require_resumable_create_layout(&settings, &credential, cancel)
                         .await?;
-                    true
                 }
-                _ => self.probe_listing(&settings, &credential, cancel).await?,
-            };
-            let capabilities = capabilities(&settings, can_list);
+                OpenMode::Existing => self.require_listing(&settings, &credential, cancel).await?,
+            }
+            let capabilities = capabilities(&settings);
             let handle = RepositoryHandle {
                 repository_id: settings.connection_identity.clone(),
                 connection_identity: settings.connection_identity.clone(),
@@ -958,7 +905,6 @@ impl Provider for GitlabPackages {
                 context: Box::new(Repository {
                     settings,
                     secret: secret.clone(),
-                    can_list,
                 }),
             };
             Ok((handle, capabilities))
@@ -1166,8 +1112,7 @@ impl Provider for GitlabPackages {
     }
 
     /// Removal addresses a numeric package file id, so the package and its file
-    /// listing are resolved first. A deploy token cannot reach the API that
-    /// carries either, and answers `Unsupported`.
+    /// listing are resolved first.
     fn delete_object<'a>(
         &'a self,
         repository: &'a RepositoryHandle,
@@ -1184,9 +1129,6 @@ impl Provider for GitlabPackages {
                 return Err(unsupported());
             }
             let credential = self.credential(&context.secret).await?;
-            if credential.kind == config::TokenKind::DeployToken || !context.can_list {
-                return Err(unsupported());
-            }
             let Some(package_id) = self
                 .locate_package(settings, &credential, &placement.package, &placement.version, cancel)
                 .await?
@@ -1236,9 +1178,6 @@ impl Provider for GitlabPackages {
             }
             let roles = config::collection_roles(collection);
             let (mut index, mut page) = api::list_cursor(cursor, roles.len())?;
-            if !context.can_list {
-                return Err(unsupported());
-            }
             let credential = self.credential(&context.secret).await?;
             let mut objects = Vec::new();
             let mut next_cursor = None;

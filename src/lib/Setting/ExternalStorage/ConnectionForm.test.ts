@@ -301,6 +301,46 @@ describe('Android Google authorization lifecycle', () => {
 })
 
 describe('service presets', () => {
+    it('asks only WebDAV for the username used to authenticate', async () => {
+        component = mount(ConnectionForm, {
+            target,
+            props: { strings, onconnected: vi.fn(), oncancel: vi.fn() },
+        })
+        await settle()
+        await selectProvider('webdav')
+        expect(labelControl<HTMLInputElement>('User name')).toBeDefined()
+        for (const provider of ['s3', 'mybox', 'github_releases', 'gitlab_packages', 'google_drive', 'onedrive']) {
+            await selectProvider(provider)
+            const labels = [...target.querySelectorAll('label.field > span')].map(label => label.textContent)
+            expect(labels).not.toContain('Account name')
+            expect(labels).not.toContain('Token owner')
+            expect(labels).not.toContain('GitHub user name')
+            expect(labels.some(label => label === 'Account' || label?.startsWith('Account ('))).toBe(false)
+        }
+    })
+
+    it('requires one GitLab access token with clear project permissions', async () => {
+        state.prepareConnection.mockResolvedValue({
+            ...prepared,
+            endpoint: { ...prepared.endpoint, providerId: 'gitlab_packages' },
+            requiresOAuth: false,
+        })
+        component = mount(ConnectionForm, {
+            target,
+            props: { strings, onconnected: vi.fn(), oncancel: vi.fn() },
+        })
+        await settle()
+        await selectProvider('gitlab_packages')
+        button(strings.prepare).click()
+        await settle()
+        labelControl<HTMLInputElement>(strings.confirmEndpoint).click()
+        await settle()
+        expect(target.textContent).toContain('api scope')
+        expect(target.textContent).toContain('Maintainer')
+        expect(target.textContent).not.toContain('Token type')
+        expect(target.textContent).not.toContain('Deploy token')
+    })
+
     it('offers Amazon S3 under its own name without becoming the preselected preset', async () => {
         component = mount(ConnectionForm, {
             target,

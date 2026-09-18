@@ -6,7 +6,7 @@ import {
     restorableExternalHistoryItems,
     externalConflictActions,
 } from './connection'
-import { buildProviderSecret } from './providerRegistry'
+import { buildConnectionConfig, buildProviderSecret, externalProviderDefinitions } from './providerRegistry'
 
 describe('external storage connection request', () => {
     it('keeps a capture policy off synchronization connections and requires one for a backup', () => {
@@ -43,9 +43,27 @@ describe('external storage connection request', () => {
             capturePolicy: defaultExternalCapturePolicy('backup'), acknowledgements: [],
         })
         expect(request.config).toEqual({
-            provider: 'gitlab_packages', profile: 'selfManaged', endpoint: 'https://gitlab.example', accountId: 'user',
+            provider: 'gitlab_packages', profile: 'selfManaged', endpoint: 'https://gitlab.example', accountId: '',
             location: { projectId: '1', packageName: 'risunest' },
         })
+    })
+
+    it.each(externalProviderDefinitions.filter(provider => provider.id !== 'webdav'))(
+        'derives $id identity natively without a renderer account label',
+        provider => {
+            expect(provider.fields.some(field => field.key === 'accountId')).toBe(false)
+            expect(buildConnectionConfig(provider.id, {}, 'windows').accountId).toBe('')
+            expect(buildConnectionConfig(provider.id, { accountId: 'untrusted-label' }, 'windows').accountId).toBe('')
+        },
+    )
+
+    it('retains the WebDAV username required for authentication', () => {
+        expect(buildConnectionConfig('webdav', { accountId: ' dav-user ' }, 'windows').accountId).toBe('dav-user')
+    })
+
+    it('sends a GitLab access token without a token-kind negotiation field', () => {
+        expect(buildProviderSecret('gitlab_packages', { token: 'synthetic-access-token' }))
+            .toEqual({ kind: 'gitlab', token: 'synthetic-access-token' })
     })
 
     it('puts the Android Google Web client and exact HTTPS callback in non-secret config', () => {
