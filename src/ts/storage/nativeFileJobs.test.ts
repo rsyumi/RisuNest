@@ -222,6 +222,7 @@ describe('native file jobs', () => {
         async (ackFails) => {
             const calls: string[] = []
             const events: string[] = []
+            let failAck = ackFails
             const refresh = vi.fn(async () => {})
             const committed = {
                 revision: 4,
@@ -253,6 +254,20 @@ describe('native file jobs', () => {
                     deviceSessionId: 'device-session',
                 },
             ]
+            const invoke = async (command: string) => {
+                calls.push(command)
+                if (command === 'native_file_job_start') return { jobId: 'job-1' }
+                if (command === 'native_file_job_status') return statuses.shift()
+                if (command === 'native_portable_select_sections') return undefined
+                if (command === 'native_file_job_finalize') return undefined
+                if (command === 'native_device_backup_recovery_complete') {
+                    events.push('device-ack')
+                    if (failAck) throw new Error('synthetic ack failure')
+                    return undefined
+                }
+                if (command === 'native_file_job_forget') return true
+                throw new Error(`Unexpected command: ${command}`)
+            }
             const running = runNativeArchiveRestore(
                 restoreRuntime(3, { refresh }),
                 { type: 'desktopPath', path: 'C:\\synthetic\\portable.risunest' },
@@ -262,25 +277,12 @@ describe('native file jobs', () => {
                         deviceSections: ['hypa'],
                     }),
                     onNativeStatus: async (value) => {
-                        if (value.state === 'succeeded') events.push('terminal-observed')
+                        if (value.state === 'succeeded') events.push('library-hold')
                     },
                 },
                 {
                     isTauri: () => true,
-                    invoke: async (command) => {
-                        calls.push(command)
-                        if (command === 'native_file_job_start') return { jobId: 'job-1' }
-                        if (command === 'native_file_job_status') return statuses.shift()
-                        if (command === 'native_portable_select_sections') return undefined
-                        if (command === 'native_file_job_finalize') return undefined
-                        if (command === 'native_device_backup_recovery_complete') {
-                            events.push('device-ack')
-                            if (ackFails) throw new Error('synthetic ack failure')
-                            return undefined
-                        }
-                        if (command === 'native_file_job_forget') return true
-                        throw new Error(`Unexpected command: ${command}`)
-                    },
+                    invoke,
                     wait: async () => undefined,
                 },
             )
@@ -291,12 +293,24 @@ describe('native file jobs', () => {
                 )
                 expect(refresh).not.toHaveBeenCalled()
                 expect(calls).not.toContain('native_file_job_forget')
+                expect(calls.filter(command => command === 'native_file_job_finalize'))
+                    .toHaveLength(1)
+                failAck = false
+                await invoke('native_device_backup_recovery_complete')
+                expect(calls.filter(command => command === 'native_file_job_finalize'))
+                    .toHaveLength(1)
+                expect(refresh).not.toHaveBeenCalled()
+                expect(calls).not.toContain('native_file_job_forget')
             } else {
                 await expect(running).resolves.toEqual(committed)
                 expect(refresh).toHaveBeenCalledOnce()
                 expect(calls).toContain('native_file_job_forget')
             }
-            expect(events).toEqual(['terminal-observed', 'device-ack'])
+            expect(events).toEqual(
+                ackFails
+                    ? ['library-hold', 'device-ack', 'device-ack']
+                    : ['library-hold', 'device-ack'],
+            )
         },
     )
 
