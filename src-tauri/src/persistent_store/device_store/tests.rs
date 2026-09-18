@@ -59,6 +59,7 @@ fn every_live_device_table_is_listed_here() {
         "device_remote_cursors",
         "device_sections",
         "device_settings",
+        "external_conflicts",
         "hypa_embeddings",
         "plugin_claim_sessions",
         "plugin_device_storage",

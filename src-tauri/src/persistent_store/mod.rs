@@ -1788,6 +1788,18 @@ impl PersistentStore {
         commit::staged_plugin_preview(&self.connection, staging_id)
     }
 
+    pub(crate) fn staged_library_counts(&self, staging_id: &str) -> StoreResult<(u64, u64)> {
+        commit::require_staging(&self.connection, staging_id)?;
+        let (characters, presets): (i64, i64) = self.connection.query_row(
+            "SELECT
+                (SELECT count(*) FROM characters WHERE generation=?1),
+                (SELECT count(*) FROM bot_presets WHERE generation=?1)",
+            [staging_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((characters as u64, presets as u64))
+    }
+
     pub(crate) fn assign_staged_plugin_values(
         &mut self,
         staging_id: &str,
@@ -2794,6 +2806,14 @@ impl PersistentStore {
                 &self.connection,
                 &self.repository_root,
             )?,
+        ));
+        roots.push((
+            "external-conflict",
+            external_conflicts::registered_conflict_roots(
+                self.device_store()?.connection(),
+                &self.repository_root,
+            )?
+            .assets,
         ));
         let mut server_conflicts =
             crate::asset_repository::migration_gc::AssetRootSet::default();

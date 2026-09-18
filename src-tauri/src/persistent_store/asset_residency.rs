@@ -99,12 +99,16 @@ impl PersistentStore {
     }
     fn residency_inventory(&self, guarded: bool) -> Result<Inventory> {
         let cas = PayloadCas::new(&self.repository_root)?;
-        let roots = self.collect_asset_gc_roots(guarded, false)?;
+        let roots = self.collect_labelled_asset_gc_roots(guarded, false)?;
         let mut referenced = BTreeSet::new();
         let mut local = BTreeSet::new();
         let mut release_blocked = false;
-        for root in roots {
+        for (label, root) in roots {
             release_blocked |= root.retain_all_objects || !root.blockers.is_empty();
+            if label == "external-conflict" {
+                local.extend(root.object_hashes.iter().cloned());
+                local.extend(root.manifest_hashes.iter().cloned());
+            }
             referenced.extend(root.object_hashes);
             referenced.extend(root.manifest_hashes.iter().cloned());
             local.extend(root.manifest_hashes);

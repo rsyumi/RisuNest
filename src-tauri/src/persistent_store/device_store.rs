@@ -464,6 +464,7 @@ fn create_schema(connection: &mut Connection) -> StoreResult<()> {
         });
     }
     transaction.execute_batch(SCHEMA)?;
+    super::external_conflicts::create_device_schema(&transaction)?;
     create_triggers(&transaction)?;
     transaction.execute(
         "INSERT INTO device_meta (singleton, writer_id, created_at, revision) VALUES (1,?1,?2,0)",
@@ -491,10 +492,12 @@ fn validate_schema(db: &Connection) -> StoreResult<()> {
     // Compare the complete definitions, including constraints and tracking expressions.
     let reference = Connection::open_in_memory()?;
     reference.execute_batch(SCHEMA)?;
+    super::external_conflicts::create_device_schema(&reference)?;
     create_triggers(&reference)?;
     if definitions(db)? != definitions(&reference)? {
         return Err(invalid("Device schema is incompatible"));
     }
+    super::external_conflicts::validate_device_schema(db)?;
     let meta: i64 = db.query_row(
         "SELECT count(*) FROM device_meta WHERE singleton=1 AND length(writer_id)>0",
         [],
