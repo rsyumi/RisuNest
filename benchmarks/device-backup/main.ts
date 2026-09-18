@@ -63,9 +63,8 @@ interface Control {
   fault?: {
     point: FaultPoint;
     reached: boolean;
-    oldExpected: string[];
     newExpected: string[];
-    outcome?: "old" | "committed";
+    outcome?: "committed";
   };
 }
 
@@ -191,8 +190,10 @@ async function fingerprints() {
   const hypaParts: BlobPart[] = [];
   for (const entryKey of [...hypaKeys, extraHypaKey]) {
     const value = cache.get(entryKey);
-    hypaParts.push(entryKey, value ? String(value.dimensions) : "missing");
     if (value) {
+      hypaParts.push(
+        JSON.stringify({ key: entryKey, dimensions: value.dimensions }),
+      );
       const vectorBytes = new Uint8Array(value.vector.byteLength);
       vectorBytes.set(
         new Uint8Array(
@@ -202,6 +203,8 @@ async function fingerprints() {
         ),
       );
       hypaParts.push(vectorBytes);
+    } else {
+      hypaParts.push(JSON.stringify({ key: entryKey, missing: true }));
     }
   }
   const plugins = pluginKeyspace();
@@ -408,7 +411,6 @@ async function restoreArchive(
     ? {
         point: faultPoint,
         reached: false,
-        oldExpected: await fingerprints(),
         newExpected: peer.expected,
       }
     : undefined;
@@ -499,12 +501,10 @@ async function resume() {
     check(!!control.fault?.reached, "synthetic-process-kill-point-reached");
     await nativeInvoke("pds_open");
     const actual = await fingerprints();
-    const oldState =
-      JSON.stringify(actual) === JSON.stringify(control.fault!.oldExpected);
     const committedState =
       JSON.stringify(actual) === JSON.stringify(control.fault!.newExpected);
-    check(oldState || committedState, "process-kill-recovers-atomic-state");
-    control.fault!.outcome = oldState ? "old" : "committed";
+    check(committedState, "process-kill-recovers-committed-state");
+    control.fault!.outcome = "committed";
     check(
       localStorage.getItem("outside_smoke_sentinel") === "untouched",
       "process-kill-outside-native-sections-preserved",
