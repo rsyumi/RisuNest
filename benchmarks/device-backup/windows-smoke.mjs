@@ -514,6 +514,58 @@ async function run() {
         if (
           reuse?.faultPoint &&
           killed &&
+          !report.verificationControlRehydrated &&
+          state.stage === "ready" &&
+          state.failure === undefined &&
+          state.revision === 0 &&
+          state.restartCount === 0 &&
+          Array.isArray(state.checks) &&
+          state.checks.length === 0 &&
+          Array.isArray(state.statusTransitions) &&
+          state.statusTransitions.length === 0 &&
+          state.fault === undefined &&
+          state.jobId === undefined &&
+          state.backupPath === undefined &&
+          state.expected === undefined
+        ) {
+          const witness = report.killPoint;
+          const killedTransition =
+            "restore-portable-backup:running:activating-database";
+          if (
+            witness?.point !== reuse.faultPoint ||
+            witness.state?.stage !== "fault-restore" ||
+            typeof witness.state?.jobId !== "string" ||
+            witness.state.jobId.length === 0 ||
+            witness.state?.fault?.point !== reuse.faultPoint ||
+            witness.state?.fault?.reached !== true ||
+            witness.state?.statusTransitions?.at(-1) !== killedTransition ||
+            !Number.isInteger(witness.pid) ||
+            !Number.isInteger(witness.restartedPid) ||
+            !Number.isFinite(witness.killedAt) ||
+            !Number.isFinite(witness.restartedAt) ||
+            witness.killedAt > witness.restartedAt ||
+            witness.pid === witness.restartedPid
+          )
+            throw new Error("synthetic-missing-control-kill-witness-invalid");
+          const completion = await evaluate(
+            page,
+            `(async()=>{try{await globalThis.__deviceBackupSmoke.restoreControl(${JSON.stringify(witness.state)});return 'unexpected-success'}catch(error){return error instanceof Error?error.message:String(error)}})()`,
+          );
+          if (completion !== "Synthetic fixture cannot be rehydrated while active")
+            throw new Error("synthetic-missing-control-startup-not-complete");
+          report.startupEntryCompletedWithMissingControl = true;
+          report.verificationStartState = state;
+          report.verificationControlRehydrated = true;
+          controlRehydrationPending = true;
+          await evaluate(
+            page,
+            `localStorage.setItem('risunest-synthetic-device-smoke-fault',${JSON.stringify(JSON.stringify(witness.state))});sessionStorage.setItem('risunest-synthetic-device-smoke',${JSON.stringify(JSON.stringify(witness.state))});setTimeout(()=>location.reload(),0);true`,
+          );
+          continue;
+        }
+        if (
+          reuse?.faultPoint &&
+          killed &&
           state.failure === "synthetic-process-kill-point-reached" &&
           !report.verificationControlRehydrated
         ) {
@@ -668,6 +720,14 @@ async function run() {
           if (report.killPoint && !reuse?.recoveryReport)
             report.killPoint.postKillVerificationMs =
               Date.now() - report.killPoint.killedAt;
+          if (reuse?.faultPoint) {
+            if (
+              state.fault?.outcome !== "old" &&
+              state.fault?.outcome !== "committed"
+            )
+              throw new Error("synthetic-fault-recovery-outcome-missing");
+            report.faultRecoveryOutcome = state.fault.outcome;
+          }
           report.passed = true;
           break;
         }
