@@ -291,18 +291,12 @@ impl PersistentStore {
             ) {
                 Ok(roots) => roots.catalogs,
                 Err(error) => {
-                    crate::nlog!(
-                        "warn",
-                        format!("external capture cleanup deferred: {error}")
-                    );
+                    crate::nlog!("warn", "external capture cleanup deferred: {error}");
                     return Ok(());
                 }
             },
             Err(error) => {
-                crate::nlog!(
-                    "warn",
-                    format!("external capture cleanup deferred: {error}")
-                );
+                crate::nlog!("warn", "external capture cleanup deferred: {error}");
                 return Ok(());
             }
         };
@@ -810,14 +804,93 @@ impl PersistentStore {
         tx.commit()?;
         Ok(!remaining)
     }
+
+    pub(crate) fn cleanup_deleted_conflict_capture(
+        &mut self,
+        reference: &DurableCaptureReference,
+    ) -> StoreResult<bool> {
+        let remaining = super::external_conflicts::registered_conflict_roots(
+            self.device_store()?.connection(),
+            &self.repository_root,
+        )?;
+        let roots = crate::external_storage::capture::registered_capture_roots(
+            [reference],
+            &self.repository_root,
+        )?;
+        let path = roots
+            .catalogs
+            .into_iter()
+            .next()
+            .ok_or_else(|| invalid("Conflict capture catalog is unavailable"))?;
+        if remaining.catalogs.contains(&path) {
+            return Ok(false);
+        }
+
+        let tx = self.connection.transaction()?;
+        let mut rows = {
+            let mut query = tx.prepare(
+                "SELECT c.id,c.identity,f.catalog_path,f.file_hash FROM external_storage_capture_files f JOIN external_storage_captures c ON c.id=f.capture_id",
+            )?;
+            query
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        rows.retain(|(_, _, candidate, _)| {
+            Path::new(candidate)
+                .canonicalize()
+                .is_ok_and(|candidate| candidate == path)
+        });
+        for (capture_id, encoded_identity, _, file_hash) in &rows {
+            if capture_id != &reference.capture_id
+                || file_hash != &reference.catalog_hash
+                || serde_json::from_str::<sync_selection::CaptureIdentity>(encoded_identity)?
+                    != reference.identity
+            {
+                return Err(invalid("Conflict capture owner differs"));
+            }
+            let active: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM external_storage_capture_refs WHERE capture_id=?1)",
+                [capture_id],
+                |row| row.get(0),
+            )?;
+            let needed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM content_change_consumers WHERE generation=?1 AND revision=?2 AND rebuild_required=0)",
+                params![reference.identity.generation, reference.identity.revision],
+                |row| row.get(0),
+            )?;
+            if active || needed {
+                return Ok(false);
+            }
+        }
+        for (capture_id, _, _, _) in rows {
+            tx.execute(
+                "DELETE FROM external_storage_capture_files WHERE capture_id=?1",
+                [&capture_id],
+            )?;
+            tx.execute(
+                "DELETE FROM external_storage_captures WHERE id=?1",
+                [&capture_id],
+            )?;
+        }
+        tx.commit()?;
+        self.remove_capture_file(&path);
+        Ok(!path.exists())
+    }
 }
 
 #[cfg(test)]
 mod conflict_cleanup_tests {
     use super::*;
     use crate::persistent_store::external_conflicts::{
-        create_device_schema, delete_external_conflict, preserve_local_conflict,
-        ExternalConflictRecord, PreservedHeadObservation, PreservedRemoteState,
+        delete_external_conflict, preserve_local_conflict, ExternalConflictRecord,
+        PreservedHeadObservation, PreservedRemoteState,
     };
     use risunest_external_storage_format::snapshot::{
         ObjectRole, PublicObjectHeader, StoredObject, WireLocator,
@@ -866,16 +939,6 @@ mod conflict_cleanup_tests {
         drop(catalog);
 
         let device = store.device_store().unwrap().connection();
-        let has_table: bool = device
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='external_conflicts')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        if !has_table {
-            create_device_schema(device).unwrap();
-        }
         preserve_local_conflict(
             device,
             &ExternalConflictRecord {
@@ -937,8 +1000,24 @@ mod conflict_cleanup_tests {
             .unwrap();
         assert!(retained);
 
+        store
+            .connection
+            .execute(
+                "DELETE FROM external_storage_capture_files WHERE capture_id=?1",
+                [&reference.capture_id],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "DELETE FROM external_storage_captures WHERE id=?1",
+                [&reference.capture_id],
+            )
+            .unwrap();
         delete_external_conflict(store.device_store().unwrap().connection(), "conflict").unwrap();
-        store.cleanup_capture_cache("new-capture").unwrap();
+        assert!(store
+            .cleanup_deleted_conflict_capture(&reference)
+            .unwrap());
         assert!(!catalog_path.exists());
     }
 }

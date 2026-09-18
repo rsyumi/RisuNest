@@ -3,7 +3,7 @@
 use super::{
     capabilities::Capabilities,
     capture::DurableCaptureReference,
-    connection_commands,
+    connection_commands, connection_store::ConnectionStore,
     contract::{Cancellation, ErrorKind, LeaseKind, ProviderError, Result},
     control, leases,
     packaging::RemoteObject,
@@ -449,6 +449,14 @@ pub(crate) async fn external_storage_export_snapshot(
         .map_err(|_| ProviderError::new(ErrorKind::Transient))?;
     let cancel = Cancellation::default();
     let connected = connection_commands::open_connected(&app, &request.connection_id).await?;
+    let known = match ConnectionStore::open(&root)?.discovery_snapshot(
+        &request.connection_id,
+        &request.snapshot_id,
+    ) {
+        Ok(value) => Some(value),
+        Err(error) if error.kind == ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
     let writer_id = crate::persistent_store::commands::with_store_mut(app.state(), |store| {
         store.external_identity()
     })
@@ -470,7 +478,25 @@ pub(crate) async fn external_storage_export_snapshot(
         &connected.stored.capabilities,
         &cancel,
         async {
-            let remote = control::find_snapshot(&connected, &request.snapshot_id, &cancel).await?;
+            let cache_root = root.clone();
+            let cache_connection = request.connection_id.clone();
+            let cache_id = request.snapshot_id.clone();
+            let remote = control::find_snapshot_with_locator_invalidation(
+                &connected,
+                &request.snapshot_id,
+                known.as_ref(),
+                move || {
+                    ConnectionStore::open(&cache_root)?
+                        .forget_discovery(&cache_connection, &cache_id)
+                },
+                &cancel,
+            )
+            .await?;
+            ConnectionStore::open(&root)?.remember_discovery(
+                &request.connection_id,
+                &request.snapshot_id,
+                &remote,
+            )?;
             let prepared = snapshot_restore::download_snapshot(
                 &remote,
                 &staging.path().join("verified"),

@@ -1032,6 +1032,19 @@ pub(crate) async fn find_snapshot_with_locator(
     known: Option<&RemoteObject>,
     cancel: &Cancellation,
 ) -> Result<RemoteObject> {
+    find_snapshot_with_locator_invalidation(connected, snapshot_id, known, || Ok(()), cancel).await
+}
+
+pub(crate) async fn find_snapshot_with_locator_invalidation<F>(
+    connected: &super::connection_commands::ConnectedRepository,
+    snapshot_id: &str,
+    known: Option<&RemoteObject>,
+    invalidate_known: F,
+    cancel: &Cancellation,
+) -> Result<RemoteObject>
+where
+    F: FnOnce() -> Result<()>,
+{
     if snapshot_id.is_empty() || snapshot_id.len() > 1024 || snapshot_id.contains('\0') {
         return Err(corrupt("invalid snapshot selection"));
     }
@@ -1043,7 +1056,7 @@ pub(crate) async fn find_snapshot_with_locator(
                 }
                 return Ok(object);
             }
-            Err(error) if error.kind == ErrorKind::NotFound => {}
+            Err(error) if error.kind == ErrorKind::NotFound => invalidate_known()?,
             Err(error) => return Err(error),
         }
     }
@@ -1644,17 +1657,23 @@ mod tests {
                 let (known, bytes) = snapshot_fixture(&connected, "target", "opaque-target", 1);
                 provider.seed("opaque-target", ObjectRole::BackupBundle, bytes);
                 provider.fail_read("opaque-target", kind);
+                let invalidated = std::sync::atomic::AtomicBool::new(false);
 
-                let error = find_snapshot_with_locator(
+                let error = find_snapshot_with_locator_invalidation(
                     &connected,
                     "target",
                     Some(&known),
+                    || {
+                        invalidated.store(true, std::sync::atomic::Ordering::Release);
+                        Ok(())
+                    },
                     &Cancellation::default(),
                 )
                 .await
                 .unwrap_err();
 
                 assert_eq!(error.kind, kind);
+                assert!(!invalidated.load(std::sync::atomic::Ordering::Acquire));
                 assert_eq!(provider.listing_count(), 0);
             }
         });
@@ -1668,16 +1687,22 @@ mod tests {
             let (mut known, bytes) = snapshot_fixture(&connected, "target", "current-target", 1);
             provider.seed("current-target", ObjectRole::BackupBundle, bytes);
             known.receipt.locator.object = "stale-target".into();
+            let invalidated = std::sync::atomic::AtomicBool::new(false);
 
-            let found = find_snapshot_with_locator(
+            let found = find_snapshot_with_locator_invalidation(
                 &connected,
                 "target",
                 Some(&known),
+                || {
+                    invalidated.store(true, std::sync::atomic::Ordering::Release);
+                    Ok(())
+                },
                 &Cancellation::default(),
             )
             .await
             .unwrap();
 
+            assert!(invalidated.load(std::sync::atomic::Ordering::Acquire));
             assert_eq!(found.receipt.locator.object, "current-target");
             assert_eq!(provider.read_attempts("stale-target"), 1);
             assert_eq!(provider.listing_count(), 1);
