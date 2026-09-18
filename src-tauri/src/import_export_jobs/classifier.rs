@@ -24,6 +24,7 @@ pub enum ContentKind {
     CharxCard,
     AppendedCharxJpeg,
     JpegAsset,
+    RescueArchive,
     Unknown,
 }
 
@@ -65,6 +66,11 @@ pub fn classify_content(
     }
     if looks_like_json(prefix) {
         return Ok(ContentKind::JsonCard);
+    }
+    if crate::native_file_jobs::raw_recovery::is_raw_recovery_archive(reader)
+        .map_err(|_| FormatError::invalid("rescue archive probe failed"))?
+    {
+        return Ok(ContentKind::RescueArchive);
     }
     if probe_charx(
         reader,
