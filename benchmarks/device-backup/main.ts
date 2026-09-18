@@ -1,25 +1,45 @@
+import "../../src/ts/polyfill";
 import { invoke as nativeInvoke } from "@tauri-apps/api/core";
-import { pluginDeviceStorage } from "../../src/ts/plugins/pluginDeviceStorage";
+import { appDataDir, join } from "@tauri-apps/api/path";
 import {
-  captureDeviceSection,
-  databaseSectionId,
-  type DeviceSpool,
-  type DeviceSectionId,
-} from "../../src/ts/storage/deviceBackup/scopes";
+  PluginDeviceKeyspace,
+  createNativePluginDeviceBackend,
+} from "../../src/ts/plugins/pluginDeviceKeyspace";
+import { deviceMaintenanceBeforeBootstrap } from "../../src/ts/storage/deviceBackup/entry";
+import type { NativePortableDeviceSection } from "../../src/ts/storage/deviceBackup/selection";
 import {
-  runDeviceMaintenance,
-  type DeviceMaintenanceBootstrap,
-} from "../../src/ts/storage/deviceBackup/maintenance";
-import type { DeviceNativeInvoke } from "../../src/ts/storage/deviceBackup/nativeSpool";
+  acknowledgeRecoveredNativeRestores,
+  reconcileNativeFileJobsBeforeBootstrap,
+} from "../../src/ts/storage/nativeFileJobRecovery";
+import {
+  runNativeArchiveExport,
+  runNativeArchiveRestore,
+  type NativeBackupExportDependencies,
+  type NativeBlockRestoreRuntime,
+  type NativeFileJobStatus,
+} from "../../src/ts/storage/nativeFileJobs";
+import {
+  createNativeHypaEmbeddingCache,
+  type HypaEmbeddingEntry,
+} from "../../src/ts/storage/hypaEmbeddingCache";
+import { createNativeDeviceSettings } from "../../src/ts/storage/nativeDeviceSettings";
 
 const key = "risunest-synthetic-device-smoke";
 const faultKey = "risunest-synthetic-device-smoke-fault";
+const pluginOwner = "device-backup-smoke";
+const settingKey = "risuNestDeviceSettings";
+const vectorCount = 2048;
+const vectorDimensions = 1024;
 const wait = (milliseconds: number) =>
   new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+
+type FaultPoint = "activating-database";
+
 interface Control {
   stage:
     | "ready"
     | "export"
+    | "restart"
     | "restore"
     | "cancel"
     | "done"
@@ -34,43 +54,54 @@ interface Control {
   startedAt?: number;
   cancellationAt?: number;
   cancellationMs?: number;
-  maxIpcBytes: number;
-  totalIpcBytes: number;
   peakHeapBytes: number;
+  maxNativeProgressBytes: number;
+  statusTransitions: string[];
   checks: string[];
+  restartCount: number;
   failure?: string;
   fault?: {
-    point: "before-commit" | "after-device-marker";
+    point: FaultPoint;
     reached: boolean;
     oldExpected: string[];
     newExpected: string[];
+    outcome?: "old" | "committed";
   };
 }
-const sections: DeviceSectionId[] = [
-  "local-storage",
-  "localforage",
-  databaseSectionId("safe_plugin_smoke_records"),
-  databaseSectionId("safe_plugin_smoke_writers"),
+
+const sections: NativePortableDeviceSection[] = [
+  "hypa",
+  "local-plugins",
+  "local-settings",
 ];
+const hypaKeys = Array.from({ length: vectorCount }, (_, index) =>
+  (index + 1).toString(16).padStart(64, "0"),
+);
+const extraHypaKey = "f".repeat(64);
+
 let control: Control = JSON.parse(
   localStorage.getItem(faultKey) ?? sessionStorage.getItem(key) ?? "null",
 ) ?? {
   stage: "ready",
   revision: 0,
-  maxIpcBytes: 0,
-  totalIpcBytes: 0,
   peakHeapBytes: 0,
+  maxNativeProgressBytes: 0,
+  statusTransitions: [],
   checks: [],
+  restartCount: 0,
 };
+
 function save() {
   sessionStorage.setItem(key, JSON.stringify(control));
   if (control.fault) localStorage.setItem(faultKey, JSON.stringify(control));
 }
+
 function check(value: unknown, label: string) {
   if (!value) throw new Error(label);
-  control.checks.push(label);
+  if (!control.checks.includes(label)) control.checks.push(label);
   save();
 }
+
 function heap() {
   control.peakHeapBytes = Math.max(
     control.peakHeapBytes,
@@ -78,244 +109,273 @@ function heap() {
       .memory?.usedJSHeapSize ?? 0,
   );
 }
-async function hash(body: Blob | ArrayBuffer) {
-  const bytes = body instanceof Blob ? await body.arrayBuffer() : body;
+
+async function hash(parts: BlobPart[]) {
+  const bytes = await new Blob(parts).arrayBuffer();
   return Array.from(
     new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)),
     (value) => value.toString(16).padStart(2, "0"),
   ).join("");
 }
-function environment(signal?: AbortSignal) {
-  return {
-    localStorage,
-    localforage: pluginDeviceStorage,
-    indexedDB,
-    keyRange: IDBKeyRange,
-    signal,
-    barrier: { assertHeld() {} },
-    estimateStorage: () => navigator.storage.estimate(),
-  };
-}
-async function fingerprints() {
-  const results: string[] = [];
-  for (const sectionId of sections) {
-    let parts: string[] = [];
-    const spool: DeviceSpool = {
-      async beginSection(_id, metadata) {
-        parts = [JSON.stringify(metadata)];
-      },
-      async appendRow(_id, row) {
-        parts.push(JSON.stringify(row));
-      },
-      async finishSection(id) {
-        results.push(
-          await hash(new TextEncoder().encode(parts.join("\n")).buffer),
-        );
-        return {
-          sectionId: id,
-          metadata: JSON.parse(parts[0]),
-          recordCount: parts.length - 1,
-          digest: results.at(-1)!,
-        };
-      },
-      async sections() {
-        throw new Error("comparison sections unused");
-      },
-      async *rows() {
-        throw new Error("comparison rows unused");
-      },
-      putBinary: hash,
-      async getBinary() {
-        throw new Error("comparison object read unused");
-      },
-    };
-    await captureDeviceSection(sectionId, spool, environment());
-  }
-  return results;
-}
-function request<T>(value: IDBRequest<T>): Promise<T> {
-  return new Promise((resolve, reject) => {
-    value.onsuccess = () => resolve(value.result);
-    value.onerror = () => reject(value.error);
-  });
-}
-async function database(
-  name: string,
-  version?: number,
-  upgrade?: (db: IDBDatabase) => void,
-) {
-  const opening = indexedDB.open(name, version);
-  if (upgrade) opening.onupgradeneeded = () => upgrade(opening.result);
-  return request(opening);
-}
-async function transaction(
-  db: IDBDatabase,
-  store: string,
-  write: (store: IDBObjectStore) => void,
-) {
-  await new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(store, "readwrite");
-    tx.oncomplete = () => resolve();
-    tx.onabort = () => reject(tx.error);
-    tx.onerror = () => {};
-    write(tx.objectStore(store));
-  });
-}
-async function seed() {
-  localStorage.setItem("safe_plugin_smoke_text", "synthetic\u0000\ud800🙂");
-  localStorage.setItem("outside_smoke_sentinel", "untouched");
-  const buffer = new Uint8Array(8 * 1024 * 1024);
-  buffer.fill(53);
-  const graph: any = {
-    array: [, undefined, NaN, -0, Infinity],
-    map: new Map(),
-    set: new Set([1n, "synthetic"]),
-    blob: new Blob([buffer]),
-    view: new Uint16Array(buffer.buffer, 4, 8),
-  };
-  Object.defineProperty(graph, "__proto__", {
-    value: { synthetic: true },
-    enumerable: true,
-    writable: true,
-    configurable: true,
-  });
-  graph.self = graph;
-  graph.map.set(graph, graph.view);
-  await pluginDeviceStorage.setItem("safe_plugin_smoke_graph", graph);
-  await pluginDeviceStorage.setItem("outside_smoke_sentinel", "untouched");
-  const db = await database("safe_plugin_smoke_records", 3, (value) => {
-    const store = value.createObjectStore("records", { autoIncrement: true });
-    store.createIndex("tag", "tag");
-    value.createObjectStore("inline", { keyPath: "id", autoIncrement: true });
-  });
-  await transaction(db, "records", (store) => {
-    store.add({ tag: "synthetic", nested: graph }, 1);
-    store.add({ tag: "deleted" }, 41);
-    store.delete(41);
-  });
-  await transaction(db, "inline", (store) => {
-    store.add({ id: 7, text: "synthetic" });
-  });
-  // Keep a raw connection alive intentionally, proving that navigation closes it.
-  (globalThis as any).__smokeRawConnection = db;
-  const writers = await database("safe_plugin_smoke_writers", 1, (value) =>
-    value.createObjectStore("counters"),
+
+function pluginKeyspace() {
+  return new PluginDeviceKeyspace(
+    pluginOwner,
+    createNativePluginDeviceBackend(),
   );
-  await transaction(writers, "counters", (store) => {
-    store.put(0, "worker");
-    store.put(0, "iframe");
+}
+
+function embeddingEntries(seed: number): HypaEmbeddingEntry[] {
+  return hypaKeys.map((entryKey, index) => {
+    const vector = new Float32Array(vectorDimensions);
+    vector.fill(seed + index / vectorCount);
+    return {
+      key: entryKey,
+      producer: "device-backup-smoke",
+      model: "synthetic",
+      endpoint: null,
+      preprocessVersion: 1,
+      dimensions: vectorDimensions,
+      vector: vector.buffer,
+      metadata: `synthetic-${seed}-${index}`,
+    };
   });
-  writers.close();
-  const writerCode = (entry: string) =>
-    `const r=indexedDB.open('safe_plugin_smoke_writers');r.onsuccess=()=>{const db=r.result;setInterval(()=>{const t=db.transaction('counters','readwrite');const s=t.objectStore('counters');const r=s.get('${entry}');r.onsuccess=()=>s.put((r.result||0)+1,'${entry}');},10);};`;
-  (globalThis as any).__smokeWorker = new Worker(
-    URL.createObjectURL(
-      new Blob([writerCode("worker")], { type: "application/javascript" }),
+}
+
+async function seed() {
+  localStorage.setItem("outside_smoke_sentinel", "untouched");
+  await createNativeHypaEmbeddingCache().write(embeddingEntries(1));
+  const plugins = pluginKeyspace();
+  await plugins.setItem("string", "text", "synthetic\u0000\ud800🙂");
+  await plugins.setItem(
+    "json",
+    "graph",
+    JSON.stringify({ nested: [1, 2, 3], enabled: true }),
+  );
+  await createNativeDeviceSettings().set(settingKey, {
+    enabled: true,
+    label: "synthetic",
+  });
+}
+
+async function mutate() {
+  await createNativeHypaEmbeddingCache().write([
+    ...embeddingEntries(7),
+    {
+      key: extraHypaKey,
+      producer: "device-backup-smoke",
+      model: "synthetic",
+      endpoint: null,
+      preprocessVersion: 1,
+      dimensions: 4,
+      vector: new Float32Array([9, 8, 7, 6]).buffer,
+      metadata: "remove-after-restore",
+    },
+  ]);
+  const plugins = pluginKeyspace();
+  await plugins.setItem("string", "text", "replaced");
+  await plugins.removeItem("json", "graph");
+  await plugins.setItem("json", "extra", JSON.stringify({ remove: true }));
+  await createNativeDeviceSettings().set(settingKey, {
+    enabled: false,
+    label: "replaced",
+    extra: true,
+  });
+}
+
+async function fingerprints() {
+  const cache = await createNativeHypaEmbeddingCache().read([
+    ...hypaKeys,
+    extraHypaKey,
+  ]);
+  const hypaParts: BlobPart[] = [];
+  for (const entryKey of [...hypaKeys, extraHypaKey]) {
+    const value = cache.get(entryKey);
+    hypaParts.push(entryKey, value ? String(value.dimensions) : "missing");
+    if (value) hypaParts.push(value.vector.buffer);
+  }
+  const plugins = pluginKeyspace();
+  const pluginParts = await Promise.all(
+    (["graph", "extra"] as const).map(async (entryKey) =>
+      JSON.stringify([
+        "json",
+        entryKey,
+        await plugins.getItem("json", entryKey),
+      ]),
     ),
   );
-  const iframe = document.createElement("iframe");
-  iframe.srcdoc = `<script>${writerCode("iframe")}</script>`;
-  document.body.append(iframe);
-  await wait(200);
+  pluginParts.push(
+    JSON.stringify([
+      "string",
+      "text",
+      await plugins.getItem("string", "text"),
+    ]),
+  );
+  const setting = await createNativeDeviceSettings().get(settingKey);
+  return [
+    await hash(hypaParts),
+    await hash(pluginParts),
+    await hash([JSON.stringify(setting)]),
+  ];
 }
-async function writerValues() {
-  const db = await database("safe_plugin_smoke_writers");
-  const tx = db.transaction("counters", "readonly");
-  const store = tx.objectStore("counters");
-  const values = await Promise.all([
-    request(store.get("worker")),
-    request(store.get("iframe")),
-  ]);
-  db.close();
-  return values;
+
+function syntheticRuntime(): NativeBlockRestoreRuntime & {
+  readonly revision: number;
+  flushPendingData(reason: string): Promise<void>;
+} {
+  return {
+    get revision() {
+      return control.revision;
+    },
+    async flushPendingData() {},
+    async capturePersistentMutationToken() {
+      return { revision: control.revision, mutationGeneration: 0 };
+    },
+    async acquireDestructiveReplacementFence(expected) {
+      return {
+        revision: expected.revision,
+        async refreshCommittedWorkingSet(revision) {
+          if (revision !== control.revision)
+            throw new Error("Synthetic device-only restore changed the library revision");
+          // The isolated entry has no DBState projection. Device-only jobs must
+          // leave the already-current library revision untouched.
+          return { kind: "committed", revision, projection: "applied" };
+        },
+        release() {},
+      };
+    },
+    markCommittedWorkingSetRefreshRequired() {},
+    getStorageAuthorityEpoch() {
+      return 0;
+    },
+  };
 }
-async function mutate() {
-  localStorage.setItem("safe_plugin_smoke_text", "replaced");
-  localStorage.setItem("safe_plugin_smoke_extra", "remove");
-  await pluginDeviceStorage.removeItem("safe_plugin_smoke_graph");
-  await pluginDeviceStorage.setItem("safe_plugin_smoke_extra", "remove");
-  for (const name of [
-    "safe_plugin_smoke_records",
-    "safe_plugin_smoke_writers",
-  ]) {
-    await request(indexedDB.deleteDatabase(name));
-    const db = await database(name, 9, (value) =>
-      value.createObjectStore("wrong"),
-    );
-    db.close();
+
+const fileJobDependencies: NativeBackupExportDependencies = {
+  isTauri: () => true,
+  invoke: (command, args) =>
+    args === undefined ? nativeInvoke(command) : nativeInvoke(command, args),
+  wait,
+  async copyToAndroidSaf() {
+    throw new Error("Synthetic smoke uses an app-owned desktopPath destination");
+  },
+};
+
+function observeStatus(status: NativeFileJobStatus) {
+  const transition = `${status.kind}:${status.state}:${status.phase}`;
+  if (control.statusTransitions.at(-1) !== transition)
+    control.statusTransitions.push(transition);
+  control.maxNativeProgressBytes = Math.max(
+    control.maxNativeProgressBytes,
+    status.progress.completedBytes,
+  );
+  heap();
+  save();
+}
+
+async function assertNativeFence(status: NativeFileJobStatus) {
+  const label = `native-pds-fence-held:${status.jobId}`;
+  if (control.checks.includes(label)) return;
+  let rejected = false;
+  try {
+    await nativeInvoke("pds_open");
+  } catch {
+    rejected = true;
+  }
+  check(rejected, label);
+}
+
+async function observeRestoreStatus(status: NativeFileJobStatus) {
+  observeStatus(status);
+  if (status.phase !== "activating-database") return;
+  await assertNativeFence(status);
+  if (
+    control.stage === "fault-restore" &&
+    control.fault &&
+    !control.fault.reached
+  ) {
+    control.fault.reached = true;
+    save();
+    await new Promise<never>(() => {});
   }
 }
-async function jobStatus() {
-  return nativeInvoke<any>("native_file_job_status", { jobId: control.jobId });
+
+async function exportArchive(destination: string) {
+  const result = await runNativeArchiveExport(
+    syntheticRuntime(),
+    { type: "desktopPath", path: destination },
+    { library: false, deviceSections: sections },
+    {
+      pollIntervalMs: 20,
+      onStarted(jobId) {
+        control.jobId = jobId;
+        save();
+      },
+      onStatus: observeStatus,
+    },
+    fileJobDependencies,
+  );
+  check(result.sourceBytes > 0, "native-archive-published");
+  check(/^[a-f0-9]{64}$/.test(result.sourceSha256), "native-archive-hashed");
+  check(
+    control.statusTransitions.some((value) =>
+      value.startsWith("export-portable-backup:"),
+    ),
+    "native-export-job-observed",
+  );
+  return result;
 }
-async function toMaintenance() {
-  const deadline = Date.now() + 120000;
-  while (Date.now() < deadline) {
-    const status = await jobStatus();
-    if (status.phase === "awaiting-device-maintenance") {
-      let rejected = false;
-      try {
-        await nativeInvoke("pds_open");
-      } catch {
-        rejected = true;
-      }
-      check(rejected, "native-pds-fence-held");
-      save();
-      location.reload();
-      return;
-    }
-    if (["failed", "cancelled"].includes(status.state))
-      throw new Error(`job-start-${status.error?.code ?? status.state}`);
-    await wait(20);
-  }
-  throw new Error("maintenance-wait-timeout");
+
+async function restore(destination: string) {
+  return runNativeArchiveRestore(
+    syntheticRuntime(),
+    { type: "desktopPath", path: destination },
+    {
+      pollIntervalMs: 20,
+      onStarted(jobId) {
+        control.jobId = jobId;
+        save();
+      },
+      onStatus: observeStatus,
+      onNativeStatus: observeRestoreStatus,
+      async choosePortableSections(preview) {
+        check(
+          !preview.libraryIncluded &&
+            sections.every((section) =>
+              preview.deviceSections.includes(section),
+            ),
+          "native-section-preview-matches",
+        );
+        return { library: false, deviceSections: sections };
+      },
+    },
+    fileJobDependencies,
+  );
 }
-async function terminal() {
-  const deadline = Date.now() + 120000;
-  while (Date.now() < deadline) {
-    const status = await jobStatus();
-    if (["succeeded", "failed", "cancelled"].includes(status.state))
-      return status;
-    await wait(20);
-  }
-  throw new Error("terminal-wait-timeout");
-}
+
 async function start() {
   check(control.stage === "ready", "synthetic-fresh-start");
   const opened = await nativeInvoke<{ revision: number }>("pds_open");
   control.revision = opened.revision;
   await seed();
-  let writers = await writerValues();
-  const writerDeadline = Date.now() + 4000;
-  while (writers.some((value) => value === 0) && Date.now() < writerDeadline) {
-    await wait(100);
-    writers = await writerValues();
-  }
-  check(
-    writers.every((value) => value > 0),
-    "synthetic-worker-and-iframe-writing",
-  );
+  control.expected = await fingerprints();
   control.stage = "export";
   control.startedAt = Date.now();
-  save();
-  const started = await nativeInvoke<{ jobId: string }>(
-    "native_file_job_start",
-    {
-      request: {
-        kind: "export-portable-backup",
-        expectedRevision: control.revision,
-        selection: { library: false, deviceSections: sections },
-      },
-    },
+  control.backupPath = await join(
+    await appDataDir(),
+    "synthetic-device-backup.risunest",
   );
-  control.jobId = started.jobId;
   save();
-  await toMaintenance();
+  await exportArchive(control.backupPath);
+  control.captureMs = Date.now() - control.startedAt;
+  control.stage = "restart";
+  save();
+  location.reload();
 }
 
 async function restoreArchive(
   peer: { archivePath: string; expected: string[] },
-  faultPoint?: "before-commit" | "after-device-marker",
+  faultPoint?: FaultPoint,
 ) {
   check(
     control.stage === "done" || control.stage === "fault-recovered",
@@ -328,20 +388,6 @@ async function restoreArchive(
       peer.expected.every((value) => /^[a-f0-9]{64}$/.test(value)),
     "synthetic-peer-descriptor-valid",
   );
-  const jobs = await nativeInvoke<Array<{ jobId: string; state: string }>>(
-    "native_file_job_list",
-  );
-  if (jobs.some((job) => job.jobId === control.jobId)) {
-    check(
-      jobs.some(
-        (job) =>
-          job.jobId === control.jobId &&
-          ["succeeded", "failed", "cancelled"].includes(job.state),
-      ),
-      "synthetic-previous-job-terminal",
-    );
-    await nativeInvoke("native_file_job_forget", { jobId: control.jobId });
-  }
   await nativeInvoke("pds_open");
   await mutate();
   control.failure = undefined;
@@ -359,203 +405,133 @@ async function restoreArchive(
   localStorage.removeItem(faultKey);
   control.startedAt = Date.now();
   save();
-  const started = await nativeInvoke<{ jobId: string }>(
-    "native_file_job_start",
-    {
-      request: {
-        kind: "restore-portable-backup",
-        source: { type: "desktopPath", path: peer.archivePath },
-        expectedRevision: control.revision,
-        selection: { library: false, deviceSections: sections },
-      },
-    },
+  await restore(peer.archivePath);
+  if (!faultPoint) await completeRestore();
+}
+
+async function completeRestore() {
+  control.restoreMs = Date.now() - control.startedAt!;
+  check(
+    control.statusTransitions.some((value) =>
+      value.startsWith("restore-portable-backup:"),
+    ),
+    "native-restore-job-observed",
   );
-  control.jobId = started.jobId;
+  check(
+    JSON.stringify(control.expected) === JSON.stringify(await fingerprints()),
+    "all-native-sections-and-bytes-roundtrip",
+  );
+  check(
+    localStorage.getItem("outside_smoke_sentinel") === "untouched",
+    "outside-native-sections-preserved",
+  );
+  control.stage = "cancel";
+  control.cancellationAt = Date.now();
   save();
-  await toMaintenance();
+  const cancellation = new AbortController();
+  let cancellationPhase: string | undefined;
+  try {
+    await runNativeArchiveExport(
+      syntheticRuntime(),
+      {
+        type: "desktopPath",
+        path: await join(await appDataDir(), "synthetic-cancelled.risunest"),
+      },
+      { library: false, deviceSections: ["hypa"] },
+      {
+        signal: cancellation.signal,
+        pollIntervalMs: 10,
+        onStarted(jobId) {
+          control.jobId = jobId;
+          save();
+        },
+        onStatus(status) {
+          observeStatus(status);
+          if (
+            !cancellation.signal.aborted &&
+            status.state === "running" &&
+            status.phase === "writing-export"
+          ) {
+            cancellationPhase = status.phase;
+            cancellation.abort();
+          }
+        },
+      },
+      fileJobDependencies,
+    );
+    throw new Error("capture-cancelled-before-publication");
+  } catch (error) {
+    if (
+      !(error instanceof DOMException && error.name === "AbortError") &&
+      !(error instanceof Error && error.name === "AbortError")
+    )
+      throw error;
+  }
+  control.cancellationMs = Date.now() - control.cancellationAt;
+  check(cancellationPhase === "writing-export", "native-job-cancel-observed");
+  await nativeInvoke("pds_open");
+  check(true, "normal-store-reopens-after-cancellation");
+  control.stage = "done";
+  save();
 }
 
 async function resume() {
-  const bootstrap = await nativeInvoke<DeviceMaintenanceBootstrap>(
-    "native_device_backup_bootstrap",
-    { freshBootstrap: true },
+  const recovered = await reconcileNativeFileJobsBeforeBootstrap({
+    invoke: fileJobDependencies.invoke,
+    wait,
+  });
+  await acknowledgeRecoveredNativeRestores(
+    recovered.pendingRestoreAcknowledgements,
+    { invoke: fileJobDependencies.invoke, wait },
   );
-  if (bootstrap.mode === "maintenance") {
-    const cancellation = new AbortController();
-    const invoke: DeviceNativeInvoke = async (command, args) => {
-      const size = Array.isArray(args?.bytes) ? args.bytes.length : 0;
-      control.maxIpcBytes = Math.max(control.maxIpcBytes, size);
-      control.totalIpcBytes += size;
-      heap();
-      const result = await nativeInvoke(command, args);
-      if (
-        control.stage === "fault-restore" &&
-        control.fault &&
-        !control.fault.reached &&
-        ((control.fault.point === "before-commit" &&
-          command === "native_device_backup_section_complete" &&
-          args?.rollback === false) ||
-          (control.fault.point === "after-device-marker" &&
-            command === "native_device_backup_finish_device"))
-      ) {
-        // The runner kills only this synthetic native process after observing
-        // this durable boundary. No product command or module is instrumented.
-        control.fault.reached = true;
-        save();
-        await new Promise<never>(() => {});
-      }
-      if (
-        control.stage === "cancel" &&
-        command === "native_device_backup_blob_append" &&
-        !cancellation.signal.aborted
-      ) {
-        control.cancellationAt = Date.now();
-        save();
-        await nativeInvoke("native_file_job_cancel", { jobId: control.jobId });
-        cancellation.abort();
-      }
-      return result as never;
-    };
-    await runDeviceMaintenance(bootstrap, {
-      invoke,
-      environment: environment(cancellation.signal),
-      wait,
-      async assertExclusiveWriters() {
-        if (
-          navigator.serviceWorker?.controller ||
-          (await navigator.serviceWorker?.getRegistrations())?.length
-        )
-          throw new Error("unexpected-synthetic-service-worker");
-      },
-      view: {
-        progress() {
-          heap();
-        },
-        async reviewReplacement(plan) {
-          check(
-            plan.some((item) => item.deletionCount > 0),
-            "deletion-plan-before-restore",
-          );
-          return true;
-        },
-        async completed() {
-          control.checks.push("result-acknowledged-before-normal-bootstrap");
-          save();
-        },
-        failed() {
-          throw new Error("maintenance-recovery-blocked");
-        },
-      },
-    });
-  }
   if (control.stage === "fault-restore") {
+    check(true, "native-startup-recovery-completed");
     check(!!control.fault?.reached, "synthetic-process-kill-point-reached");
-    const current = await nativeInvoke<DeviceMaintenanceBootstrap>(
-      "native_device_backup_bootstrap",
-    );
-    check(current.mode === "normal", "recovery-before-normal-bootstrap");
     await nativeInvoke("pds_open");
-    const expected =
-      control.fault!.point === "before-commit"
-        ? control.fault!.oldExpected
-        : control.fault!.newExpected;
+    const actual = await fingerprints();
+    const oldState =
+      JSON.stringify(actual) === JSON.stringify(control.fault!.oldExpected);
+    const committedState =
+      JSON.stringify(actual) === JSON.stringify(control.fault!.newExpected);
+    check(oldState || committedState, "process-kill-recovers-atomic-state");
+    control.fault!.outcome = oldState ? "old" : "committed";
     check(
-      JSON.stringify(await fingerprints()) === JSON.stringify(expected),
-      control.fault!.point === "before-commit"
-        ? "process-kill-recovers-entire-old-state"
-        : "process-kill-recovers-entire-committed-state",
-    );
-    check(
-      localStorage.getItem("outside_smoke_sentinel") === "untouched" &&
-        (await pluginDeviceStorage.getItem("outside_smoke_sentinel")) ===
-          "untouched",
-      "process-kill-outside-prefix-preserved",
+      localStorage.getItem("outside_smoke_sentinel") === "untouched",
+      "process-kill-outside-native-sections-preserved",
     );
     control.stage = "fault-recovered";
     save();
-  } else if (control.stage === "export") {
-    const status = await terminal();
+  } else if (control.stage === "restart") {
+    control.restartCount += 1;
+    check(control.restartCount === 1, "renderer-restart-observed");
     check(
-      status.state === "succeeded",
-      `capture-${status.error?.code ?? status.state}`,
+      JSON.stringify(control.expected) === JSON.stringify(await fingerprints()),
+      "native-fixture-survives-renderer-restart",
     );
-    await nativeInvoke("pds_open");
-    control.captureMs = Date.now() - control.startedAt!;
-    control.backupPath = status.result.handoffPath;
-    check(typeof control.backupPath === "string", "managed-archive-produced");
-    const first = await writerValues();
-    await wait(250);
-    check(
-      JSON.stringify(first) === JSON.stringify(await writerValues()),
-      "worker-and-iframe-stopped-after-navigation",
-    );
-    control.expected = await fingerprints();
-    save();
     await mutate();
-    await nativeInvoke("native_file_job_forget", { jobId: control.jobId });
     control.stage = "restore";
     control.startedAt = Date.now();
     save();
-    const started = await nativeInvoke<{ jobId: string }>(
-      "native_file_job_start",
-      {
-        request: {
-          kind: "restore-portable-backup",
-          source: { type: "desktopPath", path: control.backupPath },
-          expectedRevision: control.revision,
-          selection: { library: false, deviceSections: sections },
-        },
-      },
-    );
-    control.jobId = started.jobId;
-    save();
-    await toMaintenance();
+    await restore(control.backupPath!);
+    await completeRestore();
   } else if (control.stage === "restore") {
-    const status = await terminal();
-    check(
-      status.state === "succeeded",
-      `restore-${status.error?.code ?? status.state}`,
-    );
-    await nativeInvoke("pds_open");
-    control.restoreMs = Date.now() - control.startedAt!;
-    check(
-      JSON.stringify(control.expected) === JSON.stringify(await fingerprints()),
-      "all-selected-graphs-schema-generator-and-bytes-roundtrip",
-    );
-    check(
-      localStorage.getItem("outside_smoke_sentinel") === "untouched" &&
-        (await pluginDeviceStorage.getItem("outside_smoke_sentinel")) ===
-          "untouched",
-      "outside-prefix-preserved",
-    );
-    await nativeInvoke("native_file_job_forget", { jobId: control.jobId });
-    control.stage = "cancel";
-    save();
-    const started = await nativeInvoke<{ jobId: string }>(
-      "native_file_job_start",
-      {
-        request: {
-          kind: "export-portable-backup",
-          expectedRevision: control.revision,
-          selection: { library: false, deviceSections: ["localforage"] },
-        },
-      },
-    );
-    control.jobId = started.jobId;
-    save();
-    await toMaintenance();
-  } else if (control.stage === "cancel") {
-    const status = await terminal();
-    check(status.state !== "succeeded", "capture-cancelled-before-publication");
-    control.cancellationMs = Date.now() - control.cancellationAt!;
-    check(control.maxIpcBytes <= 256 * 1024, "bounded-ipc-chunks");
-    await nativeInvoke("pds_open");
-    check(true, "normal-store-reopens-after-cancellation");
-    control.stage = "done";
-    save();
+    throw new Error("native-restore-wrapper-did-not-settle");
+  } else if (["export", "cancel"].includes(control.stage)) {
+    throw new Error("native-file-job-wrapper-did-not-settle");
   }
 }
-(globalThis as any).__deviceBackupSmoke = {
+
+(globalThis as typeof globalThis & {
+  __deviceBackupSmoke?: {
+    state(): Control;
+    start(): Promise<void>;
+    restoreControl(value: Control): Promise<void>;
+    restoreArchive(
+      peer: { archivePath: string; expected: string[] },
+      faultPoint?: FaultPoint,
+    ): Promise<void>;
+  };
+}).__deviceBackupSmoke = {
   state: () => ({ ...control }),
   start: () =>
     entryCompletion
@@ -572,19 +548,27 @@ async function resume() {
         !["done", "fault-recovered"].includes(value.stage)
       )
         throw new Error("Synthetic fixture cannot be rehydrated while active");
-      control = { ...value, fault: undefined, failure: undefined };
+      control = {
+        ...value,
+        fault: undefined,
+        failure: undefined,
+        statusTransitions: [],
+        maxNativeProgressBytes: 0,
+      };
       localStorage.removeItem(faultKey);
       save();
     }),
-  restoreArchive: (
-    peer: { archivePath: string; expected: string[] },
-    faultPoint?: "before-commit" | "after-device-marker",
-  ) => entryCompletion.then(() => restoreArchive(peer, faultPoint)).catch(fail),
+  restoreArchive: (peer, faultPoint) =>
+    entryCompletion.then(() => restoreArchive(peer, faultPoint)).catch(fail),
 };
+
 function fail(error: unknown) {
   control.failure = error instanceof Error ? error.message : String(error);
   save();
   document.getElementById("result")!.textContent =
     "Synthetic device backup smoke failed";
 }
-const entryCompletion = resume().catch(fail);
+
+const entryCompletion = deviceMaintenanceBeforeBootstrap()
+  .then(resume)
+  .catch(fail);

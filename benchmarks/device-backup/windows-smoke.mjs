@@ -121,8 +121,9 @@ async function absent(candidate) {
 async function sourceHashes() {
   const files = [
     "benchmarks/device-backup/main.ts",
-    "src/ts/storage/deviceBackup/maintenance.ts",
-    "src-tauri/src/device_backup/commands.rs",
+    "src/ts/storage/nativeFileJobs.ts",
+    "src/ts/storage/deviceBackup/entry.ts",
+    "src-tauri/src/native_file_jobs/portable.rs",
     "src-tauri/src/device_backup/mod.rs",
   ];
   return Object.fromEntries(
@@ -197,7 +198,7 @@ async function reuseRun() {
     !values["--reuse"] ||
     (!values["--peer"] &&
       !values["--verify-fault"] &&
-      !["before-commit", "after-device-marker"].includes(values["--fault"]))
+      values["--fault"] !== "activating-database")
   )
     throw new Error("synthetic-runner-invalid-argument");
   const reportPath = path.resolve(values["--reuse"]);
@@ -238,7 +239,7 @@ async function reuseRun() {
         "synthetic-fault-restore:synthetic-process-kill-point-reached" ||
       recoveryReport.killPoint?.state?.fault?.reached !== true ||
       !recoveryReport.state.checks.includes(
-        "result-acknowledged-before-normal-bootstrap",
+        "native-startup-recovery-completed",
       )
     )
       throw new Error("synthetic-fault-report-not-control-only-failure");
@@ -255,7 +256,7 @@ async function reuseRun() {
     !within(peer.archivePath, path.join(root, ".tmp")) ||
     !peer.archivePath.endsWith(".risunest") ||
     !Array.isArray(peer.expected) ||
-    peer.expected.length !== 4 ||
+    peer.expected.length !== 3 ||
     peer.expected.some((fingerprint) => !/^[0-9a-f]{64}$/.test(fingerprint))
   )
     throw new Error("synthetic-peer-descriptor-invalid");
@@ -516,7 +517,7 @@ async function run() {
           state.failure === "synthetic-process-kill-point-reached" &&
           !report.verificationControlRehydrated
         ) {
-          const acknowledgement = "result-acknowledged-before-normal-bootstrap";
+          const acknowledgement = "native-startup-recovery-completed";
           const coldRecoveryEvidence = reuse.recoveryReport?.state ?? state;
           const previousAcknowledgements = report.killPoint.state.checks.filter(
             (check) => check === acknowledgement,
@@ -526,12 +527,6 @@ async function run() {
           ).length;
           if (coldAcknowledgements <= previousAcknowledgements)
             throw new Error("synthetic-cold-recovery-not-acknowledged");
-          const bootstrap = await evaluate(
-            page,
-            "globalThis.__TAURI_INTERNALS__.invoke('native_device_backup_bootstrap')",
-          );
-          if (bootstrap.mode !== "normal")
-            throw new Error("synthetic-cold-recovery-not-normal");
           const control = {
             ...report.killPoint.state,
             stage: "fault-restore",
@@ -542,7 +537,7 @@ async function run() {
           report.coldRecoveryState = coldRecoveryEvidence;
           report.verificationStartState = state;
           report.verificationControlRehydrated = true;
-          report.nativeRecoveryCompletedBeforeControlRehydration = true;
+          report.productStartupRecoveryCompletedBeforeControlRehydration = true;
           controlRehydrationPending = true;
           await evaluate(
             page,

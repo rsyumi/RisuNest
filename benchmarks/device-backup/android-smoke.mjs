@@ -91,11 +91,11 @@ async function fileHash(file) {
 function validateFingerprints(expected) {
   assert.ok(
     Array.isArray(expected) &&
-      expected.length === 4 &&
+      expected.length === 3 &&
       expected.every(
         (value) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value),
       ),
-    "Four synthetic section fingerprints are required",
+    "Three synthetic section fingerprints are required",
   );
 }
 
@@ -103,8 +103,8 @@ async function retainArchive() {
   validateFingerprints(state.expected);
   assert.match(
     state.backupPath,
-    /^\/data\/(?:user\/0|data)\/io\.github\.rsyumi\.risunest\/native-file-jobs\/handoffs\/risunest-backup-[a-f0-9-]{36}\.risunest$/,
-    "Archive must be the synthetic app's managed native handoff",
+    /^\/data\/(?:user\/0|data)\/io\.github\.rsyumi\.risunest\/files\/synthetic-device-backup\.risunest$/,
+    "Archive must be the synthetic app's published private destination",
   );
   const archivePath = path.join(
     path.dirname(exchangePath),
@@ -178,7 +178,7 @@ async function startPeerRestore() {
   );
   await client.evaluate(`globalThis.__deviceBackupSmoke.restoreControl({
     ...globalThis.__deviceBackupSmoke.state(), checks:[],
-    maxIpcBytes:0,totalIpcBytes:0,peakHeapBytes:0,
+    maxNativeProgressBytes:0,statusTransitions:[],peakHeapBytes:0,
     captureMs:undefined,restoreMs:undefined,cancellationMs:undefined
   })`);
   await client.evaluate(
@@ -328,8 +328,9 @@ function metrics(value) {
     captureMs: value.captureMs ?? null,
     restoreMs: value.restoreMs ?? null,
     cancellationMs: value.cancellationMs ?? null,
-    maxIpcBytes: value.maxIpcBytes,
-    totalIpcBytes: value.totalIpcBytes,
+    maxNativeProgressBytes: value.maxNativeProgressBytes,
+    statusTransitions: value.statusTransitions,
+    restartCount: value.restartCount,
     peakRendererHeapBytes: value.peakHeapBytes || null,
     checks: value.checks,
   };
@@ -498,8 +499,13 @@ async function main() {
     await delay(200);
   }
   assert.ok(
-    state.maxIpcBytes > 0 && state.maxIpcBytes <= 256 * 1024,
-    "IPC bytes were not bounded",
+    state.statusTransitions.some((value) =>
+      value.startsWith("export-portable-backup:"),
+    ) &&
+      state.statusTransitions.some((value) =>
+        value.startsWith("restore-portable-backup:"),
+      ),
+    "Native file-job phases were not observed",
   );
   const storage = await client.evaluate(
     "navigator.storage.estimate().then(({usage,quota})=>({usage,quota}))",
