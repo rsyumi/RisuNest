@@ -4,6 +4,7 @@ use super::{
 };
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use crate::external_storage::publication::PublicationPermit;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct ExternalBase {
@@ -327,18 +328,10 @@ impl PersistentStore {
     pub(crate) fn external_prepare_publication(
         &mut self,
         intent: &jobs::PublishIntent<'_>,
+        permit: &PublicationPermit,
     ) -> StoreResult<()> {
         let tx = self.connection.transaction()?;
-        jobs::prepare_publication(&tx, intent)?;
-        tx.commit()?;
-        Ok(())
-    }
-    pub(crate) fn external_prepare_publication_exit_drain(
-        &mut self,
-        intent: &jobs::PublishIntent<'_>,
-    ) -> StoreResult<()> {
-        let tx = self.connection.transaction()?;
-        jobs::prepare_publication_exit_drain(&tx, intent)?;
+        jobs::prepare_publication(&tx, intent, permit)?;
         tx.commit()?;
         Ok(())
     }
@@ -369,15 +362,12 @@ impl PersistentStore {
         tx.commit()?;
         Ok(())
     }
-    pub(crate) fn external_begin_publication(&mut self, job: &str) -> StoreResult<()> {
+    pub(crate) fn external_begin_publication(
+        &mut self,
+        permit: &PublicationPermit,
+    ) -> StoreResult<()> {
         let tx = self.connection.transaction()?;
-        jobs::begin_publication(&tx, job)?;
-        tx.commit()?;
-        Ok(())
-    }
-    pub(crate) fn external_begin_publication_exit_drain(&mut self, job: &str) -> StoreResult<()> {
-        let tx = self.connection.transaction()?;
-        jobs::begin_publication_exit_drain(&tx, job)?;
+        jobs::begin_publication(&tx, permit)?;
         tx.commit()?;
         Ok(())
     }
@@ -389,27 +379,13 @@ impl PersistentStore {
     }
     pub(crate) fn external_confirm_publication(
         &mut self,
-        job: &str,
+        permit: &PublicationPermit,
         commit: &str,
         snapshot: &str,
         observation: &str,
-        history: bool,
     ) -> StoreResult<()> {
         let tx = self.connection.transaction()?;
-        jobs::confirm_publication(&tx, job, commit, snapshot, observation, history)?;
-        tx.commit()?;
-        Ok(())
-    }
-    pub(crate) fn external_confirm_publication_exit_drain(
-        &mut self,
-        job: &str,
-        commit: &str,
-        snapshot: &str,
-        observation: &str,
-        history: bool,
-    ) -> StoreResult<()> {
-        let tx = self.connection.transaction()?;
-        jobs::confirm_publication_exit_drain(&tx, job, commit, snapshot, observation, history)?;
+        jobs::confirm_publication(&tx, permit, commit, snapshot, observation)?;
         tx.commit()?;
         Ok(())
     }
@@ -432,7 +408,7 @@ impl PersistentStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let unsettled:bool=tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM external_storage_jobs WHERE connection_id=?1 AND phase IN ('publishing','publicationUnknown','applying'))",
+            "SELECT EXISTS(SELECT 1 FROM external_storage_jobs WHERE connection_id=?1 AND phase='applying')",
             [connection], |row| row.get(0))?;
         if unsettled {
             return Err(invalid(
@@ -440,15 +416,15 @@ impl PersistentStore {
             ));
         }
         tx.execute(
-            "UPDATE external_storage_jobs SET phase='cancelled' WHERE connection_id=?1 AND phase NOT IN ('complete','cancelled')",
+            "UPDATE external_storage_jobs SET phase='publicationUnknown' WHERE connection_id=?1 AND phase='publishing'",
             [connection],
         )?;
         tx.execute(
-            "DELETE FROM external_storage_capture_refs WHERE job_id IN (SELECT id FROM external_storage_jobs WHERE connection_id=?1)",
+            "UPDATE external_storage_jobs SET phase='cancelled' WHERE connection_id=?1 AND phase NOT IN ('complete','cancelled','publicationUnknown')",
             [connection],
         )?;
         tx.execute(
-            "DELETE FROM external_storage_conflicts WHERE connection_id=?1",
+            "DELETE FROM external_storage_capture_refs WHERE job_id IN (SELECT id FROM external_storage_jobs WHERE connection_id=?1 AND phase!='publicationUnknown')",
             [connection],
         )?;
         tx.execute(
@@ -516,6 +492,7 @@ impl PersistentStore {
 
     pub(crate) fn external_accept_equivalent(
         &mut self,
+        permit: &PublicationPermit,
         connection: &str,
         repository: &str,
         previous_commit: &str,
@@ -524,61 +501,20 @@ impl PersistentStore {
         commit: &str,
         observation: &str,
         identity: &sync_selection::CaptureIdentity,
-    ) -> StoreResult<()> {
-        self.external_accept_equivalent_with_pause(
-            connection,
-            repository,
-            previous_commit,
-            previous_observation,
-            snapshot,
-            commit,
-            observation,
-            identity,
-            false,
-        )
-    }
-    pub(crate) fn external_accept_equivalent_exit_drain(
-        &mut self,
-        connection: &str,
-        repository: &str,
-        previous_commit: &str,
-        previous_observation: &str,
-        snapshot: &str,
-        commit: &str,
-        observation: &str,
-        identity: &sync_selection::CaptureIdentity,
-    ) -> StoreResult<()> {
-        self.external_accept_equivalent_with_pause(
-            connection,
-            repository,
-            previous_commit,
-            previous_observation,
-            snapshot,
-            commit,
-            observation,
-            identity,
-            true,
-        )
-    }
-    fn external_accept_equivalent_with_pause(
-        &mut self,
-        connection: &str,
-        repository: &str,
-        previous_commit: &str,
-        previous_observation: &str,
-        snapshot: &str,
-        commit: &str,
-        observation: &str,
-        identity: &sync_selection::CaptureIdentity,
-        allow_paused: bool,
     ) -> StoreResult<()> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if allow_paused {
-            sync_selection::require_publish_exit_drain(&tx, identity, connection)?;
-        } else {
-            sync_selection::require_publish(&tx, identity, connection)?;
+        if permit.job_id().is_empty() || permit.selection_epoch() != identity.selection_epoch {
+            return Err(invalid("Publication permit does not match equivalent head"));
+        }
+        match permit.mode() {
+            crate::external_storage::publication::PublicationMode::Foreground => {
+                sync_selection::require_publish(&tx, identity, connection)?;
+            }
+            crate::external_storage::publication::PublicationMode::ExitDrain => {
+                sync_selection::require_publish_exit_drain(&tx, identity, connection)?;
+            }
         }
         let current:Option<(String,String)>=tx.query_row(
             "SELECT commit_id,head_observation FROM external_storage_bases WHERE connection_id=?1 AND repository_id=?2",

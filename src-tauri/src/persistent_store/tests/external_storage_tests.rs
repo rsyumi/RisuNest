@@ -4,6 +4,18 @@ use super::super::{
 };
 use super::*;
 
+fn publication_permit(
+    job: &str,
+    identity: &selection::CaptureIdentity,
+    mode: crate::external_storage::publication::PublicationMode,
+) -> crate::external_storage::publication::PublicationPermit {
+    crate::external_storage::publication::test_publication_permit(
+        job,
+        &identity.selection_epoch,
+        mode,
+    )
+}
+
 fn count(store: &PersistentStore, table: &str) -> i64 {
     store
         .connection
@@ -187,6 +199,11 @@ fn capture(store: &mut PersistentStore, job: &str) -> selection::CaptureIdentity
             expected_head: None,
             commit_id: "synthetic-commit",
         },
+        &publication_permit(
+            job,
+            &identity,
+            crate::external_storage::publication::PublicationMode::Foreground,
+        ),
     )
     .unwrap();
     tx.commit().unwrap();
@@ -228,31 +245,39 @@ fn paused_target_allows_only_live_exit_drain_publication_paths() {
         expected_head: None,
         commit_id: "exit-commit",
     };
+    let foreground = publication_permit(
+        "exit-job",
+        &identity,
+        crate::external_storage::publication::PublicationMode::Foreground,
+    );
+    let exit = publication_permit(
+        "exit-job",
+        &identity,
+        crate::external_storage::publication::PublicationMode::ExitDrain,
+    );
     let tx = store.connection.transaction().unwrap();
-    assert!(external::prepare_publication(&tx, &intent).is_err());
-    external::prepare_publication_exit_drain(&tx, &intent).unwrap();
+    assert!(external::prepare_publication(&tx, &intent, &foreground).is_err());
+    external::prepare_publication(&tx, &intent, &exit).unwrap();
     tx.commit().unwrap();
     let tx = store.connection.transaction().unwrap();
-    assert!(external::begin_publication(&tx, "exit-job").is_err());
-    external::begin_publication_exit_drain(&tx, "exit-job").unwrap();
-    assert!(external::begin_publication_exit_drain(&tx, "exit-job").is_err());
+    assert!(external::begin_publication(&tx, &foreground).is_err());
+    external::begin_publication(&tx, &exit).unwrap();
+    assert!(external::begin_publication(&tx, &exit).is_err());
     external::publication_unknown(&tx, "exit-job").unwrap();
     assert!(external::confirm_publication(
         &tx,
-        "exit-job",
+        &foreground,
         "exit-commit",
         "snapshot",
-        "observation",
-        false
+        "observation"
     )
     .is_err());
-    external::confirm_publication_exit_drain(
+    external::confirm_publication(
         &tx,
-        "exit-job",
+        &exit,
         "exit-commit",
         "snapshot",
         "observation",
-        false,
     )
     .unwrap();
     tx.commit().unwrap();
@@ -283,6 +308,11 @@ fn equivalent_remote_advances_only_the_retained_capture_revision() {
     assert!(current.revision > retained.revision);
     store
         .external_accept_equivalent(
+            &publication_permit(
+                "equivalent",
+                &retained,
+                crate::external_storage::publication::PublicationMode::Foreground,
+            ),
             "synthetic-connection",
             "synthetic-repository",
             "old-commit",
@@ -511,7 +541,12 @@ fn definite_head_rejection_is_preserved_when_pause_arrives_after_the_response() 
     let (_dir, mut store, _) = open_fixture();
     select_external(&mut store);
     let identity = capture(&mut store, "paused-conflict");
-    store.external_begin_publication("paused-conflict").unwrap();
+    let permit = publication_permit(
+        "paused-conflict",
+        &identity,
+        crate::external_storage::publication::PublicationMode::Foreground,
+    );
+    store.external_begin_publication(&permit).unwrap();
     store
         .connection
         .execute(
@@ -562,30 +597,33 @@ fn external_intent_prevents_blind_retries_and_blocks_replacement_until_settlemen
     let (_dir, mut store, _) = open_fixture();
     select_external(&mut store);
     let identity = capture(&mut store, "job");
+    let permit = publication_permit(
+        "job",
+        &identity,
+        crate::external_storage::publication::PublicationMode::Foreground,
+    );
     let tx = store.connection.transaction().unwrap();
-    external::begin_publication(&tx, "job").unwrap();
+    external::begin_publication(&tx, &permit).unwrap();
     external::publication_unknown(&tx, "job").unwrap();
-    assert!(external::begin_publication(&tx, "job").is_err());
-    assert!(selection::require_no_pending_publication(&tx).is_err());
+    assert!(external::begin_publication(&tx, &permit).is_err());
+    assert!(selection::require_no_pending_publication(&tx).is_ok());
     tx.commit().unwrap();
     edit(&mut store, 1);
     let tx = store.connection.transaction().unwrap();
     assert!(external::confirm_publication(
         &tx,
-        "job",
+        &permit,
         "wrong-commit",
         "snapshot",
-        "observation",
-        false
+        "observation"
     )
     .is_err());
     external::confirm_publication(
         &tx,
-        "job",
+        &permit,
         "synthetic-commit",
         "snapshot",
         "observation",
-        true,
     )
     .unwrap();
     tx.commit().unwrap();
@@ -600,10 +638,9 @@ fn external_intent_prevents_blind_retries_and_blocks_replacement_until_settlemen
         identity
     );
     assert_eq!(store.revision().unwrap(), identity.revision + 1);
-    assert_eq!(count(&store, "external_storage_capture_refs"), 1);
+    assert_eq!(count(&store, "external_storage_capture_refs"), 0);
     let tx = store.connection.transaction().unwrap();
-    assert!(external::begin_publication(&tx, "job").is_err());
-    external::finish_history(&tx, "job").unwrap();
+    assert!(external::begin_publication(&tx, &permit).is_err());
     tx.commit().unwrap();
     assert_eq!(count(&store, "external_storage_capture_refs"), 0);
 }
@@ -612,33 +649,36 @@ fn external_intent_prevents_blind_retries_and_blocks_replacement_until_settlemen
 fn external_base_and_job_phase_commit_atomically() {
     let (dir, mut store, _) = open_fixture();
     select_external(&mut store);
-    capture(&mut store, "job");
+    let identity = capture(&mut store, "job");
+    let permit = publication_permit(
+        "job",
+        &identity,
+        crate::external_storage::publication::PublicationMode::Foreground,
+    );
     let tx = store.connection.transaction().unwrap();
-    external::begin_publication(&tx, "job").unwrap();
+    external::begin_publication(&tx, &permit).unwrap();
     tx.commit().unwrap();
     let tx = store.connection.transaction().unwrap();
     external::confirm_publication(
         &tx,
-        "job",
+        &permit,
         "synthetic-commit",
         "snapshot",
         "observation",
-        false,
     )
     .unwrap();
     tx.rollback().unwrap();
     drop(store);
     let mut store = PersistentStore::open(dir.path()).unwrap();
     assert_eq!(count(&store, "external_storage_bases"), 0);
-    assert!(selection::require_no_pending_publication(&store.connection).is_err());
+    assert!(selection::require_no_pending_publication(&store.connection).is_ok());
     let tx = store.connection.transaction().unwrap();
     external::confirm_publication(
         &tx,
-        "job",
+        &permit,
         "synthetic-commit",
         "snapshot",
         "observation",
-        false,
     )
     .unwrap();
     tx.commit().unwrap();

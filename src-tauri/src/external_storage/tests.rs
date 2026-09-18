@@ -89,8 +89,8 @@ fn sequential_competitors_can_both_confirm_and_recovery_snapshots_survive() {
         observation("b").authenticated_body_hash,
     )
     .unwrap();
-    a.before_write(None, ExecutionSession::Foreground).unwrap();
-    b.before_write(None, ExecutionSession::Foreground).unwrap();
+    a.before_write(None, PublicationMode::Foreground).unwrap();
+    b.before_write(None, PublicationMode::Foreground).unwrap();
     p.write(&locator(), None, b"a").unwrap();
     assert_eq!(
         a.observe_result(Some(&observation("a"))),
@@ -121,11 +121,11 @@ fn response_loss_is_reconciled_by_observation_and_never_repeated_as_old_write() 
         observation("a").authenticated_body_hash,
     )
     .unwrap();
-    a.before_write(None, ExecutionSession::ExitDrain).unwrap();
+    a.before_write(None, PublicationMode::ExitDrain).unwrap();
     p.state.lock().unwrap().lose_response = true;
     let error = p.write(&locator(), None, b"a").unwrap_err();
     assert_eq!(a.write_failed(&error), Outcome::PublicationUnknown);
-    assert!(a.before_write(None, ExecutionSession::Foreground).is_err());
+    assert!(a.before_write(None, PublicationMode::Foreground).is_err());
     assert_eq!(
         a.observe_result(Some(&observation("b"))),
         Outcome::PublicationUnknown
@@ -138,7 +138,7 @@ fn response_loss_is_reconciled_by_observation_and_never_repeated_as_old_write() 
 }
 
 #[test]
-fn sequential_hidden_and_changed_or_missing_head_cannot_publish() {
+fn sequential_changed_or_missing_head_cannot_publish() {
     let expected = observation("base");
     let mut a = Attempt::new(
         &capabilities(false),
@@ -148,15 +148,9 @@ fn sequential_hidden_and_changed_or_missing_head_cannot_publish() {
         observation("a").authenticated_body_hash,
     )
     .unwrap();
-    assert_eq!(
-        a.before_write(Some(&expected), ExecutionSession::Hidden)
-            .unwrap_err()
-            .kind,
-        ErrorKind::Cancelled
-    );
-    assert!(a.before_write(None, ExecutionSession::Foreground).is_err());
+    assert!(a.before_write(None, PublicationMode::Foreground).is_err());
     assert!(a
-        .before_write(Some(&expected), ExecutionSession::Foreground)
+        .before_write(Some(&expected), PublicationMode::Foreground)
         .is_err());
     assert!(Attempt::new(
         &capabilities(false),
@@ -166,6 +160,24 @@ fn sequential_hidden_and_changed_or_missing_head_cannot_publish() {
         observation("a").authenticated_body_hash
     )
     .is_err());
+}
+
+#[test]
+fn publication_classification_requires_the_exact_commit_and_state() {
+    assert_eq!(
+        classify_publication("commit", "snapshot-state", Some(("commit", "snapshot-state")), false),
+        PublicationObservation::Confirmed
+    );
+    for observed in [None, Some(("other", "snapshot-state")), Some(("commit", "other"))] {
+        assert_eq!(
+            classify_publication("commit", "snapshot-state", observed, false),
+            PublicationObservation::Unknown
+        );
+    }
+    assert_eq!(
+        classify_publication("commit", "snapshot-state", Some(("other", "other")), true),
+        PublicationObservation::Rejected
+    );
 }
 
 #[test]

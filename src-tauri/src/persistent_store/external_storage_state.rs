@@ -4,9 +4,10 @@ use super::{
     StoreError, StoreResult,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use crate::external_storage::publication::{PublicationMode, PublicationPermit};
 
 const SCHEMA: &str = r#"
-CREATE TABLE external_storage_jobs(id TEXT PRIMARY KEY,connection_id TEXT NOT NULL,repository_id TEXT NOT NULL,capture_id TEXT NOT NULL,identity TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('backup','sync','restore','history')),strategy TEXT CHECK(strategy IN ('cas','sequential')),expected_head TEXT,commit_id TEXT NOT NULL,phase TEXT NOT NULL CHECK(phase IN ('preparing','ready','publishing','publicationUnknown','conflictPreserving','published','historyPending','applying','complete','cancelled','stale')));
+CREATE TABLE external_storage_jobs(id TEXT PRIMARY KEY,connection_id TEXT NOT NULL,repository_id TEXT NOT NULL,capture_id TEXT NOT NULL,identity TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('backup','sync','restore','history')),strategy TEXT CHECK(strategy IN ('cas','sequential')),expected_head TEXT,commit_id TEXT NOT NULL,phase TEXT NOT NULL CHECK(phase IN ('preparing','ready','publishing','publicationUnknown','conflictPreserving','applying','complete','cancelled','stale')));
 CREATE TABLE external_storage_bases(connection_id TEXT PRIMARY KEY,repository_id TEXT NOT NULL,snapshot_id TEXT NOT NULL,commit_id TEXT NOT NULL,head_observation TEXT NOT NULL,identity TEXT NOT NULL);
 CREATE TABLE external_storage_backup_points(job_id TEXT PRIMARY KEY,connection_id TEXT NOT NULL,repository_id TEXT NOT NULL,snapshot_id TEXT NOT NULL,point_id TEXT NOT NULL,observation TEXT NOT NULL,identity TEXT NOT NULL);
 CREATE TABLE external_storage_history_points(job_id TEXT PRIMARY KEY,connection_id TEXT NOT NULL,repository_id TEXT NOT NULL,snapshot_id TEXT NOT NULL,snapshot_reference TEXT NOT NULL,point_id TEXT NOT NULL,logical_revision TEXT NOT NULL,created_at_ms TEXT NOT NULL,identity TEXT NOT NULL,point_observation TEXT);
@@ -80,7 +81,7 @@ pub(crate) fn prepare_receive(tx: &Transaction<'_>, intent: &ReceiveIntent<'_>) 
         return Err(invalid("Incomplete remote receive intent"));
     }
     let busy: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM external_storage_jobs WHERE connection_id=?1 AND phase NOT IN ('complete','cancelled','stale','historyPending'))",
+        "SELECT EXISTS(SELECT 1 FROM external_storage_jobs WHERE connection_id=?1 AND phase NOT IN ('complete','cancelled','stale','publicationUnknown'))",
         [intent.connection_id], |r| r.get(0),
     )?;
     if busy {
@@ -474,25 +475,14 @@ pub(crate) fn capture_has_consumers(db: &Connection, capture: &str) -> StoreResu
 pub(crate) fn prepare_publication(
     tx: &Transaction<'_>,
     intent: &PublishIntent<'_>,
+    permit: &PublicationPermit,
 ) -> StoreResult<()> {
-    prepare_publication_with_pause(tx, intent, false)
-}
-pub(crate) fn prepare_publication_exit_drain(
-    tx: &Transaction<'_>,
-    intent: &PublishIntent<'_>,
-) -> StoreResult<()> {
-    prepare_publication_with_pause(tx, intent, true)
-}
-fn prepare_publication_with_pause(
-    tx: &Transaction<'_>,
-    intent: &PublishIntent<'_>,
-    allow_paused: bool,
-) -> StoreResult<()> {
-    if allow_paused {
-        sync_selection::require_publish_exit_drain(tx, intent.identity, intent.connection_id)?;
-    } else {
-        sync_selection::require_publish(tx, intent.identity, intent.connection_id)?;
+    if permit.job_id() != intent.job_id
+        || permit.selection_epoch() != intent.identity.selection_epoch
+    {
+        return Err(invalid("Publication permit does not match its intent"));
     }
+    require_publication_permit(tx, permit, intent.identity, intent.connection_id)?;
     let identity = serde_json::to_string(intent.identity)?;
     let exists: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM external_storage_captures WHERE id=?1 AND identity=?2)",
@@ -502,7 +492,7 @@ fn prepare_publication_with_pause(
     if !exists {
         return Err(invalid("Publication requires a durable capture"));
     }
-    let busy:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM external_storage_jobs WHERE connection_id=?1 AND phase NOT IN ('complete','cancelled','stale'))",[intent.connection_id],|r|r.get(0))?;
+    let busy:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM external_storage_jobs WHERE connection_id=?1 AND phase NOT IN ('complete','cancelled','stale','publicationUnknown'))",[intent.connection_id],|r|r.get(0))?;
     if busy {
         return Err(invalid("External destination already has an active job"));
     }
@@ -543,17 +533,11 @@ pub(crate) fn prepare_conflict_publication(
 
 /// The caller owns file(false) through the head request AND this result's
 /// settlement. Commit this intent before making the network request.
-pub(crate) fn begin_publication(tx: &Transaction<'_>, job: &str) -> StoreResult<()> {
-    begin_publication_with_pause(tx, job, false)
-}
-pub(crate) fn begin_publication_exit_drain(tx: &Transaction<'_>, job: &str) -> StoreResult<()> {
-    begin_publication_with_pause(tx, job, true)
-}
-fn begin_publication_with_pause(
+pub(crate) fn begin_publication(
     tx: &Transaction<'_>,
-    job: &str,
-    allow_paused: bool,
+    permit: &PublicationPermit,
 ) -> StoreResult<()> {
+    let job = permit.job_id();
     let (connection, identity, phase): (String, String, String) = tx.query_row(
         "SELECT connection_id,identity,phase FROM external_storage_jobs WHERE id=?1 AND role='sync'",
         [job],
@@ -563,11 +547,7 @@ fn begin_publication_with_pause(
         return Err(invalid("Publication cannot blindly retry a head write"));
     }
     let identity = serde_json::from_str(&identity)?;
-    if allow_paused {
-        sync_selection::require_publish_exit_drain(tx, &identity, &connection)?;
-    } else {
-        sync_selection::require_publish(tx, &identity, &connection)?;
-    }
+    require_publication_permit(tx, permit, &identity, &connection)?;
     tx.execute(
         "UPDATE external_storage_jobs SET phase='publishing' WHERE id=?1",
         [job],
@@ -584,49 +564,12 @@ pub(crate) fn publication_unknown(tx: &Transaction<'_>, job: &str) -> StoreResul
 /// the strength of a local receipt file alone. Capture revision preserves R+1.
 pub(crate) fn confirm_publication(
     tx: &Transaction<'_>,
-    job: &str,
+    permit: &PublicationPermit,
     commit: &str,
     snapshot: &str,
     observation: &str,
-    history_pending: bool,
 ) -> StoreResult<()> {
-    confirm_publication_with_pause(
-        tx,
-        job,
-        commit,
-        snapshot,
-        observation,
-        history_pending,
-        false,
-    )
-}
-pub(crate) fn confirm_publication_exit_drain(
-    tx: &Transaction<'_>,
-    job: &str,
-    commit: &str,
-    snapshot: &str,
-    observation: &str,
-    history_pending: bool,
-) -> StoreResult<()> {
-    confirm_publication_with_pause(
-        tx,
-        job,
-        commit,
-        snapshot,
-        observation,
-        history_pending,
-        true,
-    )
-}
-fn confirm_publication_with_pause(
-    tx: &Transaction<'_>,
-    job: &str,
-    commit: &str,
-    snapshot: &str,
-    observation: &str,
-    history_pending: bool,
-    allow_paused: bool,
-) -> StoreResult<()> {
+    let job = permit.job_id();
     let (connection,repository,identity,expected,phase):(String,String,String,String,String)=tx.query_row("SELECT connection_id,repository_id,identity,commit_id,phase FROM external_storage_jobs WHERE id=?1",[job],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
     if expected != commit || !matches!(phase.as_str(), "publishing" | "publicationUnknown") {
         return Err(invalid(
@@ -634,43 +577,32 @@ fn confirm_publication_with_pause(
         ));
     }
     let capture = serde_json::from_str(&identity)?;
-    if allow_paused {
-        sync_selection::require_publish_exit_drain(tx, &capture, &connection)?;
-    } else {
-        sync_selection::require_publish(tx, &capture, &connection)?;
-    }
+    require_publication_permit(tx, permit, &capture, &connection)?;
     tx.execute("INSERT INTO external_storage_bases VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(connection_id) DO UPDATE SET repository_id=excluded.repository_id,snapshot_id=excluded.snapshot_id,commit_id=excluded.commit_id,head_observation=excluded.head_observation,identity=excluded.identity",params![connection,repository,snapshot,commit,observation,identity])?;
     tx.execute(
-        "UPDATE external_storage_jobs SET phase=?1 WHERE id=?2",
-        params![
-            if history_pending {
-                "historyPending"
-            } else {
-                "complete"
-            },
-            job
-        ],
-    )?;
-    if !history_pending {
-        tx.execute(
-            "DELETE FROM external_storage_capture_refs WHERE job_id=?1",
-            [job],
-        )?;
-    }
-    Ok(())
-}
-
-pub(crate) fn finish_history(tx: &Transaction<'_>, job: &str) -> StoreResult<()> {
-    if tx.execute(
-        "UPDATE external_storage_jobs SET phase='complete' WHERE id=?1 AND phase='historyPending'",
+        "UPDATE external_storage_jobs SET phase='complete' WHERE id=?1",
         [job],
-    )? != 1
-    {
-        return Err(invalid("No pending history point"));
-    }
+    )?;
     tx.execute(
         "DELETE FROM external_storage_capture_refs WHERE job_id=?1",
         [job],
     )?;
     Ok(())
+}
+
+fn require_publication_permit(
+    db: &Connection,
+    permit: &PublicationPermit,
+    capture: &CaptureIdentity,
+    connection: &str,
+) -> StoreResult<()> {
+    if permit.selection_epoch() != capture.selection_epoch {
+        return Err(invalid("Publication permit selection changed"));
+    }
+    match permit.mode() {
+        PublicationMode::Foreground => sync_selection::require_publish(db, capture, connection),
+        PublicationMode::ExitDrain => {
+            sync_selection::require_publish_exit_drain(db, capture, connection)
+        }
+    }
 }

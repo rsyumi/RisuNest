@@ -9,10 +9,72 @@ pub(crate) struct HeadObservation {
     pub version: Option<VersionToken>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ExecutionSession {
+pub(crate) enum PublicationMode {
     Foreground,
     ExitDrain,
-    Hidden,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PublicationPermit {
+    job_id: String,
+    selection_epoch: String,
+    mode: PublicationMode,
+}
+impl PublicationPermit {
+    pub(super) fn new(
+        job_id: String,
+        selection_epoch: String,
+        mode: PublicationMode,
+    ) -> Result<Self> {
+        if job_id.is_empty() || selection_epoch.is_empty() {
+            return Err(ProviderError::new(ErrorKind::Corrupt));
+        }
+        Ok(Self {
+            job_id,
+            selection_epoch,
+            mode,
+        })
+    }
+    pub(crate) fn job_id(&self) -> &str {
+        &self.job_id
+    }
+    pub(crate) fn selection_epoch(&self) -> &str {
+        &self.selection_epoch
+    }
+    pub(crate) fn mode(&self) -> PublicationMode {
+        self.mode
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_publication_permit(
+    job_id: &str,
+    selection_epoch: &str,
+    mode: PublicationMode,
+) -> PublicationPermit {
+    PublicationPermit::new(job_id.into(), selection_epoch.into(), mode).unwrap()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PublicationObservation {
+    Confirmed,
+    Rejected,
+    Unknown,
+}
+
+pub(crate) fn classify_publication(
+    intended_commit: &str,
+    intended_state: &str,
+    authenticated_head: Option<(&str, &str)>,
+    explicitly_rejected_same_request: bool,
+) -> PublicationObservation {
+    if authenticated_head == Some((intended_commit, intended_state)) {
+        PublicationObservation::Confirmed
+    } else if explicitly_rejected_same_request {
+        PublicationObservation::Rejected
+    } else {
+        PublicationObservation::Unknown
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
@@ -71,13 +133,10 @@ impl Attempt {
     pub fn before_write(
         &mut self,
         current: Option<&HeadObservation>,
-        session: ExecutionSession,
+        _mode: PublicationMode,
     ) -> Result<PublicationWrite> {
         if self.write_started || self.phase != Outcome::Ready {
             return Err(ProviderError::new(ErrorKind::PreconditionFailed));
-        }
-        if self.strategy == PublicationStrategy::Sequential && session == ExecutionSession::Hidden {
-            return Err(ProviderError::new(ErrorKind::Cancelled));
         }
         let unchanged = match (self.expected.as_ref(), current) {
             (None, None) => true,

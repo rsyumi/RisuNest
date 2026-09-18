@@ -427,11 +427,7 @@ fn connection_removal_cancels_local_jobs_releases_roots_and_deselects() {
         [&identity],
     ).unwrap();
     store.connection.execute(
-        "INSERT INTO external_storage_jobs VALUES('history','connection','repository','capture-history',?1,'sync','cas','head','commit','historyPending')",
-        [&identity],
-    ).unwrap();
-    store.connection.execute(
-        "INSERT INTO external_storage_capture_refs VALUES('capture-ready','ready'),('capture-history','history')",
+        "INSERT INTO external_storage_capture_refs VALUES('capture-ready','ready')",
         [],
     ).unwrap();
     store.connection.execute(
@@ -453,7 +449,7 @@ fn connection_removal_cancels_local_jobs_releases_roots_and_deselects() {
             .map(Result::unwrap)
             .collect()
     };
-    assert_eq!(phases, ["cancelled", "cancelled"]);
+    assert_eq!(phases, ["cancelled"]);
     assert_eq!(
         store
             .connection
@@ -482,16 +478,12 @@ fn connection_removal_cancels_local_jobs_releases_roots_and_deselects() {
 }
 
 #[test]
-fn connection_removal_rejects_uncertain_remote_work_without_local_mutation() {
-    for (phase, role) in [
-        ("publishing", "sync"),
-        ("publicationUnknown", "sync"),
-        ("applying", "restore"),
-    ] {
+fn connection_removal_detaches_unknown_publication_but_keeps_its_recovery_root() {
+    for phase in ["publishing", "publicationUnknown"] {
         let (_directory, mut store) = open_store();
         let initial = sync_selection::read(&store.connection).unwrap();
         let tx = store.connection.transaction().unwrap();
-        let selected = sync_selection::select(
+        sync_selection::select(
             &tx,
             &initial.epoch,
             &sync_selection::SyncTarget::External("connection".into()),
@@ -502,7 +494,7 @@ fn connection_removal_rejects_uncertain_remote_work_without_local_mutation() {
             serde_json::to_string(&sync_selection::identity(&store.connection).unwrap()).unwrap();
         store.connection.execute(
             "INSERT INTO external_storage_jobs VALUES('unsettled','connection','repository','capture',?1,?2,'cas','head','commit',?3)",
-            rusqlite::params![identity, role, phase],
+            rusqlite::params![identity, "sync", phase],
         ).unwrap();
         store
             .connection
@@ -516,9 +508,7 @@ fn connection_removal_rejects_uncertain_remote_work_without_local_mutation() {
             [&identity],
         ).unwrap();
 
-        assert!(store
-            .external_prepare_connection_removal("connection")
-            .is_err());
+        store.external_prepare_connection_removal("connection").unwrap();
 
         assert_eq!(
             store
@@ -529,7 +519,7 @@ fn connection_removal_rejects_uncertain_remote_work_without_local_mutation() {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            phase
+            "publicationUnknown"
         );
         assert_eq!(
             store
@@ -551,13 +541,27 @@ fn connection_removal_rejects_uncertain_remote_work_without_local_mutation() {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            1
+            0
         );
         let after = sync_selection::read(&store.connection).unwrap();
-        assert_eq!(
-            after.target,
-            sync_selection::SyncTarget::External("connection".into())
-        );
-        assert_eq!(after.epoch, selected.epoch);
+        assert_eq!(after.target, sync_selection::SyncTarget::None);
     }
+
+    let (_directory, mut store) = open_store();
+    let initial = sync_selection::read(&store.connection).unwrap();
+    let tx = store.connection.transaction().unwrap();
+    let selected = sync_selection::select(
+        &tx,
+        &initial.epoch,
+        &sync_selection::SyncTarget::External("connection".into()),
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let identity = serde_json::to_string(&sync_selection::identity(&store.connection).unwrap()).unwrap();
+    store.connection.execute(
+        "INSERT INTO external_storage_jobs VALUES('unsettled','connection','repository','capture',?1,'restore','cas','head','commit','applying')",
+        [&identity],
+    ).unwrap();
+    assert!(store.external_prepare_connection_removal("connection").is_err());
+    assert_eq!(sync_selection::read(&store.connection).unwrap().epoch, selected.epoch);
 }

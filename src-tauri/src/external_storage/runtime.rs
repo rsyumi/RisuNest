@@ -5,7 +5,7 @@ use super::{
     contract::*,
     job_store::{DurableJob, JobCommandState, JobKind, JobStore, Session, StartJobRequest},
     leases,
-    publication::ExecutionSession,
+    publication::{PublicationMode, PublicationPermit},
 };
 use crate::persistent_store::{
     self,
@@ -52,7 +52,7 @@ pub(crate) fn selection_dto(selection: Selection) -> Value {
     }
     dto
 }
-fn require_session(request: &StartJobRequest, current: &Session) -> Result<ExecutionSession> {
+fn require_session(request: &StartJobRequest, current: &Session) -> Result<PublicationMode> {
     let manual = request.reason.as_deref().unwrap_or("manual") == "manual";
     if current.id.is_empty() || current.kind == "hidden" {
         return Err(ProviderError::new(ErrorKind::Cancelled));
@@ -65,16 +65,23 @@ fn require_session(request: &StartJobRequest, current: &Session) -> Result<Execu
         }
     }
     match current.kind.as_str() {
-        "foreground" => Ok(ExecutionSession::Foreground),
-        "exitDrain" => Ok(ExecutionSession::ExitDrain),
+        "foreground" => Ok(PublicationMode::Foreground),
+        "exitDrain" => Ok(PublicationMode::ExitDrain),
         _ => Err(ProviderError::new(ErrorKind::Cancelled)),
     }
 }
-pub(crate) fn read_job_session(app: &AppHandle, id: &str) -> Result<ExecutionSession> {
+pub(crate) fn read_job_session(app: &AppHandle, id: &str) -> Result<PublicationMode> {
     let job = JobStore::open(&root(app)?)?.read(id)?;
     let state = app.state::<JobCommandState>();
     let current = state.session.lock().map_err(local_error)?;
     require_session(&job.request, &current)
+}
+pub(crate) fn publication_permit(app: &AppHandle, id: &str) -> Result<PublicationPermit> {
+    let mode = read_job_session(app, id)?;
+    let selection = native_store(app)?
+        .external_selection()
+        .map_err(local_error)?;
+    PublicationPermit::new(id.to_owned(), selection.epoch, mode)
 }
 pub(crate) async fn require_connection_idle(app: &AppHandle, connection: &str) -> Result<()> {
     let state = app.state::<JobCommandState>();
@@ -340,7 +347,7 @@ pub(crate) async fn external_storage_start_job(
     }
     let store = JobStore::open(&root)?;
     let pending = store.list_pending()?.into_iter()
-        .find(|job| job.request.connection_id == request.connection_id)
+        .find(|job| pending_matches_request(job, &request))
         .map(|job| reconcile_job(&app, job))
         .transpose()?;
     if let Some(mut pending) = pending.filter(|job| !job.terminal()) {
@@ -355,6 +362,12 @@ pub(crate) async fn external_storage_start_job(
             pending = reconcile_job(&app, store.read(&pending.id)?)?;
             let current = command_state.session.lock().map_err(local_error)?;
             require_session(&request, &current)?;
+        }
+        if pending.summary["state"] == "uncertain"
+            && pending.summary["phase"] == "publication-unknown"
+            && request.reason.as_deref() == Some("automatic")
+        {
+            return Ok(pending.summary);
         }
         let resolving = pending.summary["state"] == "conflict"
             && request.kind == JobKind::ResolveConflict
@@ -409,6 +422,16 @@ pub(crate) async fn external_storage_start_job(
         wake_job(app, job.id.clone())?;
     }
     Ok(job.summary)
+}
+fn pending_matches_request(job: &DurableJob, request: &StartJobRequest) -> bool {
+    if job.request.connection_id != request.connection_id {
+        return false;
+    }
+    let publication_unknown = job.summary["state"] == "uncertain"
+        && job.summary["phase"] == "publication-unknown";
+    !publication_unknown
+        || (job.request.kind == request.kind
+            && matches!(request.kind, JobKind::Sync | JobKind::ResolveConflict))
 }
 fn same_requested_operation(existing: &StartJobRequest, incoming: &StartJobRequest) -> bool {
     if existing.kind != incoming.kind || existing.connection_id != incoming.connection_id {
@@ -625,6 +648,9 @@ fn settle_receive_preparation(job: &mut DurableJob, prepared: Option<Value>) -> 
         job.summary["phase"] = json!("paused");
         job.summary.as_object_mut().unwrap().remove("result");
         job.summary["error"] = error_dto(&ProviderError::new(ErrorKind::Transient));
+        if uncertain {
+            job.summary["error"]["reason"] = json!("publication-unknown");
+        }
     } else {
         return false;
     }
@@ -716,6 +742,9 @@ pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
                     // its marker, so the job stays open until that is resolved.
                     let unresolved =
                         result.get("stopReason").and_then(Value::as_str) == Some("uncertain");
+                    let publication_unknown = unresolved
+                        && result.get("reason").and_then(Value::as_str)
+                            == Some("publication-unknown");
                     job.summary["state"] = json!(if maintenance || receive {
                         "waiting"
                     } else if result.get("conflictId").is_some() {
@@ -729,12 +758,20 @@ pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
                         "device-restore-maintenance"
                     } else if receive {
                         "remote-apply"
+                    } else if publication_unknown {
+                        "publication-unknown"
                     } else if unresolved {
                         "removal-unknown"
                     } else {
                         "complete"
                     });
-                    job.summary["result"] = result;
+                    if publication_unknown {
+                        job.summary.as_object_mut().unwrap().remove("result");
+                        job.summary["error"] = error_dto(&ProviderError::new(ErrorKind::Transient));
+                        job.summary["error"]["reason"] = json!("publication-unknown");
+                    } else {
+                        job.summary["result"] = result;
+                    }
                 }
                 Err(error) => {
                     let mut pds = native_store(&app)?;
@@ -812,6 +849,9 @@ pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
                         job.summary["result"] = json!({"conflictId":job.id});
                     }
                     job.summary["error"] = error_dto(&error);
+                    if pending {
+                        job.summary["error"]["reason"] = json!("publication-unknown");
+                    }
                 }
             }
             job.summary["updatedAtMs"] = json!(now_ms().to_string());
@@ -1464,6 +1504,24 @@ mod tests {
             selection_epoch: "selection".into(), revision: 1,
         })
     }
+    #[test]
+    fn detached_unknown_is_rechecked_only_by_the_same_publication_operation() {
+        let mut unknown = automatic_job();
+        unknown.summary["state"] = json!("uncertain");
+        unknown.summary["phase"] = json!("publication-unknown");
+        let same = unknown.request.clone();
+        assert!(pending_matches_request(&unknown, &same));
+
+        let restore: StartJobRequest = serde_json::from_value(json!({
+            "connectionId": unknown.request.connection_id,
+            "kind": "restore",
+            "snapshotId": "snapshot",
+            "targetRevision": "0",
+            "restoreAreas": ["library"]
+        }))
+        .unwrap();
+        assert!(!pending_matches_request(&unknown, &restore));
+    }
 
     fn receive_job_fixture() -> (tempfile::TempDir, PersistentStore, DurableJob) {
         let directory = tempfile::tempdir().unwrap();
@@ -1666,7 +1724,7 @@ mod tests {
                 }
             )
             .unwrap(),
-            ExecutionSession::Foreground
+            PublicationMode::Foreground
         );
         assert!(require_session(
             &request,

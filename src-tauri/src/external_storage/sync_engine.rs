@@ -418,15 +418,9 @@ pub(crate) fn decide_sync(input: SyncInputs<'_>) -> Result<SyncAction> {
             if !crate::trust_boundary::is_lower_hex_256(local) {
                 return Err(corrupt("invalid local fingerprint"));
             }
-            if local == remote.document.content_fingerprint {
-                Ok(SyncAction::AcceptEquivalent {
-                    remote: remote.clone(),
-                })
-            } else {
-                Ok(SyncAction::PreserveConflict {
-                    remote: remote.clone(),
-                })
-            }
+            Ok(SyncAction::PreserveConflict {
+                remote: remote.clone(),
+            })
         }
     }
 }
@@ -503,7 +497,8 @@ async fn capture_for_publication(
             .admission
             .clone();
         let _permit = admission.file(true).map_err(local_error)?;
-        let session = super::runtime::read_job_session(&worker_app, &worker_job.id)?;
+        let publication_permit =
+            super::runtime::publication_permit(&worker_app, &worker_job.id)?;
         super::runtime::require_admitted_library(
             &worker_job,
             &store.external_identity().map_err(local_error)?,
@@ -528,15 +523,9 @@ async fn capture_for_publication(
             expected_head: expected_head.as_deref(),
             commit_id: &worker_job.id,
         };
-        if session == super::publication::ExecutionSession::ExitDrain {
-            store
-                .external_prepare_publication_exit_drain(&intent)
-                .map_err(local_error)?;
-        } else {
-            store
-                .external_prepare_publication(&intent)
-                .map_err(local_error)?;
-        }
+        store
+            .external_prepare_publication(&intent, &publication_permit)
+            .map_err(local_error)?;
         let jobs = JobStore::open(&super::runtime::root(&worker_app)?)?;
         let mut durable = jobs.read(&worker_job.id)?;
         durable.capture_id = Some(capture.id.clone());
@@ -1134,53 +1123,69 @@ async fn reconcile_unknown(
     else {
         return Ok(None);
     };
-    let observed = control::read_head(
-        connected.provider.as_ref(),
-        &connected.handle,
-        &connected.stored.descriptor,
-        &connected.root_key,
-        None,
-        cancel,
-    )
-    .await?;
-    let Some(observed) = observed else {
-        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
-    };
-    if observed.document.commit_id != intent.commit_id
-        || observed.document.state.object_id != format!("snapshot-{}", job.snapshot_id)
-    {
-        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
-    }
     if intent.phase == "publishing" {
         pds(app)?
             .external_publication_unknown(&job.id)
             .map_err(local_error)?;
     }
-    let observation = observation_json(&observed.observation)?;
-    let session = super::runtime::read_job_session(app, &job.id)?;
-    if session == super::publication::ExecutionSession::ExitDrain {
-        pds(app)?
-            .external_confirm_publication_exit_drain(
-                &job.id,
-                &intent.commit_id,
-                &job.snapshot_id,
-                &observation,
-                false,
-            )
-            .map_err(local_error)?;
-    } else {
-        pds(app)?
-            .external_confirm_publication(
-                &job.id,
-                &intent.commit_id,
-                &job.snapshot_id,
-                &observation,
-                false,
-            )
-            .map_err(local_error)?;
+    let intended_state = format!("snapshot-{}", job.snapshot_id);
+    for attempt in 0..2 {
+        cancel.check()?;
+        match control::read_head(
+            connected.provider.as_ref(),
+            &connected.handle,
+            &connected.stored.descriptor,
+            &connected.root_key,
+            None,
+            cancel,
+        )
+        .await
+        {
+            Ok(observed) => {
+                let authenticated_head = observed.as_ref().map(|head| {
+                    (
+                        head.document.commit_id.as_str(),
+                        head.document.state.object_id.as_str(),
+                    )
+                });
+                if super::publication::classify_publication(
+                    &intent.commit_id,
+                    &intended_state,
+                    authenticated_head,
+                    false,
+                ) == super::publication::PublicationObservation::Confirmed
+                {
+                    let observed = observed.expect("confirmed publication has a head");
+                    let observation = observation_json(&observed.observation)?;
+                    let permit = super::runtime::publication_permit(app, &job.id)?;
+                    pds(app)?
+                        .external_confirm_publication(
+                            &permit,
+                            &intent.commit_id,
+                            &job.snapshot_id,
+                            &observation,
+                        )
+                        .map_err(local_error)?;
+                    return Ok(Some(
+                        json!({"snapshotId":job.snapshot_id,"publishedRevision":intent.identity.revision.to_string()}),
+                    ));
+                }
+            }
+            Err(error) => {
+                let retryable = matches!(
+                    error.kind,
+                    ErrorKind::Transient
+                        | ErrorKind::RateLimited
+                        | ErrorKind::DailyQuotaExhausted
+                );
+                if !retryable || attempt == 1 {
+                    return Err(error);
+                }
+            }
+        }
     }
     Ok(Some(
-        json!({"snapshotId":job.snapshot_id,"publishedRevision":intent.identity.revision.to_string()}),
+        json!({"stopReason":"uncertain","reason":"publication-unknown"}),
     ))
 }
 
@@ -1284,7 +1289,7 @@ fn record_local_conflict(
             .external_record_local_conflict_after_rejection(&record)
             .map_err(local_error)?;
     } else if super::runtime::read_job_session(app, &job.id)?
-        == super::publication::ExecutionSession::ExitDrain
+        == super::publication::PublicationMode::ExitDrain
     {
         pds(app)?
             .external_record_local_conflict_exit_drain(&record)
@@ -1305,7 +1310,7 @@ fn bind_local_conflict_snapshot(
 ) -> Result<ConflictRecord> {
     let encoded = encode_remote(local)?;
     let session = super::runtime::read_job_session(app, &job.id)?;
-    if session == super::publication::ExecutionSession::ExitDrain {
+    if session == super::publication::PublicationMode::ExitDrain {
         pds(app)?
             .external_bind_local_conflict_snapshot_exit_drain(&record.id, &encoded)
             .map_err(local_error)
@@ -1494,7 +1499,7 @@ async fn complete_conflict_preservation(
     let encoded_remote = encode_remote(&remote_snapshot)?;
     let remote_revision = i64::try_from(verified_remote.logical_revision).map_err(corrupt)?;
     let session = super::runtime::read_job_session(app, &job.id)?;
-    if session == super::publication::ExecutionSession::ExitDrain {
+    if session == super::publication::PublicationMode::ExitDrain {
         pds(app)?
             .external_complete_conflict_preservation_exit_drain(
                 &record.id,
@@ -1683,7 +1688,7 @@ async fn run_resolve_conflict(
         .admission
         .file(false)
         .map_err(local_error)?;
-    let write_session = std::sync::atomic::AtomicU8::new(0);
+    let mut publication_permit = None;
     if let Some(protection) = protection {
         protection.recheck(cancel).await?;
     }
@@ -1698,17 +1703,14 @@ async fn run_resolve_conflict(
         &prepared,
         || super::runtime::read_job_session(app, &job.id),
         |live| {
-            if live == super::publication::ExecutionSession::ExitDrain {
-                pds(app)?
-                    .external_begin_publication_exit_drain(&job.id)
-                    .map_err(local_error)?;
-                write_session.store(1, std::sync::atomic::Ordering::Release);
-            } else {
-                pds(app)?
-                    .external_begin_publication(&job.id)
-                    .map_err(local_error)?;
-                write_session.store(2, std::sync::atomic::Ordering::Release);
+            let permit = super::runtime::publication_permit(app, &job.id)?;
+            if permit.mode() != live {
+                return Err(ProviderError::new(ErrorKind::Cancelled));
             }
+            pds(app)?
+                .external_begin_publication(&permit)
+                .map_err(local_error)?;
+            publication_permit = Some(permit);
             Ok(())
         },
         cancel,
@@ -1726,27 +1728,17 @@ async fn run_resolve_conflict(
     match result {
         PublicationResult::Confirmed(head) => {
             let observation = observation_json(&head.observation)?;
-            if write_session.load(std::sync::atomic::Ordering::Acquire) == 1 {
-                pds(app)?
-                    .external_confirm_publication_exit_drain(
-                        &job.id,
-                        &commit_id,
-                        &local_document.snapshot_id,
-                        &observation,
-                        false,
-                    )
-                    .map_err(local_error)?;
-            } else {
-                pds(app)?
-                    .external_confirm_publication(
-                        &job.id,
-                        &commit_id,
-                        &local_document.snapshot_id,
-                        &observation,
-                        false,
-                    )
-                    .map_err(local_error)?;
-            }
+            let permit = publication_permit
+                .as_ref()
+                .ok_or_else(|| corrupt("missing publication permit"))?;
+            pds(app)?
+                .external_confirm_publication(
+                    permit,
+                    &commit_id,
+                    &local_document.snapshot_id,
+                    &observation,
+                )
+                .map_err(local_error)?;
             if pds(app)?.external_finish_conflict(conflict_id).is_err() {
                 crate::nlog!("error","External conflict publication committed but conflict bookkeeping did not finish");
             }
@@ -1801,11 +1793,6 @@ pub(crate) async fn run_sync(
         .publication_strategy
         .ok_or_else(|| ProviderError::new(ErrorKind::Unsupported))?;
     connected.stored.capabilities.require(strategy)?;
-    if strategy == risunest_external_storage_format::format::Strategy::Sequential
-        && session == super::publication::ExecutionSession::Hidden
-    {
-        return Err(ProviderError::new(ErrorKind::Cancelled));
-    }
     if let Some(record) = pds(app)?
         .external_conflict(&job.id)
         .map_err(local_error)?
@@ -1897,54 +1884,31 @@ pub(crate) async fn run_sync(
             receive_remote(app, connected, job, &identity, &remote, cancel).await
         }
         SyncAction::AcceptEquivalent { remote } => {
-            let accepted_identity = captured
-                .as_ref()
-                .map(|(capture, _)| capture.identity.clone())
-                .unwrap_or_else(|| identity.clone());
             if captured.is_some() {
-                pds(app)?
-                    .external_cancel_prepared(&job.id)
-                    .map_err(local_error)?;
+                return Err(corrupt("equivalent state unexpectedly captured local changes"));
             }
+            let publication_permit = super::runtime::publication_permit(app, &job.id)?;
             let base = base.ok_or_else(|| corrupt("equivalent state has no base"))?;
             let observation = observation_json(&remote.observation)?;
-            if session == super::publication::ExecutionSession::ExitDrain {
-                pds(app)?
-                    .external_accept_equivalent_exit_drain(
-                        &job.request.connection_id,
-                        &connected.stored.descriptor.repository_id,
-                        &base.commit_id,
-                        &base.head_observation,
-                        remote
-                            .document
-                            .state
-                            .object_id
-                            .trim_start_matches("snapshot-"),
-                        &remote.document.commit_id,
-                        &observation,
-                        &accepted_identity,
-                    )
-                    .map_err(local_error)?;
-            } else {
-                pds(app)?
-                    .external_accept_equivalent(
-                        &job.request.connection_id,
-                        &connected.stored.descriptor.repository_id,
-                        &base.commit_id,
-                        &base.head_observation,
-                        remote
-                            .document
-                            .state
-                            .object_id
-                            .trim_start_matches("snapshot-"),
-                        &remote.document.commit_id,
-                        &observation,
-                        &accepted_identity,
-                    )
-                    .map_err(local_error)?;
-            }
+            pds(app)?
+                .external_accept_equivalent(
+                    &publication_permit,
+                    &job.request.connection_id,
+                    &connected.stored.descriptor.repository_id,
+                    &base.commit_id,
+                    &base.head_observation,
+                    remote
+                        .document
+                        .state
+                        .object_id
+                        .trim_start_matches("snapshot-"),
+                    &remote.document.commit_id,
+                    &observation,
+                    &identity,
+                )
+                .map_err(local_error)?;
             Ok(
-                json!({"snapshotId":remote.document.state.object_id.trim_start_matches("snapshot-"),"publishedRevision":accepted_identity.revision.to_string()}),
+                json!({"snapshotId":remote.document.state.object_id.trim_start_matches("snapshot-"),"publishedRevision":identity.revision.to_string()}),
             )
         }
         SyncAction::PublishLocal { expected } => {
@@ -1993,7 +1957,7 @@ pub(crate) async fn run_sync(
                 .admission
                 .file(false)
                 .map_err(local_error)?;
-            let write_session = std::sync::atomic::AtomicU8::new(0);
+            let mut publication_permit = None;
             if let Some(protection) = protection {
                 protection.recheck(cancel).await?;
             }
@@ -2008,17 +1972,14 @@ pub(crate) async fn run_sync(
                 &prepared,
                 || super::runtime::read_job_session(app, &job.id),
                 |live| {
-                    if live == super::publication::ExecutionSession::ExitDrain {
-                        pds(app)?
-                            .external_begin_publication_exit_drain(&job.id)
-                            .map_err(local_error)?;
-                        write_session.store(1, std::sync::atomic::Ordering::Release);
-                    } else {
-                        pds(app)?
-                            .external_begin_publication(&job.id)
-                            .map_err(local_error)?;
-                        write_session.store(2, std::sync::atomic::Ordering::Release);
+                    let permit = super::runtime::publication_permit(app, &job.id)?;
+                    if permit.mode() != live {
+                        return Err(ProviderError::new(ErrorKind::Cancelled));
                     }
+                    pds(app)?
+                        .external_begin_publication(&permit)
+                        .map_err(local_error)?;
+                    publication_permit = Some(permit);
                     Ok(())
                 },
                 cancel,
@@ -2027,31 +1988,17 @@ pub(crate) async fn run_sync(
             {
                 PublicationResult::Confirmed(observed) => {
                     let observation = observation_json(&observed.observation)?;
-                    let session = write_session.load(std::sync::atomic::Ordering::Acquire);
-                    if session == 0 {
-                        return Err(corrupt("missing publication session"));
-                    }
-                    if session == 1 {
-                        pds(app)?
-                            .external_confirm_publication_exit_drain(
-                                &job.id,
-                                &job.id,
-                                &completed.snapshot_id,
-                                &observation,
-                                false,
-                            )
-                            .map_err(local_error)?;
-                    } else {
-                        pds(app)?
-                            .external_confirm_publication(
-                                &job.id,
-                                &job.id,
-                                &completed.snapshot_id,
-                                &observation,
-                                false,
-                            )
-                            .map_err(local_error)?;
-                    }
+                    let permit = publication_permit
+                        .as_ref()
+                        .ok_or_else(|| corrupt("missing publication permit"))?;
+                    pds(app)?
+                        .external_confirm_publication(
+                            permit,
+                            &job.id,
+                            &completed.snapshot_id,
+                            &observation,
+                        )
+                        .map_err(local_error)?;
                     let _ = journal
                         .release_completed_sessions(connected.dependencies.vault.as_ref())
                         .await;
@@ -2780,7 +2727,7 @@ mod tests {
                 remote: Some(&new)
             })
             .unwrap(),
-            SyncAction::AcceptEquivalent { remote: new }
+            SyncAction::PreserveConflict { remote: new }
         );
     }
     #[test]
