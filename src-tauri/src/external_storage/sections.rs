@@ -2025,7 +2025,10 @@ mod tests {
             let (captured, publications) = capture_state_sections(&mut store, &Sequence::from(11u64),
                 &parent_sections(10, 7), "connection", "library", spool.path(), &Cancellation::default()).unwrap();
             assert_eq!(captured.iter().find(|source| source.kind == SectionKind::LocalPlugins).unwrap().gc_floor, Sequence::from(7u64));
-            assert_eq!(publications.iter().find(|publication| publication.section == Section::LocalPlugins).unwrap().gc_floor, Sequence::from(7u64));
+            let publication = publications.iter()
+                .find(|publication| publication.section == Section::LocalPlugins).unwrap();
+            let (_, metadata) = open_publication_index(&publication.publication_index_path).unwrap();
+            assert_eq!(metadata.gc_floor, Sequence::from(7u64));
         }
     }
 
