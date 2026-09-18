@@ -3695,6 +3695,17 @@ describe('SaveCoordinator', () => {
         snapshot.username = 'Revision 12 snapshot'
         const store = {
             materializeDatabase: vi.fn(async () => snapshot),
+            queryPluginStorage: vi.fn(async () => ({
+                revision: 12,
+                items: [
+                    { owner: 'plugin-a', key: 'shared', byteSize: 1 },
+                    { owner: 'plugin-b', key: 'shared', byteSize: 1 },
+                ],
+            })),
+            readPluginStorage: vi.fn(async (owner: string) => ({
+                revision: 12,
+                value: owner === 'plugin-a' ? 'a' : 'b',
+            })),
             replaceFromDatabase: vi.fn(async () => ({ revision: 13 })),
         } as unknown as PersistentDataStore
         const coordinator = new SaveCoordinator({
@@ -3707,6 +3718,7 @@ describe('SaveCoordinator', () => {
 
         const materializing = coordinator.materializePersistentDatabaseSnapshotWithRevision(
             'versioned-snapshot',
+            { includePluginStorageValues: true },
         )
         const replacing = coordinator.replacePersistentDatabase(
             makeDatabase(),
@@ -3718,6 +3730,10 @@ describe('SaveCoordinator', () => {
             revision: 12,
             mutationGeneration: 0,
             database: snapshot,
+            pluginStorageValues: [
+                { owner: 'plugin-a', key: 'shared', value: 'a' },
+                { owner: 'plugin-b', key: 'shared', value: 'b' },
+            ],
         })
         await replacing
         expect(coordinator.revision).toBe(13)

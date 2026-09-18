@@ -30,6 +30,7 @@ import type {
     PluginStorageCatalog,
     PluginStorageListItem,
     PluginStorageMutation,
+    PluginStorageValue,
     PresetCatalog,
     PresetSummary,
     Versioned,
@@ -1000,6 +1001,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         databaseValue: Database,
         expectedRevision?: DataRevision,
         assetAliases: AssetAlias[] = [],
+        pluginStorageValues?: PluginStorageValue[],
     ): Promise<{ revision: DataRevision }> {
         const database = this.requireDatabase()
         const transaction = database.transaction([...STORE_NAMES], 'readwrite')
@@ -1010,7 +1012,13 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             }
             const revision = active.revision + 1
             const generation = this.generationFor(revision)
-            await this.stageDatabase(transaction, databaseValue, generation, [])
+            await this.stageDatabase(
+                transaction,
+                databaseValue,
+                generation,
+                [],
+                pluginStorageValues,
+            )
             await this.preserveRepositoriesForReplacement(
                 transaction,
                 active.generation,
@@ -2252,6 +2260,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         databaseValue: Database,
         generation: string,
         assetAliases: AssetAlias[],
+        pluginStorageValues?: PluginStorageValue[],
     ): Promise<void> {
         for (const alias of assetAliases) validateAssetAlias(alias)
         const ids = new Set<string>()
@@ -2266,12 +2275,16 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         this.putRoot(transaction, generation, root)
         this.putAssetRepositoryAuthority(transaction, generation, { format: 'legacy' })
         this.writePresetRows(transaction, generation, botPresets ?? [])
-        this.writePluginStorageRows(
-            transaction,
-            generation,
-            pluginCustomStorage ?? {},
-            pluginStorageMeta,
-        )
+        if (pluginStorageValues) {
+            this.writePluginStorageValueRows(transaction, generation, pluginStorageValues)
+        } else {
+            this.writePluginStorageRows(
+                transaction,
+                generation,
+                pluginCustomStorage ?? {},
+                pluginStorageMeta,
+            )
+        }
         for (const alias of assetAliases) {
             transaction.objectStore('assetAliases').put({
                 key: this.assetAliasKey(generation, alias.kind, alias.key),
@@ -3151,6 +3164,32 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 ...metadata,
                 value,
             } satisfies StoredPluginStorage)
+            metadataStore.put(metadata)
+        }
+    }
+
+    private writePluginStorageValueRows(
+        transaction: IDBTransaction,
+        generation: string,
+        values: readonly PluginStorageValue[],
+    ): void {
+        const valueStore = transaction.objectStore('pluginStorage')
+        const metadataStore = transaction.objectStore('pluginStorageMetadata')
+        const seen = new Set<string>()
+        for (const [ordinal, { owner, key: storageKey, value }] of values.entries()) {
+            const identity = JSON.stringify([owner, storageKey])
+            if (seen.has(identity)) throw new Error('Duplicate plugin storage owner and key')
+            seen.add(identity)
+            const metadata = {
+                key: this.pluginStorageKey(generation, owner, storageKey),
+                generation,
+                owner,
+                storageKey,
+                valueType: typeof value === 'string' ? 'string' : 'json',
+                byteSize: serializedByteSize(value),
+                ordinal,
+            } satisfies StoredPluginStorageMetadata
+            valueStore.put({ ...metadata, value } satisfies StoredPluginStorage)
             metadataStore.put(metadata)
         }
     }

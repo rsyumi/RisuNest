@@ -98,6 +98,7 @@ function createHarness() {
         database: Database
         revision: number
         mutationGeneration?: number
+        pluginStorageValues?: Array<{ owner: string; key: string; value: unknown }>
     }> = []
     const readRoot = vi.fn(async () => {
         const database = pinnedDatabases[0]!
@@ -244,6 +245,7 @@ function createHarness() {
             publishOfficial?: boolean
             expectedRevision?: number
             expectedMutationGeneration?: number
+            pluginStorageValues?: Array<{ owner: string; key: string; value: unknown }>
         },
     ) => ({ kind: 'committed' as const, revision: 5, projection: 'applied' as const }))
     const readPluginStorageSnapshot = vi.fn(async () => ({
@@ -1719,6 +1721,7 @@ describe('plugin database access', () => {
 
         expect(harness.materializeDatabaseSnapshot).toHaveBeenCalledWith(
             'plugin-database-set',
+            { includePluginStorageValues: true },
         )
         expect(harness.replacePersistentDatabase).toHaveBeenCalledTimes(1)
         const [candidate, reason, options] = harness.replacePersistentDatabase.mock.calls[0]
@@ -1738,6 +1741,39 @@ describe('plugin database access', () => {
         expect(candidate).not.toHaveProperty('privateValue')
         expect(candidate).not.toBe(authoritative)
         expect(candidate.characters).not.toBe(pluginCharacters)
+    })
+
+    it('keeps same-key values from other plugin owners during a full replacement', async () => {
+        const harness = createHarness()
+        const authoritative = {
+            username: 'Before',
+            botPresets: [],
+            characters: [{ chaId: 'inactive', name: 'Before', chats: [] }],
+            pluginCustomStorage: { shared: 'plugin-a-value' },
+        } as unknown as Database
+        harness.authoritativeSnapshots.push({
+            database: authoritative,
+            revision: 7,
+            pluginStorageValues: [
+                { owner: PLUGIN_ACCESS_OWNER, key: 'shared', value: 'plugin-a-value' },
+                { owner: 'plugin-b', key: 'shared', value: 'plugin-b-value' },
+            ],
+        })
+
+        await harness.access.setDatabase(
+            {
+                characters: [{ chaId: 'inactive', name: 'After', chats: [] }],
+                pluginCustomStorage: { shared: 'plugin-a-updated' },
+            },
+            ['characters', 'pluginCustomStorage'],
+        )
+
+        const [, , options] = harness.replacePersistentDatabase.mock.calls[0]
+        expect(options.pluginStorageValues).toHaveLength(2)
+        expect(options.pluginStorageValues).toEqual(expect.arrayContaining([
+            { owner: PLUGIN_ACCESS_OWNER, key: 'shared', value: 'plugin-a-updated' },
+            { owner: 'plugin-b', key: 'shared', value: 'plugin-b-value' },
+        ]))
     })
 
     it('waits for authoritative replacement so scalable live reprojection is observable', async () => {

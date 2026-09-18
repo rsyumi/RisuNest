@@ -1584,6 +1584,7 @@ describe('AccountStorage structured wire contract', () => {
 
         expect(mocks.materializePersistentDatabaseSnapshotWithRevision).toHaveBeenCalledWith(
             'account-unmigration',
+            { includePluginStorageValues: true },
         )
         expect(mocks.completeAccountUnmigration).toHaveBeenCalledWith(
             authoritativeDatabase,

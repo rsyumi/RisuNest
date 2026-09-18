@@ -29,6 +29,7 @@ import {
     type PersistentPresetMutationResult,
     type PersistentCharacterDetailMutation,
     type PersistentCharacterMutationResult,
+    type PersistentDatabaseMaterializationOptions,
     type PersistentDatabaseSnapshot,
     type PersistentMutationToken,
     type PersistentSelectedConversation,
@@ -473,6 +474,7 @@ export interface PersistentDataRuntime {
     materializePersistentDatabaseSnapshot(reason: string): Promise<Database>
     materializePersistentDatabaseSnapshotWithRevision(
         reason: string,
+        options?: PersistentDatabaseMaterializationOptions,
     ): Promise<PersistentDatabaseSnapshot>
     releaseInactiveWorkingSet(
         canRelease?: () => boolean | Promise<boolean>,
@@ -1108,9 +1110,10 @@ export function createPersistentDataRuntime(
         acquireCommittedWorkingSetRefreshFence,
         materializePersistentDatabaseSnapshot: (reason) =>
             coordinator.materializePersistentDatabaseSnapshot(reason),
-        materializePersistentDatabaseSnapshotWithRevision: (reason) =>
+        materializePersistentDatabaseSnapshotWithRevision: (reason, options) =>
             coordinator.materializePersistentDatabaseSnapshotWithRevision(
                 reason,
+                options,
             ),
         async releaseInactiveWorkingSet(canRelease, isCurrent) {
             const token = await coordinator.capturePersistentMutationToken(

@@ -25,6 +25,7 @@ import type {
     PersistentCompleteCharacterMutation,
     PersistentCompleteCharacterUpsert,
     PersistentCompleteCharacterUpsertOptions,
+    PersistentDatabaseMaterializationOptions,
     PersistentScopedReplacementOptions,
     PersistentDatabaseSnapshot,
     PersistentMutationToken,
@@ -696,8 +697,9 @@ export const materializePersistentDatabaseSnapshot = (reason: string): Promise<D
     getPersistentDataRuntime().materializePersistentDatabaseSnapshot(reason)
 export const materializePersistentDatabaseSnapshotWithRevision = (
     reason: string,
+    options?: PersistentDatabaseMaterializationOptions,
 ): Promise<PersistentDatabaseSnapshot> =>
-    getPersistentDataRuntime().materializePersistentDatabaseSnapshotWithRevision(reason)
+    getPersistentDataRuntime().materializePersistentDatabaseSnapshotWithRevision(reason, options)
 
 export const releaseInactiveWorkingSet = (
     canRelease?: () => boolean | Promise<boolean>,

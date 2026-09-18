@@ -693,8 +693,15 @@ pub(crate) fn pds_replace_put_root(
     state: State<'_, PersistentStoreState>,
     staging_id: String,
     root: Value,
+    plugin_storage_values: Option<Vec<super::PluginStorageValue>>,
 ) -> Result<(), StoreError> {
-    with_store_mut(state, |store| store.replace_put_root(&staging_id, &root))
+    with_store_mut(state, |store| {
+        store.replace_put_root_with_plugin_storage(
+            &staging_id,
+            &root,
+            plugin_storage_values.as_deref(),
+        )
+    })
 }
 
 #[tauri::command(async)]

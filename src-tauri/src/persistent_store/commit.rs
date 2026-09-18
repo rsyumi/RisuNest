@@ -517,11 +517,24 @@ pub(super) fn replace_put_root(
     staging_id: &str,
     root: &Value,
 ) -> StoreResult<()> {
+    replace_put_root_with_plugin_storage(connection, staging_id, root, None)
+}
+
+pub(super) fn replace_put_root_with_plugin_storage(
+    connection: &mut Connection,
+    staging_id: &str,
+    root: &Value,
+    plugin_storage_values: Option<&[super::PluginStorageValue]>,
+) -> StoreResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     require_staging(&transaction, staging_id)?;
     let mut staged_root = object(root, "Persistent root")?.clone();
     let plugin_storage_meta = staged_root.shift_remove("pluginStorageMeta");
-    if let Some(plugin_storage) = staged_root.shift_remove("pluginCustomStorage") {
+    let plugin_storage = staged_root.shift_remove("pluginCustomStorage");
+    if let Some(plugin_storage_values) = plugin_storage_values {
+        let carried = carried_plugin_import_batches(&transaction)?;
+        replace_plugin_storage_values(&transaction, staging_id, plugin_storage_values, &carried)?;
+    } else if let Some(plugin_storage) = plugin_storage {
         let plugin_storage = plugin_storage
             .as_object()
             .ok_or_else(|| validation("pluginCustomStorage must be a JSON object"))?;
@@ -536,6 +549,36 @@ pub(super) fn replace_put_root(
     }
     put_root(&transaction, staging_id, &Value::Object(staged_root))?;
     transaction.commit()?;
+    Ok(())
+}
+
+fn replace_plugin_storage_values(
+    transaction: &Transaction<'_>,
+    generation: &str,
+    values: &[super::PluginStorageValue],
+    carried: &HashMap<String, String>,
+) -> StoreResult<()> {
+    transaction.execute(
+        "DELETE FROM plugin_storage WHERE generation = ?1",
+        [generation],
+    )?;
+    for (ordinal, entry) in values.iter().enumerate() {
+        let import_batch = plugin_owner::is_unowned(&entry.owner).then(|| {
+            carried
+                .get(entry.key.as_str())
+                .map(String::as_str)
+                .unwrap_or(generation)
+        });
+        put_plugin_storage(
+            transaction,
+            generation,
+            &entry.owner,
+            &entry.key,
+            &entry.value,
+            Some(ordinal as i64),
+            import_batch,
+        )?;
+    }
     Ok(())
 }
 

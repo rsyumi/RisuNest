@@ -468,7 +468,10 @@ export function unMigrationAccount(): Promise<void> {
 }
 
 async function performAccountUnmigration(): Promise<void> {
-    const snapshot = await materializePersistentDatabaseSnapshotWithRevision('account-unmigration')
+    const snapshot = await materializePersistentDatabaseSnapshotWithRevision(
+        'account-unmigration',
+        { includePluginStorageValues: true },
+    )
     const db = snapshot.database
     const expectedRevision = snapshot.revision
     const expectedMutationGeneration = snapshot.mutationGeneration
@@ -546,6 +549,7 @@ async function performAccountUnmigration(): Promise<void> {
                 authoritative: true,
                 expectedRevision,
                 expectedMutationGeneration,
+                pluginStorageValues: snapshot.pluginStorageValues,
             })
         },
         finalize: async () => {

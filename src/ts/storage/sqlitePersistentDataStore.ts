@@ -37,6 +37,7 @@ import {
     type PersistentRoot,
     type PluginStorageCatalog,
     type PluginStorageListItem,
+    type PluginStorageValue,
     type PresetCatalog,
     type Versioned,
     type WorkingSetCommit,
@@ -337,11 +338,16 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
         database: Database,
         expectedRevision?: DataRevision,
         assetAliases: AssetAlias[] = [],
+        pluginStorageValues?: PluginStorageValue[],
     ): Promise<{ revision: DataRevision }> {
         const { stagingId } = await invokeStore<{ stagingId: string }>('pds_replace_begin')
         try {
             const { characters, botPresets, ...root } = database
-            await invokeStore<void>('pds_replace_put_root', { stagingId, root })
+            await invokeStore<void>('pds_replace_put_root', {
+                stagingId,
+                root,
+                ...(pluginStorageValues ? { pluginStorageValues } : {}),
+            })
             await invokeStore<void>('pds_replace_put_presets', {
                 stagingId,
                 presets: botPresets ?? [],
