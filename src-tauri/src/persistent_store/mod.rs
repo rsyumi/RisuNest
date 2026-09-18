@@ -2791,6 +2791,21 @@ impl PersistentStore {
                 &self.repository_root,
             )?,
         ));
+        let mut server_conflicts =
+            crate::asset_repository::migration_gc::AssetRootSet::default();
+        crate::server_sync::backups::references::visit_roots(
+            &self.repository_root,
+            |object| {
+                if object.metadata || object.local_required {
+                    server_conflicts.object_hashes.insert(object.hash);
+                }
+                Ok(())
+            },
+        )
+        .map_err(|error| StoreError::Store {
+            message: format!("server conflict roots are unavailable: {}", error.code),
+        })?;
+        roots.push(("server-conflict", server_conflicts));
         roots.extend(
             snapshot_archive::Archive::open(&self.snapshots_dir)?
                 .roots()?
