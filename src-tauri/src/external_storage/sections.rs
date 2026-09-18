@@ -845,23 +845,12 @@ fn read_source_bytes(source: &SectionSource, cancel: &Cancellation) -> Result<Ve
     Ok(bytes)
 }
 
-/// Preparation only reads downloaded local files. It validates the codec,
-/// keys, object bodies and fingerprint before sealing a bounded disk spool.
-/// No persistent or device database is opened by this function.
-pub(crate) fn prepare_received_section(
-    connection_id: &str,
-    library_lineage: &str,
-    arrival: SectionArrival,
-    participation_generation: &Sequence,
+fn prepare_section_source_rows(
     source: &CapturedSection,
+    mut spool: SectionSpoolBuilder,
+    versioned: bool,
     cancel: &Cancellation,
-) -> Result<PreparedSectionInput> {
-    cancel.check()?;
-    let section = section_of(source.kind).ok_or_else(|| corrupt("device-fixed section in a synchronized state"))?;
-    if connection_id.is_empty() || library_lineage.is_empty()
-        || source.generation == Sequence::from(0u64) || source.gc_floor > source.generation {
-        return Err(corrupt("received section identity or bounds are invalid"));
-    }
+) -> Result<PreparedSectionRows> {
     let mut objects = BTreeMap::new();
     for file in &source.sources {
         if !crate::trust_boundary::is_lower_hex_256(&file.content_sha256) {
@@ -872,14 +861,14 @@ pub(crate) fn prepare_received_section(
             wire::CatalogEntryKind::SectionObject => {
                 if file.key != format!("object/{}", file.content_sha256)
                     || file.content_sha256.len() != 64
-                    || objects.insert(file.content_sha256.clone(), file).is_some() {
+                    || objects.insert(file.content_sha256.clone(), file).is_some()
+                {
                     return Err(corrupt("section object key is invalid or duplicated"));
                 }
             }
             _ => return Err(corrupt("section source has another catalog kind")),
         }
     }
-    let mut spool = SectionSpoolBuilder::new(section).map_err(transient)?;
     let mut used_objects = BTreeSet::new();
     for file in &source.sources {
         if file.kind != wire::CatalogEntryKind::SectionEntry { continue; }
@@ -907,12 +896,20 @@ pub(crate) fn prepare_received_section(
             },
             _ => None,
         };
-        let row = SectionRow::from_entry(entry, true, |_| {
-            object.take().ok_or_else(|| crate::persistent_store::StoreError::Validation {
-                message: "Section object is missing".into(),
-            })
-        }).map_err(corrupt)?;
-        spool.push(row, &file.key, &digest).map_err(preparation_error)?;
+        if versioned {
+            let row = SectionRow::from_entry(entry, true, |_| {
+                object.take().ok_or_else(|| crate::persistent_store::StoreError::Validation {
+                    message: "Section object is missing".into(),
+                })
+            }).map_err(corrupt)?;
+            spool.push(row, &file.key, &digest).map_err(preparation_error)?;
+        } else {
+            spool.push_backup_entry(entry, |_| {
+                object.take().ok_or_else(|| crate::persistent_store::StoreError::Validation {
+                    message: "Section object is missing".into(),
+                })
+            }).map_err(preparation_error)?;
+        }
     }
     // Extra catalog objects are not installed, but corrupt ones must not be
     // hidden merely because this section has no entry that references them.
@@ -922,10 +919,36 @@ pub(crate) fn prepare_received_section(
         }
     }
     let rows = spool.finish(&source.content_fingerprint).map_err(preparation_error)?;
+    cancel.check()?;
+    Ok(rows)
+}
+
+/// Preparation only reads downloaded local files. It validates the codec,
+/// keys, object bodies and fingerprint before sealing a bounded disk spool.
+/// No persistent or device database is opened by this function.
+pub(crate) fn prepare_received_section(
+    connection_id: &str,
+    library_lineage: &str,
+    arrival: SectionArrival,
+    participation_generation: &Sequence,
+    source: &CapturedSection,
+    cancel: &Cancellation,
+) -> Result<PreparedSectionInput> {
+    cancel.check()?;
+    let section = section_of(source.kind).ok_or_else(|| corrupt("device-fixed section in a synchronized state"))?;
+    if connection_id.is_empty() || library_lineage.is_empty()
+        || source.generation == Sequence::from(0u64) || source.gc_floor > source.generation {
+        return Err(corrupt("received section identity or bounds are invalid"));
+    }
+    let rows = prepare_section_source_rows(
+        source,
+        SectionSpoolBuilder::new(section).map_err(transient)?,
+        true,
+        cancel,
+    )?;
     if rows.max_write_clock() > &source.max_write_clock {
         return Err(corrupt("section row clock exceeds its reference"));
     }
-    cancel.check()?;
     Ok(PreparedSectionInput {
         connection_id: connection_id.to_owned(), library_lineage: library_lineage.to_owned(),
         participation_generation: participation_generation.clone(), arrival,
@@ -935,6 +958,34 @@ pub(crate) fn prepare_received_section(
         },
         rows,
     })
+}
+
+/// Validates every selected backup section before the caller changes any
+/// device rows. Each returned spool is versionless and replaces only its kind.
+pub(crate) fn prepare_received_backup_sections(
+    sources: &[CapturedSection],
+    cancel: &Cancellation,
+) -> Result<Vec<PreparedSectionRows>> {
+    let zero = Sequence::from(0u64);
+    let mut seen = BTreeSet::new();
+    let mut prepared = Vec::with_capacity(sources.len());
+    for source in sources {
+        cancel.check()?;
+        if source.generation != zero
+            || source.gc_floor != zero
+            || source.max_write_clock != zero
+            || !seen.insert(source.kind.id())
+        {
+            return Err(corrupt("backup section identity or bounds are invalid"));
+        }
+        prepared.push(prepare_section_source_rows(
+            source,
+            SectionSpoolBuilder::new_backup(source.kind).map_err(transient)?,
+            false,
+            cancel,
+        )?);
+    }
+    Ok(prepared)
 }
 
 pub(crate) fn apply_prepared_section(
@@ -1302,6 +1353,51 @@ mod tests {
         )
         .expect("decode settings section");
         assert_eq!(decoded, setting_rows);
+    }
+
+    #[test]
+    fn backup_sections_prepare_every_selected_scope_before_restore() {
+        let spool = tempfile::tempdir().expect("create spool");
+        let plugin = capture_section(
+            SectionKind::LocalPlugins,
+            &[plugin_row("token", "kept", 0, "")],
+            false,
+            Sequence::from(0u64),
+            Sequence::from(0u64),
+            Sequence::from(0u64),
+            &spool.path().join("plugins"),
+            &Cancellation::default(),
+        )
+        .expect("capture backup plugin section");
+        let settings = capture_section(
+            SectionKind::LocalSettings,
+            &[SectionRow {
+                key1: "setting".into(),
+                key2: "risuNestDeviceSettings".into(),
+                key3: String::new(),
+                value: SectionValueRow::Setting { value: "{\"startup\":\"restore\"}".into() },
+                write_clock: Sequence::from(0u64),
+                writer_id: String::new(),
+            }],
+            false,
+            Sequence::from(0u64),
+            Sequence::from(0u64),
+            Sequence::from(0u64),
+            &spool.path().join("settings"),
+            &Cancellation::default(),
+        )
+        .expect("capture backup settings section");
+        let sources = [plugin, settings];
+        let prepared = prepare_received_backup_sections(&sources, &Cancellation::default())
+            .expect("prepare every backup section");
+        assert_eq!(prepared.iter().map(PreparedSectionRows::kind).collect::<Vec<_>>(), [
+            SectionKind::LocalPlugins,
+            SectionKind::LocalSettings,
+        ]);
+
+        let mut corrupt = sources.clone();
+        corrupt[1].content_fingerprint[0] ^= 1;
+        assert!(prepare_received_backup_sections(&corrupt, &Cancellation::default()).is_err());
     }
 
     #[test]
