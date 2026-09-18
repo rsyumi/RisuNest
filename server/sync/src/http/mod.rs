@@ -237,6 +237,22 @@ fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     }
     headers.get(name)?.to_str().ok()
 }
+fn retain_guard_until_body_eof<T: Send + 'static>(
+    body: axum::body::Body,
+    guard: T,
+) -> axum::body::Body {
+    use futures_util::Stream;
+    let mut body = Box::pin(body.into_data_stream());
+    let mut guard = Some(guard);
+    let stream = futures_util::stream::poll_fn(move |context| {
+        let next = body.as_mut().poll_next(context);
+        if matches!(next, std::task::Poll::Ready(None)) {
+            guard.take();
+        }
+        next
+    });
+    axum::body::Body::from_stream(stream)
+}
 async fn authorize(State(app): State<App>, request: Request, next: Next) -> Response {
     let result = async {
         let token = header(request.headers(), "authorization")
@@ -340,18 +356,8 @@ async fn authorize(State(app): State<App>, request: Request, next: Next) -> Resp
             .insert("cache-control", "no-store".parse().unwrap());
         // A slow response must retain its slot until the stream is consumed or
         // disconnected, not just until response headers are ready.
-        use futures_util::Stream;
         let (parts, body) = response.into_parts();
-        let mut body = Box::pin(body.into_data_stream());
-        let mut permits = Some(permits);
-        let stream = futures_util::stream::poll_fn(move |context| {
-            let next = body.as_mut().poll_next(context);
-            if matches!(next, std::task::Poll::Ready(None)) {
-                permits.take();
-            }
-            next
-        });
-        let response = Response::from_parts(parts, axum::body::Body::from_stream(stream));
+        let response = Response::from_parts(parts, retain_guard_until_body_eof(body, permits));
         Ok::<_, Error>(response)
     }
     .await;
@@ -1200,4 +1206,31 @@ async fn release_download_delta(
 ) -> Result<StatusCode> {
     blocking(move || app.store.release_download_delta(&device, &id)).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retain_guard_until_body_eof;
+    use axum::body::Body;
+    use futures_util::StreamExt;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    #[tokio::test]
+    async fn exhausted_body_releases_its_guard_before_the_stream_is_dropped() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let guard = semaphore.clone().try_acquire_owned().unwrap();
+        let body = retain_guard_until_body_eof(Body::from("synthetic body"), guard);
+        let mut stream = Box::pin(body.into_data_stream());
+
+        assert!(semaphore.clone().try_acquire_owned().is_err());
+        let chunk = stream.next().await.unwrap().unwrap();
+        assert_eq!(chunk.as_ref(), b"synthetic body");
+        assert!(semaphore.clone().try_acquire_owned().is_err());
+
+        assert!(stream.next().await.is_none());
+        let available = semaphore.clone().try_acquire_owned().unwrap();
+        assert!(stream.next().await.is_none());
+        drop(available);
+    }
 }

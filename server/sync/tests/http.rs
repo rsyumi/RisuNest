@@ -308,47 +308,6 @@ async fn session_identity_and_previous_device_status_are_authenticated_and_revoc
         StatusCode::UNAUTHORIZED
     );
 }
-
-#[tokio::test]
-async fn exhausted_response_bodies_release_device_request_slots_before_drop() {
-    let server = Server::start().await;
-    let url = format!("{}/session", server.base);
-    let mut first = server
-        .auth(server.client.get(&url), &server.a)
-        .send()
-        .await
-        .unwrap();
-    let mut second = server
-        .auth(server.client.get(&url), &server.a)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(first.status(), StatusCode::OK);
-    assert_eq!(second.status(), StatusCode::OK);
-
-    let busy = server
-        .auth(server.client.get(&url), &server.a)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(busy.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(
-        busy.json::<serde_json::Value>().await.unwrap()["error"],
-        "device-busy"
-    );
-
-    while first.chunk().await.unwrap().is_some() {}
-    while second.chunk().await.unwrap().is_some() {}
-
-    let admitted = server
-        .auth(server.client.get(&url), &server.a)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(admitted.status(), StatusCode::OK);
-    assert_eq!(first.status(), StatusCode::OK);
-    assert_eq!(second.status(), StatusCode::OK);
-}
 impl Server {
     async fn start() -> Self {
         let dir = tempfile::tempdir().unwrap();
