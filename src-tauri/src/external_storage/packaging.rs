@@ -2188,7 +2188,7 @@ mod tests {
             generation != 0,
             risunest_sync_wire::head::Sequence::from(generation),
             risunest_sync_wire::head::Sequence::from(0u64),
-            risunest_sync_wire::head::Sequence::from(6u64),
+            risunest_sync_wire::head::Sequence::from(if generation == 0 { 0u64 } else { 6u64 }),
             &spool.join(format!("{}-{marker}", kind.id())),
             &Cancellation::default(),
         )
