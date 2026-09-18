@@ -136,7 +136,6 @@ function embeddingEntries(seed: number): HypaEmbeddingEntry[] {
       preprocessVersion: 1,
       dimensions: vectorDimensions,
       vector: vector.buffer,
-      metadata: `synthetic-${seed}-${index}`,
     };
   });
 }
@@ -168,7 +167,6 @@ async function mutate() {
       preprocessVersion: 1,
       dimensions: 4,
       vector: new Float32Array([9, 8, 7, 6]).buffer,
-      metadata: "remove-after-restore",
     },
   ]);
   const plugins = pluginKeyspace();
