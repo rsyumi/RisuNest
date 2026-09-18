@@ -85,13 +85,14 @@ fn completion_closes_index_and_keeps_local_cas_ownership_without_archives() {
     assert!(!path.join("index.sqlite-journal").exists());
     let db = open(root.path(), &id, &|| Ok(())).unwrap();
     assert!(db.execute("DELETE FROM objects", []).is_err());
-    let pins = DurableCasJob::open(root.path(), &id).unwrap();
-    assert!(pins.is_sealed());
-    assert!(!pins.is_released());
-    assert!(pins.root_set().unwrap().object_hashes.contains(&digest));
+    assert_eq!(
+        DurableCasJob::open(root.path(), &id).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
     let mut roots = Vec::new();
     visit_roots(root.path(), |object| { roots.push(object.hash); Ok(()) }).unwrap();
-    assert_eq!(roots, vec![digest]);
+    assert_eq!(roots, vec![digest.clone()]);
+    assert!(PayloadCas::new(root.path()).unwrap().stat_object(&digest).unwrap().is_some());
 }
 
 #[test]

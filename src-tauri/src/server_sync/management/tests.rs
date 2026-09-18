@@ -1,20 +1,26 @@
 use super::*;
-use serde_json::json;
 
-fn backup(root: &Path, index: u128, complete: bool) -> (String, u64) {
-    let id = uuid::Uuid::from_u128(index).to_string();
-    let directory = root.join("server-sync/backups").join(&id);
-    fs::create_dir_all(&directory).unwrap();
-    fs::write(directory.join("local.risunest"), b"synthetic local").unwrap();
-    fs::write(directory.join("remote.risunest"), b"synthetic remote").unwrap();
+fn backup(root: &Path, complete: bool) -> (String, u64) {
+    let mut store = crate::persistent_store::PersistentStore::open(root).unwrap();
+    let mut capture = backups::references::Capture::begin(
+        root,
+        1,
+        "generation",
+        &risunest_sync_wire::RemoteHead::genesis("library".into(), "epoch".into()).unwrap(),
+    )
+    .unwrap();
+    capture
+        .metadata(backups::Side::Local, b"synthetic local")
+        .unwrap();
+    capture
+        .metadata(backups::Side::Remote, b"synthetic remote")
+        .unwrap();
+    let id = capture.id.clone();
+    let directory = capture.path.clone();
     if complete {
-        fs::write(directory.join("complete.json"), serde_json::to_vec(&json!({
-            "format": "risunest-portable-backup", "scope": "library",
-            "head": risunest_sync_wire::RemoteHead::genesis("library".into(), "epoch".into()).unwrap(),
-            "localRevision": 1,
-            "localHash": risunest_sync_wire::hash(b"synthetic local"),
-            "remoteHash": risunest_sync_wire::hash(b"synthetic remote"),
-        })).unwrap()).unwrap();
+        capture.complete_side(backups::Side::Local).unwrap();
+        capture.complete_side(backups::Side::Remote).unwrap();
+        capture.finish(&mut store, &|| Ok(())).unwrap();
     }
     (id, tree_bytes(&directory).unwrap())
 }
@@ -23,10 +29,10 @@ fn backup(root: &Path, index: u128, complete: bool) -> (String, u64) {
 fn inventory_counts_all_files_and_pages_beyond_one_hundred() {
     let root = tempfile::tempdir().unwrap();
     let mut disk_bytes = 0;
-    for index in 1..=105 {
-        disk_bytes += backup(root.path(), index, true).1;
+    for _ in 1..=105 {
+        disk_bytes += backup(root.path(), true).1;
     }
-    let incomplete = backup(root.path(), 106, false).1;
+    let incomplete = backup(root.path(), false).1;
     disk_bytes += incomplete;
     let first = inventory(root.path(), None, None, &BTreeSet::new()).unwrap();
     assert_eq!(first.items.len(), 100);
@@ -73,8 +79,8 @@ fn empty_inventory_and_cache_do_not_create_directories() {
 #[test]
 fn fresh_ownership_recheck_blocks_listed_backup_and_preserves_incomplete_data() {
     let root = tempfile::tempdir().unwrap();
-    let (id, size) = backup(root.path(), 1, true);
-    let (unfinished, unfinished_size) = backup(root.path(), 2, false);
+    let (id, size) = backup(root.path(), true);
+    let (unfinished, unfinished_size) = backup(root.path(), false);
     assert!(
         inventory(root.path(), None, None, &BTreeSet::new())
             .unwrap()
@@ -111,8 +117,8 @@ fn fresh_ownership_recheck_blocks_listed_backup_and_preserves_incomplete_data() 
 #[test]
 fn interrupted_explicit_deletion_resumes_only_its_id() {
     let root = tempfile::tempdir().unwrap();
-    let (id, _) = backup(root.path(), 1, true);
-    let (other, other_size) = backup(root.path(), 2, true);
+    let (id, _) = backup(root.path(), true);
+    let (other, other_size) = backup(root.path(), true);
     let base = root.path().join("server-sync/backups");
     let deleting = base.join(format!(".deleting-{id}"));
     fs::rename(base.join(&id), &deleting).unwrap();
@@ -221,10 +227,10 @@ fn cache_management_rejects_a_linked_cache_root_and_keeps_external_files() {
 #[test]
 fn automatic_cleanup_only_removes_canonical_tombstones_and_retries_failures() {
     let root = tempfile::tempdir().unwrap();
-    let (id, _) = backup(root.path(), 1, true);
-    let (pinned_id, _) = backup(root.path(), 2, true);
-    let (complete, complete_size) = backup(root.path(), 3, true);
-    let (incomplete, incomplete_size) = backup(root.path(), 4, false);
+    let (id, _) = backup(root.path(), true);
+    let (pinned_id, _) = backup(root.path(), true);
+    let (complete, complete_size) = backup(root.path(), true);
+    let (incomplete, incomplete_size) = backup(root.path(), false);
     let base = root.path().join("server-sync/backups");
     for id in [&id, &pinned_id] {
         let path = base.join(format!(".deleting-{id}"));
@@ -253,7 +259,7 @@ fn automatic_cleanup_refuses_links_without_blocking_other_tombstones() {
     let root = tempfile::tempdir().unwrap();
     let external = tempfile::tempdir().unwrap();
     fs::write(external.path().join("keep"), b"external").unwrap();
-    let (id, _) = backup(root.path(), 1, true);
+    let (id, _) = backup(root.path(), true);
     let base = root.path().join("server-sync/backups");
     fs::rename(base.join(&id), base.join(format!(".deleting-{id}"))).unwrap();
     let linked = base.join(format!(".deleting-{}", uuid::Uuid::from_u128(2)));
