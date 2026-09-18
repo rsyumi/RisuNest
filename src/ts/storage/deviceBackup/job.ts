@@ -10,11 +10,11 @@ import {
   type AndroidSafJavascriptBridge,
 } from "../androidSafBridge";
 import type { NativeFileJobResult } from "../nativeFileJobs";
-import {
-  requestDeviceMaintenanceRestart,
-  type DeviceMaintenanceBootstrap,
-} from "./maintenance";
-import type { DeviceNativeInvoke } from "./nativeSpool";
+
+type DeviceNativeInvoke = <T = unknown>(
+  command: string,
+  args?: Record<string, unknown>,
+) => Promise<T>;
 
 export interface PortableJobStatus {
   jobId: string;
@@ -28,55 +28,8 @@ export interface PortableJobStatus {
     | "failed"
     | "cancelled";
   phase: string;
-  expectedRevision?: number;
-  deviceSessionId?: string;
   result?: NativeFileJobResult;
   error?: { code: string; message: string };
-}
-
-export interface PortableMaintenanceOwnership {
-  /** Revision flushed under the caller's operation ownership, before starting the native job. */
-  flushedRevision: number;
-  /** Throw if the initiating operation no longer owns the current runtime. */
-  assertHeld(): void;
-}
-
-/** Call from the portable job poll loop. A return of false means keep polling. */
-export async function handlePortableDeviceMaintenanceStatus(
-  status: PortableJobStatus,
-  ownership: PortableMaintenanceOwnership,
-  dependencies: { invoke: DeviceNativeInvoke; reload?: () => void },
-): Promise<false> {
-  if (
-    status.state !== "waitingForInput" ||
-    status.phase !== "awaiting-device-maintenance"
-  )
-    return false;
-  ownership.assertHeld();
-  if (
-    !status.deviceSessionId ||
-    (status.expectedRevision !== undefined &&
-      status.expectedRevision !== ownership.flushedRevision)
-  )
-    throw new Error(
-      "Portable backup maintenance ownership does not match the flushed runtime",
-    );
-  const bootstrap = await dependencies.invoke<DeviceMaintenanceBootstrap>(
-    "native_device_backup_bootstrap",
-  );
-  ownership.assertHeld();
-  if (
-    bootstrap.mode !== "maintenance" ||
-    bootstrap.session?.sessionId !== status.deviceSessionId ||
-    bootstrap.session.jobId !== status.jobId
-  )
-    throw new Error(
-      "Portable backup device session does not belong to this file job",
-    );
-  return requestDeviceMaintenanceRestart(
-    dependencies.invoke,
-    dependencies.reload,
-  );
 }
 
 const pendingKey = "risuNestPortableExportIntent";

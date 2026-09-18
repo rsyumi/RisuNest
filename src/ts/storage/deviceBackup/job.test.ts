@@ -2,13 +2,10 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   createPortableExportIntentStore,
-  handlePortableDeviceMaintenanceStatus,
   rememberPortableExport,
   resumePendingPortableExport,
   type PortableExportResumeDependencies,
-  type PortableJobStatus,
 } from "./job";
-import type { DeviceNativeInvoke } from "./nativeSpool";
 import { AndroidSafDestinationError } from "../androidSafBridge";
 
 function intentStore() {
@@ -65,7 +62,7 @@ function resumeFixture() {
   }));
   const dependencies: PortableExportResumeDependencies = {
     store,
-    invoke: invoke as DeviceNativeInvoke,
+    invoke: invoke as PortableExportResumeDependencies["invoke"],
     wait: async () => {},
     publishAndroid,
     resumeAndroid,
@@ -77,37 +74,6 @@ function resumeFixture() {
 }
 
 describe("portable file-job restart handoff", () => {
-  it("requires current flushed ownership and the matching native session before reload", async () => {
-    const status: PortableJobStatus = {
-      jobId: "synthetic-job",
-      kind: "export-portable-backup",
-      state: "waitingForInput",
-      phase: "awaiting-device-maintenance",
-      deviceSessionId: "synthetic-session",
-      expectedRevision: 9,
-    };
-    const invoke = vi.fn(async () => ({
-      mode: "maintenance",
-      session: { sessionId: "synthetic-session", jobId: "synthetic-job" },
-    }));
-    const reload = vi.fn();
-    await expect(
-      handlePortableDeviceMaintenanceStatus(
-        status,
-        { flushedRevision: 8, assertHeld() {} },
-        { invoke: invoke as DeviceNativeInvoke, reload },
-      ),
-    ).rejects.toThrow("flushed runtime");
-    expect(reload).not.toHaveBeenCalled();
-    void handlePortableDeviceMaintenanceStatus(
-      status,
-      { flushedRevision: 9, assertHeld() {} },
-      { invoke: invoke as DeviceNativeInvoke, reload },
-    );
-    await vi.waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
-    expect(invoke).toHaveBeenCalledTimes(2);
-  });
-
   it("keeps export intent outside every plugin storage prefix", () => {
     const { values, store } = intentStore();
     rememberPortableExport(
