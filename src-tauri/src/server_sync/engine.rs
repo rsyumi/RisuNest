@@ -2084,6 +2084,9 @@ impl PersistentStore {
                         | Envelope::Character {
                             configured_index, ..
                         }
+                        | Envelope::ArchivedCharacter {
+                            configured_index, ..
+                        }
                         | Envelope::Conversation {
                             configured_index, ..
                         } => configured_index,
@@ -2288,7 +2291,9 @@ impl PersistentStore {
         use crate::server_sync::backups::{references::Object, Side};
         use crate::logical_records::LogicalRecordEnvelope as Envelope;
         let manifests: BTreeSet<&str> = match &payload.record {
-            Envelope::Root { owner_heads, .. } | Envelope::Character { owner_heads, .. } =>
+            Envelope::Root { owner_heads, .. }
+            | Envelope::Character { owner_heads, .. }
+            | Envelope::ArchivedCharacter { owner_heads, .. } =>
                 owner_heads.iter().filter_map(|head| head.manifest_hash.as_deref()).collect(),
             _ => BTreeSet::new(),
         };
@@ -2297,6 +2302,11 @@ impl PersistentStore {
         let expected = match &payload.record {
             Envelope::Asset { object_hash: Some(hash), size, .. }
             | Envelope::Inlay { object_hash: Some(hash), size, .. } => Some((hash.as_str(), *size)),
+            Envelope::ArchivedCharacter {
+                archive_object_hash,
+                archive_object_size,
+                ..
+            } => Some((archive_object_hash.as_str(), *archive_object_size)),
             _ => None,
         };
         let bytes = serde_json::to_vec(payload).map_err(|_| SyncError::new("invalid-local-payload", 409))?;

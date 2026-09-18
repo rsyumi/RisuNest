@@ -528,15 +528,87 @@ pub(super) fn reconstruct_record_with_owner_objects(
             }
         }
         LogicalRecordLocator::Character { character_id } => {
-            let (configured_index, raw): (i64, String) = connection
+            let row: (
+                i64,
+                i64,
+                bool,
+                String,
+                Option<String>,
+                String,
+                Option<String>,
+                Option<i64>,
+                String,
+                Option<String>,
+            ) = connection
                 .query_row(
-                    "SELECT configured_index, detail FROM characters
+                    "SELECT configured_index, recent_at, trashed, name, image, type,
+                            creator_notes, trash_time, detail, archived_object
+                     FROM characters
                      WHERE generation = ?1 AND character_id = ?2",
                     params![pds_generation, character_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
+                        ))
+                    },
                 )
                 .optional()?
                 .ok_or_else(|| missing_source("character"))?;
+            let (
+                configured_index,
+                recent_at,
+                trashed,
+                name,
+                image,
+                character_type,
+                creator_notes,
+                trash_time,
+                raw,
+                archived_object,
+            ) = row;
+            if let Some(archived_object) = archived_object {
+                let archived: super::archive::ArchivedObject = serde_json::from_str(&archived_object)?;
+                let owner_heads = load_owner_heads(connection, pds_generation, Some(&character_id))?;
+                let owner_heads = validate_owner_heads_with_sizes(cas, owner_heads, size)?;
+                let archive_object_size = size(&archived.object_hash)?;
+                return Ok(encode_logical_record(&LogicalRecordEnvelope::ArchivedCharacter {
+                    configured_index: nonnegative_u64(
+                        configured_index,
+                        "character configured index",
+                    )?,
+                    recent_at,
+                    trashed,
+                    name,
+                    image,
+                    character_type,
+                    creator_notes,
+                    trash_time,
+                    archive_object_hash: archived.object_hash,
+                    archive_object_size,
+                    archived_at: nonnegative_u64(archived.archived_at, "archive timestamp")?,
+                    conversation_count: nonnegative_u64(
+                        archived.conversation_count,
+                        "archived conversation count",
+                    )?,
+                    message_count: nonnegative_u64(
+                        archived.message_count,
+                        "archived message count",
+                    )?,
+                    asset_hashes: archived.asset_hashes,
+                    owner_heads: logical_owner_heads(&owner_heads),
+                })
+                .map_err(codec_error)?
+                .bytes);
+            }
             let mut detail: Value = serde_json::from_str(&raw)?;
             let mut owner_heads = resolve_owner_heads_with_sizes(
                 connection,

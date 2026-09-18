@@ -293,6 +293,14 @@ impl Cache {
                 Envelope::Root { owner_heads, .. } | Envelope::Character { owner_heads, .. } => {
                     hashes.extend(owner_heads.into_iter().filter_map(|h| h.manifest_hash))
                 }
+                Envelope::ArchivedCharacter {
+                    archive_object_hash,
+                    owner_heads,
+                    ..
+                } => {
+                    hashes.insert(archive_object_hash);
+                    hashes.extend(owner_heads.into_iter().filter_map(|h| h.manifest_hash));
+                }
                 Envelope::Asset { object_hash, .. }
                 | Envelope::Inlay { object_hash, .. }
                 | Envelope::Cold { object_hash, .. } => hashes.extend(object_hash),

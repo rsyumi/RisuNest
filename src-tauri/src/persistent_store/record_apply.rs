@@ -31,6 +31,9 @@ pub(super) fn validate_locator_envelope(
             LogicalRecordLocator::Character { .. },
             LogicalRecordEnvelope::Character { .. }
         ) | (
+            LogicalRecordLocator::Character { .. },
+            LogicalRecordEnvelope::ArchivedCharacter { .. }
+        ) | (
             LogicalRecordLocator::Conversation { .. },
             LogicalRecordEnvelope::Conversation { .. }
         ) | (
@@ -65,6 +68,40 @@ pub(super) fn validate_locator_envelope(
             required_display_name(detail, "logical character detail")?;
             if detail.contains_key("chats") {
                 return validation("logical character detail contains separated conversations");
+            }
+        }
+        (
+            LogicalRecordLocator::Character { character_id },
+            LogicalRecordEnvelope::ArchivedCharacter {
+                name,
+                trashed,
+                trash_time,
+                owner_heads,
+                ..
+            },
+        ) => {
+            if name.trim().is_empty() {
+                return validation("logical archived character display name is missing");
+            }
+            if *trashed != trash_time.is_some() {
+                return validation("logical archived character trash state is inconsistent");
+            }
+            for head in owner_heads {
+                match &head.owner {
+                    LogicalOwnerLocator::CharacterAdditional {
+                        character_id: owner_character_id,
+                    } if owner_character_id == character_id => {}
+                    LogicalOwnerLocator::CharacterAdditional { .. } => {
+                        return validation(
+                            "logical archived character owner head does not match its key",
+                        );
+                    }
+                    _ => {
+                        return validation(
+                            "logical archived character contains a non-character owner head",
+                        )
+                    }
+                }
             }
         }
         (
@@ -272,28 +309,6 @@ pub(super) fn validate_configured_index_uniqueness(
     Ok(())
 }
 
-/// The exchange format cannot describe an archived character, so a remote delta
-/// that names one or names any of its conversations is reported instead of
-/// applied. The scope is the character and its whole conversation set, and the
-/// result is the same whichever side publishes first.
-fn refuse_archived_character_delta(
-    transaction: &Transaction<'_>,
-    generation: &str,
-    locator: &LogicalRecordLocator,
-) -> Result<(), StoreError> {
-    let character_id = match locator {
-        LogicalRecordLocator::Character { character_id } => character_id,
-        LogicalRecordLocator::Conversation { character_id, .. } => character_id,
-        _ => return Ok(()),
-    };
-    if super::archive::is_archived(transaction, generation, character_id)? {
-        return validation(format!(
-            "logical delta touches archived character {character_id}"
-        ));
-    }
-    Ok(())
-}
-
 pub(super) fn apply_delete(
     transaction: &Transaction<'_>,
     generation: &str,
@@ -445,7 +460,6 @@ pub(super) fn apply_record_rows(
     envelope: &LogicalRecordEnvelope,
     message_count: u64,
 ) -> Result<(), StoreError> {
-    refuse_archived_character_delta(transaction, generation, locator)?;
     match (locator, envelope) {
         (LogicalRecordLocator::Root, LogicalRecordEnvelope::Root { value, owner_heads }) => {
             transaction
@@ -576,7 +590,8 @@ pub(super) fn apply_record_rows(
                         type = excluded.type,
                         creator_notes = excluded.creator_notes,
                         trash_time = excluded.trash_time,
-                        detail = excluded.detail",
+                        detail = excluded.detail,
+                        archived_object = NULL",
                     params![
                         generation,
                         character_id,
@@ -607,6 +622,94 @@ pub(super) fn apply_record_rows(
             insert_owner_heads(transaction, generation, owner_heads)
         }
         (
+            LogicalRecordLocator::Character { character_id },
+            LogicalRecordEnvelope::ArchivedCharacter {
+                configured_index,
+                recent_at,
+                trashed,
+                name,
+                image,
+                character_type,
+                creator_notes,
+                trash_time,
+                archive_object_hash,
+                archived_at,
+                conversation_count,
+                message_count,
+                asset_hashes,
+                owner_heads,
+                ..
+            },
+        ) => {
+            transaction
+                .execute(
+                    "DELETE FROM messages WHERE generation = ?1 AND character_id = ?2",
+                    params![generation, character_id],
+                )
+                .map_err(sql_error)?;
+            transaction
+                .execute(
+                    "DELETE FROM conversations WHERE generation = ?1 AND character_id = ?2",
+                    params![generation, character_id],
+                )
+                .map_err(sql_error)?;
+            let archived = super::archive::ArchivedObject {
+                object_hash: archive_object_hash.clone(),
+                archived_at: sqlite_i64(*archived_at, "archive timestamp")?,
+                conversation_count: sqlite_i64(
+                    *conversation_count,
+                    "archived conversation count",
+                )?,
+                message_count: sqlite_i64(*message_count, "archived message count")?,
+                asset_hashes: asset_hashes.clone(),
+            };
+            let marker = super::archive::marker_detail(character_id, name, character_type);
+            transaction
+                .execute(
+                    "INSERT INTO characters (
+                        generation, character_id, configured_index, recent_at, trashed,
+                        name, image, conversation_count, type, creator_notes, trash_time,
+                        detail, archived_object
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12)
+                     ON CONFLICT(generation, character_id) DO UPDATE SET
+                        configured_index = excluded.configured_index,
+                        recent_at = excluded.recent_at,
+                        trashed = excluded.trashed,
+                        name = excluded.name,
+                        image = excluded.image,
+                        conversation_count = 0,
+                        type = excluded.type,
+                        creator_notes = excluded.creator_notes,
+                        trash_time = excluded.trash_time,
+                        detail = excluded.detail,
+                        archived_object = excluded.archived_object",
+                    params![
+                        generation,
+                        character_id,
+                        sqlite_i64(*configured_index, "character configured index")?,
+                        recent_at,
+                        trashed,
+                        name,
+                        image,
+                        character_type,
+                        creator_notes,
+                        trash_time,
+                        serde_json::to_string(&marker).map_err(json_error)?,
+                        serde_json::to_string(&archived).map_err(json_error)?,
+                    ],
+                )
+                .map_err(sql_error)?;
+            transaction
+                .execute(
+                    "DELETE FROM asset_owner_heads
+                     WHERE generation = ?1 AND owner_kind = 'character-additional-assets'
+                       AND owner_locator = ?2",
+                    params![generation, character_id],
+                )
+                .map_err(sql_error)?;
+            insert_owner_heads(transaction, generation, owner_heads)
+        }
+        (
             LogicalRecordLocator::Conversation {
                 character_id,
                 conversation_id,
@@ -623,13 +726,14 @@ pub(super) fn apply_record_rows(
                     "SELECT EXISTS(
                         SELECT 1 FROM characters
                         WHERE generation = ?1 AND character_id = ?2
+                          AND archived_object IS NULL
                      )",
                     params![generation, character_id],
                     |row| row.get(0),
                 )
                 .map_err(sql_error)?;
             if !parent_exists {
-                return validation("logical conversation parent character is absent");
+                return validation("logical conversation parent character is absent or archived");
             }
             let object = json_object(detail, "logical conversation detail")?;
             let name = required_display_name(object, "logical conversation detail")?;

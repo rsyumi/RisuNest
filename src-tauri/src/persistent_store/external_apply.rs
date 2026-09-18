@@ -420,6 +420,25 @@ fn resolve_dependencies(
             rows::rehydrate_character_owner(detail, &character_id, &resolved)?;
             Ok(None)
         }
+        LogicalRecordEnvelope::ArchivedCharacter {
+            archive_object_hash,
+            archive_object_size,
+            asset_hashes,
+            owner_heads,
+            ..
+        } => {
+            require_object(
+                cas,
+                objects,
+                archive_object_hash,
+                Some(*archive_object_size),
+            )?;
+            for hash in asset_hashes {
+                require_object(cas, objects, hash, None)?;
+            }
+            resolve_owner_heads(cas, objects, owner_heads)?;
+            Ok(None)
+        }
         LogicalRecordEnvelope::Conversation {
             message_page_hashes,
             ..

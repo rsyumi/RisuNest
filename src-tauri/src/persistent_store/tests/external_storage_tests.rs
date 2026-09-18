@@ -743,6 +743,90 @@ fn capture_library(
 }
 
 #[test]
+fn external_capture_carries_archived_character_state_and_payload_dependencies() {
+    use crate::asset_repository::PayloadCas;
+    use crate::logical_records::{
+        decode_logical_record, encode_logical_record_key, LogicalRecordEnvelope,
+        LogicalRecordLocator,
+    };
+    struct Never;
+    impl crate::local_backup::CancellationProbe for Never {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    let (directory, mut store, database) = capture_fixture();
+    let character_id = database["characters"][0]["chaId"]
+        .as_str()
+        .expect("fixture character ID");
+    let generation = active_generation(&store.connection).unwrap();
+    let cas = PayloadCas::new(directory.path()).unwrap();
+    let asset = cas.prepare_bytes(b"archived character asset").unwrap();
+    store
+        .connection
+        .execute(
+            "INSERT INTO asset_aliases (
+                generation, logical_key, object_hash, kind, size, mime, name, ext, metadata
+             ) VALUES (?1, 'archive-asset', ?2, 'asset', ?3, 'image/png', 'archive', 'png', '{}')",
+            params![generation, asset.content_hash, asset.byte_size as i64],
+        )
+        .unwrap();
+    store
+        .connection
+        .execute(
+            "UPDATE characters SET image='archive-asset', detail=json_set(detail,'$.image','archive-asset')
+             WHERE generation=?1 AND character_id=?2",
+            params![generation, character_id],
+        )
+        .unwrap();
+    let revision = store.revision().unwrap();
+    store
+        .archive_character(character_id, revision, 10)
+        .expect("archive fixture character");
+    let archived = super::super::archive::read_archived_object(
+        &store.connection,
+        &generation,
+        character_id,
+    )
+    .unwrap()
+    .expect("archived metadata");
+
+    let capture = capture_library(&mut store, "archive-export", &Never).unwrap();
+    let key = encode_logical_record_key(&LogicalRecordLocator::Character {
+        character_id: character_id.to_owned(),
+    })
+    .unwrap();
+    let record_hash: String = capture
+        .catalog
+        .db
+        .query_row("SELECT hash FROM records WHERE key=?1", [&key], |row| row.get(0))
+        .unwrap();
+    let bytes = std::fs::read(
+        directory
+            .path()
+            .join("external-storage/objects")
+            .join(record_hash),
+    )
+    .unwrap();
+    assert!(matches!(
+        decode_logical_record(&bytes).unwrap(),
+        LogicalRecordEnvelope::ArchivedCharacter { .. }
+    ));
+    let dependencies = capture
+        .catalog
+        .db
+        .prepare("SELECT hash FROM dependencies WHERE record=?1 ORDER BY hash")
+        .unwrap()
+        .query_map([&key], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(dependencies.contains(&archived.object_hash));
+    assert!(dependencies.contains(&asset.content_hash));
+}
+
+#[test]
 fn external_capture_manager_shares_consumers_and_reuses_their_durable_cursor() {
     struct Never;
     impl crate::local_backup::CancellationProbe for Never {

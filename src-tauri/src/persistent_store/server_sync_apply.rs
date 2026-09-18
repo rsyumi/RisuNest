@@ -171,6 +171,59 @@ pub(crate) fn validate_remote_with_residency(
                         rows::rehydrate_root_owners(value, &resolved).map_err(semantic)?;
                     }
                 }
+                LogicalRecordEnvelope::ArchivedCharacter {
+                    archive_object_hash,
+                    archive_object_size,
+                    asset_hashes,
+                    owner_heads,
+                    ..
+                } => {
+                    if cas.stat_object(archive_object_hash)? != Some(*archive_object_size)
+                        && !remote(archive_object_hash, Some(*archive_object_size))?
+                    {
+                        return invalid("Missing server archive object");
+                    }
+                    for hash in asset_hashes {
+                        if cas.stat_object(hash)?.is_none() && !remote(hash, None)? {
+                            return invalid("Missing server archived asset");
+                        }
+                    }
+                    for head in owner_heads.iter() {
+                        let Some(hash) = &head.manifest_hash else {
+                            continue;
+                        };
+                        let bytes = cas.read_object(hash)?.ok_or_else(|| {
+                            StoreError::Validation {
+                                message: "Missing server owner manifest".into(),
+                            }
+                        })?;
+                        if risunest_sync_wire::hash(&bytes) != *hash {
+                            return invalid("Server owner manifest hash mismatch");
+                        }
+                        let entries = decode_owner_manifest(&bytes).map_err(|_| {
+                            StoreError::Validation {
+                                message: "Invalid server owner manifest".into(),
+                            }
+                        })?;
+                        if entries.len() as u64 != head.entry_count
+                            || encode_owner_manifest(&entries).map_err(|_| {
+                                StoreError::Validation {
+                                    message: "Invalid server owner manifest".into(),
+                                }
+                            })? != bytes
+                        {
+                            return invalid("Server owner manifest differs from its head");
+                        }
+                        for entry in entries {
+                            if let Some(hash) = entry.payload_hash {
+                                let hash = hex::encode(hash);
+                                if cas.stat_object(&hash)?.is_none() && !remote(&hash, None)? {
+                                    return invalid("Missing server owner payload");
+                                }
+                            }
+                        }
+                    }
+                }
                 LogicalRecordEnvelope::Conversation {
                     message_page_hashes,
                     ..

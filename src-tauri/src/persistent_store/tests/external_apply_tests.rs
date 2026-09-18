@@ -220,6 +220,66 @@ fn external_snapshot_stages_streamed_records_and_preserves_local_view_fields() {
 }
 
 #[test]
+fn external_snapshot_restores_archived_character_state_and_payload_references() {
+    let (directory, mut store) = open_store();
+    let staging = directory.path().join("archive-download");
+    fs::create_dir(&staging).unwrap();
+    let archive_object = write_object(&staging, b"synthetic archive payload");
+    let asset_object = write_object(&staging, b"synthetic archived asset");
+    let (root, root_hash) = root_record(&staging, "remote");
+    let (character, character_hash) = write_record(
+        &staging,
+        LogicalRecordLocator::Character {
+            character_id: "character".into(),
+        },
+        LogicalRecordEnvelope::ArchivedCharacter {
+            configured_index: 0,
+            recent_at: 700,
+            trashed: false,
+            name: "Archived character".into(),
+            image: Some("archive-asset".into()),
+            character_type: "character".into(),
+            creator_notes: None,
+            trash_time: None,
+            archive_object_hash: archive_object.content_hash.clone(),
+            archive_object_size: archive_object.byte_length,
+            archived_at: 10,
+            conversation_count: 1,
+            message_count: 2,
+            asset_hashes: vec![asset_object.content_hash.clone()],
+            owner_heads: vec![],
+        },
+    );
+    let records = vec![root, character];
+    let hashes = BTreeMap::from([
+        (records[0].key.clone(), root_hash),
+        (records[1].key.clone(), character_hash),
+    ]);
+    let scope_id = library_fingerprint_domain();
+    let content_fingerprint = fingerprint(&scope_id, &hashes);
+    let prepared = store
+        .prepare_external_snapshot_application(
+            &application(&staging, &scope_id, &content_fingerprint, 1),
+            records.into_iter().map(Ok),
+            [Ok(archive_object), Ok(asset_object)],
+        )
+        .expect("stage archived snapshot");
+    let archived = super::super::archive::read_archived_object(
+        &store.connection,
+        prepared.external_staging_id(),
+        "character",
+    )
+    .unwrap()
+    .expect("staged archive metadata");
+    assert_eq!(archived.archived_at, 10);
+    assert_eq!(archived.conversation_count, 1);
+    assert_eq!(archived.message_count, 2);
+    assert_eq!(archived.asset_hashes.len(), 1);
+    store.finish_prepared_replace(prepared).unwrap();
+    assert!(store.read_character("character", None).is_err());
+}
+
+#[test]
 fn external_snapshot_stage_feeds_atomic_normal_receive_activation() {
     let (directory, mut store) = open_store();
     let staging = directory.path().join("download");

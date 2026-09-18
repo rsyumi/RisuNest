@@ -451,12 +451,20 @@ fn replacing_from_an_upstream_database_preserves_archived_rows_objects_and_pins(
     store
         .replace_add_characters(
             &staging,
-            &[json!({
-                "type": "character",
-                "chaId": "received-only",
-                "name": "Received Only",
-                "chats": []
-            })],
+            &[
+                json!({
+                    "type": "character",
+                    "chaId": "received-first",
+                    "name": "Received First",
+                    "chats": []
+                }),
+                json!({
+                    "type": "character",
+                    "chaId": "received-last",
+                    "name": "Received Last",
+                    "chats": []
+                }),
+            ],
         )
         .expect("stage received characters");
     let preserved_revision = store
@@ -468,9 +476,10 @@ fn replacing_from_an_upstream_database_preserves_archived_rows_objects_and_pins(
         .expect("commit the replacement");
 
     let ids = character_ids_in_order(&store);
-    assert!(
-        ids.contains(&"middle-archived".to_owned()),
-        "the archived character survives a full replacement"
+    assert_eq!(
+        ids,
+        ["received-first", "middle-archived", "received-last"],
+        "the archived character survives at its saved position"
     );
     assert!(!ids.contains(&"first-active".to_owned()));
     let survived = archived_object(&store, "middle-archived");
@@ -545,105 +554,71 @@ fn a_full_database_read_leaves_archived_characters_out() {
     assert_eq!(ids, ["first-active", "last-active"]);
 }
 
-/// The exchange format has no archive, so a remote delta that names an archived
-/// character or any of its conversations is reported instead of applied. The
-/// outcome does not depend on which side published first.
 #[test]
-fn a_remote_delta_that_touches_an_archived_character_is_reported_not_applied() {
-    for remote_first in [false, true] {
-        let (_directory, mut store, _cas) = archive_store();
-        let revision = store.revision().expect("read revision");
-        store
-            .archive_character("middle-archived", revision, 10)
-            .expect("archive the character");
-        let archived_before = archived_object(&store, "middle-archived");
-        let generation = active_generation(&store.connection).expect("read active generation");
-
-        let deltas = if remote_first {
-            vec![
-                (
-                    LogicalRecordLocator::Conversation {
-                        character_id: "middle-archived".into(),
-                        conversation_id: "remote-new-chat".into(),
-                    },
-                    LogicalRecordEnvelope::Conversation {
-                        configured_index: 0,
-                        recent_at: 0,
-                        detail: json!({ "id": "remote-new-chat", "name": "Remote", "message": [] }),
-                        message_page_hashes: vec![],
-                    },
-                ),
-                (
-                    LogicalRecordLocator::Character {
-                        character_id: "middle-archived".into(),
-                    },
-                    LogicalRecordEnvelope::Character {
-                        configured_index: 1,
-                        detail: json!({
-                            "type": "character",
-                            "chaId": "middle-archived",
-                            "name": "Middle Archived",
-                            "chats": []
-                        }),
-                        owner_heads: vec![],
-                    },
-                ),
-            ]
-        } else {
-            vec![
-                (
-                    LogicalRecordLocator::Character {
-                        character_id: "middle-archived".into(),
-                    },
-                    LogicalRecordEnvelope::Character {
-                        configured_index: 1,
-                        detail: json!({
-                            "type": "character",
-                            "chaId": "middle-archived",
-                            "name": "Middle Archived",
-                            "chats": []
-                        }),
-                        owner_heads: vec![],
-                    },
-                ),
-                (
-                    LogicalRecordLocator::Conversation {
-                        character_id: "middle-archived".into(),
-                        conversation_id: "remote-new-chat".into(),
-                    },
-                    LogicalRecordEnvelope::Conversation {
-                        configured_index: 0,
-                        recent_at: 0,
-                        detail: json!({ "id": "remote-new-chat", "name": "Remote", "message": [] }),
-                        message_page_hashes: vec![],
-                    },
-                ),
-            ]
-        };
-
-        for (locator, envelope) in deltas {
-            let transaction = store.connection.transaction().expect("open transaction");
-            let error = apply_materialized_record(
-                &transaction,
-                &generation,
-                locator,
-                envelope,
-                Some(&[]),
-            )
-            .expect_err("a delta on an archived character is refused");
-            assert!(matches!(error, StoreError::Validation { .. }));
-            transaction.rollback().expect("roll back the refused delta");
+fn risunest_sync_projects_and_applies_archive_state_with_referenced_payloads() {
+    let (_source_directory, mut source, source_cas) = archive_store();
+    let archived_asset = seed_character_asset(&source, &source_cas, "middle-asset-key");
+    let revision = source.revision().expect("read source revision");
+    source
+        .archive_character("middle-archived", revision, 10)
+        .expect("archive the source character");
+    let expected = archived_object(&source, "middle-archived");
+    let generation = active_generation(&source.connection).expect("read source generation");
+    let key = super::super::server_sync_outbox::ServerDirtyKey {
+        kind: "character".into(),
+        key1: "middle-archived".into(),
+        key2: String::new(),
+        revision: source.revision().expect("read archived revision"),
+    };
+    let projected = super::super::server_sync_projection::project(
+        &source.connection,
+        &source_cas,
+        &generation,
+        &key,
+    )
+    .expect("project archived character")
+    .expect("archived character exists");
+    let dependencies = super::super::server_sync_projection::dependencies(
+        &projected,
+        &source_cas,
+    )
+    .expect("collect archive dependencies");
+    assert!(dependencies.contains(&expected.object_hash));
+    assert!(dependencies.contains(&archived_asset.content_hash));
+    assert!(matches!(
+        &projected.record,
+        LogicalRecordEnvelope::ArchivedCharacter {
+            configured_index: 1,
+            archived_at: 10,
+            conversation_count: 2,
+            message_count: 3,
+            ..
         }
+    ));
 
-        assert_eq!(archived_object(&store, "middle-archived"), archived_before);
-        let conversations: i64 = store
-            .connection
-            .query_row(
-                "SELECT COUNT(*) FROM conversations WHERE generation = ?1 AND character_id = ?2",
-                params![generation, "middle-archived"],
-                |row| row.get(0),
-            )
-            .expect("count conversations");
-        assert_eq!(conversations, 0, "no mixed active and archived state is left");
-    }
+    let (_target_directory, mut target, _target_cas) = archive_store();
+    let target_generation =
+        active_generation(&target.connection).expect("read target generation");
+    let transaction = target.connection.transaction().expect("open target transaction");
+    apply_materialized_record(
+        &transaction,
+        &target_generation,
+        LogicalRecordLocator::Character {
+            character_id: "middle-archived".into(),
+        },
+        projected.record,
+        None,
+    )
+    .expect("apply archived character");
+    transaction.commit().expect("commit archived character");
+    assert_eq!(archived_object(&target, "middle-archived"), expected);
+    let conversations: i64 = target
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM conversations WHERE generation=?1 AND character_id=?2",
+            params![target_generation, "middle-archived"],
+            |row| row.get(0),
+        )
+        .expect("count target conversations");
+    assert_eq!(conversations, 0);
 }

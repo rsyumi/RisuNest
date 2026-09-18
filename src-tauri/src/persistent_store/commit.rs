@@ -784,21 +784,31 @@ fn preserve_archived_characters(
     active: &str,
     staging_id: &str,
 ) -> StoreResult<()> {
-    let archived = super::archive::archived_character_ids(transaction, active)?;
+    let archived = {
+        let mut statement = transaction.prepare(
+            "SELECT character_id, configured_index FROM characters
+             WHERE generation = ?1 AND archived_object IS NOT NULL
+             ORDER BY configured_index ASC",
+        )?;
+        let archived = statement
+            .query_map([active], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        archived
+    };
     if archived.is_empty() {
         return Ok(());
     }
-    let mut configured_index: i64 = transaction.query_row(
-        "SELECT COALESCE(MAX(configured_index) + 1, 0) FROM characters WHERE generation = ?1",
-        [staging_id],
-        |row| row.get(0),
-    )?;
-    for character_id in archived {
+    for (character_id, configured_index) in archived {
         if character_exists(transaction, staging_id, &character_id)? {
             return Err(validation(format!(
                 "Character {character_id} is archived and the replacement carries the same character"
             )));
         }
+        transaction.execute(
+            "UPDATE characters SET configured_index = configured_index + 1
+             WHERE generation = ?1 AND configured_index >= ?2",
+            params![staging_id, configured_index],
+        )?;
         transaction.execute(
             "INSERT INTO characters (
                 generation, character_id, configured_index, recent_at, trashed, name, image,
@@ -809,7 +819,6 @@ fn preserve_archived_characters(
              FROM characters WHERE generation = ?2 AND character_id = ?4",
             params![staging_id, active, configured_index, character_id],
         )?;
-        configured_index += 1;
     }
     Ok(())
 }
