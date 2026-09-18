@@ -10,6 +10,7 @@ use crate::{
 use risunest_external_storage_format::content_identity::{hash, hash_reader};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{
+    collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -77,6 +78,22 @@ pub(crate) struct CaptureCatalog {
     identity: Option<CaptureIdentity>,
     pub(crate) rebuilt: bool,
     finalized: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DurableCaptureReference {
+    pub capture_id: String,
+    pub identity: CaptureIdentity,
+    /// Relative to `<persistent root>/external-storage`.
+    pub catalog_path: String,
+    pub catalog_hash: String,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RegisteredCaptureRoots {
+    pub assets: crate::asset_repository::migration_gc::AssetRootSet,
+    pub catalogs: BTreeSet<PathBuf>,
+    pub logical_records: BTreeSet<PathBuf>,
 }
 
 /// Both paths are selected by the native owner. Previous catalogs must have
@@ -242,6 +259,45 @@ impl CaptureCatalog {
         ))
     }
 
+    pub(crate) fn durable_reference(
+        &self,
+        capture_id: &str,
+        repository_root: &Path,
+    ) -> Result<DurableCaptureReference> {
+        if capture_id.is_empty() || capture_id.len() > 1024 || capture_id.contains('\0') {
+            return Err(invalid("Capture identity is invalid"));
+        }
+        let (hash, path, identity) = self.manifest()?;
+        let root = repository_root.join("external-storage").canonicalize()?;
+        if is_link_like(&fs::symlink_metadata(path)?) {
+            return Err(invalid("Capture catalog must not be a link"));
+        }
+        let path = path.canonicalize()?;
+        let relative = path
+            .strip_prefix(&root)
+            .map_err(|_| invalid("Capture catalog escaped its native directory"))?;
+        let relative = relative
+            .components()
+            .map(|component| match component {
+                std::path::Component::Normal(value) => value
+                    .to_str()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| invalid("Capture catalog path is invalid")),
+                _ => Err(invalid("Capture catalog path is invalid")),
+            })
+            .collect::<Result<Vec<_>>>()?
+            .join("/");
+        if relative.is_empty() || relative.len() > 8192 {
+            return Err(invalid("Capture catalog path is invalid"));
+        }
+        Ok(DurableCaptureReference {
+            capture_id: capture_id.into(),
+            identity: identity.clone(),
+            catalog_path: relative,
+            catalog_hash: hex::encode(hash),
+        })
+    }
+
     pub(crate) fn content_fingerprint(&self, scope: &[u8; 32]) -> Result<[u8; 32]> {
         if !self.finalized {
             return Err(invalid("Capture catalog is not durable"));
@@ -372,50 +428,180 @@ impl ContentCaptureSink for CaptureCatalog {
     }
 }
 
+fn resolve_registered_catalog(
+    repository_root: &Path,
+    reference: &DurableCaptureReference,
+) -> Result<(PathBuf, PathBuf)> {
+    if reference.capture_id.is_empty()
+        || reference.capture_id.len() > 1024
+        || reference.capture_id.contains('\0')
+        || !crate::trust_boundary::is_lower_hex_256(&reference.catalog_hash)
+        || reference.catalog_path.is_empty()
+        || reference.catalog_path.len() > 8192
+    {
+        return Err(invalid("Registered capture reference is invalid"));
+    }
+    let relative = Path::new(&reference.catalog_path);
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(invalid("Registered capture path is invalid"));
+    }
+    let root = repository_root.join("external-storage").canonicalize()?;
+    let path = root.join(relative);
+    if is_link_like(&fs::symlink_metadata(&path)?) {
+        return Err(invalid("Registered capture is a link"));
+    }
+    let canonical = path.canonicalize()?;
+    if !canonical.starts_with(&root) {
+        return Err(invalid("Registered capture escaped its native directory"));
+    }
+    Ok((canonical, root.join("objects")))
+}
+
+fn validate_capture_object(
+    path: &Path,
+    expected_hash: &str,
+    expected_bytes: i64,
+    verify_contents: bool,
+) -> Result<()> {
+    if expected_bytes < 0 || !crate::trust_boundary::is_lower_hex_256(expected_hash) {
+        return Err(invalid("Registered capture object identity differs"));
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if is_link_like(&metadata) || !metadata.is_file() || metadata.len() != expected_bytes as u64 {
+        return Err(invalid("Registered capture object is unavailable"));
+    }
+    if verify_contents {
+        let mut file = File::open(path)?;
+        let digest = hash_reader(&mut file, metadata.len())
+            .map_err(|_| invalid("Registered capture object integrity failed"))?;
+        if hex::encode(digest) != expected_hash {
+            return Err(invalid("Registered capture object integrity failed"));
+        }
+    }
+    Ok(())
+}
+
+fn capture_roots<'a>(
+    references: impl IntoIterator<Item = &'a DurableCaptureReference>,
+    repository_root: &Path,
+    verify_contents: bool,
+) -> Result<RegisteredCaptureRoots> {
+    let mut roots = RegisteredCaptureRoots::default();
+    for reference in references {
+        let (path, object_directory) = resolve_registered_catalog(repository_root, reference)?;
+        let expected: [u8; 32] = hex::decode(&reference.catalog_hash)
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| invalid("Registered capture hash is invalid"))?;
+        let catalog = CaptureCatalog::reopen(
+            &path,
+            &object_directory,
+            &expected,
+            &reference.identity,
+        )?;
+        roots.catalogs.insert(path);
+
+        let mut dependencies = catalog.db.prepare(
+            "SELECT DISTINCT d.hash FROM dependencies d LEFT JOIN generated g ON g.hash=d.hash WHERE g.hash IS NULL",
+        )?;
+        for hash in dependencies.query_map([], |row| row.get::<_, String>(0))? {
+            let hash = hash?;
+            if !crate::trust_boundary::is_lower_hex_256(&hash) {
+                return Err(invalid("Registered capture payload identity differs"));
+            }
+            roots.assets.object_hashes.insert(hash);
+        }
+
+        let mut objects = catalog.db.prepare(
+            "SELECT hash,bytes FROM records UNION SELECT hash,bytes FROM generated ORDER BY hash",
+        )?;
+        for object in objects.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })? {
+            let (hash, bytes) = object?;
+            let object_path = object_directory.join(&hash);
+            validate_capture_object(&object_path, &hash, bytes, verify_contents)?;
+            roots.logical_records.insert(object_path);
+        }
+    }
+    Ok(roots)
+}
+
+/// Resolves every physical input owned by durable capture references. Any
+/// error is a conservative GC blocker for the caller. Record bodies are not
+/// rehashed during inventory; source claims verify them before reading.
+pub(crate) fn registered_capture_roots<'a>(
+    references: impl IntoIterator<Item = &'a DurableCaptureReference>,
+    repository_root: &Path,
+) -> Result<RegisteredCaptureRoots> {
+    capture_roots(references, repository_root, false)
+}
+
+pub(crate) fn validate_capture_sources<'a>(
+    references: impl IntoIterator<Item = &'a DurableCaptureReference>,
+    repository_root: &Path,
+) -> Result<RegisteredCaptureRoots> {
+    capture_roots(references, repository_root, true)
+}
+
 /// GC performs this inventory only when it actually needs roots. Every normal
 /// edit/capture can reuse the durable index without scanning all asset aliases.
 pub(crate) fn registered_roots(
     db: &Connection,
     repository_root: &Path,
 ) -> Result<crate::asset_repository::migration_gc::AssetRootSet> {
-    let mut roots = crate::asset_repository::migration_gc::AssetRootSet::default();
-    let mut query=db.prepare("SELECT f.catalog_path,f.file_hash FROM external_storage_capture_files f JOIN external_storage_captures c ON c.id=f.capture_id")?;
+    let mut references = Vec::new();
+    let mut query=db.prepare("SELECT c.id,c.identity,f.catalog_path,f.file_hash FROM external_storage_capture_files f JOIN external_storage_captures c ON c.id=f.capture_id")?;
     let mut rows = query.query([])?;
     while let Some(row) = rows.next()? {
-        let raw: String = row.get(0)?;
-        let expected: String = row.get(1)?;
-        let path = PathBuf::from(raw);
-        if is_link_like(&fs::symlink_metadata(&path)?) {
+        let original = PathBuf::from(row.get::<_, String>(2)?);
+        if is_link_like(&fs::symlink_metadata(&original)?) {
             return Err(invalid("Registered capture is a link"));
         }
+        let absolute = original.canonicalize()?;
         let root = repository_root.join("external-storage").canonicalize()?;
-        if !path.canonicalize()?.starts_with(root) {
-            return Err(invalid("Registered capture escaped its spool"));
-        }
-        let mut file = File::open(&path)?;
-        let length = file.metadata()?.len();
-        let digest = hash_reader(&mut file, length)
-            .map_err(|_| invalid("Registered capture integrity failed"))?;
-        if hex::encode(digest) != expected {
-            return Err(invalid("Registered capture integrity failed"));
-        }
-        let catalog =
-            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let mut dependencies=catalog.prepare("SELECT DISTINCT d.hash FROM dependencies d LEFT JOIN generated g ON g.hash=d.hash WHERE g.hash IS NULL")?;
-        for hash in dependencies.query_map([], |r| r.get::<_, String>(0))? {
-            let hash = hash?;
-            if !crate::trust_boundary::is_lower_hex_256(&hash) {
-                return Err(invalid("Registered capture payload identity differs"));
-            }
-            roots.object_hashes.insert(hash);
-        }
+        let relative = absolute
+            .strip_prefix(&root)
+            .map_err(|_| invalid("Registered capture escaped its native directory"))?
+            .components()
+            .map(|component| match component {
+                std::path::Component::Normal(value) => value
+                    .to_str()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| invalid("Registered capture path is invalid")),
+                _ => Err(invalid("Registered capture path is invalid")),
+            })
+            .collect::<Result<Vec<_>>>()?
+            .join("/");
+        references.push(DurableCaptureReference {
+            capture_id: row.get(0)?,
+            identity: serde_json::from_str(&row.get::<_, String>(1)?)?,
+            catalog_path: relative,
+            catalog_hash: row.get(3)?,
+        });
     }
-    Ok(roots)
+    if references.is_empty() {
+        return Ok(crate::asset_repository::migration_gc::AssetRootSet::default());
+    }
+    Ok(registered_capture_roots(&references, repository_root)?.assets)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn identity() -> CaptureIdentity {
+        CaptureIdentity {
+            store_id: "store".into(),
+            library_epoch: "library".into(),
+            generation: "generation".into(),
+            selection_epoch: "selection".into(),
+            revision: 1,
+        }
+    }
 
     #[test]
     fn failed_catalog_creation_releases_the_reserved_destination_for_retry() {
@@ -474,6 +660,77 @@ mod tests {
                 .expect("read object entry")
                 .file_name()
                 .to_string_lossy()
-                .ends_with(".partial")));
+            .ends_with(".partial")));
+    }
+
+    #[test]
+    fn empty_registered_roots_do_not_require_an_external_storage_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE external_storage_captures(id TEXT,identity TEXT);
+             CREATE TABLE external_storage_capture_files(capture_id TEXT,catalog_path TEXT,file_hash TEXT);",
+        )
+        .unwrap();
+        let roots = registered_roots(&db, root.path()).unwrap();
+        assert!(roots.object_hashes.is_empty());
+        assert!(!root.path().join("external-storage").exists());
+    }
+
+    #[test]
+    fn durable_capture_roots_keep_catalog_records_and_cas_dependencies_distinct() {
+        let root = tempfile::tempdir().unwrap();
+        let external = root.path().join("external-storage");
+        let capture_directory = external.join("captures/conflict");
+        let object_directory = external.join("objects");
+        let mut catalog = CaptureCatalog::create(&capture_directory, &object_directory, None)
+            .unwrap();
+        let identity = identity();
+        let record = b"synthetic logical record";
+        let record_hash = hex::encode(hash(record));
+        let asset_hash = "03".repeat(32);
+        catalog.begin(&identity, None).unwrap();
+        catalog.record("root", record).unwrap();
+        catalog.reference("root", &asset_hash, 9).unwrap();
+        catalog.finish().unwrap();
+        let reference = catalog
+            .durable_reference("capture", root.path())
+            .unwrap();
+
+        let roots = registered_capture_roots([&reference], root.path()).unwrap();
+        assert!(roots.catalogs.contains(&capture_directory.join("capture.sqlite")));
+        assert!(roots
+            .logical_records
+            .contains(&object_directory.join(&record_hash)));
+        assert!(roots.assets.object_hashes.contains(&asset_hash));
+
+        let record_path = object_directory.join(&record_hash);
+        let mut corrupt = fs::read(&record_path).unwrap();
+        corrupt[0] ^= 1;
+        fs::write(&record_path, corrupt).unwrap();
+        assert!(registered_capture_roots([&reference], root.path()).is_ok());
+        assert!(validate_capture_sources([&reference], root.path()).is_err());
+    }
+
+    #[test]
+    fn corrupt_catalog_blocks_root_collection() {
+        let root = tempfile::tempdir().unwrap();
+        let external = root.path().join("external-storage");
+        let capture_directory = external.join("captures/conflict");
+        let object_directory = external.join("objects");
+        let mut catalog = CaptureCatalog::create(&capture_directory, &object_directory, None)
+            .unwrap();
+        catalog.begin(&identity(), None).unwrap();
+        catalog.record("root", b"record").unwrap();
+        catalog.finish().unwrap();
+        let reference = catalog
+            .durable_reference("capture", root.path())
+            .unwrap();
+        drop(catalog);
+        let path = capture_directory.join("capture.sqlite");
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[0] ^= 1;
+        fs::write(path, bytes).unwrap();
+        assert!(registered_capture_roots([&reference], root.path()).is_err());
     }
 }

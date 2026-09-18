@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 const HEAD_SCHEMA: &str = "risunest.external-head/v2";
-const POINT_SCHEMA: &str = "risunest.external-backup-point/v2";
+const POINT_SCHEMA: &str = "risunest.external-backup-point/v1";
 const BUNDLE_SCHEMA: &str = "risunest.external-backup-bundle/v1";
 const LEASE_SCHEMA: &str = "risunest.external-lease/v1";
 pub const MAX_CONTROL_BYTES: usize = 64 * 1024;
@@ -94,8 +94,7 @@ pub enum BackupPointKind {
     Conflict,
 }
 
-/// A point names its bundles by purpose. A conflict preserves both sides in
-/// full; every other kind carries exactly one.
+/// A point names the one backup bundle it preserves.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BackupPointDocument {
@@ -104,9 +103,7 @@ pub struct BackupPointDocument {
     pub point_id: String,
     pub kind: BackupPointKind,
     pub created_at_ms: u64,
-    pub bundle: Option<StoredObject>,
-    pub local_bundle: Option<StoredObject>,
-    pub remote_bundle: Option<StoredObject>,
+    pub bundle: StoredObject,
 }
 
 impl BackupPointDocument {
@@ -123,9 +120,7 @@ impl BackupPointDocument {
             point_id,
             kind,
             created_at_ms,
-            bundle: Some(bundle),
-            local_bundle: None,
-            remote_bundle: None,
+            bundle,
         };
         value.validate()?;
         Ok(value)
@@ -134,27 +129,18 @@ impl BackupPointDocument {
         repository_id: String,
         point_id: String,
         created_at_ms: u64,
-        local_bundle: StoredObject,
         remote_bundle: StoredObject,
     ) -> Result<Self> {
-        let value = Self {
-            schema: POINT_SCHEMA.into(),
+        Self::single(
             repository_id,
             point_id,
-            kind: BackupPointKind::Conflict,
+            BackupPointKind::Conflict,
             created_at_ms,
-            bundle: None,
-            local_bundle: Some(local_bundle),
-            remote_bundle: Some(remote_bundle),
-        };
-        value.validate()?;
-        Ok(value)
+            remote_bundle,
+        )
     }
     pub fn bundles(&self) -> Vec<&StoredObject> {
-        [&self.bundle, &self.local_bundle, &self.remote_bundle]
-            .into_iter()
-            .flatten()
-            .collect()
+        vec![&self.bundle]
     }
     pub fn validate(&self) -> Result<()> {
         if self.schema != POINT_SCHEMA
@@ -165,34 +151,11 @@ impl BackupPointDocument {
         {
             return Err(FormatError("invalid-backup-point"));
         }
-        match self.kind {
-            BackupPointKind::Conflict => {
-                let (Some(local), Some(remote)) = (&self.local_bundle, &self.remote_bundle) else {
-                    return Err(FormatError("invalid-backup-point"));
-                };
-                if self.bundle.is_some() {
-                    return Err(FormatError("invalid-backup-point"));
-                }
-                if local.header.object_id == remote.header.object_id {
-                    return Err(FormatError("duplicate-conflict-bundle"));
-                }
-            }
-            _ => {
-                if self.bundle.is_none()
-                    || self.local_bundle.is_some()
-                    || self.remote_bundle.is_some()
-                {
-                    return Err(FormatError("invalid-backup-point"));
-                }
-            }
-        }
-        for bundle in self.bundles() {
-            bundle.validate()?;
-            if bundle.header.role != ObjectRole::BackupBundle
-                || bundle.header.repository_id != self.repository_id
-            {
-                return Err(FormatError("invalid-backup-point-bundle"));
-            }
+        self.bundle.validate()?;
+        if self.bundle.header.role != ObjectRole::BackupBundle
+            || self.bundle.header.repository_id != self.repository_id
+        {
+            return Err(FormatError("invalid-backup-point-bundle"));
         }
         Ok(())
     }
@@ -489,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn control_documents_are_canonical_and_conflicts_require_two_distinct_bundles() {
+    fn control_documents_are_canonical_and_points_require_one_valid_bundle() {
         let head = HeadDocument::new(
             "repository".into(),
             "library".into(),
@@ -512,26 +475,35 @@ mod tests {
         )
         .is_err());
 
-        assert!(BackupPointDocument::conflict(
-            "repository".into(),
-            "point".into(),
-            1,
-            stored("bundle-a", ObjectRole::BackupBundle),
-            stored("bundle-a", ObjectRole::BackupBundle),
-        )
-        .is_err());
         let point = BackupPointDocument::conflict(
             "repository".into(),
             "point".into(),
             1,
-            stored("bundle-a", ObjectRole::BackupBundle),
             stored("bundle-b", ObjectRole::BackupBundle),
         )
         .unwrap();
-        assert_eq!(
-            BackupPointDocument::decode(&point.encode(8192).unwrap(), 8192).unwrap(),
-            point
+        let encoded = point.encode(8192).unwrap();
+        assert_eq!(BackupPointDocument::decode(&encoded, 8192).unwrap(), point);
+        let encoded_value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert!(encoded_value.get("bundle").is_some());
+        assert!(encoded_value.get("localBundle").is_none());
+        assert!(encoded_value.get("remoteBundle").is_none());
+        assert_eq!(point.bundles(), vec![&point.bundle]);
+
+        let old_dual_shape = serde_json::json!({
+            "schema": POINT_SCHEMA,
+            "repositoryId": "repository",
+            "pointId": "point",
+            "kind": "conflict",
+            "createdAtMs": 1,
+            "localBundle": stored("bundle-a", ObjectRole::BackupBundle),
+            "remoteBundle": stored("bundle-b", ObjectRole::BackupBundle),
+        });
+        assert!(
+            BackupPointDocument::decode(&serde_json::to_vec(&old_dual_shape).unwrap(), 8192)
+                .is_err()
         );
+
         let single = BackupPointDocument::single(
             "repository".into(),
             "point".into(),
@@ -541,12 +513,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(single.bundles().len(), 1);
-        let mut broken = single.clone();
-        broken.local_bundle = Some(stored("bundle-b", ObjectRole::BackupBundle));
-        assert!(broken.validate().is_err());
-        let mut emptied = single;
-        emptied.bundle = None;
-        assert!(emptied.validate().is_err());
+        assert!(BackupPointDocument::conflict(
+            "repository".into(),
+            "point".into(),
+            1,
+            stored("state", ObjectRole::SyncState),
+        )
+        .is_err());
+        let mut wrong_repository = stored("bundle", ObjectRole::BackupBundle);
+        wrong_repository.header.repository_id = "other-repository".into();
+        assert!(BackupPointDocument::conflict(
+            "repository".into(),
+            "point".into(),
+            1,
+            wrong_repository,
+        )
+        .is_err());
+        let mut invalid_hash = encoded_value;
+        invalid_hash["bundle"]["plaintextSha256"] = serde_json::json!(vec![3u8; 31]);
+        assert!(
+            BackupPointDocument::decode(&serde_json::to_vec(&invalid_hash).unwrap(), 8192).is_err()
+        );
     }
 
     #[test]
@@ -746,10 +733,10 @@ mod tests {
     }
 
     /// Two devices backing up the same repository produce separate points whose
-    /// contents are never merged, and a conflict point names both complete
-    /// bundles rather than a combination of them.
+    /// contents are never merged, and a conflict point names only the remote
+    /// bundle already being preserved.
     #[test]
-    fn a_backup_point_belongs_to_one_device_and_a_conflict_keeps_both_whole() {
+    fn a_backup_point_belongs_to_one_device_and_a_conflict_keeps_the_remote_bundle() {
         let bundle = |id: &str, writer: &str, kind: SectionKind| {
             BackupBundleDocument::new(
                 "repository".into(),
@@ -793,18 +780,17 @@ mod tests {
             "repository".into(),
             "point-conflict".into(),
             1,
-            stored("bundle-a", ObjectRole::BackupBundle),
             stored("bundle-b", ObjectRole::BackupBundle),
         )
         .unwrap();
-        assert!(conflict.bundle.is_none());
+        assert_eq!(conflict.bundle.header.object_id, "bundle-b");
         assert_eq!(
             conflict
                 .bundles()
                 .iter()
                 .map(|object| object.header.object_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["bundle-a", "bundle-b"]
+            vec!["bundle-b"]
         );
     }
 

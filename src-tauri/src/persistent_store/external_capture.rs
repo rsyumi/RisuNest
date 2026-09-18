@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     asset_repository::{owner_manifest_codec::decode_owner_manifest, PayloadCas},
-    external_storage::capture::CaptureCatalog,
+    external_storage::capture::{CaptureCatalog, DurableCaptureReference},
     local_backup::CancellationProbe,
 };
 use risunest_external_storage_format::format::library_fingerprint_domain;
@@ -23,6 +23,21 @@ pub(crate) struct CapturedSnapshot {
     pub catalog: CaptureCatalog,
     pub projected_records: usize,
     pub shared: bool,
+}
+
+impl CapturedSnapshot {
+    pub(crate) fn durable_reference(
+        &self,
+        repository_root: &Path,
+    ) -> StoreResult<DurableCaptureReference> {
+        let reference = self
+            .catalog
+            .durable_reference(&self.id, repository_root)?;
+        if reference.identity != self.identity {
+            return Err(invalid("Capture catalog identity differs"));
+        }
+        Ok(reference)
+    }
 }
 
 pub(crate) struct CaptureHydration {

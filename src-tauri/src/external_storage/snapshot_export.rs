@@ -2,11 +2,15 @@
 //! are activated only in a new scratch PDS, then passed through the normal
 //! portable-backup writer and verifier.
 use super::{
+    capture::{self, CaptureCatalog, DurableCaptureReference},
     contract::{Cancellation, ErrorKind, ProviderError, Result},
-    snapshot_restore::PreparedRemoteSnapshot,
+    snapshot_restore::{PreparedObject, PreparedRecord, PreparedRemoteSnapshot},
 };
 use crate::{
-    asset_repository::job_pins::{CasJobKind, CasReleaseOutcome, DurableCasJob},
+    asset_repository::{
+        job_pins::{CasJobKind, CasReleaseOutcome, DurableCasJob},
+        PayloadCas,
+    },
     local_backup::CancellationProbe,
     persistent_store::{
         external_apply::{
@@ -37,11 +41,142 @@ fn decode_hash(value: &str) -> Result<[u8; 32]> {
     bytes.try_into().map_err(|_| corrupt("invalid hash length"))
 }
 
+fn bounded_identity(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 1024 && !value.contains('\0')
+}
+
 struct Probe<'a>(&'a Cancellation);
 impl CancellationProbe for Probe<'_> {
     fn is_cancelled(&self) -> bool {
         self.0.check().is_err()
     }
+}
+
+/// Rebuilds the normal verified-snapshot input from a native-owned durable
+/// capture. The descriptor contains no authority to name an arbitrary path:
+/// capture validation resolves it below the persistent root and checks the
+/// catalog hash, identity and logical-record objects before any export begins.
+pub(crate) fn prepare_local_conflict_snapshot(
+    repository_root: &Path,
+    repository_id: &str,
+    reference: &DurableCaptureReference,
+) -> Result<PreparedRemoteSnapshot> {
+    if !bounded_identity(repository_id) {
+        return Err(corrupt("conflict repository identity is invalid"));
+    }
+    let roots = capture::validate_capture_sources([reference], repository_root).map_err(corrupt)?;
+    let mut catalogs = roots.catalogs.into_iter();
+    let catalog_path = catalogs
+        .next()
+        .ok_or_else(|| corrupt("conflict capture catalog is missing"))?;
+    if catalogs.next().is_some() {
+        return Err(corrupt("conflict capture resolved more than one catalog"));
+    }
+    let expected_hash = decode_hash(&reference.catalog_hash)?;
+    let external_root = repository_root
+        .join("external-storage")
+        .canonicalize()
+        .map_err(corrupt)?;
+    let object_directory = external_root.join("objects");
+    let catalog = CaptureCatalog::reopen(
+        &catalog_path,
+        &object_directory,
+        &expected_hash,
+        &reference.identity,
+    )
+    .map_err(corrupt)?;
+    let scope = library_fingerprint_domain();
+    let fingerprint = hex::encode(catalog.content_fingerprint(&scope).map_err(corrupt)?);
+    let logical_revision = u64::try_from(reference.identity.revision)
+        .map_err(|_| corrupt("conflict capture revision is invalid"))?;
+
+    let mut records = Vec::new();
+    let mut query = catalog
+        .db
+        .prepare("SELECT key,hash,bytes FROM records ORDER BY key")
+        .map_err(corrupt)?;
+    let mut rows = query.query([]).map_err(corrupt)?;
+    while let Some(row) = rows.next().map_err(corrupt)? {
+        let key: String = row.get(0).map_err(corrupt)?;
+        let content_hash: String = row.get(1).map_err(corrupt)?;
+        let bytes: i64 = row.get(2).map_err(corrupt)?;
+        if !crate::trust_boundary::is_lower_hex_256(&content_hash) {
+            return Err(corrupt("conflict capture record hash is invalid"));
+        }
+        records.push(PreparedRecord {
+            key,
+            path: object_directory.join(&content_hash),
+            content_hash,
+            byte_length: u64::try_from(bytes)
+                .map_err(|_| corrupt("conflict capture record length is invalid"))?,
+        });
+    }
+    drop(rows);
+    drop(query);
+
+    let mut objects = Vec::new();
+    let mut generated = catalog
+        .db
+        .prepare("SELECT hash,bytes FROM generated ORDER BY hash")
+        .map_err(corrupt)?;
+    for row in generated
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(corrupt)?
+    {
+        let (content_hash, bytes) = row.map_err(corrupt)?;
+        if !crate::trust_boundary::is_lower_hex_256(&content_hash) {
+            return Err(corrupt("conflict capture object hash is invalid"));
+        }
+        objects.push(PreparedObject {
+            path: object_directory.join(&content_hash),
+            content_hash,
+            byte_length: u64::try_from(bytes)
+                .map_err(|_| corrupt("conflict capture object length is invalid"))?,
+        });
+    }
+
+    let cas = PayloadCas::new(repository_root).map_err(transient)?;
+    let mut dependencies = catalog
+        .db
+        .prepare(
+            "SELECT DISTINCT d.hash,d.bytes FROM dependencies d LEFT JOIN generated g ON g.hash=d.hash WHERE g.hash IS NULL ORDER BY d.hash",
+        )
+        .map_err(corrupt)?;
+    for row in dependencies
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(corrupt)?
+    {
+        let (content_hash, bytes) = row.map_err(corrupt)?;
+        if !crate::trust_boundary::is_lower_hex_256(&content_hash) {
+            return Err(corrupt("conflict capture dependency hash is invalid"));
+        }
+        let path = cas
+            .object_path(&content_hash)
+            .map_err(transient)?
+            .ok_or_else(|| corrupt("conflict capture dependency is missing"))?;
+        objects.push(PreparedObject {
+            path,
+            content_hash,
+            byte_length: u64::try_from(bytes)
+                .map_err(|_| corrupt("conflict capture dependency length is invalid"))?,
+        });
+    }
+
+    Ok(PreparedRemoteSnapshot {
+        snapshot_id: reference.capture_id.clone(),
+        repository_id: repository_id.into(),
+        fingerprint: fingerprint.clone(),
+        library_fingerprint: fingerprint,
+        logical_revision,
+        staging_root: repository_root.canonicalize().map_err(corrupt)?,
+        records,
+        objects,
+        captured_by_device: None,
+    })
 }
 
 fn create_verified_snapshot_backup(
@@ -187,8 +322,68 @@ mod tests {
         encode_logical_record, encode_logical_record_key, LogicalRecordEnvelope,
         LogicalRecordLocator,
     };
+    use crate::persistent_store::sync_selection::CaptureIdentity;
     use risunest_external_storage_format::format::fingerprint;
+    use rusqlite::{params, Connection};
+    use sha2::{Digest, Sha256};
     use std::{collections::BTreeMap, fs};
+
+    fn durable_local_capture(
+        root: &Path,
+        marker: &str,
+    ) -> (DurableCaptureReference, String) {
+        let external = root.join("external-storage");
+        let objects = external.join("objects");
+        let capture_directory = external.join("captures").join("capture-a");
+        fs::create_dir_all(&objects).unwrap();
+        fs::create_dir_all(&capture_directory).unwrap();
+        let key = encode_logical_record_key(&LogicalRecordLocator::Root).unwrap();
+        let encoded = encode_logical_record(&LogicalRecordEnvelope::Root {
+            value: serde_json::json!({"marker":marker}),
+            owner_heads: Vec::new(),
+        })
+        .unwrap();
+        fs::write(objects.join(&encoded.hash), &encoded.bytes).unwrap();
+        let identity = CaptureIdentity {
+            store_id: "store-a".into(),
+            library_epoch: "library-a".into(),
+            generation: "generation-a".into(),
+            selection_epoch: "selection-a".into(),
+            revision: 7,
+        };
+        let catalog_path = capture_directory.join("capture.sqlite");
+        let db = Connection::open(&catalog_path).unwrap();
+        db.execute_batch(
+            "PRAGMA journal_mode=DELETE;
+             CREATE TABLE capture_info(singleton INTEGER PRIMARY KEY CHECK(singleton=1),identity TEXT NOT NULL);
+             CREATE TABLE records(key TEXT PRIMARY KEY,hash TEXT NOT NULL,bytes INTEGER NOT NULL);
+             CREATE TABLE generated(hash TEXT PRIMARY KEY,bytes INTEGER NOT NULL);
+             CREATE TABLE dependencies(record TEXT NOT NULL,hash TEXT NOT NULL,bytes INTEGER NOT NULL,PRIMARY KEY(record,hash));
+             CREATE TABLE delta(key TEXT PRIMARY KEY);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO capture_info VALUES(1,?1)",
+            [serde_json::to_string(&identity).unwrap()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO records VALUES(?1,?2,?3)",
+            params![key, encoded.hash, i64::try_from(encoded.size).unwrap()],
+        )
+        .unwrap();
+        drop(db);
+        let catalog_hash = hex::encode(Sha256::digest(fs::read(&catalog_path).unwrap()));
+        (
+            DurableCaptureReference {
+                capture_id: "capture-a".into(),
+                identity,
+                catalog_path: "captures/capture-a/capture.sqlite".into(),
+                catalog_hash,
+            },
+            key,
+        )
+    }
 
     #[test]
     fn malformed_identity_and_non_archive_destination_write_nothing() {
@@ -291,6 +486,84 @@ mod tests {
         assert_eq!(
             restored.read_root(None).unwrap().value["marker"],
             "synthetic-remote"
+        );
+    }
+
+    #[test]
+    fn durable_local_conflict_capture_becomes_a_normal_offline_archive() {
+        let root = tempfile::tempdir().unwrap();
+        let (reference, key) = durable_local_capture(root.path(), "synthetic-local");
+        let snapshot = prepare_local_conflict_snapshot(
+            root.path(),
+            "synthetic-repository",
+            &reference,
+        )
+        .unwrap();
+        assert_eq!(snapshot.snapshot_id, reference.capture_id);
+        assert_eq!(snapshot.repository_id, "synthetic-repository");
+        assert_eq!(snapshot.logical_revision, 7);
+        assert_eq!(snapshot.records.len(), 1);
+        assert_eq!(snapshot.records[0].key, key);
+
+        let destination = root.path().join("local-conflict.risunest");
+        export_verified_snapshot(
+            snapshot,
+            &destination,
+            &root.path().join("scratch"),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        let archive = crate::portable_backup::VerifiedArchive::open(
+            File::open(&destination).unwrap(),
+            root.path(),
+            &Probe(&Cancellation::default()),
+        )
+        .unwrap();
+        archive
+            .validate_library(&Probe(&Cancellation::default()))
+            .unwrap();
+        let restored_root = tempfile::tempdir().unwrap();
+        let mut restored = PersistentStore::open(restored_root.path()).unwrap();
+        let cancellation = Cancellation::default();
+        let probe = Probe(&cancellation);
+        let stage = restored
+            .stage_portable_records(&archive.db, &probe)
+            .unwrap();
+        let prepared = restored
+            .prepare_replace_commit(&stage.staging_id, Some(0))
+            .unwrap();
+        restored.finish_prepared_replace(prepared).unwrap();
+        assert_eq!(
+            restored.read_root(None).unwrap().value["marker"],
+            "synthetic-local"
+        );
+    }
+
+    #[test]
+    fn local_conflict_capture_rejects_forged_paths_and_identities() {
+        let root = tempfile::tempdir().unwrap();
+        let (reference, _) = durable_local_capture(root.path(), "synthetic-local");
+        let mut forged = reference.clone();
+        forged.catalog_path = "../captures/capture-a/capture.sqlite".into();
+        assert_eq!(
+            prepare_local_conflict_snapshot(root.path(), "repository", &forged)
+                .unwrap_err()
+                .kind,
+            ErrorKind::Corrupt
+        );
+        assert_eq!(
+            prepare_local_conflict_snapshot(root.path(), "forged\0repository", &reference)
+                .unwrap_err()
+                .kind,
+            ErrorKind::Corrupt
+        );
+        let mut forged = reference;
+        forged.capture_id = "forged\0capture".into();
+        assert_eq!(
+            prepare_local_conflict_snapshot(root.path(), "repository", &forged)
+                .unwrap_err()
+                .kind,
+            ErrorKind::Corrupt
         );
     }
 }

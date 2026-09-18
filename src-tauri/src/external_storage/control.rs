@@ -12,7 +12,7 @@ use super::{
     },
     journal::TransferJournal,
     packaging::{native_role, wire_role, RemoteObject},
-    publication::{Attempt, ExecutionSession, HeadObservation, Outcome, PublicationWrite},
+    publication::{Attempt, HeadObservation, Outcome, PublicationMode, PublicationWrite},
     transfer::SpoolSink,
     transfer_job,
 };
@@ -34,6 +34,7 @@ const MAX_POINT_PLAINTEXT: usize = wire_control::MAX_CONTROL_BYTES;
 const MAX_POINT_CIPHERTEXT: u64 = 512 * 1024;
 const MAX_SNAPSHOT_CIPHERTEXT: u64 = wire::MAX_METADATA_BYTES as u64 + 512 * 1024;
 const MAX_DISCOVERY_PAGES: usize = 10_000;
+const SNAPSHOT_DISCOVERY_PAGE_LIMIT: u16 = 100;
 
 fn corrupt(_: impl std::fmt::Display) -> ProviderError {
     ProviderError::new(ErrorKind::Corrupt)
@@ -145,17 +146,15 @@ impl BackupPointKind {
     }
 }
 
-/// A point names its bundles by purpose. A conflict preserves both sides; every
-/// other kind carries exactly one.
+/// A point names the one remote bundle it preserves. A conflict's local side
+/// remains in the native conflict store rather than being uploaded here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BackupPointDocument {
     pub repository_id: String,
     pub point_id: String,
     pub kind: BackupPointKind,
     pub created_at_ms: u64,
-    pub bundle: Option<RemoteObject>,
-    pub local_bundle: Option<RemoteObject>,
-    pub remote_bundle: Option<RemoteObject>,
+    pub bundle: RemoteObject,
 }
 impl BackupPointDocument {
     pub(crate) fn single(
@@ -166,16 +165,14 @@ impl BackupPointDocument {
         bundle: RemoteObject,
     ) -> Result<Self> {
         if kind == BackupPointKind::Conflict {
-            return Err(corrupt("a conflict point needs both bundles"));
+            return Err(corrupt("use the conflict point constructor"));
         }
         let value = Self {
             repository_id: descriptor.repository_id.clone(),
             point_id,
             kind,
             created_at_ms,
-            bundle: Some(bundle),
-            local_bundle: None,
-            remote_bundle: None,
+            bundle,
         };
         descriptor.validate().map_err(corrupt)?;
         value.check(descriptor)?;
@@ -185,7 +182,6 @@ impl BackupPointDocument {
         descriptor: &Descriptor,
         point_id: String,
         created_at_ms: u64,
-        local_bundle: RemoteObject,
         remote_bundle: RemoteObject,
     ) -> Result<Self> {
         let value = Self {
@@ -193,41 +189,19 @@ impl BackupPointDocument {
             point_id,
             kind: BackupPointKind::Conflict,
             created_at_ms,
-            bundle: None,
-            local_bundle: Some(local_bundle),
-            remote_bundle: Some(remote_bundle),
+            bundle: remote_bundle,
         };
         descriptor.validate().map_err(corrupt)?;
         value.check(descriptor)?;
         Ok(value)
     }
     pub(crate) fn bundles(&self) -> Vec<&RemoteObject> {
-        [&self.bundle, &self.local_bundle, &self.remote_bundle]
-            .into_iter()
-            .flatten()
-            .collect()
+        vec![&self.bundle]
     }
     fn check(&self, descriptor: &Descriptor) -> Result<()> {
-        let complete = match self.kind {
-            BackupPointKind::Conflict => {
-                self.bundle.is_none()
-                    && match (&self.local_bundle, &self.remote_bundle) {
-                        (Some(local), Some(remote)) => local.object_id != remote.object_id,
-                        _ => false,
-                    }
-            }
-            _ => {
-                self.bundle.is_some()
-                    && self.local_bundle.is_none()
-                    && self.remote_bundle.is_none()
-            }
-        };
         if self.repository_id != descriptor.repository_id
-            || !complete
-            || self.bundles().iter().any(|bundle| {
-                bundle.repository_id != descriptor.repository_id
-                    || bundle.role != ObjectRole::BackupBundle
-            })
+            || self.bundle.repository_id != descriptor.repository_id
+            || self.bundle.role != ObjectRole::BackupBundle
         {
             return Err(corrupt("invalid backup point"));
         }
@@ -241,31 +215,19 @@ impl BackupPointDocument {
         descriptor.validate().map_err(corrupt)?;
         self.check(descriptor)?;
         match self.kind {
-            BackupPointKind::Conflict => {
-                let (Some(local), Some(remote)) = (&self.local_bundle, &self.remote_bundle) else {
-                    return Err(corrupt("invalid backup point"));
-                };
-                wire_control::BackupPointDocument::conflict(
-                    self.repository_id.clone(),
-                    self.point_id.clone(),
-                    self.created_at_ms,
-                    local.stored(repository)?,
-                    remote.stored(repository)?,
-                )
-            }
-            _ => {
-                let bundle = self
-                    .bundle
-                    .as_ref()
-                    .ok_or_else(|| corrupt("invalid backup point"))?;
-                wire_control::BackupPointDocument::single(
-                    self.repository_id.clone(),
-                    self.point_id.clone(),
-                    self.kind.to_wire(),
-                    self.created_at_ms,
-                    bundle.stored(repository)?,
-                )
-            }
+            BackupPointKind::Conflict => wire_control::BackupPointDocument::conflict(
+                self.repository_id.clone(),
+                self.point_id.clone(),
+                self.created_at_ms,
+                self.bundle.stored(repository)?,
+            ),
+            _ => wire_control::BackupPointDocument::single(
+                self.repository_id.clone(),
+                self.point_id.clone(),
+                self.kind.to_wire(),
+                self.created_at_ms,
+                self.bundle.stored(repository)?,
+            ),
         }
         .map_err(corrupt)
     }
@@ -283,20 +245,12 @@ impl BackupPointDocument {
             wire_control::BackupPointKind::Manual => BackupPointKind::Manual,
             wire_control::BackupPointKind::Conflict => BackupPointKind::Conflict,
         };
-        let convert = |object: &Option<wire::StoredObject>| -> Result<Option<RemoteObject>> {
-            object
-                .as_ref()
-                .map(|object| RemoteObject::from_stored(object, repository))
-                .transpose()
-        };
         Ok(Self {
             repository_id: value.repository_id,
             point_id: value.point_id,
             kind,
             created_at_ms: value.created_at_ms,
-            bundle: convert(&value.bundle)?,
-            local_bundle: convert(&value.local_bundle)?,
-            remote_bundle: convert(&value.remote_bundle)?,
+            bundle: RemoteObject::from_stored(&value.bundle, repository)?,
         })
     }
 }
@@ -509,7 +463,7 @@ pub(crate) async fn publish_head(
     strategy: Strategy,
     expected: Option<&ObservedHead>,
     prepared: &PreparedHead,
-    session: ExecutionSession,
+    mode: PublicationMode,
     cancel: &Cancellation,
 ) -> Result<PublicationResult> {
     publish_head_guarded(
@@ -521,7 +475,7 @@ pub(crate) async fn publish_head(
         strategy,
         expected,
         prepared,
-        || Ok(session),
+        || Ok(mode),
         |_| Ok(()),
         cancel,
     )
@@ -545,8 +499,8 @@ pub(crate) async fn publish_head_guarded<F, G>(
     cancel: &Cancellation,
 ) -> Result<PublicationResult>
 where
-    F: FnOnce() -> Result<ExecutionSession>,
-    G: FnOnce(ExecutionSession) -> Result<()>,
+    F: FnOnce() -> Result<PublicationMode>,
+    G: FnOnce(PublicationMode) -> Result<()>,
 {
     prepared.document.to_wire(descriptor, repository)?;
     let expected_observation = expected.map(|head| head.observation.clone());
@@ -558,8 +512,8 @@ where
         prepared.document.commit_id.clone(),
         prepared.authenticated_body_hash.clone(),
     )?;
-    let session = read_session()?;
-    let write = match attempt.before_write(current.as_ref().map(|h| &h.observation), session) {
+    let mode = read_session()?;
+    let write = match attempt.before_write(current.as_ref().map(|h| &h.observation), mode) {
         Ok(write) => write,
         Err(error) if error.kind == ErrorKind::PreconditionFailed => {
             return Ok(PublicationResult::Conflict(current));
@@ -567,7 +521,7 @@ where
         Err(error) => return Err(error),
     };
     let locator = provider.head_locator(repository)?;
-    before_write(session)?;
+    before_write(mode)?;
     let write_result = match write {
         PublicationWrite::Cas(expected) => {
             provider
@@ -878,7 +832,7 @@ pub(crate) async fn open_listed_snapshot(
     {
         return Err(corrupt("invalid listed snapshot object"));
     }
-    let (_, bytes) = download_control(
+    let (read, bytes) = download_control(
         connected.provider.as_ref(),
         &connected.handle,
         &receipt.locator,
@@ -887,6 +841,15 @@ pub(crate) async fn open_listed_snapshot(
         cancel,
     )
     .await?;
+    let ReadReceipt::Body(read_receipt) = read else {
+        return Err(corrupt("listed snapshot was not downloaded"));
+    };
+    if read_receipt.locator != receipt.locator
+        || read_receipt.byte_length != receipt.byte_length
+        || !read_receipt.complete
+    {
+        return Err(corrupt("listed snapshot receipt differs"));
+    }
     let bytes = bytes.ok_or_else(|| corrupt("listed snapshot was not downloaded"))?;
     let repository_id = &connected.stored.descriptor.repository_id;
     let key = derive_key(&connected.root_key, repository_id, "metadata").map_err(corrupt)?;
@@ -910,7 +873,7 @@ pub(crate) async fn open_listed_snapshot(
             repository_id: repository_id.clone(),
             object_id: header.object_id,
             role: native_role(header.role)?,
-            receipt,
+            receipt: read_receipt,
             ciphertext_sha256: hex::encode(hash(&bytes)),
             plaintext_length: header.plaintext_length,
             plaintext_sha256: hex::encode(hash(&plaintext)),
@@ -965,19 +928,15 @@ pub(crate) async fn read_catalog_children(
     Ok(objects)
 }
 
-/// Explicit history/restore discovery. Normal sync follows the snapshot locator
-/// in the authenticated head and never scans this collection.
-pub(crate) async fn find_snapshot(
+async fn scan_snapshot(
     connected: &super::connection_commands::ConnectedRepository,
     snapshot_id: &str,
     cancel: &Cancellation,
 ) -> Result<RemoteObject> {
-    if snapshot_id.is_empty() || snapshot_id.len() > 1024 || snapshot_id.contains('\0') {
-        return Err(corrupt("invalid snapshot selection"));
-    }
     let expected_object_id = format!("snapshot-{snapshot_id}");
     let mut cursor: Option<String> = None;
     let mut seen_cursors = std::collections::BTreeSet::new();
+    let mut matched: Option<RemoteObject> = None;
     for _ in 0..MAX_DISCOVERY_PAGES {
         cancel.check()?;
         let page = connected
@@ -986,28 +945,81 @@ pub(crate) async fn find_snapshot(
                 &connected.handle,
                 Collection::Snapshots,
                 cursor.as_deref(),
-                100,
+                SNAPSHOT_DISCOVERY_PAGE_LIMIT,
                 cancel,
             )
             .await?;
+        if page.objects.len() > SNAPSHOT_DISCOVERY_PAGE_LIMIT as usize {
+            return Err(corrupt("snapshot discovery page exceeds limit"));
+        }
         for receipt in page.objects {
+            cancel.check()?;
             let (object, view) = open_listed_snapshot(connected, receipt, cancel).await?;
             if view.snapshot_id == snapshot_id {
                 if object.object_id != expected_object_id {
                     return Err(corrupt("snapshot selection identity differs"));
                 }
-                return Ok(object);
+                if let Some(previous) = &matched {
+                    if previous.ciphertext_sha256 != object.ciphertext_sha256
+                        || previous.plaintext_sha256 != object.plaintext_sha256
+                        || previous.receipt.byte_length != object.receipt.byte_length
+                    {
+                        return Err(corrupt("ambiguous snapshot discovery"));
+                    }
+                } else {
+                    matched = Some(object);
+                }
             }
         }
         let Some(next) = page.next_cursor else {
-            return Err(ProviderError::new(ErrorKind::NotFound));
+            return matched.ok_or_else(|| ProviderError::new(ErrorKind::NotFound));
         };
-        if next.is_empty() || next.len() > 4096 || !seen_cursors.insert(next.clone()) {
+        if next.is_empty()
+            || next.len() > 4096
+            || next.chars().any(char::is_control)
+            || !seen_cursors.insert(next.clone())
+        {
             return Err(corrupt("invalid snapshot discovery cursor"));
         }
         cursor = Some(next);
     }
     Err(corrupt("snapshot discovery page limit"))
+}
+
+/// Reads an authenticated locator first. Only an explicit NotFound means the
+/// provider may be scanned to recover an object's current opaque locator.
+pub(crate) async fn find_snapshot_with_locator(
+    connected: &super::connection_commands::ConnectedRepository,
+    snapshot_id: &str,
+    known: Option<&RemoteObject>,
+    cancel: &Cancellation,
+) -> Result<RemoteObject> {
+    if snapshot_id.is_empty() || snapshot_id.len() > 1024 || snapshot_id.contains('\0') {
+        return Err(corrupt("invalid snapshot selection"));
+    }
+    if let Some(snapshot) = known {
+        match open_known_snapshot_document(connected, snapshot, cancel).await {
+            Ok((object, view)) => {
+                if view.snapshot_id != snapshot_id {
+                    return Err(corrupt("snapshot selection identity differs"));
+                }
+                return Ok(object);
+            }
+            Err(error) if error.kind == ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    scan_snapshot(connected, snapshot_id, cancel).await
+}
+
+/// ID-only recovery for callers that do not yet hold an authenticated object
+/// reference. Callers with a stored locator use `find_snapshot_with_locator`.
+pub(crate) async fn find_snapshot(
+    connected: &super::connection_commands::ConnectedRepository,
+    snapshot_id: &str,
+    cancel: &Cancellation,
+) -> Result<RemoteObject> {
+    find_snapshot_with_locator(connected, snapshot_id, None, cancel).await
 }
 
 /// What a listing or a restore needs from either published document. The
@@ -1087,15 +1099,11 @@ impl SnapshotView {
     }
 }
 
-/// Reads a selected snapshot root through its authenticated direct locator.
-/// This verifies the remote object's ciphertext, RNX1 header, plaintext hash,
-/// repository and scope. Referenced packs remain unverified until restore or a
-/// dedicated full-history verification downloads them.
-pub(crate) async fn read_snapshot_document(
+async fn open_known_snapshot_document(
     connected: &super::connection_commands::ConnectedRepository,
     snapshot: &RemoteObject,
     cancel: &Cancellation,
-) -> Result<SnapshotView> {
+) -> Result<(RemoteObject, SnapshotView)> {
     if !matches!(
         snapshot.role,
         ObjectRole::SyncState | ObjectRole::BackupBundle
@@ -1106,7 +1114,7 @@ pub(crate) async fn read_snapshot_document(
         return Err(corrupt("invalid selected snapshot"));
     }
     snapshot.stored(&connected.handle)?;
-    let (_, bytes) = download_control(
+    let (read, bytes) = download_control(
         connected.provider.as_ref(),
         &connected.handle,
         &snapshot.receipt.locator,
@@ -1115,8 +1123,20 @@ pub(crate) async fn read_snapshot_document(
         cancel,
     )
     .await?;
+    let ReadReceipt::Body(receipt) = read else {
+        return Err(corrupt("selected snapshot was not downloaded"));
+    };
+    if receipt.locator != snapshot.receipt.locator
+        || receipt.byte_length != snapshot.receipt.byte_length
+        || !receipt.complete
+    {
+        return Err(corrupt("selected snapshot receipt differs"));
+    }
     let bytes = bytes.ok_or_else(|| corrupt("selected snapshot was not downloaded"))?;
-    if hex::encode(hash(&bytes)) != snapshot.ciphertext_sha256 {
+    let ciphertext_sha256 = hex::encode(hash(&bytes));
+    if bytes.len() as u64 != snapshot.receipt.byte_length
+        || ciphertext_sha256 != snapshot.ciphertext_sha256
+    {
         return Err(corrupt("snapshot ciphertext differs"));
     }
     let key = derive_key(
@@ -1133,8 +1153,10 @@ pub(crate) async fn read_snapshot_document(
         wire::MAX_METADATA_BYTES as u64,
     )
     .map_err(corrupt)?;
+    let plaintext_sha256 = hex::encode(hash(&plaintext));
     if header != snapshot.stored(&connected.handle)?.header
-        || hex::encode(hash(&plaintext)) != snapshot.plaintext_sha256
+        || plaintext.len() as u64 != snapshot.plaintext_length
+        || plaintext_sha256 != snapshot.plaintext_sha256
     {
         return Err(corrupt("snapshot plaintext differs"));
     }
@@ -1146,7 +1168,32 @@ pub(crate) async fn read_snapshot_document(
     if snapshot.object_id != format!("snapshot-{}", view.snapshot_id) {
         return Err(corrupt("snapshot document binding differs"));
     }
-    Ok(view)
+    Ok((
+        RemoteObject {
+            repository_id: header.repository_id,
+            object_id: header.object_id,
+            role: native_role(header.role)?,
+            receipt,
+            ciphertext_sha256,
+            plaintext_length: header.plaintext_length,
+            plaintext_sha256,
+        },
+        view,
+    ))
+}
+
+/// Reads a selected snapshot root through its authenticated direct locator.
+/// This verifies the remote object's ciphertext, RNX1 header, plaintext hash,
+/// repository and scope. Referenced packs remain unverified until restore or a
+/// dedicated full-history verification downloads them.
+pub(crate) async fn read_snapshot_document(
+    connected: &super::connection_commands::ConnectedRepository,
+    snapshot: &RemoteObject,
+    cancel: &Cancellation,
+) -> Result<SnapshotView> {
+    open_known_snapshot_document(connected, snapshot, cancel)
+        .await
+        .map(|(_, view)| view)
 }
 
 pub(crate) async fn list_connected_backup_points_page(
@@ -1172,6 +1219,7 @@ mod tests {
     use super::*;
     use crate::external_storage::{fake, journal::JobIdentity};
     use crate::persistent_store::sync_selection::CaptureIdentity;
+    use std::{collections::BTreeMap, sync::Arc};
 
     fn descriptor(strategy: Strategy) -> Descriptor {
         Descriptor::new("descriptor-repository".into(), Some(strategy),
@@ -1255,6 +1303,134 @@ mod tests {
             .unwrap()
     }
 
+    fn connected(
+        provider: Arc<fake::FakeProvider>,
+    ) -> super::super::connection_commands::ConnectedRepository {
+        let test = fake::loopback_dependencies(fake::MemoryVault::default(), 1_000);
+        super::super::connection_commands::ConnectedRepository {
+            stored: super::super::connection_store::StoredConnection {
+                id: "connection".into(),
+                config: super::super::contract::ConnectionConfig {
+                    provider: "synthetic".into(),
+                    profile: None,
+                    endpoint: "https://synthetic.invalid".into(),
+                    account_id: "account".into(),
+                    location: BTreeMap::new(),
+                    oauth_profile: None,
+                },
+                descriptor: descriptor(Strategy::Cas),
+                descriptor_locator: RemoteLocator {
+                    connection_identity: fake::repository().connection_identity,
+                    collection: None,
+                    object: "descriptor".into(),
+                },
+                provider_repository_id: fake::repository().repository_id,
+                credential_ref: "credential".into(),
+                root_key_ref: "key".into(),
+                capture_policy: None,
+                retention_policy: None,
+                capabilities: fake::capabilities(true),
+                created_at_ms: 1_000,
+                last_sync_at_ms: None,
+                last_backup_at_ms: None,
+            },
+            provider,
+            handle: fake::repository(),
+            dependencies: test.dependencies,
+            root_key: zeroize::Zeroizing::new([7; 32]),
+        }
+    }
+
+    fn catalog(repository: &RepositoryHandle, id: &str) -> wire::StoredObject {
+        let header = wire::PublicObjectHeader::new(
+            "descriptor-repository".into(),
+            id.into(),
+            wire::ObjectRole::Catalog,
+            4,
+        )
+        .unwrap();
+        RemoteObject {
+            repository_id: header.repository_id.clone(),
+            object_id: header.object_id.clone(),
+            role: ObjectRole::Catalog,
+            receipt: ObjectReceipt {
+                locator: RemoteLocator {
+                    connection_identity: repository.connection_identity.clone(),
+                    collection: None,
+                    object: format!("opaque-{id}"),
+                },
+                byte_length: wire::envelope_length(&header).unwrap(),
+                version: None,
+                checksum: None,
+                complete: true,
+            },
+            ciphertext_sha256: "11".repeat(32),
+            plaintext_length: 4,
+            plaintext_sha256: "22".repeat(32),
+        }
+        .stored(repository)
+        .unwrap()
+    }
+
+    fn snapshot_fixture(
+        connected: &super::super::connection_commands::ConnectedRepository,
+        snapshot_id: &str,
+        locator: &str,
+        created_at_ms: u64,
+    ) -> (RemoteObject, Vec<u8>) {
+        let plaintext = wire_control::BackupBundleDocument::new(
+            connected.stored.descriptor.repository_id.clone(),
+            snapshot_id.into(),
+            wire_control::BundleSource::Device {
+                writer_id: "writer".into(),
+            },
+            created_at_ms,
+            Some(risunest_sync_wire::head::Sequence::from(1u64)),
+            Some(risunest_sync_wire::head::Sequence::from(1u64)),
+            None,
+            wire::LibrarySnapshotRef {
+                record_catalog: catalog(&connected.handle, "records"),
+                asset_catalog: catalog(&connected.handle, "assets"),
+                content_fingerprint: [3; 32],
+            },
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .encode(MAX_POINT_PLAINTEXT)
+        .unwrap();
+        let object_id = format!("snapshot-{snapshot_id}");
+        let bytes = seal(
+            &connected.stored.descriptor,
+            &connected.root_key,
+            &object_id,
+            wire::ObjectRole::BackupBundle,
+            &plaintext,
+        )
+        .unwrap();
+        (
+            RemoteObject {
+                repository_id: connected.stored.descriptor.repository_id.clone(),
+                object_id,
+                role: ObjectRole::BackupBundle,
+                receipt: ObjectReceipt {
+                    locator: RemoteLocator {
+                        connection_identity: connected.handle.connection_identity.clone(),
+                        collection: None,
+                        object: locator.into(),
+                    },
+                    byte_length: bytes.len() as u64,
+                    version: None,
+                    checksum: None,
+                    complete: true,
+                },
+                ciphertext_sha256: hex::encode(hash(&bytes)),
+                plaintext_length: plaintext.len() as u64,
+                plaintext_sha256: hex::encode(hash(&plaintext)),
+            },
+            bytes,
+        )
+    }
+
     #[test]
     fn head_uses_descriptor_identity_and_authenticates_the_exact_ciphertext() {
         let repository = fake::repository();
@@ -1308,7 +1484,7 @@ mod tests {
             provider.state.lock().unwrap().lose_response = true;
             let result = publish_head(
                 &provider, &repository, &fake::capabilities(true), &descriptor, &[9; 32],
-                Strategy::Cas, None, &first, ExecutionSession::Foreground, &Cancellation::default(),
+                Strategy::Cas, None, &first, PublicationMode::Foreground, &Cancellation::default(),
             ).await.unwrap();
             assert!(matches!(result, PublicationResult::Confirmed(ref observed) if observed.document.commit_id == "c1"));
 
@@ -1318,7 +1494,7 @@ mod tests {
             stale.observation.authenticated_body_hash = "44".repeat(32);
             let conflict = publish_head(
                 &provider, &repository, &fake::capabilities(true), &descriptor, &[9; 32],
-                Strategy::Cas, Some(&stale), &second, ExecutionSession::Foreground, &Cancellation::default(),
+                Strategy::Cas, Some(&stale), &second, PublicationMode::Foreground, &Cancellation::default(),
             ).await.unwrap();
             assert!(matches!(conflict, PublicationResult::Conflict(Some(_))));
             assert_eq!(read_head(&provider, &repository, &descriptor, &[9; 32], None, &Cancellation::default()).await.unwrap().unwrap().document.commit_id, "c1");
@@ -1326,39 +1502,7 @@ mod tests {
     }
 
     #[test]
-    fn sequential_head_refuses_hidden_execution_before_any_write() {
-        runtime().block_on(async {
-            let provider = fake::FakeProvider::new(false);
-            let repository = fake::repository();
-            let descriptor = descriptor(Strategy::Sequential);
-            let prepared = prepare_head(
-                &descriptor,
-                &[8; 32],
-                &repository,
-                head(Strategy::Sequential, &repository, "c1"),
-            )
-            .unwrap();
-            let error = publish_head(
-                &provider,
-                &repository,
-                &fake::capabilities(false),
-                &descriptor,
-                &[8; 32],
-                Strategy::Sequential,
-                None,
-                &prepared,
-                ExecutionSession::Hidden,
-                &Cancellation::default(),
-            )
-            .await
-            .unwrap_err();
-            assert_eq!(error.kind, ErrorKind::Cancelled);
-            assert!(provider.state.lock().unwrap().objects.is_empty());
-        });
-    }
-
-    #[test]
-    fn sequential_head_revalidates_session_after_remote_pre_read() {
+    fn sequential_head_revalidates_publication_mode_after_remote_pre_read() {
         runtime().block_on(async {
             let provider = fake::FakeProvider::new(false);
             let repository = fake::repository();
@@ -1380,7 +1524,7 @@ mod tests {
                 Strategy::Sequential,
                 None,
                 &prepared,
-                || Ok(ExecutionSession::Hidden),
+                || Err(ProviderError::new(ErrorKind::Cancelled)),
                 |_| {
                     entered.store(true, std::sync::atomic::Ordering::Release);
                     Ok(())
@@ -1396,7 +1540,153 @@ mod tests {
     }
 
     #[test]
-    fn conflict_point_requires_two_snapshots_and_uploads_as_an_immutable_object() {
+    fn locator_hit_reads_only_the_target_among_one_thousand_snapshots() {
+        runtime().block_on(async {
+            let provider = Arc::new(fake::FakeProvider::new(false));
+            let connected = connected(provider.clone());
+            for index in 0..999 {
+                provider.seed(
+                    &format!("noise-{index:04}"),
+                    ObjectRole::BackupBundle,
+                    vec![index as u8],
+                );
+            }
+            let (known, bytes) = snapshot_fixture(&connected, "target", "opaque-target", 1);
+            provider.seed("opaque-target", ObjectRole::BackupBundle, bytes);
+
+            let found = find_snapshot_with_locator(
+                &connected,
+                "target",
+                Some(&known),
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(found.object_id, "snapshot-target");
+            assert_eq!(provider.read_attempts("opaque-target"), 1);
+            assert_eq!(provider.listing_count(), 0);
+        });
+    }
+
+    #[test]
+    fn locator_hash_mismatch_fails_without_fallback_listing() {
+        runtime().block_on(async {
+            let provider = Arc::new(fake::FakeProvider::new(false));
+            let connected = connected(provider.clone());
+            let (mut known, bytes) = snapshot_fixture(&connected, "target", "opaque-target", 1);
+            provider.seed("opaque-target", ObjectRole::BackupBundle, bytes);
+            known.ciphertext_sha256 = "00".repeat(32);
+
+            let error = find_snapshot_with_locator(
+                &connected,
+                "target",
+                Some(&known),
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(error.kind, ErrorKind::Corrupt);
+            assert_eq!(provider.read_attempts("opaque-target"), 1);
+            assert_eq!(provider.listing_count(), 0);
+        });
+    }
+
+    #[test]
+    fn locator_authentication_and_permission_errors_do_not_fallback() {
+        runtime().block_on(async {
+            for kind in [ErrorKind::Unauthorized, ErrorKind::ReauthRequired] {
+                let provider = Arc::new(fake::FakeProvider::new(false));
+                let connected = connected(provider.clone());
+                let (known, bytes) = snapshot_fixture(&connected, "target", "opaque-target", 1);
+                provider.seed("opaque-target", ObjectRole::BackupBundle, bytes);
+                provider.fail_read("opaque-target", kind);
+
+                let error = find_snapshot_with_locator(
+                    &connected,
+                    "target",
+                    Some(&known),
+                    &Cancellation::default(),
+                )
+                .await
+                .unwrap_err();
+
+                assert_eq!(error.kind, kind);
+                assert_eq!(provider.listing_count(), 0);
+            }
+        });
+    }
+
+    #[test]
+    fn confirmed_locator_not_found_falls_back_to_authenticated_scan() {
+        runtime().block_on(async {
+            let provider = Arc::new(fake::FakeProvider::new(false));
+            let connected = connected(provider.clone());
+            let (mut known, bytes) = snapshot_fixture(&connected, "target", "current-target", 1);
+            provider.seed("current-target", ObjectRole::BackupBundle, bytes);
+            known.receipt.locator.object = "stale-target".into();
+
+            let found = find_snapshot_with_locator(
+                &connected,
+                "target",
+                Some(&known),
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(found.receipt.locator.object, "current-target");
+            assert_eq!(provider.read_attempts("stale-target"), 1);
+            assert_eq!(provider.listing_count(), 1);
+        });
+    }
+
+    #[test]
+    fn scan_rejects_ambiguous_authenticated_snapshot_matches() {
+        runtime().block_on(async {
+            let provider = Arc::new(fake::FakeProvider::new(false));
+            let connected = connected(provider.clone());
+            let (_, first) = snapshot_fixture(&connected, "duplicate", "first", 1);
+            let (_, second) = snapshot_fixture(&connected, "duplicate", "second", 2);
+            provider.seed("first", ObjectRole::BackupBundle, first);
+            provider.seed("second", ObjectRole::BackupBundle, second);
+
+            let error = find_snapshot(&connected, "duplicate", &Cancellation::default())
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.kind, ErrorKind::Corrupt);
+            assert_eq!(provider.listing_count(), 1);
+        });
+    }
+
+    #[test]
+    fn scan_rejects_a_repeated_discovery_cursor() {
+        runtime().block_on(async {
+            let provider = Arc::new(fake::FakeProvider::new(false));
+            let connected = connected(provider.clone());
+            for _ in 0..2 {
+                provider.script_page(
+                    Collection::Snapshots,
+                    Ok(super::super::contract::ObjectPage {
+                        objects: Vec::new(),
+                        next_cursor: Some("repeat".into()),
+                    }),
+                );
+            }
+
+            let error = find_snapshot(&connected, "missing", &Cancellation::default())
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.kind, ErrorKind::Corrupt);
+            assert_eq!(provider.listing_count(), 2);
+        });
+    }
+
+    #[test]
+    fn conflict_point_keeps_one_remote_bundle_and_uploads_once_at_its_fixed_id() {
         runtime().block_on(async {
             let provider = fake::FakeProvider::new(false);
             let repository = fake::repository();
@@ -1405,18 +1695,17 @@ mod tests {
                 &descriptor,
                 "conflict-1".into(),
                 1,
-                bundle(&repository, "s1"),
-                bundle(&repository, "s1"),
+                snapshot(&repository, "s1"),
             )
             .is_err());
             let document = BackupPointDocument::conflict(
                 &descriptor,
                 "conflict-1".into(),
                 1,
-                bundle(&repository, "s1"),
                 bundle(&repository, "s2"),
             )
             .unwrap();
+            assert_eq!(document.bundles().len(), 1);
             let root = tempfile::tempdir().unwrap();
             let identity = JobIdentity {
                 job_id: "job".into(),
@@ -1435,7 +1724,7 @@ mod tests {
             let uploaded = upload_backup_point(
                 &descriptor,
                 &[6; 32],
-                document,
+                document.clone(),
                 &mut journal,
                 &provider,
                 &repository,
@@ -1445,7 +1734,21 @@ mod tests {
             .unwrap();
             assert_eq!(uploaded.repository_id, descriptor.repository_id);
             assert_eq!(uploaded.role, ObjectRole::BackupPoint);
+            assert_eq!(uploaded.object_id, "backup-point-conflict-1");
+            let repeated = upload_backup_point(
+                &descriptor,
+                &[6; 32],
+                document,
+                &mut journal,
+                &provider,
+                &repository,
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(repeated.object_id, uploaded.object_id);
             assert_eq!(provider.state.lock().unwrap().objects.len(), 1);
+            assert_eq!(provider.upload_attempts("backup-point-conflict-1"), 1);
         });
     }
 }

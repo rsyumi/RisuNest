@@ -2,10 +2,15 @@
 //! Remote bytes are fully downloaded and verified before the archive is built.
 use super::{
     capabilities::Capabilities,
+    capture::DurableCaptureReference,
     connection_commands,
     contract::{Cancellation, ErrorKind, LeaseKind, ProviderError, Result},
-    control, leases, runtime, snapshot_export, snapshot_restore,
+    control, leases,
+    packaging::RemoteObject,
+    runtime, snapshot_export, snapshot_restore,
 };
+use crate::persistent_store::external_conflicts::ConflictSourceDescriptor;
+use risunest_external_storage_format::snapshot::{ObjectRole as WireObjectRole, StoredObject};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -33,8 +38,122 @@ pub(crate) struct ExportSnapshotResponse {
     sha256: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+enum ValidatedConflictSourceKind {
+    Local {
+        repository_id: String,
+        capture: DurableCaptureReference,
+    },
+    Remote {
+        connection_id: String,
+        repository_id: String,
+        snapshot: StoredObject,
+    },
+}
+
+/// A conflict source is constructed only after native token resolution. It is
+/// deliberately not deserializable, contains no renderer-provided path, and
+/// owns the registry claim until staging and destination publication finish.
+pub(crate) struct ValidatedConflictSource<Claim> {
+    conflict_id: String,
+    kind: ValidatedConflictSourceKind,
+    claim: Claim,
+}
+
+pub(crate) struct PreparedConflictSource<Claim> {
+    pub prepared: snapshot_restore::PreparedRemoteSnapshot,
+    claim: Claim,
+}
+
+impl<Claim> PreparedConflictSource<Claim> {
+    pub(crate) fn into_parts(self) -> (snapshot_restore::PreparedRemoteSnapshot, Claim) {
+        (self.prepared, self.claim)
+    }
+}
+
 fn valid_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 1024 && !value.contains('\0')
+}
+
+fn local_conflict_source<Claim>(
+    claim: Claim,
+    conflict_id: &str,
+    repository_id: &str,
+    capture: DurableCaptureReference,
+) -> Result<ValidatedConflictSource<Claim>> {
+    if !valid_id(conflict_id) || !valid_id(repository_id) {
+        return Err(ProviderError::new(ErrorKind::Corrupt));
+    }
+    Ok(ValidatedConflictSource {
+        conflict_id: conflict_id.into(),
+        kind: ValidatedConflictSourceKind::Local {
+            repository_id: repository_id.into(),
+            capture,
+        },
+        claim,
+    })
+}
+
+fn remote_conflict_source<Claim>(
+    claim: Claim,
+    conflict_id: &str,
+    connection_id: &str,
+    repository_id: &str,
+    snapshot: StoredObject,
+) -> Result<ValidatedConflictSource<Claim>> {
+    if !valid_id(conflict_id) || !valid_id(connection_id) || !valid_id(repository_id) {
+        return Err(ProviderError::new(ErrorKind::Corrupt));
+    }
+    snapshot
+        .validate()
+        .map_err(|_| ProviderError::new(ErrorKind::Corrupt))?;
+    if snapshot.header.repository_id != repository_id
+        || !matches!(
+            snapshot.header.role,
+            WireObjectRole::SyncState | WireObjectRole::BackupBundle
+        )
+        || !snapshot
+            .header
+            .object_id
+            .strip_prefix("snapshot-")
+            .is_some_and(valid_id)
+    {
+        return Err(ProviderError::new(ErrorKind::Corrupt));
+    }
+    Ok(ValidatedConflictSource {
+        conflict_id: conflict_id.into(),
+        kind: ValidatedConflictSourceKind::Remote {
+            connection_id: connection_id.into(),
+            repository_id: repository_id.into(),
+            snapshot,
+        },
+        claim,
+    })
+}
+
+pub(crate) fn validated_conflict_source<Claim>(
+    claim: Claim,
+    descriptor: ConflictSourceDescriptor,
+) -> Result<ValidatedConflictSource<Claim>> {
+    match descriptor {
+        ConflictSourceDescriptor::Local {
+            conflict_id,
+            repository_id,
+            capture,
+        } => local_conflict_source(claim, &conflict_id, &repository_id, capture),
+        ConflictSourceDescriptor::Remote {
+            conflict_id,
+            connection_id,
+            repository_id,
+            snapshot,
+        } => remote_conflict_source(
+            claim,
+            &conflict_id,
+            &connection_id,
+            &repository_id,
+            snapshot,
+        ),
+    }
 }
 
 fn archive_name(snapshot_id: &str) -> String {
@@ -135,6 +254,177 @@ async fn with_export_lease<T>(
     }
 }
 
+fn publish_prepared_snapshot(
+    app: &AppHandle,
+    selected: FilePath,
+    prepared: snapshot_restore::PreparedRemoteSnapshot,
+    staging: &std::path::Path,
+    cancel: &Cancellation,
+) -> Result<ExportSnapshotResponse> {
+    let path_destination = selected.clone().into_path().ok();
+    let local_destination = path_destination
+        .clone()
+        .unwrap_or_else(|| staging.join("selected-snapshot.risunest"));
+    let receipt = snapshot_export::export_verified_snapshot(
+        prepared,
+        &local_destination,
+        &staging.join("export"),
+        cancel,
+    )?;
+    if path_destination.is_none() {
+        publish_uri_destination(
+            app,
+            selected.clone(),
+            &local_destination,
+            &receipt.sha256,
+            cancel,
+        )?;
+    }
+    Ok(ExportSnapshotResponse {
+        cancelled: false,
+        destination: Some(selected.to_string()),
+        sha256: Some(receipt.sha256),
+    })
+}
+
+async fn download_remote_conflict_source(
+    app: &AppHandle,
+    root: &std::path::Path,
+    staging: &std::path::Path,
+    connection_id: &str,
+    repository_id: &str,
+    snapshot: &StoredObject,
+    cancel: &Cancellation,
+) -> Result<snapshot_restore::PreparedRemoteSnapshot> {
+    let connected = connection_commands::open_connected(app, connection_id).await?;
+    if connected.stored.id != connection_id
+        || connected.stored.descriptor.repository_id != repository_id
+        || snapshot.header.repository_id != repository_id
+    {
+        return Err(ProviderError::new(ErrorKind::Corrupt));
+    }
+    let remote = RemoteObject::from_stored(snapshot, &connected.handle)?;
+    let expected_snapshot_id = snapshot
+        .header
+        .object_id
+        .strip_prefix("snapshot-")
+        .ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))?;
+    let writer_id = crate::persistent_store::commands::with_store_mut(app.state(), |store| {
+        store.external_identity()
+    })
+    .map_err(runtime::local_error)?
+    .store_id;
+    let context = leases::LeaseContext {
+        root,
+        connection_id: &connected.stored.id,
+        writer_id: &writer_id,
+        descriptor: &connected.stored.descriptor,
+        root_key: &connected.root_key,
+        provider: connected.provider.as_ref(),
+        repository: &connected.handle,
+        clock: leases::system_clock(),
+        protection_supported: connected.stored.capabilities.lease_operations,
+    };
+    with_export_lease(
+        &context,
+        &connected.stored.capabilities,
+        cancel,
+        async {
+            let prepared = snapshot_restore::download_snapshot(
+                &remote,
+                &staging.join("verified"),
+                &connected.root_key,
+                connected.provider.as_ref(),
+                &connected.handle,
+                cancel,
+            )
+            .await?;
+            if prepared.repository_id != repository_id
+                || prepared.snapshot_id != expected_snapshot_id
+            {
+                return Err(ProviderError::new(ErrorKind::Corrupt));
+            }
+            Ok(prepared)
+        },
+    )
+    .await
+}
+
+/// Prepares a source that was resolved from the native conflict-source
+/// registry. The returned wrapper owns the source claim until the caller has
+/// consumed the prepared snapshot or explicitly keeps the claim from
+/// `into_parts` while staging it.
+pub(crate) async fn prepare_validated_conflict_source<Claim: Send>(
+    app: &AppHandle,
+    source: ValidatedConflictSource<Claim>,
+    staging: &std::path::Path,
+    cancel: &Cancellation,
+) -> Result<PreparedConflictSource<Claim>> {
+    let ValidatedConflictSource {
+        conflict_id: _,
+        kind,
+        claim,
+    } = source;
+    let root = runtime::root(app)?;
+    let prepared = match kind {
+        ValidatedConflictSourceKind::Local {
+            repository_id,
+            capture,
+        } => snapshot_export::prepare_local_conflict_snapshot(
+            &root,
+            &repository_id,
+            &capture,
+        )?,
+        ValidatedConflictSourceKind::Remote {
+            connection_id,
+            repository_id,
+            snapshot,
+        } => {
+            download_remote_conflict_source(
+                app,
+                &root,
+                staging,
+                &connection_id,
+                &repository_id,
+                &snapshot,
+                cancel,
+            )
+            .await?
+        }
+    };
+    Ok(PreparedConflictSource { prepared, claim })
+}
+
+/// Exports a source that was resolved from the native conflict-source
+/// registry. The local variant never opens a provider connection; the remote
+/// variant validates its stored locator against the currently opened handle.
+pub(crate) async fn export_validated_conflict_source<Claim: Send>(
+    app: AppHandle,
+    source: ValidatedConflictSource<Claim>,
+) -> Result<ExportSnapshotResponse> {
+    let Some(selected) = selected_path(&app, &source.conflict_id) else {
+        return Ok(ExportSnapshotResponse {
+            cancelled: true,
+            destination: None,
+            sha256: None,
+        });
+    };
+    let root = runtime::root(&app)?;
+    std::fs::create_dir_all(root.join("external-storage"))
+        .map_err(|_| ProviderError::new(ErrorKind::Transient))?;
+    let staging = tempfile::Builder::new()
+        .prefix("external-conflict-export-")
+        .tempdir_in(root.join("external-storage"))
+        .map_err(|_| ProviderError::new(ErrorKind::Transient))?;
+    let cancel = Cancellation::default();
+    let prepared =
+        prepare_validated_conflict_source(&app, source, staging.path(), &cancel).await?;
+    let (snapshot, claim) = prepared.into_parts();
+    let result = publish_prepared_snapshot(&app, selected, snapshot, staging.path(), &cancel);
+    drop(claim);
+    result
+}
+
 #[tauri::command(async)]
 pub(crate) async fn external_storage_export_snapshot(
     app: AppHandle,
@@ -197,30 +487,7 @@ pub(crate) async fn external_storage_export_snapshot(
         },
     )
     .await?;
-    let path_destination = selected.clone().into_path().ok();
-    let local_destination = path_destination
-        .clone()
-        .unwrap_or_else(|| staging.path().join("selected-snapshot.risunest"));
-    let receipt = snapshot_export::export_verified_snapshot(
-        prepared,
-        &local_destination,
-        &staging.path().join("export"),
-        &cancel,
-    )?;
-    if path_destination.is_none() {
-        publish_uri_destination(
-            &app,
-            selected.clone(),
-            &local_destination,
-            &receipt.sha256,
-            &cancel,
-        )?;
-    }
-    Ok(ExportSnapshotResponse {
-        cancelled: false,
-        destination: Some(selected.to_string()),
-        sha256: Some(receipt.sha256),
-    })
+    publish_prepared_snapshot(&app, selected, prepared, staging.path(), &cancel)
 }
 
 #[cfg(test)]
@@ -230,7 +497,11 @@ mod tests {
         contract::{lease_object_id, LeaseKind, ObjectRole, RepositoryHandle},
         fake::{self, FakeLeaseClock, FakeProvider},
     };
+    use crate::persistent_store::sync_selection::CaptureIdentity;
     use risunest_external_storage_format::format::{Descriptor, Strategy};
+    use risunest_external_storage_format::snapshot::{
+        envelope_length, PublicObjectHeader, WireLocator,
+    };
     use std::{
         cell::RefCell,
         path::PathBuf,
@@ -436,6 +707,131 @@ mod tests {
         assert_eq!(
             archive_name("../snapshot/id"),
             "RisuNest-snapshotid.risunest"
+        );
+    }
+
+    fn stored_snapshot(repository_id: &str, object_id: &str, role: WireObjectRole) -> StoredObject {
+        let header = PublicObjectHeader::new(repository_id.into(), object_id.into(), role, 10)
+            .unwrap();
+        StoredObject {
+            ciphertext_length: envelope_length(&header).unwrap(),
+            ciphertext_sha256: [2; 32],
+            plaintext_length: 10,
+            plaintext_sha256: [3; 32],
+            locator: WireLocator {
+                connection_identity: "synthetic-account/root".into(),
+                collection: None,
+                object: "opaque-snapshot".into(),
+            },
+            header,
+        }
+    }
+
+    #[test]
+    fn conflict_export_sources_reject_unbound_repository_and_object_id() {
+        let valid = stored_snapshot(
+            "repository",
+            "snapshot-preserved",
+            WireObjectRole::BackupBundle,
+        );
+        assert!(remote_conflict_source(
+            (),
+            "conflict",
+            "connection",
+            "repository",
+            valid.clone(),
+        )
+        .is_ok());
+        assert_eq!(
+            remote_conflict_source((), "conflict", "connection", "other", valid.clone())
+                .unwrap_err()
+                .kind,
+            ErrorKind::Corrupt
+        );
+        let wrong_role = stored_snapshot("repository", "snapshot-preserved", WireObjectRole::Pack);
+        assert_eq!(
+            remote_conflict_source(
+                (),
+                "conflict",
+                "connection",
+                "repository",
+                wrong_role,
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::Corrupt
+        );
+        let wrong_id = stored_snapshot(
+            "repository",
+            "preserved",
+            WireObjectRole::BackupBundle,
+        );
+        assert_eq!(
+            remote_conflict_source(
+                (),
+                "conflict",
+                "connection",
+                "repository",
+                wrong_id,
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::Corrupt
+        );
+    }
+
+    #[test]
+    fn local_conflict_source_has_no_renderer_path_or_connection_input() {
+        let capture = DurableCaptureReference {
+            capture_id: "capture".into(),
+            identity: CaptureIdentity {
+                store_id: "store".into(),
+                library_epoch: "library".into(),
+                generation: "generation".into(),
+                selection_epoch: "selection".into(),
+                revision: 1,
+            },
+            catalog_path: "captures/capture/capture.sqlite".into(),
+            catalog_hash: "a".repeat(64),
+        };
+        let source = validated_conflict_source(
+            (),
+            ConflictSourceDescriptor::Local {
+                conflict_id: "conflict".into(),
+                repository_id: "repository".into(),
+                capture,
+            },
+        )
+        .unwrap();
+        assert_eq!(source.conflict_id, "conflict");
+        assert!(matches!(
+            source.kind,
+            ValidatedConflictSourceKind::Local {
+                repository_id,
+                ..
+            } if repository_id == "repository"
+        ));
+        assert_eq!(
+            local_conflict_source(
+                (),
+                "forged\0conflict",
+                "repository",
+                DurableCaptureReference {
+                    capture_id: "capture".into(),
+                    identity: CaptureIdentity {
+                        store_id: "store".into(),
+                        library_epoch: "library".into(),
+                        generation: "generation".into(),
+                        selection_epoch: "selection".into(),
+                        revision: 1,
+                    },
+                    catalog_path: "captures/capture/capture.sqlite".into(),
+                    catalog_hash: "a".repeat(64),
+                },
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::Corrupt
         );
     }
 }
