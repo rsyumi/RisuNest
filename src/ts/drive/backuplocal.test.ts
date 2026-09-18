@@ -20,7 +20,9 @@ const state = vi.hoisted(() => ({
     nativeFileClose: vi.fn(async () => undefined),
     fullReadFile: vi.fn(async () => new Uint8Array([99])),
     restoreEvents: [] as string[],
-    replacePersistentDatabase: vi.fn(async (_database: Database, _reason: string) => undefined),
+    replacePersistentDatabase: vi.fn(async (_database: Database, _reason: string) => ({
+        kind: 'committed', revision: 1, projection: 'applied',
+    } as const)),
     confirmColdStorage: vi.fn(async () => true),
     getUncleanables: vi.fn(async () => ['assets/second-read.png']),
     fallbackContext: {
@@ -156,6 +158,7 @@ describe('local backup persistent snapshot', () => {
         state.replacePersistentDatabase.mockReset().mockImplementation(async (_database, reason) => {
             expect(reason).toBe('local-backup')
             state.restoreEvents.push('database')
+            return { kind: 'committed', revision: 1, projection: 'applied' }
         })
         state.blobStore = emptyBlobStore()
         state.nativeFileClose.mockClear()

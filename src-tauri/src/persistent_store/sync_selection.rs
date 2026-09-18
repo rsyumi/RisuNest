@@ -109,7 +109,7 @@ pub(crate) fn select(
     }
     tx.execute("UPDATE library_sync_selection SET target=?1,connection_id=?2,selection_epoch=?3,paused=0,decision_required=0 WHERE singleton=1",params![kind,id,uuid::Uuid::new_v4().to_string()])?;
     tx.execute(
-        "UPDATE external_storage_jobs SET phase='stale' WHERE role='sync' AND phase IN ('preparing','ready')",
+        "UPDATE external_storage_jobs SET phase='stale' WHERE role IN ('sync','restore') AND phase IN ('preparing','ready')",
         [],
     )?;
     read(tx)
@@ -206,7 +206,6 @@ pub(super) fn restored_copy(tx: &Transaction<'_>) -> StoreResult<()> {
     tx.execute("UPDATE library_sync_selection SET selection_epoch=?1,decision_required=1 WHERE singleton=1",[uuid::Uuid::new_v4().to_string()])?;
     tx.execute("UPDATE external_storage_jobs SET phase='stale' WHERE phase NOT IN ('complete','cancelled')",[])?;
     tx.execute("UPDATE content_change_consumers SET rebuild_required=1", [])?;
-    tx.execute("DELETE FROM content_capture_reservations", [])?;
     tx.execute("DELETE FROM content_change_context", [])?;
     Ok(())
 }

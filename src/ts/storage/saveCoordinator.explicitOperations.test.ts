@@ -20,6 +20,122 @@ import {
     SaveCoordinator,
 } from './saveCoordinator.testSupport'
 
+describe('SaveCoordinator replacement commit boundary', () => {
+    function replacementHarness(initial: Database = makeDatabase()) {
+        let database = initial
+        let revision = 7
+        const commit = vi.fn(async ({ expectedRevision }: WorkingSetCommit) => {
+            expect(expectedRevision).toBe(revision)
+            return { revision: ++revision }
+        })
+        const store = makeStore(commit)
+        vi.mocked(store.replaceFromDatabase).mockImplementation(async (_database, expectedRevision) => {
+            expect(expectedRevision).toBe(revision)
+            return { revision: ++revision }
+        })
+        const publish = vi.fn((value: Database) => { database = structuredClone(value) })
+        const onBackgroundError = vi.fn()
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0] ?? null,
+            replaceDatabase: publish,
+            onBackgroundError,
+        })
+        coordinator.initialize(revision)
+        return { coordinator, store, commit, publish, onBackgroundError, database: () => database }
+    }
+
+    it('does not reserve the local write queue while replacement preparation is pending', async () => {
+        const { coordinator, store, commit, database } = replacementHarness()
+        const preparation = deferred<Database>()
+        const replacing = coordinator.replacePreparedPersistentDatabase(
+            () => preparation.promise, 'slow-preparation',
+        )
+        const settled = replacing.then(
+            (value) => ({ value }),
+            (error: unknown) => ({ error }),
+        )
+        expect(coordinator.hasDestructiveReplacementFence).toBe(false)
+        database().username = 'Edit while preparing'
+        coordinator.markPersistentDataDirty(10)
+        const flushing = coordinator.flushPendingDataLocally('during-preparation')
+        try {
+            await vi.waitFor(() => expect(commit).toHaveBeenCalledOnce())
+            await flushing
+            expect(store.replaceFromDatabase).not.toHaveBeenCalled()
+        } finally {
+            preparation.resolve(makeDatabase())
+            await Promise.allSettled([flushing, settled])
+        }
+        expect(await settled).toHaveProperty('error')
+        expect(store.replaceFromDatabase).not.toHaveBeenCalled()
+        expect(database().username).toBe('Edit while preparing')
+    })
+
+    it('fences new writers synchronously before a direct replacement enters its queue', async () => {
+        const { coordinator, store } = replacementHarness()
+        const replacing = coordinator.replacePersistentDatabase(makeDatabase(), 'guarded-replacement')
+        try {
+            expect(coordinator.hasDestructiveReplacementFence).toBe(true)
+            expect(() => coordinator.assertPersistentMutationAllowed()).toThrow(/replacement is active/i)
+            expect(() => coordinator.markPersistentDataDirty(1)).toThrow(/replacement is active/i)
+        } finally {
+            await replacing
+        }
+        expect(store.replaceFromDatabase).toHaveBeenCalledOnce()
+        expect(store.commit).not.toHaveBeenCalled()
+        expect(coordinator.hasDestructiveReplacementFence).toBe(false)
+    })
+
+    it('rejects a changed preparation snapshot before replacing even without a dirty notification', async () => {
+        const { coordinator, store, database } = replacementHarness()
+        const preparation = deferred<Database>()
+        const replacing = coordinator.replacePreparedPersistentDatabase(
+            () => preparation.promise, 'unannounced-prepare-edit',
+        )
+        const rejected = expect(replacing).rejects.toThrow()
+        database().username = 'Unannounced newer edit'
+        preparation.resolve(makeDatabase())
+        await rejected
+        expect(store.replaceFromDatabase).not.toHaveBeenCalled()
+        expect(database().username).toBe('Unannounced newer edit')
+        await coordinator.flushPendingDataLocally('preserve-unannounced-edit')
+        expect(store.commit).toHaveBeenCalledOnce()
+    })
+
+    it.each(['empty', 'removed'] as const)('does not resave the newly selected character after replacing an %s selection', async (selection) => {
+        const initial = makeDatabase()
+        if (selection === 'empty') initial.characters = []
+        const { coordinator, store, database } = replacementHarness(initial)
+        const candidate = makeDatabase()
+        candidate.characters[0].chaId = 'new-selected-character'
+        candidate.characters[0].name = 'Imported selection'
+        await coordinator.replacePersistentDatabase(candidate, 'new-selection')
+        expect(database().characters[0].chaId).toBe('new-selected-character')
+        await coordinator.flushPendingDataLocally('clean-after-replacement')
+        expect(store.replaceFromDatabase).toHaveBeenCalledOnce()
+        expect(store.commit).not.toHaveBeenCalled()
+        expect(coordinator.revision).toBe(8)
+    })
+
+    it('commits once and retains only the refresh guard when projection fails', async () => {
+        const { coordinator, store, publish, onBackgroundError } = replacementHarness()
+        const failure = new Error('projection unavailable')
+        publish.mockImplementationOnce(() => { throw failure })
+        await expect(coordinator.replacePersistentDatabase(makeDatabase(), 'failed-projection')).resolves.toEqual({
+            kind: 'committed', revision: 8, projection: 'refresh-required',
+        })
+        expect(store.replaceFromDatabase).toHaveBeenCalledOnce()
+        expect(store.commit).not.toHaveBeenCalled()
+        expect(coordinator.hasDestructiveReplacementFence).toBe(false)
+        expect(coordinator.pendingWorkingSetRefreshRevision).toBe(8)
+        expect(onBackgroundError).toHaveBeenCalledWith(failure)
+        expect(() => coordinator.markPersistentDataDirty(1)).toThrow(/replacement is active/i)
+        await expect(coordinator.flushPendingDataLocally('no-rewrite')).rejects.toThrow(/replacement is active/i)
+    })
+})
+
 describe('canonical JSON property safety', () => {
     it('preserves JSON-origin own proto keys at every nested level', () => {
         const source = JSON.parse(
@@ -441,6 +557,10 @@ describe('SaveCoordinator', () => {
             { ...structuredClone(database.characters[0].chats[0]), name: 'After' },
         )
 
+        expect(pin).not.toHaveBeenCalled()
+        expect(coordinator.revision).toBe(8)
+        expect(coordinator.hasPendingOfficialPublication).toBe(true)
+        await coordinator.publishCurrentOfficialRevision()
         expect(pin).toHaveBeenCalledWith(8)
         expect(publication.publish).toHaveBeenCalledOnce()
         expect(publication.dispose).toHaveBeenCalledOnce()
@@ -1642,6 +1762,8 @@ describe('SaveCoordinator', () => {
         coordinator.initialize(3, database)
         v3Storage = createPluginStorageStore({
             store,
+            getStorageAuthorityEpoch: () => coordinator.storageAuthorityEpoch,
+            assertPersistentMutationAllowed: (epoch) => coordinator.assertPersistentMutationAllowed(epoch),
             mutate: (mutations) => coordinator.mutatePersistentPluginStorage(
                 'overlapping-v3-v2',
                 mutations,
@@ -1992,7 +2114,7 @@ describe('SaveCoordinator', () => {
         },
     )
 
-    it('observes preparation rejection even when a stale queued replacement never consumes it', async () => {
+    it('reports preparation failure without waiting for an occupied local write queue', async () => {
         const database = makeDatabase()
         const store = makeStore(vi.fn())
         const coordinator = new SaveCoordinator({
@@ -2013,13 +2135,14 @@ describe('SaveCoordinator', () => {
         const replacing = coordinator.replacePreparedPersistentDatabase(
             () => preparation.promise, 'stale-failed-preparation', { expectedRevision: 7 },
         )
-        const rejected = expect(replacing).rejects.toBeInstanceOf(RevisionConflictError)
-        preparation.reject(new Error('preparation failed before the queue became available'))
-        // Let unhandled-rejection reporting run while the replacement is still queued.
+        const failure = new Error('preparation failed before the queue became available')
+        const rejected = expect(replacing).rejects.toBe(failure)
+        preparation.reject(failure)
+        await rejected
         await new Promise<void>((resolve) => setTimeout(resolve, 0))
         expect(store.replaceFromDatabase).not.toHaveBeenCalled()
         blocked.resolve(8)
-        await Promise.all([blocking, rejected])
+        await blocking
         expect(coordinator.revision).toBe(8)
         expect(store.commit).not.toHaveBeenCalled()
     })
@@ -2176,8 +2299,10 @@ describe('SaveCoordinator', () => {
             coordinator.markPersistentDataDirty(1)
             prepared.resolve(makeDatabase())
 
-            await expect(replacement).rejects.toThrow('mutation generation 0')
+            await expect(replacement).rejects.toBeInstanceOf(RevisionConflictError)
             expect(store.replaceFromDatabase).not.toHaveBeenCalled()
+            expect(database.username).toBe('Edit during preparation')
+            expect(store.commit).toHaveBeenCalledOnce()
         } finally {
             vi.useRealTimers()
         }
@@ -3276,7 +3401,8 @@ describe('SaveCoordinator', () => {
             'continuous-generation-edit',
             (current) => ({ ...current, name: 'Explicit replacement' }),
         )).rejects.toThrow('Resident character changed')
-        expect(publishedRevisions).toEqual([14])
+        expect(publishedRevisions).toEqual([])
+        expect(coordinator.hasPendingOfficialPublication).toBe(true)
 
         const result = await Promise.race([
             coordinator.flushPendingDataLocally('generation-completion').then(() => 'committed'),
@@ -3298,13 +3424,13 @@ describe('SaveCoordinator', () => {
         })
         expect(coordinator.revision).toBe(15)
         expect(coordinator.hasPendingOfficialPublication).toBe(true)
-        expect(pin).toHaveBeenCalledOnce()
+        expect(pin).not.toHaveBeenCalled()
 
         const publishing = coordinator.publishCurrentOfficialRevision()
         await vi.waitFor(() => expect(pin).toHaveBeenLastCalledWith(15))
         laterPublication.resolve(undefined)
         await publishing
-        expect(publishedRevisions).toEqual([14, 15])
+        expect(publishedRevisions).toEqual([15])
     })
 
     it('publishes a deferred target compensation when a tokened replacement then rejects', async () => {
@@ -3357,7 +3483,8 @@ describe('SaveCoordinator', () => {
                 'continuous-inactive-resident-edits',
                 (current) => ({ ...current, name: 'Explicit replacement' }),
             )).rejects.toThrow('Resident character changed')
-            expect(publishedRevisions).toEqual([14])
+            expect(publishedRevisions).toEqual([])
+            expect(coordinator.hasPendingOfficialPublication).toBe(true)
 
             await expect(coordinator.replacePersistentDatabase(
                 makeDatabase(),
@@ -3368,12 +3495,12 @@ describe('SaveCoordinator', () => {
             expect(commit).toHaveBeenCalledTimes(5)
             expect(coordinator.revision).toBe(15)
             expect(store.replaceFromDatabase).not.toHaveBeenCalled()
-            expect(publishedRevisions).toEqual([14])
+            expect(publishedRevisions).toEqual([])
 
             await vi.advanceTimersByTimeAsync(3_000)
 
             expect(pin).toHaveBeenLastCalledWith(15)
-            expect(publishedRevisions).toEqual([14, 15])
+            expect(publishedRevisions).toEqual([15])
         } finally {
             vi.useRealTimers()
         }
@@ -3458,10 +3585,7 @@ describe('SaveCoordinator', () => {
             'normal-exit-fence',
             { publishOfficial: false },
         )
-        const fence = await coordinator.acquireDestructiveReplacementFence(token, {
-            allowRevisionAdvance: true,
-            publishOfficial: false,
-        })
+        const fence = await coordinator.acquireDestructiveReplacementFence(token)
 
         expect(token.revision).toBe(13)
         expect(coordinator.revision).toBe(13)
@@ -3548,7 +3672,7 @@ describe('SaveCoordinator', () => {
         )
     })
 
-    it('admits an already-applied edit while the exact fence is still acquiring', async () => {
+    it('blocks mutation entry synchronously while the exact fence is still acquiring', async () => {
         const database = makeDatabase()
         const store = makeStore(vi.fn(async ({ expectedRevision }) => ({
             revision: expectedRevision + 1,
@@ -3569,12 +3693,18 @@ describe('SaveCoordinator', () => {
             'queued-preset-mutation',
             () => undefined,
         )).toThrow(/replacement is active/i)
-        database.username = 'Edit completed during final handshake'
-        expect(() => coordinator.markPersistentDataDirty(2 * 1024 * 1024)).not.toThrow()
+        expect(() => {
+            coordinator.assertPersistentMutationAllowed()
+            database.username = 'Must not be applied'
+        }).toThrow(/replacement is active/i)
+        expect(() => coordinator.markPersistentDataDirty(2 * 1024 * 1024)).toThrow(/replacement is active/i)
 
-        await expect(acquiring).rejects.toThrow(/revision|mutation generation/i)
-        expect(coordinator.revision).toBe(13)
-        expect(database.username).toBe('Edit completed during final handshake')
+        const owner = await acquiring
+        expect(coordinator.revision).toBe(12)
+        expect(database.username).toBe('Fixture')
+        expect(store.commit).not.toHaveBeenCalled()
+        coordinator.releaseDestructiveReplacementFence(owner)
+        expect(() => coordinator.assertPersistentMutationAllowed()).not.toThrow()
     })
 
     it('returns the snapshot revision atomically before a queued replacement advances it', async () => {

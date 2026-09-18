@@ -31,21 +31,24 @@ pub(crate) trait ContentCaptureSink {
 pub(crate) struct PreparedContentCapture {
     pub identity: CaptureIdentity,
     consumer: String,
-    reservation: String,
+    capture_id: String,
     reader: RevisionReadLease,
     repository_root: PathBuf,
     _inventory: super::snapshot::DeferredAssetInventory,
 }
 
 impl PersistentStore {
-    /// Reserve before opening the read snapshot. Pruning cannot discard R+1
-    /// while a first full capture at R is materialized outside the store mutex.
+    /// Pin the index and body to one read snapshot. Registration rechecks the
+    /// live floor before committing this snapshot as an incremental baseline.
     pub(crate) fn prepare_content_capture(
         &mut self,
-        reservation: &str,
+        capture_id: &str,
         consumer: &str,
         revision: i64,
     ) -> StoreResult<PreparedContentCapture> {
+        if capture_id.is_empty() {
+            return Err(missing_source("capture identity"));
+        }
         if consumer.is_empty() {
             return Err(missing_source("capture consumer"));
         }
@@ -56,48 +59,28 @@ impl PersistentStore {
                 actual: identity.revision,
             });
         }
-        let tx = self.connection.transaction()?;
-        content_change_index::reserve(&tx, reservation, &identity.generation, revision)?;
-        tx.commit()?;
-        let result = (|| {
-            let _repository_guard =
-                crate::asset_repository::coordinator::lock_repository_mutation()?;
-            let (_, reader) = super::snapshot::acquire_revision(
-                &self.database_path,
-                revision,
-                Arc::clone(&self.active_readers),
-            )?;
-            let inventory = self.active_readers.defer_asset_inventory();
-            Ok(PreparedContentCapture {
-                identity,
-                consumer: consumer.into(),
-                reservation: reservation.into(),
-                reader,
-                repository_root: self.repository_root.clone(),
-                _inventory: inventory,
-            })
-        })();
-        if result.is_err() {
-            self.connection.execute(
-                "DELETE FROM content_capture_reservations WHERE id=?1",
-                [reservation],
-            )?;
-        }
-        result
-    }
-
-    pub(crate) fn abandon_content_capture(&mut self, reservation: &str) -> StoreResult<()> {
-        self.connection.execute(
-            "DELETE FROM content_capture_reservations WHERE id=?1",
-            [reservation],
+        let _repository_guard =
+            crate::asset_repository::coordinator::lock_repository_mutation()?;
+        let (_, reader) = super::snapshot::acquire_revision(
+            &self.database_path,
+            revision,
+            Arc::clone(&self.active_readers),
         )?;
-        Ok(())
+        let inventory = self.active_readers.defer_asset_inventory();
+        Ok(PreparedContentCapture {
+            identity,
+            consumer: consumer.into(),
+            capture_id: capture_id.into(),
+            reader,
+            repository_root: self.repository_root.clone(),
+            _inventory: inventory,
+        })
     }
 }
 
 impl PreparedContentCapture {
-    /// File finalization precedes this transaction. The content cursor, cache
-    /// delta and authoritative GC reference advance together. No remote state is
+    /// File finalization precedes this transaction. The content cursor, index
+    /// floor and authoritative GC reference advance together. No remote state is
     /// required, and a rollback keeps the old local cursor usable.
     pub(crate) fn register(
         self,
@@ -123,26 +106,9 @@ impl PreparedContentCapture {
         }
         let fingerprint = catalog.content_fingerprint(scope_id)?;
         let tx = store.connection.transaction()?;
-        if catalog.rebuilt {
-            tx.execute(
-                "DELETE FROM external_storage_content_cache WHERE consumer_id=?1",
-                [&self.consumer],
-            )?;
-        }
-        let mut query=catalog.db.prepare("SELECT d.key,r.hash,r.bytes FROM delta d LEFT JOIN records r ON r.key=d.key ORDER BY d.key")?;
-        let mut rows = query.query([])?;
-        while let Some(row) = rows.next()? {
-            let key: String = row.get(0)?;
-            let hash: Option<String> = row.get(1)?;
-            tx.execute("DELETE FROM external_storage_content_cache WHERE consumer_id=?1 AND kind='logical' AND key1=?2",params![self.consumer,key])?;
-            if let Some(hash) = hash {
-                let size: i64 = row.get(2)?;
-                tx.execute("INSERT INTO external_storage_content_cache VALUES(?1,?2,'logical',?3,'',?4,?5)",params![self.consumer,self.identity.generation,key,hash,size])?;
-            }
-        }
         let id = super::external_storage_state::register_capture(
             &tx,
-            &self.reservation,
+            &self.capture_id,
             &self.identity,
             &hex::encode(scope_id),
             codec,
@@ -154,6 +120,7 @@ impl PreparedContentCapture {
             "INSERT OR IGNORE INTO external_storage_capture_files VALUES(?1,?2,?3)",
             params![id, path.to_string_lossy(), hex::encode(file_hash)],
         )?;
+        content_change_index::prune(&tx)?;
         tx.commit()?;
         Ok(id)
     }

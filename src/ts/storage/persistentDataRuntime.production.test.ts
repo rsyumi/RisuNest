@@ -355,6 +355,8 @@ describe('production persistent working-set publication', () => {
             settings: { mode: 'maximum' },
         }
         const storage = createPluginStorageStore({
+            getStorageAuthorityEpoch: () => 0,
+            assertPersistentMutationAllowed: vi.fn(),
             store: {
                 open: async () => undefined,
                 queryPluginStorage: async () => ({

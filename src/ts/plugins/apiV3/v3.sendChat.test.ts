@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
     api: null as any,
     database: null as any,
     selectedId: 0,
+    authorityEpoch: 0,
     session: null as any,
     selectedTarget: null as any,
     acquireCompleteConversation: vi.fn(),
@@ -94,7 +95,11 @@ vi.mock('src/ts/process/ttsHooks', () => ({
 vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
     acquireCompleteConversation: mocks.acquireCompleteConversation,
     captureSelectedConversationTarget: () => mocks.selectedTarget,
-    flushPendingData: vi.fn(),
+    flushPendingDataLocally: vi.fn(),
+    assertPersistentMutationAllowed: (epoch = mocks.authorityEpoch) => {
+        if (epoch !== mocks.authorityEpoch) throw new Error('Persistent mutation fenced')
+    },
+    getPersistentStorageAuthorityEpoch: () => mocks.authorityEpoch,
     getActiveConversationSession: () => mocks.session,
     getPersistentNavigationGeneration: () => 0,
     getPersistentDataRuntime: vi.fn(),

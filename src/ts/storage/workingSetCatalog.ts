@@ -229,6 +229,22 @@ export function getCatalogPresetMetadata(
     return (presets as CatalogPresetWorkingSet)[catalogPresetMetadata]
 }
 
+export function advanceCatalogPresetWorkingSetRevision(
+    presets: Database['botPresets'],
+    revision: number,
+): Database['botPresets'] {
+    const metadata = getCatalogPresetMetadata(presets)
+    if (!metadata) throw new Error('Cannot advance a non-catalog preset working set')
+    const advanced = presets.slice()
+    Object.defineProperty(advanced, catalogPresetMetadata, {
+        configurable: false,
+        enumerable: false,
+        value: { ...metadata, catalogRevision: revision } satisfies CatalogPresetMetadata,
+        writable: false,
+    })
+    return advanced
+}
+
 export function isCatalogPresetWorkingSet(presets: Database['botPresets']): boolean {
     if (!presets) return false
     return getCatalogPresetMetadata(presets)?.residency === 'selected-only'

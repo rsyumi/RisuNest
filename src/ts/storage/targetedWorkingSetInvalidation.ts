@@ -1,4 +1,5 @@
 import type { Chat, Database, character, groupChat } from './database.svelte'
+import type { ReplacementChangeSet } from './persistentDataRuntime'
 import {
     CONTENT_CHANGE_PAGE_LIMIT,
     type CharacterDetail,
@@ -9,10 +10,12 @@ import {
 import { assertPinnedRevision } from './persistentRecordIterator'
 import {
     createCatalogCharacterStub,
+    advanceCatalogPresetWorkingSetRevision,
     createCatalogPresetWorkingSet,
     createPinnedDetailOnlyCharacter,
     createPinnedResidentCharacter,
     getCatalogCharacterMetadata,
+    getCatalogPresetMetadata,
     isCatalogPresetWorkingSet,
     readPinnedActivePreset,
     type PinnedScalableWorkingSetOptions,
@@ -32,6 +35,7 @@ export interface TargetedWorkingSetInvalidationOptions
     extends PinnedScalableWorkingSetOptions {
     /** The conversation a reply is being generated into, if any. */
     deferredConversation?: DeferredConversationTarget | null
+    changeSet?: ReplacementChangeSet
     onPluginStorageChanged?(owner: string, key: string): void
 }
 
@@ -45,6 +49,7 @@ const ROOT_OWNER_KINDS = new Set(['root-module-assets', 'persona-embedded-module
 
 interface ChangePlan {
     root: boolean
+    presets: boolean
     characterIds: Set<string>
     deferredConversation: boolean
 }
@@ -55,19 +60,32 @@ function planChanges(
     keys: readonly ContentChangeKey[],
     options: TargetedWorkingSetInvalidationOptions,
 ): ChangePlan | null {
+    const changes = options.changeSet
+    if (changes?.wholeLibrary) return null
+    if (changes && changes.characterIds.length + changes.conversations.length > TARGETED_INVALIDATION_KEY_LIMIT) {
+        return null
+    }
     const plan: ChangePlan = {
-        root: false,
-        characterIds: new Set<string>(),
+        root: changes?.root ?? false,
+        presets: changes?.presets ?? false,
+        characterIds: new Set(changes?.characterIds),
         deferredConversation: false,
     }
     const deferral = options.deferredConversation ?? null
+    for (const conversation of changes?.conversations ?? []) {
+        plan.characterIds.add(conversation.characterId)
+        if (deferral?.characterId === conversation.characterId &&
+            deferral.conversationId === conversation.conversationId) {
+            plan.deferredConversation = true
+        }
+    }
     for (const key of keys) {
         switch (key.kind) {
             case 'root':
                 plan.root = true
                 break
             case 'preset':
-                // Every pass reprojects the preset catalog.
+                plan.presets = true
                 break
             case 'character':
                 plan.characterIds.add(key.key1)
@@ -150,18 +168,37 @@ export async function applyTargetedWorkingSetInvalidation(
         rootValue = root.value as unknown as Record<string, unknown>
     }
 
-    // The preset catalog revision moves with every commit, so the catalog is
-    // rebuilt on every pass rather than tracked locator by locator.
     const botPresetsId = (rootValue?.botPresetsId ?? previous.botPresetsId) as number
-    const presets = await readPinnedActivePreset(reader, botPresetsId)
-    const botPresets = createCatalogPresetWorkingSet(presets.catalog, presets.active)
+    let botPresets: Database['botPresets']
+    if (plan.presets || botPresetsId !== previous.botPresetsId ||
+        (getCatalogPresetMetadata(previous.botPresets)?.activeConfiguredIndex ?? null) !==
+            (previous.botPresets[botPresetsId] ? botPresetsId : null)) {
+        const presets = await readPinnedActivePreset(reader, botPresetsId)
+        botPresets = createCatalogPresetWorkingSet(presets.catalog, presets.active)
+    } else {
+        botPresets = advanceCatalogPresetWorkingSetRevision(previous.botPresets, reader.revision)
+    }
 
     const selectedCharacterId = options.selectedCharacterId
     const residentIds = new Set(options.activeCharacterIds)
     let selectedSummary: CharacterSummary | null = null
     let selectedDetail: CharacterDetail | null = null
+    const previousSelected = selectedCharacterId
+        ? previous.characters[positions.get(selectedCharacterId) ?? -1]
+        : null
+    const refreshSelected = !!selectedCharacterId && (
+        !previousSelected ||
+        getCatalogCharacterMetadata(previousSelected)?.residency !== 'detail' ||
+        plan.characterIds.has(selectedCharacterId)
+    )
     if (selectedCharacterId) {
         residentIds.add(selectedCharacterId)
+        if (!refreshSelected && previousSelected?.type === 'group') {
+            for (const member of previousSelected.characters) residentIds.add(member)
+        }
+    }
+    if (selectedCharacterId && refreshSelected) {
+        plan.characterIds.add(selectedCharacterId)
         selectedSummary = await reader.readCharacterSummary(selectedCharacterId)
         if (selectedSummary && !selectedSummary.archived) {
             const value = await reader.readCharacter(selectedCharacterId)

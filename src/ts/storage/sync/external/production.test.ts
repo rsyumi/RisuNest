@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ExternalJobSummary, ExternalStorageState } from './types'
+import type { CommittedApplyOutcome } from '../../persistentDataRuntime'
 
 const mocks = vi.hoisted(() => ({
     revision: 8,
@@ -18,7 +19,9 @@ const mocks = vi.hoisted(() => ({
         applyReceived: vi.fn(),
     },
     flush: vi.fn(async (_reason: string) => {}),
-    refreshWorkingSet: vi.fn(async () => {}),
+    refreshWorkingSet: vi.fn(async (revision: number): Promise<CommittedApplyOutcome> => ({
+        kind: 'committed', revision, projection: 'applied',
+    })),
     releaseFence: vi.fn(),
     reloadPlugins: vi.fn(async () => {}),
 }))

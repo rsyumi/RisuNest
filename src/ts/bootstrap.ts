@@ -633,10 +633,7 @@ export async function loadData() {
                     'normal-exit-fence',
                     { publishOfficial: false },
                 )
-                const fence = await runtime.acquireDestructiveReplacementFence(
-                    token,
-                    { allowRevisionAdvance: true, publishOfficial: false },
-                )
+                const fence = await runtime.acquireDestructiveReplacementFence(token)
                 heldExitRevision = fence.revision
                 return fence
             },

@@ -11,7 +11,7 @@ import {
     TARGETED_INVALIDATION_KEY_LIMIT,
     type TargetedWorkingSetInvalidationOptions,
 } from './targetedWorkingSetInvalidation'
-import { projectPinnedScalableWorkingSet } from './workingSetCatalog'
+import { getCatalogPresetMetadata, projectPinnedScalableWorkingSet } from './workingSetCatalog'
 
 vi.mock('./database.svelte', () => ({
     getDatabase: () => {
@@ -664,6 +664,75 @@ async function runCatalogue(order: readonly number[], variant: Variant): Promise
 }
 
 describe('targeted invalidation equals a full reprojection', () => {
+    it('refreshes a nonresident changed ID without reading unchanged character or preset bodies', async () => {
+        const model = newModel()
+        const options = {
+            selectedCharacterId: 'char-a', selectedConversationId: 'conv-a2',
+            activeCharacterIds: new Set<string>(),
+        }
+        const previous = await projectPinnedScalableWorkingSet(createReader(model), options)
+        characterOf(model, 'char-b')!.detail.name = 'Updated summary'
+        model.revision++
+        const reader = createReader(model)
+        const summary = vi.spyOn(reader, 'readCharacterSummary')
+        const body = vi.spyOn(reader, 'readCharacter')
+        const conversations = vi.spyOn(reader, 'queryConversations')
+        const messages = vi.spyOn(reader, 'readConversation')
+        const root = vi.spyOn(reader, 'readRoot')
+        const presets = vi.spyOn(reader, 'queryPresets')
+        const preset = vi.spyOn(reader, 'readPreset')
+        const result = await applyTargetedWorkingSetInvalidation(previous, [], reader, {
+            ...options,
+            changeSet: {
+                root: false, presets: false, pluginStorage: false, wholeLibrary: false,
+                characterIds: ['char-b'], conversations: [],
+            },
+        })
+
+        expect(result!.database.characters.find((value) => value.chaId === 'char-b')?.name)
+            .toBe('Updated summary')
+        expect(result!.database.characters[0]).toBe(previous.characters[0])
+        expect(summary.mock.calls).toEqual([['char-b']])
+        for (const read of [body, conversations, messages, root, presets, preset]) {
+            expect(read).not.toHaveBeenCalled()
+        }
+        expect(result!.database.botPresets[0]).toBe(previous.botPresets[0])
+        expect(getCatalogPresetMetadata(result!.database.botPresets)?.catalogRevision).toBe(2)
+        expect(getCatalogPresetMetadata(previous.botPresets)?.catalogRevision).toBe(1)
+    })
+
+    it('reprojects only the root when a committed change set contains no character or preset changes', async () => {
+        const model = newModel()
+        const options = {
+            selectedCharacterId: 'char-a', selectedConversationId: 'conv-a2',
+            activeCharacterIds: new Set<string>(),
+        }
+        const previous = await projectPinnedScalableWorkingSet(createReader(model), options)
+        model.root.username = 'Committed root'
+        model.revision++
+        const reader = createReader(model)
+        const root = vi.spyOn(reader, 'readRoot')
+        const summary = vi.spyOn(reader, 'readCharacterSummary')
+        const body = vi.spyOn(reader, 'readCharacter')
+        const presets = vi.spyOn(reader, 'queryPresets')
+        const result = await applyTargetedWorkingSetInvalidation(previous, [], reader, {
+            ...options,
+            changeSet: {
+                root: true, presets: false, pluginStorage: false, wholeLibrary: false,
+                characterIds: [], conversations: [],
+            },
+        })
+
+        expect(result!.database.username).toBe('Committed root')
+        expect(root).toHaveBeenCalledOnce()
+        expect(summary).not.toHaveBeenCalled()
+        expect(body).not.toHaveBeenCalled()
+        expect(presets).not.toHaveBeenCalled()
+        for (let index = 0; index < previous.characters.length; index++) {
+            expect(result!.database.characters[index]).toBe(previous.characters[index])
+        }
+    })
+
     for (const variant of VARIANTS) {
         it(`applies the change catalogue in order with ${variant.name}`, async () => {
             await runCatalogue(STEPS.map((_, index) => index), variant)

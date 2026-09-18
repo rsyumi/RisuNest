@@ -1907,6 +1907,13 @@ export const languageEnglish = {
     skipSavingAssetsOnWebSync: "Skip Saving Assets on Web Sync",
     applyAdditionalParamsToAll: "Apply Additional Parameters to All Models",
     risuNest: {
+        persistentData: {
+            followupFailed: 'The restore is saved, but a follow-up step could not finish. Do not import the backup again. Check sync status or restart the app.',
+            refreshTitle: 'Saved changes need a screen refresh',
+            refreshHelp: 'Your changes are saved. Editing is paused until the saved data can be read back into the screen. Refreshing does not save or import the data again.',
+            refresh: 'Refresh screen',
+            refreshFailed: 'The saved data could not be displayed. You can retry refreshing or restart the app.',
+        },
         exitSaveFailedWarning:
             'Saving failed. Choose Yes to exit without saving, or No to keep the app open and retry.',
         archive: {

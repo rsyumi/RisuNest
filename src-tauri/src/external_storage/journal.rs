@@ -54,6 +54,12 @@ pub(crate) struct TransferRecord {
     pub receipt: Option<ObjectReceipt>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpoolCleanup {
+    Retained,
+    Removed { objects: u64, bytes: u64 },
+}
+
 pub(crate) struct TransferJournal {
     db: Connection,
     directory: PathBuf,
@@ -84,6 +90,21 @@ impl TransferJournal {
     }
     pub(crate) fn job_id(&self) -> &str {
         &self.identity.job_id
+    }
+
+    pub(crate) fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    /// A previous receipt is historical once a fresh remote observation says
+    /// the object is missing. Keep its immutable source and upload session.
+    pub(crate) fn reopen_object(&mut self, object: &str) -> Result<()> {
+        if self.db.execute("UPDATE objects SET receipt=NULL WHERE id=?1", [object])
+            .map_err(storage)? != 1
+        {
+            return Err(corrupt());
+        }
+        Ok(())
     }
 
     /// What one job has already put in the repository, read without taking the
@@ -321,6 +342,71 @@ impl TransferJournal {
         Ok(())
     }
 
+    /// The actual worker must have ended before handing its journal here. PDS
+    /// completion is written only after the final remote root is confirmed;
+    /// cancellation is terminal only after any unknown publication is resolved.
+    /// This releases this job's capture reference, never another owner or the
+    /// shared capture payload. Conflicts and exports can retain every spool.
+    pub(crate) fn cleanup_terminal_spools(
+        self,
+        store: &mut crate::persistent_store::PersistentStore,
+        format_repository_id: &str,
+    ) -> Result<SpoolCleanup> {
+        let job = store.external_job(&self.identity.job_id).map_err(storage)?
+            .ok_or_else(corrupt)?;
+        if job.id != self.identity.job_id || job.connection_id != self.identity.connection_id
+            || job.repository_id != format_repository_id || job.capture_id != self.identity.capture_id
+            || job.identity != self.identity.capture
+        {
+            return Err(corrupt());
+        }
+        if !matches!(job.phase.as_str(), "complete" | "cancelled") {
+            return Ok(SpoolCleanup::Retained);
+        }
+        if !store.release_external_capture(&job.capture_id, &job.id).map_err(storage)? {
+            return Ok(SpoolCleanup::Retained);
+        }
+        if crate::trust_boundary::is_link_like(
+            &std::fs::symlink_metadata(&self.directory).map_err(storage)?,
+        ) {
+            return Err(corrupt());
+        }
+        let ids = {
+            let mut query = self.db.prepare("SELECT id FROM objects ORDER BY id").map_err(storage)?;
+            let rows = query.query_map([], |row| row.get::<_, String>(0)).map_err(storage)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>().map_err(storage)?
+        };
+        // Validate all registered files before the first unlink. Unregistered
+        // partial files, receive caches and shared source paths are not swept.
+        let mut files = Vec::new();
+        for id in ids {
+            self.record(&id)?.ok_or_else(corrupt)?;
+            let path = self.spool_path(&id);
+            match std::fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(storage(error)),
+                Ok(_) => {}
+            }
+            let file = crate::trust_boundary::open_regular_source(&path).map_err(storage)?;
+            let length = file.metadata().map_err(storage)?.len();
+            files.push((path, length));
+        }
+        let mut objects = 0u64;
+        let mut bytes = 0u64;
+        for (path, length) in files {
+            match std::fs::remove_file(path) {
+                Ok(()) => {
+                    objects = objects.checked_add(1).ok_or_else(corrupt)?;
+                    bytes = bytes.checked_add(length).ok_or_else(corrupt)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(storage(error)),
+            }
+        }
+        crate::trust_boundary::sync_directory(&self.directory).map_err(storage)?;
+        Ok(SpoolCleanup::Removed { objects, bytes })
+    }
+
     pub(crate) async fn release_completed_sessions(
         &mut self,
         vault: &dyn super::auth::SecretVault,
@@ -346,6 +432,90 @@ impl TransferJournal {
                 .map_err(storage)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        external_storage::fake,
+        persistent_store::{external_storage_state, PersistentStore},
+    };
+
+    fn fixture() -> (tempfile::TempDir, PersistentStore, JobIdentity, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(root.path()).unwrap();
+        let capture = store.external_identity().unwrap();
+        // Seed only synthetic authority through the same capture registration
+        // operation used by PDS tests. No user data or provider is involved.
+        let mut db = Connection::open(root.path().join("persistent/persistent.sqlite")).unwrap();
+        let tx = db.transaction().unwrap();
+        external_storage_state::register_capture(
+            &tx, "capture", &capture, "scope", "logical-v1", "", &"a".repeat(64), "connection",
+        ).unwrap();
+        tx.commit().unwrap();
+        drop(db);
+        store.external_prepare_backup("job", "connection", "format-repository", "capture", "point").unwrap();
+        let identity = JobIdentity {
+            job_id: "job".into(), connection_id: "connection".into(),
+            repository_id: fake::repository().repository_id, capture_id: "capture".into(), capture,
+        };
+        let directory = root.path().join("job");
+        let mut journal = TransferJournal::open(&directory, identity.clone()).unwrap();
+        let bytes = b"synthetic sealed ciphertext";
+        let intent = ObjectIntent {
+            repository_id: identity.repository_id.clone(), job_id: identity.job_id.clone(),
+            object_id: "pack".into(), role: ObjectRole::Pack,
+            byte_length: bytes.len() as u64, sha256: risunest_sync_wire::hash(bytes),
+        };
+        std::fs::write(journal.spool_path("pack"), bytes).unwrap();
+        journal.register(&intent).unwrap();
+        drop(journal);
+        (root, store, identity, directory)
+    }
+
+    #[test]
+    fn c_terminal_spool_cleanup_preserves_failed_work_and_conflict_or_export_owners() {
+        let (root, mut store, identity, directory) = fixture();
+        let journal = TransferJournal::open(&directory, identity.clone()).unwrap();
+        let spool = journal.spool_path("pack");
+        assert_eq!(journal.cleanup_terminal_spools(&mut store, "format-repository").unwrap(), SpoolCleanup::Retained);
+        assert!(spool.is_file());
+        store.retain_external_capture("capture", "conflict-owner").unwrap();
+        store.retain_external_capture("capture", "export-owner").unwrap();
+        store.external_finish_backup("job", "point", "bundle", "authenticated-synthetic-observation").unwrap();
+        let journal = TransferJournal::open(&directory, identity.clone()).unwrap();
+        assert_eq!(journal.cleanup_terminal_spools(&mut store, "format-repository").unwrap(), SpoolCleanup::Retained);
+        assert!(spool.is_file());
+        assert!(!store.release_external_capture("capture", "conflict-owner").unwrap());
+        let journal = TransferJournal::open(&directory, identity.clone()).unwrap();
+        assert_eq!(journal.cleanup_terminal_spools(&mut store, "format-repository").unwrap(), SpoolCleanup::Retained);
+        assert!(store.release_external_capture("capture", "export-owner").unwrap());
+        let shared = root.path().join("shared-source.spool");
+        std::fs::write(&shared, b"shared source").unwrap();
+        let journal = TransferJournal::open(&directory, identity.clone()).unwrap();
+        assert_eq!(journal.cleanup_terminal_spools(&mut store, "format-repository").unwrap(),
+            SpoolCleanup::Removed { objects: 1, bytes: b"synthetic sealed ciphertext".len() as u64 });
+        assert!(!spool.exists());
+        assert_eq!(std::fs::read(shared).unwrap(), b"shared source");
+        let journal = TransferJournal::open(&directory, identity).unwrap();
+        assert_eq!(journal.cleanup_terminal_spools(&mut store, "format-repository").unwrap(),
+            SpoolCleanup::Removed { objects: 0, bytes: 0 });
+    }
+
+    #[test]
+    fn c_only_authoritatively_cancelled_matching_jobs_can_discard_their_spools() {
+        let (_root, mut store, identity, directory) = fixture();
+        let journal = TransferJournal::open(&directory, identity.clone()).unwrap();
+        let spool = journal.spool_path("pack");
+        assert_eq!(journal.cleanup_terminal_spools(&mut store, "wrong-repository").unwrap_err().kind, ErrorKind::Corrupt);
+        assert!(spool.exists());
+        store.external_cancel_prepared("job").unwrap();
+        let journal = TransferJournal::open(&directory, identity).unwrap();
+        assert!(matches!(journal.cleanup_terminal_spools(&mut store, "format-repository").unwrap(),
+            SpoolCleanup::Removed { objects: 1, .. }));
+        assert!(!spool.exists());
     }
 }
 

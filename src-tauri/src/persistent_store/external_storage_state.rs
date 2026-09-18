@@ -13,7 +13,6 @@ CREATE TABLE external_storage_history_points(job_id TEXT PRIMARY KEY,connection_
 CREATE TABLE external_storage_captures(id TEXT PRIMARY KEY,identity TEXT NOT NULL,scope_id TEXT NOT NULL,codec_id TEXT NOT NULL,device_capture_id TEXT NOT NULL,manifest_hash TEXT NOT NULL CHECK(length(manifest_hash)=64 AND manifest_hash NOT GLOB '*[^0-9a-f]*'),UNIQUE(identity,scope_id,codec_id,device_capture_id));
 CREATE TABLE external_storage_capture_refs(capture_id TEXT NOT NULL,job_id TEXT NOT NULL,PRIMARY KEY(capture_id,job_id));
 CREATE TABLE external_storage_capture_files(capture_id TEXT PRIMARY KEY,catalog_path TEXT NOT NULL,file_hash TEXT NOT NULL CHECK(length(file_hash)=64 AND file_hash NOT GLOB '*[^0-9a-f]*'));
-CREATE TABLE external_storage_content_cache(consumer_id TEXT NOT NULL,generation TEXT NOT NULL,kind TEXT NOT NULL,key1 TEXT NOT NULL,key2 TEXT NOT NULL,content_hash TEXT NOT NULL CHECK(length(content_hash)=64 AND content_hash NOT GLOB '*[^0-9a-f]*'),byte_size INTEGER NOT NULL CHECK(byte_size>=0),PRIMARY KEY(consumer_id,generation,kind,key1,key2));
 CREATE TABLE external_storage_conflicts(id TEXT PRIMARY KEY,connection_id TEXT NOT NULL,repository_id TEXT NOT NULL,local_capture_id TEXT NOT NULL,local_snapshot TEXT,local_identity TEXT NOT NULL,remote_snapshot TEXT,remote_logical_revision INTEGER CHECK(remote_logical_revision>=0),remote_commit_id TEXT,remote_head_observation TEXT,created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0),preservation TEXT NOT NULL CHECK(preservation IN ('localOnly','remoteComplete')),phase TEXT NOT NULL CHECK(phase IN ('pending','resolving','publicationUnknown','resolved')));
 "#;
 
@@ -414,7 +413,6 @@ pub(crate) fn register_capture(
         &identity.generation,
         identity.revision,
     )?;
-    tx.execute("DELETE FROM content_capture_reservations WHERE id=?1", [id])?;
     Ok(capture_id)
 }
 

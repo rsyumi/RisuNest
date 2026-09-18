@@ -3,6 +3,11 @@
 //! remote carried it.
 use super::{invalid, observe_remote_clock, sequence, DeviceStore, Section};
 use crate::persistent_store::StoreResult;
+use risunest_external_storage_format::section::{
+    decode_local_plugin_entry_key, hypa_entry_key, local_plugin_entry_key, HypaValue,
+    InlineOrObject, LocalPluginValue, LocalSettingValue, ObjectReference, PluginSpace,
+    SectionEntry, SectionEntryVersion, SectionKind, SectionValue, MAX_INLINE_VALUE_BYTES,
+};
 use risunest_sync_wire::Sequence;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
@@ -36,14 +41,14 @@ pub(crate) fn section_from_id(id: &str) -> Option<Section> {
 /// The commit a removal first reached a remote in, and when that happened. A
 /// removal this device has not published yet carries none, and the marker only
 /// means anything inside the remote lineage that issued the commit number.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TombstonePublication {
     pub generation: Sequence,
     pub at_ms: u64,
 }
 
 /// Every section value a device can publish, plus the removal of one.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum SectionValueRow {
     Hypa {
         producer: String,
@@ -79,6 +84,20 @@ impl SectionValueRow {
     pub(crate) fn same_content(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Tombstone { .. }, Self::Tombstone { .. }) => true,
+            (Self::Plugin { space: a_space, value: a }, Self::Plugin { space: b_space, value: b })
+                if a_space == "json" && b_space == "json" => same_json(a, b),
+            (Self::Setting { value: a }, Self::Setting { value: b }) => same_json(a, b),
+            (
+                Self::Hypa { producer: ap, model: am, endpoint: ae, preprocess_version: av,
+                    dimensions: ad, vector: ab, metadata: ax },
+                Self::Hypa { producer: bp, model: bm, endpoint: be, preprocess_version: bv,
+                    dimensions: bd, vector: bb, metadata: bx },
+            ) => ap == bp && am == bm && ae == be && av == bv && ad == bd && ab == bb
+                && match (ax, bx) {
+                    (Some(a), Some(b)) => same_json(a, b),
+                    (None, None) => true,
+                    _ => false,
+                },
             _ => self == other,
         }
     }
@@ -90,12 +109,29 @@ impl SectionValueRow {
     }
 }
 
+fn same_json(a: &str, b: &str) -> bool {
+    match (serde_json::from_str::<serde_json::Value>(a), serde_json::from_str::<serde_json::Value>(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// The triple a section row is named by, in the order the change index holds.
 pub(crate) type SectionKey = (String, String, String);
+pub(crate) type PublishedRows = Vec<(SectionKey, SectionEntryVersion)>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReclaimedRowVersion {
+    pub write_clock: Sequence,
+    pub writer_id: String,
+    pub first_published: TombstonePublication,
+}
+
+pub(crate) type ReclaimedRows = BTreeMap<SectionKey, ReclaimedRowVersion>;
 
 /// The key triple matches the change index, so a row and its change entry name
 /// the same thing without a second encoding.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SectionRow {
     pub key1: String,
     pub key2: String,
@@ -109,8 +145,11 @@ impl SectionRow {
     pub(crate) fn key(&self) -> (String, String, String) {
         (self.key1.clone(), self.key2.clone(), self.key3.clone())
     }
-    fn version_after(&self, other: &Self) -> bool {
-        (&self.write_clock, &self.writer_id) > (&other.write_clock, &other.writer_id)
+    pub(crate) fn version(&self) -> SectionEntryVersion {
+        SectionEntryVersion {
+            write_clock: self.write_clock.clone(),
+            writer_id: self.writer_id.clone(),
+        }
     }
     fn same_version(&self, other: &Self) -> bool {
         self.write_clock == other.write_clock && self.writer_id == other.writer_id
@@ -203,92 +242,862 @@ fn first_published(
     }
 }
 
-/// Whether `candidate` names an earlier first publication than `current`. A
-/// removal this device has not published yet takes whichever marker a remote
-/// carries for the same version.
-fn earlier_marker(candidate: &SectionValueRow, current: &SectionValueRow) -> bool {
-    match (candidate.first_published(), current.first_published()) {
-        (Some(candidate), Some(current)) => {
-            (&candidate.generation, candidate.at_ms) < (&current.generation, current.at_ms)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SectionMergeDecision {
+    ApplyIncoming,
+    PublishLocal,
+    Settled,
+    MergeRemovalMarker {
+        marker: Option<TombstonePublication>,
+        write_local: bool,
+        publish: bool,
+    },
+}
+
+/// The wire form can decide a version before a large object is downloaded.
+/// Both forms borrow their values and use the same ordering and marker policy.
+pub(crate) trait SectionMergeRow {
+    fn matching_key(&self, other: &Self) -> bool;
+    fn merge_version(&self) -> StoreResult<(&Sequence, &str)>;
+    fn matching_content(&self, other: &Self) -> StoreResult<bool>;
+    fn removal_marker(&self) -> Option<(&Sequence, u64)>;
+}
+
+impl SectionMergeRow for SectionRow {
+    fn matching_key(&self, other: &Self) -> bool {
+        (&self.key1, &self.key2, &self.key3) == (&other.key1, &other.key2, &other.key3)
+            && (self.value.is_tombstone() || other.value.is_tombstone()
+                || std::mem::discriminant(&self.value) == std::mem::discriminant(&other.value))
+    }
+    fn merge_version(&self) -> StoreResult<(&Sequence, &str)> {
+        if self.writer_id.is_empty() || self.writer_id.len() > 1024 {
+            return Err(invalid("Section row carries no valid writer"));
         }
-        (Some(_), None) => true,
-        _ => false,
+        Ok((&self.write_clock, &self.writer_id))
+    }
+    fn matching_content(&self, other: &Self) -> StoreResult<bool> {
+        Ok(self.value.same_content(&other.value))
+    }
+    fn removal_marker(&self) -> Option<(&Sequence, u64)> {
+        self.value.first_published().map(|marker| (&marker.generation, marker.at_ms))
     }
 }
 
-fn read_rows(tx: &Transaction<'_>, section: Section) -> StoreResult<Vec<SectionRow>> {
+impl SectionMergeRow for SectionEntry {
+    fn matching_key(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.key == other.key
+    }
+    fn merge_version(&self) -> StoreResult<(&Sequence, &str)> {
+        self.validate().map_err(section_format_error)?;
+        let version = self.version.as_ref().ok_or_else(|| invalid("Section entry carries no version"))?;
+        Ok((&version.write_clock, &version.writer_id))
+    }
+    fn matching_content(&self, other: &Self) -> StoreResult<bool> {
+        match (&self.value, &other.value) {
+            (SectionValue::Tombstone { .. }, SectionValue::Tombstone { .. }) => Ok(true),
+            (SectionValue::Hypa(a), SectionValue::Hypa(b)) => Ok(
+                a.producer == b.producer && a.model == b.model && a.endpoint == b.endpoint
+                    && a.preprocess_version == b.preprocess_version && a.dimensions == b.dimensions
+                    && a.metadata == b.metadata && vector_identity(&a.vector)? == vector_identity(&b.vector)?
+            ),
+            _ => Ok(self.value == other.value),
+        }
+    }
+    fn removal_marker(&self) -> Option<(&Sequence, u64)> {
+        match &self.value {
+            SectionValue::Tombstone { first_published_generation, first_published_at_ms } => {
+                Some((first_published_generation, *first_published_at_ms))
+            }
+            _ => None,
+        }
+    }
+}
+
+pub(crate) fn resolve_section_row<T: SectionMergeRow>(
+    local: Option<&T>,
+    incoming: &T,
+) -> StoreResult<SectionMergeDecision> {
+    let arrived_version = incoming.merge_version()?;
+    let Some(local) = local else {
+        return Ok(SectionMergeDecision::ApplyIncoming);
+    };
+    if !local.matching_key(incoming) {
+        return Err(invalid("Section merge keys or kinds differ"));
+    }
+    match arrived_version.cmp(&local.merge_version()?) {
+        std::cmp::Ordering::Greater => return Ok(SectionMergeDecision::ApplyIncoming),
+        std::cmp::Ordering::Less => return Ok(SectionMergeDecision::PublishLocal),
+        std::cmp::Ordering::Equal => {}
+    }
+    if !local.matching_content(incoming)? {
+        return Err(invalid("Section version carries two different values"));
+    }
+    let (held, arrived) = (local.removal_marker(), incoming.removal_marker());
+    if held == arrived {
+        return Ok(SectionMergeDecision::Settled);
+    }
+    let earliest = match (held, arrived) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    Ok(SectionMergeDecision::MergeRemovalMarker {
+        write_local: held != earliest,
+        publish: arrived != earliest,
+        marker: earliest.map(|(generation, at_ms)| TombstonePublication { generation: generation.clone(), at_ms }),
+    })
+}
+
+fn section_format_error(_: risunest_external_storage_format::FormatError) -> crate::persistent_store::StoreError {
+    invalid("Section entry is invalid")
+}
+
+fn vector_identity(vector: &InlineOrObject) -> StoreResult<([u8; 32], u64)> {
+    match vector {
+        InlineOrObject::Object(reference) => Ok((reference.content_sha256, reference.byte_length)),
+        InlineOrObject::Inline(_) => {
+            let bytes = vector.decode_inline().map_err(section_format_error)?;
+            Ok((risunest_external_storage_format::content_identity::hash(&bytes), bytes.len() as u64))
+        }
+    }
+}
+
+fn row_from_sql(section: Section, row: &rusqlite::Row<'_>) -> StoreResult<SectionRow> {
+    let tombstone: bool = row.get("tombstone")?;
+    let value = if tombstone {
+        SectionValueRow::Tombstone {
+            first_published: first_published(row.get("first_published_generation")?, row.get("first_published_at_ms")?)?,
+        }
+    } else {
+        match section {
+            Section::Hypa => SectionValueRow::Hypa {
+                producer: row.get("producer")?, model: row.get("model")?, endpoint: row.get("endpoint")?,
+                preprocess_version: row.get("preprocess_version")?, dimensions: row.get("dimensions")?,
+                vector: row.get("vector")?, metadata: row.get("metadata")?,
+            },
+            Section::LocalPlugins => SectionValueRow::Plugin { space: row.get("space")?, value: row.get("value")? },
+        }
+    };
+    let (key1, key2, key3) = match section {
+        Section::Hypa => (row.get("cache_key")?, String::new(), String::new()),
+        Section::LocalPlugins => (row.get("owner")?, row.get("space")?, row.get("key")?),
+    };
+    Ok(SectionRow {
+        key1, key2, key3, value,
+        write_clock: sequence(&row.get::<_, String>("write_clock")?)?,
+        writer_id: row.get("writer_id")?,
+    })
+}
+
+fn read_rows(db: &Connection, section: Section) -> StoreResult<Vec<SectionRow>> {
+    let mut statement = db.prepare(match section {
+        Section::Hypa => "SELECT * FROM hypa_embeddings ORDER BY cache_key",
+        Section::LocalPlugins => "SELECT * FROM plugin_device_storage ORDER BY owner,space,key",
+    })?;
+    let mut query = statement.query([])?;
     let mut rows = Vec::new();
-    match section {
-        Section::Hypa => {
-            let mut statement = tx.prepare(
-                "SELECT cache_key,producer,model,endpoint,preprocess_version,dimensions,vector,
-                        metadata,tombstone,write_clock,writer_id,first_published_generation,
-                        first_published_at_ms
-                    FROM hypa_embeddings ORDER BY cache_key",
-            )?;
-            let mut query = statement.query([])?;
-            while let Some(row) = query.next()? {
-                let tombstone: i64 = row.get(8)?;
-                let vector: Option<Vec<u8>> = row.get(6)?;
-                let value = if tombstone == 1 || vector.is_none() {
-                    SectionValueRow::Tombstone {
-                        first_published: first_published(row.get(11)?, row.get(12)?)?,
-                    }
-                } else {
-                    SectionValueRow::Hypa {
-                        producer: row.get(1)?,
-                        model: row.get(2)?,
-                        endpoint: row.get(3)?,
-                        preprocess_version: row.get(4)?,
-                        dimensions: row.get(5)?,
-                        vector: vector.expect("checked vector"),
-                        metadata: row.get(7)?,
-                    }
-                };
-                rows.push(SectionRow {
-                    key1: row.get(0)?,
-                    key2: String::new(),
-                    key3: String::new(),
-                    value,
-                    write_clock: sequence(&row.get::<_, String>(9)?)?,
-                    writer_id: row.get(10)?,
-                });
-            }
-        }
-        Section::LocalPlugins => {
-            let mut statement = tx.prepare(
-                "SELECT owner,space,key,value,tombstone,write_clock,writer_id,
-                        first_published_generation,first_published_at_ms
-                    FROM plugin_device_storage ORDER BY owner,space,key",
-            )?;
-            let mut query = statement.query([])?;
-            while let Some(row) = query.next()? {
-                let tombstone: i64 = row.get(4)?;
-                let stored: Option<String> = row.get(3)?;
-                let value = match (tombstone, stored) {
-                    (0, Some(value)) => SectionValueRow::Plugin {
-                        space: row.get(1)?,
-                        value,
-                    },
-                    _ => SectionValueRow::Tombstone {
-                        first_published: first_published(row.get(7)?, row.get(8)?)?,
-                    },
-                };
-                rows.push(SectionRow {
-                    key1: row.get(0)?,
-                    key2: row.get(1)?,
-                    key3: row.get(2)?,
-                    value,
-                    write_clock: sequence(&row.get::<_, String>(5)?)?,
-                    writer_id: row.get(6)?,
-                });
-            }
-        }
+    while let Some(row) = query.next()? {
+        rows.push(row_from_sql(section, row)?);
     }
     Ok(rows)
 }
 
+fn read_row(db: &Connection, section: Section, key: &SectionKey) -> StoreResult<Option<(SectionRow, bool)>> {
+    let mut statement = db.prepare(match section {
+        Section::Hypa => "SELECT * FROM hypa_embeddings WHERE cache_key=?1 AND ?2='' AND ?3=''",
+        Section::LocalPlugins => "SELECT * FROM plugin_device_storage WHERE owner=?1 AND space=?2 AND key=?3",
+    })?;
+    let mut query = statement.query(params![key.0, key.1, key.2])?;
+    let Some(row) = query.next()? else { return Ok(None); };
+    let current = row_from_sql(section, row)?;
+    let published: Option<String> = row.get("published_clock")?;
+    let published = published.as_deref() == Some(current.write_clock.as_str());
+    Ok(Some((current, published)))
+}
+
+pub(crate) fn kind_of_section(section: Section) -> SectionKind {
+    match section {
+        Section::Hypa => SectionKind::Hypa,
+        Section::LocalPlugins => SectionKind::LocalPlugins,
+    }
+}
+
+pub(crate) fn section_entry_key(kind: SectionKind, row: &SectionRow) -> StoreResult<String> {
+    match kind {
+        SectionKind::Hypa => {
+            if !row.key2.is_empty() || !row.key3.is_empty() {
+                return Err(invalid("Embedding key is not canonical"));
+            }
+            hypa_entry_key(&row.key1).map_err(section_format_error)
+        }
+        SectionKind::LocalPlugins => local_plugin_entry_key(&row.key1, &row.key2, &row.key3).map_err(section_format_error),
+        SectionKind::LocalSettings => Ok(serde_json::to_string(&[&row.key1, &row.key2, &row.key3])?),
+    }
+}
+
+fn decode_entry_key(kind: SectionKind, key: &str) -> StoreResult<SectionKey> {
+    match kind {
+        SectionKind::Hypa => Ok((hypa_entry_key(key).map_err(section_format_error)?, String::new(), String::new())),
+        SectionKind::LocalPlugins => decode_local_plugin_entry_key(key).map_err(section_format_error),
+        SectionKind::LocalSettings => {
+            let parts: [String; 3] = serde_json::from_str(key)?;
+            if serde_json::to_string(&parts)? != key {
+                return Err(invalid("Device setting key is not canonical"));
+            }
+            let [key1, key2, key3] = parts;
+            Ok((key1, key2, key3))
+        }
+    }
+}
+
+impl SectionRow {
+    pub(crate) fn to_entry(&self, kind: SectionKind, versioned: bool) -> StoreResult<SectionEntry> {
+        let value = match (&self.value, kind) {
+            (SectionValueRow::Tombstone { first_published }, _) => {
+                let marker = first_published.as_ref().ok_or_else(|| invalid("Removal carries no first publication marker"))?;
+                SectionValue::tombstone(marker.generation.clone(), marker.at_ms)
+            }
+            (SectionValueRow::Hypa { producer, model, endpoint, preprocess_version, dimensions, vector, metadata }, SectionKind::Hypa) => {
+                let vector = if vector.len() > MAX_INLINE_VALUE_BYTES {
+                    InlineOrObject::Object(ObjectReference {
+                        content_sha256: risunest_external_storage_format::content_identity::hash(vector),
+                        byte_length: vector.len() as u64,
+                    })
+                } else {
+                    InlineOrObject::inline(vector).map_err(section_format_error)?
+                };
+                SectionValue::Hypa(HypaValue {
+                    producer: producer.clone(), model: model.clone(), endpoint: endpoint.clone(),
+                    preprocess_version: u32::try_from(*preprocess_version).map_err(|_| invalid("Embedding preprocess version is out of range"))?,
+                    dimensions: u32::try_from(*dimensions).map_err(|_| invalid("Embedding dimensions are out of range"))?,
+                    vector, metadata: metadata.as_deref().map(serde_json::from_str).transpose()?,
+                })
+            }
+            (SectionValueRow::Plugin { space, value }, SectionKind::LocalPlugins) => {
+                if space != &self.key2 {
+                    return Err(invalid("Plugin value names another space"));
+                }
+                let (space, value) = match space.as_str() {
+                    "string" => (PluginSpace::String, serde_json::Value::String(value.clone())),
+                    "json" => (PluginSpace::Json, serde_json::from_str(value)?),
+                    _ => return Err(invalid("Plugin device space is invalid")),
+                };
+                SectionValue::LocalPlugin(LocalPluginValue { space, value })
+            }
+            (SectionValueRow::Setting { value }, SectionKind::LocalSettings) => {
+                if self.key1 != "setting" || !setting_is_local(&self.key2) || !self.key3.is_empty() {
+                    return Err(invalid("Device setting is outside the backup scope"));
+                }
+                SectionValue::LocalSetting(LocalSettingValue { value: serde_json::from_str(value)? })
+            }
+            (SectionValueRow::PluginPermission { granted }, SectionKind::LocalSettings) => {
+                if self.key1 != "pluginPermission" || self.key2.is_empty() || self.key3.is_empty() {
+                    return Err(invalid("Plugin permission key is invalid"));
+                }
+                SectionValue::LocalSetting(LocalSettingValue { value: serde_json::Value::Bool(*granted) })
+            }
+            _ => return Err(invalid("Section row belongs to another section")),
+        };
+        SectionEntry::new(kind, section_entry_key(kind, self)?, value, versioned.then(|| self.version()))
+            .map_err(section_format_error)
+    }
+
+    pub(crate) fn from_entry(
+        entry: SectionEntry,
+        versioned: bool,
+        mut object: impl FnMut(&ObjectReference) -> StoreResult<Vec<u8>>,
+    ) -> StoreResult<Self> {
+        entry.validate().map_err(section_format_error)?;
+        let (key1, key2, key3) = decode_entry_key(entry.kind, &entry.key)?;
+        let (write_clock, writer_id) = match entry.version {
+            Some(version) => (version.write_clock, version.writer_id),
+            None if !versioned => (Sequence::from(0u64), String::new()),
+            None => return Err(invalid("Section entry carries no version")),
+        };
+        let value = match entry.value {
+            SectionValue::Tombstone { first_published_generation, first_published_at_ms } => {
+                i64::try_from(first_published_at_ms).map_err(|_| invalid("Device removal marker time is out of range"))?;
+                SectionValueRow::Tombstone { first_published: Some(TombstonePublication {
+                    generation: first_published_generation, at_ms: first_published_at_ms,
+                }) }
+            }
+            SectionValue::Hypa(value) => {
+                let vector = match &value.vector {
+                    InlineOrObject::Inline(_) => value.vector.decode_inline().map_err(section_format_error)?,
+                    InlineOrObject::Object(reference) => {
+                        let bytes = object(reference)?;
+                        if bytes.len() as u64 != reference.byte_length
+                            || risunest_external_storage_format::content_identity::hash(&bytes) != reference.content_sha256 {
+                            return Err(invalid("Section vector object does not match its reference"));
+                        }
+                        bytes
+                    }
+                };
+                if vector.len() as u64 != u64::from(value.dimensions) * 4 {
+                    return Err(invalid("Section vector length does not match its dimensions"));
+                }
+                SectionValueRow::Hypa {
+                    producer: value.producer, model: value.model, endpoint: value.endpoint,
+                    preprocess_version: i64::from(value.preprocess_version), dimensions: i64::from(value.dimensions),
+                    vector, metadata: value.metadata.map(|value| serde_json::to_string(&value)).transpose()?,
+                }
+            }
+            SectionValue::LocalPlugin(value) => {
+                let space = match value.space { PluginSpace::String => "string", PluginSpace::Json => "json" };
+                if space != key2 { return Err(invalid("Plugin value names another space")); }
+                let text = match value.space {
+                    PluginSpace::String => match value.value {
+                        serde_json::Value::String(text) => text,
+                        _ => return Err(invalid("Plugin string value is not text")),
+                    },
+                    PluginSpace::Json => serde_json::to_string(&value.value)?,
+                };
+                SectionValueRow::Plugin { space: space.to_owned(), value: text }
+            }
+            SectionValue::LocalSetting(value) => match key1.as_str() {
+                "setting" if setting_is_local(&key2) && key3.is_empty() => {
+                    SectionValueRow::Setting { value: serde_json::to_string(&value.value)? }
+                }
+                "pluginPermission" if !key2.is_empty() && !key3.is_empty() => SectionValueRow::PluginPermission {
+                    granted: value.value.as_bool().ok_or_else(|| invalid("Plugin permission is not a decision"))?,
+                },
+                _ => return Err(invalid("Device setting is outside the backup scope")),
+            },
+        };
+        Ok(Self { key1, key2, key3, value, write_clock, writer_id })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LocalSectionEntry {
+    pub version: SectionEntryVersion,
+    pub entry: SectionEntry,
+    pub object: Option<Vec<u8>>,
+    pub published: bool,
+}
+
+pub(crate) enum SectionWriteInput<'a> {
+    Apply { section: Section, entry: &'a SectionEntry, object: Option<&'a [u8]> },
+    Mark { section: Section, key: &'a str },
+    MarkVersion { section: Section, key: &'a str, version: &'a SectionEntryVersion },
+}
+
+/// An unfinished spool cannot be applied. It becomes a read-only input only
+/// after every received row and the transport fingerprint have been checked.
+pub(crate) struct SectionSpoolBuilder {
+    connection: Connection,
+    directory: tempfile::TempDir,
+    section: Section,
+    count: i64,
+    max_write_clock: Sequence,
+}
+
+pub(crate) struct PreparedSectionRows {
+    connection: Connection,
+    // Declared after the connection so Windows closes the file before cleanup.
+    _directory: tempfile::TempDir,
+    section: Section,
+    count: i64,
+    max_write_clock: Sequence,
+}
+
+impl SectionSpoolBuilder {
+    pub(crate) fn new(section: Section) -> StoreResult<Self> {
+        let directory = tempfile::tempdir()?;
+        let connection = Connection::open(directory.path().join("rows.sqlite"))?;
+        connection.execute_batch(
+            "PRAGMA cache_size=-4096;
+             PRAGMA temp_store=FILE;
+             PRAGMA mmap_size=0;
+             CREATE TABLE vector_values(hash TEXT PRIMARY KEY,bytes BLOB NOT NULL) WITHOUT ROWID;
+             CREATE TABLE row_values(id INTEGER PRIMARY KEY,metadata TEXT NOT NULL,vector_hash TEXT);
+             CREATE TABLE row_index(
+                key1 TEXT NOT NULL,key2 TEXT NOT NULL,key3 TEXT NOT NULL,
+                body_id INTEGER NOT NULL,write_clock TEXT NOT NULL,writer_id TEXT NOT NULL,
+                tombstone INTEGER NOT NULL,entry_key TEXT NOT NULL UNIQUE,entry_hash BLOB NOT NULL,
+                PRIMARY KEY(key1,key2,key3)
+             ) WITHOUT ROWID;
+             BEGIN IMMEDIATE;",
+        )?;
+        Ok(Self { connection, directory, section, count: 0, max_write_clock: Sequence::from(0u64) })
+    }
+
+    pub(crate) fn push(&mut self, mut row: SectionRow, entry_key: &str, entry_hash: &[u8; 32]) -> StoreResult<()> {
+        validate_sync_row(self.section, &row)?;
+        if section_entry_key(kind_of_section(self.section), &row)? != entry_key {
+            return Err(invalid("Section spool key differs from its entry"));
+        }
+        let duplicate: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM row_index
+                WHERE (key1=?1 AND key2=?2 AND key3=?3) OR entry_key=?4)",
+            params![row.key1, row.key2, row.key3, entry_key], |row| row.get(0),
+        )?;
+        if duplicate { return Err(invalid("Section spool repeats an entry key")); }
+        let vector_hash = match &mut row.value {
+            SectionValueRow::Hypa { vector, .. } => {
+                let bytes = std::mem::take(vector);
+                let digest = risunest_sync_wire::hash(&bytes);
+                self.connection.execute("INSERT OR IGNORE INTO vector_values(hash,bytes) VALUES (?1,?2)", params![digest, bytes])?;
+                Some(digest)
+            }
+            _ => None,
+        };
+        let id = self.count.checked_add(1).ok_or_else(|| invalid("Section spool row count is exhausted"))?;
+        self.connection.execute(
+            "INSERT INTO row_values(id,metadata,vector_hash) VALUES (?1,?2,?3)",
+            params![id, serde_json::to_string(&row)?, vector_hash],
+        )?;
+        self.connection.execute(
+            "INSERT INTO row_index(key1,key2,key3,body_id,write_clock,writer_id,tombstone,entry_key,entry_hash)
+                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![row.key1, row.key2, row.key3, id, row.write_clock.as_str(), row.writer_id,
+                row.value.is_tombstone(), entry_key, entry_hash.as_slice()],
+        )?;
+        self.count = id;
+        self.max_write_clock = self.max_write_clock.clone().max(row.write_clock);
+        Ok(())
+    }
+
+    pub(crate) fn finish(self, expected_fingerprint: &[u8; 32]) -> StoreResult<PreparedSectionRows> {
+        let mut fingerprint = risunest_external_storage_format::format::FingerprintBuilder::new(
+            &kind_of_section(self.section).fingerprint_domain(),
+        );
+        {
+            let mut statement = self.connection.prepare("SELECT entry_key,entry_hash FROM row_index ORDER BY entry_key")?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let key: String = row.get(0)?;
+                let digest: Vec<u8> = row.get(1)?;
+                let digest: [u8; 32] = digest.try_into().map_err(|_| invalid("Section entry hash is invalid"))?;
+                fingerprint.push(&key, &digest).map_err(section_format_error)?;
+            }
+        }
+        if fingerprint.finish() != *expected_fingerprint {
+            return Err(invalid("Section content differs from its reference"));
+        }
+        self.connection.execute_batch("COMMIT;")?;
+        drop(self.connection);
+        let connection = Connection::open_with_flags(
+            self.directory.path().join("rows.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.execute_batch("PRAGMA cache_size=-4096; PRAGMA mmap_size=0; PRAGMA query_only=ON; BEGIN;")?;
+        let count: i64 = connection.query_row("SELECT count(*) FROM row_index", [], |row| row.get(0))?;
+        if count != self.count { return Err(invalid("Section spool is incomplete")); }
+        Ok(PreparedSectionRows { connection, _directory: self.directory,
+            section: self.section, count, max_write_clock: self.max_write_clock })
+    }
+}
+
+impl PreparedSectionRows {
+    pub(crate) fn max_write_clock(&self) -> &Sequence { &self.max_write_clock }
+
+    fn row(&self, key: &SectionKey) -> StoreResult<Option<SectionRow>> {
+        let stored: Option<(String, Option<Vec<u8>>)> = self.connection.query_row(
+            "SELECT v.metadata,b.bytes FROM row_index i JOIN row_values v ON v.id=i.body_id
+                LEFT JOIN vector_values b ON b.hash=v.vector_hash
+                WHERE i.key1=?1 AND i.key2=?2 AND i.key3=?3",
+            params![key.0, key.1, key.2], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        stored.map(|(metadata, vector)| {
+            let mut row: SectionRow = serde_json::from_str(&metadata)?;
+            if let SectionValueRow::Hypa { vector: target, .. } = &mut row.value {
+                *target = vector.ok_or_else(|| invalid("Prepared vector is missing"))?;
+            }
+            Ok(row)
+        }).transpose()
+    }
+
+    fn contains(&self, key: &SectionKey, tombstone_only: bool) -> StoreResult<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM row_index WHERE key1=?1 AND key2=?2 AND key3=?3
+                AND (?4=0 OR tombstone=1))",
+            params![key.0, key.1, key.2, tombstone_only], |row| row.get(0),
+        )?)
+    }
+
+    fn visit(&self, mut visitor: impl FnMut(SectionRow) -> StoreResult<()>) -> StoreResult<()> {
+        let mut after = (String::new(), String::new(), String::new());
+        let mut visited = 0i64;
+        loop {
+            let mut statement = self.connection.prepare(
+                "SELECT key1,key2,key3 FROM row_index WHERE (key1,key2,key3)>(?1,?2,?3)
+                    ORDER BY key1,key2,key3 LIMIT 256",
+            )?;
+            let page = read_key_page(&mut statement.query(params![after.0, after.1, after.2])?)?;
+            if page.is_empty() { break; }
+            for key in page {
+                visitor(self.row(&key)?.ok_or_else(|| invalid("Prepared row is missing"))?)?;
+                visited += 1;
+                after = key;
+            }
+        }
+        if visited != self.count { return Err(invalid("Section spool scan is incomplete")); }
+        Ok(())
+    }
+}
+
+fn read_cursor(db: &Connection, connection_id: &str, library_lineage: &str, section: Section) -> StoreResult<Option<SectionCursor>> {
+    let stored: Option<(String, String, String)> = db.query_row(
+        "SELECT applied_generation,applied_gc_floor,observed_max_write_clock FROM device_remote_cursors
+            WHERE connection_id=?1 AND library_lineage=?2 AND section=?3",
+        params![connection_id, library_lineage, section.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).optional()?;
+    stored.map(|(generation, floor, observed)| Ok(SectionCursor {
+        applied_generation: sequence(&generation)?, applied_gc_floor: sequence(&floor)?,
+        observed_max_write_clock: sequence(&observed)?,
+    })).transpose()
+}
+
+fn record_cursor(tx: &Transaction<'_>, connection_id: &str, library_lineage: &str, section: Section, cursor: &SectionCursor) -> StoreResult<()> {
+    if connection_id.is_empty() || library_lineage.is_empty() {
+        return Err(invalid("Section cursor identity is missing"));
+    }
+    let current = read_cursor(tx, connection_id, library_lineage, section)?;
+    let merged = match current {
+        Some(current) => SectionCursor {
+            applied_generation: cursor.applied_generation.clone().max(current.applied_generation),
+            applied_gc_floor: cursor.applied_gc_floor.clone().max(current.applied_gc_floor),
+            observed_max_write_clock: cursor.observed_max_write_clock.clone().max(current.observed_max_write_clock),
+        },
+        None => cursor.clone(),
+    };
+    tx.execute(
+        "INSERT INTO device_remote_cursors(connection_id,library_lineage,section,
+            applied_generation,applied_gc_floor,observed_max_write_clock) VALUES (?1,?2,?3,?4,?5,?6)
+            ON CONFLICT(connection_id,library_lineage,section) DO UPDATE SET
+                applied_generation=excluded.applied_generation,applied_gc_floor=excluded.applied_gc_floor,
+                observed_max_write_clock=excluded.observed_max_write_clock",
+        params![connection_id, library_lineage, section.as_str(), merged.applied_generation.as_str(),
+            merged.applied_gc_floor.as_str(), merged.observed_max_write_clock.as_str()],
+    )?;
+    Ok(())
+}
+
+fn mark_row_version(tx: &Connection, section: Section, key: &SectionKey, version: &SectionEntryVersion, published: bool) -> StoreResult<()> {
+    let clock = published.then_some(version.write_clock.as_str());
+    match section {
+        Section::Hypa => tx.execute(
+            "UPDATE hypa_embeddings SET published_clock=?4 WHERE cache_key=?1 AND write_clock=?2 AND writer_id=?3",
+            params![key.0, version.write_clock.as_str(), version.writer_id, clock],
+        )?,
+        Section::LocalPlugins => tx.execute(
+            "UPDATE plugin_device_storage SET published_clock=?6
+                WHERE owner=?1 AND space=?2 AND key=?3 AND write_clock=?4 AND writer_id=?5",
+            params![key.0, key.1, key.2, version.write_clock.as_str(), version.writer_id, clock],
+        )?,
+    };
+    Ok(())
+}
+
+fn validate_sync_row(section: Section, row: &SectionRow) -> StoreResult<()> {
+    row.merge_version()?;
+    section_entry_key(kind_of_section(section), row)?;
+    match (section, &row.value) {
+        (_, SectionValueRow::Tombstone { first_published }) => {
+            if let Some(marker) = first_published {
+                i64::try_from(marker.at_ms).map_err(|_| invalid("Device removal marker time is out of range"))?;
+            }
+        }
+        (Section::Hypa, SectionValueRow::Hypa { producer, model, endpoint, preprocess_version,
+            dimensions, vector, metadata }) => {
+            if producer.is_empty() || model.is_empty() || endpoint.as_ref().is_some_and(String::is_empty)
+                || u32::try_from(*preprocess_version).is_err() || *dimensions <= 0
+                || u32::try_from(*dimensions).is_err() || vector.len() as u64 != *dimensions as u64 * 4 {
+                return Err(invalid("Embedding row is invalid"));
+            }
+            if let Some(metadata) = metadata { serde_json::from_str::<serde_json::Value>(metadata)?; }
+        }
+        (Section::LocalPlugins, SectionValueRow::Plugin { space, value }) => {
+            if space != &row.key2 || !matches!(space.as_str(), "string" | "json") {
+                return Err(invalid("Plugin value names another space"));
+            }
+            if space == "json" { serde_json::from_str::<serde_json::Value>(value)?; }
+        }
+        _ => return Err(invalid("Section row belongs to another section")),
+    }
+    Ok(())
+}
+
+fn merge_row(tx: &Transaction<'_>, section: Section, incoming: &SectionRow) -> StoreResult<bool> {
+    validate_sync_row(section, incoming)?;
+    merge_validated_row(tx, section, incoming)
+}
+
+fn merge_validated_row(tx: &Transaction<'_>, section: Section, incoming: &SectionRow) -> StoreResult<bool> {
+    let key = incoming.key();
+    let local = read_row(tx, section, &key)?;
+    match resolve_section_row(local.as_ref().map(|(row, _)| row), incoming)? {
+        SectionMergeDecision::ApplyIncoming => {
+            write_row(tx, section, incoming, true)?;
+            Ok(true)
+        }
+        SectionMergeDecision::PublishLocal => {
+            let (local, _) = local.expect("local winner");
+            mark_row_version(tx, section, &key, &local.version(), false)?;
+            Ok(false)
+        }
+        SectionMergeDecision::Settled => {
+            mark_row_version(tx, section, &key, &incoming.version(), true)?;
+            Ok(false)
+        }
+        SectionMergeDecision::MergeRemovalMarker { marker, write_local, publish } => {
+            if write_local {
+                let row = SectionRow { value: SectionValueRow::Tombstone { first_published: marker },
+                    key1: incoming.key1.clone(), key2: incoming.key2.clone(), key3: incoming.key3.clone(),
+                    write_clock: incoming.write_clock.clone(), writer_id: incoming.writer_id.clone() };
+                write_row(tx, section, &row, !publish)?;
+            } else {
+                mark_row_version(tx, section, &key, &incoming.version(), !publish)?;
+            }
+            Ok(false)
+        }
+    }
+}
+
+const SECTION_PAGE_ROWS: usize = 256;
+const SECTION_PAGE_BYTES: usize = 4 * 1024 * 1024;
+
+fn read_key_page(rows: &mut rusqlite::Rows<'_>) -> StoreResult<Vec<SectionKey>> {
+    let mut page = Vec::new();
+    let mut bytes = 0usize;
+    while page.len() < SECTION_PAGE_ROWS {
+        let Some(row) = rows.next()? else { break; };
+        let key: SectionKey = (row.get(0)?, row.get(1)?, row.get(2)?);
+        let size = key.0.len().saturating_add(key.1.len()).saturating_add(key.2.len())
+            .saturating_add(std::mem::size_of::<SectionKey>());
+        if !page.is_empty() && bytes.saturating_add(size) > SECTION_PAGE_BYTES { break; }
+        bytes = bytes.saturating_add(size);
+        page.push(key);
+    }
+    Ok(page)
+}
+
+fn local_key_page(db: &Connection, section: Section, after: &SectionKey, tombstones_only: bool) -> StoreResult<Vec<SectionKey>> {
+    let mut statement = db.prepare(match section {
+        Section::Hypa => "SELECT cache_key,'','' FROM hypa_embeddings
+            WHERE cache_key>?1 AND ?2='' AND ?3='' AND (?4=0 OR tombstone=1) ORDER BY cache_key LIMIT 256",
+        Section::LocalPlugins => "SELECT owner,space,key FROM plugin_device_storage
+            WHERE (owner,space,key)>(?1,?2,?3) AND (?4=0 OR tombstone=1) ORDER BY owner,space,key LIMIT 256",
+    })?;
+    let mut rows = statement.query(params![after.0, after.1, after.2, tombstones_only])?;
+    read_key_page(&mut rows)
+}
+
+fn delete_current_row(tx: &Transaction<'_>, section: Section, row: &SectionRow) -> StoreResult<()> {
+    match section {
+        Section::Hypa => tx.execute(
+            "DELETE FROM hypa_embeddings WHERE cache_key=?1 AND write_clock=?2 AND writer_id=?3 AND tombstone=?4",
+            params![row.key1, row.write_clock.as_str(), row.writer_id, row.value.is_tombstone()],
+        )?,
+        Section::LocalPlugins => tx.execute(
+            "DELETE FROM plugin_device_storage WHERE owner=?1 AND space=?2 AND key=?3
+                AND write_clock=?4 AND writer_id=?5 AND tombstone=?6",
+            params![row.key1, row.key2, row.key3, row.write_clock.as_str(), row.writer_id, row.value.is_tombstone()],
+        )?,
+    };
+    Ok(())
+}
+
+fn reclaim_prepared(tx: &Transaction<'_>, prepared: &PreparedSectionRows, floor: &Sequence) -> StoreResult<()> {
+    if *floor == Sequence::from(0u64) { return Ok(()); }
+    let mut after = (String::new(), String::new(), String::new());
+    loop {
+        let page = local_key_page(tx, prepared.section, &after, true)?;
+        if page.is_empty() { break; }
+        for key in page {
+            let (row, _) = read_row(tx, prepared.section, &key)?.ok_or_else(|| invalid("Section row disappeared"))?;
+            if row.value.first_published().is_some_and(|marker| marker.generation <= *floor)
+                && !prepared.contains(&key, true)? {
+                delete_current_row(tx, prepared.section, &row)?;
+            }
+            after = key;
+        }
+    }
+    Ok(())
+}
+
+fn rejoin_prepared(tx: &Transaction<'_>, prepared: &PreparedSectionRows, observed: &Sequence, behind_floor: bool) -> StoreResult<()> {
+    let writer_id: String = tx.query_row("SELECT writer_id FROM device_meta WHERE singleton=1", [], |row| row.get(0))?;
+    let mut issued: Option<Sequence> = None;
+    let mut after = (String::new(), String::new(), String::new());
+    loop {
+        let page = local_key_page(tx, prepared.section, &after, false)?;
+        if page.is_empty() { break; }
+        for key in page {
+            let (mut row, published) = read_row(tx, prepared.section, &key)?.ok_or_else(|| invalid("Section row disappeared"))?;
+            after = key;
+            if published {
+                // A complete snapshot beyond the floor is authoritative for
+                // settled values. Only unpublished edits may be carried back.
+                if behind_floor && !row.value.is_tombstone() && !prepared.contains(&after, false)? {
+                    delete_current_row(tx, prepared.section, &row)?;
+                }
+                continue;
+            }
+            if let Some(remote) = prepared.row(&after)? {
+                if row.same_version(&remote) {
+                    resolve_section_row(Some(&row), &remote)?;
+                    continue;
+                }
+            }
+            if row.writer_id == writer_id && row.write_clock > *observed { continue; }
+            if issued.is_none() {
+                super::begin_mutation(tx)?;
+                issued = Some(super::issue_write_clock(tx, prepared.section)?);
+            }
+            row.write_clock = issued.as_ref().expect("issued write clock").clone();
+            row.writer_id = writer_id.clone();
+            if row.value.is_tombstone() {
+                row.value = SectionValueRow::Tombstone { first_published: None };
+            }
+            write_row(tx, prepared.section, &row, false)?;
+        }
+    }
+    if issued.is_some() { super::finish_mutation(tx)?; }
+    Ok(())
+}
+
 impl DeviceStore {
+    /// The input owns a validated read-only spool. No transport or archive
+    /// decoding takes place inside this single section transaction.
+    pub(crate) fn apply_prepared_section_rows(
+        &mut self,
+        connection_id: &str,
+        library_lineage: &str,
+        expected_participation_generation: &Sequence,
+        prepared: &PreparedSectionRows,
+        cursor: &SectionCursor,
+        rejoining: bool,
+    ) -> StoreResult<SectionApplyOutcome> {
+        if connection_id.is_empty() || library_lineage.is_empty()
+            || cursor.applied_gc_floor > cursor.applied_generation
+            || prepared.max_write_clock > cursor.observed_max_write_clock {
+            return Err(invalid("Prepared section identity or bounds are invalid"));
+        }
+        let tx = self.transaction()?;
+        let (participating, generation): (bool, String) = tx.query_row(
+            "SELECT participating,participation_generation FROM device_sections WHERE section=?1",
+            [prepared.section.as_str()], |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if !participating || sequence(&generation)? != *expected_participation_generation {
+            return Err(invalid("Section participation changed during preparation"));
+        }
+        let current = read_cursor(&tx, connection_id, library_lineage, prepared.section)?;
+        if current.as_ref().is_some_and(|current| current.applied_generation > cursor.applied_generation
+            || current.applied_gc_floor > cursor.applied_gc_floor) {
+            return Err(invalid("Prepared section is older than the applied cursor"));
+        }
+        let behind_floor = current.as_ref().is_some_and(|current| cursor.applied_gc_floor > current.applied_generation);
+        let rejoining = rejoining || behind_floor || current.as_ref().is_none_or(|cursor| !cursor.joined());
+        let floor = if current.is_some() { cursor.applied_gc_floor.clone() } else { Sequence::from(0u64) };
+        observe_remote_clock(&tx, prepared.section, &cursor.observed_max_write_clock)?;
+        if rejoining {
+            reclaim_prepared(&tx, prepared, &floor)?;
+            rejoin_prepared(&tx, prepared, &cursor.observed_max_write_clock, behind_floor)?;
+        }
+        let mut outcome = SectionApplyOutcome::default();
+        prepared.visit(|row| {
+            if merge_validated_row(&tx, prepared.section, &row)? { outcome.applied += 1; }
+            else { outcome.kept += 1; }
+            Ok(())
+        })?;
+        if !rejoining { reclaim_prepared(&tx, prepared, &floor)?; }
+        record_cursor(&tx, connection_id, library_lineage, prepared.section, cursor)?;
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    pub(crate) fn read_section_entry(&self, section: Section, key: &str) -> StoreResult<Option<LocalSectionEntry>> {
+        let kind = kind_of_section(section);
+        let Some((mut row, published)) = read_row(&self.connection, section, &decode_entry_key(kind, key)?)? else { return Ok(None); };
+        let entry = row.to_entry(kind, true)?;
+        let object = match &mut row.value {
+            SectionValueRow::Hypa { vector, .. } if vector.len() > MAX_INLINE_VALUE_BYTES => Some(std::mem::take(vector)),
+            _ => None,
+        };
+        Ok(Some(LocalSectionEntry { version: row.version(), entry, object, published }))
+    }
+
+    pub(crate) fn stamp_section_removal(&self, section: Section, key: &str, generation: &Sequence, now_ms: u64) -> StoreResult<()> {
+        let at_ms = i64::try_from(now_ms).map_err(|_| invalid("Device removal marker time is out of range"))?;
+        let key = decode_entry_key(kind_of_section(section), key)?;
+        let Some((row, _)) = read_row(&self.connection, section, &key)? else { return Ok(()); };
+        if !row.value.is_tombstone() || row.value.first_published().is_some() { return Ok(()); }
+        match section {
+            Section::Hypa => self.connection.execute(
+                "UPDATE hypa_embeddings SET first_published_generation=?4,first_published_at_ms=?5
+                    WHERE cache_key=?1 AND write_clock=?2 AND writer_id=?3 AND tombstone=1 AND first_published_generation IS NULL",
+                params![key.0, row.write_clock.as_str(), row.writer_id, generation.as_str(), at_ms],
+            )?,
+            Section::LocalPlugins => self.connection.execute(
+                "UPDATE plugin_device_storage SET first_published_generation=?6,first_published_at_ms=?7
+                    WHERE owner=?1 AND space=?2 AND key=?3 AND write_clock=?4 AND writer_id=?5 AND tombstone=1
+                      AND first_published_generation IS NULL",
+                params![key.0, key.1, key.2, row.write_clock.as_str(), row.writer_id, generation.as_str(), at_ms],
+            )?,
+        };
+        Ok(())
+    }
+
+    pub(crate) fn pending_section_entry_keys(&self, section: Section, after: &str, limit: usize) -> StoreResult<Vec<String>> {
+        let limit = limit.min(256);
+        match section {
+            Section::Hypa => {
+                let mut statement = self.connection.prepare(
+                    "SELECT cache_key FROM hypa_embeddings WHERE (published_clock IS NULL OR published_clock<>write_clock)
+                        AND cache_key>?1 ORDER BY cache_key LIMIT ?2",
+                )?;
+                let keys = statement.query_map(params![after, limit as i64], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                keys.iter().map(|key| hypa_entry_key(key).map_err(section_format_error)).collect()
+            }
+            Section::LocalPlugins => {
+                let keys = unpublished_keys(&self.connection, section)?;
+                let mut encoded = keys.iter().map(|key| local_plugin_entry_key(&key.0, &key.1, &key.2).map_err(section_format_error))
+                    .collect::<StoreResult<Vec<_>>>()?;
+                encoded.sort();
+                Ok(encoded.into_iter().filter(|key| key.as_str() > after).take(limit).collect())
+            }
+        }
+    }
+
+    pub(crate) fn forget_section_publications(&mut self) -> StoreResult<()> {
+        let tx = self.transaction()?;
+        for table in ["hypa_embeddings", "plugin_device_storage"] {
+            tx.execute(&format!("UPDATE {table} SET published_clock=NULL WHERE published_clock IS NOT NULL"), [])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn write_section_entries(&mut self, writes: &[SectionWriteInput<'_>]) -> StoreResult<()> {
+        let tx = self.transaction()?;
+        for write in writes {
+            match write {
+                SectionWriteInput::Apply { section, entry, object } => {
+                    if entry.kind != kind_of_section(*section) { return Err(invalid("Section entry belongs to another section")); }
+                    let row = SectionRow::from_entry((*entry).clone(), true, |_| {
+                        object.map(|bytes| bytes.to_vec()).ok_or_else(|| invalid("Section vector object is missing"))
+                    })?;
+                    merge_row(&tx, *section, &row)?;
+                    observe_remote_clock(&tx, *section, &row.write_clock)?;
+                }
+                SectionWriteInput::Mark { section, key } => {
+                    let key = decode_entry_key(kind_of_section(*section), key)?;
+                    if let Some((row, _)) = read_row(&tx, *section, &key)? {
+                        mark_row_version(&tx, *section, &key, &row.version(), true)?;
+                    }
+                }
+                SectionWriteInput::MarkVersion { section, key, version } => {
+                    mark_row_version(&tx, *section, &decode_entry_key(kind_of_section(*section), key)?, version, true)?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn section_state(&self, section: Section) -> StoreResult<SectionState> {
         let (participating, max_write_clock, gc_floor, participation_generation): (
             i64,
@@ -339,6 +1148,15 @@ impl DeviceStore {
                     section.as_str()
                 ],
             )?;
+            if participating {
+                // Keep lineage identity for removal markers, but require a
+                // rejoin before exchanging values again after a pause.
+                transaction.execute(
+                    "UPDATE device_remote_cursors SET applied_generation='0',applied_gc_floor='0'
+                        WHERE section=?1",
+                    [section.as_str()],
+                )?;
+            }
         }
         transaction.commit()?;
         Ok(())
@@ -453,30 +1271,37 @@ impl DeviceStore {
     pub(crate) fn note_section_published(
         &mut self,
         section: Section,
-        published: &[(SectionKey, Sequence)],
-        stamped: &[(SectionKey, Sequence)],
+        published: &[(SectionKey, SectionEntryVersion)],
+        stamped: &[(SectionKey, SectionEntryVersion)],
         first_published: &TombstonePublication,
-        reclaimed: &BTreeSet<SectionKey>,
+        reclaimed: &ReclaimedRows,
         gc_floor: &Sequence,
     ) -> StoreResult<()> {
-        if published.is_empty() && stamped.is_empty() && reclaimed.is_empty() {
-            return Ok(());
-        }
         let transaction = self.transaction()?;
         // The removals this publication stopped carrying go with the floor it
         // published, in the transaction that records the publication, so a
         // publication that never finished reclaims nothing.
-        for (key1, key2, key3) in reclaimed {
+        for ((key1, key2, key3), version) in reclaimed {
+            let at_ms = i64::try_from(version.first_published.at_ms)
+                .map_err(|_| invalid("device removal marker time is out of range"))?;
             match section {
                 Section::Hypa => {
-                    transaction
-                        .execute("DELETE FROM hypa_embeddings WHERE cache_key=?1", [key1])?;
+                    transaction.execute(
+                        "DELETE FROM hypa_embeddings WHERE cache_key=?1 AND tombstone=1
+                            AND write_clock=?2 AND writer_id=?3
+                            AND first_published_generation=?4 AND first_published_at_ms=?5",
+                        params![key1, version.write_clock.as_str(), version.writer_id,
+                            version.first_published.generation.as_str(), at_ms],
+                    )?;
                 }
                 Section::LocalPlugins => {
                     transaction.execute(
                         "DELETE FROM plugin_device_storage
-                            WHERE owner=?1 AND space=?2 AND key=?3",
-                        params![key1, key2, key3],
+                            WHERE owner=?1 AND space=?2 AND key=?3 AND tombstone=1
+                              AND write_clock=?4 AND writer_id=?5
+                              AND first_published_generation=?6 AND first_published_at_ms=?7",
+                        params![key1, key2, key3, version.write_clock.as_str(), version.writer_id,
+                            version.first_published.generation.as_str(), at_ms],
                     )?;
                 }
             }
@@ -499,34 +1324,29 @@ impl DeviceStore {
             let mut statement = match section {
                 Section::Hypa => transaction.prepare(
                     "UPDATE hypa_embeddings
-                        SET first_published_generation=?3,first_published_at_ms=?4
-                        WHERE cache_key=?1 AND write_clock=?2 AND tombstone=1
+                        SET first_published_generation=?4,first_published_at_ms=?5
+                        WHERE cache_key=?1 AND write_clock=?2 AND writer_id=?3 AND tombstone=1
                           AND first_published_generation IS NULL",
                 )?,
                 Section::LocalPlugins => transaction.prepare(
                     "UPDATE plugin_device_storage
-                        SET first_published_generation=?5,first_published_at_ms=?6
-                        WHERE owner=?1 AND space=?2 AND key=?3 AND write_clock=?4
+                        SET first_published_generation=?6,first_published_at_ms=?7
+                        WHERE owner=?1 AND space=?2 AND key=?3 AND write_clock=?4 AND writer_id=?5
                           AND tombstone=1 AND first_published_generation IS NULL",
                 )?,
             };
             let generation = first_published.generation.as_str();
             let at_ms = i64::try_from(first_published.at_ms)
                 .map_err(|_| invalid("device removal marker time is out of range"))?;
-            for ((key1, key2, key3), clock) in stamped {
+            for ((key1, key2, key3), version) in stamped {
                 match section {
                     Section::Hypa => {
-                        statement.execute(params![key1, clock.as_str(), generation, at_ms])?;
+                        statement.execute(params![key1, version.write_clock.as_str(),
+                            version.writer_id, generation, at_ms])?;
                     }
                     Section::LocalPlugins => {
-                        statement.execute(params![
-                            key1,
-                            key2,
-                            key3,
-                            clock.as_str(),
-                            generation,
-                            at_ms
-                        ])?;
+                        statement.execute(params![key1, key2, key3, version.write_clock.as_str(),
+                            version.writer_id, generation, at_ms])?;
                     }
                 }
             }
@@ -535,150 +1355,26 @@ impl DeviceStore {
             let mut statement = match section {
                 Section::Hypa => transaction.prepare(
                     "UPDATE hypa_embeddings SET published_clock=?2
-                        WHERE cache_key=?1 AND write_clock=?2",
+                        WHERE cache_key=?1 AND write_clock=?2 AND writer_id=?3",
                 )?,
                 Section::LocalPlugins => transaction.prepare(
                     "UPDATE plugin_device_storage SET published_clock=?4
-                        WHERE owner=?1 AND space=?2 AND key=?3 AND write_clock=?4",
+                        WHERE owner=?1 AND space=?2 AND key=?3 AND write_clock=?4 AND writer_id=?5",
                 )?,
             };
-            for ((key1, key2, key3), clock) in published {
+            for ((key1, key2, key3), version) in published {
                 match section {
                     Section::Hypa => {
-                        statement.execute(params![key1, clock.as_str()])?;
+                        statement.execute(params![key1, version.write_clock.as_str(), version.writer_id])?;
                     }
                     Section::LocalPlugins => {
-                        statement.execute(params![key1, key2, key3, clock.as_str()])?;
+                        statement.execute(params![key1, key2, key3, version.write_clock.as_str(), version.writer_id])?;
                     }
                 }
             }
         }
         transaction.commit()?;
         Ok(())
-    }
-
-    /// Rewrites this device's section as its own newest writes, above every
-    /// version `observed` covers. Values and preserved removals both travel,
-    /// so the merge that follows keeps them wherever `remote` holds the same
-    /// key and the keys only this device holds still reach the remote. A row
-    /// the remote already carries unchanged needs neither, and a row this
-    /// device issued above `observed` and has not published is already the
-    /// newest, so a retried attempt stamps no second version.
-    pub(crate) fn reissue_section_rows(
-        &mut self,
-        section: Section,
-        observed: &Sequence,
-        remote: &[SectionRow],
-    ) -> StoreResult<usize> {
-        let transaction = self.transaction()?;
-        let writer_id: String = transaction.query_row(
-            "SELECT writer_id FROM device_meta WHERE singleton=1",
-            [],
-            |row| row.get(0),
-        )?;
-        let carried: BTreeMap<(String, String, String), &SectionRow> =
-            remote.iter().map(|row| (row.key(), row)).collect();
-        let unpublished = unpublished_keys(&transaction, section)?;
-        let pending: Vec<SectionRow> = read_rows(&transaction, section)?
-            .into_iter()
-            .filter(|row| {
-                let held = row.writer_id == writer_id
-                    && row.write_clock > *observed
-                    && unpublished.contains(&row.key());
-                let settled = carried
-                    .get(&row.key())
-                    .is_some_and(|other| {
-                        row.same_version(other) && row.value.same_content(&other.value)
-                    });
-                !held && !settled
-            })
-            .collect();
-        // The issued clock has to clear the remote as well as this device, so
-        // a value held here under another writer cannot lose its version.
-        observe_remote_clock(&transaction, section, observed)?;
-        if !pending.is_empty() {
-            super::begin_mutation(&transaction)?;
-            let clock = super::issue_write_clock(&transaction, section)?;
-            for row in &pending {
-                write_row(
-                    &transaction,
-                    section,
-                    &SectionRow {
-                        // A reissued removal is a new write for whichever
-                        // lineage receives it, and commit numbers mean nothing
-                        // across lineages, so it drops the marker it carried
-                        // and takes one from the publication that carries it.
-                        value: match &row.value {
-                            SectionValueRow::Tombstone { .. } => SectionValueRow::Tombstone {
-                                first_published: None,
-                            },
-                            value => value.clone(),
-                        },
-                        write_clock: clock.clone(),
-                        writer_id: writer_id.clone(),
-                        ..row.clone()
-                    },
-                    false,
-                )?;
-            }
-            super::finish_mutation(&transaction)?;
-        }
-        transaction.commit()?;
-        Ok(pending.len())
-    }
-
-    /// Drops the removals a remote has reclaimed. A removal goes only when the
-    /// received section declares a floor at or above the commit the removal was
-    /// first published in and no longer carries that removal itself: a floor can
-    /// stand above a removal the remote still holds, and dropping that one would
-    /// let another device's older value come back. A removal this device has not
-    /// published carries no marker and stays. The caller has already established
-    /// that the received section comes from the lineage the markers name.
-    ///
-    /// This is bookkeeping about a removal rather than a write, so it runs
-    /// outside a change context and never reaches the device change index.
-    pub(crate) fn reclaim_section_tombstones(
-        &mut self,
-        section: Section,
-        gc_floor: &Sequence,
-        received: &[SectionRow],
-    ) -> StoreResult<usize> {
-        if *gc_floor == Sequence::from(0u64) {
-            return Ok(0);
-        }
-        let carried: BTreeSet<SectionKey> = received
-            .iter()
-            .filter(|row| row.value.is_tombstone())
-            .map(SectionRow::key)
-            .collect();
-        let transaction = self.transaction()?;
-        let reclaimable: Vec<SectionKey> = read_rows(&transaction, section)?
-            .into_iter()
-            .filter(|row| {
-                row.value
-                    .first_published()
-                    .is_some_and(|marker| marker.generation <= *gc_floor)
-                    && !carried.contains(&row.key())
-            })
-            .map(|row| row.key())
-            .collect();
-        for (key1, key2, key3) in &reclaimable {
-            match section {
-                Section::Hypa => {
-                    transaction
-                        .execute("DELETE FROM hypa_embeddings WHERE cache_key=?1", [key1])?;
-                }
-                Section::LocalPlugins => {
-                    transaction.execute(
-                        "DELETE FROM plugin_device_storage
-                            WHERE owner=?1 AND space=?2 AND key=?3",
-                        params![key1, key2, key3],
-                    )?;
-                }
-            }
-        }
-        transaction.commit()?;
-        Ok(reclaimable.len())
     }
 
     /// Merges a received section. The higher `(write_clock, writer_id)` wins,
@@ -691,49 +1387,18 @@ impl DeviceStore {
     ) -> StoreResult<SectionApplyOutcome> {
         let transaction = self.transaction()?;
         let mut outcome = SectionApplyOutcome::default();
-        let local: BTreeMap<(String, String, String), SectionRow> = read_rows(&transaction, section)?
-            .into_iter()
-            .map(|row| (row.key(), row))
-            .collect();
         let mut highest = Sequence::from(0u64);
-        let mut applied = Vec::new();
-        let mut adopted = Vec::new();
+        let mut keys = BTreeSet::new();
         for row in rows {
-            if row.writer_id.is_empty() {
-                return Err(invalid("received section row has no writer"));
+            if !keys.insert(row.key()) {
+                return Err(invalid("Received section rows repeat a key"));
             }
-            if row.write_clock > highest {
-                highest = row.write_clock.clone();
+            highest = highest.max(row.write_clock.clone());
+            if merge_row(&transaction, section, row)? {
+                outcome.applied += 1;
+            } else {
+                outcome.kept += 1;
             }
-            match local.get(&row.key()) {
-                Some(current) if current.same_version(row) => {
-                    if !current.value.same_content(&row.value) {
-                        return Err(invalid(
-                            "received section row differs at the same version",
-                        ));
-                    }
-                    // Two devices can hold different first publication markers
-                    // for one removal when a confirmed publication did not
-                    // finish its local bookkeeping. The earliest marker is the
-                    // one that happened, and taking it whichever way the rows
-                    // arrive keeps the devices from publishing over each other.
-                    if earlier_marker(&row.value, &current.value) {
-                        adopted.push(row);
-                    }
-                    outcome.kept += 1;
-                }
-                Some(current) if !row.version_after(current) => outcome.kept += 1,
-                _ => applied.push(row),
-            }
-        }
-        // Received rows are staged outside a mutation context so the change
-        // index does not offer them back as this device's own writes.
-        for row in &applied {
-            write_row(&transaction, section, row, true)?;
-            outcome.applied += 1;
-        }
-        for row in &adopted {
-            write_row(&transaction, section, row, true)?;
         }
         observe_remote_clock(&transaction, section, &highest)?;
         transaction.commit()?;
@@ -746,25 +1411,7 @@ impl DeviceStore {
         library_lineage: &str,
         section: Section,
     ) -> StoreResult<Option<SectionCursor>> {
-        let stored: Option<(String, String, String)> = self
-            .connection
-            .query_row(
-                "SELECT applied_generation,applied_gc_floor,observed_max_write_clock
-                    FROM device_remote_cursors
-                    WHERE connection_id=?1 AND library_lineage=?2 AND section=?3",
-                params![connection_id, library_lineage, section.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        stored
-            .map(|(generation, floor, observed)| {
-                Ok(SectionCursor {
-                    applied_generation: sequence(&generation)?,
-                    applied_gc_floor: sequence(&floor)?,
-                    observed_max_write_clock: sequence(&observed)?,
-                })
-            })
-            .transpose()
+        read_cursor(&self.connection, connection_id, library_lineage, section)
     }
 
     /// The applied point of one section on one remote lineage. A cursor never
@@ -776,49 +1423,16 @@ impl DeviceStore {
         section: Section,
         cursor: &SectionCursor,
     ) -> StoreResult<()> {
-        if connection_id.is_empty() || library_lineage.is_empty() {
-            return Err(invalid("section cursor identity is missing"));
-        }
-        let existing = self.read_section_cursor(connection_id, library_lineage, section)?;
-        let merged = match existing {
-            Some(current) => SectionCursor {
-                applied_generation: cursor
-                    .applied_generation
-                    .clone()
-                    .max(current.applied_generation),
-                applied_gc_floor: cursor.applied_gc_floor.clone().max(current.applied_gc_floor),
-                observed_max_write_clock: cursor
-                    .observed_max_write_clock
-                    .clone()
-                    .max(current.observed_max_write_clock),
-            },
-            None => cursor.clone(),
-        };
-        self.connection.execute(
-            "INSERT INTO device_remote_cursors
-                (connection_id,library_lineage,section,applied_generation,applied_gc_floor,
-                 observed_max_write_clock)
-                VALUES (?1,?2,?3,?4,?5,?6)
-                ON CONFLICT(connection_id,library_lineage,section) DO UPDATE SET
-                    applied_generation=excluded.applied_generation,
-                    applied_gc_floor=excluded.applied_gc_floor,
-                    observed_max_write_clock=excluded.observed_max_write_clock",
-            params![
-                connection_id,
-                library_lineage,
-                section.as_str(),
-                merged.applied_generation.as_str(),
-                merged.applied_gc_floor.as_str(),
-                merged.observed_max_write_clock.as_str()
-            ],
-        )?;
+        let tx = self.transaction()?;
+        record_cursor(&tx, connection_id, library_lineage, section, cursor)?;
+        tx.commit()?;
         Ok(())
     }
 
     /// Forgets how far one lineage has been applied, so the section goes back
     /// through the rejoin path before this device publishes over it again. The
     /// row stays, because it is what says the markers this device holds were
-    /// issued by this lineage. This is the one place a cursor moves backwards.
+    /// issued by this lineage. Explicit rejoin resets may move a cursor backwards.
     pub(crate) fn forget_section_cursor(
         &mut self,
         connection_id: &str,
@@ -991,7 +1605,8 @@ fn write_row(
     let published_clock = published.then(|| row.write_clock.as_str().to_owned());
     let marker = row.value.first_published();
     let generation = marker.map(|marker| marker.generation.as_str().to_owned());
-    let at_ms = marker.map(|marker| marker.at_ms as i64);
+    let at_ms = marker.map(|marker| i64::try_from(marker.at_ms)
+        .map_err(|_| invalid("Device removal marker time is out of range"))).transpose()?;
     match (section, &row.value) {
         (Section::Hypa, SectionValueRow::Tombstone { .. }) => {
             tx.execute(
@@ -1114,3 +1729,7 @@ fn write_row(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "section_merge_tests.rs"]
+mod merge_tests;

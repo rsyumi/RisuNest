@@ -199,6 +199,9 @@ vi.mock('./generationState', () => ({
     },
 }))
 vi.mock('../storage/persistentDataRuntime.svelte', () => ({
+    assertPersistentMutationAllowed: vi.fn(),
+    getPersistentStorageAuthorityEpoch: () => 0,
+    getPersistentNavigationGeneration: () => 0,
     acknowledgeGenerationCompletion: harness.acknowledge,
     captureSelectedConversationTarget: () => null,
     acquireCompleteConversation: vi.fn(),

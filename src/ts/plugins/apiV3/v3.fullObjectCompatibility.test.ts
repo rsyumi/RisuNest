@@ -137,7 +137,9 @@ vi.mock('src/ts/process/ttsHooks', () => ({
 vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
     acquireCompleteConversation: vi.fn(),
     captureSelectedConversationTarget: vi.fn(() => null),
-    flushPendingData: vi.fn(),
+    flushPendingDataLocally: vi.fn(),
+    assertPersistentMutationAllowed: vi.fn(),
+    getPersistentStorageAuthorityEpoch: () => 0,
     getActiveConversationSession: vi.fn(() => null),
     getPersistentNavigationGeneration: vi.fn(() => 0),
     invalidateActiveConversationSession: vi.fn(),

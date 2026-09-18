@@ -20,6 +20,7 @@ use crate::persistent_store::{
     external_conflicts::{ConflictPhase, ConflictPreservation, ConflictRecord},
     external_runtime::ExternalBase,
     sync_selection::CaptureIdentity,
+    PersistentStore, PreparedReplaceCommit,
 };
 use risunest_external_storage_format::{
     format::{library_fingerprint_domain, Descriptor},
@@ -30,44 +31,160 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 
-struct ApplyClaim {
-    app: AppHandle,
+type ReceiveParticipation = Vec<(PdsSection, bool, Sequence)>;
+
+pub(crate) struct PreparedReceive {
     job_id: String,
+    connection_id: String,
+    snapshot_id: String,
+    expected: CaptureIdentity,
+    authenticated_head: String,
+    commit: PreparedReplaceCommit,
+    participation: ReceiveParticipation,
+    sections: Vec<super::snapshot_restore::PreparedSection>,
 }
-impl Drop for ApplyClaim {
-    fn drop(&mut self) {
-        if let Ok(mut active) = self
-            .app
-            .state::<super::job_store::JobCommandState>()
-            .active
-            .lock()
-        {
-            active.remove(&self.job_id);
-        }
+impl PreparedReceive {
+    fn ready_result(&self) -> Value {
+        json!({"receiveReady":true,"snapshotId":self.snapshot_id,
+            "expectedRevision":self.expected.revision.to_string()})
     }
 }
-fn claim_apply(app: &AppHandle, job: &DurableJob) -> Result<(Cancellation, ApplyClaim)> {
-    let cancel = Cancellation::default();
+
+pub(crate) fn prepared_receive_result(app: &AppHandle, job: &str) -> Result<Option<Value>> {
     let state = app.state::<super::job_store::JobCommandState>();
-    let mut active = state.active.lock().map_err(local_error)?;
-    if active.contains_key(&job.id)
-        || active
-            .values()
-            .any(|(connection, _)| connection == &job.request.connection_id)
-    {
+    let prepared = state.prepared_receives.lock().map_err(local_error)?;
+    Ok(prepared.get(job).map(PreparedReceive::ready_result))
+}
+
+pub(crate) fn discard_receive_preparation(app: &AppHandle, id: &str) -> Result<()> {
+    let state = app.state::<super::job_store::JobCommandState>();
+    let prepared = state.prepared_receives.lock().map_err(local_error)?.remove(id);
+    let jobs = JobStore::open(&super::runtime::root(app)?)?;
+    let mut job = jobs.read(id)?;
+    let staging_id = prepared.as_ref().map(|entry| entry.commit.external_staging_id())
+        .or(job.receive_staging_id.as_deref());
+    if let Some(staging_id) = staging_id {
+        pds(app)?.replace_abort(staging_id).map_err(local_error)?;
+    }
+    if job.receive_staging_id.take().is_some() {
+        jobs.put(&job)?;
+    }
+    Ok(())
+}
+
+fn require_exact_receive_identity(expected: &CaptureIdentity, current: &CaptureIdentity) -> Result<()> {
+    if expected != current {
         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
     }
-    active.insert(
-        job.id.clone(),
-        (job.request.connection_id.clone(), cancel.clone()),
-    );
-    Ok((
-        cancel,
-        ApplyClaim {
-            app: app.clone(),
-            job_id: job.id.clone(),
-        },
-    ))
+    Ok(())
+}
+
+fn receive_participation(store: &mut PersistentStore) -> Result<ReceiveParticipation> {
+    let device = store.device_store_mut().map_err(local_error)?;
+    [PdsSection::Hypa, PdsSection::LocalPlugins].into_iter().map(|section| {
+        let state = device.section_state(section).map_err(local_error)?;
+        Ok((section, state.participating, state.participation_generation))
+    }).collect()
+}
+
+fn require_receive_participation(store: &mut PersistentStore, expected: &ReceiveParticipation) -> Result<()> {
+    if receive_participation(store)? != *expected {
+        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+    }
+    Ok(())
+}
+
+fn wanted_receive_sections(participation: &ReceiveParticipation) -> std::collections::BTreeSet<String> {
+    participation.iter().filter_map(|(section, enabled, _)| {
+        if !enabled { return None; }
+        match section {
+            PdsSection::Hypa => Some(SectionKind::Hypa.id().to_owned()),
+            PdsSection::LocalPlugins => Some(SectionKind::LocalPlugins.id().to_owned()),
+        }
+    }).collect()
+}
+
+fn prepare_receive_input(
+    store: &mut PersistentStore,
+    job: &DurableJob,
+    expected: CaptureIdentity,
+    authenticated_head: String,
+    downloaded: super::snapshot_restore::PreparedRemoteSnapshot,
+    sections: Vec<super::snapshot_restore::PreparedSection>,
+    participation: ReceiveParticipation,
+) -> Result<PreparedReceive> {
+    require_exact_receive_identity(&expected, &store.external_identity().map_err(local_error)?)?;
+    store.external_validate_receive(&job.id, &job.request.connection_id, &expected, &authenticated_head)
+        .map_err(|_| ProviderError::new(ErrorKind::PreconditionFailed))?;
+    require_receive_participation(store, &participation)?;
+    let intent = store.external_job(&job.id).map_err(local_error)?
+        .ok_or_else(|| ProviderError::new(ErrorKind::PreconditionFailed))?;
+    if intent.capture_id != downloaded.snapshot_id || intent.repository_id != downloaded.repository_id {
+        return Err(corrupt("received snapshot binding differs"));
+    }
+    let wanted = wanted_receive_sections(&participation);
+    if sections.iter().any(|section| !wanted.contains(section.kind.id())) {
+        return Err(corrupt("received section is not participating"));
+    }
+    // Reject malformed device rows before exposing an activatable library.
+    for section in &sections {
+        super::sections::decode_section(section.kind, &section.entries, &section.content_fingerprint)?;
+    }
+    let scope_id = library_fingerprint_domain();
+    let fingerprint = hex::decode(&downloaded.library_fingerprint)
+        .ok().and_then(|value| value.try_into().ok())
+        .ok_or_else(|| corrupt("invalid received fingerprint"))?;
+    let application = ExternalSnapshotApplication {
+        expected_revision: expected.revision,
+        staging_root: &downloaded.staging_root,
+        scope_id: &scope_id,
+        fingerprint: &fingerprint,
+    };
+    let records = downloaded.records.into_iter().map(|record| Ok(ExternalSnapshotRecord {
+        key: record.key, content_hash: record.content_hash,
+        byte_length: record.byte_length, path: record.path,
+    }));
+    let objects = downloaded.objects.into_iter().map(|object| Ok(ExternalSnapshotObject {
+        content_hash: object.content_hash, byte_length: object.byte_length, path: object.path,
+    }));
+    let commit = store.prepare_external_snapshot_application(&application, records, objects)
+        .map_err(local_error)?;
+    Ok(PreparedReceive {
+        job_id: job.id.clone(), connection_id: job.request.connection_id.clone(),
+        snapshot_id: downloaded.snapshot_id, expected, authenticated_head, commit,
+        participation, sections,
+    })
+}
+
+// No transport or credentials enter the activation boundary.
+fn activate_prepared_receive(
+    store: &mut PersistentStore,
+    prepared: PreparedReceive,
+    current: &CaptureIdentity,
+) -> Result<i64> {
+    let staging_id = prepared.commit.external_staging_id().to_owned();
+    let result = (|| {
+        require_exact_receive_identity(&prepared.expected, current)?;
+        store.external_validate_receive(&prepared.job_id, &prepared.connection_id,
+            &prepared.expected, &prepared.authenticated_head)
+            .map_err(|_| ProviderError::new(ErrorKind::PreconditionFailed))?;
+        require_receive_participation(store, &prepared.participation)?;
+        apply_received_sections(store, &prepared.connection_id,
+            &prepared.expected.library_epoch, &prepared.sections)?;
+        store.finish_external_receive(prepared.commit, &prepared.job_id)
+            .map(|result| result.revision).map_err(local_error)
+    })();
+    if result.is_err() {
+        if let Some(completed) = store.external_receive_completion(&prepared.job_id, &prepared.connection_id)
+            .map_err(local_error)?
+        {
+            return Ok(completed.revision);
+        }
+        if store.replace_abort(&staging_id).is_err() {
+            crate::nlog!("error", "Rejected external receive stage could not be removed");
+        }
+    }
+    result
 }
 
 fn corrupt(_: impl std::fmt::Display) -> ProviderError {
@@ -511,75 +628,138 @@ async fn receive_remote(
     app: &AppHandle,
     connected: &ConnectedRepository,
     job: &DurableJob,
+    expected: &CaptureIdentity,
     remote: &ObservedHead,
     cancel: &Cancellation,
 ) -> Result<Value> {
-    let identity = pds(app)?.external_identity().map_err(local_error)?;
-    let observation = observation_json(&remote.observation)?;
-    let intent = crate::persistent_store::external_storage_state::ReceiveIntent {
-        job_id: &job.id,
-        connection_id: &job.request.connection_id,
-        repository_id: &connected.stored.descriptor.repository_id,
-        snapshot_id: remote
-            .document
-            .state
-            .object_id
-            .trim_start_matches("snapshot-"),
-        commit_id: &remote.document.commit_id,
-        authenticated_head: &observation,
-        identity: &identity,
-    };
-    let existing = pds(app)?
-        .external_jobs(&job.request.connection_id)
-        .map_err(local_error)?
-        .into_iter()
-        .find(|item| item.id == job.id);
-    if job.request.kind == JobKind::ResolveConflict {
-        if existing
-            .as_ref()
-            .is_some_and(|item| matches!(item.phase.as_str(), "stale" | "cancelled"))
+    cancel.check()?;
+    let _admission = app.state::<crate::native_file_jobs::NativeFileJobState>()
+        .admission.file(false).map_err(local_error)?;
+    let (observation, participation) = {
+        let mut store = pds(app)?;
+        require_exact_receive_identity(expected, &store.external_identity().map_err(local_error)?)?;
+        super::runtime::require_admitted_library(job, expected)?;
+        let existing = store.external_job(&job.id).map_err(local_error)?;
+        let observation = if let Some(pending) = existing.as_ref()
+            .filter(|item| item.role == "restore" && item.phase == "ready")
         {
-            pds(app)?
-                .external_prepare_conflict_receive(&intent)
-                .map_err(local_error)?;
+            let original = pending.expected_head.as_deref()
+                .ok_or_else(|| corrupt("missing received head observation"))?;
+            require_received_head(original, Some(&remote.observation))?;
+            original.to_owned()
+        } else {
+            observation_json(&remote.observation)?
+        };
+        let intent = crate::persistent_store::external_storage_state::ReceiveIntent {
+            job_id: &job.id,
+            connection_id: &job.request.connection_id,
+            repository_id: &connected.stored.descriptor.repository_id,
+            snapshot_id: remote.document.state.object_id.trim_start_matches("snapshot-"),
+            commit_id: &remote.document.commit_id,
+            authenticated_head: &observation,
+            identity: expected,
+        };
+        if job.request.kind == JobKind::ResolveConflict {
+            if existing.as_ref().is_some_and(|item| matches!(item.phase.as_str(), "stale" | "cancelled")) {
+                store.external_prepare_conflict_receive(&intent).map_err(local_error)?;
+            }
+        } else if existing.is_none() {
+            store.external_prepare_receive(&intent).map_err(local_error)?;
         }
-    } else if existing.is_none() {
-        pds(app)?
-            .external_prepare_receive(&intent)
-            .map_err(local_error)?;
-    }
+        store.external_validate_receive(&job.id, &job.request.connection_id, expected, &observation)
+            .map_err(|_| ProviderError::new(ErrorKind::PreconditionFailed))?;
+        (observation, receive_participation(&mut store)?)
+    };
+    // A process restart loses the native commit handle. Only this worker may
+    // revalidate the downloaded files and build another inactive generation.
+    discard_receive_preparation(app, &job.id)?;
     let root = super::runtime::root(app)?;
-    let staging =
-        super::runtime::job_directory(&root, &job.request.connection_id, &job.id).join("receive");
-    let prepared = super::snapshot_restore::download_snapshot(
-        &remote.document.state,
-        &staging,
-        &connected.root_key,
-        connected.provider.as_ref(),
-        &connected.handle,
-        cancel,
-    )
-    .await?;
-    let current = control::read_head(
-        connected.provider.as_ref(),
-        &connected.handle,
-        &connected.stored.descriptor,
-        &connected.root_key,
-        None,
-        cancel,
-    )
-    .await?;
-    if current.as_ref().map(|head| &head.observation) != Some(&remote.observation) {
-        if job.request.kind != JobKind::ResolveConflict {
-            pds(app)?
-                .external_cancel_prepared(&job.id)
-                .map_err(local_error)?;
+    let staging = super::runtime::job_directory(&root, &job.request.connection_id, &job.id).join("receive");
+    let downloaded = super::snapshot_restore::download_snapshot(
+        &remote.document.state, &staging, &connected.root_key,
+        connected.provider.as_ref(), &connected.handle, cancel,
+    ).await?;
+    cancel.check()?;
+    let sections = super::snapshot_restore::download_sections(
+        &remote.document.state, &wanted_receive_sections(&participation), &staging,
+        &connected.root_key, connected.provider.as_ref(), &connected.handle, cancel,
+    ).await?;
+    let worker_app = app.clone();
+    let worker_job = job.clone();
+    let worker_identity = expected.clone();
+    let worker_head = observation;
+    let worker_cancel = cancel.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        worker_cancel.check()?;
+        super::runtime::read_job_session(&worker_app, &worker_job.id)?;
+        prepare_receive_input(&mut pds(&worker_app)?, &worker_job, worker_identity,
+            worker_head, downloaded, sections, participation)
+    }).await.map_err(local_error)??;
+    let recorded = (|| {
+        let jobs = JobStore::open(&root)?;
+        let mut durable = jobs.read(&job.id)?;
+        durable.receive_staging_id = Some(prepared.commit.external_staging_id().to_owned());
+        jobs.put(&durable)
+    })();
+    if let Err(error) = recorded {
+        if pds(app).and_then(|mut store| store.replace_abort(prepared.commit.external_staging_id())
+            .map_err(local_error)).is_err()
+        {
+            crate::nlog!("error", "Unrecorded external receive stage could not be removed");
         }
+        return Err(error);
+    }
+    let checked = async {
+        let current = control::read_head(
+            connected.provider.as_ref(), &connected.handle, &connected.stored.descriptor,
+            &connected.root_key, None, cancel,
+        ).await?;
+        require_received_head(&prepared.authenticated_head,
+            current.as_ref().map(|head| &head.observation))?;
+        super::runtime::enter_repository(app, connected, job, cancel).await?;
+        {
+            let mut store = pds(app)?;
+            require_exact_receive_identity(&prepared.expected, &store.external_identity().map_err(local_error)?)?;
+            store.external_validate_receive(&job.id, &job.request.connection_id,
+                &prepared.expected, &prepared.authenticated_head)
+                .map_err(|_| ProviderError::new(ErrorKind::PreconditionFailed))?;
+            require_receive_participation(&mut store, &prepared.participation)?;
+        }
+        super::runtime::read_job_session(app, &job.id)?;
+        let state = app.state::<super::job_store::JobCommandState>();
+        let active = state.active.lock().map_err(local_error)?;
+        let (connection, owner_cancel) = active.get(&job.id)
+            .ok_or_else(|| ProviderError::new(ErrorKind::PreconditionFailed))?;
+        if connection != &job.request.connection_id {
+            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+        }
+        owner_cancel.check()?;
+        cancel.check()?;
+        let result = prepared.ready_result();
+        let mut entries = state.prepared_receives.lock().map_err(local_error)?;
+        if entries.contains_key(&job.id) {
+            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+        }
+        entries.insert(job.id.clone(), prepared);
+        Ok(result)
+    }.await;
+    if checked.is_err() {
+        if discard_receive_preparation(app, &job.id).is_err() {
+            crate::nlog!("error", "External receive preparation could not be discarded");
+        }
+    }
+    checked
+}
+
+fn require_received_head(expected: &str, observed: Option<&HeadObservation>) -> Result<()> {
+    let expected = parse_observation(expected)?;
+    if !observed.is_some_and(|current| {
+        current.commit_id == expected.commit_id
+            && current.authenticated_body_hash == expected.authenticated_body_hash
+    }) {
         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
     }
-    Ok(
-        json!({"receiveReady":true,"snapshotId":prepared.snapshot_id,"expectedRevision":identity.revision.to_string()}),
-    )
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -587,23 +767,6 @@ async fn receive_remote(
 pub(crate) struct ApplyReceivedRequest {
     job_id: String,
     expected_revision: String,
-}
-
-/// The sections this device takes part in right now. A section left out is not
-/// downloaded at all, so its values never reach this installation.
-fn participating_sections(app: &AppHandle) -> Result<std::collections::BTreeSet<String>> {
-    let mut store = pds(app)?;
-    let device = store.device_store_mut().map_err(local_error)?;
-    let mut wanted = std::collections::BTreeSet::new();
-    for (kind, section) in [
-        (SectionKind::Hypa, PdsSection::Hypa),
-        (SectionKind::LocalPlugins, PdsSection::LocalPlugins),
-    ] {
-        if device.section_state(section).map_err(local_error)?.participating {
-            wanted.insert(kind.id().to_owned());
-        }
-    }
-    Ok(wanted)
 }
 
 /// Records what a confirmed publication put on the remote, so the next cycle
@@ -659,7 +822,7 @@ fn note_sections_published(
 /// transaction, so an interrupted apply resumes from the same remote state
 /// instead of reporting the whole receive as done.
 fn apply_received_sections(
-    app: &AppHandle,
+    store: &mut PersistentStore,
     connection_id: &str,
     library_lineage: &str,
     sections: &[super::snapshot_restore::PreparedSection],
@@ -667,10 +830,9 @@ fn apply_received_sections(
     if sections.is_empty() {
         return Ok(());
     }
-    let mut store = pds(app)?;
     for prepared in sections {
         super::sections::apply_received_section(
-            &mut store,
+            store,
             connection_id,
             library_lineage,
             super::sections::SectionArrival::Continuing,
@@ -750,170 +912,130 @@ async fn rejoin_sections(
     Ok(())
 }
 
-async fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Result<Value> {
-    if request.job_id.is_empty()
-        || request.job_id.len() > 1024
-        || request.expected_revision.parse::<i64>().is_err()
-        || request.expected_revision.starts_with('-')
+fn receive_revision(request: &ApplyReceivedRequest) -> Result<i64> {
+    let revision = request.expected_revision.parse::<i64>()
+        .map_err(|_| corrupt("invalid staged receive revision"))?;
+    if request.job_id.is_empty() || request.job_id.len() > 1024 || request.job_id.contains('\0')
+        || revision < 0 || revision.to_string() != request.expected_revision
     {
         return Err(corrupt("invalid staged receive request"));
     }
-    let root = super::runtime::root(app)?;
-    let jobs = JobStore::open(&root)?;
-    let mut job = jobs.read(&request.job_id)?;
-    if job.summary["state"] != "waiting"
-        || job.summary["phase"] != "remote-apply"
-        || job.summary["result"]["receiveReady"] != true
-        || job.summary["result"]["expectedRevision"] != request.expected_revision
-    {
+    Ok(revision)
+}
+
+fn completed_receive_result(store: &PersistentStore, job: &DurableJob, expected: i64) -> Result<Option<Value>> {
+    let Some(completed) = store.external_receive_completion(&job.id, &job.request.connection_id)
+        .map_err(local_error)? else { return Ok(None) };
+    if completed.expected_revision != expected {
         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
     }
-    let (cancel, _claim) = claim_apply(app, &job)?;
-    super::runtime::read_job_session(app, &job.id)?;
-    let connected =
-        super::connection_commands::open_connected(app, &job.request.connection_id).await?;
-    // This staged receive downloads objects without going through `wake_job`,
-    // so it goes through the same admission before it asks for any of them.
-    super::runtime::enter_repository(app, &connected, &job, &cancel).await?;
-    let authoritative = pds(app)?
-        .external_jobs(&job.request.connection_id)
-        .map_err(local_error)?
-        .into_iter()
-        .find(|item| item.id == job.id && item.role == "restore" && item.phase == "ready")
+    Ok(Some(json!({"snapshotId":completed.snapshot_id,
+        "receivedRevision":completed.revision.to_string()})))
+}
+
+fn take_prepared_receive(
+    state: &super::job_store::JobCommandState,
+    claim: &super::job_store::JobClaim,
+    job: &DurableJob,
+    expected: i64,
+) -> Result<PreparedReceive> {
+    claim.require_job(state, job)?;
+    let active = state.active.lock().map_err(local_error)?;
+    let (connection, cancel) = active.get(&job.id)
         .ok_or_else(|| ProviderError::new(ErrorKind::PreconditionFailed))?;
-    if authoritative.identity.revision.to_string() != request.expected_revision {
-        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
-    }
-    let remote = control::read_head(
-        connected.provider.as_ref(),
-        &connected.handle,
-        &connected.stored.descriptor,
-        &connected.root_key,
-        None,
-        &cancel,
-    )
-    .await?
-    .ok_or_else(|| ProviderError::new(ErrorKind::PreconditionFailed))?;
-    if observation_json(&remote.observation)?
-        != authoritative
-            .expected_head
-            .as_deref()
-            .ok_or_else(|| corrupt("missing staged head"))?
-        || remote.document.commit_id != authoritative.commit_id
-        || remote.document.state.object_id != format!("snapshot-{}", authoritative.capture_id)
-    {
-        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
-    }
-    let staging =
-        super::runtime::job_directory(&root, &job.request.connection_id, &job.id).join("receive");
-    let prepared = super::snapshot_restore::download_snapshot(
-        &remote.document.state,
-        &staging,
-        &connected.root_key,
-        connected.provider.as_ref(),
-        &connected.handle,
-        &cancel,
-    )
-    .await?;
-    let wanted = participating_sections(app)?;
-    let received_sections = super::snapshot_restore::download_sections(
-        &remote.document.state,
-        &wanted,
-        &staging,
-        &connected.root_key,
-        connected.provider.as_ref(),
-        &connected.handle,
-        &cancel,
-    )
-    .await?;
-    let _permit = app
-        .state::<crate::native_file_jobs::NativeFileJobState>()
-        .admission
-        .file(true)
-        .map_err(local_error)?;
-    super::runtime::read_job_session(app, &job.id)?;
-    let latest = control::read_head(
-        connected.provider.as_ref(),
-        &connected.handle,
-        &connected.stored.descriptor,
-        &connected.root_key,
-        None,
-        &cancel,
-    )
-    .await?
-    .ok_or_else(|| ProviderError::new(ErrorKind::PreconditionFailed))?;
-    if latest.observation != remote.observation {
+    if connection != &job.request.connection_id {
         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
     }
     cancel.check()?;
+    let mut entries = state.prepared_receives.lock().map_err(local_error)?;
+    let entry = entries.get(&job.id)
+        .ok_or_else(|| ProviderError::new(ErrorKind::PreconditionFailed))?;
+    if entry.job_id != job.id || entry.connection_id != job.request.connection_id
+        || entry.expected.revision != expected
+    {
+        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+    }
+    Ok(entries.remove(&job.id).expect("prepared receive held under mutex"))
+}
+
+fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Result<Value> {
+    let expected = receive_revision(request)?;
+    let jobs = JobStore::open(&super::runtime::root(app)?)?;
+    let mut job = jobs.read(&request.job_id)?;
+    if !matches!(job.request.kind, JobKind::Sync | JobKind::ResolveConflict) {
+        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+    }
+    if let Some(result) = completed_receive_result(&pds(app)?, &job, expected)? {
+        return Ok(result);
+    }
+    let state = app.state::<super::job_store::JobCommandState>();
+    let (cancel, claim) = state.claim(&job)?;
     super::runtime::read_job_session(app, &job.id)?;
-    super::runtime::require_admitted_library(
-        &job,
-        &pds(app)?.external_identity().map_err(local_error)?,
-    )?;
-    let scope_id = library_fingerprint_domain();
-    let fingerprint = hex::decode(&prepared.library_fingerprint)
-        .ok()
-        .and_then(|value| value.try_into().ok())
-        .ok_or_else(|| corrupt("invalid received fingerprint"))?;
-    let application = ExternalSnapshotApplication {
-        expected_revision: authoritative.identity.revision,
-        staging_root: &prepared.staging_root,
-        scope_id: &scope_id,
-        fingerprint: &fingerprint,
-    };
-    let records = prepared.records.into_iter().map(|record| {
-        Ok(ExternalSnapshotRecord {
-            key: record.key,
-            content_hash: record.content_hash,
-            byte_length: record.byte_length,
-            path: record.path,
-        })
-    });
-    let objects = prepared.objects.into_iter().map(|object| {
-        Ok(ExternalSnapshotObject {
-            content_hash: object.content_hash,
-            byte_length: object.byte_length,
-            path: object.path,
-        })
-    });
-    // Sections go in before the library swap. A failure here leaves the job
-    // ready, so the retry applies the same remote rows again and only then
-    // replaces the library.
-    apply_received_sections(
-        app,
-        &job.request.connection_id,
-        &authoritative.identity.library_epoch,
-        &received_sections,
-    )?;
+    let permit = app.state::<crate::native_file_jobs::NativeFileJobState>()
+        .admission.file(true).map_err(local_error)?;
     let mut store = pds(app)?;
-    let commit = store
-        .prepare_external_snapshot_application(&application, records, objects)
-        .map_err(local_error)?;
-    let revision = store
-        .finish_external_receive(commit, &job.id)
-        .map_err(local_error)?
-        .revision;
+    // A command admitted after another apply observes that original commit.
+    if let Some(result) = completed_receive_result(&store, &job, expected)? {
+        return Ok(result);
+    }
+    let current = store.external_identity().map_err(local_error)?;
+    cancel.check()?;
+    super::runtime::read_job_session(app, &job.id)?;
+    let prepared = take_prepared_receive(&state, &claim, &job, expected)?;
+    let snapshot_id = prepared.snapshot_id.clone();
+    let outcome = activate_prepared_receive(&mut store, prepared, &current);
+    drop(store);
+    drop(permit);
+    job.receive_staging_id = None;
+    let revision = match outcome {
+        Ok(revision) => revision,
+        Err(error) => {
+            let permanent = matches!(error.kind, ErrorKind::PreconditionFailed | ErrorKind::Corrupt);
+            let mut preserving = false;
+            if permanent {
+                let mut store = pds(app)?;
+                let cancelled = if job.request.kind == JobKind::ResolveConflict {
+                    store.external_reject_conflict_resolution(&job.id)
+                } else {
+                    store.external_cancel_prepared(&job.id)
+                };
+                if cancelled.is_err() {
+                    crate::nlog!("error", "Rejected external receive intent could not be settled");
+                }
+                preserving = store.external_conflict(&job.id).map_err(local_error)?
+                    .is_some_and(|record| record.phase == ConflictPhase::Pending
+                        && record.preservation == ConflictPreservation::RemoteComplete);
+            }
+            job.summary["state"] = json!(if preserving { "conflict" } else if permanent { "failed" } else { "waiting" });
+            job.summary["phase"] = json!(if preserving { "conflict-choice" } else { "paused" });
+            job.summary.as_object_mut().unwrap().remove("result");
+            if preserving {
+                job.summary["result"] = json!({"conflictId":job.id});
+            }
+            job.summary["error"] = super::runtime::error_dto(&error);
+            job.summary["updatedAtMs"] = json!(super::runtime::now_ms().to_string());
+            if jobs.put(&job).is_err() {
+                crate::nlog!("error", "External receive reprepare state could not be persisted");
+            }
+            return Err(error);
+        }
+    };
     if job.request.kind == JobKind::ResolveConflict {
-        if store.external_finish_conflict(&job.id).is_err() {
-            crate::nlog!(
-                "error",
-                "External receive committed but conflict bookkeeping did not finish"
-            );
+        if pds(app).and_then(|mut store| store.external_finish_conflict(&job.id).map_err(local_error)).is_err() {
+            crate::nlog!("error", "External receive committed but conflict bookkeeping did not finish");
         }
     }
-    let result = json!({"snapshotId":prepared.snapshot_id,"receivedRevision":revision.to_string()});
+    let result = json!({"snapshotId":snapshot_id,"receivedRevision":revision.to_string()});
     job.summary["state"] = json!("succeeded");
     job.summary["phase"] = json!("complete");
     job.summary["result"] = result.clone();
+    job.summary.as_object_mut().unwrap().remove("error");
     job.summary["updatedAtMs"] = json!(super::runtime::now_ms().to_string());
     if jobs.put(&job).is_err() {
-        crate::nlog!(
-            "error",
-            "External receive committed but its UI summary could not be persisted"
-        );
+        crate::nlog!("error", "External receive committed but its UI summary could not be persisted");
     }
-    super::runtime::release_leases(app, &job);
+    // Terminal leases are reconciled by the next repository worker. Activation
+    // neither opens credentials nor starts a provider request, even for cleanup.
     Ok(result)
 }
 
@@ -922,7 +1044,8 @@ pub(crate) async fn external_storage_apply_received(
     app: AppHandle,
     request: ApplyReceivedRequest,
 ) -> Result<Value> {
-    apply_received(&app, &request).await
+    tokio::task::spawn_blocking(move || apply_received(&app, &request))
+        .await.map_err(local_error)?
 }
 
 async fn reconcile_unknown(
@@ -1367,7 +1490,10 @@ async fn run_resolve_conflict(
         pds(app)?
             .external_begin_conflict_resolution(conflict_id, &observation)
             .map_err(local_error)?;
-        return match receive_remote(app, connected, job, &remote, cancel).await {
+        let expected = pds(app)?.external_job(&job.id).map_err(local_error)?
+            .filter(|intent| intent.role == "restore" && intent.phase == "ready")
+            .map(|intent| intent.identity).unwrap_or(stored.local_identity.clone());
+        return match receive_remote(app, connected, job, &expected, &remote, cancel).await {
             Ok(result) => Ok(result),
             Err(error) => {
                 if pds(app)?
@@ -1617,12 +1743,18 @@ pub(crate) async fn run_sync(
     let base = store
         .external_base(&job.request.connection_id)
         .map_err(local_error)?;
+    let pending_receive = store.external_job(&job.id).map_err(local_error)?
+        .filter(|intent| intent.role == "restore" && intent.phase == "ready");
     drop(store);
-    // A section this lineage has not exchanged with yet is merged before the
-    // decision, so neither a publication nor a receive settles it against a
-    // local copy that never saw the remote rows.
-    if let (Some(base), Some(remote)) = (base.as_ref(), remote.as_ref()) {
-        rejoin_sections(app, connected, job, &identity, base, remote, cancel).await?;
+    if let Some(intent) = pending_receive {
+        let remote = remote.as_ref().ok_or_else(|| ProviderError::new(ErrorKind::PreconditionFailed))?;
+        if intent.repository_id != connected.stored.descriptor.repository_id
+            || intent.commit_id != remote.document.commit_id
+            || remote.document.state.object_id != format!("snapshot-{}", intent.capture_id)
+        {
+            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+        }
+        return receive_remote(app, connected, job, &intent.identity, remote, cancel).await;
     }
     let local_changed = base.as_ref().is_none_or(|base| {
         identity.revision != base.identity.revision
@@ -1677,7 +1809,7 @@ pub(crate) async fn run_sync(
             Ok(json!({"publishedRevision":decision_revision.to_string()}))
         }
         SyncAction::ReceiveRemote { remote } => {
-            receive_remote(app, connected, job, &remote, cancel).await
+            receive_remote(app, connected, job, &identity, &remote, cancel).await
         }
         SyncAction::AcceptEquivalent { remote } => {
             let accepted_identity = captured
@@ -1736,6 +1868,11 @@ pub(crate) async fn run_sync(
                 .ok_or_else(|| corrupt("missing publication capture"))?;
             let published_identity = capture.identity.clone();
             let local_capture_id = capture.id.clone();
+            // Rejoining changes device rows, so it belongs to publication, not
+            // to a receive's read-only preparation or conflict preservation.
+            if let (Some(base), Some(remote)) = (base.as_ref(), expected.as_ref()) {
+                rejoin_sections(app, connected, job, &published_identity, base, remote, cancel).await?;
+            }
             let (completed, mut journal, publications) = package_capture(
                 app,
                 connected,
@@ -1892,6 +2029,357 @@ pub(crate) fn external_storage_list_conflicts(
         "preservation":match record.preservation { ConflictPreservation::LocalOnly=>"local-only", ConflictPreservation::RemoteComplete=>"remote-complete" },
         "localLabel":"Local snapshot","remoteLabel":"Remote snapshot"
     }))).collect()
+}
+
+#[cfg(test)]
+mod receive_tests {
+    use super::*;
+    use crate::logical_records::{
+        encode_logical_record, encode_logical_record_key, LogicalRecordEnvelope, LogicalRecordLocator,
+    };
+    use crate::persistent_store::external_storage_state::ReceiveIntent;
+    use risunest_external_storage_format::{
+        content_identity::hash,
+        format::fingerprint,
+        section::{local_plugin_entry_key, LocalPluginValue, PluginSpace, SectionEntry, SectionEntryVersion, SectionValue},
+        snapshot::CatalogEntryKind,
+    };
+    use std::{collections::BTreeMap, fs};
+
+    fn bind(store: &mut PersistentStore, snapshot: &str) -> DurableJob {
+        let identity = store.external_identity().unwrap();
+        let request = serde_json::from_value(json!({
+            "connectionId":"connection", "kind":"sync", "reason":"automatic",
+            "session":"foreground", "sessionId":"synthetic-session"
+        })).unwrap();
+        let job = DurableJob::new(request, false, 1, identity.clone());
+        store.external_prepare_receive(&ReceiveIntent {
+            job_id: &job.id, connection_id: "connection", repository_id: "repository",
+            snapshot_id: snapshot, commit_id: snapshot, authenticated_head: "authenticated-head",
+            identity: &identity,
+        }).unwrap();
+        job
+    }
+
+    fn fixture() -> (tempfile::TempDir, PersistentStore, DurableJob, super::super::snapshot_restore::PreparedRemoteSnapshot) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let epoch = store.external_selection().unwrap().epoch;
+        store.external_select(&epoch, &crate::persistent_store::sync_selection::SyncTarget::External("connection".into())).unwrap();
+        store.device_store_mut().unwrap().set_section_participating(PdsSection::LocalPlugins, true).unwrap();
+        let job = bind(&mut store, "snapshot");
+        let staging = directory.path().join("received");
+        fs::create_dir(&staging).unwrap();
+        let key = encode_logical_record_key(&LogicalRecordLocator::Root).unwrap();
+        let record = encode_logical_record(&LogicalRecordEnvelope::Root {
+            value: json!({"marker":"remote"}), owner_heads: vec![],
+        }).unwrap();
+        let path = staging.join("root");
+        fs::write(&path, &record.bytes).unwrap();
+        let digest = hex::decode(&record.hash).unwrap().try_into().unwrap();
+        let library_fingerprint = hex::encode(fingerprint(&library_fingerprint_domain(), &BTreeMap::from([(key.clone(), digest)])));
+        let downloaded = super::super::snapshot_restore::PreparedRemoteSnapshot {
+            snapshot_id: "snapshot".into(), repository_id: "repository".into(),
+            fingerprint: library_fingerprint.clone(), library_fingerprint, logical_revision: 7,
+            staging_root: staging, captured_by_device: None, objects: vec![],
+            records: vec![super::super::snapshot_restore::PreparedRecord {
+                key, content_hash: record.hash, byte_length: record.size, path,
+            }],
+        };
+        (directory, store, job, downloaded)
+    }
+
+    fn plugin_section() -> super::super::snapshot_restore::PreparedSection {
+        let kind = SectionKind::LocalPlugins;
+        let key = local_plugin_entry_key("owner", "string", "key").unwrap();
+        let entry = SectionEntry::new(kind, key.clone(), SectionValue::LocalPlugin(LocalPluginValue {
+            space: PluginSpace::String, value: json!("remote-device-value"),
+        }), Some(SectionEntryVersion {
+            write_clock: Sequence::from(7u64), writer_id: "remote-writer".into(),
+        })).unwrap().encode().unwrap();
+        super::super::snapshot_restore::PreparedSection {
+            kind, generation: Sequence::from(7u64), gc_floor: Sequence::from(0u64),
+            max_write_clock: Sequence::from(7u64),
+            content_fingerprint: fingerprint(&kind.fingerprint_domain(), &BTreeMap::from([(key.clone(), hash(&entry))])),
+            entries: vec![(CatalogEntryKind::SectionEntry, key, entry)],
+        }
+    }
+
+    fn prepare(store: &mut PersistentStore, job: &DurableJob,
+        downloaded: super::super::snapshot_restore::PreparedRemoteSnapshot) -> PreparedReceive
+    {
+        let participation = receive_participation(store).unwrap();
+        prepare_receive_input(store, job, job.admission_identity.clone(), "authenticated-head".into(),
+            downloaded, vec![plugin_section()], participation).unwrap()
+    }
+
+    fn local_edit(store: &mut PersistentStore, revision: i64) {
+        let commit = serde_json::from_value(json!({
+            "expectedRevision": revision, "root": {"marker":"newer-local"}
+        })).unwrap();
+        store.commit(&commit).unwrap();
+    }
+
+    fn rows(store: &mut PersistentStore) -> Vec<crate::persistent_store::device_store::sections::SectionRow> {
+        store.device_store_mut().unwrap().read_section_rows(PdsSection::LocalPlugins).unwrap()
+    }
+
+    #[test]
+    fn preparation_leaves_live_data_untouched_and_activation_needs_no_download_files() {
+        let (_directory, mut store, job, downloaded) = fixture();
+        let source = downloaded.staging_root.clone();
+        let prepared = prepare(&mut store, &job, downloaded);
+        let stage = prepared.commit.external_staging_id().to_owned();
+        assert_eq!(store.revision().unwrap(), 0);
+        assert!(rows(&mut store).is_empty());
+        assert_eq!(store.materialize_staging(&stage).unwrap()["marker"], "remote");
+        fs::remove_dir_all(source).unwrap();
+        // Match the runtime: preparation and activation use separate native handles.
+        let mut reopened = store.open_native_job_store().unwrap();
+        let current = reopened.external_identity().unwrap();
+        assert_eq!(activate_prepared_receive(&mut reopened, prepared, &current).unwrap(), 1);
+        assert_eq!(store.materialize(None).unwrap()["marker"], "remote");
+        assert_eq!(rows(&mut store).len(), 1);
+        assert!(store.prepare_replace_commit(&stage, Some(1)).is_err());
+    }
+
+    #[test]
+    fn completed_receive_is_stable_after_later_local_writes_and_another_receive() {
+        let (_directory, mut store, job, downloaded) = fixture();
+        let second_input = downloaded.clone();
+        let prepared = prepare(&mut store, &job, downloaded);
+        let expected = job.admission_identity.clone();
+        activate_prepared_receive(&mut store, prepared, &expected).unwrap();
+        // The auxiliary summary deliberately remains queued, as after a failed cache write.
+        assert_eq!(job.summary["state"], "queued");
+        local_edit(&mut store, 1);
+        let second = bind(&mut store, "second-snapshot");
+        let mut second_input = second_input;
+        second_input.snapshot_id = "second-snapshot".into();
+        let prepared = prepare(&mut store, &second, second_input);
+        activate_prepared_receive(&mut store, prepared, &second.admission_identity).unwrap();
+        assert_eq!(store.external_base("connection").unwrap().unwrap().snapshot_id, "second-snapshot");
+        let result = completed_receive_result(&store, &job, 0).unwrap().unwrap();
+        assert_eq!(result["receivedRevision"], "1");
+        assert_eq!(result["snapshotId"], "snapshot");
+        assert!(completed_receive_result(&store, &job, 1).is_err());
+        assert_eq!(store.revision().unwrap(), 3);
+    }
+
+    #[test]
+    fn failed_auxiliary_summary_write_does_not_erase_or_repeat_a_committed_receive() {
+        let (directory, mut store, mut job, downloaded) = fixture();
+        let prepared = prepare(&mut store, &job, downloaded);
+        job.receive_staging_id = Some(prepared.commit.external_staging_id().to_owned());
+        let cache = JobStore::open(directory.path()).unwrap();
+        cache.put(&job).unwrap();
+        let injector = rusqlite::Connection::open(directory.path().join("external-jobs.sqlite")).unwrap();
+        injector.execute_batch(
+            "CREATE TRIGGER synthetic_summary_failure BEFORE UPDATE ON external_requests
+             BEGIN SELECT RAISE(ABORT,'synthetic summary failure'); END;"
+        ).unwrap();
+        activate_prepared_receive(&mut store, prepared, &job.admission_identity).unwrap();
+        job.summary["state"] = json!("succeeded");
+        job.receive_staging_id = None;
+        assert!(cache.put(&job).is_err());
+        let stale = cache.read(&job.id).unwrap();
+        assert_eq!(stale.summary["state"], "queued");
+        assert!(stale.receive_staging_id.is_some());
+        for _ in 0..3 {
+            assert_eq!(completed_receive_result(&store, &stale, 0).unwrap().unwrap()["receivedRevision"], "1");
+        }
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(rows(&mut store).len(), 1);
+    }
+
+    #[test]
+    fn selection_changes_invalidate_ready_receives_before_device_rows_are_changed() {
+        let (_directory, mut store, job, downloaded) = fixture();
+        let prepared = prepare(&mut store, &job, downloaded);
+        let epoch = store.external_selection().unwrap().epoch;
+        store.external_select(&epoch, &crate::persistent_store::sync_selection::SyncTarget::None).unwrap();
+        assert_eq!(store.external_job(&job.id).unwrap().unwrap().phase, "stale");
+        let current = store.external_identity().unwrap();
+        assert!(activate_prepared_receive(&mut store, prepared, &current).is_err());
+        assert_eq!(store.revision().unwrap(), 0);
+        assert!(rows(&mut store).is_empty());
+    }
+
+    #[test]
+    fn prepared_handle_is_claimed_once_and_wrong_requests_do_not_consume_it() {
+        let (_directory, mut store, job, downloaded) = fixture();
+        let prepared = prepare(&mut store, &job, downloaded);
+        let state = super::super::job_store::JobCommandState::default();
+        state.prepared_receives.lock().unwrap().insert(job.id.clone(), prepared);
+        let other_state = super::super::job_store::JobCommandState::default();
+        let (_, unrelated) = other_state.claim(&job).unwrap();
+        assert!(take_prepared_receive(&state, &unrelated, &job, 0).is_err());
+        let (_, claim) = state.claim(&job).unwrap();
+        assert!(take_prepared_receive(&state, &claim, &job, 1).is_err());
+        assert_eq!(state.prepared_receives.lock().unwrap().len(), 1);
+        let prepared = take_prepared_receive(&state, &claim, &job, 0).unwrap();
+        assert!(take_prepared_receive(&state, &claim, &job, 0).is_err());
+        activate_prepared_receive(&mut store, prepared, &job.admission_identity).unwrap();
+        drop(claim);
+        assert_eq!(completed_receive_result(&store, &job, 0).unwrap().unwrap()["receivedRevision"], "1");
+        assert_eq!(store.revision().unwrap(), 1);
+    }
+
+    #[test]
+    fn cancellation_does_not_consume_an_apply_handle_or_release_its_worker() {
+        let (_directory, mut store, job, downloaded) = fixture();
+        let prepared = prepare(&mut store, &job, downloaded);
+        let state = super::super::job_store::JobCommandState::default();
+        state.prepared_receives.lock().unwrap().insert(job.id.clone(), prepared);
+        let (cancel, claim) = state.claim(&job).unwrap();
+        cancel.cancel();
+        assert_eq!(take_prepared_receive(&state, &claim, &job, 0).err().unwrap().kind, ErrorKind::Cancelled);
+        assert_eq!(state.prepared_receives.lock().unwrap().len(), 1);
+        assert!(state.claim(&job).is_err());
+        assert_eq!(store.revision().unwrap(), 0);
+        drop(claim);
+        assert!(state.claim(&job).is_ok());
+    }
+
+    #[test]
+    fn each_identity_component_is_checked_before_device_rows_or_library_activation() {
+        for field in ["store", "library", "generation", "selection", "revision"] {
+            let (_directory, mut store, job, downloaded) = fixture();
+            let prepared = prepare(&mut store, &job, downloaded);
+            let stage = prepared.commit.external_staging_id().to_owned();
+            let mut current = job.admission_identity.clone();
+            match field {
+                "store" => current.store_id.push('x'),
+                "library" => current.library_epoch.push('x'),
+                "generation" => current.generation.push('x'),
+                "selection" => current.selection_epoch.push('x'),
+                "revision" => current.revision += 1,
+                _ => unreachable!(),
+            }
+            assert_eq!(activate_prepared_receive(&mut store, prepared, &current).err().unwrap().kind,
+                ErrorKind::PreconditionFailed, "{field}");
+            assert!(rows(&mut store).is_empty(), "{field}");
+            assert_eq!(store.revision().unwrap(), 0, "{field}");
+            assert!(store.prepare_replace_commit(&stage, Some(0)).is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn a_local_edit_during_preparation_or_before_apply_is_never_rebased() {
+        for before_stage in [true, false] {
+            let (_directory, mut store, job, downloaded) = fixture();
+            if before_stage {
+                local_edit(&mut store, 0);
+                let participation = receive_participation(&mut store).unwrap();
+                assert!(prepare_receive_input(&mut store, &job, job.admission_identity.clone(),
+                    "authenticated-head".into(), downloaded, vec![plugin_section()], participation).is_err());
+            } else {
+                let prepared = prepare(&mut store, &job, downloaded);
+                local_edit(&mut store, 0);
+                let current = store.external_identity().unwrap();
+                assert!(activate_prepared_receive(&mut store, prepared, &current).is_err());
+            }
+            assert_eq!(store.revision().unwrap(), 1);
+            assert_eq!(store.materialize(None).unwrap()["marker"], "newer-local");
+            assert!(rows(&mut store).is_empty());
+            assert!(store.external_receive_completion(&job.id, "connection").unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn participation_generation_changes_reject_even_when_the_flag_returns_to_true() {
+        let (_directory, mut store, job, downloaded) = fixture();
+        let prepared = prepare(&mut store, &job, downloaded);
+        let device = store.device_store_mut().unwrap();
+        device.set_section_participating(PdsSection::LocalPlugins, false).unwrap();
+        device.set_section_participating(PdsSection::LocalPlugins, true).unwrap();
+        assert!(activate_prepared_receive(&mut store, prepared, &job.admission_identity).is_err());
+        assert!(rows(&mut store).is_empty());
+        assert_eq!(store.revision().unwrap(), 0);
+    }
+
+    #[test]
+    fn corrupt_sections_or_snapshot_bindings_never_create_an_applicable_receive() {
+        for case in ["section", "snapshot", "repository", "record"] {
+            let (_directory, mut store, job, mut downloaded) = fixture();
+            let participation = receive_participation(&mut store).unwrap();
+            let mut section = plugin_section();
+            match case {
+                "section" => section.entries[0].2 = b"corrupt".to_vec(),
+                "snapshot" => downloaded.snapshot_id = "other-snapshot".into(),
+                "repository" => downloaded.repository_id = "other-repository".into(),
+                "record" => fs::write(&downloaded.records[0].path, b"corrupt").unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(prepare_receive_input(&mut store, &job, job.admission_identity.clone(),
+                "authenticated-head".into(), downloaded, vec![section], participation).is_err(), "{case}");
+            assert_eq!(store.revision().unwrap(), 0, "{case}");
+            assert!(rows(&mut store).is_empty(), "{case}");
+        }
+    }
+
+    #[test]
+    fn interrupted_section_progress_is_idempotent_after_worker_repreparation() {
+        let (directory, mut store, job, downloaded) = fixture();
+        let prepared = prepare(&mut store, &job, downloaded.clone());
+        apply_received_sections(&mut store, "connection", &job.admission_identity.library_epoch,
+            &prepared.sections).unwrap();
+        let first = rows(&mut store);
+        assert_eq!(first.len(), 1);
+        assert_eq!(store.revision().unwrap(), 0);
+        store.replace_abort(prepared.commit.external_staging_id()).unwrap();
+        drop(prepared);
+        drop(store);
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let state = super::super::job_store::JobCommandState::default();
+        let (_, claim) = state.claim(&job).unwrap();
+        assert!(take_prepared_receive(&state, &claim, &job, 0).is_err());
+        let prepared = prepare(&mut store, &job, downloaded);
+        activate_prepared_receive(&mut store, prepared, &job.admission_identity).unwrap();
+        assert_eq!(rows(&mut store), first);
+        assert_eq!(store.revision().unwrap(), 1);
+    }
+
+    #[test]
+    fn receive_head_checks_content_without_binding_to_an_old_provider_token() {
+        let original = HeadObservation {
+            commit_id: "received-commit".into(),
+            authenticated_body_hash: "12".repeat(32),
+            version: Some(VersionToken("before".into())),
+        };
+        let encoded = observation_json(&original).unwrap();
+        let mut current = original.clone();
+        for version in [Some(VersionToken("after".into())), None] {
+            current.version = version;
+            assert!(require_received_head(&encoded, Some(&current)).is_ok());
+        }
+        current.commit_id = "different-commit".into();
+        assert_eq!(require_received_head(&encoded, Some(&current)).unwrap_err().kind,
+            ErrorKind::PreconditionFailed);
+        current.commit_id = original.commit_id;
+        current.authenticated_body_hash = "34".repeat(32);
+        assert_eq!(require_received_head(&encoded, Some(&current)).unwrap_err().kind,
+            ErrorKind::PreconditionFailed);
+        assert_eq!(require_received_head(&encoded, None).unwrap_err().kind,
+            ErrorKind::PreconditionFailed);
+        assert_eq!(require_received_head("invalid", Some(&current)).unwrap_err().kind,
+            ErrorKind::Corrupt);
+    }
+
+    #[test]
+    fn apply_requests_accept_only_canonical_revisions_and_no_native_stage_fields() {
+        for revision in ["-1", "+1", "01", "1.0", " 1", "9223372036854775808"] {
+            assert!(receive_revision(&ApplyReceivedRequest {
+                job_id: "job".into(), expected_revision: revision.into(),
+            }).is_err());
+        }
+        assert!(serde_json::from_value::<ApplyReceivedRequest>(json!({
+            "jobId":"job", "expectedRevision":"0", "stagingId":"staging-injected"
+        })).is_err());
+        assert_eq!(receive_revision(&ApplyReceivedRequest {
+            job_id: "job".into(), expected_revision: "0".into(),
+        }).unwrap(), 0);
+    }
 }
 
 #[cfg(test)]

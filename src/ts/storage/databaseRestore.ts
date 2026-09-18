@@ -1,18 +1,42 @@
 import { safeStructuredClone } from '../polyfill'
 import type { Database } from './database.svelte'
+import type { CommittedApplyOutcome, PersistentDataRuntime } from './persistentDataRuntime'
 
-type PluginRestoreDependencies = {
-    replaceDatabase: (database: Database, reason: string) => Promise<void>
+type RestoreFollowupDependencies = {
+    onPostCommitError?(error: unknown): void | Promise<void>
+}
+
+type PluginRestoreDependencies = RestoreFollowupDependencies & {
+    replaceDatabase: PersistentDataRuntime['replacePersistentDatabase']
     loadPlugins: () => void | Promise<void>
+}
+
+async function finishCommittedRestore(
+    outcome: CommittedApplyOutcome,
+    followup: () => void | Promise<void>,
+    dependencies: RestoreFollowupDependencies,
+): Promise<CommittedApplyOutcome> {
+    try {
+        await followup()
+    } catch (error) {
+        try {
+            if (dependencies.onPostCommitError) await dependencies.onPostCommitError(error)
+            else console.error('Post-commit restore action failed', error)
+        } catch (reportError) {
+            console.error('Post-commit restore error reporting failed', reportError)
+        }
+    }
+    return outcome
 }
 
 async function installPluginRestore(
     database: Database,
     reason: string,
     dependencies: PluginRestoreDependencies,
-): Promise<void> {
-    await dependencies.replaceDatabase(database, reason)
-    await dependencies.loadPlugins()
+): Promise<CommittedApplyOutcome> {
+    const outcome = await dependencies.replaceDatabase(database, reason)
+    if (outcome.projection === 'refresh-required') return outcome
+    return finishCommittedRestore(outcome, dependencies.loadPlugins, dependencies)
 }
 
 export const installAccountBackup = (database: Database, dependencies: PluginRestoreDependencies) =>
@@ -76,42 +100,49 @@ export async function materializeAccountUnmigrationResources(
 
 export async function installLocalBackup(
     database: Database,
-    dependencies: {
-        replaceDatabase: (database: Database, reason: string) => Promise<void>
+    dependencies: RestoreFollowupDependencies & {
+        replaceDatabase: PersistentDataRuntime['replacePersistentDatabase']
         publishAcceptedRevision: () => Promise<void>
         relaunch: () => void | Promise<void>
     },
-): Promise<void> {
-    await dependencies.replaceDatabase(database, 'local-backup')
-    await dependencies.publishAcceptedRevision()
-    await dependencies.relaunch()
+): Promise<CommittedApplyOutcome> {
+    const outcome = await dependencies.replaceDatabase(database, 'local-backup', { publishOfficial: true })
+    if (outcome.projection === 'refresh-required') return outcome
+    return finishCommittedRestore(outcome, async () => {
+        await dependencies.publishAcceptedRevision()
+        await dependencies.relaunch()
+    }, dependencies)
 }
 
 export async function installDriveRestore(
     database: Database,
-    dependencies: {
-        replaceDatabase: (database: Database, reason: string) => Promise<void>
+    dependencies: RestoreFollowupDependencies & {
+        replaceDatabase: PersistentDataRuntime['replacePersistentDatabase']
         publishAcceptedRevision: () => Promise<void>
         relaunch: () => void | Promise<void>
     },
-): Promise<void> {
-    await dependencies.replaceDatabase(database, 'drive-restore')
-    await dependencies.publishAcceptedRevision()
-    await dependencies.relaunch()
+): Promise<CommittedApplyOutcome> {
+    const outcome = await dependencies.replaceDatabase(database, 'drive-restore', { publishOfficial: true })
+    if (outcome.projection === 'refresh-required') return outcome
+    return finishCommittedRestore(outcome, async () => {
+        await dependencies.publishAcceptedRevision()
+        await dependencies.relaunch()
+    }, dependencies)
 }
 
 export async function completeAccountUnmigration(
     database: Database,
-    dependencies: {
+    dependencies: RestoreFollowupDependencies & {
         prepareResources: (candidate: Database) => Promise<void>
-        replaceDatabase: (database: Database, reason: string) => Promise<void>
-        finalize: () => void
+        replaceDatabase: PersistentDataRuntime['replacePersistentDatabase']
+        finalize: () => void | Promise<void>
     },
-): Promise<void> {
+): Promise<CommittedApplyOutcome> {
     const candidate = safeStructuredClone(database)
     candidate.account = null
 
     await dependencies.prepareResources(candidate)
-    await dependencies.replaceDatabase(candidate, 'account-unmigration')
-    dependencies.finalize()
+    const outcome = await dependencies.replaceDatabase(candidate, 'account-unmigration')
+    // Device account markers must follow the committed authority even if projection failed.
+    return finishCommittedRestore(outcome, dependencies.finalize, dependencies)
 }

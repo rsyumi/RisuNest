@@ -1,65 +1,46 @@
-//! What a device announces in the repository while it is using it, and what it
-//! looks for before it starts. A work lease says that another device's objects
-//! are still in use; a delete marker says that a removal attempt is running.
-//! Nothing here expires: age is never evidence that a request ended.
-// Delete markers are placed by the removal path, which is wired next.
+//! Authenticated, finite repository protection owned by one active execution.
+//! A lost response leaves a TTL lease, never a durable delete protocol.
 use super::{
     contract::{
         lease_object_id, parse_lease_object_id, Cancellation, Collection, ErrorKind, LeaseKind,
-        ObjectIntent, ObjectRole, Provider, ProviderError, RemoteLocator, RepositoryHandle, Result,
-        UploadResolution,
+        ObjectIntent, ObjectReceipt, ObjectRole, Provider, ProviderError, ReadReceipt,
+        RemoteLocator, RepositoryHandle, Result, UploadResolution,
     },
-    gc_store::{locator_key, GcStore, LeaseIntent, LeaseState},
-    transfer::SpoolSource,
+    gc_store::locator_key,
+    journal::validate_receipt,
+    transfer::{SpoolSink, SpoolSource},
 };
 use risunest_external_storage_format::{
     content_identity::hash,
-    control as wire_control,
+    control::{LeaseDocument, LeaseKind as WireLeaseKind},
     crypto::derive_key,
     format::Descriptor,
-    snapshot::{seal_envelope, ObjectRole as EnvelopeRole, PublicObjectHeader},
+    snapshot as wire,
 };
 use std::{
-    collections::BTreeSet,
-    io::Write,
-    path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    io::{Cursor, Write},
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-/// Lease identifiers a command in this process is holding right now. A command
-/// answers no durable job, so a job starting beside it reads the command's lease
-/// as abandoned and takes it back while its owner is still reading.
-static HELD: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
-
-fn held() -> &'static Mutex<BTreeSet<String>> {
-    HELD.get_or_init(|| Mutex::new(BTreeSet::new()))
-}
-
-/// A poisoned set still holds valid identifiers: the thread that panicked is
-/// gone, and its own entry going away is exactly what should happen.
-fn held_ids() -> std::sync::MutexGuard<'static, BTreeSet<String>> {
-    held().lock().unwrap_or_else(|poison| poison.into_inner())
-}
-
-/// Keeps one identifier out of a concurrent `resume`'s reclaim set. Dropping it
-/// makes the lease reclaimable again, which is what an owner that has gone away
-/// should leave behind.
-pub(crate) struct Held(String);
-
-pub(crate) fn hold(id: &str) -> Held {
-    held_ids().insert(id.to_owned());
-    Held(id.to_owned())
-}
-
-impl Drop for Held {
-    fn drop(&mut self) {
-        held_ids().remove(&self.0);
-    }
-}
-
-const MAX_LEASE_PLAINTEXT: usize = 4 * 1024;
-const MAX_LEASE_CIPHERTEXT: u64 = 8 * 1024;
-const LEASE_PAGE: u16 = 100;
+pub(crate) const MINUTE_MS: u64 = 60_000;
+pub(crate) const LEASE_TTL_MS: u64 = 60 * MINUTE_MS;
+pub(crate) const RENEW_AFTER_MS: u64 = 15 * MINUTE_MS;
+pub(crate) const RELATIVE_CLOCK_ERROR_MS: u64 = 10 * MINUTE_MS;
+pub(crate) const CONTROL_DEADLINE_MS: u64 = MINUTE_MS;
+pub(crate) const SAFETY_MARGIN_MS: u64 = 12 * MINUTE_MS;
+pub(crate) const CLEANUP_RUN_LIMIT_MS: u64 = 45 * MINUTE_MS;
+pub(crate) const UNREACHABLE_GRACE_MS: u64 = 7 * 24 * 60 * MINUTE_MS;
+pub(crate) const CACHE_REUSE_LIMIT_MS: u64 = 5 * 24 * 60 * MINUTE_MS;
+const MAX_LEASE_PLAINTEXT: usize = 4096;
+const MAX_LEASE_CIPHERTEXT: u64 = 8192;
+const PAGE_SIZE: u16 = 100;
 
 fn corrupt() -> ProviderError {
     ProviderError::new(ErrorKind::Corrupt)
@@ -67,55 +48,208 @@ fn corrupt() -> ProviderError {
 fn transient() -> ProviderError {
     ProviderError::new(ErrorKind::Transient)
 }
-/// An HTTP response, including a refusal, ends a synchronous removal request.
-/// Only a request that left without any answer remains outstanding.
-pub(crate) fn delete_answered(error: &ProviderError) -> bool {
-    error.http_status.is_some_and(|status| status != 202)
-        || !matches!(error.kind, ErrorKind::Transient | ErrorKind::Cancelled)
+
+pub(crate) fn checked_expiry(created_at_ms: u64) -> Option<u64> {
+    created_at_ms.checked_add(LEASE_TTL_MS)
 }
-fn local(_: impl std::fmt::Display) -> ProviderError {
-    ProviderError::new(ErrorKind::Transient)
+pub(crate) fn foreign_lease_expired(expires_at_ms: u64, trusted_now_ms: u64) -> bool {
+    expires_at_ms.checked_add(RELATIVE_CLOCK_ERROR_MS)
+        .is_some_and(|expiry| trusted_now_ms >= expiry)
+}
+pub(crate) fn can_start_control_request(remaining_monotonic_ms: u64, clock_is_trusted: bool) -> bool {
+    clock_is_trusted && remaining_monotonic_ms > SAFETY_MARGIN_MS
 }
 
-struct TemporaryFile(PathBuf);
-impl Drop for TemporaryFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+/// Facts from one successful HTTP response. Cache bypass is established before
+/// request signing; neither an old receipt nor a cached Date is a clock sample.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TimeSample {
+    pub date_ms: Option<u64>,
+    pub local_before_ms: u64,
+    pub local_after_ms: u64,
+    pub round_trip_ms: u64,
+    pub cache_bypassed: bool,
+    pub cache_hit: bool,
+    pub age_ms: Option<u64>,
+    pub status: u16,
+}
+impl TimeSample {
+    pub(crate) fn trusted(&self) -> bool {
+        let Some(date_ms) = self.date_ms else { return false; };
+        if !self.cache_bypassed || self.cache_hit || self.age_ms.is_some_and(|age| age > 0)
+            || !(200..300).contains(&self.status) || self.local_after_ms < self.local_before_ms
+        {
+            return false;
+        }
+        let elapsed = i128::from(self.local_after_ms - self.local_before_ms);
+        if (elapsed - i128::from(self.round_trip_ms)).abs() > 1000 {
+            return false;
+        }
+        let local_mid = (i128::from(self.local_before_ms) + i128::from(self.local_after_ms)) / 2;
+        let server_mid = i128::from(date_ms) + 500;
+        let uncertainty = (i128::from(self.round_trip_ms) + 1) / 2 + 500;
+        (server_mid - local_mid).abs() + uncertainty <= i128::from(5 * MINUTE_MS)
     }
 }
 
-fn staging_path(root: &Path) -> Result<TemporaryFile> {
-    let directory = root.join("lease-staging");
-    std::fs::create_dir_all(&directory).map_err(local)?;
-    if crate::trust_boundary::is_link_like(&std::fs::symlink_metadata(&directory).map_err(local)?) {
-        return Err(corrupt());
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClockReading {
+    pub wall_ms: u64,
+    pub monotonic_ms: u64,
+    pub epoch: u64,
+    pub foreground: bool,
+    pub trusted: bool,
+}
+pub(crate) trait LeaseClock: Send + Sync {
+    fn reading(&self) -> ClockReading;
+}
+
+struct ClockState {
+    previous: Option<(u64, u64)>,
+    verified_at: Option<u64>,
+    foreground: bool,
+    epoch: u64,
+}
+impl ClockState {
+    fn invalidate(&mut self) {
+        self.verified_at = None;
+        match self.epoch.checked_add(1) {
+            Some(epoch) => self.epoch = epoch,
+            None => self.foreground = false,
+        }
     }
-    Ok(TemporaryFile(
-        directory.join(format!("{}.tmp", uuid::Uuid::new_v4())),
-    ))
-}
-
-fn wire_kind(kind: LeaseKind) -> wire_control::LeaseKind {
-    match kind {
-        LeaseKind::Work => wire_control::LeaseKind::Work,
-        LeaseKind::Cleanup => wire_control::LeaseKind::Cleanup,
-        LeaseKind::Deleting => wire_control::LeaseKind::Deleting,
+    fn observe_reading(&mut self, wall_ms: u64, monotonic_ms: u64) {
+        if let Some((before_wall, before_monotonic)) = self.previous {
+            if wall_ms.checked_sub(before_wall).zip(monotonic_ms.checked_sub(before_monotonic))
+                .is_none_or(|(wall, monotonic)| (i128::from(wall) - i128::from(monotonic)).abs() > 1000)
+            {
+                self.invalidate();
+            }
+        }
+        self.previous = Some((wall_ms, monotonic_ms));
     }
 }
 
-/// The last path segment of a lease locator. Adapters that keep a role folder
-/// answer with the folder in front of the name; the name itself is what carries
-/// the kind. Which device placed it is never read from here.
-fn lease_name(locator: &RemoteLocator) -> &str {
-    locator
-        .object
-        .rsplit('/')
-        .next()
-        .unwrap_or(&locator.object)
+/// The HTTP boundary supplies samples. The actual lifecycle owner invalidates
+/// this clock on suspend, even on platforms whose Instant advances during sleep.
+pub(crate) struct SystemLeaseClock {
+    origin: Instant,
+    state: Mutex<ClockState>,
+}
+impl Default for SystemLeaseClock {
+    fn default() -> Self {
+        Self {
+            origin: Instant::now(),
+            state: Mutex::new(ClockState {
+                previous: None, verified_at: None, foreground: true, epoch: 0,
+            }),
+        }
+    }
+}
+impl SystemLeaseClock {
+    pub(crate) fn observe(&self, sample: TimeSample) {
+        let now = self.reading();
+        let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+        state.verified_at = if sample.trusted() && state.foreground
+            && now.wall_ms.checked_sub(sample.local_after_ms)
+                .is_some_and(|age| age <= CONTROL_DEADLINE_MS)
+        {
+            Some(now.monotonic_ms)
+        } else {
+            None
+        };
+    }
+    pub(crate) fn set_foreground(&self, foreground: bool) {
+        let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+        if !foreground || state.foreground != foreground {
+            state.invalidate();
+        }
+        state.foreground = foreground && state.epoch != u64::MAX;
+    }
+    pub(crate) fn invalidate(&self) {
+        self.state.lock().unwrap_or_else(|poison| poison.into_inner()).invalidate();
+    }
+}
+impl LeaseClock for SystemLeaseClock {
+    fn reading(&self) -> ClockReading {
+        let wall = SystemTime::now().duration_since(UNIX_EPOCH)
+            .ok().and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
+        let monotonic = u64::try_from(self.origin.elapsed().as_millis()).ok();
+        let wall_ms = wall.unwrap_or(0);
+        let monotonic_ms = monotonic.unwrap_or(u64::MAX);
+        let mut state = self.state.lock().unwrap_or_else(|poison| {
+            let mut state = poison.into_inner();
+            state.invalidate();
+            state
+        });
+        state.observe_reading(wall_ms, monotonic_ms);
+        ClockReading {
+            wall_ms,
+            monotonic_ms,
+            epoch: state.epoch,
+            foreground: state.foreground && wall.is_some() && monotonic.is_some(),
+            trusted: state.foreground && state.verified_at.is_some_and(|verified| {
+                monotonic_ms.checked_sub(verified).is_some_and(|age| age < RENEW_AFTER_MS)
+            }),
+        }
+    }
 }
 
-/// Everything one call needs to reach the repository and this device's record
-/// of what it already placed there.
+/// Only small control operations use this deadline. Payload transfers retain
+/// their provider timeout. Dropping this future does not cancel a remote DELETE.
+pub(crate) async fn control_request<T>(
+    cancel: &Cancellation,
+    operation: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    cancel.check()?;
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(ProviderError::new(ErrorKind::Cancelled)),
+        result = tokio::time::timeout(Duration::from_millis(CONTROL_DEADLINE_MS), operation) => {
+            result.map_err(|_| transient())?
+        }
+    }
+}
+
+/// A complete collection cannot contain duplicate locators or loop its cursor.
+/// There is no page-count cutoff that turns a partial walk into a complete one.
+#[derive(Default)]
+pub(crate) struct PageTracker {
+    cursors: BTreeSet<String>,
+    locators: BTreeSet<String>,
+    empty_page_seen: bool,
+}
+impl PageTracker {
+    pub(crate) fn accept(
+        &mut self,
+        repository: &RepositoryHandle,
+        objects: &[ObjectReceipt],
+        next: Option<&str>,
+    ) -> Result<()> {
+        if objects.is_empty() && next.is_some() {
+            if self.empty_page_seen { return Err(corrupt()); }
+            self.empty_page_seen = true;
+        }
+        for object in objects {
+            object.locator.validate_for(repository)?;
+            if !object.complete || object.byte_length == 0
+                || !self.locators.insert(locator_key(&object.locator)?)
+            {
+                return Err(corrupt());
+            }
+        }
+        if let Some(cursor) = next {
+            if cursor.is_empty() || cursor.len() > 64 * 1024
+                || cursor.bytes().any(|byte| matches!(byte, 0 | b'\r' | b'\n'))
+                || !self.cursors.insert(cursor.to_owned())
+            {
+                return Err(corrupt());
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct LeaseContext<'a> {
     pub root: &'a Path,
     pub connection_id: &'a str,
@@ -124,1101 +258,716 @@ pub(crate) struct LeaseContext<'a> {
     pub root_key: &'a [u8; 32],
     pub provider: &'a dyn Provider,
     pub repository: &'a RepositoryHandle,
+    pub clock: &'a dyn LeaseClock,
+    pub protection_supported: bool,
 }
 
-impl LeaseContext<'_> {
-    /// A bookkeeping handle for one statement. It is opened per call because a
-    /// borrowed database connection cannot cross an await point, and every
-    /// step here sits between two remote requests.
-    fn store(&self) -> Result<GcStore> {
-        GcStore::open(self.root)
-    }
-}
-
-/// A lease this device confirmed. `tag` is also the identity of the removal
-/// attempt a delete marker stands for, which is what ties an outstanding
-/// request to the marker that has to outlive it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LeaseHandle {
     pub job_id: String,
     pub kind: LeaseKind,
     pub seq: u64,
-    pub tag: String,
+    pub object_id: String,
     pub locator: RemoteLocator,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ObservedKind {
-    Work,
-    Cleanup,
-    Deleting,
-    Unknown,
+    pub created_at_ms: u64,
+    pub expires_at_ms: u64,
+    issued_monotonic_ms: u64,
+    clock_epoch: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ObservedLease {
     pub locator: RemoteLocator,
-    pub kind: ObservedKind,
-    /// True when this device holds the intent row that placed it. Everything
-    /// else belongs to another device, whatever its name reads like.
-    pub mine: bool,
+    pub object_id: Option<String>,
+    pub document: Option<LeaseDocument>,
 }
-
-/// One full enumeration of the lease collection. A partial view is never one of
-/// these: a page that could not be read ends the call with an error.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LeaseSurvey {
     pub leases: Vec<ObservedLease>,
 }
-
-impl LeaseSurvey {
-    /// The delete markers that make this device wait. `own` is the marker the
-    /// caller placed for the attempt it is running now; every other marker
-    /// counts, including one an interrupted run of this device left behind.
-    pub(crate) fn blocking_markers(&self, own: Option<&RemoteLocator>) -> Vec<&ObservedLease> {
-        self.leases
-            .iter()
-            .filter(|lease| {
-                lease.kind == ObservedKind::Deleting && own != Some(&lease.locator)
-            })
-            .collect()
-    }
-    /// The work and cleanup leases of other devices. A cleanup yields to any of
-    /// them rather than removing something they may still be reading.
-    pub(crate) fn foreign_work(&self) -> Vec<&ObservedLease> {
-        self.leases
-            .iter()
-            .filter(|lease| {
-                !lease.mine
-                    && matches!(
-                        lease.kind,
-                        ObservedKind::Work | ObservedKind::Cleanup | ObservedKind::Unknown
-                    )
-            })
-            .collect()
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum YieldReason {
+    ForeignWork,
+    ForeignCleanup,
+    ForeignDeletion,
+    UnknownProtection,
+    Suspended,
+    ProtectionLost,
 }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Admission {
-    Admitted(LeaseHandle),
-    /// A removal marker is in place. `foreign` is false only when every
-    /// blocking marker belongs to this device.
-    Blocked { foreign: bool },
+    Admitted(LeaseOwner),
+    Yield { reason: YieldReason },
+    UnsupportedProtection,
 }
-
-fn observed_kind(locator: &RemoteLocator) -> ObservedKind {
-    match parse_lease_object_id(lease_name(locator)).map(|(kind, _)| kind) {
-        Ok(LeaseKind::Work) => ObservedKind::Work,
-        Ok(LeaseKind::Cleanup) => ObservedKind::Cleanup,
-        Ok(LeaseKind::Deleting) => ObservedKind::Deleting,
-        Err(_) => ObservedKind::Unknown,
+impl LeaseSurvey {
+    pub(crate) fn blocker(&self, owned: &BTreeSet<String>, now: ClockReading) -> Option<YieldReason> {
+        for lease in &self.leases {
+            let Some(document) = &lease.document else { return Some(YieldReason::UnknownProtection); };
+            let Some(object_id) = &lease.object_id else { return Some(YieldReason::UnknownProtection); };
+            if owned.contains(object_id) { continue; }
+            if now.trusted && foreign_lease_expired(document.expires_at_ms, now.wall_ms) { continue; }
+            return Some(match document.kind {
+                WireLeaseKind::Work => YieldReason::ForeignWork,
+                WireLeaseKind::Cleanup => YieldReason::ForeignCleanup,
+                WireLeaseKind::Deleting => YieldReason::ForeignDeletion,
+            });
+        }
+        None
     }
 }
 
-fn seal(ctx: &LeaseContext<'_>, object_id: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
-    ctx.descriptor.validate().map_err(|_| corrupt())?;
-    let header = PublicObjectHeader::new(
-        ctx.descriptor.repository_id.clone(),
-        object_id.into(),
-        EnvelopeRole::Lease,
+fn wire_kind(kind: LeaseKind) -> WireLeaseKind {
+    match kind {
+        LeaseKind::Work => WireLeaseKind::Work,
+        LeaseKind::Cleanup => WireLeaseKind::Cleanup,
+        LeaseKind::Deleting => WireLeaseKind::Deleting,
+    }
+}
+fn staging(root: &Path) -> Result<tempfile::TempDir> {
+    std::fs::create_dir_all(root).map_err(|_| transient())?;
+    if crate::trust_boundary::is_link_like(&std::fs::symlink_metadata(root).map_err(|_| transient())?) {
+        return Err(corrupt());
+    }
+    tempfile::tempdir_in(root).map_err(|_| transient())
+}
+fn seal(context: &LeaseContext<'_>, object_id: &str, document: &LeaseDocument) -> Result<Vec<u8>> {
+    context.descriptor.validate().map_err(|_| corrupt())?;
+    let plaintext = document.encode(MAX_LEASE_PLAINTEXT).map_err(|_| corrupt())?;
+    let header = wire::PublicObjectHeader::new(
+        context.descriptor.repository_id.clone(), object_id.into(), wire::ObjectRole::Lease,
         plaintext.len() as u64,
-    )
-    .map_err(|_| corrupt())?;
-    let key = derive_key(ctx.root_key, &ctx.descriptor.repository_id, "metadata")
+    ).map_err(|_| corrupt())?;
+    let key = derive_key(context.root_key, &context.descriptor.repository_id, "metadata")
         .map_err(|_| corrupt())?;
-    let mut sealed = Vec::new();
-    seal_envelope(
-        &mut std::io::Cursor::new(plaintext),
-        &mut sealed,
-        &key,
-        &header,
-    )
-    .map_err(|_| corrupt())?;
-    if sealed.len() as u64 > MAX_LEASE_CIPHERTEXT {
-        return Err(ProviderError::new(ErrorKind::FileTooLarge));
+    let mut bytes = Vec::new();
+    wire::seal_envelope(&mut Cursor::new(plaintext), &mut bytes, &key, &header)
+        .map_err(|_| corrupt())?;
+    if bytes.len() as u64 > MAX_LEASE_CIPHERTEXT { return Err(corrupt()); }
+    Ok(bytes)
+}
+async fn read_lease(
+    context: &LeaseContext<'_>, receipt: &ObjectReceipt, cancel: &Cancellation,
+) -> Result<(String, LeaseDocument)> {
+    receipt.locator.validate_for(context.repository)?;
+    if !receipt.complete || receipt.byte_length == 0 || receipt.byte_length > MAX_LEASE_CIPHERTEXT {
+        return Err(corrupt());
     }
-    Ok(sealed)
-}
-
-/// The request identity of one intent row. Nothing is built again here: the row
-/// is the only source, so a retry after a lost answer writes the same name with
-/// the same content.
-fn request_for(ctx: &LeaseContext<'_>, row: &LeaseIntent) -> Result<ObjectIntent> {
-    let intent = ObjectIntent {
-        repository_id: ctx.repository.repository_id.clone(),
-        job_id: row.job_id.clone(),
-        object_id: lease_name(&row.locator).to_owned(),
-        role: ObjectRole::Lease,
-        byte_length: row.bytes.len() as u64,
-        sha256: hex::encode(hash(&row.bytes)),
+    let temporary = staging(context.root)?;
+    let path = temporary.path().join("lease");
+    let mut sink = SpoolSink::create(&path, MAX_LEASE_CIPHERTEXT)?;
+    let current = match control_request(cancel, context.provider.read_object(
+        context.repository, &receipt.locator, None, &mut sink, cancel,
+    )).await? {
+        ReadReceipt::Body(current) => current,
+        ReadReceipt::NotModified(_) => return Err(corrupt()),
     };
-    intent.validate(ctx.repository)?;
-    Ok(intent)
+    if !current.complete || current.locator != receipt.locator
+        || current.byte_length != receipt.byte_length || !sink.is_verified()
+    {
+        return Err(corrupt());
+    }
+    let key = derive_key(context.root_key, &context.descriptor.repository_id, "metadata")
+        .map_err(|_| corrupt())?;
+    let mut input = crate::trust_boundary::open_regular_source(&path).map_err(|_| transient())?;
+    let mut plaintext = Vec::new();
+    let header = wire::open_envelope(&mut input, &mut plaintext, &key, MAX_LEASE_PLAINTEXT as u64)
+        .map_err(|_| corrupt())?;
+    let document = LeaseDocument::decode(&plaintext, MAX_LEASE_PLAINTEXT).map_err(|_| corrupt())?;
+    let (kind, _) = parse_lease_object_id(&header.object_id)?;
+    if header.repository_id != context.descriptor.repository_id || header.role != wire::ObjectRole::Lease
+        || header.plaintext_length != plaintext.len() as u64 || document.kind != wire_kind(kind)
+    {
+        return Err(corrupt());
+    }
+    Ok((header.object_id, document))
 }
 
-async fn create(
-    ctx: &LeaseContext<'_>,
-    row: &LeaseIntent,
-    intent: &ObjectIntent,
-    cancel: &Cancellation,
-) -> Result<RemoteLocator> {
-    let temporary = staging_path(ctx.root)?;
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary.0)
-        .map_err(local)?;
-    file.write_all(&row.bytes).map_err(local)?;
-    file.sync_all().map_err(local)?;
+pub(crate) async fn survey(context: &LeaseContext<'_>, cancel: &Cancellation) -> Result<LeaseSurvey> {
+    let mut survey = LeaseSurvey::default();
+    let mut tracker = PageTracker::default();
+    let mut object_ids = BTreeSet::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = control_request(cancel, context.provider.list_objects(
+            context.repository, Collection::Leases, cursor.as_deref(), PAGE_SIZE, cancel,
+        )).await?;
+        tracker.accept(context.repository, &page.objects, page.next_cursor.as_deref())?;
+        for receipt in page.objects {
+            match read_lease(context, &receipt, cancel).await {
+                Ok((object_id, document)) => {
+                    if !object_ids.insert(object_id.clone()) { return Err(corrupt()); }
+                    survey.leases.push(ObservedLease {
+                        locator: receipt.locator, object_id: Some(object_id), document: Some(document),
+                    });
+                }
+                Err(error) if error.kind == ErrorKind::Corrupt => survey.leases.push(ObservedLease {
+                    locator: receipt.locator, object_id: None, document: None,
+                }),
+                // Disappearance or a failed read breaks this complete observation.
+                Err(error) => return Err(error),
+            }
+        }
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => return Ok(survey),
+        }
+    }
+}
+
+async fn create_lease(
+    context: &LeaseContext<'_>, job_id: &str, kind: LeaseKind, seq: u64, cancel: &Cancellation,
+) -> Result<LeaseHandle> {
+    let before = context.clock.reading();
+    if !before.foreground { return Err(transient()); }
+    checked_expiry(before.wall_ms).ok_or_else(corrupt)?;
+    let object_id = lease_object_id(kind, &uuid::Uuid::new_v4().simple().to_string())?;
+    let document = LeaseDocument::new(
+        context.writer_id.into(), job_id.into(), wire_kind(kind), seq, before.wall_ms,
+    ).map_err(|_| corrupt())?;
+    let bytes = seal(context, &object_id, &document)?;
+    let intent = ObjectIntent {
+        repository_id: context.repository.repository_id.clone(), job_id: job_id.into(),
+        object_id: object_id.clone(), role: ObjectRole::Lease,
+        byte_length: bytes.len() as u64, sha256: hex::encode(hash(&bytes)),
+    };
+    intent.validate(context.repository)?;
+    let temporary = staging(context.root)?;
+    let path = temporary.path().join("lease");
+    let mut file = std::fs::OpenOptions::new().create_new(true).write(true).open(&path)
+        .map_err(|_| transient())?;
+    file.write_all(&bytes).map_err(|_| transient())?;
+    file.sync_all().map_err(|_| transient())?;
     drop(file);
-    let source = SpoolSource::verified(&temporary.0, intent.byte_length, &intent.sha256)?;
-    let resume = ctx.provider.begin_upload(ctx.repository, intent, cancel).await?;
-    let receipt = match ctx
-        .provider
-        .create_object(ctx.repository, intent, &source, resume.as_ref(), cancel)
-        .await
-    {
+    let source = SpoolSource::verified(&path, intent.byte_length, &intent.sha256)?;
+    let resume = control_request(cancel, context.provider.begin_upload(context.repository, &intent, cancel)).await?;
+    let receipt = match control_request(cancel, context.provider.create_object(
+        context.repository, &intent, &source, resume.as_ref(), cancel,
+    )).await {
         Ok(receipt) => receipt,
         Err(error) if error.kind == ErrorKind::Transient => {
-            match ctx
-                .provider
-                .reconcile_upload(ctx.repository, intent, resume.as_ref(), cancel)
-                .await?
-            {
+            match control_request(cancel, context.provider.reconcile_upload(
+                context.repository, &intent, resume.as_ref(), cancel,
+            )).await? {
                 UploadResolution::Complete(receipt) => receipt,
-                // The name is already taken by different bytes, which only a
-                // tag collision could produce.
                 UploadResolution::Conflict => return Err(corrupt()),
-                UploadResolution::Resumable(_) | UploadResolution::RestartRequired => {
-                    return Err(error)
-                }
+                _ => return Err(error),
             }
         }
         Err(error) => return Err(error),
     };
-    accept(ctx, intent, receipt)
-}
-
-fn accept(
-    ctx: &LeaseContext<'_>,
-    intent: &ObjectIntent,
-    receipt: super::contract::ObjectReceipt,
-) -> Result<RemoteLocator> {
-    if !receipt.complete || receipt.byte_length != intent.byte_length {
-        return Err(corrupt());
-    }
-    receipt.locator.validate_for(ctx.repository)?;
-    if lease_name(&receipt.locator) != intent.object_id {
-        return Err(corrupt());
-    }
-    Ok(receipt.locator)
-}
-
-/// Brings one row to the point where its remote object is known to exist and
-/// its locator is the one the repository answers with. A row that was written
-/// before an answer arrived is resolved here, never guessed at.
-async fn settle(
-    ctx: &LeaseContext<'_>,
-    row: &LeaseIntent,
-    cancel: &Cancellation,
-) -> Result<RemoteLocator> {
-    if row.state != LeaseState::Pending {
-        return Ok(row.locator.clone());
-    }
-    let intent = request_for(ctx, row)?;
-    let confirmed = match ctx
-        .provider
-        .reconcile_upload(ctx.repository, &intent, None, cancel)
-        .await?
+    validate_receipt(&intent, context.repository, &receipt)?;
+    let (confirmed_id, confirmed) = read_lease(context, &receipt, cancel).await?;
+    let after = context.clock.reading();
+    if confirmed_id != object_id || confirmed != document { return Err(corrupt()); }
+    if !after.foreground || before.epoch != after.epoch
+        || after.monotonic_ms.checked_sub(before.monotonic_ms)
+            .is_none_or(|elapsed| elapsed >= LEASE_TTL_MS - SAFETY_MARGIN_MS)
     {
-        UploadResolution::Complete(receipt) => accept(ctx, &intent, receipt)?,
-        UploadResolution::RestartRequired => create(ctx, row, &intent, cancel).await?,
-        UploadResolution::Conflict => return Err(corrupt()),
-        UploadResolution::Resumable(_) => return Err(transient()),
-    };
-    ctx.store()?
-        .confirm_lease_intent(ctx.connection_id, &row.locator, &confirmed)?;
-    Ok(confirmed)
-}
-
-/// Places one lease. The intent is written first, so an answer this device
-/// never sees still leaves a named object it can find and remove.
-async fn place(
-    ctx: &LeaseContext<'_>,
-    job_id: &str,
-    kind: LeaseKind,
-    seq: u64,
-    now_ms: u64,
-    cancel: &Cancellation,
-) -> Result<LeaseHandle> {
-    let tag = uuid::Uuid::new_v4().simple().to_string();
-    let object_id = lease_object_id(kind, &tag)?;
-    let document = wire_control::LeaseDocument::new(
-        ctx.writer_id.to_owned(),
-        job_id.to_owned(),
-        wire_kind(kind),
-        seq,
-        now_ms,
-    )
-    .map_err(|_| corrupt())?;
-    let plaintext = document
-        .encode(MAX_LEASE_PLAINTEXT)
-        .map_err(|_| corrupt())?;
-    let row = LeaseIntent {
-        locator: RemoteLocator {
-            connection_identity: ctx.repository.connection_identity.clone(),
-            collection: None,
-            object: object_id.clone(),
-        },
-        kind,
-        job_id: job_id.to_owned(),
-        seq,
-        bytes: seal(ctx, &object_id, &plaintext)?,
-        state: LeaseState::Pending,
-        created_at_ms: now_ms,
-    };
-    ctx.store()?.put_lease_intent(ctx.connection_id, &row)?;
-    let intent = request_for(ctx, &row)?;
-    let confirmed = create(ctx, &row, &intent, cancel).await?;
-    ctx.store()?
-        .confirm_lease_intent(ctx.connection_id, &row.locator, &confirmed)?;
-    Ok(LeaseHandle {
-        job_id: job_id.to_owned(),
-        kind,
-        seq,
-        tag,
-        locator: confirmed,
-    })
-}
-
-/// Gives one lease back. The row is marked first, so an answer this device
-/// never sees leaves a target it retries rather than an object it forgot.
-async fn drop_lease(
-    ctx: &LeaseContext<'_>,
-    row: &LeaseIntent,
-    cancel: &Cancellation,
-) -> Result<()> {
-    let locator = settle(ctx, row, cancel).await?;
-    ctx.store()?
-        .set_lease_state(ctx.connection_id, &locator, LeaseState::Releasing)?;
-    ctx.provider
-        .delete_object(ctx.repository, &locator, cancel)
-        .await?;
-    ctx.store()?.remove_lease_intent(ctx.connection_id, &locator)
-}
-
-/// Confirms this job's lease of one kind, renewing an existing one. The next
-/// number is confirmed before the previous one is given back, so the repository
-/// never shows this job without a lease.
-pub(crate) async fn register(
-    ctx: &LeaseContext<'_>,
-    job_id: &str,
-    kind: LeaseKind,
-    now_ms: u64,
-    cancel: &Cancellation,
-) -> Result<LeaseHandle> {
-    let previous = ctx
-        .store()?
-        .lease_intents(ctx.connection_id)?
-        .into_iter()
-        .filter(|row| row.job_id == job_id && row.kind == kind)
-        .max_by_key(|row| row.seq);
-    let seq = previous.as_ref().map_or(0, |row| row.seq + 1);
-    let handle = place(ctx, job_id, kind, seq, now_ms, cancel).await?;
-    if let Some(previous) = previous {
-        drop_lease(ctx, &previous, cancel).await?;
-    }
-    Ok(handle)
-}
-
-/// Reads the whole lease collection for diagnostics. Admission and removal use
-/// the stricter single-page view below.
-pub(crate) async fn survey(ctx: &LeaseContext<'_>, cancel: &Cancellation) -> Result<LeaseSurvey> {
-    let mine = ctx
-        .store()?
-        .lease_intents(ctx.connection_id)?
-        .iter()
-        .map(|row| locator_key(&row.locator))
-        .collect::<Result<BTreeSet<String>>>()?;
-    let mut leases = Vec::new();
-    let mut cursor: Option<String> = None;
-    loop {
-        cancel.check()?;
-        let page = ctx
-            .provider
-            .list_objects(
-                ctx.repository,
-                Collection::Leases,
-                cursor.as_deref(),
-                LEASE_PAGE,
-                cancel,
-            )
-            .await?;
-        for receipt in page.objects {
-            receipt.locator.validate_for(ctx.repository)?;
-            let kind = observed_kind(&receipt.locator);
-            let mine = mine.contains(&locator_key(&receipt.locator)?);
-            leases.push(ObservedLease {
-                locator: receipt.locator,
-                kind,
-                mine,
-            });
-        }
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => break,
-        }
-    }
-    Ok(LeaseSurvey { leases })
-}
-
-/// The same reading for a removal, which needs more than "this page is what
-/// the repository answered". No provider documents that a cursor walk keeps
-/// every object visible across pages, so a collection that does not fit one
-/// page answers `None` and the removal defers instead of trusting the walk.
-/// One lease per device and job means the second page is the rare case.
-pub(crate) async fn survey_single_page(
-    ctx: &LeaseContext<'_>,
-    cancel: &Cancellation,
-) -> Result<Option<LeaseSurvey>> {
-    let mine = ctx
-        .store()?
-        .lease_intents(ctx.connection_id)?
-        .iter()
-        .map(|row| locator_key(&row.locator))
-        .collect::<Result<BTreeSet<String>>>()?;
-    cancel.check()?;
-    let page = ctx
-        .provider
-        .list_objects(ctx.repository, Collection::Leases, None, LEASE_PAGE, cancel)
-        .await?;
-    if page.next_cursor.is_some() {
-        return Ok(None);
-    }
-    let mut leases = Vec::new();
-    for receipt in page.objects {
-        receipt.locator.validate_for(ctx.repository)?;
-        let kind = observed_kind(&receipt.locator);
-        let mine = mine.contains(&locator_key(&receipt.locator)?);
-        leases.push(ObservedLease {
-            locator: receipt.locator,
-            kind,
-            mine,
-        });
-    }
-    Ok(Some(LeaseSurvey { leases }))
-}
-
-/// What a publisher or a reader does before it asks for any data: confirm its
-/// own lease, then read the whole collection and stop while anyone is removing.
-/// The lease stays in place while this device waits.
-pub(crate) async fn admit(
-    ctx: &LeaseContext<'_>,
-    job_id: &str,
-    kind: LeaseKind,
-    now_ms: u64,
-    cancel: &Cancellation,
-) -> Result<Admission> {
-    let handle = register(ctx, job_id, kind, now_ms, cancel).await?;
-    let Some(survey) = survey_single_page(ctx, cancel).await? else {
         return Err(transient());
-    };
-    if survey.leases.iter().any(|lease| lease.kind == ObservedKind::Unknown) {
-        return Err(corrupt());
-    }
-    let blockers = survey.blocking_markers(None);
-    if !blockers.is_empty() {
-        return Ok(Admission::Blocked {
-            foreign: blockers.iter().any(|lease| !lease.mine),
-        });
-    }
-    Ok(Admission::Admitted(handle))
-}
-
-/// Gives back the work leases of a job whose remote requests have ended. The
-/// caller decides that; this never reads a clock to decide it. A fresh
-/// cancellation is used on purpose, because a cancelled job still has to be
-/// able to hand its lease back.
-pub(crate) async fn release(ctx: &LeaseContext<'_>, job_id: &str) -> Result<()> {
-    let cancel = Cancellation::default();
-    for row in ctx.store()?.lease_intents(ctx.connection_id)? {
-        if row.job_id == job_id && row.kind != LeaseKind::Deleting {
-            drop_lease(ctx, &row, &cancel).await?;
-        }
-    }
-    Ok(())
-}
-
-/// Announces one removal attempt. The tag of the marker is the identity of the
-/// attempt, so every request it sends is tied to the marker that outlives it.
-pub(crate) async fn place_marker(
-    ctx: &LeaseContext<'_>,
-    job_id: &str,
-    now_ms: u64,
-    cancel: &Cancellation,
-) -> Result<LeaseHandle> {
-    place(ctx, job_id, LeaseKind::Deleting, 0, now_ms, cancel).await
-}
-
-/// Records that a removal request is about to be sent. The row exists before
-/// the request does, which is what makes a lost answer detectable.
-pub(crate) fn note_delete_sent(
-    ctx: &LeaseContext<'_>,
-    marker: &LeaseHandle,
-    target: &RemoteLocator,
-    now_ms: u64,
-) -> Result<()> {
-    ctx.store()?
-        .record_delete_request(ctx.connection_id, target, &marker.tag, now_ms)
-}
-
-/// Records that the repository answered for one request. Only an answer does
-/// this; a local timeout, a cancellation or a restart does not.
-pub(crate) fn note_delete_finished(
-    ctx: &LeaseContext<'_>,
-    marker: &LeaseHandle,
-    target: &RemoteLocator,
-) -> Result<()> {
-    ctx.store()?
-        .finish_delete_request(ctx.connection_id, target, &marker.tag)
-}
-
-/// Removes a marker once every request of its attempt is known to have ended.
-/// A request whose end is unknown keeps the marker, and the repository stays
-/// closed to other work until it is known.
-pub(crate) async fn clear_marker(ctx: &LeaseContext<'_>, marker: &LeaseHandle) -> Result<()> {
-    if !ctx
-        .store()?
-        .unfinished_delete_requests(ctx.connection_id, Some(&marker.tag))?
-        .is_empty()
-    {
-        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
-    }
-    let cancel = Cancellation::default();
-    for row in ctx.store()?.lease_intents(ctx.connection_id)? {
-        if row.kind == LeaseKind::Deleting && row.locator == marker.locator {
-            drop_lease(ctx, &row, &cancel).await?;
-        }
-    }
-    ctx.store()?
-        .forget_finished_delete_requests(ctx.connection_id, &marker.tag)
-}
-
-/// Forgets an attempt after its marker disappeared remotely. Requests from the
-/// old decision must never be replayed without that marker protecting their
-/// addresses.
-pub(crate) fn abandon_marker(ctx: &LeaseContext<'_>, marker: &LeaseHandle) -> Result<()> {
-    let store = ctx.store()?;
-    store.forget_delete_requests(ctx.connection_id, &marker.tag)?;
-    store.remove_lease_intent(ctx.connection_id, &marker.locator)
-}
-
-fn marker_handle(row: &LeaseIntent, locator: RemoteLocator) -> Result<LeaseHandle> {
-    let (kind, tag) = parse_lease_object_id(lease_name(&locator))?;
-    if kind != LeaseKind::Deleting || row.kind != LeaseKind::Deleting {
-        return Err(corrupt());
     }
     Ok(LeaseHandle {
-        job_id: row.job_id.clone(),
-        kind,
-        seq: row.seq,
-        tag,
-        locator,
+        job_id: job_id.into(), kind, seq, object_id, locator: receipt.locator,
+        created_at_ms: document.created_at_ms, expires_at_ms: document.expires_at_ms,
+        issued_monotonic_ms: before.monotonic_ms, clock_epoch: before.epoch,
     })
 }
 
-async fn resume_delete_markers(ctx: &LeaseContext<'_>, cancel: &Cancellation) -> Result<()> {
-    for row in ctx
-        .store()?
-        .lease_intents(ctx.connection_id)?
-        .into_iter()
-        .filter(|row| row.kind == LeaseKind::Deleting)
-    {
-        let locator = settle(ctx, &row, cancel).await?;
-        let marker = marker_handle(&row, locator)?;
-        let Some(survey) = survey_single_page(ctx, cancel).await? else {
-            return Err(transient());
-        };
-        if !survey
-            .leases
-            .iter()
-            .any(|lease| lease.locator == marker.locator)
-        {
-            abandon_marker(ctx, &marker)?;
-            continue;
-        }
-
-        for request in ctx
-            .store()?
-            .unfinished_delete_requests(ctx.connection_id, Some(&marker.tag))?
-        {
-            let retry = Cancellation::default();
-            match ctx
-                .provider
-                .delete_object(ctx.repository, &request.locator, &retry)
-                .await
-            {
-                Ok(()) => note_delete_finished(ctx, &marker, &request.locator)?,
-                Err(error) if delete_answered(&error) => {
-                    note_delete_finished(ctx, &marker, &request.locator)?
-                }
-                Err(_) => return Err(transient()),
-            }
-        }
-        clear_marker(ctx, &marker).await?;
+async fn release(context: &LeaseContext<'_>, lease: &LeaseHandle, cancel: &Cancellation) -> Result<()> {
+    lease.locator.validate_for(context.repository)?;
+    match control_request(cancel, context.provider.delete_object(context.repository, &lease.locator, cancel)).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind == ErrorKind::NotFound || error.http_status == Some(404) => Ok(()),
+        Err(error) => Err(error),
     }
-    Ok(())
 }
 
-/// Resolves what an interrupted run left behind, before this device places
-/// anything new. `live_jobs` names the jobs that have not reached an end; a
-/// lease of any other job is given back, and one whose removal attempt still
-/// has an unanswered request is not.
-pub(crate) async fn resume(
-    ctx: &LeaseContext<'_>,
-    live_jobs: &BTreeSet<String>,
-    cancel: &Cancellation,
-) -> Result<()> {
-    resume_delete_markers(ctx, cancel).await?;
-    for row in ctx.store()?.lease_intents(ctx.connection_id)? {
-        if row.kind == LeaseKind::Deleting {
-            continue;
+pub(crate) async fn admit(
+    context: &LeaseContext<'_>, job_id: &str, kind: LeaseKind, cancel: &Cancellation,
+) -> Result<Admission> {
+    cancel.check()?;
+    if !context.protection_supported { return Ok(Admission::UnsupportedProtection); }
+    if kind == LeaseKind::Deleting { return Err(corrupt()); }
+    if !context.clock.reading().foreground {
+        return Ok(Admission::Yield { reason: YieldReason::Suspended });
+    }
+    let before = match survey(context, cancel).await {
+        Ok(before) => before,
+        Err(error) if error.kind == ErrorKind::Unsupported => return Ok(Admission::UnsupportedProtection),
+        Err(error) => return Err(error),
+    };
+    if let Some(reason) = before.blocker(&BTreeSet::new(), context.clock.reading()) {
+        return Ok(Admission::Yield { reason });
+    }
+    let sequence = before.leases.iter().filter_map(|lease| lease.document.as_ref())
+        .filter(|lease| lease.writer_id == context.writer_id && lease.job_id == job_id && lease.kind == wire_kind(kind))
+        .map(|lease| lease.seq).max().map(|seq| seq.checked_add(1).ok_or_else(corrupt)).transpose()?.unwrap_or(0);
+    let lease = match create_lease(context, job_id, kind, sequence, cancel).await {
+        Ok(lease) => lease,
+        Err(error) if error.kind == ErrorKind::Unsupported => return Ok(Admission::UnsupportedProtection),
+        Err(error) => return Err(error),
+    };
+    let owner = LeaseOwner::new(lease);
+    match owner.recheck(context, cancel).await {
+        Ok(None) => Ok(Admission::Admitted(owner)),
+        Ok(Some(reason)) => {
+            owner.release_all(context).await;
+            Ok(Admission::Yield { reason })
         }
-        match row.state {
-            LeaseState::Pending => {
-                settle(ctx, &row, cancel).await?;
+        Err(error) => {
+            owner.release_all(context).await;
+            Err(error)
+        }
+    }
+}
+
+struct OwnerState {
+    primary: LeaseHandle,
+    marker: Option<LeaseHandle>,
+    held: BTreeMap<String, LeaseHandle>,
+}
+
+/// This non-cloneable value belongs to the actual repository worker, not its
+/// durable job summary. Exactly one renewal future runs alongside that worker.
+pub(crate) struct LeaseOwner {
+    state: Mutex<OwnerState>,
+    renewal: tokio::sync::Mutex<()>,
+    running: AtomicBool,
+    closed: AtomicBool,
+    delete_in_flight: AtomicBool,
+}
+impl LeaseOwner {
+    fn new(primary: LeaseHandle) -> Self {
+        Self {
+            state: Mutex::new(OwnerState {
+                held: [(primary.object_id.clone(), primary.clone())].into_iter().collect(),
+                primary, marker: None,
+            }),
+            renewal: tokio::sync::Mutex::new(()),
+            running: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            delete_in_flight: AtomicBool::new(false),
+        }
+    }
+    fn state(&self) -> Result<std::sync::MutexGuard<'_, OwnerState>> {
+        self.state.lock().map_err(|_| corrupt())
+    }
+    pub(crate) fn primary(&self) -> Result<LeaseHandle> {
+        Ok(self.state()?.primary.clone())
+    }
+    pub(crate) fn remaining_ms(&self, context: &LeaseContext<'_>, destructive: bool) -> Result<u64> {
+        let now = context.clock.reading();
+        if self.closed.load(Ordering::Acquire) || !now.foreground { return Err(transient()); }
+        let state = self.state()?;
+        let remaining = |lease: &LeaseHandle| -> Result<u64> {
+            if lease.clock_epoch != now.epoch { return Err(transient()); }
+            let elapsed = now.monotonic_ms.checked_sub(lease.issued_monotonic_ms).ok_or_else(transient)?;
+            Ok(LEASE_TTL_MS.saturating_sub(elapsed))
+        };
+        let mut left = remaining(&state.primary)?;
+        if destructive {
+            if let Some(marker) = &state.marker { left = left.min(remaining(marker)?); }
+        }
+        Ok(left)
+    }
+    pub(crate) fn check_control(&self, context: &LeaseContext<'_>, destructive: bool) -> Result<()> {
+        if !can_start_control_request(
+            self.remaining_ms(context, destructive)?, !destructive || context.clock.reading().trusted,
+        ) {
+            return Err(transient());
+        }
+        Ok(())
+    }
+    pub(crate) fn set_delete_in_flight(&self, value: bool) {
+        self.delete_in_flight.store(value, Ordering::Release);
+    }
+    pub(crate) async fn recheck(
+        &self, context: &LeaseContext<'_>, cancel: &Cancellation,
+    ) -> Result<Option<YieldReason>> {
+        if self.check_control(context, false).is_err() {
+            return Ok(Some(YieldReason::ProtectionLost));
+        }
+        let survey = survey(context, cancel).await?;
+        let state = self.state()?;
+        let owned = state.held.keys().cloned().collect();
+        for current in std::iter::once(&state.primary).chain(state.marker.iter()) {
+            if !survey.leases.iter().any(|lease| {
+                lease.object_id.as_ref() == Some(&current.object_id) && lease.locator == current.locator
+                    && lease.document.as_ref().is_some_and(|document| {
+                        document.writer_id == context.writer_id && document.job_id == current.job_id
+                            && document.kind == wire_kind(current.kind) && document.seq == current.seq
+                            && document.created_at_ms == current.created_at_ms
+                            && document.expires_at_ms == current.expires_at_ms
+                    })
+            }) {
+                return Ok(Some(YieldReason::ProtectionLost));
             }
-            LeaseState::Releasing => drop_lease(ctx, &row, cancel).await?,
-            LeaseState::Confirmed => {}
+        }
+        drop(state);
+        if self.check_control(context, false).is_err() {
+            return Ok(Some(YieldReason::ProtectionLost));
+        }
+        Ok(survey.blocker(&owned, context.clock.reading()))
+    }
+    pub(crate) async fn place_marker(&self, context: &LeaseContext<'_>, cancel: &Cancellation) -> Result<()> {
+        let _renewing = self.renewal.lock().await;
+        self.check_control(context, true)?;
+        let primary = self.primary()?;
+        if primary.kind != LeaseKind::Cleanup || self.state()?.marker.is_some() { return Err(corrupt()); }
+        let marker = create_lease(context, &primary.job_id, LeaseKind::Deleting, 0, cancel).await?;
+        let mut state = self.state()?;
+        state.held.insert(marker.object_id.clone(), marker.clone());
+        state.marker = Some(marker);
+        Ok(())
+    }
+    pub(crate) async fn renew_if_due(&self, context: &LeaseContext<'_>, cancel: &Cancellation) -> Result<()> {
+        let _renewing = self.renewal.lock().await;
+        cancel.check()?;
+        self.check_control(context, false)?;
+        let leases = {
+            let state = self.state()?;
+            std::iter::once(state.primary.clone()).chain(state.marker.clone()).collect::<Vec<_>>()
+        };
+        for previous in leases {
+            let now = context.clock.reading();
+            if now.epoch != previous.clock_epoch { return Err(transient()); }
+            let elapsed = now.monotonic_ms.checked_sub(previous.issued_monotonic_ms).ok_or_else(transient)?;
+            if elapsed < RENEW_AFTER_MS { continue; }
+            let seq = previous.seq.checked_add(1).ok_or_else(corrupt)?;
+            let next = create_lease(context, &previous.job_id, previous.kind, seq, cancel).await?;
+            {
+                let mut state = self.state()?;
+                state.held.insert(next.object_id.clone(), next.clone());
+                if next.kind == LeaseKind::Deleting { state.marker = Some(next); }
+                else { state.primary = next; }
+            }
+            // Authenticate and install the successor before giving back its predecessor.
+            if release(context, &previous, cancel).await.is_ok() {
+                self.state()?.held.remove(&previous.object_id);
+            }
+        }
+        self.check_control(context, false)
+    }
+    async fn renewal_loop(&self, context: &LeaseContext<'_>, cancel: &Cancellation) -> Result<()> {
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(ProviderError::new(ErrorKind::Cancelled)),
+                _ = tokio::time::sleep(Duration::from_millis(MINUTE_MS)) => {}
+            }
+            if let Err(error) = self.renew_if_due(context, cancel).await {
+                // A temporary renewal failure does not erase an otherwise valid
+                // lease or the provider's upload session. Never extend its deadline.
+                if error.kind != ErrorKind::Transient || self.check_control(context, false).is_err() {
+                    return Err(error);
+                }
+            }
         }
     }
-    for row in ctx.store()?.lease_intents(ctx.connection_id)? {
-        if row.kind == LeaseKind::Deleting {
-            continue;
-        }
-        if live_jobs.contains(&row.job_id) || held_ids().contains(&row.job_id) {
-            continue;
-        }
-        drop_lease(ctx, &row, cancel).await?;
+    pub(crate) async fn release_all(&self, context: &LeaseContext<'_>) {
+        self.closed.store(true, Ordering::Release);
+        let leases = {
+            let Ok(state) = self.state() else { return; };
+            state.held.values().cloned().collect::<Vec<_>>()
+        };
+        let cancel = Cancellation::default();
+        // Shutdown must not wait one deadline for every failed old renewal.
+        // Any unreleased object is finite and expires without local replay.
+        let _ = tokio::time::timeout(Duration::from_millis(CONTROL_DEADLINE_MS), async {
+            for lease in leases {
+                if lease.kind == LeaseKind::Deleting && self.delete_in_flight.load(Ordering::Acquire) { continue; }
+                if release(context, &lease, &cancel).await.is_ok() {
+                    if let Ok(mut state) = self.state() { state.held.remove(&lease.object_id); }
+                }
+            }
+        }).await;
     }
-    Ok(())
+    pub(crate) async fn run<T>(
+        &self, context: &LeaseContext<'_>, cancel: &Cancellation,
+        operation: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        if self.running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return Err(corrupt());
+        }
+        struct Running<'a>(&'a LeaseOwner);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.closed.store(true, Ordering::Release);
+                self.0.running.store(false, Ordering::Release);
+            }
+        }
+        let _running = Running(self);
+        let result = match self.check_control(context, false) {
+            Err(error) => Err(error),
+            Ok(()) => tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(ProviderError::new(ErrorKind::Cancelled)),
+                result = operation => result,
+                result = self.renewal_loop(context, cancel) => {
+                    match result { Err(error) => Err(error), Ok(()) => Err(transient()) }
+                }
+            },
+        };
+        self.release_all(context).await;
+        result
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::external_storage::fake::{self, DeleteFault, FakeProvider};
+    use crate::external_storage::fake::{self, DeleteFault, FakeLeaseClock, FakeProvider};
     use risunest_external_storage_format::format::Strategy;
 
-    const DAY: u64 = 24 * 60 * 60 * 1000;
-    const NOW: u64 = 1_000 * DAY;
-    const CONNECTION: &str = "connection";
-
+    pub(super) const NOW: u64 = 1000 * 24 * 60 * MINUTE_MS;
     fn runtime() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
     }
-
-    fn tag(index: u8) -> String {
-        format!("{index:x}").repeat(32)
-    }
-
-    fn admitted(value: Admission) -> LeaseHandle {
-        match value {
-            Admission::Admitted(handle) => handle,
-            Admission::Blocked { foreign } => {
-                panic!("expected admission, got blocked; foreign={foreign}")
-            }
-        }
-    }
-
     struct Harness {
-        _directory: tempfile::TempDir,
-        root: PathBuf,
-        store: GcStore,
+        root: tempfile::TempDir,
         provider: FakeProvider,
         repository: RepositoryHandle,
         descriptor: Descriptor,
-        root_key: [u8; 32],
+        clock: FakeLeaseClock,
+        key: [u8; 32],
     }
-
     impl Harness {
         fn new() -> Self {
-            let directory = tempfile::tempdir().unwrap();
-            let root = directory.path().to_path_buf();
             Self {
-                store: GcStore::open(&root).unwrap(),
-                _directory: directory,
-                root,
-                provider: FakeProvider::new(true),
+                root: tempfile::tempdir().unwrap(), provider: FakeProvider::new(true),
                 repository: fake::repository(),
-                descriptor: Descriptor::new("synthetic-descriptor".into(), Some(Strategy::Cas))
-                    .unwrap(),
-                root_key: [7; 32],
+                descriptor: Descriptor::new("format-repository".into(), Some(Strategy::Cas)).unwrap(),
+                clock: FakeLeaseClock::new(NOW), key: [7; 32],
             }
         }
         fn context(&self) -> LeaseContext<'_> {
             LeaseContext {
-                root: &self.root,
-                connection_id: CONNECTION,
-                writer_id: "writer",
-                descriptor: &self.descriptor,
-                root_key: &self.root_key,
-                provider: &self.provider,
-                repository: &self.repository,
+                root: self.root.path(), connection_id: "connection", writer_id: "writer",
+                descriptor: &self.descriptor, root_key: &self.key,
+                provider: &self.provider, repository: &self.repository,
+                clock: &self.clock, protection_supported: true,
             }
         }
-        /// A lease another device left behind. Only its name is readable from
-        /// here, which is all a survey uses.
-        fn foreign(&self, kind: LeaseKind, tag: &str) -> String {
-            let object = lease_object_id(kind, tag).unwrap();
-            self.provider
-                .seed(&object, ObjectRole::Lease, b"foreign".to_vec());
-            object
+        fn foreign(&self, kind: LeaseKind, index: u64, now: u64) -> (String, Vec<u8>) {
+            let id = lease_object_id(kind, &format!("{index:032x}")).unwrap();
+            let document = LeaseDocument::new("foreign".into(), "job".into(), wire_kind(kind), 0, now).unwrap();
+            let bytes = seal(&self.context(), &id, &document).unwrap();
+            (id, bytes)
         }
-        fn rows(&self) -> Vec<LeaseIntent> {
-            self.store.lease_intents(CONNECTION).unwrap()
-        }
-        fn target(&self, object: &str) -> RemoteLocator {
-            RemoteLocator {
-                connection_identity: self.repository.connection_identity.clone(),
-                collection: None,
-                object: object.into(),
+        async fn owner(&self, kind: LeaseKind) -> LeaseOwner {
+            match admit(&self.context(), "job", kind, &Cancellation::default()).await.unwrap() {
+                Admission::Admitted(owner) => owner,
+                _ => panic!("expected admission"),
             }
         }
-        fn stored_bytes(&self, object: &str) -> Vec<u8> {
-            self.provider
-                .state
-                .lock()
-                .unwrap()
-                .objects
-                .get(object)
-                .unwrap()
-                .0
-                .clone()
+    }
+
+    #[test]
+    fn c_ttl_relative_expiry_and_safety_boundaries_are_exact() {
+        assert_eq!(LEASE_TTL_MS, risunest_external_storage_format::control::LEASE_TTL_MS);
+        assert_eq!(checked_expiry(NOW), Some(NOW + 60 * MINUTE_MS));
+        assert_eq!(checked_expiry(u64::MAX), None);
+        let expiry = checked_expiry(NOW).unwrap();
+        assert!(!foreign_lease_expired(expiry, NOW + 60 * MINUTE_MS));
+        assert!(!foreign_lease_expired(expiry, NOW + 70 * MINUTE_MS - 1));
+        assert!(foreign_lease_expired(expiry, NOW + 70 * MINUTE_MS));
+        assert!(!foreign_lease_expired(u64::MAX, u64::MAX));
+        assert!(!can_start_control_request(SAFETY_MARGIN_MS, true));
+        assert!(can_start_control_request(SAFETY_MARGIN_MS + 1, true));
+        assert!(!can_start_control_request(LEASE_TTL_MS, false));
+    }
+
+    #[test]
+    fn c_clock_samples_include_second_precision_rtt_and_cache_uncertainty() {
+        let sample = TimeSample {
+            date_ms: Some(NOW), local_before_ms: NOW + 500, local_after_ms: NOW + 500,
+            round_trip_ms: 0, cache_bypassed: true, cache_hit: false, age_ms: None, status: 200,
+        };
+        assert!(sample.trusted());
+        for offset in [299_500_i64, -299_500] {
+            let local = (i128::from(NOW + 500) + i128::from(offset)) as u64;
+            assert!(TimeSample { local_before_ms: local, local_after_ms: local, ..sample }.trusted());
+            let outside = (i128::from(local) + i128::from(offset.signum())) as u64;
+            assert!(!TimeSample { local_before_ms: outside, local_after_ms: outside, ..sample }.trusted());
         }
-        async fn remove(&self, object: &str) {
-            self.provider
-                .delete_object(&self.repository, &self.target(object), &Cancellation::default())
-                .await
-                .unwrap();
+        for invalid in [
+            TimeSample { date_ms: None, ..sample }, TimeSample { cache_bypassed: false, ..sample },
+            TimeSample { cache_hit: true, ..sample }, TimeSample { age_ms: Some(1), ..sample },
+            TimeSample { status: 304, ..sample }, TimeSample { status: 401, ..sample },
+            TimeSample { local_after_ms: NOW, ..sample },
+            TimeSample { local_after_ms: NOW + 500 + 600_000, round_trip_ms: 600_000, ..sample },
+            TimeSample { round_trip_ms: 1001, ..sample },
+        ] {
+            assert!(!invalid.trusted(), "{invalid:?}");
         }
     }
 
-    /// GC27: the next number is confirmed before the previous one is given
-    /// back, so a renewal never shows this job without a lease.
     #[test]
-    fn a_renewal_confirms_the_next_lease_before_it_removes_the_previous_one() {
-        let harness = Harness::new();
-        let cancel = Cancellation::default();
-        runtime().block_on(async {
-            let context = harness.context();
-            let first = register(&context, "job", LeaseKind::Work, NOW, &cancel)
-                .await
-                .unwrap();
-            assert_eq!(first.seq, 0);
-            assert!(harness.provider.holds(&first.locator.object));
-
-            harness
-                .provider
-                .fail_delete(&first.locator.object, DeleteFault::Transient);
-            let failed = register(&context, "job", LeaseKind::Work, NOW + 1, &cancel)
-                .await
-                .unwrap_err();
-            assert_eq!(failed.kind, ErrorKind::Transient);
-            let rows = harness.rows();
-            assert_eq!(rows.len(), 2);
-            let successor = rows.iter().find(|row| row.seq == 1).unwrap();
-            assert_eq!(successor.state, LeaseState::Confirmed);
-            assert!(harness.provider.holds(&successor.locator.object));
-            assert_eq!(
-                rows.iter().find(|row| row.seq == 0).unwrap().state,
-                LeaseState::Releasing
-            );
-            assert!(harness.provider.holds(&first.locator.object));
-
-            let live = BTreeSet::from(["job".to_owned()]);
-            resume(&context, &live, &cancel).await.unwrap();
-            assert!(!harness.provider.holds(&first.locator.object));
-            assert_eq!(harness.rows().len(), 1);
-        });
+    fn c_wall_clock_discontinuities_invalidate_instead_of_extending_protection() {
+        let mut state = ClockState { previous: None, verified_at: Some(0), foreground: true, epoch: 0 };
+        state.observe_reading(NOW, 0);
+        state.observe_reading(NOW + MINUTE_MS, MINUTE_MS);
+        assert_eq!(state.epoch, 0);
+        state.observe_reading(NOW + 2 * MINUTE_MS + 1001, 2 * MINUTE_MS);
+        assert_eq!(state.epoch, 1);
+        assert_eq!(state.verified_at, None);
+        state.observe_reading(NOW, 3 * MINUTE_MS);
+        assert_eq!(state.epoch, 2);
     }
 
-    /// GC27: a retry after an answer that never arrived writes the same name
-    /// with the bytes the row holds, and a second resume finds nothing to do.
     #[test]
-    fn an_unanswered_registration_is_resolved_with_the_bytes_the_row_holds() {
-        let harness = Harness::new();
-        let cancel = Cancellation::default();
+    fn c_foreign_work_cleanup_and_deleting_yield_before_any_upload() {
         runtime().block_on(async {
-            let context = harness.context();
-            let object = lease_object_id(LeaseKind::Work, &tag(3)).unwrap();
-            let document = wire_control::LeaseDocument::new(
-                "writer".into(),
-                "job".into(),
-                wire_control::LeaseKind::Work,
-                0,
-                NOW,
-            )
-            .unwrap();
-            let bytes = seal(
-                &context,
-                &object,
-                &document.encode(MAX_LEASE_PLAINTEXT).unwrap(),
-            )
-            .unwrap();
-            let row = LeaseIntent {
-                locator: harness.target(&object),
-                kind: LeaseKind::Work,
-                job_id: "job".into(),
-                seq: 0,
-                bytes: bytes.clone(),
-                state: LeaseState::Pending,
-                created_at_ms: NOW,
-            };
-            harness.store.put_lease_intent(CONNECTION, &row).unwrap();
-
-            let live = BTreeSet::from(["job".to_owned()]);
-            resume(&context, &live, &cancel).await.unwrap();
-            assert!(harness.provider.holds(&object));
-            assert_eq!(harness.stored_bytes(&object), bytes);
-            assert_eq!(harness.rows()[0].state, LeaseState::Confirmed);
-            resume(&context, &live, &cancel).await.unwrap();
-            assert_eq!(harness.rows().len(), 1);
-            assert_eq!(harness.stored_bytes(&object), bytes);
-        });
-    }
-
-    /// GC29: a job confirms its own lease, then refuses to ask for data while
-    /// anyone is removing. Neither two minutes nor seven days ends that wait.
-    #[test]
-    fn a_job_waits_while_a_delete_marker_is_present_however_old_it_is() {
-        let harness = Harness::new();
-        let cancel = Cancellation::default();
-        runtime().block_on(async {
-            let context = harness.context();
-            let marker = harness.foreign(LeaseKind::Deleting, &tag(1));
-            assert!(matches!(
-                admit(&context, "job", LeaseKind::Work, NOW, &cancel).await.unwrap(),
-                Admission::Blocked { foreign: true }
-            ));
-            assert_eq!(harness.rows().len(), 1, "the lease is kept while waiting");
-
-            for later in [NOW + 2 * 60 * 1000, NOW + 7 * DAY, NOW + 400 * DAY] {
-                assert!(matches!(
-                    admit(&context, "job", LeaseKind::Work, later, &cancel)
-                        .await
-                        .unwrap(),
-                    Admission::Blocked { foreign: true }
-                ));
-                assert!(harness.provider.holds(&marker), "the wait removed a marker");
+            for (kind, reason) in [
+                (LeaseKind::Work, YieldReason::ForeignWork),
+                (LeaseKind::Cleanup, YieldReason::ForeignCleanup),
+                (LeaseKind::Deleting, YieldReason::ForeignDeletion),
+            ] {
+                let h = Harness::new();
+                let (id, bytes) = h.foreign(kind, 1, NOW);
+                h.provider.seed(&id, ObjectRole::Lease, bytes);
+                let result = admit(&h.context(), "job", LeaseKind::Work, &Cancellation::default()).await.unwrap();
+                assert!(matches!(result, Admission::Yield { reason: actual } if actual == reason));
+                assert!(h.provider.uploaded_ids().is_empty());
+                assert_eq!(h.provider.delete_attempts(&id), 0);
             }
-
-            harness.remove(&marker).await;
-            let handle = admitted(
-                admit(&context, "job", LeaseKind::Work, NOW + 401 * DAY, &cancel)
-                    .await
-                    .unwrap(),
-            );
-            assert_eq!(handle.kind, LeaseKind::Work);
-            assert!(harness.provider.holds(&handle.locator.object));
-        });
-    }
-
-    /// GC20: another device's work lease is never taken back by this one, and
-    /// no amount of elapsed time changes that.
-    #[test]
-    fn another_device_s_work_lease_is_never_taken_back() {
-        let harness = Harness::new();
-        let cancel = Cancellation::default();
-        runtime().block_on(async {
-            let context = harness.context();
-            let foreign = harness.foreign(LeaseKind::Work, &tag(2));
-            let live = BTreeSet::new();
-            resume(&context, &live, &cancel).await.unwrap();
-            assert!(harness.provider.holds(&foreign));
-            assert!(harness.rows().is_empty());
-
-            let observed = survey(&context, &cancel).await.unwrap();
-            assert_eq!(observed.foreign_work().len(), 1);
-            assert!(observed.blocking_markers(None).is_empty());
-
-            register(&context, "job", LeaseKind::Cleanup, NOW + 400 * DAY, &cancel)
-                .await
-                .unwrap();
-            let observed = survey(&context, &cancel).await.unwrap();
-            assert_eq!(observed.leases.len(), 2);
-            assert_eq!(observed.foreign_work().len(), 1);
-            assert_eq!(observed.foreign_work()[0].locator.object, foreign);
-            assert!(harness.provider.holds(&foreign));
-        });
-    }
-
-    /// GC19: a cleanup finds the work and cleanup leases of other devices and
-    /// does not count its own.
-    #[test]
-    fn a_cleanup_sees_every_other_device_s_lease() {
-        let harness = Harness::new();
-        let cancel = Cancellation::default();
-        runtime().block_on(async {
-            let context = harness.context();
-            harness.foreign(LeaseKind::Work, &tag(4));
-            harness.foreign(LeaseKind::Cleanup, &tag(5));
-            let own = register(&context, "job", LeaseKind::Cleanup, NOW, &cancel)
-                .await
-                .unwrap();
-            let observed = survey(&context, &cancel).await.unwrap();
-            assert_eq!(observed.foreign_work().len(), 2);
-            assert!(
-                observed
-                    .leases
-                    .iter()
-                    .find(|lease| lease.locator == own.locator)
-                    .unwrap()
-                    .mine
-            );
-        });
-    }
-
-    /// GC31: a request whose remote end is unknown keeps the marker, through a
-    /// cancellation, a lost answer and a restart. Another job stays out until
-    /// the request is known to have ended.
-    #[test]
-    fn an_unanswered_removal_keeps_its_marker_and_the_repository_closed() {
-        let harness = Harness::new();
-        runtime().block_on(async {
-            let context = harness.context();
-            harness
-                .provider
-                .seed("pack-a", ObjectRole::Pack, b"pack".to_vec());
-            harness
-                .provider
-                .seed("pack-b", ObjectRole::Pack, b"pack".to_vec());
-            let marker = place_marker(&context, "cleanup", NOW, &Cancellation::default())
-                .await
-                .unwrap();
-
-            let first = harness.target("pack-a");
-            note_delete_sent(&context, &marker, &first, NOW).unwrap();
-            harness
-                .provider
-                .fail_delete("pack-a", DeleteFault::Unanswered);
-            let pending = Cancellation::default();
-            let (answer, ()) = tokio::join!(
-                harness
-                    .provider
-                    .delete_object(&harness.repository, &first, &pending),
-                async {
-                    pending.cancel();
-                }
-            );
-            assert_eq!(answer.unwrap_err().kind, ErrorKind::Cancelled);
-
-            let second = harness.target("pack-b");
-            note_delete_sent(&context, &marker, &second, NOW).unwrap();
-            harness
-                .provider
-                .fail_delete("pack-b", DeleteFault::AppliedThenLost);
-            assert_eq!(
-                harness
-                    .provider
-                    .delete_object(&harness.repository, &second, &Cancellation::default())
-                    .await
-                    .unwrap_err()
-                    .kind,
-                ErrorKind::Transient
-            );
-            assert!(!harness.provider.holds("pack-b"));
-
-            assert_eq!(
-                clear_marker(&context, &marker).await.unwrap_err().kind,
-                ErrorKind::PreconditionFailed
-            );
-            assert!(matches!(
-                admit(&context, "publisher", LeaseKind::Work, NOW + 7 * DAY, &Cancellation::default())
-                    .await
-                    .unwrap(),
-                Admission::Blocked { foreign: false }
-            ));
-            let live = BTreeSet::from(["publisher".to_owned()]);
-            harness.provider.fail_delete("pack-a", DeleteFault::Transient);
-            assert_eq!(
-                resume(&context, &live, &Cancellation::default())
-                    .await
-                    .unwrap_err()
-                    .kind,
-                ErrorKind::Transient
-            );
-            assert!(harness.provider.holds(&marker.locator.object));
-            assert!(harness.provider.holds("pack-a"));
-            assert_eq!(harness.provider.delete_attempts("pack-a"), 2);
-            assert_eq!(harness.provider.delete_attempts("pack-b"), 1);
-            assert_eq!(
-                harness.store.unfinished_delete_requests(CONNECTION, Some(&marker.tag))
-                    .unwrap().len(),
-                2
-            );
-
-            // A later resume observes answers for both requests, including the
-            // one that removed its object before losing the original answer.
-            resume(&context, &live, &Cancellation::default()).await.unwrap();
-            assert!(!harness.provider.holds("pack-a"));
-            assert_eq!(harness.provider.delete_attempts("pack-a"), 3);
-            assert_eq!(harness.provider.delete_attempts("pack-b"), 2);
-            assert!(!harness.provider.holds(&marker.locator.object));
-            assert!(harness
-                .store
-                .unfinished_delete_requests(CONNECTION, None)
-                .unwrap()
-                .is_empty());
-            admitted(
-                admit(&context, "publisher", LeaseKind::Work, NOW + 8 * DAY, &Cancellation::default())
-                    .await
-                    .unwrap(),
-            );
-        });
-    }
-
-    /// GC20: a marker an interrupted run left behind is kept while any request
-    /// of its attempt is unanswered, and given back once none is.
-    #[test]
-    fn a_marker_of_a_finished_job_goes_only_when_no_request_is_outstanding() {
-        let harness = Harness::new();
-        let cancel = Cancellation::default();
-        runtime().block_on(async {
-            let context = harness.context();
-            let marker = place_marker(&context, "cleanup", NOW, &cancel)
-                .await
-                .unwrap();
-            let target = harness.target("pack-a");
-            harness.provider.seed("pack-a", ObjectRole::Pack, b"pack".to_vec());
-            note_delete_sent(&context, &marker, &target, NOW).unwrap();
-
-            let live = BTreeSet::new();
-            harness.provider.fail_delete("pack-a", DeleteFault::Transient);
-            assert_eq!(resume(&context, &live, &cancel).await.unwrap_err().kind, ErrorKind::Transient);
-            assert!(harness.provider.holds(&marker.locator.object));
-            assert_eq!(harness.provider.delete_attempts("pack-a"), 1);
-
-            harness.provider.fail_delete("pack-a", DeleteFault::RateLimited);
-            resume(&context, &live, &cancel).await.unwrap();
-            assert!(!harness.provider.holds(&marker.locator.object));
-            assert!(harness.provider.holds("pack-a"));
-            assert_eq!(harness.provider.delete_attempts("pack-a"), 2);
-            assert!(harness.store.unfinished_delete_requests(CONNECTION, None).unwrap().is_empty());
-            assert!(harness.rows().is_empty());
         });
     }
 
     #[test]
-    fn a_missing_marker_never_replays_its_old_delete_requests() {
-        let harness = Harness::new();
-        let cancel = Cancellation::default();
+    fn c_registration_race_yields_and_releases_only_its_own_lease() {
         runtime().block_on(async {
-            let context = harness.context();
-            let marker = place_marker(&context, "cleanup", NOW, &cancel).await.unwrap();
-            let target = harness.target("pack-a");
-            note_delete_sent(&context, &marker, &target, NOW).unwrap();
-            harness.remove(&marker.locator.object).await;
-            harness.provider.seed("pack-a", ObjectRole::Pack, b"new-owner".to_vec());
-
-            resume(&context, &BTreeSet::new(), &cancel).await.unwrap();
-            assert_eq!(harness.provider.delete_attempts("pack-a"), 0);
-            assert_eq!(harness.stored_bytes("pack-a"), b"new-owner");
-            assert!(!harness.provider.holds(&marker.locator.object));
-            assert!(harness.store.unfinished_delete_requests(CONNECTION, None).unwrap().is_empty());
-            assert!(harness.rows().is_empty());
-
-            resume(&context, &BTreeSet::new(), &cancel).await.unwrap();
-            assert_eq!(harness.provider.delete_attempts("pack-a"), 0);
+            let h = Harness::new();
+            let (id, bytes) = h.foreign(LeaseKind::Work, 2, NOW);
+            h.provider.seed_after_list(1, &id, ObjectRole::Lease, bytes);
+            let result = admit(&h.context(), "job", LeaseKind::Work, &Cancellation::default()).await.unwrap();
+            assert!(matches!(result, Admission::Yield { reason: YieldReason::ForeignWork }));
+            assert!(h.provider.holds(&id));
+            assert_eq!(h.provider.delete_attempts(&id), 0);
+            let uploaded = h.provider.uploaded_ids();
+            assert_eq!(uploaded.len(), 1);
+            assert!(!h.provider.holds(&uploaded[0]));
         });
     }
 
-    /// GC29: a command answers no durable job, so a job starting beside it must
-    /// not read the command's lease as abandoned while it is still reading.
     #[test]
-    fn a_lease_a_command_is_holding_survives_a_job_that_starts_beside_it() {
-        let harness = Harness::new();
-        let cancel = Cancellation::default();
+    fn c_expired_lease_needs_trusted_time_and_future_or_corrupt_lease_is_not_ignored() {
         runtime().block_on(async {
-            let context = harness.context();
-            let handle = admitted(
-                admit(&context, "export", LeaseKind::Work, NOW, &cancel)
-                    .await
-                    .unwrap(),
-            );
-            let held = hold("export");
-
-            // The job list names only the job that just started.
-            let live = BTreeSet::from(["job".to_owned()]);
-            resume(&context, &live, &cancel).await.unwrap();
-            assert!(harness.provider.holds(&handle.locator.object));
-
-            drop(held);
-            resume(&context, &live, &cancel).await.unwrap();
-            assert!(!harness.provider.holds(&handle.locator.object));
-            assert!(harness.rows().is_empty());
+            let h = Harness::new();
+            let (id, bytes) = h.foreign(LeaseKind::Work, 1, NOW);
+            h.provider.seed(&id, ObjectRole::Lease, bytes);
+            h.clock.advance(70 * MINUTE_MS);
+            h.clock.set_trusted(false);
+            assert!(matches!(admit(&h.context(), "job", LeaseKind::Work, &Cancellation::default()).await.unwrap(), Admission::Yield { .. }));
+            h.clock.set_trusted(true);
+            let owner = h.owner(LeaseKind::Work).await;
+            owner.release_all(&h.context()).await;
+            let (future, bytes) = h.foreign(LeaseKind::Work, 2, NOW + 100 * LEASE_TTL_MS);
+            h.provider.seed(&future, ObjectRole::Lease, bytes);
+            assert!(matches!(admit(&h.context(), "job", LeaseKind::Work, &Cancellation::default()).await.unwrap(), Admission::Yield { .. }));
+            h.provider.forget(&future);
+            h.provider.seed("unknown", ObjectRole::Lease, b"not authenticated".to_vec());
+            assert!(matches!(admit(&h.context(), "job", LeaseKind::Work, &Cancellation::default()).await.unwrap(), Admission::Yield { reason: YieldReason::UnknownProtection }));
         });
     }
 
-    /// Diagnostics retain an unknown lease, but it cannot prove that no one
-    /// is removing objects and must not allow admission.
     #[test]
-    fn an_unclassified_lease_is_reported_but_never_allows_admission() {
-        let harness = Harness::new();
+    fn c_full_lease_enumeration_supports_multiple_pages_and_rejects_repeated_cursors() {
         runtime().block_on(async {
-            let context = harness.context();
-            harness
-                .provider
-                .seed("not-a-lease", ObjectRole::Lease, b"x".to_vec());
-            let observed = survey(&context, &Cancellation::default()).await.unwrap();
-            assert_eq!(observed.leases.len(), 1);
-            assert_eq!(observed.leases[0].kind, ObservedKind::Unknown);
-            assert_eq!(observed.foreign_work().len(), 1);
-            assert_eq!(observed.leases[0].locator.object, "not-a-lease");
-            assert_eq!(
-                admit(&context, "job", LeaseKind::Work, NOW, &Cancellation::default())
-                    .await
-                    .unwrap_err()
-                    .kind,
-                ErrorKind::Corrupt
-            );
+            let h = Harness::new();
+            for index in 0..101 {
+                let (id, bytes) = h.foreign(LeaseKind::Work, index, NOW);
+                h.provider.seed(&id, ObjectRole::Lease, bytes);
+            }
+            let survey = survey(&h.context(), &Cancellation::default()).await.unwrap();
+            assert_eq!(survey.leases.len(), 101);
+            h.provider.script_page(Collection::Leases, Ok(super::super::contract::ObjectPage {
+                objects: vec![], next_cursor: Some("repeat".into()),
+            }));
+            h.provider.script_page(Collection::Leases, Ok(super::super::contract::ObjectPage {
+                objects: vec![], next_cursor: Some("repeat".into()),
+            }));
+            assert_eq!(super::survey(&h.context(), &Cancellation::default()).await.unwrap_err().kind, ErrorKind::Corrupt);
         });
     }
 
-    /// A job that reached an end gives its work lease back; a delete marker is
-    /// not one and stays where it is.
     #[test]
-    fn releasing_a_job_leaves_a_delete_marker_alone() {
-        let harness = Harness::new();
-        let cancel = Cancellation::default();
+    fn c_renewal_confirms_a_new_lease_before_releasing_the_predecessor() {
         runtime().block_on(async {
-            let context = harness.context();
-            let work = admitted(admit(&context, "job", LeaseKind::Work, NOW, &cancel).await.unwrap());
-            let marker = place_marker(&context, "job", NOW, &cancel).await.unwrap();
-            release(&context, "job").await.unwrap();
-            assert!(!harness.provider.holds(&work.locator.object));
-            assert!(harness.provider.holds(&marker.locator.object));
-            assert_eq!(harness.rows().len(), 1);
+            let h = Harness::new();
+            let owner = h.owner(LeaseKind::Work).await;
+            let old = owner.primary().unwrap();
+            h.clock.advance(RENEW_AFTER_MS - 1);
+            owner.renew_if_due(&h.context(), &Cancellation::default()).await.unwrap();
+            assert_eq!(owner.primary().unwrap(), old);
+            h.clock.advance(1);
+            h.provider.fail_delete(&old.object_id, DeleteFault::Transient);
+            owner.renew_if_due(&h.context(), &Cancellation::default()).await.unwrap();
+            let next = owner.primary().unwrap();
+            assert_ne!(old.object_id, next.object_id);
+            assert_eq!(next.seq, old.seq + 1);
+            assert_eq!(next.expires_at_ms, next.created_at_ms + LEASE_TTL_MS);
+            assert!(h.provider.holds(&old.object_id));
+            assert!(h.provider.holds(&next.object_id));
+            assert_eq!(owner.recheck(&h.context(), &Cancellation::default()).await.unwrap(), None);
+            owner.release_all(&h.context()).await;
         });
     }
 
-    /// A cancelled job still hands its lease back, so a cancellation does not
-    /// close the repository to every other device.
     #[test]
-    fn a_cancelled_job_can_still_hand_its_lease_back() {
-        let harness = Harness::new();
+    fn c_suspend_and_lost_remote_lease_require_new_admission() {
         runtime().block_on(async {
-            let context = harness.context();
+            let h = Harness::new();
+            let owner = h.owner(LeaseKind::Work).await;
+            h.clock.suspend();
+            h.clock.foreground();
+            h.clock.set_trusted(true);
+            assert!(owner.check_control(&h.context(), false).is_err());
+            owner.release_all(&h.context()).await;
+            let fresh = h.owner(LeaseKind::Work).await;
+            h.provider.forget(&fresh.primary().unwrap().object_id);
+            assert_eq!(fresh.recheck(&h.context(), &Cancellation::default()).await.unwrap(), Some(YieldReason::ProtectionLost));
+        });
+    }
+
+    #[test]
+    fn c_one_owner_runs_once_and_cancellation_does_not_execute_the_body() {
+        runtime().block_on(async {
+            let h = Harness::new();
+            let owner = h.owner(LeaseKind::Work).await;
             let cancel = Cancellation::default();
-            let work = admitted(admit(&context, "job", LeaseKind::Work, NOW, &cancel).await.unwrap());
+            owner.running.store(true, Ordering::Release);
+            let duplicate: Result<()> = owner.run(&h.context(), &cancel, async { panic!("second worker") }).await;
+            assert_eq!(duplicate.unwrap_err().kind, ErrorKind::Corrupt);
+            owner.running.store(false, Ordering::Release);
             cancel.cancel();
-            release(&context, "job").await.unwrap();
-            assert!(!harness.provider.holds(&work.locator.object));
-            assert!(harness.rows().is_empty());
+            let result: Result<()> = owner.run(&h.context(), &cancel, async { panic!("cancelled worker") }).await;
+            assert_eq!(result.unwrap_err().kind, ErrorKind::Cancelled);
+            assert!(owner.check_control(&h.context(), false).is_err());
+        });
+    }
+
+    #[test]
+    fn c_execution_future_can_be_owned_by_the_native_worker() {
+        fn require_send<T: Send>(_: T) {}
+        runtime().block_on(async {
+            let h = Harness::new();
+            let owner = h.owner(LeaseKind::Work).await;
+            let context = h.context();
+            let cancel = Cancellation::default();
+            require_send(owner.run(&context, &cancel, async { Ok(()) }));
+            owner.release_all(&context).await;
+        });
+    }
+
+    #[test]
+    fn c_unsupported_protection_does_not_send_remote_requests() {
+        runtime().block_on(async {
+            let h = Harness::new();
+            let mut context = h.context();
+            context.protection_supported = false;
+            assert!(matches!(admit(&context, "job", LeaseKind::Work, &Cancellation::default()).await.unwrap(), Admission::UnsupportedProtection));
+            assert!(h.provider.uploaded_ids().is_empty());
+            assert_eq!(h.provider.listing_count(), 0);
         });
     }
 }

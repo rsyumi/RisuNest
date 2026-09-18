@@ -198,6 +198,8 @@ describe('persistent production runtime', () => {
             readPluginStorageSnapshot: vi.fn(async () => ({})),
             mutatePluginStorage: vi.fn(),
             invalidatePluginStorage: vi.fn(),
+            getStorageAuthorityEpoch: () => runtime.getStorageAuthorityEpoch(),
+            assertPersistentMutationAllowed: (epoch) => runtime.assertPersistentMutationAllowed(epoch),
             materializeDatabaseSnapshot: vi.fn(),
             replacePersistentDatabase: vi.fn(),
             snapshot: structuredClone,
@@ -215,7 +217,9 @@ describe('persistent production runtime', () => {
         await expect(access.setCurrentCharacter(replacement, {
             pluginName: 'official-failure-plugin',
             signal: new AbortController().signal,
-        })).rejects.toBe(officialError)
+        })).resolves.toBeUndefined()
+        expect(publish).not.toHaveBeenCalled()
+        expect(runtime.hasPendingOfficialPublication()).toBe(true)
 
         const resident = adapter.current().characters[0]
         expect(resident.name).toBe('Locally published replacement')
@@ -234,7 +238,10 @@ describe('persistent production runtime', () => {
             conversationId: 'chat-a',
             storeRevision: 2,
         })
+        await expect(runtime.publishCurrentOfficialRevision()).rejects.toBe(officialError)
         expect(publish).toHaveBeenCalledOnce()
+        expect(runtime.revision).toBe(2)
+        expect(runtime.hasPendingOfficialPublication()).toBe(true)
     })
 
     it('persists selected, inactive character, and inactive chat replacements across restart', async () => {
@@ -301,6 +308,8 @@ describe('persistent production runtime', () => {
             readPluginStorageSnapshot: vi.fn(async () => ({})),
             mutatePluginStorage: vi.fn(),
             invalidatePluginStorage: vi.fn(),
+            getStorageAuthorityEpoch: () => runtime.getStorageAuthorityEpoch(),
+            assertPersistentMutationAllowed: (epoch) => runtime.assertPersistentMutationAllowed(epoch),
             materializeDatabaseSnapshot,
             replacePersistentDatabase,
             snapshot: structuredClone,

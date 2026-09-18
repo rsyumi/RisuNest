@@ -54,6 +54,7 @@ vi.mock("../persistentDataRuntime.svelte", () => ({
   flushPendingData: vi.fn(),
   capturePersistentMutationToken: vi.fn(),
   acquireDestructiveReplacementFence: vi.fn(),
+  refreshActiveWorkingSetFromStore: vi.fn(),
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: state.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: state.listen }));

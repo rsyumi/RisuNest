@@ -130,21 +130,14 @@ fn external_delete_recreate_projects_final_state_and_messages_dirty_conversation
 }
 
 #[test]
-fn external_floor_respects_each_consumer_and_capture_reservations() {
+fn external_floor_respects_valid_consumers_without_reservations() {
     let (_dir, mut store, _) = open_fixture();
     cursor(&mut store, "slow", 1);
     edit(&mut store, 1);
     cursor(&mut store, "fast", 2);
     let tx = store.connection.transaction().unwrap();
-    changes::reserve(&tx, "capture", &active_generation(&tx).unwrap(), 1).unwrap();
     assert_eq!(changes::prune(&tx).unwrap(), 1);
     changes::require_rebuild(&tx, "slow").unwrap();
-    assert_eq!(changes::prune(&tx).unwrap(), 1);
-    tx.execute(
-        "DELETE FROM content_capture_reservations WHERE id='capture'",
-        [],
-    )
-    .unwrap();
     assert_eq!(changes::prune(&tx).unwrap(), 2);
     tx.commit().unwrap();
     let lease_id = store.acquire_revision(2).unwrap().lease;
@@ -865,7 +858,8 @@ fn external_capture_manager_shares_consumers_and_reuses_their_durable_cursor() {
     assert!(store
         .release_external_capture(&first.id, "destination-b")
         .unwrap());
-    assert_eq!(count(&store, "content_capture_reservations"), 0);
+    assert_eq!(count(&store, "content_change_consumers"), 2);
+    assert!(store.active_readers.detached_asset_roots().is_ok());
 }
 
 #[test]
@@ -1080,7 +1074,7 @@ fn external_capture_refuses_to_omit_unresolved_legacy_asset_storage() {
 }
 
 #[test]
-fn external_capture_projects_only_changed_records_at_the_reserved_snapshot() {
+fn external_capture_projects_only_changed_records_at_the_pinned_snapshot() {
     use super::super::content_capture::ContentCaptureSink;
     use crate::external_storage::capture::CaptureCatalog;
     use crate::logical_records::{decode_logical_record, LogicalRecordEnvelope};
@@ -1107,7 +1101,9 @@ fn external_capture_projects_only_changed_records_at_the_reserved_snapshot() {
     prepared
         .register(&mut store, &full, &[1; 32], "logical-v1")
         .unwrap();
-    assert!(count(&store, "external_storage_content_cache") > 1);
+    let records: i64 = full.db.query_row("SELECT count(*) FROM records", [], |row| row.get(0)).unwrap();
+    assert!(records > 1);
+    assert_eq!(count(&store, "external_storage_capture_files"), 1);
     assert!(store.active_readers.detached_asset_roots().is_ok());
     let (digest, path, _) = full.manifest().unwrap();
     let mut delta = CaptureCatalog::create(
@@ -1148,7 +1144,7 @@ fn external_capture_projects_only_changed_records_at_the_reserved_snapshot() {
     prepared
         .register(&mut store, &delta, &[1; 32], "logical-v1")
         .unwrap();
-    assert_eq!(count(&store, "content_capture_reservations"), 0);
+    assert!(store.active_readers.detached_asset_roots().is_ok());
     assert_eq!(count(&store, "external_storage_capture_files"), 2);
     let lease = store.acquire_revision(3).unwrap().lease;
     assert_eq!(
@@ -1195,13 +1191,12 @@ fn external_capture_rejects_mismatched_cache_and_releases_gc_guard_on_cancel() {
     assert!(empty.manifest().is_err());
     drop(prepared);
     assert!(store.active_readers.detached_asset_roots().is_ok());
-    store.abandon_content_capture("bad-cache").unwrap();
     assert_eq!(count(&store, "external_storage_captures"), 0);
-    assert_eq!(count(&store, "content_capture_reservations"), 0);
+    assert_eq!(count(&store, "content_change_consumers"), 1);
 }
 
 #[test]
-fn external_capture_registration_failure_does_not_advance_cache_or_cursor() {
+fn external_capture_registration_failure_does_not_advance_capture_or_cursor() {
     use crate::external_storage::capture::CaptureCatalog;
     struct Never;
     impl crate::local_backup::CancellationProbe for Never {
@@ -1226,19 +1221,18 @@ fn external_capture_registration_failure_does_not_advance_cache_or_cursor() {
         .is_err());
     for table in [
         "external_storage_captures",
-        "external_storage_content_cache",
         "content_change_consumers",
         "external_storage_capture_files",
     ] {
         assert_eq!(count(&store, table), 0);
     }
-    assert_eq!(count(&store, "content_capture_reservations"), 1);
+    let floor: i64 = store.connection.query_row("SELECT revision FROM content_change_floor WHERE singleton=1", [], |row| row.get(0)).unwrap();
+    assert_eq!(floor, 1);
     assert!(store.active_readers.detached_asset_roots().is_ok());
     store
         .connection
         .execute_batch("DROP TRIGGER synthetic_capture_failure")
         .unwrap();
-    store.abandon_content_capture("register-failure").unwrap();
     drop(store);
     let mut store = PersistentStore::open(directory.path()).unwrap();
     let prepared = store
@@ -1248,7 +1242,8 @@ fn external_capture_registration_failure_does_not_advance_cache_or_cursor() {
         .register(&mut store, &catalog, &[1; 32], "logical-v1")
         .unwrap();
     assert_eq!(count(&store, "external_storage_captures"), 1);
-    assert_eq!(count(&store, "content_capture_reservations"), 0);
+    assert_eq!(count(&store, "external_storage_capture_files"), 1);
+    assert!(store.active_readers.detached_asset_roots().is_ok());
 }
 
 #[test]

@@ -133,12 +133,21 @@ export async function loadRisuAccountBackup() {
 
         alertWait("Loading backup")
 
-        await installAccountBackup(await decodeRisuSave(buf.buffer), {
+        let followupFailed = false
+        const outcome = await installAccountBackup(await decodeRisuSave(buf.buffer), {
             replaceDatabase: replacePersistentDatabase,
             loadPlugins: async () => (await import('../plugins/plugins.svelte')).loadPlugins(),
+            onPostCommitError: (error) => {
+                followupFailed = true
+                console.error('Committed account restore follow-up failed', error)
+                alertError(language.risuNest.persistentData.followupFailed)
+            },
         })
-    
-        alertNormal('Loaded backup')
+        if (outcome.projection === 'refresh-required') {
+            alertError(language.risuNest.persistentData.refreshHelp)
+        } else if (!followupFailed) {
+            alertNormal('Loaded backup')
+        }
     }
 
 }

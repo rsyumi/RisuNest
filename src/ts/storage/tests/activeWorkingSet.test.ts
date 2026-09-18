@@ -121,7 +121,9 @@ function makeHarness(
         mutationGeneration: 0,
         initialize: vi.fn(),
         flushPendingData: vi.fn(() => Promise.resolve()),
-        replacePersistentDatabase: vi.fn(async () => undefined),
+        replacePersistentDatabase: vi.fn(async () => ({
+            kind: 'committed', revision: 1, projection: 'applied',
+        } as const)),
         adoptHydratedCharacter: vi.fn(() => true),
         markPersistentDataDirty: vi.fn(),
         recordActiveConversationMutation: vi.fn(),
@@ -1451,6 +1453,7 @@ describe('ActiveWorkingSet', () => {
         harness.coordinator.replacePersistentDatabase.mockImplementation(async () => {
             replacementStarted = true
             await replacement.promise
+            return { kind: 'committed', revision: 1, projection: 'applied' }
         })
         harness.coordinator.flushPendingData.mockImplementation(() =>
             replacementStarted ? replacement.promise : Promise.resolve(),

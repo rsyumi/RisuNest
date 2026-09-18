@@ -22,6 +22,10 @@ function deferred<T>() {
 
 function harness(entries: Record<string, { byteSize: number; value: unknown }>, budget = 10) {
     let revision = 4
+    let authorityEpoch = 0
+    const assertPersistentMutationAllowed = (expected = authorityEpoch) => {
+        if (expected !== authorityEpoch) throw new Error('Persistent mutation fenced')
+    }
     const readPluginStorage = vi.fn(async (_owner: string, key: string) => {
         const entry = entries[key]
         return entry ? { revision, value: structuredClone(entry.value) } : null
@@ -72,11 +76,45 @@ function harness(entries: Record<string, { byteSize: number; value: unknown }>, 
         store,
         mutate,
         readPluginStorage,
-        storage: createPluginStorageStore({ store, mutate }, budget),
+        storage: createPluginStorageStore({
+            store, mutate,
+            getStorageAuthorityEpoch: () => authorityEpoch,
+            assertPersistentMutationAllowed,
+        }, budget),
+        advanceAuthorityEpoch() { authorityEpoch++ },
     }
 }
 
 describe('plugin storage V3 residency', () => {
+    it('freezes mutations before waiting for the first storage index', async () => {
+        const { storage, store, mutate } = harness({}, 100)
+        const opening = deferred<void>()
+        vi.mocked(store.open).mockReturnValueOnce(opening.promise)
+        const value = { text: 'captured' }
+        const mutations = [{ type: 'set' as const, key: 'before', value }]
+        const writing = storage.forOwner(OWNER).mutate(mutations)
+        value.text = 'later edit'
+        mutations[0].key = 'after'
+        opening.resolve()
+        await writing
+        expect(mutate).toHaveBeenCalledWith([
+            { type: 'set', owner: OWNER, key: 'before', value: { text: 'captured' } },
+        ])
+    })
+
+    it('late_plugin_result_cannot_cross_replacement while its storage index loads', async () => {
+        const { storage, store, mutate, advanceAuthorityEpoch } = harness({}, 100)
+        const opening = deferred<void>()
+        vi.mocked(store.open).mockReturnValueOnce(opening.promise)
+        const writing = storage.forOwner(OWNER).setItem('old', { text: 'old library' })
+        const rejected = expect(writing).rejects.toThrow('Persistent mutation fenced')
+        advanceAuthorityEpoch()
+        storage.invalidate()
+        opening.resolve()
+        await rejected
+        expect(mutate).not.toHaveBeenCalled()
+    })
+
     it('preserves exact JSON byte budgets for strings including escaped and unpaired UTF-16', async () => {
         const values = [
             '',
@@ -281,6 +319,8 @@ describe('plugin storage V3 residency', () => {
         let authority = first.store
         const storage = createPluginStorageStore({
             store: () => authority,
+            getStorageAuthorityEpoch: () => authority === first.store ? 0 : 1,
+            assertPersistentMutationAllowed: vi.fn(),
             mutate: first.mutate,
         }, 100)
 

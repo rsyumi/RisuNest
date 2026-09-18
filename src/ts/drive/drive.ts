@@ -428,6 +428,10 @@ export async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Prom
         db.didFirstSetup = true
         await installDriveRestore(db, {
             replaceDatabase: replacePersistentDatabase,
+            onPostCommitError: (error) => {
+                console.error('Committed Drive restore follow-up failed', error)
+                alertError(language.risuNest.persistentData.followupFailed)
+            },
             publishAcceptedRevision: publishCurrentOfficialRevision,
             relaunch: async () => {
                 lastSavedCache = Date.now()

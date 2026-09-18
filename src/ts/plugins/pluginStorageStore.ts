@@ -15,6 +15,8 @@ export const PLUGIN_STORAGE_CACHE_BYTE_BUDGET = 64 * 1024 * 1024
 
 interface PluginStorageStoreDependencies {
     store: PersistentDataStore | (() => PersistentDataStore)
+    getStorageAuthorityEpoch(): number
+    assertPersistentMutationAllowed(expectedAuthorityEpoch?: number): void
     mutate(mutations: PluginStorageMutation[]): Promise<void>
 }
 
@@ -379,15 +381,18 @@ export function createPluginStorageStore(
         owner: string,
         mutations: readonly OwnerScopedStorageMutation[],
     ) => {
-        await initialize()
         if (mutations.length === 0) return
+        const authorityEpoch = dependencies.getStorageAuthorityEpoch()
+        dependencies.assertPersistentMutationAllowed(authorityEpoch)
         const normalized = mutations.map((mutation): PluginStorageMutation =>
             mutation.type === 'clear'
                 ? { type: 'clear', owner }
                 : mutation.type === 'delete' || mutation.value === undefined
                   ? { type: 'delete', owner, key: mutation.key }
-                  : { type: 'set', owner, key: mutation.key, value: mutation.value },
+                  : { type: 'set', owner, key: mutation.key, value: clonePluginStorageValue(mutation.value) },
         )
+        await initialize()
+        dependencies.assertPersistentMutationAllowed(authorityEpoch)
         const expectedAuthorityGeneration = authorityGeneration
         await dependencies.mutate(normalized)
         if (expectedAuthorityGeneration !== authorityGeneration) return

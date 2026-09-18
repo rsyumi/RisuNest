@@ -11,6 +11,7 @@ import {
 } from './nativeAssetRepository'
 import type { PreparedImmutablePayload } from './payloadCas'
 import type { DataHealthResult } from './dataHealth'
+import type { PersistentDataRuntime } from './persistentDataRuntime'
 import {
     copyNativeExportToAndroidSaf,
     discardAndroidSafSource,
@@ -428,23 +429,10 @@ export interface NativePortableRestorePreview {
     items?: NativeArchiveInventory
 }
 
-export interface NativeBlockRestoreRuntime {
-    capturePersistentMutationToken(reason: string): Promise<{
-        revision: number
-        mutationGeneration: number
-    }>
-    acquireDestructiveReplacementFence(
-        token: {
-            revision: number
-            mutationGeneration: number
-        },
-        options?: { allowRevisionAdvance?: boolean },
-    ): Promise<{
-        readonly revision: number
-        refreshCommittedWorkingSet(revision: number): Promise<void>
-        release(): void
-    }>
-}
+export type NativeBlockRestoreRuntime = Pick<
+    PersistentDataRuntime,
+    'capturePersistentMutationToken' | 'acquireDestructiveReplacementFence'
+>
 
 export interface NativeFileJobOptions {
     onStarted?(jobId: string): void | Promise<void>
@@ -1193,8 +1181,9 @@ async function runNativeReplacementRestore(
         abortBeforeNativeRestoreStart(source, dependencies)
     }
 
-    const mutationToken =
-        await runtime.capturePersistentMutationToken(mutationReason)
+    const mutationToken = await runtime.capturePersistentMutationToken(
+        mutationReason, { publishOfficial: false },
+    )
     if (options.signal?.aborted) {
         abortBeforeNativeRestoreStart(source, dependencies)
     }
@@ -1277,11 +1266,10 @@ async function runNativeReplacementRestore(
                 }
                 if (selection.deviceSections.length) {
                     await options.beforeActivation?.()
-                    replacementFence =
-                        await runtime.acquireDestructiveReplacementFence(
-                            mutationToken,
-                            { allowRevisionAdvance: true },
-                        )
+                    const activationToken = await runtime.capturePersistentMutationToken(
+                        `${mutationReason}-activation`, { publishOfficial: false },
+                    )
+                    replacementFence = await runtime.acquireDestructiveReplacementFence(activationToken)
                     options.onBlockingChange?.(true)
                 }
                 if (options.signal?.aborted) {
@@ -1314,7 +1302,7 @@ async function runNativeReplacementRestore(
                 await handlePortableDeviceMaintenanceStatus(
                     { ...status, kind },
                     {
-                        flushedRevision: mutationToken.revision,
+                        flushedRevision: replacementFence?.revision ?? mutationToken.revision,
                         assertHeld() {
                             if (!replacementFence)
                                 throw new Error(
@@ -1368,11 +1356,11 @@ async function runNativeReplacementRestore(
             ) {
                 try {
                     await options.beforeActivation?.()
-                    replacementFence =
-                        await runtime.acquireDestructiveReplacementFence(
-                            mutationToken,
-                            { allowRevisionAdvance: true },
-                        )
+                    // Explicit restores accept a fresh token after preparation and choices.
+                    const activationToken = await runtime.capturePersistentMutationToken(
+                        `${mutationReason}-activation`, { publishOfficial: false },
+                    )
+                    replacementFence = await runtime.acquireDestructiveReplacementFence(activationToken)
                 } catch (error) {
                     mutationConflict =
                         error instanceof NativeFileJobError
@@ -1397,9 +1385,7 @@ async function runNativeReplacementRestore(
                     })
                     continue
                 }
-                // The acquisition flushed whatever the renderer left dirty while
-                // the job was reading, so the replacement applies to the revision
-                // the fence now holds, not the one the start request carried.
+                // Finalization uses the exact token captured after preparation and choices.
                 await invokeNative(dependencies, 'native_file_job_finalize', {
                     jobId: started.jobId,
                     expectedRevision: replacementFence.revision,
@@ -1439,9 +1425,12 @@ async function runNativeReplacementRestore(
                 options.onStatus?.(
                     syntheticNativeFileJobStatus(terminal, 'refreshing-app'),
                 )
-                await replacementFence.refreshCommittedWorkingSet(
+                const outcome = await replacementFence.refreshCommittedWorkingSet(
                     terminal.result.revision,
                 )
+                if (outcome.projection === 'refresh-required') {
+                    throw new Error('Committed native restore requires a read-only working-set refresh')
+                }
                 options.onStatus?.(
                     syntheticNativeFileJobStatus(terminal, 'reloading-plugins'),
                 )
@@ -2051,16 +2040,11 @@ export async function runNativeArchiveExport(
                                 'publication-pending',
                                 'Finish the previous backup save before starting another',
                             )
-                        const token =
-                            await runtime.capturePersistentMutationToken(
-                                'native-portable-export',
-                            )
-                        fence =
-                            await runtime.acquireDestructiveReplacementFence(
-                                token,
-                                { allowRevisionAdvance: true },
-                            )
-                        // The acquisition's own flush can advance past the token.
+                        const token = await runtime.capturePersistentMutationToken(
+                            'native-portable-export', { publishOfficial: false },
+                        )
+                        fence = await runtime.acquireDestructiveReplacementFence(token)
+                        // Export reads exactly the revision accepted by the input guard.
                         expectedRevision = fence.revision
                     } else {
                         await runtime.flushPendingData('native-portable-export')

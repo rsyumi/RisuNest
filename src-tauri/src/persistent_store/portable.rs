@@ -600,8 +600,6 @@ fn validate_live_columns(source: &Connection) -> StoreResult<()> {
                     | "content_changes"
                     | "content_change_consumers"
                     | "content_change_floor"
-                    | "content_capture_reservations"
-                    | "external_storage_content_cache"
             )
         {
             return Err(invalid(&format!(

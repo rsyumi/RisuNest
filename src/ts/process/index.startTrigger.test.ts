@@ -64,6 +64,9 @@ vi.mock('../plugins/plugins.svelte', async () => (await import('./tests/sendChat
 vi.mock('../plugins/pluginDatabaseAccess', async (importOriginal) => (await import('./tests/sendChatTestHarness')).pluginDatabaseAccessModule(importOriginal as () => Promise<Record<string, unknown>>))
 vi.mock('./presetChain', async () => (await import('./tests/sendChatTestHarness')).presetChainModule())
 vi.mock('../storage/persistentDataRuntime.svelte', () => ({
+    assertPersistentMutationAllowed: vi.fn(),
+    getPersistentStorageAuthorityEpoch: () => 0,
+    getPersistentNavigationGeneration: () => 0,
     acknowledgeGenerationCompletion: vi.fn(async () => undefined),
     captureSelectedConversationTarget: () => null,
     acquireCompleteConversation: vi.fn(),

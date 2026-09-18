@@ -1,7 +1,7 @@
 import { writable } from "svelte/store"
 import { getDatabase } from "./database.svelte"
 import localforage from "localforage"
-import { alertLogin, alertNormalWait, alertStore } from "../alert"
+import { alertError, alertLogin, alertNormalWait, alertStore } from "../alert"
 import { getUncleanablesSync } from "../globalApi.svelte"
 import { v4 } from "uuid"
 import { language } from "src/lang"
@@ -487,6 +487,10 @@ async function performAccountUnmigration(): Promise<void> {
     const coldKeys = await listColdDataKeys(db)
 
     await completeAccountUnmigration(db, {
+        onPostCommitError: (error) => {
+            console.error('Committed account unmigration follow-up failed', error)
+            alertError(language.risuNest.persistentData.followupFailed)
+        },
         prepareResources: async (candidate) => {
             const selectedCold = await materializeAccountUnmigrationResources({
                 coldKeys,

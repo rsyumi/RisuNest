@@ -48,6 +48,8 @@ function sharedStore(initial: readonly Row[]) {
     } as unknown as PersistentDataStore
     const storage = createPluginStorageStore({
         store,
+        getStorageAuthorityEpoch: () => 0,
+        assertPersistentMutationAllowed: vi.fn(),
         mutate: async (mutations) => {
             for (const mutation of mutations) {
                 committed.push(mutation)
@@ -203,6 +205,8 @@ describe('plugin storage isolation', () => {
         } as unknown as PersistentDataStore
         const storage = createPluginStorageStore({
             store,
+            getStorageAuthorityEpoch: () => 0,
+            assertPersistentMutationAllowed: vi.fn(),
             mutate: async (mutations) => {
                 await gate
                 for (const mutation of mutations) {

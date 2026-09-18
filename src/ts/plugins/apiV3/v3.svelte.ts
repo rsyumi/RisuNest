@@ -38,7 +38,9 @@ import {
     type TTSHookFn,
 } from "src/ts/process/ttsHooks";
 import {
-    flushPendingData,
+    flushPendingDataLocally,
+    assertPersistentMutationAllowed,
+    getPersistentStorageAuthorityEpoch,
     acquireCompleteConversation,
     captureSelectedConversationTarget,
     getActiveConversationSession,
@@ -102,7 +104,9 @@ function getPluginDatabaseAccess(owner: string): PluginDatabaseAccess {
     if (existing) return existing
     const access = createProductionPluginDatabaseAccess({
         owner,
-        flushPendingData,
+        flushPendingData: flushPendingDataLocally,
+        assertPersistentMutationAllowed,
+        getStorageAuthorityEpoch: getPersistentStorageAuthorityEpoch,
         getCompatibilityDatabase: () => DBState.db,
         getSelectedCharacterId: () =>
             getDatabase().characters[get(selectedCharID)]?.chaId ?? null,
@@ -919,9 +923,12 @@ const makeRisuaiAPIV3 = (
 
         // --- Color Scheme APIs ---
         changeColorScheme: (name: string) => {
+            assertPersistentMutationAllowed()
             changeColorScheme(name)
         },
         setColorScheme: (scheme: ColorScheme) => {
+            assertPersistentMutationAllowed()
+            scheme = $state.snapshot(scheme)
             const requiredKeys = ['bgcolor','darkbg','borderc','selected','draculared','textcolor','textcolor2','darkBorderc','darkbutton','type'] as const
             for (const key of requiredKeys) {
                 if (typeof (scheme as any)[key] !== 'string') {
@@ -947,6 +954,7 @@ const makeRisuaiAPIV3 = (
 
         // --- Text Theme APIs ---
         changeTextTheme: (name: string) => {
+            assertPersistentMutationAllowed()
             if (!['standard','highcontrast'].includes(name)) {
                 throw new Error(`Invalid text theme: ${name}`)
             }
@@ -962,6 +970,8 @@ const makeRisuaiAPIV3 = (
             FontColorQuote1: string,
             FontColorQuote2: string
         }) => {
+            assertPersistentMutationAllowed()
+            theme = $state.snapshot(theme)
             const requiredKeys = ['FontColorStandard','FontColorBold','FontColorItalic','FontColorItalicBold','FontColorQuote1','FontColorQuote2'] as const
             for (const key of requiredKeys) {
                 if (typeof (theme as any)[key] !== 'string') {
@@ -996,6 +1006,7 @@ const makeRisuaiAPIV3 = (
             }
         },
         setArgument: async (key:string, value:string) => {
+            assertPersistentMutationAllowed()
             const db = getDatabase();
             for (const p of db.plugins) {
                 if (p.name === plugin.name) {
@@ -1464,11 +1475,25 @@ const makeRisuaiAPIV3 = (
             }, options.mode)
         },
         sendChat: async (message: string) => {
+            const authorityEpoch = getPersistentStorageAuthorityEpoch();
+            assertPersistentMutationAllowed(authorityEpoch);
+            const navigationGeneration = getPersistentNavigationGeneration();
+            const initialCharacter = DBState.db.characters[get(selectedCharID)];
+            const characterId = initialCharacter?.chaId;
+            const conversationId = initialCharacter?.chats[initialCharacter.chatPage]?.id;
+            const isCurrentTarget = () => {
+                const current = DBState.db.characters[get(selectedCharID)];
+                return getPersistentNavigationGeneration() === navigationGeneration &&
+                    current?.chaId === characterId &&
+                    current?.chats[current.chatPage]?.id === conversationId;
+            };
             const conf = await getPluginPermission(plugin.name, 'sendChat');
             if(!conf){
                 return false;
             }
 
+            assertPersistentMutationAllowed(authorityEpoch);
+            if(!isCurrentTarget()) return false;
             if(typeof message !== 'string'){
                 throw new Error("Message must be a string");
             }
@@ -1492,6 +1517,11 @@ const makeRisuaiAPIV3 = (
             let appendedChat: (typeof DBState.db.characters)[number]['chats'][number] | null = null;
             const rollbackAppendedMessage = () => {
                 if(!appendedMessageId || !appendedCharacter || !appendedChat) return;
+                try {
+                    assertPersistentMutationAllowed(authorityEpoch);
+                } catch {
+                    return;
+                }
                 const currentCharacter = DBState.db.characters[get(selectedCharID)];
                 if(currentCharacter !== appendedCharacter){
                     return;
@@ -1517,6 +1547,8 @@ const makeRisuaiAPIV3 = (
                 if(target){
                     completeLease = await acquireCompleteConversation('plugin-v3-send-chat', target);
                 }
+                assertPersistentMutationAllowed(authorityEpoch);
+                if(!isCurrentTarget()) return false;
                 const charId = get(selectedCharID);
                 const char = DBState.db.characters[charId];
                 if(!char){
@@ -1544,6 +1576,7 @@ const makeRisuaiAPIV3 = (
                 }
 
                 const sent = await processSendChat(-1, {}, reservation);
+                assertPersistentMutationAllowed(authorityEpoch);
                 if(!sent){
                     rollbackAppendedMessage();
                     return false;

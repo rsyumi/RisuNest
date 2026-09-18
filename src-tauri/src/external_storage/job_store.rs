@@ -4,7 +4,7 @@ use crate::persistent_store::sync_selection::CaptureIdentity;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::HashMap, path::Path, sync::Mutex};
+use std::{collections::HashMap, path::Path, sync::{Arc, Mutex}};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -99,6 +99,7 @@ pub(crate) struct DurableJob {
     pub capture_id: Option<String>,
     pub snapshot_id: String,
     pub admission_identity: CaptureIdentity,
+    pub receive_staging_id: Option<String>,
 }
 impl DurableJob {
     pub fn new(
@@ -118,6 +119,7 @@ impl DurableJob {
             capture_id: None,
             snapshot_id: uuid::Uuid::new_v4().to_string(),
             admission_identity,
+            receive_staging_id: None,
         }
     }
     pub fn terminal(&self) -> bool {
@@ -191,7 +193,9 @@ impl JobStore {
         let job: DurableJob =
             serde_json::from_str(&bytes).map_err(|_| ProviderError::new(ErrorKind::Corrupt))?;
         job.request.validate()?;
-        if job.admission_identity.revision < 0
+        if job.receive_staging_id.as_ref().is_some_and(|id| {
+            !id.starts_with("staging-") || id.len() > 128 || id.contains('\0')
+        }) || job.admission_identity.revision < 0
             || [
                 &job.admission_identity.store_id,
                 &job.admission_identity.library_epoch,
@@ -259,11 +263,114 @@ pub(crate) struct Session {
     pub kind: String,
     pub id: String,
 }
+type ActiveJobs = Arc<Mutex<HashMap<String, (String, Cancellation)>>>;
+
+#[derive(Clone)]
+pub(crate) struct JobClaim {
+    _owner: Arc<JobClaimOwner>,
+}
+impl JobClaim {
+    pub(super) fn require_job(&self, state: &JobCommandState, job: &DurableJob) -> Result<()> {
+        if self._owner.id != job.id || !Arc::ptr_eq(&self._owner.active, &state.active) {
+            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+        }
+        Ok(())
+    }
+}
+
+struct JobClaimOwner {
+    id: String,
+    active: ActiveJobs,
+}
+impl Drop for JobClaimOwner {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active.lock() {
+            active.remove(&self.id);
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct AutomaticTarget {
+    pub owner_job_id: String,
+    pub request: StartJobRequest,
+    pub identity: CaptureIdentity,
+}
+
 #[derive(Default)]
 pub(crate) struct JobCommandState {
     pub root: std::sync::OnceLock<std::path::PathBuf>,
-    pub active: Mutex<HashMap<String, (String, Cancellation)>>,
+    pub active: ActiveJobs,
     pub session: Mutex<Session>,
+    pub automatic_targets: Mutex<HashMap<String, AutomaticTarget>>,
+    pub prepared_receives: Mutex<HashMap<String, super::sync_engine::PreparedReceive>>,
+}
+impl JobCommandState {
+    pub fn claim(&self, job: &DurableJob) -> Result<(Cancellation, JobClaim)> {
+        let cancel = Cancellation::default();
+        let mut active = self.active.lock().map_err(failure)?;
+        if active.contains_key(&job.id)
+            || active.values().any(|(connection, _)| connection == &job.request.connection_id)
+        {
+            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+        }
+        active.insert(job.id.clone(), (job.request.connection_id.clone(), cancel.clone()));
+        Ok((cancel, JobClaim { _owner: Arc::new(JobClaimOwner {
+            id: job.id.clone(), active: self.active.clone(),
+        }) }))
+    }
+
+    pub fn coalesce_automatic(
+        &self,
+        running: &DurableJob,
+        request: &StartJobRequest,
+        identity: &CaptureIdentity,
+    ) -> Result<bool> {
+        if running.request.kind != JobKind::Sync
+            || request.kind != JobKind::Sync
+            || running.request.reason.as_deref() != Some("automatic")
+            || request.reason.as_deref() != Some("automatic")
+            || running.request.connection_id != request.connection_id
+        {
+            return Ok(false);
+        }
+        super::runtime::require_admitted_library(running, identity)?;
+        let target = requested_revision(request, identity.revision)?;
+        if target <= requested_revision(&running.request, running.admission_identity.revision)? {
+            return Ok(true);
+        }
+        let mut queued = self.automatic_targets.lock().map_err(failure)?;
+        if queued.get(&request.connection_id).is_some_and(|held| {
+            held.owner_job_id == running.id && requested_revision(&held.request, held.identity.revision)
+                .is_ok_and(|revision| revision >= target)
+        }) {
+            return Ok(true);
+        }
+        let mut request = request.clone();
+        request.target_revision = Some(target.to_string());
+        queued.insert(request.connection_id.clone(), AutomaticTarget {
+            owner_job_id: running.id.clone(),
+            request,
+            identity: identity.clone(),
+        });
+        Ok(true)
+    }
+
+    pub fn cancel_automatic_target(&self, job: &DurableJob) -> Result<()> {
+        let mut queued = self.automatic_targets.lock().map_err(failure)?;
+        if queued.get(&job.request.connection_id)
+            .is_some_and(|target| target.owner_job_id == job.id)
+        {
+            queued.remove(&job.request.connection_id);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn requested_revision(request: &StartJobRequest, fallback: i64) -> Result<i64> {
+    request.target_revision.as_deref().map_or(Ok(fallback), |value| {
+        value.parse().map_err(|_| ProviderError::new(ErrorKind::Corrupt))
+    })
 }
 
 #[cfg(test)]
@@ -364,6 +471,109 @@ mod tests {
         assert!(state.iter().any(|job| job.id == second.id));
         assert!(state.iter().any(|job| job.id == terminal_ids[39]));
         assert!(!state.iter().any(|job| job.id == terminal_ids[7]));
+    }
+
+    #[test]
+    fn cancellation_keeps_the_worker_claim_until_its_owner_returns() {
+        let state = JobCommandState::default();
+        let job = DurableJob::new(request(), false, 1, identity());
+        let (cancel, claim) = state.claim(&job).unwrap();
+        let retained = claim.clone();
+        cancel.cancel();
+        assert!(state.claim(&job).is_err());
+        let other = DurableJob::new(request(), false, 2, identity());
+        assert!(state.claim(&other).is_err());
+        drop(claim);
+        assert!(state.claim(&other).is_err());
+        drop(retained);
+        assert!(state.active.lock().unwrap().is_empty());
+        assert!(state.claim(&other).is_ok());
+    }
+
+    #[test]
+    fn cleanup_claim_excludes_restart_until_settlement_finishes() {
+        let state = Arc::new(JobCommandState::default());
+        let job = DurableJob::new(request(), false, 1, identity());
+        let (cancel, worker) = state.claim(&job).unwrap();
+        cancel.cancel();
+        drop(worker);
+        let (_, cleanup) = state.claim(&job).unwrap();
+        let contender_state = state.clone();
+        let contender_job = job.clone();
+        std::thread::spawn(move || {
+            assert!(contender_state.claim(&contender_job).is_err());
+            let mut other = contender_job;
+            other.id = "different-job".into();
+            assert!(contender_state.claim(&other).is_err());
+            other.request.connection_id = "different-connection".into();
+            assert!(contender_state.claim(&other).is_ok());
+        }).join().unwrap();
+        assert_eq!(state.active.lock().unwrap().len(), 1);
+        drop(cleanup);
+        assert!(state.claim(&job).is_ok());
+    }
+
+    #[test]
+    fn a_claim_is_bound_to_its_job_and_runtime_instance() {
+        let state = JobCommandState::default();
+        let other_state = JobCommandState::default();
+        let job = DurableJob::new(request(), false, 1, identity());
+        let (_, claim) = state.claim(&job).unwrap();
+        assert!(claim.require_job(&state, &job).is_ok());
+        assert!(claim.require_job(&other_state, &job).is_err());
+        let mut other_job = job.clone();
+        other_job.id = "different-job".into();
+        assert!(claim.require_job(&state, &other_job).is_err());
+    }
+
+    #[test]
+    fn stored_running_state_does_not_own_a_worker() {
+        let state = JobCommandState::default();
+        let mut job = DurableJob::new(request(), false, 1, identity());
+        job.summary["state"] = json!("running");
+        let (_, claim) = state.claim(&job).unwrap();
+        assert_eq!(state.active.lock().unwrap().len(), 1);
+        drop(claim);
+        assert!(state.active.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn automatic_requests_keep_one_latest_target_without_changing_the_capture() {
+        let state = JobCommandState::default();
+        let mut request = request();
+        request.kind = JobKind::Sync;
+        request.reason = Some("automatic".into());
+        request.target_revision = Some("1".into());
+        let job = DurableJob::new(request.clone(), false, 1, identity());
+        for revision in [2, 7, 3, 6] {
+            request.target_revision = Some(revision.to_string());
+            let mut current = identity();
+            current.revision = revision;
+            assert!(state.coalesce_automatic(&job, &request, &current).unwrap());
+        }
+        let queued = state.automatic_targets.lock().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued["synthetic"].request.target_revision.as_deref(), Some("7"));
+        assert_eq!(job.request.target_revision.as_deref(), Some("1"));
+        assert_eq!(job.admission_identity.revision, 1);
+    }
+
+    #[test]
+    fn automatic_targets_do_not_absorb_explicit_operations_or_other_connections() {
+        let state = JobCommandState::default();
+        let mut automatic = request();
+        automatic.kind = JobKind::Sync;
+        automatic.reason = Some("automatic".into());
+        let job = DurableJob::new(automatic.clone(), false, 1, identity());
+        let mut explicit = automatic.clone();
+        explicit.reason = Some("manual".into());
+        for kind in [JobKind::Sync, JobKind::Backup, JobKind::Restore, JobKind::ResolveConflict] {
+            explicit.kind = kind;
+            assert!(!state.coalesce_automatic(&job, &explicit, &identity()).unwrap());
+        }
+        automatic.connection_id = "another".into();
+        assert!(!state.coalesce_automatic(&job, &automatic, &identity()).unwrap());
+        assert!(state.automatic_targets.lock().unwrap().is_empty());
     }
 
     #[test]

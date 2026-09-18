@@ -24,7 +24,6 @@ import {
     SaveCoordinator,
     PersistentMutationFencedError,
     type CharacterAdditionRequest,
-    type DestructiveReplacementFenceOptions,
     type OfficialRevisionPublisher,
     type PersistentPresetMutation,
     type PersistentPresetMutationResult,
@@ -73,6 +72,21 @@ import { isMetadataOnlySelectedConversation } from './selectedConversationLifecy
 
 type CompleteCharacter = character | groupChat
 type RootDatabase = PersistentRoot
+
+export type CommittedApplyOutcome = Readonly<{
+    kind: 'committed'
+    revision: DataRevision
+    projection: 'applied' | 'refresh-required'
+}>
+
+export type ReplacementChangeSet = Readonly<{
+    root: boolean
+    presets: boolean
+    pluginStorage: boolean
+    characterIds: readonly string[]
+    conversations: readonly Readonly<{ characterId: string; conversationId: string }>[]
+    wholeLibrary: boolean
+}>
 
 export function capturePersistentRoot(database: Database): RootDatabase {
     const {
@@ -314,6 +328,8 @@ export interface PersistentDataRuntimeDependencies {
     onLocalRevision?(revision: DataRevision): void
     onFlushPromise?(promise: Promise<void> | null): void
     onBackgroundError?(error: unknown): void
+    onWorkingSetRefreshRequired?(revision: DataRevision | null): void
+    onDestructiveReplacementFenceChanged?(active: boolean): void
     /** Detaches the input synchronously before any asynchronous preparation. */
     prepareDatabase(database: Database): Promise<Database>
 }
@@ -322,15 +338,18 @@ export interface PersistentDataRuntime {
     readonly store: PersistentDataStore
     readonly revision: DataRevision
     getStorageAuthorityEpoch(): number
+    assertPersistentMutationAllowed(expectedAuthorityEpoch?: number): void
+    readonly pendingWorkingSetRefreshRevision: DataRevision | null
     initializeActiveWorkingSet(database: Database): Promise<void>
-    refreshActiveWorkingSetFromStore(revision: DataRevision): Promise<void>
+    refreshActiveWorkingSetFromStore(revision: DataRevision): Promise<CommittedApplyOutcome>
+    retryCommittedWorkingSetRefresh(): Promise<CommittedApplyOutcome | null>
     runStorageOnlyMutation(
         operation: (expectedRevision: DataRevision) => Promise<DataRevision>,
     ): Promise<void>
     markPersistentDataDirty(estimatedBytes: number): void
     flushPendingData(reason: string): Promise<void>
     flushPendingDataLocally(reason: string): Promise<void>
-    acknowledgeGenerationCompletion(): Promise<void>
+    acknowledgeGenerationCompletion(expectedAuthorityEpoch?: number): Promise<void>
     commitCharacterAddition(
         request: CharacterAdditionRequest,
         reason: string,
@@ -372,7 +391,7 @@ export interface PersistentDataRuntime {
         database: Database,
         reason: string,
         options?: PersistentReplacementOptions,
-    ): Promise<void>
+    ): Promise<CommittedApplyOutcome>
     mutatePersistentPluginStorage(
         reason: string,
         mutations: readonly PluginStorageMutation[],
@@ -448,7 +467,6 @@ export interface PersistentDataRuntime {
     ): Promise<PersistentMutationToken>
     acquireDestructiveReplacementFence(
         expected: PersistentMutationToken,
-        options?: DestructiveReplacementFenceOptions,
     ): Promise<PersistentDestructiveReplacementFence>
     acquireCommittedWorkingSetRefreshFence(): Promise<PersistentDestructiveReplacementFence>
     materializePersistentDatabaseSnapshot(reason: string): Promise<Database>
@@ -469,12 +487,13 @@ export interface PersistentDestructiveReplacementFence {
     refreshCommittedWorkingSet(
         revision: DataRevision,
         options?: PersistentCommittedWorkingSetRefreshOptions,
-    ): Promise<void>
+    ): Promise<CommittedApplyOutcome>
     release(): void
 }
 
 export interface PersistentCommittedWorkingSetRefreshOptions {
     forceScalableProjection?: boolean
+    changeSet?: ReplacementChangeSet
 }
 
 function createDynamicOfficialPublisher(
@@ -498,13 +517,41 @@ export function createPersistentDataRuntime(
     dependencies: PersistentDataRuntimeDependencies,
 ): PersistentDataRuntime {
     let workingSet: ActiveWorkingSet
+    let pendingRefreshChangeSet: ReplacementChangeSet | null = null
+    const captureChanges = (changes: Partial<ReplacementChangeSet>): ReplacementChangeSet => ({
+        root: changes.root ?? false,
+        presets: changes.presets ?? false,
+        pluginStorage: changes.pluginStorage ?? false,
+        wholeLibrary: changes.wholeLibrary ?? false,
+        characterIds: [...(changes.characterIds ?? [])],
+        conversations: (changes.conversations ?? []).map((target) => ({ ...target })),
+    })
+    const publishCommittedProjection = (
+        changes: Partial<ReplacementChangeSet>,
+        publish: () => void,
+    ): void => {
+        try {
+            publish()
+        } catch (error) {
+            pendingRefreshChangeSet = pendingRefreshChangeSet
+                ? captureChanges({ wholeLibrary: true })
+                : captureChanges(changes)
+            coordinator.markCommittedWorkingSetRefreshRequired(coordinator.revision, error)
+        }
+    }
     const coordinator = new SaveCoordinator({
         canonicalCapture: dependencies.state.canonicalCapture,
         store: dependencies.store,
         captureRoot: dependencies.state.captureRoot,
         capturePluginStorage: dependencies.state.capturePluginStorage,
-        publishPluginStorageWorkingSet: dependencies.state.publishPluginStorageWorkingSet,
-        publishPluginStorageMutations: dependencies.state.publishPluginStorageMutations,
+        publishPluginStorageWorkingSet: dependencies.state.publishPluginStorageWorkingSet
+            ? (storage) => publishCommittedProjection({ pluginStorage: true }, () =>
+                dependencies.state.publishPluginStorageWorkingSet!(storage))
+            : undefined,
+        publishPluginStorageMutations: dependencies.state.publishPluginStorageMutations
+            ? (mutations, keys) => publishCommittedProjection({ pluginStorage: true }, () =>
+                dependencies.state.publishPluginStorageMutations!(mutations, keys))
+            : undefined,
         capturePresets: dependencies.state.capturePresets,
         captureSelectedCharacter: dependencies.state.captureSelectedCharacter,
         captureSelectedConversationAuthority: () =>
@@ -518,10 +565,25 @@ export function createPersistentDataRuntime(
             )
             dependencies.state.replaceDatabase(database, activeCharacterIds)
         },
-        publishPresetWorkingSet: dependencies.state.publishPresetWorkingSet,
-        publishRootWorkingSet: dependencies.state.publishRootWorkingSet,
-        publishCharacterMutation: dependencies.state.publishCharacterMutation,
-        publishConversationReplacement: dependencies.state.publishConversationReplacement,
+        publishPresetWorkingSet: dependencies.state.publishPresetWorkingSet
+            ? (result) => publishCommittedProjection({ root: true, presets: true }, () =>
+                dependencies.state.publishPresetWorkingSet!(result))
+            : undefined,
+        publishRootWorkingSet: dependencies.state.publishRootWorkingSet
+            ? (root) => publishCommittedProjection({ root: true }, () =>
+                dependencies.state.publishRootWorkingSet!(root))
+            : undefined,
+        publishCharacterMutation: dependencies.state.publishCharacterMutation
+            ? (result) => publishCommittedProjection({
+                root: true,
+                characterIds: [result.characterId, ...(result.relatedCharacters?.map((value) => value.chaId) ?? [])],
+            }, () => dependencies.state.publishCharacterMutation!(result))
+            : undefined,
+        publishConversationReplacement: dependencies.state.publishConversationReplacement
+            ? (result) => publishCommittedProjection({
+                conversations: [{ characterId: result.characterId, conversationId: result.conversationId }],
+            }, () => dependencies.state.publishConversationReplacement!(result))
+            : undefined,
         isIncompleteWorkingSet: (database) =>
             hasIncompletePersistentWorkingSet(database, workingSetResidency),
         getNavigationGeneration: () => workingSet.navigationGenerationToken,
@@ -533,10 +595,10 @@ export function createPersistentDataRuntime(
             : undefined,
         clock: dependencies.clock,
         now: dependencies.now,
-        onLocalRevision: (revision) => {
+        onLocalRevision: (revision) => publishCommittedProjection({ wholeLibrary: true }, () => {
             workingSet.advanceStoreRevision(revision)
             dependencies.onLocalRevision?.(revision)
-        },
+        }),
         onStorageOnlyRevision: (revision) => workingSet.advanceStoreRevision(revision),
         onWindowedSelectedConversationRevision: (revision) =>
             workingSet.advanceStoreRevision(revision),
@@ -551,6 +613,17 @@ export function createPersistentDataRuntime(
         onPersistenceIdle: () => workingSet.scheduleSelectedConversationDemotion(),
         onFlushPromise: dependencies.onFlushPromise,
         onBackgroundError: dependencies.onBackgroundError,
+        onWorkingSetRefreshRequired: (revision) => {
+            if (revision === null) pendingRefreshChangeSet = null
+            dependencies.onWorkingSetRefreshRequired?.(revision)
+        },
+        onDestructiveReplacementFenceChanged: (active) => {
+            // A projection can request demotion while its input guard still blocks it.
+            // Retry only after the final release, preserving all ordinary demotion checks.
+            if (!active) workingSet.scheduleSelectedConversationDemotion()
+            dependencies.onDestructiveReplacementFenceChanged?.(active)
+        },
+        isConversationOperationActive: dependencies.state.isConversationOperationActive,
     })
     workingSet = new ActiveWorkingSet({
         store: dependencies.store,
@@ -570,8 +643,12 @@ export function createPersistentDataRuntime(
         }),
         publishConversation: dependencies.state.publishConversation,
         captureActivationRollback: dependencies.state.captureActivationRollback,
-        canActivateWorkingSet: dependencies.state.canActivateWorkingSet,
-        canDeactivateWorkingSet: dependencies.state.canDeactivateWorkingSet,
+        canActivateWorkingSet: () =>
+            coordinator.pendingWorkingSetRefreshRevision === null &&
+            dependencies.state.canActivateWorkingSet?.() !== false,
+        canDeactivateWorkingSet: () =>
+            coordinator.pendingWorkingSetRefreshRevision === null &&
+            dependencies.state.canDeactivateWorkingSet?.() !== false,
         canDeactivateCharacter: dependencies.state.canDeactivateCharacter,
         releaseInactiveCharacter: dependencies.state.releaseInactiveCharacter,
         shouldHydrateFullCharacter: dependencies.state.shouldHydrateFullCharacter,
@@ -587,6 +664,7 @@ export function createPersistentDataRuntime(
         id: string,
         options?: CharacterActivationOptions,
     ): Promise<boolean> => {
+        coordinator.assertPersistentMutationAllowed()
         const prepare = options?.prepare
         const normalize = options?.normalize
         if (!prepare) {
@@ -628,6 +706,7 @@ export function createPersistentDataRuntime(
             selectedConversationId: string | null
             activeCharacterIds: ReadonlySet<string>
         },
+        changeSet?: ReplacementChangeSet,
     ): Promise<{ database: Database; deferred: boolean }> => {
         const lease = await dependencies.store.acquireRevision(revision)
         let primaryError: unknown
@@ -636,7 +715,9 @@ export function createPersistentDataRuntime(
             const previous = dependencies.state.captureWorkingSetDatabase?.() ?? null
             if (previous) {
                 try {
-                    const keys = await readWorkingSetChangeWindow(lease)
+                    const keys = changeSet
+                        ? (changeSet.wholeLibrary ? null : [])
+                        : await readWorkingSetChangeWindow(lease)
                     if (keys) {
                         const generating =
                             dependencies.state.isConversationOperationActive?.() === true
@@ -648,6 +729,7 @@ export function createPersistentDataRuntime(
                             lease,
                             {
                                 ...pinned,
+                                changeSet,
                                 deferredConversation: generating,
                                 onPluginStorageChanged:
                                     dependencies.state.onPluginStorageChanged,
@@ -676,45 +758,59 @@ export function createPersistentDataRuntime(
             }
         }
     }
+    const requireCommittedRefresh = (
+        revision: DataRevision,
+        error: unknown,
+    ): CommittedApplyOutcome => {
+        coordinator.markCommittedWorkingSetRefreshRequired(revision, error)
+        return {
+            kind: 'committed',
+            revision: coordinator.revision,
+            projection: 'refresh-required',
+        }
+    }
     const refreshCommittedWorkingSet = async (
         revision: DataRevision,
-        fenceOwner?: symbol,
+        fenceOwner: symbol,
         options?: PersistentCommittedWorkingSetRefreshOptions,
-    ): Promise<void> => {
-        if (
-            fenceOwner === undefined &&
-            coordinator.hasDestructiveReplacementFence
-        ) {
-            throw new PersistentMutationFencedError()
-        }
-        if (fenceOwner !== undefined) {
+    ): Promise<CommittedApplyOutcome> => {
+        try {
             coordinator.assertDestructiveReplacementFence(fenceOwner)
-        }
-        const selectedCharacterId =
-            dependencies.state.getSelectedCharacterId() ?? null
-        const selectedConversationId =
-            dependencies.state.getSelectedConversationId?.() ?? null
-        const activeCharacterIds = workingSet.activeCharacterIds
-        const projected = await projectRefreshedWorkingSet(revision, {
-            selectedCharacterId,
-            selectedConversationId,
-            activeCharacterIds,
-        })
-        if (fenceOwner !== undefined) {
+            const navigationGeneration = workingSet.navigationGenerationToken
+            const selectedCharacterId =
+                dependencies.state.getSelectedCharacterId() ?? null
+            const selectedConversationId =
+                dependencies.state.getSelectedConversationId?.() ?? null
+            const activeCharacterIds = workingSet.activeCharacterIds
+            const projected = await projectRefreshedWorkingSet(revision, {
+                selectedCharacterId,
+                selectedConversationId,
+                activeCharacterIds,
+            }, options?.changeSet)
             coordinator.assertDestructiveReplacementFence(fenceOwner)
+            if (
+                navigationGeneration !== workingSet.navigationGenerationToken ||
+                selectedCharacterId !== (dependencies.state.getSelectedCharacterId() ?? null) ||
+                selectedConversationId !== (dependencies.state.getSelectedConversationId?.() ?? null)
+            ) {
+                throw new PersistentMutationFencedError()
+            }
+            workingSet.invalidateNavigation()
+            dependencies.state.replaceDatabase(
+                projected.database,
+                activeCharacterIds,
+                options?.forceScalableProjection ?? true,
+            )
+            workingSet.installCommittedWorkingSet(projected.database, revision)
+            if (projected.deferred) {
+                deferredContentPending = true
+            } else {
+                await commitContentCursor(revision)
+            }
+            return { kind: 'committed', revision, projection: 'applied' }
+        } catch (error) {
+            return requireCommittedRefresh(revision, error)
         }
-        workingSet.invalidateNavigation()
-        dependencies.state.replaceDatabase(
-            projected.database,
-            activeCharacterIds,
-            options?.forceScalableProjection ?? true,
-        )
-        workingSet.installCommittedWorkingSet(projected.database, revision)
-        if (projected.deferred) {
-            deferredContentPending = true
-            return
-        }
-        await commitContentCursor(revision)
     }
     const acquireCommittedWorkingSetRefreshFence =
         async (): Promise<PersistentDestructiveReplacementFence> => {
@@ -725,25 +821,33 @@ export function createPersistentDataRuntime(
             return {
                 revision: heldRevision,
                 async refreshCommittedWorkingSet(minimumRevision, options) {
+                    options = options && {
+                        ...options,
+                        changeSet: options.changeSet ? captureChanges(options.changeSet) : undefined,
+                    }
                     if (released) {
                         throw new Error(
                             'Destructive persistent replacement fence was released',
                         )
                     }
-                    coordinator.assertDestructiveReplacementFence(owner)
-                    const latest = await dependencies.store.readRoot()
-                    coordinator.assertDestructiveReplacementFence(owner)
-                    if (latest.revision < minimumRevision) {
-                        throw new RevisionConflictError(
+                    try {
+                        coordinator.assertDestructiveReplacementFence(owner)
+                        const latest = await dependencies.store.readRoot()
+                        coordinator.assertDestructiveReplacementFence(owner)
+                        const minimum = Math.max(
                             minimumRevision,
-                            latest.revision,
+                            coordinator.pendingWorkingSetRefreshRevision ?? minimumRevision,
                         )
+                        if (latest.revision < minimum) {
+                            throw new RevisionConflictError(minimum, latest.revision)
+                        }
+                        return refreshCommittedWorkingSet(latest.revision, owner, {
+                            ...options,
+                            changeSet: latest.revision === minimumRevision ? options?.changeSet : undefined,
+                        })
+                    } catch (error) {
+                        return requireCommittedRefresh(minimumRevision, error)
                     }
-                    return refreshCommittedWorkingSet(
-                        latest.revision,
-                        owner,
-                        options,
-                    )
                 },
                 release() {
                     if (released) return
@@ -763,11 +867,9 @@ export function createPersistentDataRuntime(
                 await coordinator.flushPendingDataLocally('deferred-content-change')
                 const token = await coordinator.capturePersistentMutationToken(
                     'deferred-content-change',
+                    { publishOfficial: false },
                 )
-                const owner = await coordinator.acquireDestructiveReplacementFence(
-                    token,
-                    { allowRevisionAdvance: true },
-                )
+                const owner = await coordinator.acquireDestructiveReplacementFence(token)
                 try {
                     await refreshCommittedWorkingSet(token.revision, owner)
                 } finally {
@@ -786,6 +888,11 @@ export function createPersistentDataRuntime(
             return coordinator.revision
         },
         getStorageAuthorityEpoch: () => coordinator.storageAuthorityEpoch,
+        assertPersistentMutationAllowed: (expectedAuthorityEpoch) =>
+            coordinator.assertPersistentMutationAllowed(expectedAuthorityEpoch),
+        get pendingWorkingSetRefreshRevision() {
+            return coordinator.pendingWorkingSetRefreshRevision
+        },
         async initializeActiveWorkingSet(database) {
             const result = await workingSet.initializeActiveWorkingSet(database)
             // A recreated WebView starts from a projection of the current
@@ -793,8 +900,27 @@ export function createPersistentDataRuntime(
             await commitContentCursor(coordinator.revision)
             return result
         },
-        refreshActiveWorkingSetFromStore: (revision) =>
-            refreshCommittedWorkingSet(revision),
+        async refreshActiveWorkingSetFromStore(revision) {
+            const fence = await acquireCommittedWorkingSetRefreshFence()
+            try {
+                return await fence.refreshCommittedWorkingSet(revision)
+            } finally {
+                fence.release()
+            }
+        },
+        async retryCommittedWorkingSetRefresh() {
+            const revision = coordinator.pendingWorkingSetRefreshRevision
+            if (revision === null) return null
+            const changes = pendingRefreshChangeSet
+            const fence = await acquireCommittedWorkingSetRefreshFence()
+            try {
+                return await fence.refreshCommittedWorkingSet(revision, {
+                    changeSet: changes ?? undefined,
+                })
+            } finally {
+                fence.release()
+            }
+        },
         runStorageOnlyMutation: (operation) =>
             coordinator.runStorageOnlyMutation(operation),
         markPersistentDataDirty: (estimatedBytes) =>
@@ -802,8 +928,11 @@ export function createPersistentDataRuntime(
         flushPendingData: (reason) => coordinator.flushPendingData(reason),
         flushPendingDataLocally: (reason) =>
             coordinator.flushPendingDataLocally(reason),
-        acknowledgeGenerationCompletion: () =>
-            coordinator.flushPendingDataLocally('generation-completion'),
+        async acknowledgeGenerationCompletion(expectedAuthorityEpoch = coordinator.storageAuthorityEpoch) {
+            coordinator.assertPersistentMutationAllowed(expectedAuthorityEpoch)
+            await coordinator.flushPendingDataLocally('generation-completion')
+            coordinator.assertPersistentMutationAllowed(expectedAuthorityEpoch)
+        },
         commitCharacterAddition: (request, reason) =>
             coordinator.commitCharacterAddition(request, reason),
         activateCharacter,
@@ -826,7 +955,7 @@ export function createPersistentDataRuntime(
         refreshSelectedConversationAfterReplacement: (
             target,
             expectedSession,
-        ) =>
+        ) => coordinator.pendingWorkingSetRefreshRevision === null &&
             workingSet.refreshSelectedConversationAfterReplacement(
                 target,
                 expectedSession,
@@ -946,16 +1075,17 @@ export function createPersistentDataRuntime(
             coordinator.readPersistentSelectedConversation(characterId, reason),
         capturePersistentMutationToken: (reason, options) =>
             coordinator.capturePersistentMutationToken(reason, options),
-        async acquireDestructiveReplacementFence(expected, options) {
-            const owner = await coordinator.acquireDestructiveReplacementFence(
-                expected,
-                options,
-            )
+        async acquireDestructiveReplacementFence(expected) {
+            const owner = await coordinator.acquireDestructiveReplacementFence(expected)
             const heldRevision = coordinator.revision
             let released = false
             return {
                 revision: heldRevision,
                 refreshCommittedWorkingSet(revision, options) {
+                    options = options && {
+                        ...options,
+                        changeSet: options.changeSet ? captureChanges(options.changeSet) : undefined,
+                    }
                     if (released) {
                         return Promise.reject(
                             new Error(

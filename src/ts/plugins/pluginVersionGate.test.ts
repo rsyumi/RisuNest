@@ -1,5 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+// Version-gate unit tests isolate admission; actual write fences have runtime coverage.
+vi.mock('../storage/persistentDataRuntime.svelte', async (original) => ({
+    ...(await original<object>()),
+    assertPersistentMutationAllowed: vi.fn(),
+    getPersistentStorageAuthorityEpoch: vi.fn(() => 0),
+}))
+
 vi.mock('../storage/persistentDataStoreFactory', () => ({
     getPersistentDataStore: () => undefined,
 }))

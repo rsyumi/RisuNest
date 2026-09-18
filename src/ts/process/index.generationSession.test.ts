@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
     events: [] as string[],
     modelResponse: null as any,
     modelRequestCount: 0,
+    authorityEpoch: 0,
     modelRequests: [] as any[],
     presetActivationCount: 0,
     presetActivation: null as null | (() => Promise<void> | void),
@@ -117,6 +118,11 @@ vi.mock('./presetChain', () => ({
     }),
 }))
 vi.mock('../storage/persistentDataRuntime.svelte', () => ({
+    assertPersistentMutationAllowed: (epoch = mocks.authorityEpoch) => {
+        if (epoch !== mocks.authorityEpoch) throw new PersistentMutationFencedError()
+    },
+    getPersistentStorageAuthorityEpoch: () => mocks.authorityEpoch,
+    getPersistentNavigationGeneration: () => 0,
     acknowledgeGenerationCompletion: mocks.acknowledge,
     captureSelectedConversationTarget: () => mocks.selectedTarget,
     acquireCompleteConversation: mocks.acquireCompleteConversation,
@@ -131,6 +137,7 @@ vi.mock('../storage/persistentDataRuntime.svelte', () => ({
 import type { character, Chat, Database, Message } from '../storage/database.svelte'
 import { ActiveConversationSession } from '../storage/activeConversationSession'
 import { SelectedConversationPromotionStaleError } from '../storage/activeWorkingSet.svelte'
+import { PersistentMutationFencedError } from '../storage/saveCoordinator'
 import { DBState, selectedCharID } from '../stores.svelte'
 import { doingChat, sendChat } from './index.svelte'
 
@@ -283,6 +290,7 @@ describe('sendChat generation session integration', () => {
         mocks.events.length = 0
         mocks.modelResponse = streamingResponse('answer')
         mocks.modelRequestCount = 0
+        mocks.authorityEpoch = 0
         mocks.modelRequests.length = 0
         mocks.presetActivationCount = 0
         mocks.presetActivation = null
@@ -330,6 +338,41 @@ describe('sendChat generation session integration', () => {
                 },
             }
         })
+    })
+
+    it('discards a provider result from an old authority even when target IDs and objects are retained', async () => {
+        installDatabase()
+        const response = deferred<any>()
+        mocks.modelResponse = response.promise
+        const sending = sendChat()
+        await vi.waitFor(() => expect(mocks.modelRequestCount).toBe(1))
+        const before = JSON.stringify(DBState.db.characters[0].chats[0].message)
+        mocks.authorityEpoch++
+        response.resolve(streamingResponse('must not be applied'))
+
+        await expect(sending).resolves.toBe(false)
+        expect(JSON.stringify(DBState.db.characters[0].chats[0].message)).toBe(before)
+        expect(mocks.acknowledge).not.toHaveBeenCalled()
+        expect(get(doingChat)).toBe(false)
+    })
+
+    it('refuses late output-script results after an authority replacement', async () => {
+        installDatabase()
+        const script = deferred<{ data: string; emoChanged: boolean }>()
+        mocks.processScriptFull.mockImplementation(async (_char, data, mode) =>
+            mode === 'editoutput' ? script.promise : { data, emoChanged: false })
+        const sending = sendChat()
+        await vi.waitFor(() => expect(mocks.processScriptFull.mock.calls.some(
+            (call) => call[2] === 'editoutput',
+        )).toBe(true))
+        mocks.authorityEpoch++
+        const before = JSON.stringify(DBState.db.characters[0].chats[0].message)
+        script.resolve({ data: 'late transformed text', emoChanged: false })
+
+        await expect(sending).resolves.toBe(false)
+        expect(JSON.stringify(DBState.db.characters[0].chats[0].message)).toBe(before)
+        expect(mocks.acknowledge).not.toHaveBeenCalled()
+        expect(get(doingChat)).toBe(false)
     })
 
     it('promotes before generation reads history and holds one lease across awaited streaming work', async () => {
