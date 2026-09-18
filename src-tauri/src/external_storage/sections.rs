@@ -947,32 +947,21 @@ pub(crate) fn apply_prepared_section(
     ).map(|_| ()).map_err(device_error)
 }
 
-/// The buffered snapshot receiver uses the same preparation and application
-/// APIs. File-based receivers pass their existing local sources directly to
-/// preparation, then keep only the returned capability for activation.
+/// Downloaded section sources are prepared into the same private row spool
+/// used by file-based receivers before any device rows are changed.
 pub(crate) fn apply_received_section(
     store: &mut crate::persistent_store::PersistentStore,
     connection_id: &str,
     library_lineage: &str,
     arrival: SectionArrival,
-    received: &super::snapshot_restore::PreparedSection,
+    received: &CapturedSection,
 ) -> Result<()> {
     let section = section_of(received.kind).ok_or_else(|| corrupt("device-fixed section in a synchronized state"))?;
     let state = store.device_store_mut().map_err(device_error)?.section_state(section).map_err(device_error)?;
     if !state.participating { return Ok(()); }
-    let directory = tempfile::tempdir().map_err(transient)?;
-    let mut sources = Vec::new();
-    for (kind, key, bytes) in &received.entries {
-        let (content_sha256, path) = write_spool_object(directory.path(), bytes)?;
-        sources.push(SectionSource { kind: *kind, key: key.clone(), content_sha256,
-            byte_length: bytes.len() as u64, path });
-    }
     let prepared = prepare_received_section(
         connection_id, library_lineage, arrival, &state.participation_generation,
-        &CapturedSection {
-            kind: received.kind, generation: received.generation.clone(), gc_floor: received.gc_floor.clone(),
-            max_write_clock: received.max_write_clock.clone(), content_fingerprint: received.content_fingerprint, sources,
-        },
+        received,
         &Cancellation::default(),
     )?;
     apply_prepared_section(store, &prepared)
@@ -1339,15 +1328,8 @@ mod tests {
         assert!(decode_section(SectionKind::Hypa, &[], &plugins.content_fingerprint).is_err());
     }
 
-    fn prepared(section: &CapturedSection) -> super::super::snapshot_restore::PreparedSection {
-        super::super::snapshot_restore::PreparedSection {
-            kind: section.kind,
-            generation: section.generation.clone(),
-            gc_floor: section.gc_floor.clone(),
-            max_write_clock: section.max_write_clock.clone(),
-            content_fingerprint: section.content_fingerprint,
-            entries: carried(section),
-        }
+    fn prepared(section: &CapturedSection) -> CapturedSection {
+        section.clone()
     }
 
     fn published_plugin_values(section: &CapturedSection) -> Vec<(String, Option<String>)> {
