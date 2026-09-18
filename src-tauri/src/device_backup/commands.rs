@@ -93,7 +93,7 @@ pub(crate) fn native_device_backup_bootstrap(
     }
     if matches!(
         session.phase.as_str(),
-        "loading-source" | "preparing" | "awaiting-native-preparation"
+        "loading-source" | "preparing"
     ) {
         release_native_restore_pins(
             session,

@@ -370,22 +370,6 @@ impl DeviceBackupState {
         }
         spool::verify_blobs(connection, id, Spool::Source)?;
         spool::verify_blobs(connection, id, Spool::Rollback)?;
-        connection.execute(
-            "UPDATE sessions SET phase='awaiting-native-preparation' WHERE id=?1",
-            [id],
-        )?;
-        Ok(())
-    }
-
-    /// Native-only: the incoming library is validated and its objects are staged.
-    pub(crate) fn allow_device_apply(&self, id: &str) -> Result<()> {
-        let mut inner = self.lock()?;
-        let connection = inner.connection.as_mut().unwrap();
-        let session = active_session_for(connection, id)?;
-        require(
-            session.phase == "awaiting-native-preparation",
-            "Restore is not awaiting native preparation",
-        )?;
         connection.execute("UPDATE sessions SET phase='prepared' WHERE id=?1", [id])?;
         Ok(())
     }
@@ -541,7 +525,7 @@ impl DeviceBackupState {
         require(
             matches!(
                 session.phase.as_str(),
-                "loading-source" | "preparing" | "awaiting-native-preparation"
+                "loading-source" | "preparing"
             ),
             "Accepted native restore must resume instead of failing",
         )?;
@@ -690,7 +674,6 @@ pub(crate) fn active_native_portable_stage(root: &Path) -> Result<Option<String>
         phase.as_str(),
         "loading-source"
             | "preparing"
-            | "awaiting-native-preparation"
             | "prepared"
             | "applying-device"
             | "committing-library"
@@ -773,7 +756,6 @@ fn session_for(connection: &Connection, id: &str) -> Result<Session> {
         match session.phase.as_str() {
             "loading-source" => "await-source",
             "committing-library" => "await-library",
-            "awaiting-native-preparation" => "await-native-preparation",
             "rolled-back" => "complete",
             _ => "continue",
         }

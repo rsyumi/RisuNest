@@ -441,11 +441,11 @@ fn selected_empty_native_section_clears_only_that_section() {
 }
 
 #[test]
-fn native_journal_resumes_before_or_after_an_inflight_section_commit() {
+fn native_journal_resumes_before_intent_and_around_an_inflight_section_commit() {
     use crate::local_backup::NeverCancelled;
     use crate::persistent_store::device_store::plugin_values::PluginDeviceMutation;
 
-    for committed_before_interrupt in [false, true] {
+    for interruption in ["before-intent", "after-intent", "after-commit"] {
         let root = tempfile::tempdir().unwrap();
         let selected = vec!["local-plugins".to_owned()];
         let mut source = crate::persistent_store::PersistentStore::open(
@@ -498,11 +498,12 @@ fn native_journal_resumes_before_or_after_an_inflight_section_commit() {
         coordinator.source_ready(&id).unwrap();
         journal_prepared_native_sections(&coordinator, &id, Spool::Rollback, &rollback).unwrap();
         coordinator.prepared(&id).unwrap();
-        coordinator.allow_device_apply(&id).unwrap();
-        coordinator
-            .section_intent(&id, "local-plugins")
-            .unwrap();
-        let revision_after_first_apply = if committed_before_interrupt {
+        if interruption != "before-intent" {
+            coordinator
+                .section_intent(&id, "local-plugins")
+                .unwrap();
+        }
+        let revision_after_first_apply = if interruption == "after-commit" {
             apply_prepared_native_sections(&mut target, &incoming).unwrap();
             Some(target.device_store().unwrap().revision().unwrap())
         } else {
@@ -521,6 +522,12 @@ fn native_journal_resumes_before_or_after_an_inflight_section_commit() {
                 .phase,
             "applying-device"
         );
+        if interruption == "before-intent" {
+            assert_eq!(
+                recovered.pending_source_sections(&id).unwrap(),
+                vec!["local-plugins".to_owned()]
+            );
+        }
         let mut target = crate::persistent_store::PersistentStore::open(root.path()).unwrap();
         resume_journaled_native_restore(&recovered, &id, &mut target).unwrap();
         let session = recovered.session(&id).unwrap();
@@ -594,7 +601,6 @@ fn native_library_stage_survives_reopen_and_marker_prevents_second_activation() 
     coordinator.source_ready(&id).unwrap();
     journal_prepared_native_sections(&coordinator, &id, Spool::Rollback, &rollback).unwrap();
     coordinator.prepared(&id).unwrap();
-    coordinator.allow_device_apply(&id).unwrap();
     drop(store);
 
     let mut reopened = crate::persistent_store::PersistentStore::open(root.path()).unwrap();
@@ -756,7 +762,6 @@ fn missing_journal_owned_stage_blocks_open_without_discarding_source_spool() {
     coordinator.source_ready(&id).unwrap();
     journal_prepared_native_sections(&coordinator, &id, Spool::Rollback, &rollback).unwrap();
     coordinator.prepared(&id).unwrap();
-    coordinator.allow_device_apply(&id).unwrap();
     store.replace_abort(&stage).unwrap();
     drop(store);
 
