@@ -54,7 +54,6 @@ describe("device maintenance bootstrap ordering", () => {
     expect(state.invoke).toHaveBeenNthCalledWith(
       2,
       "native_device_backup_bootstrap",
-      { freshBootstrap: true },
     );
     expect(state.normalStarted).not.toHaveBeenCalled();
     decide({ mode: "normal", session: null });
@@ -76,7 +75,6 @@ describe("device maintenance bootstrap ordering", () => {
     expect(state.invoke).toHaveBeenNthCalledWith(
       2,
       "native_device_backup_bootstrap",
-      { freshBootstrap: true },
     );
     expect(state.normalStarted).not.toHaveBeenCalled();
   });

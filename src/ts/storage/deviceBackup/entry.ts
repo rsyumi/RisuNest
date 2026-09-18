@@ -57,7 +57,6 @@ export async function deviceMaintenanceBeforeBootstrap(
   try {
     let bootstrap = await invoke<NativeDeviceBackupBootstrap>(
       "native_device_backup_bootstrap",
-      { freshBootstrap: true },
     );
     if (bootstrap.mode === "normal") return;
     const session = bootstrap.session;
