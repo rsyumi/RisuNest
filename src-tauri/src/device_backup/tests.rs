@@ -64,7 +64,7 @@ fn native_catalog_validation_rejects_unknown_noncanonical_and_corrupt_entries() 
         validate_archive_catalog(&catalog.db, &Never)
             .unwrap_err()
             .code,
-        "device-invalid-state"
+        "device-metadata-invalid"
     );
     catalog
         .db
