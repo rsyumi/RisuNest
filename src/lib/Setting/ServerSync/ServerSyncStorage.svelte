@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { language } from "src/lang";
-  import { alertConfirm } from "src/ts/alert";
+  import { alertConfirm, alertNormal } from "src/ts/alert";
   import SettingButton from "../RisuNest/SettingButton.svelte";
   import { formatRisuNestStorageBytes as bytes } from "src/ts/storage/risuNestStorageDashboard";
   import { serverSyncError } from "src/ts/storage/sync/serverSync";
@@ -10,8 +10,10 @@
     getServerSyncCacheUsage,
     cleanupServerSyncCache,
     deleteServerSyncBackup,
+    exportServerSyncBackup,
     restoreServerSyncBackup,
     type ServerSyncBackupInventory,
+    type ServerSyncBackupSide,
     type ServerSyncCacheUsage,
   } from "src/ts/storage/sync/serverSyncProduction";
   /** `backups` lists the conflict backups, `cache` the space they and the
@@ -28,6 +30,8 @@
   let error = $state("");
   const text = $derived(language.risuNest.serverSync);
   const labels = $derived(text.management);
+  const backupBytes = (side: ServerSyncBackupSide) =>
+    side.localRequiredBytes + side.remoteDependentBytes;
   async function load(older = false): Promise<void> {
     const cursor = older ? (inventory?.next ?? undefined) : undefined;
     const [next, usage] = await Promise.all([
@@ -61,7 +65,10 @@
   }
   async function remove(id: string): Promise<void> {
     if (await alertConfirm(labels.deleteConfirm))
-      await action(() => deleteServerSyncBackup(id), true, `remove:${id}`);
+      await action(async () => {
+        const result = await deleteServerSyncBackup(id);
+        if (result.cleanup === "pending") alertNormal(labels.deleteCleanupPending);
+      }, true, `remove:${id}`);
   }
   async function restore(id: string, side: "local" | "remote"): Promise<void> {
     if (await alertConfirm(labels.restoreConfirm))
@@ -70,6 +77,13 @@
         true,
         `restore:${id}:${side}`,
       );
+  }
+  async function exportBackup(id: string, side: "local" | "remote"): Promise<void> {
+    await action(
+      () => exportServerSyncBackup(id, side),
+      false,
+      `export:${id}:${side}`,
+    );
   }
   async function clean(): Promise<void> {
     if (await alertConfirm(labels.cleanConfirm))
@@ -116,7 +130,7 @@
       <div class="grid gap-2 rounded border border-darkborderc p-3">
         <p class="text-sm">
           {new Date(item.createdAt).toLocaleString()} · {bytes(
-            item.localBytes + item.remoteBytes,
+            backupBytes(item.local) + backupBytes(item.remote),
           )}
         </p>
         <div class="flex flex-wrap gap-2">
@@ -124,19 +138,31 @@
             variant="secondary"
             busy={pending === `restore:${item.id}:local`}
             disabled={busy ||
-              !item.recoveryReady ||
+              item.local.availability === "unavailable" ||
               Boolean(item.blockedReason)}
             onclick={() => restore(item.id, "local")}
-            >{text.restoreLocalBackup} ({bytes(item.localBytes)})</SettingButton
+            >{text.restoreLocalBackup} ({bytes(backupBytes(item.local))})</SettingButton
           >
           <SettingButton
             variant="secondary"
             busy={pending === `restore:${item.id}:remote`}
             disabled={busy ||
-              !item.recoveryReady ||
+              item.remote.availability === "unavailable" ||
               Boolean(item.blockedReason)}
             onclick={() => restore(item.id, "remote")}
-            >{text.restoreRemoteBackup} ({bytes(item.remoteBytes)})</SettingButton
+            >{text.restoreRemoteBackup} ({bytes(backupBytes(item.remote))})</SettingButton
+          >
+          <SettingButton
+            variant="secondary"
+            busy={pending === `export:${item.id}:local`}
+            disabled={busy || item.local.availability === "unavailable" || Boolean(item.blockedReason)}
+            onclick={() => exportBackup(item.id, "local")}>{text.exportLocalBackup}</SettingButton
+          >
+          <SettingButton
+            variant="secondary"
+            busy={pending === `export:${item.id}:remote`}
+            disabled={busy || item.remote.availability === "unavailable" || Boolean(item.blockedReason)}
+            onclick={() => exportBackup(item.id, "remote")}>{text.exportRemoteBackup}</SettingButton
           >
           <SettingButton
             variant="secondary"

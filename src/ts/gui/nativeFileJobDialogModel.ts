@@ -92,6 +92,13 @@ const EXPECTED_STAGES: Record<NativeFileOperationFormat, DialogStageId[]> = {
         'refreshing-app',
         'reloading-plugins',
     ],
+    'conflict-reference': [
+        'reading-database',
+        'finalizing-staging',
+        'activating',
+        'refreshing-app',
+        'reloading-plugins',
+    ],
     content: ['reading-archive', 'preparing-attachments', 'finalizing-staging'],
     'local-backup': [
         'reading-archive',

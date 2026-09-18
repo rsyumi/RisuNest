@@ -8,6 +8,10 @@ import {
 import { subscribeLocalPersistentRevision } from '../../persistentRevisionEvents'
 import type { SyncExitDrainAdapter } from '../../syncExitCoordinator'
 import { registerCommittedWorkingSetContinuation } from '../../committedWorkingSetContinuation'
+import {
+    exportPortableBackupFromReferenceSource,
+    restoreBackupFromNativeSource,
+} from '../../portableBackupFileRouteProduction.svelte'
 import { getExternalStorageBridge } from './bridge'
 import {
     createExternalStorageController,
@@ -69,6 +73,17 @@ async function refreshForeground(current: ProductionRuntime): Promise<void> {
     current.scheduler.resume()
 }
 
+function parseExternalLocalRevision(value: string | number): number {
+    if (typeof value === 'string' && !/^(0|[1-9][0-9]*)$/.test(value)) {
+        throw new RangeError('Invalid local revision')
+    }
+    const revision = typeof value === 'number' ? value : Number(value)
+    if (!Number.isSafeInteger(revision) || revision < 0) {
+        throw new RangeError('Local revision is outside the supported range')
+    }
+    return revision
+}
+
 async function applyReceivedSync(
     current: ProductionRuntime,
     job: ExternalJobSummary,
@@ -100,13 +115,7 @@ async function applyReceivedSync(
             job.id,
             String(fence.revision) as DecimalString,
         )
-        if (!/^(0|[1-9]\d*)$/.test(result.receivedRevision)) {
-            throw new Error('External sync receive did not report an activated revision')
-        }
-        const receivedRevision = Number(result.receivedRevision)
-        if (!Number.isSafeInteger(receivedRevision)) {
-            throw new RangeError('External sync receive revision exceeds the renderer range')
-        }
+        const receivedRevision = parseExternalLocalRevision(result.receivedRevision)
         const continueAfterRefresh = async (): Promise<void> => {
             await (
                 await import('../../../plugins/plugins.svelte')
@@ -134,6 +143,40 @@ async function applyReceivedSync(
         }
     } finally {
         releaseFence()
+    }
+}
+
+export async function requestExternalConflictRestore(
+    conflictId: string,
+    side: 'local' | 'remote',
+): Promise<void> {
+    const bridge = getExternalStorageBridge()
+    let token: string | undefined
+    try {
+        await restoreBackupFromNativeSource(async () => {
+            const result = await bridge.openConflictSource(conflictId, side)
+            token = result.source.token
+            return result.source
+        })
+    } finally {
+        if (token) await bridge.releaseConflictSource(token)
+    }
+}
+
+export async function requestExternalConflictExport(
+    conflictId: string,
+    side: 'local' | 'remote',
+): Promise<void> {
+    const bridge = getExternalStorageBridge()
+    let token: string | undefined
+    try {
+        await exportPortableBackupFromReferenceSource(async () => {
+            const result = await bridge.openConflictSource(conflictId, side)
+            token = result.source.token
+            return result.source
+        })
+    } finally {
+        if (token) await bridge.releaseConflictSource(token)
     }
 }
 
@@ -216,7 +259,11 @@ export function installExternalStorageProduction(): Promise<() => void> {
 
 /** Gives answer-completion saves the five-second synchronization policy. */
 export function notifyExternalStorageGenerationComplete(revision: number): void {
-    if (!Number.isSafeInteger(revision) || revision < 0) return
+    try {
+        revision = parseExternalLocalRevision(revision)
+    } catch {
+        return
+    }
     runtime?.scheduler.durableRevision(String(revision) as DecimalString, 'generation-complete')
 }
 

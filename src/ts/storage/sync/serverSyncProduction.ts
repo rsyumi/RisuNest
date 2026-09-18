@@ -75,15 +75,23 @@ export function resumeServerSyncAfterBackup(): void {
     if (syncAvailable?.()) void invoke("server_sync_events_start").catch(() => {});
   }
 }
+export type ServerSyncBackupAvailability =
+  | "local-complete"
+  | "connection-required"
+  | "unavailable";
+export interface ServerSyncBackupSide {
+  localRequiredBytes: number;
+  remoteDependentBytes: number;
+  availability: ServerSyncBackupAvailability;
+}
 export interface ServerSyncBackup {
   id: string;
   createdAt: number;
   head: ServerHead;
   localRevision: number;
-  localBytes: number;
-  remoteBytes: number;
+  local: ServerSyncBackupSide;
+  remote: ServerSyncBackupSide;
   preservationScope: "library";
-  recoveryReady: boolean;
 }
 export interface ServerSyncBackupCursor {
   createdAt: number;
@@ -129,7 +137,10 @@ function cleanupDeletedBackups(): void {
 }
 export const deleteServerSyncBackup = async (id: string) => {
   try {
-    await invoke<void>("server_sync_backup_delete", { id });
+    return await invoke<{
+      localDeleted: true;
+      cleanup: "complete" | "pending";
+    }>("server_sync_backup_delete", { id });
   } finally {
     cleanupDeletedBackups();
   }
@@ -138,8 +149,11 @@ export const getServerSyncCacheUsage = () =>
   invoke<ServerSyncCacheUsage>("server_sync_cache_usage");
 export const cleanupServerSyncCache = () =>
   invoke<ServerSyncCacheUsage>("server_sync_cache_cleanup");
-export const listServerSyncBackups = () =>
-  invoke<ServerSyncBackup[]>("server_sync_backups");
+export const listServerSyncBackups = (before?: ServerSyncBackupCursor) =>
+  invoke<{ items: ServerSyncBackup[]; next: ServerSyncBackupCursor | null }>(
+    "server_sync_backups",
+    { before: before ?? null },
+  );
 export async function restoreServerSyncBackup(
   id: string,
   side: "local" | "remote",
@@ -149,12 +163,35 @@ export async function restoreServerSyncBackup(
   let lease: string | undefined;
   try {
     await restoreBackupFromNativeSource(async () => {
-      const source = await invoke<{ path: string; lease: string }>(
+      const result = await invoke<{
+        source: { type: "conflictReference"; token: string };
+        lease: string;
+      }>(
         "server_sync_backup_source",
         { id, side },
       );
-      lease = source.lease;
-      return { type: "desktopPath", path: source.path };
+      lease = result.lease;
+      return result.source;
+    });
+  } finally {
+    if (lease) await invoke<void>("server_sync_backup_release", { lease });
+  }
+}
+export async function exportServerSyncBackup(
+  id: string,
+  side: "local" | "remote",
+): Promise<void> {
+  const { exportPortableBackupFromReferenceSource } =
+    await import("../portableBackupFileRouteProduction.svelte");
+  let lease: string | undefined;
+  try {
+    await exportPortableBackupFromReferenceSource(async () => {
+      const result = await invoke<{
+        source: { type: "conflictReference"; token: string };
+        lease: string;
+      }>("server_sync_backup_source", { id, side });
+      lease = result.lease;
+      return result.source;
     });
   } finally {
     if (lease) await invoke<void>("server_sync_backup_release", { lease });

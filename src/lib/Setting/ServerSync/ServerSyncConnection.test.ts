@@ -51,7 +51,7 @@ vi.mock("src/ts/storage/sync/serverSyncProduction", () => ({
   })),
   cleanupServerSyncCache: vi.fn(),
   deleteServerSyncBackup: vi.fn(),
-  listServerSyncBackups: vi.fn(async () => []),
+  listServerSyncBackups: vi.fn(async () => ({ items: [], next: null })),
   restoreServerSyncBackup: vi.fn(),
 }));
 vi.mock("src/ts/storage/sync/serverAssetResidency", () => ({

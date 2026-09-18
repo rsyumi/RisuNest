@@ -107,6 +107,13 @@ export interface ExternalConnectionError {
     message: string
     retryable: boolean
     retryAtMs?: DecimalString
+    reason?:
+        | 'publication-unknown'
+        | 'lineage-changed'
+        | 'local-changed'
+        | 'remote-changed'
+        | 'auth-required'
+        | 'key-locked'
     action:
         | 'retry'
         | 'reauthenticate'
@@ -250,10 +257,31 @@ export interface ExternalConflictSummary {
     connectionId: string
     detectedAtMs: DecimalString
     localRevision: DecimalString
-    remoteRevision: DecimalString | null
-    preservation: 'local-only' | 'remote-complete'
-    localLabel: string
-    remoteLabel: string
+    remoteRevision: DecimalString
+    localAvailable: boolean
+    remoteAvailable: boolean
+    remotePointConfirmed: boolean
+    resolved: boolean
+}
+
+export interface ExternalConflictCursor {
+    createdAtMs: number
+    id: string
+}
+
+export interface ExternalConflictPage {
+    conflicts: ExternalConflictSummary[]
+    nextCursor?: ExternalConflictCursor
+}
+
+export interface ExternalConflictSource {
+    type: 'conflictReference'
+    token: string
+}
+
+export interface ExternalConflictDeleteResult {
+    localDeleted: true
+    remotePoint: 'deleted' | 'not-found' | 'left-remote'
 }
 
 export interface ExternalQuotaBucket {

@@ -1997,7 +1997,9 @@ export const languageKorean = {
                 scope: '라이브러리만 포함합니다. 기기 플러그인 데이터는 포함하지 않습니다.',
                 restoreConfirm:
                     '이 백업으로 되돌릴까요? 지금 라이브러리를 먼저 백업하며, 동기화는 일시 중지 상태로 둡니다.',
-                deleteConfirm: '이 충돌 백업을 이 기기에서 지울까요?',
+                deleteConfirm: '이 충돌 백업을 이 기기에서 삭제하시겠습니까?',
+                deleteCleanupPending:
+                    '로컬 백업은 삭제됐으며, 서버 정리는 나중에 계속됩니다.',
                 cleanConfirm:
                     '필요 없는 임시 파일을 정리할까요? 진행 중인 작업에 필요한 파일과 이 기기의 라이브러리 파일은 그대로 둡니다.',
             },
@@ -2008,6 +2010,8 @@ export const languageKorean = {
             noBackups: '충돌 백업이 없습니다.',
             restoreLocalBackup: '이 기기 백업 복원',
             restoreRemoteBackup: '서버 백업 복원',
+            exportLocalBackup: '이 기기 백업 저장',
+            exportRemoteBackup: '서버 백업 저장',
             reregister: '새 기기로 등록',
             reregisterHelp:
                 '서버에서 이 기기를 새로 등록한 뒤 새 등록 코드를 입력하세요. 이 기기에서 고친 내용은 그대로 두고 서버와 맞춥니다.',

@@ -24,10 +24,12 @@ import {
     recallPluginValueAssignment,
     rememberPluginValueAssignment,
 } from './pluginValueAssignmentRetention'
+import type { NativePortableDeviceSection } from './deviceBackup/selection'
 
 export type NativeFileJobSource =
     | { type: 'desktopPath'; path: string }
     | { type: 'androidSpool'; token: string }
+    | { type: 'conflictReference'; token: string }
 
 export type NativeFileJobState =
     | 'queued'
@@ -241,6 +243,7 @@ export type NativeFileOperationFormat =
     | 'risu-save'
     | 'local-backup'
     | 'library-backup'
+    | 'conflict-reference'
     | 'content'
 
 /**
@@ -399,7 +402,7 @@ export interface NativeFileJobStatus {
 
 export interface NativePortableSelection {
     library: boolean
-    deviceSections: string[]
+    deviceSections: NativePortableDeviceSection[]
     /** Absent brings the whole library; present brings only the records it names. */
     items?: NativeArchiveSelection
 }
@@ -424,7 +427,7 @@ export interface NativeArchiveSelection {
 export interface NativePortableRestorePreview {
     libraryIncluded: boolean
     repairRequired: boolean
-    deviceSections: string[]
+    deviceSections: NativePortableDeviceSection[]
     /** What is wrong with the archive's library, even when the gate refuses it. */
     diagnosis?: DataHealthResult
     items?: NativeArchiveInventory
@@ -1207,6 +1210,10 @@ async function runNativeReplacementRestore(
         warningCodes?: string[]
     }
     let cancellationRequested = false
+    let uiBlocking = false
+    let portableSelectionMade =
+        kind !== 'restore-portable-backup' ||
+        ('type' in source && source.type === 'conflictReference')
     let terminal: NativeFileJobStatus | undefined
     let mutationConflict: NativeFileJobError | undefined
     let assignedPreview: NativeStagedPluginPreview | undefined
@@ -1217,6 +1224,11 @@ async function runNativeReplacementRestore(
               >
           >
         | undefined
+    const startUiBlocking = (): void => {
+        if (uiBlocking) return
+        uiBlocking = true
+        options.onBlockingChange?.(true)
+    }
     try {
         while (!terminal) {
             if (options.signal?.aborted && !cancellationRequested) {
@@ -1246,6 +1258,13 @@ async function runNativeReplacementRestore(
                 throw error
             }
             if (
+                portableSelectionMade &&
+                status.state === 'running' &&
+                !cancellationRequested
+            ) {
+                startUiBlocking()
+            }
+            if (
                 kind === 'restore-portable-backup' &&
                 status.state === 'waitingForInput' &&
                 status.phase === 'awaiting-backup-selection'
@@ -1265,14 +1284,6 @@ async function runNativeReplacementRestore(
                     })
                     continue
                 }
-                if (selection.deviceSections.length) {
-                    await options.beforeActivation?.()
-                    const activationToken = await runtime.capturePersistentMutationToken(
-                        `${mutationReason}-activation`, { publishOfficial: false },
-                    )
-                    replacementFence = await runtime.acquireDestructiveReplacementFence(activationToken)
-                    options.onBlockingChange?.(true)
-                }
                 if (options.signal?.aborted) {
                     cancellationRequested = true
                     await invokeNative(dependencies, 'native_file_job_cancel', {
@@ -1286,35 +1297,10 @@ async function runNativeReplacementRestore(
                     {
                         jobId: started.jobId,
                         selection,
-                        ...(replacementFence
-                            ? { expectedRevision: replacementFence.revision }
-                            : {}),
                     },
                 )
-            }
-            if (
-                kind === 'restore-portable-backup' &&
-                status.state === 'waitingForInput' &&
-                status.phase === 'awaiting-device-maintenance'
-            ) {
-                const { handlePortableDeviceMaintenanceStatus } = await import(
-                    './deviceBackup/job'
-                )
-                await handlePortableDeviceMaintenanceStatus(
-                    { ...status, kind },
-                    {
-                        flushedRevision: replacementFence?.revision ?? mutationToken.revision,
-                        assertHeld() {
-                            if (!replacementFence)
-                                throw new Error(
-                                    'Device restore ownership was released',
-                                )
-                        },
-                    },
-                    {
-                        invoke: dependencies.invoke as import('./deviceBackup/nativeSpool').DeviceNativeInvoke,
-                    },
-                )
+                portableSelectionMade = true
+                startUiBlocking()
             }
             if (
                 status.state === 'waitingForInput' &&
@@ -1356,6 +1342,7 @@ async function runNativeReplacementRestore(
                 !cancellationRequested
             ) {
                 try {
+                    startUiBlocking()
                     await options.beforeActivation?.()
                     // Explicit restores accept a fresh token after preparation and choices.
                     const activationToken = await runtime.capturePersistentMutationToken(
@@ -1378,7 +1365,6 @@ async function runNativeReplacementRestore(
                     })
                     continue
                 }
-                options.onBlockingChange?.(true)
                 if (options.signal?.aborted) {
                     cancellationRequested = true
                     await invokeNative(dependencies, 'native_file_job_cancel', {
@@ -1421,6 +1407,23 @@ async function runNativeReplacementRestore(
                     'missing-activation-fence',
                     'Native restore committed without a renderer replacement fence',
                 )
+            }
+            if (
+                kind === 'restore-portable-backup' &&
+                terminal.deviceSessionId
+            ) {
+                try {
+                    await invokeNative(
+                        dependencies,
+                        'native_device_backup_recovery_complete',
+                        { sessionId: terminal.deviceSessionId },
+                    )
+                } catch (error) {
+                    throw new NativeFileJobActivationCommittedError(
+                        terminal.result.revision,
+                        error,
+                    )
+                }
             }
             const committedResult = {
                 ...terminal.result,
@@ -1508,7 +1511,7 @@ async function runNativeReplacementRestore(
         throw error
     } finally {
         replacementFence?.release()
-        options.onBlockingChange?.(false)
+        if (uiBlocking) options.onBlockingChange?.(false)
     }
 }
 
@@ -2020,6 +2023,33 @@ function runNativePortableBackupExport(
     )
 }
 
+
+export function runNativeArchiveReferenceExport(
+    source: NativeFileJobSource,
+    destination: NativeBackupDestination,
+    options: NativeFileJobOptions = {},
+    dependencies: NativeBackupExportDependencies = productionBackupExportDependencies,
+): Promise<NativeFileJobResult> {
+    return runNativeManagedExport(
+        {
+            operation: 'RisuNest backup',
+            safLengthMismatchLabel: 'RisuNest backup',
+            handoffCleanupCommand: 'native_portable_handoff_cleanup',
+            destination,
+            relaySafCopyProgress: true,
+            prepareRequest: () => ({
+                kind: 'export-portable-backup',
+                source,
+                selection: { library: true, deviceSections: [] },
+                ...(destination.type === 'desktopPath'
+                    ? { destination: destination.path }
+                    : {}),
+            }),
+        },
+        options,
+        dependencies,
+    )
+}
 
 export async function runNativeArchiveExport(
     runtime: NativeBlockRestoreRuntime & {

@@ -2187,6 +2187,8 @@ export const languageEnglish = {
                 restoreConfirm:
                     'Go back to this backup? The current library is backed up first, and sync stays paused.',
                 deleteConfirm: 'Delete this conflict backup from this device?',
+                deleteCleanupPending:
+                    'The local backup was deleted. Server cleanup will continue later.',
                 cleanConfirm:
                     'Clear unneeded temporary files? Files the running operation needs and the library files on this device are kept.',
             },
@@ -2197,6 +2199,8 @@ export const languageEnglish = {
             noBackups: 'No conflict backups.',
             restoreLocalBackup: 'Restore this device’s backup',
             restoreRemoteBackup: 'Restore server backup',
+            exportLocalBackup: 'Save this device’s backup',
+            exportRemoteBackup: 'Save server backup',
             reregister: 'Register a new device',
             reregisterHelp:
                 'Register this device again on the server, then enter the new registration code. Edits on this device are kept and matched with the server.',

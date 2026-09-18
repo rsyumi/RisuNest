@@ -18,7 +18,11 @@ const mocks = vi.hoisted(() => ({
         cancelJob: vi.fn(),
         requestDeviceMaintenanceRestart: vi.fn(),
         applyReceived: vi.fn(),
+        openConflictSource: vi.fn(),
+        releaseConflictSource: vi.fn(),
     },
+    restoreConflictSource: vi.fn(),
+    exportConflictSource: vi.fn(),
     flush: vi.fn(async (_reason: string) => {}),
     refreshWorkingSet: vi.fn(async (revision: number): Promise<CommittedApplyOutcome> => ({
         kind: 'committed', revision, projection: 'applied',
@@ -65,6 +69,10 @@ vi.mock('../../persistentRevisionEvents', () => ({
         mocks.listener = listener
         return () => { mocks.listener = undefined }
     },
+}))
+vi.mock('../../portableBackupFileRouteProduction.svelte', () => ({
+    restoreBackupFromNativeSource: mocks.restoreConflictSource,
+    exportPortableBackupFromReferenceSource: mocks.exportConflictSource,
 }))
 
 const initialState: ExternalStorageState = {
@@ -122,6 +130,20 @@ describe('external storage production integration', () => {
     beforeEach(() => {
         vi.clearAllMocks()
         mocks.pendingContinuation = undefined
+        mocks.restoreConflictSource.mockImplementation(async (source) => {
+            await source({
+                signal: new AbortController().signal,
+                onStatus: () => {},
+                onSource: () => {},
+            })
+        })
+        mocks.exportConflictSource.mockImplementation(async (source) => {
+            await source()
+        })
+        mocks.bridge.openConflictSource.mockResolvedValue({
+            source: { type: 'conflictReference', token: 'external:source-token' },
+        })
+        mocks.bridge.releaseConflictSource.mockResolvedValue(undefined)
         mocks.revision = 8
         mocks.bridge.getState.mockResolvedValue(initialState)
         mocks.bridge.startJob.mockImplementation(async request =>
@@ -336,6 +358,74 @@ describe('external storage production integration', () => {
         expect(mocks.refreshWorkingSet).toHaveBeenCalledWith(12)
         expect(mocks.reloadPlugins).toHaveBeenCalledOnce()
         expect(mocks.releaseFence).toHaveBeenCalledOnce()
+    })
+
+    it.each(['01', '9007199254740992'])(
+        'rejects an invalid received revision %s at the local revision boundary',
+        async (receivedRevision) => {
+            const {
+                installExternalStorageProduction,
+                requestExternalStorageResolveConflict,
+            } = await import('./production')
+            mocks.revision = 11
+            mocks.bridge.startJob.mockResolvedValue({
+                ...succeeded('old-sync', '11'),
+                kind: 'resolve-conflict',
+                state: 'waiting',
+                phase: 'remote-apply',
+                result: { receiveReady: true, snapshotId: 'remote', expectedRevision: '11' },
+            })
+            mocks.bridge.applyReceived.mockResolvedValue({
+                snapshotId: 'remote', receivedRevision,
+            })
+            await installExternalStorageProduction()
+
+            await expect(
+                requestExternalStorageResolveConflict('old-sync', 'conflict-1', 'remote'),
+            ).rejects.toBeInstanceOf(RangeError)
+            expect(mocks.refreshWorkingSet).not.toHaveBeenCalled()
+            expect(mocks.releaseFence).toHaveBeenCalledOnce()
+        },
+    )
+
+    it('releases an opened conflict source after a cancelled restore', async () => {
+        const { requestExternalConflictRestore } = await import('./production')
+        mocks.restoreConflictSource.mockImplementationOnce(async (source) => {
+            await source({
+                signal: new AbortController().signal,
+                onStatus: () => {},
+                onSource: () => {},
+            })
+            throw new DOMException('cancelled', 'AbortError')
+        })
+
+        await expect(requestExternalConflictRestore('conflict-1', 'remote'))
+            .rejects.toMatchObject({ name: 'AbortError' })
+        expect(mocks.bridge.openConflictSource).toHaveBeenCalledWith(
+            'conflict-1',
+            'remote',
+        )
+        expect(mocks.bridge.releaseConflictSource).toHaveBeenCalledWith(
+            'external:source-token',
+        )
+    })
+
+    it('holds a conflict source through portable export and releases it after failure', async () => {
+        const { requestExternalConflictExport } = await import('./production')
+        mocks.exportConflictSource.mockImplementationOnce(async (source) => {
+            await source()
+            throw new Error('synthetic export failure')
+        })
+
+        await expect(requestExternalConflictExport('conflict-1', 'local'))
+            .rejects.toThrow('synthetic export failure')
+        expect(mocks.bridge.openConflictSource).toHaveBeenCalledWith(
+            'conflict-1',
+            'local',
+        )
+        expect(mocks.bridge.releaseConflictSource).toHaveBeenCalledWith(
+            'external:source-token',
+        )
     })
 
     it('defers a received repository continuation without applying it again', async () => {

@@ -130,6 +130,26 @@ describe('ExternalStorageBridge', () => {
         })
     })
 
+    it('forwards conflict paging, source ownership, recheck, and deletion exactly', async () => {
+        const invoke = vi.fn(async (command: string) => ({ command }))
+        const bridge = new ExternalStorageBridge({ supported: () => true, invoke })
+        const cursor = { createdAtMs: 7, id: 'conflict-7' }
+
+        await bridge.listConflicts(cursor, 25)
+        await bridge.openConflictSource('conflict-1', 'remote')
+        await bridge.releaseConflictSource('external:source-token')
+        await bridge.recheckConflict('conflict-1')
+        await bridge.deleteConflict('conflict-1', true)
+
+        expect(invoke.mock.calls).toEqual([
+            ['external_storage_list_conflicts', { cursor, limit: 25 }],
+            ['external_storage_open_conflict_source', { id: 'conflict-1', side: 'remote' }],
+            ['external_storage_release_conflict_source', { token: 'external:source-token' }],
+            ['external_storage_recheck_conflict', { id: 'conflict-1' }],
+            ['external_storage_delete_conflict', { id: 'conflict-1', deleteRemotePoint: true }],
+        ])
+    })
+
     it('does not prepare a device capture when native already woke a rebound job', async () => {
         const invoke = vi.fn(async (command: string) => {
             if (command === 'external_storage_start_job') return {

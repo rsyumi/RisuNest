@@ -11,6 +11,10 @@ import {
   type ServerSyncProgress,
 } from "./serverSync";
 import type { SyncExitDrainResult } from "../syncExitCoordinator";
+import {
+  matchesCompletedServerCycle,
+  type ServerAttemptIdentity,
+} from "./serverSyncCompletion";
 
 export interface ServerSyncSnapshot {
   status?: ServerStatus;
@@ -28,7 +32,7 @@ export interface ServerSyncSnapshot {
   attemptId?: number;
   /** Wall-clock start of the current attempt, for the elapsed time. */
   attemptStartedAt?: number;
-  attemptIdentity?: { endpoint: string; libraryId: string; deviceId: string };
+  attemptIdentity?: ServerAttemptIdentity;
   initialSyncComplete?: boolean;
   refreshPending?: boolean;
   replacing?: boolean;
@@ -128,27 +132,10 @@ export function createServerSyncController(
           endpoint: result.endpoint,
         };
       }
-      const identityNow = state.attemptIdentity;
       state.initialSyncComplete = Boolean(
         !state.error &&
-        identityNow &&
-        status?.configured &&
-        result?.phase === "idle" &&
-        status.endpoint === identityNow.endpoint &&
-        status.libraryId === identityNow.libraryId &&
-        status.deviceId === identityNow.deviceId &&
-        !status.registrationRequired &&
-        !status.reconciling &&
-        !status.operationPending &&
-        !status.fullScan &&
-        status.dirtyRecords === 0 &&
-        !facade.needsRefresh() &&
-        status.localRevision === result.localRevision &&
-        status.head &&
-        status.head.libraryId === result.head?.libraryId &&
-        status.head.epoch === result.head?.epoch &&
-        status.head.seq === result.head?.seq &&
-        status.head.headId === result.head?.headId,
+          !facade.needsRefresh() &&
+          matchesCompletedServerCycle(status, result, state.attemptIdentity),
       );
       if (state.initialSyncComplete) state.lastSuccessAt = Date.now();
     } catch (cause) {
@@ -219,6 +206,41 @@ export function createServerSyncController(
     if (state.replacing) return "library-operation-busy";
     return undefined;
   };
+  const beginReplacement = async (): Promise<() => Promise<void>> => {
+    if (state.running || state.replacing || facade.needsRefresh())
+      throw new ServerSyncError("resolve-pending-operation-first");
+    state.replacing = true;
+    invalidateCompletion();
+    publish();
+    let released = false;
+    const release = async (): Promise<void> => {
+      if (released) return;
+      released = true;
+      try {
+        await refreshStatus();
+      } catch (cause) {
+        state.error = serverSyncError(cause).code;
+      }
+      state.replacing = false;
+      publish();
+    };
+    try {
+      await facade.cancel();
+      await refreshStatus();
+      if (
+        !statusFresh ||
+        !state.status ||
+        state.status.operationPending ||
+        facade.needsRefresh()
+      ) {
+        throw new ServerSyncError("resolve-pending-operation-first");
+      }
+      return release;
+    } catch (cause) {
+      await release();
+      throw cause;
+    }
+  };
   return {
     holdAutomaticSync(): void {
       state.paused = true;
@@ -246,33 +268,13 @@ export function createServerSyncController(
         throw new ServerSyncError("resolve-pending-operation-first");
       }
     },
+    beginReplacement,
     async withReplacement<T>(operation: () => Promise<T>): Promise<T> {
-      if (state.running || state.replacing || facade.needsRefresh())
-        throw new ServerSyncError("resolve-pending-operation-first");
-      // Reservation precedes asynchronous status/cancellation checks, without a PDS fence.
-      state.replacing = true;
-      invalidateCompletion();
-      publish();
+      const release = await beginReplacement();
       try {
-        await facade.cancel();
-        await refreshStatus();
-        if (
-          !statusFresh ||
-          !state.status ||
-          state.status.operationPending ||
-          facade.needsRefresh()
-        ) {
-          throw new ServerSyncError("resolve-pending-operation-first");
-        }
         return await operation();
       } finally {
-        try {
-          await refreshStatus();
-        } catch (cause) {
-          state.error = serverSyncError(cause).code;
-        }
-        state.replacing = false;
-        publish();
+        await release();
       }
     },
     reportVerifiedBytes(verifiedBytes: string): void {

@@ -22,6 +22,10 @@ import type {
     PrepareExternalConnectionRequest,
     StartExternalJobRequest,
     ExternalConflictSummary,
+    ExternalConflictCursor,
+    ExternalConflictDeleteResult,
+    ExternalConflictPage,
+    ExternalConflictSource,
     ExternalExitCapture,
 } from './types'
 
@@ -189,8 +193,39 @@ export class ExternalStorageBridge {
         })
     }
 
-    listConflicts(connectionId: string): Promise<ExternalConflictSummary[]> {
-        return this.native('external_storage_list_conflicts', { connectionId })
+    listConflicts(
+        cursor?: ExternalConflictCursor,
+        limit?: number,
+    ): Promise<ExternalConflictPage> {
+        return this.native('external_storage_list_conflicts', {
+            ...(cursor ? { cursor } : {}),
+            ...(limit === undefined ? {} : { limit }),
+        })
+    }
+
+    openConflictSource(
+        id: string,
+        side: 'local' | 'remote',
+    ): Promise<{ source: ExternalConflictSource }> {
+        return this.native('external_storage_open_conflict_source', { id, side })
+    }
+
+    releaseConflictSource(token: string): Promise<void> {
+        return this.native('external_storage_release_conflict_source', { token })
+    }
+
+    deleteConflict(
+        id: string,
+        deleteRemotePoint: boolean,
+    ): Promise<ExternalConflictDeleteResult> {
+        return this.native('external_storage_delete_conflict', {
+            id,
+            deleteRemotePoint,
+        })
+    }
+
+    recheckConflict(id: string): Promise<ExternalConflictSummary> {
+        return this.native('external_storage_recheck_conflict', { id })
     }
 
     getQuota(connectionId: string): Promise<ExternalQuotaSummary> {

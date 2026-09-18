@@ -577,7 +577,8 @@
         const connection = externalConnection
         if (!externalBridge || !connection) return
         try {
-            externalConflict = (await externalBridge.listConflicts(connection.id))[0]
+            externalConflict = (await externalBridge.listConflicts(undefined, 50)).conflicts
+                .find(conflict => conflict.connectionId === connection.id)
             externalStage = externalConflict ? 'conflict' : 'error'
         } catch (cause) {
             externalFailure(cause)

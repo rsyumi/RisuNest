@@ -48,9 +48,10 @@ function conflict(
         detectedAtMs: '1' as ExternalConflictSummary['detectedAtMs'],
         localRevision: '2' as ExternalConflictSummary['localRevision'],
         remoteRevision: '9' as ExternalConflictSummary['remoteRevision'],
-        preservation: 'remote-complete',
-        localLabel: 'This device',
-        remoteLabel: 'Repository',
+        localAvailable: true,
+        remoteAvailable: true,
+        remotePointConfirmed: true,
+        resolved: false,
         ...overrides,
     }
 }
@@ -111,11 +112,10 @@ describe('external storage onboarding backups', () => {
 describe('external storage onboarding first synchronization', () => {
     it('reads the repository side before it can be chosen', () => {
         expect(externalOnboardingConflictStep(conflict({
-            preservation: 'local-only',
-            remoteRevision: null,
+            remotePointConfirmed: false,
         }))).toBe('receive-repository')
         expect(externalOnboardingConflictStep(conflict())).toBe('take-repository')
-        expect(externalOnboardingConflictStep(conflict({ remoteRevision: null }))).toBe('wait')
+        expect(externalOnboardingConflictStep(conflict({ remoteAvailable: false }))).toBe('wait')
     })
 
     it('separates a finished attempt, a first-attach decision and a failure', () => {

@@ -11,6 +11,11 @@ import type {
     ServerSyncCacheUsage,
 } from './sync/serverSyncProduction'
 
+export interface ServerSyncBackupDeleteResult {
+    localDeleted: true
+    cleanup: 'complete' | 'pending'
+}
+
 export type RisuNestStorageCardId =
     | 'total'
     | 'media'
@@ -44,7 +49,8 @@ export interface RisuNestStorageDashboardDependencies {
     executeGc(): Promise<NativeAssetGcResult>
     deleteSnapshot(id: string): Promise<void>
     deleteConflictBackup(id: string): Promise<void>
-    deleteServerBackup(id: string): Promise<void>
+    deleteServerBackup(id: string): Promise<ServerSyncBackupDeleteResult>
+    exportServerBackup(id: string, side: 'local' | 'remote'): Promise<void>
     restoreServerBackup(id: string, side: 'local' | 'remote'): Promise<void>
     createSnapshot(reason: string): Promise<NativeSnapshotCreated>
 }
@@ -277,9 +283,10 @@ export function createRisuNestStorageDashboard(
         },
         async deleteServerBackup(id: string) {
             return run(`delete-server-backup:${id}`, async () => {
-                await deps.deleteServerBackup(id)
+                const result = await deps.deleteServerBackup(id)
                 invalidatePendingReloads()
                 await reload()
+                return result
             })
         },
         async restoreServerBackup(id: string, side: 'local' | 'remote') {
@@ -288,6 +295,11 @@ export function createRisuNestStorageDashboard(
                 invalidatePendingReloads()
                 await reload()
             })
+        },
+        async exportServerBackup(id: string, side: 'local' | 'remote') {
+            return run(`export-server-backup:${id}:${side}`, () =>
+                deps.exportServerBackup(id, side),
+            )
         },
         /** Appends the page before the last loaded one to the server backup list. */
         async loadMoreServerBackups() {

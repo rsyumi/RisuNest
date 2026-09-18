@@ -4,6 +4,8 @@ const state = vi.hoisted(() => ({
   native: true,
   ready: true,
   running: false,
+  restoredSource: undefined as unknown,
+  exportedSource: undefined as unknown,
   available: undefined as undefined | (() => boolean),
   revisionListener: undefined as undefined | (() => void),
   scheduler: {
@@ -21,11 +23,22 @@ const state = vi.hoisted(() => ({
   }),
   invoke: vi.fn(async (command: string) =>
     command === "server_sync_backup_source"
-      ? { path: "synthetic-backup-path", lease: "synthetic-source-lease" }
-      : undefined,
+      ? {
+          source: {
+            type: "conflictReference",
+            token: "123e4567-e89b-42d3-a456-426614174000",
+          },
+          lease: "synthetic-source-lease",
+        }
+      : command === "server_sync_backup_delete"
+        ? { localDeleted: true, cleanup: "pending" }
+        : undefined,
   ),
   restore: vi.fn(async (source?: () => Promise<unknown>) => {
-    if (source) await source();
+    if (source) state.restoredSource = await source();
+  }),
+  exportBackup: vi.fn(async (source?: () => Promise<unknown>) => {
+    if (source) state.exportedSource = await source();
   }),
   controller: {
     initialize: vi.fn(async () => {}),
@@ -60,6 +73,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: state.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: state.listen }));
 vi.mock("../portableBackupFileRouteProduction.svelte", () => ({
   restoreBackupFromNativeSource: state.restore,
+  exportPortableBackupFromReferenceSource: state.exportBackup,
 }));
 vi.mock("./serverSync", async (original) => ({
   ...(await original<object>()),
@@ -94,6 +108,8 @@ beforeEach(() => {
   state.controllerListener = undefined;
   state.ready = true;
   state.running = false;
+  state.restoredSource = undefined;
+  state.exportedSource = undefined;
   state.controller.canRestore.mockReturnValue(true);
   state.controller.canAutoSync.mockImplementation(() => state.ready);
   state.controller.snapshot.mockImplementation(() => ({
@@ -155,6 +171,10 @@ describe("native server synchronization scheduling", () => {
       id: "backup-id",
       side: "remote",
     });
+    expect(state.restoredSource).toEqual({
+      type: "conflictReference",
+      token: "123e4567-e89b-42d3-a456-426614174000",
+    });
     expect(state.invoke).toHaveBeenCalledWith("server_sync_backup_release", {
       lease: "synthetic-source-lease",
     });
@@ -167,6 +187,30 @@ describe("native server synchronization scheduling", () => {
       restoreServerSyncBackup("backup-id", "local"),
     ).rejects.toMatchObject({ code: "server-sync-busy" });
     expect(state.invoke).not.toHaveBeenCalled();
+  });
+  it("returns the native delete outcome after removing the local backup", async () => {
+    const { deleteServerSyncBackup } = await import("./serverSyncProduction");
+
+    await expect(deleteServerSyncBackup("backup-id")).resolves.toEqual({
+      localDeleted: true,
+      cleanup: "pending",
+    });
+    expect(state.invoke).toHaveBeenCalledWith("server_sync_backup_delete", {
+      id: "backup-id",
+    });
+  });
+  it("holds the server source lease through portable export", async () => {
+    const { exportServerSyncBackup } = await import("./serverSyncProduction");
+
+    await exportServerSyncBackup("backup-id", "local");
+
+    expect(state.exportedSource).toEqual({
+      type: "conflictReference",
+      token: "123e4567-e89b-42d3-a456-426614174000",
+    });
+    expect(state.invoke).toHaveBeenCalledWith("server_sync_backup_release", {
+      lease: "synthetic-source-lease",
+    });
   });
   it("keeps the native source pinned until restore or cancellation has settled", async () => {
     let finish!: () => void;

@@ -82,9 +82,10 @@ function resultRevision(job: ExternalJobSummary): bigint | undefined {
 }
 
 function blockedReason(job: ExternalJobSummary): string {
+    if (job.error?.reason) return job.error.reason
     if (job.error?.code) return job.error.code
     if (job.state === 'conflict') return 'external-storage-conflict'
-    if (job.state === 'uncertain') return 'external-storage-publication-uncertain'
+    if (job.state === 'uncertain') return 'publication-unknown'
     if (job.state === 'cancelled') return 'external-storage-job-cancelled'
     return 'external-storage-job-failed'
 }

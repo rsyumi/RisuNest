@@ -18,11 +18,16 @@ const server = vi.hoisted(() => ({
     getServerSyncCacheUsage: vi.fn(),
     cleanupServerSyncCache: vi.fn(),
     deleteServerSyncBackup: vi.fn(),
+    exportServerSyncBackup: vi.fn(),
     restoreServerSyncBackup: vi.fn(),
 }))
 vi.mock('src/ts/storage/sync/serverSyncProduction', () => server)
 const backups = vi.hoisted(() => ({ list: vi.fn(), remove: vi.fn() }))
-const alerts = vi.hoisted(() => ({ alertConfirm: vi.fn(), alertError: vi.fn() }))
+const alerts = vi.hoisted(() => ({
+    alertConfirm: vi.fn(),
+    alertError: vi.fn(),
+    alertNormal: vi.fn(),
+}))
 
 vi.mock('src/ts/storage/nativePersistentMaintenance', () => maintenance)
 vi.mock('src/ts/storage/sync/syncConflictBackup', () => ({ getSyncConflictBackupStore: () => backups }))
@@ -52,10 +57,17 @@ const serverBackup: ManagedServerSyncBackup = {
             'local-plugins': { stateId: 'plugins-state', changedSeq: '0', gcFloor: '0' },
         },
     },
-    localBytes: 1024,
-    remoteBytes: 2048,
+    local: {
+        localRequiredBytes: 1024,
+        remoteDependentBytes: 0,
+        availability: 'local-complete',
+    },
+    remote: {
+        localRequiredBytes: 256,
+        remoteDependentBytes: 2048,
+        availability: 'connection-required',
+    },
     preservationScope: 'library',
-    recoveryReady: true,
     diskBytes: 3200,
     deletable: true,
     blockedReason: null,
@@ -345,13 +357,16 @@ describe('RisuNestStorageDashboard', () => {
         const target = setup(Promise.resolve(stats), [serverBackup])
         alerts.alertConfirm.mockResolvedValue(true)
         server.restoreServerSyncBackup.mockResolvedValue(undefined)
-        server.deleteServerSyncBackup.mockResolvedValue(undefined)
+        server.deleteServerSyncBackup.mockResolvedValue({ localDeleted: true, cleanup: 'complete' })
         server.cleanupServerSyncCache.mockResolvedValue({ totalBytes: 512, protectedBytes: 512, reclaimableBytes: 0, blockedReason: null })
         await vi.waitFor(() => expect(button(target, syncText.restoreRemoteBackup)).toBeDefined())
 
         button(target, syncText.restoreRemoteBackup)!.click()
         await vi.waitFor(() => expect(server.restoreServerSyncBackup).toHaveBeenCalledExactlyOnceWith('synthetic-id', 'remote'))
         expect(alerts.alertConfirm).toHaveBeenCalledWith(syncText.management.restoreConfirm)
+
+        button(target, syncText.exportLocalBackup)!.click()
+        await vi.waitFor(() => expect(server.exportServerSyncBackup).toHaveBeenCalledExactlyOnceWith('synthetic-id', 'local'))
 
         const syncList = target.querySelector<HTMLElement>('[data-storage-backup-list="sync-backups"]')!
         expect(syncList.textContent).toContain(new Date(5).toLocaleString())

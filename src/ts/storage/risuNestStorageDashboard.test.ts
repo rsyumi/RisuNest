@@ -112,6 +112,7 @@ describe('RisuNest storage dashboard view model', () => {
             deleteSnapshot: vi.fn(),
             deleteConflictBackup: vi.fn(),
             deleteServerBackup: vi.fn(),
+            exportServerBackup: vi.fn(),
             restoreServerBackup: vi.fn(),
             createSnapshot: vi.fn(),
         })
@@ -151,6 +152,7 @@ describe('RisuNest storage dashboard view model', () => {
             deleteSnapshot: vi.fn(),
             deleteConflictBackup: vi.fn(),
             deleteServerBackup: vi.fn(),
+            exportServerBackup: vi.fn(),
             restoreServerBackup: vi.fn(),
             createSnapshot: vi.fn(),
         })
@@ -207,6 +209,7 @@ describe('RisuNest storage dashboard view model', () => {
             deleteSnapshot: vi.fn(),
             deleteConflictBackup: vi.fn(),
             deleteServerBackup: vi.fn(),
+            exportServerBackup: vi.fn(),
             restoreServerBackup: vi.fn(),
             createSnapshot: vi.fn(),
         })
@@ -252,6 +255,7 @@ describe('RisuNest storage dashboard view model', () => {
             deleteSnapshot: vi.fn(),
             deleteConflictBackup: vi.fn(),
             deleteServerBackup: vi.fn(),
+            exportServerBackup: vi.fn(),
             restoreServerBackup: vi.fn(),
             createSnapshot: vi.fn(),
         })
@@ -285,6 +289,7 @@ describe('RisuNest storage dashboard view model', () => {
             deleteSnapshot: vi.fn(),
             deleteConflictBackup: vi.fn(),
             deleteServerBackup: vi.fn(),
+            exportServerBackup: vi.fn(),
             restoreServerBackup: vi.fn(),
             createSnapshot: vi.fn(),
         })
@@ -314,6 +319,7 @@ describe('RisuNest storage dashboard view model', () => {
             deleteSnapshot: vi.fn(),
             deleteConflictBackup: vi.fn(),
             deleteServerBackup: vi.fn(),
+            exportServerBackup: vi.fn(),
             restoreServerBackup: vi.fn(),
             createSnapshot: vi.fn(),
         })
@@ -357,6 +363,7 @@ describe('RisuNest storage dashboard view model', () => {
             deleteSnapshot: vi.fn(),
             deleteConflictBackup: vi.fn(),
             deleteServerBackup: vi.fn(),
+            exportServerBackup: vi.fn(),
             restoreServerBackup: vi.fn(),
             createSnapshot: vi.fn(),
         })
@@ -391,6 +398,7 @@ describe('RisuNest storage dashboard view model', () => {
             deleteSnapshot: vi.fn(),
             deleteConflictBackup: vi.fn(),
             deleteServerBackup: vi.fn(),
+            exportServerBackup: vi.fn(),
             restoreServerBackup: vi.fn(),
             createSnapshot: vi.fn().mockResolvedValue({}),
         })
@@ -422,6 +430,7 @@ describe('RisuNest storage dashboard view model', () => {
             deleteSnapshot: vi.fn(),
             deleteConflictBackup: vi.fn(),
             deleteServerBackup: vi.fn(),
+            exportServerBackup: vi.fn(),
             restoreServerBackup: vi.fn(),
             createSnapshot: vi.fn().mockResolvedValue({}),
         })
@@ -458,6 +467,7 @@ describe('RisuNest storage dashboard view model', () => {
             deleteSnapshot: vi.fn(),
             deleteConflictBackup: vi.fn(),
             deleteServerBackup: vi.fn(),
+            exportServerBackup: vi.fn(),
             restoreServerBackup: vi.fn(),
             createSnapshot: vi.fn().mockResolvedValue({}),
         })
@@ -503,6 +513,7 @@ describe('RisuNest storage dashboard view model', () => {
             deleteSnapshot,
             deleteConflictBackup: vi.fn(),
             deleteServerBackup: vi.fn(),
+            exportServerBackup: vi.fn(),
             restoreServerBackup: vi.fn(),
             createSnapshot: vi.fn(),
         })

@@ -170,22 +170,27 @@ describe('external storage connection request', () => {
         }])
     })
 
-    it('offers only same-sync preservation retry until the remote conflict copy is complete', () => {
-        const localOnly = {
+    it('gates conflict resolution on durable remote confirmation and side availability', () => {
+        const unconfirmed = {
             id: 'conflict-1', connectionId: 'connection', detectedAtMs: '1' as const,
-            localRevision: '8' as const, remoteRevision: null, preservation: 'local-only' as const,
-            localLabel: 'Local snapshot', remoteLabel: 'Remote snapshot',
+            localRevision: '8' as const, remoteRevision: '7' as const,
+            localAvailable: true, remoteAvailable: true,
+            remotePointConfirmed: false, resolved: false,
         }
 
-        expect(externalConflictActions(localOnly)).toEqual(['retry-sync'])
+        expect(externalConflictActions(unconfirmed)).toEqual(['retry-sync'])
         expect(externalConflictActions({
-            ...localOnly,
-            remoteRevision: '7',
-            preservation: 'remote-complete',
+            ...unconfirmed,
+            remotePointConfirmed: true,
         })).toEqual(['keep-local', 'use-remote'])
         expect(externalConflictActions({
-            ...localOnly,
-            preservation: 'remote-complete',
+            ...unconfirmed,
+            remotePointConfirmed: true,
+            localAvailable: false,
+        })).toEqual(['use-remote'])
+        expect(externalConflictActions({
+            ...unconfirmed,
+            resolved: true,
         })).toEqual([])
     })
 })

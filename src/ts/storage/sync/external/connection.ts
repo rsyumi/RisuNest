@@ -118,7 +118,10 @@ export type ExternalConflictAction = 'retry-sync' | 'keep-local' | 'use-remote'
 export function externalConflictActions(
     conflict: ExternalConflictSummary,
 ): ExternalConflictAction[] {
-    if (conflict.preservation === 'local-only') return ['retry-sync']
-    if (conflict.remoteRevision === null) return []
-    return ['keep-local', 'use-remote']
+    if (conflict.resolved) return []
+    if (!conflict.remotePointConfirmed) return ['retry-sync']
+    const actions: ExternalConflictAction[] = []
+    if (conflict.localAvailable) actions.push('keep-local')
+    if (conflict.remoteAvailable) actions.push('use-remote')
+    return actions
 }

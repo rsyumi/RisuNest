@@ -3,18 +3,21 @@
     import QRCode from 'qrcode'
     import SettingGroup from '../RisuNest/SettingGroup.svelte'
     import SettingButton from '../RisuNest/SettingButton.svelte'
-    import { alertConfirm } from 'src/ts/alert'
+    import { alertConfirm, alertNormal } from 'src/ts/alert'
     import { DBState } from 'src/ts/stores.svelte'
     import { getExternalStorageBridge } from 'src/ts/storage/sync/external/bridge'
     import { externalConflictActions, externalJobIsActive, externalJobProgress, mergeExternalHistoryItems } from 'src/ts/storage/sync/external/connection'
     import {
         refreshExternalStorageProductionState,
+        requestExternalConflictExport,
         requestExternalStorageNow,
+        requestExternalConflictRestore,
         requestExternalStorageResolveConflict,
         requestExternalStorageRestore,
     } from 'src/ts/storage/sync/external/production'
     import type {
         ExternalConflictSummary,
+        ExternalConflictCursor,
         ExternalConnectionResult,
         ExternalCapturePolicy,
         ExternalConnectionSummary,
@@ -46,6 +49,7 @@
     let historyCursor = $state<Record<string, string | undefined>>({})
     let historyLoading = $state<Record<string, boolean>>({})
     let conflicts = $state<Record<string, ExternalConflictSummary[]>>({})
+    let conflictCursor = $state<Record<string, ExternalConflictCursor | undefined>>({})
     let quota = $state<Record<string, ExternalQuotaSummary>>({})
     let recovery = $state<ExternalRecoveryMaterial | null>(null)
     let recoveryQr = $state('')
@@ -221,11 +225,28 @@
         expanded[connection.id] = kind
         try {
             if (kind === 'history') await loadHistory(connection, false)
-            if (kind === 'conflicts') conflicts[connection.id] = await bridge.listConflicts(connection.id)
+            if (kind === 'conflicts') await loadConflicts(connection, false)
             if (kind === 'quota') quota[connection.id] = await bridge.getQuota(connection.id)
         } catch (reason) {
             error = externalErrorMessage(strings, reason)
         }
+    }
+
+    async function loadConflicts(
+        connection: ExternalConnectionSummary,
+        append: boolean,
+    ): Promise<void> {
+        const page = await bridge.listConflicts(
+            append ? conflictCursor[connection.id] : undefined,
+            50,
+        )
+        const pageItems = page.conflicts.filter(
+            conflict => conflict.connectionId === connection.id,
+        )
+        conflicts[connection.id] = append
+            ? [...(conflicts[connection.id] ?? []), ...pageItems]
+            : pageItems
+        conflictCursor[connection.id] = page.nextCursor
     }
 
     async function loadHistory(connection: ExternalConnectionSummary, append: boolean): Promise<void> {
@@ -313,12 +334,67 @@
         }
     }
 
-    async function retryConflictPreservation(connection: ExternalConnectionSummary): Promise<void> {
-        await runJob(connection, 'sync')
+    async function recheckConflict(
+        connection: ExternalConnectionSummary,
+        conflict: ExternalConflictSummary,
+    ): Promise<void> {
+        busy = true
         try {
-            conflicts[connection.id] = await bridge.listConflicts(connection.id)
+            const refreshed = await bridge.recheckConflict(conflict.id)
+            conflicts[connection.id] = (conflicts[connection.id] ?? []).map(item =>
+                item.id === refreshed.id ? refreshed : item)
         } catch (reason) {
             error = externalErrorMessage(strings, reason)
+        } finally {
+            busy = false
+        }
+    }
+
+    async function restoreConflict(
+        conflict: ExternalConflictSummary,
+        side: 'local' | 'remote',
+    ): Promise<void> {
+        busy = true
+        try {
+            await requestExternalConflictRestore(conflict.id, side)
+            await refresh(true)
+        } catch (reason) {
+            error = externalErrorMessage(strings, reason)
+        } finally {
+            busy = false
+        }
+    }
+
+    async function exportConflict(
+        conflict: ExternalConflictSummary,
+        side: 'local' | 'remote',
+    ): Promise<void> {
+        busy = true
+        try {
+            await requestExternalConflictExport(conflict.id, side)
+        } catch (reason) {
+            error = externalErrorMessage(strings, reason)
+        } finally {
+            busy = false
+        }
+    }
+
+    async function deleteConflict(
+        connection: ExternalConnectionSummary,
+        conflict: ExternalConflictSummary,
+    ): Promise<void> {
+        if (!(await alertConfirm(strings.deleteConflictConfirm))) return
+        busy = true
+        try {
+            const result = await bridge.deleteConflict(conflict.id, true)
+            conflicts[connection.id] = (conflicts[connection.id] ?? []).filter(
+                item => item.id !== conflict.id,
+            )
+            if (result.remotePoint === 'left-remote') alertNormal(strings.remoteDeletePending)
+        } catch (reason) {
+            error = externalErrorMessage(strings, reason)
+        } finally {
+            busy = false
         }
     }
 
@@ -572,24 +648,38 @@
                 {:else if expanded[connection.id] === 'conflicts'}
                     <div class="list" role="tabpanel">
                         {#each conflicts[connection.id] ?? [] as conflict (conflict.id)}
-                            {@const pending = conflict.preservation === 'local-only'}
+                            {@const pending = !conflict.remotePointConfirmed}
+                            {@const actions = externalConflictActions(conflict)}
                             <div class="conflict" class:info={pending}>
-                                <strong>{pending ? strings.remotePendingTitle : strings.conflictTitle}</strong>
-                                <p>{pending ? strings.preservationPending : strings.preservationComplete}</p>
+                                <strong>{conflict.resolved ? strings.conflictResolved : pending ? strings.remotePendingTitle : strings.conflictTitle}</strong>
+                                <p>{conflict.resolved ? strings.conflictResolvedHelp : pending ? strings.preservationPending : strings.preservationComplete}</p>
                                 <dl class="kv">
-                                    <dt>{strings.thisDevice}</dt><dd>{conflict.localLabel}</dd>
-                                    <dt>{strings.repositorySide}</dt><dd>{conflict.remoteRevision === null ? strings.remotePending : conflict.remoteLabel}</dd>
+                                    <dt>{strings.thisDevice}</dt><dd>{conflict.localRevision}{#if !conflict.localAvailable} · {strings.copyUnavailable}{/if}</dd>
+                                    <dt>{strings.repositorySide}</dt><dd>{conflict.remoteRevision}{#if pending} · {strings.remotePending}{:else if !conflict.remoteAvailable} · {strings.copyUnavailable}{/if}</dd>
                                 </dl>
                                 <div class="actions">
-                                    {#if externalConflictActions(conflict).includes('retry-sync')}
-                                        <SettingButton disabled={busy} onclick={() => retryConflictPreservation(connection)}>{strings.retryPreservation}</SettingButton>
-                                    {:else if externalConflictActions(conflict).includes('keep-local')}
+                                    {#if actions.includes('retry-sync')}
+                                        <SettingButton disabled={busy} onclick={() => recheckConflict(connection, conflict)}>{strings.retryPreservation}</SettingButton>
+                                    {/if}
+                                    {#if actions.includes('keep-local')}
                                         <SettingButton onclick={() => runJob(connection, 'resolve-conflict', { conflictId: conflict.id, choice: 'local' })}>{strings.local}</SettingButton>
+                                    {/if}
+                                    {#if actions.includes('use-remote')}
                                         <SettingButton onclick={() => runJob(connection, 'resolve-conflict', { conflictId: conflict.id, choice: 'remote' })}>{strings.remote}</SettingButton>
                                     {/if}
+                                    {#if conflict.localAvailable}
+                                        <SettingButton variant="secondary" disabled={busy} onclick={() => restoreConflict(conflict, 'local')}>{strings.restoreLocalCopy}</SettingButton>
+                                        <SettingButton variant="secondary" disabled={busy} onclick={() => exportConflict(conflict, 'local')}>{strings.exportLocalCopy}</SettingButton>
+                                    {/if}
+                                    {#if conflict.remoteAvailable}
+                                        <SettingButton variant="secondary" disabled={busy} onclick={() => restoreConflict(conflict, 'remote')}>{strings.restoreRemoteCopy}</SettingButton>
+                                        <SettingButton variant="secondary" disabled={busy} onclick={() => exportConflict(conflict, 'remote')}>{strings.exportRemoteCopy}</SettingButton>
+                                    {/if}
+                                    <SettingButton variant="secondary" disabled={busy} onclick={() => deleteConflict(connection, conflict)}>{strings.deleteConflict}</SettingButton>
                                 </div>
                             </div>
                         {/each}
+                        {#if conflictCursor[connection.id]}<div><SettingButton variant="secondary" onclick={() => loadConflicts(connection, true)}>{strings.loadMore}</SettingButton></div>{/if}
                     </div>
                 {:else if expanded[connection.id] === 'quota'}
                     {@const usage = quota[connection.id]}

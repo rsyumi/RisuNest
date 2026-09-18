@@ -11,6 +11,8 @@ const m = vi.hoisted(() => ({
     legacy: vi.fn(),
     export: vi.fn(),
     discard: vi.fn(),
+    beginReplacement: vi.fn(),
+    releaseReplacement: vi.fn(),
     confirmReplacement: vi.fn(),
     after: vi.fn(),
     resume: vi.fn(),
@@ -50,7 +52,7 @@ vi.mock('./nativeFileJobManager', () => ({
 vi.mock('./sync/serverSyncProduction', () => ({
     getServerSyncController: () => ({
         assertFileOperationAvailable() {},
-        withReplacement: async (fn: () => Promise<unknown>) => fn(),
+        beginReplacement: m.beginReplacement,
         confirmReplacement: m.confirmReplacement,
     }),
     resumeServerSyncAfterBackup: m.resume,
@@ -90,6 +92,7 @@ describe('common backup file production route', () => {
         )
         m.invoke.mockResolvedValue('portable')
         m.confirm.mockResolvedValue(true)
+        m.beginReplacement.mockResolvedValue(m.releaseReplacement)
         for (const operation of [m.portable, m.block, m.legacy, m.export])
             operation.mockResolvedValue(result)
         m.chooseExport.mockResolvedValue({
@@ -117,8 +120,6 @@ describe('common backup file production route', () => {
             expect(selected).toHaveBeenCalledOnce()
             expect(m.manager).toHaveBeenCalledOnce()
             const options = selected.mock.calls[0][2]
-            await options.beforeActivation()
-            expect(m.confirmReplacement).toHaveBeenCalledOnce()
             if (format === 'portable') {
                 m.chooseRestore.mockResolvedValue({
                     library: true,
@@ -151,6 +152,22 @@ describe('common backup file production route', () => {
         ).toBeNull()
         expect(m.discard).toHaveBeenCalledWith('synthetic-token')
         expect(m.legacy).not.toHaveBeenCalled()
+    })
+    it('reserves server replacement only after native preparation reaches activation', async () => {
+        m.invoke.mockResolvedValue('block-risu-save')
+        m.block.mockImplementationOnce(async (_runtime, _source, options) => {
+            expect(m.beginReplacement).not.toHaveBeenCalled()
+            await options.beforeActivation()
+            expect(m.beginReplacement).toHaveBeenCalledOnce()
+            return result
+        })
+
+        await expect(restoreBackupFromNativeSource({
+            type: 'desktopPath',
+            path: 'C:\\synthetic\\prepared.risudat',
+        })).resolves.toEqual(result)
+
+        expect(m.releaseReplacement).toHaveBeenCalledOnce()
     })
     it('a first run skips the replacement confirmation and asks for sections as an import', async () => {
         m.invoke.mockResolvedValue('local-backup')

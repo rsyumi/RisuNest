@@ -144,7 +144,8 @@ export function createExternalStorageScheduler(
                 if (result.error?.action === 'wait' || result.error?.action === 'reauthenticate'
                     || result.error?.action === 'unlock-key'
                     || result.error?.action === 'resolve-conflict'
-                    || result.error?.action === 'free-space') return
+                    || result.error?.action === 'free-space'
+                    || result.reason === 'publication-unknown') return
                 merge(destination, item.revision, 'edit')
                 scheduleNext()
             })

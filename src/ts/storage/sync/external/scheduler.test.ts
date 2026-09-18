@@ -139,4 +139,34 @@ describe('external storage scheduler', () => {
         await vi.advanceTimersByTimeAsync(1)
         expect(request).toHaveBeenCalledTimes(2)
     })
+
+    it('leaves an unknown publication stopped until an explicit request', async () => {
+        const request = vi.fn().mockResolvedValue({
+            kind: 'blocked' as const,
+            reason: 'publication-unknown',
+            error: {
+                code: 'transient',
+                message: 'Unknown publication result',
+                retryable: true,
+                action: 'retry' as const,
+                reason: 'publication-unknown' as const,
+            },
+        })
+        const controller = {
+            request,
+            cancel: vi.fn(async () => {}),
+        } as unknown as ExternalStorageController
+        const scheduler = createExternalStorageScheduler(controller, {
+            available: () => true,
+            destinations: () => [{ connectionId: 'sync-1', kind: 'sync' }],
+            session: () => ({ kind: 'foreground', id: 'foreground-1' }),
+        })
+
+        scheduler.durableRevision('7')
+        await vi.advanceTimersByTimeAsync(15_000)
+        await vi.advanceTimersByTimeAsync(300_000)
+
+        expect(request).toHaveBeenCalledOnce()
+        expect(scheduler.pendingRevision('sync-1', 'sync')).toBeUndefined()
+    })
 })

@@ -1,4 +1,5 @@
 import type { ServerSyncSnapshot } from "./serverSyncController";
+import { matchesCompletedServerCycle } from "./serverSyncCompletion";
 
 /** Completion belongs to the current identity and verified cycle, never to
  * Promise resolution or historical lastSuccessAt. */
@@ -13,23 +14,7 @@ export function completedServerSyncAttempt(
     snapshot.replacing ||
     snapshot.refreshPending ||
     snapshot.error ||
-    !status?.configured ||
-    !identity ||
-    status.registrationRequired ||
-    status.reconciling ||
-    status.operationPending ||
-    status.fullScan ||
-    status.dirtyRecords !== 0 ||
-    result?.phase !== "idle" ||
-    status.endpoint !== identity.endpoint ||
-    status.libraryId !== identity.libraryId ||
-    status.deviceId !== identity.deviceId ||
-    status.localRevision !== result.localRevision ||
-    !status.head ||
-    status.head.headId !== result.head.headId ||
-    status.head.seq !== result.head.seq ||
-    status.head.epoch !== result.head.epoch ||
-    status.head.libraryId !== result.head.libraryId
+    !matchesCompletedServerCycle(status, result, identity)
   )
     return null;
   return snapshot.attemptId;

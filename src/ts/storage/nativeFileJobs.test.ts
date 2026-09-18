@@ -7,6 +7,7 @@ import {
     runNativeOfficialAccountSnapshotRestore,
     runNativeBlockRisuSaveRestore,
     runNativeArchiveRestore,
+    runNativeArchiveReferenceExport,
     runNativeBlockRisuSaveExport,
     runNativeLegacyLocalBackupExport,
     runNativeCompatibleLocalBackupExport,
@@ -169,13 +170,144 @@ async function restoreOverPluginValues(options: {
 }
 
 describe('native file jobs', () => {
+    it('starts a library-only portable export from an opaque conflict source', async () => {
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const result = {
+            revision: 0,
+            sourceBytes: 128,
+            sourceSha256: 'a'.repeat(64),
+            characterCount: 1,
+            presetCount: 0,
+            warningCodes: [],
+        }
+
+        await expect(runNativeArchiveReferenceExport(
+            { type: 'conflictReference', token: 'external:source-token' },
+            { type: 'desktopPath', path: 'C:\\chosen\\conflict.risunest' },
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command, args) => {
+                    calls.push([command, args])
+                    if (command === 'native_file_job_start') return { jobId: 'export-1' }
+                    if (command === 'native_file_job_status') return {
+                        ...status('succeeded', result),
+                        jobId: 'export-1',
+                        kind: 'export-portable-backup',
+                    }
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+                copyToAndroidSaf: async () => ({ bytes: 0, warningCodes: [] }),
+            },
+        )).resolves.toEqual(result)
+
+        expect(calls[0]).toEqual([
+            'native_file_job_start',
+            {
+                request: {
+                    kind: 'export-portable-backup',
+                    source: { type: 'conflictReference', token: 'external:source-token' },
+                    selection: { library: true, deviceSections: [] },
+                    destination: 'C:\\chosen\\conflict.risunest',
+                },
+            },
+        ])
+        expect(JSON.stringify(calls[0])).not.toContain('expectedRevision')
+    })
+
+    it.each([false, true])(
+        'acknowledges a committed portable device session before refresh (ack fails: %s)',
+        async (ackFails) => {
+            const calls: string[] = []
+            const events: string[] = []
+            const refresh = vi.fn(async () => {})
+            const committed = {
+                revision: 4,
+                sourceBytes: 128,
+                sourceSha256: 'b'.repeat(64),
+                characterCount: 1,
+                presetCount: 0,
+                warningCodes: [],
+            }
+            const statuses: NativeFileJobStatus[] = [
+                {
+                    ...status('waitingForInput'),
+                    kind: 'restore-portable-backup',
+                    phase: 'awaiting-backup-selection',
+                    restorePreview: {
+                        libraryIncluded: true,
+                        repairRequired: false,
+                        deviceSections: ['hypa'],
+                    },
+                },
+                {
+                    ...status('waitingForInput'),
+                    kind: 'restore-portable-backup',
+                    phase: 'awaiting-activation',
+                },
+                {
+                    ...status('succeeded', committed),
+                    kind: 'restore-portable-backup',
+                    deviceSessionId: 'device-session',
+                },
+            ]
+            const running = runNativeArchiveRestore(
+                restoreRuntime(3, { refresh }),
+                { type: 'desktopPath', path: 'C:\\synthetic\\portable.risunest' },
+                {
+                    choosePortableSections: async () => ({
+                        library: true,
+                        deviceSections: ['hypa'],
+                    }),
+                    onNativeStatus: async (value) => {
+                        if (value.state === 'succeeded') events.push('terminal-observed')
+                    },
+                },
+                {
+                    isTauri: () => true,
+                    invoke: async (command) => {
+                        calls.push(command)
+                        if (command === 'native_file_job_start') return { jobId: 'job-1' }
+                        if (command === 'native_file_job_status') return statuses.shift()
+                        if (command === 'native_portable_select_sections') return undefined
+                        if (command === 'native_file_job_finalize') return undefined
+                        if (command === 'native_device_backup_recovery_complete') {
+                            events.push('device-ack')
+                            if (ackFails) throw new Error('synthetic ack failure')
+                            return undefined
+                        }
+                        if (command === 'native_file_job_forget') return true
+                        throw new Error(`Unexpected command: ${command}`)
+                    },
+                    wait: async () => undefined,
+                },
+            )
+
+            if (ackFails) {
+                await expect(running).rejects.toBeInstanceOf(
+                    NativeFileJobActivationCommittedError,
+                )
+                expect(refresh).not.toHaveBeenCalled()
+                expect(calls).not.toContain('native_file_job_forget')
+            } else {
+                await expect(running).resolves.toEqual(committed)
+                expect(refresh).toHaveBeenCalledOnce()
+                expect(calls).toContain('native_file_job_forget')
+            }
+            expect(events).toEqual(['terminal-observed', 'device-ack'])
+        },
+    )
+
     it.each(['chooser', 'fence'])(
-        'cancels portable restore aborted during %s before native section approval',
+        'keeps portable selection outside the replacement fence when aborted during %s',
         async (point) => {
             const abort = new AbortController()
             const commands: string[] = []
+            const events: string[] = []
             const released = vi.fn()
-            let polled = false
+            let polls = 0
             const preview = {
                 ...status('waitingForInput'),
                 kind: 'restore-portable-backup' as const,
@@ -183,7 +315,7 @@ describe('native file jobs', () => {
                 restorePreview: {
                     libraryIncluded: true,
                     repairRequired: false,
-                    deviceSections: ['local-storage'],
+                    deviceSections: ['hypa'],
                 },
             }
             await expect(
@@ -200,11 +332,14 @@ describe('native file jobs', () => {
                     },
                     {
                         signal: abort.signal,
+                        onBlockingChange: (blocking) => {
+                            events.push(`blocking:${blocking}`)
+                        },
                         choosePortableSections: async () => {
                             if (point === 'chooser') abort.abort()
                             return {
                                 library: true,
-                                deviceSections: ['local-storage'],
+                                deviceSections: ['hypa'],
                             }
                         },
                     },
@@ -216,9 +351,16 @@ describe('native file jobs', () => {
                             if (command === 'native_file_job_start')
                                 return { jobId: 'job-1' }
                             if (command === 'native_file_job_status') {
-                                if (!polled) {
-                                    polled = true
+                                polls += 1
+                                if (polls === 1) {
                                     return preview
+                                }
+                                if (point === 'fence' && polls === 2) {
+                                    return {
+                                        ...status('waitingForInput'),
+                                        kind: 'restore-portable-backup',
+                                        phase: 'awaiting-activation',
+                                    }
                                 }
                                 return {
                                     ...status('cancelled'),
@@ -231,7 +373,17 @@ describe('native file jobs', () => {
                 ),
             ).rejects.toMatchObject({ name: 'AbortError' })
             expect(commands).toContain('native_file_job_cancel')
-            expect(commands).not.toContain('native_portable_select_sections')
+            expect(commands.includes('native_portable_select_sections')).toBe(
+                point === 'fence',
+            )
+            if (point === 'fence') {
+                expect(events).toEqual(['blocking:true', 'blocking:false'])
+                expect(commands.indexOf('native_portable_select_sections')).toBeLessThan(
+                    commands.indexOf('native_file_job_cancel'),
+                )
+            } else {
+                expect(events).toEqual([])
+            }
             expect(released).toHaveBeenCalledTimes(point === 'fence' ? 1 : 0)
         },
     )
