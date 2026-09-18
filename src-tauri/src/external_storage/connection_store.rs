@@ -379,6 +379,20 @@ impl ConnectionStore {
         role: ObjectRole,
         expected_ciphertext_sha256: Option<&str>,
     ) -> Result<RemoteObject> {
+        let value = self.discovery_snapshot(connection, id)?;
+        if value.role != role || expected_ciphertext_sha256.is_some_and(|hash| {
+            !crate::trust_boundary::is_lower_hex_256(hash) || hash != value.ciphertext_sha256
+        }) {
+            return Err(corrupt());
+        }
+        Ok(value)
+    }
+
+    pub(crate) fn discovery_snapshot(
+        &self,
+        connection: &str,
+        id: &str,
+    ) -> Result<RemoteObject> {
         let current = self.read(connection)?;
         let encoded: Option<String> = self
             .0
@@ -395,12 +409,17 @@ impl ConnectionStore {
         }
         let value: RemoteObject = serde_json::from_str(&encoded).map_err(|_| corrupt())?;
         validate_discovery(&current, id, &value)?;
-        if value.role != role || expected_ciphertext_sha256.is_some_and(|hash| {
-            !crate::trust_boundary::is_lower_hex_256(hash) || hash != value.ciphertext_sha256
-        }) {
-            return Err(corrupt());
-        }
         Ok(value)
+    }
+
+    pub(crate) fn forget_discovery(&self, connection: &str, id: &str) -> Result<()> {
+        self.0
+            .execute(
+                "DELETE FROM discovery WHERE connection_id=?1 AND id=?2",
+                params![connection, id],
+            )
+            .map_err(storage)?;
+        Ok(())
     }
 }
 
@@ -670,6 +689,7 @@ mod tests {
             ciphertext_sha256: "a".repeat(64), plaintext_sha256: "b".repeat(64), plaintext_length: 50,
         };
         store.remember_discovery(&value.id, "a", &reference).unwrap();
+        assert_eq!(store.discovery_snapshot(&value.id, "a").unwrap(), reference);
         assert_eq!(store.discovery(&value.id, "a", ObjectRole::BackupBundle,
             Some(&reference.ciphertext_sha256)).unwrap(), reference);
         assert_eq!(store.discovery(&value.id, "a", ObjectRole::SyncState, None).unwrap_err().kind, ErrorKind::Corrupt);
@@ -687,9 +707,19 @@ mod tests {
             mutate(&mut invalid);
             assert_eq!(store.remember_discovery(&value.id, "a", &invalid).unwrap_err().kind, ErrorKind::Corrupt);
         }
+        let mut state = reference.clone();
+        state.object_id = "snapshot-b".into();
+        state.role = ObjectRole::SyncState;
+        state.receipt.locator.object = "state-b".into();
+        store.remember_discovery(&value.id, "b", &state).unwrap();
+        assert_eq!(store.discovery_snapshot(&value.id, "b").unwrap(), state);
+        store.forget_discovery(&value.id, "a").unwrap();
+        store.forget_discovery(&value.id, "a").unwrap();
+        assert_eq!(store.discovery_snapshot(&value.id, "a").unwrap_err().kind, ErrorKind::NotFound);
+        assert_eq!(store.discovery_snapshot(&value.id, "b").unwrap(), state);
         // A cache row is not enough once its connection has been removed.
         store.remove(&value.id).unwrap();
-        assert_eq!(store.discovery(&value.id, "a", ObjectRole::BackupBundle, None).unwrap_err().kind, ErrorKind::NotFound);
+        assert_eq!(store.discovery_snapshot(&value.id, "b").unwrap_err().kind, ErrorKind::NotFound);
     }
 
     #[test]
