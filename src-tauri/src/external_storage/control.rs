@@ -289,6 +289,12 @@ pub(crate) struct BackupPointPage {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteConflictPointDeleteOutcome {
+    Deleted,
+    NotFound,
+}
+
 fn seal(
     descriptor: &Descriptor,
     root_key: &[u8; 32],
@@ -818,6 +824,46 @@ async fn open_listed_point(
         },
         document,
     })
+}
+
+pub(crate) async fn delete_authenticated_conflict_point(
+    connected: &super::connection_commands::ConnectedRepository,
+    conflict_id: &str,
+    point: &wire::StoredObject,
+    cancel: &Cancellation,
+) -> Result<RemoteConflictPointDeleteOutcome> {
+    if conflict_id.is_empty()
+        || conflict_id.len() > 1024
+        || conflict_id.contains('\0')
+        || point.header.role != wire::ObjectRole::BackupPoint
+        || point.header.object_id != format!("backup-point-{conflict_id}")
+    {
+        return Err(corrupt("conflict point identity differs"));
+    }
+    let expected = RemoteObject::from_stored(point, &connected.handle)?;
+    let listed = match open_listed_point(
+        expected.receipt.clone(),
+        &connected.stored.descriptor,
+        &connected.root_key,
+        connected.provider.as_ref(),
+        &connected.handle,
+        cancel,
+    )
+    .await
+    {
+        Err(error) if error.kind == ErrorKind::NotFound => {
+            return Ok(RemoteConflictPointDeleteOutcome::NotFound)
+        }
+        other => other?,
+    };
+    if listed.reference.stored(&connected.handle)? != *point {
+        return Err(corrupt("conflict point bytes differ"));
+    }
+    connected
+        .provider
+        .delete_object(&connected.handle, &expected.receipt.locator, cancel)
+        .await?;
+    Ok(RemoteConflictPointDeleteOutcome::Deleted)
 }
 
 pub(crate) async fn list_backup_points_page(
@@ -1841,6 +1887,64 @@ mod tests {
             assert_eq!(repeated.object_id, uploaded.object_id);
             assert_eq!(provider.state.lock().unwrap().objects.len(), 1);
             assert_eq!(provider.upload_attempts("backup-point-conflict-1"), 1);
+        });
+    }
+
+    #[test]
+    fn conflict_point_delete_distinguishes_authenticated_presence_from_absence() {
+        runtime().block_on(async {
+            let provider = Arc::new(fake::FakeProvider::new(false));
+            let connected = connected(provider);
+            let root = tempfile::tempdir().unwrap();
+            let identity = JobIdentity {
+                job_id: "job".into(),
+                connection_id: "connection".into(),
+                repository_id: connected.handle.repository_id.clone(),
+                capture_id: "capture".into(),
+                capture: CaptureIdentity {
+                    store_id: "store".into(),
+                    library_epoch: "epoch".into(),
+                    generation: "generation".into(),
+                    selection_epoch: "selection".into(),
+                    revision: 1,
+                },
+            };
+            let mut journal = TransferJournal::open(root.path(), identity).unwrap();
+            let uploaded = ensure_remote_conflict_point(
+                &connected.stored.descriptor,
+                "conflict",
+                1,
+                bundle(&connected.handle, "remote"),
+                &mut journal,
+                &connected,
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+            let stored = uploaded.stored(&connected.handle).unwrap();
+
+            assert_eq!(
+                delete_authenticated_conflict_point(
+                    &connected,
+                    "conflict",
+                    &stored,
+                    &Cancellation::default(),
+                )
+                .await
+                .unwrap(),
+                RemoteConflictPointDeleteOutcome::Deleted
+            );
+            assert_eq!(
+                delete_authenticated_conflict_point(
+                    &connected,
+                    "conflict",
+                    &stored,
+                    &Cancellation::default(),
+                )
+                .await
+                .unwrap(),
+                RemoteConflictPointDeleteOutcome::NotFound
+            );
         });
     }
 }
