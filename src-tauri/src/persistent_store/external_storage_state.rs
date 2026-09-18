@@ -7,14 +7,13 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use crate::external_storage::publication::{PublicationMode, PublicationPermit};
 
 const SCHEMA: &str = r#"
-CREATE TABLE external_storage_jobs(id TEXT PRIMARY KEY,connection_id TEXT NOT NULL,repository_id TEXT NOT NULL,capture_id TEXT NOT NULL,identity TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('backup','sync','restore','history')),strategy TEXT CHECK(strategy IN ('cas','sequential')),expected_head TEXT,commit_id TEXT NOT NULL,phase TEXT NOT NULL CHECK(phase IN ('preparing','ready','publishing','publicationUnknown','conflictPreserving','applying','complete','cancelled','stale')));
+CREATE TABLE external_storage_jobs(id TEXT PRIMARY KEY,connection_id TEXT NOT NULL,repository_id TEXT NOT NULL,capture_id TEXT NOT NULL,identity TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('backup','sync','restore','history')),strategy TEXT CHECK(strategy IN ('cas','sequential')),expected_head TEXT,commit_id TEXT NOT NULL,phase TEXT NOT NULL CHECK(phase IN ('preparing','ready','publishing','publicationUnknown','applying','complete','cancelled','stale')));
 CREATE TABLE external_storage_bases(connection_id TEXT PRIMARY KEY,repository_id TEXT NOT NULL,snapshot_id TEXT NOT NULL,commit_id TEXT NOT NULL,head_observation TEXT NOT NULL,identity TEXT NOT NULL);
 CREATE TABLE external_storage_backup_points(job_id TEXT PRIMARY KEY,connection_id TEXT NOT NULL,repository_id TEXT NOT NULL,snapshot_id TEXT NOT NULL,point_id TEXT NOT NULL,observation TEXT NOT NULL,identity TEXT NOT NULL);
 CREATE TABLE external_storage_history_points(job_id TEXT PRIMARY KEY,connection_id TEXT NOT NULL,repository_id TEXT NOT NULL,snapshot_id TEXT NOT NULL,snapshot_reference TEXT NOT NULL,point_id TEXT NOT NULL,logical_revision TEXT NOT NULL,created_at_ms TEXT NOT NULL,identity TEXT NOT NULL,point_observation TEXT);
 CREATE TABLE external_storage_captures(id TEXT PRIMARY KEY,identity TEXT NOT NULL,scope_id TEXT NOT NULL,codec_id TEXT NOT NULL,device_capture_id TEXT NOT NULL,manifest_hash TEXT NOT NULL CHECK(length(manifest_hash)=64 AND manifest_hash NOT GLOB '*[^0-9a-f]*'),UNIQUE(identity,scope_id,codec_id,device_capture_id));
 CREATE TABLE external_storage_capture_refs(capture_id TEXT NOT NULL,job_id TEXT NOT NULL,PRIMARY KEY(capture_id,job_id));
 CREATE TABLE external_storage_capture_files(capture_id TEXT PRIMARY KEY,catalog_path TEXT NOT NULL,file_hash TEXT NOT NULL CHECK(length(file_hash)=64 AND file_hash NOT GLOB '*[^0-9a-f]*'));
-CREATE TABLE external_storage_conflicts(id TEXT PRIMARY KEY,connection_id TEXT NOT NULL,repository_id TEXT NOT NULL,local_capture_id TEXT NOT NULL,local_snapshot TEXT,local_identity TEXT NOT NULL,remote_snapshot TEXT,remote_logical_revision INTEGER CHECK(remote_logical_revision>=0),remote_commit_id TEXT,remote_head_observation TEXT,created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0),preservation TEXT NOT NULL CHECK(preservation IN ('localOnly','remoteComplete')),phase TEXT NOT NULL CHECK(phase IN ('pending','resolving','publicationUnknown','resolved')));
 "#;
 
 pub(super) fn create_schema(db: &Connection) -> StoreResult<()> {
@@ -47,6 +46,23 @@ fn invalid(message: &str) -> StoreError {
     StoreError::Validation {
         message: message.into(),
     }
+}
+
+fn reusable_job(tx: &Transaction<'_>, job: &str, connection: &str) -> StoreResult<bool> {
+    let existing = tx
+        .query_row(
+            "SELECT connection_id,phase FROM external_storage_jobs WHERE id=?1",
+            [job],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((existing_connection, phase)) = existing else {
+        return Ok(false);
+    };
+    if existing_connection != connection || !matches!(phase.as_str(), "stale" | "cancelled") {
+        return Err(invalid("External job cannot be reused"));
+    }
+    Ok(true)
 }
 
 /// A verified remote snapshot selected for normal sync receive. For restore
@@ -87,43 +103,31 @@ pub(crate) fn prepare_receive(tx: &Transaction<'_>, intent: &ReceiveIntent<'_>) 
     if busy {
         return Err(invalid("Destination already has an active job"));
     }
-    tx.execute(
-        "INSERT INTO external_storage_jobs VALUES(?1,?2,?3,?4,?5,'restore',NULL,?6,?7,'ready')",
-        params![
-            intent.job_id,
-            intent.connection_id,
-            intent.repository_id,
-            intent.snapshot_id,
-            serde_json::to_string(intent.identity)?,
-            intent.authenticated_head,
-            intent.commit_id
-        ],
-    )?;
-    Ok(())
-}
-
-pub(crate) fn prepare_conflict_receive(
-    tx: &Transaction<'_>,
-    intent: &ReceiveIntent<'_>,
-) -> StoreResult<()> {
-    sync_selection::require_publish(tx, intent.identity, intent.connection_id)?;
-    if sync_selection::identity(tx)? != *intent.identity {
-        return Err(invalid("Local revision changed before conflict receive"));
-    }
-    if [
-        intent.repository_id,
-        intent.snapshot_id,
-        intent.commit_id,
-        intent.authenticated_head,
-    ]
-    .iter()
-    .any(|value| value.is_empty())
-    {
-        return Err(invalid("Incomplete conflict receive intent"));
-    }
-    if tx.execute("UPDATE external_storage_jobs SET repository_id=?2,capture_id=?3,identity=?4,role='restore',strategy=NULL,expected_head=?5,commit_id=?6,phase='ready' WHERE id=?1 AND connection_id=?7 AND phase IN ('stale','cancelled')",
-        params![intent.job_id,intent.repository_id,intent.snapshot_id,serde_json::to_string(intent.identity)?,intent.authenticated_head,intent.commit_id,intent.connection_id])?!=1 {
-        return Err(invalid("No preserved conflict receive to prepare"));
+    let identity = serde_json::to_string(intent.identity)?;
+    if reusable_job(tx, intent.job_id, intent.connection_id)? {
+        if tx.execute(
+            "UPDATE external_storage_jobs SET repository_id=?2,capture_id=?3,identity=?4,role='restore',strategy=NULL,expected_head=?5,commit_id=?6,phase='ready' WHERE id=?1 AND connection_id=?7 AND phase IN ('stale','cancelled')",
+            params![intent.job_id,intent.repository_id,intent.snapshot_id,identity,intent.authenticated_head,intent.commit_id,intent.connection_id],
+        )? != 1 {
+            return Err(invalid("External job cannot be reused"));
+        }
+        tx.execute(
+            "DELETE FROM external_storage_capture_refs WHERE job_id=?1",
+            [intent.job_id],
+        )?;
+    } else {
+        tx.execute(
+            "INSERT INTO external_storage_jobs VALUES(?1,?2,?3,?4,?5,'restore',NULL,?6,?7,'ready')",
+            params![
+                intent.job_id,
+                intent.connection_id,
+                intent.repository_id,
+                intent.snapshot_id,
+                identity,
+                intent.authenticated_head,
+                intent.commit_id
+            ],
+        )?;
     }
     Ok(())
 }
@@ -446,16 +450,6 @@ pub(crate) fn prepare_backup(
 }
 
 pub(crate) fn cancel_prepared(tx: &Transaction<'_>, job: &str) -> StoreResult<()> {
-    let unresolved_conflict: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM external_storage_conflicts WHERE id=?1 AND phase!='resolved')",
-        [job],
-        |row| row.get(0),
-    )?;
-    if unresolved_conflict {
-        return Err(invalid(
-            "Unresolved external conflict keeps its preserved capture",
-        ));
-    }
     if tx.execute("UPDATE external_storage_jobs SET phase='cancelled' WHERE id=?1 AND phase IN ('preparing','ready','stale')",[job])?!=1 {return Err(invalid("In-flight publication must be reconciled before cancellation"));}
     tx.execute(
         "DELETE FROM external_storage_capture_refs WHERE job_id=?1",
@@ -496,38 +490,36 @@ pub(crate) fn prepare_publication(
     if busy {
         return Err(invalid("External destination already has an active job"));
     }
+    if reusable_job(tx, intent.job_id, intent.connection_id)? {
+        if tx.execute(
+            "UPDATE external_storage_jobs SET repository_id=?2,capture_id=?3,identity=?4,role='sync',strategy=?5,expected_head=?6,commit_id=?7,phase='ready' WHERE id=?1 AND connection_id=?8 AND phase IN ('stale','cancelled')",
+            params![intent.job_id,intent.repository_id,intent.capture_id,identity,intent.strategy,intent.expected_head,intent.commit_id,intent.connection_id],
+        )? != 1 {
+            return Err(invalid("External job cannot be reused"));
+        }
+    } else {
+        tx.execute(
+            "INSERT INTO external_storage_jobs VALUES(?1,?2,?3,?4,?5,'sync',?6,?7,?8,'ready')",
+            params![
+                intent.job_id,
+                intent.connection_id,
+                intent.repository_id,
+                intent.capture_id,
+                identity,
+                intent.strategy,
+                intent.expected_head,
+                intent.commit_id
+            ],
+        )?;
+    }
     tx.execute(
-        "INSERT INTO external_storage_jobs VALUES(?1,?2,?3,?4,?5,'sync',?6,?7,?8,'ready')",
-        params![
-            intent.job_id,
-            intent.connection_id,
-            intent.repository_id,
-            intent.capture_id,
-            identity,
-            intent.strategy,
-            intent.expected_head,
-            intent.commit_id
-        ],
+        "DELETE FROM external_storage_capture_refs WHERE job_id=?1 AND capture_id!=?2",
+        params![intent.job_id, intent.capture_id],
     )?;
     tx.execute(
-        "INSERT INTO external_storage_capture_refs VALUES(?1,?2)",
+        "INSERT OR IGNORE INTO external_storage_capture_refs VALUES(?1,?2)",
         params![intent.capture_id, intent.job_id],
     )?;
-    Ok(())
-}
-
-pub(crate) fn prepare_conflict_publication(
-    tx: &Transaction<'_>,
-    intent: &PublishIntent<'_>,
-) -> StoreResult<()> {
-    sync_selection::require_publish(tx, intent.identity, intent.connection_id)?;
-    if sync_selection::identity(tx)? != *intent.identity {
-        return Err(invalid("Conflict local preview changed"));
-    }
-    if tx.execute("UPDATE external_storage_jobs SET repository_id=?2,capture_id=?3,identity=?4,role='sync',strategy=?5,expected_head=?6,commit_id=?7,phase='ready' WHERE id=?1 AND connection_id=?8 AND phase IN ('stale','cancelled')",
-        params![intent.job_id,intent.repository_id,intent.capture_id,serde_json::to_string(intent.identity)?,intent.strategy,intent.expected_head,intent.commit_id,intent.connection_id])?!=1 {
-        return Err(invalid("No preserved conflict publication to prepare"));
-    }
     Ok(())
 }
 

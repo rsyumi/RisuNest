@@ -1,26 +1,22 @@
-//! Manual external snapshot restore and durable device-maintenance continuation.
+//! Manual external snapshot restore and durable commit recovery.
 //! Remote reads finish before either the library writer fence or PDS is opened.
 use super::{
     connection_commands::ConnectedRepository,
+    connection_store::ConnectionStore,
     contract::{Cancellation, ErrorKind, ProviderError, Result},
-    job_store::{DurableJob, JobClaim, JobCommandState, JobKind, JobStore},
+    job_store::{DurableJob, JobKind, JobStore},
     runtime,
     snapshot_restore::{self, PreparedRemoteSnapshot},
 };
-use crate::{
-    device_backup::{DeviceBackupError, DeviceBackupState, Operation, Session as DeviceSession},
-    persistent_store::{
-        commands::PersistentStoreState,
-        external_apply::{
-            ExternalSnapshotApplication, ExternalSnapshotObject, ExternalSnapshotRecord,
-        },
-        PersistentStore, StoreError,
-    },
+use crate::persistent_store::{
+    commands::PersistentStoreState,
+    external_apply::{ExternalSnapshotApplication, ExternalSnapshotObject, ExternalSnapshotRecord},
+    PersistentStore, StoreError,
 };
 use risunest_external_storage_format::section::SectionKind;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::BTreeSet, path::Path, sync::Mutex, time::Duration};
+use std::{collections::BTreeSet, path::Path};
 use tauri::{AppHandle, Manager};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,65 +95,6 @@ pub(crate) fn completed_restore(app: &AppHandle, job: &DurableJob) -> Result<Opt
     completed_restore_in_store(&runtime::native_store(app)?, job)
 }
 
-struct RetainedRestore {
-    job_id: String,
-    store: PersistentStore,
-    claim: Option<JobClaim>,
-}
-
-#[derive(Default)]
-pub(crate) struct RuntimeRestoreState(Mutex<Option<RetainedRestore>>);
-
-impl RuntimeRestoreState {
-    fn retain(&self, job: &str, store: PersistentStore) -> Result<()> {
-        let mut slot = self.0.lock().map_err(runtime::local_error)?;
-        if slot.is_some() {
-            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
-        }
-        *slot = Some(RetainedRestore { job_id: job.to_owned(), store, claim: None });
-        Ok(())
-    }
-
-    fn with_store<T>(
-        &self,
-        job: &str,
-        operation: impl FnOnce(&mut PersistentStore) -> Result<T>,
-    ) -> Result<T> {
-        let mut slot = self.0.lock().map_err(runtime::local_error)?;
-        let retained = slot.as_mut().ok_or_else(corrupt)?;
-        if retained.job_id != job {
-            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
-        }
-        operation(&mut retained.store)
-    }
-
-    fn retain_claim(&self, job: &str, claim: JobClaim) -> Result<()> {
-        let mut slot = self.0.lock().map_err(runtime::local_error)?;
-        let retained = slot.as_mut().ok_or_else(corrupt)?;
-        if retained.job_id != job || retained.claim.is_some() {
-            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
-        }
-        retained.claim = Some(claim);
-        Ok(())
-    }
-
-    fn release_claim(&self, job: &str) {
-        if let Ok(mut slot) = self.0.lock() {
-            if let Some(retained) = slot.as_mut().filter(|retained| retained.job_id == job) {
-                retained.claim.take();
-            }
-        }
-    }
-
-    fn release(&self, job: &str) {
-        if let Ok(mut slot) = self.0.lock() {
-            if slot.as_ref().is_some_and(|retained| retained.job_id == job) {
-                slot.take();
-            }
-        }
-    }
-}
-
 fn corrupt() -> ProviderError {
     ProviderError::new(ErrorKind::Corrupt)
 }
@@ -167,39 +104,6 @@ fn pds_error(error: StoreError) -> ProviderError {
         StoreError::RevisionConflict { .. } => ProviderError::new(ErrorKind::PreconditionFailed),
         StoreError::Validation { .. } => corrupt(),
         _ => ProviderError::new(ErrorKind::Transient),
-    }
-}
-
-fn device_error(error: DeviceBackupError) -> ProviderError {
-    if error.code.contains("cancel") {
-        ProviderError::new(ErrorKind::Cancelled)
-    } else if error.code.contains("invalid") || error.code.contains("missing") {
-        corrupt()
-    } else {
-        ProviderError::new(ErrorKind::Transient)
-    }
-}
-
-fn device_command_error() -> DeviceBackupError {
-    DeviceBackupError {
-        code: "external-restore-invalid".into(),
-        message: "The external restore maintenance journal is invalid".into(),
-    }
-}
-
-fn existing_external_jobs(root: &Path) -> crate::device_backup::Result<Option<JobStore>> {
-    let path = root.join("external-jobs.sqlite");
-    match std::fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.is_file() && !crate::trust_boundary::is_link_like(&metadata) => {
-            crate::trust_boundary::open_regular_source(&path)
-                .map_err(|_| device_command_error())?;
-            JobStore::open(root)
-                .map(Some)
-                .map_err(|_| device_command_error())
-        }
-        Ok(_) => Err(device_command_error()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(device_command_error()),
     }
 }
 
@@ -368,7 +272,31 @@ pub(crate) async fn run_restore(
         .map_err(|_| corrupt())?;
     let root = runtime::root(app)?;
     update_phase(&root, job, "downloading")?;
-    let remote = super::control::find_snapshot(connected, snapshot_id, cancel).await?;
+    let known = match ConnectionStore::open(&root)?
+        .discovery_snapshot(&job.request.connection_id, snapshot_id)
+    {
+        Ok(value) => Some(value),
+        Err(error) if error.kind == ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let cache_root = root.clone();
+    let cache_connection = job.request.connection_id.clone();
+    let cache_id = snapshot_id.to_owned();
+    let remote = super::control::find_snapshot_with_locator_invalidation(
+        connected,
+        snapshot_id,
+        known.as_ref(),
+        move || {
+            ConnectionStore::open(&cache_root)?.forget_discovery(&cache_connection, &cache_id)
+        },
+        cancel,
+    )
+    .await?;
+    ConnectionStore::open(&root)?.remember_discovery(
+        &job.request.connection_id,
+        snapshot_id,
+        &remote,
+    )?;
     let staging_root =
         runtime::job_directory(&root, &job.request.connection_id, &job.id).join("restore-snapshot");
     let snapshot = snapshot_restore::download_snapshot(
@@ -540,426 +468,6 @@ fn cleanup_staging(path: &Path) {
     }
 }
 
-/// Called after renderer rollback preparation. Portable restore sessions are a no-op.
-pub(crate) fn resume_prepared_device_restore(
-    app: AppHandle,
-    session_id: &str,
-) -> crate::device_backup::Result<()> {
-    let state = app.state::<DeviceBackupState>();
-    let session = state.session(session_id)?;
-    if session.operation != Operation::Restore || session.phase != "awaiting-native-preparation" {
-        return Err(device_command_error());
-    }
-    let root = state.repository_root();
-    let Some(jobs) = existing_external_jobs(root)? else {
-        return Ok(());
-    };
-    let job = match jobs.read(&session.job_id) {
-        Ok(job) => job,
-        Err(error) if error.kind == ErrorKind::NotFound => return Ok(()),
-        Err(_) => return Err(device_command_error()),
-    };
-    if job.request.kind != JobKind::Restore {
-        return Err(device_command_error());
-    }
-    let task_app = app.clone();
-    let task_session = session_id.to_owned();
-    tauri::async_runtime::spawn(async move {
-        resume_task(task_app, job, task_session).await;
-    });
-    Ok(())
-}
-
-async fn claim_continuation(app: &AppHandle, job: &DurableJob) -> Result<(Cancellation, JobClaim)> {
-    runtime::wait_for_job_release(app, &job.id).await?;
-    app.state::<JobCommandState>().claim(job)
-}
-
-async fn resume_task(app: AppHandle, original: DurableJob, session_id: String) {
-    let claimed = claim_continuation(&app, &original).await;
-    let mut worker_claim = None;
-    let mut retained = false;
-    let result = match claimed {
-        Ok((cancel, claim)) => {
-            let keep = app.state::<RuntimeRestoreState>().retain_claim(&original.id, claim.clone());
-            worker_claim = Some(claim);
-            match keep {
-                Ok(()) => {
-                    retained = true;
-                    continue_device_restore(&app, &original, &session_id, &cancel).await
-                }
-                Err(error) => Err(error),
-            }
-        }
-        Err(error) => Err(error),
-    };
-    let committed = result.is_ok();
-    if !committed {
-        let state = app.state::<DeviceBackupState>();
-        if let Ok(session) = state.session(&session_id) {
-            if matches!(
-                session.phase.as_str(),
-                "awaiting-native-preparation" | "prepared" | "applying-device"
-            ) {
-                let _ = state.fail(&session_id, "external-restore-native-failed");
-            }
-        }
-    }
-    if let Err(error) = persist_device_outcome(&app, &original, &session_id, result) {
-        crate::nlog!(
-            "error",
-            "External restore continuation outcome could not be persisted: {error}"
-        );
-    }
-    if !committed {
-        if retained {
-            app.state::<RuntimeRestoreState>().release_claim(&original.id);
-        }
-        drop(worker_claim);
-    }
-}
-
-fn validate_waiting_session(job: &DurableJob, session: &DeviceSession) -> Result<i64> {
-    if job.request.kind != JobKind::Restore
-        || job.summary["state"] != "waiting"
-        || job.summary["phase"] != "device-restore-maintenance"
-        || job.summary["result"]["maintenanceSessionId"].as_str()
-            != Some(session.session_id.as_str())
-        || session.job_id != job.id
-        || session.operation != Operation::Restore
-    {
-        return Err(corrupt());
-    }
-    job.request
-        .target_revision
-        .as_deref()
-        .ok_or_else(corrupt)?
-        .parse::<i64>()
-        .map_err(|_| corrupt())
-}
-
-async fn continue_device_restore(
-    app: &AppHandle,
-    original: &DurableJob,
-    session_id: &str,
-    cancel: &Cancellation,
-) -> Result<Value> {
-    let state = app.state::<DeviceBackupState>();
-    let root = state.repository_root();
-    let job = JobStore::open(root)?.read(&original.id)?;
-    let session = state.session(session_id).map_err(device_error)?;
-    let expected_revision = validate_waiting_session(&job, &session)?;
-    if session.phase != "awaiting-native-preparation" {
-        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
-    }
-    if session.includes_library {
-        let stage = session.new_generation.as_deref().ok_or_else(corrupt)?;
-        app.state::<RuntimeRestoreState>()
-            .with_store(&job.id, |store| {
-                store
-                    .prepare_replace_commit(stage, Some(expected_revision))
-                    .map_err(pds_error)
-            })?;
-    } else if session.new_generation.is_some() {
-        return Err(corrupt());
-    }
-    state.allow_device_apply(session_id).map_err(device_error)?;
-
-    loop {
-        let session = state.session(session_id).map_err(device_error)?;
-        match session.phase.as_str() {
-            "prepared" | "applying-device" => {
-                if cancel.check().is_err() {
-                    let _ = state.fail(session_id, "external-restore-cancelled");
-                    return Err(ProviderError::new(ErrorKind::Cancelled));
-                }
-            }
-            "committing-library" => {
-                let stage = session.new_generation.as_deref().ok_or_else(corrupt)?;
-                let (key, marker) = state.commit_marker(session_id).map_err(device_error)?;
-                let marker = serde_json::to_value(marker).map_err(runtime::local_error)?;
-                let revision =
-                    match app
-                        .state::<RuntimeRestoreState>()
-                        .with_store(&job.id, |store| {
-                            let prepared = store
-                                .prepare_replace_commit(stage, Some(expected_revision))
-                                .map_err(pds_error)?;
-                            store
-                                .finish_prepared_replace_with_app_kv(prepared, &key, &marker)
-                                .map_err(pds_error)
-                        }) {
-                        Ok(revision) => revision,
-                        Err(error) => {
-                            let _ = state.library_commit_failed(session_id);
-                            return Err(error);
-                        }
-                    };
-                if let Err(error) = state.mark_library_committed(session_id) {
-                    crate::nlog!(
-                        "error",
-                        "External restore library marker committed before journal update: {error}"
-                    );
-                }
-                return Ok(json!({
-                    "snapshotId": job.request.snapshot_id.as_deref().ok_or_else(corrupt)?,
-                    "receivedRevision": revision.revision.to_string()
-                }));
-            }
-            "committed" => {
-                let revision = app
-                    .state::<RuntimeRestoreState>()
-                    .with_store(&job.id, |store| store.revision().map_err(pds_error))?;
-                return Ok(json!({
-                    "snapshotId": job.request.snapshot_id.as_deref().ok_or_else(corrupt)?,
-                    "receivedRevision": revision.to_string()
-                }));
-            }
-            "rolling-back" | "rolled-back" | "recovery-required" => {
-                return Err(ProviderError::new(ErrorKind::Transient));
-            }
-            _ => return Err(corrupt()),
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-fn persist_device_outcome(
-    app: &AppHandle,
-    original: &DurableJob,
-    session_id: &str,
-    result: Result<Value>,
-) -> Result<()> {
-    let state = app.state::<DeviceBackupState>();
-    let store = JobStore::open(state.repository_root())?;
-    let mut job = store.read(&original.id)?;
-    if job.terminal() {
-        return Ok(());
-    }
-    if job.summary["result"]["maintenanceSessionId"].as_str() != Some(session_id) {
-        return Err(corrupt());
-    }
-    match result {
-        Ok(result) => {
-            job.summary["state"] = json!("waiting");
-            job.summary["phase"] = json!("device-restore-maintenance");
-            job.summary["maintenanceOutcome"] = json!({
-                "state":"succeeded",
-                "result":result
-            });
-            job.summary.as_object_mut().unwrap().remove("error");
-        }
-        Err(error) => {
-            job.summary["state"] = json!("failed");
-            job.summary["phase"] = json!("paused");
-            job.summary["error"] = runtime::error_dto(&error);
-        }
-    }
-    job.summary["updatedAtMs"] = json!(runtime::now_ms().to_string());
-    store.put(&job)
-}
-
-fn finalize_maintenance_outcome(store: &JobStore, job: &mut DurableJob) -> Result<()> {
-    let outcome = job
-        .summary
-        .get("maintenanceOutcome")
-        .cloned()
-        .ok_or_else(corrupt)?;
-    match outcome["state"].as_str() {
-        Some("succeeded") => {
-            let result = outcome.get("result").cloned().ok_or_else(corrupt)?;
-            if result["snapshotId"].as_str() != job.request.snapshot_id.as_deref()
-                || result["receivedRevision"]
-                    .as_str()
-                    .and_then(|value| value.parse::<i64>().ok())
-                    .is_none()
-            {
-                return Err(corrupt());
-            }
-            job.summary["state"] = json!("succeeded");
-            job.summary["phase"] = json!("complete");
-            job.summary["result"] = result;
-            job.summary.as_object_mut().unwrap().remove("error");
-        }
-        Some("failed") => {
-            let error = outcome.get("error").cloned().ok_or_else(corrupt)?;
-            job.summary["state"] = json!("failed");
-            job.summary["phase"] = json!("paused");
-            job.summary["error"] = error;
-        }
-        _ => return Err(corrupt()),
-    }
-    job.summary
-        .as_object_mut()
-        .unwrap()
-        .remove("maintenanceOutcome");
-    job.summary["updatedAtMs"] = json!(runtime::now_ms().to_string());
-    store.put(job)
-}
-
-/// Durably records the native outcome before the device journal releases its
-/// writer fences. A later state read can finish this cross-database settlement.
-pub(crate) fn prepare_device_restore_settlement(
-    app: AppHandle,
-    session: &DeviceSession,
-) -> crate::device_backup::Result<()> {
-    if session.operation != Operation::Restore {
-        return Ok(());
-    }
-    let state = app.state::<DeviceBackupState>();
-    let root = state.repository_root();
-    let Some(store) = existing_external_jobs(root)? else {
-        return Ok(());
-    };
-    let mut job = match store.read(&session.job_id) {
-        Ok(job) => job,
-        Err(error) if error.kind == ErrorKind::NotFound => return Ok(()),
-        Err(_) => return Err(device_command_error()),
-    };
-    if job.request.kind != JobKind::Restore {
-        return Err(device_command_error());
-    }
-    if job.terminal() {
-        return Ok(());
-    }
-    if job.summary["result"]["maintenanceSessionId"].as_str() != Some(session.session_id.as_str()) {
-        return Err(device_command_error());
-    }
-    let outcome = match session.phase.as_str() {
-        "committed" => {
-            let revision = PersistentStore::external_revision_at_root(root)
-                .map_err(|_| device_command_error())?;
-            json!({
-                "state":"succeeded",
-                "result":{
-                    "snapshotId":job.request.snapshot_id.as_deref().ok_or_else(device_command_error)?,
-                    "receivedRevision":revision.to_string()
-                }
-            })
-        }
-        "rolling-back" | "rolled-back" => json!({
-            "state":"failed",
-            "error":runtime::error_dto(&ProviderError::new(ErrorKind::Transient))
-        }),
-        _ => return Err(device_command_error()),
-    };
-    if job
-        .summary
-        .get("maintenanceOutcome")
-        .is_some_and(|existing| existing != &outcome)
-    {
-        return Err(device_command_error());
-    }
-    job.summary["state"] = json!("waiting");
-    job.summary["phase"] = json!("device-restore-settling");
-    job.summary["maintenanceOutcome"] = outcome;
-    job.summary["updatedAtMs"] = json!(runtime::now_ms().to_string());
-    store.put(&job).map_err(|_| device_command_error())
-}
-
-/// Called after the device journal releases its fences. It closes outcomes that
-/// survived a process interruption after commit or while rolling back.
-pub(crate) fn settle_device_restore(
-    app: AppHandle,
-    session: &DeviceSession,
-) -> crate::device_backup::Result<()> {
-    if session.operation != Operation::Restore {
-        return Ok(());
-    }
-    let device_state = app.state::<DeviceBackupState>();
-    let root = device_state.repository_root().to_path_buf();
-    let Some(store) = existing_external_jobs(device_state.repository_root())? else {
-        return Ok(());
-    };
-    let job = match store.read(&session.job_id) {
-        Ok(job) => job,
-        Err(error) if error.kind == ErrorKind::NotFound => return Ok(()),
-        Err(_) => return Err(device_command_error()),
-    };
-    if job.request.kind != JobKind::Restore {
-        return Err(device_command_error());
-    }
-    let job = if job.terminal() {
-        job
-    } else {
-        let mut settled = job;
-        finalize_maintenance_outcome(&store, &mut settled).map_err(|_| device_command_error())?;
-        settled
-    };
-    if session.phase != "committed" {
-        if let Some(stage) = session.new_generation.as_deref() {
-            let cleanup = app
-                .state::<RuntimeRestoreState>()
-                .with_store(&job.id, |store| {
-                    store.replace_abort(stage).map_err(pds_error)
-                })
-                .or_else(|_| {
-                    runtime::native_store(&app)
-                        .and_then(|mut store| store.replace_abort(stage).map_err(pds_error))
-                });
-            if let Err(error) = cleanup {
-                crate::nlog!(
-                    "error",
-                    "Rolled-back external restore staging cleanup failed: {error}"
-                );
-            }
-        }
-    }
-    app.state::<RuntimeRestoreState>().release(&job.id);
-    let staging =
-        runtime::job_directory(&root, &job.request.connection_id, &job.id).join("restore-snapshot");
-    cleanup_staging(&staging);
-    Ok(())
-}
-
-/// Completes a settlement left after a process loss between journal release and
-/// external job update. Active maintenance keeps the candidate pending.
-pub(crate) fn reconcile_device_restore_settlements(app: &AppHandle) -> Result<()> {
-    let device = app.state::<DeviceBackupState>();
-    if device.is_blocking().map_err(device_error)? {
-        return Ok(());
-    }
-    let root = runtime::root(app)?;
-    let jobs = JobStore::open(&root)?;
-    let store = runtime::native_store(app)?;
-    for mut job in jobs.list_pending()? {
-        if !job.terminal()
-            && job.request.kind == JobKind::Restore
-            && job.summary["result"]["maintenanceSessionId"].is_null()
-        {
-            if let Some(result) = completed_restore_in_store(&store, &job)? {
-                job.summary["state"] = json!("succeeded");
-                job.summary["phase"] = json!("complete");
-                job.summary["result"] = result;
-                job.summary.as_object_mut().unwrap().remove("error");
-                job.summary["updatedAtMs"] = json!(runtime::now_ms().to_string());
-                jobs.put(&job)?;
-            }
-        }
-    }
-    let Some(store) = existing_external_jobs(device.repository_root()).map_err(device_error)?
-    else {
-        return Ok(());
-    };
-    for mut job in store.list_pending()? {
-        if !job.terminal()
-            && job.request.kind == JobKind::Restore
-            && job.summary["phase"] == "device-restore-settling"
-        {
-            finalize_maintenance_outcome(&store, &mut job)?;
-            let staging = runtime::job_directory(
-                device.repository_root(),
-                &job.request.connection_id,
-                &job.id,
-            )
-            .join("restore-snapshot");
-            cleanup_staging(&staging);
-            app.state::<RuntimeRestoreState>().release(&job.id);
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -973,28 +481,6 @@ mod tests {
             selection_epoch: "selection".into(),
             revision: 0,
         }
-    }
-
-    #[test]
-    fn settlement_cannot_release_a_restore_worker_that_has_not_returned() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = PersistentStore::open(directory.path()).unwrap();
-        let request = serde_json::from_value(json!({
-            "connectionId":"connection", "kind":"restore", "snapshotId":"snapshot",
-            "targetRevision":"0", "restoreAreas":["library"]
-        })).unwrap();
-        let job = DurableJob::new(request, false, 1, identity());
-        let commands = JobCommandState::default();
-        let (cancel, worker) = commands.claim(&job).unwrap();
-        let retained = RuntimeRestoreState::default();
-        retained.retain(&job.id, store).unwrap();
-        retained.retain_claim(&job.id, worker.clone()).unwrap();
-        retained.release(&job.id);
-        cancel.cancel();
-        assert!(commands.claim(&job).is_err());
-        drop(worker);
-        assert!(commands.active.lock().unwrap().is_empty());
-        assert!(commands.claim(&job).is_ok());
     }
 
     #[test]
@@ -1079,61 +565,6 @@ mod tests {
             "this-device"
         )
         .is_ok());
-    }
-
-    #[test]
-    fn dedicated_restore_store_survives_the_renderer_maintenance_gate() {
-        let root = tempfile::tempdir().unwrap();
-        let store = PersistentStore::open(root.path()).unwrap();
-        let renderer = PersistentStoreState::default();
-        let retained = RuntimeRestoreState::default();
-
-        retained.retain("restore-job", store).unwrap();
-        let maintenance = renderer.acquire_device_maintenance().unwrap();
-        assert_eq!(
-            retained
-                .with_store("restore-job", |store| {
-                    store.revision().map_err(pds_error)
-                })
-                .unwrap(),
-            0
-        );
-        assert!(retained.with_store("other-job", |_| Ok(())).is_err());
-        drop(maintenance);
-        retained.release("restore-job");
-        assert!(retained.with_store("restore-job", |_| Ok(())).is_err());
-    }
-
-    #[test]
-    fn durable_maintenance_outcome_finalizes_after_journal_release() {
-        let root = tempfile::tempdir().unwrap();
-        let store = JobStore::open(root.path()).unwrap();
-        let request = serde_json::from_value(json!({
-            "connectionId":"synthetic-connection",
-            "kind":"restore",
-            "snapshotId":"synthetic-snapshot",
-            "targetRevision":"0"
-        }))
-        .unwrap();
-        let mut job = DurableJob::new(request, false, 1, identity());
-        job.summary["state"] = json!("waiting");
-        job.summary["phase"] = json!("device-restore-settling");
-        job.summary["result"] = json!({"maintenanceSessionId":"synthetic-session"});
-        job.summary["maintenanceOutcome"] = json!({
-            "state":"succeeded",
-            "result":{
-                "snapshotId":"synthetic-snapshot",
-                "receivedRevision":"1"
-            }
-        });
-        store.put(&job).unwrap();
-
-        finalize_maintenance_outcome(&store, &mut job).unwrap();
-        let reopened = store.read(&job.id).unwrap();
-        assert_eq!(reopened.summary["state"], "succeeded");
-        assert_eq!(reopened.summary["phase"], "complete");
-        assert_eq!(reopened.summary["result"]["receivedRevision"], "1");
-        assert!(reopened.summary.get("maintenanceOutcome").is_none());
     }
 
     #[test]

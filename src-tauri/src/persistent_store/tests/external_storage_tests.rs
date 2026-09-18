@@ -211,6 +211,134 @@ fn capture(store: &mut PersistentStore, job: &str) -> selection::CaptureIdentity
 }
 
 #[test]
+fn ordinary_receive_reuses_only_the_same_terminal_job() {
+    let (_dir, mut store, _) = open_fixture();
+    select_external(&mut store);
+    let identity = capture(&mut store, "reused-receive");
+    store
+        .connection
+        .execute(
+            "UPDATE external_storage_jobs SET phase='stale' WHERE id='reused-receive'",
+            [],
+        )
+        .unwrap();
+    let receive = external::ReceiveIntent {
+        job_id: "reused-receive",
+        connection_id: "synthetic-connection",
+        repository_id: "remote-repository",
+        snapshot_id: "remote-snapshot",
+        commit_id: "remote-commit",
+        authenticated_head: "remote-head",
+        identity: &identity,
+    };
+    let tx = store.connection.transaction().unwrap();
+    external::prepare_receive(&tx, &receive).unwrap();
+    tx.commit().unwrap();
+    let job = store.external_job("reused-receive").unwrap().unwrap();
+    assert_eq!((job.role.as_str(), job.phase.as_str()), ("restore", "ready"));
+    assert_eq!(job.capture_id, "remote-snapshot");
+    assert_eq!(count(&store, "external_storage_capture_refs"), 0);
+
+    store
+        .connection
+        .execute(
+            "UPDATE external_storage_jobs SET connection_id='other',phase='stale' WHERE id='reused-receive'",
+            [],
+        )
+        .unwrap();
+    let tx = store.connection.transaction().unwrap();
+    assert!(external::prepare_receive(&tx, &receive).is_err());
+    tx.rollback().unwrap();
+    store
+        .connection
+        .execute(
+            "UPDATE external_storage_jobs SET connection_id='synthetic-connection',phase='ready' WHERE id='reused-receive'",
+            [],
+        )
+        .unwrap();
+    let tx = store.connection.transaction().unwrap();
+    assert!(external::prepare_receive(&tx, &receive).is_err());
+}
+
+#[test]
+fn ordinary_publication_reuses_only_the_same_terminal_job_and_capture_ref() {
+    let (_dir, mut store, _) = open_fixture();
+    select_external(&mut store);
+    let identity = capture(&mut store, "reused-publication");
+    let tx = store.connection.transaction().unwrap();
+    let replacement_capture = external::register_capture(
+        &tx,
+        "replacement-capture",
+        &identity,
+        "library",
+        "codec-2",
+        "",
+        &"b".repeat(64),
+        "replacement-consumer",
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    store
+        .connection
+        .execute(
+            "UPDATE external_storage_jobs SET phase='cancelled' WHERE id='reused-publication'",
+            [],
+        )
+        .unwrap();
+    let intent = external::PublishIntent {
+        job_id: "reused-publication",
+        connection_id: "synthetic-connection",
+        repository_id: "updated-repository",
+        capture_id: &replacement_capture,
+        identity: &identity,
+        strategy: "cas",
+        expected_head: Some("updated-head"),
+        commit_id: "updated-commit",
+    };
+    let permit = publication_permit(
+        "reused-publication",
+        &identity,
+        crate::external_storage::publication::PublicationMode::Foreground,
+    );
+    let tx = store.connection.transaction().unwrap();
+    external::prepare_publication(&tx, &intent, &permit).unwrap();
+    tx.commit().unwrap();
+    let job = store.external_job("reused-publication").unwrap().unwrap();
+    assert_eq!((job.role.as_str(), job.phase.as_str()), ("sync", "ready"));
+    assert_eq!(job.repository_id, "updated-repository");
+    assert_eq!(count(&store, "external_storage_capture_refs"), 1);
+    let capture_ref: String = store
+        .connection
+        .query_row(
+            "SELECT capture_id FROM external_storage_capture_refs WHERE job_id='reused-publication'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(capture_ref, replacement_capture);
+
+    store
+        .connection
+        .execute(
+            "UPDATE external_storage_jobs SET connection_id='other',phase='stale' WHERE id='reused-publication'",
+            [],
+        )
+        .unwrap();
+    let tx = store.connection.transaction().unwrap();
+    assert!(external::prepare_publication(&tx, &intent, &permit).is_err());
+    tx.rollback().unwrap();
+    store
+        .connection
+        .execute(
+            "UPDATE external_storage_jobs SET connection_id='synthetic-connection',phase='ready' WHERE id='reused-publication'",
+            [],
+        )
+        .unwrap();
+    let tx = store.connection.transaction().unwrap();
+    assert!(external::prepare_publication(&tx, &intent, &permit).is_err());
+}
+
+#[test]
 fn paused_target_allows_only_live_exit_drain_publication_paths() {
     let (_dir, mut store, _) = open_fixture();
     select_external(&mut store);
@@ -331,256 +459,6 @@ fn equivalent_remote_advances_only_the_retained_capture_revision() {
     assert_eq!(base.commit_id, "remote-commit");
     assert_eq!(selection::identity(&store.connection).unwrap(), current);
     assert_ne!(base.identity.revision, current.revision);
-}
-
-#[test]
-fn preserved_conflict_pins_capture_and_round_trips_remote_revision() {
-    let (_dir, mut store, _) = open_fixture();
-    select_external(&mut store);
-    let identity = capture(&mut store, "conflict-job");
-    let record = super::super::external_conflicts::ConflictRecord {
-        id: "conflict-job".into(),
-        connection_id: "synthetic-connection".into(),
-        repository_id: "synthetic-repository".into(),
-        local_capture_id: "synthetic-capture".into(),
-        local_snapshot: Some("{\"side\":\"local\"}".into()),
-        local_identity: identity.clone(),
-        remote_snapshot: Some("{\"side\":\"remote\"}".into()),
-        remote_logical_revision: Some(17),
-        remote_commit_id: Some("remote-commit".into()),
-        remote_head_observation: Some("remote-observation".into()),
-        created_at_ms: 1,
-        preservation: super::super::external_conflicts::ConflictPreservation::RemoteComplete,
-        phase: super::super::external_conflicts::ConflictPhase::Pending,
-    };
-    store.external_record_conflict(&record).unwrap();
-    let loaded = store.external_conflict("conflict-job").unwrap().unwrap();
-    assert_eq!(loaded.remote_logical_revision, Some(17));
-    assert_eq!(loaded.local_identity, identity);
-    assert_eq!(count(&store, "external_storage_capture_refs"), 1);
-    assert!(store.external_cancel_prepared("conflict-job").is_err());
-    assert_eq!(
-        store.external_jobs("synthetic-connection").unwrap()[0].phase,
-        "stale"
-    );
-    let resolving = store
-        .external_begin_conflict_resolution("conflict-job", "remote-observation")
-        .unwrap();
-    assert_eq!(
-        resolving.phase,
-        super::super::external_conflicts::ConflictPhase::Resolving
-    );
-    store
-        .external_prepare_conflict_publication(&external::PublishIntent {
-            job_id: "conflict-job",
-            connection_id: "synthetic-connection",
-            repository_id: "synthetic-repository",
-            capture_id: "synthetic-capture",
-            identity: &identity,
-            strategy: "sequential",
-            expected_head: Some("remote-observation"),
-            commit_id: "resolved-local-commit",
-        })
-        .unwrap();
-    store
-        .connection
-        .execute(
-            "UPDATE external_storage_jobs SET phase='complete' WHERE id='conflict-job'",
-            [],
-        )
-        .unwrap();
-    store.external_finish_conflict("conflict-job").unwrap();
-    assert_eq!(
-        store.external_conflict("conflict-job").unwrap().unwrap().phase,
-        super::super::external_conflicts::ConflictPhase::Resolved
-    );
-    assert_eq!(count(&store, "external_storage_capture_refs"), 0);
-}
-
-#[test]
-fn local_only_conflict_keeps_its_capture_until_remote_preservation_completes() {
-    let (_dir, mut store, _) = open_fixture();
-    select_external(&mut store);
-    let identity = capture(&mut store, "conflict-local-only");
-    let local = super::super::external_conflicts::ConflictRecord {
-        id: "conflict-local-only".into(),
-        connection_id: "synthetic-connection".into(),
-        repository_id: "synthetic-repository".into(),
-        local_capture_id: "synthetic-capture".into(),
-        local_snapshot: None,
-        local_identity: identity.clone(),
-        remote_snapshot: Some("{\"side\":\"remote\"}".into()),
-        remote_logical_revision: None,
-        remote_commit_id: Some("remote-commit".into()),
-        remote_head_observation: Some("remote-observation".into()),
-        created_at_ms: 1,
-        preservation: super::super::external_conflicts::ConflictPreservation::LocalOnly,
-        phase: super::super::external_conflicts::ConflictPhase::Pending,
-    };
-    store.external_record_local_conflict(&local).unwrap();
-    assert!(store
-        .external_conflict("conflict-local-only")
-        .unwrap()
-        .unwrap()
-        .local_snapshot
-        .is_none());
-    assert_eq!(
-        store.external_jobs("synthetic-connection").unwrap()[0].phase,
-        "conflictPreserving"
-    );
-    assert_eq!(count(&store, "external_storage_capture_refs"), 1);
-    assert!(store.external_cancel_prepared("conflict-local-only").is_err());
-    let local = store
-        .external_bind_local_conflict_snapshot(
-            "conflict-local-only",
-            "{\"side\":\"local\"}",
-        )
-        .unwrap();
-    assert_eq!(
-        local.local_snapshot.as_deref(),
-        Some("{\"side\":\"local\"}")
-    );
-    assert!(store
-        .external_complete_conflict_preservation(
-            "conflict-local-only",
-            "{\"side\":\"other-remote\"}",
-            17,
-            "remote-commit",
-            "remote-observation",
-        )
-        .is_err());
-    assert_eq!(
-        store
-            .external_conflict("conflict-local-only")
-            .unwrap()
-            .unwrap()
-            .preservation,
-        super::super::external_conflicts::ConflictPreservation::LocalOnly
-    );
-    assert_eq!(count(&store, "external_storage_capture_refs"), 1);
-
-    let completed = store
-        .external_complete_conflict_preservation(
-            "conflict-local-only",
-            "{\"side\":\"remote\"}",
-            17,
-            "remote-commit",
-            "remote-observation",
-        )
-        .unwrap();
-    assert_eq!(
-        completed.preservation,
-        super::super::external_conflicts::ConflictPreservation::RemoteComplete
-    );
-    assert_eq!(completed.remote_logical_revision, Some(17));
-    assert_eq!(
-        store.external_jobs("synthetic-connection").unwrap()[0].phase,
-        "stale"
-    );
-    assert_eq!(count(&store, "external_storage_capture_refs"), 1);
-    store
-        .external_begin_conflict_resolution("conflict-local-only", "remote-observation")
-        .unwrap();
-    store
-        .external_reject_conflict_resolution("conflict-local-only")
-        .unwrap();
-    assert_eq!(
-        store
-            .external_conflict("conflict-local-only")
-            .unwrap()
-            .unwrap()
-            .phase,
-        super::super::external_conflicts::ConflictPhase::Pending
-    );
-    assert_eq!(
-        store.external_jobs("synthetic-connection").unwrap()[0].phase,
-        "cancelled"
-    );
-    assert_eq!(count(&store, "external_storage_capture_refs"), 1);
-    store
-        .external_begin_conflict_resolution("conflict-local-only", "remote-observation")
-        .unwrap();
-    store
-        .external_prepare_conflict_receive(&external::ReceiveIntent {
-            job_id: "conflict-local-only",
-            connection_id: "synthetic-connection",
-            repository_id: "synthetic-repository",
-            snapshot_id: "remote-snapshot",
-            commit_id: "remote-commit",
-            authenticated_head: "remote-observation",
-            identity: &identity,
-        })
-        .unwrap();
-    let resumed = store.external_jobs("synthetic-connection").unwrap();
-    assert_eq!(resumed[0].phase, "ready");
-    assert_eq!(resumed[0].role, "restore");
-    assert_eq!(count(&store, "external_storage_capture_refs"), 1);
-    store
-        .connection
-        .execute(
-            "UPDATE external_storage_jobs SET phase='complete' WHERE id='conflict-local-only'",
-            [],
-        )
-        .unwrap();
-    store
-        .external_finish_conflict("conflict-local-only")
-        .unwrap();
-    assert_eq!(
-        store
-            .external_conflict("conflict-local-only")
-            .unwrap()
-            .unwrap()
-            .phase,
-        super::super::external_conflicts::ConflictPhase::Resolved
-    );
-    assert_eq!(count(&store, "external_storage_capture_refs"), 0);
-}
-
-#[test]
-fn definite_head_rejection_is_preserved_when_pause_arrives_after_the_response() {
-    let (_dir, mut store, _) = open_fixture();
-    select_external(&mut store);
-    let identity = capture(&mut store, "paused-conflict");
-    let permit = publication_permit(
-        "paused-conflict",
-        &identity,
-        crate::external_storage::publication::PublicationMode::Foreground,
-    );
-    store.external_begin_publication(&permit).unwrap();
-    store
-        .connection
-        .execute(
-            "UPDATE library_sync_selection SET paused=1 WHERE singleton=1",
-            [],
-        )
-        .unwrap();
-    store
-        .external_record_local_conflict_after_rejection(
-            &super::super::external_conflicts::ConflictRecord {
-                id: "paused-conflict".into(),
-                connection_id: "synthetic-connection".into(),
-                repository_id: "synthetic-repository".into(),
-                local_capture_id: "synthetic-capture".into(),
-                local_snapshot: Some("{\"side\":\"local\"}".into()),
-                local_identity: identity,
-                remote_snapshot: None,
-                remote_logical_revision: None,
-                remote_commit_id: None,
-                remote_head_observation: None,
-                created_at_ms: 1,
-                preservation:
-                    super::super::external_conflicts::ConflictPreservation::LocalOnly,
-                phase: super::super::external_conflicts::ConflictPhase::Pending,
-            },
-        )
-        .unwrap();
-    assert!(selection::read(&store.connection).unwrap().paused);
-    assert_eq!(
-        store.external_jobs("synthetic-connection").unwrap()[0].phase,
-        "conflictPreserving"
-    );
-    assert_eq!(count(&store, "external_storage_capture_refs"), 1);
-    assert!(store.external_cancel_prepared("paused-conflict").is_err());
 }
 
 #[test]

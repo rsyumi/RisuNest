@@ -344,24 +344,6 @@ impl PersistentStore {
         tx.commit()?;
         Ok(())
     }
-    pub(crate) fn external_prepare_conflict_receive(
-        &mut self,
-        intent: &jobs::ReceiveIntent<'_>,
-    ) -> StoreResult<()> {
-        let tx = self.connection.transaction()?;
-        jobs::prepare_conflict_receive(&tx, intent)?;
-        tx.commit()?;
-        Ok(())
-    }
-    pub(crate) fn external_prepare_conflict_publication(
-        &mut self,
-        intent: &jobs::PublishIntent<'_>,
-    ) -> StoreResult<()> {
-        let tx = self.connection.transaction()?;
-        jobs::prepare_conflict_publication(&tx, intent)?;
-        tx.commit()?;
-        Ok(())
-    }
     pub(crate) fn external_begin_publication(
         &mut self,
         permit: &PublicationPermit,

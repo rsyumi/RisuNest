@@ -9,7 +9,7 @@ use super::{
 };
 use crate::persistent_store::{
     self,
-    external_conflicts::{ConflictPhase, ConflictPreservation},
+    external_conflicts,
     sync_selection::{Selection, SyncTarget},
     PersistentStore,
 };
@@ -39,6 +39,18 @@ pub(crate) fn root(app: &AppHandle) -> Result<PathBuf> {
 pub(crate) fn native_store(app: &AppHandle) -> Result<PersistentStore> {
     persistent_store::commands::with_store_mut(app.state(), |store| store.open_native_job_store())
         .map_err(local_error)
+}
+pub(crate) fn record_connection_completion(
+    app: &AppHandle,
+    connection_id: &str,
+    kind: super::connection_store::CompletionKind,
+) {
+    let result = root(app).and_then(|root| {
+        ConnectionStore::open(&root)?.record_completion(connection_id, kind, now_ms())
+    });
+    if result.is_err() {
+        crate::nlog!("warn", "External connection completion timestamp could not be recorded");
+    }
 }
 pub(crate) fn selection_dto(selection: Selection) -> Value {
     let (kind, id) = match selection.target {
@@ -142,7 +154,6 @@ pub(crate) fn external_storage_capture_exit_target(app: AppHandle) -> Result<Val
 }
 #[tauri::command]
 pub(crate) fn external_storage_get_state(app: AppHandle) -> Result<Value> {
-    super::runtime_restore::reconcile_device_restore_settlements(&app)?;
     let root = root(&app)?;
     let connections = ConnectionStore::open(&root)?
         .list()?
@@ -211,7 +222,6 @@ pub(crate) async fn external_storage_set_sync_target(
 }
 #[tauri::command]
 pub(crate) fn external_storage_get_job(app: AppHandle, job_id: String) -> Result<Value> {
-    super::runtime_restore::reconcile_device_restore_settlements(&app)?;
     let directory = root(&app)?;
     let job = reconcile_job(&app, JobStore::open(&directory)?.read(&job_id)?)?;
     continue_observed_automatic(&app, &job);
@@ -251,20 +261,16 @@ pub(crate) async fn external_storage_cancel_job(app: AppHandle, job_id: String) 
     if job.summary["state"] != "succeeded" {
         let mut pds = native_store(&app)?;
         let authoritative = pds.external_job(&job_id).map_err(local_error)?;
-        let conflict = pds.external_conflict(&job_id).map_err(local_error)?;
+        let conflict = super::sync_engine::conflict_record(&app, &job_id)?;
         let local_conflict = conflict
             .as_ref()
-            .is_some_and(|record| record.preservation == ConflictPreservation::LocalOnly);
+            .is_some_and(|record| !record.resolved && record.remote_point.is_none());
         if authoritative.as_ref().is_some_and(|item| {
             ["publishing", "publicationUnknown", "applying"].contains(&item.phase.as_str())
         }) {
             return Err(ProviderError::new(ErrorKind::PreconditionFailed));
         }
-        if local_conflict
-            || authoritative
-                .as_ref()
-                .is_some_and(|item| item.phase == "conflictPreserving")
-        {
+        if local_conflict {
             job.summary["state"] = json!("waiting");
             job.summary["phase"] = json!("conflict-preservation-paused");
             job.summary["error"] = error_dto(&ProviderError::new(ErrorKind::Cancelled));
@@ -273,8 +279,7 @@ pub(crate) async fn external_storage_cancel_job(app: AppHandle, job_id: String) 
             return Ok(job.summary);
         }
         if conflict.as_ref().is_some_and(|record| {
-            record.phase == ConflictPhase::Pending
-                && record.preservation == ConflictPreservation::RemoteComplete
+            !record.resolved && record.remote_point.is_some()
         }) {
             job.summary["state"] = json!("conflict");
             job.summary["phase"] = json!("conflict-choice");
@@ -287,18 +292,10 @@ pub(crate) async fn external_storage_cancel_job(app: AppHandle, job_id: String) 
             .as_ref()
             .is_some_and(|item| ["preparing", "ready", "stale"].contains(&item.phase.as_str()))
         {
-            if job.request.kind == JobKind::ResolveConflict {
-                pds.external_reject_conflict_resolution(&job_id)
-                    .map_err(local_error)?;
-            } else {
-                pds.external_cancel_prepared(&job_id).map_err(local_error)?;
-            }
+            pds.external_cancel_prepared(&job_id).map_err(local_error)?;
         }
         let preserved_choice = job.request.kind == JobKind::ResolveConflict
-            && pds
-                .external_conflict(&job_id)
-                .map_err(local_error)?
-                .is_some_and(|record| record.phase == ConflictPhase::Pending);
+            && conflict.as_ref().is_some_and(|record| !record.resolved);
         job.summary["state"] = json!(if preserved_choice {
             "conflict"
         } else {
@@ -483,19 +480,6 @@ fn completed_job_result(pds: &mut PersistentStore, job: &DurableJob) -> Result<O
     else {
         return Ok(None);
     };
-    if job.request.kind == JobKind::ResolveConflict {
-        let bookkeeping = (|| -> Result<()> {
-            if pds.external_conflict(&job.id).map_err(local_error)?.is_some_and(|record| {
-                matches!(record.phase, ConflictPhase::Resolving | ConflictPhase::PublicationUnknown)
-            }) {
-                pds.external_finish_conflict(&job.id).map_err(local_error)?;
-            }
-            Ok(())
-        })();
-        if bookkeeping.is_err() {
-            crate::nlog!("error", "External job completed but conflict bookkeeping did not finish");
-        }
-    }
     if matches!(job.request.kind, JobKind::Sync | JobKind::ResolveConflict)
         && completed.role == "restore"
     {
@@ -567,6 +551,19 @@ fn reconcile_stopped_job(app: &AppHandle, mut job: DurableJob) -> Result<Durable
         completed_job_result(&mut pds, &job)?
     };
     if let Some(result) = complete {
+        if job.request.kind == JobKind::ResolveConflict {
+            let settled = match super::sync_engine::conflict_record(app, &job.id) {
+                Ok(Some(record)) if record.resolved => Ok(()),
+                Ok(Some(record)) if record.remote_point.is_some() => {
+                    super::sync_engine::mark_conflict_resolved(app, &job.id)
+                }
+                Ok(_) => Err(ProviderError::new(ErrorKind::Corrupt)),
+                Err(error) => Err(error),
+            };
+            if settled.is_err() {
+                crate::nlog!("error", "External job completed but conflict bookkeeping did not finish");
+            }
+        }
         settle_interrupted(&mut job, Some(result), false);
         let _ = JobStore::open(&root(app)?).and_then(|store| store.put(&job));
         return Ok(job);
@@ -578,9 +575,8 @@ fn reconcile_stopped_job(app: &AppHandle, mut job: DurableJob) -> Result<Durable
     }
     {
         if let Some(intent) = authoritative.as_ref().filter(|item| matches!(item.phase.as_str(), "stale" | "cancelled")) {
-            let preserving = pds.external_conflict(&job.id).map_err(local_error)?
-                .is_some_and(|record| record.phase == ConflictPhase::Pending
-                    && record.preservation == ConflictPreservation::RemoteComplete);
+            let preserving = super::sync_engine::conflict_record(app, &job.id)?
+                .is_some_and(|record| !record.resolved && record.remote_point.is_some());
             settle_invalidated(&mut job, &intent.phase, preserving);
             if super::sync_engine::discard_receive_preparation(app, &job.id).is_ok() {
                 job.receive_staging_id = None;
@@ -595,9 +591,7 @@ fn reconcile_stopped_job(app: &AppHandle, mut job: DurableJob) -> Result<Durable
             let _ = JobStore::open(&root(app)?).and_then(|store| store.put(&job));
             return Ok(job);
         }
-        if job.terminal() || job.summary["phase"] == "device-restore-maintenance"
-            || job.summary["state"] != "running"
-        {
+        if job.terminal() || job.summary["state"] != "running" {
             return Ok(job);
         }
     }
@@ -707,6 +701,68 @@ impl RepositoryProtection<'_> {
         self.owner.check_control(self.context, false)
     }
 }
+
+pub(crate) async fn recheck_preserved_conflict(
+    app: &AppHandle,
+    id: &str,
+    cancel: &Cancellation,
+) -> Result<Value> {
+    let root = root(app)?;
+    let job = JobStore::open(&root)?.read(id)?;
+    let record = super::sync_engine::conflict_record(app, id)?
+        .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
+    if job.id != id
+        || record.id != id
+        || !matches!(job.request.kind, JobKind::Sync | JobKind::ResolveConflict)
+        || record.connection_id != job.request.connection_id
+        || job.capture_id.as_deref() != Some(record.local.capture_id.as_str())
+        || record.local.identity != job.admission_identity
+    {
+        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+    }
+    let connected =
+        super::connection_commands::open_connected(app, &job.request.connection_id).await?;
+    if connected.stored.id != record.connection_id
+        || connected.stored.descriptor.repository_id != record.repository_id
+    {
+        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+    }
+    let writer_id = native_store(app)?
+        .external_identity()
+        .map_err(local_error)?
+        .store_id;
+    let context = lease_context(&root, &connected, &writer_id);
+    match leases::admit(&context, id, LeaseKind::Work, cancel).await? {
+        leases::Admission::Admitted(owner) => {
+            let protection = RepositoryProtection {
+                owner: &owner,
+                context: &context,
+            };
+            owner
+                .run(
+                    &context,
+                    cancel,
+                    super::sync_engine::ensure_conflict_point(
+                        app,
+                        &connected,
+                        &job,
+                        record,
+                        true,
+                        Some(&protection),
+                        cancel,
+                    ),
+                )
+                .await
+        }
+        leases::Admission::Yield { .. } => {
+            Err(ProviderError::new(ErrorKind::Transient))
+        }
+        leases::Admission::UnsupportedProtection => {
+            Err(ProviderError::new(ErrorKind::Unsupported))
+        }
+    }
+}
+
 pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
     let job = JobStore::open(&root(&app)?)?.read(&id)?;
     if job.terminal() {
@@ -736,7 +792,6 @@ pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
             let mut job = store.read(&id)?;
             match result {
                 Ok(result) => {
-                    let maintenance = result.get("maintenanceSessionId").is_some();
                     let receive = result.get("receiveReady").and_then(Value::as_bool) == Some(true);
                     // A removal that left a request whose end is unknown keeps
                     // its marker, so the job stays open until that is resolved.
@@ -745,7 +800,7 @@ pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
                     let publication_unknown = unresolved
                         && result.get("reason").and_then(Value::as_str)
                             == Some("publication-unknown");
-                    job.summary["state"] = json!(if maintenance || receive {
+                    job.summary["state"] = json!(if receive {
                         "waiting"
                     } else if result.get("conflictId").is_some() {
                         "conflict"
@@ -754,9 +809,7 @@ pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
                     } else {
                         "succeeded"
                     });
-                    job.summary["phase"] = json!(if maintenance {
-                        "device-restore-maintenance"
-                    } else if receive {
+                    job.summary["phase"] = json!(if receive {
                         "remote-apply"
                     } else if publication_unknown {
                         "publication-unknown"
@@ -776,15 +829,10 @@ pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
                 Err(error) => {
                     let mut pds = native_store(&app)?;
                     let authoritative = pds.external_job(&job.id).map_err(local_error)?;
-                    let preserving = authoritative
+                    let conflict = super::sync_engine::conflict_record(&app, &job.id)?;
+                    let preserving = conflict
                         .as_ref()
-                        .is_some_and(|item| item.phase == "conflictPreserving")
-                        || pds
-                            .external_conflict(&job.id)
-                            .map_err(local_error)?
-                            .is_some_and(|record| {
-                                record.preservation == ConflictPreservation::LocalOnly
-                            });
+                        .is_some_and(|record| !record.resolved && record.remote_point.is_none());
                     let pending = authoritative.iter().any(|item| {
                         item.id == id
                             && ["publishing", "publicationUnknown", "applying"]
@@ -810,23 +858,13 @@ pub(crate) fn wake_job(app: AppHandle, id: String) -> Result<()> {
                             item.id == id
                                 && ["preparing", "ready", "stale"].contains(&item.phase.as_str())
                         }) {
-                            if job.request.kind == JobKind::ResolveConflict {
-                                pds.external_reject_conflict_resolution(&item.id)
-                                    .map_err(local_error)?;
-                            } else {
-                                pds.external_cancel_prepared(&item.id)
-                                    .map_err(local_error)?;
-                            }
+                            pds.external_cancel_prepared(&item.id).map_err(local_error)?;
                         }
                     }
                     let preserved_choice = job.request.kind == JobKind::ResolveConflict
-                        && pds
-                            .external_conflict(&job.id)
-                            .map_err(local_error)?
-                            .is_some_and(|record| {
-                                record.phase == ConflictPhase::Pending
-                                    && record.preservation == ConflictPreservation::RemoteComplete
-                            });
+                        && conflict.as_ref().is_some_and(|record| {
+                            !record.resolved && record.remote_point.is_some()
+                        });
                     job.summary["state"] = json!(if pending {
                         "uncertain"
                     } else if preserved_choice {
@@ -1123,35 +1161,46 @@ async fn run_cleanup(
             references: Vec::new(),
         })
         .collect::<Vec<_>>();
-    for conflict in native_store(app)?
-        .external_conflicts(&job.request.connection_id)
-        .map_err(local_error)?
     {
-        let mut references = Vec::new();
-        for encoded in [conflict.local_snapshot, conflict.remote_snapshot]
-            .into_iter()
-            .flatten()
-        {
-            let reference: super::packaging::RemoteObject =
-                serde_json::from_str(&encoded).map_err(local_error)?;
-            if reference.repository_id != connected.stored.descriptor.repository_id {
-                return Err(ProviderError::new(ErrorKind::Corrupt));
+        let pds = native_store(app)?;
+        let device = pds.device_store().map_err(local_error)?.connection();
+        let mut cursor = None;
+        loop {
+            let page = external_conflicts::external_conflicts_page(device, cursor.as_ref(), 50)
+                .map_err(local_error)?;
+            for conflict in page.conflicts {
+                if conflict.connection_id != job.request.connection_id {
+                    continue;
+                }
+                if conflict.repository_id != connected.stored.descriptor.repository_id {
+                    return Err(ProviderError::new(ErrorKind::Corrupt));
+                }
+                let mut references = vec![super::packaging::RemoteObject::from_stored(
+                    &conflict.remote.snapshot,
+                    &connected.handle,
+                )?];
+                if let Some(point) = conflict.remote_point.as_ref() {
+                    references.push(super::packaging::RemoteObject::from_stored(
+                        point,
+                        &connected.handle,
+                    )?);
+                }
+                if let Some(owner) = unfinished.iter_mut().find(|owner| owner.job_id == conflict.id)
+                {
+                    owner.references.extend(references);
+                } else {
+                    unfinished.push(super::cleanup::UnfinishedJob {
+                        directory: job_directory(&root, &job.request.connection_id, &conflict.id),
+                        snapshot_ids: std::collections::BTreeSet::new(),
+                        job_id: conflict.id,
+                        references,
+                    });
+                }
             }
-            reference.stored(&connected.handle)?;
-            references.push(reference);
-        }
-        if references.is_empty() {
-            continue;
-        }
-        if let Some(owner) = unfinished.iter_mut().find(|owner| owner.job_id == conflict.id) {
-            owner.references.extend(references);
-        } else {
-            unfinished.push(super::cleanup::UnfinishedJob {
-                directory: job_directory(&root, &job.request.connection_id, &conflict.id),
-                snapshot_ids: std::collections::BTreeSet::new(),
-                job_id: conflict.id,
-                references,
-            });
+            let Some(next) = page.next else {
+                break;
+            };
+            cursor = Some(next);
         }
     }
     // One reading of the clock: the retention decision and the grace window
@@ -1400,6 +1449,11 @@ async fn run_backup(
             &observation,
         )
         .map_err(local_error)?;
+    record_connection_completion(
+        app,
+        &job.request.connection_id,
+        super::connection_store::CompletionKind::Backup,
+    );
     ConnectionStore::open(&root)?.remember_discovery(
         &job.request.connection_id,
         &completed.snapshot_id,
@@ -1539,21 +1593,13 @@ mod tests {
     }
 
     #[test]
-    fn committed_receive_survives_failure_to_read_conflict_bookkeeping() {
-        let (directory, mut store, mut job) = receive_job_fixture();
+    fn committed_receive_result_is_idempotent() {
+        let (_directory, mut store, mut job) = receive_job_fixture();
         let stage = store.replace_begin().unwrap();
         store.replace_put_root(&stage.staging_id, &json!({"marker":"synthetic-remote"})).unwrap();
         let prepared = store.prepare_replace_commit(&stage.staging_id, Some(0)).unwrap();
         store.finish_external_receive(prepared, &job.id).unwrap();
         job.request.kind = JobKind::ResolveConflict;
-        let injector = rusqlite::Connection::open(
-            directory.path().join("persistent/persistent.sqlite"),
-        )
-        .unwrap();
-        injector.execute_batch(
-            "ALTER TABLE external_storage_conflicts RENAME TO synthetic_unavailable_conflicts"
-        ).unwrap();
-        assert!(store.external_conflict(&job.id).is_err());
         for _ in 0..2 {
             let result = completed_job_result(&mut store, &job).unwrap().unwrap();
             assert_eq!(result["receivedRevision"], "1");

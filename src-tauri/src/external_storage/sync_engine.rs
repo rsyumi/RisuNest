@@ -6,9 +6,7 @@
 use super::{
     connection_commands::ConnectedRepository,
     contract::{Cancellation, ErrorKind, ProviderError, Result, VersionToken},
-    control::{
-        self, BackupPointDocument, HeadDocument, ObservedHead, PublicationResult,
-    },
+    control::{self, HeadDocument, ObservedHead, PublicationResult},
     job_store::{DurableJob, JobKind, JobStore},
     journal::{JobIdentity, TransferJournal},
     packaging::{CompletedSnapshot, PackageLimits, SnapshotMetadata, SnapshotPurpose},
@@ -17,7 +15,9 @@ use super::{
 use crate::persistent_store::{
     device_store::Section as PdsSection,
     external_apply::{ExternalSnapshotApplication, ExternalSnapshotObject, ExternalSnapshotRecord},
-    external_conflicts::{ConflictPhase, ConflictPreservation, ConflictRecord},
+    external_conflicts::{
+        self, ExternalConflictRecord, PreservedHeadObservation, PreservedRemoteState,
+    },
     external_runtime::ExternalBase,
     sync_selection::CaptureIdentity,
     PersistentStore, PreparedReplaceCommit,
@@ -540,15 +540,6 @@ async fn capture_for_publication(
     .map_err(local_error)?
 }
 
-/// A publication produces a synchronized state. Conflict preservation produces
-/// an immutable bundle instead, because the material it keeps is this device's
-/// own and is never merged.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PackageAs {
-    State,
-    Bundle,
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn package_capture(
     app: &AppHandle,
@@ -557,7 +548,6 @@ async fn package_capture(
     capture: crate::persistent_store::external_capture::CapturedSnapshot,
     fingerprint: [u8; 32],
     expected: Option<&ObservedHead>,
-    produce: PackageAs,
     cancel: &Cancellation,
 ) -> Result<(
     CompletedSnapshot,
@@ -579,22 +569,18 @@ async fn package_capture(
     )?;
     // Step 4 of the publication contract needs the latest state, not just the
     // head: the new state inherits its sections and continues its commit order.
-    let parent = match (produce, expected) {
-        (PackageAs::State, Some(head)) => Some(
+    let parent = match expected {
+        Some(head) => Some(
             control::read_snapshot_document(connected, &head.document.state, cancel).await?,
         ),
-        _ => None,
+        None => None,
     };
-    // A section this device publishes takes the commit number the new state
-    // gets. A bundle preserves this device's own material instead of joining a
-    // commit order, so it carries none.
-    let generation = match (produce, &parent) {
-        (PackageAs::State, Some(view)) => Sequence::try_from(view.revision.clone())
+    let generation = match &parent {
+        Some(view) => Sequence::try_from(view.revision.clone())
             .map_err(corrupt)?
             .next()
             .map_err(corrupt)?,
-        (PackageAs::State, None) => Sequence::from(1u64),
-        (PackageAs::Bundle, _) => Sequence::from(0u64),
+        None => Sequence::from(1u64),
     };
     let (sections, publications) = {
         let worker_app = app.clone();
@@ -637,18 +623,10 @@ async fn package_capture(
         logical_revision: u64::try_from(identity.revision).map_err(corrupt)?,
         parent_snapshot_id: parent.as_ref().map(|view| view.snapshot_id.clone()),
         content_fingerprint: fingerprint,
-        purpose: match produce {
-            PackageAs::State => SnapshotPurpose::SyncState {
-                epoch: identity.generation.clone(),
-                generation,
-                parent_sections: parent.map(|view| view.sections).unwrap_or_default(),
-            },
-            PackageAs::Bundle => SnapshotPurpose::BackupBundle {
-                source: risunest_external_storage_format::control::BundleSource::Device {
-                    writer_id: identity.store_id.clone(),
-                },
-                remote_generation: None,
-            },
+        purpose: SnapshotPurpose::SyncState {
+            epoch: identity.generation.clone(),
+            generation,
+            parent_sections: parent.map(|view| view.sections).unwrap_or_default(),
         },
     };
     let cache = directory
@@ -696,6 +674,12 @@ async fn receive_remote(
     cancel: &Cancellation,
 ) -> Result<Value> {
     cancel.check()?;
+    remember_discovery(
+        app,
+        &job.request.connection_id,
+        remote.document.state.object_id.trim_start_matches("snapshot-"),
+        &remote.document.state,
+    );
     let _admission = app.state::<crate::native_file_jobs::NativeFileJobState>()
         .admission.file(false).map_err(local_error)?;
     let (observation, participation) = {
@@ -724,7 +708,7 @@ async fn receive_remote(
         };
         if job.request.kind == JobKind::ResolveConflict {
             if existing.as_ref().is_some_and(|item| matches!(item.phase.as_str(), "stale" | "cancelled")) {
-                store.external_prepare_conflict_receive(&intent).map_err(local_error)?;
+                store.external_prepare_receive(&intent).map_err(local_error)?;
             }
         } else if existing.is_none() {
             store.external_prepare_receive(&intent).map_err(local_error)?;
@@ -876,27 +860,13 @@ fn note_sections_published_in_store(
         if matching.next().is_some() {
             return Err(corrupt("confirmed state repeats a published section"));
         }
-        let cursor = crate::persistent_store::device_store::sections::SectionCursor {
-            applied_generation: reference.generation.clone(),
-            applied_gc_floor: reference.gc_floor.clone(),
-            observed_max_write_clock: reference.max_write_clock.clone(),
-        };
-        device
-            .note_section_published(
-                publication.section,
-                &publication.published,
-                &publication.stamped,
-                &publication.first_published,
-                &publication.reclaimed,
-                &publication.gc_floor,
-                Some((
-                    connection_id,
-                    library_lineage,
-                    &publication.participation_generation,
-                    &cursor,
-                )),
-            )
-            .map_err(local_error)?;
+        super::sections::note_prepared_section_published(
+            device,
+            publication,
+            connection_id,
+            library_lineage,
+            reference,
+        )?;
     }
     Ok(())
 }
@@ -1053,17 +1023,12 @@ fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Result<Val
             let mut preserving = false;
             if permanent {
                 let mut store = pds(app)?;
-                let cancelled = if job.request.kind == JobKind::ResolveConflict {
-                    store.external_reject_conflict_resolution(&job.id)
-                } else {
-                    store.external_cancel_prepared(&job.id)
-                };
+                let cancelled = store.external_cancel_prepared(&job.id);
                 if cancelled.is_err() {
                     crate::nlog!("error", "Rejected external receive intent could not be settled");
                 }
-                preserving = store.external_conflict(&job.id).map_err(local_error)?
-                    .is_some_and(|record| record.phase == ConflictPhase::Pending
-                        && record.preservation == ConflictPreservation::RemoteComplete);
+                preserving = conflict_record(app, &job.id)?
+                    .is_some_and(|record| !record.resolved && record.remote_point.is_some());
             }
             job.summary["state"] = json!(if preserving { "conflict" } else if permanent { "failed" } else { "waiting" });
             job.summary["phase"] = json!(if preserving { "conflict-choice" } else { "paused" });
@@ -1080,10 +1045,15 @@ fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Result<Val
         }
     };
     if job.request.kind == JobKind::ResolveConflict {
-        if pds(app).and_then(|mut store| store.external_finish_conflict(&job.id).map_err(local_error)).is_err() {
+        if mark_conflict_resolved(app, &job.id).is_err() {
             crate::nlog!("error", "External receive committed but conflict bookkeeping did not finish");
         }
     }
+    super::runtime::record_connection_completion(
+        app,
+        &job.request.connection_id,
+        super::connection_store::CompletionKind::Sync,
+    );
     let result = json!({"snapshotId":snapshot_id,"receivedRevision":revision.to_string()});
     job.summary["state"] = json!("succeeded");
     job.summary["phase"] = json!("complete");
@@ -1156,8 +1126,35 @@ async fn reconcile_unknown(
                 ) == super::publication::PublicationObservation::Confirmed
                 {
                     let observed = observed.expect("confirmed publication has a head");
+                    remember_discovery(
+                        app,
+                        &job.request.connection_id,
+                        &job.snapshot_id,
+                        &observed.document.state,
+                    );
+                    let confirmed = control::read_snapshot_document(
+                        connected,
+                        &observed.document.state,
+                        cancel,
+                    )
+                    .await?;
                     let observation = observation_json(&observed.observation)?;
                     let permit = super::runtime::publication_permit(app, &job.id)?;
+                    let sections_spool = super::runtime::job_directory(
+                        &super::runtime::root(app)?,
+                        &job.request.connection_id,
+                        &job.id,
+                    )
+                    .join("sections");
+                    let publications =
+                        super::sections::load_prepared_section_publications(&sections_spool)?;
+                    note_sections_published(
+                        app,
+                        &job.request.connection_id,
+                        &intent.identity.library_epoch,
+                        &confirmed.sections,
+                        &publications,
+                    )?;
                     pds(app)?
                         .external_confirm_publication(
                             &permit,
@@ -1166,6 +1163,11 @@ async fn reconcile_unknown(
                             &observation,
                         )
                         .map_err(local_error)?;
+                    super::runtime::record_connection_completion(
+                        app,
+                        &job.request.connection_id,
+                        super::connection_store::CompletionKind::Sync,
+                    );
                     return Ok(Some(
                         json!({"snapshotId":job.snapshot_id,"publishedRevision":intent.identity.revision.to_string()}),
                     ));
@@ -1189,143 +1191,110 @@ async fn reconcile_unknown(
     ))
 }
 
-fn encode_remote(value: &super::packaging::RemoteObject) -> Result<String> {
-    serde_json::to_string(value).map_err(corrupt)
-}
-fn decode_remote(
-    value: &str,
-    connected: &ConnectedRepository,
-) -> Result<super::packaging::RemoteObject> {
-    if value.is_empty() || value.len() > 256 * 1024 {
-        return Err(corrupt("invalid preserved snapshot"));
-    }
-    let object: super::packaging::RemoteObject = serde_json::from_str(value).map_err(corrupt)?;
-    if serde_json::to_string(&object).map_err(corrupt)? != value
-        || object.repository_id != connected.stored.descriptor.repository_id
-        || !matches!(
-            object.role,
-            super::contract::ObjectRole::SyncState | super::contract::ObjectRole::BackupBundle
-        )
-    {
-        return Err(corrupt("preserved snapshot binding differs"));
-    }
-    object.stored(&connected.handle)?;
-    Ok(object)
-}
-
 async fn preserve_conflict(
     app: &AppHandle,
     connected: &ConnectedRepository,
     job: &DurableJob,
     remote: ObservedHead,
     capture: crate::persistent_store::external_capture::CapturedSnapshot,
-    fingerprint: [u8; 32],
+    _fingerprint: [u8; 32],
     protection: Option<&super::runtime::RepositoryProtection<'_>>,
     cancel: &Cancellation,
 ) -> Result<Value> {
-    let local_identity = capture.identity.clone();
-    let local_capture_id = capture.id.clone();
-    let record = record_local_conflict(
-        app,
-        connected,
-        job,
-        None,
-        &local_capture_id,
-        &local_identity,
-        Some(&remote),
-        false,
-    )?;
-    // A bundle keeps this device's own material instead of joining the
-    // synchronized commit order, so it publishes nothing to mark.
-    let (local, journal, _) = package_capture(
-        app,
-        connected,
-        job,
-        capture,
-        fingerprint,
-        None,
-        PackageAs::Bundle,
-        cancel,
-    )
-    .await?;
-    let record = bind_local_conflict_snapshot(app, job, record, &local.reference)?;
-    complete_conflict_preservation(
-        app, connected, job, record, Some(remote), journal, protection, cancel,
-    )
-        .await
+    let local = capture
+        .durable_reference(&super::runtime::root(app)?)
+        .map_err(local_error)?;
+    let record = conflict_record_from_remote(connected, job, local, &remote, cancel).await?;
+    let record = preserve_local_conflict(app, job, record)?;
+    ensure_conflict_point(app, connected, job, record, false, protection, cancel).await
 }
 
-fn record_local_conflict(
-    app: &AppHandle,
+async fn conflict_record_from_remote(
     connected: &ConnectedRepository,
     job: &DurableJob,
-    local: Option<&super::packaging::RemoteObject>,
-    local_capture_id: &str,
-    local_identity: &CaptureIdentity,
-    remote: Option<&ObservedHead>,
-    after_rejection: bool,
-) -> Result<ConflictRecord> {
-    let record = ConflictRecord {
+    local: super::capture::DurableCaptureReference,
+    remote: &ObservedHead,
+    cancel: &Cancellation,
+) -> Result<ExternalConflictRecord> {
+    let view = control::read_snapshot_document(connected, &remote.document.state, cancel).await?;
+    Ok(ExternalConflictRecord {
         id: job.id.clone(),
+        created_at_ms: i64::try_from(super::runtime::now_ms()).map_err(corrupt)?,
         connection_id: job.request.connection_id.clone(),
         repository_id: connected.stored.descriptor.repository_id.clone(),
-        local_capture_id: local_capture_id.into(),
-        local_snapshot: local.map(encode_remote).transpose()?,
-        local_identity: local_identity.clone(),
-        remote_snapshot: remote
-            .map(|head| encode_remote(&head.document.state))
-            .transpose()?,
-        remote_logical_revision: None,
-        remote_commit_id: remote.map(|head| head.document.commit_id.clone()),
-        remote_head_observation: remote
-            .map(|head| observation_json(&head.observation))
-            .transpose()?,
-        created_at_ms: i64::try_from(super::runtime::now_ms()).map_err(corrupt)?,
-        preservation: ConflictPreservation::LocalOnly,
-        phase: ConflictPhase::Pending,
-    };
-    if after_rejection {
-        pds(app)?
-            .external_record_local_conflict_after_rejection(&record)
-            .map_err(local_error)?;
-    } else if super::runtime::read_job_session(app, &job.id)?
-        == super::publication::PublicationMode::ExitDrain
-    {
-        pds(app)?
-            .external_record_local_conflict_exit_drain(&record)
-            .map_err(local_error)?;
-    } else {
-        pds(app)?
-            .external_record_local_conflict(&record)
-            .map_err(local_error)?;
-    }
-    Ok(record)
+        local,
+        remote: PreservedRemoteState {
+            snapshot: remote.document.state.stored(&connected.handle)?,
+            logical_revision: view.revision.parse().map_err(corrupt)?,
+            commit_id: remote.document.commit_id.clone(),
+            head: PreservedHeadObservation {
+                commit_id: remote.document.commit_id.clone(),
+                authenticated_body_hash: remote.observation.authenticated_body_hash.clone(),
+            },
+        },
+        remote_point: None,
+        resolved: false,
+    })
 }
 
-fn bind_local_conflict_snapshot(
+fn preserve_local_conflict(
     app: &AppHandle,
     job: &DurableJob,
-    record: ConflictRecord,
-    local: &super::packaging::RemoteObject,
-) -> Result<ConflictRecord> {
-    let encoded = encode_remote(local)?;
-    let session = super::runtime::read_job_session(app, &job.id)?;
-    if session == super::publication::PublicationMode::ExitDrain {
-        pds(app)?
-            .external_bind_local_conflict_snapshot_exit_drain(&record.id, &encoded)
-            .map_err(local_error)
+    record: ExternalConflictRecord,
+) -> Result<ExternalConflictRecord> {
+    let owner = external_conflicts::conflict_capture_owner(&record.id).map_err(local_error)?;
+    let mut store = pds(app)?;
+    let existing = external_conflicts::external_conflict(
+        store.device_store().map_err(local_error)?.connection(),
+        &record.id,
+    )
+    .map_err(local_error)?;
+    let preserved = if existing.is_some() {
+        external_conflicts::preserve_local_conflict(
+            store.device_store().map_err(local_error)?.connection(),
+            &record,
+        )
+        .map_err(local_error)?
     } else {
-        pds(app)?
-            .external_bind_local_conflict_snapshot(&record.id, &encoded)
-            .map_err(local_error)
+        store
+            .retain_external_capture(&record.local.capture_id, &owner)
+            .map_err(local_error)?;
+        match external_conflicts::preserve_local_conflict(
+            store.device_store().map_err(local_error)?.connection(),
+            &record,
+        ) {
+            Ok(preserved) => preserved,
+            Err(error) => {
+                if store
+                    .release_external_capture(&record.local.capture_id, &owner)
+                    .is_err()
+                {
+                    crate::nlog!("error", "Failed to compensate a rejected conflict capture owner");
+                }
+                return Err(local_error(error));
+            }
+        }
+    };
+    if store
+        .external_job(&job.id)
+        .map_err(local_error)?
+        .is_some_and(|intent| matches!(intent.phase.as_str(), "ready" | "publishing"))
+    {
+        store
+            .external_publication_rejected(&job.id)
+            .map_err(local_error)?;
     }
+    store
+        .release_external_capture(&record.local.capture_id, &job.id)
+        .map_err(local_error)?;
+    Ok(preserved)
 }
 
 fn conflict_journal(
     app: &AppHandle,
     connected: &ConnectedRepository,
     job: &DurableJob,
-    record: &ConflictRecord,
+    record: &ExternalConflictRecord,
 ) -> Result<TransferJournal> {
     let root = super::runtime::root(app)?;
     let directory = super::runtime::job_directory(&root, &job.request.connection_id, &job.id);
@@ -1335,8 +1304,8 @@ fn conflict_journal(
             job_id: job.id.clone(),
             connection_id: job.request.connection_id.clone(),
             repository_id: connected.handle.repository_id.clone(),
-            capture_id: record.local_capture_id.clone(),
-            capture: record.local_identity.clone(),
+            capture_id: record.local.capture_id.clone(),
+            capture: record.local.identity.clone(),
         },
     )
 }
@@ -1345,185 +1314,90 @@ async fn resume_conflict_preservation(
     app: &AppHandle,
     connected: &ConnectedRepository,
     job: &DurableJob,
-    record: ConflictRecord,
+    record: ExternalConflictRecord,
     protection: Option<&super::runtime::RepositoryProtection<'_>>,
     cancel: &Cancellation,
 ) -> Result<Value> {
-    if record.local_snapshot.is_some() {
-        let journal = conflict_journal(app, connected, job, &record)?;
-        return complete_conflict_preservation(
-            app, connected, job, record, None, journal, protection, cancel,
-        )
-        .await;
-    }
-    let capture = pds(app)?
-        .reopen_external_capture(&record.local_capture_id)
-        .map_err(local_error)?;
-    if capture.identity != record.local_identity {
-        return Err(corrupt("conflict capture identity differs"));
-    }
-    let fingerprint = capture
-        .catalog
-        .content_fingerprint(&library_fingerprint_domain())
-        .map_err(local_error)?;
-    // A bundle keeps this device's own material instead of joining the
-    // synchronized commit order, so it publishes nothing to mark.
-    let (local, journal, _) = package_capture(
-        app,
-        connected,
-        job,
-        capture,
-        fingerprint,
-        None,
-        PackageAs::Bundle,
-        cancel,
-    )
-    .await?;
-    let record = bind_local_conflict_snapshot(app, job, record, &local.reference)?;
-    complete_conflict_preservation(
-        app, connected, job, record, None, journal, protection, cancel,
-    ).await
+    ensure_conflict_point(app, connected, job, record, false, protection, cancel).await
 }
 
-async fn complete_conflict_preservation(
+pub(crate) async fn ensure_conflict_point(
     app: &AppHandle,
     connected: &ConnectedRepository,
     job: &DurableJob,
-    record: ConflictRecord,
-    observed_remote: Option<ObservedHead>,
-    mut journal: TransferJournal,
+    record: ExternalConflictRecord,
+    force_recheck: bool,
     protection: Option<&super::runtime::RepositoryProtection<'_>>,
     cancel: &Cancellation,
 ) -> Result<Value> {
-    if record.preservation != ConflictPreservation::LocalOnly
-        || record.connection_id != job.request.connection_id
+    if record.connection_id != job.request.connection_id
         || record.repository_id != connected.stored.descriptor.repository_id
+        || (record.resolved && !force_recheck)
     {
         return Err(corrupt("invalid local conflict preservation"));
     }
-    let local_snapshot = record
-        .local_snapshot
-        .as_deref()
-        .ok_or_else(|| corrupt("local conflict upload is incomplete"))?;
-    let (remote_snapshot, remote_commit_id, remote_observation) = match (
-        record.remote_snapshot.as_deref(),
-        record.remote_commit_id.as_deref(),
-        record.remote_head_observation.as_deref(),
-    ) {
-        (Some(snapshot), Some(commit), Some(observation)) => (
-            decode_remote(snapshot, connected)?,
-            commit.to_owned(),
-            observation.to_owned(),
-        ),
-        (None, None, None) => {
-            let remote = match observed_remote {
-                Some(remote) => remote,
-                None => control::read_head(
-                    connected.provider.as_ref(),
-                    &connected.handle,
-                    &connected.stored.descriptor,
-                    &connected.root_key,
-                    None,
-                    cancel,
-                )
-                .await?
-                .ok_or_else(|| ProviderError::new(ErrorKind::PreconditionFailed))?,
-            };
-            (
-                remote.document.state.clone(),
-                remote.document.commit_id.clone(),
-                observation_json(&remote.observation)?,
-            )
-        }
-        _ => return Err(corrupt("partial remote conflict binding")),
-    };
-    let root = super::runtime::root(app)?;
-    let staging = super::runtime::job_directory(&root, &job.request.connection_id, &job.id)
-        .join("conflict-remote");
-    let verified_remote = super::snapshot_restore::download_snapshot(
-        &remote_snapshot,
-        &staging,
-        &connected.root_key,
-        connected.provider.as_ref(),
+    if record.remote_point.is_some() && !force_recheck {
+        return Ok(json!({"snapshotId":record.local.capture_id,"conflictId":job.id,"preservation":"remote-complete"}));
+    }
+    let mut journal = conflict_journal(app, connected, job, &record)?;
+    let remote_snapshot = super::packaging::RemoteObject::from_stored(
+        &record.remote.snapshot,
         &connected.handle,
+    )?;
+    let created_at_ms = u64::try_from(record.created_at_ms).map_err(corrupt)?;
+    let remote_bundle = control::ensure_remote_conflict_bundle(
+        connected,
+        &record.id,
+        &record.remote.commit_id,
+        created_at_ms,
+        &remote_snapshot,
+        &mut journal,
         cancel,
     )
     .await?;
-    if verified_remote.snapshot_id
-        != remote_snapshot.object_id.trim_start_matches("snapshot-")
-    {
-        return Err(corrupt("conflict snapshot identity differs"));
-    }
-    let created_at_ms = u64::try_from(record.created_at_ms).map_err(corrupt)?;
-    let remote_bundle = if remote_snapshot.role == super::contract::ObjectRole::BackupBundle {
-        remote_snapshot.clone()
-    } else {
-        let view = control::read_snapshot_document(connected, &remote_snapshot, cancel).await?;
-        control::upload_backup_bundle(
-            &connected.stored.descriptor,
-            &connected.root_key,
-            format!("conflict-{}-remote", job.id),
-            risunest_external_storage_format::control::BundleSource::SyncState {
-                commit_id: remote_commit_id.clone(),
-            },
-            created_at_ms,
-            view.library,
-            view.sections,
-            &mut journal,
-            connected.provider.as_ref(),
-            &connected.handle,
-            cancel,
-        )
-        .await?
-    };
-    let point = BackupPointDocument::conflict(
-        &connected.stored.descriptor,
-        format!("conflict-{}", job.id),
-        created_at_ms,
-        decode_remote(local_snapshot, connected)?,
-        remote_bundle,
-    )?;
     if let Some(protection) = protection {
         protection.recheck(cancel).await?;
     }
-    control::upload_backup_point(
+    let point = control::ensure_remote_conflict_point(
         &connected.stored.descriptor,
-        &connected.root_key,
-        point,
+        &record.id,
+        created_at_ms,
+        remote_bundle,
         &mut journal,
-        connected.provider.as_ref(),
-        &connected.handle,
+        connected,
         cancel,
     )
     .await?;
-    let encoded_remote = encode_remote(&remote_snapshot)?;
-    let remote_revision = i64::try_from(verified_remote.logical_revision).map_err(corrupt)?;
-    let session = super::runtime::read_job_session(app, &job.id)?;
-    if session == super::publication::PublicationMode::ExitDrain {
-        pds(app)?
-            .external_complete_conflict_preservation_exit_drain(
-                &record.id,
-                &encoded_remote,
-                remote_revision,
-                &remote_commit_id,
-                &remote_observation,
-            )
-            .map_err(local_error)?;
-    } else {
-        pds(app)?
-            .external_complete_conflict_preservation(
-                &record.id,
-                &encoded_remote,
-                remote_revision,
-                &remote_commit_id,
-                &remote_observation,
-            )
-            .map_err(local_error)?;
-    }
+    let store = pds(app)?;
+    external_conflicts::confirm_external_conflict_point(
+        store.device_store().map_err(local_error)?.connection(),
+        &record.id,
+        &point.stored(&connected.handle)?,
+    )
+    .map_err(local_error)?;
     let _ = journal
         .release_completed_sessions(connected.dependencies.vault.as_ref())
         .await;
-    Ok(json!({"snapshotId":decode_remote(local_snapshot, connected)?.object_id.trim_start_matches("snapshot-"),"conflictId":job.id,"preservation":"remote-complete"}))
+    Ok(json!({"snapshotId":record.local.capture_id,"conflictId":job.id,"preservation":"remote-complete"}))
+}
+
+pub(crate) fn conflict_record(app: &AppHandle, id: &str) -> Result<Option<ExternalConflictRecord>> {
+    let store = pds(app)?;
+    external_conflicts::external_conflict(
+        store.device_store().map_err(local_error)?.connection(),
+        id,
+    )
+    .map_err(local_error)
+}
+
+pub(crate) fn mark_conflict_resolved(app: &AppHandle, id: &str) -> Result<()> {
+    let store = pds(app)?;
+    external_conflicts::mark_external_conflict_resolved(
+        store.device_store().map_err(local_error)?.connection(),
+        id,
+    )
+    .map(|_| ())
+    .map_err(local_error)
 }
 
 async fn run_resolve_conflict(
@@ -1546,10 +1420,14 @@ async fn run_resolve_conflict(
         .choice
         .as_deref()
         .ok_or_else(|| corrupt("missing conflict choice"))?;
-    let stored = pds(app)?
-        .external_conflict(conflict_id)
+    let stored = {
+        let store = pds(app)?;
+        external_conflicts::external_conflict_for_resolution(
+            store.device_store().map_err(local_error)?.connection(),
+            conflict_id,
+        )
         .map_err(local_error)?
-        .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
+    };
     if stored.connection_id != job.request.connection_id
         || stored.repository_id != connected.stored.descriptor.repository_id
     {
@@ -1566,86 +1444,71 @@ async fn run_resolve_conflict(
     .await?
     .ok_or_else(|| ProviderError::new(ErrorKind::PreconditionFailed))?;
     let observation = observation_json(&remote.observation)?;
-    if stored.preservation != ConflictPreservation::RemoteComplete
-        || stored.remote_head_observation.as_deref() != Some(observation.as_str())
-        || stored.remote_commit_id.as_deref() != Some(remote.document.commit_id.as_str())
+    if stored.remote.head.commit_id != remote.document.commit_id
+        || stored.remote.head.authenticated_body_hash
+            != remote.observation.authenticated_body_hash
+        || stored.remote.snapshot != remote.document.state.stored(&connected.handle)?
     {
         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
     }
+    remember_discovery(
+        app,
+        &job.request.connection_id,
+        remote.document.state.object_id.trim_start_matches("snapshot-"),
+        &remote.document.state,
+    );
     if choice == "remote" {
-        pds(app)?
-            .external_begin_conflict_resolution(conflict_id, &observation)
-            .map_err(local_error)?;
         let expected = pds(app)?.external_job(&job.id).map_err(local_error)?
             .filter(|intent| intent.role == "restore" && intent.phase == "ready")
-            .map(|intent| intent.identity).unwrap_or(stored.local_identity.clone());
-        return match receive_remote(app, connected, job, &expected, &remote, cancel).await {
-            Ok(result) => Ok(result),
-            Err(error) => {
-                if pds(app)?
-                    .external_reject_conflict_resolution(conflict_id)
-                    .is_err()
-                {
-                    crate::nlog!("error", "Failed to reset a rejected remote conflict choice");
-                }
-                Err(error)
-            }
-        };
+            .map(|intent| intent.identity).unwrap_or(stored.local.identity.clone());
+        return receive_remote(app, connected, job, &expected, &remote, cancel).await;
     }
     if choice != "local" {
         return Err(corrupt("invalid conflict choice"));
     }
-    let local = decode_remote(
-        stored
-            .local_snapshot
-            .as_deref()
-            .ok_or_else(|| corrupt("local conflict upload is incomplete"))?,
-        connected,
-    )?;
-    let local_document = control::read_snapshot_document(connected, &local, cancel).await?;
+    let capture = pds(app)?
+        .reopen_external_capture(&stored.local.capture_id)
+        .map_err(local_error)?;
+    if capture.durable_reference(&super::runtime::root(app)?).map_err(local_error)?
+        != stored.local
+    {
+        return Err(corrupt("conflict capture binding differs"));
+    }
+    let fingerprint = capture
+        .catalog
+        .content_fingerprint(&library_fingerprint_domain())
+        .map_err(local_error)?;
+    let base = {
+        let store = pds(app)?;
+        store
+            .external_base(&job.request.connection_id)
+            .map_err(local_error)?
+    };
+    if let Some(base) = base {
+        rejoin_sections(
+            app,
+            connected,
+            job,
+            &stored.local.identity,
+            &base,
+            &remote,
+            cancel,
+        )
+        .await?;
+    }
     let strategy = connected
         .stored
         .descriptor
         .publication_strategy
         .ok_or_else(|| ProviderError::new(ErrorKind::Unsupported))?;
     let commit_id = format!("resolve-{}", job.id);
-    // The preserved material is a bundle. A head points at a state, so the
-    // resolution republishes that library reference as one and continues the
-    // remote commit order from the head it is replacing.
-    let remote_state = control::read_snapshot_document(connected, &remote.document.state, cancel)
-        .await?;
-    let mut resolve_journal = TransferJournal::open(
-        &super::runtime::job_directory(
-            &super::runtime::root(app)?,
-            &job.request.connection_id,
-            &job.id,
-        ),
-        JobIdentity {
-            job_id: job.id.clone(),
-            connection_id: job.request.connection_id.clone(),
-            repository_id: connected.handle.repository_id.clone(),
-            capture_id: stored.local_capture_id.clone(),
-            capture: stored.local_identity.clone(),
-        },
-    )?;
-    let (state, state_fingerprint) = control::upload_sync_state(
-        &connected.stored.descriptor,
-        &connected.root_key,
-        commit_id.clone(),
-        remote.document.library_id.clone(),
-        stored.local_identity.generation.clone(),
-        Sequence::try_from(remote_state.revision.clone())
-            .map_err(corrupt)?
-            .next()
-            .map_err(corrupt)?,
-        Some(remote_state.snapshot_id.clone()),
-        stored.local_identity.store_id.clone(),
-        u64::try_from(stored.created_at_ms).map_err(corrupt)?,
-        local_document.library.clone(),
-        remote_state.sections.clone(),
-        &mut resolve_journal,
-        connected.provider.as_ref(),
-        &connected.handle,
+    let (completed, mut resolve_journal, publications) = package_capture(
+        app,
+        connected,
+        job,
+        capture,
+        fingerprint,
+        Some(&remote),
         cancel,
     )
     .await?;
@@ -1654,8 +1517,8 @@ async fn run_resolve_conflict(
         remote.document.library_id.clone(),
         commit_id.clone(),
         Some(remote.document.commit_id.clone()),
-        state_fingerprint,
-        state,
+        completed.fingerprint.clone(),
+        completed.reference.clone(),
     )?;
     let prepared = control::prepare_head(
         &connected.stored.descriptor,
@@ -1663,15 +1526,12 @@ async fn run_resolve_conflict(
         &connected.handle,
         document,
     )?;
-    pds(app)?
-        .external_begin_conflict_resolution(conflict_id, &observation)
-        .map_err(local_error)?;
     let intent = crate::persistent_store::external_storage_state::PublishIntent {
         job_id: &job.id,
         connection_id: &job.request.connection_id,
         repository_id: &connected.stored.descriptor.repository_id,
-        capture_id: &stored.local_capture_id,
-        identity: &stored.local_identity,
+        capture_id: &stored.local.capture_id,
+        identity: &stored.local.identity,
         strategy: match strategy {
             risunest_external_storage_format::format::Strategy::Cas => "cas",
             risunest_external_storage_format::format::Strategy::Sequential => "sequential",
@@ -1679,14 +1539,14 @@ async fn run_resolve_conflict(
         expected_head: Some(&observation),
         commit_id: &commit_id,
     };
-    if let Err(error) = pds(app)?.external_prepare_conflict_publication(&intent) {
-        let _ = pds(app)?.external_reject_conflict_resolution(conflict_id);
-        return Err(local_error(error));
-    }
     let _permit = app
         .state::<crate::native_file_jobs::NativeFileJobState>()
         .admission
         .file(false)
+        .map_err(local_error)?;
+    let prepare_permit = super::runtime::publication_permit(app, &job.id)?;
+    pds(app)?
+        .external_prepare_publication(&intent, &prepare_permit)
         .map_err(local_error)?;
     let mut publication_permit = None;
     if let Some(protection) = protection {
@@ -1718,49 +1578,56 @@ async fn run_resolve_conflict(
     .await
     {
         Ok(result) => result,
-        Err(error) => {
-            pds(app)?
-                .external_reject_conflict_resolution(conflict_id)
-                .map_err(local_error)?;
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
     match result {
         PublicationResult::Confirmed(head) => {
+            remember_discovery(
+                app,
+                &job.request.connection_id,
+                &completed.snapshot_id,
+                &completed.reference,
+            );
             let observation = observation_json(&head.observation)?;
             let permit = publication_permit
                 .as_ref()
                 .ok_or_else(|| corrupt("missing publication permit"))?;
+            note_sections_published(
+                app,
+                &job.request.connection_id,
+                &stored.local.identity.library_epoch,
+                &completed.sections,
+                &publications,
+            )?;
             pds(app)?
                 .external_confirm_publication(
                     permit,
                     &commit_id,
-                    &local_document.snapshot_id,
+                    &completed.snapshot_id,
                     &observation,
                 )
                 .map_err(local_error)?;
-            if pds(app)?.external_finish_conflict(conflict_id).is_err() {
+            if mark_conflict_resolved(app, conflict_id).is_err() {
                 crate::nlog!("error","External conflict publication committed but conflict bookkeeping did not finish");
             }
+            super::runtime::record_connection_completion(
+                app,
+                &job.request.connection_id,
+                super::connection_store::CompletionKind::Sync,
+            );
             Ok(
-                json!({"snapshotId":local_document.snapshot_id,"publishedRevision":stored.local_identity.revision.to_string()}),
+                json!({"snapshotId":completed.snapshot_id,"publishedRevision":stored.local.identity.revision.to_string()}),
             )
         }
         PublicationResult::Conflict(_) => {
             pds(app)?
                 .external_publication_rejected(&job.id)
                 .map_err(local_error)?;
-            pds(app)?
-                .external_reject_conflict_resolution(conflict_id)
-                .map_err(local_error)?;
             Err(ProviderError::new(ErrorKind::PreconditionFailed))
         }
         PublicationResult::Unknown { .. } => {
             pds(app)?
                 .external_publication_unknown(&job.id)
-                .map_err(local_error)?;
-            pds(app)?
-                .external_conflict_publication_unknown(conflict_id)
                 .map_err(local_error)?;
             Err(ProviderError::new(ErrorKind::Transient))
         }
@@ -1776,7 +1643,7 @@ pub(crate) async fn run_sync(
 ) -> Result<Value> {
     if job.request.kind == JobKind::ResolveConflict {
         if let Some(result) = reconcile_unknown(app, connected, job, cancel).await? {
-            if pds(app)?.external_finish_conflict(&job.id).is_err() {
+            if mark_conflict_resolved(app, &job.id).is_err() {
                 crate::nlog!("error","External conflict publication reconciled but conflict bookkeeping did not finish");
             }
             return Ok(result);
@@ -1793,12 +1660,12 @@ pub(crate) async fn run_sync(
         .publication_strategy
         .ok_or_else(|| ProviderError::new(ErrorKind::Unsupported))?;
     connected.stored.capabilities.require(strategy)?;
-    if let Some(record) = pds(app)?
-        .external_conflict(&job.id)
-        .map_err(local_error)?
-        .filter(|record| record.preservation == ConflictPreservation::LocalOnly)
-    {
-        return resume_conflict_preservation(app, connected, job, record, protection, cancel).await;
+    if let Some(record) = conflict_record(app, &job.id)?.filter(|record| !record.resolved) {
+        return if record.remote_point.is_some() {
+            Ok(json!({"snapshotId":record.local.capture_id,"conflictId":job.id,"preservation":"remote-complete"}))
+        } else {
+            resume_conflict_preservation(app, connected, job, record, protection, cancel).await
+        };
     }
     let remote = control::read_head(
         connected.provider.as_ref(),
@@ -1809,6 +1676,14 @@ pub(crate) async fn run_sync(
         cancel,
     )
     .await?;
+    if let Some(remote) = remote.as_ref() {
+        remember_discovery(
+            app,
+            &job.request.connection_id,
+            remote.document.state.object_id.trim_start_matches("snapshot-"),
+            &remote.document.state,
+        );
+    }
     let store = pds(app)?;
     let identity = store.external_identity().map_err(local_error)?;
     let local_pristine = store.external_library_is_pristine().map_err(local_error)?;
@@ -1916,7 +1791,9 @@ pub(crate) async fn run_sync(
                 .take()
                 .ok_or_else(|| corrupt("missing publication capture"))?;
             let published_identity = capture.identity.clone();
-            let local_capture_id = capture.id.clone();
+            let local_reference = capture
+                .durable_reference(&super::runtime::root(app)?)
+                .map_err(local_error)?;
             // Rejoining changes device rows, so it belongs to publication, not
             // to a receive's read-only preparation or conflict preservation.
             if let (Some(base), Some(remote)) = (base.as_ref(), expected.as_ref()) {
@@ -1929,7 +1806,6 @@ pub(crate) async fn run_sync(
                 capture,
                 fingerprint,
                 expected.as_ref(),
-                PackageAs::State,
                 cancel,
             )
             .await?;
@@ -1987,10 +1863,23 @@ pub(crate) async fn run_sync(
             .await?
             {
                 PublicationResult::Confirmed(observed) => {
+                    remember_discovery(
+                        app,
+                        &job.request.connection_id,
+                        &completed.snapshot_id,
+                        &completed.reference,
+                    );
                     let observation = observation_json(&observed.observation)?;
                     let permit = publication_permit
                         .as_ref()
                         .ok_or_else(|| corrupt("missing publication permit"))?;
+                    note_sections_published(
+                        app,
+                        &job.request.connection_id,
+                        &published_identity.library_epoch,
+                        &completed.sections,
+                        &publications,
+                    )?;
                     pds(app)?
                         .external_confirm_publication(
                             permit,
@@ -2002,33 +1891,41 @@ pub(crate) async fn run_sync(
                     let _ = journal
                         .release_completed_sessions(connected.dependencies.vault.as_ref())
                         .await;
-                    note_sections_published(
+                    super::runtime::record_connection_completion(
                         app,
                         &job.request.connection_id,
-                        &published_identity.library_epoch,
-                        &completed.sections,
-                        &publications,
-                    )?;
+                        super::connection_store::CompletionKind::Sync,
+                    );
                     Ok(
                         json!({"snapshotId":completed.snapshot_id,"publishedRevision":published_identity.revision.to_string()}),
                     )
                 }
                 PublicationResult::Conflict(remote) => {
                     drop(_permit);
-                    let record = record_local_conflict(
-                        app,
+                    let remote = match remote {
+                        Some(remote) => remote,
+                        None => control::read_head(
+                            connected.provider.as_ref(),
+                            &connected.handle,
+                            &connected.stored.descriptor,
+                            &connected.root_key,
+                            None,
+                            cancel,
+                        )
+                        .await?
+                        .ok_or_else(|| ProviderError::new(ErrorKind::PreconditionFailed))?,
+                    };
+                    let record = conflict_record_from_remote(
                         connected,
                         job,
-                        Some(&completed.reference),
-                        &local_capture_id,
-                        &published_identity,
-                        remote.as_ref(),
-                        true,
-                    )?;
-                    complete_conflict_preservation(
-                        app, connected, job, record, remote, journal, protection, cancel,
+                        local_reference,
+                        &remote,
+                        cancel,
                     )
-                    .await
+                    .await?;
+                    let record = preserve_local_conflict(app, job, record)?;
+                    drop(journal);
+                    ensure_conflict_point(app, connected, job, record, false, protection, cancel).await
                 }
                 PublicationResult::Unknown { .. } => {
                     pds(app)?
@@ -2052,20 +1949,178 @@ pub(crate) async fn run_sync(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ExternalConflictCursorRequest {
+    created_at_ms: i64,
+    id: String,
+}
+
+fn remember_discovery(
+    app: &AppHandle,
+    connection_id: &str,
+    snapshot_id: &str,
+    reference: &super::packaging::RemoteObject,
+) {
+    let result = super::runtime::root(app).and_then(|root| {
+        super::connection_store::ConnectionStore::open(&root)?
+            .remember_discovery(connection_id, snapshot_id, reference)
+    });
+    if result.is_err() {
+        crate::nlog!("warn", "External snapshot locator could not be cached");
+    }
+}
+
+fn conflict_summary(
+    record: &ExternalConflictRecord,
+    local_available: bool,
+    remote_available: bool,
+) -> Value {
+    json!({
+        "id":record.id,
+        "connectionId":record.connection_id,
+        "detectedAtMs":record.created_at_ms.to_string(),
+        "localRevision":record.local.identity.revision.to_string(),
+        "remoteRevision":record.remote.logical_revision.to_string(),
+        "localAvailable":local_available,
+        "remoteAvailable":remote_available,
+        "remotePointConfirmed":record.remote_point.is_some(),
+        "resolved":record.resolved,
+    })
+}
+
 #[tauri::command]
 pub(crate) fn external_storage_list_conflicts(
     app: AppHandle,
-    connection_id: String,
-) -> Result<Vec<Value>> {
-    if connection_id.is_empty() || connection_id.len() > 1024 {
-        return Err(corrupt("invalid connection"));
+    cursor: Option<ExternalConflictCursorRequest>,
+    limit: Option<usize>,
+) -> Result<Value> {
+    let limit = limit.unwrap_or(50);
+    if limit == 0 || limit > 50 {
+        return Err(corrupt("invalid conflict page limit"));
     }
-    pds(&app)?.external_conflicts(&connection_id).map_err(local_error)?.into_iter().map(|record|Ok(json!({
-        "id":record.id,"connectionId":record.connection_id,"detectedAtMs":record.created_at_ms.to_string(),
-        "localRevision":record.local_identity.revision.to_string(),"remoteRevision":record.remote_logical_revision.map(|value|value.to_string()),
-        "preservation":match record.preservation { ConflictPreservation::LocalOnly=>"local-only", ConflictPreservation::RemoteComplete=>"remote-complete" },
-        "localLabel":"Local snapshot","remoteLabel":"Remote snapshot"
-    }))).collect()
+    let root = super::runtime::root(&app)?;
+    let store = pds(&app)?;
+    let cursor = cursor.map(|cursor| external_conflicts::ExternalConflictCursor {
+        created_at_ms: cursor.created_at_ms,
+        id: cursor.id,
+    });
+    let page = external_conflicts::external_conflicts_page(
+        store.device_store().map_err(local_error)?.connection(),
+        cursor.as_ref(),
+        limit,
+    )
+    .map_err(local_error)?;
+    let connections = super::connection_store::ConnectionStore::open(&root).ok();
+    let conflicts = page
+        .conflicts
+        .iter()
+        .map(|record| {
+            let local_available =
+                super::capture::registered_capture_roots([&record.local], &root).is_ok();
+            let remote_available = connections
+                .as_ref()
+                .is_some_and(|connections| connections.read(&record.connection_id).is_ok());
+            conflict_summary(record, local_available, remote_available)
+        })
+        .collect::<Vec<_>>();
+    let mut result = json!({"conflicts":conflicts});
+    if let Some(next) = page.next {
+        result["nextCursor"] = json!({"createdAtMs":next.created_at_ms,"id":next.id});
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+pub(crate) async fn external_storage_delete_conflict(
+    app: AppHandle,
+    id: String,
+    delete_remote_point: bool,
+) -> std::result::Result<Value, crate::native_file_jobs::NativeJobError> {
+    if id.is_empty() || id.len() > 1024 || id.contains('\0') {
+        return Err(crate::native_file_jobs::NativeJobError::new(
+            "invalid-input",
+            "External conflict identity is invalid",
+        ));
+    }
+    let state = app.state::<crate::native_file_jobs::NativeFileJobState>();
+    let mutation = state.external_conflict_mutation_admission()?;
+    let record = {
+        let mut store = pds(&app).map_err(|error| {
+            crate::native_file_jobs::NativeJobError::new("store-error", error.to_string())
+        })?;
+        let in_use = state.external_conflict_in_use(&id)?;
+        if in_use {
+            return Err(crate::native_file_jobs::NativeJobError::new(
+                "conflict-source-in-use",
+                "External conflict source is in use",
+            ));
+        }
+        let record = external_conflicts::delete_external_conflict(
+            store
+                .device_store()
+                .map_err(|error| {
+                    crate::native_file_jobs::NativeJobError::new(
+                        "store-error",
+                        error.to_string(),
+                    )
+                })?
+                .connection(),
+            &id,
+        )
+        .map_err(|error| {
+            crate::native_file_jobs::NativeJobError::new("store-error", error.to_string())
+        })?;
+        if store.cleanup_deleted_conflict_capture(&record.local).is_err() {
+            crate::nlog!(
+                "warn",
+                "Deleted external conflict capture could not be cleaned immediately"
+            );
+        }
+        record
+    };
+    drop(mutation);
+    drop(state);
+    if !delete_remote_point || record.remote_point.is_none() {
+        return Ok(json!({"localDeleted":true,"remotePoint":"left-remote"}));
+    }
+    let remote = async {
+        let connected = super::connection_commands::open_connected(&app, &record.connection_id).await?;
+        if connected.stored.descriptor.repository_id != record.repository_id {
+            return Err(ProviderError::new(ErrorKind::Corrupt));
+        }
+        control::delete_authenticated_conflict_point(
+            &connected,
+            &record.id,
+            record.remote_point.as_ref().expect("checked conflict point"),
+            &Cancellation::default(),
+        )
+        .await
+    }
+    .await;
+    let remote_point = match remote {
+        Ok(control::RemoteConflictPointDeleteOutcome::Deleted) => "deleted",
+        Ok(control::RemoteConflictPointDeleteOutcome::NotFound) => "not-found",
+        Err(_) => "left-remote",
+    };
+    Ok(json!({"localDeleted":true,"remotePoint":remote_point}))
+}
+
+#[tauri::command]
+pub(crate) async fn external_storage_recheck_conflict(
+    app: AppHandle,
+    id: String,
+) -> Result<Value> {
+    if id.is_empty() || id.len() > 1024 || id.contains('\0') {
+        return Err(corrupt("invalid conflict identity"));
+    }
+    let root = super::runtime::root(&app)?;
+    super::runtime::recheck_preserved_conflict(&app, &id, &Cancellation::default()).await?;
+    let record = conflict_record(&app, &id)?
+        .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
+    let local_available =
+        super::capture::validate_capture_sources([&record.local], &root).is_ok();
+    Ok(conflict_summary(&record, local_available, true))
 }
 
 #[cfg(test)]
@@ -2367,7 +2422,7 @@ mod receive_tests {
     }
 
     #[test]
-    fn publication_ack_skips_carried_sections_and_stale_participation_generations() {
+    fn publication_ack_skips_carried_sections() {
         let (_directory, mut store, _job, _downloaded) = fixture();
         let sections = BTreeMap::from([(
             SectionKind::LocalPlugins.id().to_owned(),
@@ -2375,34 +2430,6 @@ mod receive_tests {
         )]);
         note_sections_published_in_store(&mut store, "connection", "library", &sections, &[])
             .unwrap();
-        assert!(store.device_store_mut().unwrap()
-            .read_section_cursor("connection", "library", PdsSection::LocalPlugins)
-            .unwrap().is_none());
-
-        let captured_generation = store.device_store_mut().unwrap()
-            .section_state(PdsSection::LocalPlugins).unwrap().participation_generation;
-        let publication = super::super::sections::SectionPublication {
-            section: PdsSection::LocalPlugins,
-            participation_generation: captured_generation,
-            published: Vec::new(),
-            stamped: Vec::new(),
-            first_published: crate::persistent_store::device_store::sections::TombstonePublication {
-                generation: Sequence::from(7u64),
-                at_ms: 1,
-            },
-            reclaimed: BTreeMap::new(),
-            gc_floor: Sequence::from(0u64),
-        };
-        let device = store.device_store_mut().unwrap();
-        device.set_section_participating(PdsSection::LocalPlugins, false).unwrap();
-        device.set_section_participating(PdsSection::LocalPlugins, true).unwrap();
-        note_sections_published_in_store(
-            &mut store,
-            "connection",
-            "library",
-            &sections,
-            &[publication],
-        ).unwrap();
         assert!(store.device_store_mut().unwrap()
             .read_section_cursor("connection", "library", PdsSection::LocalPlugins)
             .unwrap().is_none());

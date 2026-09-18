@@ -30,7 +30,6 @@ fn all_live_tables_have_an_explicit_preservation_owner() {
         "external_storage_jobs",
         "external_storage_bases",
         "external_storage_backup_points",
-        "external_storage_conflicts",
         "external_storage_history_points",
         "external_storage_captures",
         "external_storage_capture_refs",
@@ -87,7 +86,11 @@ fn all_live_tables_have_an_explicit_preservation_owner() {
 fn content_change_schema_retains_live_protections_without_write_only_tables() {
     let mut db = rusqlite::Connection::open_in_memory().unwrap();
     super::schema::initialize(&mut db).unwrap();
-    for name in ["content_capture_reservations", "external_storage_content_cache"] {
+    for name in [
+        "content_capture_reservations",
+        "external_storage_content_cache",
+        "external_storage_conflicts",
+    ] {
         let exists: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
             [name],

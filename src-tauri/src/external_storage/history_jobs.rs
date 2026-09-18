@@ -1,6 +1,7 @@
 //! Durable manual history publication over an already immutable snapshot.
 use super::{
     connection_commands::ConnectedRepository,
+    connection_store::ConnectionStore,
     contract::{Cancellation, ErrorKind, ObjectRole, ProviderError, Result},
     control::{BackupPointDocument, BackupPointKind},
     job_store::DurableJob,
@@ -152,7 +153,33 @@ pub(crate) async fn run_pin_history(
     {
         Some(record) => record,
         None => {
-            let snapshot = super::control::find_snapshot(connected, snapshot_id, cancel).await?;
+            let cache_root = root(app)?;
+            let known = match ConnectionStore::open(&cache_root)?
+                .discovery_snapshot(&job.request.connection_id, snapshot_id)
+            {
+                Ok(value) => Some(value),
+                Err(error) if error.kind == ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
+            let invalidation_root = cache_root.clone();
+            let invalidation_connection = job.request.connection_id.clone();
+            let invalidation_id = snapshot_id.to_owned();
+            let snapshot = super::control::find_snapshot_with_locator_invalidation(
+                connected,
+                snapshot_id,
+                known.as_ref(),
+                move || {
+                    ConnectionStore::open(&invalidation_root)?
+                        .forget_discovery(&invalidation_connection, &invalidation_id)
+                },
+                cancel,
+            )
+            .await?;
+            ConnectionStore::open(&cache_root)?.remember_discovery(
+                &job.request.connection_id,
+                snapshot_id,
+                &snapshot,
+            )?;
             let document =
                 super::control::read_snapshot_document(connected, &snapshot, cancel).await?;
             let snapshot_reference = serde_json::to_string(&snapshot).map_err(|_| corrupt())?;
