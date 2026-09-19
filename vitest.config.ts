@@ -1,32 +1,26 @@
-import { svelte } from '@sveltejs/vite-plugin-svelte'
-import { defineConfig } from 'vitest/config'
-import { responsesInternalsPlugin } from './tests/support/responsesInternals'
+import { defineConfig, mergeConfig } from 'vitest/config'
+import { sharedVitestConfig } from './tests/vitestShared'
+import { appTestIncludes, extendedAppTests, harnessVitestTests, separateRunnerPaths } from './tests/suiteOwnership.mjs'
 
-const exclude = [
-  '**/node_modules/**',
-  '**/dist/**',
-  '**/.git/**',
-  '**/.tmp/**',
-  '**/.worktrees/**',
-  '**/.superpowers/**',
-  '**/docs/research/**',
-  // These suites use node:test and run with the Node test runner.
-  'crates/sync-wire/tests/golden.test.mjs',
-  'benchmarks/sync-server/transfer-comparison.test.mjs',
-]
-
-export default defineConfig({
-  plugins: [responsesInternalsPlugin(), svelte()],
-  resolve: {
-    alias: {
-      src: '/src',
-    },
-    conditions: ['browser'],
-  },
+export default mergeConfig(sharedVitestConfig(), defineConfig({
   test: {
-    exclude,
-    benchmark: { exclude },
-    environment: 'happy-dom',
-    setupFiles: ['vitest.setup.ts'],
+    projects: [
+      {
+        extends: true,
+        test: {
+          name: 'app',
+          include: appTestIncludes,
+          exclude: [...extendedAppTests, ...harnessVitestTests, ...separateRunnerPaths],
+        },
+      },
+      {
+        extends: true,
+        test: { name: 'app-extended', include: extendedAppTests },
+      },
+      {
+        extends: true,
+        test: { name: 'harness', include: harnessVitestTests, exclude: separateRunnerPaths },
+      },
+    ],
   },
-})
+}))

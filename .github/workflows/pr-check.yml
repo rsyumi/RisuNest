@@ -54,3 +54,25 @@ jobs:
 
       - name: Run tests
         run: pnpm test
+
+  independent-frontends:
+    name: Independent frontend checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.1
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --dir server/manager/gui --ignore-workspace install --frozen-lockfile
+      - run: pnpm --dir server/endpoint-registry --ignore-workspace install --frozen-lockfile
+      - run: pnpm check:test-inventory
+      - run: pnpm --dir server/manager/gui --ignore-workspace check
+      - run: pnpm test:manager
+      - run: pnpm --dir server/endpoint-registry --ignore-workspace check
+      - run: pnpm test:registry
