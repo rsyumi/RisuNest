@@ -1,4 +1,9 @@
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rerun-if-changed=src/macos_termination.m");
+        cc::Build::new().file("src/macos_termination.m").compile("risunest_termination");
+        println!("cargo:rustc-link-lib=framework=AppKit");
+    }
     let windows_msvc = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
         && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
 

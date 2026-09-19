@@ -40,6 +40,36 @@ pub(crate) struct ExitState(Mutex<ExitDecision>);
 use tauri::{Emitter, Manager};
 
 #[cfg(target_os = "macos")]
+static APP: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "macos")]
+extern "C" fn request_native_quit() -> std::ffi::c_int {
+    std::panic::catch_unwind(|| {
+        let Some(app) = APP.get() else { return 1; };
+        let state = app.state::<ExitState>();
+        let held = {
+            let decision = state.0.lock().unwrap_or_else(|error| error.into_inner());
+            decision.ready && !decision.allowed
+        };
+        if held { app.exit(0); }
+        i32::from(held)
+    }).unwrap_or(1)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn install_native_quit(app: &tauri::AppHandle) -> Result<(), String> {
+    unsafe extern "C" {
+        fn risunest_install_termination_handler(callback: extern "C" fn() -> std::ffi::c_int) -> std::ffi::c_int;
+    }
+    APP.set(app.clone()).map_err(|_| "macOS quit bridge already installed")?;
+    // Setup runs on the AppKit thread after Tao has installed its delegate.
+    if unsafe { risunest_install_termination_handler(request_native_quit) } != 1 {
+        return Err("Unable to install macOS native quit protection".into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 pub(crate) fn document_started(app: &tauri::AppHandle) {
     if let Some(state) = app.try_state::<ExitState>() {
         state

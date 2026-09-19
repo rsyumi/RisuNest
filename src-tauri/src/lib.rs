@@ -526,6 +526,8 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
     builder
         .setup(move |app| {
             let setup_result = (|| -> Result<(), String> {
+                #[cfg(target_os = "macos")]
+                macos_lifecycle::install_native_quit(app.handle())?;
                 #[cfg(any(target_os = "android", target_os = "ios"))]
                 app.handle()
                     .plugin(tauri_plugin_barcode_scanner::init())

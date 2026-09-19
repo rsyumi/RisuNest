@@ -4510,6 +4510,7 @@ dependencies = [
  "axum",
  "base64 0.21.7",
  "cap-primitives",
+ "cc",
  "crc32fast",
  "darling 0.20.11",
  "eventsource-client",

@@ -11,6 +11,7 @@ edition = "2021"
 
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
+cc = "1"
 
 [dependencies]
 axum = "0.8.9"
