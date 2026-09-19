@@ -252,6 +252,47 @@ describe('external storage production integration', () => {
         visibilitySpy.mockRestore()
     })
 
+    it('queues the current durable revision after reconnecting without another edit', async () => {
+        vi.useFakeTimers()
+        try {
+            const { installExternalStorageProduction } = await import('./production')
+            await installExternalStorageProduction()
+            await vi.advanceTimersByTimeAsync(15_000)
+            expect(mocks.bridge.startJob).toHaveBeenCalledOnce()
+            mocks.bridge.startJob.mockClear()
+            mocks.revision = 12
+            window.dispatchEvent(new Event('online'))
+            await vi.advanceTimersByTimeAsync(15_001)
+            expect(mocks.bridge.startJob).toHaveBeenCalledWith(expect.objectContaining({
+                connectionId: 'old-sync', targetRevision: '12', reason: 'automatic',
+            }))
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
+    it('queues the already-saved revision for a new destination without another edit', async () => {
+        vi.useFakeTimers()
+        try {
+            const { installExternalStorageProduction, refreshExternalStorageProductionState } = await import('./production')
+            await installExternalStorageProduction()
+            mocks.revision = 21
+            mocks.bridge.getState.mockResolvedValue({
+                ...initialState,
+                selection: { ...initialState.selection, connectionId: 'new-sync' },
+                connections: [{ ...initialState.connections[0], id: 'new-sync' }],
+            })
+            await refreshExternalStorageProductionState()
+            await vi.advanceTimersByTimeAsync(15_000)
+            expect(mocks.bridge.startJob).toHaveBeenCalledOnce()
+            expect(mocks.bridge.startJob).toHaveBeenCalledWith(expect.objectContaining({
+                connectionId: 'new-sync', targetRevision: '21', reason: 'automatic',
+            }))
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
     it('refreshes cached routing immediately after a settings mutation', async () => {
         const {
             getExternalStorageSyncExitDrainAdapter,

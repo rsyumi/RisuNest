@@ -1,5 +1,6 @@
 import { isTauri } from "../../platform";
 import { invalidatePluginDeviceKeyspaces } from "../../plugins/pluginDeviceKeyspace";
+import { subscribeLibraryFileOperationReleased } from "../libraryFileOperation";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -216,6 +217,9 @@ export function startServerSync(): void {
   const scheduler = createServerSyncScheduler(controller, { available });
   activeScheduler = scheduler;
   syncAvailable = available;
+  subscribeLibraryFileOperationReleased(() => {
+    if (controller.canAutoSync()) resumeServerSyncAfterBackup();
+  });
   subscribeLocalPersistentRevision(() => {
     controller.invalidateCompletion();
     scheduler.localCommit();

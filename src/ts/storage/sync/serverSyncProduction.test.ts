@@ -121,6 +121,24 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 describe("native server synchronization scheduling", () => {
+  it.each([true, false])("rechecks scheduling after file admission releases without clearing a restore hold (%s)", async (ready) => {
+    const { startServerSync } = await import("./serverSyncProduction");
+    const { reserveLibraryFileOperation, isLibraryFileOperationReserved } = await import("../libraryFileOperation");
+    startServerSync();
+    await Promise.resolve();
+    const release = reserveLibraryFileOperation();
+    state.scheduler.resume.mockClear();
+    state.invoke.mockClear();
+    state.ready = ready;
+    state.controller.canAutoSync.mockImplementation(() => state.ready && !isLibraryFileOperationReserved());
+    expect(isLibraryFileOperationReserved()).toBe(true);
+    release();
+    release();
+    expect(isLibraryFileOperationReserved()).toBe(false);
+    expect(state.scheduler.resume).toHaveBeenCalledTimes(ready ? 1 : 0);
+    if (ready) expect(state.invoke).toHaveBeenCalledWith("server_sync_events_start");
+    else expect(state.invoke).not.toHaveBeenCalledWith("server_sync_events_start");
+  });
   it("adapts normal exit drains to the server revision controller", async () => {
     const { createServerSyncExitDrainAdapter } = await import(
       "./serverSyncProduction"

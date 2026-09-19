@@ -140,6 +140,22 @@ describe('external storage scheduler', () => {
         expect(request).toHaveBeenCalledTimes(2)
     })
 
+    it.each(['retry', 'wait'])('does not reschedule a non-retryable %s response', async (action) => {
+        const { scheduler, request } = harness()
+        request.mockResolvedValue({
+            kind: 'blocked', reason: 'permanent-rejection',
+            error: { code: 'corrupt', message: 'Rejected', retryable: false, action, retryAtMs: '20000' },
+        } as never)
+        scheduler.durableRevision('7')
+        await vi.advanceTimersByTimeAsync(15_000)
+        scheduler.resume()
+        await vi.advanceTimersByTimeAsync(300_000)
+        expect(request).toHaveBeenCalledOnce()
+        expect(scheduler.pendingRevision('destination-1', 'sync')).toBeUndefined()
+        await scheduler.requestNow('destination-1', 'sync', '7')
+        expect(request).toHaveBeenCalledTimes(2)
+    })
+
     it('leaves an unknown publication stopped until an explicit request', async () => {
         const request = vi.fn().mockResolvedValue({
             kind: 'blocked' as const,

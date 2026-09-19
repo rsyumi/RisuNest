@@ -215,7 +215,13 @@ export function installExternalStorageProduction(): Promise<() => void> {
             scheduler.durableRevision(String(value) as DecimalString, cause)
         }))
 
-        const onOnline = (): void => scheduler.resume()
+        const onOnline = (): void => {
+            current.lifecycle = current.lifecycle.then(async () => {
+                if (runtime === current && document.visibilityState !== 'hidden') {
+                    await refreshForeground(current)
+                }
+            }).catch(() => {})
+        }
         const onOffline = (): void => {
             void scheduler.suspend(destination => destination.kind === 'sync')
         }
@@ -267,6 +273,9 @@ export async function refreshExternalStorageProductionState(): Promise<void> {
     const state = await getExternalStorageBridge().getState()
     current.state = state
     current.controller.replaceState(state)
+    const token = await capturePersistentMutationToken('external-storage-routing-changed')
+    if (runtime !== current) return
+    current.scheduler.durableRevision(String(token.revision) as DecimalString)
     current.scheduler.resume()
 }
 

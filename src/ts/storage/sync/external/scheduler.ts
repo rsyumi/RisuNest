@@ -131,7 +131,7 @@ export function createExternalStorageScheduler(
                 session: dependencies.session(),
             }
             void controller.request(request).then((result) => {
-                if (result.kind !== 'blocked') return
+                if (result.kind !== 'blocked' || result.error?.retryable === false) return
                 if (
                     result.error?.retryable
                     && result.error.retryAtMs !== undefined
