@@ -8,6 +8,7 @@ import type {
     CompleteConversationLease,
     ConversationPublicationOptions,
     SelectedConversationTarget,
+    WindowedConversationMutationController,
 } from './activeWorkingSet.svelte'
 import type { ConversationViewportSource } from '../conversationViewportSource'
 import type { Chat, Database, character, groupChat } from './database.svelte'
@@ -523,6 +524,16 @@ export const acquireCompleteConversation = (
     target?: SelectedConversationTarget | null,
 ): Promise<CompleteConversationLease> =>
     getPersistentDataRuntime().acquireCompleteConversation(reason, target)
+export const captureWindowedConversationMutationController = (
+    target: SelectedConversationTarget,
+    chat: Chat,
+    absoluteStartIndex: number,
+): WindowedConversationMutationController | null =>
+    getPersistentDataRuntime().captureWindowedConversationMutationController(
+        target,
+        chat,
+        absoluteStartIndex,
+    )
 export const tryDemoteSelectedConversation = (
     target?: SelectedConversationTarget | null,
 ): boolean => getPersistentDataRuntime().tryDemoteSelectedConversation(target)

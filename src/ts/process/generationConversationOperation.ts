@@ -6,6 +6,7 @@ import type {
     ActiveConversationSession,
     MessageLocator,
 } from '../storage/activeConversationSession'
+import type { WindowedConversationMutationController } from '../storage/activeWorkingSet.svelte'
 
 interface GenerationConversationOperationOptions {
     session: ActiveConversationSession | null
@@ -17,6 +18,7 @@ interface GenerationConversationOperationOptions {
     continueLast?: boolean
     messageId?: string
     onFallbackMutation?(): void
+    windowedController?: WindowedConversationMutationController | null
 }
 
 export interface GenerationConversationOperation {
@@ -30,6 +32,18 @@ export interface GenerationConversationOperation {
     refresh(): boolean
     acceptCommit(commit: ConversationOperationCommit): boolean
     release(): void
+}
+
+const windowedControllers = new WeakMap<Chat, WindowedConversationMutationController>()
+
+export function bindWindowedGenerationController(
+    chat: Chat,
+    controller: WindowedConversationMutationController,
+): () => void {
+    windowedControllers.set(chat, controller)
+    return () => {
+        if (windowedControllers.get(chat) === controller) windowedControllers.delete(chat)
+    }
 }
 
 function hasExactlyOneTarget(options: GenerationConversationOperationOptions): boolean {
@@ -62,9 +76,72 @@ export function captureGenerationConversationOperation(
     const session = options.session
     const usesSession = canUseActiveSession(options)
 
-    return usesSession
+    const windowedController = options.windowedController ?? windowedControllers.get(options.chat)
+    return windowedController
+        ? captureWindowedOperation(windowedController, options)
+        : usesSession
         ? captureSessionOperation(session!, options)
         : captureFullArrayFallback(options)
+}
+
+function captureWindowedOperation(
+    controller: WindowedConversationMutationController,
+    options: GenerationConversationOperationOptions,
+): GenerationConversationOperation {
+    const chat = controller.chat
+    let localIndex: number
+    if (options.append !== undefined) {
+        localIndex = chat.message.length
+        trackRerollOutput(chat, options.append)
+        if (!controller.applyRange(localIndex, 0, [options.append], 'append')) {
+            throw new RangeError('Windowed generation operation owner is no longer current')
+        }
+    } else if (options.continueLast) {
+        localIndex = chat.message.length - 1
+        if (!chat.message[localIndex]) throw new RangeError('Cannot continue an empty conversation')
+    } else {
+        localIndex = chat.message.findIndex((message) => message.chatId === options.messageId)
+        if (localIndex < 0) {
+            throw new RangeError(`Generation message ${options.messageId} was not found`)
+        }
+    }
+    let released = false
+    let currentMessageId = chat.message[localIndex]?.chatId
+    const operation: GenerationConversationOperation = {
+        get absoluteIndex() { return controller.absoluteStartIndex + localIndex },
+        get messageId() { return currentMessageId },
+        usesFullArrayFallback: false,
+        isOwned() {
+            return !released
+                && controller.isCurrent()
+                && options.isOwnerCurrent?.() !== false
+                && chat.message[localIndex]?.chatId === currentMessageId
+        },
+        snapshot() {
+            return operation.isOwned() ? safeStructuredClone(chat.message[localIndex]) : null
+        },
+        commitData(data) {
+            const current = operation.snapshot()
+            return current !== null && operation.commitMessage({ ...current, data })
+        },
+        commitMessage(message) {
+            if (!operation.isOwned()) return false
+            trackRerollOutput(chat, message)
+            if (!controller.applyRange(localIndex, 1, [message], 'edit')) return false
+            currentMessageId = chat.message[localIndex]?.chatId
+            return true
+        },
+        refresh() {
+            if (!controller.isCurrent() || currentMessageId === undefined) return false
+            const nextIndex = chat.message.findIndex((message) => message.chatId === currentMessageId)
+            if (nextIndex < 0) return false
+            localIndex = nextIndex
+            return true
+        },
+        acceptCommit: () => operation.isOwned(),
+        release() { released = true },
+    }
+    return operation
 }
 
 export function captureGenerationTailFallbackOperation(

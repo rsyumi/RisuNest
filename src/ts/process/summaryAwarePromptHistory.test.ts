@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { planSummaryAwarePromptHistory } from './summaryAwarePromptHistory'
+import {
+    planSummaryAwarePromptHistory,
+    planSummaryAwarePromptMetadata,
+} from './summaryAwarePromptHistory'
 
 const chat = (messages: any[], summaries: any[]) => ({
     id: 'chat',
@@ -60,6 +63,47 @@ describe('summary-aware prompt history admission', () => {
         ], [{ chatMemos: ['missing'] }]), true)).toMatchObject({
             route: 'complete',
             reason: 'unresolved-summary-boundary',
+        })
+    })
+
+    it('keeps disabled rows out of metadata boundary ordinals without renumbering bodies', () => {
+        const conversation = chat([], [{ chatMemos: ['a', 'b'] }])
+        const decision = planSummaryAwarePromptMetadata(conversation, [
+            { chatId: 'a', role: 'user', parserInert: true },
+            { chatId: 'disabled', role: 'char', disabled: true, parserInert: true },
+            { chatId: 'b', role: 'char', parserInert: true },
+            { chatId: 'c', role: 'user', parserInert: true },
+        ], false)
+        expect(decision).toMatchObject({
+            route: 'summary-aware',
+            plan: {
+                boundaryMemo: 'b',
+                bodyStartIndex: 3,
+                effectiveMessageMemos: ['a', 'b', 'c'],
+            },
+        })
+    })
+
+    it('uses the complete route when allBefore would require omitted greeting history', () => {
+        const conversation = chat([], [{ chatMemos: ['a'] }])
+        expect(planSummaryAwarePromptMetadata(conversation, [
+            { chatId: 'reset', role: 'user', disabled: 'allBefore', parserInert: true },
+            { chatId: 'a', role: 'user', parserInert: true },
+            { chatId: 'b', role: 'char', parserInert: true },
+        ], false)).toEqual({
+            route: 'complete',
+            reason: 'all-before-before-summary-boundary',
+        })
+    })
+
+    it('falls back when any metadata row can run history-dependent parsing', () => {
+        const conversation = chat([], [{ chatMemos: ['a'] }])
+        expect(planSummaryAwarePromptMetadata(conversation, [
+            { chatId: 'a', role: 'user', parserInert: true },
+            { chatId: 'b', role: 'char', parserInert: false },
+        ], false)).toEqual({
+            route: 'complete',
+            reason: 'summarized-message-has-dynamic-processing',
         })
     })
 })

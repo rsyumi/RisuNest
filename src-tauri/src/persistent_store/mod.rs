@@ -732,6 +732,31 @@ pub(crate) struct ConversationWindow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConversationMessageMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) chat_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) disabled: Option<Value>,
+    pub(crate) parser_inert: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConversationMessageMetadataWindow {
+    pub(crate) character_id: String,
+    pub(crate) conversation_id: String,
+    pub(crate) messages: Vec<ConversationMessageMetadata>,
+    pub(crate) start_index: i64,
+    pub(crate) end_index: i64,
+    pub(crate) total_messages: i64,
+    pub(crate) has_more_before: bool,
+    pub(crate) has_more_after: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(
     tag = "type",
     rename_all = "kebab-case",
@@ -1497,6 +1522,15 @@ impl PersistentStore {
     ) -> StoreResult<Option<Versioned<ConversationWindow>>> {
         let (connection, target) = self.read_view(lease)?;
         query::read_conversation_window(connection, query, &target)
+    }
+
+    pub(crate) fn read_conversation_message_metadata_window(
+        &self,
+        query: &ConversationWindowQuery,
+        lease: Option<&str>,
+    ) -> StoreResult<Option<Versioned<ConversationMessageMetadataWindow>>> {
+        let (connection, target) = self.read_view(lease)?;
+        query::read_conversation_message_metadata_window(connection, query, &target)
     }
 
     pub(crate) fn query_plugin_storage(

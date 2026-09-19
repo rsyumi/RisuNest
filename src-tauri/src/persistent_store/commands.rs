@@ -537,6 +537,17 @@ pub(crate) fn pds_read_conversation_window(
 }
 
 #[tauri::command(async)]
+pub(crate) fn pds_read_conversation_message_metadata_window(
+    state: State<'_, PersistentStoreState>,
+    query: ConversationWindowQuery,
+    lease: Option<String>,
+) -> Result<Option<Versioned<super::ConversationMessageMetadataWindow>>, StoreError> {
+    with_store(state, |store| {
+        store.read_conversation_message_metadata_window(&query, lease.as_deref())
+    })
+}
+
+#[tauri::command(async)]
 pub(crate) fn pds_query_plugin_storage(
     state: State<'_, PersistentStoreState>,
     lease: Option<String>,

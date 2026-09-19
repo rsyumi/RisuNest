@@ -3089,7 +3089,7 @@ mod tests {
     }
 
     #[test]
-    fn current_exporter_round_trip_supports_a_character_larger_than_64_mib() {
+    fn current_exporter_round_trip_streams_a_message_history_larger_than_64_mib() {
         let directory = TempDir::new().unwrap();
         let mut store = PersistentStore::open(directory.path()).unwrap();
         let staging = store.replace_begin().unwrap().staging_id;
@@ -3106,6 +3106,11 @@ mod tests {
             )
             .unwrap();
         store.replace_put_presets(&staging, &[]).unwrap();
+        let messages = (0..16_385).map(|index| json!({
+            "role": if index % 2 == 0 { "user" } else { "char" },
+            "data": "x".repeat(4 * 1024),
+            "chatId": format!("large-message-{index}"),
+        })).collect::<Vec<_>>();
         store
             .replace_add_characters(
                 &staging,
@@ -3113,8 +3118,11 @@ mod tests {
                     "type": "character",
                     "chaId": "large-character",
                     "name": "Large character",
-                    "description": "x".repeat(64 * 1024 * 1024 + 1),
-                    "chats": [],
+                    "chats": [{
+                        "id": "large-conversation",
+                        "name": "Large conversation",
+                        "message": messages,
+                    }],
                 })],
             )
             .unwrap();
@@ -3135,13 +3143,23 @@ mod tests {
             .create(JobKind::RestoreBlockRisuSave)
             .unwrap();
 
-        let result = restore_block_risu_save_path(&exported_path, 1, &job, &sink).unwrap();
+        let measurement = crate::test_memory::measure_working_set(|| {
+            restore_block_risu_save_path(&exported_path, 1, &job, &sink)
+        });
+        let result = measurement.value.unwrap();
 
         assert_eq!(result.revision, 2);
         assert_eq!(result.character_count, 1);
         assert_eq!(sink.full_character_calls.load(Ordering::Acquire), 0);
         assert_eq!(sink.incremental_character_calls.load(Ordering::Acquire), 1);
         assert!(sink.max_message_page.load(Ordering::Acquire) <= MESSAGE_PAGE_COUNT);
+        println!(
+            "BOUNDED_RISUSAVE_MEMORY {{\"messageCount\":16385,\"messageBytes\":4096,\"baselineWorkingSetBytes\":{:?},\"peakWorkingSetBytes\":{:?},\"retainedWorkingSetBytes\":{:?},\"maxMessagePage\":{}}}",
+            measurement.baseline_working_set_bytes,
+            measurement.peak_working_set_bytes,
+            measurement.retained_working_set_bytes,
+            sink.max_message_page.load(Ordering::Acquire),
+        );
         let mut store = sink.store.lock().unwrap();
         store.release_revision(&lease).unwrap();
         store.cleanup_risu_save_export(&exported_path).unwrap();

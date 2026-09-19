@@ -26,6 +26,7 @@ import {
     type ContentChangeWindow,
     type ConversationPage,
     type ConversationQuery,
+    type ConversationMessageMetadataWindow,
     type ConversationWindow,
     type ConversationWindowQuery,
     type DataRevision,
@@ -195,6 +196,15 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
     ): Promise<Versioned<ConversationWindow> | null> {
         validateConversationWindowQuery(input)
         return await invokeStore('pds_read_conversation_window', { query: input })
+    }
+
+    async readConversationMessageMetadataWindow(
+        input: ConversationWindowQuery,
+    ): Promise<Versioned<ConversationMessageMetadataWindow> | null> {
+        validateConversationWindowQuery(input)
+        return await invokeStore('pds_read_conversation_message_metadata_window', {
+            query: input,
+        })
     }
 
     queryPluginStorage(): Promise<PluginStorageCatalog> {
@@ -465,6 +475,14 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
                 assertActive()
                 validateConversationWindowQuery(input)
                 return invokeStore('pds_read_conversation_window', { query: input, lease })
+            },
+            readConversationMessageMetadataWindow: async (input) => {
+                assertActive()
+                validateConversationWindowQuery(input)
+                return invokeStore('pds_read_conversation_message_metadata_window', {
+                    query: input,
+                    lease,
+                })
             },
             queryPluginStorage: async () => {
                 assertActive()

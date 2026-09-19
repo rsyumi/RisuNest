@@ -377,6 +377,45 @@ describe('SynchronousSessionConversationViewportSource', () => {
 })
 
 describe('PersistentConversationViewportSource', () => {
+    it('publishes optimistic generated tail rows while persistent reads remain on the pinned base', async () => {
+        const readConversationWindow = vi.fn(async () => ({
+            revision: 7,
+            value: persistentWindow(0, [
+                message('zero', 'stored-zero'),
+                message('one', 'stored-one'),
+            ], 2),
+        }))
+        const source = new PersistentConversationViewportSource({
+            reader: { readConversationWindow },
+            characterId: 'character-a',
+            conversationId: 'conversation-a',
+            revision: 7,
+            totalMessages: 2,
+            rowBudget: 8,
+        })
+        const listener = vi.fn()
+        source.subscribe(listener)
+
+        const rollback = source.applyOptimisticRange(2, 0, [
+            message('generated', 'streamed'),
+        ])
+        expect(source.snapshot()).toMatchObject({ totalMessages: 3 })
+        expect(source.snapshot().rowAt(2)?.message).toMatchObject({ data: 'streamed' })
+
+        await source.ensureRange({ startIndex: 0, limit: 3, reason: 'viewport' })
+        expect(source.snapshot().rowAt(0)?.message).toMatchObject({ data: 'stored-zero' })
+        expect(source.snapshot().rowAt(2)?.message).toMatchObject({ data: 'streamed' })
+        expect(readConversationWindow).toHaveBeenCalledWith(expect.objectContaining({
+            startIndex: 0,
+            limit: 3,
+        }))
+
+        rollback()
+        expect(source.snapshot()).toMatchObject({ totalMessages: 2 })
+        expect(source.snapshot().rowAt(2)).toBeUndefined()
+        expect(listener).toHaveBeenCalledTimes(3)
+    })
+
     it('derives owned keys in constant space and loads an exact persistent window', async () => {
         const readConversationWindow = vi.fn(
             async (input: ConversationWindowQuery): Promise<Versioned<ConversationWindow>> => ({

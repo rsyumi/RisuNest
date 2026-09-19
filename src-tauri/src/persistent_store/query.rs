@@ -3,8 +3,8 @@ use super::{
     ArchivedCharacterSummary, AssetAlias, AssetAliasListQuery, AssetAliasPage, AssetOwnerHead,
     AssetOwnerLocator, AssetRepositoryAuthorityState, CharacterPage, CharacterQuery,
     CharacterSummary, ConversationPage, ConversationQuery, ConversationSummary,
-    ConversationWindow, ConversationWindowQuery, PluginStorageCatalog, PluginStorageListItem,
-    PluginStorageSummary,
+    ConversationMessageMetadata, ConversationMessageMetadataWindow, ConversationWindow,
+    ConversationWindowQuery, PluginStorageCatalog, PluginStorageListItem, PluginStorageSummary,
     PresetCatalog, PresetSummary, QueryOrder, ReadTarget, StoreError, StoreResult, Versioned,
     CONVERSATION_RANGE_MAX_LIMIT, JAVASCRIPT_MAX_SAFE_INTEGER,
 };
@@ -890,6 +890,113 @@ pub(super) fn read_conversation_window(
     Ok(Some(Versioned {
         revision: target.revision,
         value: ConversationWindow {
+            character_id: query.character_id.clone(),
+            conversation_id: query.conversation_id.clone(),
+            messages,
+            start_index,
+            end_index,
+            total_messages,
+            has_more_before: start_index > 0,
+            has_more_after: end_index < total_messages,
+        },
+    }))
+}
+
+pub(super) fn read_conversation_message_metadata_window(
+    connection: &Connection,
+    query: &ConversationWindowQuery,
+    target: &ReadTarget,
+) -> StoreResult<Option<Versioned<ConversationMessageMetadataWindow>>> {
+    let Some(start_index) = query.start_index else {
+        return Err(StoreError::Validation {
+            message: "conversation metadata range requires startIndex".to_owned(),
+        });
+    };
+    if !(0..=JAVASCRIPT_MAX_SAFE_INTEGER).contains(&start_index) {
+        return Err(StoreError::Validation {
+            message: "conversation metadata range startIndex must be a nonnegative safe integer"
+                .to_owned(),
+        });
+    }
+    let Some(limit) = query.limit else {
+        return Err(StoreError::Validation {
+            message: "conversation metadata range requires limit".to_owned(),
+        });
+    };
+    if !(1..=CONVERSATION_RANGE_MAX_LIMIT).contains(&limit)
+        || query.anchor_message_id.is_some()
+        || query.anchor_occurrence.is_some()
+        || query.before.is_some()
+        || query.after.is_some()
+    {
+        return Err(StoreError::Validation {
+            message: "conversation metadata range is invalid".to_owned(),
+        });
+    }
+    let total_messages: Option<i64> = connection
+        .query_row(
+            "SELECT message_count FROM conversations WHERE generation = ?1 AND character_id = ?2 AND conversation_id = ?3",
+            params![target.generation, query.character_id, query.conversation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(total_messages) = total_messages else {
+        return Ok(None);
+    };
+    let start_index = start_index.min(total_messages);
+    let end_index = (start_index + limit).min(total_messages);
+    let mut statement = connection.prepare(
+        "SELECT message_id, json_extract(value, '$.role'), json_quote(json_extract(value, '$.disabled')),
+                json_type(value, '$.data') = 'text'
+                AND instr(json_extract(value, '$.data'), '{{') = 0
+                AND instr(json_extract(value, '$.data'), '}}') = 0
+                AND instr(json_extract(value, '$.data'), '<Thoughts>') = 0
+                AND instr(json_extract(value, '$.data'), '</Thoughts>') = 0
+         FROM messages
+         WHERE generation = ?1 AND character_id = ?2 AND conversation_id = ?3
+           AND message_index >= ?4 AND message_index < ?5
+         ORDER BY message_index ASC",
+    )?;
+    let rows = statement.query_map(
+        params![
+            target.generation,
+            query.character_id,
+            query.conversation_id,
+            start_index,
+            end_index
+        ],
+        |row| {
+            let disabled_json: Option<String> = row.get(2)?;
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                disabled_json,
+                row.get::<_, bool>(3)?,
+            ))
+        },
+    )?;
+    let mut messages = Vec::with_capacity((end_index - start_index) as usize);
+    for row in rows {
+        let (chat_id, role, disabled_json, parser_inert) = row?;
+        let disabled = disabled_json
+            .filter(|value| value != "null")
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?;
+        messages.push(ConversationMessageMetadata {
+            chat_id,
+            role,
+            disabled,
+            parser_inert,
+        });
+    }
+    if messages.len() != (end_index - start_index) as usize {
+        return Err(StoreError::Store {
+            message: "Conversation metadata range is incomplete".to_owned(),
+        });
+    }
+    Ok(Some(Versioned {
+        revision: target.revision,
+        value: ConversationMessageMetadataWindow {
             character_id: query.character_id.clone(),
             conversation_id: query.conversation_id.clone(),
             messages,

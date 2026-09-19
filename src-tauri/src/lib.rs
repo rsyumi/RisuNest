@@ -46,6 +46,8 @@ mod publication_upload;
 mod regex_shadow;
 mod server_sync;
 mod trust_boundary;
+#[cfg(test)]
+mod test_memory;
 #[cfg(windows)]
 mod windows_appearance;
 
@@ -802,6 +804,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         persistent_store::commands::pds_read_conversation,
         persistent_store::commands::pds_read_conversation_metadata,
         persistent_store::commands::pds_read_conversation_window,
+        persistent_store::commands::pds_read_conversation_message_metadata_window,
         persistent_store::commands::pds_query_plugin_storage,
         persistent_store::commands::pds_list_plugin_storage,
         persistent_store::commands::pds_read_plugin_storage,

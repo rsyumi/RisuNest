@@ -369,6 +369,66 @@ fn malformed_streamed_restore_keeps_the_archive_and_cleans_partial_staging() {
 }
 
 #[test]
+#[ignore = "synthetic memory benchmark"]
+fn large_character_archive_and_restore_memory_measurement() {
+    const MESSAGE_COUNT: i64 = 16_384;
+    const MESSAGE_BYTES: usize = 2 * 1024;
+    let (_directory, mut store, _cas) = archive_store();
+    let generation = active_generation(&store.connection).expect("read active generation");
+    let transaction = store.connection.transaction().expect("begin fixture transaction");
+    transaction.execute(
+        "DELETE FROM messages
+         WHERE generation=?1 AND character_id='middle-archived' AND conversation_id='middle-chat'",
+        [&generation],
+    ).expect("clear fixture messages");
+    {
+        let mut statement = transaction.prepare(
+            "INSERT INTO messages (
+                generation, character_id, conversation_id, message_index, message_id, value
+             ) VALUES (?1, 'middle-archived', 'middle-chat', ?2, ?3, ?4)",
+        ).expect("prepare message insert");
+        let body = "x".repeat(MESSAGE_BYTES);
+        for index in 0..MESSAGE_COUNT {
+            let message_id = format!("scale-{index}");
+            let value = serde_json::to_string(&json!({
+                "role": if index % 2 == 0 { "user" } else { "char" },
+                "data": body,
+                "chatId": message_id,
+            })).expect("encode message");
+            statement.execute(params![generation, index, message_id, value])
+                .expect("insert message");
+        }
+    }
+    transaction.execute(
+        "UPDATE conversations SET message_count=?2
+         WHERE generation=?1 AND character_id='middle-archived' AND conversation_id='middle-chat'",
+        params![generation, MESSAGE_COUNT],
+    ).expect("update message count");
+    transaction.commit().expect("commit scale fixture");
+
+    let archive_revision = store.revision().expect("read archive revision");
+    let archive = crate::test_memory::measure_working_set(|| {
+        store.archive_character("middle-archived", archive_revision, 10)
+    });
+    archive.value.expect("archive large character");
+    let restore_revision = store.revision().expect("read restore revision");
+    let restore = crate::test_memory::measure_working_set(|| {
+        store.restore_character("middle-archived", restore_revision)
+    });
+    restore.value.expect("restore large character");
+
+    println!(
+        "BOUNDED_ARCHIVE_MEMORY {{\"messageCount\":{MESSAGE_COUNT},\"messageBytes\":{MESSAGE_BYTES},\"archiveBaselineWorkingSetBytes\":{:?},\"archivePeakWorkingSetBytes\":{:?},\"archiveRetainedWorkingSetBytes\":{:?},\"restoreBaselineWorkingSetBytes\":{:?},\"restorePeakWorkingSetBytes\":{:?},\"restoreRetainedWorkingSetBytes\":{:?}}}",
+        archive.baseline_working_set_bytes,
+        archive.peak_working_set_bytes,
+        archive.retained_working_set_bytes,
+        restore.baseline_working_set_bytes,
+        restore.peak_working_set_bytes,
+        restore.retained_working_set_bytes,
+    );
+}
+
+#[test]
 fn an_archived_character_rejects_every_mutation_except_deleting_it() {
     let (_directory, mut store, _cas) = archive_store();
     let revision = store.revision().expect("read revision");

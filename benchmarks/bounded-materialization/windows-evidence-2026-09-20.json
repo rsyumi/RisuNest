@@ -1,0 +1,84 @@
+{
+  "platform": "Windows x86_64",
+  "fixturesAreSynthetic": true,
+  "generation": {
+    "variant": "Hypa V3 standard",
+    "totalMessages": 50000,
+    "summarizedMessages": 49968,
+    "unsummarizedMessages": 32,
+    "metadataRows": 50000,
+    "metadataPages": 391,
+    "classificationRows": 50000,
+    "bodyRowsTransferred": 32,
+    "bodyPages": 32,
+    "bodyBytesTransferred": 67136,
+    "coveredBodyTransfers": 0,
+    "commonPreprocessingRows": 32,
+    "preparationElapsedMs": 37.6197,
+    "parentBaselineHeapUsedBytes": 26042024,
+    "parentPeakHeapUsedBytes": 47604840,
+    "parentRetainedHeapUsedBytes": 34749632
+  },
+  "archive": {
+    "messageCount": 16384,
+    "messageBodyBytes": 2048,
+    "archiveBaselineNativeWorkingSetBytes": 39145472,
+    "archivePeakNativeWorkingSetBytes": 43462656,
+    "archiveRetainedNativeWorkingSetBytes": 41553920,
+    "restoreBaselineNativeWorkingSetBytes": 41598976,
+    "restorePeakNativeWorkingSetBytes": 196452352,
+    "restoreRetainedNativeWorkingSetBytes": 121520128
+  },
+  "risuSave": {
+    "messageCount": 16385,
+    "messageBodyBytes": 4096,
+    "maximumStagingPageMessages": 128,
+    "baselineNativeWorkingSetBytes": 126144512,
+    "peakNativeWorkingSetBytes": 138248192,
+    "retainedNativeWorkingSetBytes": 138354688
+  },
+  "pluginIframeTransfer": {
+    "characters": 64,
+    "conversationsPerCharacter": 8,
+    "messagesPerConversation": 32,
+    "messageBodyBytes": 2048,
+    "parentSteadyRetainedCharacterBytes": 0,
+    "maximumParentTransientChunkBytes": 538339,
+    "iframeCharacterCount": 64,
+    "iframeSteadyRetainedJsonBytes": 34451116,
+    "webViewPeakHeapUsedBytes": 48511840,
+    "webViewRetainedHeapUsedBytes": 35824708,
+    "totalProcessTreeBaselineWorkingSetBytes": 663048192,
+    "totalProcessTreePeakWorkingSetBytes": 987033600,
+    "totalProcessTreeRetainedWorkingSetBytes": 948637696
+  },
+  "generationAdmission": {
+    "supported": [
+      "native windowed selected conversation",
+      "standard non-experimental Hypa V3",
+      "stable unique message IDs",
+      "parser-inert stored messages",
+      "no generation triggers or plugin edit/output hooks",
+      "no editprocess or editoutput regex scripts",
+      "no lorebook, additional-text, inlay-view, dynamic-history, or explicit-history consumer",
+      "no pending selected-session edits"
+    ],
+    "completePathFallback": [
+      "Hypa V2",
+      "experimental Hypa V3",
+      "group conversations",
+      "missing, duplicate, or unresolved summary IDs",
+      "allBefore before the summary boundary",
+      "orphan-summary policy that leaves no resolvable boundary",
+      "mutating or unclassified scripts and triggers",
+      "independent old-history consumers",
+      "pending edits, navigation changes, and revision or authority changes"
+    ]
+  },
+  "limitations": [
+    "Browser memory evidence uses headless Microsoft Edge and the same page-to-iframe chunk protocol shape, not a physical mobile WebView.",
+    "The IndexedDB metadata reader preserves web correctness but still deserializes bounded message pages in JavaScript, so native no-body-transfer claims do not apply to web storage.",
+    "Native measurements are process working-set samples from debug test binaries and are comparative evidence, not fixed RAM guarantees.",
+    "macOS, Linux, Android, and iOS device runs were not performed because no physical-device or remote-lab authorization was requested."
+  ]
+}

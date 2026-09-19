@@ -13,10 +13,14 @@ const mocks = vi.hoisted(() => ({
     presetActivationCount: 0,
     presetActivation: null as null | (() => Promise<void> | void),
     outputTrigger: null as null | ((chat: any) => Promise<any> | any),
+    outputTriggerReturnsNull: false,
     tokenizeResult: null as Promise<number> | null,
     inlay: null as null | ((data: string) => { text: string, promise?: Promise<string> }),
     listeners: new Set<(event: any) => Promise<void> | void>(),
     selectedTarget: null as any,
+    selectedAuthority: null as any,
+    windowedController: null as any,
+    persistentStore: null as any,
     acquireCompleteConversation: vi.fn(),
     activeCompleteLeases: 0,
     completeLeaseReleases: 0,
@@ -87,6 +91,7 @@ vi.mock('./triggers', () => ({
         if (mode === 'start') return null
         mocks.events.push('output-trigger')
         const clone = JSON.parse(JSON.stringify(arg.chat))
+        if (mocks.outputTriggerReturnsNull) return null
         return mocks.outputTrigger ? await mocks.outputTrigger(clone) : { chat: clone }
     }),
 }))
@@ -104,7 +109,21 @@ vi.mock('./inlayScreen', () => ({
 vi.mock('./transformers', async () => (await import('./tests/sendChatTestHarness')).transformersModule())
 vi.mock('./memory/hanuraiMemory', async () => (await import('./tests/sendChatTestHarness')).hanuraiMemoryModule())
 vi.mock('./memory/hypav2', async () => (await import('./tests/sendChatTestHarness')).hypav2Module())
-vi.mock('./memory/hypav3', async () => (await import('./tests/sendChatTestHarness')).hypav3Module())
+vi.mock('./memory/hypav3', async () => (await import('./tests/sendChatTestHarness')).hypav3Module({
+    getCurrentHypaV3Preset: () => ({
+        settings: {
+            preserveOrphanedMemory: false,
+            useExperimentalImpl: false,
+            recentMemoryRatio: 0,
+            similarMemoryRatio: 0,
+        },
+    }),
+    hypaMemoryV3: vi.fn(async (chats: any[], currentTokens: number, _max: number, room: any) => ({
+        chats,
+        currentTokens,
+        memory: room.hypaV3Data,
+    })),
+}))
 vi.mock('./scriptings', async () => (await import('./tests/sendChatTestHarness')).scriptingsModule())
 vi.mock('../model/modellist', async () => (await import('./tests/sendChatTestHarness')).modellistModule())
 vi.mock('./modules', async () => (await import('./tests/sendChatTestHarness')).modulesModule())
@@ -125,6 +144,11 @@ vi.mock('../storage/persistentDataRuntime.svelte', () => ({
     getPersistentNavigationGeneration: () => 0,
     acknowledgeGenerationCompletion: mocks.acknowledge,
     captureSelectedConversationTarget: () => mocks.selectedTarget,
+    captureSelectedConversationAuthority: () => mocks.selectedAuthority,
+    captureWindowedConversationMutationController: (...args: any[]) =>
+        typeof mocks.windowedController === 'function'
+            ? mocks.windowedController(...args)
+            : mocks.windowedController,
     acquireCompleteConversation: mocks.acquireCompleteConversation,
     getActiveConversationSession: () => mocks.session,
     invalidateActiveConversationSession: () => {
@@ -132,6 +156,9 @@ vi.mock('../storage/persistentDataRuntime.svelte', () => ({
         mocks.session?.invalidate()
         mocks.session = null
     },
+}))
+vi.mock('../storage/persistentDataStoreFactory', () => ({
+    getPersistentDataStore: () => mocks.persistentStore,
 }))
 
 import type { character, Chat, Database, Message } from '../storage/database.svelte'
@@ -295,10 +322,14 @@ describe('sendChat generation session integration', () => {
         mocks.presetActivationCount = 0
         mocks.presetActivation = null
         mocks.outputTrigger = null
+        mocks.outputTriggerReturnsNull = false
         mocks.tokenizeResult = null
         mocks.inlay = null
         mocks.listeners.clear()
         mocks.selectedTarget = null
+        mocks.selectedAuthority = null
+        mocks.windowedController = null
+        mocks.persistentStore = null
         mocks.activeCompleteLeases = 0
         mocks.completeLeaseReleases = 0
         mocks.lastCharPunctuation = true
@@ -338,6 +369,108 @@ describe('sendChat generation session integration', () => {
                 },
             }
         })
+    })
+
+    it('generates from a pinned unsummarized tail without complete promotion', async () => {
+        const installed = installDatabase(makeChat([]))
+        const storedMessages = [
+            { role: 'user', data: 'covered-a', chatId: 'a' },
+            { role: 'char', data: 'covered-b', chatId: 'b' },
+            { role: 'user', data: 'tail', chatId: 'c' },
+        ] as Message[]
+        installed.chat.hypaV3Data = {
+            summaries: [{ chatMemos: ['a', 'b'], summary: 'covered' }],
+        } as any
+        DBState.db.hypaV3 = true
+        mocks.session = null
+        mocks.outputTriggerReturnsNull = true
+        mocks.selectedTarget = {
+            characterId: installed.currentCharacter.chaId,
+            conversationId: installed.chat.id,
+            navigationGeneration: 0,
+            storeRevision: 1,
+        }
+        mocks.selectedAuthority = {
+            kind: 'windowed',
+            characterId: installed.currentCharacter.chaId,
+            conversationId: installed.chat.id,
+            sessionToken: 'windowed-session',
+            storeRevision: 1,
+            persistedSessionVersion: 0,
+            sessionVersion: 0,
+            totalMessages: storedMessages.length,
+        }
+        const bodyReads: number[] = []
+        const lease = {
+            revision: 1,
+            async readConversationMessageMetadataWindow(input: any) {
+                const end = Math.min(storedMessages.length, input.startIndex + input.limit)
+                return {
+                    revision: 1,
+                    value: {
+                        characterId: input.characterId,
+                        conversationId: input.conversationId,
+                        messages: storedMessages.slice(input.startIndex, end).map((message) => ({
+                            chatId: message.chatId,
+                            role: message.role,
+                            parserInert: true,
+                        })),
+                        startIndex: input.startIndex,
+                        endIndex: end,
+                        totalMessages: storedMessages.length,
+                        hasMoreBefore: input.startIndex > 0,
+                        hasMoreAfter: end < storedMessages.length,
+                    },
+                }
+            },
+            async readConversationWindow(input: any) {
+                bodyReads.push(input.startIndex)
+                return {
+                    revision: 1,
+                    value: {
+                        characterId: input.characterId,
+                        conversationId: input.conversationId,
+                        messages: [structuredClone(storedMessages[input.startIndex])],
+                        startIndex: input.startIndex,
+                        endIndex: input.startIndex + 1,
+                        totalMessages: storedMessages.length,
+                        hasMoreBefore: input.startIndex > 0,
+                        hasMoreAfter: input.startIndex + 1 < storedMessages.length,
+                    },
+                }
+            },
+            release: vi.fn(async () => undefined),
+        }
+        mocks.persistentStore = {
+            readConversationMessageMetadataWindow: vi.fn(),
+            acquireRevision: vi.fn(async () => lease),
+        }
+        const mutations: any[] = []
+        mocks.windowedController = (_target: any, chat: Chat, absoluteStartIndex: number) => ({
+            chat,
+            absoluteStartIndex,
+            isCurrent: () => true,
+            applyRange(localStart: number, deleteCount: number, messages: Message[]) {
+                chat.message.splice(localStart, deleteCount, ...structuredClone(messages))
+                mutations.push({
+                    start: absoluteStartIndex + localStart,
+                    deleteCount,
+                    messages: structuredClone(messages),
+                })
+                return true
+            },
+            release: vi.fn(),
+        })
+
+        await expect(sendChat()).resolves.toBe(true)
+
+        expect(mocks.acquireCompleteConversation).not.toHaveBeenCalled()
+        expect(bodyReads).toEqual([2])
+        expect(mutations.some((mutation) =>
+            mutation.start === 3 && mutation.messages[0]?.data === 'answer',
+        )).toBe(true)
+        expect(lease.release).toHaveBeenCalledOnce()
+        expect(mocks.acknowledge).toHaveBeenCalledOnce()
     })
 
     it('discards a provider result from an old authority even when target IDs and objects are retained', async () => {
