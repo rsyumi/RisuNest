@@ -2637,7 +2637,7 @@ export const languageEnglish = {
             openSettings: 'Open notification settings',
             keepAlive: 'Keep app alive while generating',
             keepAliveHelp:
-                "Shows a notification while receiving a response so Android doesn't stop the app in the background.",
+                "Uses a notification to help generation continue in the background. Android can still suspend or stop the app.",
             keepAliveNeedsNotifications:
                 "This feature doesn't work while notifications are off.",
             operatingSystem: 'Operating system',

@@ -81,6 +81,7 @@ function installAndroidNativeControl(): void {
         begin: () => control.request<boolean>('generation.begin'),
         end: () => control.request<boolean>('generation.end'),
         notificationsEnabled: () => control.request<boolean>('generation.notificationsEnabled'),
+        requestNotifications: () => control.request<void>('generation.requestNotifications'),
         openNotificationSettings: () => control.request<boolean>('generation.openNotificationSettings'),
         webViewVersion: () => control.request<string>('generation.webViewVersion'),
     }

@@ -7,7 +7,7 @@
     import SettingButton from '../RisuNest/SettingButton.svelte'
     import { getDetailedOSLabel } from 'src/ts/platform'
     import { getDeviceSettings, subscribeDeviceSettings, updateDeviceSettings } from 'src/ts/storage/deviceSettings'
-    import { androidGenerationNotificationsEnabled } from 'src/ts/androidGenerationKeepAlive'
+    import { androidGenerationNotificationsEnabled, requestAndroidGenerationNotifications } from 'src/ts/androidGenerationKeepAlive'
 
     let notificationStatus = $state<boolean | null>(null)
     let keepAlive = $state(getDeviceSettings().androidKeepAliveDuringGeneration)
@@ -63,10 +63,15 @@
     })
     onDestroy(unsubscribe)
 
-    function setKeepAlive(next: boolean): void {
+    async function setKeepAlive(next: boolean): Promise<void> {
         if (next === keepAlive) return
         keepAlive = next
         updateDeviceSettings({ androidKeepAliveDuringGeneration: next })
+        if (next) {
+            const version = refreshVersion
+            await requestAndroidGenerationNotifications()
+            if (version === refreshVersion) await refresh()
+        }
     }
 
 </script>

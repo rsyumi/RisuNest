@@ -6,6 +6,7 @@ export interface AndroidGenerationKeepAliveBridge {
     begin(): boolean | Promise<boolean>
     end(): boolean | void | Promise<boolean | void>
     notificationsEnabled(): boolean | Promise<boolean>
+    requestNotifications(): void | Promise<void>
     openNotificationSettings(): boolean | void | Promise<boolean | void>
     webViewVersion(): string | Promise<string>
 }
@@ -35,6 +36,15 @@ export async function endAndroidGenerationKeepAlive(acquired: boolean): Promise<
         await bridge()?.end()
     } catch {
         // Ending is best effort. The Android service timeout is the final cleanup path.
+    }
+}
+
+export async function requestAndroidGenerationNotifications(): Promise<void> {
+    if (!isTauriAndroid) return
+    try {
+        await bridge()?.requestNotifications()
+    } catch {
+        // Permission readiness is read separately; a failed request never implies a grant.
     }
 }
 

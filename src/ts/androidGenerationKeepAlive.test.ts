@@ -9,6 +9,7 @@ vi.mock('./platform', () => ({
 import {
     beginAndroidGenerationKeepAlive,
     endAndroidGenerationKeepAlive,
+    requestAndroidGenerationNotifications,
 } from './androidGenerationKeepAlive'
 
 describe('Android generation keep-alive', () => {
@@ -53,6 +54,18 @@ describe('Android generation keep-alive', () => {
 
         expect(begin).toHaveBeenCalledTimes(1)
         expect(end).toHaveBeenCalledTimes(1)
+    })
+
+    it('keeps explicit permission requests separate from generation acquisition', async () => {
+        const requestNotifications = vi.fn(async () => {})
+        window.RisuGenerationKeepAlive = {
+            begin: async () => false,
+            requestNotifications,
+        } as any
+        expect(await beginAndroidGenerationKeepAlive(true)).toBe(false)
+        expect(requestNotifications).not.toHaveBeenCalled()
+        await requestAndroidGenerationNotifications()
+        expect(requestNotifications).toHaveBeenCalledOnce()
     })
 
     it('does not mistake an asynchronous refusal for ownership', async () => {

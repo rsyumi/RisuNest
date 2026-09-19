@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => {
         notificationStatus: null as boolean | null,
         getDetailedOSLabel: vi.fn(async () => 'Android 16'),
         openNotificationSettings: vi.fn(),
+        requestAndroidGenerationNotifications: vi.fn(async () => {}),
         getDeviceSettings: vi.fn(() => ({ ...settings })),
         updateDeviceSettings: vi.fn((partial: Partial<typeof settings>) => {
             Object.assign(settings, partial)
@@ -30,6 +31,7 @@ vi.mock('src/ts/storage/deviceSettings', () => ({
 }))
 vi.mock('src/ts/androidGenerationKeepAlive', () => ({
     androidGenerationNotificationsEnabled: mocks.androidGenerationNotificationsEnabled,
+    requestAndroidGenerationNotifications: mocks.requestAndroidGenerationNotifications,
 }))
 
 import RisuNestAndroidPlatform from './RisuNestAndroidPlatform.svelte'
@@ -41,6 +43,7 @@ describe('RisuNest Android platform settings', () => {
         if (mounted) await unmount(mounted)
         mounted = null
         mocks.notificationStatus = null
+        mocks.updateDeviceSettings({ androidKeepAliveDuringGeneration: false })
         vi.clearAllMocks()
         document.body.replaceChildren()
         delete window.RisuGenerationKeepAlive
@@ -52,6 +55,7 @@ describe('RisuNest Android platform settings', () => {
             begin: () => false,
             end: () => undefined,
             notificationsEnabled: () => status === true,
+            requestNotifications: vi.fn(),
             openNotificationSettings: mocks.openNotificationSettings,
             webViewVersion: async () => '140.0.1',
         }
@@ -123,6 +127,19 @@ describe('RisuNest Android platform settings', () => {
         expect(notificationBadge?.classList.contains('border-success-500')).toBe(true)
         expect(notificationBadge?.classList.contains('border-draculared')).toBe(false)
         expect(target.textContent).not.toContain("This feature doesn't work while notifications are off.")
+    })
+
+    it('requests permission when enabling without treating the request as a grant', async () => {
+        const target = await mountPlatform(false)
+        expect(mocks.requestAndroidGenerationNotifications).not.toHaveBeenCalled()
+        const toggle = target.querySelector('input[type="checkbox"]') as HTMLInputElement
+        toggle.click()
+        await vi.waitFor(() => expect(mocks.requestAndroidGenerationNotifications).toHaveBeenCalledOnce())
+        expect(target.querySelector('[role="status"]')?.textContent).toBe('Off')
+        expect(target.querySelector('[role="alert"]')).not.toBeNull()
+        toggle.click()
+        await tick()
+        expect(mocks.requestAndroidGenerationNotifications).toHaveBeenCalledOnce()
     })
 
     it('refreshes permission on native resume without browser focus or visibility events', async () => {

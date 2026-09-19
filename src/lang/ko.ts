@@ -2447,7 +2447,7 @@ export const languageKorean = {
             openSettings: '알림 설정 열기',
             keepAlive: '응답 생성 중 앱 유지',
             keepAliveHelp:
-                '응답을 받는 동안 알림을 띄워 앱이 백그라운드에서 꺼지지 않게 합니다.',
+                '알림을 사용해 백그라운드에서도 생성을 이어가도록 돕습니다. Android가 앱을 일시 중지하거나 종료할 수 있습니다.',
             keepAliveNeedsNotifications:
                 '알림이 꺼져 있으면 이 기능이 동작하지 않습니다.',
             operatingSystem: '운영체제',

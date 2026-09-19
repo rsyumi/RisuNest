@@ -831,17 +831,26 @@ class MainActivityBehaviorTest {
   }
 
   @Test
-  fun `generation keep alive requests notification permission before checking availability`() {
+  fun `generation keep alive does not start while notification permission is unavailable`() {
     val events = mutableListOf<String>()
 
     val started = beginGenerationKeepAlive(
-      requestNotifications = { events.add("request") },
       notificationsEnabled = { events.add("enabled"); false },
       startService = { events.add("start"); true },
     )
 
     assertEquals(false, started)
-    assertEquals(listOf("request", "enabled"), events)
+    assertEquals(listOf("enabled"), events)
+  }
+
+  @Test
+  fun `generation keep alive starts immediately after permission is ready`() {
+    var starts = 0
+    assertEquals(true, beginGenerationKeepAlive(
+      notificationsEnabled = { true },
+      startService = { starts++; true },
+    ))
+    assertEquals(1, starts)
   }
 
   @Test

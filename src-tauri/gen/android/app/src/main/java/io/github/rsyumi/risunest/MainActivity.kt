@@ -488,11 +488,9 @@ internal fun requestPostNotificationsIfNeeded(
 }
 
 internal fun beginGenerationKeepAlive(
-  requestNotifications: () -> Unit,
   notificationsEnabled: () -> Boolean,
   startService: () -> Boolean,
 ): Boolean {
-  requestNotifications()
   if (!notificationsEnabled()) return false
   return startService()
 }
@@ -878,6 +876,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       "generation.begin" -> generationCommands.begin()
       "generation.end" -> generationCommands.end()
       "generation.notificationsEnabled" -> generationCommands.notificationsEnabled()
+      "generation.requestNotifications" -> requestPostNotificationsForForegroundService()
       "generation.openNotificationSettings" -> generationCommands.openNotificationSettings()
       "generation.webViewVersion" -> generationCommands.webViewVersion()
       "saf.pickBackupSource" -> safCommands.pickBackupSource(args[0])
@@ -923,7 +922,6 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   private inner class GenerationKeepAliveBridge {
     fun begin(): Boolean = generationKeepAliveOwner.begin {
       beginGenerationKeepAlive(
-        requestNotifications = ::requestPostNotificationsForForegroundService,
         notificationsEnabled = { GenerationForegroundService.notificationsEnabled(this@MainActivity) },
         startService = { GenerationForegroundService.start(this@MainActivity) },
       )
