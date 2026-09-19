@@ -1,5 +1,5 @@
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, onTestFinished, vi } from 'vitest'
 
 import {
     projectPinnedCompatibilityDatabase,
@@ -256,6 +256,7 @@ describe('pinned asset-owner compatibility projector', () => {
         await lease.release()
     })
 
+    // Includes full-scale fixture construction and import while coverage is enabled.
     it('bounds expected-scale projection to one head query and one manifest decode', async () => {
         const database = makeAssetManifestFixture()
         database.personas = []
@@ -283,6 +284,7 @@ describe('pinned asset-owner compatibility projector', () => {
             }],
         })
         const lease = await store.acquireRevision(shadowed.revision)
+        onTestFinished(() => lease.release())
         const readOwnerHead = vi.spyOn(lease, 'readAssetOwnerHead')
         const readOwnerManifest = vi.fn(async () => manifest.bytes.slice())
 
@@ -304,5 +306,5 @@ describe('pinned asset-owner compatibility projector', () => {
             projectionMs,
         }))
         await lease.release()
-    })
+    }, 15_000)
 })
