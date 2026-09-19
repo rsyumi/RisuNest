@@ -51,6 +51,15 @@
     let isEditing = $state(false);
     let editText = $state('');
     let textareaRef: HTMLTextAreaElement | null = $state(null);
+    let focusTimer: ReturnType<typeof setTimeout> | undefined;
+    let scrollTimer: ReturnType<typeof setTimeout> | undefined;
+
+    function clearEditTimers() {
+        clearTimeout(focusTimer);
+        clearTimeout(scrollTimer);
+        focusTimer = undefined;
+        scrollTimer = undefined;
+    }
 
     let isConfirmingDelete = $state(false);
 
@@ -348,12 +357,15 @@
         isEditing = true;
 
         // Focus textarea on next tick
-        setTimeout(() => {
+        clearEditTimers();
+        focusTimer = setTimeout(() => {
+            focusTimer = undefined;
             if (textareaRef) {
                 textareaRef.focus();
                 adjustHeight();
-                setTimeout(() => {
-                    const buttonsEl = textareaRef.closest('.partial-edit-modal')?.querySelector('.partial-edit-buttons');
+                scrollTimer = setTimeout(() => {
+                    scrollTimer = undefined;
+                    const buttonsEl = textareaRef?.closest('.partial-edit-modal')?.querySelector('.partial-edit-buttons');
                     if (buttonsEl) {
                         (buttonsEl as HTMLElement).scrollIntoView({ behavior: 'instant', block: 'nearest' });
                     }
@@ -408,6 +420,7 @@
 
     // Close edit mode
     function closeEdit() {
+        clearEditTimers();
         isEditing = false;
         editText = '';
         resetMatchingState();
@@ -672,6 +685,7 @@
 
     // Cleanup on component unmount
     onDestroy(() => {
+        clearEditTimers();
         matchingRequestId += 1;
         if (blockButtonWrapper) {
             blockButtonWrapper.remove();

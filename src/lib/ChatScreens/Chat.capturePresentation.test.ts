@@ -355,10 +355,15 @@ describe('Chat frozen capture presentation', () => {
     })
 
     afterEach(async () => {
-        if (mounted) await unmount(mounted)
-        document.body.replaceChildren()
-        TestIntersectionObserver.instance = undefined
-        vi.unstubAllGlobals()
+        try {
+            if (mounted) await unmount(mounted)
+        } finally {
+            mounted = undefined
+            vi.useRealTimers()
+            document.body.replaceChildren()
+            TestIntersectionObserver.instance = undefined
+            vi.unstubAllGlobals()
+        }
     })
 
     test.each(['off', 'balanced', 'strong'] as const)(
@@ -919,7 +924,7 @@ describe('Chat frozen capture presentation', () => {
         expect((mounted as { hasActiveEditor(): boolean }).hasActiveEditor()).toBe(false)
     })
 
-    test('releases the windowed editor pin when a partial edit is cancelled', async () => {
+    test.each(['cancel', 'unmount'] as const)('cleans up a pending partial edit scroll on %s', async (action) => {
         const harness = makeWindowedEditHarness()
         live.db = {
             ...live.db,
@@ -968,18 +973,24 @@ describe('Chat frozen capture presentation', () => {
         await tick()
         document.dispatchEvent(new MouseEvent('mousemove', { clientX: 10, clientY: 10 }))
         await tick()
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
         document.querySelector<HTMLButtonElement>('.partial-edit-btn-edit')!.click()
         await tick()
+        await vi.advanceTimersByTimeAsync(10)
 
         expect((mounted as { hasActiveEditor(): boolean }).hasActiveEditor()).toBe(true)
-        const cancel = await vi.waitFor(() => {
-            const button = document.querySelector<HTMLButtonElement>('.partial-edit-cancel-btn')
-            expect(button).not.toBeNull()
-            return button!
-        })
-        cancel.click()
-        await tick()
-        expect((mounted as { hasActiveEditor(): boolean }).hasActiveEditor()).toBe(false)
+        const cancel = document.querySelector<HTMLButtonElement>('.partial-edit-cancel-btn')
+        expect(cancel).not.toBeNull()
+        if (action === 'cancel') {
+            cancel!.click()
+            await tick()
+            expect((mounted as { hasActiveEditor(): boolean }).hasActiveEditor()).toBe(false)
+        } else {
+            await unmount(mounted!)
+            mounted = undefined
+        }
+        await vi.advanceTimersByTimeAsync(200)
+        expect(document.querySelector('.partial-edit-modal')).toBeNull()
     })
 
     test('promotes and releases a windowed message operation before removing its row', async () => {
