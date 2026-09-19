@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
-import moduleSettingsSource from './ModuleSettings.svelte?raw'
+import { readFileSync } from 'node:fs'
+const moduleSettingsSource = readFileSync('src/lib/Setting/Pages/Module/ModuleSettings.svelte', 'utf8')
 import { commitModuleCharacterConversion } from './moduleCharacterConversion'
 
 describe('module character conversion persistence', () => {

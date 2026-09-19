@@ -1,5 +1,6 @@
 import { expect, it } from 'vitest'
-import source from './Onboarding.svelte?raw'
+import { readFileSync } from 'node:fs'
+const source = readFileSync('src/lib/Others/Onboarding/Onboarding.svelte', 'utf8')
 
 it('uses shared theme tokens for onboarding surfaces, actions, and warnings', () => {
     expect(source).toContain('--o-panel: var(--color-darkbg)')

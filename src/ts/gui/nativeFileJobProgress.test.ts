@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
 
-import appSource from '../../App.svelte?raw'
-import dialogSource from '../../lib/Others/NativeFileJobDialog.svelte?raw'
+import { readFileSync } from 'node:fs'
+const appSource = readFileSync('src/App.svelte', 'utf8')
+const dialogSource = readFileSync('src/lib/Others/NativeFileJobDialog.svelte', 'utf8')
 import { languageEnglish } from 'src/lang/en'
 import type { NativeFileJobStatus } from '../storage/nativeFileJobs'
 import {

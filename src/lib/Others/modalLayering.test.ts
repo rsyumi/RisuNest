@@ -3,29 +3,29 @@ import { join } from 'node:path'
 
 import { describe, expect, it } from 'vitest'
 
-import alertComp from './AlertComp.svelte?raw'
-import customSidebarConfig from './CustomSidebarConfig.svelte?raw'
-import categoryManagerModal from './HypaV3Modal/category-manager-modal.svelte?raw'
-import tagManagerModal from './HypaV3Modal/tag-manager-modal.svelte?raw'
-import irisModal from './IrisModal.svelte?raw'
-import nativeFileJobDialog from './NativeFileJobDialog.svelte?raw'
-import popupEditor from './PopupEditor.svelte?raw'
-import promptDiffModal from './PromptDiffModal.svelte?raw'
-import easyPanel from './ProTools/EasyPanel.svelte?raw'
-import defaultChatScreen from '../ChatScreens/DefaultChatScreen.svelte?raw'
-import chatScreenshotDialog from '../ChatScreens/ChatScreenshotDialog.svelte?raw'
-import botpreset from '../Setting/botpreset.svelte?raw'
-import triggerV2List from '../SideBars/Scripts/TriggerV2List.svelte?raw'
-import textAreaInput from '../UI/GUI/TextAreaInput.svelte?raw'
-import modelList from '../UI/ModelList.svelte?raw'
-import openrouterProviderList from '../UI/OpenrouterProviderList.svelte?raw'
-import popupList from '../UI/PopupList.svelte?raw'
-import promptDataItem from '../UI/PromptDataItem.svelte?raw'
-import realmFrame from '../UI/Realm/RealmFrame.svelte?raw'
-import realmMain from '../UI/Realm/RealmMain.svelte?raw'
-import realmPopUp from '../UI/Realm/RealmPopUp.svelte?raw'
-import realmUpload from '../UI/Realm/RealmUpload.svelte?raw'
-import observer from '../../ts/observer.svelte.ts?raw'
+const alertComp = readFileSync('src/lib/Others/AlertComp.svelte', 'utf8')
+const customSidebarConfig = readFileSync('src/lib/Others/CustomSidebarConfig.svelte', 'utf8')
+const categoryManagerModal = readFileSync('src/lib/Others/HypaV3Modal/category-manager-modal.svelte', 'utf8')
+const tagManagerModal = readFileSync('src/lib/Others/HypaV3Modal/tag-manager-modal.svelte', 'utf8')
+const irisModal = readFileSync('src/lib/Others/IrisModal.svelte', 'utf8')
+const nativeFileJobDialog = readFileSync('src/lib/Others/NativeFileJobDialog.svelte', 'utf8')
+const popupEditor = readFileSync('src/lib/Others/PopupEditor.svelte', 'utf8')
+const promptDiffModal = readFileSync('src/lib/Others/PromptDiffModal.svelte', 'utf8')
+const easyPanel = readFileSync('src/lib/Others/ProTools/EasyPanel.svelte', 'utf8')
+const defaultChatScreen = readFileSync('src/lib/ChatScreens/DefaultChatScreen.svelte', 'utf8')
+const chatScreenshotDialog = readFileSync('src/lib/ChatScreens/ChatScreenshotDialog.svelte', 'utf8')
+const botpreset = readFileSync('src/lib/Setting/botpreset.svelte', 'utf8')
+const triggerV2List = readFileSync('src/lib/SideBars/Scripts/TriggerV2List.svelte', 'utf8')
+const textAreaInput = readFileSync('src/lib/UI/GUI/TextAreaInput.svelte', 'utf8')
+const modelList = readFileSync('src/lib/UI/ModelList.svelte', 'utf8')
+const openrouterProviderList = readFileSync('src/lib/UI/OpenrouterProviderList.svelte', 'utf8')
+const popupList = readFileSync('src/lib/UI/PopupList.svelte', 'utf8')
+const promptDataItem = readFileSync('src/lib/UI/PromptDataItem.svelte', 'utf8')
+const realmFrame = readFileSync('src/lib/UI/Realm/RealmFrame.svelte', 'utf8')
+const realmMain = readFileSync('src/lib/UI/Realm/RealmMain.svelte', 'utf8')
+const realmPopUp = readFileSync('src/lib/UI/Realm/RealmPopUp.svelte', 'utf8')
+const realmUpload = readFileSync('src/lib/UI/Realm/RealmUpload.svelte', 'utf8')
+const observer = readFileSync('src/ts/observer.svelte.ts', 'utf8')
 
 /**
  * Full-screen modals (alerts, confirmations, permission prompts, pickers) sit on the shared

@@ -1,14 +1,15 @@
+import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
-import backupSource from './RisuNestBackupRestore.svelte?raw'
-import performanceSource from './RisuNestPerformanceSettings.svelte?raw'
-import storageSource from './RisuNestStorageDashboard.svelte?raw'
-import androidSource from './RisuNestAndroidPlatform.svelte?raw'
-import logSource from './RisuNestLogViewer.svelte?raw'
-import serverSyncSource from '../ServerSync/ServerSyncConnection.svelte?raw'
-import segmentedSource from '../RisuNest/SegmentedButtons.svelte?raw'
-import groupSource from '../RisuNest/SettingGroup.svelte?raw'
-import rowSource from '../RisuNest/SettingRow.svelte?raw'
+const backupSource = readFileSync('src/lib/Setting/Pages/RisuNestBackupRestore.svelte', 'utf8')
+const performanceSource = readFileSync('src/lib/Setting/Pages/RisuNestPerformanceSettings.svelte', 'utf8')
+const storageSource = readFileSync('src/lib/Setting/Pages/RisuNestStorageDashboard.svelte', 'utf8')
+const androidSource = readFileSync('src/lib/Setting/Pages/RisuNestAndroidPlatform.svelte', 'utf8')
+const logSource = readFileSync('src/lib/Setting/Pages/RisuNestLogViewer.svelte', 'utf8')
+const serverSyncSource = readFileSync('src/lib/Setting/ServerSync/ServerSyncConnection.svelte', 'utf8')
+const segmentedSource = readFileSync('src/lib/Setting/RisuNest/SegmentedButtons.svelte', 'utf8')
+const groupSource = readFileSync('src/lib/Setting/RisuNest/SettingGroup.svelte', 'utf8')
+const rowSource = readFileSync('src/lib/Setting/RisuNest/SettingRow.svelte', 'utf8')
 
 describe('RisuNest settings theme and layout conventions', () => {
     it('uses theme tokens rather than fixed foreground and error colors', () => {

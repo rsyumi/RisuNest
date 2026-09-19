@@ -2,8 +2,9 @@
 
 import { describe, expect, test } from 'vitest'
 
-import triggerSource from './TriggerV2List.svelte?raw'
-import observerSource from 'src/ts/observer.svelte.ts?raw'
+import { readFileSync } from 'node:fs'
+const triggerSource = readFileSync('src/lib/SideBars/Scripts/TriggerV2List.svelte', 'utf8')
+const observerSource = readFileSync('src/ts/observer.svelte.ts', 'utf8')
 
 describe('TriggerV2List export', () => {
     test('passes binary data to downloadFile instead of creating object URLs', () => {

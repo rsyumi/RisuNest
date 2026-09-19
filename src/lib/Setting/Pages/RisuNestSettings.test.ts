@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
-import settingsRawSource from '../Settings.svelte?raw'
-import pageRawSource from './RisuNestSettings.svelte?raw'
-import backupRestoreRawSource from './RisuNestBackupRestore.svelte?raw'
-import storageRawSource from './RisuNestStorageDashboard.svelte?raw'
-import tauriLibRawSource from '../../../../src-tauri/src/lib.rs?raw'
+import { readFileSync } from 'node:fs'
+const settingsRawSource = readFileSync('src/lib/Setting/Settings.svelte', 'utf8')
+const pageRawSource = readFileSync('src/lib/Setting/Pages/RisuNestSettings.svelte', 'utf8')
+const backupRestoreRawSource = readFileSync('src/lib/Setting/Pages/RisuNestBackupRestore.svelte', 'utf8')
+const storageRawSource = readFileSync('src/lib/Setting/Pages/RisuNestStorageDashboard.svelte', 'utf8')
+const tauriLibRawSource = readFileSync('src-tauri/src/lib.rs', 'utf8')
 import { languageEnglish } from 'src/lang/en'
 import { languageKorean } from 'src/lang/ko'
 

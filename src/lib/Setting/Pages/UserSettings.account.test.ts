@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { parse } from 'svelte/compiler'
-import source from './UserSettings.svelte?raw'
+import { readFileSync } from 'node:fs'
+const source = readFileSync('src/lib/Setting/Pages/UserSettings.svelte', 'utf8')
 
 function handler(name: string, marker = 'unMigrationAccount') {
     let expression: any
