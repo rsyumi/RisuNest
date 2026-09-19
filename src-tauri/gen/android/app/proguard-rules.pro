@@ -22,3 +22,10 @@
 
 # Native credential access uses this class by name through JNI.
 -keep class io.github.rsyumi.risunest.ServerSyncSecrets { *; }
+
+# Rust invokes these static entry points by name; keep their JNI signatures.
+-keep class io.github.rsyumi.risunest.ExternalStorageSecrets {
+    public static native void initialize();
+    public static byte[] seal(java.lang.String, byte[]);
+    public static byte[] open(java.lang.String, byte[]);
+}
