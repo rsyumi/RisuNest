@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { BlobMetadata } from './blobStore'
+import type { BlobMetadata, InlayBlobMetadata } from './blobStore'
 import { createTauriCasObjectUrl } from './platformBlobStore'
 import {
     createCompleteAssetRepositoryBlobStore,
@@ -88,6 +88,7 @@ function createFacade(input: {
             inlayType: 'image' as const,
             width: 19,
             height: 23,
+            preservationReason: undefined as InlayBlobMetadata['preservationReason'],
         },
     }))
     const options = {
@@ -634,6 +635,17 @@ describe('complete AssetRepository BlobStore facade', () => {
             'MIME',
         )
         expect(alias.mime).toBe('image/png\0text/html')
+    })
+
+    it('returns the preservation outcome after activation without storing it in the alias', async () => {
+        const { facade, encodeNewInlayImage, store } = createFacade()
+        const encoded = await encodeNewInlayImage()
+        encodeNewInlayImage.mockResolvedValue({
+            ...encoded, metadata: { ...encoded.metadata, preservationReason: 'animation-cost' },
+        })
+        const result = await facade.putNewInlayImage('preserved', new Uint8Array([1]), { name: 'loop.gif' })
+        expect(result.preservationReason).toBe('animation-cost')
+        expect(vi.mocked(store.commitAssetAlias).mock.calls[0][0]).not.toHaveProperty('preservationReason')
     })
 
     it('encodes a new Inlay once and publishes the returned encoded bytes without another transform', async () => {

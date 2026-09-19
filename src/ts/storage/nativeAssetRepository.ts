@@ -410,6 +410,7 @@ export function createNativeNewInlayImageEncoder(
                     inlayType: encoded.metadata.inlayType,
                     width: encoded.metadata.width,
                     height: encoded.metadata.height,
+                    preservationReason: encoded.metadata.preservationReason,
                 },
             }
         },

@@ -1,3 +1,5 @@
+import { setRuntimePerformanceProfile } from 'src/ts/runtimePerformanceProfile'
+vi.mock('src/ts/alert', () => ({ alertToast: vi.fn() }))
 import fc from 'fast-check'
 import localforage from 'localforage'
 import { beforeEach, describe, expect, test, vi } from 'vitest'
@@ -192,14 +194,14 @@ beforeEach(() => {
 describe('setInlayAsset', () => {
     test('normalizes absent and malformed configured options at the encoding boundary', () => {
         expect(getInlayEncodeOptions()).toEqual({
-            format: 'webp', quality: 85, maxDimension: 0, skipReencode: true, animationMaxFps: 0,
+            format: 'webp', quality: 85, maxDimension: 0, skipReencode: true, animationDecodeBytes: 256 * 1024 * 1024, animationMaxFps: 0,
         })
         vi.mocked(getDatabase).mockReturnValue({
             risunestInlayFormat: 'invalid', risunestInlayWebpQuality: 140.6,
             risunestInlayMaxDimension: -4.4, risunestInlaySkipReencode: 'yes',
         } as any)
         expect(getInlayEncodeOptions()).toEqual({
-            format: 'webp', quality: 100, maxDimension: 0, skipReencode: true, animationMaxFps: 0,
+            format: 'webp', quality: 100, maxDimension: 0, skipReencode: true, animationDecodeBytes: 256 * 1024 * 1024, animationMaxFps: 0,
         })
     })
 
@@ -960,4 +962,15 @@ describe('BlobStore inlay compatibility', () => {
         await saveInlayedSignature('signature', signature)
         expect((await getInlayAsset('signature'))?.data).toBe(JSON.stringify(signature))
     })
+})
+
+test('uses the currently selected performance profile for animation admission', () => {
+    try {
+        setRuntimePerformanceProfile('low-spec')
+        expect(getInlayEncodeOptions().animationDecodeBytes).toBe(64 * 1024 * 1024)
+        setRuntimePerformanceProfile('normal')
+        expect(getInlayEncodeOptions().animationDecodeBytes).toBe(256 * 1024 * 1024)
+    } finally {
+        setRuntimePerformanceProfile('normal')
+    }
 })

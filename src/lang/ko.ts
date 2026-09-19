@@ -2087,6 +2087,7 @@ export const languageKorean = {
                 '저사양은 메모리 사용량을 줄이는 대신 긴 대화에서 스크롤이 조금 느려질 수 있습니다.',
         },
         inlay: {
+            animationPreserved: '애니메이션 변환을 건너뛰고 원본으로 저장했습니다.',
             title: '채팅 첨부 이미지',
             format: '저장 형식',
             formatWebp: 'WebP (권장)',

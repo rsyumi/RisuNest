@@ -1,3 +1,6 @@
+import { alertToast } from 'src/ts/alert'
+import { language } from 'src/lang'
+vi.mock('src/ts/alert', () => ({ alertToast: vi.fn() }))
 import { beforeEach, describe, expect, test, vi } from 'vitest'
 import type { BlobMetadata, BlobStore, InlayBlobMetadata } from 'src/ts/storage/blobStore'
 
@@ -12,6 +15,7 @@ const native = vi.hoisted(() => ({
     metadata: new Map<string, BlobMetadata>(),
     payloads: new Map<string, Uint8Array>(),
     optimizedWrites: [] as Array<{ key: string, data: Uint8Array, name: string }>,
+    preservationReason: undefined as InlayBlobMetadata['preservationReason'],
     opaqueWrites: [] as string[],
     removes: [] as string[],
 }))
@@ -35,7 +39,7 @@ const nativeStore = {
             const bmp = data.length >= 2 && data[0] === 0x42 && data[1] === 0x4d
             const preserved: InlayBlobMetadata = {
                 key, kind: 'inlay', size: data.byteLength, mime: bmp ? 'image/bmp' : 'application/octet-stream',
-                name: input.name, ext: bmp ? 'bmp' : '', inlayType: 'image',
+                name: input.name, ext: bmp ? 'bmp' : '', inlayType: 'image', preservationReason: native.preservationReason,
             }
             native.metadata.set(key, preserved)
             native.payloads.set(key, data.slice())
@@ -131,6 +135,8 @@ function expectNoLegacyAccess(): void {
 
 describe('native inlay fresh-install boundary', () => {
     beforeEach(() => {
+        native.preservationReason = undefined
+        vi.mocked(alertToast).mockClear()
         native.metadata.clear()
         native.payloads.clear()
         native.optimizedWrites = []
@@ -321,4 +327,15 @@ describe('native inlay fresh-install boundary', () => {
             mime: 'image/bmp', ext: 'bmp',
         })
     })
+})
+
+test('reports original preservation after both native image entry points finish storing', async () => {
+    native.preservationReason = 'animation-cost'
+    const bytes = new Uint8Array([71, 73, 70])
+    await setInlayAsset('preserve-set', { data: new Blob([bytes]), name: 'loop.gif', ext: 'gif', type: 'image' })
+    await writeInlayImage({ src: 'synthetic:image' } as HTMLImageElement, { id: 'preserve-write', data: bytes })
+    expect(native.payloads.get('preserve-set')).toEqual(bytes)
+    expect(native.payloads.get('preserve-write')).toEqual(bytes)
+    expect(alertToast).toHaveBeenCalledTimes(2)
+    expect(alertToast).toHaveBeenCalledWith(language.risuNest.inlay.animationPreserved)
 })

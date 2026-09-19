@@ -1,6 +1,7 @@
 export type RuntimePerformanceProfile = 'normal' | 'low-spec'
 
 export interface RuntimePerformanceBudgets {
+    inlayAnimationDecodeBytes: number
     browserAssetDataUrlCacheBytes: number
     providerImageCacheBytes: number
     hypaCacheBatchEntries: number
@@ -14,6 +15,7 @@ export interface RuntimePerformanceBudgets {
 
 const runtimePerformanceBudgets: Record<RuntimePerformanceProfile, RuntimePerformanceBudgets> = {
     normal: {
+        inlayAnimationDecodeBytes: 256 * 1024 * 1024,
         browserAssetDataUrlCacheBytes: 16 * 1024 * 1024,
         providerImageCacheBytes: 16 * 1024 * 1024,
         hypaCacheBatchEntries: 1024,
@@ -25,6 +27,7 @@ const runtimePerformanceBudgets: Record<RuntimePerformanceProfile, RuntimePerfor
         scriptingEngineCacheEntries: 16,
     },
     'low-spec': {
+        inlayAnimationDecodeBytes: 64 * 1024 * 1024,
         browserAssetDataUrlCacheBytes: 8 * 1024 * 1024,
         providerImageCacheBytes: 4 * 1024 * 1024,
         hypaCacheBatchEntries: 64,

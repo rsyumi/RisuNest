@@ -128,7 +128,7 @@ describe('native asset repository adapters', () => {
         await expect(encoder.encodeNewInlayImage(
             'inlay-id',
             Uint8Array.of(1, 2),
-            { name: 'Image', options: { format: 'png', quality: 12, maxDimension: 256, skipReencode: true, animationMaxFps: 0 } },
+            { name: 'Image', options: { format: 'png', quality: 12, maxDimension: 256, skipReencode: true, animationDecodeBytes: 256 * 1024 * 1024, animationMaxFps: 0 } },
         )).resolves.toEqual({
             data: Uint8Array.of(4, 5, 6),
             metadata: {
@@ -144,7 +144,7 @@ describe('native asset repository adapters', () => {
         expect(invoke).toHaveBeenCalledOnce()
         expect(invoke).toHaveBeenCalledWith('native_media_encode_inlay_image', {
             id: 'inlay-id', data: [1, 2], name: 'Image',
-            options: { format: 'png', quality: 12, maxDimension: 256, skipReencode: true, animationMaxFps: 0 },
+            options: { format: 'png', quality: 12, maxDimension: 256, skipReencode: true, animationDecodeBytes: 256 * 1024 * 1024, animationMaxFps: 0 },
         })
     })
 
@@ -183,7 +183,7 @@ describe('native asset repository adapters', () => {
         await expect(createNativeNewInlayImageEncoder(invoke).encodeNewInlayImage(
             'large-inlay',
             source,
-            { name: 'large.png', options: { format: 'png', quality: 85, maxDimension: 0, skipReencode: false, animationMaxFps: 0 } },
+            { name: 'large.png', options: { format: 'png', quality: 85, maxDimension: 0, skipReencode: false, animationDecodeBytes: 256 * 1024 * 1024, animationMaxFps: 0 } },
         )).resolves.toMatchObject({ data: output })
 
         expect(invoke.mock.calls.map(([command]) => command)).toEqual([
@@ -219,7 +219,7 @@ describe('native asset repository adapters', () => {
             name: 'original.png',
             options: {
                 format: 'original', quality: Number.NaN,
-                maxDimension: Number.MAX_SAFE_INTEGER, skipReencode: true, animationMaxFps: 0,
+                maxDimension: Number.MAX_SAFE_INTEGER, skipReencode: true, animationDecodeBytes: 256 * 1024 * 1024, animationMaxFps: 0,
             },
         })
 
@@ -227,7 +227,7 @@ describe('native asset repository adapters', () => {
             id: 'original-id', data: Array.from(source), name: 'original.png',
             options: {
                 format: 'original', quality: 85, maxDimension: 4_294_967_295,
-                skipReencode: true, animationMaxFps: 0,
+                skipReencode: true, animationDecodeBytes: 256 * 1024 * 1024, animationMaxFps: 0,
             },
         })
     })
@@ -247,7 +247,7 @@ describe('native asset repository adapters', () => {
         }))
 
         await expect(encoder.encodeNewInlayImage('inlay-id', Uint8Array.of(1, 2, 3), {
-            name: 'Image', options: { format, quality: 85, maxDimension: 0, skipReencode: false, animationMaxFps: 0 },
+            name: 'Image', options: { format, quality: 85, maxDimension: 0, skipReencode: false, animationDecodeBytes: 256 * 1024 * 1024, animationMaxFps: 0 },
         })).rejects.toThrow('neither the requested format nor the original image')
     })
 
@@ -263,7 +263,7 @@ describe('native asset repository adapters', () => {
         }))
 
         await expect(encoder.encodeNewInlayImage('kept', source, {
-            name: 'loop.gif', options: { format: 'webp', quality: 85, maxDimension: 0, skipReencode: false, animationMaxFps: 0 },
+            name: 'loop.gif', options: { format: 'webp', quality: 85, maxDimension: 0, skipReencode: false, animationDecodeBytes: 256 * 1024 * 1024, animationMaxFps: 0 },
         })).resolves.toEqual({
             data: source,
             metadata: {

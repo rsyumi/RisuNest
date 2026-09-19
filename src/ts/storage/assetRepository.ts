@@ -525,7 +525,15 @@ export function createCompleteTypedAssetRepository(
         if (encoded.metadata.kind !== 'inlay') {
             throw new TypeError('New Inlay image encoder must return Inlay metadata')
         }
-        return preparePublish(identity, encoded.data, encoded.metadata)
+        const { preservationReason, ...metadata } = encoded.metadata
+        const prepared = await preparePublish(identity, encoded.data, metadata)
+        return {
+            ...prepared,
+            async activate() {
+                const result = await prepared.activate()
+                return { ...result, ...(preservationReason ? { preservationReason } : {}) }
+            },
+        }
     }
 
     return {

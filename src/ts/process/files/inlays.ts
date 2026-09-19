@@ -1,3 +1,6 @@
+import { alertToast } from "../../alert";
+import { language } from "src/lang";
+import { getRuntimePerformanceBudgets } from "../../runtimePerformanceProfile";
 import { v4 } from "uuid";
 import { getImageType } from "src/ts/media";
 import { getDatabase, type Database } from "../../storage/database.svelte";
@@ -70,6 +73,7 @@ export function getInlayEncodeOptions(): InlayEncodeOptions {
         maxDimension: db.risunestInlayMaxDimension,
         skipReencode: db.risunestInlaySkipReencode,
         animationMaxFps: db.risunestInlayAnimationMaxFps,
+        animationDecodeBytes: getRuntimePerformanceBudgets().inlayAnimationDecodeBytes,
     })
 }
 
@@ -170,7 +174,8 @@ export async function writeInlayImage(
         // The native encoder decides what it can improve and keeps the rest as it is.
         const blobStore = await resolveBlobStore()
         if (!blobStore.putNewInlayImage) throw new Error('Native Inlay image writer is unavailable')
-        await blobStore.putNewInlayImage(imgid, data, { name: arg.name ?? imgid, options })
+        const metadata = await blobStore.putNewInlayImage(imgid, data, { name: arg.name ?? imgid, options })
+        if (metadata.preservationReason) alertToast(language.risuNest.inlay.animationPreserved)
         return imgid
     }
     let drawHeight = 0
@@ -368,7 +373,8 @@ export async function setInlayAsset(id: string, img: InlayAsset): Promise<string
     validateNewInlayInput(bytes)
     if (isTauri && img.type === 'image') {
         if (!blobStore.putNewInlayImage) throw new Error('Native Inlay image writer is unavailable')
-        await blobStore.putNewInlayImage(inlayId, bytes, { name: img.name, options: getInlayEncodeOptions() })
+        const metadata = await blobStore.putNewInlayImage(inlayId, bytes, { name: img.name, options: getInlayEncodeOptions() })
+        if (metadata.preservationReason) alertToast(language.risuNest.inlay.animationPreserved)
         return inlayId
     }
     if (img.type === 'image') {

@@ -2276,6 +2276,7 @@ export const languageEnglish = {
                 'Low-spec uses less memory, but scrolling long chats may be slightly slower.',
         },
         inlay: {
+            animationPreserved: 'Animation conversion was skipped. The original was saved.',
             title: 'Chat image attachments',
             format: 'Storage format',
             formatWebp: 'WebP (recommended)',

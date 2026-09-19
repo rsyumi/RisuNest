@@ -28,6 +28,7 @@ use tauri::http::{
 use tauri::{AppHandle, Manager};
 
 pub(crate) mod ipc;
+mod animation_policy;
 
 const MAX_BODY_BYTES: u64 = 1024 * 1024;
 const EXPOSED_HEADERS: &str = "Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag";
@@ -65,6 +66,8 @@ pub(crate) struct InlayImageMetadata {
     width: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preservation_reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -86,7 +89,11 @@ pub(crate) struct InlayEncodeOptions {
     /// Frames per second an animation is thinned down to, or 0 to keep the original rate.
     #[serde(deserialize_with = "deserialize_inlay_animation_fps")]
     animation_max_fps: u32,
+    #[serde(default = "default_animation_decode_bytes")]
+    animation_decode_bytes: u64,
 }
+
+fn default_animation_decode_bytes() -> u64 { 256 * 1024 * 1024 }
 
 fn deserialize_inlay_animation_fps<'de, D>(deserializer: D) -> Result<u32, D::Error>
 where
@@ -159,6 +166,7 @@ impl Default for InlayEncodeOptions {
             max_dimension: 0,
             skip_reencode: false,
             animation_max_fps: 0,
+            animation_decode_bytes: default_animation_decode_bytes(),
         }
     }
 }
@@ -1099,6 +1107,7 @@ fn preserved_inlay_image(
             inlay_type: "image".to_owned(),
             width: size.map(|(width, _)| width),
             height: size.map(|(_, height)| height),
+            preservation_reason: None,
         },
     }
 }
@@ -1355,6 +1364,7 @@ fn encode_animated_inlay_image(
             inlay_type: "image".to_owned(),
             width: Some(width),
             height: Some(height),
+            preservation_reason: None,
         },
         data: encoded,
     })
@@ -1375,6 +1385,11 @@ fn encode_inlay_image(
     };
     if let Some(source) = inlay_animation(format, data) {
         if options.format != InlayEncodeFormat::Original {
+            if !animation_policy::permits_decode(data, source, options.animation_decode_bytes) {
+                let mut preserved = preserved_inlay_image(id, data, name, None);
+                preserved.metadata.preservation_reason = Some("animation-cost".to_owned());
+                return Ok(preserved);
+            }
             if let Ok(encoded) = encode_animated_inlay_image(id, data, name, &options, source) {
                 return Ok(encoded);
             }
@@ -1449,6 +1464,7 @@ fn encode_inlay_image(
         inlay_type: "image".to_owned(),
         width: Some(output_width),
         height: Some(output_height),
+        preservation_reason: None,
     };
     Ok(EncodedInlayImage {
         data: encoded,
