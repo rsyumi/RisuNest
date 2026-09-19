@@ -28,6 +28,7 @@ import {
     iterateUnarchivedPinnedCharacterSummaries,
     iteratePinnedCharacters,
     iteratePinnedConversations,
+    releasePersistentRevisionLease,
     withPersistentRevisionLease,
 } from '../storage/persistentRecordIterator'
 import { defineOwnEnumerableProperty } from '../storage/ownEnumerableProperty'
@@ -198,6 +199,10 @@ export interface PluginDatabaseAccessDependencies {
 }
 
 export interface PluginDatabaseAccess {
+    getFullObjectSnapshotStream(
+        target: { characterIndex?: number; chatIndex?: number },
+        context: PluginFullObjectCallContext,
+    ): Promise<PluginIframeSnapshot | null | undefined>
     getCurrentCharacter(
         context: PluginFullObjectCallContext,
     ): Promise<PluginCompleteCharacter | undefined>
@@ -234,6 +239,10 @@ export interface PluginDatabaseAccess {
         includeOnly: string[] | 'all',
         allowedKeys: readonly string[],
     ): Promise<Record<string, unknown>>
+    getDatabaseSnapshotStream(
+        includeOnly: string[] | 'all',
+        allowedKeys: readonly string[],
+    ): Promise<ReadableStream<PluginDatabaseSnapshotChunk>>
     setDatabaseLite(
         database: Record<string, unknown>,
         allowedKeys: readonly string[],
@@ -242,6 +251,64 @@ export interface PluginDatabaseAccess {
         database: Record<string, unknown>,
         allowedKeys: readonly string[],
     ): Promise<void>
+}
+
+export interface PluginIframeSnapshot {
+    __type: 'IFRAME_OBJECT_STREAM'
+    value: ReadableStream<PluginDatabaseSnapshotChunk>
+    select: 'character' | 'conversation'
+}
+
+export type PluginDatabaseSnapshotChunk =
+    | { type: 'set'; key: string; value: unknown }
+    | { type: 'arrayStart'; key: string }
+    | { type: 'arrayPush'; key: string; value: unknown }
+    | { type: 'recordStart'; key: string }
+    | { type: 'recordSet'; key: string; entryKey: string; value: unknown }
+    | { type: 'characterStart'; key: 'characters'; value: unknown }
+    | { type: 'conversationStart'; key: 'characters'; value: unknown }
+    | { type: 'message'; key: 'characters'; value: unknown }
+
+async function* streamPinnedConversation(
+    reader: PersistentRevisionLease,
+    characterId: string,
+    conversationId: string,
+): AsyncGenerator<PluginDatabaseSnapshotChunk> {
+    const metadata = await reader.readConversationMetadata(characterId, conversationId)
+    if (!metadata) throw new Error(`Missing conversation ${conversationId}`)
+    assertPinnedRevision(reader.revision, metadata.revision, 'Conversation metadata')
+    yield { type: 'conversationStart', key: 'characters', value: metadata.value.conversation }
+    for (let startIndex = 0; startIndex < metadata.value.totalMessages; startIndex++) {
+        const page = await reader.readConversationWindow({
+            characterId, conversationId, startIndex, limit: 1,
+        })
+        if (!page) throw new Error(`Missing conversation ${conversationId}`)
+        assertPinnedRevision(reader.revision, page.revision, 'Conversation messages')
+        if (page.value.startIndex !== startIndex || page.value.messages.length !== 1
+            || page.value.totalMessages !== metadata.value.totalMessages) {
+            throw new Error('Incomplete plugin snapshot message page')
+        }
+        yield { type: 'message', key: 'characters', value: page.value.messages[0] }
+    }
+}
+
+async function* streamPinnedCharacter(
+    reader: PersistentRevisionLease,
+    characterId: string,
+    detail: unknown,
+): AsyncGenerator<PluginDatabaseSnapshotChunk> {
+    yield { type: 'characterStart', key: 'characters', value: detail }
+    let cursor: string | undefined
+    do {
+        const page = await reader.queryConversations({
+            characterId, order: 'configured', limit: 100, cursor,
+        })
+        assertPinnedRevision(reader.revision, page.revision, 'Conversation catalog')
+        for (const summary of page.items) {
+            yield* streamPinnedConversation(reader, characterId, summary.id)
+        }
+        cursor = page.nextCursor
+    } while (cursor !== undefined)
 }
 
 const SYNCHRONOUS_CHARACTER_SET_ERROR =
@@ -680,6 +747,72 @@ export function createPluginDatabaseAccess(
     }
 
     return {
+        async getFullObjectSnapshotStream(target, context) {
+            throwIfFullObjectCallAborted(context.signal)
+            await dependencies.flushPendingData('plugin-full-object-read')
+            throwIfFullObjectCallAborted(context.signal)
+            const selectedId = dependencies.getSelectedCharacterId()
+            if (target.characterIndex === undefined && selectedId === null) return undefined
+            await openStore()
+            const reader = await acquireCurrentRevisionReader()
+            let transferred = false
+            try {
+                throwIfFullObjectCallAborted(context.signal)
+                const resolved = target.characterIndex === undefined
+                    ? { characterId: selectedId! }
+                    : target.chatIndex === undefined
+                        ? await resolvePinnedCharacterTarget(reader, target.characterIndex)
+                        : await resolvePinnedConversationTarget(reader, target.characterIndex, target.chatIndex)
+                if (!resolved) return null
+                const detail = await reader.readCharacter(resolved.characterId)
+                if (!detail) return target.characterIndex === undefined ? undefined : null
+                assertPinnedRevision(reader.revision, detail.revision, 'Character')
+                const chunks = (async function* (): AsyncGenerator<PluginDatabaseSnapshotChunk> {
+                    yield { type: 'arrayStart', key: 'characters' }
+                    if ('conversationId' in resolved) {
+                        yield { type: 'characterStart', key: 'characters', value: detail.value }
+                        yield* streamPinnedConversation(reader, resolved.characterId, String(resolved.conversationId))
+                    } else {
+                        yield* streamPinnedCharacter(reader, resolved.characterId, detail.value)
+                    }
+                })()
+                let closed = false
+                const close = async () => {
+                    if (closed) return
+                    closed = true
+                    context.signal.removeEventListener('abort', abort)
+                    try { await chunks.return(undefined) }
+                    finally { await releasePersistentRevisionLease(reader) }
+                }
+                const abort = () => { void close().catch(() => undefined) }
+                context.signal.addEventListener('abort', abort, { once: true })
+                const value = new ReadableStream<PluginDatabaseSnapshotChunk>({
+                    async pull(controller) {
+                        try {
+                            throwIfFullObjectCallAborted(context.signal)
+                            const next = await chunks.next()
+                            throwIfFullObjectCallAborted(context.signal)
+                            if (next.done) {
+                                await close()
+                                controller.close()
+                            } else controller.enqueue(next.value)
+                        } catch (error) {
+                            await close().catch(() => undefined)
+                            controller.error(error)
+                        }
+                    },
+                    cancel: close,
+                })
+                transferred = true
+                return {
+                    __type: 'IFRAME_OBJECT_STREAM', value,
+                    select: target.chatIndex === undefined ? 'character' : 'conversation',
+                }
+            } finally {
+                if (!transferred) await releasePersistentRevisionLease(reader)
+            }
+        },
+
         async getCurrentCharacter(context) {
             throwIfFullObjectCallAborted(context.signal)
             await dependencies.flushPendingData('plugin-full-object-read')
@@ -1010,6 +1143,109 @@ export function createPluginDatabaseAccess(
             const result = await dependencies.store.readConversationWindow(query)
             throwIfQueryAborted(input.signal)
             return result ? { ...result.value, revision: result.revision } : null
+        },
+
+        async getDatabaseSnapshotStream(includeOnly, allowedKeys) {
+            const requestedKeys =
+                includeOnly === 'all'
+                    ? [...allowedKeys]
+                    : allowedKeys.filter((key) => includeOnly.includes(key))
+            await dependencies.flushPendingData('plugin-full-database-snapshot')
+            await openStore()
+            const reader = await acquireCurrentRevisionReader()
+            const iterator = (async function* (): AsyncGenerator<PluginDatabaseSnapshotChunk> {
+                let failed = false
+                try {
+                    const pinnedRoot = await reader.readRoot()
+                    assertPinnedRevision(reader.revision, pinnedRoot.revision, 'Root')
+                    for (const key of requestedKeys) {
+                        if (key === 'characters') {
+                            yield { type: 'arrayStart', key }
+                            for await (const character of iteratePinnedCharacters(reader)) {
+                                yield* streamPinnedCharacter(reader, character.summary.id, character.detail)
+                            }
+                            continue
+                        }
+                        if (key === 'botPresets') {
+                            yield { type: 'arrayStart', key }
+                            const catalog = await reader.queryPresets()
+                            assertPinnedRevision(reader.revision, catalog.revision, 'Preset catalog')
+                            for (const summary of catalog.items) {
+                                const preset = await reader.readPreset(summary.id)
+                                if (!preset) throw new Error(`Missing preset ${summary.id}`)
+                                assertPinnedRevision(
+                                    reader.revision,
+                                    preset.revision,
+                                    `Preset ${summary.id}`,
+                                )
+                                yield { type: 'arrayPush', key, value: preset.value }
+                            }
+                            continue
+                        }
+                        if (key === 'pluginCustomStorage') {
+                            yield { type: 'recordStart', key }
+                            const catalog = await reader.queryPluginStorage()
+                            assertPinnedRevision(
+                                reader.revision,
+                                catalog.revision,
+                                'Plugin storage catalog',
+                            )
+                            for (const summary of catalog.items) {
+                                if (summary.owner !== dependencies.owner) continue
+                                const value = await reader.readPluginStorage(
+                                    dependencies.owner,
+                                    summary.key,
+                                )
+                                if (!value) {
+                                    throw new Error(
+                                        `Missing plugin storage value for ${summary.key}`,
+                                    )
+                                }
+                                assertPinnedRevision(
+                                    reader.revision,
+                                    value.revision,
+                                    `Plugin storage value ${summary.key}`,
+                                )
+                                yield {
+                                    type: 'recordSet',
+                                    key,
+                                    entryKey: summary.key,
+                                    value: value.value,
+                                }
+                            }
+                            continue
+                        }
+                        yield {
+                            type: 'set',
+                            key,
+                            value: (pinnedRoot.value as unknown as Record<string, unknown>)[key],
+                        }
+                    }
+                } catch (error) {
+                    failed = true
+                    throw error
+                } finally {
+                    try {
+                        await releasePersistentRevisionLease(reader)
+                    } catch (error) {
+                        if (!failed) throw error
+                    }
+                }
+            })()
+            return new ReadableStream<PluginDatabaseSnapshotChunk>({
+                async pull(controller) {
+                    try {
+                        const next = await iterator.next()
+                        if (next.done) controller.close()
+                        else controller.enqueue(next.value)
+                    } catch (error) {
+                        controller.error(error)
+                    }
+                },
+                async cancel() {
+                    await iterator.return(undefined)
+                },
+            })
         },
 
         async getDatabaseSnapshot(includeOnly, allowedKeys) {

@@ -609,6 +609,109 @@ pub(super) fn replace_add_characters(
     Ok(())
 }
 
+pub(super) fn replace_put_character_detail(
+    connection: &mut Connection,
+    staging_id: &str,
+    detail: &Value,
+    conversation_count: i64,
+) -> StoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_staging(&transaction, staging_id)?;
+    let character_id = required_string(detail, "chaId", "Persistent data import")?;
+    if character_exists(&transaction, staging_id, character_id)? {
+        return Err(validation(
+            "Persistent data import requires unique character IDs",
+        ));
+    }
+    let configured_index: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM characters WHERE generation = ?1",
+        [staging_id],
+        |row| row.get(0),
+    )?;
+    put_character_records(
+        &transaction,
+        staging_id,
+        detail,
+        configured_index,
+        conversation_count,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+pub(super) fn replace_put_conversation_row(
+    connection: &mut Connection,
+    staging_id: &str,
+    character_id: &str,
+    configured_index: i64,
+    detail: &Value,
+    recent_at: i64,
+    message_count: i64,
+) -> StoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_staging(&transaction, staging_id)?;
+    let conversation_id = required_string(detail, "id", "Persistent data import conversation")?;
+    let name = required_display_name(detail, "Persistent data import conversation")?;
+    let exists = transaction
+        .query_row(
+            "SELECT 1 FROM conversations WHERE generation = ?1 AND character_id = ?2 AND conversation_id = ?3",
+            params![staging_id, character_id, conversation_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if exists {
+        return Err(validation(
+            "Persistent data import requires unique, nonempty chat IDs",
+        ));
+    }
+    put_conversation_record(
+        &transaction,
+        staging_id,
+        character_id,
+        conversation_id,
+        configured_index,
+        recent_at,
+        name,
+        message_count,
+        detail,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+pub(super) fn replace_add_conversation_messages(
+    connection: &mut Connection,
+    staging_id: &str,
+    character_id: &str,
+    conversation_id: &str,
+    start: i64,
+    messages: &[Value],
+) -> StoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_staging(&transaction, staging_id)?;
+    let expected_start: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM messages WHERE generation = ?1 AND character_id = ?2 AND conversation_id = ?3",
+        params![staging_id, character_id, conversation_id],
+        |row| row.get(0),
+    )?;
+    if start != expected_start {
+        return Err(validation(
+            "Persistent data import message pages must be contiguous",
+        ));
+    }
+    insert_messages(
+        &transaction,
+        staging_id,
+        character_id,
+        conversation_id,
+        start,
+        messages,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 pub(super) fn replace_put_presets(
     connection: &mut Connection,
     staging_id: &str,

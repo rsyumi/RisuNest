@@ -1,4 +1,4 @@
-import type { Chat, Database, character, groupChat } from './database.svelte'
+import type { Chat, Database, Message, character, groupChat } from './database.svelte'
 import type { CommittedApplyOutcome } from './persistentDataRuntime'
 import { safeStructuredClone } from '../polyfill'
 import {
@@ -137,6 +137,19 @@ export interface CompleteConversationLease {
     readonly reason: string
     readonly session: ActiveConversationSession
     readonly target: SelectedConversationTarget
+    release(): void
+}
+
+export interface WindowedConversationMutationController {
+    readonly chat: Chat
+    readonly absoluteStartIndex: number
+    isCurrent(): boolean
+    applyRange(
+        localStart: number,
+        deleteCount: number,
+        messages: readonly Message[],
+        command: 'append' | 'edit' | 'replace-range' | 'update-metadata',
+    ): boolean
     release(): void
 }
 
@@ -370,6 +383,140 @@ export class ActiveWorkingSet {
         }
     }
 
+    captureWindowedConversationMutationController(
+        target: SelectedConversationTarget,
+        chat: Chat,
+        absoluteStartIndex: number,
+    ): WindowedConversationMutationController | null {
+        const initialState = this.selectedConversationState
+        if (
+            initialState?.kind !== 'windowed'
+            || !this.matchesTarget(initialState, target)
+            || !Number.isSafeInteger(absoluteStartIndex)
+            || absoluteStartIndex < 0
+            || absoluteStartIndex + chat.message.length !== initialState.authority.totalMessages
+        ) return null
+        let released = false
+        let expectedSessionVersion = initialState.authority.sessionVersion
+        const requireState = (): WindowedSelectedConversationState | null => {
+            const state = this.selectedConversationState
+            return !released
+                && state?.kind === 'windowed'
+                && state.navigationGeneration === initialState.navigationGeneration
+                && state.characterId === initialState.characterId
+                && state.conversationId === initialState.conversationId
+                && state.authority.sessionToken === initialState.authority.sessionToken
+                && state.authority.sessionVersion === expectedSessionVersion
+                && state.authority.totalMessages === absoluteStartIndex + chat.message.length
+                ? state
+                : null
+        }
+        const syncMetadata = (state: WindowedSelectedConversationState) => {
+            const metadata = cloneConversationMetadata(chat) as Record<string, unknown>
+            const shell = state.conversation as unknown as Record<string, unknown>
+            for (const key of Object.keys(shell)) {
+                if (key !== 'message' && !Object.hasOwn(metadata, key)) delete shell[key]
+            }
+            for (const [key, value] of Object.entries(metadata)) {
+                if (key !== 'message') shell[key] = safeStructuredClone(value)
+            }
+            return metadata
+        }
+        const restoreObject = (
+            target: Record<string, unknown>,
+            snapshot: Record<string, unknown>,
+        ) => {
+            for (const key of Object.keys(target)) {
+                if (!Object.hasOwn(snapshot, key)) delete target[key]
+            }
+            for (const [key, value] of Object.entries(snapshot)) {
+                target[key] = safeStructuredClone(value)
+            }
+        }
+        return {
+            chat,
+            absoluteStartIndex,
+            isCurrent: () => requireState() !== null,
+            applyRange: (localStart, deleteCount, messages, command) => {
+                const state = requireState()
+                if (
+                    !state
+                    || !this.dependencies.coordinator.recordActiveConversationMutation
+                    || !Number.isSafeInteger(localStart)
+                    || localStart < 0
+                    || !Number.isSafeInteger(deleteCount)
+                    || deleteCount < 0
+                    || localStart + deleteCount > chat.message.length
+                ) return false
+                const replacedMessages = chat.message.slice(localStart, localStart + deleteCount)
+                const shellSnapshot = safeStructuredClone(
+                    state.conversation,
+                ) as unknown as Record<string, unknown>
+                const authoritySnapshot = state.authority
+                const summarySnapshot = state.summary
+                const previousVersion = state.authority.sessionVersion
+                const sessionVersion = previousVersion + 1
+                const detachedMessages = safeStructuredClone([...messages])
+                let rollbackViewport = () => {}
+                try {
+                    chat.message.splice(
+                        localStart,
+                        deleteCount,
+                        ...safeStructuredClone(detachedMessages),
+                    )
+                    const metadata = syncMetadata(state)
+                    state.authority = {
+                        ...state.authority,
+                        sessionVersion,
+                        totalMessages:
+                            state.authority.totalMessages - deleteCount + detachedMessages.length,
+                    }
+                    state.summary = {
+                        ...state.summary,
+                        messageCount: state.authority.totalMessages,
+                        recentAt:
+                            chat.lastDate
+                            ?? detachedMessages.at(-1)?.time
+                            ?? state.summary.recentAt,
+                    }
+                    rollbackViewport = state.viewportSource.applyOptimisticRange(
+                        absoluteStartIndex + localStart,
+                        deleteCount,
+                        detachedMessages,
+                    )
+                    this.dependencies.coordinator.recordActiveConversationMutation({
+                        characterId: state.characterId,
+                        conversationId: state.conversationId,
+                        sessionToken: state.authority.sessionToken,
+                        previousVersion,
+                        sessionVersion,
+                        commands: [command],
+                        mutations: [{
+                            start: absoluteStartIndex + localStart,
+                            deleteCount,
+                            messages: detachedMessages,
+                            sessionVersion,
+                        }],
+                        conversation: metadata,
+                    })
+                    expectedSessionVersion = sessionVersion
+                    return true
+                } catch (error) {
+                    rollbackViewport()
+                    chat.message.splice(localStart, detachedMessages.length, ...replacedMessages)
+                    restoreObject(
+                        state.conversation as unknown as Record<string, unknown>,
+                        shellSnapshot,
+                    )
+                    state.authority = authoritySnapshot
+                    state.summary = summarySnapshot
+                    throw error
+                }
+            },
+            release() { released = true },
+        }
+    }
+
     tryDemoteSelectedConversation(target = this.captureSelectedConversationTarget()): boolean {
         const state = this.selectedConversationState
         const transition = this.dependencies.coordinator.runSelectedConversationTransition
@@ -593,6 +740,21 @@ export class ActiveWorkingSet {
         event: PersistedConversationMutationEvent,
     ): boolean {
         const session = this.activeSession
+        const windowed = this.selectedConversationState
+        if (
+            windowed?.kind === 'windowed'
+            && windowed.characterId === event.characterId
+            && windowed.conversationId === event.conversationId
+            && windowed.authority.sessionToken === event.sessionToken
+            && event.sessionVersion > windowed.authority.persistedSessionVersion
+            && event.sessionVersion <= windowed.authority.sessionVersion
+        ) {
+            windowed.authority = {
+                ...windowed.authority,
+                persistedSessionVersion: event.sessionVersion,
+            }
+            return true
+        }
         if (
             !session ||
             !session.isActive ||

@@ -341,6 +341,24 @@ export interface ConversationWindow {
     hasMoreAfter: boolean
 }
 
+export interface ConversationMessageMetadata {
+    chatId?: string
+    role?: Message['role']
+    disabled?: Message['disabled']
+    parserInert: boolean
+}
+
+export interface ConversationMessageMetadataWindow {
+    characterId: string
+    conversationId: string
+    messages: ConversationMessageMetadata[]
+    startIndex: number
+    endIndex: number
+    totalMessages: number
+    hasMoreBefore: boolean
+    hasMoreAfter: boolean
+}
+
 export interface CharacterQuery {
     search?: string
     order: 'configured' | 'recent'
@@ -487,6 +505,9 @@ export interface PersistentRevisionReader {
     readConversationWindow(
         input: ConversationWindowQuery,
     ): Promise<Versioned<ConversationWindow> | null>
+    readConversationMessageMetadataWindow?(
+        input: ConversationWindowQuery,
+    ): Promise<Versioned<ConversationMessageMetadataWindow> | null>
     queryPluginStorage(): Promise<PluginStorageCatalog>
     readPluginStorage(owner: string, key: string): Promise<Versioned<unknown> | null>
     readAssetAlias(identity: AssetAliasIdentity): Promise<Versioned<AssetAlias> | null>
@@ -525,6 +546,9 @@ export interface PersistentDataStore {
     readConversationWindow(
         input: ConversationWindowQuery,
     ): Promise<Versioned<ConversationWindow> | null>
+    readConversationMessageMetadataWindow?(
+        input: ConversationWindowQuery,
+    ): Promise<Versioned<ConversationMessageMetadataWindow> | null>
     queryPluginStorage(): Promise<PluginStorageCatalog>
     readPluginStorage(owner: string, key: string): Promise<Versioned<unknown> | null>
     /** Sizes and ownership only. Values stay in the store until one is opened. */
@@ -549,10 +573,12 @@ export interface PersistentDataStore {
     archiveCharacter(
         characterId: string,
         expectedRevision: DataRevision,
+        signal?: AbortSignal,
     ): Promise<{ revision: DataRevision }>
     restoreCharacter(
         characterId: string,
         expectedRevision: DataRevision,
+        signal?: AbortSignal,
     ): Promise<{ revision: DataRevision }>
     replaceFromDatabase(
         database: Database,

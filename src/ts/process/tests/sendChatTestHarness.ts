@@ -194,6 +194,9 @@ export function modellistModule(overrides: ModuleOverrides = {}) {
 export function modulesModule(overrides: ModuleOverrides = {}) {
     return {
         getModuleAssets: vi.fn(() => []),
+        getModuleLorebooks: vi.fn(() => []),
+        getModuleRegexScripts: vi.fn(() => []),
+        getModuleTriggers: vi.fn(() => []),
         getModuleToggles: vi.fn(() => ''),
         moduleUpdate: vi.fn(),
         ...overrides,

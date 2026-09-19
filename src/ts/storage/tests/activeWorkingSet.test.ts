@@ -1,7 +1,7 @@
 import { IDBFactory, IDBKeyRange, IDBObjectStore } from 'fake-indexeddb'
 import { describe, expect, it, vi } from 'vitest'
 import { ActiveWorkingSet } from '../activeWorkingSet.svelte'
-import type { Chat, Database, character, groupChat } from '../database.svelte'
+import type { Chat, Database, Message, character, groupChat } from '../database.svelte'
 import { IndexedDbPersistentDataStore } from '../indexedDbPersistentDataStore'
 import {
     capturePersistentRoot,
@@ -426,6 +426,110 @@ function makeWindowedHarness(input: {
 }
 
 describe('ActiveWorkingSet', () => {
+    it('fences a tail controller after another controller makes a same-length edit', async () => {
+        const full = makeChat('chat-a')
+        full.message = [
+            { role: 'user', data: 'covered', chatId: 'a' },
+            { role: 'user', data: 'tail', chatId: 'b' },
+        ] as Message[]
+        const harness = makeWindowedHarness({ characters: [makeCharacter('a', [full])] })
+        await harness.workingSet.activateCharacter('a')
+        const target = harness.workingSet.captureSelectedConversationTarget()!
+        const local = { ...structuredClone(full), message: [structuredClone(full.message[1])] }
+        const first = harness.workingSet.captureWindowedConversationMutationController(target, local, 1)!
+        const other = harness.workingSet.captureWindowedConversationMutationController(target, structuredClone(local), 1)!
+        expect(other.applyRange(0, 1, [{ role: 'user', data: 'external edit', chatId: 'b' }], 'edit')).toBe(true)
+        expect(first.applyRange(0, 1, [{ role: 'user', data: 'stale edit', chatId: 'b' }], 'edit')).toBe(false)
+        expect(local.message[0].data).toBe('tail')
+    })
+
+    it('records bounded generation tail mutations without promoting the conversation', async () => {
+        const full = makeChat('chat-a')
+        full.message = [
+            { role: 'user', data: 'covered-a', chatId: 'a' },
+            { role: 'char', data: 'covered-b', chatId: 'b' },
+            { role: 'user', data: 'tail', chatId: 'c' },
+        ] as Message[]
+        const harness = makeWindowedHarness({ characters: [makeCharacter('a', [full])] })
+        await expect(harness.workingSet.activateCharacter('a')).resolves.toBe(true)
+        const target = harness.workingSet.captureSelectedConversationTarget()!
+        const local = { ...structuredClone(full), message: [structuredClone(full.message[2])] }
+        const controller = harness.workingSet.captureWindowedConversationMutationController(
+            target,
+            local,
+            2,
+        )!
+
+        expect(controller.applyRange(1, 0, [{
+            role: 'char', data: '', chatId: 'generated',
+        }], 'append')).toBe(true)
+        expect(harness.workingSet.acknowledgeConversationMutationPersisted({
+            characterId: 'a',
+            conversationId: 'chat-a',
+            sessionToken: harness.workingSet.captureSelectedConversationAuthority()!.sessionToken,
+            sessionVersion: 1,
+            revision: 2,
+        })).toBe(true)
+        harness.workingSet.advanceStoreRevision(2)
+        expect(controller.applyRange(1, 1, [{
+            role: 'char', data: 'complete', chatId: 'generated',
+        }], 'edit')).toBe(true)
+
+        expect(Object.getOwnPropertyDescriptor(
+            harness.database.characters[0].chats[0],
+            'message',
+        )?.get).toBeTypeOf('function')
+        expect(harness.workingSet.captureSelectedConversationAuthority()).toMatchObject({
+            totalMessages: 4,
+            persistedSessionVersion: 1,
+            sessionVersion: 2,
+        })
+        expect(harness.coordinator.recordActiveConversationMutation.mock.calls.map(
+            ([event]) => event.mutations[0],
+        )).toMatchObject([
+            { start: 3, deleteCount: 0, sessionVersion: 1 },
+            { start: 3, deleteCount: 1, sessionVersion: 2 },
+        ])
+        expect(harness.workingSet.acknowledgeConversationMutationPersisted({
+            characterId: 'a',
+            conversationId: 'chat-a',
+            sessionToken: harness.workingSet.captureSelectedConversationAuthority()!.sessionToken,
+            sessionVersion: 2,
+            revision: 2,
+        })).toBe(true)
+        expect(harness.workingSet.captureSelectedConversationAuthority()).toMatchObject({
+            persistedSessionVersion: 2,
+        })
+        expect(harness.readConversation).not.toHaveBeenCalled()
+    })
+
+    it('rolls back a bounded tail mutation when persistence rejects its evidence', async () => {
+        const full = makeChat('chat-a')
+        full.message = [
+            { role: 'user', data: 'covered', chatId: 'a' },
+            { role: 'char', data: 'tail', chatId: 'b' },
+        ] as Message[]
+        const harness = makeWindowedHarness({ characters: [makeCharacter('a', [full])] })
+        await expect(harness.workingSet.activateCharacter('a')).resolves.toBe(true)
+        const target = harness.workingSet.captureSelectedConversationTarget()!
+        const local = { ...structuredClone(full), message: [structuredClone(full.message[1])] }
+        const controller = harness.workingSet.captureWindowedConversationMutationController(
+            target,
+            local,
+            1,
+        )!
+        const authorityBefore = harness.workingSet.captureSelectedConversationAuthority()
+        harness.coordinator.recordActiveConversationMutation.mockImplementationOnce(() => {
+            throw new Error('Synthetic persistence rejection')
+        })
+
+        expect(() => controller.applyRange(1, 0, [{
+            role: 'char', data: 'generated', chatId: 'generated',
+        }], 'append')).toThrow('Synthetic persistence rejection')
+        expect(local.message).toEqual([{ role: 'char', data: 'tail', chatId: 'b' }])
+        expect(harness.workingSet.captureSelectedConversationAuthority()).toEqual(authorityBefore)
+    })
+
     it('propagates a windowed transition failure after restoring the previous selection', async () => {
         const harness = makeWindowedHarness({
             characters: [makeCharacter('a', [makeChat('chat-a')]), makeCharacter('b', [makeChat('chat-b')])],

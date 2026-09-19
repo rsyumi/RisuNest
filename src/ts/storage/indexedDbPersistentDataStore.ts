@@ -15,6 +15,7 @@ import type {
     CharacterQuery,
     CharacterSummary,
     ConversationMutation,
+    ConversationMessageMetadataWindow,
     ConversationPage,
     ConversationQuery,
     ConversationSummary,
@@ -674,6 +675,28 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         return this.readConversationWindowFromTransaction(transaction, revision, generation, input)
     }
 
+    async readConversationMessageMetadataWindow(
+        input: ConversationWindowQuery,
+    ): Promise<Versioned<ConversationMessageMetadataWindow> | null> {
+        const window = await this.readConversationWindow(input)
+        return window && {
+            revision: window.revision,
+            value: {
+                ...window.value,
+                messages: window.value.messages.map(({ chatId, role, disabled, data }) => ({
+                    ...(chatId === undefined ? {} : { chatId }),
+                    ...(role === undefined ? {} : { role }),
+                    ...(disabled === undefined ? {} : { disabled }),
+                    parserInert: typeof data === 'string'
+                        && !data.includes('{{')
+                        && !data.includes('}}')
+                        && !data.includes('<Thoughts>')
+                        && !data.includes('</Thoughts>'),
+                })),
+            },
+        }
+    }
+
     async queryPluginStorage(): Promise<PluginStorageCatalog> {
         const transaction = this.requireDatabase().transaction(
             ['meta', 'pluginStorageMetadata'],
@@ -1313,6 +1336,37 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                     generation,
                     input,
                 )
+            },
+            readConversationMessageMetadataWindow: async (input) => {
+                assertActive()
+                validateConversationWindowQuery(input)
+                const transaction = this.requireDatabase().transaction(
+                    ['meta', 'conversations', 'messagePages', 'messageOccurrences'],
+                    'readonly',
+                )
+                await this.validateSnapshotLease(transaction, lease, generation, revision)
+                const window = await this.readConversationWindowFromTransaction(
+                    transaction,
+                    revision,
+                    generation,
+                    input,
+                )
+                return window && {
+                    revision: window.revision,
+                    value: {
+                        ...window.value,
+                        messages: window.value.messages.map(({ chatId, role, disabled, data }) => ({
+                            ...(chatId === undefined ? {} : { chatId }),
+                            ...(role === undefined ? {} : { role }),
+                            ...(disabled === undefined ? {} : { disabled }),
+                            parserInert: typeof data === 'string'
+                                && !data.includes('{{')
+                                && !data.includes('}}')
+                                && !data.includes('<Thoughts>')
+                                && !data.includes('</Thoughts>'),
+                        })),
+                    },
+                }
             },
             queryPluginStorage: async () => {
                 assertActive()

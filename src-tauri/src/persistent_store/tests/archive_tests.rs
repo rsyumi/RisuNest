@@ -2,6 +2,7 @@ use super::*;
 use crate::asset_repository::PayloadCas;
 use crate::logical_records::{LogicalRecordEnvelope, LogicalRecordLocator};
 use crate::persistent_store::record_apply::apply_materialized_record;
+use std::cell::Cell;
 
 fn archive_store() -> (tempfile::TempDir, PersistentStore, PayloadCas) {
     let directory = tempfile::tempdir().expect("create archive directory");
@@ -284,6 +285,225 @@ fn archiving_moves_conversations_into_one_object_and_restoring_puts_them_back() 
         archive::read_archived_object(&store.connection, &generation, "middle-archived")
             .expect("read archived object")
             .is_none()
+    );
+}
+
+#[test]
+fn cancelling_streamed_archive_keeps_the_live_character_and_revision() {
+    let (_directory, mut store, _cas) = archive_store();
+    let before = store
+        .read_character("middle-archived", None)
+        .expect("read active character")
+        .expect("character exists")
+        .value;
+    let revision = store.revision().expect("read revision");
+    let checks = Cell::new(0_u32);
+    let is_cancelled = || {
+        let next = checks.get() + 1;
+        checks.set(next);
+        next >= 6
+    };
+
+    let error = store
+        .archive_character_with_cancellation(
+            "middle-archived",
+            revision,
+            10,
+            &is_cancelled,
+        )
+        .expect_err("cancel archive while streaming");
+
+    assert!(error.to_string().contains("cancelled"));
+    assert_eq!(store.revision().expect("read revision after cancellation"), revision);
+    assert_eq!(
+        store
+            .read_character("middle-archived", None)
+            .expect("read character after cancellation")
+            .expect("live character remains")
+            .value,
+        before,
+    );
+}
+
+#[test]
+fn cancelling_streamed_restore_keeps_the_archive_object_and_cleans_staging() {
+    let (_directory, mut store, cas) = archive_store();
+    let revision = store.revision().expect("read revision");
+    store
+        .archive_character("middle-archived", revision, 10)
+        .expect("archive character");
+    let archived = archived_object(&store, "middle-archived");
+    let revision = store.revision().expect("read archived revision");
+    let checks = Cell::new(0_u32);
+    let is_cancelled = || {
+        let next = checks.get() + 1;
+        checks.set(next);
+        next >= 5
+    };
+
+    let error = store
+        .restore_character_with_cancellation("middle-archived", revision, &is_cancelled)
+        .expect_err("cancel restore while staging");
+
+    assert!(error.to_string().contains("cancelled"));
+    assert_eq!(store.revision().expect("read revision after cancellation"), revision);
+    assert_eq!(archived_object(&store, "middle-archived"), archived);
+    assert!(cas
+        .stat_object(&archived.object_hash)
+        .expect("stat retained archive")
+        .is_some());
+    let staging_tables: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_database_list WHERE name = 'archive_restore'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count restore staging tables");
+    assert_eq!(staging_tables, 0);
+
+    store
+        .restore_character("middle-archived", revision)
+        .expect("retained archive remains restorable");
+}
+
+#[test]
+fn malformed_streamed_restore_keeps_the_archive_and_cleans_partial_staging() {
+    let (_directory, mut store, cas) = archive_store();
+    let revision = store.revision().expect("read revision");
+    store
+        .archive_character("middle-archived", revision, 10)
+        .expect("archive the character");
+    let original = archived_object(&store, "middle-archived");
+    let original_bytes = cas
+        .read_object(&original.object_hash)
+        .expect("read original archive")
+        .expect("archive object exists");
+    let mut decoder = flate2::read::GzDecoder::new(original_bytes.as_slice());
+    let mut json_bytes = Vec::new();
+    std::io::Read::read_to_end(&mut decoder, &mut json_bytes).expect("decode archive");
+    let mut payload: Value = serde_json::from_slice(&json_bytes).expect("parse archive");
+    payload["conversations"]
+        .as_array_mut()
+        .expect("conversation array")
+        .push(json!({ "unexpected": true }));
+    let mut encoder =
+        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    serde_json::to_writer(&mut encoder, &payload).expect("encode malformed payload");
+    let malformed = cas
+        .prepare_bytes(&encoder.finish().expect("finish malformed archive"))
+        .expect("prepare malformed archive");
+    let mut redirected = original.clone();
+    redirected.object_hash = malformed.content_hash;
+    let generation = active_generation(&store.connection).expect("read active generation");
+    store
+        .connection
+        .execute(
+            "UPDATE characters SET archived_object = ?3
+             WHERE generation = ?1 AND character_id = ?2",
+            params![
+                generation,
+                "middle-archived",
+                serde_json::to_string(&redirected).expect("encode archive metadata")
+            ],
+        )
+        .expect("point fixture at malformed archive");
+
+    let before_revision = store.revision().expect("read revision before restore");
+    assert!(store
+        .restore_character("middle-archived", before_revision)
+        .is_err());
+    assert_eq!(
+        store.revision().expect("read revision after failed restore"),
+        before_revision
+    );
+    let retained = archived_object(&store, "middle-archived");
+    assert_eq!(retained.object_hash, redirected.object_hash);
+    assert!(cas
+        .stat_object(&original.object_hash)
+        .expect("stat original archive")
+        .is_some());
+    let active_rows: i64 = store
+        .connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM conversations
+                 WHERE generation = ?1 AND character_id = ?2) +
+                (SELECT COUNT(*) FROM messages
+                 WHERE generation = ?1 AND character_id = ?2)",
+            params![generation, "middle-archived"],
+            |row| row.get(0),
+        )
+        .expect("count active rows");
+    assert_eq!(active_rows, 0);
+    let staging_tables: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_database_list WHERE name = 'archive_restore'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count restore staging tables");
+    assert_eq!(staging_tables, 0);
+}
+
+#[test]
+#[ignore = "synthetic memory benchmark"]
+fn large_character_archive_and_restore_memory_measurement() {
+    const MESSAGE_COUNT: i64 = 16_384;
+    const MESSAGE_BYTES: usize = 2 * 1024;
+    let (_directory, mut store, _cas) = archive_store();
+    let generation = active_generation(&store.connection).expect("read active generation");
+    let transaction = store.connection.transaction().expect("begin fixture transaction");
+    transaction.execute(
+        "DELETE FROM messages
+         WHERE generation=?1 AND character_id='middle-archived' AND conversation_id='middle-chat'",
+        [&generation],
+    ).expect("clear fixture messages");
+    {
+        let mut statement = transaction.prepare(
+            "INSERT INTO messages (
+                generation, character_id, conversation_id, message_index, message_id, value
+             ) VALUES (?1, 'middle-archived', 'middle-chat', ?2, ?3, ?4)",
+        ).expect("prepare message insert");
+        let body = "x".repeat(MESSAGE_BYTES);
+        for index in 0..MESSAGE_COUNT {
+            let message_id = format!("scale-{index}");
+            let value = serde_json::to_string(&json!({
+                "role": if index % 2 == 0 { "user" } else { "char" },
+                "data": body,
+                "chatId": message_id,
+            })).expect("encode message");
+            statement.execute(params![generation, index, message_id, value])
+                .expect("insert message");
+        }
+    }
+    transaction.execute(
+        "UPDATE conversations SET message_count=?2
+         WHERE generation=?1 AND character_id='middle-archived' AND conversation_id='middle-chat'",
+        params![generation, MESSAGE_COUNT],
+    ).expect("update message count");
+    transaction.commit().expect("commit scale fixture");
+
+    let archive_revision = store.revision().expect("read archive revision");
+    let archive = crate::test_memory::measure_working_set(|| {
+        store.archive_character("middle-archived", archive_revision, 10)
+    });
+    archive.value.expect("archive large character");
+    let restore_revision = store.revision().expect("read restore revision");
+    let restore = crate::test_memory::measure_working_set(|| {
+        store.restore_character("middle-archived", restore_revision)
+    });
+    restore.value.expect("restore large character");
+
+    println!(
+        "BOUNDED_ARCHIVE_MEMORY {{\"messageCount\":{MESSAGE_COUNT},\"messageBytes\":{MESSAGE_BYTES},\"archiveBaselineWorkingSetBytes\":{:?},\"archivePeakWorkingSetBytes\":{:?},\"archiveRetainedWorkingSetBytes\":{:?},\"restoreBaselineWorkingSetBytes\":{:?},\"restorePeakWorkingSetBytes\":{:?},\"restoreRetainedWorkingSetBytes\":{:?}}}",
+        archive.baseline_working_set_bytes,
+        archive.peak_working_set_bytes,
+        archive.retained_working_set_bytes,
+        restore.baseline_working_set_bytes,
+        restore.peak_working_set_bytes,
+        restore.retained_working_set_bytes,
     );
 }
 

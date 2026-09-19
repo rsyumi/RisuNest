@@ -953,6 +953,53 @@ fn conversation_windows_support_strict_absolute_ranges() {
 }
 
 #[test]
+fn conversation_metadata_windows_exclude_bodies_and_classify_parser_work() {
+    let (_directory, mut store, _) = open_fixture();
+    let mut dynamic = message("{{history}}");
+    dynamic["chatId"] = json!("dynamic");
+    dynamic["disabled"] = json!("allBefore");
+    let mut disabled = message("disabled");
+    disabled["disabled"] = json!(true);
+    commit(
+        &mut store,
+        1,
+        ConversationMutation::ReplaceRange {
+            character_id: "char-a".to_owned(),
+            conversation_id: "conv-long".to_owned(),
+            start: 1,
+            delete_count: 1,
+            messages: vec![dynamic, disabled],
+            conversation: None,
+            configured_index: None,
+        },
+    );
+    let result = store
+        .read_conversation_message_metadata_window(
+            &ConversationWindowQuery {
+                character_id: "char-a".to_owned(),
+                conversation_id: "conv-long".to_owned(),
+                start_index: Some(0),
+                limit: Some(3),
+                anchor_message_id: None,
+                anchor_occurrence: None,
+                before: None,
+                after: None,
+            },
+            None,
+        )
+        .expect("read metadata range")
+        .expect("conversation exists");
+
+    assert_eq!((result.value.start_index, result.value.end_index), (0, 3));
+    assert_eq!(result.value.messages[0].chat_id.as_deref(), Some("msg-000"));
+    assert!(result.value.messages[0].parser_inert);
+    assert_eq!(result.value.messages[1].chat_id.as_deref(), Some("dynamic"));
+    assert_eq!(result.value.messages[1].disabled, Some(json!("allBefore")));
+    assert!(!result.value.messages[1].parser_inert);
+    assert_eq!(result.value.messages[2].disabled, Some(json!(true)));
+}
+
+#[test]
 fn replace_range_supports_append_insert_delete_and_conversation_lifecycle() {
     let (_directory, mut store, _) = open_fixture();
     let revision = commit(

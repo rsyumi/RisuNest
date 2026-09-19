@@ -1,0 +1,429 @@
+{
+  "platform": "Windows x86_64",
+  "fixturesAreSynthetic": true,
+  "generation": {
+    "totalMessages": 50000,
+    "summarizedMessages": 49968,
+    "suffixMessages": 32,
+    "baselineHeapUsedBytes": 28036032,
+    "peakHeapUsedBytes": 43367912,
+    "retainedHeapUsedBytes": 43367912,
+    "metadataRows": 50000,
+    "metadataPages": 391,
+    "bodyRows": 32,
+    "bodyPages": 32,
+    "bodyBytes": 67136,
+    "elapsedMs": 49.86259999999993,
+    "classificationRows": 50000,
+    "scope": "Node preparation helper with synthetic store; CBS, regex and tokenizer are not executed",
+    "coveredBodyTransfers": 0
+  },
+  "archive": {
+    "messageCount": 16384,
+    "messageBodyBytes": 2048,
+    "archiveBaselineNativeWorkingSetBytes": 51335168,
+    "archivePeakNativeWorkingSetBytes": 54046720,
+    "archiveRetainedNativeWorkingSetBytes": 51847168,
+    "restoreBaselineNativeWorkingSetBytes": 51904512,
+    "restorePeakNativeWorkingSetBytes": 148045824,
+    "restoreRetainedNativeWorkingSetBytes": 51044352
+  },
+  "risuSave": {
+    "messageCount": 16385,
+    "messageBodyBytes": 4096,
+    "maximumStagingPageMessages": 128,
+    "baselineNativeWorkingSetBytes": 126144512,
+    "peakNativeWorkingSetBytes": 138248192,
+    "retainedNativeWorkingSetBytes": 138354688
+  },
+  "pluginIframeTransfer": {
+    "fixture": {
+      "characters": 1,
+      "conversationsPerCharacter": 1,
+      "messagesPerConversation": 16384,
+      "messageBodyBytes": 2048
+    },
+    "implementation": "Production SandboxHost and iframe assembly, synthetic bounded source (storage reads excluded)",
+    "logicalDomains": {
+      "maximumParentChunkBytes": 2146,
+      "iframeCharacterCount": 1,
+      "iframeRetainedJsonBytes": 34411814
+    },
+    "peaks": {
+      "webViewHeapUsedBytes": 13452576,
+      "totalProcessTreeWorkingSetBytes": 836603904
+    },
+    "samples": [
+      {
+        "label": "baseline",
+        "webViewHeapUsedBytes": 822580,
+        "webViewHeapTotalBytes": 2097152,
+        "processTree": {
+          "workingSetBytes": 707670016,
+          "privateBytes": 310325248,
+          "processCount": 13
+        }
+      },
+      {
+        "label": "after-512-messages",
+        "webViewHeapUsedBytes": 2892480,
+        "webViewHeapTotalBytes": 4980736,
+        "processTree": {
+          "workingSetBytes": 798924800,
+          "privateBytes": 355966976,
+          "processCount": 15
+        }
+      },
+      {
+        "label": "after-1024-messages",
+        "webViewHeapUsedBytes": 3846396,
+        "webViewHeapTotalBytes": 7864320,
+        "processTree": {
+          "workingSetBytes": 811405312,
+          "privateBytes": 366383104,
+          "processCount": 15
+        }
+      },
+      {
+        "label": "after-1536-messages",
+        "webViewHeapUsedBytes": 5255328,
+        "webViewHeapTotalBytes": 9961472,
+        "processTree": {
+          "workingSetBytes": 818233344,
+          "privateBytes": 373911552,
+          "processCount": 15
+        }
+      },
+      {
+        "label": "after-2048-messages",
+        "webViewHeapUsedBytes": 2560120,
+        "webViewHeapTotalBytes": 10485760,
+        "processTree": {
+          "workingSetBytes": 828768256,
+          "privateBytes": 380956672,
+          "processCount": 15
+        }
+      },
+      {
+        "label": "after-2560-messages",
+        "webViewHeapUsedBytes": 3755568,
+        "webViewHeapTotalBytes": 10485760,
+        "processTree": {
+          "workingSetBytes": 833294336,
+          "privateBytes": 386846720,
+          "processCount": 15
+        }
+      },
+      {
+        "label": "after-3072-messages",
+        "webViewHeapUsedBytes": 5709764,
+        "webViewHeapTotalBytes": 10747904,
+        "processTree": {
+          "workingSetBytes": 836603904,
+          "privateBytes": 389890048,
+          "processCount": 15
+        }
+      },
+      {
+        "label": "after-3584-messages",
+        "webViewHeapUsedBytes": 3164928,
+        "webViewHeapTotalBytes": 10747904,
+        "processTree": {
+          "workingSetBytes": 805277696,
+          "privateBytes": 380067840,
+          "processCount": 14
+        }
+      },
+      {
+        "label": "after-4096-messages",
+        "webViewHeapUsedBytes": 6183084,
+        "webViewHeapTotalBytes": 12845056,
+        "processTree": {
+          "workingSetBytes": 552800256,
+          "privateBytes": 263479296,
+          "processCount": 9
+        }
+      },
+      {
+        "label": "after-4608-messages",
+        "webViewHeapUsedBytes": 5438172,
+        "webViewHeapTotalBytes": 14680064,
+        "processTree": {
+          "workingSetBytes": 558559232,
+          "privateBytes": 269312000,
+          "processCount": 9
+        }
+      },
+      {
+        "label": "after-5120-messages",
+        "webViewHeapUsedBytes": 1694144,
+        "webViewHeapTotalBytes": 16777216,
+        "processTree": {
+          "workingSetBytes": 563589120,
+          "privateBytes": 275197952,
+          "processCount": 9
+        }
+      },
+      {
+        "label": "after-5632-messages",
+        "webViewHeapUsedBytes": 4705164,
+        "webViewHeapTotalBytes": 16777216,
+        "processTree": {
+          "workingSetBytes": 568373248,
+          "privateBytes": 280293376,
+          "processCount": 9
+        }
+      },
+      {
+        "label": "after-6144-messages",
+        "webViewHeapUsedBytes": 3951880,
+        "webViewHeapTotalBytes": 16777216,
+        "processTree": {
+          "workingSetBytes": 576638976,
+          "privateBytes": 288178176,
+          "processCount": 9
+        }
+      },
+      {
+        "label": "after-6656-messages",
+        "webViewHeapUsedBytes": 6967220,
+        "webViewHeapTotalBytes": 16777216,
+        "processTree": {
+          "workingSetBytes": 586158080,
+          "privateBytes": 298274816,
+          "processCount": 9
+        }
+      },
+      {
+        "label": "after-7168-messages",
+        "webViewHeapUsedBytes": 2831628,
+        "webViewHeapTotalBytes": 16515072,
+        "processTree": {
+          "workingSetBytes": 585105408,
+          "privateBytes": 297132032,
+          "processCount": 9
+        }
+      },
+      {
+        "label": "after-7680-messages",
+        "webViewHeapUsedBytes": 5847232,
+        "webViewHeapTotalBytes": 16515072,
+        "processTree": {
+          "workingSetBytes": 588595200,
+          "privateBytes": 300232704,
+          "processCount": 9
+        }
+      },
+      {
+        "label": "after-8192-messages",
+        "webViewHeapUsedBytes": 8860624,
+        "webViewHeapTotalBytes": 17825792,
+        "processTree": {
+          "workingSetBytes": 545210368,
+          "privateBytes": 277393408,
+          "processCount": 8
+        }
+      },
+      {
+        "label": "after-8704-messages",
+        "webViewHeapUsedBytes": 11878448,
+        "webViewHeapTotalBytes": 20709376,
+        "processTree": {
+          "workingSetBytes": 500326400,
+          "privateBytes": 237707264,
+          "processCount": 8
+        }
+      },
+      {
+        "label": "after-9216-messages",
+        "webViewHeapUsedBytes": 1410608,
+        "webViewHeapTotalBytes": 22806528,
+        "processTree": {
+          "workingSetBytes": 499236864,
+          "privateBytes": 237326336,
+          "processCount": 7
+        }
+      },
+      {
+        "label": "after-9728-messages",
+        "webViewHeapUsedBytes": 4425636,
+        "webViewHeapTotalBytes": 22806528,
+        "processTree": {
+          "workingSetBytes": 504434688,
+          "privateBytes": 242110464,
+          "processCount": 7
+        }
+      },
+      {
+        "label": "after-10240-messages",
+        "webViewHeapUsedBytes": 7437916,
+        "webViewHeapTotalBytes": 22806528,
+        "processTree": {
+          "workingSetBytes": 508264448,
+          "privateBytes": 245911552,
+          "processCount": 7
+        }
+      },
+      {
+        "label": "after-10752-messages",
+        "webViewHeapUsedBytes": 10445316,
+        "webViewHeapTotalBytes": 22806528,
+        "processTree": {
+          "workingSetBytes": 514007040,
+          "privateBytes": 252354560,
+          "processCount": 7
+        }
+      },
+      {
+        "label": "after-11264-messages",
+        "webViewHeapUsedBytes": 13452576,
+        "webViewHeapTotalBytes": 22806528,
+        "processTree": {
+          "workingSetBytes": 511938560,
+          "privateBytes": 250454016,
+          "processCount": 7
+        }
+      },
+      {
+        "label": "after-11776-messages",
+        "webViewHeapUsedBytes": 1647968,
+        "webViewHeapTotalBytes": 3145728,
+        "processTree": {
+          "workingSetBytes": 486137856,
+          "privateBytes": 223846400,
+          "processCount": 7
+        }
+      },
+      {
+        "label": "after-12288-messages",
+        "webViewHeapUsedBytes": 2787332,
+        "webViewHeapTotalBytes": 6029312,
+        "processTree": {
+          "workingSetBytes": 492277760,
+          "privateBytes": 229752832,
+          "processCount": 7
+        }
+      },
+      {
+        "label": "after-12800-messages",
+        "webViewHeapUsedBytes": 4528016,
+        "webViewHeapTotalBytes": 7864320,
+        "processTree": {
+          "workingSetBytes": 498630656,
+          "privateBytes": 235782144,
+          "processCount": 7
+        }
+      },
+      {
+        "label": "after-13312-messages",
+        "webViewHeapUsedBytes": 2952352,
+        "webViewHeapTotalBytes": 7864320,
+        "processTree": {
+          "workingSetBytes": 507072512,
+          "privateBytes": 244023296,
+          "processCount": 7
+        }
+      },
+      {
+        "label": "after-13824-messages",
+        "webViewHeapUsedBytes": 4136528,
+        "webViewHeapTotalBytes": 9699328,
+        "processTree": {
+          "workingSetBytes": 505466880,
+          "privateBytes": 241823744,
+          "processCount": 7
+        }
+      },
+      {
+        "label": "after-14336-messages",
+        "webViewHeapUsedBytes": 1277376,
+        "webViewHeapTotalBytes": 10223616,
+        "processTree": {
+          "workingSetBytes": 505204736,
+          "privateBytes": 242044928,
+          "processCount": 7
+        }
+      },
+      {
+        "label": "after-14848-messages",
+        "webViewHeapUsedBytes": 4283840,
+        "webViewHeapTotalBytes": 10223616,
+        "processTree": {
+          "workingSetBytes": 507826176,
+          "privateBytes": 244670464,
+          "processCount": 7
+        }
+      },
+      {
+        "label": "after-15360-messages",
+        "webViewHeapUsedBytes": 7292188,
+        "webViewHeapTotalBytes": 13369344,
+        "processTree": {
+          "workingSetBytes": 512847872,
+          "privateBytes": 249397248,
+          "processCount": 7
+        }
+      },
+      {
+        "label": "after-15872-messages",
+        "webViewHeapUsedBytes": 6542584,
+        "webViewHeapTotalBytes": 15990784,
+        "processTree": {
+          "workingSetBytes": 518606848,
+          "privateBytes": 255045632,
+          "processCount": 7
+        }
+      },
+      {
+        "label": "after-16384-messages",
+        "webViewHeapUsedBytes": 2809336,
+        "webViewHeapTotalBytes": 17039360,
+        "processTree": {
+          "workingSetBytes": 512122880,
+          "privateBytes": 249372672,
+          "processCount": 7
+        }
+      },
+      {
+        "label": "retained-after-gc",
+        "webViewHeapUsedBytes": 906888,
+        "webViewHeapTotalBytes": 15466496,
+        "processTree": {
+          "workingSetBytes": 542257152,
+          "privateBytes": 280862720,
+          "processCount": 7
+        }
+      }
+    ],
+    "measurementScope": "Runtime heap samples cover the host target only; iframe retained JSON size is logical size, not a separate iframe heap sample. Process-tree samples include browser overhead."
+  },
+  "generationAdmission": {
+    "supported": [
+      "native windowed selected conversation",
+      "standard non-experimental Hypa V3",
+      "stable unique message IDs",
+      "parser-inert stored messages",
+      "no generation triggers or plugin edit/output hooks",
+      "no editprocess or editoutput regex scripts",
+      "no lorebook, additional-text, inlay-view, dynamic-history, or explicit-history consumer",
+      "no pending selected-session edits"
+    ],
+    "completePathFallback": [
+      "Hypa V2",
+      "experimental Hypa V3",
+      "group conversations",
+      "missing, duplicate, or unresolved summary IDs",
+      "allBefore before the summary boundary",
+      "orphan-summary policy that leaves no resolvable boundary",
+      "mutating or unclassified scripts and triggers",
+      "independent old-history consumers",
+      "pending edits, navigation changes, and revision or authority changes"
+    ]
+  },
+  "limitations": [
+    "Synthetic fixtures only. Generation measures the preparation helper with a synthetic store, not end-to-end CBS/regex/tokenization or a native WebView.",
+    "Archive and RisuSave measurements are Windows debug Rust test process working sets, not fixed RAM guarantees. RisuSave evidence is the earlier unchanged-path run.",
+    "Plugin benchmark executes the production bridge and guest assembler with a synthetic bounded source, excluding storage reads. Final guest graph remains proportional to the requested object. Host heap and logical guest JSON size are different metrics.",
+    "No Linux, macOS, Android or iOS run was performed. No real user data or live RisuRealm material was used."
+  ]
+}

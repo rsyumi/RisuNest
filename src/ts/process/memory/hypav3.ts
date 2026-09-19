@@ -105,6 +105,12 @@ export interface HypaV3Result {
     memory?: SerializableHypaV3Data;
 }
 
+export interface HypaV3PreparedHistory {
+    boundaryMemo: string;
+    effectiveMessageMemos: readonly string[];
+    historyStartIndex: number;
+}
+
 const logPrefix = "[HypaV3]";
 const memoryPromptTag = "Past Events Summary";
 const summarySeparator = "\n\n";
@@ -128,12 +134,14 @@ export async function hypaMemoryV3(
     maxContextTokens: number,
     room: Chat,
     char: character | groupChat,
-    tokenizer: ChatTokenizer
+    tokenizer: ChatTokenizer,
+    preparedHistory?: HypaV3PreparedHistory,
 ): Promise<HypaV3Result> {
     const settings = getCurrentHypaV3Preset().settings;
 
     try {
         if (settings.useExperimentalImpl) {
+            if (preparedHistory) throw new Error('Prepared history is unsupported by experimental Hypa V3');
             console.log(logPrefix, "Using experimental implementation.");
 
             return await hypaMemoryV3MainExp(
@@ -152,7 +160,8 @@ export async function hypaMemoryV3(
             maxContextTokens,
             room,
             char,
-            tokenizer
+            tokenizer,
+            preparedHistory,
         );
     } catch (error) {
         if (error instanceof Error) {
@@ -965,7 +974,8 @@ async function hypaMemoryV3Main(
     maxContextTokens: number,
     room: Chat,
     char: character | groupChat,
-    tokenizer: ChatTokenizer
+    tokenizer: ChatTokenizer,
+    preparedHistory?: HypaV3PreparedHistory,
 ): Promise<HypaV3Result> {
     const db = getDatabase();
     const settings = getCurrentHypaV3Preset().settings;
@@ -991,7 +1001,7 @@ async function hypaMemoryV3Main(
 
     // Clean orphaned summaries
     if (!settings.preserveOrphanedMemory) {
-        cleanOrphanedSummary(chats, data);
+        cleanOrphanedSummary(chats, data, preparedHistory?.effectiveMessageMemos);
     }
 
     // Determine starting index
@@ -999,8 +1009,18 @@ async function hypaMemoryV3Main(
 
     if (data.summaries.length > 0) {
         const lastSummary = data.summaries.at(-1);
+        const lastSummaryMemo = [...lastSummary.chatMemos].at(-1);
+        if (preparedHistory) {
+            if (lastSummaryMemo !== preparedHistory.boundaryMemo) {
+                throw new Error('Prepared history summary boundary became stale');
+            }
+            startIdx = preparedHistory.historyStartIndex;
+            for (const chat of chats.slice(0, startIdx)) {
+                currentTokens -= await tokenizer.tokenizeChat(chat);
+            }
+        } else {
         const lastChatIndex = chats.findIndex(
-            (chat) => chat.memo === [...lastSummary.chatMemos].at(-1)
+            (chat) => chat.memo === lastSummaryMemo
         );
 
         if (lastChatIndex !== -1) {
@@ -1011,6 +1031,7 @@ async function hypaMemoryV3Main(
             for (const chat of summarizedChats) {
                 currentTokens -= await tokenizer.tokenizeChat(chat);
             }
+        }
         }
     }
 
@@ -1650,9 +1671,16 @@ function toSerializableHypaV3Data(data: HypaV3Data): SerializableHypaV3Data {
     };
 }
 
-function cleanOrphanedSummary(chats: OpenAIChat[], data: HypaV3Data): void {
+function cleanOrphanedSummary(
+    chats: OpenAIChat[],
+    data: HypaV3Data,
+    additionalMemos: readonly string[] = [],
+): void {
     // Collect all memos from current chats
-    const currentChatMemos = new Set(chats.map((chat) => chat.memo));
+    const currentChatMemos = new Set([
+        ...chats.map((chat) => chat.memo),
+        ...additionalMemos,
+    ]);
     const originalLength = data.summaries.length;
 
     // Filter summaries - keep only those whose chatMemos are subset of current chat memos

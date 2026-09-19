@@ -2994,6 +2994,61 @@ impl restore::ReplacementSink for PersistentReplacementSink {
         })
     }
 
+    fn supports_incremental_characters(&self) -> bool {
+        true
+    }
+
+    fn put_character_detail(
+        &self,
+        staging_id: &str,
+        detail: &serde_json::Value,
+        conversation_count: i64,
+    ) -> crate::persistent_store::StoreResult<()> {
+        crate::persistent_store::commands::with_store_mut(self.app.state(), |store| {
+            store.replace_put_character_detail(staging_id, detail, conversation_count)
+        })
+    }
+
+    fn put_conversation_row(
+        &self,
+        staging_id: &str,
+        character_id: &str,
+        configured_index: i64,
+        detail: &serde_json::Value,
+        recent_at: i64,
+        message_count: i64,
+    ) -> crate::persistent_store::StoreResult<()> {
+        crate::persistent_store::commands::with_store_mut(self.app.state(), |store| {
+            store.replace_put_conversation_row(
+                staging_id,
+                character_id,
+                configured_index,
+                detail,
+                recent_at,
+                message_count,
+            )
+        })
+    }
+
+    fn add_conversation_messages(
+        &self,
+        staging_id: &str,
+        character_id: &str,
+        conversation_id: &str,
+        start: i64,
+        messages: &[serde_json::Value],
+    ) -> crate::persistent_store::StoreResult<()> {
+        crate::persistent_store::commands::with_store_mut(self.app.state(), |store| {
+            store.replace_add_conversation_messages(
+                staging_id,
+                character_id,
+                conversation_id,
+                start,
+                messages,
+            )
+        })
+    }
+
     fn preserve_active_repositories(
         &self,
         staging_id: &str,

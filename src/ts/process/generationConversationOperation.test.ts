@@ -61,6 +61,57 @@ function createHarness(messages: Message[]) {
 }
 
 describe('generation conversation operation', () => {
+    it('keeps absolute indices for windowed append, continuation, and recapture', () => {
+        const currentChat = chat([message('tail', 'tail-1')])
+        let current = true
+        const mutations: Array<{ start: number, deleteCount: number, messages: Message[] }> = []
+        const controller = {
+            chat: currentChat,
+            absoluteStartIndex: 400,
+            isCurrent: () => current,
+            applyRange(start: number, deleteCount: number, messages: readonly Message[]) {
+                if (!current) return false
+                currentChat.message.splice(start, deleteCount, ...structuredClone(messages))
+                mutations.push({ start, deleteCount, messages: structuredClone([...messages]) })
+                return true
+            },
+            release() { current = false },
+        }
+        const base = {
+            session: null,
+            getCurrentSession: () => null,
+            chat: currentChat,
+            getCurrentChat: () => currentChat,
+            windowedController: controller,
+        }
+
+        const appended = captureGenerationConversationOperation({
+            ...base,
+            append: message('', 'generation-1'),
+        })
+        expect(appended.absoluteIndex).toBe(401)
+        expect(appended.commitData('streamed')).toBe(true)
+        appended.release()
+
+        const continued = captureGenerationConversationOperation({ ...base, continueLast: true })
+        expect(continued.absoluteIndex).toBe(401)
+        expect(continued.commitData('continued')).toBe(true)
+        continued.release()
+
+        const recaptured = recaptureGenerationConversationOperation({
+            ...base,
+            messageId: 'generation-1',
+        })
+        expect(recaptured?.absoluteIndex).toBe(401)
+        expect(recaptured?.snapshot()?.data).toBe('continued')
+        expect(mutations.map(({ start, deleteCount }) => ({ start, deleteCount }))).toEqual([
+            { start: 1, deleteCount: 0 },
+            { start: 1, deleteCount: 1 },
+            { start: 1, deleteCount: 1 },
+        ])
+        recaptured?.release()
+    })
+
     it('recaptures a message by ID through the conversation operation boundary', () => {
         const harness = createHarness([message('target', 'generation-1')])
         const capture = (messageId: string) => recaptureGenerationConversationOperation({

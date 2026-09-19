@@ -191,6 +191,24 @@ function createHarness() {
                     ?.chats.find((value) => value.id === conversationId)
                 return chat ? { revision, value: chat } : null
             },
+            readConversationMetadata: async (characterId: string, conversationId: string) => {
+                const chat = characters.find((value) => value.chaId === characterId)
+                    ?.chats.find((value) => value.id === conversationId)
+                if (!chat) return null
+                const { message, ...conversation } = chat
+                return { revision, value: { characterId, conversationId, conversation, totalMessages: message.length } }
+            },
+            readConversationWindow: async ({ characterId, conversationId, startIndex, limit }) => {
+                const chat = characters.find((value) => value.chaId === characterId)
+                    ?.chats.find((value) => value.id === conversationId)
+                if (!chat) return null
+                return { revision, value: {
+                    characterId, conversationId, startIndex,
+                    endIndex: Math.min(startIndex + limit, chat.message.length),
+                    messages: chat.message.slice(startIndex, startIndex + limit),
+                    totalMessages: chat.message.length,
+                } }
+            },
             queryPluginStorage: async () => ({
                 revision,
                 items: Object.keys(pluginStorage).map((key) => ({
@@ -520,6 +538,88 @@ describe('plugin database access', () => {
             'active-c',
         ])
         expect(JSON.stringify(result)).not.toContain('archived-b')
+    })
+
+    it('streams full snapshot message rows without assembling host characters', async () => {
+        const harness = createHarness()
+        harness.pinnedDatabases.push(makeFullObjectDatabase([
+            makeCharacter('active-a'),
+            makeCharacter('active-b'),
+        ]))
+
+        const stream = await harness.access.getDatabaseSnapshotStream(
+            ['characters'],
+            ['characters'],
+        )
+        const chunks = []
+        for await (const chunk of stream as any) chunks.push(chunk)
+
+        expect(chunks.map((chunk) => chunk.type)).toEqual([
+            'arrayStart',
+            'characterStart',
+            'conversationStart',
+            'message',
+            'conversationStart',
+            'message',
+            'characterStart',
+            'conversationStart',
+            'message',
+            'conversationStart',
+            'message',
+        ])
+        expect(chunks.filter((chunk) => chunk.type === 'characterStart').map((chunk) => chunk.value.chaId)).toEqual([
+            'active-a',
+            'active-b',
+        ])
+        expect(harness.snapshot).not.toHaveBeenCalled()
+        expect(harness.releasedLeases[0]).toHaveBeenCalledOnce()
+    })
+
+    it('releases a streamed snapshot lease when iframe assembly is cancelled', async () => {
+        const harness = createHarness()
+        harness.pinnedDatabases.push(makeFullObjectDatabase([makeCharacter('active')]))
+        const stream = await harness.access.getDatabaseSnapshotStream(
+            ['characters'],
+            ['characters'],
+        )
+        const reader = stream.getReader()
+        await reader.read()
+        await reader.cancel()
+        expect(harness.releasedLeases[0]).toHaveBeenCalledOnce()
+    })
+
+    it.each([
+        [{}, 'character', 'active'],
+        [{ characterIndex: 1 }, 'character', 'trashed'],
+        [{ characterIndex: 0, chatIndex: 1 }, 'conversation', 'active'],
+    ] as const)('streams a full-object target %j from one pinned revision', async (target, select, id) => {
+        const harness = createHarness()
+        harness.pinnedDatabases.push(makeFullObjectDatabase())
+        const result = await harness.access.getFullObjectSnapshotStream(target, callContext())
+        expect(result?.select).toBe(select)
+        const chunks: any[] = []
+        for await (const chunk of result!.value as any) chunks.push(chunk)
+        expect(chunks.find((chunk) => chunk.type === 'characterStart').value.chaId).toBe(id)
+        expect(chunks.filter((chunk) => chunk.type === 'message').map((chunk) => chunk.value.data))
+            .toEqual(select === 'conversation' ? ['b'] : ['a', 'b'])
+        expect(harness.snapshot).not.toHaveBeenCalled()
+        expect(harness.releasedLeases[0]).toHaveBeenCalledOnce()
+    })
+
+    it('releases full-object streaming resources when the plugin is unloaded', async () => {
+        const harness = createHarness()
+        harness.pinnedDatabases.push(makeFullObjectDatabase())
+        const lifetime = new AbortController()
+        const result = await harness.access.getFullObjectSnapshotStream({}, {
+            pluginName: PLUGIN_ACCESS_OWNER, signal: lifetime.signal,
+        })
+        const reader = result!.value.getReader()
+        await reader.read()
+        lifetime.abort()
+        await vi.waitFor(() => expect(harness.releasedLeases[0]).toHaveBeenCalledOnce())
+        await expect(reader.read()).rejects.toMatchObject({ name: 'AbortError' })
+        reader.releaseLock()
+        expect(harness.releasedLeases[0]).toHaveBeenCalledOnce()
     })
 
     // Invariants 20 and 27.

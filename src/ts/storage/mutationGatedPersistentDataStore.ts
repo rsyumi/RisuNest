@@ -66,10 +66,16 @@ export function createMutationGatedPersistentDataStore(
             gate.runTransition(() => store.activateAssetRepositoryMigration(input)),
         commit: (input: WorkingSetCommit) => gate.runWrite(() => store.commit(input)),
         archivePreview: (characterId: string) => store.archivePreview(characterId),
-        archiveCharacter: (characterId: string, expectedRevision: DataRevision) =>
-            gate.runWrite(() => store.archiveCharacter(characterId, expectedRevision)),
-        restoreCharacter: (characterId: string, expectedRevision: DataRevision) =>
-            gate.runWrite(() => store.restoreCharacter(characterId, expectedRevision)),
+        archiveCharacter: (
+            characterId: string,
+            expectedRevision: DataRevision,
+            signal?: AbortSignal,
+        ) => gate.runWrite(() => store.archiveCharacter(characterId, expectedRevision, signal)),
+        restoreCharacter: (
+            characterId: string,
+            expectedRevision: DataRevision,
+            signal?: AbortSignal,
+        ) => gate.runWrite(() => store.restoreCharacter(characterId, expectedRevision, signal)),
         replaceFromDatabase: (...args: Parameters<PersistentDataStore['replaceFromDatabase']>) =>
             gate.runTransition(() => store.replaceFromDatabase(...args)),
         materializeDatabase: (revision?: DataRevision) => store.materializeDatabase(revision),

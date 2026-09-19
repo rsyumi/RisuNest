@@ -766,7 +766,7 @@ const makeRisuaiAPIV3 = (
         signal: pluginLifetime.signal,
     })
     const getCompleteCurrentCharacter = () =>
-        getPluginDatabaseAccess(plugin.name).getCurrentCharacter(fullObjectContext())
+        getPluginDatabaseAccess(plugin.name).getFullObjectSnapshotStream({}, fullObjectContext())
     const setCompleteCurrentCharacter = (character: unknown) =>
         getPluginDatabaseAccess(plugin.name).setCurrentCharacter(
             character as any,
@@ -891,7 +891,13 @@ const makeRisuaiAPIV3 = (
             if(!conf){
                 return null;
             }
-            return getPluginDatabaseAccess(plugin.name).getDatabaseSnapshot(includeOnly, allowedDbKeys)
+            const access = getPluginDatabaseAccess(plugin.name)
+            const needsCharacters = includeOnly === 'all' || includeOnly.includes('characters')
+            if (!needsCharacters) return access.getDatabaseSnapshot(includeOnly, allowedDbKeys)
+            return {
+                __type: 'IFRAME_OBJECT_STREAM',
+                value: await access.getDatabaseSnapshotStream(includeOnly, allowedDbKeys),
+            }
         },
         queryCharacters: async (input?: PluginCharacterQuery) => {
             const allowed = await getPluginPermission(plugin.name, 'db', 'periodically')
@@ -1015,7 +1021,9 @@ const makeRisuaiAPIV3 = (
             }
         },
         getCharacterFromIndex: (index:number) => {
-            return getPluginDatabaseAccess(plugin.name).getCharacterFromIndex(index, fullObjectContext())
+            return getPluginDatabaseAccess(plugin.name).getFullObjectSnapshotStream(
+                { characterIndex: index }, fullObjectContext(),
+            )
         },
         setCharacterToIndex: (index:number, char:any) => {
             return getPluginDatabaseAccess(plugin.name).setCharacterToIndex(
@@ -1025,9 +1033,8 @@ const makeRisuaiAPIV3 = (
             )
         },
         getChatFromIndex: (characterIndex:number, chatIndex:number) => {
-            return getPluginDatabaseAccess(plugin.name).getChatFromIndex(
-                characterIndex,
-                chatIndex,
+            return getPluginDatabaseAccess(plugin.name).getFullObjectSnapshotStream(
+                { characterIndex, chatIndex },
                 fullObjectContext(),
             )
         },

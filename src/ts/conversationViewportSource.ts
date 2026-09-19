@@ -1,4 +1,5 @@
 import { ChatRenderIdentityRegistry } from './chatRenderIdentity'
+import { safeStructuredClone } from './polyfill'
 import type {
     CapturedChatMessageTarget,
     CurrentChatMessageTarget,
@@ -373,7 +374,9 @@ implements ConversationViewportSource {
     private readonly listeners = new Set<() => void>()
     private readonly pins = new Map<number, PersistentRangePinState>()
     private rows = new Map<number, PersistentCachedRow>()
+    private optimisticRows = new Set<number>()
     private currentRevision: DataRevision
+    private persistedTotalMessages: number
     private totalMessages: number
     private epoch = 0
     private accessClock = 0
@@ -396,6 +399,7 @@ implements ConversationViewportSource {
         this.characterId = options.characterId
         this.conversationId = options.conversationId
         this.currentRevision = options.revision
+        this.persistedTotalMessages = options.totalMessages
         this.totalMessages = options.totalMessages
         this.rowBudget = options.rowBudget
     }
@@ -436,9 +440,9 @@ implements ConversationViewportSource {
         if (!result) throw new Error(`Conversation ${this.conversationId} was not found`)
         if (result.revision !== revision) return
         const window = result.value
-        const expectedStartIndex = Math.min(this.totalMessages, input.startIndex)
+        const expectedStartIndex = Math.min(this.persistedTotalMessages, input.startIndex)
         const expectedEndIndex = Math.min(
-            this.totalMessages,
+            this.persistedTotalMessages,
             expectedStartIndex + input.limit,
         )
         if (
@@ -446,13 +450,14 @@ implements ConversationViewportSource {
             window.conversationId !== this.conversationId ||
             window.startIndex !== expectedStartIndex ||
             window.endIndex !== expectedEndIndex ||
-            window.totalMessages !== this.totalMessages ||
+            window.totalMessages !== this.persistedTotalMessages ||
             window.messages.length !== expectedEndIndex - expectedStartIndex
         ) {
             throw new Error(`Conversation ${this.conversationId} returned a mismatched window`)
         }
         for (let offset = 0; offset < window.messages.length; offset++) {
             const absoluteIndex = window.startIndex + offset
+            if (this.optimisticRows.has(absoluteIndex)) continue
             const key = this.keyAt(epoch, this.totalMessages, absoluteIndex)
             if (key === undefined) continue
             this.rows.set(absoluteIndex, {
@@ -469,6 +474,58 @@ implements ConversationViewportSource {
         this.notifyListeners()
     }
 
+    applyOptimisticRange(
+        startIndex: number,
+        deleteCount: number,
+        messages: readonly Message[],
+    ): () => void {
+        this.assertUsable()
+        if (
+            !Number.isSafeInteger(startIndex)
+            || startIndex < 0
+            || !Number.isSafeInteger(deleteCount)
+            || deleteCount < 0
+            || startIndex + deleteCount > this.totalMessages
+            || (messages.length !== deleteCount
+                && !(startIndex === this.totalMessages && deleteCount === 0))
+        ) throw new RangeError('Optimistic conversation range is unsupported')
+        const previousRows = new Map(this.rows)
+        const previousOptimisticRows = new Set(this.optimisticRows)
+        const previousTotalMessages = this.totalMessages
+        this.totalMessages = this.totalMessages - deleteCount + messages.length
+        for (let offset = 0; offset < Math.max(deleteCount, messages.length); offset += 1) {
+            const absoluteIndex = startIndex + offset
+            if (offset >= messages.length) {
+                this.rows.delete(absoluteIndex)
+                this.optimisticRows.delete(absoluteIndex)
+                continue
+            }
+            const key = this.keyAt(this.epoch, this.totalMessages, absoluteIndex)
+            if (key === undefined) continue
+            this.rows.set(absoluteIndex, {
+                row: {
+                    key,
+                    absoluteIndex,
+                    message: safeStructuredClone(messages[offset]),
+                    sourceVersion: this.epoch,
+                },
+                lastUsed: ++this.accessClock,
+            })
+            this.optimisticRows.add(absoluteIndex)
+        }
+        this.evictUnpinnedRows()
+        this.notifyListeners()
+        let restored = false
+        return () => {
+            if (restored || this.disposed) return
+            restored = true
+            this.rows = previousRows
+            this.optimisticRows = previousOptimisticRows
+            this.totalMessages = previousTotalMessages
+            this.notifyListeners()
+        }
+    }
+
     advanceRevision(revision: DataRevision, totalMessages: number): void {
         this.assertUsable()
         this.validateRevision(revision)
@@ -477,10 +534,12 @@ implements ConversationViewportSource {
             throw new RangeError('Persistent conversation revision must advance')
         }
         this.currentRevision = revision
+        this.persistedTotalMessages = totalMessages
         this.totalMessages = totalMessages
         this.epoch += 1
         this.pins.clear()
         this.rows = new Map()
+        this.optimisticRows = new Set()
         this.notifyListeners()
     }
 
