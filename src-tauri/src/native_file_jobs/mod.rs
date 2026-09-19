@@ -48,6 +48,9 @@ const ANDROID_SPOOL_STALE_MILLIS: u64 = 24 * 60 * 60 * 1_000;
 const HANDOFF_STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 const ANDROID_SPOOL_STAGING_PREFIX: &str = ".spooling-";
 const ANDROID_SPOOL_CLEANUP_PREFIX: &str = ".cleanup-";
+// Keep Rust ownership changes exclusive, then retain the opened file so cleanup
+// initiated outside Rust cannot invalidate an already successful claim on POSIX.
+static ANDROID_SPOOL_OWNERSHIP_GATE: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -422,6 +425,13 @@ pub(crate) struct OpenedJobSource {
     pub(crate) total_bytes: u64,
 }
 
+#[derive(Debug)]
+struct ClaimedSpoolSource {
+    #[cfg(test)]
+    path: PathBuf,
+    opened: OpenedJobSource,
+}
+
 fn open_regular_file_no_follow(path: &Path) -> Result<OpenedJobSource, NativeJobError> {
     open_source_file(path, false)
 }
@@ -586,7 +596,7 @@ fn claim_spool_source(
     job_root: &Path,
     token: &str,
     owned_directory: &Path,
-) -> Result<PathBuf, NativeJobError> {
+) -> Result<ClaimedSpoolSource, NativeJobError> {
     claim_spool_source_with_display_name(job_root, token, owned_directory, None)
 }
 
@@ -595,7 +605,7 @@ fn claim_spool_content_source(
     token: &str,
     owned_directory: &Path,
     display_name: &str,
-) -> Result<PathBuf, NativeJobError> {
+) -> Result<ClaimedSpoolSource, NativeJobError> {
     claim_spool_source_with_display_name(job_root, token, owned_directory, Some(display_name))
 }
 
@@ -604,7 +614,10 @@ fn claim_spool_source_with_display_name(
     token: &str,
     owned_directory: &Path,
     expected_display_name: Option<&str>,
-) -> Result<PathBuf, NativeJobError> {
+) -> Result<ClaimedSpoolSource, NativeJobError> {
+    let _ownership = ANDROID_SPOOL_OWNERSHIP_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     parse_android_spool_token(token)?;
     let sources_root = job_root.join("sources").canonicalize().map_err(|error| {
         invalid_source_error(format!("Android source root is unavailable: {error}"))
@@ -635,7 +648,13 @@ fn claim_spool_source_with_display_name(
             "claimed Android spool escapes its native job directory",
         ));
     }
-    validate_spool_source(&canonical_claimed, token, expected_display_name)
+    let path = validate_spool_source(&canonical_claimed, token, expected_display_name)?;
+    let opened = open_regular_file_no_follow(&path)?;
+    Ok(ClaimedSpoolSource {
+        #[cfg(test)]
+        path,
+        opened,
+    })
 }
 
 fn validate_spool_source(
@@ -1001,6 +1020,9 @@ fn cleanup_spool_directories_at(
     now_millis: u64,
     stale_after_millis: u64,
 ) -> Result<(), String> {
+    let _ownership = ANDROID_SPOOL_OWNERSHIP_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if !sources_root.is_dir() {
         return Ok(());
     }
@@ -1780,7 +1802,7 @@ impl NativeFileJobState {
             JobSource::DesktopPath { .. } => open_job_source(&self.root, &source),
             JobSource::AndroidSpool { token } => {
                 claim_spool_content_source(&self.root, token, &owned_directory, &display_name)
-                    .and_then(|path| open_regular_file_no_follow(&path))
+                    .map(|source| source.opened)
             }
             JobSource::ConflictReference { .. } => Err(invalid_source_error(
                 "conflict references cannot import content",
@@ -2006,13 +2028,13 @@ impl NativeFileJobState {
             match source {
                 JobSource::DesktopPath { .. } if opened_source.is_some() => Ok(()),
                 JobSource::AndroidSpool { token } if opened_source.is_none() => {
-                    let path = claim_spool_source_with_display_name(
+                    let source = claim_spool_source_with_display_name(
                         &self.root,
                         token,
                         &owned_directory,
                         expected_display_name,
                     )?;
-                    *opened_source = Some(open_regular_file_no_follow(&path)?);
+                    *opened_source = Some(source.opened);
                     Ok(())
                 }
                 JobSource::ConflictReference { .. } => Err(NativeJobError::new(
@@ -4727,7 +4749,7 @@ mod tests {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::json;
     use std::fs;
-    use std::io::{Cursor, Write};
+    use std::io::{Cursor, Read, Write};
     use std::sync::Barrier;
     use std::thread;
     use std::time::Duration;
@@ -5364,8 +5386,9 @@ mod tests {
 
         let source = claim_spool_source(directory.path(), &token, &owned).unwrap();
 
-        assert_eq!(source.file_name().unwrap(), "source.risudat");
-        assert!(source.starts_with(owned.canonicalize().unwrap()));
+        assert_eq!(source.path.file_name().unwrap(), "source.risudat");
+        assert!(source.path.starts_with(owned.canonicalize().unwrap()));
+        assert_eq!(source.opened.total_bytes, 9);
         assert!(!directory.path().join("sources").join(&token).exists());
         assert!(claim_spool_source(directory.path(), &token, &owned).is_err());
     }
@@ -5472,7 +5495,11 @@ mod tests {
             cleanup.join().unwrap().unwrap();
 
             match claimed {
-                Ok(source) => assert_eq!(fs::read(source).unwrap(), b"RISUSAVE\0"),
+                Ok(mut source) => {
+                    let mut bytes = Vec::new();
+                    source.opened.file.read_to_end(&mut bytes).unwrap();
+                    assert_eq!(bytes, b"RISUSAVE\0");
+                }
                 Err(_) => assert!(!owned.join("android-source").exists()),
             }
             assert!(!directory.path().join("sources").join(&token).exists());
