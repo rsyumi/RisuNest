@@ -22,6 +22,7 @@ vi.mock('./native', () => ({ nativeUpdate: nativeMocks }))
 
 import {
     checkForAppUpdate,
+    applyAppUpdate,
     startAppUpdateChecks,
     stopAppUpdateChecks,
     UPDATE_CHECK_INTERVAL_MS,
@@ -71,6 +72,7 @@ function dependencies(options: { auto?: boolean; skipped?: string; check?: () =>
         cancel: vi.fn(),
         open: vi.fn(),
         restart: vi.fn(),
+        prepareInstall: vi.fn(async () => ({ release: vi.fn() })),
     }
     return { value, check, saveSettings }
 }
@@ -162,6 +164,76 @@ describe('app update controller', () => {
         expect(vi.getTimerCount()).toBe(1)
         await vi.advanceTimersToNextTimerAsync()
         expect(nativeMocks.check).toHaveBeenCalledTimes(2)
+    })
+
+    it('awaits local persistence and retains the fence through installation and restart', async () => {
+        const fixture = dependencies()
+        const order: string[] = []
+        let finishPreparation!: (value: { release(): void }) => void
+        const release = vi.fn(() => { order.push('release') })
+        fixture.value.prepareInstall = vi.fn(() => new Promise<{ release(): void }>(resolve => { finishPreparation = resolve }))
+        fixture.value.install = vi.fn(async () => {
+            expect(release).not.toHaveBeenCalled()
+            order.push('install')
+        })
+        fixture.value.restart = vi.fn(async () => {
+            expect(release).not.toHaveBeenCalled()
+            order.push('restart')
+        })
+        appUpdateState.update(state => ({ ...state, update: available.update }))
+        const pending = applyAppUpdate(fixture.value)
+        expect(fixture.value.install).not.toHaveBeenCalled()
+        await applyAppUpdate(fixture.value)
+        expect(fixture.value.prepareInstall).toHaveBeenCalledTimes(1)
+        finishPreparation({ release })
+        await pending
+        expect(fixture.value.install).toHaveBeenCalledWith('verified-handle')
+        expect(order).toEqual(['install', 'restart', 'release'])
+    })
+
+    it('does not install or restart when local persistence fails', async () => {
+        const fixture = dependencies()
+        fixture.value.prepareInstall = vi.fn().mockRejectedValue(new Error('local save failed'))
+        appUpdateState.update(state => ({ ...state, update: available.update }))
+        await applyAppUpdate(fixture.value)
+        expect(fixture.value.install).not.toHaveBeenCalled()
+        expect(fixture.value.restart).not.toHaveBeenCalled()
+        expect(get(appUpdateState)).toMatchObject({ phase: 'error', error: 'local save failed' })
+    })
+
+    it.each(['install', 'restart'] as const)('releases editing protection after %s failure', async (step) => {
+        const fixture = dependencies()
+        const release = vi.fn()
+        fixture.value.prepareInstall = vi.fn(async () => ({ release }))
+        fixture.value[step] = vi.fn().mockRejectedValue(new Error('synthetic failure'))
+        appUpdateState.update(state => ({ ...state, update: available.update }))
+        await applyAppUpdate(fixture.value)
+        expect(release).toHaveBeenCalledTimes(1)
+        expect(get(appUpdateState)).toMatchObject({ phase: 'error', error: 'synthetic failure' })
+        if (step === 'install') expect(fixture.value.restart).not.toHaveBeenCalled()
+    })
+
+    it('releases editing protection after installer cancellation', async () => {
+        const fixture = dependencies()
+        const release = vi.fn()
+        fixture.value.prepareInstall = vi.fn(async () => ({ release }))
+        fixture.value.install = vi.fn().mockRejectedValue(new Error('cancelled'))
+        appUpdateState.update(state => ({ ...state, update: available.update }))
+        await applyAppUpdate(fixture.value)
+        expect(release).toHaveBeenCalledTimes(1)
+        expect(fixture.value.restart).not.toHaveBeenCalled()
+        expect(get(appUpdateState)).toMatchObject({ phase: 'available', error: '' })
+    })
+
+    it.each(['stage-deb', 'open-link', 'disabled'] as const)('does not fence editing for %s', async (installStrategy) => {
+        const fixture = dependencies()
+        appUpdateState.update(state => ({ ...state, update: { ...available.update!, installStrategy } }))
+        await applyAppUpdate(fixture.value)
+        expect(fixture.value.prepareInstall).not.toHaveBeenCalled()
+        expect(fixture.value.install).not.toHaveBeenCalled()
+        expect(fixture.value.restart).not.toHaveBeenCalled()
+        if (installStrategy === 'stage-deb') expect(fixture.value.stageDeb).toHaveBeenCalledTimes(1)
+        else expect(fixture.value.open).toHaveBeenCalledTimes(1)
     })
 
     it('does not start a check while an install is active', async () => {

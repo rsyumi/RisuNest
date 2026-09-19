@@ -11,6 +11,7 @@ import {
     type AppUpdateSettings,
 } from './settings'
 import { appUpdateState } from './state.svelte'
+import { prepareUpdateInstallation } from './persistence'
 
 export const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
 const UPDATE_CHECK_TIMEOUT_MS = 30_000
@@ -33,6 +34,7 @@ export interface UpdateControllerDependencies {
     cancel: typeof nativeUpdate.cancel
     open: (url: string) => void
     restart: () => Promise<void>
+    prepareInstall: () => Promise<{ release(): void }>
 }
 
 const production: UpdateControllerDependencies = {
@@ -46,6 +48,7 @@ const production: UpdateControllerDependencies = {
     cancel: nativeUpdate.cancel,
     open: openURL,
     restart: relaunch,
+    prepareInstall: prepareUpdateInstallation,
 }
 
 export async function checkForAppUpdate(
@@ -203,6 +206,7 @@ export function clearSkippedAppUpdate(): void {
 }
 
 export async function applyAppUpdate(dependencies: UpdateControllerDependencies = production): Promise<void> {
+    if (['downloading', 'applying'].includes(get(appUpdateState).phase)) return
     const update = get(appUpdateState).update
     if (!update) return
     if (update.installStrategy === 'open-link' || update.installStrategy === 'disabled') {
@@ -217,8 +221,15 @@ export async function applyAppUpdate(dependencies: UpdateControllerDependencies 
             appUpdateState.update(state => ({ ...state, phase: 'staged', stagedDeb, progress: null }))
             return
         }
-        await dependencies.install(update.handleId)
-        await dependencies.restart()
+        const fence = await dependencies.prepareInstall()
+        try {
+            await dependencies.install(update.handleId)
+            await dependencies.restart()
+        } finally {
+            // On Windows a successful installer exits natively before returning.
+            // A returned cancellation/failure must restore normal editing.
+            fence.release()
+        }
     } catch (error) {
         const message = describe(error)
         appUpdateState.update(state => ({
