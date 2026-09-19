@@ -16,9 +16,9 @@ import {
 } from './nativePluginPermissions'
 
 /**
- * What a native install is still allowed to leave in the WebView. Everything
- * else belongs to the library or to the device file, so a new name here has to
- * be argued for rather than appearing by accident.
+ * Storage-name inventory, not proof of platform routing. Native persistence
+ * behavior is checked separately below. Each known browser write needs an
+ * explicit owner and a reason for remaining outside the native store.
  *
  * Only writes are collected: a read of a name nothing writes leaves nothing
  * behind, and a removal only takes something away.
@@ -40,6 +40,8 @@ const NATIVE_RESIDUAL: Record<string, string> = {
         'export block cache, not assigned a tier',
     'indexedDB dynamic src/ts/translator/bergamotTranslator.ts':
         'local translation model cache, not assigned a tier',
+    'indexedDB dynamic src/ts/drive/legacyBackupAttachments.ts':
+        'temporary WebView restore staging, also used after native fallback; kept only when rollback fails',
 }
 
 /** Reached only by the web build, which has no device tier. */
@@ -136,8 +138,8 @@ function collect(): Set<string> {
     return found
 }
 
-describe('residual browser storage', () => {
-    it('writes only the names a native install is allowed to leave behind', () => {
+describe('browser storage-name inventory', () => {
+    it('accounts for every source-level storage name with an owner and rationale', () => {
         const allowed = [...Object.keys(NATIVE_RESIDUAL), ...Object.keys(WEB_ONLY)].sort()
 
         expect([...collect()].sort()).toEqual(allowed)
