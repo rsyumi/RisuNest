@@ -7,7 +7,7 @@ use image::{
     codecs::gif::{GifEncoder, Repeat},
     codecs::webp::WebPDecoder,
     imageops::FilterType,
-    AnimationDecoder, Delay, DynamicImage, Frame, ImageFormat, Rgba, RgbaImage,
+    AnimationDecoder, Delay, DynamicImage, Frame, ImageDecoder, ImageFormat, ImageReader, Rgba, RgbaImage,
 };
 use serde_json::json;
 use std::{fs, io::Cursor, path::Path};
@@ -1146,6 +1146,37 @@ fn skipped_webp_reencodes_when_max_dimension_requires_resize() {
         (Some(5), Some(3))
     );
     assert_eq!(result.metadata.mime, "image/webp");
+}
+
+#[test]
+fn original_mode_keeps_header_dimensions_without_decoding_png_pixels() {
+    let valid = encoded_fixture(ImageFormat::Png, 8, 3);
+    let mut source = valid[..8].to_vec();
+    for (kind, payload) in png_chunks(&valid) {
+        let kind: &[u8; 4] = kind.as_bytes().try_into().unwrap();
+        source.extend(png_chunk(kind, if kind == b"IDAT" { b"invalid pixels" } else { &payload }));
+    }
+    let decoder = ImageReader::new(Cursor::new(&source)).with_guessed_format().unwrap().into_decoder().unwrap();
+    assert_eq!(decoder.dimensions(), (8, 3));
+    assert!(DynamicImage::from_decoder(decoder).is_err());
+    let result = encode_inlay_image("original", &source, "image.png", Some(InlayEncodeOptions {
+        format: InlayEncodeFormat::Original, ..InlayEncodeOptions::default()
+    })).unwrap();
+    assert_eq!(result.data, source);
+    assert_eq!((result.metadata.width, result.metadata.height), (Some(8), Some(3)));
+}
+
+#[test]
+fn metadata_only_original_dimensions_follow_every_exif_orientation() {
+    for orientation in 1..=8 {
+        let source = with_exif_orientation(encoded_fixture(ImageFormat::Jpeg, 8, 3), orientation);
+        let result = encode_inlay_image("original", &source, "image.jpg", Some(InlayEncodeOptions {
+            format: InlayEncodeFormat::Original, ..InlayEncodeOptions::default()
+        })).unwrap();
+        let expected = if orientation >= 5 { (Some(3), Some(8)) } else { (Some(8), Some(3)) };
+        assert_eq!((result.metadata.width, result.metadata.height), expected);
+        assert_eq!(result.data, source);
+    }
 }
 
 #[test]

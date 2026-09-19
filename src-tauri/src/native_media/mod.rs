@@ -1395,16 +1395,23 @@ fn encode_inlay_image(
         return Ok(preserved_inlay_image(id, data, name, None));
     };
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let (mut width, mut height) = decoder.dimensions();
+    if matches!(orientation, Orientation::Rotate90 | Orientation::Rotate270
+        | Orientation::Rotate90FlipH | Orientation::Rotate270FlipH)
+    {
+        std::mem::swap(&mut width, &mut height);
+    }
+    let needs_resize = options.max_dimension > 0 && width.max(height) > options.max_dimension;
+    if options.format == InlayEncodeFormat::Original
+        || (options.format == InlayEncodeFormat::Webp && options.skip_reencode
+            && format == ImageFormat::WebP && !needs_resize)
+    {
+        return Ok(preserved_inlay_image(id, data, name, Some((width, height))));
+    }
     let Ok(mut decoded) = DynamicImage::from_decoder(decoder) else {
         return Ok(preserved_inlay_image(id, data, name, None));
     };
     decoded.apply_orientation(orientation);
-    let width = decoded.width();
-    let height = decoded.height();
-    if options.format == InlayEncodeFormat::Original {
-        return Ok(preserved_inlay_image(id, data, name, Some((width, height))));
-    }
-    let needs_resize = options.max_dimension > 0 && width.max(height) > options.max_dimension;
     if needs_resize {
         let scale = options.max_dimension as f64 / width.max(height) as f64;
         decoded = decoded.resize(
@@ -1413,20 +1420,16 @@ fn encode_inlay_image(
             FilterType::Lanczos3,
         );
     }
-    let rgba = decoded.to_rgba8();
+    let rgba = decoded.into_rgba8();
+    let (output_width, output_height) = rgba.dimensions();
     let (encoded, mime, ext) = match options.format {
         InlayEncodeFormat::Original => unreachable!(),
         InlayEncodeFormat::Png => {
             let mut value = Vec::new();
-            DynamicImage::ImageRgba8(rgba.clone())
+            DynamicImage::ImageRgba8(rgba)
                 .write_to(&mut Cursor::new(&mut value), ImageFormat::Png)
                 .map_err(|error| format!("failed to encode PNG Inlay image: {error}"))?;
             (value, "image/png", "png")
-        }
-        InlayEncodeFormat::Webp
-            if options.skip_reencode && format == ImageFormat::WebP && !needs_resize =>
-        {
-            (data.to_vec(), "image/webp", "webp")
         }
         InlayEncodeFormat::Webp => (
             webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
@@ -1444,8 +1447,8 @@ fn encode_inlay_image(
         name: name.to_owned(),
         ext: ext.to_owned(),
         inlay_type: "image".to_owned(),
-        width: Some(rgba.width()),
-        height: Some(rgba.height()),
+        width: Some(output_width),
+        height: Some(output_height),
     };
     Ok(EncodedInlayImage {
         data: encoded,
