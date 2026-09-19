@@ -1,4 +1,5 @@
 import { isTauri } from "../../platform";
+import { invalidatePluginDeviceKeyspaces } from "../../plugins/pluginDeviceKeyspace";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -28,6 +29,7 @@ export function getServerSyncController() {
         acquireDestructiveReplacementFence,
         refreshActiveWorkingSetFromStore,
       },
+      invalidateDevicePlugins: invalidatePluginDeviceKeyspaces,
       restorePlugins: async () => {
         await (
           await import("../../plugins/plugins.svelte")

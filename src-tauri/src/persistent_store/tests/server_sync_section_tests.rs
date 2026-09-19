@@ -576,6 +576,51 @@ fn a_prepared_section_ack_does_not_ack_a_later_value_or_removal() {
     fleet.task.abort();
 }
 
+#[test]
+fn section_only_plugin_refresh_is_retained_across_activation_confirmation() {
+    for (participating, local_edit) in [(true, false), (false, false), (true, true)] {
+        let fleet = fleet();
+        let (_author_dir, mut author) = prepared();
+        let (_reader_dir, mut reader) = prepared();
+        for store in [&mut author, &mut reader] {
+            store.device_store_mut().unwrap()
+                .set_section_participating(Section::LocalPlugins, true).unwrap();
+            fleet.bind(store);
+            assert_eq!(settle(store).phase, "idle");
+        }
+        author.device_store_mut().unwrap().write_plugin_device_values("synthetic-plugin", &[
+            PluginDeviceMutation::Set { space: "string".into(), key: "received".into(), value: "new".into() },
+        ]).unwrap();
+        assert_eq!(settle(&mut author).phase, "idle");
+        assert_eq!(settle(&mut author).phase, "idle");
+        let crate::persistent_store::server_sync_engine::Preparation::Ready(mut ready) = reader
+            .server_prepare_cycle(&CycleOptions::default()).unwrap()
+        else { panic!("expected preparation") };
+        assert_eq!(ready.applied, 0);
+        if local_edit {
+            let mut root = reader.read_root(None).unwrap().value;
+            root["username"] = json!("local edit after preparation");
+            reader.commit(&WorkingSetCommit {
+                root: Some(root), ..empty_working_set_commit(ready.revision)
+            }).unwrap();
+            assert_eq!(reader.server_activate_cycle(&mut ready).unwrap_err().code, "local-revision-changed");
+            assert_eq!(reader.device_store().unwrap()
+                .read_plugin_device_value("synthetic-plugin", "string", "received").unwrap(), None);
+            fleet.task.abort();
+            continue;
+        }
+        if !participating {
+            reader.device_store_mut().unwrap()
+                .set_section_participating(Section::LocalPlugins, false).unwrap();
+        }
+        let revision = reader.server_activate_cycle(&mut ready).unwrap();
+        assert_eq!(ready.plugin_changes(), (participating, participating));
+        assert_eq!(reader.server_activate_cycle(&mut ready).unwrap(), revision);
+        assert_eq!(ready.plugin_changes(), (participating, participating));
+        fleet.task.abort();
+    }
+}
+
 /// Invariant 18. A choice made after a cycle was planned cancels that cycle's
 /// section work instead of carrying out the previous choice.
 #[test]

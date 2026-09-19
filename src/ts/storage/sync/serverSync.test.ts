@@ -72,7 +72,7 @@ function fixture(
     }
     if (command === "server_sync_activate") {
       expect(fenced).toBe(true);
-      return 8;
+      return { revision: 8, pluginsChanged: true, devicePluginsChanged: false };
     }
     if (command === "server_sync_publish") {
       expect(fenced).toBe(false);
@@ -91,6 +91,45 @@ function fixture(
   return { facade, native, runtime, fence, trace, progress };
 }
 describe("server sync activation boundary", () => {
+  it('refreshes chat changes without restarting unrelated plugins', async () => {
+    const { runtime, native, fence } = fixture();
+    const original = native.getMockImplementation()!;
+    native.mockImplementation(async (command) => command === 'server_sync_activate'
+      ? { revision: 8, pluginsChanged: false, devicePluginsChanged: false } as never
+      : original(command));
+    const restorePlugins = vi.fn();
+    const invalidateDevicePlugins = vi.fn();
+    const facade = createServerSyncFacade({ runtime, invoke: native as never, restorePlugins, invalidateDevicePlugins });
+    await facade.cycle();
+    expect(fence.refreshCommittedWorkingSet).toHaveBeenCalledOnce();
+    expect(restorePlugins).not.toHaveBeenCalled();
+    expect(invalidateDevicePlugins).not.toHaveBeenCalled();
+  });
+
+  it('invalidates a section-only application before release and retries only plugin reload', async () => {
+    const { runtime, native, fence } = fixture();
+    const original = native.getMockImplementation()!;
+    native.mockImplementation(async (command) => {
+      const reply = await original(command);
+      if (command === 'server_sync_prepare') return { ...reply, appliedRecords: 0 } as never;
+      if (command === 'server_sync_activate') return {
+        revision: 7, pluginsChanged: true, devicePluginsChanged: true,
+      } as never;
+      return reply;
+    });
+    const invalidateDevicePlugins = vi.fn(() => expect(fence.release).not.toHaveBeenCalled());
+    const restorePlugins = vi.fn().mockRejectedValueOnce(new Error('synthetic reload failure')).mockResolvedValue(undefined);
+    const facade = createServerSyncFacade({ runtime, invoke: native as never, restorePlugins, invalidateDevicePlugins });
+    await expect(facade.cycle()).rejects.toMatchObject({ code: 'committed-refresh-pending' });
+    expect(invalidateDevicePlugins).toHaveBeenCalledOnce();
+    expect(fence.release).toHaveBeenCalledOnce();
+    expect(fence.refreshCommittedWorkingSet).not.toHaveBeenCalled();
+    await expect(facade.cycle()).resolves.toEqual(result);
+    expect(invalidateDevicePlugins).toHaveBeenCalledOnce();
+    expect(restorePlugins).toHaveBeenCalledTimes(2);
+    expect(runtime.refreshActiveWorkingSetFromStore).not.toHaveBeenCalled();
+    expect(native.mock.calls.filter(([command]) => command === 'server_sync_activate')).toHaveLength(1);
+  });
   it.each(['flush', 'token', 'fence'] as const)(
     'releases an unactivated preparation when %s fails and permits another cycle',
     async (failure) => {

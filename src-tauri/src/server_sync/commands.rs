@@ -667,8 +667,16 @@ pub(crate) async fn server_sync_prepare(
     })
     .await
 }
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ActivationReply {
+    revision: i64,
+    plugins_changed: bool,
+    device_plugins_changed: bool,
+}
+
 #[tauri::command]
-pub(crate) async fn server_sync_activate(app: AppHandle, preparation_id: String) -> Result<i64> {
+pub(crate) async fn server_sync_activate(app: AppHandle, preparation_id: String) -> Result<ActivationReply> {
     blocking(move || {
         let state = app.state::<ServerSyncCommandState>();
         let _running = state.claim()?;
@@ -680,7 +688,9 @@ pub(crate) async fn server_sync_activate(app: AppHandle, preparation_id: String)
             return Err(SyncError::new("stale-server-preparation", 409));
         }
         let job = slot.as_mut().unwrap();
-        job.store.server_activate_cycle(&mut job.cycle)
+        let revision = job.store.server_activate_cycle(&mut job.cycle)?;
+        let (plugins_changed, device_plugins_changed) = job.cycle.plugin_changes();
+        Ok(ActivationReply { revision, plugins_changed, device_plugins_changed })
     })
     .await
 }

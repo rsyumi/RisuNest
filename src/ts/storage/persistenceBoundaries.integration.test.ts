@@ -229,7 +229,10 @@ describe('persistence boundary regressions', () => {
                 head, appliedRecords: 1,
             }
             if (command === 'server_sync_activate') {
-                return (await store.replaceFromDatabase(database('Remote committed'), 1)).revision
+                return {
+                    revision: (await store.replaceFromDatabase(database('Remote committed'), 1)).revision,
+                    pluginsChanged: true, devicePluginsChanged: false,
+                }
             }
             if (command === 'server_sync_publish') return {
                 endpoint: 'https://synthetic.invalid', phase: 'idle', localRevision: 2,

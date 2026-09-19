@@ -1,7 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
     PluginDeviceKeyspace,
+    PLUGIN_DEVICE_CACHE_BYTES,
     createBrowserPluginDeviceBackend,
+    getPluginDeviceKeyspace,
+    invalidatePluginDeviceKeyspaces,
     type PluginDeviceBackend,
     type PluginDeviceMutation,
     type PluginDeviceSpace,
@@ -88,6 +91,92 @@ function recordingBackend(
 describe('plugin device keyspace', () => {
     beforeEach(() => {
         localStorage.clear()
+        invalidatePluginDeviceKeyspaces()
+    })
+
+    it('invalidates an already-held shared wrapper', async () => {
+        const backend = createBrowserPluginDeviceBackend()
+        const keyspace = getPluginDeviceKeyspace('shared-wrapper')
+        await keyspace.setItem('string', 'key', 'old')
+        await backend.write('shared-wrapper', [{ type: 'set', space: 'string', key: 'key', value: 'received' }])
+        invalidatePluginDeviceKeyspaces('shared-wrapper')
+        expect(getPluginDeviceKeyspace('shared-wrapper')).toBe(keyspace)
+        await expect(keyspace.getItem('string', 'key')).resolves.toBe('received')
+    })
+
+    it('does not resurrect a hydration invalidated by native application', async () => {
+        const { backend } = recordingBackend([{ owner: 'a', space: 'string', key: 'key', value: 'old' }])
+        const old = await backend.hydrate('a')
+        let finish!: (value: typeof old) => void
+        vi.spyOn(backend, 'hydrate').mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+        const keyspace = new PluginDeviceKeyspace('a', backend)
+        const first = keyspace.getItem('string', 'key')
+        keyspace.invalidate()
+        await backend.write('a', [{ type: 'set', space: 'string', key: 'key', value: 'received' }])
+        await expect(keyspace.getItem('string', 'key')).resolves.toBe('received')
+        finish(old)
+        await expect(first).resolves.toBe('received')
+        await expect(keyspace.getItem('string', 'key')).resolves.toBe('received')
+    })
+
+    it('discards a new hydration if an older in-flight write commits afterwards', async () => {
+        const { backend } = recordingBackend([{ owner: 'a', space: 'string', key: 'key', value: 'old' }])
+        const write = backend.write.bind(backend)
+        let finish!: () => void
+        const gate = new Promise<void>(resolve => { finish = resolve })
+        const writes = vi.spyOn(backend, 'write').mockImplementationOnce(async (owner, mutations) => {
+            await gate
+            await write(owner, mutations)
+        })
+        const keyspace = new PluginDeviceKeyspace('a', backend)
+        const pending = keyspace.setItem('string', 'key', 'new')
+        await vi.waitFor(() => expect(writes).toHaveBeenCalledOnce())
+        keyspace.invalidate()
+        await expect(keyspace.getItem('string', 'key')).resolves.toBe('old')
+        finish()
+        await pending
+        await expect(keyspace.getItem('string', 'key')).resolves.toBe('new')
+    })
+
+    it('does not let a late write acknowledgement overwrite a newer cached value', async () => {
+        const { backend } = recordingBackend()
+        const write = backend.write.bind(backend)
+        let finish!: () => void
+        const gate = new Promise<void>(resolve => { finish = resolve })
+        const writes = vi.spyOn(backend, 'write').mockImplementationOnce(async (owner, mutations) => {
+            await write(owner, mutations)
+            await gate
+        })
+        const keyspace = new PluginDeviceKeyspace('a', backend)
+        const older = keyspace.setItem('string', 'key', 'old')
+        await vi.waitFor(() => expect(writes).toHaveBeenCalledOnce())
+        await keyspace.setItem('string', 'key', 'new')
+        finish()
+        await older
+        await expect(keyspace.getItem('string', 'key')).resolves.toBe('new')
+    })
+
+    it('keeps writes durable but drops a cache that grows beyond its byte budget', async () => {
+        const { backend } = recordingBackend()
+        const reads = vi.spyOn(backend, 'read')
+        const hydrations = vi.spyOn(backend, 'hydrate')
+        const keyspace = new PluginDeviceKeyspace('a', backend)
+        const value = 'x'.repeat(PLUGIN_DEVICE_CACHE_BYTES / 4)
+        for (const key of ['one', 'two', 'three']) await keyspace.setItem('string', key, value)
+        await expect(keyspace.getItem('string', 'three')).resolves.toBe(value)
+        expect(reads).toHaveBeenCalledOnce()
+        expect(hydrations).toHaveBeenCalledOnce()
+        await expect(keyspace.keys('string')).resolves.toEqual(['one', 'three', 'two'])
+    })
+
+    it('does not accumulate replacement costs for the same cached key', async () => {
+        const { backend } = recordingBackend()
+        const reads = vi.spyOn(backend, 'read')
+        const keyspace = new PluginDeviceKeyspace('a', backend)
+        const value = 'x'.repeat(PLUGIN_DEVICE_CACHE_BYTES / 8)
+        for (let index = 0; index < 8; index += 1) await keyspace.setItem('string', 'key', value)
+        await expect(keyspace.getItem('string', 'key')).resolves.toBe(value)
+        expect(reads).not.toHaveBeenCalled()
     })
 
     it('answers for one owner and one space only', async () => {

@@ -6,6 +6,7 @@ pub(crate) struct ValidatedRecords {
     db: rusqlite::Connection,
     _file: tempfile::NamedTempFile,
     len: usize,
+    plugins_changed: bool,
 }
 impl ValidatedRecords {
     pub fn new() -> StoreResult<Self> {
@@ -20,6 +21,7 @@ impl ValidatedRecords {
             db,
             _file: file,
             len: 0,
+            plugins_changed: false,
         })
     }
     pub fn push(&mut self, record: ValidatedRecord) -> StoreResult<()> {
@@ -40,10 +42,15 @@ impl ValidatedRecords {
             ],
         )?;
         self.len += 1;
+        self.plugins_changed |= matches!(record.locator,
+            LogicalRecordLocator::Root | LogicalRecordLocator::Plugin { .. });
         Ok(())
     }
     pub fn len(&self) -> usize {
         self.len
+    }
+    pub fn affects_plugins(&self) -> bool {
+        self.plugins_changed
     }
     pub fn is_empty(&self) -> bool {
         self.len == 0
@@ -51,6 +58,7 @@ impl ValidatedRecords {
     pub fn clear(&mut self) -> StoreResult<()> {
         self.db.execute("DELETE FROM records", [])?;
         self.len = 0;
+        self.plugins_changed = false;
         Ok(())
     }
     pub fn deletes(&self, key: &str) -> StoreResult<bool> {
@@ -124,6 +132,7 @@ mod tests {
             staged.push(validate_remote(record, &cas).unwrap()).unwrap();
         }
         assert_eq!(staged.len(), 256);
+        assert!(staged.affects_plugins());
         assert!(staged._file.as_file().metadata().unwrap().len() > 4 * 1024 * 1024);
         let mut delivered_ordinals = BTreeSet::new();
         staged

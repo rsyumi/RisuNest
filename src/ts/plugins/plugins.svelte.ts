@@ -475,6 +475,8 @@ export async function loadPlugins() {
 }
 
 export async function loadPluginsAfterAuthoritativeRestore() {
+    const { invalidatePluginDeviceKeyspaces } = await import('./pluginDeviceKeyspace')
+    invalidatePluginDeviceKeyspaces()
     await loadPlugins()
 }
 

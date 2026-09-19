@@ -297,6 +297,8 @@ pub(crate) struct PreparedCycle {
     reads: BTreeMap<String, RecordVersion>,
     committed: bool,
     pub applied: usize,
+    plugins_changed: bool,
+    device_plugins_changed: bool,
     pub proposals: usize,
     clear_acknowledged: bool,
     section_honored: bool,
@@ -310,6 +312,13 @@ pub(crate) struct PreparedCycle {
     cycle_items: Option<std::sync::Arc<CycleItemCounter>>,
     retry_budget: std::sync::Arc<RetryBudget>,
 }
+impl PreparedCycle {
+    pub(crate) fn plugin_changes(&self) -> (bool, bool) {
+        let device = self.section_honored && self.device_plugins_changed;
+        (self.plugins_changed || device, device)
+    }
+}
+
 /// A published embedding body is bounded by the store's own dimension limit.
 const MAX_SECTION_OBJECT_BYTES: usize = 1024 * 1024;
 
@@ -1354,6 +1363,11 @@ impl PersistentStore {
         let (section_applied, section_proposals) =
             self.prepare_server_sections(&client, &transfer, &cache, &participation, committed)?;
         let applied = records.len();
+        let plugins_changed = records.affects_plugins();
+        let device_plugins_changed = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM server_section_records WHERE domain='local-plugins' AND action='apply')",
+            [], |row| row.get(0),
+        )?;
         Ok(Preparation::Ready(PreparedCycle {
             revision,
             previous: status.head,
@@ -1368,6 +1382,8 @@ impl PersistentStore {
             reads,
             committed,
             applied,
+            plugins_changed,
+            device_plugins_changed,
             proposals,
             clear_acknowledged,
             section_honored: false,
@@ -1387,6 +1403,9 @@ impl PersistentStore {
     pub(crate) fn server_activate_cycle(&mut self, ready: &mut PreparedCycle) -> Result<i64> {
         if let Some(revision) = ready.activated {
             return Ok(revision);
+        }
+        if self.revision()? != ready.revision {
+            return Err(SyncError::new("local-revision-changed", 409));
         }
         // A participation choice made after this cycle was planned cancels the
         // section work rather than applying the previous choice.
